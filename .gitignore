@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+target/
+
+# Build output
+dist/
+.vite/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+src-tauri/WixTools/
+
+# Lock files (keep pnpm-lock)
+Cargo.lock
+
+# Generated
+icon.png
+*.pyc
