@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Debug - Catch Runtime Errors</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #111; color: #0f0; }
+    .error { color: #f44; margin: 10px 0; padding: 10px; border: 1px solid #f44; }
+    .info { color: #4af; margin: 5px 0; }
+    pre { white-space: pre-wrap; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <h2>Runtime Error Diagnostic</h2>
+  <div id="log"></div>
+  <script>
+    const log = document.getElementById('log');
+    function addLog(msg, isError) {
+      const div = document.createElement('div');
+      div.className = isError ? 'error' : 'info';
+      div.innerHTML = '<pre>' + msg + '</pre>';
+      log.appendChild(div);
+    }
+
+    // Catch all errors
+    window.addEventListener('error', (e) => {
+      addLog('UNCAUGHT ERROR: ' + e.message + '\nFile: ' + e.filename + '\nLine: ' + e.lineno + ':' + e.colno + '\nStack: ' + (e.error?.stack || 'N/A'), true);
+    });
+
+    window.addEventListener('unhandledrejection', (e) => {
+      const reason = e.reason;
+      addLog('UNHANDLED PROMISE REJECTION: ' + (reason?.message || reason) + '\nStack: ' + (reason?.stack || 'N/A'), true);
+    });
+
+    addLog('Starting module load test...');
+
+    // Test importing main.tsx
+    async function testImports() {
+      try {
+        addLog('1. Testing React import...');
+        const React = await import('/node_modules/.vite/deps/react.js?v=*');
+        addLog('   React loaded OK: ' + typeof React.default);
+      } catch(e) {
+        addLog('   React FAILED: ' + e.message, true);
+      }
+
+      try {
+        addLog('2. Testing main.tsx import...');
+        await import('/src/main.tsx');
+        addLog('   main.tsx loaded OK');
+      } catch(e) {
+        addLog('   main.tsx FAILED: ' + e.message + '\n   Stack: ' + e.stack, true);
+      }
+    }
+
+    testImports();
+  </script>
+</body>
+</html>
+</script>
+</body>
+</html>

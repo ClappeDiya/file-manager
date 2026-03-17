@@ -1,1 +1,7 @@
-{"onlyBuiltDependencies":["esbuild"]}
+module.exports = {
+  hooks: {
+    readPackage(pkg) {
+      return pkg;
+    },
+  },
+};

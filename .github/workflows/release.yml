@@ -1,0 +1,360 @@
+name: Release Build & Auto-Update
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Release channel'
+        required: true
+        default: 'stable'
+        type: choice
+        options:
+          - stable
+          - beta
+
+env:
+  CARGO_TERM_COLOR: always
+  TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Determine release channel from tag or manual input
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.channel.outputs.channel }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Determine channel
+        id: channel
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "channel=$INPUT_CHANNEL" >> "$GITHUB_OUTPUT"
+          elif [[ "$REF_NAME" == *"-beta"* ]]; then
+            echo "channel=beta" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract version
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${REF_NAME}"
+          VERSION="${VERSION#v}"
+          echo "version=${VERSION:-0.1.0}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # macOS builds: .dmg installer, universal binary (x86_64 + aarch64)
+  # ---------------------------------------------------------------------------
+  build-macos:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action/setup@v1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Import code-signing certificates
+        if: env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          rm certificate.p12
+
+      - name: Build Tauri app (macOS)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'Unified File Ops v__VERSION__'
+          releaseBody: |
+            See CHANGELOG.md for details.
+          releaseDraft: true
+          prerelease: ${{ needs.prepare.outputs.channel == 'beta' }}
+          args: --target ${{ matrix.target }}
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
+
+  # ---------------------------------------------------------------------------
+  # Windows builds: .msi (WiX) and .exe (NSIS) installers
+  # ---------------------------------------------------------------------------
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action/setup@v1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Import code-signing certificate (Windows)
+        if: env.WINDOWS_CERTIFICATE != ''
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $certBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          [IO.File]::WriteAllBytes("certificate.pfx", $certBytes)
+          Import-PfxCertificate -FilePath certificate.pfx -CertStoreLocation Cert:\CurrentUser\My -Password (ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force)
+          Remove-Item certificate.pfx
+
+      - name: Build Tauri app (Windows)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'Unified File Ops v__VERSION__'
+          releaseBody: |
+            See CHANGELOG.md for details.
+          releaseDraft: true
+          prerelease: ${{ needs.prepare.outputs.channel == 'beta' }}
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
+            src-tauri/target/release/bundle/msi/*.msi.sig
+
+  # ---------------------------------------------------------------------------
+  # Linux builds: .deb, .rpm, .AppImage
+  # ---------------------------------------------------------------------------
+  build-linux:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libfuse2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action/setup@v1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri app (Linux)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'Unified File Ops v__VERSION__'
+          releaseBody: |
+            See CHANGELOG.md for details.
+          releaseDraft: true
+          prerelease: ${{ needs.prepare.outputs.channel == 'beta' }}
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz
+            src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz.sig
+
+  # ---------------------------------------------------------------------------
+  # Publish update manifest (latest.json) for Tauri updater
+  # ---------------------------------------------------------------------------
+  publish-update:
+    needs: [prepare, build-macos, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate update manifest
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+          REPO: ${{ github.repository }}
+        run: |
+          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          NOTES="Release ${VERSION} (${CHANNEL} channel)"
+
+          # Helper: read signature file content
+          read_sig() {
+            if [ -f "$1" ]; then cat "$1"; else echo ""; fi
+          }
+
+          # Collect signatures
+          MACOS_AARCH64_SIG=$(read_sig artifacts/macos-aarch64-apple-darwin/*.app.tar.gz.sig 2>/dev/null || echo "")
+          MACOS_X86_SIG=$(read_sig artifacts/macos-x86_64-apple-darwin/*.app.tar.gz.sig 2>/dev/null || echo "")
+          WINDOWS_NSIS_SIG=$(read_sig artifacts/windows-x86_64/*.exe.sig 2>/dev/null || echo "")
+          LINUX_SIG=$(read_sig artifacts/linux-x86_64/*.AppImage.tar.gz.sig 2>/dev/null || echo "")
+
+          REPO_URL="https://github.com/${REPO}/releases/download/v${VERSION}"
+
+          cat > latest.json << MANIFEST
+          {
+            "version": "${VERSION}",
+            "notes": "${NOTES}",
+            "pub_date": "${DATE}",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "${MACOS_AARCH64_SIG}",
+                "url": "${REPO_URL}/Unified.File.Operations.Platform_${VERSION}_aarch64.app.tar.gz"
+              },
+              "darwin-x86_64": {
+                "signature": "${MACOS_X86_SIG}",
+                "url": "${REPO_URL}/Unified.File.Operations.Platform_${VERSION}_x64.app.tar.gz"
+              },
+              "windows-x86_64": {
+                "signature": "${WINDOWS_NSIS_SIG}",
+                "url": "${REPO_URL}/Unified.File.Operations.Platform_${VERSION}_x64-setup.exe"
+              },
+              "linux-x86_64": {
+                "signature": "${LINUX_SIG}",
+                "url": "${REPO_URL}/Unified.File.Operations.Platform_${VERSION}_amd64.AppImage.tar.gz"
+              }
+            }
+          }
+          MANIFEST
+
+      - name: Upload update manifest to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          gh release upload "v${VERSION}" latest.json --clobber
+
+  # ---------------------------------------------------------------------------
+  # Homebrew cask update (macOS)
+  # ---------------------------------------------------------------------------
+  update-homebrew:
+    needs: [prepare, build-macos]
+    if: needs.prepare.outputs.channel == 'stable'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew cask
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          echo "::notice::Homebrew cask update for v${VERSION} would be triggered here."
+          echo "To complete Homebrew distribution:"
+          echo "1. Create/update tap repo: ufop/homebrew-tap"
+          echo "2. Update Casks/unified-file-ops.rb with version ${VERSION}"
+          echo "3. Update SHA256 checksums for .dmg artifacts"
+
+  # ---------------------------------------------------------------------------
+  # winget manifest update (Windows)
+  # ---------------------------------------------------------------------------
+  update-winget:
+    needs: [prepare, build-windows]
+    if: needs.prepare.outputs.channel == 'stable'
+    runs-on: windows-latest
+    steps:
+      - name: Update winget manifest
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          Write-Host "::notice::winget manifest update for v${VERSION} would be triggered here."
+          Write-Host "To complete winget distribution:"
+          Write-Host "1. Fork microsoft/winget-pkgs"
+          Write-Host "2. Create manifests/u/UFOP/UnifiedFileOps/${VERSION}/"
+          Write-Host "3. Submit PR with installer URLs and SHA256 hashes"

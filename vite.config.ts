@@ -10,6 +10,14 @@ export default defineConfig(async () => ({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      "@ufop/design-tokens": path.resolve(
+        __dirname,
+        "./packages/design-tokens/src/index.ts",
+      ),
+      "@ufop/ui-components": path.resolve(
+        __dirname,
+        "./packages/ui-components/src/index.ts",
+      ),
     },
   },
   clearScreen: false,

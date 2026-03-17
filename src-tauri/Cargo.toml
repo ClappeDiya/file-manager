@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Unified File Operations Platform - Rust Core"
 authors = ["UFOP Team"]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.80"
 
 [lib]
 name = "unified_file_ops_lib"
@@ -29,6 +29,60 @@ rusqlite = { version = "0.35", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
+# T-015/T-016: Bandwidth throttling, checksums, hashing
+md-5 = "0.10"
+sha2 = "0.10"
+digest = "0.10"
+# Transfer integrity: xxHash3 for fast hashing, ring for SHA-256
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+ring = "0.17"
+# Platform-specific low-level I/O
+libc = "0.2"
+# T-019: OS keychain credential storage
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+# T-018: CSV export
+csv = "1.3"
+# T-017/T-018: Additional utilities
+base64 = "0.22"
+rand = "0.8"
+# T-020: SFTP connector via libssh2
+ssh2 = "0.9"
+# T-021: FTP/FTPS connector
+suppaftp = { version = "6", features = ["native-tls"] }
+# T-022: WebDAV - URL encoding
+urlencoding = "2"
+# T-026..T-030: Cloud connector dependencies
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "native-tls"] }
+url = "2"
+hmac = "0.12"
+hex = "0.4"
+percent-encoding = "2"
+async-trait = "0.1"
+# T-034..T-038: Unicode normalization and compatibility engine
+unicode-normalization = "0.1"
+# T-039..T-042: Sync engine - filesystem watcher, scheduling, glob matching
+notify = { version = "6", features = ["macos_fsevent"] }
+cron = "0.12"
+glob = "0.3"
+regex = "1"
+# T-047: Encryption (in-transit and at-rest)
+aes-gcm = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+chacha20poly1305 = "0.10"
+# T-031: Peer discovery - hostname detection
+hostname = "0.4"
+# Home directory detection for SSH key generation
+dirs = "5"
+# T-064: Auto-update support
+tauri-plugin-updater = "2"
+# OS notifications
+tauri-plugin-notification = "2"
+# Log rotation with daily files
+tracing-appender = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

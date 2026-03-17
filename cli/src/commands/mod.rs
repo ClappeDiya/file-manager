@@ -1,0 +1,10 @@
+pub mod archive;
+pub mod checksum;
+pub mod compat;
+pub mod connection;
+pub mod duplicates;
+pub mod login;
+pub mod rename;
+pub mod status;
+pub mod sync;
+pub mod transfer;

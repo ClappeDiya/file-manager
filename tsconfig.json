@@ -24,6 +24,6 @@
     },
     "baseUrl": "."
   },
-  "include": ["src"],
+  "include": ["src", "packages/design-tokens/src", "packages/ui-components/src"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

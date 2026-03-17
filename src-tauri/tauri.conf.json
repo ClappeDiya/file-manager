@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src 'self' https://releases.ufop.app https://api.github.com"
     }
   },
   "bundle": {
@@ -35,12 +35,91 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "category": "Utility",
+    "shortDescription": "Cross-platform file manager, transfer, sync & governance",
+    "longDescription": "Unified File Operations Platform provides comprehensive file management with local/remote browsing, multi-protocol transfers (SFTP, FTP, WebDAV, S3, GCS, Azure), real-time sync, and data governance across macOS, Windows, and Linux.",
+    "copyright": "Copyright (c) 2024 UFOP Team",
+    "licenseFile": "../LICENSE",
+    "resources": [],
+    "externalBin": [],
     "macOS": {
-      "signingIdentity": null
+      "signingIdentity": null,
+      "entitlements": null,
+      "exceptionDomain": "",
+      "frameworks": [],
+      "providerShortName": null,
+      "minimumSystemVersion": "10.15"
     },
     "windows": {
       "certificateThumbprint": null,
-      "timestampUrl": ""
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com",
+      "tsp": false,
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "allowDowngrades": false,
+      "wix": {
+        "language": [
+          "en-US",
+          "es-ES",
+          "fr-FR",
+          "de-DE",
+          "pt-BR",
+          "ja-JP",
+          "zh-CN",
+          "ko-KR"
+        ]
+      },
+      "nsis": {
+        "languages": [
+          "English",
+          "Spanish",
+          "French",
+          "German",
+          "PortugueseBR",
+          "Japanese",
+          "SimpChinese",
+          "Korean"
+        ],
+        "displayLanguageSelector": true,
+        "installerIcon": "icons/icon.ico",
+        "headerImage": null,
+        "sidebarImage": null,
+        "installMode": "both"
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libayatana-appindicator3-1"
+        ],
+        "section": "utils",
+        "priority": "optional"
+      },
+      "rpm": {
+        "epoch": 0,
+        "release": "1"
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "dialog": true,
+      "pubkey": "",
+      "endpoints": [
+        "https://releases.ufop.app/{{target}}/{{arch}}/{{current_version}}",
+        "https://github.com/ufop/unified-file-ops/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

@@ -1,32 +1,44 @@
-import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect } from "react";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { ThemeProvider } from "@/components/theme-provider";
+import { HomePage } from "@/pages/home";
+import { DemoPage } from "@/pages/demo";
+import { useI18n } from "@/lib/i18n";
+import { initAutoUpdateCheck } from "@/lib/updater";
 
+/**
+ * Root application component.
+ * Sets up routing, theme provider, i18n, auto-update, and global layout.
+ */
 function App() {
-  const [greeting, setGreeting] = useState<string>("");
-  const [error, setError] = useState<string | null>(null);
+  const { init: initI18n, isInitialized: i18nReady } = useI18n();
 
+  // Initialize i18n (locale detection + translation loading)
   useEffect(() => {
-    invoke<string>("greet", { name: "UFOP" })
-      .then((response) => setGreeting(response))
-      .catch((err: unknown) =>
-        setError(err instanceof Error ? err.message : String(err)),
-      );
+    if (!i18nReady) {
+      initI18n();
+    }
+  }, [initI18n, i18nReady]);
+
+  // Initialize periodic auto-update checks (every 4 hours)
+  useEffect(() => {
+    const cleanup = initAutoUpdateCheck();
+    return cleanup;
   }, []);
 
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-4 p-8">
-      <h1 className="text-2xl font-bold">Unified File Operations Platform</h1>
-      {error ? (
-        <p className="text-[var(--color-error)]" role="alert">
-          Connection error: {error}
-        </p>
-      ) : (
-        <p className="text-[var(--color-text-secondary)]">{greeting}</p>
-      )}
-      <p className="text-sm text-[var(--color-text-tertiary)]">
-        Tauri 2 + React + TypeScript + Vite
-      </p>
-    </div>
+    <ThemeProvider>
+      <BrowserRouter>
+        <div className="h-full" role="application" aria-label="Unified File Operations Platform">
+          <Routes>
+            <Route path="/" element={<HomePage />} />
+            <Route path="/demo" element={<DemoPage />} />
+            {/* Catch-all redirect to home */}
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </div>
+      </BrowserRouter>
+    </ThemeProvider>
   );
 }
 
