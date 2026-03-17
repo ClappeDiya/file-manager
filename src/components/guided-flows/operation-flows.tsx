@@ -14,6 +14,7 @@ import { useState } from "react";
 import { useUIStore } from "@/stores/ui-store";
 import { WizardShell, type WizardStepDef } from "./wizard-shell";
 import { cn } from "@ufop/ui-components";
+import { pickFolder } from "@/lib/folder-picker";
 import {
   ArrowUpDown,
   FolderOpen,
@@ -101,7 +102,10 @@ export function StartTransferWizard() {
               />
               <button
                 className="px-3 py-2.5 rounded-lg border border-[var(--color-border)] text-sm text-[color:var(--color-text-secondary)] hover:bg-[var(--color-hover-bg)]"
-                onClick={() => setSourcePath("/Users/me/Documents/project")}
+                onClick={async () => {
+                  const path = await pickFolder("Select source folder");
+                  if (path) setSourcePath(path);
+                }}
               >
                 <FolderOpen className="h-4 w-4" aria-hidden="true" />
               </button>
@@ -130,7 +134,10 @@ export function StartTransferWizard() {
               />
               <button
                 className="px-3 py-2.5 rounded-lg border border-[var(--color-border)] text-sm text-[color:var(--color-text-secondary)] hover:bg-[var(--color-hover-bg)]"
-                onClick={() => setDestPath("/Volumes/External/backup")}
+                onClick={async () => {
+                  const path = await pickFolder("Select destination folder");
+                  if (path) setDestPath(path);
+                }}
               >
                 <FolderOpen className="h-4 w-4" aria-hidden="true" />
               </button>

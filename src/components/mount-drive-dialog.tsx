@@ -17,6 +17,7 @@
  */
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
+import { pickFolder } from "@/lib/folder-picker";
 import {
   HardDrive,
   FolderOpen,
@@ -197,9 +198,9 @@ function MountNewDriveForm({
           />
           <button
             type="button"
-            onClick={() => {
-              // In a real implementation, this would open a folder picker dialog
-              // For now, keep the text input
+            onClick={async () => {
+              const path = await pickFolder("Select mount point");
+              if (path) setMountPoint(path);
             }}
             className="text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800"
             title="Browse for folder"

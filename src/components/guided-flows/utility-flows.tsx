@@ -16,6 +16,7 @@ import { useState } from "react";
 import { useUIStore } from "@/stores/ui-store";
 import { WizardShell, type WizardStepDef } from "./wizard-shell";
 import { cn } from "@ufop/ui-components";
+import { pickFolder } from "@/lib/folder-picker";
 import {
   RotateCcw,
   FileText,
@@ -413,7 +414,10 @@ export function CopyToExternalWizard() {
                 placeholder="/Users/you/Documents"
                 className="flex-1 px-3 py-2.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] text-sm text-[color:var(--color-text)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]"
               />
-              <button className="px-3 py-2.5 rounded-lg border border-[var(--color-border)] hover:bg-[var(--color-hover-bg)]" onClick={() => setSourcePath("/Users/me/Documents")}>
+              <button className="px-3 py-2.5 rounded-lg border border-[var(--color-border)] hover:bg-[var(--color-hover-bg)]" onClick={async () => {
+                  const path = await pickFolder("Select source folder");
+                  if (path) setSourcePath(path);
+                }}>
                 <FolderOpen className="h-4 w-4" aria-hidden="true" />
               </button>
             </div>

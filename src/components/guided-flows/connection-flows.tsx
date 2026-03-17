@@ -12,6 +12,7 @@ import { useState } from "react";
 import { useUIStore } from "@/stores/ui-store";
 import { WizardShell, type WizardStepDef } from "./wizard-shell";
 import { cn } from "@ufop/ui-components";
+import { pickFolder } from "@/lib/folder-picker";
 import {
   FolderOpen,
   Check,
@@ -102,7 +103,10 @@ export function ConnectLocalSyncWizard() {
               />
               <button
                 className="px-3 py-2.5 rounded-lg border border-[var(--color-border)] text-sm text-[color:var(--color-text-secondary)] hover:bg-[var(--color-hover-bg)]"
-                onClick={() => setSourcePath("/Users/me/Documents")}
+                onClick={async () => {
+                  const path = await pickFolder("Select source folder");
+                  if (path) setSourcePath(path);
+                }}
                 title="Browse for folder"
               >
                 <FolderOpen className="h-4 w-4" aria-hidden="true" />
@@ -132,7 +136,10 @@ export function ConnectLocalSyncWizard() {
               />
               <button
                 className="px-3 py-2.5 rounded-lg border border-[var(--color-border)] text-sm text-[color:var(--color-text-secondary)] hover:bg-[var(--color-hover-bg)]"
-                onClick={() => setDestPath("/Volumes/Backup/Documents")}
+                onClick={async () => {
+                  const path = await pickFolder("Select destination folder");
+                  if (path) setDestPath(path);
+                }}
                 title="Browse for folder"
               >
                 <FolderOpen className="h-4 w-4" aria-hidden="true" />
