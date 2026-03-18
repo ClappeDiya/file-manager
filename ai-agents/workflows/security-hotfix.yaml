@@ -1,0 +1,23 @@
+id: workflow-security-hotfix
+name: Security Hotfix Workflow
+description: Agent bundle for urgent security fixes
+load_agents:
+  - global-policy.yaml
+  - core/security-review.yaml
+  - core/test-and-qa.yaml
+  - core/release-validation.yaml
+  - support/ci-devops.yaml
+  - core/documentation.yaml
+risk_class: R3-R4
+required_outputs:
+  - Security fix implementation
+  - Security review signoff
+  - Regression test confirming fix
+  - No new vulnerability introduced
+  - Emergency release validation
+  - Release notes with security advisory
+  - Handoff manifest with urgency classification
+workflow_notes:
+  - Security hotfixes may use expedited review but must not skip QA
+  - Must still pass through release channels (canary > beta > stable)
+  - Emergency hotfix channel available for critical vulnerabilities

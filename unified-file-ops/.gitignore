@@ -4,8 +4,6 @@ target/
 
 # Build output
 dist/
-.next/
-out/
 .vite/
 
 # IDE
@@ -24,22 +22,13 @@ Thumbs.db
 .env.local
 .env.*.local
 
-# Tauri build artifacts
+# Tauri
 src-tauri/target/
 src-tauri/gen/
 src-tauri/WixTools/
 
 # Lock files (keep pnpm-lock)
 Cargo.lock
-
-# Runtime data
-.data/
-
-# Playwright MCP logs
-.playwright-mcp/
-
-# Screenshots (development artifacts)
-*.png
 
 # Generated
 icon.png

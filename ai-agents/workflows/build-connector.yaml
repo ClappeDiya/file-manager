@@ -1,0 +1,17 @@
+id: workflow-build-connector
+name: Build Connector Workflow
+description: Agent bundle for implementing any new protocol or cloud connector
+load_agents:
+  - global-policy.yaml
+  - core/connector-protocol.yaml
+  - core/test-and-qa.yaml
+  - core/security-review.yaml
+  - core/documentation.yaml
+risk_class: R3
+required_outputs:
+  - Connector implementation with auth, upload/download, resume, retry
+  - Provider capability notes
+  - Auth-flow security review
+  - Connector test suite (auth, happy path, failure, edge cases)
+  - Setup documentation
+  - Handoff manifest

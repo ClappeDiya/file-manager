@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Next.js build
+.next/
+out/
+
+# Environment
+.env
+.env.local
+.env.production.local
+
+# Runtime data (recovery codes, stored passwords)
+.data/
+
+# Debug
+npm-debug.log*

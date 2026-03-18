@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Unified File Operations Platform</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      // Diagnostic: Catch any errors during module loading
+      window.__APP_ERRORS = [];
+      window.addEventListener('error', function(e) {
+        var msg = 'ERROR: ' + e.message + ' | File: ' + e.filename + ' | Line: ' + e.lineno;
+        window.__APP_ERRORS.push(msg);
+        console.error('[DIAG]', msg);
+        var el = document.getElementById('__diag');
+        if (!el) {
+          el = document.createElement('pre');
+          el.id = '__diag';
+          el.style.cssText = 'position:fixed;top:0;left:0;right:0;background:red;color:white;padding:10px;z-index:99999;font-size:12px;max-height:50vh;overflow:auto;';
+          document.body.appendChild(el);
+        }
+        el.textContent += msg + '\n';
+      });
+      window.addEventListener('unhandledrejection', function(e) {
+        var reason = e.reason;
+        var msg = 'UNHANDLED REJECTION: ' + (reason && reason.message || reason) + ' | Stack: ' + (reason && reason.stack || 'N/A');
+        window.__APP_ERRORS.push(msg);
+        console.error('[DIAG]', msg);
+        var el = document.getElementById('__diag');
+        if (!el) {
+          el = document.createElement('pre');
+          el.id = '__diag';
+          el.style.cssText = 'position:fixed;top:0;left:0;right:0;background:red;color:white;padding:10px;z-index:99999;font-size:12px;max-height:50vh;overflow:auto;';
+          document.body.appendChild(el);
+        }
+        el.textContent += msg + '\n';
+      });
+
+      // Monitor #root for content - detect blank page
+      setTimeout(function() {
+        var root = document.getElementById('root');
+        var content = root ? root.innerHTML.trim() : '';
+        if (!content) {
+          var el = document.getElementById('__diag');
+          if (!el) {
+            el = document.createElement('pre');
+            el.id = '__diag';
+            el.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#b45309;color:white;padding:10px;z-index:99999;font-size:12px;max-height:50vh;overflow:auto;';
+            document.body.appendChild(el);
+          }
+          el.textContent += 'WARNING: #root is empty after 3s. React did not render.\n';
+          el.textContent += 'Errors captured: ' + window.__APP_ERRORS.length + '\n';
+          window.__APP_ERRORS.forEach(function(e) { el.textContent += '  - ' + e + '\n'; });
+        }
+      }, 3000);
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

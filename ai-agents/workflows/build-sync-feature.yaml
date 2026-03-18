@@ -1,0 +1,18 @@
+id: workflow-build-sync-feature
+name: Build Sync Feature Workflow
+description: Agent bundle for sync engine changes including conflict handling
+load_agents:
+  - global-policy.yaml
+  - core/sync-engine.yaml
+  - core/compatibility-engine.yaml
+  - core/desktop-ui.yaml
+  - core/test-and-qa.yaml
+  - core/security-review.yaml
+risk_class: R4
+required_outputs:
+  - Sync behavior implementation
+  - Compatibility integration if naming/path affected
+  - UI for sync preview/conflict resolution
+  - Dry-run accuracy tests
+  - Destructive-path security review
+  - Handoff manifest with rollback note

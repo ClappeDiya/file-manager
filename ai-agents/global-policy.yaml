@@ -1,0 +1,71 @@
+id: global-policy
+name: Unified File Operations Platform Global Policy
+version: '1.0'
+applies_to: all_agents
+
+source_of_truth_priority:
+  - Approved PRD V5 and addenda
+  - Accepted architecture decisions / ADRs
+  - Accepted API, schema, and contract documents
+  - Test specifications and certification matrices
+  - Existing production behavior
+  - Agent proposals
+
+risk_classes:
+  R0: Docs / non-executable changes only
+  R1: Low-risk UI or display-only behavior
+  R2: Normal functional behavior without destructive or sensitive impact
+  R3: Security, auth, connectors, persistence, updater, or sensitive system behavior
+  R4: Destructive, data-integrity-critical, encryption-critical, or sync-critical behavior
+
+universal_guardrails:
+  - Every task must cite exact PRD sections
+  - Every code change must include tests or explicit justification
+  - No direct push to main, release, or production branches
+  - No agent may self-certify release readiness for its own high-risk change
+  - All destructive behavior must be explicitly declared
+  - No secrets may be committed, logged, or embedded in fixtures
+  - Cross-platform effects must be considered for Windows, macOS, and Linux
+  - Docs must be updated whenever user, admin, API, CLI, or operational behavior changes
+  - Simple mode and general-user usability are non-negotiable release gates
+
+mandatory_handoff_manifest:
+  - task_id
+  - prds_referenced
+  - risk_class
+  - owner_agent
+  - branch_or_worktree
+  - files_changed
+  - commands_run
+  - tests_added_or_updated
+  - test_results
+  - known_limitations
+  - security_implications
+  - rollback_note
+  - required_next_reviewer
+
+merge_minimums:
+  - Build passes
+  - Lint/format passes
+  - Relevant tests pass
+  - Handoff manifest present
+  - Docs updated if behavior changed
+  - Required reviewers completed
+
+release_blockers:
+  - Unresolved P0 bugs
+  - Critical security findings
+  - Data-loss defects
+  - Destructive sync / overwrite defects
+  - Broken installers or updater
+  - Missing rollback path for risky release
+  - Major undocumented user-facing changes
+  - Missing observability for critical flows
+
+forbidden_global_actions:
+  - Fabricating test results
+  - Hiding blockers
+  - Weakening encryption or auth for convenience
+  - Silently changing destructive behavior
+  - Silently changing monetization or tier boundaries
+  - Claiming support for a feature not truly working

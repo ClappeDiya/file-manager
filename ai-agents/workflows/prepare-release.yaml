@@ -1,0 +1,21 @@
+id: workflow-prepare-release
+name: Prepare Release Workflow
+description: Agent bundle for validating release readiness
+load_agents:
+  - global-policy.yaml
+  - core/release-validation.yaml
+  - support/ci-devops.yaml
+  - core/test-and-qa.yaml
+  - core/security-review.yaml
+  - core/documentation.yaml
+risk_class: R3-R4
+required_outputs:
+  - Build artifacts for all 3 platforms
+  - Installer validation results
+  - Signing verification
+  - QA pass/fail report
+  - Security posture summary
+  - Documentation completeness check
+  - Blocker inventory
+  - Rollback procedure
+  - Go/no-go recommendation

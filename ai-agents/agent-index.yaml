@@ -1,0 +1,32 @@
+id: agent-index
+name: Unified File Operations Platform Agent Index
+version: '1.0'
+policy_file: global-policy.yaml
+
+core_agents:
+  - core/orchestrator.yaml
+  - core/rust-core-architect.yaml
+  - core/connector-protocol.yaml
+  - core/sync-engine.yaml
+  - core/compatibility-engine.yaml
+  - core/desktop-ui.yaml
+  - core/admin-console.yaml
+  - core/test-and-qa.yaml
+  - core/security-review.yaml
+  - core/documentation.yaml
+  - core/release-validation.yaml
+
+support_agents:
+  - support/ci-devops.yaml
+  - support/maintenance-regression.yaml
+  - support/dependency-license-compliance.yaml
+  - support/observability-telemetry.yaml
+  - support/product-consistency.yaml
+  - support/api-cli.yaml
+  - support/terminal-shell-integration.yaml
+  - support/migration-workflow.yaml
+
+loading_guidance:
+  - Load global-policy.yaml first when supported
+  - Then load only the agent file needed for the task
+  - For R3 and R4 tasks, always load QA, Security, and Release Validation alongside

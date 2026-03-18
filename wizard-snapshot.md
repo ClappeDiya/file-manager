@@ -1,0 +1,374 @@
+- application "Unified File Operations Platform" [ref=e3]:
+  - generic [ref=e4]:
+    - toolbar "Main toolbar" [ref=e5]:
+      - generic [ref=e6]:
+        - button "Hide sidebar" [ref=e7] [cursor=pointer]:
+          - img [ref=e8]
+        - img [ref=e10]
+        - heading "File Manager" [level=1] [ref=e12]
+        - generic [ref=e13]: advanced
+      - generic [ref=e14]:
+        - generic [ref=e15]:
+          - button "List view" [ref=e16]:
+            - img [ref=e17]
+          - button "Detail view" [pressed] [ref=e18]:
+            - img [ref=e19]
+          - button "Grid view" [ref=e20]:
+            - img [ref=e21]
+          - button "Compact view" [ref=e23]:
+            - img [ref=e24]
+        - button "Workspaces" [ref=e27] [cursor=pointer]:
+          - img [ref=e28]
+        - button "Open AI assistant" [ref=e31] [cursor=pointer]:
+          - img [ref=e32]
+        - button "Open terminal" [ref=e35] [cursor=pointer]:
+          - img [ref=e36]
+        - radiogroup "Theme selection" [ref=e38]:
+          - radio "Light theme" [checked] [ref=e39] [cursor=pointer]:
+            - img [ref=e40]
+            - generic [ref=e46]: Light
+          - radio "Dark theme" [ref=e47] [cursor=pointer]:
+            - img [ref=e48]
+            - generic [ref=e50]: Dark
+          - radio "System theme" [ref=e51] [cursor=pointer]:
+            - img [ref=e52]
+            - generic [ref=e54]: System
+          - radio "High Contrast theme" [ref=e55] [cursor=pointer]:
+            - img [ref=e56]
+            - generic [ref=e59]: High Contrast
+    - generic [ref=e60]:
+      - navigation "File navigation sidebar" [ref=e61]:
+        - region "Scrollable content" [ref=e62]:
+          - generic [ref=e63]:
+            - generic [ref=e64]:
+              - button "Favorites section" [expanded] [ref=e65]:
+                - img [ref=e66]
+                - img [ref=e68]
+                - text: Favorites
+              - group "Favorites" [ref=e70]:
+                - paragraph [ref=e71]: Drag folders here to add favorites
+            - generic [ref=e72]:
+              - button "Devices section" [expanded] [ref=e73]:
+                - img [ref=e74]
+                - img [ref=e76]
+                - text: Devices
+              - group "Devices" [ref=e78]:
+                - button "This Computer" [ref=e80]:
+                  - img [ref=e81]
+                  - generic [ref=e84]: This Computer
+            - button "Folders section" [ref=e86]:
+              - img [ref=e87]
+              - img [ref=e89]
+              - text: Folders
+            - button "Recent section" [ref=e92]:
+              - img [ref=e93]
+              - img [ref=e95]
+              - text: Recent
+      - generic [ref=e98]:
+        - generic [ref=e100]:
+          - toolbar "Pane controls" [ref=e101]:
+            - button "Enable dual-pane mode" [ref=e102] [cursor=pointer]:
+              - img [ref=e103]
+          - region "File pane" [ref=e105]:
+            - generic [ref=e106]:
+              - tablist "Pane 1 tabs" [ref=e107]:
+                - tab "Root Pin tab" [selected] [ref=e109] [cursor=pointer]:
+                  - generic / [ref=e110]: Root
+                  - button "Pin tab" [ref=e112]:
+                    - img [ref=e113]
+                - button "New tab" [ref=e115]:
+                  - img [ref=e116]
+              - navigation "Breadcrumb navigation" [ref=e117]:
+                - button "Navigate back" [disabled] [ref=e118]:
+                  - img [ref=e119]
+                - button "Navigate forward" [disabled] [ref=e121]:
+                  - img [ref=e122]
+                - button "Navigate to root" [ref=e125]:
+                  - img [ref=e126]
+              - generic [ref=e129]:
+                - img [ref=e130]
+                - textbox "Filter files" [ref=e133]:
+                  - /placeholder: Filter files... (Cmd+F)
+                - generic [ref=e134] [cursor=pointer]:
+                  - checkbox "Contents" [ref=e135]
+                  - text: Contents
+                - generic [ref=e136]: 21 items
+              - generic [ref=e137]:
+                - generic [ref=e138]: "Group:"
+                - combobox [ref=e139]:
+                  - option "No grouping" [selected]
+                  - option "By Type"
+                  - option "By Extension"
+                  - option "By Date"
+                  - option "By Size"
+              - generic [ref=e140]:
+                - row "Name Size Modified Type" [ref=e141]:
+                  - columnheader "Name" [ref=e142] [cursor=pointer]:
+                    - generic [ref=e143]:
+                      - text: Name
+                      - img [ref=e145]
+                    - separator [ref=e148]
+                  - columnheader "Size" [ref=e149] [cursor=pointer]:
+                    - generic [ref=e150]:
+                      - text: Size
+                      - img [ref=e152]
+                    - separator [ref=e155]
+                  - columnheader "Modified" [ref=e156] [cursor=pointer]:
+                    - generic [ref=e157]:
+                      - text: Modified
+                      - img [ref=e159]
+                    - separator [ref=e162]
+                  - columnheader "Type" [ref=e163] [cursor=pointer]:
+                    - generic [ref=e164]:
+                      - text: Type
+                      - img [ref=e166]
+                    - separator [ref=e169]
+                - grid "File listing" [ref=e170]:
+                  - generic [ref=e236]:
+                    - row "Documents -- Mar 17, 2026, 09:48 AM Folder" [ref=e237]:
+                      - gridcell "Documents" [ref=e238]:
+                        - generic [ref=e239]:
+                          - img [ref=e240]
+                          - generic [ref=e242]: Documents
+                      - gridcell "--" [ref=e243]:
+                        - generic [ref=e244]: "--"
+                      - gridcell "Mar 17, 2026, 09:48 AM" [ref=e245]:
+                        - generic [ref=e246]: Mar 17, 2026, 09:48 AM
+                      - gridcell "Folder" [ref=e247]:
+                        - generic [ref=e248]: Folder
+                    - row "Downloads -- Mar 16, 2026, 09:48 AM Folder" [ref=e249]:
+                      - gridcell "Downloads" [ref=e250]:
+                        - generic [ref=e251]:
+                          - img [ref=e252]
+                          - generic [ref=e254]: Downloads
+                      - gridcell "--" [ref=e255]:
+                        - generic [ref=e256]: "--"
+                      - gridcell "Mar 16, 2026, 09:48 AM" [ref=e257]:
+                        - generic [ref=e258]: Mar 16, 2026, 09:48 AM
+                      - gridcell "Folder" [ref=e259]:
+                        - generic [ref=e260]: Folder
+                    - row "Pictures -- Mar 15, 2026, 09:48 AM Folder" [ref=e261]:
+                      - gridcell "Pictures" [ref=e262]:
+                        - generic [ref=e263]:
+                          - img [ref=e264]
+                          - generic [ref=e266]: Pictures
+                      - gridcell "--" [ref=e267]:
+                        - generic [ref=e268]: "--"
+                      - gridcell "Mar 15, 2026, 09:48 AM" [ref=e269]:
+                        - generic [ref=e270]: Mar 15, 2026, 09:48 AM
+                      - gridcell "Folder" [ref=e271]:
+                        - generic [ref=e272]: Folder
+                    - row "Music -- Mar 14, 2026, 09:48 AM Folder" [ref=e273]:
+                      - gridcell "Music" [ref=e274]:
+                        - generic [ref=e275]:
+                          - img [ref=e276]
+                          - generic [ref=e278]: Music
+                      - gridcell "--" [ref=e279]:
+                        - generic [ref=e280]: "--"
+                      - gridcell "Mar 14, 2026, 09:48 AM" [ref=e281]:
+                        - generic [ref=e282]: Mar 14, 2026, 09:48 AM
+                      - gridcell "Folder" [ref=e283]:
+                        - generic [ref=e284]: Folder
+                    - row "Videos -- Mar 13, 2026, 09:48 AM Folder" [ref=e285]:
+                      - gridcell "Videos" [ref=e286]:
+                        - generic [ref=e287]:
+                          - img [ref=e288]
+                          - generic [ref=e290]: Videos
+                      - gridcell "--" [ref=e291]:
+                        - generic [ref=e292]: "--"
+                      - gridcell "Mar 13, 2026, 09:48 AM" [ref=e293]:
+                        - generic [ref=e294]: Mar 13, 2026, 09:48 AM
+                      - gridcell "Folder" [ref=e295]:
+                        - generic [ref=e296]: Folder
+                    - row "Desktop -- Mar 12, 2026, 09:48 AM Folder" [ref=e297]:
+                      - gridcell "Desktop" [ref=e298]:
+                        - generic [ref=e299]:
+                          - img [ref=e300]
+                          - generic [ref=e302]: Desktop
+                      - gridcell "--" [ref=e303]:
+                        - generic [ref=e304]: "--"
+                      - gridcell "Mar 12, 2026, 09:48 AM" [ref=e305]:
+                        - generic [ref=e306]: Mar 12, 2026, 09:48 AM
+                      - gridcell "Folder" [ref=e307]:
+                        - generic [ref=e308]: Folder
+                    - row "Projects -- Mar 11, 2026, 09:48 AM Folder" [ref=e309]:
+                      - gridcell "Projects" [ref=e310]:
+                        - generic [ref=e311]:
+                          - img [ref=e312]
+                          - generic [ref=e314]: Projects
+                      - gridcell "--" [ref=e315]:
+                        - generic [ref=e316]: "--"
+                      - gridcell "Mar 11, 2026, 09:48 AM" [ref=e317]:
+                        - generic [ref=e318]: Mar 11, 2026, 09:48 AM
+                      - gridcell "Folder" [ref=e319]:
+                        - generic [ref=e320]: Folder
+                    - row "Archives -- Mar 10, 2026, 09:48 AM Folder" [ref=e321]:
+                      - gridcell "Archives" [ref=e322]:
+                        - generic [ref=e323]:
+                          - img [ref=e324]
+                          - generic [ref=e326]: Archives
+                      - gridcell "--" [ref=e327]:
+                        - generic [ref=e328]: "--"
+                      - gridcell "Mar 10, 2026, 09:48 AM" [ref=e329]:
+                        - generic [ref=e330]: Mar 10, 2026, 09:48 AM
+                      - gridcell "Folder" [ref=e331]:
+                        - generic [ref=e332]: Folder
+                    - row "readme.md 57.5 KB Mar 17, 2026, 09:48 AM md" [ref=e333]:
+                      - gridcell "readme.md" [ref=e334]:
+                        - generic [ref=e335]:
+                          - img [ref=e336]
+                          - generic [ref=e339]: readme.md
+                      - gridcell "57.5 KB" [ref=e340]:
+                        - generic [ref=e341]: 57.5 KB
+                      - gridcell "Mar 17, 2026, 09:48 AM" [ref=e342]:
+                        - generic [ref=e343]: Mar 17, 2026, 09:48 AM
+                      - gridcell "md" [ref=e344]:
+                        - generic [ref=e345]: md
+                    - row "config.json 5.1 KB Mar 17, 2026, 08:48 AM json" [ref=e346]:
+                      - gridcell "config.json" [ref=e347]:
+                        - generic [ref=e348]:
+                          - img [ref=e349]
+                          - generic [ref=e354]: config.json
+                      - gridcell "5.1 KB" [ref=e355]:
+                        - generic [ref=e356]: 5.1 KB
+                      - gridcell "Mar 17, 2026, 08:48 AM" [ref=e357]:
+                        - generic [ref=e358]: Mar 17, 2026, 08:48 AM
+                      - gridcell "json" [ref=e359]:
+                        - generic [ref=e360]: json
+                    - row "index.ts 51.6 KB Mar 17, 2026, 07:48 AM ts" [ref=e361]:
+                      - gridcell "index.ts" [ref=e362]:
+                        - generic [ref=e363]:
+                          - img [ref=e364]
+                          - generic [ref=e369]: index.ts
+                      - gridcell "51.6 KB" [ref=e370]:
+                        - generic [ref=e371]: 51.6 KB
+                      - gridcell "Mar 17, 2026, 07:48 AM" [ref=e372]:
+                        - generic [ref=e373]: Mar 17, 2026, 07:48 AM
+                      - gridcell "ts" [ref=e374]:
+                        - generic [ref=e375]: ts
+                    - row "styles.css 47.9 KB Mar 17, 2026, 06:48 AM css" [ref=e376]:
+                      - gridcell "styles.css" [ref=e377]:
+                        - generic [ref=e378]:
+                          - img [ref=e379]
+                          - generic [ref=e384]: styles.css
+                      - gridcell "47.9 KB" [ref=e385]:
+                        - generic [ref=e386]: 47.9 KB
+                      - gridcell "Mar 17, 2026, 06:48 AM" [ref=e387]:
+                        - generic [ref=e388]: Mar 17, 2026, 06:48 AM
+                      - gridcell "css" [ref=e389]:
+                        - generic [ref=e390]: css
+                    - row "package.json 99.8 KB Mar 17, 2026, 05:48 AM json" [ref=e391]:
+                      - gridcell "package.json" [ref=e392]:
+                        - generic [ref=e393]:
+                          - img [ref=e394]
+                          - generic [ref=e399]: package.json
+                      - gridcell "99.8 KB" [ref=e400]:
+                        - generic [ref=e401]: 99.8 KB
+                      - gridcell "Mar 17, 2026, 05:48 AM" [ref=e402]:
+                        - generic [ref=e403]: Mar 17, 2026, 05:48 AM
+                      - gridcell "json" [ref=e404]:
+                        - generic [ref=e405]: json
+                    - row "tsconfig.json 86.1 KB Mar 17, 2026, 04:48 AM json" [ref=e406]:
+                      - gridcell "tsconfig.json" [ref=e407]:
+                        - generic [ref=e408]:
+                          - img [ref=e409]
+                          - generic [ref=e414]: tsconfig.json
+                      - gridcell "86.1 KB" [ref=e415]:
+                        - generic [ref=e416]: 86.1 KB
+                      - gridcell "Mar 17, 2026, 04:48 AM" [ref=e417]:
+                        - generic [ref=e418]: Mar 17, 2026, 04:48 AM
+                      - gridcell "json" [ref=e419]:
+                        - generic [ref=e420]: json
+                    - row "vite.config.ts 49.6 KB Mar 17, 2026, 03:48 AM ts" [ref=e421]:
+                      - gridcell "vite.config.ts" [ref=e422]:
+                        - generic [ref=e423]:
+                          - img [ref=e424]
+                          - generic [ref=e429]: vite.config.ts
+                      - gridcell "49.6 KB" [ref=e430]:
+                        - generic [ref=e431]: 49.6 KB
+                      - gridcell "Mar 17, 2026, 03:48 AM" [ref=e432]:
+                        - generic [ref=e433]: Mar 17, 2026, 03:48 AM
+                      - gridcell "ts" [ref=e434]:
+                        - generic [ref=e435]: ts
+                    - row "app.tsx 70.8 KB Mar 17, 2026, 02:48 AM tsx" [ref=e436]:
+                      - gridcell "app.tsx" [ref=e437]:
+                        - generic [ref=e438]:
+                          - img [ref=e439]
+                          - generic [ref=e444]: app.tsx
+                      - gridcell "70.8 KB" [ref=e445]:
+                        - generic [ref=e446]: 70.8 KB
+                      - gridcell "Mar 17, 2026, 02:48 AM" [ref=e447]:
+                        - generic [ref=e448]: Mar 17, 2026, 02:48 AM
+                      - gridcell "tsx" [ref=e449]:
+                        - generic [ref=e450]: tsx
+                    - row "readme.md 26.9 KB Mar 16, 2026, 11:48 PM md" [ref=e451]:
+                      - gridcell "readme.md" [ref=e452]:
+                        - generic [ref=e453]:
+                          - img [ref=e454]
+                          - generic [ref=e457]: readme.md
+                      - gridcell "26.9 KB" [ref=e458]:
+                        - generic [ref=e459]: 26.9 KB
+                      - gridcell "Mar 16, 2026, 11:48 PM" [ref=e460]:
+                        - generic [ref=e461]: Mar 16, 2026, 11:48 PM
+                      - gridcell "md" [ref=e462]:
+                        - generic [ref=e463]: md
+                    - row "config.json 92.6 KB Mar 16, 2026, 10:48 PM json" [ref=e464]:
+                      - gridcell "config.json" [ref=e465]:
+                        - generic [ref=e466]:
+                          - img [ref=e467]
+                          - generic [ref=e472]: config.json
+                      - gridcell "92.6 KB" [ref=e473]:
+                        - generic [ref=e474]: 92.6 KB
+                      - gridcell "Mar 16, 2026, 10:48 PM" [ref=e475]:
+                        - generic [ref=e476]: Mar 16, 2026, 10:48 PM
+                      - gridcell "json" [ref=e477]:
+                        - generic [ref=e478]: json
+        - button "Open terminal" [ref=e171]:
+          - img [ref=e172]
+          - generic [ref=e174]: Terminal
+          - img [ref=e175]
+    - contentinfo "Status bar" [ref=e177]:
+      - generic [ref=e178]: Ready
+      - generic [ref=e179]:
+        - button "Settings" [ref=e180]:
+          - img [ref=e181]
+        - generic [ref=e184]: UFOP v0.1.0 (dev mode)
+  - dialog "Set Up Local Sync" [ref=e185]:
+    - generic [ref=e186]:
+      - generic [ref=e187]:
+        - generic [ref=e188]:
+          - heading "Set Up Local Sync" [level=2] [ref=e189]
+          - paragraph [ref=e190]: Keep two folders on this computer in sync
+        - generic [ref=e191]:
+          - button "Show help" [ref=e192] [cursor=pointer]:
+            - img [ref=e193]
+          - button "Cancel wizard" [ref=e196] [cursor=pointer]:
+            - img [ref=e197]
+      - generic [ref=e201]:
+        - generic [ref=e203]:
+          - generic [ref=e204]: "1"
+          - generic [ref=e205]: Source Folder
+        - generic [ref=e208]:
+          - generic [ref=e209]: "2"
+          - generic [ref=e210]: Destination Folder
+        - generic [ref=e212]:
+          - generic [ref=e213]: "3"
+          - generic [ref=e214]: Sync Mode
+        - generic [ref=e217]:
+          - generic [ref=e218]: "4"
+          - generic [ref=e219]: Confirm
+      - generic [ref=e221]:
+        - heading "Where is the source folder?" [level=3] [ref=e222]
+        - paragraph [ref=e223]: This is the primary folder. Any changes here will be synced to the destination.
+        - generic [ref=e224]:
+          - text: Folder path
+          - generic [ref=e225]:
+            - textbox "Folder path" [ref=e226]:
+              - /placeholder: /Users/you/Documents
+            - button "Browse for folder" [ref=e227]:
+              - img [ref=e228]
+      - generic [ref=e231]:
+        - button "Cancel" [ref=e232] [cursor=pointer]
+        - button "Next" [ref=e233] [cursor=pointer]:
+          - text: Next
+          - img [ref=e234]
