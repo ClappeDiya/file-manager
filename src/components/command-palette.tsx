@@ -26,6 +26,7 @@ import {
   Clipboard,
   Globe,
   FileEdit,
+  Zap,
 } from "lucide-react";
 
 // ──────────────────────────────────────────────
@@ -374,6 +375,8 @@ export function getDefaultCommands(actions: {
   onCopyRelativePath?: () => void;
   onOpenInEditor?: () => void;
   onOpenSettings?: () => void;
+  onToggleAutomations?: () => void;
+  onCreateAutomation?: () => void;
 }): CommandItem[] {
   const isMac = typeof navigator !== "undefined" && navigator.platform.startsWith("Mac");
   const cmd = isMac ? "\u2318" : "Ctrl+";
@@ -669,6 +672,23 @@ export function getDefaultCommands(actions: {
       category: "Navigation",
       action: actions.onOpenSettings || (() => {}),
       keywords: ["settings", "preferences", "config"],
+    },
+    // Automations (Quickflows)
+    {
+      id: "toggle-automations",
+      label: "Toggle Quickflows Panel",
+      icon: <Zap className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onToggleAutomations || (() => {}),
+      keywords: ["automation", "quickflow", "rules", "workflow", "watcher"],
+    },
+    {
+      id: "create-automation",
+      label: "Create Automation Rule",
+      icon: <Zap className="h-4 w-4" />,
+      category: "File",
+      action: actions.onCreateAutomation || (() => {}),
+      keywords: ["automation", "quickflow", "rule", "new", "create", "watcher", "trigger"],
     },
   ];
 

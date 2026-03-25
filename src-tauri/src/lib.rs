@@ -1,4 +1,5 @@
 pub mod ai_engine;
+pub mod automation_engine;
 pub mod commands;
 pub mod compat_engine;
 pub mod connectors;
@@ -12,7 +13,8 @@ pub mod sync_engine;
 pub mod transfer_engine;
 
 use ai_engine::AiAssistant;
-use commands::{ai_commands, archive_commands, aws_commands, batch_rename_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, log_commands, master_password_commands, mount_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, settings_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, url_handler_commands, version_commands};
+use automation_engine::AutomationManager;
+use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, log_commands, master_password_commands, mount_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, settings_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, url_handler_commands, version_commands};
 use commands::terminal_commands::TerminalManager;
 use connectors::{ConnectionManager, ConnectorRegistry, GoogleDriveConnector, OneDriveConnector, PeerManager, S3Connector, ServerTransferManager};
 use mount_engine::MountManager;
@@ -44,6 +46,7 @@ struct AppState {
     gdrive_connector: std::sync::Arc<GoogleDriveConnector>,
     onedrive_connector: std::sync::Arc<OneDriveConnector>,
     editor_state: std::sync::Arc<commands::editor_commands::EditorState>,
+    automation_mgr: AutomationManager,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -118,6 +121,15 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // Initialize editor state (external editor mappings and file watch)
     let editor_state = std::sync::Arc::new(commands::editor_commands::EditorState::new());
 
+    // Initialize automation manager (Quickflows)
+    let automation_mgr = AutomationManager::new();
+    if let Err(e) = automation_mgr.load_rules_from_db(&repo).await {
+        tracing::warn!("Failed to load automation rules (non-fatal): {e}");
+    }
+    if let Err(e) = automation_mgr.start_all_watchers().await {
+        tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
+    }
+
     Ok(AppState {
         repo,
         transfer_mgr,
@@ -136,6 +148,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         gdrive_connector,
         onedrive_connector,
         editor_state,
+        automation_mgr,
     })
 }
 
@@ -195,6 +208,7 @@ pub fn run() {
                     gdrive_connector: std::sync::Arc::new(GoogleDriveConnector::new()),
                     onedrive_connector: std::sync::Arc::new(OneDriveConnector::new()),
                     editor_state: std::sync::Arc::new(commands::editor_commands::EditorState::new()),
+                    automation_mgr: AutomationManager::new(),
                 }
             }
         }
@@ -228,6 +242,7 @@ pub fn run() {
         .manage(app_state.gdrive_connector)
         .manage(app_state.onedrive_connector)
         .manage(app_state.editor_state)
+        .manage(app_state.automation_mgr)
         .invoke_handler(tauri::generate_handler![
             // System
             system_commands::greet,
@@ -580,6 +595,18 @@ pub fn run() {
             // SSH Key Generation
             ssh_key_commands::generate_ssh_key,
             ssh_key_commands::list_ssh_keys,
+            // Automation engine (Quickflows)
+            automation_commands::create_automation_rule,
+            automation_commands::update_automation_rule,
+            automation_commands::delete_automation_rule,
+            automation_commands::list_automation_rules,
+            automation_commands::get_automation_rule,
+            automation_commands::enable_automation_rule,
+            automation_commands::run_automation_rule,
+            automation_commands::test_automation_rule,
+            automation_commands::list_automation_logs,
+            automation_commands::clear_automation_logs,
+            automation_commands::parse_automation_nl,
         ])
         .on_window_event(move |_window, event| {
             if let tauri::WindowEvent::Destroyed = event {

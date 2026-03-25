@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useFileManagerStore, type ViewMode } from "@/stores/file-manager-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useAiStore } from "@/stores/ai-store";
+import { useAutomationStore } from "@/stores/automation-store";
 import { useTerminalStore } from "@/stores/terminal-store";
 import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { DualPaneLayout } from "./dual-pane-layout";
@@ -13,6 +14,7 @@ import { FilterBar, filterFiles } from "./filter-bar";
 import { ContextMenu, getFileContextMenuItems, type ContextMenuItem } from "./context-menu";
 import { CommandPalette, getDefaultCommands } from "./command-palette";
 import { AiPanel } from "./ai-panel";
+import { AutomationPanel } from "./automation-panel";
 import { TerminalPanel } from "./terminal-panel";
 import { useFileSelection, useFileDragDrop } from "@/hooks/use-file-selection";
 import { cn } from "@ufop/ui-components";
@@ -34,6 +36,7 @@ import {
   Unlink2,
   Save,
   FolderDown,
+  Zap,
 } from "lucide-react";
 
 // Toolbar customization definition (#14)
@@ -45,6 +48,7 @@ const ALL_TOOLBAR_ITEMS = [
   { id: "terminal", label: "Terminal" },
   { id: "theme", label: "Theme Switcher" },
   { id: "undo", label: "Undo Button" },
+  { id: "automations", label: "Quickflows" },
   { id: "sync-browse", label: "Sync Browse" },
   { id: "grouping", label: "Grouping" },
 ];
@@ -77,6 +81,10 @@ export function FileManager() {
   // AI panel state (T-043..T-045)
   const aiPanelOpen = useAiStore((s) => s.panelOpen);
   const toggleAiPanel = useAiStore((s) => s.togglePanel);
+
+  // Automation panel (Quickflows)
+  const automationPanelOpen = useAutomationStore((s) => s.panelOpen);
+  const toggleAutomationPanel = useAutomationStore((s) => s.togglePanel);
 
   // Terminal state (T-046)
   const terminalPanelOpen = useTerminalStore((s) => s.panelOpen);
@@ -290,8 +298,13 @@ export function FileManager() {
             await tauriInvoke("open_in_editor", { filePath: path, editorPath: mapping?.app_path || null, editorArgs: mapping?.args || null });
           } catch {}
         },
+        onToggleAutomations: toggleAutomationPanel,
+        onCreateAutomation: () => {
+          if (!automationPanelOpen) toggleAutomationPanel();
+          useAutomationStore.getState().openEditor();
+        },
       }),
-    [toggleSidebar, handleUndo, handleSaveWorkspace, getFirstSelectedPath],
+    [toggleSidebar, handleUndo, handleSaveWorkspace, getFirstSelectedPath, toggleAutomationPanel, automationPanelOpen],
   );
 
   return (
@@ -415,6 +428,18 @@ export function FileManager() {
               </div>
             )}
           </div>
+          {toolbarItems.includes("automations") && (
+            <Button
+              variant={automationPanelOpen ? "secondary" : "ghost"}
+              size="icon"
+              onClick={toggleAutomationPanel}
+              aria-label={automationPanelOpen ? "Close Quickflows" : "Open Quickflows"}
+              title="Quickflows (Automations)"
+              data-testid="toggle-automation-panel"
+            >
+              <Zap className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
           {toolbarItems.includes("ai") && (
             <Button
               variant={aiPanelOpen ? "secondary" : "ghost"}
@@ -522,6 +547,7 @@ export function FileManager() {
           <TerminalPanel />
         </div>
 
+        <AutomationPanel />
         <AiPanel />
       </div>
 

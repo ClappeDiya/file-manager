@@ -1000,6 +1000,100 @@ impl Default for AiAssistant {
     }
 }
 
+// ── Automation NL Bridge ──
+
+/// Convert a parsed NL job config into an AutomationRule.
+pub fn parsed_job_to_automation_rule(
+    parsed: &ParsedJobConfig,
+    original_input: &str,
+) -> crate::automation_engine::AutomationRule {
+    use crate::automation_engine::{AutomationRule, RuleAction, RuleCondition, RuleTrigger};
+
+    let input_lower = original_input.to_lowercase();
+
+    // Determine trigger
+    let trigger = if let Some(ref cron) = parsed.schedule {
+        RuleTrigger::Schedule {
+            cron_expr: cron.clone(),
+            cron_human: parsed.schedule_human.clone(),
+        }
+    } else if input_lower.contains("when") && (input_lower.contains("appear") || input_lower.contains("arrive") || input_lower.contains("added") || input_lower.contains("new file")) {
+        RuleTrigger::FileAppears {
+            watch_path: parsed.source_path.clone().unwrap_or_else(|| "~/Downloads".to_string()),
+            recursive: !input_lower.contains("no subfolder"),
+        }
+    } else if input_lower.contains("when") && (input_lower.contains("change") || input_lower.contains("modif")) {
+        RuleTrigger::FileModified {
+            watch_path: parsed.source_path.clone().unwrap_or_else(|| "~/Downloads".to_string()),
+            recursive: true,
+        }
+    } else if parsed.source_path.is_some() {
+        RuleTrigger::FileAppears {
+            watch_path: parsed.source_path.clone().unwrap(),
+            recursive: true,
+        }
+    } else {
+        RuleTrigger::Manual
+    };
+
+    // Determine action from intent
+    let action = match parsed.intent.as_str() {
+        "sync" | "transfer" | "backup" => {
+            if let Some(ref connector) = parsed.dest_connector {
+                RuleAction::TransferToConnector {
+                    connector_protocol: connector.clone(),
+                    connection_id: String::new(),
+                    remote_path: parsed.dest_path.clone().unwrap_or_else(|| "/".to_string()),
+                }
+            } else if let Some(ref dest) = parsed.dest_path {
+                RuleAction::CopyFile { dest_path: dest.clone() }
+            } else {
+                RuleAction::Notify {
+                    title: "Quickflow".to_string(),
+                    body: "Configure destination to complete this rule.".to_string(),
+                }
+            }
+        }
+        "rename" => RuleAction::RenameFile {
+            pattern: parsed.rename_pattern.clone().unwrap_or_else(|| "date_prefix".to_string()),
+        },
+        _ => {
+            if input_lower.contains("move") {
+                RuleAction::MoveFile { dest_path: parsed.dest_path.clone().unwrap_or_default() }
+            } else if let Some(ref dest) = parsed.dest_path {
+                RuleAction::MoveFile { dest_path: dest.clone() }
+            } else {
+                RuleAction::Notify { title: "Quickflow".to_string(), body: original_input.to_string() }
+            }
+        }
+    };
+
+    // Build conditions from input keywords
+    let mut conditions = Vec::new();
+    let ext_keywords = [
+        ("pdf", "pdf"), ("image", "jpg,jpeg,png,gif,webp"), ("photo", "jpg,jpeg,png,heic"),
+        ("video", "mp4,mov,avi,mkv"), ("document", "pdf,doc,docx"),
+    ];
+    for (keyword, exts) in &ext_keywords {
+        if input_lower.contains(keyword) {
+            conditions.push(RuleCondition::ExtensionIs {
+                extensions: exts.split(',').map(|s| s.to_string()).collect(),
+            });
+            break;
+        }
+    }
+
+    let name = if original_input.len() > 50 {
+        format!("{}...", &original_input[..47])
+    } else {
+        original_input.to_string()
+    };
+
+    let mut rule = AutomationRule::new(name, trigger, action);
+    rule.conditions = conditions;
+    rule
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

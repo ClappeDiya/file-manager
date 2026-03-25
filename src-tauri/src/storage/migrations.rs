@@ -57,8 +57,49 @@ fn all_migrations() -> Vec<Migration> {
             description: "Sync time offset compensation and FTP data type",
             sql: V8_SCHEMA,
         },
+        Migration {
+            version: 9,
+            description: "Automation engine - quickflow rules and execution logs",
+            sql: V9_SCHEMA,
+        },
     ]
 }
+
+/// Schema v9: Automation engine - quickflow rules and execution logs.
+const V9_SCHEMA: &str = r#"
+-- Automation rules (trigger -> conditions -> action)
+CREATE TABLE IF NOT EXISTS automation_rules (
+    id              TEXT PRIMARY KEY NOT NULL,
+    name            TEXT NOT NULL,
+    enabled         INTEGER NOT NULL DEFAULT 0,
+    trigger_json    TEXT NOT NULL,
+    conditions_json TEXT NOT NULL DEFAULT '[]',
+    action_json     TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    last_triggered  TEXT,
+    trigger_count   INTEGER NOT NULL DEFAULT 0,
+    error_count     INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_automation_rules_enabled ON automation_rules(enabled);
+
+-- Automation execution log
+CREATE TABLE IF NOT EXISTS automation_logs (
+    id              TEXT PRIMARY KEY NOT NULL,
+    rule_id         TEXT NOT NULL REFERENCES automation_rules(id) ON DELETE CASCADE,
+    rule_name       TEXT NOT NULL,
+    triggered_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at    TEXT,
+    trigger_event   TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'running',
+    files_affected  TEXT NOT NULL DEFAULT '[]',
+    error_message   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_automation_logs_rule ON automation_logs(rule_id);
+CREATE INDEX IF NOT EXISTS idx_automation_logs_triggered ON automation_logs(triggered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_automation_logs_status ON automation_logs(status);
+"#;
 
 /// Schema v8: Sync time offset and FTP data type fields.
 const V8_SCHEMA: &str = r#"
@@ -552,7 +593,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 8);
+        assert_eq!(applied, 9);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -582,7 +623,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 8);
+        assert_eq!(first, 9);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -595,7 +636,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 8);
+        assert_eq!(current_version(&conn).unwrap(), 9);
     }
 
     #[test]

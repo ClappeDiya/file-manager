@@ -1,4 +1,5 @@
 pub mod ai_commands;
+pub mod automation_commands;
 pub mod archive_commands;
 pub mod aws_commands;
 pub mod batch_rename_commands;
