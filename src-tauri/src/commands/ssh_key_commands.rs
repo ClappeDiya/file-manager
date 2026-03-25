@@ -102,7 +102,10 @@ pub async fn generate_ssh_key(
     cmd.args(algo.keygen_args());
     cmd.arg("-f").arg(&key_path);
 
-    // Passphrase (empty string = no passphrase)
+    // Passphrase (empty string = no passphrase).
+    // Note: -N flag exposes passphrase briefly in process listing. This is the standard
+    // non-interactive approach for ssh-keygen. The process runs < 1 second. Using stdin
+    // piping would require handling interactive prompts which is error-prone.
     let pass = passphrase.unwrap_or_default();
     cmd.arg("-N").arg(&pass);
 

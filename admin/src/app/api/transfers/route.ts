@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
+import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /**
  * Transfer Management API (T-059)
@@ -95,9 +96,11 @@ export async function GET(request: NextRequest) {
 
 /** POST /api/transfers - Trigger a new transfer */
 export async function POST(request: NextRequest) {
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
+
   const apiKey = getApiKey(request);
-  if (!apiKey) return unauthorized();
-  if (!checkRateLimit(apiKey)) return rateLimited();
+  if (apiKey && !checkRateLimit(apiKey)) return rateLimited();
 
   try {
     const body = await request.json();
@@ -124,7 +127,7 @@ export async function POST(request: NextRequest) {
       updated_at: new Date().toISOString(),
       error_message: null,
       verify_checksum: verify_checksum ?? true,
-      created_by: apiKey.slice(0, 8),
+      created_by: authResult.user.email,
     };
 
     transfers.push(transfer);

@@ -285,6 +285,8 @@ fn sync_to_disk_blocking(path: &str) -> Result<(), AppError> {
     {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
+        // SAFETY: `fd` is a valid file descriptor from `AsRawFd` on an open `File`.
+        // `F_FULLFSYNC` is a macOS-specific fcntl that flushes all data to permanent storage.
         let ret = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
         if ret != 0 {
             return Err(AppError::Transfer {
@@ -298,6 +300,8 @@ fn sync_to_disk_blocking(path: &str) -> Result<(), AppError> {
     {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
+        // SAFETY: `fd` is a valid file descriptor from `AsRawFd` on an open `File`.
+        // `fdatasync` flushes file data (not metadata) to permanent storage.
         let ret = unsafe { libc::fdatasync(fd) };
         if ret != 0 {
             return Err(AppError::Transfer {
@@ -530,11 +534,14 @@ fn preallocate_blocking(path: &str, size: u64) -> Result<(), AppError> {
     {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
+        // SAFETY: `fd` is a valid file descriptor from `AsRawFd` on an open `File`.
+        // `fallocate` pre-allocates disk space to avoid fragmentation during large writes.
         let ret = unsafe { libc::fallocate(fd, 0, 0, size as libc::off_t) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             // fallocate may not be supported on all filesystems; fall back to ftruncate
             tracing::debug!("fallocate failed ({err}), falling back to ftruncate");
+            // SAFETY: `fd` is a valid file descriptor. `ftruncate` sets the file size for pre-allocation.
             let ret = unsafe { libc::ftruncate(fd, size as libc::off_t) };
             if ret != 0 {
                 return Err(AppError::Transfer {
@@ -549,6 +556,8 @@ fn preallocate_blocking(path: &str, size: u64) -> Result<(), AppError> {
     {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
+        // SAFETY: `fd` is a valid file descriptor from `AsRawFd` on an open `File`.
+        // `ftruncate` sets the file size for pre-allocation on macOS.
         let ret = unsafe { libc::ftruncate(fd, size as libc::off_t) };
         if ret != 0 {
             return Err(AppError::Transfer {

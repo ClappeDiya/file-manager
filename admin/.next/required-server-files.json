@@ -99,7 +99,7 @@
         "transform": "lodash/{{member}}"
       }
     },
-    "outputFileTracingRoot": "/Users/md/Documents/Md/FileManager/unified-file-ops",
+    "outputFileTracingRoot": "/Users/md/Documents/Md/FileManager",
     "experimental": {
       "useSkewCookie": false,
       "cacheLife": {
@@ -293,10 +293,10 @@
     ],
     "serverExternalPackages": [],
     "turbopack": {
-      "root": "/Users/md/Documents/Md/FileManager/unified-file-ops"
+      "root": "/Users/md/Documents/Md/FileManager"
     }
   },
-  "appDir": "/Users/md/Documents/Md/FileManager/unified-file-ops/admin",
+  "appDir": "/Users/md/Documents/Md/FileManager/admin",
   "relativeAppDir": "admin",
   "files": [
     ".next/routes-manifest.json",
@@ -319,6 +319,6 @@
     ".next/required-server-files.json"
   ],
   "ignore": [
-    "../node_modules/.pnpm/next@15.5.12_@babel+core@7.29.0_react-dom@19.2.4_react@19.2.4__react@19.2.4/node_modules/next/dist/compiled/@ampproject/toolbox-optimizer/**/*"
+    "../node_modules/.pnpm/next@15.5.14_@babel+core@7.29.0_react-dom@19.2.4_react@19.2.4__react@19.2.4/node_modules/next/dist/compiled/@ampproject/toolbox-optimizer/**/*"
   ]
 }

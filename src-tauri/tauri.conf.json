@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src 'self' https://releases.ufop.app https://api.github.com"
+      "csp": "default-src 'self'; script-src 'self'; img-src 'self' asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src 'self' https://releases.ufop.app https://api.github.com"
     }
   },
   "bundle": {
@@ -110,7 +110,7 @@
   },
   "plugins": {
     "updater": {
-      "active": true,
+      "active": false,
       "dialog": true,
       "pubkey": "",
       "endpoints": [

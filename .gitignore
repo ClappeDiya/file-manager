@@ -29,8 +29,10 @@ src-tauri/target/
 src-tauri/gen/
 src-tauri/WixTools/
 
-# Lock files (keep pnpm-lock)
-Cargo.lock
+# Lock files (keep pnpm-lock and Cargo.lock for reproducible builds)
+
+# Claude Code
+.claude/
 
 # Runtime data
 .data/

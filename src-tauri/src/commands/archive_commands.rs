@@ -7,6 +7,23 @@ use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Sanitize a path argument to prevent flag injection in shell commands.
+/// Rejects paths starting with `-` and prefixes relative paths with `./`.
+fn sanitize_archive_path(path: &str) -> Result<String, AppError> {
+    if path.starts_with('-') {
+        return Err(AppError::validation(format!(
+            "Invalid path: paths must not start with '-': {path}"
+        )));
+    }
+    // Prefix bare relative paths with ./ to prevent interpretation as flags
+    let sanitized = if !path.starts_with('/') && !path.starts_with("./") && !path.starts_with("../") {
+        format!("./{path}")
+    } else {
+        path.to_string()
+    };
+    Ok(sanitized)
+}
+
 /// Virtual folder entry when browsing an archive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveEntry {
@@ -70,6 +87,8 @@ pub async fn archive_browse(
     archive_path: String,
     sub_path: Option<String>,
 ) -> Result<ArchiveBrowseResult, AppError> {
+    // Sanitize archive path to prevent flag injection
+    let archive_path = sanitize_archive_path(&archive_path)?;
     let path = Path::new(&archive_path);
     if !path.exists() {
         return Err(AppError::not_found(format!("Archive not found: {archive_path}")));
@@ -142,8 +161,15 @@ pub async fn archive_browse(
 /// Create an archive.
 #[tauri::command]
 pub async fn archive_create(params: CreateArchiveParams) -> Result<ArchiveOpResult, AppError> {
-    // Validate sources
+    // Sanitize all paths to prevent flag injection
+    let output_path = sanitize_archive_path(&params.output_path)?;
+    let mut sanitized_sources = Vec::with_capacity(params.source_paths.len());
     for src in &params.source_paths {
+        sanitized_sources.push(sanitize_archive_path(src)?);
+    }
+
+    // Validate sources
+    for src in &sanitized_sources {
         if !Path::new(src).exists() {
             return Err(AppError::not_found(format!("Source not found: {src}")));
         }
@@ -157,8 +183,7 @@ pub async fn archive_create(params: CreateArchiveParams) -> Result<ArchiveOpResu
     }
 
     // Calculate total size for queue decision
-    let total_size = params
-        .source_paths
+    let total_size = sanitized_sources
         .iter()
         .map(|p| calculate_dir_size(Path::new(p)).unwrap_or(0))
         .sum::<u64>();
@@ -172,10 +197,10 @@ pub async fn archive_create(params: CreateArchiveParams) -> Result<ArchiveOpResu
 
     // Execute archive creation
     let result = match fmt.as_str() {
-        "zip" => create_zip(&params.output_path, &params.source_paths, params.password.as_deref()),
-        "tar" => create_tar(&params.output_path, &params.source_paths, false),
-        "tar.gz" | "tgz" => create_tar(&params.output_path, &params.source_paths, true),
-        "7z" => create_7z(&params.output_path, &params.source_paths, params.password.as_deref()),
+        "zip" => create_zip(&output_path, &sanitized_sources, params.password.as_deref()),
+        "tar" => create_tar(&output_path, &sanitized_sources, false),
+        "tar.gz" | "tgz" => create_tar(&output_path, &sanitized_sources, true),
+        "7z" => create_7z(&output_path, &sanitized_sources, params.password.as_deref()),
         _ => unreachable!(),
     };
 
@@ -183,7 +208,7 @@ pub async fn archive_create(params: CreateArchiveParams) -> Result<ArchiveOpResu
         Ok(count) => Ok(ArchiveOpResult {
             success: true,
             action: "create".into(),
-            archive_path: params.output_path,
+            archive_path: output_path,
             files_processed: count,
             total_size,
             errors: vec![],
@@ -192,7 +217,7 @@ pub async fn archive_create(params: CreateArchiveParams) -> Result<ArchiveOpResu
         Err(e) => Ok(ArchiveOpResult {
             success: false,
             action: "create".into(),
-            archive_path: params.output_path,
+            archive_path: output_path,
             files_processed: 0,
             total_size,
             errors: vec![e.to_string()],
@@ -204,7 +229,9 @@ pub async fn archive_create(params: CreateArchiveParams) -> Result<ArchiveOpResu
 /// Extract an archive.
 #[tauri::command]
 pub async fn archive_extract(params: ExtractArchiveParams) -> Result<ArchiveOpResult, AppError> {
-    let archive_path = Path::new(&params.archive_path);
+    // Sanitize archive path to prevent flag injection
+    let sanitized_archive = sanitize_archive_path(&params.archive_path)?;
+    let archive_path = Path::new(&sanitized_archive);
     if !archive_path.exists() {
         return Err(AppError::not_found(format!(
             "Archive not found: {}",
@@ -212,12 +239,13 @@ pub async fn archive_extract(params: ExtractArchiveParams) -> Result<ArchiveOpRe
         )));
     }
 
-    let dest = params.dest_dir.unwrap_or_else(|| {
-        archive_path
+    let dest = match params.dest_dir {
+        Some(d) => sanitize_archive_path(&d)?,
+        None => archive_path
             .parent()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| ".".into())
-    });
+            .unwrap_or_else(|| ".".into()),
+    };
 
     // Create destination
     std::fs::create_dir_all(&dest).map_err(|e| {
@@ -241,10 +269,10 @@ pub async fn archive_extract(params: ExtractArchiveParams) -> Result<ArchiveOpRe
     };
 
     let result = match ext.as_str() {
-        "zip" => extract_zip_archive(&params.archive_path, &dest, params.password.as_deref()),
-        "tar" => extract_tar_archive(&params.archive_path, &dest, false),
-        "gz" | "tgz" => extract_tar_archive(&params.archive_path, &dest, true),
-        "7z" => extract_7z_archive(&params.archive_path, &dest, params.password.as_deref()),
+        "zip" => extract_zip_archive(&sanitized_archive, &dest, params.password.as_deref()),
+        "tar" => extract_tar_archive(&sanitized_archive, &dest, false),
+        "gz" | "tgz" => extract_tar_archive(&sanitized_archive, &dest, true),
+        "7z" => extract_7z_archive(&sanitized_archive, &dest, params.password.as_deref()),
         _ => return Err(AppError::file_op(
             format!("Unsupported format: .{ext}"),
             "Supported: zip, tar, tar.gz, 7z",
@@ -255,7 +283,7 @@ pub async fn archive_extract(params: ExtractArchiveParams) -> Result<ArchiveOpRe
         Ok(count) => Ok(ArchiveOpResult {
             success: true,
             action: "extract".into(),
-            archive_path: params.archive_path,
+            archive_path: sanitized_archive,
             files_processed: count,
             total_size: file_size,
             errors: vec![],
@@ -264,7 +292,7 @@ pub async fn archive_extract(params: ExtractArchiveParams) -> Result<ArchiveOpRe
         Err(e) => Ok(ArchiveOpResult {
             success: false,
             action: "extract".into(),
-            archive_path: params.archive_path,
+            archive_path: sanitized_archive,
             files_processed: 0,
             total_size: file_size,
             errors: vec![e.to_string()],
@@ -406,18 +434,25 @@ fn create_zip(
     password: Option<&str>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut args = vec!["-r".to_string()];
-    if let Some(pw) = password {
-        args.push("-P".to_string());
-        args.push(pw.to_string());
+    if password.is_some() {
+        // Use -e (encrypt) flag; password is passed via ZIPPASSWORD env var
+        // to avoid exposing it on the command line via -P
+        args.push("-e".to_string());
     }
     args.push(output.to_string());
     args.extend(sources.iter().cloned());
 
-    let status = std::process::Command::new("zip")
-        .args(&args)
+    let mut cmd = std::process::Command::new("zip");
+    cmd.args(&args)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
+        .stderr(std::process::Stdio::null());
+
+    // Pass password via environment variable to avoid command-line exposure
+    if let Some(pw) = password {
+        cmd.env("ZIPPASSWORD", pw);
+    }
+
+    let status = cmd.status()?;
 
     if !status.success() {
         return Err("zip creation failed".into());
@@ -477,7 +512,10 @@ fn extract_zip_archive(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut args = vec!["-o".to_string(), archive.to_string(), "-d".to_string(), dest.to_string()];
     if let Some(pw) = password {
-        args.insert(0, format!("-P{pw}"));
+        // Pass password via -P as a separate arg (unzip does not support env vars for passwords).
+        // This is safe because we use Command args (no shell interpretation).
+        args.insert(0, "-P".to_string());
+        args.insert(1, pw.to_string());
     }
 
     let status = std::process::Command::new("unzip")

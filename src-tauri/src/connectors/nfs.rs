@@ -20,6 +20,34 @@ use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Whitelist of allowed NFS mount option prefixes.
+/// Options must start with one of these prefixes to be accepted.
+const ALLOWED_NFS_OPTION_PREFIXES: &[&str] = &[
+    "ro", "rw", "soft", "hard", "intr", "noac", "nolock",
+    "tcp", "udp", "sec=sys", "sec=krb5", "nfsvers=3", "nfsvers=4",
+    "vers=3", "vers=4", "timeo=", "retrans=", "rsize=", "wsize=",
+];
+
+/// Validate that an NFS extra_option is allowed by the whitelist.
+fn validate_nfs_option(opt: &str) -> Result<(), AppError> {
+    let trimmed = opt.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    for prefix in ALLOWED_NFS_OPTION_PREFIXES {
+        if trimmed.starts_with(prefix) {
+            return Ok(());
+        }
+    }
+    Err(AppError::Connection {
+        message: format!("Disallowed NFS mount option: '{trimmed}'"),
+        advice: format!(
+            "Allowed options: {}",
+            ALLOWED_NFS_OPTION_PREFIXES.join(", ")
+        ),
+    })
+}
+
 // ──────────────────────────────────────────────
 // NFS Configuration
 // ──────────────────────────────────────────────
@@ -208,6 +236,7 @@ impl NfsConnector {
             }
 
             for opt in &config.extra_options {
+                validate_nfs_option(opt)?;
                 opts.push(opt.clone());
             }
 
@@ -259,6 +288,7 @@ impl NfsConnector {
             }
 
             for opt in &config.extra_options {
+                validate_nfs_option(opt)?;
                 opts.push(opt.clone());
             }
 

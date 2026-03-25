@@ -23,6 +23,54 @@ use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Validate that a hostname is a legitimate hostname or IP address,
+/// preventing command injection via malicious hostnames.
+fn validate_hostname(host: &str) -> Result<(), AppError> {
+    if host.is_empty() {
+        return Err(AppError::Connection {
+            message: "Hostname is empty.".to_string(),
+            advice: "Provide a valid hostname or IP address.".to_string(),
+        });
+    }
+
+    // Check for valid IPv4 address
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Ok(());
+    }
+
+    // Check for valid IPv6 address (may be bracketed)
+    let ipv6_candidate = host.trim_start_matches('[').trim_end_matches(']');
+    if ipv6_candidate.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Ok(());
+    }
+
+    // Validate hostname format: alphanumeric labels separated by dots
+    let hostname_re = regex::Regex::new(
+        r"^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$"
+    ).unwrap();
+
+    if !hostname_re.is_match(host) {
+        return Err(AppError::Connection {
+            message: format!("Invalid hostname: {host}"),
+            advice: "Hostname must contain only alphanumeric characters, hyphens, and dots.".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validate that an SMB credential field does not contain characters
+/// that could break mount option parsing (commas, equals signs).
+fn validate_smb_credential(field_name: &str, value: &str) -> Result<(), AppError> {
+    if value.contains(',') || value.contains('=') {
+        return Err(AppError::Connection {
+            message: format!("{field_name} contains invalid characters (',' or '=')."),
+            advice: format!("Remove commas and equals signs from the {field_name}."),
+        });
+    }
+    Ok(())
+}
+
 // ──────────────────────────────────────────────
 // SMB Configuration
 // ──────────────────────────────────────────────
@@ -218,7 +266,21 @@ impl SmbConnector {
         username: Option<&str>,
         password: Option<&str>,
         config: &SmbConfig,
-    ) -> Command {
+    ) -> Result<Command, AppError> {
+        // Validate hostname to prevent injection
+        validate_hostname(host)?;
+
+        // Validate credentials don't contain mount-option-breaking characters
+        if let Some(user) = username {
+            validate_smb_credential("username", user)?;
+        }
+        if let Some(pass) = password {
+            validate_smb_credential("password", pass)?;
+        }
+        if let Some(domain) = &config.domain {
+            validate_smb_credential("domain", domain)?;
+        }
+
         let _smb_path = format!("//{host}/{share}");
 
         #[cfg(target_os = "macos")]
@@ -256,7 +318,7 @@ impl SmbConnector {
                 .arg(format!("vers={}", config.max_version.as_mount_option()));
             cmd.arg(&url);
             cmd.arg(mount_point);
-            cmd
+            Ok(cmd)
         }
 
         #[cfg(target_os = "linux")]
@@ -311,7 +373,7 @@ impl SmbConnector {
             }
 
             cmd.arg("-o").arg(opts.join(","));
-            cmd
+            Ok(cmd)
         }
 
         #[cfg(target_os = "windows")]
@@ -340,7 +402,7 @@ impl SmbConnector {
                 cmd.arg(format!("/user:{full_user}"));
             }
 
-            cmd
+            Ok(cmd)
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -348,7 +410,7 @@ impl SmbConnector {
             let _ = (smb_path, username, password, config);
             let mut cmd = Command::new("echo");
             cmd.arg("SMB mount not supported on this platform");
-            cmd
+            Ok(cmd)
         }
     }
 
@@ -783,7 +845,7 @@ impl Connector for SmbConnector {
                     user_clone.as_deref(),
                     None, // Password handled via credential store
                     &config_clone,
-                );
+                )?;
 
                 let output = cmd.output().map_err(|e| AppError::Connection {
                     message: format!("Failed to execute mount command: {e}"),

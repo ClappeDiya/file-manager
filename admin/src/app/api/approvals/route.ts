@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { dataStore } from '@/lib/data-store';
 import type { ApprovalRequest, ApprovalState, ApprovalTrigger } from '@/lib/types/approvals';
+import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /** GET /api/approvals - List approval requests */
 export async function GET(request: NextRequest) {
@@ -34,6 +35,9 @@ export async function GET(request: NextRequest) {
 
 /** POST /api/approvals - Create a new approval request */
 export async function POST(request: NextRequest) {
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
+
   try {
     const body = await request.json();
     const {
@@ -76,6 +80,9 @@ export async function POST(request: NextRequest) {
 
 /** PATCH /api/approvals - Review (approve/deny) a request */
 export async function PATCH(request: NextRequest) {
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
+
   try {
     const body = await request.json();
     const { id, action, reviewedBy, reviewedByName, reviewComment } = body;

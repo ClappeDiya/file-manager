@@ -6,6 +6,10 @@ use thiserror::Error;
 /// why it happened, and what the user can do about it.
 ///
 /// Internal details are logged server-side but NEVER sent to the frontend.
+///
+/// NOTE: Path exposure in error messages (e.g., FileOperation) is intentional for a file
+/// manager application. Users need to see which file paths failed. Internal system paths
+/// (database, config) use the `Internal` variant which sanitizes messages before sending.
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("File operation failed: {message}. {advice}")]

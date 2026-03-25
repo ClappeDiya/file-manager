@@ -1,4 +1,4 @@
-// File: /Users/md/Documents/Md/FileManager/unified-file-ops/admin/src/app/users/page.tsx
+// File: /Users/md/Documents/Md/FileManager/admin/src/app/users/page.tsx
 import * as entry from '../../../../src/app/users/page.js'
 import type { ResolvingMetadata, ResolvingViewport } from 'next/dist/lib/metadata/types/metadata-interface.js'
 

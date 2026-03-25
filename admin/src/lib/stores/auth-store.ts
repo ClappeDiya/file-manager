@@ -9,12 +9,14 @@ interface AuthState {
   user: AdminUser | null;
   isAuthenticated: boolean;
   isLoading: boolean;
+  isValidating: boolean;
   error: string | null;
 
   // Actions
   setUser: (user: AdminUser | null) => void;
   login: (email: string, password: string) => Promise<void>;
   logout: () => void;
+  validateSession: () => Promise<void>;
   checkPermission: (permission: Permission) => boolean;
   setError: (error: string | null) => void;
 }
@@ -25,6 +27,7 @@ export const useAuthStore = create<AuthState>()(
       user: null,
       isAuthenticated: false,
       isLoading: false,
+      isValidating: false,
       error: null,
 
       setUser: (user) => {
@@ -66,6 +69,21 @@ export const useAuthStore = create<AuthState>()(
         fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
       },
 
+      validateSession: async () => {
+        set({ isValidating: true });
+        try {
+          const response = await fetch('/api/auth/session');
+          if (response.ok) {
+            const { user } = await response.json();
+            set({ isAuthenticated: true, user, isValidating: false });
+          } else {
+            set({ isAuthenticated: false, user: null, isValidating: false });
+          }
+        } catch {
+          set({ isAuthenticated: false, user: null, isValidating: false });
+        }
+      },
+
       checkPermission: (permission: Permission) => {
         const { user } = get();
         if (!user) return false;
@@ -78,7 +96,6 @@ export const useAuthStore = create<AuthState>()(
       name: 'ufop-admin-auth',
       partialize: (state) => ({
         user: state.user,
-        isAuthenticated: state.isAuthenticated,
       }),
     }
   )

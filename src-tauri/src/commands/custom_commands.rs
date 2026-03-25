@@ -171,12 +171,24 @@ pub async fn expand_custom_command(
 /// Execute a custom command locally and return the result.
 ///
 /// For remote execution, the frontend should route through the terminal panel.
+/// Security: Uses shlex to parse commands into binary + args, avoiding shell injection.
+/// Falls back to shell execution only when necessary (pipes, redirects), with proper quoting.
 #[tauri::command]
 pub async fn execute_custom_command(
     command_id: String,
     file_paths: Vec<String>,
     remote_base: Option<String>,
 ) -> Result<CommandExecutionResult, AppError> {
+    // Validate file paths contain no null bytes (prevents injection via null terminators)
+    for fp in &file_paths {
+        if fp.contains('\0') {
+            return Err(AppError::file_op(
+                "File path contains invalid null byte",
+                "Remove null characters from the file path.",
+            ));
+        }
+    }
+
     let commands = CUSTOM_COMMANDS.read().await;
     let cmd = commands
         .iter()
@@ -207,25 +219,67 @@ pub async fn execute_custom_command(
             .join(" && ")
     };
 
-    // Execute locally
-    let output = tokio::process::Command::new(if cfg!(target_os = "windows") {
-        "cmd"
+    // Security: Try to parse without shell first using shlex.
+    // If the expanded command contains shell operators (pipes, redirects, &&, ||),
+    // shlex::split will still parse it as tokens, but we detect shell operators
+    // and fall back to shell execution with properly quoted substitutions.
+    let needs_shell = expanded.contains("&&")
+        || expanded.contains("||")
+        || expanded.contains('|')
+        || expanded.contains('>')
+        || expanded.contains('<')
+        || expanded.contains(';');
+
+    let output = if !needs_shell {
+        // Safe path: parse command into binary + args without shell
+        let parts = shlex::split(&expanded).ok_or_else(|| {
+            AppError::file_op(
+                "Failed to parse command template",
+                "Check that quotes are balanced in the command.",
+            )
+        })?;
+
+        if parts.is_empty() {
+            return Err(AppError::file_op(
+                "Command template is empty after expansion",
+                "Provide a valid command.",
+            ));
+        }
+
+        let (binary, args) = parts.split_first().unwrap();
+        tokio::process::Command::new(binary)
+            .args(args)
+            .output()
+            .await
+            .map_err(|e| {
+                AppError::file_op(
+                    format!("Failed to execute command: {e}"),
+                    "Check that the command binary exists and is executable.",
+                )
+            })?
     } else {
-        "sh"
-    })
-    .args(if cfg!(target_os = "windows") {
-        vec!["/C", &expanded]
-    } else {
-        vec!["-c", &expanded]
-    })
-    .output()
-    .await
-    .map_err(|e| {
-        AppError::file_op(
-            format!("Failed to execute command: {e}"),
-            "Check that the command is valid.",
-        )
-    })?;
+        // Shell path: command uses shell features. The expand_template function
+        // already quotes all substituted values, so shell metacharacters in
+        // file paths are safely escaped.
+        tokio::process::Command::new(if cfg!(target_os = "windows") {
+            "cmd"
+        } else {
+            "sh"
+        })
+        .args(if cfg!(target_os = "windows") {
+            vec!["/C", &expanded]
+        } else {
+            vec!["-c", &expanded]
+        })
+        .output()
+        .await
+        .map_err(|e| {
+            AppError::file_op(
+                format!("Failed to execute command: {e}"),
+                "Check that the command is valid.",
+            )
+        })?
+    };
 
     Ok(CommandExecutionResult {
         command_id: cmd.id,
@@ -358,22 +412,23 @@ fn expand_template(template: &str, file_path: &str, remote_base: Option<&str>) -
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
+    // Security: all substituted values are shell-quoted to prevent injection
     template
-        .replace("{path}", file_path)
-        .replace("{name}", &name)
-        .replace("{stem}", &stem)
-        .replace("{dir}", &dir)
-        .replace("{ext}", &ext)
-        .replace("{remote_path}", remote_base.unwrap_or(file_path))
-        .replace("{local_path}", file_path)
+        .replace("{path}", &shell_quote(file_path))
+        .replace("{name}", &shell_quote(&name))
+        .replace("{stem}", &shell_quote(&stem))
+        .replace("{dir}", &shell_quote(&dir))
+        .replace("{ext}", &shell_quote(&ext))
+        .replace("{remote_path}", &shell_quote(remote_base.unwrap_or(file_path)))
+        .replace("{local_path}", &shell_quote(file_path))
 }
 
+/// Shell-quote a string by wrapping it in single quotes.
+/// This is the safest approach: the only character that needs escaping inside
+/// single quotes is the single quote itself (replaced with `'\''`).
+/// Always quotes to prevent shell metacharacter injection.
 fn shell_quote(s: &str) -> String {
-    if s.contains(' ') || s.contains('\'') || s.contains('"') || s.contains('$') || s.contains('\\') {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    } else {
-        s.to_string()
-    }
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -387,7 +442,11 @@ mod tests {
             "/home/user/docs/report.txt",
             None,
         );
-        assert_eq!(result, "cat /home/user/docs/report.txt | grep report.txt");
+        // Values are now shell-quoted for injection safety
+        assert_eq!(
+            result,
+            "cat '/home/user/docs/report.txt' | grep 'report.txt'"
+        );
     }
 
     #[test]
@@ -397,17 +456,35 @@ mod tests {
             "/photos/image.jpg",
             None,
         );
-        assert_eq!(result, "convert /photos/image.jpg /photos/image.png");
+        assert_eq!(result, "convert '/photos/image.jpg' '/photos'/'image'.png");
     }
 
     #[test]
-    fn test_shell_quote_simple() {
-        assert_eq!(shell_quote("simple"), "simple");
-    }
-
-    #[test]
-    fn test_shell_quote_spaces() {
+    fn test_shell_quote_always_quotes() {
+        // shell_quote now always wraps in single quotes
+        assert_eq!(shell_quote("simple"), "'simple'");
         assert_eq!(shell_quote("has spaces"), "'has spaces'");
+    }
+
+    #[test]
+    fn test_shell_quote_injection_safe() {
+        // Verify that shell metacharacters are safely quoted
+        assert_eq!(
+            shell_quote("; rm -rf /"),
+            "'; rm -rf /'"
+        );
+        assert_eq!(
+            shell_quote("$(whoami)"),
+            "'$(whoami)'"
+        );
+        assert_eq!(
+            shell_quote("`id`"),
+            "'`id`'"
+        );
+        assert_eq!(
+            shell_quote("file'name"),
+            "'file'\\''name'"
+        );
     }
 
     #[tokio::test]
@@ -420,7 +497,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(script.contains("cp -r /src/file.txt /dest"));
+        assert!(script.contains("cp -r '/src/file.txt' '/dest'"));
     }
 
     #[tokio::test]
@@ -436,6 +513,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(script.contains("chmod -R 755 /var/www"));
+        assert!(script.contains("chmod -R 755 '/var/www'"));
     }
 }

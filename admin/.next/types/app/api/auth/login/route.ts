@@ -1,4 +1,4 @@
-// File: /Users/md/Documents/Md/FileManager/unified-file-ops/admin/src/app/api/auth/login/route.ts
+// File: /Users/md/Documents/Md/FileManager/admin/src/app/api/auth/login/route.ts
 import * as entry from '../../../../../../src/app/api/auth/login/route.js'
 import type { NextRequest } from 'next/server.js'
 

@@ -1,4 +1,4 @@
-// File: /Users/md/Documents/Md/FileManager/unified-file-ops/admin/src/app/api/webhooks/route.ts
+// File: /Users/md/Documents/Md/FileManager/admin/src/app/api/webhooks/route.ts
 import * as entry from '../../../../../src/app/api/webhooks/route.js'
 import type { NextRequest } from 'next/server.js'
 

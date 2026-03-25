@@ -1,6 +1,8 @@
+use crate::commands::confirmation_commands::validate_confirmation;
 use crate::core::error::AppError;
 use crate::core::traits::StorageOperations;
 use crate::core::types::WorkspaceState;
+use crate::security::confirmation::ConfirmationManager;
 use crate::storage::Repository;
 use tauri::State;
 
@@ -45,8 +47,14 @@ pub async fn set_config(
 }
 
 /// Reset the database (for troubleshooting).
+/// Security: requires a confirmation token to prevent accidental or XSS-driven data loss.
 #[tauri::command]
-pub async fn reset_database(repo: State<'_, Repository>) -> Result<(), AppError> {
-    tracing::warn!("Database reset requested by user");
+pub async fn reset_database(
+    confirmation_token: String,
+    repo: State<'_, Repository>,
+    confirmation_mgr: State<'_, ConfirmationManager>,
+) -> Result<(), AppError> {
+    validate_confirmation(&confirmation_token, "reset_database", confirmation_mgr.inner()).await?;
+    tracing::warn!("Database reset confirmed by user — proceeding");
     repo.reset().await
 }

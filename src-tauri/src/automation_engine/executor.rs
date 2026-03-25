@@ -6,8 +6,85 @@
 
 use super::{AutomationLog, AutomationRule, AutomationStatus, RuleAction};
 use chrono::Utc;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+/// Validate that an automation action path does not escape allowed boundaries.
+///
+/// 1. Rejects paths containing `..` segments (path traversal).
+/// 2. Canonicalizes the path if possible.
+/// 3. If a `watch_dir` is provided, ensures the path stays within it.
+fn validate_automation_path(
+    path_str: &str,
+    watch_dir: Option<&str>,
+) -> Result<PathBuf, String> {
+    // Reject paths with .. segments
+    let path = Path::new(path_str);
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(format!(
+                "Path traversal detected: '{}' contains '..' segments",
+                path_str
+            ));
+        }
+    }
+
+    // Canonicalize if the path (or its parent) exists
+    let canonical = if path.exists() {
+        path.canonicalize()
+            .map_err(|e| format!("Cannot canonicalize path '{}': {}", path_str, e))?
+    } else if let Some(parent) = path.parent() {
+        if parent.exists() {
+            let canonical_parent = parent
+                .canonicalize()
+                .map_err(|e| format!("Cannot canonicalize parent of '{}': {}", path_str, e))?;
+            canonical_parent.join(path.file_name().unwrap_or_default())
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    };
+
+    // If a watch directory is specified, validate we don't escape it
+    if let Some(watch) = watch_dir {
+        let watch_path = Path::new(watch);
+        let canonical_watch = if watch_path.exists() {
+            watch_path
+                .canonicalize()
+                .map_err(|e| format!("Cannot canonicalize watch dir '{}': {}", watch, e))?
+        } else {
+            watch_path.to_path_buf()
+        };
+
+        if !canonical.starts_with(&canonical_watch) {
+            return Err(format!(
+                "Path '{}' escapes the watch directory '{}'",
+                path_str, watch
+            ));
+        }
+    }
+
+    Ok(canonical)
+}
+
+/// Validate that a rename target does not contain path separators,
+/// preventing directory traversal via rename.
+fn validate_rename_name(new_name: &str) -> Result<(), String> {
+    if new_name.contains('/') || new_name.contains('\\') {
+        return Err(format!(
+            "Rename target '{}' must not contain path separators ('/' or '\\')",
+            new_name
+        ));
+    }
+    if new_name.contains("..") {
+        return Err(format!(
+            "Rename target '{}' must not contain '..'",
+            new_name
+        ));
+    }
+    Ok(())
+}
 
 /// Execute the action for a triggered rule.
 ///
@@ -68,8 +145,10 @@ async fn dispatch_action(
     match action {
         RuleAction::MoveFile { dest_path } => {
             let source = triggered_file.ok_or("No source file for move action")?;
+            // Validate destination path to prevent path traversal
+            let validated_dest = validate_automation_path(dest_path, None)?;
             let source_path = Path::new(source);
-            let dest_dir = Path::new(dest_path);
+            let dest_dir = validated_dest.as_path();
 
             // Ensure destination exists
             if !dest_dir.exists() {
@@ -97,8 +176,10 @@ async fn dispatch_action(
 
         RuleAction::CopyFile { dest_path } => {
             let source = triggered_file.ok_or("No source file for copy action")?;
+            // Validate destination path to prevent path traversal
+            let validated_dest = validate_automation_path(dest_path, None)?;
             let source_path = Path::new(source);
-            let dest_dir = Path::new(dest_path);
+            let dest_dir = validated_dest.as_path();
 
             if !dest_dir.exists() {
                 std::fs::create_dir_all(dest_dir)
@@ -132,6 +213,8 @@ async fn dispatch_action(
                 .ok_or("Cannot determine filename")?;
 
             let new_name = apply_rename_pattern(file_name, pattern);
+            // Validate rename target doesn't contain path separators or traversal
+            validate_rename_name(&new_name)?;
             let dest = parent.join(&new_name);
 
             if dest.exists() {

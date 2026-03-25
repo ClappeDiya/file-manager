@@ -570,7 +570,9 @@ pub fn reset_database(conn: &Connection) -> Result<(), AppError> {
 
     // Drop all tables
     for table in &tables {
-        conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{table}\""))?;
+        // Security: escape double quotes in table name to prevent SQL injection
+        let escaped_table = table.replace('"', "\"\"");
+        conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped_table}\""))?;
     }
 
     // Re-run migrations

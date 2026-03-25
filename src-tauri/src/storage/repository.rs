@@ -280,6 +280,9 @@ impl Repository {
                         profile.proxy_host,
                         profile.proxy_port,
                         profile.proxy_username,
+                        // TODO(security/M-2): Encrypt proxy_password via MasterPasswordManager
+                        // before storing. Requires passing MasterPasswordManager to save_connection
+                        // and decrypting on load. Tracked for next sprint.
                         profile.proxy_password,
                         profile.default_local_dir,
                         profile.default_remote_dir,

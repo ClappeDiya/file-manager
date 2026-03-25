@@ -188,6 +188,32 @@ pub async fn open_in_editor(
     let args = editor_args.unwrap_or_default();
 
     if let Some(editor) = editor_path {
+        // Security: validate editor path before execution
+        let editor_path_obj = Path::new(&editor);
+        if !editor_path_obj.exists() {
+            return Err(AppError::file_op(
+                format!("Editor not found: {editor}"),
+                "Check that the editor path is correct and the application is installed.",
+            ));
+        }
+        if !editor_path_obj.is_file() && !editor_path_obj.is_symlink() {
+            return Err(AppError::file_op(
+                format!("Editor path is not a file: {editor}"),
+                "Provide a path to an executable file.",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&editor) {
+                if meta.permissions().mode() & 0o111 == 0 {
+                    return Err(AppError::file_op(
+                        format!("Editor is not executable: {editor}"),
+                        "Check the file permissions.",
+                    ));
+                }
+            }
+        }
         // Open with specified editor
         let mut cmd = std::process::Command::new(&editor);
         for arg in &args {
