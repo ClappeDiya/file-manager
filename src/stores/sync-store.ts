@@ -24,6 +24,7 @@ export interface SyncPair {
   verify_mode: string;
   checksum_enabled: boolean;
   created_at: string;
+  time_offset_secs: number | null;
 }
 
 export interface SyncFilter {

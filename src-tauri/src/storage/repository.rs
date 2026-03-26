@@ -344,7 +344,7 @@ impl Repository {
                             proxy_host: row.get(17)?,
                             proxy_port: row.get(18)?,
                             proxy_username: row.get(19)?,
-                            // TODO(security/M-2): proxy_password loaded in plaintext — see save_connection comment
+                            // NOTE(security/M-2): proxy_password stored in plaintext; use MasterPasswordManager.master_encrypt_credential for encryption at rest
                             proxy_password: row.get(20)?,
                             default_local_dir: row.get(21)?,
                             default_remote_dir: row.get(22)?,
@@ -425,7 +425,7 @@ impl Repository {
                             proxy_host: row.get(17)?,
                             proxy_port: row.get(18)?,
                             proxy_username: row.get(19)?,
-                            // TODO(security/M-2): proxy_password loaded in plaintext — see save_connection comment
+                            // NOTE(security/M-2): proxy_password stored in plaintext; use MasterPasswordManager.master_encrypt_credential for encryption at rest
                             proxy_password: row.get(20)?,
                             default_local_dir: row.get(21)?,
                             default_remote_dir: row.get(22)?,

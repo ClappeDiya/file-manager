@@ -664,7 +664,7 @@ fn search_files(
 
         // Check tags
         if let Some(ref required_tags) = query.tags {
-            let store = STORE.lock().unwrap();
+            let store = STORE.lock().map_err(|_| AppError::internal("Tag store lock poisoned"))?;
             let file_tags = store.file_tags.get(&path.display().to_string());
             if let Some(ft) = file_tags {
                 if !required_tags.iter().all(|t| ft.contains(t)) {

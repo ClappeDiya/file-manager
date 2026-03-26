@@ -575,6 +575,7 @@ pub fn run() {
             file_ops_commands::create_symlink,
             file_ops_commands::read_symlink,
             file_ops_commands::resolve_path,
+            file_ops_commands::open_file_with_default,
             // S3 Object Tags
             s3_commands::s3_get_object_tags,
             s3_commands::s3_put_object_tags,

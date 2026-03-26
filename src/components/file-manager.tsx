@@ -39,6 +39,7 @@ import {
   Save,
   FolderDown,
   Zap,
+  Layers,
 } from "lucide-react";
 
 // Toolbar customization definition (#14)
@@ -53,7 +54,6 @@ const ALL_TOOLBAR_ITEMS = [
   { id: "automations", label: "Quickflows" },
   { id: "smart-spaces", label: "Smart Spaces" },
   { id: "sync-browse", label: "Sync Browse" },
-  { id: "grouping", label: "Grouping" },
 ];
 
 // ──────────────────────────────────────────────
@@ -92,6 +92,7 @@ export function FileManager() {
   // Smart Spaces
   const spacesWizardOpen = useSpacesStore((s) => s.wizardOpen);
   const closeSpacesWizard = useSpacesStore((s) => s.closeWizard);
+  const openSpacesWizard = useSpacesStore((s) => s.openWizard);
 
   // Terminal state (T-046)
   const terminalPanelOpen = useTerminalStore((s) => s.panelOpen);
@@ -348,7 +349,7 @@ export function FileManager() {
           {toolbarItems.includes("view-modes") && <ViewModeSelector />}
           {toolbarItems.includes("hidden-files") && <HiddenFilesToggle />}
           {/* Sync Browsing toggle (#38) */}
-          {!singlePaneMode && (
+          {toolbarItems.includes("sync-browse") && !singlePaneMode && (
             <Button
               variant={syncBrowsing ? "secondary" : "ghost"}
               size="icon"
@@ -364,10 +365,10 @@ export function FileManager() {
               )}
             </Button>
           )}
-          {syncBrowsing && !singlePaneMode && (
+          {toolbarItems.includes("sync-browse") && syncBrowsing && !singlePaneMode && (
             <span className="text-[length:var(--font-size-xs)] text-[color:var(--color-primary)] font-medium">Sync</span>
           )}
-          {undoStack.length > 0 && (
+          {toolbarItems.includes("undo") && undoStack.length > 0 && (
             <Button
               variant="ghost"
               size="icon"
@@ -446,6 +447,18 @@ export function FileManager() {
               data-testid="toggle-automation-panel"
             >
               <Zap className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
+          {toolbarItems.includes("smart-spaces") && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => openSpacesWizard()}
+              aria-label="Create Smart Space"
+              title="Smart Spaces"
+              data-testid="toggle-smart-spaces"
+            >
+              <Layers className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
           {toolbarItems.includes("ai") && (

@@ -652,6 +652,30 @@ pub async fn resolve_path(
     sftp.realpath(&path).await
 }
 
+/// Open a file with the OS default application.
+#[tauri::command]
+pub async fn open_file_with_default(path: String) -> Result<(), AppError> {
+    let status = {
+        #[cfg(target_os = "macos")]
+        { std::process::Command::new("open").arg(&path).status() }
+        #[cfg(target_os = "windows")]
+        { std::process::Command::new("cmd").args(["/C", "start", "", &path]).status() }
+        #[cfg(target_os = "linux")]
+        { std::process::Command::new("xdg-open").arg(&path).status() }
+    };
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(AppError::file_op(
+            format!("Default app exited with {s} for {path}"),
+            "Check you have a default application set for this file type.",
+        )),
+        Err(e) => Err(AppError::file_op(
+            format!("Failed to open {path}: {e}"),
+            "Check the file exists and your OS default app handler is available.",
+        )),
+    }
+}
+
 // ──────────────────────────────────────────────
 // Internal helpers
 // ──────────────────────────────────────────────
