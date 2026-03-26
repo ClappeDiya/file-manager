@@ -7,6 +7,23 @@ use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Sanitize an archive path to prevent flag injection.
+/// Rejects paths starting with '-' and prefixes relative paths with './' .
+fn sanitize_archive_path(path: &str) -> Result<String, AppError> {
+    if path.starts_with('-') {
+        return Err(AppError::file_op(
+            "Invalid archive path: cannot start with '-'",
+            "Rename the file to remove the leading dash.",
+        ));
+    }
+    // Prefix relative paths with ./ to prevent flag injection
+    if !path.starts_with('/') && !path.starts_with("./") {
+        Ok(format!("./{}", path))
+    } else {
+        Ok(path.to_string())
+    }
+}
+
 /// Virtual folder entry when browsing an archive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveEntry {
@@ -282,8 +299,9 @@ pub async fn archive_info(archive_path: String) -> Result<ArchiveBrowseResult, A
 // ── Internal helpers ──
 
 fn list_zip_entries(path: &str) -> Result<Vec<ArchiveEntry>, AppError> {
+    let safe_path = sanitize_archive_path(path)?;
     let output = std::process::Command::new("zipinfo")
-        .args(["-1", path])
+        .args(["-1", &safe_path])
         .output()
         .map_err(|e| AppError::internal(format!("zipinfo failed: {e}")))?;
 
@@ -312,9 +330,10 @@ fn list_zip_entries(path: &str) -> Result<Vec<ArchiveEntry>, AppError> {
 }
 
 fn list_tar_entries(path: &str, compressed: bool) -> Result<Vec<ArchiveEntry>, AppError> {
+    let safe_path = sanitize_archive_path(path)?;
     let flag = if compressed { "-tzf" } else { "-tf" };
     let output = std::process::Command::new("tar")
-        .args([flag, path])
+        .args([flag, &safe_path])
         .output()
         .map_err(|e| AppError::internal(format!("tar list failed: {e}")))?;
 
@@ -343,8 +362,9 @@ fn list_tar_entries(path: &str, compressed: bool) -> Result<Vec<ArchiveEntry>, A
 }
 
 fn list_7z_entries(path: &str) -> Result<Vec<ArchiveEntry>, AppError> {
+    let safe_path = sanitize_archive_path(path)?;
     let output = std::process::Command::new("7z")
-        .args(["l", "-slt", path])
+        .args(["l", "-slt", &safe_path])
         .output()
         .map_err(|e| AppError::internal(format!("7z list failed: {e}")))?;
 
@@ -405,13 +425,18 @@ fn create_zip(
     sources: &[String],
     password: Option<&str>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    let safe_output = sanitize_archive_path(output).map_err(|e| e.to_string())?;
+    let safe_sources: Vec<String> = sources
+        .iter()
+        .map(|s| sanitize_archive_path(s).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut args = vec!["-r".to_string()];
     if let Some(pw) = password {
         args.push("-P".to_string());
         args.push(pw.to_string());
     }
-    args.push(output.to_string());
-    args.extend(sources.iter().cloned());
+    args.push(safe_output);
+    args.extend(safe_sources.iter().cloned());
 
     let status = std::process::Command::new("zip")
         .args(&args)
@@ -430,9 +455,14 @@ fn create_tar(
     sources: &[String],
     compress: bool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    let safe_output = sanitize_archive_path(output).map_err(|e| e.to_string())?;
+    let safe_sources: Vec<String> = sources
+        .iter()
+        .map(|s| sanitize_archive_path(s).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
     let flag = if compress { "-czf" } else { "-cf" };
-    let mut args = vec![flag.to_string(), output.to_string()];
-    args.extend(sources.iter().cloned());
+    let mut args = vec![flag.to_string(), safe_output];
+    args.extend(safe_sources.iter().cloned());
 
     let status = std::process::Command::new("tar")
         .args(&args)
@@ -451,12 +481,17 @@ fn create_7z(
     sources: &[String],
     password: Option<&str>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    let safe_output = sanitize_archive_path(output).map_err(|e| e.to_string())?;
+    let safe_sources: Vec<String> = sources
+        .iter()
+        .map(|s| sanitize_archive_path(s).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut args = vec!["a".to_string()];
     if let Some(pw) = password {
         args.push(format!("-p{pw}"));
     }
-    args.push(output.to_string());
-    args.extend(sources.iter().cloned());
+    args.push(safe_output);
+    args.extend(safe_sources.iter().cloned());
 
     let status = std::process::Command::new("7z")
         .args(&args)
@@ -475,7 +510,8 @@ fn extract_zip_archive(
     dest: &str,
     password: Option<&str>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let mut args = vec!["-o".to_string(), archive.to_string(), "-d".to_string(), dest.to_string()];
+    let safe_archive = sanitize_archive_path(archive).map_err(|e| e.to_string())?;
+    let mut args = vec!["-o".to_string(), safe_archive, "-d".to_string(), dest.to_string()];
     if let Some(pw) = password {
         args.insert(0, format!("-P{pw}"));
     }
@@ -497,9 +533,10 @@ fn extract_tar_archive(
     dest: &str,
     compressed: bool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    let safe_archive = sanitize_archive_path(archive).map_err(|e| e.to_string())?;
     let flag = if compressed { "-xzf" } else { "-xf" };
     let status = std::process::Command::new("tar")
-        .args([flag, archive, "-C", dest])
+        .args([flag, &safe_archive, "-C", dest])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()?;
@@ -515,9 +552,10 @@ fn extract_7z_archive(
     dest: &str,
     password: Option<&str>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    let safe_archive = sanitize_archive_path(archive).map_err(|e| e.to_string())?;
     let mut args = vec![
         "x".to_string(),
-        archive.to_string(),
+        safe_archive,
         format!("-o{dest}"),
         "-y".to_string(),
     ];

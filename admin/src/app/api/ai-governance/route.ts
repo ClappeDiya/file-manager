@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /**
  * AI Governance API (T-059)
@@ -96,10 +97,8 @@ export async function GET(request: NextRequest) {
 
 /** POST /api/ai-governance - Update settings */
 export async function POST(request: NextRequest) {
-  const apiKey = getApiKey(request);
-  if (!apiKey) {
-    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
-  }
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
 
   try {
     const body = await request.json();
@@ -119,7 +118,7 @@ export async function POST(request: NextRequest) {
     auditLog.push({
       id: `ai_${Date.now()}`,
       action: 'settings_updated',
-      user: apiKey.slice(0, 8),
+      user: authResult.user.email,
       input: JSON.stringify(body),
       output: 'AI governance settings updated',
       approved: true,

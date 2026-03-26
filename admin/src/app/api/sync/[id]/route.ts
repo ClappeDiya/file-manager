@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /**
  * Sync Pair Detail API (T-059)
@@ -50,10 +51,8 @@ export async function PATCH(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const apiKey = getApiKey(request);
-  if (!apiKey) {
-    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
-  }
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
 
   const { id } = await params;
   try {
@@ -103,10 +102,8 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const apiKey = getApiKey(request);
-  if (!apiKey) {
-    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
-  }
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
 
   const { id } = await params;
   return NextResponse.json({ success: true, deleted: id });

@@ -9,6 +9,7 @@ interface AuthState {
   user: AdminUser | null;
   isAuthenticated: boolean;
   isLoading: boolean;
+  isValidating: boolean;
   error: string | null;
 
   // Actions
@@ -17,6 +18,7 @@ interface AuthState {
   logout: () => void;
   checkPermission: (permission: Permission) => boolean;
   setError: (error: string | null) => void;
+  validateSession: () => Promise<void>;
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -25,6 +27,7 @@ export const useAuthStore = create<AuthState>()(
       user: null,
       isAuthenticated: false,
       isLoading: false,
+      isValidating: false,
       error: null,
 
       setUser: (user) => {
@@ -73,12 +76,26 @@ export const useAuthStore = create<AuthState>()(
       },
 
       setError: (error) => set({ error }),
+
+      validateSession: async () => {
+        set({ isValidating: true });
+        try {
+          const response = await fetch('/api/auth/session');
+          if (!response.ok) {
+            set({ user: null, isAuthenticated: false, isValidating: false });
+            return;
+          }
+          const { user } = await response.json();
+          set({ user, isAuthenticated: true, isValidating: false });
+        } catch {
+          set({ user: null, isAuthenticated: false, isValidating: false });
+        }
+      },
     }),
     {
       name: 'ufop-admin-auth',
       partialize: (state) => ({
         user: state.user,
-        isAuthenticated: state.isAuthenticated,
       }),
     }
   )

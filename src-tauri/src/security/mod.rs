@@ -9,6 +9,8 @@
 //! - `vault`: Encrypted vault management (create/lock/unlock/encrypt/decrypt)
 //! - `tls`: TLS enforcement helpers for in-transit encryption
 
+pub mod audit;
+pub mod confirmation;
 pub mod credential_store;
 pub mod encryption;
 pub mod kdf;

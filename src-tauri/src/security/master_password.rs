@@ -28,16 +28,74 @@ const CONFIG_KEY_KDF_PARAMS: &str = "master_password_kdf_params";
 /// AAD context for credential encryption, binding ciphertexts to our domain.
 const CREDENTIAL_AAD: &[u8] = b"ufop-master-password-credential-v1";
 
+/// Maximum failed password attempts before rate-limiting.
+const MAX_ATTEMPTS: u32 = 5;
+/// Lockout duration after exceeding MAX_ATTEMPTS.
+const LOCKOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Rate-limiting state for master password verification.
+struct RateLimitState {
+    failed_attempts: u32,
+    locked_until: Option<std::time::Instant>,
+}
+
+impl RateLimitState {
+    fn new() -> Self {
+        Self {
+            failed_attempts: 0,
+            locked_until: None,
+        }
+    }
+
+    /// Check if we are currently rate-limited. Returns Err if locked out.
+    fn check_rate_limit(&self) -> Result<(), AppError> {
+        if let Some(until) = self.locked_until {
+            if std::time::Instant::now() < until {
+                let remaining = until.duration_since(std::time::Instant::now());
+                return Err(AppError::encryption(
+                    "Too many failed attempts",
+                    format!(
+                        "Account is locked. Try again in {} seconds.",
+                        remaining.as_secs() + 1
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a failed password attempt. Locks out after MAX_ATTEMPTS.
+    fn record_failure(&mut self) {
+        self.failed_attempts += 1;
+        if self.failed_attempts >= MAX_ATTEMPTS {
+            self.locked_until = Some(std::time::Instant::now() + LOCKOUT_DURATION);
+            tracing::warn!(
+                "Master password rate limit triggered after {} failed attempts",
+                self.failed_attempts
+            );
+        }
+    }
+
+    /// Reset rate limit state after a successful authentication.
+    fn reset(&mut self) {
+        self.failed_attempts = 0;
+        self.locked_until = None;
+    }
+}
+
 /// In-memory state for the master password session.
 pub struct MasterPasswordManager {
     /// The derived encryption key, present only while the app is unlocked.
     cached_key: Arc<RwLock<Option<EncryptionKey>>>,
+    /// Rate limiting state for failed verification attempts.
+    rate_limit: Arc<RwLock<RateLimitState>>,
 }
 
 impl MasterPasswordManager {
     pub fn new() -> Self {
         Self {
             cached_key: Arc::new(RwLock::new(None)),
+            rate_limit: Arc::new(RwLock::new(RateLimitState::new())),
         }
     }
 
@@ -125,11 +183,23 @@ impl MasterPasswordManager {
         repo: &crate::storage::Repository,
         password: String,
     ) -> Result<bool, AppError> {
+        // Check rate limit before attempting verification
+        {
+            let rl = self.rate_limit.read().await;
+            rl.check_rate_limit()?;
+        }
+
         let (salt, params, expected_hash) = self.load_stored_params(repo).await?;
         let pwd = Password::new(password);
         match kdf::verify_password(&pwd, &salt, &params, &expected_hash) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
+            Ok(_) => {
+                self.rate_limit.write().await.reset();
+                Ok(true)
+            }
+            Err(_) => {
+                self.rate_limit.write().await.record_failure();
+                Ok(false)
+            }
         }
     }
 
@@ -221,17 +291,27 @@ impl MasterPasswordManager {
         repo: &crate::storage::Repository,
         password: String,
     ) -> Result<bool, AppError> {
+        // Check rate limit before attempting unlock
+        {
+            let rl = self.rate_limit.read().await;
+            rl.check_rate_limit()?;
+        }
+
         let (salt, params, expected_hash) = self.load_stored_params(repo).await?;
         let pwd = Password::new(password);
 
         match kdf::verify_password(&pwd, &salt, &params, &expected_hash) {
             Ok(key) => {
+                self.rate_limit.write().await.reset();
                 let mut cached = self.cached_key.write().await;
                 *cached = Some(key);
                 tracing::info!("App unlocked");
                 Ok(true)
             }
-            Err(_) => Ok(false),
+            Err(_) => {
+                self.rate_limit.write().await.record_failure();
+                Ok(false)
+            }
         }
     }
 

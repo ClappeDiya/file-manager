@@ -29,6 +29,7 @@ pub struct WatchHandle {
 }
 
 /// Start a filesystem watcher for an automation rule.
+#[allow(clippy::too_many_arguments)]
 pub fn start_file_watcher(
     rule_id: String,
     watch_path: String,
@@ -95,12 +96,12 @@ pub fn start_file_watcher(
                     }
 
                     // Filter by trigger type
-                    let is_relevant = match (&trigger, &event.kind) {
-                        (RuleTrigger::FileAppears { .. }, EventKind::Create(_)) => true,
-                        (RuleTrigger::FileModified { .. }, EventKind::Modify(_)) => true,
-                        (RuleTrigger::FileDeleted { .. }, EventKind::Remove(_)) => true,
-                        _ => false,
-                    };
+                    let is_relevant = matches!(
+                        (&trigger, &event.kind),
+                        (RuleTrigger::FileAppears { .. }, EventKind::Create(_))
+                            | (RuleTrigger::FileModified { .. }, EventKind::Modify(_))
+                            | (RuleTrigger::FileDeleted { .. }, EventKind::Remove(_))
+                    );
 
                     if !is_relevant {
                         continue;

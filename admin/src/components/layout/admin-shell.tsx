@@ -1,6 +1,6 @@
 'use client';
 
-import React from 'react';
+import React, { useEffect } from 'react';
 import { useAuthStore } from '@/lib/stores/auth-store';
 import { Sidebar } from './sidebar';
 import { Header } from './header';
@@ -10,7 +10,19 @@ interface AdminShellProps {
 }
 
 export function AdminShell({ children }: AdminShellProps) {
-  const { isAuthenticated } = useAuthStore();
+  const { isAuthenticated, isValidating, validateSession } = useAuthStore();
+
+  useEffect(() => {
+    validateSession();
+  }, [validateSession]);
+
+  if (isValidating) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-background">
+        <div className="text-muted-foreground">Validating session...</div>
+      </div>
+    );
+  }
 
   if (!isAuthenticated) {
     return <>{children}</>;

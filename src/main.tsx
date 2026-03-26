@@ -102,13 +102,20 @@ async function bootstrap() {
     try {
       const root = document.getElementById("root");
       if (root) {
-        root.innerHTML = `
-          <div style="padding:20px;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;">
-            <h2 style="color:#b91c1c">Application failed to initialize</h2>
-            <pre style="white-space:pre-wrap;color:#111;background:#fee; padding:12px;border-radius:6px;">${String(err && err.stack ? err.stack : err)}</pre>
-            <p>Please check the browser console for more details.</p>
-          </div>
-        `;
+        const wrapper = document.createElement("div");
+        wrapper.style.cssText = "padding:20px;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;";
+        const heading = document.createElement("h2");
+        heading.style.color = "#b91c1c";
+        heading.textContent = "Application failed to initialize";
+        const pre = document.createElement("pre");
+        pre.style.cssText = "white-space:pre-wrap;color:#111;background:#fee;padding:12px;border-radius:6px;";
+        pre.textContent = String(err && err.stack ? err.stack : err);
+        const hint = document.createElement("p");
+        hint.textContent = "Please check the browser console for more details.";
+        wrapper.appendChild(heading);
+        wrapper.appendChild(pre);
+        wrapper.appendChild(hint);
+        root.replaceChildren(wrapper);
       }
     } catch (_e) {
       // ignore

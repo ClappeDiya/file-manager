@@ -280,6 +280,10 @@ impl Repository {
                         profile.proxy_host,
                         profile.proxy_port,
                         profile.proxy_username,
+                        // Security (M-2): proxy_password arrives here already encrypted
+                        // by the command layer (connection_commands.rs) via MasterPasswordManager.
+                        // Values are stored as "enc:<base64>" when encrypted, or plaintext
+                        // as a graceful fallback when the master password is not set/locked.
                         profile.proxy_password,
                         profile.default_local_dir,
                         profile.default_remote_dir,
@@ -340,6 +344,7 @@ impl Repository {
                             proxy_host: row.get(17)?,
                             proxy_port: row.get(18)?,
                             proxy_username: row.get(19)?,
+                            // TODO(security/M-2): proxy_password loaded in plaintext — see save_connection comment
                             proxy_password: row.get(20)?,
                             default_local_dir: row.get(21)?,
                             default_remote_dir: row.get(22)?,
@@ -420,6 +425,7 @@ impl Repository {
                             proxy_host: row.get(17)?,
                             proxy_port: row.get(18)?,
                             proxy_username: row.get(19)?,
+                            // TODO(security/M-2): proxy_password loaded in plaintext — see save_connection comment
                             proxy_password: row.get(20)?,
                             default_local_dir: row.get(21)?,
                             default_remote_dir: row.get(22)?,

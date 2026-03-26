@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { dataStore } from '@/lib/data-store';
 import type { PolicyRule, PolicyDomain, PolicyAssignmentTarget } from '@/lib/types/policies';
 import { validatePolicyConfig, detectPolicyConflicts } from '@/lib/utils/policy-engine';
+import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /** GET /api/policies - List all policies */
 export async function GET(request: NextRequest) {
@@ -21,6 +22,9 @@ export async function GET(request: NextRequest) {
 
 /** POST /api/policies - Create a new policy */
 export async function POST(request: NextRequest) {
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
+
   try {
     const body = await request.json();
     const { domain, name, description, assignmentTarget, assignmentValue, enforcementMode, configuration } = body;
@@ -69,6 +73,9 @@ export async function POST(request: NextRequest) {
 
 /** PUT /api/policies - Update a policy */
 export async function PUT(request: NextRequest) {
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
+
   try {
     const body = await request.json();
     const { id, ...updates } = body;
@@ -97,6 +104,9 @@ export async function PUT(request: NextRequest) {
 
 /** DELETE /api/policies - Delete a policy */
 export async function DELETE(request: NextRequest) {
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
+
   const { searchParams } = new URL(request.url);
   const id = searchParams.get('id');
 

@@ -103,6 +103,11 @@ pub async fn generate_ssh_key(
     cmd.arg("-f").arg(&key_path);
 
     // Passphrase (empty string = no passphrase)
+    // NOTE(security): The `-N` flag passes the passphrase via command-line argument,
+    // which is briefly visible in process listings (e.g., `ps aux`). On shared systems
+    // this is a minor information disclosure risk. Alternatives (expect scripts, stdin
+    // piping) add complexity. Since ssh-keygen is short-lived and this is a desktop app
+    // with a single user session, the risk is accepted.
     let pass = passphrase.unwrap_or_default();
     cmd.arg("-N").arg(&pass);
 

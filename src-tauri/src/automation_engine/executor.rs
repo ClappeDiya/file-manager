@@ -60,6 +60,34 @@ pub async fn execute_rule_action(
     }
 }
 
+/// Validate that a path does not contain '..' traversal components.
+/// If `watch_dir` is provided, verify the path stays within it.
+fn validate_automation_path(path: &std::path::Path, watch_dir: Option<&std::path::Path>) -> Result<(), String> {
+    // Reject paths with .. components
+    for component in path.components() {
+        if let std::path::Component::ParentDir = component {
+            return Err("Path contains '..' traversal".to_string());
+        }
+    }
+    // If watch_dir specified, verify path stays within it
+    if let Some(boundary) = watch_dir {
+        if let (Ok(canonical), Ok(boundary_canonical)) = (std::fs::canonicalize(path), std::fs::canonicalize(boundary)) {
+            if !canonical.starts_with(&boundary_canonical) {
+                return Err(format!("Path {} is outside watch directory {}", canonical.display(), boundary_canonical.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that a rename target name does not contain path separators or '..'.
+fn validate_rename_name(name: &str) -> Result<(), String> {
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err("Rename target cannot contain path separators or '..'".to_string());
+    }
+    Ok(())
+}
+
 /// Dispatch an action to the appropriate engine.
 async fn dispatch_action(
     action: &RuleAction,
@@ -70,6 +98,10 @@ async fn dispatch_action(
             let source = triggered_file.ok_or("No source file for move action")?;
             let source_path = Path::new(source);
             let dest_dir = Path::new(dest_path);
+
+            // Validate paths against traversal attacks
+            validate_automation_path(source_path, None)?;
+            validate_automation_path(dest_dir, None)?;
 
             // Ensure destination exists
             if !dest_dir.exists() {
@@ -100,6 +132,10 @@ async fn dispatch_action(
             let source_path = Path::new(source);
             let dest_dir = Path::new(dest_path);
 
+            // Validate paths against traversal attacks
+            validate_automation_path(source_path, None)?;
+            validate_automation_path(dest_dir, None)?;
+
             if !dest_dir.exists() {
                 std::fs::create_dir_all(dest_dir)
                     .map_err(|e| format!("Cannot create destination directory: {e}"))?;
@@ -125,6 +161,10 @@ async fn dispatch_action(
         RuleAction::RenameFile { pattern } => {
             let source = triggered_file.ok_or("No source file for rename action")?;
             let source_path = Path::new(source);
+
+            // Validate source path against traversal
+            validate_automation_path(source_path, None)?;
+
             let parent = source_path.parent().ok_or("Cannot determine parent directory")?;
             let file_name = source_path
                 .file_name()
@@ -132,6 +172,9 @@ async fn dispatch_action(
                 .ok_or("Cannot determine filename")?;
 
             let new_name = apply_rename_pattern(file_name, pattern);
+
+            // Validate that the new name doesn't contain path separators or traversal
+            validate_rename_name(&new_name)?;
             let dest = parent.join(&new_name);
 
             if dest.exists() {

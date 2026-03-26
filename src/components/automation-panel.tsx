@@ -203,7 +203,7 @@ function RuleCard({ rule }: RuleCardProps) {
               {rule.name}
             </span>
             {rule.error_count > 0 && (
-              <Badge variant="destructive" className="text-[10px] px-1 py-0">
+              <Badge variant="error" className="text-[10px] px-1 py-0">
                 {rule.error_count} err
               </Badge>
             )}

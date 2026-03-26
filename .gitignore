@@ -30,7 +30,7 @@ src-tauri/gen/
 src-tauri/WixTools/
 
 # Lock files (keep pnpm-lock)
-Cargo.lock
+# Cargo.lock — committed for reproducible builds
 
 # Runtime data
 .data/
@@ -40,6 +40,9 @@ Cargo.lock
 
 # Screenshots (development artifacts)
 *.png
+
+# Claude Code
+.claude/
 
 # Generated
 icon.png

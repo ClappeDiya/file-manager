@@ -6,6 +6,7 @@
 //! - Encrypting and decrypting saved connection credentials
 
 use crate::core::error::AppError;
+use crate::security::audit::SecurityAudit;
 use crate::security::MasterPasswordManager;
 use crate::storage::Repository;
 use tauri::State;
@@ -29,9 +30,13 @@ pub async fn set_master_password(
     repo: State<'_, Repository>,
     master_pw_mgr: State<'_, MasterPasswordManager>,
 ) -> Result<(), AppError> {
-    master_pw_mgr
+    let result = master_pw_mgr
         .set_master_password(repo.inner(), password)
-        .await
+        .await;
+    if result.is_ok() {
+        SecurityAudit::log(repo.inner(), "auth.master_password_set", "user", "master_password", "Initial master password configured").await;
+    }
+    result
 }
 
 /// Verify a master password without unlocking the app.
@@ -43,9 +48,11 @@ pub async fn verify_master_password(
     repo: State<'_, Repository>,
     master_pw_mgr: State<'_, MasterPasswordManager>,
 ) -> Result<bool, AppError> {
-    master_pw_mgr
+    let result = master_pw_mgr
         .verify_master_password(repo.inner(), password)
-        .await
+        .await?;
+    SecurityAudit::log_auth_attempt(repo.inner(), result).await;
+    Ok(result)
 }
 
 /// Change the master password.
@@ -60,18 +67,24 @@ pub async fn change_master_password(
     repo: State<'_, Repository>,
     master_pw_mgr: State<'_, MasterPasswordManager>,
 ) -> Result<(), AppError> {
-    master_pw_mgr
+    let result = master_pw_mgr
         .change_master_password(repo.inner(), old_password, new_password)
         .await
-        .map(|_| ())
+        .map(|_| ());
+    if result.is_ok() {
+        SecurityAudit::log_password_change(repo.inner()).await;
+    }
+    result
 }
 
 /// Lock the app — clear the cached encryption key from memory.
 #[tauri::command]
 pub async fn master_lock_app(
+    repo: State<'_, Repository>,
     master_pw_mgr: State<'_, MasterPasswordManager>,
 ) -> Result<(), AppError> {
     master_pw_mgr.lock_app().await;
+    SecurityAudit::log_lock_event(repo.inner(), true).await;
     Ok(())
 }
 
@@ -84,7 +97,12 @@ pub async fn master_unlock_app(
     repo: State<'_, Repository>,
     master_pw_mgr: State<'_, MasterPasswordManager>,
 ) -> Result<bool, AppError> {
-    master_pw_mgr.unlock_app(repo.inner(), password).await
+    let result = master_pw_mgr.unlock_app(repo.inner(), password).await?;
+    SecurityAudit::log_auth_attempt(repo.inner(), result).await;
+    if result {
+        SecurityAudit::log_lock_event(repo.inner(), false).await;
+    }
+    Ok(result)
 }
 
 /// Check if the app is currently unlocked.

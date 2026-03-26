@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
+import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /**
  * Webhook Management API (T-059)
@@ -77,10 +78,8 @@ export async function GET(request: NextRequest) {
 
 /** POST /api/webhooks */
 export async function POST(request: NextRequest) {
-  const apiKey = getApiKey(request);
-  if (!apiKey) {
-    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
-  }
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
 
   try {
     const body = await request.json();
@@ -127,7 +126,7 @@ export async function POST(request: NextRequest) {
       updated_at: new Date().toISOString(),
       last_triggered: null,
       failure_count: 0,
-      created_by: apiKey.slice(0, 8),
+      created_by: authResult.user.email,
     };
 
     webhooks.push(webhook);

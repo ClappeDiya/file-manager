@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 interface Connector {
   id: string;
@@ -22,6 +23,9 @@ export async function GET() {
 
 /** POST /api/connectors - Add a new connector */
 export async function POST(request: NextRequest) {
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
+
   try {
     const body = await request.json();
     const { name, type, config } = body;
@@ -47,6 +51,9 @@ export async function POST(request: NextRequest) {
 
 /** DELETE /api/connectors - Remove a connector */
 export async function DELETE(request: NextRequest) {
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
+
   const { searchParams } = new URL(request.url);
   const id = searchParams.get('id');
 

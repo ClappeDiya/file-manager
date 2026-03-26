@@ -14,11 +14,12 @@ pub mod transfer_engine;
 
 use ai_engine::AiAssistant;
 use automation_engine::AutomationManager;
-use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, log_commands, master_password_commands, mount_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, settings_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, log_commands, master_password_commands, mount_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, settings_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, url_handler_commands, version_commands};
 use commands::terminal_commands::TerminalManager;
 use connectors::{ConnectionManager, ConnectorRegistry, GoogleDriveConnector, OneDriveConnector, PeerManager, S3Connector, ServerTransferManager};
 use mount_engine::MountManager;
 use core::traits::StorageOperations;
+use security::confirmation::ConfirmationManager;
 use security::CredentialStore;
 use security::MasterPasswordManager;
 use security::vault::VaultManager;
@@ -47,6 +48,7 @@ struct AppState {
     onedrive_connector: std::sync::Arc<OneDriveConnector>,
     editor_state: std::sync::Arc<commands::editor_commands::EditorState>,
     automation_mgr: AutomationManager,
+    confirmation_mgr: ConfirmationManager,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -130,6 +132,8 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
     }
 
+    let confirmation_mgr = ConfirmationManager::new();
+
     Ok(AppState {
         repo,
         transfer_mgr,
@@ -149,6 +153,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         onedrive_connector,
         editor_state,
         automation_mgr,
+        confirmation_mgr,
     })
 }
 
@@ -209,6 +214,7 @@ pub fn run() {
                     onedrive_connector: std::sync::Arc::new(OneDriveConnector::new()),
                     editor_state: std::sync::Arc::new(commands::editor_commands::EditorState::new()),
                     automation_mgr: AutomationManager::new(),
+                    confirmation_mgr: ConfirmationManager::new(),
                 }
             }
         }
@@ -243,6 +249,7 @@ pub fn run() {
         .manage(app_state.onedrive_connector)
         .manage(app_state.editor_state)
         .manage(app_state.automation_mgr)
+        .manage(app_state.confirmation_mgr)
         .invoke_handler(tauri::generate_handler![
             // System
             system_commands::greet,
@@ -256,6 +263,8 @@ pub fn run() {
             state_commands::get_config,
             state_commands::set_config,
             state_commands::reset_database,
+            // Confirmation tokens for destructive operations
+            confirmation_commands::request_destructive_confirmation,
             // Transfer management (T-015)
             transfer_commands::enqueue_transfer,
             transfer_commands::pause_transfer,

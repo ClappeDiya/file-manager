@@ -570,7 +570,7 @@ pub fn reset_database(conn: &Connection) -> Result<(), AppError> {
 
     // Drop all tables
     for table in &tables {
-        conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{table}\""))?;
+        conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\"", table.replace('"', "\"\"")))?;
     }
 
     // Re-run migrations

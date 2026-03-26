@@ -6,6 +6,14 @@ use thiserror::Error;
 /// why it happened, and what the user can do about it.
 ///
 /// Internal details are logged server-side but NEVER sent to the frontend.
+///
+/// # Note on path exposure in error messages
+///
+/// `FileOperation` errors intentionally include file paths in their messages.
+/// This is by design: UFOP is a file manager, and users need to see which
+/// file or folder caused the error. Paths are user-supplied and already
+/// visible in the UI, so including them in error messages does not leak
+/// additional information. Only the `Internal` variant sanitizes its message.
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("File operation failed: {message}. {advice}")]

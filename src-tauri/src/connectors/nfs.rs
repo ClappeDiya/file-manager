@@ -70,6 +70,26 @@ impl NfsVersion {
 }
 
 
+/// Allowed NFS mount option prefixes. Only standard, safe options are permitted
+/// to prevent injection of arbitrary flags into mount commands.
+const ALLOWED_NFS_OPTION_PREFIXES: &[&str] = &[
+    "ro", "rw", "soft", "hard", "intr", "noac", "nolock", "tcp", "udp",
+    "sec=", "nfsvers=", "vers=", "timeo=", "retrans=", "rsize=", "wsize=",
+    "port=", "mountport=", "actimeo=", "bg", "fg",
+];
+
+fn validate_nfs_option(option: &str) -> Result<(), AppError> {
+    let trimmed = option.trim();
+    if ALLOWED_NFS_OPTION_PREFIXES.iter().any(|prefix| trimmed.starts_with(prefix)) {
+        Ok(())
+    } else {
+        Err(AppError::connection(
+            format!("Disallowed NFS mount option: {trimmed}"),
+            "Only standard NFS mount options are permitted.",
+        ))
+    }
+}
+
 /// NFS mount configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NfsConfig {
@@ -176,6 +196,11 @@ impl NfsConnector {
         mount_point: &Path,
         config: &NfsConfig,
     ) -> Result<Command, AppError> {
+        // Validate extra_options against whitelist before building any command
+        for opt in &config.extra_options {
+            validate_nfs_option(opt)?;
+        }
+
         #[cfg(target_os = "macos")]
         {
             let mut cmd = Command::new("mount");

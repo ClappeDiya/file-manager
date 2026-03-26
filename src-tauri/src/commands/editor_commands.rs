@@ -188,6 +188,37 @@ pub async fn open_in_editor(
     let args = editor_args.unwrap_or_default();
 
     if let Some(editor) = editor_path {
+        // Validate that the editor path exists and is executable
+        let editor_p = Path::new(&editor);
+        if !editor_p.exists() {
+            return Err(AppError::file_op(
+                format!("Editor not found: {editor}"),
+                "Check that the editor path is correct and the application is installed.",
+            ));
+        }
+        if !editor_p.is_file() {
+            return Err(AppError::file_op(
+                format!("Editor path is not a file: {editor}"),
+                "Provide the path to an executable file, not a directory.",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&editor)
+                .map_err(|e| AppError::file_op(
+                    format!("Cannot read editor metadata: {e}"),
+                    "Check file permissions.",
+                ))?
+                .permissions();
+            if perms.mode() & 0o111 == 0 {
+                return Err(AppError::file_op(
+                    format!("Editor is not executable: {editor}"),
+                    "Set the executable bit: chmod +x on the editor binary.",
+                ));
+            }
+        }
+
         // Open with specified editor
         let mut cmd = std::process::Command::new(&editor);
         for arg in &args {

@@ -11,10 +11,12 @@
     <script>
       // Diagnostic: Catch any errors during module loading
       window.__APP_ERRORS = [];
+      var __IS_DEV = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || window.location.protocol === 'file:' || window.location.port === '1420';
       window.addEventListener('error', function(e) {
         var msg = 'ERROR: ' + e.message + ' | File: ' + e.filename + ' | Line: ' + e.lineno;
         window.__APP_ERRORS.push(msg);
         console.error('[DIAG]', msg);
+        if (!__IS_DEV) return;
         var el = document.getElementById('__diag');
         if (!el) {
           el = document.createElement('pre');
@@ -29,6 +31,7 @@
         var msg = 'UNHANDLED REJECTION: ' + (reason && reason.message || reason) + ' | Stack: ' + (reason && reason.stack || 'N/A');
         window.__APP_ERRORS.push(msg);
         console.error('[DIAG]', msg);
+        if (!__IS_DEV) return;
         var el = document.getElementById('__diag');
         if (!el) {
           el = document.createElement('pre');
@@ -40,22 +43,24 @@
       });
 
       // Monitor #root for content - detect blank page
-      setTimeout(function() {
-        var root = document.getElementById('root');
-        var content = root ? root.innerHTML.trim() : '';
-        if (!content) {
-          var el = document.getElementById('__diag');
-          if (!el) {
-            el = document.createElement('pre');
-            el.id = '__diag';
-            el.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#b45309;color:white;padding:10px;z-index:99999;font-size:12px;max-height:50vh;overflow:auto;';
-            document.body.appendChild(el);
+      if (__IS_DEV) {
+        setTimeout(function() {
+          var root = document.getElementById('root');
+          var content = root ? root.innerHTML.trim() : '';
+          if (!content) {
+            var el = document.getElementById('__diag');
+            if (!el) {
+              el = document.createElement('pre');
+              el.id = '__diag';
+              el.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#b45309;color:white;padding:10px;z-index:99999;font-size:12px;max-height:50vh;overflow:auto;';
+              document.body.appendChild(el);
+            }
+            el.textContent += 'WARNING: #root is empty after 3s. React did not render.\n';
+            el.textContent += 'Errors captured: ' + window.__APP_ERRORS.length + '\n';
+            window.__APP_ERRORS.forEach(function(e) { el.textContent += '  - ' + e + '\n'; });
           }
-          el.textContent += 'WARNING: #root is empty after 3s. React did not render.\n';
-          el.textContent += 'Errors captured: ' + window.__APP_ERRORS.length + '\n';
-          window.__APP_ERRORS.forEach(function(e) { el.textContent += '  - ' + e + '\n'; });
-        }
-      }, 3000);
+        }, 3000);
+      }
     </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>

@@ -154,6 +154,43 @@ pub struct SmbDiscoveryResult {
 // SMB Connector
 // ──────────────────────────────────────────────
 
+/// Validate that a hostname is a valid IP address or RFC 1123 hostname.
+fn validate_hostname(host: &str) -> Result<(), AppError> {
+    // Accept valid IP addresses
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    // Validate hostname per RFC 1123
+    let valid = host.len() <= 253
+        && !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        });
+    if !valid {
+        return Err(AppError::connection(
+            "Invalid hostname",
+            "Use a valid hostname or IP address.",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that a mount credential value does not contain characters
+/// that could break or inject into mount option strings.
+fn validate_mount_credential(value: &str, field_name: &str) -> Result<(), AppError> {
+    if value.contains(',') || value.contains('=') {
+        return Err(AppError::connection(
+            format!("{field_name} contains invalid characters"),
+            "Remove commas and equals signs from the value.",
+        ));
+    }
+    Ok(())
+}
+
 /// SMB/CIFS connector using system mount commands.
 pub struct SmbConnector {
     /// Current connection state
@@ -288,6 +325,7 @@ impl SmbConnector {
             }
 
             if let Some(user) = username {
+                // Credential values are validated upstream via validate_mount_credential()
                 opts.push(format!("username={user}"));
             }
             if let Some(pass) = password {
@@ -753,6 +791,14 @@ impl Connector for SmbConnector {
                     advice: "Set the remote path to /ShareName or /ShareName/subfolder."
                         .to_string(),
                 });
+            }
+
+            // Validate hostname to prevent command injection
+            validate_hostname(&host)?;
+
+            // Validate credentials to prevent mount option injection
+            if let Some(ref user) = username {
+                validate_mount_credential(user, "Username")?;
             }
 
             // Validate SMB version

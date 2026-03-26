@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { dataStore } from '@/lib/data-store';
 import type { AdminUser, Role } from '@/lib/types/auth';
+import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /** GET /api/users - List all users */
 export async function GET(request: NextRequest) {
@@ -25,6 +26,9 @@ export async function GET(request: NextRequest) {
 
 /** POST /api/users - Invite a new user */
 export async function POST(request: NextRequest) {
+  const authResult = await requireRole(request, 'admin');
+  if (!isAuthorized(authResult)) return authResult;
+
   try {
     const body = await request.json();
     const { email, role, name } = body;
@@ -57,6 +61,9 @@ export async function POST(request: NextRequest) {
 
 /** PATCH /api/users - Bulk operations */
 export async function PATCH(request: NextRequest) {
+  const authResult = await requireRole(request, 'admin');
+  if (!isAuthorized(authResult)) return authResult;
+
   try {
     const body = await request.json();
     const { action, userIds } = body;

@@ -6,10 +6,63 @@ use crate::core::error::AppError;
 use crate::core::types::{
     ConnectionGroup, ConnectionProfile, ConnectionProtocol, ProxyConfig,
 };
+use crate::security::audit::SecurityAudit;
+use crate::security::MasterPasswordManager;
 use crate::storage::Repository;
 use chrono::Utc;
 use tauri::State;
 use uuid::Uuid;
+
+/// Encrypt a proxy password using the master password if the app is unlocked.
+/// Returns the encrypted string, or the original if the app is locked (graceful degradation).
+async fn encrypt_proxy_password(
+    password: Option<String>,
+    master_pw: &MasterPasswordManager,
+) -> Option<String> {
+    match password {
+        Some(pw) if !pw.is_empty() => {
+            if master_pw.is_unlocked().await {
+                match master_pw.encrypt_credential(&pw).await {
+                    Ok(encrypted) => Some(format!("enc:{encrypted}")),
+                    Err(e) => {
+                        tracing::warn!("Failed to encrypt proxy password (storing plaintext): {e}");
+                        Some(pw)
+                    }
+                }
+            } else {
+                // App locked — store plaintext with warning
+                tracing::debug!("Master password locked — proxy password stored unencrypted");
+                Some(pw)
+            }
+        }
+        other => other,
+    }
+}
+
+/// Decrypt a proxy password. Handles both encrypted (enc: prefix) and legacy plaintext.
+async fn decrypt_proxy_password(
+    password: Option<String>,
+    master_pw: &MasterPasswordManager,
+) -> Option<String> {
+    match password {
+        Some(pw) if pw.starts_with("enc:") => {
+            let ciphertext = &pw[4..];
+            if master_pw.is_unlocked().await {
+                match master_pw.decrypt_credential(ciphertext).await {
+                    Ok(decrypted) => Some(decrypted),
+                    Err(e) => {
+                        tracing::warn!("Failed to decrypt proxy password: {e}");
+                        Some(pw) // Return raw so caller knows it's encrypted
+                    }
+                }
+            } else {
+                // App locked — can't decrypt, return marker so UI shows "locked"
+                Some("[encrypted - unlock app to view]".to_string())
+            }
+        }
+        other => other, // Legacy plaintext — return as-is
+    }
+}
 
 /// Save a connection profile.
 #[tauri::command]
@@ -38,7 +91,11 @@ pub async fn save_connection(
     // Charset
     charset: Option<String>,
     manager: State<'_, ConnectionManager>,
+    master_pw: State<'_, MasterPasswordManager>,
+    repo: State<'_, Repository>,
 ) -> Result<ConnectionProfile, AppError> {
+    // Security (M-2): encrypt proxy password before storage
+    let encrypted_proxy_password = encrypt_proxy_password(proxy_password, master_pw.inner()).await;
     let id = connection_id
         .and_then(|s| Uuid::parse_str(&s).ok())
         .unwrap_or_else(Uuid::new_v4);
@@ -64,7 +121,7 @@ pub async fn save_connection(
         proxy_host,
         proxy_port,
         proxy_username,
-        proxy_password,
+        proxy_password: encrypted_proxy_password,
         default_local_dir,
         default_remote_dir,
         charset,
@@ -76,28 +133,45 @@ pub async fn save_connection(
         symlink_policy: None,
     };
 
-    manager.save_connection(profile, password).await
+    let conn_name = profile.name.clone();
+    let result = manager.save_connection(profile, password).await;
+    if result.is_ok() {
+        SecurityAudit::log_connection_change(repo.inner(), "save", &conn_name).await;
+    }
+    result
 }
 
-/// List all saved connections.
+/// List all saved connections (proxy passwords are decrypted if app is unlocked).
 #[tauri::command]
 pub async fn list_connections(
     manager: State<'_, ConnectionManager>,
+    master_pw: State<'_, MasterPasswordManager>,
 ) -> Result<Vec<ConnectionProfile>, AppError> {
-    manager.list_connections().await
+    let mut connections = manager.list_connections().await?;
+    // Security (M-2): decrypt proxy passwords on load
+    for conn in &mut connections {
+        conn.proxy_password = decrypt_proxy_password(conn.proxy_password.take(), master_pw.inner()).await;
+    }
+    Ok(connections)
 }
 
-/// Get a single connection.
+/// Get a single connection (proxy password decrypted if app is unlocked).
 #[tauri::command]
 pub async fn get_connection(
     connection_id: String,
     manager: State<'_, ConnectionManager>,
+    master_pw: State<'_, MasterPasswordManager>,
 ) -> Result<Option<ConnectionProfile>, AppError> {
     let id = Uuid::parse_str(&connection_id).map_err(|_| AppError::Connection {
         message: format!("Invalid connection ID: {connection_id}"),
         advice: "Provide a valid UUID.".to_string(),
     })?;
-    manager.get_connection(id).await
+    let mut profile = manager.get_connection(id).await?;
+    // Security (M-2): decrypt proxy password on load
+    if let Some(ref mut p) = profile {
+        p.proxy_password = decrypt_proxy_password(p.proxy_password.take(), master_pw.inner()).await;
+    }
+    Ok(profile)
 }
 
 /// Delete a connection.
@@ -105,12 +179,17 @@ pub async fn get_connection(
 pub async fn delete_connection(
     connection_id: String,
     manager: State<'_, ConnectionManager>,
+    repo: State<'_, Repository>,
 ) -> Result<(), AppError> {
     let id = Uuid::parse_str(&connection_id).map_err(|_| AppError::Connection {
         message: format!("Invalid connection ID: {connection_id}"),
         advice: "Provide a valid UUID.".to_string(),
     })?;
-    manager.delete_connection(id).await
+    let result = manager.delete_connection(id).await;
+    if result.is_ok() {
+        SecurityAudit::log_connection_change(repo.inner(), "delete", &connection_id).await;
+    }
+    result
 }
 
 /// Test a connection.

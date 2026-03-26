@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { dataStore } from '@/lib/data-store';
+import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /** GET /api/workspaces - List workspaces and shared resources */
 export async function GET(request: NextRequest) {
@@ -22,6 +23,9 @@ export async function GET(request: NextRequest) {
 
 /** POST /api/workspaces - Share a resource or create a workspace */
 export async function POST(request: NextRequest) {
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
+
   try {
     const body = await request.json();
     const { action } = body;

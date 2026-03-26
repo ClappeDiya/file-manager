@@ -13,7 +13,9 @@ export async function getSession(): Promise<SessionUser | null> {
     const token = cookieStore.get('ufop-admin-session')?.value;
     if (!token) return null;
 
-    const secret = new TextEncoder().encode(process.env.NEXTAUTH_SECRET || 'ufop-admin-secret-change-me');
+    const jwtSecret = process.env.NEXTAUTH_SECRET;
+    if (!jwtSecret) return null;
+    const secret = new TextEncoder().encode(jwtSecret);
     const { payload } = await jwtVerify(token, secret);
 
     return {
