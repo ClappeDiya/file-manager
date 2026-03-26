@@ -21,6 +21,7 @@ pub mod notification_commands;
 pub mod peer_commands;
 pub mod preview_commands;
 pub mod s3_commands;
+pub mod space_commands;
 pub mod settings_commands;
 pub mod ssh_key_commands;
 pub mod state_commands;

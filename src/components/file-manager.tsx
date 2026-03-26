@@ -3,6 +3,7 @@ import { useFileManagerStore, type ViewMode } from "@/stores/file-manager-store"
 import { useUIStore } from "@/stores/ui-store";
 import { useAiStore } from "@/stores/ai-store";
 import { useAutomationStore } from "@/stores/automation-store";
+import { useSpacesStore } from "@/stores/spaces-store";
 import { useTerminalStore } from "@/stores/terminal-store";
 import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { DualPaneLayout } from "./dual-pane-layout";
@@ -15,6 +16,7 @@ import { ContextMenu, getFileContextMenuItems, type ContextMenuItem } from "./co
 import { CommandPalette, getDefaultCommands } from "./command-palette";
 import { AiPanel } from "./ai-panel";
 import { AutomationPanel } from "./automation-panel";
+import { SmartSpaceWizard } from "./smart-space-wizard";
 import { TerminalPanel } from "./terminal-panel";
 import { useFileSelection, useFileDragDrop } from "@/hooks/use-file-selection";
 import { cn } from "@ufop/ui-components";
@@ -49,6 +51,7 @@ const ALL_TOOLBAR_ITEMS = [
   { id: "theme", label: "Theme Switcher" },
   { id: "undo", label: "Undo Button" },
   { id: "automations", label: "Quickflows" },
+  { id: "smart-spaces", label: "Smart Spaces" },
   { id: "sync-browse", label: "Sync Browse" },
   { id: "grouping", label: "Grouping" },
 ];
@@ -85,6 +88,10 @@ export function FileManager() {
   // Automation panel (Quickflows)
   const automationPanelOpen = useAutomationStore((s) => s.panelOpen);
   const toggleAutomationPanel = useAutomationStore((s) => s.togglePanel);
+
+  // Smart Spaces
+  const spacesWizardOpen = useSpacesStore((s) => s.wizardOpen);
+  const closeSpacesWizard = useSpacesStore((s) => s.closeWizard);
 
   // Terminal state (T-046)
   const terminalPanelOpen = useTerminalStore((s) => s.panelOpen);
@@ -303,6 +310,7 @@ export function FileManager() {
           if (!automationPanelOpen) toggleAutomationPanel();
           useAutomationStore.getState().openEditor();
         },
+        onCreateSmartSpace: () => useSpacesStore.getState().openWizard(),
       }),
     [toggleSidebar, handleUndo, handleSaveWorkspace, getFirstSelectedPath, toggleAutomationPanel, automationPanelOpen],
   );
@@ -532,6 +540,26 @@ export function FileManager() {
                   return [];
                 }
               } : undefined}
+              onActivateSpace={(space) => {
+                const store = useFileManagerStore.getState();
+                // Navigate left pane to local path
+                const pane0Tab = store.getActiveTab(0);
+                if (pane0Tab) {
+                  const label = space.local_path.split("/").filter(Boolean).pop() || space.local_path;
+                  store.navigateTab(0, pane0Tab.id, space.local_path, label);
+                }
+                // If remote path, navigate right pane and ensure dual-pane mode
+                if (space.remote_path) {
+                  if (store.singlePaneMode) {
+                    store.toggleSinglePaneMode();
+                  }
+                  const pane1Tab = store.getActiveTab(1);
+                  if (pane1Tab) {
+                    const label = space.remote_path.split("/").filter(Boolean).pop() || space.remote_path;
+                    store.navigateTab(1, pane1Tab.id, space.remote_path, label);
+                  }
+                }
+              }}
             />
           </aside>
         )}
@@ -550,6 +578,9 @@ export function FileManager() {
         <AutomationPanel />
         <AiPanel />
       </div>
+
+      {/* Smart Space Wizard */}
+      {spacesWizardOpen && <SmartSpaceWizard onClose={closeSpacesWizard} />}
 
       <footer
         className="relative flex items-center justify-between border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-4"

@@ -14,6 +14,8 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import type { FileEntryData } from "./file-list";
+import { SmartSpacesSection } from "./smart-spaces-section";
+import type { SmartSpace } from "@/stores/spaces-store";
 
 // ──────────────────────────────────────────────
 // Types
@@ -43,6 +45,7 @@ interface SidebarNavProps {
   drives?: DriveInfo[];
   onLoadChildren?: (path: string) => Promise<FileEntryData[]>;
   onEjectDrive?: (path: string) => void;
+  onActivateSpace?: (space: SmartSpace) => void;
   className?: string;
 }
 
@@ -51,6 +54,7 @@ export function SidebarNav({
   drives = [],
   onLoadChildren,
   onEjectDrive,
+  onActivateSpace,
   className,
 }: SidebarNavProps) {
   const favorites = useFileManagerStore((s) => s.favorites);
@@ -59,7 +63,7 @@ export function SidebarNav({
   const removeFavorite = useFileManagerStore((s) => s.removeFavorite);
 
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
-    new Set(["favorites", "devices"]),
+    new Set(["smart-spaces", "favorites", "devices"]),
   );
 
   const toggleSection = useCallback((section: string) => {
@@ -105,6 +109,13 @@ export function SidebarNav({
       data-testid="sidebar-nav"
     >
       <div className="py-2">
+        {/* Smart Spaces Section */}
+        <SmartSpacesSection
+          expanded={expandedSections.has("smart-spaces")}
+          onToggle={() => toggleSection("smart-spaces")}
+          onActivateSpace={(space) => onActivateSpace?.(space)}
+        />
+
         {/* Favorites Section */}
         <SidebarSection
           title="Favorites"

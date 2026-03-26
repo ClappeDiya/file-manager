@@ -62,6 +62,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "Automation engine - quickflow rules and execution logs",
             sql: V9_SCHEMA,
         },
+        Migration {
+            version: 10,
+            description: "Smart Spaces - named workspaces bundling local folder + connection + sync pair + automations",
+            sql: V10_SCHEMA,
+        },
     ]
 }
 
@@ -99,6 +104,33 @@ CREATE TABLE IF NOT EXISTS automation_logs (
 CREATE INDEX IF NOT EXISTS idx_automation_logs_rule ON automation_logs(rule_id);
 CREATE INDEX IF NOT EXISTS idx_automation_logs_triggered ON automation_logs(triggered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_automation_logs_status ON automation_logs(status);
+"#;
+
+/// Schema v10: Smart Spaces - named workspaces bundling local folder + connection + sync pair + automations.
+const V10_SCHEMA: &str = r#"
+-- Smart Spaces: named persistent workspaces
+CREATE TABLE IF NOT EXISTS smart_spaces (
+    id              TEXT PRIMARY KEY NOT NULL,
+    name            TEXT NOT NULL,
+    icon            TEXT NOT NULL DEFAULT 'folder-heart',
+    color           TEXT NOT NULL DEFAULT '#6366f1',
+    local_path      TEXT NOT NULL,
+    connection_id   TEXT,
+    remote_path     TEXT,
+    sync_pair_id    TEXT,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_smart_spaces_enabled ON smart_spaces(enabled);
+
+-- Junction table: space <-> automation rules
+CREATE TABLE IF NOT EXISTS space_automations (
+    space_id    TEXT NOT NULL REFERENCES smart_spaces(id) ON DELETE CASCADE,
+    rule_id     TEXT NOT NULL,
+    PRIMARY KEY (space_id, rule_id)
+);
+CREATE INDEX IF NOT EXISTS idx_space_automations_space ON space_automations(space_id);
 "#;
 
 /// Schema v8: Sync time offset and FTP data type fields.
@@ -593,7 +625,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 9);
+        assert_eq!(applied, 10);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -623,7 +655,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 9);
+        assert_eq!(first, 10);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -636,7 +668,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 9);
+        assert_eq!(current_version(&conn).unwrap(), 10);
     }
 
     #[test]

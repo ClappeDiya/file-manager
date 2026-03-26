@@ -27,6 +27,7 @@ import {
   Globe,
   FileEdit,
   Zap,
+  Layers,
 } from "lucide-react";
 
 // ──────────────────────────────────────────────
@@ -377,6 +378,7 @@ export function getDefaultCommands(actions: {
   onOpenSettings?: () => void;
   onToggleAutomations?: () => void;
   onCreateAutomation?: () => void;
+  onCreateSmartSpace?: () => void;
 }): CommandItem[] {
   const isMac = typeof navigator !== "undefined" && navigator.platform.startsWith("Mac");
   const cmd = isMac ? "\u2318" : "Ctrl+";
@@ -689,6 +691,15 @@ export function getDefaultCommands(actions: {
       category: "File",
       action: actions.onCreateAutomation || (() => {}),
       keywords: ["automation", "quickflow", "rule", "new", "create", "watcher", "trigger"],
+    },
+    // Smart Spaces
+    {
+      id: "create-smart-space",
+      label: "Create Smart Space...",
+      icon: <Layers className="h-4 w-4" />,
+      category: "File",
+      action: actions.onCreateSmartSpace || (() => {}),
+      keywords: ["space", "workspace", "folder", "connection", "sync", "bundle"],
     },
   ];
 

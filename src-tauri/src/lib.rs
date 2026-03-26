@@ -10,11 +10,13 @@ pub mod mount_engine;
 pub mod security;
 pub mod storage;
 pub mod sync_engine;
+pub mod spaces_engine;
 pub mod transfer_engine;
 
 use ai_engine::AiAssistant;
 use automation_engine::AutomationManager;
-use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, log_commands, master_password_commands, mount_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, settings_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, url_handler_commands, version_commands};
+use spaces_engine::SpacesManager;
+use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, log_commands, master_password_commands, mount_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, url_handler_commands, version_commands};
 use commands::terminal_commands::TerminalManager;
 use connectors::{ConnectionManager, ConnectorRegistry, GoogleDriveConnector, OneDriveConnector, PeerManager, S3Connector, ServerTransferManager};
 use mount_engine::MountManager;
@@ -48,6 +50,7 @@ struct AppState {
     onedrive_connector: std::sync::Arc<OneDriveConnector>,
     editor_state: std::sync::Arc<commands::editor_commands::EditorState>,
     automation_mgr: AutomationManager,
+    spaces_mgr: SpacesManager,
     confirmation_mgr: ConfirmationManager,
 }
 
@@ -132,6 +135,12 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
     }
 
+    // Initialize Smart Spaces manager
+    let spaces_mgr = SpacesManager::new();
+    if let Err(e) = spaces_mgr.load_from_db(&repo).await {
+        tracing::warn!("Failed to load smart spaces (non-fatal): {e}");
+    }
+
     let confirmation_mgr = ConfirmationManager::new();
 
     Ok(AppState {
@@ -153,6 +162,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         onedrive_connector,
         editor_state,
         automation_mgr,
+        spaces_mgr,
         confirmation_mgr,
     })
 }
@@ -214,6 +224,7 @@ pub fn run() {
                     onedrive_connector: std::sync::Arc::new(OneDriveConnector::new()),
                     editor_state: std::sync::Arc::new(commands::editor_commands::EditorState::new()),
                     automation_mgr: AutomationManager::new(),
+                    spaces_mgr: SpacesManager::new(),
                     confirmation_mgr: ConfirmationManager::new(),
                 }
             }
@@ -249,6 +260,7 @@ pub fn run() {
         .manage(app_state.onedrive_connector)
         .manage(app_state.editor_state)
         .manage(app_state.automation_mgr)
+        .manage(app_state.spaces_mgr)
         .manage(app_state.confirmation_mgr)
         .invoke_handler(tauri::generate_handler![
             // System
@@ -616,6 +628,16 @@ pub fn run() {
             automation_commands::list_automation_logs,
             automation_commands::clear_automation_logs,
             automation_commands::parse_automation_nl,
+            // Smart Spaces
+            space_commands::create_space,
+            space_commands::list_spaces,
+            space_commands::get_space,
+            space_commands::update_space,
+            space_commands::delete_space,
+            space_commands::get_space_status,
+            space_commands::activate_space,
+            space_commands::attach_space_automation,
+            space_commands::detach_space_automation,
         ])
         .on_window_event(move |_window, event| {
             if let tauri::WindowEvent::Destroyed = event {
