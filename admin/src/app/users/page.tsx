@@ -378,16 +378,16 @@ export default function UsersPage() {
                 <div className="space-y-4">
                   <Input
                     label="SCIM Endpoint"
-                    value="https://api.ufop.io/scim/v2/org_001"
+                    value={`${typeof window !== 'undefined' ? window.location.origin : ''}/api/scim/v2`}
                     readOnly
                     hint="Provide this URL to your identity provider"
                   />
                   <Input
                     label="SCIM Bearer Token"
                     type="password"
-                    value="scim_token_placeholder"
+                    value="••••••••••••••••"
                     readOnly
-                    hint="Use this token for SCIM authentication"
+                    hint="Generate a token to enable SCIM provisioning"
                   />
                   <div className="flex items-center gap-2">
                     <input type="checkbox" id="scim-enabled" className="rounded" />

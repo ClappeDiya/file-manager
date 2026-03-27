@@ -9,24 +9,13 @@ import { requireRole, isAuthorized } from '@/lib/utils/require-role';
  * DELETE /api/transfers/:id - Cancel and remove transfer
  */
 
-// Simple in-memory store (shared with parent route via imports would need a shared module)
-// In production, this would use a database
-
-function getApiKey(request: NextRequest): string | null {
-  const auth = request.headers.get('authorization');
-  if (auth?.startsWith('Bearer ')) return auth.slice(7);
-  return request.headers.get('x-api-key');
-}
-
 /** GET /api/transfers/:id */
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const apiKey = getApiKey(request);
-  if (!apiKey) {
-    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
-  }
+  const authResult = await requireRole(request, 'viewer');
+  if (!isAuthorized(authResult)) return authResult;
 
   const { id } = await params;
 

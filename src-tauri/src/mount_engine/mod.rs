@@ -1,11 +1,13 @@
-//! Mount Engine - Virtual mount management for remote/cloud storage.
+//! Mount Engine - Native OS mount management for remote/cloud storage.
 //!
-//! This module provides a stub/simulation of FUSE-based mounting.
-//! It tracks mount state (connection_id, mount_point, status) and persists
-//! mount configurations in SQLite for auto-mount on startup.
+//! Uses native OS mount commands where available:
+//! - macOS: `mount_smbfs` (SMB), `mount_nfs` (NFS), `sshfs` (SFTP if installed)
+//! - Linux: `mount.cifs` (SMB), `mount.nfs` (NFS), `sshfs` (SFTP)
 //!
-//! Actual FUSE integration (via macFUSE / libfuse) will be added later.
-//! For now, the module validates connections and manages mount metadata.
+//! For protocols without native OS mount support (S3, cloud storage), the engine
+//! reports `MountCapability::NotSupported` with a clear explanation.
+//!
+//! Mount metadata is persisted in SQLite for auto-mount on startup.
 
 use crate::connectors::ConnectionManager;
 use crate::core::error::AppError;
@@ -116,11 +118,93 @@ impl VirtualMount {
 // Mount Manager
 // ──────────────────────────────────────────────
 
-/// Manages virtual mounts and their persistence.
-///
-/// In stub mode, this tracks mount state in memory and SQLite
-/// without actually creating FUSE mounts. The connection is validated
-/// to exist before a mount entry is created.
+/// Mount capability for a given protocol on the current OS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MountCapability {
+    /// Native OS mount command available.
+    NativeMount { command: String },
+    /// Requires an external tool that's not installed.
+    RequiresInstall { tool: String, install_hint: String },
+    /// Protocol cannot be mounted as a filesystem.
+    NotSupported { reason: String },
+}
+
+/// Check what mount capability exists for a given protocol on the current OS.
+pub fn check_mount_capability(protocol: &str) -> MountCapability {
+    match protocol {
+        "smb" | "cifs" => {
+            if cfg!(target_os = "macos") {
+                MountCapability::NativeMount { command: "mount_smbfs".to_string() }
+            } else if cfg!(target_os = "linux") {
+                if std::process::Command::new("mount.cifs").arg("--version").output().is_ok() {
+                    MountCapability::NativeMount { command: "mount.cifs".to_string() }
+                } else {
+                    MountCapability::RequiresInstall {
+                        tool: "cifs-utils".to_string(),
+                        install_hint: "sudo apt install cifs-utils".to_string(),
+                    }
+                }
+            } else {
+                MountCapability::NotSupported { reason: "SMB mount not supported on this OS".to_string() }
+            }
+        }
+        "nfs" => {
+            if cfg!(target_os = "macos") {
+                MountCapability::NativeMount { command: "mount_nfs".to_string() }
+            } else if cfg!(target_os = "linux") {
+                if std::process::Command::new("mount.nfs").arg("--version").output().is_ok() {
+                    MountCapability::NativeMount { command: "mount.nfs".to_string() }
+                } else {
+                    MountCapability::RequiresInstall {
+                        tool: "nfs-common".to_string(),
+                        install_hint: "sudo apt install nfs-common".to_string(),
+                    }
+                }
+            } else {
+                MountCapability::NotSupported { reason: "NFS mount not supported on this OS".to_string() }
+            }
+        }
+        "sftp" => {
+            // sshfs is available on macOS (via macFUSE+sshfs) and Linux
+            if std::process::Command::new("sshfs").arg("--version").output().is_ok() {
+                MountCapability::NativeMount { command: "sshfs".to_string() }
+            } else if cfg!(target_os = "macos") {
+                MountCapability::RequiresInstall {
+                    tool: "sshfs + macFUSE".to_string(),
+                    install_hint: "brew install macfuse sshfs".to_string(),
+                }
+            } else {
+                MountCapability::RequiresInstall {
+                    tool: "sshfs".to_string(),
+                    install_hint: "sudo apt install sshfs".to_string(),
+                }
+            }
+        }
+        "webdav" => {
+            if cfg!(target_os = "macos") {
+                // macOS has built-in WebDAV mount support
+                MountCapability::NativeMount { command: "mount_webdav".to_string() }
+            } else if cfg!(target_os = "linux") {
+                if std::process::Command::new("mount.davfs").output().is_ok() {
+                    MountCapability::NativeMount { command: "mount.davfs".to_string() }
+                } else {
+                    MountCapability::RequiresInstall {
+                        tool: "davfs2".to_string(),
+                        install_hint: "sudo apt install davfs2".to_string(),
+                    }
+                }
+            } else {
+                MountCapability::NotSupported { reason: "WebDAV mount not supported on this OS".to_string() }
+            }
+        }
+        _ => MountCapability::NotSupported {
+            reason: format!("Protocol '{}' cannot be mounted as a filesystem. Use sync or transfer instead.", protocol),
+        },
+    }
+}
+
+/// Manages mounts using native OS commands and persists state in SQLite.
 pub struct MountManager {
     /// Active mounts keyed by mount ID.
     mounts: Arc<RwLock<HashMap<Uuid, VirtualMount>>>,
@@ -131,6 +215,11 @@ impl MountManager {
         Self {
             mounts: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Check mount capability for a protocol.
+    pub fn check_capability(&self, protocol: &str) -> MountCapability {
+        check_mount_capability(protocol)
     }
 
     /// Mount a remote connection at the specified mount point.
@@ -167,19 +256,106 @@ impl MountManager {
             }
         }
 
+        let protocol_str = profile.protocol.as_str();
+
+        // Check capability before attempting mount
+        let capability = check_mount_capability(protocol_str);
+        match &capability {
+            MountCapability::NotSupported { reason } => {
+                return Err(AppError::connection(
+                    format!("Cannot mount '{}': {}", protocol_str, reason),
+                    "Use sync or transfer to access this remote storage.",
+                ));
+            }
+            MountCapability::RequiresInstall { tool, install_hint } => {
+                return Err(AppError::connection(
+                    format!("Mounting '{}' requires '{}' which is not installed", protocol_str, tool),
+                    install_hint.clone(),
+                ));
+            }
+            MountCapability::NativeMount { .. } => {}
+        }
+
+        // Validate mount point: must be absolute, no path traversal, within user home
+        let mp_path = std::path::Path::new(&mount_point);
+        if !mp_path.is_absolute() {
+            return Err(AppError::validation(
+                "Mount point must be an absolute path (e.g. '/Users/you/Volumes/mount').",
+            ));
+        }
+        // Canonicalize the parent to detect .. traversal (mount point itself may not exist yet)
+        let canonical = if mp_path.exists() {
+            mp_path.canonicalize().map_err(|e| {
+                AppError::file_op(
+                    format!("Cannot resolve mount point '{}': {}", mount_point, e),
+                    "Check the path exists and you have permission.",
+                )
+            })?
+        } else {
+            // For non-existent paths, canonicalize the nearest existing parent
+            let mut parent = mp_path.to_path_buf();
+            while !parent.exists() && parent.parent().is_some() {
+                parent = parent.parent().unwrap().to_path_buf();
+            }
+            let parent_clone = parent.clone();
+            let canon_parent = parent.canonicalize().unwrap_or(parent_clone);
+            canon_parent.join(mp_path.strip_prefix(&canon_parent).unwrap_or(mp_path))
+        };
+
+        // Block mounting to sensitive system directories
+        let canonical_str = canonical.to_string_lossy();
+        let blocked_prefixes = ["/etc", "/usr", "/bin", "/sbin", "/var", "/System", "/Library", "/boot", "/proc", "/sys", "/dev"];
+        for prefix in &blocked_prefixes {
+            if canonical_str.starts_with(prefix) {
+                return Err(AppError::validation(
+                    format!("Mount point '{}' is in a restricted system directory. Choose a path within your home directory.", mount_point),
+                ));
+            }
+        }
+
+        // Ensure mount point directory exists
+        if !mp_path.exists() {
+            std::fs::create_dir_all(mp_path).map_err(|e| {
+                AppError::file_op(
+                    format!("Cannot create mount point '{}': {}", mount_point, e),
+                    "Choose an existing directory or check permissions.",
+                )
+            })?;
+        }
+
+        // Execute native OS mount command
+        let mount_result = Self::execute_native_mount(
+            protocol_str,
+            &profile,
+            &mount_point,
+        ).await;
+
         let mount_id = Uuid::new_v4();
         let now = Utc::now();
+
+        let (status, error_message, msg) = match mount_result {
+            Ok(()) => (
+                MountStatus::Mounted,
+                None,
+                format!("Successfully mounted '{}' at '{}'", profile.name, mount_point),
+            ),
+            Err(e) => (
+                MountStatus::Error,
+                Some(e.to_string()),
+                format!("Mount failed for '{}': {}", profile.name, e),
+            ),
+        };
 
         let virtual_mount = VirtualMount {
             id: mount_id,
             connection_id,
             connection_name: profile.name.clone(),
-            protocol: profile.protocol.as_str().to_string(),
+            protocol: protocol_str.to_string(),
             mount_point: mount_point.clone(),
-            status: MountStatus::Mounted,
+            status,
             auto_mount: false,
             created_at: now,
-            error_message: None,
+            error_message: error_message.clone(),
         };
 
         // Persist to SQLite
@@ -187,12 +363,14 @@ impl MountManager {
         let cid = connection_id.to_string();
         let mid = mount_id.to_string();
         let ts = now.to_rfc3339();
+        let status_str = status.as_str().to_string();
+        let err_msg = error_message.clone();
         repo.pool()
             .execute(move |conn| {
                 conn.execute(
-                    "INSERT INTO mount_configs (id, connection_id, mount_point, auto_mount, status, created_at)
-                     VALUES (?1, ?2, ?3, 0, 'mounted', ?4)",
-                    rusqlite::params![mid, cid, mp, ts],
+                    "INSERT INTO mount_configs (id, connection_id, mount_point, auto_mount, status, error_message, created_at)
+                     VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
+                    rusqlite::params![mid, cid, mp, status_str, err_msg, ts],
                 )?;
                 Ok(())
             })
@@ -205,22 +383,123 @@ impl MountManager {
         }
 
         tracing::info!(
-            "Mounted connection '{}' ({}) at '{}' (mount_id: {})",
-            profile.name,
-            profile.protocol.as_str(),
-            mount_point,
-            mount_id
+            "Mount result for '{}' ({}) at '{}': {} (mount_id: {})",
+            profile.name, protocol_str, mount_point, status.as_str(), mount_id
         );
+
+        if status == MountStatus::Error {
+            return Err(AppError::connection(
+                error_message.unwrap_or_default(),
+                "Check connection credentials and network access.",
+            ));
+        }
 
         Ok(MountResult {
             mount_id,
             mount_point,
-            status: MountStatus::Mounted,
-            message: format!(
-                "Successfully mounted '{}' (stub mode - FUSE integration pending)",
-                profile.name
-            ),
+            status,
+            message: msg,
         })
+    }
+
+    /// Execute the native OS mount command for a given protocol.
+    async fn execute_native_mount(
+        protocol: &str,
+        profile: &crate::core::types::ConnectionProfile,
+        mount_point: &str,
+    ) -> Result<(), String> {
+        use tokio::process::Command;
+
+        let remote_path = &profile.remote_path;
+        let username = profile.username.as_deref().unwrap_or("");
+        let port = profile.port.unwrap_or(0);
+
+        match protocol {
+            "smb" | "cifs" => {
+                let path_part = if remote_path.starts_with('/') {
+                    remote_path.clone()
+                } else {
+                    format!("/{}", remote_path)
+                };
+
+                let output = if cfg!(target_os = "macos") {
+                    let smb_url = if !username.is_empty() {
+                        format!("//{}@{}{}", username, profile.host, path_part)
+                    } else {
+                        format!("//{}{}", profile.host, path_part)
+                    };
+                    Command::new("mount_smbfs").arg(&smb_url).arg(mount_point).output().await
+                } else {
+                    let share = format!("//{}{}", profile.host, path_part);
+                    let mut cmd = Command::new("mount.cifs");
+                    cmd.arg(&share).arg(mount_point);
+                    if !username.is_empty() {
+                        cmd.arg("-o").arg(format!("user={}", username));
+                    }
+                    cmd.output().await
+                };
+
+                match output {
+                    Ok(o) if o.status.success() => Ok(()),
+                    Ok(o) => Err(String::from_utf8_lossy(&o.stderr).to_string()),
+                    Err(e) => Err(format!("Failed to execute mount command: {e}")),
+                }
+            }
+            "nfs" => {
+                let nfs_path = format!(
+                    "{}:{}",
+                    profile.host,
+                    if remote_path.is_empty() { "/" } else { remote_path }
+                );
+                let cmd_name = if cfg!(target_os = "macos") { "mount_nfs" } else { "mount.nfs" };
+                let output = Command::new(cmd_name).arg(&nfs_path).arg(mount_point).output().await;
+
+                match output {
+                    Ok(o) if o.status.success() => Ok(()),
+                    Ok(o) => Err(String::from_utf8_lossy(&o.stderr).to_string()),
+                    Err(e) => Err(format!("Failed to execute {cmd_name}: {e}")),
+                }
+            }
+            "sftp" => {
+                let user = if username.is_empty() { "root" } else { username };
+                let path = if remote_path.is_empty() { "/" } else { remote_path.as_str() };
+                let remote = format!("{}@{}:{}", user, profile.host, path);
+                let ssh_port = if port > 0 { port } else { 22 };
+
+                let output = Command::new("sshfs")
+                    .arg(&remote)
+                    .arg(mount_point)
+                    .arg("-p").arg(ssh_port.to_string())
+                    .arg("-o").arg("StrictHostKeyChecking=ask")
+                    .output()
+                    .await;
+
+                match output {
+                    Ok(o) if o.status.success() => Ok(()),
+                    Ok(o) => Err(String::from_utf8_lossy(&o.stderr).to_string()),
+                    Err(e) => Err(format!("Failed to execute sshfs: {e}")),
+                }
+            }
+            "webdav" => {
+                let scheme = if port == 443 { "https" } else { "http" };
+                let effective_port = if port > 0 { port } else { 80 };
+                let path = if remote_path.is_empty() { "/" } else { remote_path.as_str() };
+                let webdav_url = format!("{}://{}:{}{}", scheme, profile.host, effective_port, path);
+
+                let output = if cfg!(target_os = "macos") {
+                    Command::new("mount_webdav").arg(&webdav_url).arg(mount_point).output().await
+                } else {
+                    Command::new("mount.davfs").arg(&webdav_url).arg(mount_point).output().await
+                };
+
+                match output {
+                    Ok(o) if o.status.success() => Ok(()),
+                    Ok(o) => Err(String::from_utf8_lossy(&o.stderr).to_string()),
+                    Err(e) => Err(format!("Failed to execute mount command: {e}")),
+                }
+            }
+            _ => Err(format!("Protocol '{}' does not support filesystem mounting", protocol)),
+        }
     }
 
     /// Unmount a remote drive.
@@ -238,6 +517,35 @@ impl MountManager {
         let mid = mount_id.to_string();
 
         if let Some(info) = &mount_info {
+            // Execute real OS unmount
+            let mp = &info.mount_point;
+            let cmd_name = if cfg!(target_os = "macos") { "umount" } else { "fusermount" };
+            let output = if info.protocol == "sftp" && cfg!(target_os = "linux") {
+                tokio::process::Command::new("fusermount")
+                    .arg("-u")
+                    .arg(mp)
+                    .output()
+                    .await
+            } else {
+                tokio::process::Command::new("umount")
+                    .arg(mp)
+                    .output()
+                    .await
+            };
+
+            match output {
+                Ok(o) if o.status.success() => {
+                    tracing::info!("OS unmount succeeded for '{}'", mp);
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    tracing::warn!("OS unmount returned error for '{}': {} (may already be unmounted)", mp, stderr);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to run {} for '{}': {} (may already be unmounted)", cmd_name, mp, e);
+                }
+            }
+
             tracing::info!(
                 "Unmounted '{}' from '{}' (mount_id: {})",
                 info.connection_name,

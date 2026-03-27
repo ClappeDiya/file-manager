@@ -28,48 +28,10 @@ interface Transfer {
 
 const transfers: Transfer[] = [];
 
-// Rate limiting state
-const rateLimits: Map<string, { count: number; resetAt: number }> = new Map();
-const RATE_LIMIT = 1000; // requests per minute
-const RATE_WINDOW = 60000; // 1 minute in ms
-
-function checkRateLimit(apiKey: string): boolean {
-  const now = Date.now();
-  const entry = rateLimits.get(apiKey);
-  if (!entry || now > entry.resetAt) {
-    rateLimits.set(apiKey, { count: 1, resetAt: now + RATE_WINDOW });
-    return true;
-  }
-  if (entry.count >= RATE_LIMIT) return false;
-  entry.count++;
-  return true;
-}
-
-function getApiKey(request: NextRequest): string | null {
-  const auth = request.headers.get('authorization');
-  if (auth?.startsWith('Bearer ')) return auth.slice(7);
-  return request.headers.get('x-api-key');
-}
-
-function unauthorized() {
-  return NextResponse.json(
-    { error: 'Authentication required', code: 'AUTH_REQUIRED' },
-    { status: 401 }
-  );
-}
-
-function rateLimited() {
-  return NextResponse.json(
-    { error: 'Rate limit exceeded', code: 'RATE_LIMITED', retry_after: 60 },
-    { status: 429, headers: { 'Retry-After': '60' } }
-  );
-}
-
 /** GET /api/transfers - List transfers */
 export async function GET(request: NextRequest) {
-  const apiKey = getApiKey(request);
-  if (!apiKey) return unauthorized();
-  if (!checkRateLimit(apiKey)) return rateLimited();
+  const authResult = await requireRole(request, 'viewer');
+  if (!isAuthorized(authResult)) return authResult;
 
   const { searchParams } = new URL(request.url);
   const status = searchParams.get('status');
@@ -99,10 +61,6 @@ export async function POST(request: NextRequest) {
   const authResult = await requireRole(request, 'manager');
   if (!isAuthorized(authResult)) return authResult;
 
-  const apiKey = getApiKey(request);
-  if (!apiKey) return unauthorized();
-  if (!checkRateLimit(apiKey)) return rateLimited();
-
   try {
     const body = await request.json();
     const { source, destination, priority, verify_checksum } = body;
@@ -128,7 +86,7 @@ export async function POST(request: NextRequest) {
       updated_at: new Date().toISOString(),
       error_message: null,
       verify_checksum: verify_checksum ?? true,
-      created_by: apiKey.slice(0, 8),
+      created_by: authResult.user.email,
     };
 
     transfers.push(transfer);

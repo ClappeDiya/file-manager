@@ -420,6 +420,10 @@ pub fn run() {
             ai_commands::ai_get_audit_log,
             ai_commands::ai_get_feature_toggles,
             ai_commands::ai_set_feature_toggles,
+            ai_commands::ai_probe_ollama,
+            ai_commands::ai_execute_parsed_job,
+            ai_commands::ai_get_ollama_model,
+            ai_commands::ai_set_ollama_model,
             // Terminal (T-046)
             terminal_commands::terminal_create_local,
             terminal_commands::terminal_create_remote,
@@ -508,6 +512,7 @@ pub fn run() {
             integrity_commands::integrity_delete_smart_folder,
             integrity_commands::integrity_run_smart_folder,
             // Mount Engine (Finder-mounted remote storage)
+            mount_commands::check_mount_capability,
             mount_commands::mount_remote,
             mount_commands::unmount_remote,
             mount_commands::list_mounts,

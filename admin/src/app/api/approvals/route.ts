@@ -5,6 +5,9 @@ import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /** GET /api/approvals - List approval requests */
 export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, 'viewer');
+  if (!isAuthorized(authResult)) return authResult;
+
   const { searchParams } = new URL(request.url);
   const state = searchParams.get('state') as ApprovalState | null;
   const trigger = searchParams.get('trigger') as ApprovalTrigger | null;
@@ -53,8 +56,9 @@ export async function POST(request: NextRequest) {
     const now = new Date();
     const expiresAt = new Date(now.getTime() + 48 * 60 * 60 * 1000); // 48 hours
 
+    const { v4: uuidv4 } = await import('uuid');
     const newApproval: ApprovalRequest = {
-      id: `apr_${Date.now()}`,
+      id: `apr_${uuidv4().slice(0, 12)}`,
       operation,
       trigger,
       source,
@@ -106,11 +110,17 @@ export async function PATCH(request: NextRequest) {
       return NextResponse.json({ error: 'Approval has expired' }, { status: 400 });
     }
 
+    // Prevent self-approval: reviewer must not be the requester
+    const reviewerEmail = authResult.user.email;
+    if (dataStore.approvals[index].requestedBy === reviewerEmail) {
+      return NextResponse.json({ error: 'Cannot review your own approval request' }, { status: 403 });
+    }
+
     dataStore.approvals[index] = {
       ...dataStore.approvals[index],
       state: action === 'approve' ? 'approved' : 'denied',
-      reviewedBy: reviewedBy || 'unknown',
-      reviewedByName: reviewedByName || 'Unknown',
+      reviewedBy: reviewerEmail,
+      reviewedByName: authResult.user.name,
       reviewedAt: new Date().toISOString(),
       reviewComment: reviewComment || '',
     };

@@ -4,6 +4,9 @@ import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /** GET /api/workspaces - List workspaces and shared resources */
 export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, 'viewer');
+  if (!isAuthorized(authResult)) return authResult;
+
   const { searchParams } = new URL(request.url);
   const type = searchParams.get('type'); // connections, templates, workspaces
 

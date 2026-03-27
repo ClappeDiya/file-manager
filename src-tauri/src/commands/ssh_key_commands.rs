@@ -102,15 +102,6 @@ pub async fn generate_ssh_key(
     cmd.args(algo.keygen_args());
     cmd.arg("-f").arg(&key_path);
 
-    // Passphrase (empty string = no passphrase)
-    // NOTE(security): The `-N` flag passes the passphrase via command-line argument,
-    // which is briefly visible in process listings (e.g., `ps aux`). On shared systems
-    // this is a minor information disclosure risk. Alternatives (expect scripts, stdin
-    // piping) add complexity. Since ssh-keygen is short-lived and this is a desktop app
-    // with a single user session, the risk is accepted.
-    let pass = passphrase.unwrap_or_default();
-    cmd.arg("-N").arg(&pass);
-
     // Comment
     let key_comment = comment.unwrap_or_else(|| {
         format!(
@@ -122,7 +113,79 @@ pub async fn generate_ssh_key(
     });
     cmd.arg("-C").arg(&key_comment);
 
-    // Run ssh-keygen
+    // Passphrase: use SSH_ASKPASS with a temp script to avoid passing
+    // the passphrase via command-line argument (visible in `ps aux`).
+    let pass = passphrase.unwrap_or_default();
+
+    if pass.is_empty() {
+        // No passphrase — pass empty string via -N (safe, no secret to leak)
+        cmd.arg("-N").arg("");
+    } else {
+        // Create a temporary askpass script that echoes the passphrase
+        let askpass_dir = std::env::temp_dir();
+        let askpass_path = askpass_dir.join(format!("ufop_askpass_{}.sh", std::process::id()));
+        // Write script: #!/bin/sh\necho '<escaped_pass>'
+        let escaped_pass = pass.replace('\'', "'\\''");
+        std::fs::write(&askpass_path, format!("#!/bin/sh\necho '{escaped_pass}'"))
+            .map_err(|e| AppError::Sync {
+                message: format!("Failed to create askpass helper: {e}"),
+                advice: "Check temp directory permissions.".to_string(),
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&askpass_path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| AppError::Sync {
+                    message: format!("Failed to set askpass permissions: {e}"),
+                    advice: "Check temp directory permissions.".to_string(),
+                })?;
+        }
+        cmd.arg("-N").arg(""); // Trigger passphrase prompt
+        cmd.env("SSH_ASKPASS", &askpass_path);
+        cmd.env("SSH_ASKPASS_REQUIRE", "force");
+        cmd.env("DISPLAY", ":0"); // Required to trigger SSH_ASKPASS
+
+        // ssh-keygen needs no controlling terminal to use SSH_ASKPASS
+        cmd.stdin(std::process::Stdio::null());
+
+        let output = cmd.output().map_err(|e| AppError::Sync {
+            message: format!("Failed to run ssh-keygen: {e}"),
+            advice: "Ensure ssh-keygen is installed and accessible in PATH.".to_string(),
+        });
+
+        // Clean up askpass script immediately
+        let _ = std::fs::remove_file(&askpass_path);
+
+        let output = output?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(AppError::Sync {
+                message: format!("ssh-keygen failed: {stderr}"),
+                advice: "Check the key type, path, and passphrase.".to_string(),
+            });
+        }
+
+        // Set correct permissions on the private key
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+        }
+
+        // Read the generated public key
+        let pub_key_path = format!("{}.pub", key_path.display());
+        let public_key = std::fs::read_to_string(&pub_key_path).unwrap_or_default();
+
+        return Ok(SshKeyGenResult {
+            private_key_path: key_path.to_string_lossy().to_string(),
+            public_key_path: pub_key_path,
+            public_key_content: public_key,
+            algorithm: format!("{:?}", algo),
+        });
+    }
+
+    // Run ssh-keygen (no passphrase case)
     let output = cmd.output().map_err(|e| AppError::Sync {
         message: format!("Failed to run ssh-keygen: {e}"),
         advice: "Ensure ssh-keygen is installed and accessible in PATH.".to_string(),

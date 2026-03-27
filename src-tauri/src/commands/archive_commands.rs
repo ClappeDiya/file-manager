@@ -430,12 +430,37 @@ fn create_zip(
         .iter()
         .map(|s| sanitize_archive_path(s).map_err(|e| e.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut args = vec!["-r".to_string()];
+
     if let Some(pw) = password {
-        args.push("-P".to_string());
-        args.push(pw.to_string());
+        // Use 7z for password-protected archives to avoid exposing password
+        // in process arguments. 7z supports stdin password via -si flag.
+        // Fallback to zip -P only if 7z is unavailable.
+        if which_exists("7z") {
+            return create_7z_with_stdin_password(
+                &safe_output, &safe_sources, pw,
+            );
+        }
+        // zip does not support stdin passwords — -P is the only option.
+        // This is a known limitation; the password is briefly visible in `ps`.
+        tracing::warn!("Using zip -P (password visible in process list). Install 7z for safer password handling.");
+        let mut args = vec!["-r".to_string(), "-P".to_string(), pw.to_string()];
+        args.push(safe_output);
+        args.extend(safe_sources.iter().cloned());
+
+        let status = std::process::Command::new("zip")
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+
+        if !status.success() {
+            return Err("zip creation failed".into());
+        }
+        return Ok(sources.len());
     }
-    args.push(safe_output);
+
+    // No password — straightforward zip
+    let mut args = vec!["-r".to_string(), safe_output];
     args.extend(safe_sources.iter().cloned());
 
     let status = std::process::Command::new("zip")
@@ -448,6 +473,47 @@ fn create_zip(
         return Err("zip creation failed".into());
     }
     Ok(sources.len())
+}
+
+/// Check if a command exists in PATH.
+fn which_exists(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Create a 7z archive with password piped via stdin (not visible in `ps`).
+fn create_7z_with_stdin_password(
+    output: &str,
+    sources: &[String],
+    password: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let count = sources.len();
+    let mut args = vec!["a".to_string(), format!("-p"), output.to_string()];
+    args.extend(sources.iter().cloned());
+
+    let mut child = std::process::Command::new("7z")
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(password.as_bytes())?;
+        stdin.write_all(b"\n")?;
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err("7z creation with password failed".into());
+    }
+    Ok(count)
 }
 
 fn create_tar(
@@ -486,11 +552,12 @@ fn create_7z(
         .iter()
         .map(|s| sanitize_archive_path(s).map_err(|e| e.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut args = vec!["a".to_string()];
+
     if let Some(pw) = password {
-        args.push(format!("-p{pw}"));
+        return create_7z_with_stdin_password(&safe_output, &safe_sources, pw);
     }
-    args.push(safe_output);
+
+    let mut args = vec!["a".to_string(), safe_output];
     args.extend(safe_sources.iter().cloned());
 
     let status = std::process::Command::new("7z")
@@ -511,11 +578,49 @@ fn extract_zip_archive(
     password: Option<&str>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let safe_archive = sanitize_archive_path(archive).map_err(|e| e.to_string())?;
-    let mut args = vec!["-o".to_string(), safe_archive, "-d".to_string(), dest.to_string()];
+
     if let Some(pw) = password {
-        args.insert(0, format!("-P{pw}"));
+        // Prefer 7z for extraction with password (stdin-safe)
+        if which_exists("7z") {
+            let args = vec![
+                "x".to_string(),
+                safe_archive.clone(),
+                format!("-o{dest}"),
+                "-y".to_string(),
+                "-p".to_string(),
+            ];
+            use std::io::Write;
+            let mut child = std::process::Command::new("7z")
+                .args(&args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(pw.as_bytes())?;
+                stdin.write_all(b"\n")?;
+            }
+            let status = child.wait()?;
+            if !status.success() {
+                return Err("7z extraction with password failed".into());
+            }
+            return Ok(count_items(Path::new(dest))?);
+        }
+        // Fallback: unzip -P (password visible in process list)
+        tracing::warn!("Using unzip -P (password visible in process list). Install 7z for safer password handling.");
+        let args = vec![format!("-P{pw}"), "-o".to_string(), safe_archive, "-d".to_string(), dest.to_string()];
+        let status = std::process::Command::new("unzip")
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err("unzip failed".into());
+        }
+        return Ok(count_items(Path::new(dest))?);
     }
 
+    let args = vec!["-o".to_string(), safe_archive, "-d".to_string(), dest.to_string()];
     let status = std::process::Command::new("unzip")
         .args(&args)
         .stdout(std::process::Stdio::null())
@@ -553,15 +658,40 @@ fn extract_7z_archive(
     password: Option<&str>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let safe_archive = sanitize_archive_path(archive).map_err(|e| e.to_string())?;
-    let mut args = vec![
+
+    if let Some(pw) = password {
+        // Pipe password via stdin to avoid exposure in process args
+        use std::io::Write;
+        let args = vec![
+            "x".to_string(),
+            safe_archive,
+            format!("-o{dest}"),
+            "-y".to_string(),
+            "-p".to_string(),
+        ];
+        let mut child = std::process::Command::new("7z")
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(pw.as_bytes())?;
+            stdin.write_all(b"\n")?;
+        }
+        let status = child.wait()?;
+        if !status.success() {
+            return Err("7z extraction failed".into());
+        }
+        return Ok(count_items(Path::new(dest))?);
+    }
+
+    let args = vec![
         "x".to_string(),
         safe_archive,
         format!("-o{dest}"),
         "-y".to_string(),
     ];
-    if let Some(pw) = password {
-        args.push(format!("-p{pw}"));
-    }
 
     let status = std::process::Command::new("7z")
         .args(&args)

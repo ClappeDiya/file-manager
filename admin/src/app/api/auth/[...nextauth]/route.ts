@@ -1,27 +1,28 @@
 /**
- * NextAuth.js route handler placeholder.
+ * Auth providers discovery endpoint.
  *
- * In production, this would be configured with:
- * - CredentialsProvider for username/password auth
- * - SAML provider for SSO (Business tier)
- * - SCIM integration for user provisioning (Enterprise tier)
+ * Returns the available authentication methods. The actual auth flow
+ * is handled by /api/auth/login (JWT-based with bcrypt password verification).
  *
- * For now, auth is handled by the custom /api/auth/login route
- * and the client-side auth store.
+ * GET /api/auth/providers — list available auth methods
+ * POST /api/auth/providers — redirects to /api/auth/login
  */
 
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 
 export async function GET() {
   return NextResponse.json({
     providers: [
-      { id: 'credentials', name: 'Email & Password', type: 'credentials' },
-      { id: 'saml', name: 'SAML 2.0 SSO', type: 'saml', tier: 'business' },
-      { id: 'scim', name: 'SCIM Provisioning', type: 'scim', tier: 'enterprise' },
+      { id: 'credentials', name: 'Email & Password', type: 'credentials', active: true },
+      { id: 'saml', name: 'SAML 2.0 SSO', type: 'saml', active: false, tier: 'business' },
     ],
+    loginEndpoint: '/api/auth/login',
+    logoutEndpoint: '/api/auth/logout',
+    sessionEndpoint: '/api/auth/session',
   });
 }
 
-export async function POST() {
-  return NextResponse.json({ error: 'Use /api/auth/login for authentication' }, { status: 307 });
+export async function POST(request: NextRequest) {
+  // Redirect to the real login endpoint using the request's own origin
+  return NextResponse.redirect(new URL('/api/auth/login', request.url), 307);
 }

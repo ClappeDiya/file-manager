@@ -7,6 +7,7 @@ use crate::core::error::AppError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -78,6 +79,15 @@ pub struct ParsedJobConfig {
     pub preview_config: Option<String>,
 }
 
+/// Result from executing a parsed intent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiExecutionResult {
+    pub success: bool,
+    pub action_taken: String,
+    pub entity_id: Option<String>,
+    pub audit_id: String,
+}
+
 /// An AI audit log entry (T-045).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiAuditEntry {
@@ -125,17 +135,198 @@ pub struct AiAssistant {
     audit_log: Arc<RwLock<Vec<AiAuditEntry>>>,
     feature_toggles: Arc<RwLock<AiFeatureToggles>>,
     pending_confirmations: Arc<RwLock<Vec<String>>>,
+    // Ollama integration
+    http_client: reqwest::Client,
+    ollama_available: Arc<RwLock<Option<bool>>>,
+    ollama_model: Arc<RwLock<String>>,
 }
 
 impl AiAssistant {
     pub fn new() -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+
         Self {
             chat_history: Arc::new(RwLock::new(Vec::new())),
             suggestions: Arc::new(RwLock::new(Vec::new())),
             audit_log: Arc::new(RwLock::new(Vec::new())),
             feature_toggles: Arc::new(RwLock::new(AiFeatureToggles::default())),
             pending_confirmations: Arc::new(RwLock::new(Vec::new())),
+            http_client,
+            ollama_available: Arc::new(RwLock::new(None)),
+            ollama_model: Arc::new(RwLock::new("llama3.2".to_string())),
         }
+    }
+
+    // ── Ollama Integration ──
+
+    /// Probe whether Ollama is running locally.
+    pub async fn probe_ollama(&self) -> bool {
+        // Return cached result if available
+        {
+            let cached = self.ollama_available.read().await;
+            if let Some(available) = *cached {
+                return available;
+            }
+        }
+
+        let result = self
+            .http_client
+            .get("http://localhost:11434/api/tags")
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await;
+
+        let available = match result {
+            Ok(resp) if resp.status().is_success() => {
+                // Check if any model is available; pick one if configured model missing
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
+                        if !models.is_empty() {
+                            let configured = self.ollama_model.read().await.clone();
+                            let has_configured = models.iter().any(|m| {
+                                m.get("name")
+                                    .and_then(|n| n.as_str())
+                                    .map(|n| n.starts_with(&configured))
+                                    .unwrap_or(false)
+                            });
+                            if !has_configured {
+                                // Fall back to first available model
+                                if let Some(first) = models
+                                    .first()
+                                    .and_then(|m| m.get("name"))
+                                    .and_then(|n| n.as_str())
+                                {
+                                    let model_name = first.split(':').next().unwrap_or(first);
+                                    let mut model = self.ollama_model.write().await;
+                                    *model = model_name.to_string();
+                                    tracing::info!(
+                                        "Ollama: configured model not found, using '{}'",
+                                        model_name
+                                    );
+                                }
+                            }
+                            true
+                        } else {
+                            tracing::info!("Ollama running but no models pulled");
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+
+        let mut cached = self.ollama_available.write().await;
+        *cached = Some(available);
+        if available {
+            tracing::info!("Ollama detected at localhost:11434");
+        }
+        available
+    }
+
+    /// Reset the cached Ollama availability (e.g., when user changes settings).
+    pub async fn reset_ollama_probe(&self) {
+        let mut cached = self.ollama_available.write().await;
+        *cached = None;
+    }
+
+    /// Set the Ollama model name.
+    pub async fn set_ollama_model(&self, model: String) {
+        let mut current = self.ollama_model.write().await;
+        *current = model;
+        // Reset probe so next call re-checks model availability
+        drop(current);
+        self.reset_ollama_probe().await;
+    }
+
+    /// Get the current Ollama model name.
+    pub async fn get_ollama_model(&self) -> String {
+        self.ollama_model.read().await.clone()
+    }
+
+    /// Call Ollama to parse natural language into a ParsedJobConfig.
+    async fn call_ollama(
+        &self,
+        input: &str,
+        context_path: Option<&str>,
+    ) -> Result<ParsedJobConfig, AppError> {
+        let model = self.ollama_model.read().await.clone();
+
+        let context_hint = context_path
+            .map(|p| format!("\nThe user's current directory is: {p}"))
+            .unwrap_or_default();
+
+        let system_prompt = format!(
+            r#"You are a file manager assistant. Parse the user's request into a JSON object.
+Return ONLY valid JSON with these fields:
+- intent: one of "sync" | "transfer" | "backup" | "automation" | "filter" | "navigate" | "vault" | "rename" | "exclusion"
+- source_path: string or null (use ~ for home directory)
+- dest_path: string or null
+- dest_connector: one of "s3" | "google_drive" | "dropbox" | "onedrive" | "sftp" | "ftp" | "webdav" | "smb" | "local" | "azure_blob" | "backblaze_b2" or null
+- schedule: cron expression string or null (use "watch" for real-time)
+- schedule_human: human-readable schedule description or null
+- direction: "one_way" | "bidirectional" or null
+- filter_patterns: array of glob strings (e.g. ["*.pdf"])
+- exclude_patterns: array of glob strings
+- rename_pattern: string or null
+- confidence: float 0.0-1.0
+- needs_clarification: boolean
+- clarification_questions: array of strings
+
+If the user says "when X happens, do Y", set intent to "automation".
+If the user wants to view/find/show files, set intent to "filter" or "navigate".
+If the user wants to encrypt, set intent to "vault".{context_hint}"#
+        );
+
+        let payload = serde_json::json!({
+            "model": model,
+            "prompt": format!("{}\n\nUser request: {}", system_prompt, input),
+            "stream": false,
+            "format": "json"
+        });
+
+        let resp = self
+            .http_client
+            .post("http://localhost:11434/api/generate")
+            .timeout(Duration::from_secs(8))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| AppError::Internal {
+                message: format!("Ollama request failed: {e}"),
+            })?;
+
+        if !resp.status().is_success() {
+            return Err(AppError::Internal {
+                message: format!("Ollama returned status {}", resp.status()),
+            });
+        }
+
+        let body: serde_json::Value =
+            resp.json().await.map_err(|e| AppError::Internal {
+                message: format!("Failed to parse Ollama response: {e}"),
+            })?;
+
+        let response_text = body
+            .get("response")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::Internal {
+                message: "Ollama response missing 'response' field".to_string(),
+            })?;
+
+        let config: ParsedJobConfig =
+            serde_json::from_str(response_text).map_err(|e| AppError::Internal {
+                message: format!("Failed to parse Ollama JSON output: {e}"),
+            })?;
+
+        Ok(config)
     }
 
     // ── T-043: Error Explanations ──
@@ -504,7 +695,17 @@ impl AiAssistant {
     // ── T-044: Natural Language Job Creation ──
 
     /// Parse a natural language command into a job configuration.
+    /// Tries Ollama first if available, falls back to keyword matching.
     pub async fn parse_natural_language(&self, input: &str) -> Result<ParsedJobConfig, AppError> {
+        self.parse_natural_language_with_context(input, None).await
+    }
+
+    /// Parse natural language with optional context path for path resolution.
+    pub async fn parse_natural_language_with_context(
+        &self,
+        input: &str,
+        context_path: Option<&str>,
+    ) -> Result<ParsedJobConfig, AppError> {
         let toggles = self.feature_toggles.read().await;
         if !toggles.ai_master_enabled || !toggles.nl_job_creation {
             return Err(AppError::Configuration {
@@ -514,10 +715,58 @@ impl AiAssistant {
         }
         drop(toggles);
 
+        // Try Ollama first if available
+        if self.probe_ollama().await {
+            match self.call_ollama(input, context_path).await {
+                Ok(mut config) => {
+                    // Log to audit trail
+                    self.log_ai_action(
+                        "nl_parse_ollama",
+                        input,
+                        &format!(
+                            "Intent: {}, confidence: {:.0}%",
+                            config.intent,
+                            config.confidence * 100.0
+                        ),
+                        false,
+                        false,
+                    )
+                    .await;
+
+                    // Build preview config from Ollama result
+                    if config.preview_config.is_none() && config.confidence > 0.3 {
+                        config.preview_config = Some(
+                            serde_json::json!({
+                                "name": format!("{} job", config.intent),
+                                "source_path": config.source_path.clone().unwrap_or_default(),
+                                "dest_path": config.dest_path.clone().unwrap_or_default(),
+                                "mode": config.direction.clone().unwrap_or_else(|| "one_way".to_string()),
+                                "trigger": if config.schedule.is_some() { "scheduled" } else { "manual" },
+                                "cron_expr": config.schedule.clone(),
+                            })
+                            .to_string(),
+                        );
+                    }
+
+                    return Ok(config);
+                }
+                Err(e) => {
+                    tracing::warn!("Ollama parse failed, falling back to keyword stub: {e}");
+                }
+            }
+        }
+
+        // Keyword-based fallback
         let input_lower = input.to_lowercase();
 
         // Parse intent
-        let intent = if input_lower.contains("sync") || input_lower.contains("synchronize") {
+        let intent = if input_lower.contains("when") && (input_lower.contains("appear") || input_lower.contains("arrive") || input_lower.contains("land") || input_lower.contains("added") || input_lower.contains("change") || input_lower.contains("modif")) {
+            "automation"
+        } else if input_lower.contains("show") || input_lower.contains("find") || input_lower.contains("larger than") || input_lower.contains("smaller than") || input_lower.contains("filter") {
+            "filter"
+        } else if input_lower.contains("encrypt") || input_lower.contains("vault") || input_lower.contains("decrypt") {
+            "vault"
+        } else if input_lower.contains("sync") || input_lower.contains("synchronize") {
             "sync"
         } else if input_lower.contains("transfer") || input_lower.contains("send") || input_lower.contains("upload") {
             "transfer"
@@ -527,6 +776,8 @@ impl AiAssistant {
             "exclusion"
         } else if input_lower.contains("rename") || input_lower.contains("name pattern") {
             "rename"
+        } else if input_lower.contains("go to") || input_lower.contains("open") || input_lower.contains("navigate") {
+            "navigate"
         } else {
             "sync" // default intent
         };
@@ -726,6 +977,19 @@ impl AiAssistant {
     }
 
     // ── Internal Helpers ──
+
+    /// Log an AI action to the audit trail (public, for use from commands).
+    pub async fn log_ai_action_public(
+        &self,
+        action_type: &str,
+        input_summary: &str,
+        output_summary: &str,
+        user_confirmed: bool,
+        destructive: bool,
+    ) {
+        self.log_ai_action(action_type, input_summary, output_summary, user_confirmed, destructive)
+            .await;
+    }
 
     /// Log an AI action to the audit trail.
     async fn log_ai_action(

@@ -4,10 +4,12 @@
 //! natural language job creation, and safety controls.
 
 use crate::ai_engine::{
-    AiAssistant, AiAuditEntry, AiChatMessage, AiFeatureToggles, AiSuggestion,
+    AiAssistant, AiAuditEntry, AiChatMessage, AiExecutionResult, AiFeatureToggles, AiSuggestion,
     ErrorExplanation, ParsedJobConfig, SuggestionContext,
 };
+use crate::automation_engine::AutomationManager;
 use crate::core::error::AppError;
+use crate::storage::Repository;
 use tauri::State;
 
 // ── T-043: Error Explanations ──
@@ -101,9 +103,166 @@ pub async fn ai_accept_suggestion(
 #[tauri::command]
 pub async fn ai_parse_natural_language(
     input: String,
+    context_path: Option<String>,
     assistant: State<'_, AiAssistant>,
 ) -> Result<ParsedJobConfig, AppError> {
-    assistant.parse_natural_language(&input).await
+    assistant
+        .parse_natural_language_with_context(&input, context_path.as_deref())
+        .await
+}
+
+// ── Intent Bar: Ollama Integration ──
+
+/// Probe whether Ollama is available locally.
+#[tauri::command]
+pub async fn ai_probe_ollama(
+    assistant: State<'_, AiAssistant>,
+) -> Result<bool, AppError> {
+    Ok(assistant.probe_ollama().await)
+}
+
+/// Execute a parsed intent (the bridge from NL → engine actions).
+#[tauri::command]
+pub async fn ai_execute_parsed_job(
+    config_json: String,
+    assistant: State<'_, AiAssistant>,
+    automation_mgr: State<'_, AutomationManager>,
+    repo: State<'_, Repository>,
+) -> Result<AiExecutionResult, AppError> {
+    let config: ParsedJobConfig = serde_json::from_str(&config_json).map_err(|e| {
+        AppError::State {
+            message: format!("Invalid parsed job config: {e}"),
+            advice: "The intent configuration is malformed.".to_string(),
+        }
+    })?;
+
+    let audit_id = uuid::Uuid::new_v4().to_string();
+
+    let result = match config.intent.as_str() {
+        "automation" => {
+            // Build an automation rule from the parsed config
+            let rule =
+                crate::ai_engine::parsed_job_to_automation_rule(&config, &config_json);
+            let rule_name = rule.name.clone();
+            let rule_id = rule.id.clone();
+            automation_mgr.save_rule(&repo, &rule).await?;
+            tracing::info!("Intent Bar: created automation rule '{rule_name}' ({rule_id})");
+
+            AiExecutionResult {
+                success: true,
+                action_taken: format!("Created automation rule: {rule_name}"),
+                entity_id: Some(rule_id),
+                audit_id: audit_id.clone(),
+            }
+        }
+        "sync" | "backup" => {
+            // Return a preview result — actual sync pair creation requires
+            // connection selection which needs user interaction
+            let source = config
+                .source_path
+                .clone()
+                .unwrap_or_else(|| "not specified".to_string());
+            let dest = config
+                .dest_connector
+                .clone()
+                .or(config.dest_path.clone())
+                .unwrap_or_else(|| "not specified".to_string());
+            let schedule_desc = config
+                .schedule_human
+                .clone()
+                .unwrap_or_else(|| "manual".to_string());
+
+            AiExecutionResult {
+                success: true,
+                action_taken: format!("sync:{source}→{dest}|schedule:{schedule_desc}"),
+                entity_id: config.preview_config.clone(),
+                audit_id: audit_id.clone(),
+            }
+        }
+        "transfer" => {
+            let source = config
+                .source_path
+                .clone()
+                .unwrap_or_else(|| "not specified".to_string());
+            let dest = config
+                .dest_connector
+                .clone()
+                .or(config.dest_path.clone())
+                .unwrap_or_else(|| "not specified".to_string());
+
+            AiExecutionResult {
+                success: true,
+                action_taken: format!("transfer:{source}→{dest}"),
+                entity_id: config.preview_config.clone(),
+                audit_id: audit_id.clone(),
+            }
+        }
+        "filter" | "navigate" => {
+            // These are frontend-only actions — return info for the UI to act on
+            let path = config.source_path.clone();
+            let filter_info = serde_json::json!({
+                "intent": config.intent,
+                "path": path,
+                "filter_patterns": config.filter_patterns,
+                "exclude_patterns": config.exclude_patterns,
+            });
+
+            AiExecutionResult {
+                success: true,
+                action_taken: config.intent.clone(),
+                entity_id: Some(filter_info.to_string()),
+                audit_id: audit_id.clone(),
+            }
+        }
+        "vault" => {
+            let source = config.source_path.clone();
+            AiExecutionResult {
+                success: true,
+                action_taken: "vault".to_string(),
+                entity_id: source,
+                audit_id: audit_id.clone(),
+            }
+        }
+        _ => {
+            AiExecutionResult {
+                success: true,
+                action_taken: format!("{}:{}", config.intent, config.source_path.clone().unwrap_or_default()),
+                entity_id: config.preview_config.clone(),
+                audit_id: audit_id.clone(),
+            }
+        }
+    };
+
+    // Log execution to audit
+    assistant
+        .log_ai_action_public(
+            "intent_executed",
+            &config.intent,
+            &result.action_taken,
+            true,
+            false,
+        )
+        .await;
+
+    Ok(result)
+}
+
+/// Get Ollama model name.
+#[tauri::command]
+pub async fn ai_get_ollama_model(
+    assistant: State<'_, AiAssistant>,
+) -> Result<String, AppError> {
+    Ok(assistant.get_ollama_model().await)
+}
+
+/// Set Ollama model name.
+#[tauri::command]
+pub async fn ai_set_ollama_model(
+    model: String,
+    assistant: State<'_, AiAssistant>,
+) -> Result<(), AppError> {
+    assistant.set_ollama_model(model).await;
+    Ok(())
 }
 
 // ── T-045: Safety Controls ──

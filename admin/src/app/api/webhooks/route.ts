@@ -53,18 +53,10 @@ const VALID_EVENTS = [
   'ai.suggestion_generated',
 ];
 
-function getApiKey(request: NextRequest): string | null {
-  const auth = request.headers.get('authorization');
-  if (auth?.startsWith('Bearer ')) return auth.slice(7);
-  return request.headers.get('x-api-key');
-}
-
 /** GET /api/webhooks */
 export async function GET(request: NextRequest) {
-  const apiKey = getApiKey(request);
-  if (!apiKey) {
-    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
-  }
+  const authResult = await requireRole(request, 'manager');
+  if (!isAuthorized(authResult)) return authResult;
 
   return NextResponse.json({
     webhooks: webhooks.map(w => ({

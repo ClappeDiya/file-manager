@@ -1,26 +1,29 @@
-//! Tauri commands for remote drive mounting (Finder-mounted remote storage).
+//! Tauri commands for remote drive mounting.
 //!
-//! Provides IPC commands for:
-//! - Mounting/unmounting remote connections as local directories
-//! - Listing active and saved mounts
-//! - Checking mount health/status
-//! - Saving/deleting persistent auto-mount configurations
-//!
-//! This is a stub implementation. Actual FUSE integration will be added
-//! when macFUSE (macOS) or libfuse (Linux) support is enabled.
+//! Uses native OS mount commands (mount_smbfs, sshfs, mount_nfs, etc.)
+//! to mount remote connections as local directories. Includes capability
+//! detection to report clearly when mounting is not possible.
 
 use crate::connectors::ConnectionManager;
 use crate::core::error::AppError;
-use crate::mount_engine::{MountConfig, MountInfo, MountManager, MountResult, MountStatus};
+use crate::mount_engine::{MountCapability, MountConfig, MountInfo, MountManager, MountResult, MountStatus};
 use crate::storage::Repository;
 use tauri::State;
 use uuid::Uuid;
 
-/// Mount a remote connection at a local directory.
+/// Check whether a protocol can be mounted on the current OS.
+#[tauri::command]
+pub async fn check_mount_capability(
+    protocol: String,
+    mount_mgr: State<'_, MountManager>,
+) -> Result<MountCapability, AppError> {
+    Ok(mount_mgr.check_capability(&protocol))
+}
+
+/// Mount a remote connection at a local directory using native OS commands.
 ///
-/// Validates that the connection exists, creates a mount entry,
-/// and returns the mount status. In stub mode, no actual FUSE mount
-/// is created — only metadata is tracked.
+/// Validates the connection exists, checks mount capability for the protocol,
+/// creates the mount point directory if needed, and executes the OS mount.
 #[tauri::command]
 pub async fn mount_remote(
     connection_id: String,

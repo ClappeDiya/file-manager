@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { dataStore } from '@/lib/data-store';
+import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /** GET /api/devices - List device health status */
 export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, 'viewer');
+  if (!isAuthorized(authResult)) return authResult;
+
   const { searchParams } = new URL(request.url);
   const status = searchParams.get('status');
   const userId = searchParams.get('userId');

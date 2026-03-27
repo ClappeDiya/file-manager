@@ -17,7 +17,10 @@ let connectors: Connector[] = [
 ];
 
 /** GET /api/connectors - List all connectors */
-export async function GET() {
+export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, 'viewer');
+  if (!isAuthorized(authResult)) return authResult;
+
   return NextResponse.json({ connectors });
 }
 
@@ -34,8 +37,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Name and type required' }, { status: 400 });
     }
 
+    const { v4: uuidv4 } = await import('uuid');
     const newConnector: Connector = {
-      id: `conn_${Date.now()}`,
+      id: `conn_${uuidv4().slice(0, 12)}`,
       name,
       type,
       status: 'disconnected',

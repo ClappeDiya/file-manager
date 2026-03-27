@@ -5,6 +5,9 @@ import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /** GET /api/users - List all users */
 export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, 'admin');
+  if (!isAuthorized(authResult)) return authResult;
+
   const { searchParams } = new URL(request.url);
   const role = searchParams.get('role');
   const search = searchParams.get('search');
@@ -41,8 +44,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'User already exists' }, { status: 409 });
     }
 
+    const { v4: uuidv4 } = await import('uuid');
     const newUser: AdminUser = {
-      id: `usr_${Date.now()}`,
+      id: `usr_${uuidv4().slice(0, 12)}`,
       email,
       name: name || email.split('@')[0],
       role: (role as Role) || 'user',
@@ -72,6 +76,13 @@ export async function PATCH(request: NextRequest) {
       return NextResponse.json({ error: 'Action and userIds required' }, { status: 400 });
     }
 
+    // Prevent self-deactivation/deletion
+    const currentUserEmail = authResult.user.email;
+    const currentUser = dataStore.users.find(u => u.email === currentUserEmail);
+    if (currentUser && userIds.includes(currentUser.id)) {
+      return NextResponse.json({ error: 'Cannot modify your own account via bulk operations' }, { status: 403 });
+    }
+
     switch (action) {
       case 'deactivate':
         dataStore.users = dataStore.users.map(u => userIds.includes(u.id) ? { ...u, isActive: false } : u);
@@ -79,9 +90,17 @@ export async function PATCH(request: NextRequest) {
       case 'activate':
         dataStore.users = dataStore.users.map(u => userIds.includes(u.id) ? { ...u, isActive: true } : u);
         break;
-      case 'remove':
+      case 'remove': {
+        // Prevent removing the last admin
+        const remainingAdmins = dataStore.users.filter(u =>
+          u.role === 'org_owner' && u.isActive && !userIds.includes(u.id)
+        );
+        if (remainingAdmins.length === 0) {
+          return NextResponse.json({ error: 'Cannot remove the last administrator' }, { status: 403 });
+        }
         dataStore.users = dataStore.users.filter(u => !userIds.includes(u.id));
         break;
+      }
       default:
         return NextResponse.json({ error: 'Unknown action' }, { status: 400 });
     }

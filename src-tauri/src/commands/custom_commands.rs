@@ -168,14 +168,70 @@ pub async fn expand_custom_command(
     Ok(expanded.join(" && "))
 }
 
+/// Allowlist of safe command prefixes. Commands whose first token (binary name)
+/// matches one of these are permitted without further review. All other commands
+/// are blocked unless the frontend passes `user_confirmed: true`, indicating the
+/// user explicitly approved execution via a native confirmation dialog.
+const ALLOWED_COMMANDS: &[&str] = &[
+    // File inspection
+    "cat", "head", "tail", "wc", "file", "stat", "du", "ls", "find",
+    // Text processing
+    "grep", "awk", "sed", "sort", "uniq", "cut", "tr", "diff", "jq",
+    // Media / document tools
+    "ffmpeg", "ffprobe", "convert", "identify", "exiftool", "mediainfo",
+    // Compression
+    "zip", "unzip", "tar", "gzip", "gunzip", "bzip2", "xz", "7z",
+    // Checksums
+    "md5sum", "sha256sum", "shasum", "xxhsum", "b2sum",
+    // Code tools
+    "git", "python3", "node", "npx", "cargo",
+    // Editors / viewers (non-destructive)
+    "open", "xdg-open", "code", "nano", "less", "bat",
+];
+
+/// Patterns that are always blocked regardless of allowlist or confirmation.
+const BLOCKED_PATTERNS: &[&str] = &[
+    "rm -rf /",
+    "mkfs",
+    "dd if=",
+    "> /dev/sd",
+    "chmod 777 /",
+    ":(){ :|:& };:",
+    "curl | sh",
+    "curl | bash",
+    "wget | sh",
+    "wget | bash",
+];
+
+/// Check if a command template's first token is in the allowlist.
+fn is_command_allowed(expanded: &str) -> bool {
+    // Extract the first token (binary name) from the expanded command
+    let first_token = expanded.split_whitespace().next().unwrap_or("");
+    // Match against the basename (e.g. "/usr/bin/grep" → "grep")
+    let basename = first_token.rsplit('/').next().unwrap_or(first_token);
+    ALLOWED_COMMANDS.iter().any(|&allowed| basename == allowed)
+}
+
+/// Check if a command contains any blocked dangerous patterns.
+fn contains_blocked_pattern(expanded: &str) -> Option<&'static str> {
+    let lower = expanded.to_lowercase();
+    BLOCKED_PATTERNS.iter().find(|&&pat| lower.contains(pat)).copied()
+}
+
 /// Execute a custom command locally and return the result.
 ///
 /// For remote execution, the frontend should route through the terminal panel.
+///
+/// Security: Commands are checked against an allowlist. Commands not on the
+/// allowlist require `user_confirmed: true` (the frontend must show a native
+/// OS confirmation dialog before setting this flag). Dangerous patterns are
+/// always blocked.
 #[tauri::command]
 pub async fn execute_custom_command(
     command_id: String,
     file_paths: Vec<String>,
     remote_base: Option<String>,
+    user_confirmed: Option<bool>,
 ) -> Result<CommandExecutionResult, AppError> {
     let commands = CUSTOM_COMMANDS.read().await;
     let cmd = commands
@@ -216,6 +272,28 @@ pub async fn execute_custom_command(
             .collect::<Vec<_>>()
             .join(" && ")
     };
+
+    // Block dangerous patterns unconditionally
+    if let Some(pattern) = contains_blocked_pattern(&expanded) {
+        return Err(AppError::file_op(
+            format!("Command blocked: contains dangerous pattern '{pattern}'"),
+            "This command pattern is not allowed for safety reasons.",
+        ));
+    }
+
+    // Check allowlist — if not on the list, require explicit user confirmation
+    if !is_command_allowed(&expanded) {
+        if user_confirmed != Some(true) {
+            return Err(AppError::file_op(
+                format!("Command '{}' requires confirmation. The command is not on the safe allowlist.", cmd.name),
+                "The frontend must show a confirmation dialog and re-call with user_confirmed: true.",
+            ));
+        }
+        tracing::warn!(
+            "Executing non-allowlisted command with user confirmation: {}",
+            cmd.name
+        );
+    }
 
     // Determine if the command needs a shell (pipes, redirects, &&, etc.)
     let needs_shell = expanded.contains('|')

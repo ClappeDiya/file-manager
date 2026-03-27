@@ -90,28 +90,41 @@ export function exportAuditEntries(
         'User Email', 'IP Address', 'Description', 'Resource Type', 'Resource ID',
         'Integrity Hash',
       ];
+      // Sanitize CSV cell values to prevent formula injection
+      const sanitizeCell = (value: string): string => {
+        let v = value.replace(/"/g, '""');
+        // Prefix formula-triggering characters to prevent spreadsheet injection
+        if (/^[=+\-@\t\r]/.test(v)) {
+          v = `'${v}`;
+        }
+        return `"${v}"`;
+      };
       const rows = entries.map(e => [
-        e.id,
-        e.eventType,
-        e.severity,
-        e.timestamp,
-        e.userId,
-        e.userName,
-        e.userEmail,
-        e.ipAddress,
-        `"${e.description.replace(/"/g, '""')}"`,
-        e.resourceType ?? '',
-        e.resourceId ?? '',
-        e.integrityHash,
+        sanitizeCell(e.id),
+        sanitizeCell(e.eventType),
+        sanitizeCell(e.severity),
+        sanitizeCell(e.timestamp),
+        sanitizeCell(e.userId),
+        sanitizeCell(e.userName),
+        sanitizeCell(e.userEmail),
+        sanitizeCell(e.ipAddress),
+        sanitizeCell(e.description),
+        sanitizeCell(e.resourceType ?? ''),
+        sanitizeCell(e.resourceId ?? ''),
+        sanitizeCell(e.integrityHash),
       ]);
       return [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
     }
 
     case 'syslog': {
+      // Sanitize syslog values: strip newlines and control characters to prevent log injection
+      const sanitizeSyslog = (v: string): string =>
+        // eslint-disable-next-line no-control-regex
+        v.replace(/[\r\n\u0000-\u001f\u007f]/g, ' ').replace(/"/g, '\\"');
       return entries
         .map(e => {
           const severity = { info: 6, warning: 4, error: 3, critical: 2 }[e.severity];
-          return `<${severity}>1 ${e.timestamp} ufop-admin - ${e.eventType} - ${e.description} [meta userId="${e.userId}" ip="${e.ipAddress}"]`;
+          return `<${severity}>1 ${sanitizeSyslog(e.timestamp)} ufop-admin - ${sanitizeSyslog(e.eventType)} - ${sanitizeSyslog(e.description)} [meta userId="${sanitizeSyslog(e.userId)}" ip="${sanitizeSyslog(e.ipAddress)}"]`;
         })
         .join('\n');
     }

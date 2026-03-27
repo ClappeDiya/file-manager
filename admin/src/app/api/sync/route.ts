@@ -28,18 +28,10 @@ interface SyncPair {
 
 const syncPairs: SyncPair[] = [];
 
-function getApiKey(request: NextRequest): string | null {
-  const auth = request.headers.get('authorization');
-  if (auth?.startsWith('Bearer ')) return auth.slice(7);
-  return request.headers.get('x-api-key');
-}
-
 /** GET /api/sync - List sync pairs */
 export async function GET(request: NextRequest) {
-  const apiKey = getApiKey(request);
-  if (!apiKey) {
-    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
-  }
+  const authResult = await requireRole(request, 'viewer');
+  if (!isAuthorized(authResult)) return authResult;
 
   const { searchParams } = new URL(request.url);
   const status = searchParams.get('status');

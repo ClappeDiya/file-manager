@@ -94,9 +94,7 @@ export const useAuthStore = create<AuthState>()(
     }),
     {
       name: 'ufop-admin-auth',
-      partialize: (state) => ({
-        user: state.user,
-      }),
+      partialize: () => ({}),
     }
   )
 );

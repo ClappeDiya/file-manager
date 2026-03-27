@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use tokio::sync::RwLock;
+use zeroize::Zeroize;
 
 // Block size for block blob uploads: 4MB
 #[allow(dead_code)]
@@ -67,8 +68,12 @@ pub enum AzureBlobType {
 }
 
 /// Azure authentication method.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Secret fields implement `Drop` via the containing struct's `Zeroize` derive
+/// to clear credentials from memory when no longer needed.
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
 #[serde(rename_all = "snake_case")]
+#[zeroize(drop)]
 pub enum AzureAuthMethod {
     /// Storage account key
     AccountKey { account_name: String, account_key: String },
@@ -240,6 +245,8 @@ impl AzureBlobConnector {
     }
 
     /// Generate a SAS URL for temporary access to a blob.
+    ///
+    /// Implements Azure Storage Service SAS v2023-01-03 with HMAC-SHA256 signing.
     pub async fn generate_sas_url(
         &self,
         container: &str,
@@ -251,9 +258,93 @@ impl AzureBlobConnector {
             AppError::connection("Not connected", "Connect first.")
         })?;
 
+        let account_key = match &conn.config.auth_method {
+            AzureAuthMethod::AccountKey { account_key, .. } => {
+                if account_key.is_empty() {
+                    return Err(AppError::Configuration {
+                        message: "Account key is empty".to_string(),
+                        advice: "Provide an Azure Storage account key to generate SAS URLs.".to_string(),
+                    });
+                }
+                account_key.clone()
+            }
+            AzureAuthMethod::SasToken { sas_token, .. } => {
+                // Already have a SAS token — append it directly
+                let base = Self::endpoint_url(&conn.account_name, &conn.config.endpoint_url);
+                let token = sas_token.trim_start_matches('?');
+                return Ok(format!("{base}/{container}/{blob_name}?{token}"));
+            }
+            _ => {
+                return Err(AppError::Configuration {
+                    message: "SAS URL generation requires AccountKey or SasToken auth".to_string(),
+                    advice: "Switch to AccountKey authentication to generate SAS URLs.".to_string(),
+                });
+            }
+        };
+
         let base = Self::endpoint_url(&conn.account_name, &conn.config.endpoint_url);
-        // In real implementation, this would compute HMAC-SHA256 signature
-        let url = format!("{base}/{container}/{blob_name}?sv=2023-01-03&se=placeholder&sp=r&sig=placeholder");
+        let sv = "2023-01-03";
+        let sp = "r"; // read permission
+        let sr = "b"; // blob resource
+        let st = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let se = (chrono::Utc::now() + chrono::Duration::hours(expiry_hours as i64))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let spr = "https";
+        let canonicalized_resource = format!("/blob/{}/{}/{}", conn.account_name, container, blob_name);
+
+        // Build string-to-sign per Azure Storage SAS v2023-01-03 spec
+        let string_to_sign = format!(
+            "{sp}\n{st}\n{se}\n{cr}\n\n\n{spr}\n{sv}\n{sr}\n\n\n\n\n\n",
+            sp = sp,
+            st = st,
+            se = se,
+            cr = canonicalized_resource,
+            spr = spr,
+            sv = sv,
+            sr = sr,
+        );
+
+        // HMAC-SHA256 sign with Base64-decoded account key
+        let key_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &account_key,
+        )
+        .map_err(|e| AppError::Configuration {
+            message: format!("Invalid account key (Base64 decode failed): {e}"),
+            advice: "Check that the Azure Storage account key is correctly copied.".to_string(),
+        })?;
+
+        use hmac::{Hmac, Mac};
+        type HmacSha256 = Hmac<sha2::Sha256>;
+
+        let mut mac = HmacSha256::new_from_slice(&key_bytes)
+            .map_err(|e| AppError::Internal { message: format!("HMAC init failed: {e}") })?;
+        mac.update(string_to_sign.as_bytes());
+        let signature = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            mac.finalize().into_bytes(),
+        );
+
+        let sig_encoded = percent_encoding::utf8_percent_encode(
+            &signature,
+            percent_encoding::NON_ALPHANUMERIC,
+        );
+
+        let url = format!(
+            "{base}/{container}/{blob_name}?sv={sv}&st={st}&se={se}&sr={sr}&sp={sp}&spr={spr}&sig={sig}",
+            base = base,
+            container = container,
+            blob_name = blob_name,
+            sv = sv,
+            st = st,
+            se = se,
+            sr = sr,
+            sp = sp,
+            spr = spr,
+            sig = sig_encoded,
+        );
+
         tracing::info!("Generated SAS URL for {}/{} (expires in {}h)", container, blob_name, expiry_hours);
         Ok(url)
     }

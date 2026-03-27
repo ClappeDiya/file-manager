@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use tokio::sync::RwLock;
+use zeroize::Zeroize;
 
 // Large object segment size: 5GB (Swift limit per segment)
 #[allow(dead_code)]
@@ -31,8 +32,12 @@ const DEFAULT_SEGMENT_SIZE: u64 = 100 * 1024 * 1024;
 // ── Swift Types ──
 
 /// OpenStack authentication method.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Secret fields are zeroized on drop to prevent credential leakage
+/// in memory dumps or core files.
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
 #[serde(rename_all = "snake_case")]
+#[zeroize(drop)]
 pub enum SwiftAuthMethod {
     /// Keystone v3 (username + password + project)
     KeystoneV3 {
@@ -118,11 +123,13 @@ pub struct SwiftObjectMeta {
 }
 
 /// Internal Swift connection state.
+///
+/// The auth_token is zeroized on drop to prevent leakage in memory dumps.
 #[allow(dead_code)]
 struct SwiftConnection {
     config: SwiftConfig,
     storage_url: String,
-    auth_token: String,
+    auth_token: zeroize::Zeroizing<String>,
     token_expires: Option<DateTime<Utc>>,
     connected: bool,
 }
@@ -145,42 +152,239 @@ impl SwiftConnector {
         }
     }
 
-    /// Authenticate and obtain a token.
+    /// Authenticate and obtain a token via the configured auth method.
     async fn authenticate(config: &SwiftConfig) -> Result<(String, String, Option<DateTime<Utc>>), AppError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| AppError::connection(&format!("HTTP client error: {e}"), "Check TLS configuration."))?;
+
         match &config.auth_method {
-            SwiftAuthMethod::KeystoneV3 { auth_url, username, project_name, domain_name, .. } => {
+            SwiftAuthMethod::KeystoneV3 { auth_url, username, password, project_name, domain_name, region } => {
                 tracing::info!(
                     "Authenticating via Keystone v3: {} user={} project={} domain={}",
                     auth_url, username, project_name, domain_name
                 );
-                // Real implementation: POST to auth_url/auth/tokens
-                // with identity/password and scope/project
-                Ok((
-                    format!("{}/v1/AUTH_{}", auth_url.trim_end_matches("/identity/v3"), project_name),
-                    "placeholder-token".to_string(),
-                    None,
-                ))
+
+                let auth_body = serde_json::json!({
+                    "auth": {
+                        "identity": {
+                            "methods": ["password"],
+                            "password": {
+                                "user": {
+                                    "name": username,
+                                    "password": password,
+                                    "domain": { "name": domain_name }
+                                }
+                            }
+                        },
+                        "scope": {
+                            "project": {
+                                "name": project_name,
+                                "domain": { "name": domain_name }
+                            }
+                        }
+                    }
+                });
+
+                let token_url = format!("{}/auth/tokens", auth_url.trim_end_matches('/'));
+                let resp = client
+                    .post(&token_url)
+                    .json(&auth_body)
+                    .send()
+                    .await
+                    .map_err(|e| AppError::connection(
+                        &format!("Keystone v3 auth failed: {e}"),
+                        "Check auth URL, credentials, and network connectivity.",
+                    ))?;
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(AppError::connection(
+                        &format!("Keystone v3 auth returned {status}: {body}"),
+                        "Check username, password, project, and domain.",
+                    ));
+                }
+
+                let auth_token = resp
+                    .headers()
+                    .get("x-subject-token")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from)
+                    .ok_or_else(|| AppError::connection(
+                        "Keystone v3 response missing X-Subject-Token header",
+                        "The identity service may be misconfigured.",
+                    ))?;
+
+                let catalog: serde_json::Value = resp.json().await.map_err(|e| {
+                    AppError::connection(&format!("Failed to parse Keystone response: {e}"), "")
+                })?;
+
+                // Extract storage URL from service catalog
+                let storage_url = Self::extract_swift_endpoint(&catalog, region.as_deref())?;
+
+                // Parse token expiry
+                let token_expires = catalog
+                    .pointer("/token/expires_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc));
+
+                Ok((storage_url, auth_token, token_expires))
             }
-            SwiftAuthMethod::ApplicationCredential { auth_url, credential_id, .. } => {
+
+            SwiftAuthMethod::ApplicationCredential { auth_url, credential_id, credential_secret } => {
                 tracing::info!("Authenticating via application credential: {}", credential_id);
-                Ok((
-                    format!("{}/v1/AUTH_app", auth_url),
-                    "placeholder-token".to_string(),
-                    None,
-                ))
+
+                let auth_body = serde_json::json!({
+                    "auth": {
+                        "identity": {
+                            "methods": ["application_credential"],
+                            "application_credential": {
+                                "id": credential_id,
+                                "secret": credential_secret
+                            }
+                        }
+                    }
+                });
+
+                let token_url = format!("{}/auth/tokens", auth_url.trim_end_matches('/'));
+                let resp = client
+                    .post(&token_url)
+                    .json(&auth_body)
+                    .send()
+                    .await
+                    .map_err(|e| AppError::connection(
+                        &format!("Application credential auth failed: {e}"),
+                        "Check credential ID, secret, and auth URL.",
+                    ))?;
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(AppError::connection(
+                        &format!("Application credential auth returned {status}: {body}"),
+                        "Verify the credential has not expired or been revoked.",
+                    ));
+                }
+
+                let auth_token = resp
+                    .headers()
+                    .get("x-subject-token")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from)
+                    .ok_or_else(|| AppError::connection(
+                        "Keystone response missing X-Subject-Token header",
+                        "The identity service may be misconfigured.",
+                    ))?;
+
+                let catalog: serde_json::Value = resp.json().await.map_err(|e| {
+                    AppError::connection(&format!("Failed to parse Keystone response: {e}"), "")
+                })?;
+
+                let storage_url = Self::extract_swift_endpoint(&catalog, None)?;
+                let token_expires = catalog
+                    .pointer("/token/expires_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc));
+
+                Ok((storage_url, auth_token, token_expires))
             }
-            SwiftAuthMethod::TempAuth { auth_url, username, .. } => {
+
+            SwiftAuthMethod::TempAuth { auth_url, username, password } => {
                 tracing::info!("Authenticating via TempAuth: {} user={}", auth_url, username);
-                Ok((
-                    format!("{}/v1/AUTH_{}", auth_url, username),
-                    "placeholder-token".to_string(),
-                    None,
-                ))
+
+                let resp = client
+                    .get(auth_url)
+                    .header("X-Auth-User", username.as_str())
+                    .header("X-Auth-Key", password.as_str())
+                    .send()
+                    .await
+                    .map_err(|e| AppError::connection(
+                        &format!("TempAuth request failed: {e}"),
+                        "Check auth URL and credentials.",
+                    ))?;
+
+                if !resp.status().is_success() {
+                    return Err(AppError::connection(
+                        &format!("TempAuth returned {}", resp.status()),
+                        "Check username and key.",
+                    ));
+                }
+
+                let storage_url = resp
+                    .headers()
+                    .get("x-storage-url")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from)
+                    .ok_or_else(|| AppError::connection(
+                        "TempAuth response missing X-Storage-Url",
+                        "The Swift proxy may not support TempAuth.",
+                    ))?;
+
+                let auth_token = resp
+                    .headers()
+                    .get("x-auth-token")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from)
+                    .ok_or_else(|| AppError::connection(
+                        "TempAuth response missing X-Auth-Token",
+                        "The Swift proxy may not support TempAuth.",
+                    ))?;
+
+                Ok((storage_url, auth_token, None))
             }
+
             SwiftAuthMethod::Token { storage_url, auth_token } => {
                 Ok((storage_url.clone(), auth_token.clone(), None))
             }
         }
+    }
+
+    /// Extract the object-store endpoint from a Keystone v3 service catalog.
+    fn extract_swift_endpoint(
+        catalog: &serde_json::Value,
+        region: Option<&str>,
+    ) -> Result<String, AppError> {
+        let services = catalog
+            .pointer("/token/catalog")
+            .and_then(|c| c.as_array())
+            .ok_or_else(|| AppError::connection(
+                "Keystone catalog not found in token response",
+                "The identity service may not have a service catalog configured.",
+            ))?;
+
+        for svc in services {
+            let svc_type = svc.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if svc_type != "object-store" {
+                continue;
+            }
+            if let Some(endpoints) = svc.get("endpoints").and_then(|e| e.as_array()) {
+                // Prefer public interface, optionally filter by region
+                for ep in endpoints {
+                    let interface = ep.get("interface").and_then(|i| i.as_str()).unwrap_or("");
+                    let ep_region = ep.get("region_id").and_then(|r| r.as_str());
+                    if interface == "public" {
+                        if let Some(wanted) = region {
+                            if ep_region == Some(wanted) {
+                                if let Some(url) = ep.get("url").and_then(|u| u.as_str()) {
+                                    return Ok(url.trim_end_matches('/').to_string());
+                                }
+                            }
+                        } else if let Some(url) = ep.get("url").and_then(|u| u.as_str()) {
+                            return Ok(url.trim_end_matches('/').to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(AppError::connection(
+            "No object-store endpoint found in Keystone catalog",
+            "Ensure the Swift service is registered in the catalog for this project.",
+        ))
     }
 
     /// List containers in the account.
@@ -295,30 +499,51 @@ impl SwiftConnector {
         Ok(())
     }
 
-    /// Generate a temporary URL for an object.
+    /// Generate a temporary URL for an object using HMAC-SHA256 signing.
     pub async fn generate_temp_url(
         &self,
         container: &str,
         object_name: &str,
         expires_secs: u64,
-        _method: &str,
+        method: &str,
     ) -> Result<String, AppError> {
         let state = self.state.read().await;
         let conn = state.as_ref().ok_or_else(|| {
             AppError::connection("Not connected", "Connect first.")
         })?;
 
-        let _key = conn.config.temp_url_key.as_ref().ok_or_else(|| {
+        let key = conn.config.temp_url_key.as_ref().ok_or_else(|| {
             AppError::file_op(
                 "TempURL key not configured",
                 "Set a TempURL key in the Swift connection settings.",
             )
         })?;
 
-        // Real implementation: HMAC-SHA256 of method\nexpires\npath
-        let path = format!("/v1/AUTH_account/{}/{}", container, object_name);
-        let url = format!("{}{}?temp_url_sig=placeholder&temp_url_expires={}", conn.storage_url, path, expires_secs);
-        tracing::info!("Generated TempURL for {}/{}", container, object_name);
+        // Extract the path portion from storage_url
+        let storage_path = url::Url::parse(&conn.storage_url)
+            .map(|u| u.path().to_string())
+            .unwrap_or_else(|_| "/v1/AUTH_account".to_string());
+
+        let path = format!("{}/{}/{}", storage_path.trim_end_matches('/'), container, object_name);
+        let expires = chrono::Utc::now().timestamp() as u64 + expires_secs;
+
+        // HMAC-SHA256 of "METHOD\nexpires\npath"
+        let string_to_sign = format!("{}\n{}\n{}", method.to_uppercase(), expires, path);
+
+        use hmac::{Hmac, Mac};
+        type HmacSha256 = Hmac<sha2::Sha256>;
+
+        let mut mac = HmacSha256::new_from_slice(key.as_bytes())
+            .map_err(|e| AppError::Internal { message: format!("HMAC init failed: {e}") })?;
+        mac.update(string_to_sign.as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
+
+        let url = format!(
+            "{}{}?temp_url_sig={}&temp_url_expires={}",
+            conn.storage_url, path, signature, expires
+        );
+
+        tracing::info!("Generated TempURL for {}/{} (expires in {}s)", container, object_name, expires_secs);
         Ok(url)
     }
 
@@ -392,7 +617,7 @@ impl Connector for SwiftConnector {
             *self.state.write().await = Some(SwiftConnection {
                 config,
                 storage_url,
-                auth_token,
+                auth_token: zeroize::Zeroizing::new(auth_token),
                 token_expires,
                 connected: true,
             });

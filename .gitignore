@@ -4,7 +4,7 @@ target/
 
 # Build output
 dist/
-.next/
+**/.next/
 out/
 .vite/
 

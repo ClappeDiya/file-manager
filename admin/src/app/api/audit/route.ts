@@ -2,9 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { dataStore } from '@/lib/data-store';
 import type { AuditEventType, AuditSeverity, AuditExportFormat } from '@/lib/types/audit';
 import { exportAuditEntries } from '@/lib/utils/audit-integrity';
+import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /** GET /api/audit - Query audit log with search/filter */
 export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, 'admin');
+  if (!isAuthorized(authResult)) return authResult;
+
   const { searchParams } = new URL(request.url);
   const eventType = searchParams.get('eventType') as AuditEventType | null;
   const severity = searchParams.get('severity') as AuditSeverity | null;
@@ -13,8 +17,8 @@ export async function GET(request: NextRequest) {
   const dateTo = searchParams.get('dateTo');
   const search = searchParams.get('search');
   const exportFormat = searchParams.get('export') as AuditExportFormat | null;
-  const page = parseInt(searchParams.get('page') || '1');
-  const pageSize = parseInt(searchParams.get('pageSize') || '50');
+  const page = Math.max(1, parseInt(searchParams.get('page') || '1'));
+  const pageSize = Math.min(200, Math.max(1, parseInt(searchParams.get('pageSize') || '50')));
 
   let entries = [...dataStore.auditEntries];
 

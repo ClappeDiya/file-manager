@@ -6,6 +6,9 @@ import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /** GET /api/policies - List all policies */
 export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, 'viewer');
+  if (!isAuthorized(authResult)) return authResult;
+
   const { searchParams } = new URL(request.url);
   const domain = searchParams.get('domain') as PolicyDomain | null;
   const target = searchParams.get('target') as PolicyAssignmentTarget | null;
@@ -41,8 +44,9 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    const { v4: uuidv4 } = await import('uuid');
     const newPolicy: PolicyRule = {
-      id: `pol_${Date.now()}`,
+      id: `pol_${uuidv4().slice(0, 12)}`,
       domain,
       name,
       description: description || '',
@@ -89,9 +93,18 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: 'Policy not found' }, { status: 404 });
     }
 
+    // Whitelist allowed update fields to prevent mass assignment
+    const ALLOWED_UPDATE_FIELDS = ['name', 'description', 'configuration', 'enforcementMode', 'assignmentTarget', 'assignmentValue', 'isActive'] as const;
+    const safeUpdates: Record<string, unknown> = {};
+    for (const field of ALLOWED_UPDATE_FIELDS) {
+      if (field in updates) {
+        safeUpdates[field] = updates[field];
+      }
+    }
+
     dataStore.policies[index] = {
       ...dataStore.policies[index],
-      ...updates,
+      ...safeUpdates,
       updatedAt: new Date().toISOString(),
       version: dataStore.policies[index].version + 1,
     };
