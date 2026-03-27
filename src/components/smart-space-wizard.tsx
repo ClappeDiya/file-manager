@@ -17,6 +17,7 @@ import {
   Briefcase,
   ChevronRight,
   ChevronLeft,
+  X,
 } from "lucide-react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { useSpacesStore, type SmartSpace } from "@/stores/spaces-store";
@@ -156,16 +157,33 @@ export function SmartSpaceWizard({ onClose }: SmartSpaceWizardProps) {
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>
-            {step === 1 && "Create Smart Space"}
-            {step === 2 && "Connect Remote (Optional)"}
-            {step === 3 && "Sync Rule (Optional)"}
-          </DialogTitle>
-          <DialogDescription>
-            {step === 1 && "Bundle a local folder with a remote connection."}
-            {step === 2 && "Link an existing connection or skip for local-only."}
-            {step === 3 && "Attach a sync pair or skip."}
-          </DialogDescription>
+          <div className="flex items-start justify-between">
+            <div className="flex-1 min-w-0">
+              <DialogTitle>
+                {step === 1 && "Create Smart Space"}
+                {step === 2 && "Connect Remote (Optional)"}
+                {step === 3 && "Sync Rule (Optional)"}
+              </DialogTitle>
+              <DialogDescription>
+                {step === 1 && "Bundle a local folder with a remote connection."}
+                {step === 2 && "Link an existing connection or skip for local-only."}
+                {step === 3 && "Attach a sync pair or skip."}
+              </DialogDescription>
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className={cn(
+                "shrink-0 ml-2 p-1 rounded-md",
+                "text-[color:var(--color-text-tertiary)]",
+                "hover:text-[color:var(--color-text-primary)] hover:bg-[var(--color-hover-bg)]",
+                "transition-colors",
+              )}
+              aria-label="Close"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
         </DialogHeader>
 
         <div className="space-y-4 py-2">
@@ -390,6 +408,18 @@ export function SmartSpaceWizard({ onClose }: SmartSpaceWizardProps) {
             </span>
 
             <div className="flex gap-2">
+              <button
+                className={cn(
+                  "rounded-md border px-3 py-1.5 text-sm",
+                  "bg-[var(--color-input-bg)] border-[var(--color-border)]",
+                  "text-[color:var(--color-text-tertiary)]",
+                  "hover:bg-[var(--color-hover-bg)]",
+                )}
+                onClick={onClose}
+                type="button"
+              >
+                Cancel
+              </button>
               {step > 1 && (
                 <button
                   className={cn(

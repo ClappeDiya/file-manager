@@ -39,7 +39,7 @@
     "shortDescription": "Cross-platform file manager, transfer, sync & governance",
     "longDescription": "Unified File Operations Platform provides comprehensive file management with local/remote browsing, multi-protocol transfers (SFTP, FTP, WebDAV, S3, GCS, Azure), real-time sync, and data governance across macOS, Windows, and Linux.",
     "copyright": "Copyright (c) 2024 UFOP Team",
-    "licenseFile": "../LICENSE",
+    "licenseFile": null,
     "resources": [],
     "externalBin": [],
     "macOS": {
