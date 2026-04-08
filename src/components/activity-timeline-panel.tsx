@@ -50,6 +50,7 @@ import {
   Ban,
   MinusCircle,
   AlertTriangle,
+  Link2,
 } from "lucide-react";
 
 /**
@@ -223,6 +224,12 @@ export function ActivityTimelinePanel() {
   const [filter, setFilter] = useState<EngineFilter>("all");
   const [query, setQuery] = useState("");
   const [failedOnly, setFailedOnly] = useState(false);
+  // Correlation-trace filter: when set, the timeline narrows to every
+  // event sharing this correlation_id — exposing the cross-engine causal
+  // chain the ledger already records (e.g. one sync run → N fs writes →
+  // M automation fires). This surfaces hidden operation tracing with
+  // literally one new predicate; zero backend changes.
+  const [correlationFilter, setCorrelationFilter] = useState<string | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -333,8 +340,11 @@ export function ActivityTimelinePanel() {
   // path so users can find by what happened, what kind of op, or where.
   const filteredEvents = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (filter === "all" && q === "" && !failedOnly) return events;
+    if (filter === "all" && q === "" && !failedOnly && correlationFilter === null) {
+      return events;
+    }
     return events.filter((e) => {
+      if (correlationFilter !== null && e.correlation_id !== correlationFilter) return false;
       if (filter !== "all" && e.engine !== filter) return false;
       if (failedOnly && e.status === "ok") return false;
       if (q === "") return true;
@@ -343,7 +353,7 @@ export function ActivityTimelinePanel() {
       if (e.subject_path && e.subject_path.toLowerCase().includes(q)) return true;
       return false;
     });
-  }, [events, filter, query, failedOnly]);
+  }, [events, filter, query, failedOnly, correlationFilter]);
 
   // Pre-compute engine → count for the filter chips so users can see at a
   // glance where activity is concentrated. Single pass, no repeated loops.
@@ -367,7 +377,7 @@ export function ActivityTimelinePanel() {
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = 0;
-  }, [query, filter, failedOnly]);
+  }, [query, filter, failedOnly, correlationFilter]);
 
   // How many events are non-ok (failed/cancelled/skipped)? This drives
   // the header "failed only" toggle badge — users debugging problems
@@ -493,6 +503,37 @@ export function ActivityTimelinePanel() {
         )}
       </div>
 
+      {/*
+       * Active correlation-trace chip. Only rendered when the user has
+       * clicked into a correlation on a row — presents the short ID with
+       * a one-click clear. Placed above the engine chips so it's obvious
+       * *why* the list just narrowed, and so clearing it is instant.
+       */}
+      {correlationFilter !== null && (
+        <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--color-border)] bg-sky-500/5">
+          <Link2 className="h-3 w-3 text-sky-500" aria-hidden="true" />
+          <span className="text-[11px] text-[color:var(--color-text-muted)]">
+            Tracing operation
+          </span>
+          <code
+            className="flex-1 truncate rounded bg-[var(--color-bg-primary)] px-1.5 py-0.5 text-[10px] text-[color:var(--color-text)]"
+            title={correlationFilter}
+          >
+            {correlationFilter.length > 12
+              ? `${correlationFilter.slice(0, 8)}…`
+              : correlationFilter}
+          </code>
+          <button
+            type="button"
+            onClick={() => setCorrelationFilter(null)}
+            aria-label="Clear correlation trace filter"
+            className="rounded p-0.5 text-[color:var(--color-text-muted)] hover:text-[color:var(--color-text)]"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </div>
+      )}
+
       {/* Engine filter chips — only show engines that actually appeared */}
       {activeEngines.length > 0 && (
         <div className="flex flex-wrap gap-1 px-3 py-2 border-b border-[var(--color-border)]">
@@ -540,11 +581,18 @@ export function ActivityTimelinePanel() {
             </div>
           )}
           {!loading && filteredEvents.length === 0 && (
-            <EmptyState filter={filter} query={query} failedOnly={failedOnly} />
+            <EmptyState
+              filter={filter}
+              query={query}
+              failedOnly={failedOnly}
+              correlationFilter={correlationFilter}
+            />
           )}
           <TimelineList
             events={filteredEvents}
             onNavigate={navigateToEvent}
+            onTrace={setCorrelationFilter}
+            activeCorrelation={correlationFilter}
             query={query}
           />
         </div>
@@ -585,17 +633,22 @@ function EmptyState({
   filter,
   query,
   failedOnly,
+  correlationFilter,
 }: {
   filter: EngineFilter;
   query: string;
   failedOnly: boolean;
+  correlationFilter: string | null;
 }) {
   const hasQuery = query.trim() !== "";
-  // Message priority: query first (most specific), then failed-only, then
+  // Message priority: correlation trace first (most specific — user is
+  // tracing a single operation), then query, then failed-only, then
   // engine filter, then the default "nothing ran yet" state. Keeps the
   // copy aligned with the most recently-set filter so users understand
   // why they're seeing an empty list.
-  const message = hasQuery
+  const message = correlationFilter !== null
+    ? "No other events in this operation trace."
+    : hasQuery
     ? `No activity matches "${query.trim()}".`
     : failedOnly
       ? "No failed events in the recent window — everything is healthy."
@@ -623,10 +676,14 @@ function EmptyState({
 function TimelineList({
   events,
   onNavigate,
+  onTrace,
+  activeCorrelation,
   query,
 }: {
   events: LedgerEvent[];
   onNavigate: (event: LedgerEvent) => void;
+  onTrace: (id: string | null) => void;
+  activeCorrelation: string | null;
   query: string;
 }) {
   let lastDay: string | null = null;
@@ -649,6 +706,8 @@ function TimelineList({
         key={ev.id}
         event={ev}
         onNavigate={onNavigate}
+        onTrace={onTrace}
+        activeCorrelation={activeCorrelation}
         query={query}
       />,
     );
@@ -659,10 +718,14 @@ function TimelineList({
 function TimelineRow({
   event,
   onNavigate,
+  onTrace,
+  activeCorrelation,
   query,
 }: {
   event: LedgerEvent;
   onNavigate: (event: LedgerEvent) => void;
+  onTrace: (id: string | null) => void;
+  activeCorrelation: string | null;
   query: string;
 }) {
   const EngineIcon = ENGINE_ICONS[event.engine] ?? Activity;
@@ -676,8 +739,14 @@ function TimelineRow({
   // as a plain container rather than a button so assistive tech doesn't
   // announce a dead "press to activate" affordance.
   const navigable = event.subject_path !== null && event.subject_path.length > 0;
+  const hasCorrelation = event.correlation_id !== null && event.correlation_id.length > 0;
+  const isTraceActive = hasCorrelation && event.correlation_id === activeCorrelation;
 
-  const commonInner = (
+  // The row body holds engine icon + summary + meta line. Kept as plain
+  // content so we can wrap it in either a <button> (navigable) or a <div>
+  // (not navigable) without nesting interactive elements — the trace
+  // affordance is rendered as a sibling, never a descendant, of the body.
+  const body = (
     <>
       <EngineIcon
         className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-[color:var(--color-text-muted)]"
@@ -721,23 +790,60 @@ function TimelineRow({
     </>
   );
 
-  if (!navigable) {
-    return (
-      <div className="flex items-start gap-2 rounded-md py-1.5 px-2">
-        {commonInner}
-      </div>
-    );
-  }
-
-  return (
+  // Trace affordance — shown only when this event carries a correlation_id.
+  // Clicking it narrows the whole timeline to every event in the same causal
+  // chain (sync run → fs writes → automation fires). When that same trace is
+  // already active, clicking again clears it — so the button is a toggle.
+  const traceButton = hasCorrelation ? (
     <button
       type="button"
-      onClick={() => onNavigate(event)}
-      className="flex w-full items-start gap-2 rounded-md py-1.5 px-2 text-left hover:bg-[var(--color-bg-tertiary)] focus:outline-none focus:ring-2 focus:ring-sky-500/40"
-      title={`Jump to ${event.subject_path}`}
-      aria-label={`Jump to ${event.subject_path}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        onTrace(isTraceActive ? null : event.correlation_id);
+      }}
+      title={
+        isTraceActive
+          ? "Clear operation trace"
+          : "Trace all events in this operation"
+      }
+      aria-label={
+        isTraceActive
+          ? "Clear operation trace"
+          : `Trace all events in operation ${event.correlation_id}`
+      }
+      aria-pressed={isTraceActive}
+      className={cn(
+        "flex-shrink-0 rounded p-1 transition-colors focus:outline-none focus:ring-2 focus:ring-sky-500/40",
+        isTraceActive
+          ? "text-sky-500"
+          : "text-[color:var(--color-text-muted)] opacity-0 hover:text-sky-500 group-hover:opacity-100 focus:opacity-100",
+      )}
     >
-      {commonInner}
+      <Link2 className="h-3 w-3" aria-hidden="true" />
     </button>
+  ) : null;
+
+  // Use a flex container with the (maybe-navigable) body as one child and
+  // the trace button as a sibling. The body holds its own interactivity —
+  // the two never nest, which keeps a11y semantics clean.
+  return (
+    <div className="group flex items-start gap-1 rounded-md pr-1 hover:bg-[var(--color-bg-tertiary)]">
+      {navigable ? (
+        <button
+          type="button"
+          onClick={() => onNavigate(event)}
+          className="flex min-w-0 flex-1 items-start gap-2 rounded-md py-1.5 pl-2 pr-1 text-left focus:outline-none focus:ring-2 focus:ring-sky-500/40"
+          title={`Jump to ${event.subject_path}`}
+          aria-label={`Jump to ${event.subject_path}`}
+        >
+          {body}
+        </button>
+      ) : (
+        <div className="flex min-w-0 flex-1 items-start gap-2 py-1.5 pl-2 pr-1">
+          {body}
+        </div>
+      )}
+      {traceButton}
+    </div>
   );
 }
