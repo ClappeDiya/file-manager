@@ -161,6 +161,39 @@ pub enum AutomationStatus {
     Running,
 }
 
+/// DRY helper that translates an [`AutomationLog`] into a unified ledger
+/// event. Used by BOTH the manual `run_rule` path and the autonomous
+/// scheduler watcher path so the cross-engine timeline captures every
+/// fire — including the ones that happen while the user is asleep.
+pub(crate) async fn record_automation_log(
+    ledger: &crate::ledger::OperationLedger,
+    log: &AutomationLog,
+) {
+    use crate::ledger::{LedgerEngine, LedgerStatus, RecordEvent};
+
+    let status = match log.status {
+        AutomationStatus::Success => LedgerStatus::Ok,
+        AutomationStatus::Failed => LedgerStatus::Failed,
+        AutomationStatus::Skipped => LedgerStatus::Skipped,
+        AutomationStatus::Running => LedgerStatus::Ok,
+    };
+
+    let summary = match (&log.error_message, log.files_affected.len()) {
+        (Some(err), _) => format!("automation '{}' failed: {}", log.rule_name, err),
+        (None, 0) => format!("automation '{}' fired", log.rule_name),
+        (None, n) => format!("automation '{}' fired ({} files)", log.rule_name, n),
+    };
+
+    let mut ev = RecordEvent::new(LedgerEngine::Automation, "rule_fire")
+        .status(status)
+        .correlation(&log.rule_id)
+        .summary(summary);
+    if let Some(first) = log.files_affected.first() {
+        ev = ev.subject(first.clone());
+    }
+    ledger.record(ev).await;
+}
+
 // ── Manager ──
 
 /// Maximum number of active filesystem watchers to prevent resource exhaustion.
@@ -179,6 +212,11 @@ pub struct AutomationManager {
     exec_semaphore: Arc<tokio::sync::Semaphore>,
     /// Cooldown tracker to prevent circular triggers (file_path -> last_trigger_time).
     cooldowns: Arc<RwLock<HashMap<String, std::time::Instant>>>,
+    /// Optional unified Operation Ledger. When `Some`, every rule execution
+    /// (manual via `run_rule` AND autonomous via the scheduler watcher path)
+    /// emits a ledger event. Optional so existing tests / non-Tauri callers
+    /// can construct the manager without a ledger.
+    ledger: Option<crate::ledger::OperationLedger>,
 }
 
 impl AutomationManager {
@@ -189,7 +227,15 @@ impl AutomationManager {
             active_watchers: Arc::new(RwLock::new(HashMap::new())),
             exec_semaphore: Arc::new(tokio::sync::Semaphore::new(5)),
             cooldowns: Arc::new(RwLock::new(HashMap::new())),
+            ledger: None,
         }
+    }
+
+    /// Inject the unified Operation Ledger. Idempotent; subsequent calls
+    /// replace the previous handle. Should be called BEFORE
+    /// [`start_all_watchers`] so autonomous fires are captured.
+    pub fn set_ledger(&mut self, ledger: crate::ledger::OperationLedger) {
+        self.ledger = Some(ledger);
     }
 
     /// Load rules from SQLite on startup.
@@ -405,6 +451,7 @@ impl AutomationManager {
             self.cooldowns.clone(),
             self.rules.clone(),
             self.logs.clone(),
+            self.ledger.clone(),
         )?;
 
         self.active_watchers.write().await.insert(rule.id.clone(), handle);
@@ -463,6 +510,12 @@ impl AutomationManager {
         // Save log
         self.save_log(repo, &log).await?;
         self.logs.write().await.push(log.clone());
+
+        // Emit a unified-ledger event for this rule fire (manual path).
+        // Fail-open: ledger errors are swallowed inside `record`.
+        if let Some(ledger) = &self.ledger {
+            record_automation_log(ledger, &log).await;
+        }
 
         Ok(log)
     }

@@ -13,6 +13,7 @@ pub mod encryption_commands;
 pub mod file_ops_commands;
 pub mod fs_commands;
 pub mod integrity_commands;
+pub mod ledger_commands;
 pub mod log_commands;
 pub mod master_password_commands;
 pub mod mount_commands;

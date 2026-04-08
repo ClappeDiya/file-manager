@@ -41,6 +41,7 @@ pub fn start_file_watcher(
     cooldowns: Arc<RwLock<HashMap<String, Instant>>>,
     rules: Arc<RwLock<Vec<AutomationRule>>>,
     logs: Arc<RwLock<Vec<AutomationLog>>>,
+    ledger: Option<crate::ledger::OperationLedger>,
 ) -> Result<WatchHandle, crate::core::error::AppError> {
     let path = PathBuf::from(&watch_path);
 
@@ -193,6 +194,13 @@ pub fn start_file_watcher(
 
                         // Store log
                         logs.write().await.push(log.clone());
+
+                        // Emit unified-ledger event for the autonomous fire.
+                        // This is the ONLY way users see autonomous activity
+                        // in the cross-engine timeline. Fail-open.
+                        if let Some(led) = &ledger {
+                            super::record_automation_log(led, &log).await;
+                        }
 
                         tracing::info!(
                             "Automation '{}' executed for '{}': {:?}",

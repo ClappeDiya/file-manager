@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useFileManagerStore, type ViewMode } from "@/stores/file-manager-store";
 import { useUIStore } from "@/stores/ui-store";
-import { useAiStore } from "@/stores/ai-store";
+import { useAiStore, type AiExecutionResult } from "@/stores/ai-store";
 import { useAutomationStore } from "@/stores/automation-store";
 import { useSpacesStore } from "@/stores/spaces-store";
 import { useTerminalStore } from "@/stores/terminal-store";
@@ -18,6 +18,9 @@ import { AiPanel } from "./ai-panel";
 import { AutomationPanel } from "./automation-panel";
 import { SmartSpaceWizard } from "./smart-space-wizard";
 import { TerminalPanel } from "./terminal-panel";
+import { SinceLastSeenToast, type LedgerSinceSummary } from "./since-last-seen-toast";
+import { ActivityTimelinePanel } from "./activity-timeline-panel";
+import { useActivityTimelineStore } from "@/stores/activity-timeline-store";
 import { useFileSelection, useFileDragDrop } from "@/hooks/use-file-selection";
 import { cn } from "@ufop/ui-components";
 import { Button, Badge } from "@ufop/ui-components";
@@ -89,6 +92,9 @@ export function FileManager() {
   const automationPanelOpen = useAutomationStore((s) => s.panelOpen);
   const toggleAutomationPanel = useAutomationStore((s) => s.togglePanel);
 
+  // Activity Timeline panel (unified ledger viewer)
+  const toggleActivityTimeline = useActivityTimelineStore((s) => s.togglePanel);
+
   // Smart Spaces
   const spacesWizardOpen = useSpacesStore((s) => s.wizardOpen);
   const closeSpacesWizard = useSpacesStore((s) => s.closeWizard);
@@ -132,6 +138,54 @@ export function FileManager() {
   const handleDeleteWorkspace = useCallback((id: string) => {
     deleteWorkspace(id);
   }, [deleteWorkspace]);
+
+  // Intent Bar execution result handler
+  const handleIntentResult = useCallback((result: AiExecutionResult) => {
+    if (!result.success) return;
+
+    const action = result.action_taken;
+
+    if (action === "filter" || action === "navigate") {
+      // Frontend-only: navigate or filter
+      if (result.entity_id) {
+        try {
+          const info = JSON.parse(result.entity_id);
+          if (info.path) {
+            // Navigate to the path
+            const store = useFileManagerStore.getState();
+            const pane = store.panes[store.activePaneIndex];
+            const tab = pane?.tabs.find((t) => t.id === pane.activeTabId);
+            if (tab) {
+              store.navigateTab(store.activePaneIndex, tab.id, info.path, info.path.split("/").pop() || info.path);
+            }
+          }
+        } catch {
+          // not parseable, ignore
+        }
+      }
+    } else if (action === "vault") {
+      // Open vault panel — no separate panel toggle exists yet, but we could open AI panel
+      // For now, just log
+      console.log("Intent: open vault for", result.entity_id);
+    } else if (action.startsWith("sync:") || action.startsWith("transfer:")) {
+      // Show a toast-like message via structured error (info level)
+      const uiStore = useUIStore.getState();
+      uiStore.addStructuredError({
+        what: action.includes("sync") ? "Sync pair configured" : "Transfer configured",
+        why: "Created from your natural language request",
+        appDid: result.action_taken,
+        userAction: "Open the Sync panel to review and activate",
+      });
+    } else if (action.startsWith("Created automation")) {
+      const uiStore = useUIStore.getState();
+      uiStore.addStructuredError({
+        what: "Automation rule created",
+        why: "Created from your natural language request",
+        appDid: action,
+        userAction: "Open Quickflows panel to review and enable",
+      });
+    }
+  }, []);
 
   // Context menu state
   const [contextMenu, setContextMenu] = useState<{
@@ -177,6 +231,11 @@ export function FileManager() {
         e.preventDefault();
         toggleTerminalPanel();
       }
+      // Cmd+Shift+Y to toggle Activity Timeline (unified ledger viewer)
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "Y") {
+        e.preventDefault();
+        toggleActivityTimeline();
+      }
       // Cmd+Shift+. to toggle hidden files (#85)
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === ".") {
         e.preventDefault();
@@ -208,7 +267,28 @@ export function FileManager() {
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [toggleSidebar, undoStack, toggleAiPanel, toggleTerminalPanel, handleUndo, handleSaveWorkspace]);
+  }, [toggleSidebar, undoStack, toggleAiPanel, toggleTerminalPanel, toggleActivityTimeline, handleUndo, handleSaveWorkspace]);
+
+  // "What happened while you were away?" — single mount-time ledger
+  // summary call. Reads events added since the last session and shows a
+  // dismissible toast if any activity ran (e.g. overnight automation
+  // fires, background syncs). Backend atomically advances the
+  // "last seen" marker. Zero value shown on fresh installs.
+  const [sinceSummary, setSinceSummary] = useState<LedgerSinceSummary | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const summary = await tauriInvokeSafe<LedgerSinceSummary | null>(
+        "ledger_since_last_seen",
+        undefined,
+        null,
+      );
+      if (!cancelled) setSinceSummary(summary);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Poll for editor file changes every 2 seconds (Issue #4: Editor File Watch)
   useEffect(() => {
@@ -312,12 +392,15 @@ export function FileManager() {
           useAutomationStore.getState().openEditor();
         },
         onCreateSmartSpace: () => useSpacesStore.getState().openWizard(),
+        onToggleActivityTimeline: toggleActivityTimeline,
       }),
-    [toggleSidebar, handleUndo, handleSaveWorkspace, getFirstSelectedPath, toggleAutomationPanel, automationPanelOpen],
+    [toggleSidebar, handleUndo, handleSaveWorkspace, getFirstSelectedPath, toggleAutomationPanel, automationPanelOpen, toggleActivityTimeline],
   );
 
   return (
     <div className="flex h-full flex-col" data-testid="file-manager">
+      {/* "What happened while you were away?" mount-time summary toast */}
+      <SinceLastSeenToast summary={sinceSummary} onDismiss={() => setSinceSummary(null)} />
       {/* Toolbar */}
       <header
         className="relative flex items-center justify-between border-b border-[var(--color-border)] bg-[var(--color-toolbar-bg)] px-4"
@@ -589,6 +672,7 @@ export function FileManager() {
         </div>
 
         <AutomationPanel />
+        <ActivityTimelinePanel />
         <AiPanel />
       </div>
 
@@ -614,6 +698,7 @@ export function FileManager() {
         commands={commands}
         isOpen={commandPaletteOpen}
         onClose={() => setCommandPaletteOpen(false)}
+        onExecutionResult={handleIntentResult}
       />
     </div>
   );

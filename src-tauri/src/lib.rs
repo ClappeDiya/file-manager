@@ -6,6 +6,7 @@ pub mod connectors;
 pub mod core;
 pub mod fs_engine;
 pub mod governance;
+pub mod ledger;
 pub mod mount_engine;
 pub mod security;
 pub mod storage;
@@ -16,7 +17,8 @@ pub mod transfer_engine;
 use ai_engine::AiAssistant;
 use automation_engine::AutomationManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, log_commands, master_password_commands, mount_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, ledger_commands, log_commands, master_password_commands, mount_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, url_handler_commands, version_commands};
+use ledger::OperationLedger;
 use commands::terminal_commands::TerminalManager;
 use connectors::{ConnectionManager, ConnectorRegistry, GoogleDriveConnector, OneDriveConnector, PeerManager, S3Connector, ServerTransferManager};
 use mount_engine::MountManager;
@@ -52,6 +54,7 @@ struct AppState {
     automation_mgr: AutomationManager,
     spaces_mgr: SpacesManager,
     confirmation_mgr: ConfirmationManager,
+    ledger: OperationLedger,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -126,8 +129,18 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // Initialize editor state (external editor mappings and file watch)
     let editor_state = std::sync::Arc::new(commands::editor_commands::EditorState::new());
 
+    // Operation Ledger — unified append-only event store across all engines.
+    // Created BEFORE the automation manager so we can inject it and capture
+    // autonomous rule fires in the cross-engine timeline.
+    let ledger = OperationLedger::new(repo.pool().clone());
+    // Best-effort startup prune (30-day retention). Non-fatal.
+    if let Err(e) = ledger.prune(30).await {
+        tracing::warn!("Operation ledger prune failed (non-fatal): {e}");
+    }
+
     // Initialize automation manager (Quickflows)
-    let automation_mgr = AutomationManager::new();
+    let mut automation_mgr = AutomationManager::new();
+    automation_mgr.set_ledger(ledger.clone());
     if let Err(e) = automation_mgr.load_rules_from_db(&repo).await {
         tracing::warn!("Failed to load automation rules (non-fatal): {e}");
     }
@@ -164,6 +177,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         automation_mgr,
         spaces_mgr,
         confirmation_mgr,
+        ledger,
     })
 }
 
@@ -205,6 +219,9 @@ pub fn run() {
                 let credential_store = std::sync::Arc::new(CredentialStore::new());
                 let connection_mgr = ConnectionManager::new(repo.clone(), credential_store);
                 let transfer_history = TransferHistory::new(repo.pool().clone());
+                let ledger = OperationLedger::new(repo.pool().clone());
+                let mut automation_mgr = AutomationManager::new();
+                automation_mgr.set_ledger(ledger.clone());
                 AppState {
                     repo,
                     transfer_mgr: TransferManager::new(),
@@ -223,9 +240,10 @@ pub fn run() {
                     gdrive_connector: std::sync::Arc::new(GoogleDriveConnector::new()),
                     onedrive_connector: std::sync::Arc::new(OneDriveConnector::new()),
                     editor_state: std::sync::Arc::new(commands::editor_commands::EditorState::new()),
-                    automation_mgr: AutomationManager::new(),
+                    automation_mgr,
                     spaces_mgr: SpacesManager::new(),
                     confirmation_mgr: ConfirmationManager::new(),
+                    ledger,
                 }
             }
         }
@@ -262,6 +280,7 @@ pub fn run() {
         .manage(app_state.automation_mgr)
         .manage(app_state.spaces_mgr)
         .manage(app_state.confirmation_mgr)
+        .manage(app_state.ledger)
         .invoke_handler(tauri::generate_handler![
             // System
             system_commands::greet,
@@ -269,6 +288,7 @@ pub fn run() {
             system_commands::get_platform_info,
             // Filesystem
             fs_commands::list_directory,
+            fs_commands::pick_folder,
             // State management
             state_commands::save_workspace_state,
             state_commands::load_workspace_state,
@@ -644,6 +664,12 @@ pub fn run() {
             space_commands::activate_space,
             space_commands::attach_space_automation,
             space_commands::detach_space_automation,
+            // Operation Ledger (unified cross-engine event store)
+            ledger_commands::ledger_recent,
+            ledger_commands::ledger_query,
+            ledger_commands::ledger_count,
+            ledger_commands::ledger_prune,
+            ledger_commands::ledger_since_last_seen,
         ])
         .on_window_event(move |_window, event| {
             if let tauri::WindowEvent::Destroyed = event {

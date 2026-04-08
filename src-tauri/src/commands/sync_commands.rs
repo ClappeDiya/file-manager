@@ -5,6 +5,7 @@
 
 use crate::core::error::AppError;
 use crate::core::types::*;
+use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
 use crate::sync_engine::SyncManager;
 use tauri::State;
 use uuid::Uuid;
@@ -16,6 +17,33 @@ fn parse_uuid(s: &str) -> Result<Uuid, AppError> {
         message: format!("Invalid UUID '{}': {}", s, e),
         advice: "Provide a valid UUID.".to_string(),
     })
+}
+
+/// DRY ledger helper for the sync engine. Mirrors the Phase 2/3a pattern.
+async fn record_sync(
+    ledger: &OperationLedger,
+    kind: &str,
+    status: LedgerStatus,
+    pair_id: &str,
+    summary: String,
+    subject: Option<String>,
+    target: Option<String>,
+    bytes: Option<u64>,
+) {
+    let mut ev = RecordEvent::new(LedgerEngine::Sync, kind)
+        .status(status)
+        .correlation(pair_id)
+        .summary(summary);
+    if let Some(s) = subject {
+        ev = ev.subject(s);
+    }
+    if let Some(t) = target {
+        ev = ev.target(t);
+    }
+    if let Some(b) = bytes {
+        ev = ev.bytes(b as i64);
+    }
+    ledger.record(ev).await;
 }
 
 // ── T-039: Sync Pair CRUD ──
@@ -36,6 +64,7 @@ pub async fn create_sync_pair(
     checksum_enabled: Option<bool>,
     time_offset_secs: Option<i64>,
     manager: State<'_, SyncManager>,
+    ledger: State<'_, OperationLedger>,
 ) -> Result<SyncPair, AppError> {
     let sync_mode = SyncMode::from_str_lossy(&mode);
 
@@ -78,7 +107,19 @@ pub async fn create_sync_pair(
     };
 
     use crate::core::traits::SyncOperations;
-    manager.create_pair(pair).await
+    let created = manager.create_pair(pair).await?;
+    record_sync(
+        &ledger,
+        "create_pair",
+        LedgerStatus::Ok,
+        &created.id.to_string(),
+        format!("create_pair: {} ({} → {})", created.name, created.source_path, created.dest_path),
+        Some(created.source_path.clone()),
+        Some(created.dest_path.clone()),
+        None,
+    )
+    .await;
+    Ok(created)
 }
 
 /// Detect server time offset by comparing local clock to remote filesystem timestamp.
@@ -134,10 +175,23 @@ pub async fn detect_time_offset(
 pub async fn delete_sync_pair(
     pair_id: String,
     manager: State<'_, SyncManager>,
+    ledger: State<'_, OperationLedger>,
 ) -> Result<(), AppError> {
     let id = parse_uuid(&pair_id)?;
     use crate::core::traits::SyncOperations;
-    manager.delete_pair(id).await
+    manager.delete_pair(id).await?;
+    record_sync(
+        &ledger,
+        "delete_pair",
+        LedgerStatus::Ok,
+        &pair_id,
+        format!("delete_pair: {pair_id}"),
+        None,
+        None,
+        None,
+    )
+    .await;
+    Ok(())
 }
 
 /// List all sync pairs.
@@ -167,9 +221,54 @@ pub async fn update_sync_pair(
 pub async fn run_sync(
     pair_id: String,
     manager: State<'_, SyncManager>,
+    ledger: State<'_, OperationLedger>,
 ) -> Result<SyncReport, AppError> {
     let id = parse_uuid(&pair_id)?;
-    manager.execute_sync(id).await
+    let result = manager.execute_sync(id).await;
+    match &result {
+        Ok(report) => {
+            let status = match report.status {
+                SyncRunStatus::Success => LedgerStatus::Ok,
+                SyncRunStatus::PartialSuccess => LedgerStatus::Ok,
+                SyncRunStatus::Failed => LedgerStatus::Failed,
+                SyncRunStatus::Cancelled => LedgerStatus::Cancelled,
+                SyncRunStatus::Running => LedgerStatus::Ok,
+            };
+            record_sync(
+                &ledger,
+                "run",
+                status,
+                &pair_id,
+                format!(
+                    "sync run: {} (+{} ~{} -{}, {} bytes, {}ms)",
+                    report.pair_name,
+                    report.files_added,
+                    report.files_modified,
+                    report.files_deleted,
+                    report.bytes_transferred,
+                    report.duration_ms,
+                ),
+                None,
+                None,
+                Some(report.bytes_transferred),
+            )
+            .await;
+        }
+        Err(e) => {
+            record_sync(
+                &ledger,
+                "run",
+                LedgerStatus::Failed,
+                &pair_id,
+                format!("sync run failed: {e}"),
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
+    }
+    result
 }
 
 /// Get the health indicator for a sync pair.
@@ -253,9 +352,22 @@ pub async fn get_sync_reports(
 pub async fn rollback_sync(
     pair_id: String,
     manager: State<'_, SyncManager>,
+    ledger: State<'_, OperationLedger>,
 ) -> Result<u64, AppError> {
     let id = parse_uuid(&pair_id)?;
-    manager.rollback_last_run(id).await
+    let count = manager.rollback_last_run(id).await?;
+    record_sync(
+        &ledger,
+        "rollback",
+        LedgerStatus::Ok,
+        &pair_id,
+        format!("rollback: {count} entries reverted"),
+        None,
+        None,
+        None,
+    )
+    .await;
+    Ok(count)
 }
 
 /// Export a sync report as CSV.
@@ -287,9 +399,22 @@ pub async fn export_sync_report_json(
 pub async fn start_sync_watcher(
     pair_id: String,
     manager: State<'_, SyncManager>,
+    ledger: State<'_, OperationLedger>,
 ) -> Result<(), AppError> {
     let id = parse_uuid(&pair_id)?;
-    manager.start_watcher(id).await
+    manager.start_watcher(id).await?;
+    record_sync(
+        &ledger,
+        "watcher_start",
+        LedgerStatus::Ok,
+        &pair_id,
+        format!("watcher_start: {pair_id}"),
+        None,
+        None,
+        None,
+    )
+    .await;
+    Ok(())
 }
 
 /// Stop filesystem watcher for a sync pair.
@@ -297,9 +422,22 @@ pub async fn start_sync_watcher(
 pub async fn stop_sync_watcher(
     pair_id: String,
     manager: State<'_, SyncManager>,
+    ledger: State<'_, OperationLedger>,
 ) -> Result<(), AppError> {
     let id = parse_uuid(&pair_id)?;
-    manager.stop_watcher(id).await
+    manager.stop_watcher(id).await?;
+    record_sync(
+        &ledger,
+        "watcher_stop",
+        LedgerStatus::Ok,
+        &pair_id,
+        format!("watcher_stop: {pair_id}"),
+        None,
+        None,
+        None,
+    )
+    .await;
+    Ok(())
 }
 
 /// Validate a cron expression for scheduling.

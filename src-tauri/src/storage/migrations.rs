@@ -67,8 +67,41 @@ fn all_migrations() -> Vec<Migration> {
             description: "Smart Spaces - named workspaces bundling local folder + connection + sync pair + automations",
             sql: V10_SCHEMA,
         },
+        Migration {
+            version: 11,
+            description: "Operation Ledger - unified append-only event store across all engines",
+            sql: V11_SCHEMA,
+        },
     ]
 }
+
+/// Schema v11: Operation Ledger - unified append-only event store across all engines.
+///
+/// One row per operation event from any engine (transfer, sync, automation, fs, mount,
+/// spaces, ai, vault). Powers cross-engine timeline, "what happened to file X" lookup,
+/// undo of last operation, and forensic queries — without each engine inventing its
+/// own log table. Writes are fail-open from engine call sites: a ledger error never
+/// fails the underlying operation.
+const V11_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS operation_ledger (
+    id              TEXT PRIMARY KEY NOT NULL,
+    occurred_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    engine          TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'ok',
+    subject_path    TEXT,
+    target_path     TEXT,
+    bytes           INTEGER,
+    correlation_id  TEXT,
+    summary         TEXT NOT NULL DEFAULT '',
+    details_json    TEXT NOT NULL DEFAULT '{}',
+    undo_token      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_oplog_occurred  ON operation_ledger(occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_oplog_engine    ON operation_ledger(engine, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_oplog_subject   ON operation_ledger(subject_path);
+CREATE INDEX IF NOT EXISTS idx_oplog_correlation ON operation_ledger(correlation_id);
+"#;
 
 /// Schema v9: Automation engine - quickflow rules and execution logs.
 const V9_SCHEMA: &str = r#"
@@ -625,7 +658,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 10);
+        assert_eq!(applied, 11);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -655,7 +688,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 10);
+        assert_eq!(first, 11);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -668,7 +701,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 10);
+        assert_eq!(current_version(&conn).unwrap(), 11);
     }
 
     #[test]

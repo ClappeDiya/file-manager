@@ -1,9 +1,49 @@
 use crate::core::error::AppError;
 use crate::core::types::FileEntry;
+use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// DRY helper: record a successful filesystem operation in the unified ledger.
+///
+/// Fail-open by construction — `OperationLedger::record` swallows DB errors and
+/// only logs them at warn level. Callers do not need to handle failure.
+///
+/// Records a single subject/target pair for batches; for multi-source ops we
+/// emit one record per pair so the timeline / undo views can show each item.
+async fn record_fs_ok(
+    ledger: &OperationLedger,
+    kind: &str,
+    sources: &[String],
+    dests: &[String],
+    correlation_id: &str,
+) {
+    // Pair sources to dests where possible; otherwise record each side alone.
+    let pair_count = sources.len().max(dests.len()).max(1);
+    for i in 0..pair_count {
+        let subject = sources.get(i).cloned();
+        let target = dests.get(i).cloned();
+        let summary = match (&subject, &target) {
+            (Some(s), Some(t)) => format!("{kind}: {s} → {t}"),
+            (Some(s), None) => format!("{kind}: {s}"),
+            (None, Some(t)) => format!("{kind}: {t}"),
+            (None, None) => kind.to_string(),
+        };
+        let mut ev = RecordEvent::new(LedgerEngine::Fs, kind)
+            .status(LedgerStatus::Ok)
+            .summary(summary)
+            .correlation(correlation_id);
+        if let Some(s) = subject {
+            ev = ev.subject(s);
+        }
+        if let Some(t) = target {
+            ev = ev.target(t);
+        }
+        ledger.record(ev).await;
+    }
+}
 
 /// Result of a file operation, used for undo support.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +72,15 @@ pub struct FileOpProgress {
 pub async fn copy_files(
     source_paths: Vec<String>,
     dest_dir: String,
+    ledger: tauri::State<'_, OperationLedger>,
+) -> Result<FileOpResult, AppError> {
+    copy_files_impl(source_paths, dest_dir, &ledger).await
+}
+
+pub async fn copy_files_impl(
+    source_paths: Vec<String>,
+    dest_dir: String,
+    ledger: &OperationLedger,
 ) -> Result<FileOpResult, AppError> {
     let dest_path = Path::new(&dest_dir);
     if !dest_path.exists() {
@@ -98,12 +147,15 @@ pub async fn copy_files(
         dest_paths.push(target.to_string_lossy().to_string());
     }
 
+    let undo_id = Uuid::new_v4().to_string();
+    record_fs_ok(ledger, "copy", &source_paths, &dest_paths, &undo_id).await;
+
     Ok(FileOpResult {
         success: true,
         operation: "copy".to_string(),
         source_paths,
         dest_paths,
-        undo_id: Uuid::new_v4().to_string(),
+        undo_id,
     })
 }
 
@@ -112,6 +164,15 @@ pub async fn copy_files(
 pub async fn move_files(
     source_paths: Vec<String>,
     dest_dir: String,
+    ledger: tauri::State<'_, OperationLedger>,
+) -> Result<FileOpResult, AppError> {
+    move_files_impl(source_paths, dest_dir, &ledger).await
+}
+
+pub async fn move_files_impl(
+    source_paths: Vec<String>,
+    dest_dir: String,
+    ledger: &OperationLedger,
 ) -> Result<FileOpResult, AppError> {
     let dest_path = Path::new(&dest_dir);
     if !dest_path.exists() {
@@ -154,12 +215,15 @@ pub async fn move_files(
         dest_paths.push(target.to_string_lossy().to_string());
     }
 
+    let undo_id = Uuid::new_v4().to_string();
+    record_fs_ok(ledger, "move", &source_paths, &dest_paths, &undo_id).await;
+
     Ok(FileOpResult {
         success: true,
         operation: "move".to_string(),
         source_paths,
         dest_paths,
-        undo_id: Uuid::new_v4().to_string(),
+        undo_id,
     })
 }
 
@@ -168,6 +232,15 @@ pub async fn move_files(
 pub async fn rename_file(
     path: String,
     new_name: String,
+    ledger: tauri::State<'_, OperationLedger>,
+) -> Result<FileOpResult, AppError> {
+    rename_file_impl(path, new_name, &ledger).await
+}
+
+pub async fn rename_file_impl(
+    path: String,
+    new_name: String,
+    ledger: &OperationLedger,
 ) -> Result<FileOpResult, AppError> {
     let src = Path::new(&path);
     if !src.exists() {
@@ -204,12 +277,17 @@ pub async fn rename_file(
         )
     })?;
 
+    let undo_id = Uuid::new_v4().to_string();
+    let source_paths = vec![path];
+    let dest_paths = vec![target.to_string_lossy().to_string()];
+    record_fs_ok(ledger, "rename", &source_paths, &dest_paths, &undo_id).await;
+
     Ok(FileOpResult {
         success: true,
         operation: "rename".to_string(),
-        source_paths: vec![path],
-        dest_paths: vec![target.to_string_lossy().to_string()],
-        undo_id: Uuid::new_v4().to_string(),
+        source_paths,
+        dest_paths,
+        undo_id,
     })
 }
 
@@ -217,6 +295,14 @@ pub async fn rename_file(
 #[tauri::command]
 pub async fn duplicate_files(
     paths: Vec<String>,
+    ledger: tauri::State<'_, OperationLedger>,
+) -> Result<FileOpResult, AppError> {
+    duplicate_files_impl(paths, &ledger).await
+}
+
+pub async fn duplicate_files_impl(
+    paths: Vec<String>,
+    ledger: &OperationLedger,
 ) -> Result<FileOpResult, AppError> {
     let mut dest_paths = Vec::new();
 
@@ -279,12 +365,15 @@ pub async fn duplicate_files(
         dest_paths.push(target.to_string_lossy().to_string());
     }
 
+    let undo_id = Uuid::new_v4().to_string();
+    record_fs_ok(ledger, "duplicate", &paths, &dest_paths, &undo_id).await;
+
     Ok(FileOpResult {
         success: true,
         operation: "duplicate".to_string(),
         source_paths: paths,
         dest_paths,
-        undo_id: Uuid::new_v4().to_string(),
+        undo_id,
     })
 }
 
@@ -294,6 +383,15 @@ pub async fn duplicate_files(
 pub async fn delete_files(
     paths: Vec<String>,
     permanent: bool,
+    ledger: tauri::State<'_, OperationLedger>,
+) -> Result<FileOpResult, AppError> {
+    delete_files_impl(paths, permanent, &ledger).await
+}
+
+pub async fn delete_files_impl(
+    paths: Vec<String>,
+    permanent: bool,
+    ledger: &OperationLedger,
 ) -> Result<FileOpResult, AppError> {
     for path in &paths {
         let p = Path::new(path);
@@ -326,22 +424,32 @@ pub async fn delete_files(
         }
     }
 
+    let undo_id = Uuid::new_v4().to_string();
+    let kind = if permanent { "delete_permanent" } else { "delete_trash" };
+    record_fs_ok(ledger, kind, &paths, &[], &undo_id).await;
+
     Ok(FileOpResult {
         success: true,
-        operation: if permanent {
-            "delete_permanent".to_string()
-        } else {
-            "delete_trash".to_string()
-        },
+        operation: kind.to_string(),
         source_paths: paths,
         dest_paths: vec![],
-        undo_id: Uuid::new_v4().to_string(),
+        undo_id,
     })
 }
 
 /// Create a new directory.
 #[tauri::command]
-pub async fn create_directory(path: String) -> Result<FileOpResult, AppError> {
+pub async fn create_directory(
+    path: String,
+    ledger: tauri::State<'_, OperationLedger>,
+) -> Result<FileOpResult, AppError> {
+    create_directory_impl(path, &ledger).await
+}
+
+pub async fn create_directory_impl(
+    path: String,
+    ledger: &OperationLedger,
+) -> Result<FileOpResult, AppError> {
     let p = Path::new(&path);
     if p.exists() {
         return Err(AppError::file_op(
@@ -357,18 +465,32 @@ pub async fn create_directory(path: String) -> Result<FileOpResult, AppError> {
         )
     })?;
 
+    let undo_id = Uuid::new_v4().to_string();
+    let dest_paths = vec![path];
+    record_fs_ok(ledger, "create_folder", &[], &dest_paths, &undo_id).await;
+
     Ok(FileOpResult {
         success: true,
         operation: "create_folder".to_string(),
         source_paths: vec![],
-        dest_paths: vec![path],
-        undo_id: Uuid::new_v4().to_string(),
+        dest_paths,
+        undo_id,
     })
 }
 
 /// Create a new empty file.
 #[tauri::command]
-pub async fn create_file(path: String) -> Result<FileOpResult, AppError> {
+pub async fn create_file(
+    path: String,
+    ledger: tauri::State<'_, OperationLedger>,
+) -> Result<FileOpResult, AppError> {
+    create_file_impl(path, &ledger).await
+}
+
+pub async fn create_file_impl(
+    path: String,
+    ledger: &OperationLedger,
+) -> Result<FileOpResult, AppError> {
     let p = Path::new(&path);
     if p.exists() {
         return Err(AppError::file_op(
@@ -396,12 +518,16 @@ pub async fn create_file(path: String) -> Result<FileOpResult, AppError> {
         )
     })?;
 
+    let undo_id = Uuid::new_v4().to_string();
+    let dest_paths = vec![path];
+    record_fs_ok(ledger, "create_file", &[], &dest_paths, &undo_id).await;
+
     Ok(FileOpResult {
         success: true,
         operation: "create_file".to_string(),
         source_paths: vec![],
-        dest_paths: vec![path],
-        undo_id: Uuid::new_v4().to_string(),
+        dest_paths,
+        undo_id,
     })
 }
 
@@ -918,14 +1044,25 @@ fn is_default_port(protocol: &str, port: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::DbPool;
     use std::fs;
     use tempfile::tempdir;
+
+    /// Build a fresh in-memory ledger for tests. The `operation_ledger` table
+    /// does not need to exist for `record()` to be called — it's fail-open.
+    /// We exercise the IPC command path, not the ledger persistence path
+    /// (that's covered by `crate::ledger::tests`).
+    fn test_ledger() -> OperationLedger {
+        let pool = DbPool::open_in_memory().unwrap();
+        OperationLedger::new(pool)
+    }
 
     #[tokio::test]
     async fn test_create_file() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.txt").to_string_lossy().to_string();
-        let result = create_file(file_path.clone()).await.unwrap();
+        let l = test_ledger();
+        let result = create_file_impl(file_path.clone(), &l).await.unwrap();
         assert!(result.success);
         assert_eq!(result.operation, "create_file");
         assert!(Path::new(&file_path).exists());
@@ -935,7 +1072,8 @@ mod tests {
     async fn test_create_directory_cmd() {
         let dir = tempdir().unwrap();
         let dir_path = dir.path().join("subdir").to_string_lossy().to_string();
-        let result = create_directory(dir_path.clone()).await.unwrap();
+        let l = test_ledger();
+        let result = create_directory_impl(dir_path.clone(), &l).await.unwrap();
         assert!(result.success);
         assert_eq!(result.operation, "create_folder");
         assert!(Path::new(&dir_path).is_dir());
@@ -947,9 +1085,11 @@ mod tests {
         let src = dir.path().join("original.txt");
         fs::write(&src, "content").unwrap();
 
-        let result = rename_file(
+        let l = test_ledger();
+        let result = rename_file_impl(
             src.to_string_lossy().to_string(),
             "renamed.txt".to_string(),
+            &l,
         )
         .await
         .unwrap();
@@ -967,15 +1107,17 @@ mod tests {
         let dest_dir = dir.path().join("dest");
         fs::create_dir(&dest_dir).unwrap();
 
-        let result = copy_files(
+        let l = test_ledger();
+        let result = copy_files_impl(
             vec![src.to_string_lossy().to_string()],
             dest_dir.to_string_lossy().to_string(),
+            &l,
         )
         .await
         .unwrap();
         assert!(result.success);
-        assert!(src.exists()); // Original still exists
-        assert!(dest_dir.join("source.txt").exists()); // Copy exists
+        assert!(src.exists());
+        assert!(dest_dir.join("source.txt").exists());
     }
 
     #[tokio::test]
@@ -984,12 +1126,13 @@ mod tests {
         let src = dir.path().join("file.txt");
         fs::write(&src, "hello").unwrap();
 
-        // Create existing file at destination
         fs::write(dir.path().join("file.txt"), "existing").unwrap();
 
-        let result = copy_files(
+        let l = test_ledger();
+        let result = copy_files_impl(
             vec![src.to_string_lossy().to_string()],
             dir.path().to_string_lossy().to_string(),
+            &l,
         )
         .await
         .unwrap();
@@ -1006,15 +1149,17 @@ mod tests {
         let dest_dir = dir.path().join("dest");
         fs::create_dir(&dest_dir).unwrap();
 
-        let result = move_files(
+        let l = test_ledger();
+        let result = move_files_impl(
             vec![src.to_string_lossy().to_string()],
             dest_dir.to_string_lossy().to_string(),
+            &l,
         )
         .await
         .unwrap();
         assert!(result.success);
-        assert!(!src.exists()); // Original moved
-        assert!(dest_dir.join("source.txt").exists()); // At destination
+        assert!(!src.exists());
+        assert!(dest_dir.join("source.txt").exists());
     }
 
     #[tokio::test]
@@ -1023,7 +1168,8 @@ mod tests {
         let src = dir.path().join("file.txt");
         fs::write(&src, "content").unwrap();
 
-        let result = duplicate_files(vec![src.to_string_lossy().to_string()])
+        let l = test_ledger();
+        let result = duplicate_files_impl(vec![src.to_string_lossy().to_string()], &l)
             .await
             .unwrap();
         assert!(result.success);
@@ -1037,9 +1183,11 @@ mod tests {
         let src = dir.path().join("delete_me.txt");
         fs::write(&src, "content").unwrap();
 
-        let result = delete_files(
+        let l = test_ledger();
+        let result = delete_files_impl(
             vec![src.to_string_lossy().to_string()],
             true,
+            &l,
         )
         .await
         .unwrap();
@@ -1056,14 +1204,15 @@ mod tests {
         let dest_dir = dir.path().join("dest");
         fs::create_dir(&dest_dir).unwrap();
 
-        let result = copy_files(
+        let l = test_ledger();
+        let result = copy_files_impl(
             vec![src.to_string_lossy().to_string()],
             dest_dir.to_string_lossy().to_string(),
+            &l,
         )
         .await
         .unwrap();
 
-        // Undo
         let undo_result = undo_file_operation(
             result.operation,
             result.source_paths,
@@ -1081,14 +1230,15 @@ mod tests {
         let src = dir.path().join("original.txt");
         fs::write(&src, "content").unwrap();
 
-        let result = rename_file(
+        let l = test_ledger();
+        let result = rename_file_impl(
             src.to_string_lossy().to_string(),
             "renamed.txt".to_string(),
+            &l,
         )
         .await
         .unwrap();
 
-        // Undo
         undo_file_operation(
             result.operation,
             result.source_paths,
@@ -1105,7 +1255,8 @@ mod tests {
     async fn test_undo_create_file() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("new.txt").to_string_lossy().to_string();
-        let result = create_file(file_path.clone()).await.unwrap();
+        let l = test_ledger();
+        let result = create_file_impl(file_path.clone(), &l).await.unwrap();
 
         undo_file_operation(
             result.operation,
@@ -1124,9 +1275,11 @@ mod tests {
         let src = dir.path().join("file.txt");
         fs::write(&src, "content").unwrap();
 
-        let result = rename_file(
+        let l = test_ledger();
+        let result = rename_file_impl(
             src.to_string_lossy().to_string(),
             "invalid/name".to_string(),
+            &l,
         )
         .await;
         assert!(result.is_err());
@@ -1145,9 +1298,11 @@ mod tests {
         let dest_dir = dir.path().join("dest");
         fs::create_dir(&dest_dir).unwrap();
 
-        let result = copy_files(
+        let l = test_ledger();
+        let result = copy_files_impl(
             vec![src_dir.to_string_lossy().to_string()],
             dest_dir.to_string_lossy().to_string(),
+            &l,
         )
         .await
         .unwrap();
