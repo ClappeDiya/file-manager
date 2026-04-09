@@ -220,6 +220,19 @@ interface FileListProps {
   rowHeight?: number;
   /** Git status per file path (#46) */
   gitStatus?: Record<string, string>;
+  /** Per-file ledger activity map used to render the inline activity
+   *  dot. Keyed by full path; missing keys render nothing (no dot).
+   *  `ageBucket` and `ageLabel` are pre-computed by the hook so the
+   *  render path stays pure (no `Date.now()` during render). */
+  activityMap?: Record<
+    string,
+    {
+      lastSeen: string;
+      hitCount: number;
+      ageBucket: "recent" | "today" | "week";
+      ageLabel: string;
+    }
+  >;
   /** Group files by attribute (#77) */
   groupBy?: string | null;
 }
@@ -236,6 +249,7 @@ export function FileList({
   onFocusedIndexChange,
   rowHeight: customRowHeight,
   gitStatus,
+  activityMap,
   groupBy,
 }: FileListProps) {
   const rowHeight = customRowHeight || (viewMode === "compact" ? 28 : viewMode === "grid" ? 120 : 36);
@@ -251,6 +265,7 @@ export function FileList({
         onContextMenu={onContextMenu}
         focusedIndex={focusedIndex}
         onFocusedIndexChange={onFocusedIndexChange}
+        activityMap={activityMap}
       />
     );
   }
@@ -268,6 +283,7 @@ export function FileList({
       onFocusedIndexChange={onFocusedIndexChange}
       rowHeight={rowHeight}
       gitStatus={gitStatus}
+      activityMap={activityMap}
       groupBy={groupBy}
     />
   );
@@ -276,6 +292,55 @@ export function FileList({
 // ──────────────────────────────────────────────
 // Table-based views (list, detail, compact)
 // ──────────────────────────────────────────────
+
+// ──────────────────────────────────────────────
+// ActivityDot — inline ledger activity indicator for a single file row.
+// ──────────────────────────────────────────────
+
+/**
+ * Small colored dot surfaced inline next to a filename, rendered only
+ * when the unified operation ledger has recent activity on that file's
+ * exact path. Color encodes recency:
+ *   - green : within the last hour  (`recent`)
+ *   - blue  : within the last 24 hours (`today`)
+ *   - sky   : older than 24 hours (within the 7-day window; `week`)
+ *
+ * Fully pure by construction: consumes the pre-bucketed fields
+ * computed by `useDirectoryActivity` at fetch time, so there is no
+ * impure `Date.now()` call in the render path. Dots are frozen at the
+ * moment the directory was fetched — re-navigating the pane refreshes
+ * them naturally. Zero interactivity beyond the hover tooltip.
+ */
+function ActivityDot({
+  info,
+}: {
+  info: {
+    lastSeen: string;
+    hitCount: number;
+    ageBucket: "recent" | "today" | "week";
+    ageLabel: string;
+  };
+}) {
+  const colorClass =
+    info.ageBucket === "recent"
+      ? "bg-emerald-500"
+      : info.ageBucket === "today"
+        ? "bg-blue-500"
+        : "bg-sky-500/60";
+  const touches =
+    info.hitCount === 1 ? "1 touch" : `${info.hitCount} touches`;
+  const title = `Ledger activity: ${info.ageLabel} · ${touches}`;
+  return (
+    <span
+      aria-label={title}
+      title={title}
+      className={cn(
+        "inline-block h-1.5 w-1.5 shrink-0 rounded-full",
+        colorClass,
+      )}
+    />
+  );
+}
 
 interface FileTableViewProps {
   files: FileEntryData[];
@@ -289,6 +354,15 @@ interface FileTableViewProps {
   onFocusedIndexChange?: (index: number) => void;
   rowHeight: number;
   gitStatus?: Record<string, string>;
+  activityMap?: Record<
+    string,
+    {
+      lastSeen: string;
+      hitCount: number;
+      ageBucket: "recent" | "today" | "week";
+      ageLabel: string;
+    }
+  >;
   groupBy?: string | null;
 }
 
@@ -306,6 +380,7 @@ function FileTableView({
   onFocusedIndexChange,
   rowHeight,
   gitStatus,
+  activityMap,
   groupBy,
 }: FileTableViewProps) {
   const [sorting, setSorting] = useState<SortingState>([]);
@@ -357,6 +432,7 @@ function FileTableView({
         cell: ({ row }) => {
           const entry = row.original;
           const git = gitStatus?.[entry.path];
+          const activity = activityMap?.[entry.path];
           return (
             <div className="flex items-center gap-2 min-w-0">
               {getFileIcon(entry)}
@@ -379,6 +455,7 @@ function FileTableView({
                   (link)
                 </span>
               )}
+              {activity && <ActivityDot info={activity} />}
               {git && (viewMode === "detail" || viewMode === "list") && (
                 <GitStatusBadge status={git} />
               )}
@@ -484,7 +561,7 @@ function FileTableView({
     }
 
     return cols;
-  }, [viewMode, visibleColumns, gitStatus]);
+  }, [viewMode, visibleColumns, gitStatus, activityMap]);
 
   const table = useReactTable({
     data: files,
@@ -781,6 +858,9 @@ function FileTableView({
                     )}>
                       {entry.name}
                     </span>
+                    {activityMap?.[entry.path] && (
+                      <ActivityDot info={activityMap[entry.path]} />
+                    )}
                     {gitStatus?.[entry.path] && <GitStatusBadge status={gitStatus[entry.path]} />}
                   </div>
                   {viewMode === "detail" && (
@@ -889,6 +969,15 @@ interface FileGridViewProps {
   onContextMenu?: (entry: FileEntryData, event: React.MouseEvent) => void;
   focusedIndex: number;
   onFocusedIndexChange?: (index: number) => void;
+  activityMap?: Record<
+    string,
+    {
+      lastSeen: string;
+      hitCount: number;
+      ageBucket: "recent" | "today" | "week";
+      ageLabel: string;
+    }
+  >;
 }
 
 function FileGridView({
@@ -900,6 +989,7 @@ function FileGridView({
   onContextMenu,
   focusedIndex,
   onFocusedIndexChange,
+  activityMap,
 }: FileGridViewProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const selectedSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
@@ -1067,18 +1157,23 @@ function FileGridView({
                         <File className="h-10 w-10 text-[color:var(--color-text-secondary)]" aria-hidden="true" />
                       )}
                     </div>
-                    <span
-                      className={cn(
-                        "text-[length:var(--font-size-xs)] text-center leading-tight mt-1",
-                        "w-full truncate px-1",
-                        entry.is_dir
-                          ? "font-medium text-[color:var(--color-primary)]"
-                          : "text-[color:var(--color-text)]",
+                    <div className="flex items-center justify-center gap-1 w-full px-1 mt-1">
+                      {activityMap?.[entry.path] && (
+                        <ActivityDot info={activityMap[entry.path]} />
                       )}
-                      title={entry.name}
-                    >
-                      {entry.name}
-                    </span>
+                      <span
+                        className={cn(
+                          "text-[length:var(--font-size-xs)] text-center leading-tight",
+                          "truncate",
+                          entry.is_dir
+                            ? "font-medium text-[color:var(--color-primary)]"
+                            : "text-[color:var(--color-text)]",
+                        )}
+                        title={entry.name}
+                      >
+                        {entry.name}
+                      </span>
+                    </div>
                   </div>
                 );
               })}

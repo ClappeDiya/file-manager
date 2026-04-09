@@ -7,6 +7,7 @@ pub mod core;
 pub mod fs_engine;
 pub mod governance;
 pub mod ledger;
+pub mod lineage;
 pub mod mount_engine;
 pub mod security;
 pub mod storage;
@@ -17,7 +18,7 @@ pub mod transfer_engine;
 use ai_engine::AiAssistant;
 use automation_engine::AutomationManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, ledger_commands, log_commands, master_password_commands, mount_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
 use ledger::OperationLedger;
 use commands::terminal_commands::TerminalManager;
 use connectors::{ConnectionManager, ConnectorRegistry, GoogleDriveConnector, OneDriveConnector, PeerManager, S3Connector, ServerTransferManager};
@@ -670,6 +671,14 @@ pub fn run() {
             ledger_commands::ledger_count,
             ledger_commands::ledger_prune,
             ledger_commands::ledger_since_last_seen,
+            ledger_commands::ledger_recent_paths,
+            ledger_commands::ledger_directory_activity,
+            // Universal Time-Travel Undo (cross-session Cmd+Z backed by the ledger)
+            undo_commands::undo_last,
+            undo_commands::undo_by_correlation,
+            undo_commands::list_undoable,
+            // File Lineage / Provenance Graph (reads the ledger only; zero writes)
+            lineage_commands::get_file_lineage,
         ])
         .on_window_event(move |_window, event| {
             if let tauri::WindowEvent::Destroyed = event {

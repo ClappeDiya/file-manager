@@ -21,6 +21,11 @@ import { TerminalPanel } from "./terminal-panel";
 import { SinceLastSeenToast, type LedgerSinceSummary } from "./since-last-seen-toast";
 import { ActivityTimelinePanel } from "./activity-timeline-panel";
 import { useActivityTimelineStore } from "@/stores/activity-timeline-store";
+import { LineagePanel } from "./lineage-panel";
+import { useLineageStore } from "@/stores/lineage-store";
+import { PathJumpDialog } from "./path-jump-dialog";
+import { usePathJumpStore } from "@/stores/path-jump-store";
+import { useDirectoryActivity } from "@/hooks/use-directory-activity";
 import { useFileSelection, useFileDragDrop } from "@/hooks/use-file-selection";
 import { cn } from "@ufop/ui-components";
 import { Button, Badge } from "@ufop/ui-components";
@@ -193,18 +198,61 @@ export function FileManager() {
     items: ContextMenuItem[];
   } | null>(null);
 
+  // Universal Time-Travel Undo — talks to the ledger-backed `undo_last`
+  // command so Cmd+Z works across app restarts and across every engine that
+  // records to the unified ledger, not just the in-session memory stack.
+  //
+  // Outside Tauri we fall back to the legacy in-memory stack so the Vite
+  // browser preview still echoes something to the console when Cmd+Z is
+  // pressed. Inside Tauri the in-memory `popUndo()` is still invoked to keep
+  // the visible undoStack badge count in sync with what the backend just
+  // reversed — it's a display hint, not the source of truth.
   const handleUndo = useCallback(async () => {
-    const entry = popUndo();
-    if (entry) {
-      if (isTauriAvailable()) {
-        try {
-          await tauriInvoke("undo_file_operation", { operationId: entry.id });
-        } catch (err) {
-          console.error("Undo failed:", err);
-        }
-      } else {
-        console.log("Undo (demo mode):", entry);
-      }
+    if (!isTauriAvailable()) {
+      const entry = popUndo();
+      if (entry) console.log("Undo (demo mode):", entry);
+      return;
+    }
+    try {
+      const outcome = await tauriInvoke<{
+        success: boolean;
+        correlation_id: string;
+        kind: string;
+        summary: string;
+        item_count: number;
+      }>("undo_last", undefined, {
+        success: false,
+        correlation_id: "",
+        kind: "",
+        summary: "Nothing to undo",
+        item_count: 0,
+      });
+      // Keep the optimistic in-memory stack in sync with real history.
+      if (outcome.success) popUndo();
+      // Surface result via the existing structured-error toast channel so
+      // we don't introduce a new notification system.
+      useUIStore.getState().addStructuredError({
+        what: outcome.success
+          ? `Undid ${outcome.kind}`
+          : "Nothing to undo",
+        why: outcome.success
+          ? outcome.summary
+          : "The operation ledger has no reversible entries from this or prior sessions.",
+        appDid: outcome.success
+          ? `Reversed ${outcome.item_count} item(s) via operation ledger`
+          : "No-op",
+        userAction: outcome.success
+          ? "Press Cmd+Z again to undo the next most recent operation"
+          : "Perform a file operation first, then Cmd+Z will reverse it",
+      });
+    } catch (err) {
+      console.error("Undo failed:", err);
+      useUIStore.getState().addStructuredError({
+        what: "Undo failed",
+        why: String(err),
+        appDid: "The backend rejected the undo request",
+        userAction: "Check the Activity Timeline for the most recent operation and try the per-entry Undo button",
+      });
     }
   }, [popUndo]);
 
@@ -235,6 +283,14 @@ export function FileManager() {
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "Y") {
         e.preventDefault();
         toggleActivityTimeline();
+      }
+      // Cmd+Shift+O — Instant Jump. Opens the path picker that fuzzy-
+      // searches every path the unified ledger has ever seen, across
+      // connectors and sessions. Zero cognitive overload: invisible
+      // until pressed.
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "O") {
+        e.preventDefault();
+        usePathJumpStore.getState().open();
       }
       // Cmd+Shift+. to toggle hidden files (#85)
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === ".") {
@@ -673,11 +729,15 @@ export function FileManager() {
 
         <AutomationPanel />
         <ActivityTimelinePanel />
+        <LineagePanel />
         <AiPanel />
       </div>
 
       {/* Smart Space Wizard */}
       {spacesWizardOpen && <SmartSpaceWizard onClose={closeSpacesWizard} />}
+
+      {/* Instant Jump — Cmd+Shift+O universal path recall */}
+      <PathJumpDialog />
 
       <footer
         className="relative flex items-center justify-between border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-4"
@@ -759,6 +819,12 @@ function FilePane({ paneIndex, onContextMenu }: FilePaneProps) {
   // Feature 2: Git status (#46)
   const [gitStatus, setGitStatus] = useState<Record<string, string>>({});
   const [isGitRepo, setIsGitRepo] = useState(false);
+
+  // Ledger-backed per-file activity dots. Fetches once per directory
+  // change via a single `ledger_directory_activity` IPC call — no
+  // polling, no background work, no per-row round-trips. Keyed by
+  // full path; missing keys render nothing in the file list.
+  const activityMap = useDirectoryActivity(currentPath);
 
   // Feature 5: Editable comments (#82)
   const [infoDialog, setInfoDialog] = useState<{
@@ -1362,6 +1428,12 @@ function FilePane({ paneIndex, onContextMenu }: FilePaneProps) {
         // Open with / editor
         onOpenWith: handleOpenWith,
         onOpenInEditor: handleOpenInEditor,
+        // Show File History — opens the lineage panel for this exact path.
+        // The panel fetches once via `get_file_lineage`, then self-hides on
+        // Escape or its own close button. No state persists between calls.
+        onShowHistory: () => {
+          useLineageStore.getState().beginRequest(entry.path);
+        },
       });
       onContextMenu({ position: { x: event.clientX, y: event.clientY }, items });
     },
@@ -1485,6 +1557,7 @@ function FilePane({ paneIndex, onContextMenu }: FilePaneProps) {
         focusedIndex={focusedIndex}
         onFocusedIndexChange={setFocusedIndex}
         gitStatus={gitStatus}
+        activityMap={activityMap}
         groupBy={pane.groupBy}
       />
 

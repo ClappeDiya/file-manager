@@ -29,6 +29,7 @@ import {
   Globe,
   FolderOpen,
   FileEdit,
+  History,
 } from "lucide-react";
 
 // ──────────────────────────────────────────────
@@ -276,6 +277,7 @@ export function getFileContextMenuItems(options: {
   onCopyRelativePath?: () => void;
   onOpenWith?: () => void;
   onOpenInEditor?: () => void;
+  onShowHistory?: () => void;
 }): ContextMenuItem[] {
   const items: ContextMenuItem[] = [];
   const isMac = typeof navigator !== "undefined" && navigator.platform.startsWith("Mac");
@@ -451,6 +453,20 @@ export function getFileContextMenuItems(options: {
       action: options.onGetInfo,
       advancedOnly: true,
     });
+
+    // Show File History — opens the lineage panel, which walks the unified
+    // operation ledger to surface every rename / move / copy / sync /
+    // transfer / automation fire that ever touched this file, even under
+    // prior names. Zero cost until clicked — no background work.
+    if (options.onShowHistory) {
+      items.push({
+        id: "show-history",
+        label: "Show File History",
+        icon: <History className="h-3.5 w-3.5" />,
+        action: options.onShowHistory,
+        advancedOnly: true,
+      });
+    }
 
     if (options.isDirectory && options.onCalculateSize) {
       items.push({

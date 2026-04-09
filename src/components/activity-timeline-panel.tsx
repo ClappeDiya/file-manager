@@ -26,7 +26,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useActivityTimelineStore } from "@/stores/activity-timeline-store";
 import { useFileManagerStore } from "@/stores/file-manager-store";
-import { tauriInvokeSafe } from "@/hooks/use-tauri";
+import { useUIStore } from "@/stores/ui-store";
+import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { cn } from "@ufop/ui-components";
 import { Button, Badge, ScrollArea } from "@ufop/ui-components";
 import {
@@ -51,6 +52,7 @@ import {
   MinusCircle,
   AlertTriangle,
   Link2,
+  Undo2,
 } from "lucide-react";
 
 /**
@@ -221,6 +223,11 @@ export function ActivityTimelinePanel() {
   const togglePanel = useActivityTimelineStore((s) => s.togglePanel);
   const [events, setEvents] = useState<LedgerEvent[]>([]);
   const [loading, setLoading] = useState(false);
+  // Set of correlation_ids the backend currently considers reversible.
+  // Fetched alongside events so each row can show a per-entry "Undo" button
+  // without any extra calls per row. This is O(N) in undoable groups, with
+  // N capped at 100 by `list_undoable`.
+  const [undoableIds, setUndoableIds] = useState<Set<string>>(() => new Set());
   const [filter, setFilter] = useState<EngineFilter>("all");
   const [query, setQuery] = useState("");
   const [failedOnly, setFailedOnly] = useState(false);
@@ -263,14 +270,58 @@ export function ActivityTimelinePanel() {
 
   const loadEvents = useCallback(async () => {
     setLoading(true);
-    const rows = await tauriInvokeSafe<LedgerEvent[]>(
-      "ledger_recent",
-      { limit: 200 },
-      [],
-    );
+    // Fetch events and the current undoable groups in parallel. A single
+    // round-trip per refresh; both lists already live in the ledger.
+    const [rows, undoableOps] = await Promise.all([
+      tauriInvokeSafe<LedgerEvent[]>("ledger_recent", { limit: 200 }, []),
+      tauriInvokeSafe<Array<{ correlation_id: string }>>(
+        "list_undoable",
+        { limit: 100 },
+        [],
+      ),
+    ]);
     setEvents(rows ?? []);
+    setUndoableIds(new Set((undoableOps ?? []).map((o) => o.correlation_id)));
     setLoading(false);
   }, []);
+
+  // Per-entry Undo handler — reverses the single correlation group via the
+  // ledger-backed backend, surfaces the result through the existing
+  // structured-error toast channel, and refreshes so the "Undo" affordance
+  // disappears from the row that was just reversed.
+  const handleUndoEntry = useCallback(
+    async (correlationId: string) => {
+      try {
+        const outcome = await tauriInvoke<{
+          success: boolean;
+          correlation_id: string;
+          kind: string;
+          summary: string;
+          item_count: number;
+        }>("undo_by_correlation", { correlationId }, {
+          success: false,
+          correlation_id: correlationId,
+          kind: "",
+          summary: "",
+          item_count: 0,
+        });
+        useUIStore.getState().addStructuredError({
+          what: outcome.success ? `Undid ${outcome.kind}` : "Undo failed",
+          why: outcome.summary,
+          appDid: outcome.success
+            ? `Reversed ${outcome.item_count} item(s) via operation ledger`
+            : "Backend rejected the undo request",
+          userAction: outcome.success
+            ? "The file has been restored to its previous state"
+            : "Check that the files still exist at their current paths",
+        });
+      } catch (err) {
+        console.error("Undo by correlation failed:", err);
+      }
+      void loadEvents();
+    },
+    [loadEvents],
+  );
 
   // Fetch when panel opens (not when merely mounted + closed) so the panel
   // is truly inert until the user asks for it.
@@ -594,6 +645,8 @@ export function ActivityTimelinePanel() {
             onTrace={setCorrelationFilter}
             activeCorrelation={correlationFilter}
             query={query}
+            undoableIds={undoableIds}
+            onUndoEntry={handleUndoEntry}
           />
         </div>
       </ScrollArea>
@@ -679,12 +732,16 @@ function TimelineList({
   onTrace,
   activeCorrelation,
   query,
+  undoableIds,
+  onUndoEntry,
 }: {
   events: LedgerEvent[];
   onNavigate: (event: LedgerEvent) => void;
   onTrace: (id: string | null) => void;
   activeCorrelation: string | null;
   query: string;
+  undoableIds: Set<string>;
+  onUndoEntry: (correlationId: string) => void;
 }) {
   let lastDay: string | null = null;
   const nodes: React.ReactNode[] = [];
@@ -701,6 +758,8 @@ function TimelineList({
       );
       lastDay = day;
     }
+    const canUndo =
+      ev.correlation_id !== null && undoableIds.has(ev.correlation_id);
     nodes.push(
       <TimelineRow
         key={ev.id}
@@ -709,6 +768,8 @@ function TimelineList({
         onTrace={onTrace}
         activeCorrelation={activeCorrelation}
         query={query}
+        canUndo={canUndo}
+        onUndoEntry={onUndoEntry}
       />,
     );
   }
@@ -721,12 +782,16 @@ function TimelineRow({
   onTrace,
   activeCorrelation,
   query,
+  canUndo,
+  onUndoEntry,
 }: {
   event: LedgerEvent;
   onNavigate: (event: LedgerEvent) => void;
   onTrace: (id: string | null) => void;
   activeCorrelation: string | null;
   query: string;
+  canUndo: boolean;
+  onUndoEntry: (correlationId: string) => void;
 }) {
   const EngineIcon = ENGINE_ICONS[event.engine] ?? Activity;
   const statusMeta = STATUS_META[event.status] ?? STATUS_META.ok;
@@ -844,6 +909,20 @@ function TimelineRow({
         </div>
       )}
       {traceButton}
+      {canUndo && event.correlation_id && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onUndoEntry(event.correlation_id!);
+          }}
+          title={`Undo this ${event.kind}`}
+          aria-label={`Undo this ${event.kind} operation`}
+          className="flex-shrink-0 rounded p-1 text-[color:var(--color-text-muted)] opacity-0 transition-colors hover:text-amber-500 focus:outline-none focus:opacity-100 focus:ring-2 focus:ring-amber-500/40 group-hover:opacity-100"
+        >
+          <Undo2 className="h-3 w-3" aria-hidden="true" />
+        </button>
+      )}
     </div>
   );
 }

@@ -180,6 +180,21 @@ impl RecordEvent {
     }
 }
 
+/// A single distinct path the ledger has ever seen, with its most-recent
+/// timestamp and a touch count. Used by [`OperationLedger::recent_paths`]
+/// to power the Instant Jump picker — the "one keybind, type three
+/// letters, navigate to any path you've ever touched" surface.
+///
+/// The path is either a former `subject_path` or a former `target_path`
+/// value; this deliberately unions both so renames are discoverable by
+/// both their old and new names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerPathHit {
+    pub path: String,
+    pub last_seen: String,
+    pub hit_count: i64,
+}
+
 /// Compact "what happened since timestamp X" summary. Used by
 /// [`OperationLedger::since`] and the `ledger_since_last_seen` IPC command
 /// to power a non-intrusive startup toast ("12 operations ran while you
@@ -352,6 +367,208 @@ impl OperationLedger {
             .await
     }
 
+    /// Return every event whose `subject_path` OR `target_path` equals the
+    /// given path. Ordered oldest-first so callers walking a causal chain
+    /// see renames/moves in the order they happened. Capped at `limit` to
+    /// bound memory on pathological histories; `limit` clamps to [1, 1000].
+    ///
+    /// This is the primitive that powers [`crate::lineage`] — given a file's
+    /// current location, find every ledger row that touches that exact path,
+    /// which in turn reveals older names via their `subject_path`.
+    pub async fn events_touching_path(
+        &self,
+        path: String,
+        limit: u32,
+    ) -> Result<Vec<LedgerEvent>, AppError> {
+        let limit = limit.clamp(1, 1000);
+        self.pool
+            .execute(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, occurred_at, engine, kind, status,
+                            subject_path, target_path, bytes,
+                            correlation_id, summary, details_json, undo_token
+                     FROM operation_ledger
+                     WHERE subject_path = ?1 OR target_path = ?1
+                     ORDER BY occurred_at ASC, id ASC
+                     LIMIT ?2",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![path, limit], row_to_event)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    /// Return every distinct path under `dir_path` that has any ledger
+    /// activity, optionally bounded by a `since_iso` cutoff. Both
+    /// `subject_path` and `target_path` columns are unioned so a rename
+    /// shows up from either side.
+    ///
+    /// Matching uses `LIKE 'dir/%' ESCAPE '\'` with SQL wildcards (`%`
+    /// and `_`) and the escape character (`\`) escaped in the input so
+    /// paths containing those literals still match correctly.
+    ///
+    /// This powers the per-file **activity dots** rendered inline in
+    /// the file list — a single SQL scan per directory navigation
+    /// gives every file's most-recent ledger touch without polling,
+    /// without per-file round-trips, and without any new storage.
+    pub async fn directory_activity(
+        &self,
+        dir_path: String,
+        since_iso: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<LedgerPathHit>, AppError> {
+        let limit = limit.clamp(1, 2000);
+        self.pool
+            .execute(move |conn| {
+                // Escape LIKE wildcards and the escape character so a
+                // path literal like `/foo_bar/100%` still matches only
+                // itself, not `foobarX100Y`.
+                let escaped = escape_like(&dir_path);
+                // Strict descendants (exclude dir itself — the directory's
+                // own name is never shown in the file list row).
+                let pattern = format!("{escaped}/%");
+
+                let (sql, bind_since) = match since_iso.as_ref() {
+                    Some(_) => (
+                        // `datetime(?2)` canonicalizes RFC-3339 inputs
+                        // from chrono (`T` separator) into SQLite's
+                        // `YYYY-MM-DD HH:MM:SS` so the comparison is
+                        // semantic, not lexical. Same trick `since()`
+                        // uses.
+                        "SELECT path, MAX(occurred_at) AS last_seen, COUNT(*) AS hits \
+                         FROM (SELECT subject_path AS path, occurred_at FROM operation_ledger \
+                                 WHERE subject_path LIKE ?1 ESCAPE '\\' AND occurred_at > datetime(?2) \
+                               UNION ALL \
+                               SELECT target_path AS path, occurred_at FROM operation_ledger \
+                                 WHERE target_path LIKE ?1 ESCAPE '\\' AND occurred_at > datetime(?2)) \
+                         GROUP BY path \
+                         ORDER BY last_seen DESC \
+                         LIMIT ?3",
+                        true,
+                    ),
+                    None => (
+                        "SELECT path, MAX(occurred_at) AS last_seen, COUNT(*) AS hits \
+                         FROM (SELECT subject_path AS path, occurred_at FROM operation_ledger \
+                                 WHERE subject_path LIKE ?1 ESCAPE '\\' \
+                               UNION ALL \
+                               SELECT target_path AS path, occurred_at FROM operation_ledger \
+                                 WHERE target_path LIKE ?1 ESCAPE '\\') \
+                         GROUP BY path \
+                         ORDER BY last_seen DESC \
+                         LIMIT ?2",
+                        false,
+                    ),
+                };
+
+                let mut stmt = conn.prepare(sql)?;
+                let rows = if bind_since {
+                    stmt.query_map(
+                        rusqlite::params![pattern, since_iso.unwrap(), limit],
+                        |row| {
+                            Ok(LedgerPathHit {
+                                path: row.get(0)?,
+                                last_seen: row.get(1)?,
+                                hit_count: row.get(2)?,
+                            })
+                        },
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    stmt.query_map(rusqlite::params![pattern, limit], |row| {
+                        Ok(LedgerPathHit {
+                            path: row.get(0)?,
+                            last_seen: row.get(1)?,
+                            hit_count: row.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+                };
+                Ok(rows)
+            })
+            .await
+    }
+
+    /// Return the most-recently-touched distinct paths in the ledger,
+    /// unioning `subject_path` and `target_path` columns so renames are
+    /// discoverable by either side. Ordered by most-recent first, with
+    /// a per-path `hit_count` that the UI can use as a secondary sort.
+    ///
+    /// `limit` clamps to `[1, 500]`. `query` is an optional
+    /// case-insensitive substring filter applied in SQL via `LIKE`.
+    ///
+    /// This is the primitive behind the **Instant Jump** surface — one
+    /// SQL scan, no joins, bounded by the ledger's 30-day retention. An
+    /// active user typically has a few thousand distinct paths at most,
+    /// so the query is cheap even without a dedicated index.
+    pub async fn recent_paths(
+        &self,
+        limit: u32,
+        query: Option<String>,
+    ) -> Result<Vec<LedgerPathHit>, AppError> {
+        let limit = limit.clamp(1, 500);
+        self.pool
+            .execute(move |conn| {
+                // Normalize query to a LIKE pattern. `None` or empty string
+                // means "no filter" — the column-level `IS NOT NULL` guards
+                // still apply so we never surface a `None` path.
+                let like_pattern: Option<String> = query
+                    .map(|q| q.trim().to_string())
+                    .filter(|q| !q.is_empty())
+                    .map(|q| format!("%{}%", q.to_lowercase()));
+
+                // UNION ALL the two path columns into a single virtual
+                // table so GROUP BY collapses duplicates seen on either
+                // side. Both branches of the UNION must project
+                // `occurred_at` too so the outer `MAX(occurred_at)` has
+                // a column to reference. `COUNT(*)` is the hit count
+                // (subject+target deliberately double-counts a rename
+                // row: a rename row touches a path from two sides).
+                let sql = if like_pattern.is_some() {
+                    "SELECT path, MAX(occurred_at) AS last_seen, COUNT(*) AS hits \
+                     FROM (SELECT subject_path AS path, occurred_at FROM operation_ledger WHERE subject_path IS NOT NULL AND subject_path <> '' \
+                           UNION ALL \
+                           SELECT target_path AS path, occurred_at FROM operation_ledger WHERE target_path IS NOT NULL AND target_path <> '') \
+                     WHERE LOWER(path) LIKE ?1 \
+                     GROUP BY path \
+                     ORDER BY last_seen DESC, hits DESC \
+                     LIMIT ?2"
+                } else {
+                    "SELECT path, MAX(occurred_at) AS last_seen, COUNT(*) AS hits \
+                     FROM (SELECT subject_path AS path, occurred_at FROM operation_ledger WHERE subject_path IS NOT NULL AND subject_path <> '' \
+                           UNION ALL \
+                           SELECT target_path AS path, occurred_at FROM operation_ledger WHERE target_path IS NOT NULL AND target_path <> '') \
+                     GROUP BY path \
+                     ORDER BY last_seen DESC, hits DESC \
+                     LIMIT ?1"
+                };
+
+                let mut stmt = conn.prepare(sql)?;
+                let rows = if let Some(pat) = like_pattern {
+                    stmt.query_map(rusqlite::params![pat, limit], |row| {
+                        Ok(LedgerPathHit {
+                            path: row.get(0)?,
+                            last_seen: row.get(1)?,
+                            hit_count: row.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    stmt.query_map(rusqlite::params![limit], |row| {
+                        Ok(LedgerPathHit {
+                            path: row.get(0)?,
+                            last_seen: row.get(1)?,
+                            hit_count: row.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+                };
+                Ok(rows)
+            })
+            .await
+    }
+
     /// Delete events older than `days` days. Returns the number of rows deleted.
     /// Default retention is 30 days.
     pub async fn prune(&self, days: u32) -> Result<usize, AppError> {
@@ -451,6 +668,24 @@ impl OperationLedger {
             })
             .await
     }
+}
+
+/// Escape SQL `LIKE` wildcards (`%`, `_`) and the escape character (`\`)
+/// in a user-supplied path so a literal path containing these characters
+/// still matches itself — not some pattern expansion. Used in concert
+/// with `LIKE ... ESCAPE '\'` clauses.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerEvent> {
@@ -652,5 +887,335 @@ mod tests {
         assert_eq!(id.len(), 36); // uuid v4 length
         let recent = ledger.recent(10).await.unwrap();
         assert_eq!(recent[0].id, id);
+    }
+
+    // ---------------------------------------------------------------
+    // recent_paths — powers the Instant Jump / universal path recall.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn recent_paths_empty_ledger_returns_empty() {
+        let ledger = fresh_ledger().await;
+        let hits = ledger.recent_paths(50, None).await.unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recent_paths_unions_subject_and_target_columns() {
+        let ledger = fresh_ledger().await;
+        // One rename op with (subject=/a, target=/b). Both sides should
+        // appear as distinct paths in the result.
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "rename")
+                    .subject("/a")
+                    .target("/b"),
+            )
+            .await;
+        let hits = ledger.recent_paths(50, None).await.unwrap();
+        let paths: std::collections::HashSet<String> =
+            hits.iter().map(|h| h.path.clone()).collect();
+        assert!(paths.contains("/a"));
+        assert!(paths.contains("/b"));
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recent_paths_groups_and_counts_repeated_touches() {
+        let ledger = fresh_ledger().await;
+        // Three separate rows all touching /hot — expect one row with hit_count=3.
+        for _ in 0..3 {
+            ledger
+                .record(
+                    RecordEvent::new(LedgerEngine::Fs, "access")
+                        .subject("/hot"),
+                )
+                .await;
+        }
+        // One row touching /cold.
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "access").subject("/cold"),
+            )
+            .await;
+        let hits = ledger.recent_paths(50, None).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        // Because they all happen at the same second, ordering within
+        // the same last_seen falls back to hits DESC — so /hot is first.
+        let hot = hits.iter().find(|h| h.path == "/hot").unwrap();
+        let cold = hits.iter().find(|h| h.path == "/cold").unwrap();
+        assert_eq!(hot.hit_count, 3);
+        assert_eq!(cold.hit_count, 1);
+    }
+
+    #[tokio::test]
+    async fn recent_paths_filter_matches_case_insensitively() {
+        let ledger = fresh_ledger().await;
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "x")
+                    .subject("/home/daisy/Projects/ufop/README.md"),
+            )
+            .await;
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "x")
+                    .subject("/tmp/unrelated.txt"),
+            )
+            .await;
+        let hits = ledger
+            .recent_paths(50, Some("UFOP".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.contains("ufop"));
+    }
+
+    #[tokio::test]
+    async fn recent_paths_empty_query_is_equivalent_to_no_filter() {
+        let ledger = fresh_ledger().await;
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "x").subject("/only"),
+            )
+            .await;
+        let hits_no_filter = ledger.recent_paths(50, None).await.unwrap();
+        let hits_empty_filter = ledger
+            .recent_paths(50, Some("   ".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(hits_no_filter.len(), 1);
+        assert_eq!(hits_empty_filter.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recent_paths_ignores_null_and_empty_path_columns() {
+        let ledger = fresh_ledger().await;
+        // Event with neither subject nor target path — should contribute
+        // zero rows to recent_paths.
+        ledger
+            .record(RecordEvent::new(LedgerEngine::System, "boot"))
+            .await;
+        // Event with only a subject.
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "create").subject("/real"),
+            )
+            .await;
+        let hits = ledger.recent_paths(50, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/real");
+    }
+
+    // ---------------------------------------------------------------
+    // directory_activity — powers per-file activity dots in file list.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn directory_activity_returns_only_descendants() {
+        let ledger = fresh_ledger().await;
+        // Three events: one outside /work, two inside.
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "copy")
+                    .subject("/other/x.txt"),
+            )
+            .await;
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "copy")
+                    .subject("/work/a.txt"),
+            )
+            .await;
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "copy")
+                    .subject("/work/sub/b.txt"),
+            )
+            .await;
+
+        let hits = ledger
+            .directory_activity("/work".to_string(), None, 50)
+            .await
+            .unwrap();
+        let paths: std::collections::HashSet<String> =
+            hits.iter().map(|h| h.path.clone()).collect();
+        assert!(paths.contains("/work/a.txt"));
+        assert!(paths.contains("/work/sub/b.txt"));
+        assert!(!paths.contains("/other/x.txt"));
+        assert!(!paths.contains("/work")); // the dir itself is excluded
+    }
+
+    #[tokio::test]
+    async fn directory_activity_since_filter_excludes_old_events() {
+        let ledger = fresh_ledger().await;
+
+        // Old event
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "copy").subject("/d/old"),
+            )
+            .await;
+        // Advance past SQLite's 1-second resolution.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let cutoff = chrono::Utc::now().to_rfc3339();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        // New event
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "copy").subject("/d/new"),
+            )
+            .await;
+
+        let hits = ledger
+            .directory_activity("/d".to_string(), Some(cutoff), 50)
+            .await
+            .unwrap();
+        let paths: std::collections::HashSet<String> =
+            hits.iter().map(|h| h.path.clone()).collect();
+        assert!(paths.contains("/d/new"));
+        assert!(!paths.contains("/d/old"));
+    }
+
+    #[tokio::test]
+    async fn directory_activity_unions_subject_and_target() {
+        let ledger = fresh_ledger().await;
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "rename")
+                    .subject("/q/a")
+                    .target("/q/b"),
+            )
+            .await;
+        let hits = ledger
+            .directory_activity("/q".to_string(), None, 50)
+            .await
+            .unwrap();
+        let paths: std::collections::HashSet<String> =
+            hits.iter().map(|h| h.path.clone()).collect();
+        assert!(paths.contains("/q/a"));
+        assert!(paths.contains("/q/b"));
+    }
+
+    #[tokio::test]
+    async fn directory_activity_escapes_sql_wildcards_in_dir_name() {
+        let ledger = fresh_ledger().await;
+        // Three directories that would collide under naive LIKE.
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "x")
+                    .subject("/100%/inside.txt"),
+            )
+            .await;
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "x")
+                    .subject("/1005/inside.txt"),
+            )
+            .await;
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "x")
+                    .subject("/100X/inside.txt"),
+            )
+            .await;
+
+        // Only `/100%/inside.txt` should match — not the lookalikes.
+        let hits = ledger
+            .directory_activity("/100%".to_string(), None, 50)
+            .await
+            .unwrap();
+        let paths: std::collections::HashSet<String> =
+            hits.iter().map(|h| h.path.clone()).collect();
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains("/100%/inside.txt"));
+    }
+
+    #[tokio::test]
+    async fn directory_activity_escapes_underscore_in_dir_name() {
+        let ledger = fresh_ledger().await;
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "x")
+                    .subject("/foo_bar/inside.txt"),
+            )
+            .await;
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "x")
+                    .subject("/fooXbar/inside.txt"),
+            )
+            .await;
+
+        let hits = ledger
+            .directory_activity("/foo_bar".to_string(), None, 50)
+            .await
+            .unwrap();
+        let paths: std::collections::HashSet<String> =
+            hits.iter().map(|h| h.path.clone()).collect();
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains("/foo_bar/inside.txt"));
+    }
+
+    #[tokio::test]
+    async fn directory_activity_empty_ledger_returns_empty() {
+        let ledger = fresh_ledger().await;
+        let hits = ledger
+            .directory_activity("/anywhere".to_string(), None, 50)
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn directory_activity_ordered_newest_first() {
+        let ledger = fresh_ledger().await;
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "x").subject("/p/older"),
+            )
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        ledger
+            .record(
+                RecordEvent::new(LedgerEngine::Fs, "x").subject("/p/newer"),
+            )
+            .await;
+
+        let hits = ledger
+            .directory_activity("/p".to_string(), None, 50)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, "/p/newer");
+        assert_eq!(hits[1].path, "/p/older");
+    }
+
+    #[test]
+    fn escape_like_handles_all_wildcards() {
+        assert_eq!(escape_like("/plain"), "/plain");
+        assert_eq!(escape_like("100%"), "100\\%");
+        assert_eq!(escape_like("foo_bar"), "foo\\_bar");
+        assert_eq!(escape_like("a\\b"), "a\\\\b");
+        assert_eq!(escape_like("%_\\"), "\\%\\_\\\\");
+    }
+
+    #[tokio::test]
+    async fn recent_paths_respects_limit_clamp() {
+        let ledger = fresh_ledger().await;
+        for i in 0..10 {
+            ledger
+                .record(
+                    RecordEvent::new(LedgerEngine::Fs, "x")
+                        .subject(format!("/p{i}")),
+                )
+                .await;
+        }
+        // Limit=3 → only 3 rows.
+        let hits = ledger.recent_paths(3, None).await.unwrap();
+        assert_eq!(hits.len(), 3);
+        // Limit=0 is clamped to 1 (not an error).
+        let one = ledger.recent_paths(0, None).await.unwrap();
+        assert_eq!(one.len(), 1);
     }
 }

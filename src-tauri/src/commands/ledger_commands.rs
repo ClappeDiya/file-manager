@@ -4,7 +4,9 @@
 //! and "what happened" UI can be built without inventing per-engine endpoints.
 
 use crate::core::error::AppError;
-use crate::ledger::{LedgerEvent, LedgerQuery, LedgerSinceSummary, OperationLedger};
+use crate::ledger::{
+    LedgerEvent, LedgerPathHit, LedgerQuery, LedgerSinceSummary, OperationLedger,
+};
 use crate::storage::Repository;
 use tauri::State;
 
@@ -45,6 +47,52 @@ pub async fn ledger_prune(
     ledger: State<'_, OperationLedger>,
 ) -> Result<usize, AppError> {
     ledger.prune(days.unwrap_or(30)).await
+}
+
+/// Return every distinct path under `dir_path` that has any ledger
+/// activity, optionally filtered to events after `since_iso`.
+///
+/// Powers the per-file **activity dots** rendered inline in the file
+/// list: the frontend calls this once per directory navigation and
+/// builds a path → most-recent-touch map, then each row checks its own
+/// path against the map and renders a colored dot if found. One SQL
+/// scan per directory, no polling, no per-file round-trips.
+#[tauri::command]
+pub async fn ledger_directory_activity(
+    dir_path: String,
+    since_iso: Option<String>,
+    limit: Option<u32>,
+    ledger: State<'_, OperationLedger>,
+) -> Result<Vec<LedgerPathHit>, AppError> {
+    if dir_path.is_empty() {
+        return Err(AppError::file_op(
+            "dir_path is required",
+            "Internal usage error: pass the current pane's directory.",
+        ));
+    }
+    ledger
+        .directory_activity(dir_path, since_iso, limit.unwrap_or(1000))
+        .await
+}
+
+/// Universal Path Recall — returns distinct paths the ledger has ever
+/// seen, unioning subject and target columns, ranked most-recent-first.
+///
+/// The optional `query` is a case-insensitive substring filter that
+/// lets the frontend do type-to-filter fuzzy matching cheaply in the
+/// backend instead of pulling the whole set on every keystroke. `limit`
+/// defaults to 100 and is clamped to `[1, 500]` by the ledger.
+///
+/// This powers the Instant Jump picker (`Cmd+Shift+O`) — one keybind,
+/// type three letters, navigate to any path you've ever touched across
+/// every connector and session.
+#[tauri::command]
+pub async fn ledger_recent_paths(
+    limit: Option<u32>,
+    query: Option<String>,
+    ledger: State<'_, OperationLedger>,
+) -> Result<Vec<LedgerPathHit>, AppError> {
+    ledger.recent_paths(limit.unwrap_or(100), query).await
 }
 
 /// "What happened while you were away?" — returns a compact summary of
