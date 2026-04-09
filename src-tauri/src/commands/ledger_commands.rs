@@ -137,3 +137,22 @@ pub async fn ledger_since_last_seen(
 
     Ok(summary)
 }
+
+/// Rolling-window engine pulse — returns a `LedgerSinceSummary` covering
+/// the last `window_secs` seconds (default 300 = 5 minutes). Unlike
+/// `ledger_since_last_seen`, this command is **idempotent** — it never
+/// advances any stored timestamp, so the status bar can poll it cheaply
+/// every few seconds without losing event windows.
+///
+/// Powers the ambient Engine Pulse indicator in the status bar: one
+/// lightweight GROUP BY query per poll, showing total recent ops, errors,
+/// and which engines are active — all from the existing `since()` method.
+#[tauri::command]
+pub async fn ledger_get_pulse(
+    window_secs: Option<u64>,
+    ledger: State<'_, OperationLedger>,
+) -> Result<LedgerSinceSummary, AppError> {
+    let secs = window_secs.unwrap_or(300).clamp(10, 3600);
+    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(secs as i64);
+    ledger.since(cutoff.to_rfc3339()).await
+}

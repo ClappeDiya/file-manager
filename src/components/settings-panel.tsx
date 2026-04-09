@@ -11,6 +11,7 @@
  */
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
+import { useAiStore } from "@/stores/ai-store";
 
 // ── Types ──
 
@@ -1168,6 +1169,89 @@ function GssapiSection() {
   );
 }
 
+// ── AI / Ollama Section ──
+
+function OllamaSection() {
+  const { ollamaAvailable, ollamaModel, probeOllama, setOllamaModel, loadOllamaModel } =
+    useAiStore();
+  const [modelInput, setModelInput] = useState(ollamaModel);
+
+  useEffect(() => {
+    probeOllama();
+    loadOllamaModel();
+  }, [probeOllama, loadOllamaModel]);
+
+  useEffect(() => {
+    setModelInput(ollamaModel);
+  }, [ollamaModel]);
+
+  const handleModelSave = useCallback(() => {
+    const trimmed = modelInput.trim();
+    if (trimmed && trimmed !== ollamaModel) {
+      setOllamaModel(trimmed);
+    }
+  }, [modelInput, ollamaModel, setOllamaModel]);
+
+  return (
+    <div className="pt-3 space-y-3">
+      {/* Status */}
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-gray-500 dark:text-gray-400">Local AI (Ollama)</span>
+        <span
+          className={`text-xs font-medium ${
+            ollamaAvailable === true
+              ? "text-green-500"
+              : ollamaAvailable === false
+                ? "text-gray-400"
+                : "text-yellow-500"
+          }`}
+        >
+          {ollamaAvailable === true
+            ? "Connected"
+            : ollamaAvailable === false
+              ? "Not detected"
+              : "Checking..."}
+        </span>
+      </div>
+
+      {/* Model selector */}
+      <div className="flex items-center gap-2">
+        <label className="text-xs text-gray-500 dark:text-gray-400 shrink-0">Model</label>
+        <input
+          type="text"
+          value={modelInput}
+          onChange={(e) => setModelInput(e.target.value)}
+          onBlur={handleModelSave}
+          onKeyDown={(e) => e.key === "Enter" && handleModelSave()}
+          className="flex-1 text-xs px-2 py-1 rounded border border-gray-300 dark:border-gray-600 bg-transparent"
+          placeholder="llama3.2"
+        />
+      </div>
+
+      {/* Help text */}
+      <p className="text-xs text-gray-400">
+        {ollamaAvailable
+          ? "The Intent Bar (Cmd+K) uses your local Ollama for natural language commands. No data leaves your machine."
+          : "Install Ollama for free AI-powered natural language commands in the Intent Bar (Cmd+K). Visit ollama.com to get started."}
+      </p>
+
+      {/* Re-probe button */}
+      {ollamaAvailable === false && (
+        <button
+          type="button"
+          onClick={() => {
+            // Reset cached probe and retry
+            probeOllama();
+          }}
+          className="text-xs px-3 py-1 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800"
+        >
+          Check again
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ── Main Settings Panel ──
 
 export default function SettingsPanel({
@@ -1202,6 +1286,11 @@ export default function SettingsPanel({
         {/* Export */}
         <Section title="Export Settings" defaultOpen>
           <ExportSection summary={summary} />
+        </Section>
+
+        {/* AI / Local LLM */}
+        <Section title="AI &amp; Intent Bar">
+          <OllamaSection />
         </Section>
 
         {/* Editor Mappings */}

@@ -9,6 +9,8 @@ pub mod governance;
 pub mod ledger;
 pub mod lineage;
 pub mod mount_engine;
+pub mod narrator;
+pub mod safety;
 pub mod security;
 pub mod storage;
 pub mod sync_engine;
@@ -18,8 +20,10 @@ pub mod transfer_engine;
 use ai_engine::AiAssistant;
 use automation_engine::AutomationManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
 use ledger::OperationLedger;
+use narrator::OperationNarrator;
+use safety::SafetyInterlock;
 use commands::terminal_commands::TerminalManager;
 use connectors::{ConnectionManager, ConnectorRegistry, GoogleDriveConnector, OneDriveConnector, PeerManager, S3Connector, ServerTransferManager};
 use mount_engine::MountManager;
@@ -56,6 +60,8 @@ struct AppState {
     spaces_mgr: SpacesManager,
     confirmation_mgr: ConfirmationManager,
     ledger: OperationLedger,
+    safety_interlock: SafetyInterlock,
+    narrator: OperationNarrator,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -157,6 +163,17 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
 
     let confirmation_mgr = ConfirmationManager::new();
 
+    // Safety Interlock — context-aware anomaly detection built on top of the
+    // existing operation ledger. Adds no new infrastructure; reads the
+    // ledger to baseline user behavior and only surfaces a confirmation
+    // dialog when an operation is far outside the user's normal pattern.
+    let safety_interlock = SafetyInterlock::new(ledger.clone());
+
+    // Operation Narrator — one-click plain-language story for any
+    // correlation-id trace in the ledger. Pure composition over the
+    // existing ledger query primitive; zero new infrastructure.
+    let narrator = OperationNarrator::new(ledger.clone());
+
     Ok(AppState {
         repo,
         transfer_mgr,
@@ -179,6 +196,8 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         spaces_mgr,
         confirmation_mgr,
         ledger,
+        safety_interlock,
+        narrator,
     })
 }
 
@@ -221,6 +240,8 @@ pub fn run() {
                 let connection_mgr = ConnectionManager::new(repo.clone(), credential_store);
                 let transfer_history = TransferHistory::new(repo.pool().clone());
                 let ledger = OperationLedger::new(repo.pool().clone());
+                let safety_interlock = SafetyInterlock::new(ledger.clone());
+                let narrator = OperationNarrator::new(ledger.clone());
                 let mut automation_mgr = AutomationManager::new();
                 automation_mgr.set_ledger(ledger.clone());
                 AppState {
@@ -245,6 +266,8 @@ pub fn run() {
                     spaces_mgr: SpacesManager::new(),
                     confirmation_mgr: ConfirmationManager::new(),
                     ledger,
+                    safety_interlock,
+                    narrator,
                 }
             }
         }
@@ -282,6 +305,8 @@ pub fn run() {
         .manage(app_state.spaces_mgr)
         .manage(app_state.confirmation_mgr)
         .manage(app_state.ledger)
+        .manage(app_state.safety_interlock)
+        .manage(app_state.narrator)
         .invoke_handler(tauri::generate_handler![
             // System
             system_commands::greet,
@@ -673,12 +698,18 @@ pub fn run() {
             ledger_commands::ledger_since_last_seen,
             ledger_commands::ledger_recent_paths,
             ledger_commands::ledger_directory_activity,
+            ledger_commands::ledger_get_pulse,
             // Universal Time-Travel Undo (cross-session Cmd+Z backed by the ledger)
             undo_commands::undo_last,
             undo_commands::undo_by_correlation,
             undo_commands::list_undoable,
             // File Lineage / Provenance Graph (reads the ledger only; zero writes)
             lineage_commands::get_file_lineage,
+            // Safety Interlock (context-aware anomaly detection over the ledger)
+            safety_commands::safety_assess_intent,
+            safety_commands::safety_confirm_intent,
+            // Operation Narrator (plain-language cross-engine story per correlation trace)
+            narrator_commands::narrator_narrate_operation,
         ])
         .on_window_event(move |_window, event| {
             if let tauri::WindowEvent::Destroyed = event {

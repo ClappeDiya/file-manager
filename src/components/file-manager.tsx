@@ -6,6 +6,7 @@ import { useAutomationStore } from "@/stores/automation-store";
 import { useSpacesStore } from "@/stores/spaces-store";
 import { useTerminalStore } from "@/stores/terminal-store";
 import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
+import { assessBeforeExecute } from "@/lib/safety";
 import { DualPaneLayout } from "./dual-pane-layout";
 import { TabBar } from "./tab-bar";
 import { BreadcrumbBar } from "./breadcrumb-bar";
@@ -25,6 +26,8 @@ import { LineagePanel } from "./lineage-panel";
 import { useLineageStore } from "@/stores/lineage-store";
 import { PathJumpDialog } from "./path-jump-dialog";
 import { usePathJumpStore } from "@/stores/path-jump-store";
+import { SafetyInterlockDialog } from "./safety-interlock-dialog";
+import { EnginePulseIndicator } from "./engine-pulse-indicator";
 import { useDirectoryActivity } from "@/hooks/use-directory-activity";
 import { useFileSelection, useFileDragDrop } from "@/hooks/use-file-selection";
 import { cn } from "@ufop/ui-components";
@@ -739,6 +742,9 @@ export function FileManager() {
       {/* Instant Jump — Cmd+Shift+O universal path recall */}
       <PathJumpDialog />
 
+      {/* Safety Interlock — context-aware confirmation for anomalous ops */}
+      <SafetyInterlockDialog />
+
       <footer
         className="relative flex items-center justify-between border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-4"
         style={{ height: "var(--status-bar-height)" }}
@@ -1054,7 +1060,18 @@ function FilePane({ paneIndex, onContextMenu }: FilePaneProps) {
         const otherPath = store.getActivePath(otherPaneIndex);
         const proceed = await checkConflicts(selectedPaths, otherPath);
         if (!proceed) return;
-        await tauriInvoke("move_files", { sourcePaths: selectedPaths, destDir: otherPath });
+        const result = await assessBeforeExecute(
+          {
+            engine: "fs",
+            kind: "move",
+            affected_files: selectedPaths.length,
+            total_bytes: 0,
+            subject_path: currentPath,
+            summary: `Move ${selectedPaths.length} item${selectedPaths.length === 1 ? "" : "s"} → ${otherPath}`,
+          },
+          () => tauriInvoke("move_files", { sourcePaths: selectedPaths, destDir: otherPath }),
+        );
+        if (result === null) return;
         pushUndo({ id: `move-${Date.now()}`, type: "move", sourcePaths: selectedPaths, destPaths: selectedPaths.map((p) => `${otherPath}/${p.split("/").pop()}`), timestamp: Date.now() });
         loadDirectory(currentPath);
       } catch (err) { console.error("Move failed:", err); }
@@ -1065,7 +1082,18 @@ function FilePane({ paneIndex, onContextMenu }: FilePaneProps) {
     if (selectedPaths.length === 0) return;
     if (isTauriAvailable()) {
       try {
-        await tauriInvoke("delete_files", { paths: selectedPaths, permanent: false });
+        const result = await assessBeforeExecute(
+          {
+            engine: "fs",
+            kind: "delete",
+            affected_files: selectedPaths.length,
+            total_bytes: 0,
+            subject_path: currentPath,
+            summary: `Move ${selectedPaths.length} item${selectedPaths.length === 1 ? "" : "s"} to Trash`,
+          },
+          () => tauriInvoke("delete_files", { paths: selectedPaths, permanent: false }),
+        );
+        if (result === null) return;
         pushUndo({ id: `delete-${Date.now()}`, type: "delete", sourcePaths: selectedPaths, destPaths: [], timestamp: Date.now() });
         loadDirectory(currentPath);
       } catch (err) { console.error("Delete failed:", err); }
@@ -1081,13 +1109,30 @@ function FilePane({ paneIndex, onContextMenu }: FilePaneProps) {
     if (!confirmed) return;
     if (isTauriAvailable()) {
       try {
-        // Use cloud_delete_permanently for cloud provider files, otherwise delete_files with permanent=true
-        try {
-          await tauriInvoke("cloud_delete_permanently", { paths });
-        } catch {
-          // Fallback to local permanent delete if cloud command is not available
-          await tauriInvoke("delete_files", { paths, permanent: true });
-        }
+        // Safety Interlock runs AFTER the inline confirm so the user has
+        // two independent decision points for hard deletes: the OS-style
+        // name list confirm, and the anomaly-aware interlock.
+        const result = await assessBeforeExecute(
+          {
+            engine: "fs",
+            kind: "purge",
+            affected_files: paths.length,
+            total_bytes: 0,
+            subject_path: currentPath,
+            summary: `Permanently delete ${paths.length} item${paths.length === 1 ? "" : "s"}`,
+          },
+          async () => {
+            // Use cloud_delete_permanently for cloud provider files,
+            // otherwise fall back to delete_files with permanent=true.
+            try {
+              await tauriInvoke("cloud_delete_permanently", { paths });
+            } catch {
+              await tauriInvoke("delete_files", { paths, permanent: true });
+            }
+            return true;
+          },
+        );
+        if (result === null) return;
         loadDirectory(currentPath);
       } catch (err) { console.error("Permanent delete failed:", err); }
     } else { console.log("Delete permanently (demo mode):", paths); }
@@ -1740,6 +1785,10 @@ function StatusBarContent() {
           ? `${selectedPaths.length} item${selectedPaths.length !== 1 ? "s" : ""} selected`
           : "Ready"}
       </span>
+
+      {/* Engine Pulse — ambient cross-engine activity heartbeat */}
+      <EnginePulseIndicator />
+
       <div className="flex items-center gap-2">
         <button
           onClick={toggleSettings}

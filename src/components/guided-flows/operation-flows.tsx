@@ -101,8 +101,11 @@ export function StartTransferWizard() {
                 className="flex-1 px-3 py-2.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] text-sm text-[color:var(--color-text)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]"
               />
               <button
+                type="button"
                 className="px-3 py-2.5 rounded-lg border border-[var(--color-border)] text-sm text-[color:var(--color-text-secondary)] hover:bg-[var(--color-hover-bg)]"
-                onClick={async () => {
+                onClick={async (e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
                   const path = await pickFolder("Select source folder");
                   if (path) setSourcePath(path);
                 }}
@@ -133,8 +136,11 @@ export function StartTransferWizard() {
                 className="flex-1 px-3 py-2.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] text-sm text-[color:var(--color-text)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]"
               />
               <button
+                type="button"
                 className="px-3 py-2.5 rounded-lg border border-[var(--color-border)] text-sm text-[color:var(--color-text-secondary)] hover:bg-[var(--color-hover-bg)]"
-                onClick={async () => {
+                onClick={async (e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
                   const path = await pickFolder("Select destination folder");
                   if (path) setDestPath(path);
                 }}

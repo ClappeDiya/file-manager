@@ -53,7 +53,9 @@ import {
   AlertTriangle,
   Link2,
   Undo2,
+  BookOpen,
 } from "lucide-react";
+import { OperationNarrativeCard } from "./operation-narrative-card";
 
 /**
  * Wire-format event from the Rust `ledger_recent` command.
@@ -237,6 +239,9 @@ export function ActivityTimelinePanel() {
   // M automation fires). This surfaces hidden operation tracing with
   // literally one new predicate; zero backend changes.
   const [correlationFilter, setCorrelationFilter] = useState<string | null>(null);
+  // Whether the Operation Narrator card is open for the active
+  // correlation filter. Reset automatically when the filter clears.
+  const [narrativeOpen, setNarrativeOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -561,28 +566,62 @@ export function ActivityTimelinePanel() {
        * *why* the list just narrowed, and so clearing it is instant.
        */}
       {correlationFilter !== null && (
-        <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--color-border)] bg-sky-500/5">
-          <Link2 className="h-3 w-3 text-sky-500" aria-hidden="true" />
-          <span className="text-[11px] text-[color:var(--color-text-muted)]">
-            Tracing operation
-          </span>
-          <code
-            className="flex-1 truncate rounded bg-[var(--color-bg-primary)] px-1.5 py-0.5 text-[10px] text-[color:var(--color-text)]"
-            title={correlationFilter}
-          >
-            {correlationFilter.length > 12
-              ? `${correlationFilter.slice(0, 8)}…`
-              : correlationFilter}
-          </code>
-          <button
-            type="button"
-            onClick={() => setCorrelationFilter(null)}
-            aria-label="Clear correlation trace filter"
-            className="rounded p-0.5 text-[color:var(--color-text-muted)] hover:text-[color:var(--color-text)]"
-          >
-            <X className="h-3 w-3" />
-          </button>
-        </div>
+        <>
+          <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--color-border)] bg-sky-500/5">
+            <Link2 className="h-3 w-3 text-sky-500" aria-hidden="true" />
+            <span className="text-[11px] text-[color:var(--color-text-muted)]">
+              Tracing operation
+            </span>
+            <code
+              className="flex-1 truncate rounded bg-[var(--color-bg-primary)] px-1.5 py-0.5 text-[10px] text-[color:var(--color-text)]"
+              title={correlationFilter}
+            >
+              {correlationFilter.length > 12
+                ? `${correlationFilter.slice(0, 8)}…`
+                : correlationFilter}
+            </code>
+            {/*
+             * Operation Narrator trigger. Opens an inline card with a
+             * plain-language story built by a pure deterministic
+             * summarizer in the Rust backend over the exact same
+             * correlation-id filter. No modal, no route change, no new
+             * infrastructure — just a second view of the same data.
+             */}
+            <button
+              type="button"
+              onClick={() => setNarrativeOpen((v) => !v)}
+              aria-label={narrativeOpen ? "Close operation narrative" : "Explain this operation"}
+              aria-pressed={narrativeOpen}
+              className={cn(
+                "rounded px-1.5 py-0.5 text-[10px] transition-colors",
+                narrativeOpen
+                  ? "bg-sky-500/20 text-sky-300"
+                  : "text-[color:var(--color-text-muted)] hover:bg-[var(--color-bg-primary)] hover:text-[color:var(--color-text)]",
+              )}
+              title={narrativeOpen ? "Close narrative" : "Explain this operation"}
+            >
+              <BookOpen className="h-3 w-3" aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setCorrelationFilter(null);
+                setNarrativeOpen(false);
+              }}
+              aria-label="Clear correlation trace filter"
+              className="rounded p-0.5 text-[color:var(--color-text-muted)] hover:text-[color:var(--color-text)]"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </div>
+          {narrativeOpen && (
+            <OperationNarrativeCard
+              key={correlationFilter}
+              correlationId={correlationFilter}
+              onClose={() => setNarrativeOpen(false)}
+            />
+          )}
+        </>
       )}
 
       {/* Engine filter chips — only show engines that actually appeared */}

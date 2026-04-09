@@ -74,6 +74,13 @@ export interface AiFeatureToggles {
   model_routing: string;
 }
 
+export interface AiExecutionResult {
+  success: boolean;
+  action_taken: string;
+  entity_id: string | null;
+  audit_id: string;
+}
+
 // ── Store ──
 
 interface AiState {
@@ -97,6 +104,12 @@ interface AiState {
   featureToggles: AiFeatureToggles;
   confirmationPending: string | null;
 
+  // Intent Bar state
+  ollamaAvailable: boolean | null;
+  ollamaModel: string;
+  intentPhase: "idle" | "loading" | "preview" | "clarify";
+  currentIntentPreview: ParsedJobConfig | null;
+
   // UI state
   panelOpen: boolean;
   activeTab: "chat" | "suggestions" | "audit";
@@ -117,6 +130,14 @@ interface AiState {
   loadFeatureToggles: () => Promise<void>;
   setFeatureToggles: (toggles: AiFeatureToggles) => Promise<void>;
 
+  // Intent Bar actions
+  probeOllama: () => Promise<void>;
+  submitIntent: (input: string, contextPath?: string) => Promise<ParsedJobConfig | null>;
+  confirmIntent: () => Promise<AiExecutionResult | null>;
+  clearIntent: () => void;
+  loadOllamaModel: () => Promise<void>;
+  setOllamaModel: (model: string) => Promise<void>;
+
   // UI actions
   setPanelOpen: (open: boolean) => void;
   togglePanel: () => void;
@@ -127,16 +148,16 @@ interface AiState {
 
 export const useAiStore = create<AiState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       // Initial state
-      chatMessages: [],
+      chatMessages: [] as AiChatMessage[],
       chatLoading: false,
-      suggestions: [],
+      suggestions: [] as AiSuggestion[],
       suggestionsLoading: false,
-      currentParsedJob: null,
+      currentParsedJob: null as ParsedJobConfig | null,
       nlLoading: false,
-      currentExplanation: null,
-      auditLog: [],
+      currentExplanation: null as ErrorExplanation | null,
+      auditLog: [] as AiAuditEntry[],
       featureToggles: {
         ai_master_enabled: true,
         error_explanations: true,
@@ -145,10 +166,14 @@ export const useAiStore = create<AiState>()(
         content_analysis_opt_in: false,
         model_routing: "local",
       },
-      confirmationPending: null,
+      confirmationPending: null as string | null,
+      ollamaAvailable: null as boolean | null,
+      ollamaModel: "llama3.2",
+      intentPhase: "idle" as AiState["intentPhase"],
+      currentIntentPreview: null as ParsedJobConfig | null,
       panelOpen: false,
-      activeTab: "chat",
-      error: null,
+      activeTab: "chat" as AiState["activeTab"],
+      error: null as string | null,
 
       // Chat
       sendMessage: async (message: string) => {
@@ -300,6 +325,7 @@ export const useAiStore = create<AiState>()(
         try {
           const config = await tauriInvoke<ParsedJobConfig>("ai_parse_natural_language", {
             input,
+            contextPath: null,
           });
           set({ currentParsedJob: config });
           return config;
@@ -358,10 +384,76 @@ export const useAiStore = create<AiState>()(
         }
       },
 
+      // Intent Bar actions
+      probeOllama: async () => {
+        try {
+          const available = await tauriInvoke<boolean>("ai_probe_ollama", undefined, false);
+          set({ ollamaAvailable: available });
+        } catch {
+          set({ ollamaAvailable: false });
+        }
+      },
+
+      submitIntent: async (input: string, contextPath?: string) => {
+        set({ intentPhase: "loading", error: null });
+        try {
+          const config = await tauriInvoke<ParsedJobConfig>("ai_parse_natural_language", {
+            input,
+            contextPath: contextPath ?? null,
+          });
+          const phase =
+            config.needs_clarification && config.confidence < 0.5
+              ? "clarify"
+              : "preview";
+          set({ currentIntentPreview: config, intentPhase: phase });
+          return config;
+        } catch (e: any) {
+          set({ intentPhase: "idle", error: e?.message });
+          return null;
+        }
+      },
+
+      confirmIntent: async (): Promise<AiExecutionResult | null> => {
+        const preview = get().currentIntentPreview;
+        if (!preview) return null;
+        try {
+          const result = await tauriInvoke<AiExecutionResult>("ai_execute_parsed_job", {
+            configJson: JSON.stringify(preview),
+          });
+          set({ intentPhase: "idle" as AiState["intentPhase"], currentIntentPreview: null as ParsedJobConfig | null });
+          return result;
+        } catch (e: any) {
+          set({ error: e?.message || "Failed to execute intent" });
+          return null;
+        }
+      },
+
+      clearIntent: () => {
+        set({ intentPhase: "idle", currentIntentPreview: null, error: null });
+      },
+
+      loadOllamaModel: async () => {
+        try {
+          const model = await tauriInvoke<string>("ai_get_ollama_model", undefined, "llama3.2");
+          set({ ollamaModel: model });
+        } catch {
+          // keep default
+        }
+      },
+
+      setOllamaModel: async (model: string) => {
+        try {
+          await tauriInvoke("ai_set_ollama_model", { model });
+          set({ ollamaModel: model, ollamaAvailable: null });
+        } catch (e: any) {
+          set({ error: e?.message || "Failed to set model" });
+        }
+      },
+
       // UI actions
       setPanelOpen: (open: boolean) => set({ panelOpen: open }),
       togglePanel: () => set((state) => ({ panelOpen: !state.panelOpen })),
-      setActiveTab: (tab) => set({ activeTab: tab }),
+      setActiveTab: (tab: "chat" | "suggestions" | "audit") => set({ activeTab: tab }),
       clearError: () => set({ error: null }),
       clearParsedJob: () => set({ currentParsedJob: null }),
     }),
