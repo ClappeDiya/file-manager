@@ -10,6 +10,7 @@
  */
 
 import { useState, useCallback, useMemo } from "react";
+import { formatBytes } from "@/lib/format-bytes";
 import { cn } from "@ufop/ui-components";
 import {
   HardDrive,
@@ -172,18 +173,6 @@ export interface MigrationProgress {
 // ──────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────
-
-function formatBytes(bytes: number): string {
-  const TB = 1024 ** 4;
-  const GB = 1024 ** 3;
-  const MB = 1024 ** 2;
-  const KB = 1024;
-  if (bytes >= TB) return `${(bytes / TB).toFixed(1)} TB`;
-  if (bytes >= GB) return `${(bytes / GB).toFixed(1)} GB`;
-  if (bytes >= MB) return `${(bytes / MB).toFixed(1)} MB`;
-  if (bytes >= KB) return `${(bytes / KB).toFixed(1)} KB`;
-  return `${bytes} B`;
-}
 
 function formatDuration(ms: number): string {
   const seconds = Math.floor(ms / 1000);

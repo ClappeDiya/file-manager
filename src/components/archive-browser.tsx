@@ -11,6 +11,7 @@
  */
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import { formatBytes } from "@/lib/format-bytes";
 
 // ── Types ──
 
@@ -74,14 +75,6 @@ interface CreateArchiveDialogProps {
 }
 
 // ── Utility ──
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-}
 
 function getFileIcon(entry: ArchiveEntry): string {
   if (entry.is_dir) return "folder";

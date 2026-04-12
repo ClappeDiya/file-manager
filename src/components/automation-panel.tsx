@@ -12,7 +12,9 @@ import {
   type RuleAction,
   type RuleCondition,
   type AutomationLog,
+  type QuickflowSuggestion,
 } from "@/stores/automation-store";
+import { formatBytes } from "@/lib/format-bytes";
 import { cn } from "@ufop/ui-components";
 import { Button, Badge, ScrollArea } from "@ufop/ui-components";
 import {
@@ -34,6 +36,7 @@ import {
   Pencil,
   ToggleLeft,
   ToggleRight,
+  Sparkles,
 } from "lucide-react";
 
 // ── NL Input Bar ──
@@ -122,6 +125,15 @@ function actionLabel(action: RuleAction): string {
       return "Run custom command";
     case "notify":
       return `Notify: ${action.title}`;
+    case "replay_op": {
+      // Operation Pin: a captured copy/move replayed verbatim. The
+      // source list and destination both travel with the rule, so the
+      // label shows the file count and the destination — that's all
+      // the user needs to recognize what they pinned.
+      const verb = action.kind === "move" ? "Move" : "Copy";
+      const n = action.source_paths.length;
+      return `Replay: ${verb} ${n} file${n === 1 ? "" : "s"} → ${shortenPath(action.dest_path)}`;
+    }
   }
 }
 
@@ -334,13 +346,6 @@ function conditionLabel(condition: RuleCondition): string {
   }
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1073741824) return `${(bytes / 1048576).toFixed(1)} MB`;
-  return `${(bytes / 1073741824).toFixed(1)} GB`;
-}
-
 // ── Log Entry ──
 
 function LogEntry({ log }: { log: AutomationLog }) {
@@ -376,6 +381,108 @@ function LogEntry({ log }: { log: AutomationLog }) {
 
 // ── Main Panel ──
 
+// ── Quickflow Suggestions ──
+//
+// Renders the patterns surfaced by the ledger → automation bridge. Pure
+// UI: state and IPC live in `useAutomationStore`. The card disappears
+// entirely when there are no suggestions, so the panel stays clean for
+// users whose history hasn't built up a repeated pattern yet.
+
+interface SuggestionCardProps {
+  suggestion: QuickflowSuggestion;
+}
+
+function SuggestionCard({ suggestion }: SuggestionCardProps) {
+  const acceptSuggestion = useAutomationStore((s) => s.acceptSuggestion);
+  const dismissSuggestion = useAutomationStore((s) => s.dismissSuggestion);
+  const [busy, setBusy] = useState(false);
+
+  const handleAccept = useCallback(async () => {
+    setBusy(true);
+    await acceptSuggestion(suggestion.id);
+    // Store removes the card on success; no need to clear `busy`.
+  }, [acceptSuggestion, suggestion.id]);
+
+  const handleDismiss = useCallback(() => {
+    void dismissSuggestion(suggestion.id);
+  }, [dismissSuggestion, suggestion.id]);
+
+  const verb = suggestion.kind === "move" ? "moved" : "copied";
+  const sample = suggestion.sample_files.slice(0, 2).join(", ");
+
+  return (
+    <div
+      className="border border-dashed border-[var(--color-primary)] rounded-lg p-3 bg-[var(--color-bg)]"
+      role="group"
+      aria-label={`Quickflow suggestion: ${suggestion.suggested_name}`}
+    >
+      <div className="flex items-start gap-2">
+        <Sparkles
+          className="h-3.5 w-3.5 mt-0.5 text-[var(--color-primary)]"
+          aria-hidden="true"
+        />
+        <div className="flex-1 min-w-0">
+          <p className="text-xs text-[color:var(--color-text)]">
+            You&apos;ve {verb} <strong>{suggestion.hit_count}</strong> files from{" "}
+            <code className="text-[10px] bg-[var(--color-bg-elevated)] px-1 rounded">
+              {shortenPath(suggestion.source_dir)}
+            </code>{" "}
+            to{" "}
+            <code className="text-[10px] bg-[var(--color-bg-elevated)] px-1 rounded">
+              {shortenPath(suggestion.dest_dir)}
+            </code>
+          </p>
+          {sample && (
+            <p className="text-[10px] text-[var(--color-text-muted)] mt-1 truncate">
+              e.g. {sample}
+            </p>
+          )}
+        </div>
+      </div>
+      <div className="flex justify-end gap-1.5 mt-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={handleDismiss}
+          disabled={busy}
+          aria-label={`Dismiss suggestion ${suggestion.suggested_name}`}
+        >
+          Dismiss
+        </Button>
+        <Button
+          variant="default"
+          size="sm"
+          onClick={handleAccept}
+          disabled={busy}
+          aria-label={`Save suggestion ${suggestion.suggested_name} as a Quickflow`}
+        >
+          {busy ? (
+            <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+          ) : (
+            "Save as Quickflow"
+          )}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function SuggestionsSection() {
+  const suggestions = useAutomationStore((s) => s.suggestions);
+  if (suggestions.length === 0) return null;
+  return (
+    <div className="space-y-2 mb-2">
+      <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-[var(--color-text-muted)] font-semibold px-1">
+        <Sparkles className="h-3 w-3" aria-hidden="true" />
+        Suggested from your activity
+      </div>
+      {suggestions.map((s) => (
+        <SuggestionCard key={s.id} suggestion={s} />
+      ))}
+    </div>
+  );
+}
+
 export function AutomationPanel() {
   const panelOpen = useAutomationStore((s) => s.panelOpen);
   const togglePanel = useAutomationStore((s) => s.togglePanel);
@@ -384,17 +491,19 @@ export function AutomationPanel() {
   const loading = useAutomationStore((s) => s.loading);
   const loadRules = useAutomationStore((s) => s.loadRules);
   const loadLogs = useAutomationStore((s) => s.loadLogs);
+  const loadSuggestions = useAutomationStore((s) => s.loadSuggestions);
   const openEditor = useAutomationStore((s) => s.openEditor);
 
   const [activeTab, setActiveTab] = useState<"rules" | "logs">("rules");
 
-  // Load rules on mount
+  // Load rules, logs, and suggestions whenever the panel opens.
   useEffect(() => {
     if (panelOpen) {
       loadRules();
       loadLogs();
+      loadSuggestions();
     }
-  }, [panelOpen, loadRules, loadLogs]);
+  }, [panelOpen, loadRules, loadLogs, loadSuggestions]);
 
   if (!panelOpen) return null;
 
@@ -470,6 +579,7 @@ export function AutomationPanel() {
         <div className="p-3 space-y-2">
           {activeTab === "rules" && (
             <>
+              <SuggestionsSection />
               {loading && (
                 <div className="flex items-center justify-center py-8 text-[var(--color-text-muted)]">
                   <Loader2 className="h-5 w-5 animate-spin" />

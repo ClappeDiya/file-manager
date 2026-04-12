@@ -28,20 +28,9 @@
  *   every override.
  */
 import { useCallback, useEffect, useMemo, useRef, type KeyboardEvent } from "react";
+import { formatBytes } from "@/lib/format-bytes";
 import { useSafetyStore } from "@/stores/safety-store";
 import { AlertTriangle, ShieldAlert, X } from "lucide-react";
-
-function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "—";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let value = bytes;
-  let idx = 0;
-  while (value >= 1024 && idx < units.length - 1) {
-    value /= 1024;
-    idx += 1;
-  }
-  return `${value.toFixed(value >= 10 || idx === 0 ? 0 : 1)} ${units[idx]}`;
-}
 
 export function SafetyInterlockDialog() {
   const pending = useSafetyStore((s) => s.pending);
@@ -81,7 +70,7 @@ export function SafetyInterlockDialog() {
       parts.push(`${i.affected_files.toLocaleString()} file${i.affected_files === 1 ? "" : "s"}`);
     }
     if (i.total_bytes > 0) {
-      parts.push(formatBytes(i.total_bytes));
+      parts.push(formatBytes(i.total_bytes, { binary: true }));
     }
     if (parts.length === 0) parts.push("1 item");
     return `${i.engine} · ${i.kind} · ${parts.join(" · ")}`;
@@ -175,7 +164,7 @@ export function SafetyInterlockDialog() {
               {assessment.baseline_median_files} file
               {assessment.baseline_median_files === 1 ? "" : "s"}
               {assessment.baseline_median_bytes > 0
-                ? ` · ${formatBytes(assessment.baseline_median_bytes)}`
+                ? ` · ${formatBytes(assessment.baseline_median_bytes, { binary: true })}`
                 : ""}
             </p>
           )}

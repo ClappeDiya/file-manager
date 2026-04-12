@@ -12,6 +12,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { isTauriAvailable, tauriInvoke } from "@/hooks/use-tauri";
+import { formatBytes } from "@/lib/format-bytes";
 import { cn } from "@ufop/ui-components";
 import { ScrollArea } from "@ufop/ui-components";
 import {
@@ -90,20 +91,6 @@ export interface NfsExportData {
 // ──────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────
-
-/** Format bytes to human-readable string (e.g., "256.0 GB"). */
-function formatBytes(bytes: number): string {
-  const TB = 1024 * 1024 * 1024 * 1024;
-  const GB = 1024 * 1024 * 1024;
-  const MB = 1024 * 1024;
-  const KB = 1024;
-
-  if (bytes >= TB) return `${(bytes / TB).toFixed(1)} TB`;
-  if (bytes >= GB) return `${(bytes / GB).toFixed(1)} GB`;
-  if (bytes >= MB) return `${(bytes / MB).toFixed(1)} MB`;
-  if (bytes >= KB) return `${(bytes / KB).toFixed(1)} KB`;
-  return `${bytes} B`;
-}
 
 /** Get the filesystem type display string. */
 function getFilesystemDisplay(fs: string | { unknown: string }): string {

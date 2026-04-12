@@ -9,6 +9,7 @@
  */
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import { formatBytes } from "@/lib/format-bytes";
 
 interface TransferHistoryRecord {
   id: string;
@@ -28,14 +29,6 @@ interface TransferHistoryRecord {
   conflict_policy: string | null;
   conflict_resolution: string | null;
   retry_count: number;
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 }
 
 function formatDuration(ms: number | null): string {

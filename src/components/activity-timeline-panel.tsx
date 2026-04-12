@@ -24,6 +24,7 @@
  * right-side panels; self-hides via its own Zustand store when closed.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { formatBytes } from "@/lib/format-bytes";
 import { useActivityTimelineStore } from "@/stores/activity-timeline-store";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { useUIStore } from "@/stores/ui-store";
@@ -49,29 +50,7 @@ import {
 } from "lucide-react";
 import { OperationNarrativeCard } from "./operation-narrative-card";
 import { useAutomationStore } from "@/stores/automation-store";
-
-interface LedgerEvent {
-  id: string;
-  occurred_at: string;
-  engine: string;
-  kind: string;
-  status: string;
-  subject_path: string | null;
-  target_path: string | null;
-  bytes: number | null;
-  correlation_id: string | null;
-  summary: string;
-  details_json: string;
-  undo_token: string | null;
-}
-
-/** Format bytes into a short human string. Duplicates no existing util. */
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
+import type { LedgerEventWire as LedgerEvent } from "@/lib/ledger-tail-extract";
 
 /**
  * Format an ISO-ish timestamp into a short relative label ("2m ago").

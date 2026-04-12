@@ -18,6 +18,7 @@
  */
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import { formatBytes } from "@/lib/format-bytes";
 import { useUIStore } from "@/stores/ui-store";
 
 // ── Types (mirrors Rust types) ──
@@ -100,14 +101,6 @@ const STORAGE_CLASS_OPTIONS = [
 ];
 
 // ── Helpers ──
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
-}
 
 function formatDate(dateStr: string | null): string {
   if (!dateStr) return "-";
@@ -247,7 +240,7 @@ function ObjectPropertiesSection({
           {properties.key}
         </span>
         <span className="text-gray-500 dark:text-gray-400">Size</span>
-        <span>{formatBytes(properties.content_length)}</span>
+        <span>{formatBytes(properties.content_length, { decimals: 2 })}</span>
         <span className="text-gray-500 dark:text-gray-400">Content Type</span>
         <span>{properties.content_type || "-"}</span>
         <span className="text-gray-500 dark:text-gray-400">Last Modified</span>
@@ -1022,7 +1015,7 @@ function FileVersionsSection({
                   </div>
                   <div className="text-gray-500 dark:text-gray-400 mt-0.5">
                     {formatDate(version.last_modified)} &middot;{" "}
-                    {formatBytes(version.size)}
+                    {formatBytes(version.size, { decimals: 2 })}
                   </div>
                 </div>
                 {!version.is_latest && (
