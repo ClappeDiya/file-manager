@@ -14,6 +14,7 @@ import { useCallback } from "react";
 import { useUIStore, type ActivityEntry, type ActivityType } from "@/stores/ui-store";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { cn } from "@ufop/ui-components";
+import { formatRelativeTime } from "@/lib/ledger-dispatch";
 import { Button } from "@ufop/ui-components";
 import { ScrollArea } from "@ufop/ui-components";
 import {
@@ -88,25 +89,6 @@ function getActivityColor(type: ActivityType): string {
   }
 }
 
-function formatRelativeTime(isoTimestamp: string): string {
-  const now = Date.now();
-  const then = new Date(isoTimestamp).getTime();
-  const diffMs = now - then;
-
-  if (diffMs < 60_000) return "Just now";
-  if (diffMs < 3_600_000) {
-    const mins = Math.floor(diffMs / 60_000);
-    return `${mins} minute${mins !== 1 ? "s" : ""} ago`;
-  }
-  if (diffMs < 86_400_000) {
-    const hours = Math.floor(diffMs / 3_600_000);
-    return `${hours} hour${hours !== 1 ? "s" : ""} ago`;
-  }
-  const days = Math.floor(diffMs / 86_400_000);
-  if (days === 1) return "Yesterday";
-  if (days < 7) return `${days} days ago`;
-  return new Date(isoTimestamp).toLocaleDateString();
-}
 
 // ──────────────────────────────────────────────
 // Activity Feed Component
@@ -263,7 +245,7 @@ function ActivityRow({
 
           {/* Timestamp */}
           <p className="text-xs text-[color:var(--color-text-tertiary)] mt-1.5">
-            {formatRelativeTime(entry.timestamp)}
+            {formatRelativeTime(entry.timestamp, undefined, "prose")}
           </p>
         </div>
 

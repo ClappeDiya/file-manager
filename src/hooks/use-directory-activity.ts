@@ -23,13 +23,15 @@
  *   still caps at its own 30-day retention.
  */
 import { useEffect, useState } from "react";
-import { tauriInvokeSafe } from "./use-tauri";
+import { isTauriAvailable, tauriInvokeSafe } from "./use-tauri";
+import { formatRelativeTime } from "@/lib/ledger-dispatch";
 
 /** Wire-format mirror of `LedgerPathHit` in `src-tauri/src/ledger/mod.rs`. */
 interface LedgerPathHit {
   path: string;
   last_seen: string;
   hit_count: number;
+  last_engine: string | null;
 }
 
 /** Age bucket frozen at the moment the directory was fetched. Frozen
@@ -38,6 +40,21 @@ interface LedgerPathHit {
  *  during render. The user re-navigating the directory re-fetches and
  *  re-buckets naturally. */
 export type ActivityAgeBucket = "recent" | "today" | "week";
+
+/** Engine that most recently touched a file — matches `LedgerEngine`
+ *  string identifiers in the Rust backend. */
+export type LedgerEngineKind =
+  | "fs"
+  | "transfer"
+  | "sync"
+  | "automation"
+  | "mount"
+  | "spaces"
+  | "ai"
+  | "vault"
+  | "compat"
+  | "connector"
+  | "system";
 
 export interface FileActivityInfo {
   /** ISO-like timestamp (`YYYY-MM-DD HH:MM:SS` or RFC-3339). */
@@ -48,6 +65,8 @@ export interface FileActivityInfo {
   ageBucket: ActivityAgeBucket;
   /** Pre-formatted relative-age label (e.g. "12m", "3h", "2d"). */
   ageLabel: string;
+  /** Engine that most recently touched this path (e.g. "sync", "transfer"). */
+  lastEngine: LedgerEngineKind | null;
 }
 
 /** Activity lookup — zero allocation per-row if the map is empty. */
@@ -62,10 +81,6 @@ function sevenDaysAgoIso(): string {
   return new Date(Date.now() - SINCE_DAYS * 24 * 60 * 60 * 1000).toISOString();
 }
 
-/** Compute the age bucket + label for a ledger timestamp, anchored to a
- *  caller-supplied `now`. Keeps the bucketing deterministic relative to
- *  a single fetch snapshot so downstream components don't need to call
- *  `Date.now()` during render. */
 function bucketAge(
   lastSeen: string,
   now: number,
@@ -75,19 +90,118 @@ function bucketAge(
   );
   const validMs = Number.isNaN(parsed.getTime()) ? now : parsed.getTime();
   const ageMin = Math.max(Math.round((now - validMs) / 60000), 0);
-  if (ageMin < 60) {
-    return {
-      ageBucket: "recent",
-      ageLabel: ageMin <= 1 ? "just now" : `${ageMin}m ago`,
+  const ageLabel =
+    ageMin <= 1
+      ? "just now"
+      : formatRelativeTime(lastSeen, now, "withSuffix");
+  if (ageMin < 60) return { ageBucket: "recent", ageLabel };
+  if (ageMin < 24 * 60) return { ageBucket: "today", ageLabel };
+  return { ageBucket: "week", ageLabel };
+}
+
+/** Number of days the **Stale Files Filter** chip considers when
+ *  deciding whether a file has been "forgotten". 30 days strikes the
+ *  right balance: long enough that genuinely-active files never get
+ *  flagged, short enough that the user sees a meaningful cleanup
+ *  opportunity in heavily-used folders. Lives next to `SINCE_DAYS` so
+ *  the two windows are visually adjacent and easy to keep in sync. */
+export const STALE_SINCE_DAYS = 30;
+
+function nDaysAgoIso(days: number): string {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+/** Result returned by [`useRecentlyTouchedSet`]. The `loaded` flag is
+ *  the critical safety bit: it discriminates "no paths touched"
+ *  (fetch completed and ledger really is empty) from "fetch hasn't
+ *  finished yet" / "running outside Tauri". Consumers MUST gate any
+ *  inverse computation (e.g. "X files are stale") on `loaded` —
+ *  otherwise every file flashes as stale during the brief loading
+ *  window or in browser preview mode. */
+export interface RecentlyTouchedResult {
+  /** Paths that the ledger has seen in the staleness window. Empty
+   *  set when `loaded === false`. */
+  touched: Set<string>;
+  /** True once the backend has answered at least once for this
+   *  directory. False outside Tauri (the fetch fail-soft path never
+   *  resolves to "loaded with real data") and during the initial
+   *  fetch. */
+  loaded: boolean;
+}
+
+/**
+ * Returns the Set of paths under `dirPath` that have at least one
+ * ledger event within the last `sinceDays` days. Powers the
+ * **Stale Files Filter** chip in the FilterBar — the consumer flips
+ * this set to compute the *inverse* (files with no recent activity).
+ *
+ * Why a separate hook from `useDirectoryActivity`?
+ *
+ * - **Different time window**: 30 days vs 7 days. The 7-day signal
+ *   drives the inline activity dots; the 30-day signal drives the
+ *   cleanup chip. Conflating them would force a single window that's
+ *   wrong for at least one consumer.
+ * - **Different shape**: callers only need membership-test ("is this
+ *   path stale?"), not the full per-path metadata. Returning a `Set`
+ *   keeps the consumer side O(1) per file with zero allocation noise.
+ * - **DRY**: shares the existing `ledger_directory_activity` Tauri
+ *   command — no new IPC, no new SQL, no new infrastructure.
+ *
+ * The returned [`RecentlyTouchedResult`] carries a `loaded` flag so
+ * consumers can suppress the chip count entirely until the first
+ * fetch completes (avoiding the "every file flashes as stale during
+ * loading" pitfall). Outside Tauri the hook stays in `loaded: false`
+ * forever, which is what we want — without the ledger we genuinely
+ * cannot tell what's stale.
+ */
+export function useRecentlyTouchedSet(
+  dirPath: string | null,
+  sinceDays: number = STALE_SINCE_DAYS,
+): RecentlyTouchedResult {
+  const [result, setResult] = useState<RecentlyTouchedResult>(() => ({
+    touched: new Set<string>(),
+    loaded: false,
+  }));
+
+  useEffect(() => {
+    if (!dirPath) {
+      setResult({ touched: new Set(), loaded: false });
+      return;
+    }
+    // Reset to "loading" on every directory change so the chip
+    // disappears immediately and reappears only after the new
+    // directory's data arrives.
+    setResult({ touched: new Set(), loaded: false });
+    let cancelled = false;
+    (async () => {
+      // Only consider the result authoritative when we're inside
+      // Tauri AND the call returned successfully. Outside Tauri,
+      // `tauriInvokeSafe` resolves to the fallback ([]) immediately
+      // — but that "empty list" is meaningless for staleness, so we
+      // refuse to mark the result as loaded.
+      if (!isTauriAvailable()) {
+        return;
+      }
+      const hits = await tauriInvokeSafe<LedgerPathHit[]>(
+        "ledger_directory_activity",
+        {
+          dirPath,
+          sinceIso: nDaysAgoIso(sinceDays),
+          limit: 1000,
+        },
+        [],
+      );
+      if (cancelled) return;
+      const next = new Set<string>();
+      for (const hit of hits) next.add(hit.path);
+      setResult({ touched: next, loaded: true });
+    })();
+    return () => {
+      cancelled = true;
     };
-  }
-  if (ageMin < 24 * 60) {
-    return { ageBucket: "today", ageLabel: `${Math.round(ageMin / 60)}h ago` };
-  }
-  return {
-    ageBucket: "week",
-    ageLabel: `${Math.round(ageMin / (60 * 24))}d ago`,
-  };
+  }, [dirPath, sinceDays]);
+
+  return result;
 }
 
 /**
@@ -128,6 +242,7 @@ export function useDirectoryActivity(dirPath: string | null): FileActivityMap {
           hitCount: hit.hit_count,
           ageBucket,
           ageLabel,
+          lastEngine: (hit.last_engine as LedgerEngineKind) ?? null,
         };
       }
       setMap(next);

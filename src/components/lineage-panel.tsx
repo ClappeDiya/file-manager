@@ -26,67 +26,17 @@
 import { useCallback, useEffect } from "react";
 import { useLineageStore, type LineageEvent } from "@/stores/lineage-store";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import { formatRelativeTime } from "@/lib/ledger-dispatch";
+import { ENGINE_ICONS, STATUS_META } from "@/lib/engine-ui-constants";
 import { cn } from "@ufop/ui-components";
 import { Button, Badge, ScrollArea } from "@ufop/ui-components";
 import {
   X,
   History,
-  FileText,
-  ArrowRightLeft,
-  RefreshCcw,
-  Zap,
-  HardDrive,
-  Layers,
-  Bot,
-  ShieldCheck,
-  Wrench,
-  Plug,
-  Settings,
   Activity,
   AlertTriangle,
-  CheckCircle2,
-  XCircle,
-  Ban,
-  MinusCircle,
 } from "lucide-react";
 
-/** Same engine → icon map shape as activity-timeline-panel, kept local
- *  so this component stays self-contained. */
-const ENGINE_ICONS: Record<string, typeof Activity> = {
-  fs: FileText,
-  transfer: ArrowRightLeft,
-  sync: RefreshCcw,
-  automation: Zap,
-  mount: HardDrive,
-  spaces: Layers,
-  ai: Bot,
-  vault: ShieldCheck,
-  compat: Wrench,
-  connector: Plug,
-  system: Settings,
-};
-
-const STATUS_META: Record<string, { Icon: typeof CheckCircle2; className: string }> = {
-  ok: { Icon: CheckCircle2, className: "text-emerald-500" },
-  failed: { Icon: XCircle, className: "text-red-500" },
-  cancelled: { Icon: Ban, className: "text-amber-500" },
-  skipped: { Icon: MinusCircle, className: "text-[color:var(--color-text-muted)]" },
-};
-
-function formatRelative(iso: string): string {
-  // SQLite stores `YYYY-MM-DD HH:MM:SS` in UTC; append Z so Date parses it.
-  const d = new Date(iso.includes("T") ? iso : `${iso.replace(" ", "T")}Z`);
-  if (Number.isNaN(d.getTime())) return iso;
-  const diffMs = Date.now() - d.getTime();
-  const diffSec = Math.round(diffMs / 1000);
-  if (diffSec < 60) return `${diffSec}s ago`;
-  const diffMin = Math.round(diffSec / 60);
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffHr = Math.round(diffMin / 60);
-  if (diffHr < 24) return `${diffHr}h ago`;
-  const diffDay = Math.round(diffHr / 24);
-  return `${diffDay}d ago`;
-}
 
 function shortPath(path: string): string {
   const parts = path.split(/[/\\]/).filter(Boolean);
@@ -300,7 +250,7 @@ function LineageRow({ event }: { event: LineageEvent }) {
           </span>
         </div>
         <div className="mt-0.5 flex items-center gap-2 text-[10px] text-[color:var(--color-text-muted)]">
-          <span>{formatRelative(event.occurred_at)}</span>
+          <span>{formatRelativeTime(event.occurred_at, undefined, "withSuffix")}</span>
           <span aria-hidden="true">·</span>
           <span>{event.engine}</span>
           <span aria-hidden="true">·</span>

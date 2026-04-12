@@ -33,14 +33,57 @@ import {
 import { usePathJumpStore } from "@/stores/path-jump-store";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { tauriInvokeSafe } from "@/hooks/use-tauri";
+import {
+  dispatchLedgerPath,
+  deriveLabel,
+  labelForKind,
+  formatRelativeTime,
+} from "@/lib/ledger-dispatch";
 import { cn } from "@ufop/ui-components";
 import { Search, Clock, Hash, CornerDownLeft, History } from "lucide-react";
 
-/** Wire-format mirror of `LedgerPathHit` in `src-tauri/src/ledger/mod.rs`. */
+/** Wire-format mirror of `LedgerPathHit` in `src-tauri/src/ledger/mod.rs`.
+ *  Iter 40: `last_kind` added so each hit row can render a
+ *  contextual badge ("edit_text", "copy", "move", …) that tells
+ *  the user WHY the path is ranked where it is. Optional because
+ *  the Rust side serde-skips None, and because sibling queries
+ *  like `directory_activity` / `frecent_paths` leave it unset. */
 interface PathHit {
   path: string;
   last_seen: string;
   hit_count: number;
+  last_kind?: string;
+}
+
+/** Iter 37 props — optional callback that lifts the file-vs-dir
+ *  decision up to the host. When omitted the dialog falls back to
+ *  the pre-iter-37 behaviour of unconditionally navigating the
+ *  active pane's tab, so existing call sites that pass no props
+ *  stay binary-compatible. The host is expected to decide whether
+ *  to open the file in the in-app text editor, the archive
+ *  browser, or reveal it in its parent directory — matching the
+ *  iter-31/32 double-click routing in file-manager.tsx. */
+export interface PathJumpDialogProps {
+  onOpenFile?: (path: string, size: number) => void;
+  onOpenArchive?: (path: string) => void;
+  /** Iter 38: open a media/PDF path in the inline preview pane.
+   *  Called only when `isPreviewablePath` returns true for the
+   *  hit AND the host decided preview routing is appropriate
+   *  (the host is responsible for any contextual gating — e.g.
+   *  the FilePane handleOpen only routes previewable files
+   *  when the pane is already visible; the Instant Jump gate
+   *  is different because a successful jump usually implies
+   *  the user wants the content surfaced immediately). */
+  onOpenPreview?: (path: string) => void;
+  /** Classification predicate so the host can share its
+   *  extension whitelist for text files. If omitted, the
+   *  dialog treats every non-directory as a "reveal in parent"
+   *  candidate. */
+  isPlainTextPath?: (path: string) => boolean;
+  /** Classification predicate for archive files. See above. */
+  isArchivePath?: (path: string) => boolean;
+  /** Iter 38: classification predicate for previewable files. */
+  isPreviewablePath?: (path: string) => boolean;
 }
 
 /** Debounce in ms. Every keystroke is cheap (single SQL scan), but
@@ -51,26 +94,6 @@ const DEBOUNCE_MS = 100;
  *  modal list can render usefully without scrolling, but small enough
  *  that the SQL scan stays trivial on any realistic ledger. */
 const RESULT_LIMIT = 150;
-
-function formatRelative(iso: string): string {
-  // SQLite stores `YYYY-MM-DD HH:MM:SS` in UTC; append Z so Date parses.
-  const d = new Date(iso.includes("T") ? iso : `${iso.replace(" ", "T")}Z`);
-  if (Number.isNaN(d.getTime())) return iso;
-  const diffMs = Date.now() - d.getTime();
-  const diffSec = Math.round(diffMs / 1000);
-  if (diffSec < 60) return `${diffSec}s`;
-  const diffMin = Math.round(diffSec / 60);
-  if (diffMin < 60) return `${diffMin}m`;
-  const diffHr = Math.round(diffMin / 60);
-  if (diffHr < 24) return `${diffHr}h`;
-  const diffDay = Math.round(diffHr / 24);
-  return `${diffDay}d`;
-}
-
-function deriveLabel(path: string): string {
-  const parts = path.split(/[/\\]/).filter(Boolean);
-  return parts[parts.length - 1] ?? path;
-}
 
 /**
  * Very small highlighter — wraps exact substring matches of `query` in
@@ -92,7 +115,14 @@ function Highlight({ text, query }: { text: string; query: string }) {
   );
 }
 
-export function PathJumpDialog() {
+export function PathJumpDialog({
+  onOpenFile,
+  onOpenArchive,
+  onOpenPreview,
+  isPlainTextPath,
+  isArchivePath,
+  isPreviewablePath,
+}: PathJumpDialogProps = {}) {
   const isOpen = usePathJumpStore((s) => s.isOpen);
   const close = usePathJumpStore((s) => s.close);
 
@@ -101,6 +131,14 @@ export function PathJumpDialog() {
   const [hits, setHits] = useState<PathHit[]>([]);
   const [loading, setLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
+  // Iter 41: client-side kind filter. When non-null, the result
+  // list is narrowed to hits whose `last_kind` exactly matches
+  // the filter. Set by clicking a badge on any row; cleared by
+  // pressing Escape once (before the Escape-to-close path fires)
+  // or by clicking the filter pill's close button. Pure client
+  // filter — no extra IPC — because `ledger_recent_paths` already
+  // returned every kind in the top-100 window.
+  const [kindFilter, setKindFilter] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
 
@@ -143,12 +181,37 @@ export function PathJumpDialog() {
       setQuery("");
       setDebouncedQuery("");
       setSelectedIndex(0);
+      // Iter 41: clear any stale filter from a previous open, so
+      // every modal session starts with the full ledger view.
+      setKindFilter(null);
       // Defer focus to the next tick so the modal is mounted first.
       const handle = window.setTimeout(() => inputRef.current?.focus(), 0);
       return () => window.clearTimeout(handle);
     }
     return;
   }, [isOpen]);
+
+  // Iter 41: derived visible hits. When a kind filter is active
+  // the list narrows to hits whose `last_kind` matches exactly.
+  // When the filter is null (default), visibleHits === hits so
+  // the pre-iter-41 behaviour is a zero-cost pass-through.
+  const visibleHits = useMemo(
+    () =>
+      kindFilter === null
+        ? hits
+        : hits.filter((h) => h.last_kind === kindFilter),
+    [hits, kindFilter],
+  );
+
+  // Iter 41: clamp the selected index whenever `visibleHits`
+  // shrinks beneath it (e.g. user clicks a filter and the list
+  // collapses from 40 rows to 5). Prevents a stale index from
+  // pointing past the end of the list.
+  useEffect(() => {
+    if (selectedIndex >= visibleHits.length && visibleHits.length > 0) {
+      setSelectedIndex(0);
+    }
+  }, [visibleHits.length, selectedIndex]);
 
   // Scroll the highlighted row into view as the selection moves.
   useEffect(() => {
@@ -164,25 +227,75 @@ export function PathJumpDialog() {
   // tab and navigates it to the chosen path. `navigateTab` is idempotent
   // for the same path so re-jumping to the current directory is a no-op
   // that still gets picked up by the breadcrumb-history layer.
-  const navigateTo = useCallback(
+  //
+  // Iter 37: file-aware routing. Because iter 35 put every in-app
+  // text-editor save into the ledger under kind `edit_text`, the
+  // ledger_recent_paths response now includes FILES as well as
+  // directories. The pre-iter-37 code unconditionally called
+  // `navigateTab` on the hit path, which worked for directories
+  // but failed silently for files (list_directory on a file
+  // errors). This callback now fetches metadata, then routes:
+  //   - is_dir=true              → navigateTab (unchanged behaviour)
+  //   - archive file             → onOpenArchive(path)
+  //   - plain-text file ≤1MB     → onOpenFile(path, size)
+  //   - everything else (files)  → navigate the pane to the file's
+  //                                parent directory so the file is
+  //                                at least visible in the list
+  // Metadata IPC failure falls through to the legacy path so an
+  // offline/broken state never locks the dialog.
+  const doNavigateTab = useCallback(
     (path: string) => {
       const store = useFileManagerStore.getState();
       const paneIndex = store.activePaneIndex;
       const activeTab = store.getActiveTab(paneIndex);
-      if (!activeTab) {
-        close();
-        return;
-      }
+      if (!activeTab) return;
       store.navigateTab(paneIndex, activeTab.id, path, deriveLabel(path));
+    },
+    [],
+  );
+
+  // Iter 42: routing core lifted into `src/lib/ledger-dispatch.ts`.
+  // `dispatchLedgerPath` is shared with the file-manager's new
+  // Cmd+Shift+L "Jump to Last Touched" shortcut, so Instant Jump
+  // (Enter) and the last-touched teleport now route through one
+  // codepath — zero divergence risk.
+  const navigateTo = useCallback(
+    async (path: string) => {
+      await dispatchLedgerPath(path, {
+        isArchivePath,
+        isPlainTextPath,
+        isPreviewablePath,
+        onOpenArchive,
+        onOpenFile,
+        onOpenPreview,
+        onNavigateDir: doNavigateTab,
+      });
       close();
     },
-    [close],
+    [
+      close,
+      doNavigateTab,
+      isArchivePath,
+      isPlainTextPath,
+      isPreviewablePath,
+      onOpenArchive,
+      onOpenFile,
+      onOpenPreview,
+    ],
   );
 
   const onKeyDown = useCallback(
     (e: KeyboardEvent<HTMLInputElement>) => {
       if (e.key === "Escape") {
         e.preventDefault();
+        // Iter 41: Escape precedence — active kind filter clears
+        // first, then query text, then closes the modal. This
+        // gives the user a consistent "back up one level" gesture
+        // without stealing the close shortcut.
+        if (kindFilter !== null) {
+          setKindFilter(null);
+          return;
+        }
         if (query !== "") {
           setQuery("");
           return;
@@ -192,7 +305,9 @@ export function PathJumpDialog() {
       }
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        setSelectedIndex((i) => Math.min(i + 1, Math.max(hits.length - 1, 0)));
+        setSelectedIndex((i) =>
+          Math.min(i + 1, Math.max(visibleHits.length - 1, 0)),
+        );
         return;
       }
       if (e.key === "ArrowUp") {
@@ -202,12 +317,12 @@ export function PathJumpDialog() {
       }
       if (e.key === "Enter") {
         e.preventDefault();
-        const hit = hits[selectedIndex];
+        const hit = visibleHits[selectedIndex];
         if (hit) navigateTo(hit.path);
         return;
       }
     },
-    [query, hits, selectedIndex, navigateTo, close],
+    [query, visibleHits, selectedIndex, navigateTo, close, kindFilter],
   );
 
   const emptyStateMessage = useMemo(() => {
@@ -257,6 +372,41 @@ export function PathJumpDialog() {
           </div>
         </div>
 
+        {/* Iter 41: active kind-filter pill. Appears just below
+            the input row whenever the user has clicked a kind
+            badge on any hit. Clears via its own ✕ button or via
+            Escape (the iter-41 precedence layer). */}
+        {kindFilter !== null && (() => {
+          const { label, tone } = labelForKind(kindFilter);
+          return (
+            <div
+              className="flex items-center gap-2 border-b border-[var(--color-border)] px-3 py-1.5"
+              role="status"
+              aria-live="polite"
+            >
+              <span className="text-[10px] text-[color:var(--color-text-muted)]">
+                Filtering by
+              </span>
+              <span
+                className={cn(
+                  "rounded px-1.5 py-px text-[10px] font-medium",
+                  tone,
+                )}
+              >
+                {label}
+              </span>
+              <button
+                type="button"
+                onClick={() => setKindFilter(null)}
+                className="ml-auto text-[10px] text-[color:var(--color-text-muted)] hover:text-[color:var(--color-text)]"
+                aria-label="Clear kind filter"
+              >
+                ✕ clear
+              </button>
+            </div>
+          );
+        })()}
+
         {/* Result list */}
         <div
           ref={listRef}
@@ -264,7 +414,7 @@ export function PathJumpDialog() {
           role="listbox"
           aria-label="Path results"
         >
-          {hits.length === 0 ? (
+          {visibleHits.length === 0 ? (
             <div className="px-4 py-10 text-center">
               <History
                 className="mx-auto h-6 w-6 text-[color:var(--color-text-muted)] opacity-50"
@@ -275,7 +425,7 @@ export function PathJumpDialog() {
               </div>
             </div>
           ) : (
-            hits.map((hit, idx) => (
+            visibleHits.map((hit, idx) => (
               <button
                 key={hit.path}
                 type="button"
@@ -301,12 +451,49 @@ export function PathJumpDialog() {
                   <div className="mt-0.5 flex items-center gap-3 text-[10px] text-[color:var(--color-text-muted)]">
                     <span className="flex items-center gap-1">
                       <Clock className="h-3 w-3" aria-hidden="true" />
-                      {formatRelative(hit.last_seen)} ago
+                      {formatRelativeTime(hit.last_seen, undefined, "withSuffix")}
                     </span>
                     <span className="flex items-center gap-1">
                       <Hash className="h-3 w-3" aria-hidden="true" />
                       {hit.hit_count} {hit.hit_count === 1 ? "touch" : "touches"}
                     </span>
+                    {hit.last_kind && (() => {
+                      const kindKey = hit.last_kind;
+                      const { label, tone } = labelForKind(kindKey);
+                      const isActive = kindFilter === kindKey;
+                      return (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            // Iter 41: click on a kind badge toggles
+                            // the client-side filter WITHOUT jumping
+                            // to the path (stopPropagation + the
+                            // parent button's onClick). Clicking the
+                            // same kind a second time clears the
+                            // filter so the gesture round-trips in
+                            // one fingertip.
+                            e.stopPropagation();
+                            e.preventDefault();
+                            setKindFilter((prev) =>
+                              prev === kindKey ? null : kindKey,
+                            );
+                          }}
+                          className={cn(
+                            "rounded px-1.5 py-px text-[10px] font-medium transition-all",
+                            tone,
+                            isActive && "ring-1 ring-sky-400",
+                          )}
+                          aria-label={
+                            isActive
+                              ? `Clear ${label} filter`
+                              : `Filter to ${label} only`
+                          }
+                          aria-pressed={isActive}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })()}
                   </div>
                 </div>
               </button>
@@ -316,9 +503,10 @@ export function PathJumpDialog() {
 
         {/* Footer hint */}
         <div className="flex items-center justify-between border-t border-[var(--color-border)] px-3 py-1.5 text-[10px] text-[color:var(--color-text-muted)]">
-          <span>↑↓ navigate · Enter jump · Esc close</span>
+          <span>↑↓ navigate · Enter jump · click badge to filter · Esc back</span>
           <span>
-            {hits.length} {hits.length === 1 ? "path" : "paths"}
+            {visibleHits.length} of {hits.length}{" "}
+            {hits.length === 1 ? "path" : "paths"}
           </span>
         </div>
       </div>

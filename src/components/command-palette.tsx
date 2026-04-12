@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { useAiStore, type AiExecutionResult, type ParsedJobConfig } from "@/stores/ai-store";
+import {
+  applyMruOrdering,
+  readCommandUsage,
+  recordCommandUsage,
+} from "@/lib/command-mru";
 import { cn } from "@ufop/ui-components";
 import {
   Search,
@@ -30,18 +35,37 @@ import {
   Zap,
   Activity,
   Layers,
+  RotateCcw,
+  Bookmark,
+  BookmarkPlus,
   Loader2,
   Sparkles,
   ArrowRight,
+  ArrowLeftRight,
   Shield,
   Filter,
   FolderSync,
   Upload,
+  History,
+  ShieldCheck,
 } from "lucide-react";
 
 // ──────────────────────────────────────────────
 // Types
 // ──────────────────────────────────────────────
+
+/** Iter 48: secondary shortcut entry. Rendered in the keyboard
+ *  cheat sheet below the primary `shortcut` so multi-gesture
+ *  features (Jump Ring forward/reverse, future copy/move
+ *  modifier pairs, …) can surface every binding without needing
+ *  separate palette entries that would clutter ⌘K. Not shown in
+ *  the ⌘K palette itself — that surface stays one-row-per-action. */
+export interface AdditionalShortcut {
+  /** Keyboard glyph string, e.g. "\u2318\u21E7\u2325L". */
+  keys: string;
+  /** Short hint (≤40 chars) describing what the variant does. */
+  hint: string;
+}
 
 export interface CommandItem {
   id: string;
@@ -49,6 +73,10 @@ export interface CommandItem {
   description?: string;
   icon?: React.ReactNode;
   shortcut?: string;
+  /** Iter 48: secondary shortcuts surfaced in the keyboard cheat
+   *  sheet only. Undefined or empty array = single shortcut,
+   *  which is the pre-iter-48 behaviour. */
+  additionalShortcuts?: AdditionalShortcut[];
   category: string;
   action: () => void;
   keywords?: string[];
@@ -248,9 +276,29 @@ export function CommandPalette({ commands, isOpen, onClose, onExecutionResult }:
     clearIntent,
   } = useAiStore();
 
+  // Iter 24: read the MRU usage map fresh on every palette open.
+  // Using `useState` (rather than `useRef` + version counter)
+  // keeps the memo deps honest: when the map changes, React
+  // triggers a re-render AND the memo's dep array picks it up
+  // naturally via the `mruUsage` reference. The one extra
+  // render per open is trivial compared to a clean dep list
+  // that doesn't need a lint suppression.
+  const [mruUsage, setMruUsage] = useState(() => readCommandUsage());
+  useEffect(() => {
+    if (isOpen) {
+      setMruUsage(readCommandUsage());
+    }
+  }, [isOpen]);
+
   // Filter and sort by fuzzy match score
   const filteredCommands = useMemo(() => {
-    if (!query.trim()) return commands;
+    // Iter 24: empty query \u2192 frecency-sorted list instead of the
+    // raw declaration order. Commands the user has executed before
+    // rise to the top (sorted by useCount DESC, lastUsedAt DESC);
+    // everything else keeps its original declaration order below.
+    // On first use (no localStorage record), this is a no-op and
+    // the palette behaves exactly like iter 23.
+    if (!query.trim()) return applyMruOrdering(commands, mruUsage);
 
     const scored = commands
       .map((cmd) => {
@@ -273,7 +321,7 @@ export function CommandPalette({ commands, isOpen, onClose, onExecutionResult }:
       .sort((a, b) => b.score - a.score);
 
     return scored.map((s) => s.cmd);
-  }, [commands, query]);
+  }, [commands, query, mruUsage]);
 
   // Reset selection when query changes
   useEffect(() => {
@@ -358,6 +406,11 @@ export function CommandPalette({ commands, isOpen, onClose, onExecutionResult }:
               // Standard command execution
               const cmd = filteredCommands[selectedIndex];
               if (cmd) {
+                // Iter 24: record the usage so the next palette
+                // open surfaces this command at the top. Fire
+                // before `action()` so a long-running async
+                // action doesn't block the write.
+                recordCommandUsage(cmd.id);
                 cmd.action();
                 onClose();
               }
@@ -520,6 +573,8 @@ export function CommandPalette({ commands, isOpen, onClose, onExecutionResult }:
                             : "text-[color:var(--color-text)] hover:bg-[var(--color-hover-bg)]",
                         )}
                         onClick={() => {
+                          // Iter 24: record usage for MRU ordering.
+                          recordCommandUsage(cmd.id);
                           cmd.action();
                           onClose();
                         }}
@@ -639,6 +694,89 @@ export function getDefaultCommands(actions: {
   onCreateAutomation?: () => void;
   onCreateSmartSpace?: () => void;
   onToggleActivityTimeline?: () => void;
+  onReopenClosedTab?: () => void;
+  onStashSelection?: () => void;
+  onRecallLastStash?: () => void;
+  /** Toggle a bookmark on the active pane's current directory. */
+  onToggleBookmarkCurrentDir?: () => void;
+  /** Live snapshot of the favorites ring so the palette can surface
+   *  each bookmark as its own jump entry. Kept optional for callers
+   *  that build the palette without the file-manager store wired in. */
+  bookmarks?: Array<{ id: string; name: string; path: string }>;
+  /** Jump the active pane to a bookmark by its slot index. */
+  onJumpToBookmark?: (index: number) => void;
+  /** Open the active pane's current path as a fresh tab in the OTHER
+   *  pane and focus it. Auto-exits single-pane mode. */
+  onOpenInOtherPane?: () => void;
+  /** Swap the contents of the two panes \u2014 left becomes right and
+   *  vice versa, taking selections, tabs, and per-pane history along
+   *  with them. Auto-exits single-pane mode. */
+  onSwapPanes?: () => void;
+  /** Copy the active pane's filter text to the other pane so both
+   *  sides filter for the same query. No-op when the source filter
+   *  is empty. */
+  onEchoFilterToOtherPane?: () => void;
+  /** Copy the active pane's full view configuration (viewMode,
+   *  sortBy, sortAsc, groupBy) to the other pane in one keystroke.
+   *  Idempotent: silent no-op when both panes already match. */
+  onMirrorViewToOtherPane?: () => void;
+  /** Duplicate the active tab as a fresh tab in the SAME pane.
+   *  The clone gets its own back/forward history starting from
+   *  the current path. Pairs with Open in Other Pane (which
+   *  targets the inactive pane) to give the user both same-pane
+   *  and cross-pane "fork this view" gestures. */
+  onDuplicateActiveTab?: () => void;
+  /** Open the Batch Rename dialog on the active pane's current
+   *  selection. Iter 25 surfaces the long-orphaned rename engine
+   *  (token substitution, find/replace, regex, sequential
+   *  numbering, case transformation, undo). No-op with a toast
+   *  when the selection is empty. */
+  onBatchRename?: () => void;
+  /** Open the Connection Manager panel \u2014 saved profiles,
+   *  quick-connect, connection test, third-party import, and
+   *  the 17-protocol registry (SFTP, S3, Google Drive, WebDAV,
+   *  SMB, FTP, Azure Blob, GCS, Dropbox, Box, OneDrive, iCloud
+   *  Drive, Mega, pCloud, Nextcloud, OpenStack Swift, MinIO). */
+  onOpenConnections?: () => void;
+  /** Open the Sync Panel \u2014 sync-pair health indicators,
+   *  create-pair wizard, dry-run preview, conflict resolution,
+   *  reports, and rollback. Iter 28 surfaces the long-orphaned
+   *  1454-LOC component. */
+  onOpenSync?: () => void;
+  /** Open the Transfer History (Journal) panel \u2014 searchable
+   *  table of every historical transfer with status, checksum
+   *  verification, retry count, duration, and speed; CSV/JSON
+   *  export; retention cleanup. Iter 30 surfaces the long-
+   *  orphaned 284-LOC component that complements the transfer
+   *  engine's journal + crash-recovery layer. */
+  onOpenTransferHistory?: () => void;
+  /** Open the Integrity Tools panel — four tabs covering
+   *  checksum computation (MD5 / SHA-1 / SHA-256), checksum
+   *  verification, duplicate detection, tags and labels, and
+   *  Smart Folder saved queries. Iter 36 surfaces the last
+   *  clean 1071-LOC orphan (T-063) with five pre-registered
+   *  backend IPCs. */
+  onOpenIntegrityTools?: () => void;
+  /** Open the Preview Pane on the active pane's first selected
+   *  file. Supports images (EXIF), PDFs, syntax-highlighted
+   *  code (30+ languages), rendered Markdown, audio waveforms,
+   *  video thumbnails, archive contents, and plain metadata
+   *  for large files. Sandboxed \u2014 no script / network / write.
+   *  Iter 29 surfaces the long-orphaned 844-LOC component.
+   *  Shows a structured-error toast when selection is empty. */
+  onOpenPreview?: () => void;
+  /** Copy every selected path (one per line) to the system
+   *  clipboard, or the current directory path when nothing is
+   *  selected. Different from the single-path `onCopyPath` entry,
+   *  which silently drops every path but the first from a
+   *  multi-file selection. */
+  onCopyAllPaths?: () => void;
+  /** Iter 42: "Jump to Last Touched" — teleport directly to the
+   *  most recently touched ledger path without opening Instant
+   *  Jump. Routes through the same shared dispatch helper as
+   *  Instant Jump, so archives/text/media/folders all land on
+   *  the right surface. No-op when the ledger is empty. */
+  onJumpLastTouched?: () => void;
 }): CommandItem[] {
   const isMac = typeof navigator !== "undefined" && navigator.platform.startsWith("Mac");
   const cmd = isMac ? "\u2318" : "Ctrl+";
@@ -926,14 +1064,266 @@ export function getDefaultCommands(actions: {
       action: actions.onOpenInEditor || (() => {}),
       keywords: ["editor", "external", "vscode", "open", "edit"],
     },
-    // Settings
+    // Preview \u2014 iter 29 surfaced the 844-LOC orphaned
+    // PreviewPane. Images (with EXIF), PDFs, syntax-highlighted
+    // code (30+ languages), rendered Markdown, audio waveforms,
+    // video thumbnails, archive contents, plain metadata for
+    // huge files. All sandboxed. 4 IPC commands (preview_file,
+    // preview_get_exif, set_permissions, set_owner) were
+    // pre-registered in the Rust backend; the component just
+    // had zero importers until iter 29.
+    {
+      id: "open-preview",
+      label: "Preview File\u2026",
+      description:
+        "Open a sandboxed preview (images, PDF, code, Markdown, audio, video, archive, EXIF) for the selected file",
+      icon: <Eye className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7P`,
+      category: "File Operations",
+      action: actions.onOpenPreview || (() => {}),
+      keywords: [
+        "preview",
+        "peek",
+        "quick look",
+        "view",
+        "show",
+        "inspect",
+        "file preview",
+        "pdf",
+        "image",
+        "exif",
+        "markdown",
+        "syntax",
+        "code",
+        "thumbnail",
+        "metadata",
+      ],
+    },
+    // Sync Panel \u2014 iter 28 surfaced the 1454-LOC orphaned
+    // sync-pair manager. Health indicators, create-pair
+    // wizard, dry-run preview, conflict resolution, reports,
+    // and rollback. All 14 sync IPC commands were already
+    // registered in the Rust backend; the component just had
+    // zero importers until iter 28.
+    {
+      id: "open-sync",
+      label: "Sync Pairs\u2026",
+      description:
+        "Manage sync pairs \u2014 health indicators, dry-run preview, conflict resolution, reports, rollback",
+      icon: <FolderSync className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7H`,
+      category: "Navigation",
+      action: actions.onOpenSync || (() => {}),
+      keywords: [
+        "sync",
+        "sync pair",
+        "sync pairs",
+        "mirror",
+        "replicate",
+        "dry run",
+        "preview",
+        "conflict",
+        "rollback",
+        "health",
+        "scheduled",
+        "one-way",
+        "two-way",
+        "backup",
+      ],
+    },
+    // Transfer History (Journal) \u2014 iter 30 surfaced the 284-LOC
+    // `TransferHistoryPanel` orphan that complements the transfer
+    // engine's journal + crash-recovery layer. Shows every
+    // historical transfer with status, checksum verification,
+    // retry count, duration, speed; supports CSV/JSON export and
+    // retention cleanup. Three backend IPCs (search_transfer_history,
+    // export_transfer_history, cleanup_transfer_history) were
+    // already registered; the component just had zero importers
+    // until iter 30. Cmd+Shift+J mnemonic = "Journal" \u2014 the only
+    // still-free letter that carried semantic meaning after the
+    // iter 12\u201329 accumulation.
+    {
+      id: "open-transfer-history",
+      label: "Transfer History\u2026",
+      description:
+        "Searchable journal of every transfer \u2014 status, checksum, retries, speed, duration; CSV/JSON export",
+      icon: <History className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7J`,
+      category: "Navigation",
+      action: actions.onOpenTransferHistory || (() => {}),
+      keywords: [
+        "transfer",
+        "transfers",
+        "history",
+        "journal",
+        "log",
+        "completed",
+        "failed",
+        "retry",
+        "retries",
+        "checksum",
+        "verified",
+        "speed",
+        "bandwidth",
+        "throughput",
+        "duration",
+        "export",
+        "csv",
+        "json",
+        "audit",
+        "report",
+        "past",
+        "old",
+      ],
+    },
+    // Integrity Tools — iter 36 surfaced the last clean 1071-LOC
+    // orphan (T-063). Four tabs covering MD5/SHA-1/SHA-256
+    // checksums, duplicate detection, tags/labels, and Smart
+    // Folder saved queries. Five pre-registered backend IPCs
+    // (integrity_checksum, integrity_verify, compute_checksum,
+    // integrity_find_duplicates, integrity_get_file_info).
+    // Cmd+Shift+I mnemonic = "Integrity".
+    {
+      id: "open-integrity-tools",
+      label: "Integrity Tools…",
+      description:
+        "Checksums (MD5/SHA-1/SHA-256), duplicate detection, tags and labels, Smart Folder saved queries",
+      icon: <ShieldCheck className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7I`,
+      category: "Navigation",
+      action: actions.onOpenIntegrityTools || (() => {}),
+      keywords: [
+        "integrity",
+        "checksum",
+        "hash",
+        "md5",
+        "sha1",
+        "sha256",
+        "verify",
+        "duplicate",
+        "duplicates",
+        "dedupe",
+        "tag",
+        "tags",
+        "label",
+        "labels",
+        "smart folder",
+        "smart folders",
+        "saved query",
+        "filter",
+      ],
+    },
+    // Iter 42/43/45: Jump to Last Touched. One-keystroke teleport
+    // to a recently touched ledger path. Complements Instant Jump
+    // (⌘⇧O) — that one opens a picker, this one is zero-UI: it
+    // fetches top `ledger_recent_paths` rows and routes through
+    // the shared dispatch helper so archives land in the browser,
+    // text in the editor, media in the preview pane, folders in
+    // the active tab. Iter 43 upgraded the handler to a "Jump
+    // Ring" (rapid re-press cycles forward, the current tab path
+    // is always filtered out). Iter 45 added reverse cycling on
+    // ⌘⇧⌥L and extracted the decision logic into a pure,
+    // unit-tested `pickJumpRingTarget` function. "L" mnemonic = "Last".
+    {
+      id: "jump-last-touched",
+      label: "Jump to Last Touched",
+      description:
+        "Teleport to a recently touched ledger path — \u2318\u21E7L cycles forward, \u2318\u21E7\u2325L cycles back, the current folder is always skipped",
+      icon: <History className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7L`,
+      // Iter 48: surface the reverse cycling gesture in the
+      // keyboard cheat sheet (?). Secondary shortcuts don't
+      // show up in ⌘K itself — the palette stays one row per
+      // action — but they DO appear in the cheat sheet so
+      // power users discover the Alt modifier convention.
+      additionalShortcuts: [
+        {
+          keys: `${cmd}\u21E7\u2325L`,
+          hint: "Cycle back through the ring",
+        },
+      ],
+      category: "Navigation",
+      action: actions.onJumpLastTouched || (() => {}),
+      keywords: [
+        "jump",
+        "last",
+        "recent",
+        "most recent",
+        "teleport",
+        "back",
+        "where",
+        "left off",
+        "resume",
+        "return",
+        "previous",
+        "ledger",
+        "history",
+        "ring",
+        "cycle",
+        "alt tab",
+      ],
+    },
+    // Connection Manager \u2014 iter 27 surfaced the 1941-LOC
+    // `ConnectionPanel` orphan that manages profiles across the
+    // 17 connector protocols. All 17 Tauri commands it uses
+    // were already registered in the Rust backend; the
+    // component just had zero importers until iter 27.
+    {
+      id: "open-connections",
+      label: "Connection Manager\u2026",
+      description:
+        "Manage saved connections (SFTP, S3, Google Drive, WebDAV, SMB, FTP, Azure, GCS, Dropbox, \u2026)",
+      icon: <Globe className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7N`,
+      category: "Navigation",
+      action: actions.onOpenConnections || (() => {}),
+      keywords: [
+        "connection",
+        "connections",
+        "connect",
+        "remote",
+        "server",
+        "sftp",
+        "s3",
+        "google drive",
+        "webdav",
+        "smb",
+        "ftp",
+        "azure",
+        "gcs",
+        "dropbox",
+        "protocol",
+        "manager",
+        "new connection",
+      ],
+    },
+    // Settings \u2014 iter 26 wired the long-orphaned `SettingsPanel`
+    // (1354 LOC with 9+ backend commands already registered) to
+    // this entry. The palette stub existed from a prior iter but
+    // `actions.onOpenSettings` was never passed, so the entry did
+    // nothing until now. Iter 26 enriches the entry with the
+    // universal Cmd+, shortcut + richer keywords.
     {
       id: "open-settings",
-      label: "Open Settings",
+      label: "Settings\u2026",
+      description:
+        "Export/import, sync across installations, notification prefs, privacy, logs",
       icon: <Settings className="h-4 w-4" />,
+      shortcut: `${cmd},`,
       category: "Navigation",
       action: actions.onOpenSettings || (() => {}),
-      keywords: ["settings", "preferences", "config"],
+      keywords: [
+        "settings",
+        "preferences",
+        "options",
+        "config",
+        "configure",
+        "export",
+        "import",
+        "notifications",
+        "privacy",
+        "logs",
+      ],
     },
     // Automations (Quickflows)
     {
@@ -961,6 +1351,67 @@ export function getDefaultCommands(actions: {
       action: actions.onCreateSmartSpace || (() => {}),
       keywords: ["space", "workspace", "folder", "connection", "sync", "bundle"],
     },
+    // Selection Stash — capture the active pane's selection into the
+    // global persistent stash ring. Pairs with "Recall Last Stash" so
+    // the user can navigate away, do something else, and come back to
+    // the same working set without rebuilding it manually.
+    {
+      id: "stash-selection",
+      label: "Stash Selection",
+      description: "Save the current selection so you can recall it later",
+      icon: <Bookmark className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7M`,
+      category: "Selection",
+      action: actions.onStashSelection || (() => {}),
+      keywords: [
+        "stash",
+        "save",
+        "selection",
+        "mark",
+        "remember",
+        "bookmark selection",
+        "memory",
+        "set aside",
+      ],
+    },
+    {
+      id: "recall-last-stash",
+      label: "Recall Last Stash",
+      description:
+        "Restore the most recent stashed selection into the active pane",
+      icon: <Bookmark className="h-4 w-4" />,
+      category: "Selection",
+      action: actions.onRecallLastStash || (() => {}),
+      keywords: [
+        "recall",
+        "restore",
+        "stash",
+        "last",
+        "selection",
+        "bring back",
+        "resume",
+      ],
+    },
+    // Reopen the most recently closed tab in the active pane —
+    // browser-muscle-memory shortcut. Fully no-op when the ring buffer
+    // is empty, so the entry is always safe to surface.
+    {
+      id: "reopen-closed-tab",
+      label: "Reopen Closed Tab",
+      description: "Revive the most recently closed tab in the active pane",
+      icon: <RotateCcw className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7T`,
+      category: "Navigation",
+      action: actions.onReopenClosedTab || (() => {}),
+      keywords: [
+        "reopen",
+        "restore",
+        "tab",
+        "closed",
+        "undo close",
+        "bring back",
+      ],
+    },
     // Activity Timeline (unified ledger viewer)
     {
       id: "toggle-activity-timeline",
@@ -981,7 +1432,233 @@ export function getDefaultCommands(actions: {
         "what happened",
       ],
     },
+    // Open in Other Pane — opens the active pane's current path as a
+    // fresh tab in the OTHER pane and focuses it. Auto-exits single-pane
+    // mode (revealing the second pane is part of the gesture).
+    {
+      id: "open-in-other-pane",
+      label: "Open in Other Pane",
+      description:
+        "Mirror the current location into the other pane as a new tab",
+      icon: <Columns2 className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7E`,
+      category: "Navigation",
+      action: actions.onOpenInOtherPane || (() => {}),
+      keywords: [
+        "pane",
+        "split",
+        "side by side",
+        "mirror",
+        "echo",
+        "twin",
+        "compare",
+        "open here",
+        "dual",
+      ],
+    },
+    // Copy All Paths — copies every selected path to the clipboard
+    // (one per line), or the current directory path when nothing
+    // is selected. The existing "Copy Path" entry silently drops
+    // everything but the first path, so this entry fills the
+    // multi-select gap and also provides a keyboard shortcut.
+    {
+      id: "copy-all-paths",
+      label: "Copy Selected Paths",
+      description:
+        "Copy every selected path to the clipboard \u2014 or the current directory when nothing is selected",
+      icon: <Clipboard className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7C`,
+      category: "File Operations",
+      action: actions.onCopyAllPaths || (() => {}),
+      keywords: [
+        "copy path",
+        "copy paths",
+        "clipboard",
+        "multi copy",
+        "paste",
+        "absolute",
+        "all paths",
+        "selection paths",
+        "export paths",
+      ],
+    },
+    // Batch Rename \u2014 opens the rename engine on the active pane's
+    // current selection. Iter 25 surfaced this long-orphaned
+    // feature: token substitution ({name}, {ext}, {num}, {date},
+    // {parent}, {counter}), find/replace with optional regex,
+    // sequential numbering, case transformation, live preview,
+    // undo, and compatibility-warning integration \u2014 all of it
+    // was already built and tested in Rust + React, just never
+    // wired into the UI.
+    {
+      id: "batch-rename",
+      label: "Batch Rename\u2026",
+      description:
+        "Open the batch rename engine on the selected files (patterns, regex, numbering, case)",
+      icon: <FileEdit className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7R`,
+      category: "File Operations",
+      action: actions.onBatchRename || (() => {}),
+      keywords: [
+        "batch rename",
+        "bulk rename",
+        "rename",
+        "regex rename",
+        "find replace",
+        "pattern rename",
+        "case",
+        "numbering",
+        "multi rename",
+        "mass rename",
+      ],
+    },
+    // Duplicate Tab \u2014 clones the active tab as a fresh tab in the
+    // SAME pane and focuses it. Different from Open in Other Pane
+    // (which targets the inactive pane). The clone gets its own
+    // back/forward history so navigating it does not disturb the
+    // original.
+    {
+      id: "duplicate-active-tab",
+      label: "Duplicate Tab",
+      description:
+        "Clone the active tab as a fresh tab in the same pane with its own history",
+      icon: <CopyPlus className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7K`,
+      category: "Navigation",
+      action: actions.onDuplicateActiveTab || (() => {}),
+      keywords: [
+        "duplicate",
+        "clone",
+        "fork",
+        "tab",
+        "copy tab",
+        "split tab",
+        "twin tab",
+        "new tab here",
+        "open here",
+      ],
+    },
+    // Mirror View to Other Pane — copies the active pane's view
+    // configuration (viewMode, sortBy, sortAsc, groupBy) to the
+    // other pane in one keystroke. Replaces 3-4 menu clicks needed
+    // to align two panes for side-by-side comparison. Idempotent
+    // (silent no-op when both panes already match).
+    {
+      id: "mirror-view-to-other-pane",
+      label: "Mirror View to Other Pane",
+      description:
+        "Copy view mode, sort column, sort direction, and grouping to the other pane",
+      icon: <Layout className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7V`,
+      category: "Navigation",
+      action: actions.onMirrorViewToOtherPane || (() => {}),
+      keywords: [
+        "view",
+        "mirror view",
+        "equalize",
+        "align",
+        "sort echo",
+        "match view",
+        "sync view",
+        "compare layout",
+        "twin view",
+        "same sort",
+      ],
+    },
+    // Echo Filter to Other Pane — copies the active pane's filter
+    // text to the inactive pane so both sides filter for the same
+    // query. No-op when the source filter is empty (silent: avoids
+    // wiping the other pane's filter by surprise).
+    {
+      id: "echo-filter-to-other-pane",
+      label: "Echo Filter to Other Pane",
+      description:
+        "Copy the active pane's filter text to the other pane so both sides filter for the same query",
+      icon: <Filter className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7F`,
+      category: "Navigation",
+      action: actions.onEchoFilterToOtherPane || (() => {}),
+      keywords: [
+        "filter",
+        "echo",
+        "mirror filter",
+        "same query",
+        "both panes",
+        "sync filter",
+        "copy filter",
+        "twin filter",
+        "apply filter",
+      ],
+    },
+    // Swap Panes — flips the two panes' contents, taking tabs,
+    // selections, and per-pane history with them. Auto-exits single-
+    // pane mode. Pairs with Open in Other Pane: mirror, then swap if
+    // the source/target sides are wrong.
+    {
+      id: "swap-panes",
+      label: "Swap Panes",
+      description:
+        "Flip the left and right panes \u2014 contents, tabs, selections, and history all travel together",
+      icon: <ArrowLeftRight className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7X`,
+      category: "Navigation",
+      action: actions.onSwapPanes || (() => {}),
+      keywords: [
+        "swap",
+        "flip",
+        "exchange",
+        "switch",
+        "sides",
+        "left right",
+        "rotate",
+        "trade",
+        "panes",
+        "reverse",
+      ],
+    },
+    // Bookmark Current Folder — toggles the active pane's directory in
+    // the same `favorites` ring the sidebar drag-drop populates. Single
+    // entry, two outcomes (add / remove): the action itself decides
+    // based on whether the path is already bookmarked.
+    {
+      id: "bookmark-current-folder",
+      label: "Bookmark Current Folder",
+      description:
+        "Add (or remove) the active pane's directory from your bookmarks",
+      icon: <BookmarkPlus className="h-4 w-4" />,
+      shortcut: `${cmd}\u21E7B`,
+      category: "Navigation",
+      action: actions.onToggleBookmarkCurrentDir || (() => {}),
+      keywords: [
+        "bookmark",
+        "favorite",
+        "star",
+        "save",
+        "pin",
+        "remember",
+        "add to favorites",
+      ],
+    },
   ];
+
+  // Inject the first nine bookmarks as their own palette entries so the
+  // user can fuzzy-search them by name without remembering slot numbers.
+  // Slot 1..9 maps directly to ⌘1..⌘9 muscle memory.
+  const bookmarks = actions.bookmarks ?? [];
+  const onJump = actions.onJumpToBookmark;
+  for (let i = 0; i < Math.min(bookmarks.length, 9); i += 1) {
+    const fav = bookmarks[i];
+    commands.push({
+      id: `jump-bookmark-${fav.id}`,
+      label: `Jump to ${fav.name}`,
+      description: fav.path,
+      icon: <Bookmark className="h-4 w-4" />,
+      shortcut: `${cmd}${i + 1}`,
+      category: "Bookmarks",
+      action: onJump ? () => onJump(i) : () => {},
+      keywords: ["bookmark", "favorite", "jump", "navigate", fav.name],
+    });
+  }
 
   return commands;
 }

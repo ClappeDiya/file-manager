@@ -28,6 +28,12 @@ import { useActivityTimelineStore } from "@/stores/activity-timeline-store";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { useUIStore } from "@/stores/ui-store";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
+import { formatRelativeTime } from "@/lib/ledger-dispatch";
+import {
+  ENGINE_ICONS,
+  ENGINE_LABELS,
+  STATUS_META,
+} from "@/lib/engine-ui-constants";
 import { cn } from "@ufop/ui-components";
 import { Button, Badge, ScrollArea } from "@ufop/ui-components";
 import {
@@ -35,33 +41,15 @@ import {
   RefreshCw,
   Search,
   Activity,
-  FileText,
-  ArrowRightLeft,
-  RefreshCcw,
-  Zap,
-  HardDrive,
-  Layers,
-  Bot,
-  ShieldCheck,
-  Wrench,
-  Plug,
-  Settings,
-  CheckCircle2,
-  XCircle,
-  Ban,
-  MinusCircle,
   AlertTriangle,
   Link2,
   Undo2,
+  Pin,
   BookOpen,
 } from "lucide-react";
 import { OperationNarrativeCard } from "./operation-narrative-card";
+import { useAutomationStore } from "@/stores/automation-store";
 
-/**
- * Wire-format event from the Rust `ledger_recent` command.
- * Must match `LedgerEvent` in `src-tauri/src/ledger/mod.rs` exactly —
- * all `Option<T>` fields serialize as `T | null`.
- */
 interface LedgerEvent {
   id: string;
   occurred_at: string;
@@ -77,44 +65,6 @@ interface LedgerEvent {
   undo_token: string | null;
 }
 
-/** Centralized engine → icon map. New engines just add one entry. */
-const ENGINE_ICONS: Record<string, typeof Activity> = {
-  fs: FileText,
-  transfer: ArrowRightLeft,
-  sync: RefreshCcw,
-  automation: Zap,
-  mount: HardDrive,
-  spaces: Layers,
-  ai: Bot,
-  vault: ShieldCheck,
-  compat: Wrench,
-  connector: Plug,
-  system: Settings,
-};
-
-/** Engine display labels. Pluralization handled at call-site if needed. */
-const ENGINE_LABELS: Record<string, string> = {
-  fs: "File",
-  transfer: "Transfer",
-  sync: "Sync",
-  automation: "Automation",
-  mount: "Mount",
-  spaces: "Space",
-  ai: "AI",
-  vault: "Vault",
-  compat: "Compat",
-  connector: "Connector",
-  system: "System",
-};
-
-/** Status → (icon, color class) map. Keeps status rendering DRY. */
-const STATUS_META: Record<string, { Icon: typeof Activity; className: string }> = {
-  ok: { Icon: CheckCircle2, className: "text-emerald-500" },
-  failed: { Icon: XCircle, className: "text-red-500" },
-  cancelled: { Icon: Ban, className: "text-amber-500" },
-  skipped: { Icon: MinusCircle, className: "text-slate-400" },
-};
-
 /** Format bytes into a short human string. Duplicates no existing util. */
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -129,18 +79,6 @@ function formatBytes(n: number): string {
  * (which Date treats as local time when parsed) are handled by coercing
  * the space-separated form to `T`-separated UTC.
  */
-function formatRelative(iso: string): string {
-  // SQLite form: "2026-04-08 12:34:56" → treat as UTC
-  const normalized = iso.includes("T") ? iso : iso.replace(" ", "T") + "Z";
-  const t = new Date(normalized).getTime();
-  if (Number.isNaN(t)) return iso;
-  const deltaSec = Math.max(0, Math.floor((Date.now() - t) / 1000));
-  if (deltaSec < 5) return "just now";
-  if (deltaSec < 60) return `${deltaSec}s ago`;
-  if (deltaSec < 3600) return `${Math.floor(deltaSec / 60)}m ago`;
-  if (deltaSec < 86_400) return `${Math.floor(deltaSec / 3600)}h ago`;
-  return `${Math.floor(deltaSec / 86_400)}d ago`;
-}
 
 /**
  * Group events by calendar day label ("Today", "Yesterday", "Apr 6").
@@ -179,6 +117,23 @@ function splitPath(path: string): { parent: string; leaf: string } {
 }
 
 type EngineFilter = "all" | keyof typeof ENGINE_ICONS;
+
+/**
+ * Ledger event kinds that can be promoted to a re-runnable manual
+ * Quickflow via the Operation Pin flow. Must stay in lock-step with
+ * `automation_engine::pinner::PINNABLE_KINDS` on the Rust side.
+ */
+const PINNABLE_KINDS: ReadonlySet<string> = new Set(["copy", "move"]);
+
+function isPinnableEvent(event: LedgerEvent): boolean {
+  return (
+    event.engine === "fs" &&
+    event.status === "ok" &&
+    PINNABLE_KINDS.has(event.kind) &&
+    event.correlation_id !== null &&
+    event.correlation_id.length > 0
+  );
+}
 
 /**
  * Escape user input for safe insertion into a RegExp. Inlined (4 lines)
@@ -220,7 +175,22 @@ function Highlight({ text, query }: { text: string; query: string }) {
   );
 }
 
-export function ActivityTimelinePanel() {
+/** Iter 46 props — optional smart-dispatch callback. When provided,
+ *  clicking a timeline row routes through the shared dispatch helper
+ *  (same behaviour as Instant Jump and the Jump Ring), so archive
+ *  files land in the archive browser, text files in the in-app
+ *  editor, media in the preview pane, and folders in the active
+ *  tab. When omitted, the panel falls back to the pre-iter-46
+ *  "navigate-to-parent" behaviour so existing call sites that mount
+ *  the component without props stay binary-compatible. */
+export interface ActivityTimelinePanelProps {
+  onDispatchPath?: (path: string) => void | Promise<void>;
+}
+
+export function ActivityTimelinePanel(
+  props: ActivityTimelinePanelProps = {},
+) {
+  const { onDispatchPath } = props;
   const panelOpen = useActivityTimelineStore((s) => s.panelOpen);
   const togglePanel = useActivityTimelineStore((s) => s.togglePanel);
   const [events, setEvents] = useState<LedgerEvent[]>([]);
@@ -246,11 +216,23 @@ export function ActivityTimelinePanel() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   /**
-   * "Jump-to-path" — navigate the active pane to the parent directory
-   * of the subject, closing the loop from "what happened" to "take me
-   * there". Pulls store methods via `.getState()` so we don't subscribe
-   * the component to navigation state (which would cause re-renders on
+   * "Jump-to-path" — navigate from "what happened" to "take me there".
+   * Pulls store methods via `.getState()` so we don't subscribe the
+   * component to navigation state (which would cause re-renders on
    * every path change in either pane).
+   *
+   * Iter 46: when the parent passes `onDispatchPath`, we delegate to
+   * the shared `dispatchLedgerPath` helper so archive files open the
+   * archive browser, text files open the in-app editor, media opens
+   * the preview pane, and folders navigate the active tab. This
+   * closes the DRY loop with Instant Jump and the Jump Ring —
+   * clicking a timeline row behaves identically to Enter-in-Instant-
+   * Jump, and all four surfaces (FilePane double-click, Instant
+   * Jump, Jump Ring, Activity Timeline) route through ONE code path.
+   *
+   * Falls back to the pre-iter-46 parent-navigation path when the
+   * prop is absent, preserving binary-compatibility for any future
+   * caller that mounts the panel without the dispatch callback.
    *
    * Edge cases handled:
    * - subject_path `null` (engine events without a path target): no-op
@@ -258,20 +240,31 @@ export function ActivityTimelinePanel() {
    * - same path as active tab: still emits navigateTab so history picks
    *   up the "jump" intent (harmless; `navigateTab` is idempotent-ish)
    */
-  const navigateToEvent = useCallback((event: LedgerEvent) => {
-    const target = event.subject_path;
-    if (!target) return;
-    const store = useFileManagerStore.getState();
-    const paneIndex = store.activePaneIndex;
-    const activeTab = store.getActiveTab(paneIndex);
-    if (!activeTab) return;
-    const { parent, leaf } = splitPath(target);
-    // Navigate to the parent directory so the user can see context; if
-    // there is no parent (e.g. root-level), fall back to the target.
-    const destination = parent || target;
-    const label = leaf || destination.split(/[/\\]/).filter(Boolean).pop() || destination;
-    store.navigateTab(paneIndex, activeTab.id, destination, label);
-  }, []);
+  const navigateToEvent = useCallback(
+    (event: LedgerEvent) => {
+      const target = event.subject_path;
+      if (!target) return;
+      if (onDispatchPath) {
+        void onDispatchPath(target);
+        return;
+      }
+      const store = useFileManagerStore.getState();
+      const paneIndex = store.activePaneIndex;
+      const activeTab = store.getActiveTab(paneIndex);
+      if (!activeTab) return;
+      const { parent, leaf } = splitPath(target);
+      // Legacy fallback: navigate to the parent so the user can
+      // see context; if there is no parent (e.g. root-level), fall
+      // back to the target.
+      const destination = parent || target;
+      const label =
+        leaf ||
+        destination.split(/[/\\]/).filter(Boolean).pop() ||
+        destination;
+      store.navigateTab(paneIndex, activeTab.id, destination, label);
+    },
+    [onDispatchPath],
+  );
 
   const loadEvents = useCallback(async () => {
     setLoading(true);
@@ -289,6 +282,31 @@ export function ActivityTimelinePanel() {
     setUndoableIds(new Set((undoableOps ?? []).map((o) => o.correlation_id)));
     setLoading(false);
   }, []);
+
+  // Per-entry Pin handler — promotes a single past ledger event into a
+  // saved manual-trigger Quickflow via the new `pin_ledger_event` IPC.
+  // The new rule is disabled-by-default; the user must explicitly enable
+  // it from the automation panel before any side effects occur. Surfaces
+  // the outcome through the existing structured-error toast channel.
+  const pinLedgerEvent = useAutomationStore((s) => s.pinLedgerEvent);
+  const handlePinEntry = useCallback(
+    async (correlationId: string, kind: string) => {
+      const rule = await pinLedgerEvent(correlationId);
+      useUIStore.getState().addStructuredError({
+        what: rule ? `Pinned ${kind}` : "Pin failed",
+        why: rule
+          ? `Saved as "${rule.name}" (disabled — enable from the Automation panel to run it)`
+          : "Backend rejected the pin request",
+        appDid: rule
+          ? "Created a re-runnable manual Quickflow capturing the original sources and destination"
+          : "Could not build a replay rule from this ledger event",
+        userAction: rule
+          ? "Open the Automation panel to enable and run this Quickflow on demand"
+          : "Confirm the original copy/move event is still in the ledger and try again",
+      });
+    },
+    [pinLedgerEvent],
+  );
 
   // Per-entry Undo handler — reverses the single correlation group via the
   // ledger-backed backend, surfaces the result through the existing
@@ -686,6 +704,7 @@ export function ActivityTimelinePanel() {
             query={query}
             undoableIds={undoableIds}
             onUndoEntry={handleUndoEntry}
+            onPinEntry={handlePinEntry}
           />
         </div>
       </ScrollArea>
@@ -773,6 +792,7 @@ function TimelineList({
   query,
   undoableIds,
   onUndoEntry,
+  onPinEntry,
 }: {
   events: LedgerEvent[];
   onNavigate: (event: LedgerEvent) => void;
@@ -781,6 +801,7 @@ function TimelineList({
   query: string;
   undoableIds: Set<string>;
   onUndoEntry: (correlationId: string) => void;
+  onPinEntry: (correlationId: string, kind: string) => void;
 }) {
   let lastDay: string | null = null;
   const nodes: React.ReactNode[] = [];
@@ -799,6 +820,7 @@ function TimelineList({
     }
     const canUndo =
       ev.correlation_id !== null && undoableIds.has(ev.correlation_id);
+    const canPin = isPinnableEvent(ev);
     nodes.push(
       <TimelineRow
         key={ev.id}
@@ -809,6 +831,8 @@ function TimelineList({
         query={query}
         canUndo={canUndo}
         onUndoEntry={onUndoEntry}
+        canPin={canPin}
+        onPinEntry={onPinEntry}
       />,
     );
   }
@@ -823,6 +847,8 @@ function TimelineRow({
   query,
   canUndo,
   onUndoEntry,
+  canPin,
+  onPinEntry,
 }: {
   event: LedgerEvent;
   onNavigate: (event: LedgerEvent) => void;
@@ -831,6 +857,8 @@ function TimelineRow({
   query: string;
   canUndo: boolean;
   onUndoEntry: (correlationId: string) => void;
+  canPin: boolean;
+  onPinEntry: (correlationId: string, kind: string) => void;
 }) {
   const EngineIcon = ENGINE_ICONS[event.engine] ?? Activity;
   const statusMeta = STATUS_META[event.status] ?? STATUS_META.ok;
@@ -870,7 +898,7 @@ function TimelineRow({
           </span>
         </div>
         <div className="mt-0.5 flex items-center gap-2 text-[10px] text-[color:var(--color-text-muted)]">
-          <span>{formatRelative(event.occurred_at)}</span>
+          <span>{formatRelativeTime(event.occurred_at, undefined, "withJustNow")}</span>
           <span aria-hidden="true">·</span>
           <span>
             <Highlight text={event.kind} query={query} />
@@ -960,6 +988,21 @@ function TimelineRow({
           className="flex-shrink-0 rounded p-1 text-[color:var(--color-text-muted)] opacity-0 transition-colors hover:text-amber-500 focus:outline-none focus:opacity-100 focus:ring-2 focus:ring-amber-500/40 group-hover:opacity-100"
         >
           <Undo2 className="h-3 w-3" aria-hidden="true" />
+        </button>
+      )}
+      {canPin && event.correlation_id && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onPinEntry(event.correlation_id!, event.kind);
+          }}
+          title={`Pin this ${event.kind} as a re-runnable Quickflow`}
+          aria-label={`Pin this ${event.kind} operation as a re-runnable Quickflow`}
+          className="flex-shrink-0 rounded p-1 text-[color:var(--color-text-muted)] opacity-0 transition-colors hover:text-violet-500 focus:outline-none focus:opacity-100 focus:ring-2 focus:ring-violet-500/40 group-hover:opacity-100"
+          data-testid={`pin-event-${event.correlation_id}`}
+        >
+          <Pin className="h-3 w-3" aria-hidden="true" />
         </button>
       )}
     </div>
