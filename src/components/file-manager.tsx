@@ -249,6 +249,9 @@ export function FileManager() {
 
   // Activity Timeline panel (unified ledger viewer)
   const toggleActivityTimeline = useActivityTimelineStore((s) => s.togglePanel);
+  const activityTimelineOpen = useActivityTimelineStore((s) => s.panelOpen);
+  // Lineage panel opens lazily once a file is selected for inspection.
+  const lineagePanelOpen = useLineageStore((s) => s.pendingPath !== null);
 
   // Smart Spaces
   const spacesWizardOpen = useSpacesStore((s) => s.wizardOpen);
@@ -268,6 +271,7 @@ export function FileManager() {
   // Toolbar customization (#14)
   const toolbarItems = useUIStore((s) => s.toolbarItems);
   const setToolbarItems = useUIStore((s) => s.setToolbarItems);
+  const resetToolbar = useUIStore((s) => s.resetToolbar);
   const toolbarCustomizerOpen = useUIStore((s) => s.toolbarCustomizerOpen);
   const toggleToolbarCustomizer = useUIStore((s) => s.toggleToolbarCustomizer);
   // Iter 29: subscribe to the ui-store's preview slot so React
@@ -1608,7 +1612,8 @@ export function FileManager() {
         onContextMenu={(e) => { e.preventDefault(); toggleToolbarCustomizer(); }}
       >
         <div className="flex items-center gap-3">
-          {toolbarItems.includes("sidebar") && (
+          {/* In Simple Mode the outer SimpleModeWrapper provides sidebar toggle + title; suppress the duplicates here. */}
+          {appMode !== "simple" && toolbarItems.includes("sidebar") && (
             <Button
               variant="ghost"
               size="icon"
@@ -1619,11 +1624,15 @@ export function FileManager() {
               <PanelLeft className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
-          <FolderOpen className="h-5 w-5 text-[color:var(--color-primary)]" aria-hidden="true" />
-          <h1 className="text-[length:var(--font-size-md)] font-semibold text-[color:var(--color-text)]">
-            File Manager
-          </h1>
-          <Badge variant="secondary">{appMode}</Badge>
+          {appMode !== "simple" && (
+            <>
+              <FolderOpen className="h-5 w-5 text-[color:var(--color-primary)]" aria-hidden="true" />
+              <h1 className="text-[length:var(--font-size-md)] font-semibold text-[color:var(--color-text)]">
+                File Manager
+              </h1>
+              <Badge variant="secondary">{appMode}</Badge>
+            </>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
@@ -1667,24 +1676,29 @@ export function FileManager() {
               size="icon"
               onClick={() => setWorkspaceMenuOpen(!workspaceMenuOpen)}
               aria-label="Workspaces"
+              aria-haspopup="menu"
+              aria-expanded={workspaceMenuOpen}
               title="Workspaces"
               data-testid="workspace-menu-trigger"
             >
               <FolderDown className="h-4 w-4" aria-hidden="true" />
             </Button>
             {workspaceMenuOpen && (
-              <div className="absolute right-0 top-full z-50 mt-1 w-64 bg-[var(--color-bg-elevated)] border border-[var(--color-border)] rounded-lg shadow-lg overflow-hidden">
+              <div className="absolute right-0 top-full z-50 mt-1 w-64 bg-[var(--color-bg-elevated)] border border-[var(--color-border)] rounded-lg shadow-lg overflow-hidden" role="menu">
                 <div className="px-3 py-2 border-b border-[var(--color-border)] flex items-center justify-between">
                   <span className="text-xs font-semibold text-[color:var(--color-text)]">Workspaces</span>
-                  <button
+                  <Button
+                    variant="link"
+                    size="sm"
+                    className="text-xs gap-1 h-auto"
                     onClick={() => { handleSaveWorkspace(); }}
-                    className="flex items-center gap-1 text-xs text-blue-500 hover:text-blue-600"
+                    aria-label="Save current view as a workspace"
                   >
-                    <Save className="h-3 w-3" />
+                    <Save className="h-3 w-3" aria-hidden="true" />
                     Save Current
-                  </button>
+                  </Button>
                 </div>
-                <div className="max-h-48 overflow-auto">
+                <div className="max-h-48 overflow-auto" role="none">
                   {workspaces.length === 0 ? (
                     <div className="px-3 py-4 text-xs text-center text-[color:var(--color-text-tertiary)]">
                       No saved workspaces yet.
@@ -1696,18 +1710,23 @@ export function FileManager() {
                       <div
                         key={ws.id}
                         className="flex items-center justify-between px-3 py-1.5 hover:bg-[var(--color-hover-bg)] group"
+                        role="none"
                       >
                         <button
+                          type="button"
+                          role="menuitem"
                           onClick={() => handleLoadWorkspace(ws.id)}
-                          className="flex-1 text-left text-xs text-[color:var(--color-text)] truncate"
+                          className="flex-1 text-left text-xs text-[color:var(--color-text)] truncate focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]"
                           title={`Load "${ws.name}" (saved ${new Date(ws.savedAt).toLocaleDateString()})`}
                         >
                           {ws.name}
                         </button>
                         <button
+                          type="button"
                           onClick={(e) => { e.stopPropagation(); handleDeleteWorkspace(ws.id); }}
-                          className="text-xs text-red-400 hover:text-red-500 opacity-0 group-hover:opacity-100 ml-2"
-                          title="Delete workspace"
+                          className="text-xs text-[color:var(--color-error)] hover:opacity-80 opacity-0 group-hover:opacity-100 ml-2 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]"
+                          title={`Delete workspace "${ws.name}"`}
+                          aria-label={`Delete workspace "${ws.name}"`}
                         >
                           Del
                         </button>
@@ -1772,7 +1791,8 @@ export function FileManager() {
               <Terminal className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
-          {toolbarItems.includes("theme") && <ThemeSwitcher />}
+          {/* In Simple Mode the outer SimpleModeWrapper renders the ThemeSwitcher; suppress duplicate. */}
+          {appMode !== "simple" && toolbarItems.includes("theme") && <ThemeSwitcher />}
         </div>
 
         {/* Toolbar Customizer (#14) */}
@@ -1796,18 +1816,27 @@ export function FileManager() {
                 {item.label}
               </label>
             ))}
-            <button
-              onClick={toggleToolbarCustomizer}
-              className="mt-2 w-full text-xs py-1 rounded bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)]"
-            >
-              Done
-            </button>
+            <div className="mt-2 flex items-center gap-2">
+              <button
+                onClick={resetToolbar}
+                className="flex-1 text-xs py-1 rounded border border-[var(--color-border)] text-[color:var(--color-text)] hover:bg-[var(--color-hover-bg)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]"
+                title="Reset toolbar to default items"
+              >
+                Reset
+              </button>
+              <button
+                onClick={toggleToolbarCustomizer}
+                className="flex-1 text-xs py-1 rounded bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]"
+              >
+                Done
+              </button>
+            </div>
           </div>
         )}
       </header>
 
       {/* Main content area */}
-      <div className="flex flex-1 overflow-hidden">
+      <div id="main-content" tabIndex={-1} className="flex flex-1 overflow-hidden">
         {sidebarOpen && (
           <aside
             className="border-r border-[var(--color-border)] shrink-0 overflow-hidden"
@@ -1877,10 +1906,14 @@ export function FileManager() {
           <TerminalPanel />
         </div>
 
-        <AutomationPanel />
-        <ActivityTimelinePanel onDispatchPath={handleDispatchLedgerPath} />
-        <LineagePanel />
-        <AiPanel />
+        {/* Lazy-mount: only render side panels when their toggle is on, so a fresh window
+            ships with just the file canvas + sidebar instead of four hidden panels. */}
+        {automationPanelOpen && <AutomationPanel />}
+        {activityTimelineOpen && (
+          <ActivityTimelinePanel onDispatchPath={handleDispatchLedgerPath} />
+        )}
+        {lineagePanelOpen && <LineagePanel />}
+        {aiPanelOpen && <AiPanel />}
       </div>
 
       {/* Smart Space Wizard */}

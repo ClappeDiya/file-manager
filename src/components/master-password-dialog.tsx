@@ -11,6 +11,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { Lock, Unlock, KeyRound, AlertCircle } from "lucide-react";
 import { tauriInvoke, isTauriAvailable } from "@/hooks/use-tauri";
+import { useFocusTrap } from "@/hooks/use-focus-trap";
 
 // ── Types ──
 
@@ -41,17 +42,20 @@ export function MasterPasswordDialog({
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Trap focus inside the dialog and restore on close. Escape only closes
+  // when a cancel handler is provided (Setup/Unlock paths must complete).
+  const containerRef = useFocusTrap<HTMLDivElement>({
+    active: open,
+    onEscape: onCancel,
+    initialFocusRef: inputRef,
+  });
 
-  // Focus the first input when the dialog opens
   useEffect(() => {
     if (open) {
       setPassword("");
       setConfirmPassword("");
       setOldPassword("");
       setError("");
-      // Small delay to let the DOM render
-      const timer = setTimeout(() => inputRef.current?.focus(), 50);
-      return () => clearTimeout(timer);
     }
   }, [open, mode]);
 
@@ -146,12 +150,12 @@ export function MasterPasswordDialog({
   const IconComponent = mode === "unlock" ? Lock : KeyRound;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
-      <div className="w-full max-w-sm mx-4 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 shadow-xl">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="master-password-title">
+      <div ref={containerRef} className="w-full max-w-sm mx-4 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 shadow-xl">
         {/* Header */}
         <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-          <IconComponent className="w-4 h-4 text-blue-500" />
-          <h2 className="text-sm font-semibold">{title}</h2>
+          <IconComponent className="w-4 h-4 text-blue-500" aria-hidden="true" />
+          <h2 id="master-password-title" className="text-sm font-semibold">{title}</h2>
         </div>
 
         {/* Form */}

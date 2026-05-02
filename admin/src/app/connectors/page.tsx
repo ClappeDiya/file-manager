@@ -32,11 +32,7 @@ const CONNECTOR_TYPES = [
 ];
 
 export default function ConnectorsPage() {
-  const [connectors, setConnectors] = useState<Connector[]>([
-    { id: 'conn_001', name: 'Production S3', type: 's3', status: 'connected', lastTestedAt: '2026-03-15T08:00:00Z', config: { bucket: 'acme-prod', region: 'us-east-1' } },
-    { id: 'conn_002', name: 'Archive Azure', type: 'azure_blob', status: 'connected', lastTestedAt: '2026-03-15T08:00:00Z', config: { container: 'archive', account: 'acmestorage' } },
-    { id: 'conn_003', name: 'Partner SFTP', type: 'sftp', status: 'disconnected', config: { host: 'sftp.partner.com', port: '22' } },
-  ]);
+  const [connectors, setConnectors] = useState<Connector[]>([]);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [newName, setNewName] = useState('');
   const [newType, setNewType] = useState('s3');

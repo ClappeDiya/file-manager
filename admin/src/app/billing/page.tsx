@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { CreditCard, Users, HardDrive, ArrowUpRight, Check } from 'lucide-react';
+import { CreditCard, Users, HardDrive, Check } from 'lucide-react';
 import { PageHeader } from '@/components/layout/page-header';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -21,7 +21,7 @@ const plans = [
     price: '$29',
     period: '/user/month',
     features: ['Unlimited users', '1 TB storage', 'All connectors', 'SAML SSO', '90-day audit log', 'Policy engine', 'Approval workflows', 'Email support'],
-    current: true,
+    current: false,
   },
   {
     name: 'Enterprise',
@@ -40,11 +40,11 @@ export default function BillingPage() {
         description="Manage your subscription, usage, and billing information"
       />
 
-      {/* Usage Stats */}
+      {/* Usage Stats — values populate once a subscription is provisioned. */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
-        <StatCard title="Current Plan" value="Business" icon={CreditCard} variant="info" subtitle="Billed annually" />
-        <StatCard title="Active Users" value="7 / Unlimited" icon={Users} variant="success" />
-        <StatCard title="Storage Used" value="245 GB / 1 TB" icon={HardDrive} variant="default" subtitle="24.5% used" />
+        <StatCard title="Current Plan" value="—" icon={CreditCard} variant="default" subtitle="No active subscription" />
+        <StatCard title="Active Users" value="—" icon={Users} variant="default" />
+        <StatCard title="Storage Used" value="—" icon={HardDrive} variant="default" />
       </div>
 
       {/* Plans */}
@@ -88,26 +88,8 @@ export default function BillingPage() {
           <CardTitle>Billing History</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="space-y-3">
-            {[
-              { date: 'Mar 1, 2026', amount: '$203.00', status: 'Paid', invoice: 'INV-2026-003' },
-              { date: 'Feb 1, 2026', amount: '$203.00', status: 'Paid', invoice: 'INV-2026-002' },
-              { date: 'Jan 1, 2026', amount: '$203.00', status: 'Paid', invoice: 'INV-2026-001' },
-            ].map((item) => (
-              <div key={item.invoice} className="flex items-center justify-between py-2 border-b border-border last:border-0">
-                <div>
-                  <p className="text-sm font-medium text-foreground">{item.invoice}</p>
-                  <p className="text-xs text-foreground-tertiary">{item.date}</p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <span className="text-sm font-medium text-foreground">{item.amount}</span>
-                  <Badge variant="success">{item.status}</Badge>
-                  <Button variant="ghost" size="sm">
-                    <ArrowUpRight size={14} />
-                  </Button>
-                </div>
-              </div>
-            ))}
+          <div className="py-8 text-center text-sm text-foreground-tertiary">
+            No invoices yet. Past invoices will appear here once the first billing cycle closes.
           </div>
         </CardContent>
       </Card>

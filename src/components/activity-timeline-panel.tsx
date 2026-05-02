@@ -49,6 +49,7 @@ import {
   BookOpen,
 } from "lucide-react";
 import { OperationNarrativeCard } from "./operation-narrative-card";
+import { FeaturePeek } from "@/components/feature-peek";
 import { useAutomationStore } from "@/stores/automation-store";
 import type { LedgerEventWire as LedgerEvent } from "@/lib/ledger-tail-extract";
 
@@ -515,6 +516,15 @@ export function ActivityTimelinePanel(
           </Button>
         </div>
       </div>
+
+      <FeaturePeek
+        id="activity-timeline-intro"
+        title="Every operation is recorded here"
+        shortcut="Cmd+Shift+L"
+      >
+        Transfers, syncs, AI runs, even safety prompts — they all land in this ledger.
+        Click any row to jump back to where it happened.
+      </FeaturePeek>
 
       {/* Search bar — client-side filter over summary, kind, and path. */}
       <div className="relative px-3 py-2 border-b border-[var(--color-border)]">

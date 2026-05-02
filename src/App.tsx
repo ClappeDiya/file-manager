@@ -30,6 +30,12 @@ function App() {
     <ThemeProvider>
       <BrowserRouter>
         <div className="h-full" role="application" aria-label="Unified File Operations Platform">
+          <a
+            href="#main-content"
+            className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:rounded-md focus:bg-primary focus:px-3 focus:py-2 focus:text-sm focus:text-primary-foreground"
+          >
+            Skip to main content
+          </a>
           <Routes>
             <Route path="/" element={<HomePage />} />
             <Route path="/demo" element={<DemoPage />} />

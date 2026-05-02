@@ -1,9 +1,9 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Users, Monitor, Shield, CheckSquare, ScrollText,
-  AlertTriangle, Activity, ArrowUpRight, Clock,
+  AlertTriangle, Activity, ArrowUpRight, Clock, RefreshCw,
 } from 'lucide-react';
 import { PageHeader } from '@/components/layout/page-header';
 import { StatCard } from '@/components/ui/stat-card';
@@ -15,6 +15,8 @@ import type { AdminUser } from '@/lib/types/auth';
 import type { PolicyRule } from '@/lib/types/policies';
 import type { ApprovalRequest } from '@/lib/types/approvals';
 import type { AuditEntry, DeviceHealth } from '@/lib/types/audit';
+import { useToastStore } from '@/lib/stores/toast-store';
+import { useTranslate } from '@/lib/i18n';
 
 export default function DashboardPage() {
   const [users, setUsers] = useState<AdminUser[]>([]);
@@ -23,45 +25,66 @@ export default function DashboardPage() {
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
   const [policies, setPolicies] = useState<PolicyRule[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const notify = useToastStore((s) => s.notify);
+  const t = useTranslate();
+
+  const fetchDashboardData = useCallback(async () => {
+    try {
+      const [usersRes, approvalsRes, devicesRes, auditRes, policiesRes] = await Promise.all([
+        fetch('/api/users'),
+        fetch('/api/approvals'),
+        fetch('/api/devices'),
+        fetch('/api/audit?pageSize=5'),
+        fetch('/api/policies'),
+      ]);
+
+      if (!usersRes.ok || !approvalsRes.ok || !devicesRes.ok || !auditRes.ok || !policiesRes.ok) {
+        throw new Error('Failed to fetch dashboard data');
+      }
+
+      const [usersData, approvalsData, devicesData, auditData, policiesData] = await Promise.all([
+        usersRes.json(),
+        approvalsRes.json(),
+        devicesRes.json(),
+        auditRes.json(),
+        policiesRes.json(),
+      ]);
+
+      setUsers(usersData.users || []);
+      setApprovals(approvalsData.approvals || []);
+      setDevices(devicesData.devices || []);
+      setAuditEntries(auditData.entries || []);
+      setPolicies(policiesData.policies || []);
+      setLastUpdated(new Date());
+      setError(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to load dashboard';
+      setError(message);
+      throw err;
+    }
+  }, []);
 
   useEffect(() => {
-    async function fetchDashboardData() {
-      try {
-        const [usersRes, approvalsRes, devicesRes, auditRes, policiesRes] = await Promise.all([
-          fetch('/api/users'),
-          fetch('/api/approvals'),
-          fetch('/api/devices'),
-          fetch('/api/audit?pageSize=5'),
-          fetch('/api/policies'),
-        ]);
+    fetchDashboardData()
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, [fetchDashboardData]);
 
-        if (!usersRes.ok || !approvalsRes.ok || !devicesRes.ok || !auditRes.ok || !policiesRes.ok) {
-          throw new Error('Failed to fetch dashboard data');
-        }
-
-        const [usersData, approvalsData, devicesData, auditData, policiesData] = await Promise.all([
-          usersRes.json(),
-          approvalsRes.json(),
-          devicesRes.json(),
-          auditRes.json(),
-          policiesRes.json(),
-        ]);
-
-        setUsers(usersData.users || []);
-        setApprovals(approvalsData.approvals || []);
-        setDevices(devicesData.devices || []);
-        setAuditEntries(auditData.entries || []);
-        setPolicies(policiesData.policies || []);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load dashboard');
-      } finally {
-        setLoading(false);
-      }
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await fetchDashboardData();
+      notify(t('dashboard.refreshSuccess'), 'success');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Refresh failed';
+      notify(t('dashboard.refreshError', { message }), 'error');
+    } finally {
+      setRefreshing(false);
     }
-
-    fetchDashboardData();
-  }, []);
+  }, [fetchDashboardData, notify, t]);
 
   if (loading) {
     return (
@@ -95,8 +118,23 @@ export default function DashboardPage() {
   return (
     <div>
       <PageHeader
-        title="Dashboard"
-        description="Overview of your organization's file operations"
+        title={t('dashboard.title')}
+        description={
+          lastUpdated
+            ? `${t('dashboard.description')} · ${t('dashboard.updatedAt', { time: formatRelativeTime(lastUpdated.toISOString()) })}`
+            : t('dashboard.description')
+        }
+        actions={
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleRefresh}
+            loading={refreshing}
+            aria-label={t('dashboard.refreshAria')}
+          >
+            <RefreshCw size={14} aria-hidden="true" /> {t('common.refresh')}
+          </Button>
+        }
       />
 
       {/* Stats Grid */}
@@ -107,7 +145,6 @@ export default function DashboardPage() {
           subtitle={`${users.length} total`}
           icon={Users}
           variant="info"
-          trend={{ value: 12, label: 'from last month' }}
         />
         <StatCard
           title="Pending Approvals"

@@ -1,6 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  transpilePackages: ['@ufop/design-tokens'],
+  transpilePackages: ['@ufop/design-tokens', '@ufop/ui-components'],
   serverExternalPackages: [],
   async headers() {
     return [

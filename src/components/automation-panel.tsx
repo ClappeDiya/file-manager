@@ -17,6 +17,7 @@ import {
 import { formatBytes } from "@/lib/format-bytes";
 import { cn } from "@ufop/ui-components";
 import { Button, Badge, ScrollArea } from "@ufop/ui-components";
+import { FeaturePeek } from "@/components/feature-peek";
 import {
   X,
   Plus,
@@ -198,16 +199,23 @@ function RuleCard({ rule }: RuleCardProps) {
     >
       {/* Header */}
       <div className="flex items-start gap-2">
-        <button
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-6 w-6 mt-0.5"
           onClick={(e) => {
             e.stopPropagation();
             setExpanded(!expanded);
           }}
-          className="mt-0.5 text-[var(--color-text-muted)]"
-          aria-label={expanded ? "Collapse" : "Expand"}
+          aria-label={expanded ? "Collapse rule details" : "Expand rule details"}
+          aria-expanded={expanded}
         >
-          {expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-        </button>
+          {expanded ? (
+            <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+          )}
+        </Button>
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
@@ -228,23 +236,26 @@ function RuleCard({ rule }: RuleCardProps) {
           </div>
         </div>
 
-        {/* Toggle */}
+        {/* Enabled toggle — `role="switch"` so screen readers announce state. */}
         <button
+          type="button"
+          role="switch"
+          aria-checked={rule.enabled}
           onClick={(e) => {
             e.stopPropagation();
             toggleRule(rule.id, !rule.enabled);
           }}
           className={cn(
-            "text-lg",
-            rule.enabled ? "text-green-500" : "text-[var(--color-text-muted)]",
+            "inline-flex items-center justify-center h-6 w-6 rounded transition-theme focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]",
+            rule.enabled ? "text-[color:var(--color-success)]" : "text-[var(--color-text-muted)] hover:text-[color:var(--color-text)]",
           )}
           title={rule.enabled ? "Disable rule" : "Enable rule"}
-          aria-label={rule.enabled ? "Disable rule" : "Enable rule"}
+          aria-label={`Rule ${rule.name}: ${rule.enabled ? "enabled" : "disabled"}`}
         >
           {rule.enabled ? (
-            <ToggleRight className="h-5 w-5" />
+            <ToggleRight className="h-5 w-5" aria-hidden="true" />
           ) : (
-            <ToggleLeft className="h-5 w-5" />
+            <ToggleLeft className="h-5 w-5" aria-hidden="true" />
           )}
         </button>
       </div>
@@ -544,6 +555,16 @@ export function AutomationPanel() {
           </Button>
         </div>
       </div>
+
+      {/* First-run hint that explains what Quickflows are. */}
+      <FeaturePeek
+        id="quickflows-intro"
+        title="Quickflows automate repetitive moves"
+        shortcut="Cmd+K then 'automation'"
+      >
+        Describe a rule in plain English below — UFOP turns it into a watcher that
+        runs whenever the trigger fires (e.g. "when PDFs land in Downloads, move to Documents").
+      </FeaturePeek>
 
       {/* NL Input */}
       <NLInputBar />

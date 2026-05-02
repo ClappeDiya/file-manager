@@ -18,6 +18,7 @@ import { StatCard } from '@/components/ui/stat-card';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 import { formatDate } from '@/lib/utils/format';
 import type { SharedConnection, SyncTemplate, PropagationStatus, Workspace } from '@/lib/types/workspaces';
+import { useToastStore } from '@/lib/stores/toast-store';
 
 function PropagationBadge({ status }: { status: PropagationStatus }) {
   const variant = status.status === 'complete' ? 'success' :
@@ -39,6 +40,7 @@ export default function WorkspacesPage() {
   const [activeTab, setActiveTab] = useState('connections');
   const [showShareDialog, setShowShareDialog] = useState(false);
   const [propagating, setPropagating] = useState<Set<string>>(new Set());
+  const notify = useToastStore((s) => s.notify);
 
   useEffect(() => {
     fetch('/api/workspaces')
@@ -58,13 +60,15 @@ export default function WorkspacesPage() {
   const handlePropagate = async (id: string) => {
     setPropagating(prev => new Set(prev).add(id));
     try {
-      await fetch('/api/workspaces', {
+      const response = await fetch('/api/workspaces', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'propagate', resourceId: id }),
       });
-    } catch {
-      // Silent failure
+      if (!response.ok) throw new Error(`Request failed (${response.status})`);
+      notify('Propagation started', 'success');
+    } catch (err) {
+      notify(`Propagation failed. ${err instanceof Error ? err.message : ''}`.trim(), 'error');
     }
     setTimeout(() => {
       setPropagating(prev => {

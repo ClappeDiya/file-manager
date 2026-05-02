@@ -16,7 +16,15 @@ import {
   POLICY_DOMAIN_LABELS, POLICY_DOMAIN_DESCRIPTIONS,
 } from '@/lib/types/policies';
 import { formatDate } from '@/lib/utils/format';
+import { useToastStore } from '@/lib/stores/toast-store';
+import { z } from 'zod';
 // Policy conflict detection is now handled server-side via the API
+
+const policySchema = z.object({
+  name: z.string().trim().min(2, 'Name must be at least 2 characters').max(120, 'Name is too long'),
+  description: z.string().trim().max(500, 'Description is too long').optional(),
+  assignmentValue: z.string().trim().min(1, 'Assignment value is required'),
+});
 
 const DOMAIN_ICONS: Record<PolicyDomain, React.ElementType> = {
   allowed_connectors: Settings,
@@ -42,6 +50,7 @@ export default function PoliciesPage() {
   const [showDetailDialog, setShowDetailDialog] = useState(false);
   const [selectedPolicy, setSelectedPolicy] = useState<PolicyRule | null>(null);
   const [propagatingPolicies, setPropagatingPolicies] = useState<Set<string>>(new Set());
+  const notify = useToastStore((s) => s.notify);
 
   // New policy form state
   const [newDomain, setNewDomain] = useState<PolicyDomain>('encryption_requirements');
@@ -50,6 +59,7 @@ export default function PoliciesPage() {
   const [newTarget, setNewTarget] = useState<PolicyAssignmentTarget>('org');
   const [newTargetValue, setNewTargetValue] = useState('org_001');
   const [newMode, setNewMode] = useState<PolicyEnforcementMode>('enforce');
+  const [policyErrors, setPolicyErrors] = useState<{ name?: string; description?: string; assignmentValue?: string }>({});
 
   useEffect(() => {
     fetch('/api/policies')
@@ -72,7 +82,21 @@ export default function PoliciesPage() {
   const domainOptions = Object.entries(POLICY_DOMAIN_LABELS).map(([value, label]) => ({ value, label }));
 
   const handleCreatePolicy = async () => {
-    if (!newName) return;
+    const parsed = policySchema.safeParse({
+      name: newName,
+      description: newDescription,
+      assignmentValue: newTargetValue,
+    });
+    if (!parsed.success) {
+      const fieldErrors: { name?: string; description?: string; assignmentValue?: string } = {};
+      for (const issue of parsed.error.issues) {
+        const key = issue.path[0] as 'name' | 'description' | 'assignmentValue';
+        if (!fieldErrors[key]) fieldErrors[key] = issue.message;
+      }
+      setPolicyErrors(fieldErrors);
+      return;
+    }
+    setPolicyErrors({});
 
     try {
       const res = await fetch('/api/policies', {
@@ -80,27 +104,32 @@ export default function PoliciesPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           domain: newDomain,
-          name: newName,
-          description: newDescription,
+          name: parsed.data.name,
+          description: parsed.data.description ?? '',
           assignmentTarget: newTarget,
-          assignmentValue: newTargetValue,
+          assignmentValue: parsed.data.assignmentValue,
           enforcementMode: newMode,
           configuration: {},
         }),
       });
 
-      if (!res.ok) throw new Error('Failed to create policy');
+      if (!res.ok) throw new Error(`Failed to create policy (${res.status})`);
       const data = await res.json();
 
       if (data.conflicts?.length > 0) {
-        console.warn('Policy conflicts detected:', data.conflicts);
+        const summary = `Created with ${data.conflicts.length} conflict${data.conflicts.length === 1 ? '' : 's'} — review precedence.`;
+        notify(summary, 'info');
+      } else {
+        notify('Policy created', 'success');
       }
 
       setPolicies([...policies, data.policy]);
       setShowCreateDialog(false);
       resetForm();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      notify(`Could not create policy. ${message}`, 'error');
     }
   };
 
@@ -121,10 +150,12 @@ export default function PoliciesPage() {
 
   const handleDeletePolicy = async (policyId: string) => {
     try {
-      await fetch(`/api/policies?id=${policyId}`, { method: 'DELETE' });
+      const response = await fetch(`/api/policies?id=${policyId}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error(`Request failed (${response.status})`);
       setPolicies(policies.filter(p => p.id !== policyId));
-    } catch {
-      // Optimistic removal already applied
+      notify('Policy deleted', 'success');
+    } catch (err) {
+      notify(`Could not delete policy. ${err instanceof Error ? err.message : ''}`.trim(), 'error');
     }
   };
 
@@ -309,7 +340,11 @@ export default function PoliciesPage() {
       </Card>
 
       {/* Create Policy Dialog */}
-      <Dialog open={showCreateDialog} onClose={() => setShowCreateDialog(false)} className="max-w-xl">
+      <Dialog
+        open={showCreateDialog}
+        onClose={() => { setShowCreateDialog(false); setPolicyErrors({}); }}
+        className="max-w-xl"
+      >
         <DialogHeader>
           <DialogTitle>Create Policy</DialogTitle>
           <DialogDescription>Define a new policy rule for your organization</DialogDescription>
@@ -329,12 +364,14 @@ export default function PoliciesPage() {
             placeholder="e.g., Encryption Policy for Legal Team"
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
+            error={policyErrors.name}
           />
           <Input
             label="Description"
             placeholder="Describe what this policy enforces"
             value={newDescription}
             onChange={(e) => setNewDescription(e.target.value)}
+            error={policyErrors.description}
           />
           <Select
             label="Assign To"
@@ -353,6 +390,7 @@ export default function PoliciesPage() {
             value={newTargetValue}
             onChange={(e) => setNewTargetValue(e.target.value)}
             hint="Precedence: user > role > connection_type > org"
+            error={policyErrors.assignmentValue}
           />
           <Select
             label="Enforcement Mode"
@@ -367,7 +405,12 @@ export default function PoliciesPage() {
           />
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={() => { setShowCreateDialog(false); resetForm(); }}>Cancel</Button>
+          <Button
+            variant="outline"
+            onClick={() => { setShowCreateDialog(false); resetForm(); setPolicyErrors({}); }}
+          >
+            Cancel
+          </Button>
           <Button onClick={handleCreatePolicy}>Create Policy</Button>
         </DialogFooter>
       </Dialog>
