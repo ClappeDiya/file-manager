@@ -253,27 +253,35 @@ function ChooseStyleStep({
     icon: React.ReactNode;
     label: string;
     description: string;
+    mode: "Simple" | "Advanced";
+    includes: string[];
   }[] = [
     {
       id: "personal",
       icon: <User className="h-6 w-6" aria-hidden="true" />,
-      label: "Personal",
+      label: "Just browse and organize",
       description:
-        "I manage photos, documents, and music. Keep things simple and organized.",
+        "Photos, documents, downloads. A clean two-pane file manager with the essentials.",
+      mode: "Simple",
+      includes: ["File browser", "Drag-and-drop transfers", "Cloud accounts", "Search"],
     },
     {
       id: "power",
       icon: <Zap className="h-6 w-6" aria-hidden="true" />,
-      label: "Power User",
+      label: "Power tools & automation",
       description:
-        "I need advanced features like regex, checksums, scripting, and detailed logs.",
+        "Bulk operations, scripting, and AI assists for people who move thousands of files at a time.",
+      mode: "Advanced",
+      includes: ["Regex rename", "Checksums", "Quickflow rules", "AI assistant", "Terminal", "Activity ledger"],
     },
     {
       id: "work",
       icon: <Briefcase className="h-6 w-6" aria-hidden="true" />,
-      label: "Workplace",
+      label: "Team collaboration",
       description:
-        "I share files with a team, manage servers, and need compliance features.",
+        "Share connections with teammates, sync workspaces, and keep an audit trail for compliance.",
+      mode: "Advanced",
+      includes: ["Shared connections", "Sync workspaces", "Lineage", "Approval flows", "Audit log"],
     },
   ];
 
@@ -283,45 +291,56 @@ function ChooseStyleStep({
         How will you use File Manager?
       </h2>
       <p className="text-sm text-[color:var(--color-text-secondary)] mb-6">
-        This customizes your experience. You can change this anytime in Settings.
+        Pick what fits today — you can switch anytime in Settings without losing data.
       </p>
 
       <div className="space-y-3">
-        {styles.map((style) => (
-          <button
-            key={style.id}
-            className={cn(
-              "flex items-start gap-4 w-full p-4 rounded-xl border-2 text-left transition-all",
-              userStyle === style.id
-                ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5"
-                : "border-[var(--color-border)] hover:border-[var(--color-text-tertiary)]",
-            )}
-            onClick={() => onSelect(style.id)}
-            aria-pressed={userStyle === style.id}
-          >
-            <div
+        {styles.map((style) => {
+          const selected = userStyle === style.id;
+          return (
+            <button
+              key={style.id}
               className={cn(
-                "h-10 w-10 rounded-lg flex items-center justify-center shrink-0",
-                userStyle === style.id
-                  ? "bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)]"
-                  : "bg-[var(--color-bg-secondary)] text-[color:var(--color-text-secondary)]",
+                "flex items-start gap-4 w-full p-4 rounded-xl border-2 text-left transition-all",
+                selected
+                  ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5"
+                  : "border-[var(--color-border)] hover:border-[var(--color-text-tertiary)]",
               )}
+              onClick={() => onSelect(style.id)}
+              aria-pressed={selected}
             >
-              {style.icon}
-            </div>
-            <div>
-              <span className="text-sm font-semibold text-[color:var(--color-text)] block">
-                {style.label}
-              </span>
-              <span className="text-xs text-[color:var(--color-text-secondary)] mt-0.5 block leading-relaxed">
-                {style.description}
-              </span>
-            </div>
-            {userStyle === style.id && (
-              <Check className="h-5 w-5 text-[color:var(--color-primary)] shrink-0 ml-auto mt-2" aria-hidden="true" />
-            )}
-          </button>
-        ))}
+              <div
+                className={cn(
+                  "h-10 w-10 rounded-lg flex items-center justify-center shrink-0",
+                  selected
+                    ? "bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)]"
+                    : "bg-[var(--color-bg-secondary)] text-[color:var(--color-text-secondary)]",
+                )}
+              >
+                {style.icon}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-sm font-semibold text-[color:var(--color-text)]">
+                    {style.label}
+                  </span>
+                  <span className="text-[10px] uppercase tracking-wide rounded px-1.5 py-0.5 bg-[var(--color-bg-secondary)] text-[color:var(--color-text-secondary)]">
+                    {style.mode} mode
+                  </span>
+                </div>
+                <span className="text-xs text-[color:var(--color-text-secondary)] mt-1 block leading-relaxed">
+                  {style.description}
+                </span>
+                <span className="text-xs text-[color:var(--color-text-tertiary)] mt-2 block">
+                  Includes: {style.includes.join(" · ")}
+                </span>
+              </div>
+              {selected && (
+                <Check className="h-5 w-5 text-[color:var(--color-primary)] shrink-0 ml-auto mt-2" aria-hidden="true" />
+              )}
+            </button>
+          );
+        })}
       </div>
     </div>
   );

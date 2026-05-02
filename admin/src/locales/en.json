@@ -1,0 +1,54 @@
+{
+  "app": {
+    "name": "UFOP Admin Console",
+    "tagline": "Administration for the Unified File Operations Platform"
+  },
+  "common": {
+    "save": "Save",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "remove": "Remove",
+    "refresh": "Refresh",
+    "search": "Search",
+    "loading": "Loading…",
+    "error": "Error",
+    "success": "Success",
+    "noResults": "No results"
+  },
+  "nav": {
+    "dashboard": "Dashboard",
+    "users": "Users & Roles",
+    "devices": "Devices",
+    "policies": "Policies",
+    "approvals": "Approvals",
+    "audit": "Audit Log",
+    "connectors": "Connectors",
+    "workspaces": "Workspaces",
+    "aiGovernance": "AI Governance",
+    "billing": "Billing",
+    "support": "Support"
+  },
+  "shell": {
+    "skipToContent": "Skip to main content",
+    "toggleSidebar": "Toggle sidebar",
+    "notifications": "Notifications",
+    "logout": "Logout",
+    "themeLabel": "Theme: {theme}. Activate to switch.",
+    "locked": "Locked"
+  },
+  "footer": {
+    "privacy": "Privacy",
+    "terms": "Terms",
+    "status": "Status",
+    "support": "Support",
+    "copyright": "© {year} UFOP · Unified File Operations Platform"
+  },
+  "dashboard": {
+    "title": "Dashboard",
+    "description": "Overview of your organization's file operations",
+    "updatedAt": "Updated {time}",
+    "refreshAria": "Refresh dashboard",
+    "refreshSuccess": "Dashboard refreshed",
+    "refreshError": "Could not refresh: {message}"
+  }
+}

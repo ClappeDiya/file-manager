@@ -30,6 +30,7 @@ import {
   ToggleRight,
 } from "lucide-react";
 import { AiSuggestionCard } from "./ai-suggestion-card";
+import { FeaturePeek } from "@/components/feature-peek";
 
 // ──────────────────────────────────────────────
 // AI Panel - Main Component
@@ -89,6 +90,15 @@ export function AiPanel({ className }: AiPanelProps) {
       aria-label="AI Assistant"
     >
       <AiPanelHeader onClose={() => setPanelOpen(false)} />
+
+      <FeaturePeek
+        id="ai-panel-intro"
+        title="Tell the assistant what you want done"
+        shortcut="Cmd+Shift+A"
+      >
+        Ask in natural language ("organize my Downloads by type") or describe a transfer.
+        UFOP plans the steps, shows them, and waits for your confirmation before running.
+      </FeaturePeek>
 
       {/* Tab bar */}
       <div className="flex border-b border-[var(--color-border)]">

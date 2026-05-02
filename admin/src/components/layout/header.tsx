@@ -1,53 +1,53 @@
 'use client';
 
 import React from 'react';
-import { Menu, Bell, Sun, Moon, LogOut, User } from 'lucide-react';
+import { Menu, Bell, Sun, Moon, Monitor, LogOut, User } from 'lucide-react';
 import { useAdminStore } from '@/lib/stores/admin-store';
 import { useAuthStore } from '@/lib/stores/auth-store';
 import { ROLE_LABELS } from '@/lib/types/auth';
-import { Button } from '@/components/ui/button';
+import { useTranslate } from '@/lib/i18n';
 
 export function Header() {
   const { toggleMobileSidebar, theme, setTheme } = useAdminStore();
   const { user, logout } = useAuthStore();
+  const t = useTranslate();
 
-  const toggleTheme = () => {
-    setTheme(theme === 'light' ? 'dark' : 'light');
+  const cycleTheme = () => {
+    setTheme(theme === 'light' ? 'dark' : theme === 'dark' ? 'system' : 'light');
   };
+  const ThemeIcon = theme === 'light' ? Sun : theme === 'dark' ? Moon : Monitor;
+  const themeLabel = t('shell.themeLabel', { theme });
 
   return (
     <header className="h-14 border-b border-border bg-background-elevated flex items-center justify-between px-4 lg:px-6 shrink-0">
       <div className="flex items-center gap-3">
         <button
           onClick={toggleMobileSidebar}
-          className="lg:hidden p-2 rounded-md hover:bg-background-secondary transition-colors"
-          aria-label="Toggle sidebar"
+          className="lg:hidden h-10 w-10 inline-flex items-center justify-center rounded-md hover:bg-background-secondary transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+          aria-label={t('shell.toggleSidebar')}
         >
-          <Menu size={20} />
+          <Menu size={20} aria-hidden="true" />
         </button>
       </div>
 
       <div className="flex items-center gap-2">
         {/* Notifications */}
         <button
-          className="relative p-2 rounded-md hover:bg-background-secondary transition-colors"
-          aria-label="Notifications"
+          className="relative h-10 w-10 inline-flex items-center justify-center rounded-md hover:bg-background-secondary transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+          aria-label={t('shell.notifications')}
         >
-          <Bell size={18} className="text-foreground-secondary" />
-          <span className="absolute top-1.5 right-1.5 w-2 h-2 bg-error rounded-full" />
+          <Bell size={18} className="text-foreground-secondary" aria-hidden="true" />
+          <span className="absolute top-1.5 right-1.5 w-2 h-2 bg-error rounded-full" aria-hidden="true" />
         </button>
 
-        {/* Theme toggle */}
+        {/* Theme cycle: light → dark → system */}
         <button
-          onClick={toggleTheme}
-          className="p-2 rounded-md hover:bg-background-secondary transition-colors"
-          aria-label="Toggle theme"
+          onClick={cycleTheme}
+          className="h-10 w-10 inline-flex items-center justify-center rounded-md hover:bg-background-secondary transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+          aria-label={themeLabel}
+          title={themeLabel}
         >
-          {theme === 'dark' ? (
-            <Sun size={18} className="text-foreground-secondary" />
-          ) : (
-            <Moon size={18} className="text-foreground-secondary" />
-          )}
+          <ThemeIcon size={18} className="text-foreground-secondary" aria-hidden="true" />
         </button>
 
         {/* User menu */}
@@ -62,11 +62,11 @@ export function Header() {
             </div>
             <button
               onClick={logout}
-              className="p-2 rounded-md hover:bg-background-secondary transition-colors"
-              aria-label="Logout"
-              title="Logout"
+              className="h-10 w-10 inline-flex items-center justify-center rounded-md hover:bg-background-secondary transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+              aria-label={t('shell.logout')}
+              title={t('shell.logout')}
             >
-              <LogOut size={16} className="text-foreground-secondary" />
+              <LogOut size={16} className="text-foreground-secondary" aria-hidden="true" />
             </button>
           </div>
         )}

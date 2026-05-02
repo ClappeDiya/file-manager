@@ -1,9 +1,18 @@
 'use client';
 
 import React from 'react';
+import { Input as SharedInput, type InputProps as SharedInputProps } from '@ufop/ui-components';
 import { cn } from '@/lib/utils/cn';
 
-export interface InputProps extends React.InputHTMLAttributes<HTMLInputElement> {
+/**
+ * Admin Input — wraps the shared `@ufop/ui-components` Input with the admin's
+ * label / error / hint affordances. Bare-input styles, focus rings, and
+ * `aria-invalid` come from the shared package; the admin layer adds:
+ *  - a visible <label> tied to the input
+ *  - field-level error message with `role="alert"` + `aria-describedby`
+ *  - hint text that swaps out when an error is present
+ */
+export interface InputProps extends Omit<SharedInputProps, 'error'> {
   label?: string;
   error?: string;
   hint?: string;
@@ -11,7 +20,9 @@ export interface InputProps extends React.InputHTMLAttributes<HTMLInputElement> 
 
 export const Input = React.forwardRef<HTMLInputElement, InputProps>(
   ({ className, label, error, hint, id, ...props }, ref) => {
-    const inputId = id || label?.toLowerCase().replace(/\s+/g, '-');
+    const generatedId = React.useId();
+    const inputId = id || (label ? `${label.toLowerCase().replace(/\s+/g, '-')}-${generatedId}` : generatedId);
+    const helperId = `${inputId}-helper`;
 
     return (
       <div className="flex flex-col gap-1.5">
@@ -20,24 +31,19 @@ export const Input = React.forwardRef<HTMLInputElement, InputProps>(
             {label}
           </label>
         )}
-        <input
+        <SharedInput
           ref={ref}
           id={inputId}
-          className={cn(
-            'flex h-9 w-full rounded-md border bg-background px-3 py-2 text-sm',
-            'placeholder:text-foreground-disabled',
-            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:border-border-focus',
-            'disabled:cursor-not-allowed disabled:opacity-50',
-            error ? 'border-border-error' : 'border-border',
-            className
-          )}
+          error={Boolean(error)}
+          aria-describedby={(error || hint) ? helperId : undefined}
+          className={cn(className)}
           {...props}
         />
-        {error && <p className="text-xs text-error">{error}</p>}
-        {hint && !error && <p className="text-xs text-foreground-tertiary">{hint}</p>}
+        {error && <p id={helperId} className="text-xs text-error" role="alert">{error}</p>}
+        {hint && !error && <p id={helperId} className="text-xs text-foreground-tertiary">{hint}</p>}
       </div>
     );
-  }
+  },
 );
 
 Input.displayName = 'Input';

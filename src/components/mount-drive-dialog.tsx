@@ -16,6 +16,7 @@
  * - Clicking a mounted drive could navigate the file list to that mount point
  */
 import { useState, useCallback, useEffect } from "react";
+import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { pickFolder } from "@/lib/folder-picker";
 import {
@@ -349,6 +350,7 @@ export default function MountDriveDialog({
   const [unmountingId, setUnmountingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [savedConfigsExpanded, setSavedConfigsExpanded] = useState(false);
+  const containerRef = useFocusTrap<HTMLDivElement>({ active: open, onEscape: onClose });
 
   // Load connections and mounts
   const loadData = useCallback(async () => {
@@ -406,20 +408,21 @@ export default function MountDriveDialog({
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
+    <div className="fixed inset-0 z-50 flex items-center justify-center" role="dialog" aria-modal="true" aria-labelledby="mount-drive-title">
       {/* Backdrop */}
       <div
         className="absolute inset-0 bg-black/50"
         onClick={onClose}
+        aria-hidden="true"
       />
 
       {/* Dialog */}
-      <div className="relative bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg max-h-[85vh] overflow-hidden flex flex-col">
+      <div ref={containerRef} className="relative bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg max-h-[85vh] overflow-hidden flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
           <div className="flex items-center gap-2">
-            <HardDrive size={18} className="text-blue-500" />
-            <h2 className="text-base font-semibold">Mount Remote Drive</h2>
+            <HardDrive size={18} className="text-blue-500" aria-hidden="true" />
+            <h2 id="mount-drive-title" className="text-base font-semibold">Mount Remote Drive</h2>
           </div>
           <div className="flex items-center gap-2">
             <button

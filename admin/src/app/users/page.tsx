@@ -19,6 +19,13 @@ import { StatCard } from '@/components/ui/stat-card';
 import { ROLE_LABELS, ROLE_PERMISSIONS, type Role, type AdminUser } from '@/lib/types/auth';
 import { formatDate, formatRelativeTime } from '@/lib/utils/format';
 import { useAuthStore } from '@/lib/stores/auth-store';
+import { useToastStore } from '@/lib/stores/toast-store';
+import { z } from 'zod';
+
+const inviteSchema = z.object({
+  email: z.string().trim().min(1, 'Email is required').email('Enter a valid email address'),
+  role: z.string().min(1, 'Pick a role'),
+});
 
 export default function UsersPage() {
   const [searchQuery, setSearchQuery] = useState('');
@@ -29,11 +36,13 @@ export default function UsersPage() {
   const [selectedUser, setSelectedUser] = useState<AdminUser | null>(null);
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState<Role>('user');
+  const [inviteErrors, setInviteErrors] = useState<{ email?: string; role?: string }>({});
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const _currentUser = useAuthStore((s) => s.user);
+  const notify = useToastStore((s) => s.notify);
 
   useEffect(() => {
     fetch('/api/users')
@@ -56,21 +65,38 @@ export default function UsersPage() {
   const roleOptions = Object.entries(ROLE_LABELS).map(([value, label]) => ({ value, label }));
 
   const handleInvite = async () => {
-    if (!inviteEmail) return;
+    const parsed = inviteSchema.safeParse({ email: inviteEmail, role: inviteRole });
+    if (!parsed.success) {
+      const fieldErrors: { email?: string; role?: string } = {};
+      for (const issue of parsed.error.issues) {
+        const key = issue.path[0] as 'email' | 'role';
+        if (!fieldErrors[key]) fieldErrors[key] = issue.message;
+      }
+      setInviteErrors(fieldErrors);
+      return;
+    }
+    setInviteErrors({});
     try {
       const res = await fetch('/api/users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: inviteEmail, role: inviteRole, name: inviteEmail.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) }),
+        body: JSON.stringify({
+          email: parsed.data.email,
+          role: parsed.data.role,
+          name: parsed.data.email.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
+        }),
       });
-      if (!res.ok) throw new Error('Failed to invite user');
+      if (!res.ok) throw new Error(`Failed to invite user (${res.status})`);
       const data = await res.json();
       setUsers([...users, data.user]);
       setShowInviteDialog(false);
       setInviteEmail('');
       setInviteRole('user');
+      notify('Invitation sent', 'success');
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      notify(`Could not invite user. ${message}`, 'error');
     }
   };
 
@@ -85,27 +111,31 @@ export default function UsersPage() {
     if (!user) return;
     const action = user.isActive ? 'deactivate' : 'activate';
     try {
-      await fetch('/api/users', {
+      const response = await fetch('/api/users', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, userIds: [userId] }),
       });
+      if (!response.ok) throw new Error(`Request failed (${response.status})`);
       setUsers(users.map(u => u.id === userId ? { ...u, isActive: !u.isActive } : u));
-    } catch {
-      // Optimistic update already applied
+      notify(`User ${action}d`, 'success');
+    } catch (err) {
+      notify(`Could not ${action} user. ${err instanceof Error ? err.message : ''}`.trim(), 'error');
     }
   };
 
   const handleRemove = async (userId: string) => {
     try {
-      await fetch('/api/users', {
+      const response = await fetch('/api/users', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'remove', userIds: [userId] }),
       });
+      if (!response.ok) throw new Error(`Request failed (${response.status})`);
       setUsers(users.filter(u => u.id !== userId));
-    } catch {
-      // Optimistic update already applied
+      notify('User removed', 'success');
+    } catch (err) {
+      notify(`Could not remove user. ${err instanceof Error ? err.message : ''}`.trim(), 'error');
     }
   };
 
@@ -402,7 +432,13 @@ export default function UsersPage() {
       </Tabs>
 
       {/* Invite Dialog */}
-      <Dialog open={showInviteDialog} onClose={() => setShowInviteDialog(false)}>
+      <Dialog
+        open={showInviteDialog}
+        onClose={() => {
+          setShowInviteDialog(false);
+          setInviteErrors({});
+        }}
+      >
         <DialogHeader>
           <DialogTitle>Invite User</DialogTitle>
           <DialogDescription>Send an invitation to join your organization</DialogDescription>
@@ -414,16 +450,26 @@ export default function UsersPage() {
             placeholder="user@example.com"
             value={inviteEmail}
             onChange={(e) => setInviteEmail(e.target.value)}
+            error={inviteErrors.email}
           />
           <Select
             label="Role"
             options={roleOptions}
             value={inviteRole}
             onChange={(e) => setInviteRole(e.target.value as Role)}
+            error={inviteErrors.role}
           />
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={() => setShowInviteDialog(false)}>Cancel</Button>
+          <Button
+            variant="outline"
+            onClick={() => {
+              setShowInviteDialog(false);
+              setInviteErrors({});
+            }}
+          >
+            Cancel
+          </Button>
           <Button onClick={handleInvite}>
             <Mail size={14} /> Send Invitation
           </Button>

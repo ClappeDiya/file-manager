@@ -27,9 +27,10 @@
  *   ledger as a `safety.confirmed` event, so a future review can trace
  *   every override.
  */
-import { useCallback, useEffect, useMemo, useRef, type KeyboardEvent } from "react";
+import { useMemo, useRef } from "react";
 import { formatBytes } from "@/lib/format-bytes";
 import { useSafetyStore } from "@/stores/safety-store";
+import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { AlertTriangle, ShieldAlert, X } from "lucide-react";
 
 export function SafetyInterlockDialog() {
@@ -43,24 +44,14 @@ export function SafetyInterlockDialog() {
   // High-risk defaults focus to Cancel (destructive-safe default);
   // medium-risk defaults focus to Proceed (flows that just need a nudge).
   const isHigh = pending?.assessment.level === "high";
+  const initialFocusRef = isHigh ? cancelButtonRef : proceedButtonRef;
 
-  useEffect(() => {
-    if (!pending) return;
-    const target = isHigh ? cancelButtonRef.current : proceedButtonRef.current;
-    target?.focus();
-  }, [pending, isHigh]);
-
-  // Keyboard: Escape always rejects. Enter approves only if the current
-  // focus isn't already on the cancel button (which would be double-action).
-  const onKeyDown = useCallback(
-    (e: KeyboardEvent<HTMLDivElement>) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        reject();
-      }
-    },
-    [reject],
-  );
+  // Trap Tab inside the dialog, fire `reject()` on Escape, restore focus on close.
+  const containerRef = useFocusTrap<HTMLDivElement>({
+    active: !!pending,
+    onEscape: reject,
+    initialFocusRef,
+  });
 
   const displaySummary = useMemo(() => {
     if (!pending) return null;
@@ -85,12 +76,12 @@ export function SafetyInterlockDialog() {
 
   return (
     <div
+      ref={containerRef}
       className="fixed inset-0 z-[60] flex items-center justify-center p-4"
       role="dialog"
       aria-modal="true"
       aria-labelledby="safety-interlock-title"
       aria-describedby="safety-interlock-reasons"
-      onKeyDown={onKeyDown}
     >
       <div
         className="absolute inset-0 bg-black/60 backdrop-blur-sm"

@@ -123,8 +123,23 @@ export interface UIState {
   // Preview panel
   previewPanelOpen: boolean;
   previewPanelWidth: number;
+  /** Iter 29: absolute path of the file currently being previewed.
+   *  Paired with `previewPanelOpen` so the modal knows WHICH file
+   *  to render. The boolean alone was a pre-existing half-wired
+   *  orphan (declared, persisted, tested, but never consumed) \u2014
+   *  iter 29 both consumes it and adds the path it was missing. */
+  previewFilePath: string | null;
   togglePreviewPanel: () => void;
   setPreviewPanelWidth: (width: number) => void;
+  /** Iter 29: open the preview panel on a specific file. Sets
+   *  both the open flag AND the file path in one atomic update
+   *  so consumers always see a consistent pair. */
+  openPreviewFor: (path: string) => void;
+  /** Iter 29: close the preview panel and clear the file path.
+   *  Separate from `togglePreviewPanel` so callers that know
+   *  they want the panel closed don't accidentally re-open it
+   *  when it happens to be closed already. */
+  closePreview: () => void;
 
   // ── Onboarding (T-055) ──
   onboardingComplete: boolean;
@@ -153,6 +168,7 @@ export interface UIState {
   // ── Toolbar Customization (#14) ──
   toolbarItems: string[];
   setToolbarItems: (items: string[]) => void;
+  resetToolbar: () => void;
   toolbarCustomizerOpen: boolean;
   toggleToolbarCustomizer: () => void;
 
@@ -162,6 +178,9 @@ export interface UIState {
 
 const MAX_ACTIVITY_ENTRIES = 100;
 const MAX_ERRORS = 50;
+/** Toolbar items shown by default for new installs. Exported so the toolbar
+ *  customizer's "Reset to defaults" button stays in sync with the store. */
+export const DEFAULT_TOOLBAR_ITEMS = ["sidebar", "view-modes", "ai", "terminal", "theme"] as const;
 
 /**
  * Applies the resolved theme to the document.
@@ -246,10 +265,15 @@ export const useUIStore = create<UIState>()(
       // Preview panel
       previewPanelOpen: false,
       previewPanelWidth: 320,
+      previewFilePath: null,
       togglePreviewPanel: () =>
         set((state) => ({ previewPanelOpen: !state.previewPanelOpen })),
       setPreviewPanelWidth: (width: number) =>
         set({ previewPanelWidth: Math.max(200, Math.min(600, width)) }),
+      openPreviewFor: (path: string) =>
+        set({ previewPanelOpen: true, previewFilePath: path }),
+      closePreview: () =>
+        set({ previewPanelOpen: false, previewFilePath: null }),
 
       // ── Onboarding (T-055) ──
       onboardingComplete: false,
@@ -330,8 +354,9 @@ export const useUIStore = create<UIState>()(
         set({ activeGuidedFlow: flowId }),
 
       // ── Toolbar Customization (#14) ──
-      toolbarItems: ["sidebar", "view-modes", "ai", "terminal", "theme"],
+      toolbarItems: [...DEFAULT_TOOLBAR_ITEMS],
       setToolbarItems: (items: string[]) => set({ toolbarItems: items }),
+      resetToolbar: () => set({ toolbarItems: [...DEFAULT_TOOLBAR_ITEMS] }),
       toolbarCustomizerOpen: false,
       toggleToolbarCustomizer: () =>
         set((state) => ({ toolbarCustomizerOpen: !state.toolbarCustomizerOpen })),
@@ -356,6 +381,7 @@ export const useUIStore = create<UIState>()(
         statusBarVisible: state.statusBarVisible,
         previewPanelOpen: state.previewPanelOpen,
         previewPanelWidth: state.previewPanelWidth,
+        previewFilePath: state.previewFilePath,
         onboardingComplete: state.onboardingComplete,
         userStyle: state.userStyle,
         activityFeed: state.activityFeed,

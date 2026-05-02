@@ -297,19 +297,54 @@ export function FileList({
 // ActivityDot — inline ledger activity indicator for a single file row.
 // ──────────────────────────────────────────────
 
+/** Engine-specific label for the activity badge tooltip. */
+const ENGINE_LABELS: Record<string, string> = {
+  fs: "File op",
+  transfer: "Transfer",
+  sync: "Sync",
+  automation: "Automation",
+  mount: "Mount",
+  vault: "Vault",
+  connector: "Connector",
+  spaces: "Space",
+  ai: "AI",
+  compat: "Compat",
+  system: "System",
+};
+
+/** Engine-aware color mapping. When the engine is known, color encodes
+ *  which subsystem last touched the file. When unknown, falls back to
+ *  age-based coloring for backward compatibility. */
+function engineColor(engine: string | null | undefined): string | null {
+  switch (engine) {
+    case "transfer": return "bg-emerald-500";   // green  — transfers
+    case "sync":     return "bg-blue-500";       // blue   — syncs
+    case "automation": return "bg-violet-500";   // purple — automations
+    case "vault":    return "bg-amber-500";      // amber  — encryption
+    case "connector": return "bg-teal-500";      // teal   — connections
+    default:         return null;                 // fall back to age-based
+  }
+}
+
 /**
- * Small colored dot surfaced inline next to a filename, rendered only
- * when the unified operation ledger has recent activity on that file's
- * exact path. Color encodes recency:
+ * Small colored badge surfaced inline next to a filename, rendered only
+ * when the unified operation ledger has recent activity on that file.
+ *
+ * **Engine-aware coloring** (when `lastEngine` is populated):
+ *   - green  : transfer engine
+ *   - blue   : sync engine
+ *   - purple : automation engine (Quickflows)
+ *   - amber  : vault / encryption
+ *   - teal   : connector operations
+ *
+ * **Recency fallback** (when engine is unknown or fs/system):
  *   - green : within the last hour  (`recent`)
  *   - blue  : within the last 24 hours (`today`)
- *   - sky   : older than 24 hours (within the 7-day window; `week`)
+ *   - sky   : older than 24 hours (`week`)
  *
  * Fully pure by construction: consumes the pre-bucketed fields
- * computed by `useDirectoryActivity` at fetch time, so there is no
- * impure `Date.now()` call in the render path. Dots are frozen at the
- * moment the directory was fetched — re-navigating the pane refreshes
- * them naturally. Zero interactivity beyond the hover tooltip.
+ * computed by `useDirectoryActivity` at fetch time. Dots are frozen
+ * at the moment the directory was fetched — re-navigating refreshes.
  */
 function ActivityDot({
   info,
@@ -319,17 +354,22 @@ function ActivityDot({
     hitCount: number;
     ageBucket: "recent" | "today" | "week";
     ageLabel: string;
+    lastEngine?: string | null;
   };
 }) {
-  const colorClass =
-    info.ageBucket === "recent"
+  const engColor = engineColor(info.lastEngine);
+  const colorClass = engColor
+    ?? (info.ageBucket === "recent"
       ? "bg-emerald-500"
       : info.ageBucket === "today"
         ? "bg-blue-500"
-        : "bg-sky-500/60";
+        : "bg-sky-500/60");
+  const engineLabel = info.lastEngine
+    ? ENGINE_LABELS[info.lastEngine] ?? info.lastEngine
+    : "Ledger";
   const touches =
     info.hitCount === 1 ? "1 touch" : `${info.hitCount} touches`;
-  const title = `Ledger activity: ${info.ageLabel} · ${touches}`;
+  const title = `${engineLabel}: ${info.ageLabel} · ${touches}`;
   return (
     <span
       aria-label={title}
@@ -657,6 +697,28 @@ function FileTableView({
           if (row) onOpen?.(row.original);
           return;
         }
+        // Shift+F10 (cross-platform) and the dedicated ContextMenu / Apps key
+        // open the right-click menu on the focused row, anchored to the row's
+        // on-screen rect so keyboard-only users don't have to chase a mouse.
+        case "F10":
+        case "ContextMenu": {
+          if (e.key === "F10" && !e.shiftKey) return;
+          e.preventDefault();
+          const row = rows[focusedIndex];
+          if (!row || !onContextMenu) return;
+          const el = parentRef.current?.querySelector<HTMLElement>(
+            `[data-testid="file-row-${focusedIndex}"]`,
+          );
+          const rect = el?.getBoundingClientRect();
+          const synthetic = {
+            preventDefault: () => {},
+            stopPropagation: () => {},
+            clientX: rect ? rect.left + 16 : 100,
+            clientY: rect ? rect.top + rect.height / 2 : 100,
+          } as unknown as React.MouseEvent;
+          onContextMenu(row.original, synthetic);
+          return;
+        }
         default:
           return;
       }
@@ -666,7 +728,7 @@ function FileTableView({
         virtualizer.scrollToIndex(newIndex, { align: "auto" });
       }
     },
-    [focusedIndex, rows, rowHeight, onOpen, onFocusedIndexChange, virtualizer],
+    [focusedIndex, rows, rowHeight, onOpen, onFocusedIndexChange, onContextMenu, virtualizer],
   );
 
   return (
@@ -1071,6 +1133,25 @@ function FileGridView({
           if (entry) onOpen?.(entry);
           return;
         }
+        case "F10":
+        case "ContextMenu": {
+          if (e.key === "F10" && !e.shiftKey) return;
+          e.preventDefault();
+          const entry = files[focusedIndex];
+          if (!entry || !onContextMenu) return;
+          const el = parentRef.current?.querySelector<HTMLElement>(
+            `[data-testid="file-grid-item-${focusedIndex}"]`,
+          );
+          const rect = el?.getBoundingClientRect();
+          const synthetic = {
+            preventDefault: () => {},
+            stopPropagation: () => {},
+            clientX: rect ? rect.left + rect.width / 2 : 100,
+            clientY: rect ? rect.top + rect.height / 2 : 100,
+          } as unknown as React.MouseEvent;
+          onContextMenu(entry, synthetic);
+          return;
+        }
         default:
           return;
       }
@@ -1082,7 +1163,7 @@ function FileGridView({
         rowVirtualizer.scrollToIndex(targetRow, { align: "auto" });
       }
     },
-    [focusedIndex, files, columnCount, onOpen, onFocusedIndexChange, rowVirtualizer],
+    [focusedIndex, files, columnCount, onOpen, onFocusedIndexChange, onContextMenu, rowVirtualizer],
   );
 
   return (
