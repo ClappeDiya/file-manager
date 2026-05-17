@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Color, spacing, typography, radius, shadow, and motion CSS variables come
+ * from `@ufop/design-tokens/css`, imported once in `app/layout.tsx`. Do NOT
+ * redeclare them here — the desktop app and admin console use the same file,
+ * so divergence here would silently drift the three surfaces apart.
+ */
+
+@layer base {
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-size: var(--font-size-base);
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  a {
+    @apply text-primary hover:text-primary-hover transition-colors;
+  }
+}
+
+@layer components {
+  .container-prose {
+    @apply max-w-4xl mx-auto px-6;
+  }
+
+  .container-page {
+    @apply max-w-6xl mx-auto px-6;
+  }
+
+  .container-wide {
+    @apply max-w-7xl mx-auto px-6;
+  }
+
+  .marketing-card {
+    @apply bg-background-elevated rounded-lg border border-border shadow-sm p-6;
+  }
+
+  .marketing-section {
+    @apply py-16 md:py-24;
+  }
+
+  .marketing-heading {
+    @apply text-3xl md:text-4xl font-bold tracking-tight text-foreground;
+  }
+
+  .marketing-subheading {
+    @apply text-lg md:text-xl text-foreground-secondary leading-relaxed;
+  }
+
+  .pill {
+    @apply inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium bg-background-secondary text-foreground-secondary border border-border;
+  }
+}
+
+/* Honor the OS-level "reduce motion" preference. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
