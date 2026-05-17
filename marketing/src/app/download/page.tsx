@@ -6,7 +6,7 @@ export const metadata: Metadata = {
   description: 'Get FileManager for macOS, Windows, or Linux. Signed installers with auto-updates.',
 };
 
-const RELEASE_BASE = 'https://github.com/ufop/unified-file-ops/releases/latest/download';
+const RELEASE_BASE = 'https://github.com/ClappeDiya/file-manager/releases/latest/download';
 const VERSION_LABEL = 'latest';
 
 const platforms = [
@@ -18,7 +18,7 @@ const platforms = [
     downloads: [
       { label: 'Universal .dmg', href: `${RELEASE_BASE}/FileManager-${VERSION_LABEL}-universal.dmg` },
     ],
-    code: 'brew install --cask ufop/tap/unified-file-ops',
+    code: 'brew install --cask ClappeDiya/tap/unified-file-ops',
   },
   {
     id: 'windows',
@@ -102,7 +102,7 @@ export default function DownloadPage() {
           For manual verification, the SHA-256 checksums and signature files are attached to every GitHub release.
         </p>
         <a
-          href="https://github.com/ufop/unified-file-ops/releases"
+          href="https://github.com/ClappeDiya/file-manager/releases"
           className="text-sm font-medium"
           rel="noopener"
         >

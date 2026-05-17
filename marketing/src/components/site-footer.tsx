@@ -24,7 +24,7 @@ const sections = [
       { href: '/legal/privacy', label: 'Privacy' },
       { href: '/legal/terms', label: 'Terms' },
       { href: '/legal/refund', label: 'Refunds' },
-      { href: 'https://github.com/ufop/unified-file-ops/blob/main/LICENSE', label: 'License' },
+      { href: 'https://github.com/ClappeDiya/file-manager/blob/master/LICENSE', label: 'License' },
     ],
   },
 ];

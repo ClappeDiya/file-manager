@@ -39,7 +39,7 @@ export default async function DocsIndexPage() {
               Download &amp; explore
             </Link>
             <a
-              href="https://github.com/ufop/unified-file-ops"
+              href="https://github.com/ClappeDiya/file-manager"
               rel="noopener"
               className="inline-flex items-center gap-2 px-4 py-2 rounded-md border border-border bg-background text-foreground text-sm font-medium hover:bg-background-secondary transition-colors"
             >

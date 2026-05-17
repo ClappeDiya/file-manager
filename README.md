@@ -22,7 +22,7 @@ A unified replacement for ForkLift, Transmit, Cyberduck, Rclone-GUI, and the fil
 
 ```bash
 # macOS
-brew install --cask ufop/tap/unified-file-ops
+brew install --cask ClappeDiya/tap/unified-file-ops
 
 # Windows
 winget install UFOP.UnifiedFileOps

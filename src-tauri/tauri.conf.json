@@ -110,12 +110,12 @@
   },
   "plugins": {
     "updater": {
-      "active": false,
+      "active": true,
       "dialog": true,
-      "pubkey": "",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY1MTg5OTk3MzIyOEFBMEUKUldRT3FpZ3lsNWtZOVZqNExlUmNaMkRNbEFFWTg1aldqRHFPWjk0Z0JnWWhTZDFUT3NKMG54eloK",
       "endpoints": [
         "https://releases.filemanager.clappe.com/{{target}}/{{arch}}/{{current_version}}",
-        "https://github.com/ufop/unified-file-ops/releases/latest/download/latest.json"
+        "https://github.com/ClappeDiya/file-manager/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

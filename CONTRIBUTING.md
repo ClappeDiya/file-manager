@@ -89,6 +89,18 @@ This repo is set up to be driven by AI coding agents. The configuration lives in
 
 Agent governance rules are in `docs/AI-Agent-Governance-Addendum.md`.
 
+## Releasing
+
+This project **does not use GitHub Actions**. Releases are cut from a local Mac with both the Apple Developer signing identity and the Tauri updater key configured.
+
+1. Fill in `.env.local` (copy `.env.example` first). Required: `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, plus the Apple `APPLE_*` vars.
+2. Run `./scripts/release-local.sh --check` to verify prereqs.
+3. Tag and publish: `./scripts/release-local.sh --version 1.0.0` (or `--prerelease` for RC tags).
+4. For stable releases, manually open a PR to [`ClappeDiya/homebrew-tap`](https://github.com/ClappeDiya/homebrew-tap) updating `Casks/unified-file-ops.rb`.
+5. Windows signing: pending SignPath Foundation approval; until then ship `.msi`/`.exe` unsigned with a download-page disclaimer.
+
+The `.github/workflows/*.yml.disabled` files are reference scaffolding only — they document the CI flow we'd use if Actions were ever turned back on, but they are not executed.
+
 ## Versioning
 
 - PRD: V5 (Definitive)

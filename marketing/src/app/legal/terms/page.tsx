@@ -26,7 +26,7 @@ export default function TermsPage() {
       <p>
         The desktop app is offered without warranty. We will do our best to keep it stable and update it
         regularly, but we make no SLA commitments for free users. If something breaks, please report it at
-        <a href="https://github.com/ufop/unified-file-ops/issues"> github.com/ufop/unified-file-ops/issues</a>.
+        <a href="https://github.com/ClappeDiya/file-manager/issues"> github.com/ClappeDiya/file-manager/issues</a>.
       </p>
 
       <h2 className="text-xl font-bold text-foreground mt-8">Paid plans</h2>

@@ -29,7 +29,7 @@ const channels = [
     icon: Github,
     title: 'Bugs & feature requests',
     body: 'Open an issue on GitHub. We triage weekly and tag everything publicly.',
-    cta: { label: 'github.com/ufop/unified-file-ops', href: 'https://github.com/ufop/unified-file-ops/issues' },
+    cta: { label: 'github.com/ClappeDiya/file-manager', href: 'https://github.com/ClappeDiya/file-manager/issues' },
   },
 ];
 
