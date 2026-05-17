@@ -1,0 +1,31 @@
+# releases.filemanager.clappe.com — minimal redirect-to-GitHub-Releases proxy.
+#
+# Bound to :8080 internally (Traefik handles TLS termination on :443).
+# Tauri auto-updater hits this host for latest.json and signed binaries; every
+# request is 302-redirected to the matching path on GitHub Releases.
+
+{
+    # Disable Caddy's built-in TLS/admin so the container is single-purpose.
+    admin off
+    auto_https off
+}
+
+:8080 {
+    # Liveness for the Docker healthcheck.
+    @health path /healthz
+    handle @health {
+        respond "ok" 200
+    }
+
+    # Friendly landing for humans opening the URL in a browser.
+    @root path /
+    handle @root {
+        redir https://github.com/ClappeDiya/file-manager/releases/latest 302
+    }
+
+    # Every other path → matching asset on GitHub Releases.
+    # e.g. /latest.json → github.com/ClappeDiya/file-manager/releases/latest/download/latest.json
+    handle {
+        redir https://github.com/ClappeDiya/file-manager/releases/latest/download{uri} 302
+    }
+}

@@ -1,0 +1,103 @@
+# =============================================================================
+# FileManager — production compose (GHCR pull-only)
+# =============================================================================
+# Deployed to: singularity (184.70.179.66) via Dokploy + Traefik.
+# Built locally and pushed to GHCR by scripts/build-push-marketing.sh; pulled
+# and run by scripts/deploy-marketing.sh. The project does NOT use GitHub
+# Actions — see CONTRIBUTING.md "Releasing".
+#
+# Usage on the VPS:
+#   cd /opt/filemanager
+#   IMAGE_TAG=sha-abc1234 docker compose -f docker-compose.ghcr.yml pull
+#   IMAGE_TAG=sha-abc1234 docker compose -f docker-compose.ghcr.yml up -d
+# =============================================================================
+
+name: filemanager
+
+services:
+  marketing:
+    image: ghcr.io/clappediya/filemanager-marketing:${IMAGE_TAG:-production}
+    container_name: filemanager-marketing
+    restart: unless-stopped
+    # Resource limit because singularity hosts is-website-prod alongside —
+    # see memory: project-deployment-targets. Next.js standalone is light.
+    mem_limit: 512m
+    mem_reservation: 128m
+    cpus: 1.0
+    environment:
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
+      PORT: "3002"
+      HOSTNAME: 0.0.0.0
+      NEXT_PUBLIC_SITE_URL: https://filemanager.clappe.com
+      NEXT_PUBLIC_GITHUB_REPO: ClappeDiya/file-manager
+      # Optional — set in .env.production to forward waitlist signups
+      WAITLIST_WEBHOOK_URL: ${WAITLIST_WEBHOOK_URL:-}
+    expose:
+      - "3002"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3002/ > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+      # HTTP → HTTPS redirect
+      - "traefik.http.routers.filemanager-marketing-http.rule=Host(`filemanager.clappe.com`) || Host(`www.filemanager.clappe.com`) || Host(`docs.filemanager.clappe.com`)"
+      - "traefik.http.routers.filemanager-marketing-http.entrypoints=web"
+      - "traefik.http.routers.filemanager-marketing-http.middlewares=filemanager-redirect-https"
+      - "traefik.http.middlewares.filemanager-redirect-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.filemanager-redirect-https.redirectscheme.permanent=true"
+      # HTTPS service
+      - "traefik.http.routers.filemanager-marketing.rule=Host(`filemanager.clappe.com`) || Host(`www.filemanager.clappe.com`) || Host(`docs.filemanager.clappe.com`)"
+      - "traefik.http.routers.filemanager-marketing.entrypoints=websecure"
+      - "traefik.http.routers.filemanager-marketing.tls=true"
+      - "traefik.http.routers.filemanager-marketing.tls.certresolver=letsencrypt"
+      - "traefik.http.services.filemanager-marketing.loadbalancer.server.port=3002"
+    networks:
+      - dokploy-network
+
+  releases-proxy:
+    # Tiny Caddy that 302-redirects every request to the matching path on
+    # GitHub Releases. Tauri's updater hits releases.filemanager.clappe.com
+    # for latest.json and platform binaries — it follows the redirect to
+    # github.com/ClappeDiya/file-manager/releases/latest/download/<path>.
+    image: caddy:2.8-alpine
+    container_name: filemanager-releases-proxy
+    restart: unless-stopped
+    mem_limit: 64m
+    mem_reservation: 16m
+    cpus: 0.25
+    volumes:
+      - ./releases-proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+      # HTTP → HTTPS redirect
+      - "traefik.http.routers.filemanager-releases-http.rule=Host(`releases.filemanager.clappe.com`)"
+      - "traefik.http.routers.filemanager-releases-http.entrypoints=web"
+      - "traefik.http.routers.filemanager-releases-http.middlewares=filemanager-releases-redirect-https"
+      - "traefik.http.middlewares.filemanager-releases-redirect-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.filemanager-releases-redirect-https.redirectscheme.permanent=true"
+      # HTTPS service
+      - "traefik.http.routers.filemanager-releases.rule=Host(`releases.filemanager.clappe.com`)"
+      - "traefik.http.routers.filemanager-releases.entrypoints=websecure"
+      - "traefik.http.routers.filemanager-releases.tls=true"
+      - "traefik.http.routers.filemanager-releases.tls.certresolver=letsencrypt"
+      - "traefik.http.services.filemanager-releases.loadbalancer.server.port=8080"
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true

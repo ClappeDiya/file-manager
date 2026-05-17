@@ -23,6 +23,7 @@ Thumbs.db
 .env
 .env.local
 .env.*.local
+.env.production
 
 # Tauri build artifacts
 src-tauri/target/

@@ -11,7 +11,7 @@ WORKDIR /repo
 # deps: install workspace deps once, cache across stages
 # ---------------------------------------------------------------------------
 FROM base AS deps
-COPY pnpm-workspace.yaml pnpm-lock.yaml package.json ./
+COPY pnpm-workspace.yaml pnpm-lock.yaml package.json .npmrc .pnpmfile.cjs ./
 COPY packages/design-tokens/package.json packages/design-tokens/
 COPY packages/ui-components/package.json packages/ui-components/
 COPY marketing/package.json marketing/

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://filemanager.clappe.com/sitemap.xml
