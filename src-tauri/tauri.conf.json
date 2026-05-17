@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; img-src 'self' asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src 'self' https://releases.ufop.app https://api.github.com"
+      "csp": "default-src 'self'; script-src 'self'; img-src 'self' asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src 'self' https://releases.filemanager.clappe.com https://api.github.com"
     }
   },
   "bundle": {
@@ -38,8 +38,8 @@
     "category": "Utility",
     "shortDescription": "Cross-platform file manager, transfer, sync & governance",
     "longDescription": "Unified File Operations Platform provides comprehensive file management with local/remote browsing, multi-protocol transfers (SFTP, FTP, WebDAV, S3, GCS, Azure), real-time sync, and data governance across macOS, Windows, and Linux.",
-    "copyright": "Copyright (c) 2024 UFOP Team",
-    "licenseFile": null,
+    "copyright": "Copyright (c) 2026 Clappe",
+    "licenseFile": "../LICENSE",
     "resources": [],
     "externalBin": [],
     "macOS": {
@@ -114,7 +114,7 @@
       "dialog": true,
       "pubkey": "",
       "endpoints": [
-        "https://releases.ufop.app/{{target}}/{{arch}}/{{current_version}}",
+        "https://releases.filemanager.clappe.com/{{target}}/{{arch}}/{{current_version}}",
         "https://github.com/ufop/unified-file-ops/releases/latest/download/latest.json"
       ],
       "windows": {

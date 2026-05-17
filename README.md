@@ -1,40 +1,59 @@
-# Unified File Operations Platform
+# FileManager — by Clappe
 
-**Cross-Platform File Manager, Transfer, Sync & Governance**
+**The cross-platform file manager for power users. One app for local + remote browsing, multi-protocol transfers, real-time sync, and team-grade governance — with your files staying on your machine.**
 
-## Project Structure
+[Download](https://filemanager.clappe.com) · [Docs](https://filemanager.clappe.com/docs) · [Pricing](https://filemanager.clappe.com/pricing) · [Changelog](https://filemanager.clappe.com/changelog)
 
+---
+
+## What it is
+
+A unified replacement for ForkLift, Transmit, Cyberduck, Rclone-GUI, and the file manager built into your OS — one app that does:
+
+- **Dual-pane browsing** — local + remote side-by-side
+- **17 protocols** — SFTP, S3, Google Drive, Dropbox, OneDrive, WebDAV, SMB/CIFS, NFS, FTP/FTPS, Backblaze B2, Azure Blob, OpenStack Swift, mDNS peer-to-peer, server-to-server relay, and more
+- **Crash-safe transfers** — resume from anywhere, integrity-verified with xxHash3 + SHA-256, atomic rename, journal-backed
+- **Real-time bidirectional sync** — conflict resolution, redaction rules, scheduled or continuous
+- **Local AI assistant** — runs against your own Ollama; no API keys, no cloud calls, no data leaving your box
+- **Governance built in** — audit log, version history, encryption-at-rest, master-password vault, lineage tracking
+- **CLI** — automate the same operations from your terminal
+
+## Install
+
+```bash
+# macOS
+brew install --cask ufop/tap/unified-file-ops
+
+# Windows
+winget install UFOP.UnifiedFileOps
+
+# Linux (.deb, .rpm, .AppImage)
+# Download from https://filemanager.clappe.com/download
 ```
-FileManager/
-├── README.md                          ← This file
-├── docs/                              ← Product specifications
-│   ├── PRD-V5-Definitive.md           ← Master PRD (markdown)
-│   ├── AI-Agent-Governance-Addendum.md ← Agent governance spec
-│   └── *.docx                         ← Formatted documents
-├── ai-agents/                         ← AI agent configurations
-│   ├── README.md                      ← Agent loading guide
-│   ├── global-policy.yaml             ← Shared governance rules
-│   ├── agent-index.yaml               ← Agent registry
-│   ├── core/                          ← 11 core agents
-│   ├── support/                       ← 8 support agents
-│   └── workflows/                     ← Task bundle templates
-└── planning/                          ← Delivery planning
-    ├── sprint-plan.md                 ← 42-sprint plan
-    └── epics-summary.md               ← Epic-to-sprint mapping
-```
 
-## Tech Stack
-- **Desktop:** Tauri 2 + Rust core + React/TypeScript/Vite
-- **Admin Console:** Next.js + TypeScript
-- **Key Libraries:** TanStack Table/Virtual/Query, Zustand, shadcn/ui, React Aria
+All installers are code-signed and auto-update.
 
-## Quick Start
-1. Read `docs/PRD-V5-Definitive.md` for full product spec
-2. Read `ai-agents/README.md` for agent loading instructions
-3. Load `ai-agents/global-policy.yaml` + specific agent for any task
+## Pricing
 
-## Document Versions
-- PRD: V5 (Definitive)
-- Agent Governance: v1.0
-- Agent Pack: v1.0
-- Sprint Plan: 42 sprints, 8 phases, 21 months
+| Plan | For | Price |
+|---|---|---|
+| **Free** | Individuals | Forever free — all 17 connectors, all file ops, all sync, local AI |
+| **Business** | Teams | $9.99 / user / month — shared workspaces, policy engine, approval workflows, audit log, SAML SSO, admin console |
+| **Enterprise** | Large orgs | Custom — SCIM, SIEM integration, unlimited audit retention, dedicated support |
+
+The desktop app is and always will be free for individuals. We charge for *team coordination*, not for what the file manager does on your laptop.
+
+## Privacy stance
+
+- **No telemetry by default.** Opt-in only.
+- **No file contents ever leave your machine** unless *you* configure a transfer to a destination *you* control.
+- **Credentials live in your OS keychain.** We never see them.
+- **AI runs locally** via Ollama. We don't proxy AI through any cloud service.
+
+## License
+
+Source-available under [PolyForm Shield 1.0.0](LICENSE). Free for any use except building a competing product. Commercial use, modifications, and redistribution are all permitted.
+
+## Contributing & Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, architecture overview, and the AI-agent governance setup used by this repo.

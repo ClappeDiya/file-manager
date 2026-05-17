@@ -18,7 +18,7 @@ const plans = [
   },
   {
     name: 'Business',
-    price: '$29',
+    price: '$9.99',
     period: '/user/month',
     features: ['Unlimited users', '1 TB storage', 'All connectors', 'SAML SSO', '90-day audit log', 'Policy engine', 'Approval workflows', 'Email support'],
     current: false,
