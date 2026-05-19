@@ -104,15 +104,42 @@
 #  22. stale-supp    scripts/check-stale-suppressions.sh
 #                                                    — every entry in the
 #                                                       audit GHSA_IGNORE
-#                                                       list has a
+#                                                       (check-pnpm-audit.sh)
+#                                                       and RUSTSEC_IGNORE
+#                                                       (check-cargo-audit.sh)
+#                                                       lists has a
 #                                                       review-by date
 #                                                       still in the
 #                                                       future; malformed
 #                                                       entries also fail
-#  23. test          pnpm test                       — Vitest (frontend, ~44 files)
-#  24. cargo         cargo check --workspace         — Rust type-check
-#  25. cargo-test    cargo test --lib                — Rust unit tests
-#  26. build         pnpm build                      — Vite production bundle
+#  23. caps          scripts/check-tauri-capabilities.sh
+#                                                    — every sensitive Tauri
+#                                                       capability (fs:*)
+#                                                       ships with a non-
+#                                                       empty `allow` path
+#                                                       scope (iter 30)
+#  24. cargo-audit   scripts/check-cargo-audit.sh    — Rust CVE scanner,
+#                                                       symmetric to pnpm
+#                                                       audit; RUSTSEC_IGNORE
+#                                                       suppression list
+#                                                       (iter 30)
+#  25. ret-types     scripts/check-command-return-types.sh
+#                                                    — every
+#                                                       #[tauri::command]
+#                                                       returns either
+#                                                       Result<T, AppError>
+#                                                       or bare T (iter 30)
+#  26. env-example   scripts/check-env-example-drift.sh
+#                                                    — every user-facing
+#                                                       env var referenced
+#                                                       in code is declared
+#                                                       in at least one
+#                                                       .env.example
+#                                                       template (iter 31)
+#  27. test          pnpm test                       — Vitest (frontend, ~44 files)
+#  28. cargo         cargo check --workspace         — Rust type-check
+#  29. cargo-test    cargo test --lib                — Rust unit tests
+#  30. build         pnpm build                      — Vite production bundle
 #
 # Stages 3–19 are sub-second-to-~1s source-text/registry checks. They
 # catch silent runtime failures (typo'd `tauriInvoke<T>("name")` callsites,
@@ -236,6 +263,10 @@ run_stage "audit"        "bash scripts/check-pnpm-audit.sh"
 run_stage "ws-deps"      "bash scripts/check-workspace-deps.sh"
 run_stage "csp"          "bash scripts/check-tauri-csp.sh"
 run_stage "stale-supp"   "bash scripts/check-stale-suppressions.sh"
+run_stage "caps"         "bash scripts/check-tauri-capabilities.sh"
+run_stage "cargo-audit"  "bash scripts/check-cargo-audit.sh"
+run_stage "ret-types"    "bash scripts/check-command-return-types.sh"
+run_stage "env-example"  "bash scripts/check-env-example-drift.sh"
 run_stage "test"         "pnpm test"
 run_stage "cargo"        "cd src-tauri && cargo check --workspace"
 run_stage "cargo-test"   "cd src-tauri && cargo test --lib"

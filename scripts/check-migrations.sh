@@ -1,16 +1,37 @@
 #!/usr/bin/env bash
-# check-migrations.sh — verify migration count consistency across:
+# check-migrations.sh — verify migration count consistency AND content
+# discipline across the storage layer.
+#
+# Count/sequence checks (original iter 11 scope):
 #   1. all_migrations() in src-tauri/src/storage/migrations.rs (source of truth)
 #   2. test_current_version assertion in   src-tauri/src/storage/migrations.rs
 #   3. test_repository_creation assertion in src-tauri/src/storage/repository.rs
 #
+# Content-discipline checks (iter 32 extension):
+#   * Each Migration entry must have a non-empty `description`.
+#   * Each entry's `sql:` field must reference a constant named exactly
+#     `V<version>_SCHEMA` (codifies the naming convention so a copy-paste
+#     bug like `Migration { version: 12, sql: V11_SCHEMA, … }` is caught).
+#   * Each `V<N>_SCHEMA` constant must exist in the file.
+#   * Each `V<N>_SCHEMA` constant body must contain at least one DDL/DML
+#     keyword (CREATE/ALTER/DROP/INSERT/UPDATE/DELETE) — empty stubs are
+#     a silent no-op at runtime and cause schema drift.
+#   * Each `V<N>_SCHEMA` constant must be referenced exactly twice in
+#     the file: once for its definition (`const V<N>_SCHEMA: &str = r#"…"#`)
+#     and once inside an `all_migrations()` entry. Three references = the
+#     "I forgot to rename the copy-paste" bug; one reference = orphan
+#     constant (declared but never wired).
+#
 # Why this exists:
-#   CLAUDE.md flags this as a footgun: "When adding a migration, update version
-#   count in test assertions (both `migrations.rs` and `repository.rs`)."
-#   The Vec<Migration> grows, both assertions silently keep the old number, and
-#   the failure mode is: cargo test fails ONLY when those two specific tests
-#   are run, with a confusing `assert_eq!(11, 12)` instead of "you forgot to
-#   bump the count". This script catches it at the verify gate instead.
+#   CLAUDE.md flags the count assertion as a footgun: "When adding a
+#   migration, update version count in test assertions (both `migrations.rs`
+#   and `repository.rs`)." The Vec<Migration> grows, both assertions
+#   silently keep the old number, and the failure mode is `cargo test`
+#   failing with a confusing `assert_eq!(11, 12)` instead of "you forgot
+#   to bump the count". Iter 32's content checks extend this to other
+#   silent migration-drift modes: empty schema bodies that produce no
+#   SQL effect, mis-aimed schema constants (typed v11 but wired to
+#   V10_SCHEMA), and unused stubs.
 #
 # What it checks:
 #   - Counts entries in the Vec<Migration> body of fn all_migrations()
@@ -21,8 +42,13 @@
 #   - Verifies count == both assertion values
 #   - Verifies version numbers in all_migrations() are 1..=N with no gaps
 #     (gap = silent merge conflict resolution bug)
+#   - Verifies each Migration entry has a non-empty `description`
+#   - Verifies each entry's `sql:` field references `V<version>_SCHEMA`
+#   - Verifies each `V<N>_SCHEMA` constant exists, has DDL/DML body,
+#     and is referenced exactly twice (def + one use)
 #
-# Pure-bash, no jq / python. Runs in well under a second.
+# Pure-bash for count/sequence; python3 for content (multi-line Rust
+# parsing). Sub-second.
 #
 # Usage:
 #   ./scripts/check-migrations.sh           # verify; non-zero on mismatch
@@ -41,7 +67,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --list)  LIST=true; shift ;;
     -h|--help)
-      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "Unknown arg: $1 (try --help)"; exit 2 ;;
@@ -201,8 +227,134 @@ if [[ "$repo_assert_n" != "$count" ]]; then
   fail "$REPO asserts MAX(version) == $repo_assert_n, but all_migrations() has $count entries — bump the assertion"
 fi
 
+# ---------------------------------------------------------------------------
+# 4. Content discipline (iter 32 extension).
+#    Walk each Migration { version, description, sql } entry and validate
+#    the schema constant it points to. Done in python3 since the entries
+#    span multiple lines and the schema constants are r#"…"# multi-line
+#    raw strings — too hairy for awk + sed.
+# ---------------------------------------------------------------------------
+if ! command -v python3 >/dev/null 2>&1; then
+  fail "python3 not on PATH — cannot run content discipline checks"
+fi
+
+content_findings_file="$(mktemp -t check-migrations.XXXXXX)"
+# Add the temp file to the cleanup trap.
+trap 'rm -f "$content_findings_file"' EXIT
+
+python3 - "$MIG" >"$content_findings_file" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1]).read_text()
+
+# Parse each `Migration { ... }` entry inside fn all_migrations().
+# Capture: version, description, sql_const_name.
+fn_match = re.search(r'fn\s+all_migrations\s*\(\s*\)\s*->\s*Vec<Migration>\s*\{(.+?)\n\}', src, re.DOTALL)
+if not fn_match:
+    print("PARSE-ERROR\tcould not locate fn all_migrations() body")
+    sys.exit(0)
+body = fn_match.group(1)
+
+entries = []
+for m in re.finditer(
+    r'Migration\s*\{\s*'
+    r'version\s*:\s*(\d+)\s*,\s*'
+    r'description\s*:\s*"([^"]*)"\s*,\s*'
+    r'sql\s*:\s*([A-Za-z_][A-Za-z_0-9]*)\s*,\s*'
+    r'\}',
+    body,
+):
+    entries.append((int(m.group(1)), m.group(2), m.group(3)))
+
+if not entries:
+    print("PARSE-ERROR\tregex extracted zero Migration entries from all_migrations() body")
+    sys.exit(0)
+
+# Index every `const V<N>_SCHEMA: &str = r#"…"#` definition body.
+const_bodies = {}
+for cm in re.finditer(
+    r'const\s+(V\d+_SCHEMA)\s*:\s*&str\s*=\s*r#"(.+?)"#\s*;',
+    src,
+    re.DOTALL,
+):
+    const_bodies[cm.group(1)] = cm.group(2)
+
+# Count total file-level references to each V<N>_SCHEMA token.
+ref_counts = {}
+for tok in re.finditer(r'\bV\d+_SCHEMA\b', src):
+    ref_counts[tok.group(0)] = ref_counts.get(tok.group(0), 0) + 1
+
+DDL_DML = re.compile(r'\b(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|PRAGMA)\b', re.IGNORECASE)
+
+findings = []
+for version, desc, sql_name in entries:
+    expected_const = f"V{version}_SCHEMA"
+    if desc.strip() == "":
+        findings.append(f"version {version}: description is empty")
+    if sql_name != expected_const:
+        findings.append(
+            f"version {version}: sql references `{sql_name}` but naming "
+            f"convention is V<version>_SCHEMA (expected `{expected_const}`) "
+            f"— likely a copy-paste bug"
+        )
+    if sql_name not in const_bodies:
+        findings.append(
+            f"version {version}: sql references `{sql_name}` but no "
+            f"`const {sql_name}: &str = r#\"…\"#;` definition was found"
+        )
+    else:
+        body_text = const_bodies[sql_name]
+        if not DDL_DML.search(body_text):
+            findings.append(
+                f"{sql_name}: body has no DDL/DML keyword "
+                f"(CREATE/ALTER/DROP/INSERT/UPDATE/DELETE/PRAGMA) — "
+                f"empty stub will silently no-op at runtime"
+            )
+
+# Reference-count check: every V<N>_SCHEMA constant should appear exactly
+# twice in the file — once for the `const` definition, once inside an
+# `all_migrations()` entry's `sql:` field.
+for const_name in const_bodies:
+    actual = ref_counts.get(const_name, 0)
+    if actual != 2:
+        findings.append(
+            f"{const_name}: referenced {actual} time(s) in the file, "
+            f"expected exactly 2 (1 definition + 1 use). "
+            + ("Orphan constant — declared but no Migration entry wires it."
+               if actual < 2
+               else "Re-use — a second Migration entry shares this constant (copy-paste bug)?")
+        )
+
+for f in findings:
+    print(f"FINDING\t{f}")
+
+print(f"OK\tentries={len(entries)}\tconstants={len(const_bodies)}")
+PY
+
+content_errors=()
+content_summary=""
+while IFS=$'\t' read -r tag rest; do
+  case "$tag" in
+    OK)        content_summary="$rest" ;;
+    FINDING)   content_errors+=("$rest") ;;
+    PARSE-ERROR) fail "content discipline parse error: $rest" ;;
+  esac
+done <"$content_findings_file"
+
+if [[ "${#content_errors[@]}" -gt 0 ]]; then
+  for err in "${content_errors[@]}"; do
+    fail "$err"
+  done
+fi
+
+if [[ "$LIST" == true ]]; then
+  echo "content discipline: $content_summary"
+fi
+
 if [[ "$failed" -eq 0 ]]; then
-  echo "OK: $count migration(s), assertions in sync (migrations.rs=$mig_assert_n, repository.rs=$repo_assert_n)"
+  echo "OK: $count migration(s), assertions in sync (migrations.rs=$mig_assert_n, repository.rs=$repo_assert_n); content discipline clean ($content_summary)"
   exit 0
 fi
 exit 1
