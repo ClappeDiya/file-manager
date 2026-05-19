@@ -136,10 +136,17 @@
 #                                                       in at least one
 #                                                       .env.example
 #                                                       template (iter 31)
-#  27. test          pnpm test                       — Vitest (frontend, ~44 files)
-#  28. cargo         cargo check --workspace         — Rust type-check
-#  29. cargo-test    cargo test --lib                — Rust unit tests
-#  30. build         pnpm build                      — Vite production bundle
+#  27. invoke-types  scripts/check-tauri-invoke-types.sh
+#                                                    — every tauriInvoke
+#                                                       call whose return
+#                                                       is consumed
+#                                                       supplies an
+#                                                       explicit <T> type
+#                                                       arg (iter 34)
+#  28. test          pnpm test                       — Vitest (frontend, ~44 files)
+#  29. cargo         cargo check --workspace         — Rust type-check
+#  30. cargo-test    cargo test --lib                — Rust unit tests
+#  31. build         pnpm build                      — Vite production bundle
 #
 # Stages 3–19 are sub-second-to-~1s source-text/registry checks. They
 # catch silent runtime failures (typo'd `tauriInvoke<T>("name")` callsites,
@@ -267,6 +274,7 @@ run_stage "caps"         "bash scripts/check-tauri-capabilities.sh"
 run_stage "cargo-audit"  "bash scripts/check-cargo-audit.sh"
 run_stage "ret-types"    "bash scripts/check-command-return-types.sh"
 run_stage "env-example"  "bash scripts/check-env-example-drift.sh"
+run_stage "invoke-types" "bash scripts/check-tauri-invoke-types.sh"
 run_stage "test"         "pnpm test"
 run_stage "cargo"        "cd src-tauri && cargo check --workspace"
 run_stage "cargo-test"   "cd src-tauri && cargo test --lib"

@@ -13,7 +13,11 @@ use uuid::Uuid;
 ///
 /// Records a single subject/target pair for batches; for multi-source ops we
 /// emit one record per pair so the timeline / undo views can show each item.
-async fn record_fs_ok(
+///
+/// Iter 35: exposed `pub(crate)` so `fs_commands::write_text_file_full` can
+/// use the same recording path as the rest of the FS engine, keeping the
+/// audit format uniform across copy/move/rename/create_file/edit_text.
+pub(crate) async fn record_fs_ok(
     ledger: &OperationLedger,
     kind: &str,
     sources: &[String],
@@ -446,6 +450,63 @@ pub async fn create_directory(
     create_directory_impl(path, &ledger).await
 }
 
+/// Idempotent directory creation. Returns success whether the directory
+/// already exists or was newly created. Used by Smart Archive to ensure
+/// the dated `.archive/{YYYY-MM}/` subfolder exists before moving files
+/// into it — the regular `create_directory` errors when the path already
+/// exists (because that's a "user-typed-an-existing-name" mistake), but
+/// Smart Archive's intent is genuinely "ensure this exists, I don't care
+/// whether it did before".
+///
+/// Records a `create_folder` ledger event ONLY when the directory is
+/// actually created — pre-existing directories produce no ledger noise.
+#[tauri::command]
+pub async fn ensure_directory(
+    path: String,
+    ledger: tauri::State<'_, OperationLedger>,
+) -> Result<FileOpResult, AppError> {
+    ensure_directory_impl(path, &ledger).await
+}
+
+pub async fn ensure_directory_impl(
+    path: String,
+    ledger: &OperationLedger,
+) -> Result<FileOpResult, AppError> {
+    let p = Path::new(&path);
+    let already_existed = p.exists();
+    if !already_existed {
+        std::fs::create_dir_all(p).map_err(|e| {
+            AppError::file_op(
+                format!("Failed to ensure directory: {e}"),
+                "Check that you have write permission to the parent folder.",
+            )
+        })?;
+    } else if !p.is_dir() {
+        return Err(AppError::file_op(
+            format!("Path exists but is not a directory: {path}"),
+            "Pick a different destination — a file with this name is in the way.",
+        ));
+    }
+
+    let undo_id = Uuid::new_v4().to_string();
+    let dest_paths = vec![path];
+    if !already_existed {
+        record_fs_ok(ledger, "create_folder", &[], &dest_paths, &undo_id).await;
+    }
+
+    Ok(FileOpResult {
+        success: true,
+        operation: if already_existed {
+            "ensure_folder_existing".to_string()
+        } else {
+            "create_folder".to_string()
+        },
+        source_paths: vec![],
+        dest_paths,
+        undo_id,
+    })
+}
+
 pub async fn create_directory_impl(
     path: String,
     ledger: &OperationLedger,
@@ -591,6 +652,131 @@ pub async fn undo_file_operation(
             return Err(AppError::file_op(
                 format!("Cannot undo operation: {operation}"),
                 "This operation type does not support undo.",
+            ));
+        }
+    }
+
+    Ok(true)
+}
+
+/// Redo a previously-undone file operation by re-applying it.
+///
+/// Symmetric mirror of [`undo_file_operation`]: where `undo_file_operation`
+/// reverses a `(kind, source_paths, dest_paths)` tuple, this function
+/// re-applies the original op. Together they form a complete Cmd+Z /
+/// Cmd+Shift+Z pair on top of the existing ledger marker mechanism.
+///
+/// Reuses the same dispatch shape as undo so callers can hand the same
+/// data through either function without re-deriving paths. Per-kind
+/// behaviour mirrors the original op:
+///
+/// - `copy`, `duplicate` — copy each `source_paths[i]` to `dest_paths[i]`,
+///   creating parent directories as needed (matching `copy_files_impl`).
+/// - `move`, `rename`    — rename `source_paths[i]` → `dest_paths[i]`.
+/// - `create_folder`     — recreate each entry in `dest_paths` as a directory.
+/// - `create_file`       — recreate each entry in `dest_paths` as an empty file.
+///
+/// Fails cleanly when the original source no longer exists (move/rename) or
+/// the destination already exists (any kind) so the user can see exactly
+/// why the redo could not complete.
+#[tauri::command]
+pub async fn redo_file_operation(
+    operation: String,
+    source_paths: Vec<String>,
+    dest_paths: Vec<String>,
+) -> Result<bool, AppError> {
+    match operation.as_str() {
+        "copy" | "duplicate" => {
+            for (src, dest) in source_paths.iter().zip(dest_paths.iter()) {
+                let s = Path::new(src);
+                let d = Path::new(dest);
+                if !s.exists() {
+                    return Err(AppError::file_op(
+                        format!("Cannot redo {operation}: source missing: {src}"),
+                        "The original file is no longer at its expected path.",
+                    ));
+                }
+                if let Some(parent) = d.parent() {
+                    if !parent.as_os_str().is_empty() && !parent.exists() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            AppError::file_op(
+                                format!("Redo failed creating parent: {e}"),
+                                "Check write permissions on the destination.",
+                            )
+                        })?;
+                    }
+                }
+                if s.is_dir() {
+                    copy_dir_recursive(s, d)?;
+                } else {
+                    std::fs::copy(s, d).map_err(|e| {
+                        AppError::file_op(
+                            format!("Redo failed copying: {e}"),
+                            "Check disk space and permissions.",
+                        )
+                    })?;
+                }
+            }
+        }
+        "move" | "rename" => {
+            for (src, dest) in source_paths.iter().zip(dest_paths.iter()) {
+                let s = Path::new(src);
+                if !s.exists() {
+                    return Err(AppError::file_op(
+                        format!("Cannot redo {operation}: source missing: {src}"),
+                        "The original file is no longer at its expected path.",
+                    ));
+                }
+                std::fs::rename(s, dest).map_err(|e| {
+                    AppError::file_op(
+                        format!("Redo failed: {e}"),
+                        "Manual restoration may be needed.",
+                    )
+                })?;
+            }
+        }
+        "create_folder" => {
+            for dest in &dest_paths {
+                let p = Path::new(dest);
+                if p.exists() {
+                    continue;
+                }
+                std::fs::create_dir_all(p).map_err(|e| {
+                    AppError::file_op(
+                        format!("Redo failed creating folder: {e}"),
+                        "Check write permissions.",
+                    )
+                })?;
+            }
+        }
+        "create_file" => {
+            for dest in &dest_paths {
+                let p = Path::new(dest);
+                if p.exists() {
+                    continue;
+                }
+                if let Some(parent) = p.parent() {
+                    if !parent.as_os_str().is_empty() && !parent.exists() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            AppError::file_op(
+                                format!("Redo failed creating parent: {e}"),
+                                "Check write permissions.",
+                            )
+                        })?;
+                    }
+                }
+                std::fs::File::create(p).map_err(|e| {
+                    AppError::file_op(
+                        format!("Redo failed creating file: {e}"),
+                        "Check disk space and permissions.",
+                    )
+                })?;
+            }
+        }
+        _ => {
+            return Err(AppError::file_op(
+                format!("Cannot redo operation: {operation}"),
+                "This operation type does not support redo.",
             ));
         }
     }
@@ -798,6 +984,89 @@ pub async fn open_file_with_default(path: String) -> Result<(), AppError> {
         Err(e) => Err(AppError::file_op(
             format!("Failed to open {path}: {e}"),
             "Check the file exists and your OS default app handler is available.",
+        )),
+    }
+}
+
+/// Reveal a path in the native OS file manager with the entry
+/// highlighted/selected. Different from `open_file_with_default`,
+/// which opens the file in its default *application*: this opens
+/// the *containing folder* (or selects the entry within it) so the
+/// user can manipulate it via the OS shell.
+///
+/// Platform behaviour:
+/// - macOS: `open -R <path>` — Finder opens to the parent and
+///   selects the entry.
+/// - Windows: `explorer /select,<path>` — Explorer opens with the
+///   entry highlighted.
+/// - Linux: best-effort. Most file managers don't have a unified
+///   "select-the-entry" CLI flag, so we fall back to `xdg-open`
+///   on the *parent directory* (or the path itself if it's a
+///   directory). The user still lands in the right place; the
+///   selection-highlight semantic is OS-dependent.
+#[tauri::command]
+pub async fn reveal_in_os(path: String) -> Result<(), AppError> {
+    if path.trim().is_empty() {
+        return Err(AppError::file_op(
+            "Cannot reveal an empty path",
+            "Internal usage error: pass the absolute path you want revealed.",
+        ));
+    }
+
+    let target = std::path::Path::new(&path);
+    if !target.exists() {
+        return Err(AppError::file_op(
+            format!("Cannot reveal '{path}' — it no longer exists"),
+            "The file may have been moved or deleted since you last saw it.",
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    let status = std::process::Command::new("open")
+        .args(["-R", &path])
+        .status();
+
+    #[cfg(target_os = "windows")]
+    let status = std::process::Command::new("explorer")
+        .arg(format!("/select,{path}"))
+        .status();
+
+    #[cfg(target_os = "linux")]
+    let status = {
+        // No portable cross-DE "select this entry" flag exists, so
+        // we open the parent directory in the user's default
+        // handler. For a directory target, open the directory
+        // itself (xdg-open would otherwise navigate INTO it which
+        // is what the user already wanted).
+        let target_dir: std::path::PathBuf = if target.is_dir() {
+            target.to_path_buf()
+        } else {
+            target
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("/"))
+        };
+        std::process::Command::new("xdg-open")
+            .arg(&target_dir)
+            .status()
+    };
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        // Windows' `explorer /select,...` is known to return non-
+        // zero exit codes even on success in some shells, but the
+        // file manager DOES open as expected. We treat any
+        // non-error path as success on Windows specifically.
+        #[cfg(target_os = "windows")]
+        Ok(_) => Ok(()),
+        #[cfg(not(target_os = "windows"))]
+        Ok(s) => Err(AppError::file_op(
+            format!("Reveal-in-OS exited with status {s} for {path}"),
+            "Check that your OS file manager is installed and reachable on PATH.",
+        )),
+        Err(e) => Err(AppError::file_op(
+            format!("Failed to reveal {path}: {e}"),
+            "Check that your OS file manager is installed and reachable on PATH.",
         )),
     }
 }
@@ -1080,6 +1349,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ensure_directory_creates_when_missing() {
+        let dir = tempdir().unwrap();
+        // Nested path so create_dir_all has work to do.
+        let nested = dir
+            .path()
+            .join(".archive")
+            .join("2026-04")
+            .to_string_lossy()
+            .to_string();
+        let l = test_ledger();
+        let result = ensure_directory_impl(nested.clone(), &l).await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.operation, "create_folder");
+        assert!(Path::new(&nested).is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_directory_idempotent_when_existing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("already_here").to_string_lossy().to_string();
+        std::fs::create_dir(&path).unwrap();
+        let l = test_ledger();
+        let result = ensure_directory_impl(path.clone(), &l).await.unwrap();
+        assert!(result.success);
+        assert_eq!(
+            result.operation, "ensure_folder_existing",
+            "pre-existing dir must report a distinct operation kind"
+        );
+        assert!(Path::new(&path).is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_directory_refuses_when_path_is_file() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("not_a_dir.txt");
+        fs::write(&file_path, "I am a file").unwrap();
+        let l = test_ledger();
+        let result =
+            ensure_directory_impl(file_path.to_string_lossy().to_string(), &l).await;
+        assert!(
+            result.is_err(),
+            "ensure_directory must refuse when the path exists as a non-directory"
+        );
+    }
+
+    #[tokio::test]
     async fn test_rename_file() {
         let dir = tempdir().unwrap();
         let src = dir.path().join("original.txt");
@@ -1309,5 +1624,62 @@ mod tests {
         assert!(result.success);
         assert!(dest_dir.join("src_dir/file1.txt").exists());
         assert!(dest_dir.join("src_dir/subdir/file2.txt").exists());
+    }
+
+    // ── reveal_in_os — input validation only ───────────────────
+    //
+    // The reveal action spawns a platform-specific subprocess
+    // (`open -R`, `explorer /select,`, `xdg-open`) whose effect is
+    // visible only to a logged-in desktop session. Running it in
+    // CI would either pop UI (macOS, headed Linux) or fail in
+    // sandboxed/headless environments. We therefore only test the
+    // input-validation branches; the subprocess success path is
+    // covered manually + by the platform's own contract.
+
+    #[tokio::test]
+    async fn test_reveal_in_os_rejects_empty_path() {
+        let result = reveal_in_os(String::new()).await;
+        assert!(
+            result.is_err(),
+            "empty path must reject before spawning any subprocess"
+        );
+        if let Err(AppError::FileOperation { message, .. }) = result {
+            assert!(
+                message.contains("empty"),
+                "error message should mention empty path, got: {message}"
+            );
+        } else {
+            panic!("expected AppError::FileOp for empty input");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reveal_in_os_rejects_whitespace_only_path() {
+        let result = reveal_in_os("   \t  ".to_string()).await;
+        assert!(
+            result.is_err(),
+            "whitespace-only path must reject before spawning any subprocess",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reveal_in_os_rejects_nonexistent_path() {
+        let dir = tempdir().unwrap();
+        let ghost = dir
+            .path()
+            .join("definitely-not-here-12345.txt")
+            .to_string_lossy()
+            .to_string();
+        let result = reveal_in_os(ghost.clone()).await;
+        assert!(
+            result.is_err(),
+            "non-existent path must reject before spawning any subprocess",
+        );
+        if let Err(AppError::FileOperation { message, .. }) = result {
+            assert!(
+                message.contains("no longer exists") || message.contains(&ghost),
+                "error message should reference the missing path, got: {message}"
+            );
+        }
     }
 }

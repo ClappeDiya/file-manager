@@ -12,6 +12,7 @@
  */
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
+import { copyToClipboardWithToast } from "@/lib/clipboard";
 
 // ── Types ──
 
@@ -305,11 +306,10 @@ export default function NetworkWizard({
           `${r.passed ? "PASS" : "FAIL"} | ${r.test_name} | ${r.duration_ms}ms${r.details ? ` | ${r.details}` : ""}${r.error ? ` | Error: ${r.error}` : ""}`,
       ),
     ];
-    try {
-      await navigator.clipboard.writeText(lines.join("\n"));
-    } catch {
-      // Fallback silently
-    }
+    await copyToClipboardWithToast(
+      lines.join("\n"),
+      "Copy Network Diagnostics",
+    );
   };
 
   const allPassed = results.length > 0 && results.every((r) => r.passed);

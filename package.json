@@ -42,6 +42,7 @@
     "cargo-audit:check": "bash scripts/check-cargo-audit.sh",
     "ret-types:check": "bash scripts/check-command-return-types.sh",
     "env-example:check": "bash scripts/check-env-example-drift.sh",
+    "invoke-types:check": "bash scripts/check-tauri-invoke-types.sh",
     "hooks:install": "bash scripts/install-git-hooks.sh",
     "hooks:uninstall": "bash scripts/install-git-hooks.sh --uninstall",
     "hooks:status": "bash scripts/install-git-hooks.sh --status",

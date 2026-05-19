@@ -47,11 +47,21 @@ import {
   Undo2,
   Pin,
   BookOpen,
+  Folder,
+  History,
 } from "lucide-react";
+import { useLineageStore } from "@/stores/lineage-store";
 import { OperationNarrativeCard } from "./operation-narrative-card";
 import { FeaturePeek } from "@/components/feature-peek";
 import { useAutomationStore } from "@/stores/automation-store";
 import type { LedgerEventWire as LedgerEvent } from "@/lib/ledger-tail-extract";
+import {
+  isPinnableEvent,
+  isRetryableEvent,
+  isUndoableKindEvent,
+} from "@/lib/ledger-event-flags";
+import { correlationCounts } from "@/lib/correlation-counts";
+import { dispatchRefresh, parentDirectoriesOf } from "@/lib/refresh-affected";
 
 /**
  * Format an ISO-ish timestamp into a short relative label ("2m ago").
@@ -98,22 +108,9 @@ function splitPath(path: string): { parent: string; leaf: string } {
 
 type EngineFilter = "all" | keyof typeof ENGINE_ICONS;
 
-/**
- * Ledger event kinds that can be promoted to a re-runnable manual
- * Quickflow via the Operation Pin flow. Must stay in lock-step with
- * `automation_engine::pinner::PINNABLE_KINDS` on the Rust side.
- */
-const PINNABLE_KINDS: ReadonlySet<string> = new Set(["copy", "move"]);
-
-function isPinnableEvent(event: LedgerEvent): boolean {
-  return (
-    event.engine === "fs" &&
-    event.status === "ok" &&
-    PINNABLE_KINDS.has(event.kind) &&
-    event.correlation_id !== null &&
-    event.correlation_id.length > 0
-  );
-}
+// Pin / Retry row eligibility predicates live in `@/lib/ledger-event-flags`
+// so the React panel file stays component-only (fast-refresh clean) and
+// the rules can be exhaustively unit-tested without rendering anything.
 
 /**
  * Escape user input for safe insertion into a RegExp. Inlined (4 lines)
@@ -173,6 +170,10 @@ export function ActivityTimelinePanel(
   const { onDispatchPath } = props;
   const panelOpen = useActivityTimelineStore((s) => s.panelOpen);
   const togglePanel = useActivityTimelineStore((s) => s.togglePanel);
+  const pendingPreset = useActivityTimelineStore((s) => s.pendingPreset);
+  const consumePendingPreset = useActivityTimelineStore(
+    (s) => s.consumePendingPreset,
+  );
   const [events, setEvents] = useState<LedgerEvent[]>([]);
   const [loading, setLoading] = useState(false);
   // Set of correlation_ids the backend currently considers reversible.
@@ -180,6 +181,12 @@ export function ActivityTimelinePanel(
   // without any extra calls per row. This is O(N) in undoable groups, with
   // N capped at 100 by `list_undoable`.
   const [undoableIds, setUndoableIds] = useState<Set<string>>(() => new Set());
+  // Mirror of `undoableIds` for the redo affordance — populated from
+  // `list_redoable`, refreshed alongside the events on the same poll.
+  // A correlation_id appears in at most one of the two sets at a time
+  // (the backend's marker-parity logic guarantees mutual exclusion), so
+  // each row renders either Undo OR Redo, never both.
+  const [redoableIds, setRedoableIds] = useState<Set<string>>(() => new Set());
   const [filter, setFilter] = useState<EngineFilter>("all");
   const [query, setQuery] = useState("");
   const [failedOnly, setFailedOnly] = useState(false);
@@ -189,6 +196,39 @@ export function ActivityTimelinePanel(
   // M automation fires). This surfaces hidden operation tracing with
   // literally one new predicate; zero backend changes.
   const [correlationFilter, setCorrelationFilter] = useState<string | null>(null);
+  // Path-prefix filter: when set, narrows the timeline to events whose
+  // `subject_path` OR `target_path` starts with this prefix — answering
+  // "what happened in THIS folder?". Composes with every other filter
+  // (engine, status, search, correlation) and shares the same chip-row
+  // UX as the correlation filter. Triggered by the "Show this folder's
+  // activity" context-menu entry; dismissible via the chip. Zero new
+  // backend code — just one more predicate over the existing 200-row
+  // `ledger_recent` pull the panel already does.
+  const [pathFilter, setPathFilter] = useState<string | null>(null);
+
+  // Drill-in from ambient surfaces (engine-pulse error badge, future
+  // overview cards): when an external caller stages a `pendingPreset`
+  // via `openWithPreset`, we consume it on mount AND on every change so
+  // re-clicking the same affordance after dismissal re-applies the
+  // filter. `consumePendingPreset` is atomic — read-and-clear in one
+  // store transaction — so the same preset never re-applies twice on
+  // its own. We unset filters the caller didn't request via `undefined`
+  // (i.e. we don't clobber correlation when the caller only set failed).
+  useEffect(() => {
+    if (pendingPreset === null) return;
+    const preset = consumePendingPreset();
+    if (preset === null) return;
+    if (preset.failedOnly !== undefined) setFailedOnly(preset.failedOnly);
+    if (preset.engineFilter !== undefined) {
+      setFilter(preset.engineFilter as EngineFilter);
+    }
+    if (preset.correlationFilter !== undefined) {
+      setCorrelationFilter(preset.correlationFilter);
+    }
+    if (preset.pathFilter !== undefined) {
+      setPathFilter(preset.pathFilter);
+    }
+  }, [pendingPreset, consumePendingPreset]);
   // Whether the Operation Narrator card is open for the active
   // correlation filter. Reset automatically when the filter clears.
   const [narrativeOpen, setNarrativeOpen] = useState(false);
@@ -248,18 +288,25 @@ export function ActivityTimelinePanel(
 
   const loadEvents = useCallback(async () => {
     setLoading(true);
-    // Fetch events and the current undoable groups in parallel. A single
-    // round-trip per refresh; both lists already live in the ledger.
-    const [rows, undoableOps] = await Promise.all([
+    // Fetch events, undoable groups, and redoable groups in parallel — one
+    // round-trip per refresh; all three lists already live in the ledger
+    // and share the same backing scan on the Rust side.
+    const [rows, undoableOps, redoableOps] = await Promise.all([
       tauriInvokeSafe<LedgerEvent[]>("ledger_recent", { limit: 200 }, []),
       tauriInvokeSafe<Array<{ correlation_id: string }>>(
         "list_undoable",
         { limit: 100 },
         [],
       ),
+      tauriInvokeSafe<Array<{ correlation_id: string }>>(
+        "list_redoable",
+        { limit: 100 },
+        [],
+      ),
     ]);
     setEvents(rows ?? []);
     setUndoableIds(new Set((undoableOps ?? []).map((o) => o.correlation_id)));
+    setRedoableIds(new Set((redoableOps ?? []).map((o) => o.correlation_id)));
     setLoading(false);
   }, []);
 
@@ -286,6 +333,54 @@ export function ActivityTimelinePanel(
       });
     },
     [pinLedgerEvent],
+  );
+
+  // Per-entry Retry handler — failure-side mirror of Pin. Re-attempts a
+  // failed (or cancelled) fs.copy / fs.move event via the new
+  // `retry_failed_event` IPC. The IPC executes the action in place, does
+  // NOT persist a rule, and records the retry outcome to the ledger so
+  // the activity timeline auto-refresh surfaces the attempt next to its
+  // cause. Surfaces the result through the same structured-error toast
+  // channel as the Pin handler for visual + cognitive parity.
+  const retryFailedEvent = useAutomationStore((s) => s.retryFailedEvent);
+  const handleRetryEntry = useCallback(
+    async (correlationId: string, kind: string) => {
+      const log = await retryFailedEvent(correlationId);
+      const succeeded = log?.status === "success";
+      const count = log?.files_affected.length ?? 0;
+      useUIStore.getState().addStructuredError({
+        what: succeeded
+          ? `Retried ${kind}`
+          : log
+            ? `Retry of ${kind} failed`
+            : "Retry rejected",
+        why: succeeded
+          ? `Re-attempted ${count} file${count === 1 ? "" : "s"} successfully`
+          : log?.error_message ??
+            "Backend rejected the retry — the original event may no longer be eligible",
+        appDid: succeeded
+          ? "Re-executed the original copy/move and recorded a fresh ledger row for the retry"
+          : "Replayed the action through the executor; nothing changed on disk",
+        userAction: succeeded
+          ? "Refresh the timeline to see the new success row next to the original failure"
+          : "Check that the source files still exist and the destination is writable, then try again",
+      });
+      // On success, dispatch a path-aware refresh so any pane viewing
+      // the destination directory (or a parent) repaints with the
+      // restored files. The retry's ledger row carries the original
+      // correlation id, so the existing tail-poll dedup correctly
+      // skips emitting a second toast — but the tail-poll also won't
+      // refresh on its own (kind="retry" is intentionally outside
+      // MUTATION_KINDS), so the dispatch here is the single canonical
+      // refresh signal for the retry flow.
+      if (succeeded && log && log.files_affected.length > 0) {
+        dispatchRefresh(parentDirectoriesOf(log.files_affected));
+      }
+      // Refresh so the new retry row shows up and the failed-only chip
+      // count stays accurate.
+      void loadEvents();
+    },
+    [retryFailedEvent, loadEvents],
   );
 
   // Per-entry Undo handler — reverses the single correlation group via the
@@ -320,6 +415,44 @@ export function ActivityTimelinePanel(
         });
       } catch (err) {
         console.error("Undo by correlation failed:", err);
+      }
+      void loadEvents();
+    },
+    [loadEvents],
+  );
+
+  // Per-entry Redo handler — symmetric mirror of `handleUndoEntry`. Re-applies
+  // the original operation via the ledger-backed `redo_by_correlation` IPC.
+  // After it returns the panel refreshes, which flips the row's affordance
+  // from "Redo" back to "Undo" (mutual exclusion of the two sets).
+  const handleRedoEntry = useCallback(
+    async (correlationId: string) => {
+      try {
+        const outcome = await tauriInvoke<{
+          success: boolean;
+          correlation_id: string;
+          kind: string;
+          summary: string;
+          item_count: number;
+        }>("redo_by_correlation", { correlationId }, {
+          success: false,
+          correlation_id: correlationId,
+          kind: "",
+          summary: "",
+          item_count: 0,
+        });
+        useUIStore.getState().addStructuredError({
+          what: outcome.success ? `Redid ${outcome.kind}` : "Redo failed",
+          why: outcome.summary,
+          appDid: outcome.success
+            ? `Re-applied ${outcome.item_count} item(s) via operation ledger`
+            : "Backend rejected the redo request",
+          userAction: outcome.success
+            ? "The operation has been re-applied"
+            : "Check that the original source files still exist at their expected paths",
+        });
+      } catch (err) {
+        console.error("Redo by correlation failed:", err);
       }
       void loadEvents();
     },
@@ -389,25 +522,57 @@ export function ActivityTimelinePanel(
   }, [panelOpen, loadEvents]);
 
   // Compute the filtered view once per dependency change. `events` is at
-  // most ~200 rows so a single pass with both predicates is fine — no need
-  // for two array allocations. Search matches summary, kind, and subject
-  // path so users can find by what happened, what kind of op, or where.
+  // most ~200 rows so a single pass with all predicates is fine — no need
+  // for multiple array allocations. Search matches summary, kind, and
+  // subject path so users can find by what happened, what kind of op, or
+  // where. The path prefix predicate uses a normalised "with trailing
+  // separator" form so `/docs` does not accidentally match `/documents`.
   const filteredEvents = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (filter === "all" && q === "" && !failedOnly && correlationFilter === null) {
+    // Strip any trailing path separator so a caller passing `/docs/`
+    // matches the same set as `/docs`. Defensive — the in-app caller
+    // (`onShowFolderActivity`) passes a canonical path, but the chip
+    // text and any future callers should be tolerant of either form.
+    const pathPrefix = pathFilter !== null
+      ? pathFilter.replace(/[/\\]+$/, "")
+      : null;
+    // Treat exact match as a match, plus anything starting with prefix +
+    // separator. This avoids the `/docs` vs `/documents` false positive.
+    const startsWithPath = pathPrefix === null || pathPrefix === ""
+      ? null
+      : (p: string | null): boolean =>
+          p !== null &&
+          (p === pathPrefix ||
+            p.startsWith(pathPrefix + "/") ||
+            p.startsWith(pathPrefix + "\\"));
+    if (
+      filter === "all" &&
+      q === "" &&
+      !failedOnly &&
+      correlationFilter === null &&
+      startsWithPath === null
+    ) {
       return events;
     }
     return events.filter((e) => {
       if (correlationFilter !== null && e.correlation_id !== correlationFilter) return false;
       if (filter !== "all" && e.engine !== filter) return false;
       if (failedOnly && e.status === "ok") return false;
+      if (startsWithPath !== null) {
+        // Match if either side of the rename/copy/move row touches the
+        // scoped folder. This correctly surfaces "moved out of here" and
+        // "moved into here" with the same filter.
+        if (!startsWithPath(e.subject_path) && !startsWithPath(e.target_path)) {
+          return false;
+        }
+      }
       if (q === "") return true;
       if (e.summary.toLowerCase().includes(q)) return true;
       if (e.kind.toLowerCase().includes(q)) return true;
       if (e.subject_path && e.subject_path.toLowerCase().includes(q)) return true;
       return false;
     });
-  }, [events, filter, query, failedOnly, correlationFilter]);
+  }, [events, filter, query, failedOnly, correlationFilter, pathFilter]);
 
   // Pre-compute engine → count for the filter chips so users can see at a
   // glance where activity is concentrated. Single pass, no repeated loops.
@@ -422,6 +587,22 @@ export function ActivityTimelinePanel(
     [engineCounts],
   );
 
+  // Sum bytes across the CURRENTLY FILTERED events — same filter
+  // predicate the renderer uses, so the header byte total always
+  // matches what the user actually sees. Pure derivation, single
+  // pass; recomputes only when the filter set changes. Suppressed
+  // (kept at 0) when every visible event omits a bytes field, so
+  // metadata-only windows don't surface a noisy "0 B" label.
+  const filteredBytes = useMemo(() => {
+    let total = 0;
+    for (const e of filteredEvents) {
+      if (e.bytes !== null && e.bytes !== undefined && e.bytes > 0) {
+        total += e.bytes;
+      }
+    }
+    return total;
+  }, [filteredEvents]);
+
   // Reset scroll to top whenever the active filter changes. Without this,
   // typing in search or flipping a chip leaves the user staring at a
   // stale scroll position (sometimes past the end of the filtered list).
@@ -431,7 +612,7 @@ export function ActivityTimelinePanel(
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = 0;
-  }, [query, filter, failedOnly, correlationFilter]);
+  }, [query, filter, failedOnly, correlationFilter, pathFilter]);
 
   // How many events are non-ok (failed/cancelled/skipped)? This drives
   // the header "failed only" toggle badge — users debugging problems
@@ -454,7 +635,10 @@ export function ActivityTimelinePanel(
       <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--color-border)]">
         <div className="flex items-center gap-2">
           <Activity className="h-4 w-4 text-sky-500" aria-hidden="true" />
-          <span className="text-sm font-semibold text-[color:var(--color-text)]">
+          <span
+            className="text-sm font-semibold text-[color:var(--color-text)]"
+            title="Activity Timeline (⌘⇧Y to toggle)"
+          >
             Activity
           </span>
           {/*
@@ -467,15 +651,28 @@ export function ActivityTimelinePanel(
           <Badge
             variant="secondary"
             className="text-[10px]"
-            title={
-              filteredEvents.length !== events.length
-                ? `${filteredEvents.length} of ${events.length} events match current filters`
-                : `${events.length} events`
-            }
+            title={(() => {
+              // Same ` · X.X MB total` suffix on both branches — extracted
+              // so a future format change touches one place. Empty when
+              // there's no byte volume to report.
+              const bytesTitleSuffix =
+                filteredBytes > 0
+                  ? ` · ${formatBytes(filteredBytes)} total`
+                  : "";
+              return filteredEvents.length !== events.length
+                ? `${filteredEvents.length} of ${events.length} events match current filters${bytesTitleSuffix}`
+                : `${events.length} events${bytesTitleSuffix}`;
+            })()}
+            data-testid="activity-timeline-header-count"
           >
             {filteredEvents.length !== events.length
               ? `${filteredEvents.length} of ${events.length}`
               : events.length}
+            {filteredBytes > 0 && (
+              <span className="ml-1 opacity-70" data-testid="activity-timeline-header-bytes">
+                · {formatBytes(filteredBytes)}
+              </span>
+            )}
           </Badge>
         </div>
         <div className="flex items-center gap-1">
@@ -496,7 +693,7 @@ export function ActivityTimelinePanel(
             variant="ghost"
             size="icon"
             onClick={() => void loadEvents()}
-            title="Refresh"
+            title="Refresh activity"
             aria-label="Refresh activity timeline"
             disabled={loading}
           >
@@ -509,7 +706,7 @@ export function ActivityTimelinePanel(
             variant="ghost"
             size="icon"
             onClick={togglePanel}
-            title="Close panel"
+            title="Close panel (Esc or ⌘⇧Y to toggle)"
             aria-label="Close activity panel"
           >
             <X className="h-4 w-4" />
@@ -631,6 +828,80 @@ export function ActivityTimelinePanel(
         </>
       )}
 
+      {/*
+       * Active path-scope chip. Symmetric mirror of the correlation chip:
+       * shows the folder the timeline is narrowed to and offers a one-
+       * click clear. Triggered by the "Show this folder's activity"
+       * context-menu entry; composes with every other filter. The path
+       * is truncated to the last two segments so a deep prefix
+       * (`/Users/me/Documents/Projects/UFOP/src`) still fits the chip.
+       */}
+      {pathFilter !== null && (
+        <div
+          className="flex items-center gap-2 px-3 py-2 border-b border-[var(--color-border)] bg-emerald-500/5"
+          data-testid="activity-timeline-path-chip"
+        >
+          <Folder className="h-3 w-3 text-emerald-500" aria-hidden="true" />
+          <span className="text-[11px] text-[color:var(--color-text-muted)]">
+            In folder
+          </span>
+          <code
+            className="flex-1 truncate rounded bg-[var(--color-bg-primary)] px-1.5 py-0.5 text-[10px] text-[color:var(--color-text)]"
+            title={pathFilter}
+          >
+            {(() => {
+              const parts = pathFilter.split(/[/\\]/).filter(Boolean);
+              return parts.length <= 2
+                ? pathFilter
+                : `…/${parts.slice(-2).join("/")}`;
+            })()}
+          </code>
+          <button
+            type="button"
+            onClick={() => setPathFilter(null)}
+            aria-label="Clear folder filter"
+            className="rounded p-0.5 text-[color:var(--color-text-muted)] hover:text-[color:var(--color-text)]"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </div>
+      )}
+
+      {/*
+       * Clear-all-filters affordance — appears only when at least one
+       * filter is active (any of: engine != all, search non-empty,
+       * failed-only on, correlation trace, path filter). Lets the
+       * user reset every narrowing predicate in one click rather
+       * than dismissing chips and clearing the search box one by
+       * one. Reuses the existing setters so no new state-flow.
+       */}
+      {(filter !== "all" ||
+        query !== "" ||
+        failedOnly ||
+        correlationFilter !== null ||
+        pathFilter !== null) && (
+        <div className="flex items-center justify-end px-3 py-1 border-b border-[var(--color-border)]">
+          <button
+            type="button"
+            onClick={() => {
+              setFilter("all");
+              setQuery("");
+              setFailedOnly(false);
+              setCorrelationFilter(null);
+              setPathFilter(null);
+              setNarrativeOpen(false);
+            }}
+            data-testid="activity-timeline-clear-filters"
+            className="inline-flex items-center gap-1 rounded-full border border-[var(--color-border)] px-2 py-0.5 text-[10px] text-[color:var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[color:var(--color-text)] transition-colors"
+            title="Clear every active filter"
+            aria-label="Clear every active filter"
+          >
+            <X className="h-3 w-3" aria-hidden="true" />
+            Clear all filters
+          </button>
+        </div>
+      )}
+
       {/* Engine filter chips — only show engines that actually appeared */}
       {activeEngines.length > 0 && (
         <div className="flex flex-wrap gap-1 px-3 py-2 border-b border-[var(--color-border)]">
@@ -683,6 +954,7 @@ export function ActivityTimelinePanel(
               query={query}
               failedOnly={failedOnly}
               correlationFilter={correlationFilter}
+              pathFilter={pathFilter}
             />
           )}
           <TimelineList
@@ -693,7 +965,13 @@ export function ActivityTimelinePanel(
             query={query}
             undoableIds={undoableIds}
             onUndoEntry={handleUndoEntry}
+            redoableIds={redoableIds}
+            onRedoEntry={handleRedoEntry}
             onPinEntry={handlePinEntry}
+            onRetryEntry={handleRetryEntry}
+            onShowFileHistory={(path) => {
+              useLineageStore.getState().beginRequest(path);
+            }}
           />
         </div>
       </ScrollArea>
@@ -734,20 +1012,25 @@ function EmptyState({
   query,
   failedOnly,
   correlationFilter,
+  pathFilter,
 }: {
   filter: EngineFilter;
   query: string;
   failedOnly: boolean;
   correlationFilter: string | null;
+  pathFilter: string | null;
 }) {
   const hasQuery = query.trim() !== "";
   // Message priority: correlation trace first (most specific — user is
-  // tracing a single operation), then query, then failed-only, then
-  // engine filter, then the default "nothing ran yet" state. Keeps the
-  // copy aligned with the most recently-set filter so users understand
-  // why they're seeing an empty list.
+  // tracing a single operation), then path-scope (also specific — they
+  // asked about THIS folder), then query, then failed-only, then engine
+  // filter, then the default "nothing ran yet" state. Keeps the copy
+  // aligned with the most recently-set filter so users understand why
+  // they're seeing an empty list.
   const message = correlationFilter !== null
     ? "No other events in this operation trace."
+    : pathFilter !== null
+    ? "No recent activity inside this folder. Clear the folder filter to see other engines' events."
     : hasQuery
     ? `No activity matches "${query.trim()}".`
     : failedOnly
@@ -756,7 +1039,7 @@ function EmptyState({
         ? "No activity yet. Operations will appear here as engines run."
         : `No ${ENGINE_LABELS[filter] ?? filter} activity in the recent window.`;
   return (
-    <div className="py-8 text-center">
+    <div className="py-8 text-center" role="status" aria-live="polite">
       <Activity
         className="mx-auto h-6 w-6 text-[color:var(--color-text-muted)] opacity-50"
         aria-hidden="true"
@@ -781,7 +1064,11 @@ function TimelineList({
   query,
   undoableIds,
   onUndoEntry,
+  redoableIds,
+  onRedoEntry,
   onPinEntry,
+  onRetryEntry,
+  onShowFileHistory,
 }: {
   events: LedgerEvent[];
   onNavigate: (event: LedgerEvent) => void;
@@ -790,8 +1077,24 @@ function TimelineList({
   query: string;
   undoableIds: Set<string>;
   onUndoEntry: (correlationId: string) => void;
+  redoableIds: Set<string>;
+  onRedoEntry: (correlationId: string) => void;
   onPinEntry: (correlationId: string, kind: string) => void;
+  onRetryEntry: (correlationId: string, kind: string) => void;
+  /** Open the Lineage Panel for the row's subject_path. Provided only
+   *  on rows that have a subject_path — symmetric mirror of the
+   *  "View folder activity" button added to the Lineage Panel in
+   *  iteration 15. */
+  onShowFileHistory: (path: string) => void;
 }) {
+  // Pre-compute correlation_id → count. The hint is attached to the
+  // FIRST (newest) row of each multi-row group only — track which
+  // correlation_ids have already been decorated so subsequent rows in
+  // the same group stay clean. Skipped when a correlation filter is
+  // active because the user is already focused on one operation.
+  const counts = useMemo(() => correlationCounts(events), [events]);
+  const decorated = new Set<string>();
+
   let lastDay: string | null = null;
   const nodes: React.ReactNode[] = [];
   for (const ev of events) {
@@ -807,9 +1110,48 @@ function TimelineList({
       );
       lastDay = day;
     }
+    // Both Undo and Redo affordances attach only to the ORIGINAL operation
+    // row (kind = copy/move/rename/etc.), never to the `fs.undone` /
+    // `fs.redone` marker rows that share the same correlation_id. Without
+    // the `isUndoableKindEvent` gate the marker rows would erroneously
+    // surface a Redo button because they carry the same correlation_id as
+    // the original op.
+    const isUndoableShape = isUndoableKindEvent(ev);
     const canUndo =
-      ev.correlation_id !== null && undoableIds.has(ev.correlation_id);
+      isUndoableShape && undoableIds.has(ev.correlation_id!);
+    // Undo and Redo are mutually exclusive (a correlation_id can only be
+    // in one of the two sets per the marker-parity logic), so the row
+    // never renders both at once.
+    const canRedo =
+      isUndoableShape && redoableIds.has(ev.correlation_id!);
     const canPin = isPinnableEvent(ev);
+    // Pin and Retry are mutually exclusive (status is either "ok" or
+    // not), so the row never renders both — see `isRetryableEvent`.
+    const canRetry = isRetryableEvent(ev);
+    // Group-size hint: show the count chip only on the first occurrence
+    // of each multi-row correlation. activeCorrelation suppresses it
+    // because every visible row already shares the traced cid. Marker
+    // rows (`fs.undone` / `fs.redone`) are skipped as decoration anchors
+    // — they share the correlation_id with the original op but are
+    // meta-events, not part of the per-file count. The chip therefore
+    // attaches to the original op row (or the newest non-marker row
+    // visible under the current filter), matching how the Undo/Redo
+    // affordances also gate on `isUndoableKindEvent`.
+    let groupSize = 0;
+    const isMarkerRow =
+      ev.kind === "fs.undone" || ev.kind === "fs.redone";
+    if (
+      ev.correlation_id !== null &&
+      activeCorrelation === null &&
+      !isMarkerRow &&
+      !decorated.has(ev.correlation_id)
+    ) {
+      const c = counts.get(ev.correlation_id) ?? 0;
+      if (c >= 2) {
+        groupSize = c;
+        decorated.add(ev.correlation_id);
+      }
+    }
     nodes.push(
       <TimelineRow
         key={ev.id}
@@ -820,8 +1162,14 @@ function TimelineList({
         query={query}
         canUndo={canUndo}
         onUndoEntry={onUndoEntry}
+        canRedo={canRedo}
+        onRedoEntry={onRedoEntry}
         canPin={canPin}
         onPinEntry={onPinEntry}
+        canRetry={canRetry}
+        onRetryEntry={onRetryEntry}
+        groupSize={groupSize}
+        onShowFileHistory={onShowFileHistory}
       />,
     );
   }
@@ -836,8 +1184,14 @@ function TimelineRow({
   query,
   canUndo,
   onUndoEntry,
+  canRedo,
+  onRedoEntry,
   canPin,
   onPinEntry,
+  canRetry,
+  onRetryEntry,
+  groupSize,
+  onShowFileHistory,
 }: {
   event: LedgerEvent;
   onNavigate: (event: LedgerEvent) => void;
@@ -846,8 +1200,19 @@ function TimelineRow({
   query: string;
   canUndo: boolean;
   onUndoEntry: (correlationId: string) => void;
+  canRedo: boolean;
+  onRedoEntry: (correlationId: string) => void;
   canPin: boolean;
   onPinEntry: (correlationId: string, kind: string) => void;
+  canRetry: boolean;
+  onRetryEntry: (correlationId: string, kind: string) => void;
+  /** When > 0, this row is the newest of a multi-row correlation
+   *  group and should surface a "+N more in this op" chip that
+   *  triggers the trace filter on click. 0 means no chip. */
+  groupSize: number;
+  /** Open the Lineage Panel for this row's subject_path. The button
+   *  only renders when a subject_path is present. */
+  onShowFileHistory: (path: string) => void;
 }) {
   const EngineIcon = ENGINE_ICONS[event.engine] ?? Activity;
   const statusMeta = STATUS_META[event.status] ?? STATUS_META.ok;
@@ -896,6 +1261,32 @@ function TimelineRow({
             <>
               <span aria-hidden="true">·</span>
               <span>{bytesLabel}</span>
+            </>
+          )}
+          {groupSize >= 2 && hasCorrelation && (
+            <>
+              <span aria-hidden="true">·</span>
+              <span
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onTrace(event.correlation_id);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onTrace(event.correlation_id);
+                  }
+                }}
+                title={`This operation touched ${groupSize} files — click to trace`}
+                aria-label={`Trace this operation, ${groupSize} files`}
+                data-testid={`group-size-${event.correlation_id}`}
+                className="cursor-pointer rounded bg-sky-500/10 px-1 py-px text-[9px] font-medium text-sky-600 transition-colors hover:bg-sky-500/20 hover:text-sky-700 focus:outline-none focus:ring-1 focus:ring-sky-500/40 dark:text-sky-400 dark:hover:text-sky-300"
+              >
+                +{groupSize - 1} more in op
+              </span>
             </>
           )}
           {navigable && (
@@ -979,6 +1370,21 @@ function TimelineRow({
           <Undo2 className="h-3 w-3" aria-hidden="true" />
         </button>
       )}
+      {canRedo && event.correlation_id && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onRedoEntry(event.correlation_id!);
+          }}
+          title={`Redo this ${event.kind}`}
+          aria-label={`Redo this ${event.kind} operation`}
+          className="flex-shrink-0 rounded p-1 text-[color:var(--color-text-muted)] opacity-0 transition-colors hover:text-amber-500 focus:outline-none focus:opacity-100 focus:ring-2 focus:ring-amber-500/40 group-hover:opacity-100"
+          data-testid={`redo-event-${event.correlation_id}`}
+        >
+          <Undo2 className="h-3 w-3 -scale-x-100" aria-hidden="true" />
+        </button>
+      )}
       {canPin && event.correlation_id && (
         <button
           type="button"
@@ -992,6 +1398,41 @@ function TimelineRow({
           data-testid={`pin-event-${event.correlation_id}`}
         >
           <Pin className="h-3 w-3" aria-hidden="true" />
+        </button>
+      )}
+      {canRetry && event.correlation_id && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onRetryEntry(event.correlation_id!, event.kind);
+          }}
+          title={`Retry this failed ${event.kind} now`}
+          aria-label={`Retry this failed ${event.kind} operation`}
+          className="flex-shrink-0 rounded p-1 text-[color:var(--color-text-muted)] opacity-0 transition-colors hover:text-emerald-500 focus:outline-none focus:opacity-100 focus:ring-2 focus:ring-emerald-500/40 group-hover:opacity-100"
+          data-testid={`retry-event-${event.correlation_id}`}
+        >
+          <RefreshCw className="h-3 w-3" aria-hidden="true" />
+        </button>
+      )}
+      {/* Show File History — symmetric mirror of the Lineage Panel's
+       *  "View folder activity" button from iteration 15. Opens the
+       *  Lineage Panel for this row's subject_path so the user can
+       *  see the file's full ledger history without leaving the
+       *  timeline. Only renders when subject_path is present. */}
+      {event.subject_path && event.subject_path.length > 0 && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onShowFileHistory(event.subject_path!);
+          }}
+          title={`Show history for ${event.subject_path}`}
+          aria-label={`Show file history for ${event.subject_path}`}
+          className="flex-shrink-0 rounded p-1 text-[color:var(--color-text-muted)] opacity-0 transition-colors hover:text-sky-500 focus:outline-none focus:opacity-100 focus:ring-2 focus:ring-sky-500/40 group-hover:opacity-100"
+          data-testid={`show-history-${event.id}`}
+        >
+          <History className="h-3 w-3" aria-hidden="true" />
         </button>
       )}
     </div>

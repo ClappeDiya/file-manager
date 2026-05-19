@@ -11,6 +11,7 @@
  */
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import { copyToClipboardWithToast } from "@/lib/clipboard";
 
 // ── Types (mirrors Rust types) ──
 
@@ -455,9 +456,9 @@ function CloudEncrypt({ vaultId }: { vaultId: string }) {
     }
   };
 
-  const handleCopyResult = () => {
+  const handleCopyResult = async () => {
     if (result && !result.startsWith("Error:")) {
-      navigator.clipboard.writeText(result).catch(() => {});
+      await copyToClipboardWithToast(result, "Copy Vault Result");
     }
   };
 

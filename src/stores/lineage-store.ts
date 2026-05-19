@@ -68,3 +68,27 @@ export const useLineageStore = create<LineageState>((set) => ({
   close: () =>
     set({ request: null, loading: false, pendingPath: null, error: null }),
 }));
+
+/**
+ * Pure filter used by the Lineage Panel chip row. Extracted so the
+ * filter semantics can be unit-tested without rendering the panel.
+ *
+ * - `engineFilter === "all"` means no engine filter active.
+ * - `failedOnly` is treated AND-style with the engine filter so a
+ *   user can ask "show me only sync failures" by setting both.
+ *
+ * Returns the same array reference when neither filter is active so
+ * React `useMemo` consumers preserve referential equality.
+ */
+export function filterLineageEvents(
+  events: LineageEvent[],
+  engineFilter: string,
+  failedOnly: boolean,
+): LineageEvent[] {
+  if (engineFilter === "all" && !failedOnly) return events;
+  return events.filter((ev) => {
+    if (engineFilter !== "all" && ev.engine !== engineFilter) return false;
+    if (failedOnly && ev.status === "ok") return false;
+    return true;
+  });
+}

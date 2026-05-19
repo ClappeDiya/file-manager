@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useFileManagerStore, type PaneTab } from "@/stores/file-manager-store";
 import { cn } from "@ufop/ui-components";
 import { Tooltip } from "@ufop/ui-components";
 import { X, Plus, Pin, PinOff } from "lucide-react";
+import { ContextMenu, getTabContextMenuItems } from "./context-menu";
 
 /**
  * Tabbed browsing bar for a single pane.
@@ -28,10 +29,24 @@ export function TabBar({ paneIndex, className }: TabBarProps) {
   const unpinTab = useFileManagerStore((s) => s.unpinTab);
   const reorderTabs = useFileManagerStore((s) => s.reorderTabs);
   const activePaneIndex = useFileManagerStore((s) => s.activePaneIndex);
+  // Iter 20: tab context menu actions
+  const closeOtherTabs = useFileManagerStore((s) => s.closeOtherTabs);
+  const closeTabsToRight = useFileManagerStore((s) => s.closeTabsToRight);
+  const duplicateTab = useFileManagerStore((s) => s.duplicateTab);
+  const moveTabToOtherPane = useFileManagerStore((s) => s.moveTabToOtherPane);
 
   const tabsRef = useRef<HTMLDivElement>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
+  // Iter 20: tab context menu state. `null` when closed; carries the
+  // anchor tab id + click position when open. Mirrors the file
+  // context menu pattern in file-manager.tsx: parent holds state,
+  // <ContextMenu> renders once at the TabBar root.
+  const [tabMenu, setTabMenu] = useState<{
+    tabId: string;
+    x: number;
+    y: number;
+  } | null>(null);
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -111,7 +126,61 @@ export function TabBar({ paneIndex, className }: TabBarProps) {
     addTab(paneIndex, path, label);
   }, [pane, paneIndex, addTab]);
 
+  // Iter 20: compute the right-click menu items lazily, only when the
+  // menu is open. Counts and the target tab snapshot are derived from
+  // the current tabs list at menu-build time, so they stay in sync
+  // with any close/pin that happened between the right-click and the
+  // user picking an action.
+  const tabMenuItems = useMemo(() => {
+    if (!tabMenu) return [];
+    const target = pane.tabs.find((t) => t.id === tabMenu.tabId);
+    if (!target) return [];
+
+    const sorted = [...pane.tabs].sort((a, b) => {
+      if (a.pinned && !b.pinned) return -1;
+      if (!a.pinned && b.pinned) return 1;
+      return 0;
+    });
+    const fromIdx = sorted.findIndex((t) => t.id === tabMenu.tabId);
+    const closableOthers = pane.tabs.filter(
+      (t) => t.id !== tabMenu.tabId && !t.pinned,
+    ).length;
+    const closableToRight =
+      fromIdx >= 0
+        ? sorted.slice(fromIdx + 1).filter((t) => !t.pinned).length
+        : 0;
+
+    return getTabContextMenuItems({
+      isPinned: target.pinned,
+      totalTabs: pane.tabs.length,
+      closableOthers,
+      closableToRight,
+      onClose: () => closeTab(paneIndex, tabMenu.tabId),
+      onCloseOthers: () => closeOtherTabs(paneIndex, tabMenu.tabId),
+      onCloseToRight: () => closeTabsToRight(paneIndex, tabMenu.tabId),
+      onPinToggle: () =>
+        target.pinned
+          ? unpinTab(paneIndex, tabMenu.tabId)
+          : pinTab(paneIndex, tabMenu.tabId),
+      onDuplicate: () => duplicateTab(paneIndex, tabMenu.tabId),
+      onMoveToOtherPane: () =>
+        moveTabToOtherPane(paneIndex, tabMenu.tabId),
+    });
+  }, [
+    tabMenu,
+    pane.tabs,
+    paneIndex,
+    closeTab,
+    closeOtherTabs,
+    closeTabsToRight,
+    pinTab,
+    unpinTab,
+    duplicateTab,
+    moveTabToOtherPane,
+  ]);
+
   return (
+    <>
     <div
       className={cn(
         "flex items-center gap-0.5 bg-[var(--color-bg-secondary)] border-b border-[var(--color-border)] px-1",
@@ -141,6 +210,10 @@ export function TabBar({ paneIndex, className }: TabBarProps) {
             onActivate={() => setActiveTab(paneIndex, tab.id)}
             onClose={() => closeTab(paneIndex, tab.id)}
             onPin={() => (tab.pinned ? unpinTab(paneIndex, tab.id) : pinTab(paneIndex, tab.id))}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setTabMenu({ tabId: tab.id, x: e.clientX, y: e.clientY });
+            }}
             canClose={pane.tabs.length > 1}
             isDragging={dragIndex === index}
             isDropTarget={dropIndex === index}
@@ -167,6 +240,13 @@ export function TabBar({ paneIndex, className }: TabBarProps) {
         <Plus className="h-3.5 w-3.5" aria-hidden="true" />
       </button>
     </div>
+
+    <ContextMenu
+      items={tabMenuItems}
+      position={tabMenu ? { x: tabMenu.x, y: tabMenu.y } : null}
+      onClose={() => setTabMenu(null)}
+    />
+    </>
   );
 }
 
@@ -182,6 +262,10 @@ interface TabItemProps {
   onActivate: () => void;
   onClose: () => void;
   onPin: () => void;
+  /** Iter 20 — right-click handler. The parent TabBar handles
+   *  preventDefault + opening the shared <ContextMenu>; this prop
+   *  just routes the event up. */
+  onContextMenu: (e: React.MouseEvent) => void;
   canClose: boolean;
   isDragging: boolean;
   isDropTarget: boolean;
@@ -197,6 +281,7 @@ function TabItem({
   onActivate,
   onClose,
   onPin,
+  onContextMenu,
   canClose,
   isDragging,
   isDropTarget,
@@ -221,6 +306,7 @@ function TabItem({
           isDropTarget && "border-l-2 border-l-[var(--color-primary)]",
         )}
         onClick={onActivate}
+        onContextMenu={onContextMenu}
         draggable
         onDragStart={onDragStart}
         onDragOver={onDragOver}

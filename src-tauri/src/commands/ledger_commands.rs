@@ -5,7 +5,7 @@
 
 use crate::core::error::AppError;
 use crate::ledger::{
-    LedgerEvent, LedgerPathHit, LedgerQuery, LedgerSinceSummary, OperationLedger,
+    FrecencyHit, LedgerEvent, LedgerPathHit, LedgerQuery, LedgerSinceSummary, OperationLedger,
 };
 use crate::storage::Repository;
 use tauri::State;
@@ -128,6 +128,12 @@ pub async fn ledger_since_last_seen(
             total: 0,
             by_engine: std::collections::BTreeMap::new(),
             by_status: std::collections::BTreeMap::new(),
+            // First-run sentinel: no events, no bytes, no per-engine
+            // breakdown. `None` distinguishes "first run" from
+            // "zero-byte but non-empty run" so the UI can choose
+            // whether to render the bytes line.
+            bytes_total: None,
+            bytes_by_engine: None,
         },
     };
 
@@ -155,4 +161,50 @@ pub async fn ledger_get_pulse(
     let secs = window_secs.unwrap_or(300).clamp(10, 3600);
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(secs as i64);
     ledger.since(cutoff.to_rfc3339()).await
+}
+
+/// Frecency-ranked paths — a composite score balancing how *often* and
+/// how *recently* each path was touched in the ledger. Each touch
+/// contributes `1 / (1 + age_days / 7)` to the path's score; summing
+/// across all touches naturally promotes paths that are both recent AND
+/// frequent.
+///
+/// When `dirs_only` is true (default), paths are grouped by their parent
+/// directory — ideal for the **Smart Locations** sidebar where navigation
+/// targets are directories, not individual files.
+///
+/// `limit` defaults to 8 and is clamped to `[1, 50]` to match sidebar
+/// real estate. Zero new tables, zero new indexes — pure read-only
+/// composition over the existing `operation_ledger` table.
+#[tauri::command]
+pub async fn ledger_frecent_paths(
+    limit: Option<u32>,
+    dirs_only: Option<bool>,
+    ledger: State<'_, OperationLedger>,
+) -> Result<Vec<FrecencyHit>, AppError> {
+    ledger
+        .frecent_paths(limit.unwrap_or(8), dirs_only.unwrap_or(true))
+        .await
+}
+
+/// **Smart Send-To** — return the destination directories where files of
+/// the given extension have most often been moved or copied, ranked by
+/// frecency. Powers the inline "Send to {dir}" entries in the file
+/// context menu so the user can route a file to its most likely target
+/// in one click instead of navigating a folder picker.
+///
+/// `extension` is normalized: leading dots are stripped, casing is
+/// ignored. `limit` defaults to 3 (matching the menu's visual budget)
+/// and is clamped to `[1, 20]`. Pure derivation over the existing
+/// `operation_ledger` table — no new schema, no new indexes, no
+/// background work.
+#[tauri::command]
+pub async fn ledger_extension_destinations(
+    extension: String,
+    limit: Option<u32>,
+    ledger: State<'_, OperationLedger>,
+) -> Result<Vec<FrecencyHit>, AppError> {
+    ledger
+        .extension_destinations(extension, limit.unwrap_or(3))
+        .await
 }

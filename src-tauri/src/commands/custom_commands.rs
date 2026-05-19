@@ -209,7 +209,7 @@ fn is_command_allowed(expanded: &str) -> bool {
     let first_token = expanded.split_whitespace().next().unwrap_or("");
     // Match against the basename (e.g. "/usr/bin/grep" → "grep")
     let basename = first_token.rsplit('/').next().unwrap_or(first_token);
-    ALLOWED_COMMANDS.iter().any(|&allowed| basename == allowed)
+    ALLOWED_COMMANDS.contains(&basename)
 }
 
 /// Check if a command contains any blocked dangerous patterns.

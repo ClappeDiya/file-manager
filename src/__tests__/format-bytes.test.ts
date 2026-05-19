@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { formatBytes } from "@/lib/format-bytes";
+import { formatBytes, formatBytesSuffix } from "@/lib/format-bytes";
 
 describe("formatBytes", () => {
   it("returns '0 B' for zero", () => {
@@ -77,5 +77,36 @@ describe("formatBytes", () => {
     const result = formatBytes(2048);
     expect(result).toBe("2.0 KB");
     expect(result).not.toContain("KiB");
+  });
+});
+
+describe("formatBytesSuffix", () => {
+  it("returns empty string for null (first-run sentinel)", () => {
+    expect(formatBytesSuffix(null)).toBe("");
+  });
+
+  it("returns empty string for undefined (older backend payload)", () => {
+    expect(formatBytesSuffix(undefined)).toBe("");
+  });
+
+  it("returns empty string for zero (metadata-only window)", () => {
+    expect(formatBytesSuffix(0)).toBe("");
+  });
+
+  it("returns empty string for negative values", () => {
+    expect(formatBytesSuffix(-1)).toBe("");
+  });
+
+  it("prepends default separator ', ' for positive values", () => {
+    expect(formatBytesSuffix(1536)).toBe(", 1.5 KB");
+  });
+
+  it("respects a custom separator", () => {
+    expect(formatBytesSuffix(1_048_576, " · ")).toBe(" · 1.0 MB");
+  });
+
+  it("uses formatBytes for the numeric portion", () => {
+    expect(formatBytesSuffix(1024)).toBe(", 1.0 KB");
+    expect(formatBytesSuffix(1_073_741_824)).toBe(", 1.0 GB");
   });
 });

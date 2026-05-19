@@ -22,6 +22,18 @@
 #     "I forgot to rename the copy-paste" bug; one reference = orphan
 #     constant (declared but never wired).
 #
+# Destructive-DDL safety check (iter 33 extension):
+#   * Any `DROP TABLE`, `DROP INDEX`, `DROP VIEW`, `DROP TRIGGER`,
+#     `ALTER TABLE … DROP COLUMN`, or `ALTER TABLE … RENAME (COLUMN|TO)`
+#     statement inside a `V<N>_SCHEMA` body must be preceded — within
+#     the prior 5 non-empty lines of the same body — by a comment
+#     starting with `-- SAFETY:` that justifies why this data-loss-
+#     potential statement is safe and how user data is preserved.
+#     Default-deny: if a destructive statement lacks justification,
+#     fail loudly at the gate. This is the single most catastrophic
+#     failure mode for the storage layer (silent column drop = silent
+#     user-data loss), so the policy is strict.
+#
 # Why this exists:
 #   CLAUDE.md flags the count assertion as a footgun: "When adding a
 #   migration, update version count in test assertions (both `migrations.rs`
@@ -46,6 +58,8 @@
 #   - Verifies each entry's `sql:` field references `V<version>_SCHEMA`
 #   - Verifies each `V<N>_SCHEMA` constant exists, has DDL/DML body,
 #     and is referenced exactly twice (def + one use)
+#   - Verifies destructive DDL inside V<N>_SCHEMA bodies has an
+#     adjacent `-- SAFETY:` justification comment
 #
 # Pure-bash for count/sequence; python3 for content (multi-line Rust
 # parsing). Sub-second.
@@ -67,7 +81,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --list)  LIST=true; shift ;;
     -h|--help)
-      sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "Unknown arg: $1 (try --help)"; exit 2 ;;
@@ -281,12 +295,63 @@ for cm in re.finditer(
 ):
     const_bodies[cm.group(1)] = cm.group(2)
 
-# Count total file-level references to each V<N>_SCHEMA token.
+# Count total file-level references to each V<N>_SCHEMA token. Iter 32
+# scanned the raw source which could over-count if a future doc-comment
+# ever mentioned a schema constant name. Iter 33/34 refines: strip
+# line-comments (`// ...`, `/// ...`, `//! ...`) and block-comments
+# (`/* ... */`) before counting, so `// see V11_SCHEMA for shape` and
+# `/// derived from V11_SCHEMA` no longer inflate the count.
+src_no_comments = re.sub(r'/\*.*?\*/', '', src, flags=re.DOTALL)
+src_no_comments = re.sub(r'//[^\n]*', '', src_no_comments)
 ref_counts = {}
-for tok in re.finditer(r'\bV\d+_SCHEMA\b', src):
+for tok in re.finditer(r'\bV\d+_SCHEMA\b', src_no_comments):
     ref_counts[tok.group(0)] = ref_counts.get(tok.group(0), 0) + 1
 
 DDL_DML = re.compile(r'\b(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|PRAGMA)\b', re.IGNORECASE)
+# Destructive DDL — data loss potential. Each occurrence in a V*_SCHEMA
+# body must be preceded by a `-- SAFETY:` comment within the SAME body
+# (iter 33). Standard SQLite syntax patterns:
+#   DROP TABLE [IF EXISTS] <name>
+#   DROP INDEX [IF EXISTS] <name>
+#   DROP VIEW [IF EXISTS] <name>
+#   DROP TRIGGER [IF EXISTS] <name>
+#   ALTER TABLE <name> DROP COLUMN <col>      (SQLite ≥ 3.35)
+#   ALTER TABLE <name> RENAME COLUMN <a> TO <b>
+#   ALTER TABLE <name> RENAME TO <new>
+DESTRUCTIVE_PATTERNS = [
+    re.compile(r'\bDROP\s+(TABLE|INDEX|VIEW|TRIGGER)\b', re.IGNORECASE),
+    re.compile(r'\bALTER\s+TABLE\s+\S+\s+DROP\s+COLUMN\b', re.IGNORECASE),
+    re.compile(r'\bALTER\s+TABLE\s+\S+\s+RENAME\s+(COLUMN|TO)\b', re.IGNORECASE),
+]
+SAFETY_COMMENT = re.compile(r'^\s*--\s*SAFETY:', re.IGNORECASE)
+
+def find_unsafe_destructive(body_text: str):
+    """Yield (line_no, statement) for each destructive line that does
+    not have a `-- SAFETY:` comment in the prior 5 non-empty lines."""
+    lines = body_text.splitlines()
+    for idx, line in enumerate(lines):
+        for pat in DESTRUCTIVE_PATTERNS:
+            if pat.search(line):
+                # Look back up to 5 non-empty, non-comment-only-non-SAFETY
+                # lines for a `-- SAFETY:` justification. The comment must
+                # immediately precede (within 5 logical lines) so it's not
+                # a forgotten doc-comment from much earlier in the body.
+                seen = 0
+                justified = False
+                for back in range(idx - 1, -1, -1):
+                    prev = lines[back]
+                    if SAFETY_COMMENT.search(prev):
+                        justified = True
+                        break
+                    stripped = prev.strip()
+                    if not stripped:
+                        continue
+                    seen += 1
+                    if seen >= 5:
+                        break
+                if not justified:
+                    yield (idx + 1, line.strip())
+                break  # one pattern hit per line is enough
 
 findings = []
 for version, desc, sql_name in entries:
@@ -311,6 +376,14 @@ for version, desc, sql_name in entries:
                 f"{sql_name}: body has no DDL/DML keyword "
                 f"(CREATE/ALTER/DROP/INSERT/UPDATE/DELETE/PRAGMA) — "
                 f"empty stub will silently no-op at runtime"
+            )
+        # iter 33: destructive-DDL safety check.
+        for line_no, stmt in find_unsafe_destructive(body_text):
+            findings.append(
+                f"{sql_name} line {line_no}: destructive DDL without `-- SAFETY:` "
+                f"justification within the prior 5 lines — `{stmt[:80]}`. "
+                f"Add `-- SAFETY: <reason + data-preservation plan>` immediately "
+                f"before this line, or split into a separate, scoped migration."
             )
 
 # Reference-count check: every V<N>_SCHEMA constant should appear exactly

@@ -12,6 +12,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useAiStore } from "@/stores/ai-store";
+import { copyToClipboardWithToast } from "@/lib/clipboard";
 
 // ── Types ──
 
@@ -120,11 +121,7 @@ function ExportSection({ summary }: { summary: SettingsSummary | null }) {
 
   const handleCopy = async () => {
     if (!exportResult) return;
-    try {
-      await navigator.clipboard.writeText(exportResult);
-    } catch {
-      // Fallback
-    }
+    await copyToClipboardWithToast(exportResult, "Copy Settings Export");
   };
 
   return (

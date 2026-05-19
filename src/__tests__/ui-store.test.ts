@@ -15,6 +15,7 @@ describe("UI Store (Zustand)", () => {
       statusBarVisible: true,
       previewPanelOpen: false,
       previewPanelWidth: 320,
+      previewFilePath: null,
       onboardingComplete: false,
       onboardingStep: "welcome",
       userStyle: "personal",
@@ -175,6 +176,48 @@ describe("UI Store (Zustand)", () => {
       // Maximum: 600
       useUIStore.getState().setPreviewPanelWidth(800);
       expect(useUIStore.getState().previewPanelWidth).toBe(600);
+    });
+
+    // Iter 29: the long-orphaned previewPanel slot was completed
+    // with `previewFilePath` + `openPreviewFor` + `closePreview`
+    // so the ui-store knows WHICH file to preview, not just that
+    // the panel is open.
+    it("defaults previewFilePath to null", () => {
+      expect(useUIStore.getState().previewFilePath).toBeNull();
+    });
+
+    it("openPreviewFor sets both the open flag and the path atomically", () => {
+      useUIStore.getState().openPreviewFor("/home/work/report.pdf");
+      const state = useUIStore.getState();
+      expect(state.previewPanelOpen).toBe(true);
+      expect(state.previewFilePath).toBe("/home/work/report.pdf");
+    });
+
+    it("closePreview clears both the open flag and the path atomically", () => {
+      useUIStore.getState().openPreviewFor("/home/work/report.pdf");
+      useUIStore.getState().closePreview();
+      const state = useUIStore.getState();
+      expect(state.previewPanelOpen).toBe(false);
+      expect(state.previewFilePath).toBeNull();
+    });
+
+    it("openPreviewFor on a second path replaces the first (preview follows the user)", () => {
+      useUIStore.getState().openPreviewFor("/a.pdf");
+      useUIStore.getState().openPreviewFor("/b.pdf");
+      expect(useUIStore.getState().previewFilePath).toBe("/b.pdf");
+      expect(useUIStore.getState().previewPanelOpen).toBe(true);
+    });
+
+    it("togglePreviewPanel does NOT clear previewFilePath (legacy boolean toggle preserved)", () => {
+      // The pre-existing `togglePreviewPanel` stays a pure
+      // boolean flip for backward compat. Consumers that want
+      // the "close and clear path" semantics should call
+      // `closePreview` instead. This test pins that contract.
+      useUIStore.getState().openPreviewFor("/a.pdf");
+      useUIStore.getState().togglePreviewPanel();
+      const state = useUIStore.getState();
+      expect(state.previewPanelOpen).toBe(false);
+      expect(state.previewFilePath).toBe("/a.pdf");
     });
   });
 

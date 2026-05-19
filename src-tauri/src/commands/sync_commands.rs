@@ -20,6 +20,7 @@ fn parse_uuid(s: &str) -> Result<Uuid, AppError> {
 }
 
 /// DRY ledger helper for the sync engine. Mirrors the Phase 2/3a pattern.
+#[allow(clippy::too_many_arguments)]
 async fn record_sync(
     ledger: &OperationLedger,
     kind: &str,

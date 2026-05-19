@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useFileManagerStore, type FavoriteItem } from "@/stores/file-manager-store";
 import { cn } from "@ufop/ui-components";
 import { ScrollArea } from "@ufop/ui-components";
@@ -12,14 +12,23 @@ import {
   FolderOpen,
   Trash2,
   TriangleAlert,
+  Sparkles,
 } from "lucide-react";
 import type { FileEntryData } from "./file-list";
 import { SmartSpacesSection } from "./smart-spaces-section";
 import type { SmartSpace } from "@/stores/spaces-store";
+import { tauriInvokeSafe } from "@/hooks/use-tauri";
 
 // ──────────────────────────────────────────────
 // Types
 // ──────────────────────────────────────────────
+
+interface FrecencyHit {
+  path: string;
+  last_seen: string;
+  hit_count: number;
+  score: number;
+}
 
 interface DriveInfo {
   name: string;
@@ -27,6 +36,13 @@ interface DriveInfo {
   totalSpace?: number;
   freeSpace?: number;
   removable?: boolean;
+  /** Iter 19: rich hover tooltip pre-computed at the FileManager →
+   *  SidebarNav boundary. Format mirrors the iter-16 status-bar
+   *  free-space hover ("Macintosh HD: 245 GB free of 500 GB") with
+   *  a "name (mount_point)" fallback for drives without space
+   *  accounting. Optional so legacy callers fall back to the
+   *  original `name (path)` tooltip without breaking. */
+  tooltip?: string;
 }
 
 interface TreeNode {
@@ -62,8 +78,24 @@ export function SidebarNav({
   const addFavorite = useFileManagerStore((s) => s.addFavorite);
   const removeFavorite = useFileManagerStore((s) => s.removeFavorite);
 
+  const [smartLocations, setSmartLocations] = useState<FrecencyHit[]>([]);
+
+  // Fetch frecency-ranked locations from the ledger on mount and every 60s.
+  useEffect(() => {
+    const fetchSmartLocations = () => {
+      tauriInvokeSafe<FrecencyHit[]>(
+        "ledger_frecent_paths",
+        { limit: 8, dirsOnly: true },
+        [],
+      ).then(setSmartLocations);
+    };
+    fetchSmartLocations();
+    const interval = setInterval(fetchSmartLocations, 60_000);
+    return () => clearInterval(interval);
+  }, []);
+
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
-    new Set(["smart-spaces", "favorites", "devices"]),
+    new Set(["smart-spaces", "smart-locations", "favorites", "devices"]),
   );
 
   const toggleSection = useCallback((section: string) => {
@@ -115,6 +147,36 @@ export function SidebarNav({
           onToggle={() => toggleSection("smart-spaces")}
           onActivateSpace={(space) => onActivateSpace?.(space)}
         />
+
+        {/* Smart Locations — frecency-ranked from operation ledger */}
+        {smartLocations.length > 0 && (
+          <SidebarSection
+            title="Smart"
+            icon={<Sparkles className="h-4 w-4" aria-hidden="true" />}
+            expanded={expandedSections.has("smart-locations")}
+            onToggle={() => toggleSection("smart-locations")}
+            testId="sidebar-smart-locations"
+          >
+            {smartLocations.map((loc) => (
+              <button
+                key={loc.path}
+                className={cn(
+                  "flex items-center gap-2 w-full px-4 py-1.5 text-left",
+                  "text-[length:var(--font-size-xs)] text-[color:var(--color-text-secondary)]",
+                  "hover:bg-[var(--color-hover-bg)] transition-theme",
+                  "focus-visible:outline-2 focus-visible:outline-inset focus-visible:outline-[var(--color-focus-ring)]",
+                )}
+                onClick={() => onNavigate(loc.path)}
+                title={`${loc.path} — ${loc.hit_count} operations`}
+              >
+                <Folder className="h-3.5 w-3.5 text-[color:var(--color-primary)] shrink-0" aria-hidden="true" />
+                <span className="truncate">
+                  {loc.path.split("/").filter(Boolean).pop() || loc.path}
+                </span>
+              </button>
+            ))}
+          </SidebarSection>
+        )}
 
         {/* Favorites Section */}
         <SidebarSection
@@ -364,7 +426,7 @@ function DriveRow({
           "focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]",
         )}
         onClick={() => onNavigate(drive.path)}
-        title={`${drive.name} (${drive.path})`}
+        title={drive.tooltip ?? `${drive.name} (${drive.path})`}
       >
         <HardDrive className="h-3.5 w-3.5 text-[color:var(--color-text-secondary)] shrink-0" aria-hidden="true" />
         <div className="flex-1 min-w-0">

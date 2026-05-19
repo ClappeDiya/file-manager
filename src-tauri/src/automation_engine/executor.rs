@@ -254,6 +254,55 @@ async fn dispatch_action(
             // OS notification is handled at the Tauri command layer
             Ok(vec![])
         }
+
+        RuleAction::ReplayOp {
+            kind,
+            source_paths,
+            dest_path,
+        } => {
+            // Pinned-operation replay: re-run a captured copy/move exactly
+            // as it was first performed. Source list and destination both
+            // travel with the rule, so `triggered_file` is irrelevant.
+            let dest_dir = Path::new(dest_path);
+            validate_automation_path(dest_dir, None)?;
+            if !dest_dir.exists() {
+                std::fs::create_dir_all(dest_dir)
+                    .map_err(|e| format!("Cannot create destination directory: {e}"))?;
+            }
+
+            let mut affected = Vec::with_capacity(source_paths.len());
+            for source in source_paths {
+                let source_path = Path::new(source);
+                validate_automation_path(source_path, None)?;
+                if !source_path.exists() {
+                    return Err(format!(
+                        "Replay source no longer exists: {source} (the original file was moved or deleted)"
+                    ));
+                }
+                let file_name = source_path
+                    .file_name()
+                    .ok_or_else(|| format!("Cannot determine filename for {source}"))?;
+                let target = dest_dir.join(file_name);
+                let final_target = if target.exists() {
+                    find_unique_name(&target)
+                } else {
+                    target
+                };
+                match kind.as_str() {
+                    "move" => std::fs::rename(source_path, &final_target)
+                        .map_err(|e| format!("Replay move failed for {source}: {e}"))?,
+                    "copy" => {
+                        std::fs::copy(source_path, &final_target)
+                            .map_err(|e| format!("Replay copy failed for {source}: {e}"))?;
+                    }
+                    other => {
+                        return Err(format!("Unsupported ReplayOp kind: '{other}'"));
+                    }
+                }
+                affected.push(final_target.to_string_lossy().to_string());
+            }
+            Ok(affected)
+        }
     }
 }
 
@@ -430,5 +479,92 @@ mod tests {
         let log = execute_rule_action(&rule, Some(source.to_str().unwrap()), true).await;
         assert_eq!(log.status, AutomationStatus::Success);
         assert!(source.exists()); // file should NOT be deleted in dry run
+    }
+
+    // ── ReplayOp (Operation Pin) ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_replay_op_copy_replays_multiple_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "alpha").unwrap();
+        std::fs::write(&b, "beta").unwrap();
+
+        let dest = dir.path().join("backup");
+        let action = RuleAction::ReplayOp {
+            kind: "copy".to_string(),
+            source_paths: vec![
+                a.to_string_lossy().to_string(),
+                b.to_string_lossy().to_string(),
+            ],
+            dest_path: dest.to_string_lossy().to_string(),
+        };
+
+        let result = dispatch_action(&action, None).await.unwrap();
+        assert_eq!(result.len(), 2);
+        // Sources still exist (it's a copy, not a move)
+        assert!(a.exists());
+        assert!(b.exists());
+        // Targets exist at the destination
+        assert!(dest.join("a.txt").exists());
+        assert!(dest.join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_replay_op_move_replays_and_removes_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, "alpha").unwrap();
+
+        let dest = dir.path().join("archive");
+        let action = RuleAction::ReplayOp {
+            kind: "move".to_string(),
+            source_paths: vec![a.to_string_lossy().to_string()],
+            dest_path: dest.to_string_lossy().to_string(),
+        };
+
+        let result = dispatch_action(&action, None).await.unwrap();
+        assert_eq!(result.len(), 1);
+        // Source is gone after a move
+        assert!(!a.exists());
+        // Target exists at the destination
+        assert!(dest.join("a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_replay_op_missing_source_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let action = RuleAction::ReplayOp {
+            kind: "copy".to_string(),
+            source_paths: vec![dir.path().join("ghost.txt").to_string_lossy().to_string()],
+            dest_path: dir.path().join("dst").to_string_lossy().to_string(),
+        };
+
+        let result = dispatch_action(&action, None).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            err.contains("no longer exists"),
+            "expected friendly missing-source error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replay_op_unknown_kind_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, "alpha").unwrap();
+
+        let action = RuleAction::ReplayOp {
+            kind: "delete".to_string(),
+            source_paths: vec![a.to_string_lossy().to_string()],
+            dest_path: dir.path().join("dst").to_string_lossy().to_string(),
+        };
+
+        let result = dispatch_action(&action, None).await;
+        assert!(result.is_err());
+        // Source must NOT have been touched
+        assert!(a.exists());
     }
 }
