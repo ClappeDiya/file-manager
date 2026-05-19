@@ -110,12 +110,12 @@ pub async fn compute_lineage(
                 }
                 // Any new path mentioned by this row becomes a frontier
                 // member for the next hop.
-                for side in [row.subject_path.as_deref(), row.target_path.as_deref()]
+                for p in [row.subject_path.as_deref(), row.target_path.as_deref()]
+                    .into_iter()
+                    .flatten()
                 {
-                    if let Some(p) = side {
-                        if !p.is_empty() && visited_paths.insert(p.to_string()) {
-                            next_frontier.push(p.to_string());
-                        }
+                    if !p.is_empty() && visited_paths.insert(p.to_string()) {
+                        next_frontier.push(p.to_string());
                     }
                 }
                 collected.push(row);

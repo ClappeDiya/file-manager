@@ -1,8 +1,20 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { CommandPalette, getDefaultCommands, type CommandItem } from "@/components/command-palette";
+import { MRU_STORAGE_KEY } from "@/lib/command-mru";
 
 describe("T-013: CommandPalette", () => {
+  // Iter 24: the palette persists command-usage frecency to
+  // localStorage so the empty-query list boosts the user's
+  // favorites to the top. jsdom preserves localStorage across
+  // tests in the same file, so a click in one test would re-
+  // order subsequent tests' empty-query results. Clear the MRU
+  // key between every test to keep each assertion independent of
+  // execution order.
+  beforeEach(() => {
+    localStorage.removeItem(MRU_STORAGE_KEY);
+  });
+
   const mockCommands: CommandItem[] = [
     {
       id: "new-folder",

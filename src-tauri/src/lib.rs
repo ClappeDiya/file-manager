@@ -18,6 +18,7 @@ pub mod spaces_engine;
 pub mod transfer_engine;
 
 use ai_engine::AiAssistant;
+use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use spaces_engine::SpacesManager;
 use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
@@ -62,6 +63,7 @@ struct AppState {
     ledger: OperationLedger,
     safety_interlock: SafetyInterlock,
     narrator: OperationNarrator,
+    quickflow_suggester: LedgerSuggester,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -174,6 +176,12 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // existing ledger query primitive; zero new infrastructure.
     let narrator = OperationNarrator::new(ledger.clone());
 
+    // Quickflow Suggester — bridges the ledger and the automation engine.
+    // Watches for repeated source→dest move/copy patterns and surfaces
+    // single-click "Save as Quickflow" suggestions inside the existing
+    // automation panel. Pure derivation over existing ledger data.
+    let quickflow_suggester = LedgerSuggester::new(ledger.clone());
+
     Ok(AppState {
         repo,
         transfer_mgr,
@@ -198,6 +206,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         ledger,
         safety_interlock,
         narrator,
+        quickflow_suggester,
     })
 }
 
@@ -242,6 +251,7 @@ pub fn run() {
                 let ledger = OperationLedger::new(repo.pool().clone());
                 let safety_interlock = SafetyInterlock::new(ledger.clone());
                 let narrator = OperationNarrator::new(ledger.clone());
+                let quickflow_suggester = LedgerSuggester::new(ledger.clone());
                 let mut automation_mgr = AutomationManager::new();
                 automation_mgr.set_ledger(ledger.clone());
                 AppState {
@@ -268,6 +278,7 @@ pub fn run() {
                     ledger,
                     safety_interlock,
                     narrator,
+                    quickflow_suggester,
                 }
             }
         }
@@ -307,6 +318,7 @@ pub fn run() {
         .manage(app_state.ledger)
         .manage(app_state.safety_interlock)
         .manage(app_state.narrator)
+        .manage(app_state.quickflow_suggester)
         .invoke_handler(tauri::generate_handler![
             // System
             system_commands::greet,
@@ -315,6 +327,8 @@ pub fn run() {
             // Filesystem
             fs_commands::list_directory,
             fs_commands::pick_folder,
+            fs_commands::read_text_file_full,
+            fs_commands::write_text_file_full,
             // State management
             state_commands::save_workspace_state,
             state_commands::load_workspace_state,
@@ -518,8 +532,10 @@ pub fn run() {
             file_ops_commands::duplicate_files,
             file_ops_commands::delete_files,
             file_ops_commands::create_directory,
+            file_ops_commands::ensure_directory,
             file_ops_commands::create_file,
             file_ops_commands::undo_file_operation,
+            file_ops_commands::redo_file_operation,
             file_ops_commands::get_file_metadata,
             file_ops_commands::cloud_delete_to_trash,
             file_ops_commands::cloud_delete_permanently,
@@ -627,6 +643,7 @@ pub fn run() {
             file_ops_commands::read_symlink,
             file_ops_commands::resolve_path,
             file_ops_commands::open_file_with_default,
+            file_ops_commands::reveal_in_os,
             // S3 Object Tags
             s3_commands::s3_get_object_tags,
             s3_commands::s3_put_object_tags,
@@ -680,6 +697,14 @@ pub fn run() {
             automation_commands::list_automation_logs,
             automation_commands::clear_automation_logs,
             automation_commands::parse_automation_nl,
+            // Quickflow Suggester (ledger → automation bridge)
+            automation_commands::quickflow_suggestions_list,
+            automation_commands::quickflow_suggestion_dismiss,
+            automation_commands::quickflow_suggestion_accept,
+            // Operation Pin (single past ledger event → re-runnable manual Quickflow)
+            automation_commands::pin_ledger_event,
+            // Operation Retry (failure-side symmetry of Pin — re-attempt a failed fs.copy/fs.move)
+            automation_commands::retry_failed_event,
             // Smart Spaces
             space_commands::create_space,
             space_commands::list_spaces,
@@ -699,10 +724,18 @@ pub fn run() {
             ledger_commands::ledger_recent_paths,
             ledger_commands::ledger_directory_activity,
             ledger_commands::ledger_get_pulse,
+            // Smart Locations (frecency-ranked paths from ledger — zero new infrastructure)
+            ledger_commands::ledger_frecent_paths,
+            // Smart Send-To (extension → frecency-ranked destination dirs)
+            ledger_commands::ledger_extension_destinations,
             // Universal Time-Travel Undo (cross-session Cmd+Z backed by the ledger)
             undo_commands::undo_last,
             undo_commands::undo_by_correlation,
             undo_commands::list_undoable,
+            // Universal Time-Travel Redo (cross-session Cmd+Shift+Z, symmetric with undo)
+            undo_commands::redo_last,
+            undo_commands::redo_by_correlation,
+            undo_commands::list_redoable,
             // File Lineage / Provenance Graph (reads the ledger only; zero writes)
             lineage_commands::get_file_lineage,
             // Safety Interlock (context-aware anomaly detection over the ledger)

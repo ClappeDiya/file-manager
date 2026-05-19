@@ -669,6 +669,7 @@ export function getDefaultCommands(actions: {
   onRename?: () => void;
   onDuplicate?: () => void;
   onUndo?: () => void;
+  onRedo?: () => void;
   onRefresh?: () => void;
   onToggleDualPane?: () => void;
   onToggleSidebar?: () => void;
@@ -676,6 +677,13 @@ export function getDefaultCommands(actions: {
   onSetTheme?: (theme: string) => void;
   onAddToFavorites?: () => void;
   onTogglePreview?: () => void;
+  /** Open the Lineage / "Show File History" panel for the first
+   *  selected file. Mirrors the existing right-click "Show File
+   *  History" + activity-dot click flows; surfaced as a keyboard
+   *  gesture (Cmd+Shift+G) and a command-palette entry so users
+   *  who prefer keyboard or palette discovery reach the same
+   *  ledger-derived surface. */
+  onShowFileHistory?: () => void;
   onSelectAll?: () => void;
   onInvertSelection?: () => void;
   onSaveWorkspace?: () => void;
@@ -856,6 +864,15 @@ export function getDefaultCommands(actions: {
       category: "Edit",
       action: actions.onUndo || (() => {}),
     },
+    {
+      id: "redo",
+      label: "Redo",
+      icon: <Undo2 className="h-4 w-4 -scale-x-100" />,
+      shortcut: `${cmd}⇧Z`,
+      category: "Edit",
+      action: actions.onRedo || (() => {}),
+      keywords: ["repeat", "reapply"],
+    },
 
     // Selection
     {
@@ -929,6 +946,15 @@ export function getDefaultCommands(actions: {
       category: "View",
       action: actions.onTogglePreview || (() => {}),
       keywords: ["preview", "panel"],
+    },
+    {
+      id: "show-file-history",
+      label: "Show File History",
+      icon: <History className="h-4 w-4" />,
+      shortcut: `${cmd}⇧G`,
+      category: "View",
+      action: actions.onShowFileHistory || (() => {}),
+      keywords: ["lineage", "provenance", "get history"],
     },
     {
       id: "refresh",

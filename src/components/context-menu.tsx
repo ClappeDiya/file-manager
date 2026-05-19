@@ -30,6 +30,14 @@ import {
   FolderOpen,
   FileEdit,
   History,
+  SendToBack,
+  ShieldCheck,
+  FileArchive,
+  PackageOpen,
+  Pin,
+  PinOff,
+  X as CloseIcon,
+  ChevronsRight,
 } from "lucide-react";
 
 // ──────────────────────────────────────────────
@@ -242,6 +250,20 @@ export function ContextMenu({ items, position, onClose }: ContextMenuProps) {
 // Pre-built context menu item sets
 // ──────────────────────────────────────────────
 
+/**
+ * Compress a directory path into a short label for use in menu items.
+ * Prefers the trailing folder name (e.g., `/Users/md/Documents/Receipts`
+ * → `Receipts`); falls back to the full path for short / unusual inputs.
+ */
+function shortenFolderName(path: string): string {
+  const trimmed = path.replace(/[/\\]+$/, "");
+  if (trimmed === "" || trimmed === "/") return path;
+  const lastSlash = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  if (lastSlash < 0) return trimmed;
+  const tail = trimmed.slice(lastSlash + 1);
+  return tail.length > 0 ? tail : trimmed;
+}
+
 export function getFileContextMenuItems(options: {
   hasSelection: boolean;
   isDirectory: boolean;
@@ -278,6 +300,52 @@ export function getFileContextMenuItems(options: {
   onOpenWith?: () => void;
   onOpenInEditor?: () => void;
   onShowHistory?: () => void;
+  /** **Show this folder's activity** — open the Activity Timeline panel
+   *  pre-filtered to events whose `subject_path` or `target_path` starts
+   *  with this folder's path. Symmetric per-folder mirror of
+   *  `onShowHistory` (which is per-file). Wired on folder rows only —
+   *  see the `isDirectory` gate at the call site. */
+  onShowFolderActivity?: () => void;
+  /** **Compress to archive** — open the existing `CreateArchiveDialog`
+   *  with the right-clicked selection pre-filled. The dialog is the
+   *  orphaned tail of the iter 31 archive integration: backend
+   *  `archive_create` IPC has been wired since T-062 with full format /
+   *  password / compression-level support, but the UI never had an
+   *  entry point. Every mainstream file manager has "Compress N items"
+   *  in the right-click menu; this entry closes that gap with zero new
+   *  infrastructure. Hidden when the caller omits the prop so the
+   *  pane-only-selection (Paste-only) menu stays untouched. */
+  onCompress?: () => void;
+  /** **Extract Here** — mirror of iter 14's `onCompress`. Pre-wired
+   *  `archive_extract` IPC already supports zip / tar / tar.gz / 7z
+   *  with optional password. The caller (FilePane) sets this prop only
+   *  when the right-clicked entry has an archive extension, so the
+   *  menu doesn't need to gate on file type itself. Direct action (no
+   *  dialog) — extracts into `${parent}/${stem}/` next to the archive.
+   *  Same singleton-action contract as `onRevealInOs`. */
+  onExtract?: () => void;
+  /** Reveal the selected entry in the OS's native file manager
+   *  (Finder on macOS / Explorer on Windows / xdg-open the parent
+   *  on Linux). Mirrors the "Show in Finder" / "Show in Explorer"
+   *  staple that every mainstream file manager has. */
+  onRevealInOs?: () => void;
+  /** Iter 39: open Integrity Tools with the right-clicked
+   *  selection preset into the Checksums tab. Lets users jump
+   *  from "these files" to "hash them / verify them / find
+   *  duplicates of them" without manually reselecting inside
+   *  the modal the way iter 36 required. The handler receives
+   *  no args — the FilePane closure is expected to snapshot the
+   *  selection + current directory at menu-build time. */
+  onVerifyIntegrity?: () => void;
+  /** **Smart Send-To** — frecency-ranked destination directories the
+   *  ledger has learned for the right-clicked file's extension. When
+   *  non-empty, each entry is rendered inline as a one-click
+   *  "Send to {dir}" action that fires the existing `move_files` IPC.
+   *  Pass an empty array (or omit) to hide the section entirely. */
+  smartDestinations?: Array<{ path: string; hit_count: number }>;
+  /** Handler invoked when the user clicks a Send-To entry. Receives
+   *  the destination directory the user picked. */
+  onSendTo?: (destDir: string) => void;
 }): ContextMenuItem[] {
   const items: ContextMenuItem[] = [];
   const isMac = typeof navigator !== "undefined" && navigator.platform.startsWith("Mac");
@@ -291,6 +359,46 @@ export function getFileContextMenuItems(options: {
       shortcut: "Enter",
       action: options.onOpen,
     });
+
+    // Reveal in the native OS file manager — Finder on macOS,
+    // Explorer on Windows, parent-directory open on Linux. Staple
+    // power-user action present in every mainstream file manager.
+    // Shown right under Open so users find it at the position
+    // muscle memory expects. Platform-aware label so the menu
+    // text matches what the user is about to see ("Show in
+    // Finder" vs "Show in Explorer" vs the generic fallback).
+    if (options.onRevealInOs) {
+      const isWin =
+        typeof navigator !== "undefined" &&
+        navigator.platform.toLowerCase().includes("win");
+      items.push({
+        id: "reveal-in-os",
+        label: isMac
+          ? "Show in Finder"
+          : isWin
+            ? "Show in Explorer"
+            : "Show in File Manager",
+        icon: <FolderOpen className="h-3.5 w-3.5" />,
+        action: options.onRevealInOs,
+      });
+    }
+
+    // Iter 15: Extract Here — direct action for archive files
+    // (.zip / .tar / .tar.gz / .7z). Sits right after the
+    // platform-aware "Show in OS" entry because extraction IS the
+    // primary intent for an archive — exposing it at the top of
+    // the menu saves the user a double-click into ArchiveBrowser
+    // when they already know they want everything extracted. The
+    // mirror entry is iter 14's "Compress…" further down, which
+    // *creates* archives from arbitrary selections.
+    if (options.onExtract) {
+      items.push({
+        id: "extract-here",
+        label: "Extract Here",
+        icon: <PackageOpen className="h-3.5 w-3.5" />,
+        action: options.onExtract,
+      });
+    }
 
     // Feature 2: Edit & Auto-Upload for remote files (#44)
     if (options.onEditRemote && options.hasSelection && !options.isDirectory) {
@@ -329,6 +437,22 @@ export function getFileContextMenuItems(options: {
         label: "Open in Editor",
         icon: <FileEdit className="h-3.5 w-3.5" />,
         action: options.onOpenInEditor,
+      });
+    }
+
+    // Iter 39: Verify integrity on the right-clicked selection.
+    // Available for both files AND directories — checksums for
+    // files, duplicate-scan / smart-folder base path for
+    // directories. The single menu entry routes to whichever
+    // tab makes sense because the IntegrityTools modal adapts
+    // its default tab based on the selection shape.
+    if (options.onVerifyIntegrity) {
+      items.push({
+        id: "verify-integrity",
+        label: "Verify Integrity…",
+        icon: <ShieldCheck className="h-3.5 w-3.5" />,
+        shortcut: `${cmdKey}Shift+I`,
+        action: options.onVerifyIntegrity,
       });
     }
 
@@ -385,6 +509,27 @@ export function getFileContextMenuItems(options: {
       shortcut: `${cmdKey}X`,
       action: options.onCut,
     });
+
+    // Smart Send-To — ledger-derived frecency-ranked destinations for
+    // files with this extension. Hidden entirely when the ledger has
+    // no relevant history (no clutter for new users). Each entry is
+    // a one-click move via the existing fs.move_files IPC.
+    if (
+      options.smartDestinations &&
+      options.smartDestinations.length > 0 &&
+      options.onSendTo
+    ) {
+      items.push({ id: "sep-send-to", label: "", separator: true });
+      for (const dest of options.smartDestinations) {
+        const shortName = shortenFolderName(dest.path);
+        items.push({
+          id: `send-to-${dest.path}`,
+          label: `Send to ${shortName}`,
+          icon: <SendToBack className="h-3.5 w-3.5" />,
+          action: () => options.onSendTo!(dest.path),
+        });
+      }
+    }
   }
 
   items.push({
@@ -403,6 +548,23 @@ export function getFileContextMenuItems(options: {
       shortcut: `${cmdKey}D`,
       action: options.onDuplicate,
     });
+
+    // Compress — sits right after Duplicate because they're the two
+    // "make a new file from the selection" actions. The trailing
+    // ellipsis signals that a dialog will open (format / compression
+    // level / optional password). Backend has full support via the
+    // pre-wired `archive_create` IPC; this entry surfaces the
+    // `CreateArchiveDialog` that was already built but never mounted.
+    if (options.onCompress) {
+      items.push({
+        id: "compress",
+        label: options.selectionCount > 1
+          ? `Compress ${options.selectionCount} Items…`
+          : "Compress…",
+        icon: <FileArchive className="h-3.5 w-3.5" />,
+        action: options.onCompress,
+      });
+    }
 
     items.push({ id: "sep2", label: "", separator: true });
 
@@ -464,6 +626,21 @@ export function getFileContextMenuItems(options: {
         label: "Show File History",
         icon: <History className="h-3.5 w-3.5" />,
         action: options.onShowHistory,
+        advancedOnly: true,
+      });
+    }
+
+    // Show Folder Activity — opens the Activity Timeline pre-filtered to
+    // events under this folder. Folder-only mirror of "Show File History":
+    // same ledger source, broader scope. Surfaces "what happened in this
+    // folder?" with zero new IPC — the panel already pulls
+    // `ledger_recent(200)` and adds one client-side predicate.
+    if (options.isDirectory && options.onShowFolderActivity) {
+      items.push({
+        id: "show-folder-activity",
+        label: "Show Folder Activity",
+        icon: <History className="h-3.5 w-3.5" />,
+        action: options.onShowFolderActivity,
         advancedOnly: true,
       });
     }
@@ -606,6 +783,125 @@ export function getFileContextMenuItems(options: {
     shortcut: `${cmdKey}R`,
     action: options.onRefresh,
   });
+
+  return items;
+}
+
+// ──────────────────────────────────────────────
+// Tab context menu (iter 20) — browser-parity right-click on tabs.
+// Reuses the same `ContextMenu` component as the file context menu;
+// the items list lives here next to `getFileContextMenuItems` so both
+// menus share imports, icon conventions, and the disabled / danger
+// styling rules.
+// ──────────────────────────────────────────────
+
+/** Build the right-click menu for a tab. Every action operates on the
+ *  *target* tab (the one right-clicked) — never the active tab — so
+ *  the gesture matches the browser convention of "do this thing to
+ *  THIS tab" regardless of which tab is currently focused.
+ *
+ *  Several actions are conditionally enabled rather than hidden:
+ *    - Close Tab: disabled if the tab is pinned or it's the last tab.
+ *    - Close Other Tabs: disabled if nothing would actually close.
+ *    - Close Tabs to the Right: disabled if no closable tab sits to the right.
+ *    - Move to Other Pane: hidden in single-tab panes (the move would
+ *      leave the source pane empty); also hidden for pinned tabs since
+ *      moving them would contradict the pin contract.
+ *
+ *  The caller is responsible for passing the counts / flags it
+ *  already knows (no IPC, no store reads from inside this builder)
+ *  so this function stays a pure data transform — easily tested. */
+export function getTabContextMenuItems(options: {
+  isPinned: boolean;
+  /** Total tab count in the pane (post-pin sort doesn't matter — the
+   *  count is invariant under sorting). Used to gate "Close Tab" and
+   *  "Move to Other Pane". */
+  totalTabs: number;
+  /** Count of non-pinned tabs other than the target tab. When zero,
+   *  "Close Other Tabs" is disabled because nothing would close. */
+  closableOthers: number;
+  /** Count of non-pinned tabs whose visual position is to the right
+   *  of the target. When zero, "Close Tabs to the Right" is disabled. */
+  closableToRight: number;
+  onClose: () => void;
+  onCloseOthers: () => void;
+  onCloseToRight: () => void;
+  onPinToggle: () => void;
+  onDuplicate: () => void;
+  /** Optional — omit when single-pane mode + only one tab make the move
+   *  meaningless. Iter 20 hides the entry entirely in those cases. */
+  onMoveToOtherPane?: () => void;
+}): ContextMenuItem[] {
+  const isMac =
+    typeof navigator !== "undefined" && navigator.platform.startsWith("Mac");
+  const cmdKey = isMac ? "⌘" : "Ctrl+";
+
+  const items: ContextMenuItem[] = [];
+
+  // Close Tab — disabled for pinned and last-tab cases, matching the
+  // safety checks inside `closeTab` in the store. Disabling rather than
+  // hiding keeps the menu shape stable so users build muscle memory.
+  items.push({
+    id: "close-tab",
+    label: "Close Tab",
+    icon: <CloseIcon className="h-3.5 w-3.5" />,
+    shortcut: `${cmdKey}W`,
+    action: options.onClose,
+    disabled: options.isPinned || options.totalTabs <= 1,
+    danger: true,
+  });
+
+  items.push({
+    id: "close-other-tabs",
+    label: "Close Other Tabs",
+    icon: <XSquare className="h-3.5 w-3.5" />,
+    action: options.onCloseOthers,
+    disabled: options.closableOthers === 0,
+    danger: true,
+  });
+
+  items.push({
+    id: "close-tabs-to-right",
+    label: "Close Tabs to the Right",
+    icon: <ChevronsRight className="h-3.5 w-3.5" />,
+    action: options.onCloseToRight,
+    disabled: options.closableToRight === 0,
+    danger: true,
+  });
+
+  items.push({ id: "tab-sep1", label: "", separator: true });
+
+  items.push({
+    id: "pin-toggle",
+    label: options.isPinned ? "Unpin Tab" : "Pin Tab",
+    icon: options.isPinned ? (
+      <PinOff className="h-3.5 w-3.5" />
+    ) : (
+      <Pin className="h-3.5 w-3.5" />
+    ),
+    action: options.onPinToggle,
+  });
+
+  items.push({
+    id: "duplicate-tab",
+    label: "Duplicate Tab",
+    icon: <CopyPlus className="h-3.5 w-3.5" />,
+    action: options.onDuplicate,
+  });
+
+  // Move to Other Pane — only show when the move is actually possible.
+  // Pinned tabs and single-tab panes hide the entry entirely rather
+  // than disable: this action is for power users and showing it
+  // dimmed in a single-tab pane would just clutter the menu.
+  if (options.onMoveToOtherPane && !options.isPinned && options.totalTabs > 1) {
+    items.push({ id: "tab-sep2", label: "", separator: true });
+    items.push({
+      id: "move-to-other-pane",
+      label: "Move to Other Pane",
+      icon: <ArrowLeftRight className="h-3.5 w-3.5" />,
+      action: options.onMoveToOtherPane,
+    });
+  }
 
   return items;
 }

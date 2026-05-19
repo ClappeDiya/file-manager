@@ -68,6 +68,7 @@ export function SmartSpacesSection({
           onClick={onToggle}
           aria-expanded={expanded}
           aria-label="Smart Spaces section"
+          title={expanded ? "Collapse Smart Spaces" : "Expand Smart Spaces"}
         >
           <svg
             className={cn(
@@ -108,9 +109,12 @@ export function SmartSpacesSection({
             </p>
           ) : spaces.length === 0 ? (
             <button
-              className="w-full px-4 py-2 text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)] italic hover:text-[color:var(--color-text-secondary)] text-left"
+              className="w-full px-4 py-2 text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)] italic hover:text-[color:var(--color-text-secondary)] text-left inline-flex items-center gap-1.5"
               onClick={() => openWizard()}
+              aria-label="Create your first Smart Space"
+              title="Open the Smart Space wizard"
             >
+              <Plus className="h-3 w-3 flex-shrink-0" aria-hidden="true" />
               Create your first Smart Space...
             </button>
           ) : (
@@ -169,7 +173,13 @@ function SpaceRow({
           onActivate();
         }
       }}
-      aria-label={`Open ${space.name}`}
+      // Hover tooltip + accessible label reveal the underlying local
+      // path so users juggling multiple spaces with similar names
+      // (e.g. "Photos" rooted at two different drives) can
+      // disambiguate without opening the space. Pure derivation from
+      // existing `space.local_path` — no extra fetch, no IPC.
+      title={`${space.name} · ${space.local_path}`}
+      aria-label={`Open ${space.name} (${space.local_path})`}
     >
       {/* Color dot */}
       <span
@@ -197,7 +207,7 @@ function SpaceRow({
           e.stopPropagation();
           onDelete();
         }}
-        title="Delete space"
+        title={`Delete ${space.name}`}
         aria-label={`Delete ${space.name}`}
       >
         <Trash2 className="h-3 w-3" />

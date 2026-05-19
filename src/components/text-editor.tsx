@@ -25,10 +25,16 @@ interface TextEditorProps {
   language?: string;
   /** Whether the file is read-only */
   readOnly?: boolean;
-  /** Called when user saves (Cmd+S) */
-  onSave: (content: string) => void;
+  /** Called when user saves (Cmd+S). Awaited so the Saving… state
+   *  stays visible until the write completes (iter 32). */
+  onSave: (content: string) => void | Promise<void>;
   /** Called when user closes the editor */
   onClose: () => void;
+  /** Iter 34: fired whenever the internal dirty flag flips. Lets
+   *  the hosting modal block accidental close when there are
+   *  unsaved edits. Optional so direct consumers (if any ever
+   *  exist outside `TextEditorModal`) don't break. */
+  onDirtyChange?: (isDirty: boolean) => void;
 }
 
 export function TextEditor({
@@ -39,6 +45,7 @@ export function TextEditor({
   readOnly = false,
   onSave,
   onClose,
+  onDirtyChange,
 }: TextEditorProps) {
   const [content, setContent] = useState(initialContent);
   const [isDirty, setIsDirty] = useState(false);
@@ -56,8 +63,16 @@ export function TextEditor({
     if (readOnly || saving || tooLarge) return;
     setSaving(true);
     try {
-      onSave(content);
+      await onSave(content);
       setIsDirty(false);
+    } catch {
+      // Iter 34: host either blocked the save (external-edit
+      // conflict from iter 33) or the write itself failed.
+      // Either way, keep `isDirty=true` so the "Modified"
+      // indicator stays visible, the close-confirm guard fires,
+      // and the user knows their edits are not yet persisted.
+      // The host component (TextEditorModal) is responsible for
+      // surfacing the reason via its own banner state.
     } finally {
       setSaving(false);
     }
@@ -93,6 +108,15 @@ export function TextEditor({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [readOnly, isDirty, showFind, tooLarge, handleSave]);
+
+  // Iter 34: bubble dirty-state changes to the host so it can
+  // block accidental close with an unsaved-changes warning.
+  // Fires on every flip (clean→dirty on first edit, dirty→clean
+  // after save or reload). The host hooks this via the
+  // `onDirtyChange` callback prop.
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+  }, [isDirty, onDirtyChange]);
 
   // Update match count when find query changes
   useEffect(() => {

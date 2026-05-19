@@ -34,7 +34,13 @@ export type RuleAction =
   | { type: "run_sync"; sync_pair_id: string }
   | { type: "transfer_to_connector"; connector_protocol: string; connection_id: string; remote_path: string }
   | { type: "execute_custom_command"; command_id: string }
-  | { type: "notify"; title: string; body: string };
+  | { type: "notify"; title: string; body: string }
+  /** Replay a captured set of file operations exactly as the user once
+   *  performed them. Created by the **Operation Pin** flow from a single
+   *  ledger event — carries its own source list so the trigger doesn't
+   *  need to provide a file. Mirrors `RuleAction::ReplayOp` in the Rust
+   *  automation engine. */
+  | { type: "replay_op"; kind: string; source_paths: string[]; dest_path: string };
 
 export interface AutomationRule {
   id: string;
@@ -63,6 +69,21 @@ export interface AutomationLog {
   error_message: string | null;
 }
 
+/**
+ * A pattern surfaced by the Quickflow Suggester. Mirrors
+ * `automation_engine::suggester::QuickflowSuggestion` on the Rust side.
+ */
+export interface QuickflowSuggestion {
+  id: string;
+  kind: "copy" | "move";
+  source_dir: string;
+  dest_dir: string;
+  hit_count: number;
+  last_seen: string;
+  sample_files: string[];
+  suggested_name: string;
+}
+
 // ── Store ──
 
 interface AutomationState {
@@ -74,6 +95,7 @@ interface AutomationState {
   // Data (not persisted - loaded from backend)
   rules: AutomationRule[];
   logs: AutomationLog[];
+  suggestions: QuickflowSuggestion[];
   loading: boolean;
   nlParsing: boolean;
   editorRule: Partial<AutomationRule> | null;
@@ -95,6 +117,27 @@ interface AutomationState {
   loadLogs: (ruleId?: string) => Promise<void>;
   clearLogs: (ruleId?: string) => Promise<void>;
   parseNaturalLanguage: (input: string) => Promise<AutomationRule | null>;
+
+  // Quickflow Suggester (ledger → automation bridge)
+  loadSuggestions: () => Promise<void>;
+  acceptSuggestion: (id: string) => Promise<AutomationRule | null>;
+  dismissSuggestion: (id: string) => Promise<void>;
+
+  /** Operation Pin — turn a single past ledger event (identified by its
+   *  correlation_id) into a saved manual-trigger Quickflow that can be
+   *  re-run on demand. Returns the new (disabled-by-default) rule, or
+   *  null on backend rejection. The created rule is also pushed into
+   *  `rules[]` so the automation panel re-renders without a refetch. */
+  pinLedgerEvent: (correlationId: string) => Promise<AutomationRule | null>;
+
+  /** Operation Retry — failure-side mirror of Pin. Re-attempts a failed
+   *  (or cancelled) fs.copy / fs.move event identified by its
+   *  correlation_id, without persisting a saved rule. Returns the
+   *  executor's `AutomationLog` (success/failed + files affected +
+   *  error message) so the caller can render a precise toast, or null
+   *  on backend rejection. The retry attempt is recorded to the unified
+   *  ledger so it appears on the activity timeline next to its cause. */
+  retryFailedEvent: (correlationId: string) => Promise<AutomationLog | null>;
 }
 
 export const useAutomationStore = create<AutomationState>()(
@@ -108,6 +151,7 @@ export const useAutomationStore = create<AutomationState>()(
       // Data
       rules: [],
       logs: [],
+      suggestions: [],
       loading: false,
       nlParsing: false,
       editorRule: null,
@@ -230,6 +274,79 @@ export const useAutomationStore = create<AutomationState>()(
         } catch (e) {
           console.error("Failed to parse automation NL:", e);
           set({ nlParsing: false });
+          return null;
+        }
+      },
+
+      loadSuggestions: async () => {
+        try {
+          const suggestions = await tauriInvoke<QuickflowSuggestion[]>(
+            "quickflow_suggestions_list",
+            undefined,
+            [],
+          );
+          set({ suggestions });
+        } catch (e) {
+          console.error("Failed to load Quickflow suggestions:", e);
+        }
+      },
+
+      acceptSuggestion: async (id) => {
+        try {
+          const rule = await tauriInvoke<AutomationRule>(
+            "quickflow_suggestion_accept",
+            { id },
+          );
+          set((s) => ({
+            suggestions: s.suggestions.filter((sg) => sg.id !== id),
+          }));
+          await get().loadRules();
+          return rule;
+        } catch (e) {
+          console.error("Failed to accept Quickflow suggestion:", e);
+          return null;
+        }
+      },
+
+      dismissSuggestion: async (id) => {
+        try {
+          await tauriInvoke("quickflow_suggestion_dismiss", { id });
+          set((s) => ({
+            suggestions: s.suggestions.filter((sg) => sg.id !== id),
+          }));
+        } catch (e) {
+          console.error("Failed to dismiss Quickflow suggestion:", e);
+        }
+      },
+
+      pinLedgerEvent: async (correlationId) => {
+        try {
+          const rule = await tauriInvoke<AutomationRule>("pin_ledger_event", {
+            correlationId,
+          });
+          // Push the new rule into the in-memory list so the automation
+          // panel re-renders without a round-trip refetch. The backend has
+          // already persisted it to SQLite via `mgr.save_rule`.
+          set((s) => ({ rules: [rule, ...s.rules] }));
+          return rule;
+        } catch (e) {
+          console.error("Failed to pin ledger event:", e);
+          return null;
+        }
+      },
+
+      retryFailedEvent: async (correlationId) => {
+        try {
+          // Ephemeral execution — the backend does NOT persist a rule.
+          // It records a `kind="retry"` row to the unified ledger, so
+          // the timeline auto-refresh will surface the attempt on the
+          // next ledger-tail poll.
+          const log = await tauriInvoke<AutomationLog>("retry_failed_event", {
+            correlationId,
+          });
+          return log;
+        } catch (e) {
+          console.error("Failed to retry ledger event:", e);
           return null;
         }
       },

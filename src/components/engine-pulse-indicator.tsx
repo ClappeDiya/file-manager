@@ -20,7 +20,9 @@
 import { useEffect, useRef, useState } from "react";
 import { Activity, AlertCircle } from "lucide-react";
 import { getEnginePulse } from "@/lib/pulse";
+import { formatBytesSuffix } from "@/lib/format-bytes";
 import type { LedgerSinceSummary } from "@/components/since-last-seen-toast";
+import { useActivityTimelineStore } from "@/stores/activity-timeline-store";
 
 /** How often to poll (ms). 10 s keeps the status bar fresh without
  *  adding meaningful load — one lightweight SQL GROUP BY per tick. */
@@ -59,6 +61,41 @@ const ENGINE_COLORS: Record<string, string> = {
 export function EnginePulseIndicator() {
   const [pulse, setPulse] = useState<LedgerSinceSummary | null>(null);
   const mountedRef = useRef(true);
+  // Drill-in: when the user clicks the error badge, open the Activity
+  // Timeline pre-filtered to ALL failed events. Pulled via `.getState()`
+  // inside the handler instead of via subscription because the
+  // component does not need to re-render when the store mutates —
+  // only the click consumer mutates it.
+  //
+  // The preset explicitly clears `engineFilter` (to `"all"`) and
+  // `correlationFilter` (to `null`) so the user sees every failure,
+  // not just failures inside whatever filter happened to be active
+  // when they clicked. Omitting those fields would silently respect
+  // the panel's prior state — surprising in the most common case of
+  // "I just want to see what's broken".
+  const openTimelineFailed = () => {
+    useActivityTimelineStore.getState().openWithPreset({
+      failedOnly: true,
+      engineFilter: "all",
+      correlationFilter: null,
+    });
+  };
+
+  // Per-engine drill-in: clicking a colored dot opens the Activity
+  // Timeline filtered to that engine. Symmetric with the error-badge
+  // drill-in just above — same `openWithPreset` primitive, same
+  // sibling-clearing intent (`failedOnly: false`, `correlationFilter:
+  // null`) so a user clicking "Transfer" sees every transfer event,
+  // not just transfer failures inside whatever filter happened to be
+  // active. Together the badge + dots make every per-axis slice the
+  // status bar already advertises one click away.
+  const openTimelineForEngine = (engine: string) => {
+    useActivityTimelineStore.getState().openWithPreset({
+      engineFilter: engine,
+      failedOnly: false,
+      correlationFilter: null,
+    });
+  };
 
   useEffect(() => {
     mountedRef.current = true;
@@ -80,12 +117,29 @@ export function EnginePulseIndicator() {
   const errorCount = pulse.by_status.failed ?? 0;
   const isActive = pulse.total > 0;
 
+  // Per-engine tooltip text. Includes byte volume when the backend
+  // computed it AND that engine actually moved data — silently omits
+  // the `(0 B)` for engines whose events carry no bytes (renames,
+  // folder creates) to keep the tooltip terse. `formatBytesSuffix`
+  // centralises the suppression rule used here, in the engine-dot
+  // button below, in the headline byte total, and in the
+  // since-last-seen toast.
+  const bytesByEngine = pulse.bytes_by_engine ?? null;
   const engineTooltip = activeEngines
-    .map((e) => `${ENGINE_LABELS[e] ?? e}: ${pulse.by_engine[e]}`)
+    .map((e) => {
+      const opCount = pulse.by_engine[e];
+      const bytes = bytesByEngine ? bytesByEngine[e] : null;
+      return `${ENGINE_LABELS[e] ?? e}: ${opCount}${formatBytesSuffix(bytes)}`;
+    })
     .join(", ");
 
+  // Global byte total — surfaced inline in the headline so the user
+  // sees aggregate data volume alongside op count without scanning the
+  // per-engine breakdown. Same suppression contract as above.
+  const totalBytesLabel = formatBytesSuffix(pulse.bytes_total);
+
   const tooltip = isActive
-    ? `${pulse.total} op${pulse.total !== 1 ? "s" : ""} in last 5 min — ${engineTooltip}`
+    ? `${pulse.total} op${pulse.total !== 1 ? "s" : ""}${totalBytesLabel} in last 5 min — ${engineTooltip}`
     : "No recent activity";
 
   return (
@@ -112,24 +166,55 @@ export function EnginePulseIndicator() {
             {pulse.total}
           </span>
 
-          {/* Engine dots — one per active engine */}
+          {/* Engine dots — one per active engine. Each dot is a button
+              whose VISUAL is still a tiny 6px circle (preserving the
+              ambient aesthetic) but whose interactive area is padded to
+              a generous click target via `p-1 -m-1`. Clicking opens
+              the Activity Timeline filtered to that engine — same
+              `openWithPreset` primitive the error badge uses. */}
           <div className="flex items-center gap-0.5">
-            {activeEngines.map((engine) => (
-              <span
-                key={engine}
-                className={`inline-block h-1.5 w-1.5 rounded-full ${ENGINE_COLORS[engine] ?? "bg-gray-400"}`}
-                title={`${ENGINE_LABELS[engine] ?? engine}: ${pulse.by_engine[engine]} ops`}
-                aria-hidden="true"
-              />
-            ))}
+            {activeEngines.map((engine) => {
+              const label = ENGINE_LABELS[engine] ?? engine;
+              const count = pulse.by_engine[engine];
+              const engBytes = bytesByEngine ? bytesByEngine[engine] : null;
+              const engBytesLabel = formatBytesSuffix(engBytes);
+              return (
+                <button
+                  key={engine}
+                  type="button"
+                  onClick={() => openTimelineForEngine(engine)}
+                  title={`${label}: ${count} op${count !== 1 ? "s" : ""}${engBytesLabel} — click to drill in`}
+                  aria-label={`Open Activity Timeline filtered to ${label} (${count} op${count !== 1 ? "s" : ""}${engBytesLabel})`}
+                  className="rounded-full p-1 -m-1 transition-colors hover:bg-[color:var(--color-hover-bg,rgba(255,255,255,0.08))] focus:outline-none focus:ring-1 focus:ring-sky-500/40"
+                  data-testid={`engine-pulse-dot-${engine}`}
+                >
+                  <span
+                    className={`block h-1.5 w-1.5 rounded-full ${ENGINE_COLORS[engine] ?? "bg-gray-400"}`}
+                    aria-hidden="true"
+                  />
+                </button>
+              );
+            })}
           </div>
 
-          {/* Error badge — only when errors exist */}
+          {/* Error badge — only when errors exist. Clickable: opens
+              the Activity Timeline pre-filtered to failed events so
+              the user can drill in with one click instead of hunting
+              for the failed-only chip inside the panel. The button
+              shape and color are unchanged from the prior
+              read-only badge so this is a purely accretive affordance. */}
           {errorCount > 0 && (
-            <span className="flex items-center gap-0.5 text-[10px] tabular-nums text-red-500">
+            <button
+              type="button"
+              onClick={openTimelineFailed}
+              title={`${errorCount} failed op${errorCount !== 1 ? "s" : ""} in last 5 min — click to drill in`}
+              aria-label={`Open Activity Timeline filtered to ${errorCount} failed event${errorCount !== 1 ? "s" : ""}`}
+              className="flex items-center gap-0.5 rounded text-[10px] tabular-nums text-red-500 transition-colors hover:text-red-400 hover:bg-red-500/10 focus:outline-none focus:ring-1 focus:ring-red-500/40 px-1 -mx-1"
+              data-testid="engine-pulse-error-badge"
+            >
               <AlertCircle className="h-2.5 w-2.5" aria-hidden="true" />
               {errorCount}
-            </span>
+            </button>
           )}
         </>
       ) : (

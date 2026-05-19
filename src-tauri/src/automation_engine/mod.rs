@@ -10,7 +10,9 @@
 
 pub mod evaluator;
 pub mod executor;
+pub mod pinner;
 pub mod scheduler;
+pub mod suggester;
 
 use crate::core::error::AppError;
 use chrono::Utc;
@@ -135,6 +137,20 @@ pub enum RuleAction {
     ExecuteCustomCommand { command_id: String },
     /// Send an OS notification.
     Notify { title: String, body: String },
+    /// Replay a captured set of file operations exactly as the user once
+    /// performed them. Carries its own source list and destination, so the
+    /// trigger doesn't need to provide a file. Created by the **Operation
+    /// Pin** flow from a single ledger event — DRY by construction: source
+    /// of truth is the original ledger row, the rule is just a saved
+    /// re-runnable handle.
+    ReplayOp {
+        /// One of: `"copy"`, `"move"`. Drives the executor branch.
+        kind: String,
+        /// Absolute paths captured from the original ledger event.
+        source_paths: Vec<String>,
+        /// Destination directory captured from the original ledger event.
+        dest_path: String,
+    },
 }
 
 /// An execution log entry for a rule run.

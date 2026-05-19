@@ -32,6 +32,12 @@ interface LedgerPathHit {
   last_seen: string;
   hit_count: number;
   last_engine: string | null;
+  /** Kind of the most-recent ledger event that touched this path
+   *  (e.g. `copy`, `rename`, `sync.file`, `transfer.completed`).
+   *  Populated by the backend so the inline activity-dot tooltip can
+   *  describe WHAT happened, not just which engine did it. Optional
+   *  on the wire — older payloads may omit it. */
+  last_kind?: string | null;
 }
 
 /** Age bucket frozen at the moment the directory was fetched. Frozen
@@ -67,6 +73,11 @@ export interface FileActivityInfo {
   ageLabel: string;
   /** Engine that most recently touched this path (e.g. "sync", "transfer"). */
   lastEngine: LedgerEngineKind | null;
+  /** Kind of the most-recent ledger event (e.g. "copy", "rename",
+   *  "sync.file"). `null` when the backend didn't compute it (older
+   *  ledger payloads). Used by the activity-dot tooltip to describe
+   *  WHAT happened, not just which engine did it. */
+  lastKind: string | null;
 }
 
 /** Activity lookup — zero allocation per-row if the map is empty. */
@@ -243,6 +254,7 @@ export function useDirectoryActivity(dirPath: string | null): FileActivityMap {
           ageBucket,
           ageLabel,
           lastEngine: (hit.last_engine as LedgerEngineKind) ?? null,
+          lastKind: hit.last_kind ?? null,
         };
       }
       setMap(next);

@@ -22,3 +22,20 @@ export function formatBytes(
   const fixed = i === 0 ? 0 : decimals;
   return `${value.toFixed(fixed)} ${units[i]}`;
 }
+
+/**
+ * Format a byte count as a tooltip/headline suffix: returns `"{separator}{formatted}"`
+ * when bytes is a positive finite number, otherwise returns an empty string.
+ *
+ * Centralises the suppression rule the ledger UIs share — first-run
+ * sentinel (`null`), older backend payloads (`undefined`), and
+ * metadata-only windows (`0`) all collapse to "" so renames and folder
+ * creates never surface a noisy `0 B` next to the op count.
+ */
+export function formatBytesSuffix(
+  bytes: number | null | undefined,
+  separator: string = ", ",
+): string {
+  if (bytes === null || bytes === undefined || bytes <= 0) return "";
+  return `${separator}${formatBytes(bytes)}`;
+}

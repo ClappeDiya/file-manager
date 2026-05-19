@@ -157,7 +157,7 @@ impl SwiftConnector {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
-            .map_err(|e| AppError::connection(&format!("HTTP client error: {e}"), "Check TLS configuration."))?;
+            .map_err(|e| AppError::connection(format!("HTTP client error: {e}"), "Check TLS configuration."))?;
 
         match &config.auth_method {
             SwiftAuthMethod::KeystoneV3 { auth_url, username, password, project_name, domain_name, region } => {
@@ -194,7 +194,7 @@ impl SwiftConnector {
                     .send()
                     .await
                     .map_err(|e| AppError::connection(
-                        &format!("Keystone v3 auth failed: {e}"),
+                        format!("Keystone v3 auth failed: {e}"),
                         "Check auth URL, credentials, and network connectivity.",
                     ))?;
 
@@ -202,7 +202,7 @@ impl SwiftConnector {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
                     return Err(AppError::connection(
-                        &format!("Keystone v3 auth returned {status}: {body}"),
+                        format!("Keystone v3 auth returned {status}: {body}"),
                         "Check username, password, project, and domain.",
                     ));
                 }
@@ -218,7 +218,7 @@ impl SwiftConnector {
                     ))?;
 
                 let catalog: serde_json::Value = resp.json().await.map_err(|e| {
-                    AppError::connection(&format!("Failed to parse Keystone response: {e}"), "")
+                    AppError::connection(format!("Failed to parse Keystone response: {e}"), "")
                 })?;
 
                 // Extract storage URL from service catalog
@@ -256,7 +256,7 @@ impl SwiftConnector {
                     .send()
                     .await
                     .map_err(|e| AppError::connection(
-                        &format!("Application credential auth failed: {e}"),
+                        format!("Application credential auth failed: {e}"),
                         "Check credential ID, secret, and auth URL.",
                     ))?;
 
@@ -264,7 +264,7 @@ impl SwiftConnector {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
                     return Err(AppError::connection(
-                        &format!("Application credential auth returned {status}: {body}"),
+                        format!("Application credential auth returned {status}: {body}"),
                         "Verify the credential has not expired or been revoked.",
                     ));
                 }
@@ -280,7 +280,7 @@ impl SwiftConnector {
                     ))?;
 
                 let catalog: serde_json::Value = resp.json().await.map_err(|e| {
-                    AppError::connection(&format!("Failed to parse Keystone response: {e}"), "")
+                    AppError::connection(format!("Failed to parse Keystone response: {e}"), "")
                 })?;
 
                 let storage_url = Self::extract_swift_endpoint(&catalog, None)?;
@@ -303,13 +303,13 @@ impl SwiftConnector {
                     .send()
                     .await
                     .map_err(|e| AppError::connection(
-                        &format!("TempAuth request failed: {e}"),
+                        format!("TempAuth request failed: {e}"),
                         "Check auth URL and credentials.",
                     ))?;
 
                 if !resp.status().is_success() {
                     return Err(AppError::connection(
-                        &format!("TempAuth returned {}", resp.status()),
+                        format!("TempAuth returned {}", resp.status()),
                         "Check username and key.",
                     ));
                 }

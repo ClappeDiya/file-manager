@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 /// DRY ledger helper for the transfer engine. Builds a `RecordEvent`
 /// with the supplied fields and records it (fail-open).
+#[allow(clippy::too_many_arguments)]
 async fn record_xfer(
     ledger: &OperationLedger,
     kind: &str,

@@ -66,6 +66,31 @@ export function formatDate(dateStr: string | null): string {
   });
 }
 
+/**
+ * Render the Size column for a row, accounting for the optional
+ * `folderSizes` map produced by the user-initiated "Calculate Size"
+ * context-menu action.
+ *
+ * Files always show their byte count.
+ *
+ * Folders show `--` until the user explicitly asks the platform to
+ * compute their recursive size. Once computed, the result is cached
+ * in the FilePane's `folderSizes` state and surfaced here so the
+ * value sticks for the remainder of the pane's lifetime. Before
+ * this iteration the cached value was never read — see
+ * `_folderSizes` in `file-manager.tsx`.
+ */
+export function formatEntrySize(
+  entry: FileEntryData,
+  folderSizes?: Record<string, number>,
+): string {
+  if (entry.is_dir) {
+    const cached = folderSizes?.[entry.path];
+    return cached !== undefined ? formatFileSize(cached) : "--";
+  }
+  return formatFileSize(entry.size);
+}
+
 function getFileIcon(entry: FileEntryData): React.ReactNode {
   if (entry.is_dir) {
     return <Folder className="h-4 w-4 text-[color:var(--color-primary)]" aria-hidden="true" />;
@@ -235,6 +260,19 @@ interface FileListProps {
   >;
   /** Group files by attribute (#77) */
   groupBy?: string | null;
+  /** Folder → recursive-byte-count cache populated by the user-
+   *  initiated "Calculate Size" context-menu action. Folders show
+   *  their cached size if present, otherwise `--`. Files always
+   *  show their byte count regardless. */
+  folderSizes?: Record<string, number>;
+  /** When provided, the inline activity dot becomes a button that
+   *  invokes this callback with the corresponding file path. The
+   *  intended consumer (file-manager.tsx) routes the path into the
+   *  existing lineage panel so the dot's visual "this file has
+   *  activity" hint gets a one-click drill-in to the full history.
+   *  When omitted, the dot stays a pure visual span — backward
+   *  compatible with any caller that hasn't opted in. */
+  onActivityDotClick?: (path: string) => void;
 }
 
 export function FileList({
@@ -251,6 +289,8 @@ export function FileList({
   gitStatus,
   activityMap,
   groupBy,
+  folderSizes,
+  onActivityDotClick,
 }: FileListProps) {
   const rowHeight = customRowHeight || (viewMode === "compact" ? 28 : viewMode === "grid" ? 120 : 36);
 
@@ -266,6 +306,7 @@ export function FileList({
         focusedIndex={focusedIndex}
         onFocusedIndexChange={onFocusedIndexChange}
         activityMap={activityMap}
+        onActivityDotClick={onActivityDotClick}
       />
     );
   }
@@ -285,6 +326,8 @@ export function FileList({
       gitStatus={gitStatus}
       activityMap={activityMap}
       groupBy={groupBy}
+      folderSizes={folderSizes}
+      onActivityDotClick={onActivityDotClick}
     />
   );
 }
@@ -346,8 +389,9 @@ function engineColor(engine: string | null | undefined): string | null {
  * computed by `useDirectoryActivity` at fetch time. Dots are frozen
  * at the moment the directory was fetched — re-navigating refreshes.
  */
-function ActivityDot({
+export function ActivityDot({
   info,
+  onClick,
 }: {
   info: {
     lastSeen: string;
@@ -355,7 +399,17 @@ function ActivityDot({
     ageBucket: "recent" | "today" | "week";
     ageLabel: string;
     lastEngine?: string | null;
+    /** Kind of the most-recent ledger event (e.g. `copy`, `rename`,
+     *  `sync.file`). Optional for backward compatibility — when
+     *  absent the tooltip falls back to the engine-only label. */
+    lastKind?: string | null;
   };
+  /** When provided, the dot becomes a button — clicking it opens
+   *  the file-lineage panel for the corresponding path. The pure
+   *  visual span behaviour is preserved when this is omitted so
+   *  any consumer that hasn't opted into drill-in still gets the
+   *  identical ambient indicator. */
+  onClick?: () => void;
 }) {
   const engColor = engineColor(info.lastEngine);
   const colorClass = engColor
@@ -369,16 +423,57 @@ function ActivityDot({
     : "Ledger";
   const touches =
     info.hitCount === 1 ? "1 touch" : `${info.hitCount} touches`;
-  const title = `${engineLabel}: ${info.ageLabel} · ${touches}`;
-  return (
+  // Compose "Engine kind · age · touches" when the kind is known so
+  // users see WHAT happened (rename, copy, sync.file) not just which
+  // engine did it. Falls back to "Engine: age · touches" when the
+  // backend didn't populate `lastKind` — keeps older payloads working.
+  const baseTitle = info.lastKind
+    ? `${engineLabel} ${info.lastKind} · ${info.ageLabel} · ${touches}`
+    : `${engineLabel}: ${info.ageLabel} · ${touches}`;
+  const dotEl = (
     <span
-      aria-label={title}
-      title={title}
+      aria-hidden="true"
       className={cn(
         "inline-block h-1.5 w-1.5 shrink-0 rounded-full",
         colorClass,
       )}
     />
+  );
+  // No drill-in handler → pure visual indicator. Preserves the prior
+  // span-only behaviour for any caller that hasn't opted in.
+  if (!onClick) {
+    return (
+      <span
+        aria-label={baseTitle}
+        title={baseTitle}
+        className={cn(
+          "inline-block h-1.5 w-1.5 shrink-0 rounded-full",
+          colorClass,
+        )}
+      />
+    );
+  }
+  // Drill-in mode — the dot becomes a button that opens the file
+  // lineage panel for the corresponding path. `e.stopPropagation()`
+  // prevents the parent row's select/open handler from also firing
+  // (clicking the dot is "show history", not "select the file").
+  // Hit-target padding (`p-1 -m-1`) gives a 14px interactive area
+  // around the 6px visual circle without disturbing the row layout.
+  const interactiveTitle = `${baseTitle} — click to show file history`;
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      aria-label={interactiveTitle}
+      title={interactiveTitle}
+      data-testid="activity-dot"
+      className="rounded-full p-1 -m-1 transition-colors hover:bg-[color:var(--color-hover-bg,rgba(255,255,255,0.08))] focus:outline-none focus:ring-1 focus:ring-sky-500/40"
+    >
+      {dotEl}
+    </button>
   );
 }
 
@@ -404,6 +499,8 @@ interface FileTableViewProps {
     }
   >;
   groupBy?: string | null;
+  folderSizes?: Record<string, number>;
+  onActivityDotClick?: (path: string) => void;
 }
 
 const ALL_COLUMNS = ["name", "size", "modified", "type", "permissions", "created", "extension"] as const;
@@ -422,6 +519,8 @@ function FileTableView({
   gitStatus,
   activityMap,
   groupBy,
+  folderSizes,
+  onActivityDotClick,
 }: FileTableViewProps) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [columnResizeMode] = useState<ColumnResizeMode>("onChange");
@@ -495,7 +594,16 @@ function FileTableView({
                   (link)
                 </span>
               )}
-              {activity && <ActivityDot info={activity} />}
+              {activity && (
+                <ActivityDot
+                  info={activity}
+                  onClick={
+                    onActivityDotClick
+                      ? () => onActivityDotClick(entry.path)
+                      : undefined
+                  }
+                />
+              )}
               {git && (viewMode === "detail" || viewMode === "list") && (
                 <GitStatusBadge status={git} />
               )}
@@ -514,7 +622,7 @@ function FileTableView({
           minSize: 60,
           cell: ({ row }) => (
             <span className="text-[color:var(--color-text-secondary)] text-[length:var(--font-size-sm)]">
-              {row.original.is_dir ? "--" : formatFileSize(row.original.size)}
+              {formatEntrySize(row.original, folderSizes)}
             </span>
           ),
         });
@@ -594,14 +702,14 @@ function FileTableView({
         minSize: 60,
         cell: ({ row }) => (
           <span className="text-[color:var(--color-text-secondary)] text-[length:var(--font-size-sm)]">
-            {row.original.is_dir ? "--" : formatFileSize(row.original.size)}
+            {formatEntrySize(row.original, folderSizes)}
           </span>
         ),
       });
     }
 
     return cols;
-  }, [viewMode, visibleColumns, gitStatus, activityMap]);
+  }, [viewMode, visibleColumns, gitStatus, activityMap, folderSizes]);
 
   const table = useReactTable({
     data: files,
@@ -921,14 +1029,21 @@ function FileTableView({
                       {entry.name}
                     </span>
                     {activityMap?.[entry.path] && (
-                      <ActivityDot info={activityMap[entry.path]} />
+                      <ActivityDot
+                        info={activityMap[entry.path]}
+                        onClick={
+                          onActivityDotClick
+                            ? () => onActivityDotClick(entry.path)
+                            : undefined
+                        }
+                      />
                     )}
                     {gitStatus?.[entry.path] && <GitStatusBadge status={gitStatus[entry.path]} />}
                   </div>
                   {viewMode === "detail" && (
                     <>
                       <div className="flex items-center px-3 text-[color:var(--color-text-secondary)] text-[length:var(--font-size-sm)]" style={{ width: 100 }}>
-                        {entry.is_dir ? "--" : formatFileSize(entry.size)}
+                        {formatEntrySize(entry, folderSizes)}
                       </div>
                       <div className="flex items-center px-3 text-[color:var(--color-text-secondary)] text-[length:var(--font-size-sm)]" style={{ width: 180 }}>
                         {formatDate(entry.modified)}
@@ -1040,6 +1155,7 @@ interface FileGridViewProps {
       ageLabel: string;
     }
   >;
+  onActivityDotClick?: (path: string) => void;
 }
 
 function FileGridView({
@@ -1052,6 +1168,7 @@ function FileGridView({
   focusedIndex,
   onFocusedIndexChange,
   activityMap,
+  onActivityDotClick,
 }: FileGridViewProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const selectedSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
@@ -1240,7 +1357,14 @@ function FileGridView({
                     </div>
                     <div className="flex items-center justify-center gap-1 w-full px-1 mt-1">
                       {activityMap?.[entry.path] && (
-                        <ActivityDot info={activityMap[entry.path]} />
+                        <ActivityDot
+                          info={activityMap[entry.path]}
+                          onClick={
+                            onActivityDotClick
+                              ? () => onActivityDotClick(entry.path)
+                              : undefined
+                          }
+                        />
                       )}
                       <span
                         className={cn(

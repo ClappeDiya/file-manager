@@ -1,7 +1,7 @@
 import { useCallback, useRef, useEffect, useState } from "react";
 import { cn } from "@ufop/ui-components";
 import { Button, Badge } from "@ufop/ui-components";
-import { Search, X, Filter, Save, ChevronDown } from "lucide-react";
+import { Search, X, Filter, Save, ChevronDown, Wind, Archive } from "lucide-react";
 import { useFileManagerStore, type SavedSearch } from "@/stores/file-manager-store";
 
 // ──────────────────────────────────────────────
@@ -14,6 +14,29 @@ interface FilterBarProps {
   filteredCount: number;
   onContentSearch?: (query: string, path: string) => void;
   className?: string;
+  /** **Stale Files Filter** — number of files in the current directory
+   *  that the unified ledger has NOT seen any activity on within the
+   *  staleness window. When > 0, the FilterBar renders a "Stale" chip
+   *  that toggles a stale-only filter on the file list. When 0, the
+   *  chip is hidden entirely (zero base cognitive load). Pass
+   *  `undefined` to disable the chip across the board. */
+  staleCount?: number;
+  /** Whether the stale-only filter is currently active. Controlled by
+   *  the parent so the filter logic stays in one place
+   *  (file-manager.tsx) and the chip stays a pure presentational
+   *  toggle. */
+  staleActive?: boolean;
+  /** Toggle handler for the Stale chip. The parent flips its filter
+   *  state and re-runs the file pipeline. */
+  onToggleStale?: () => void;
+  /** **Smart Archive** — completes the cleanup story started by the
+   *  Stale chip. When the user has the stale filter active and there
+   *  are stale files visible, this handler is invoked to move them
+   *  into a dated `.archive/{YYYY-MM}/` subfolder of the current
+   *  directory. The button is rendered next to the active chip; the
+   *  handler is responsible for the safety / undo / refresh plumbing
+   *  (FilterBar stays purely presentational). */
+  onArchiveStale?: () => void;
 }
 
 export function FilterBar({
@@ -22,6 +45,10 @@ export function FilterBar({
   filteredCount,
   onContentSearch,
   className,
+  staleCount,
+  staleActive,
+  onToggleStale,
+  onArchiveStale,
 }: FilterBarProps) {
   const filterText = useFileManagerStore((s) => s.panes[paneIndex].filterText);
   const setFilterText = useFileManagerStore((s) => s.setFilterText);
@@ -29,10 +56,18 @@ export function FilterBar({
   const [searchContents, setSearchContents] = useState(false);
   const contentSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Focus filter on Cmd+F
+  // Focus filter on Cmd+F. Both pane FilterBars mount window-level
+  // listeners, so we MUST gate on `activePaneIndex` — otherwise both
+  // handlers fire for every Cmd+F and the last-mounted one wins,
+  // silently routing focus to whichever pane happens to be index 1.
+  // Reading from the store synchronously inside the handler keeps
+  // this reactive without re-binding the listener on every focus
+  // change.
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+        const activeIndex = useFileManagerStore.getState().activePaneIndex;
+        if (activeIndex !== paneIndex) return;
         e.preventDefault();
         inputRef.current?.focus();
         inputRef.current?.select();
@@ -40,7 +75,7 @@ export function FilterBar({
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
+  }, [paneIndex]);
 
   // Debounced content search
   useEffect(() => {
@@ -112,6 +147,66 @@ export function FilterBar({
           />
           Contents
         </label>
+      )}
+      {/* Stale Files chip — surfaces files in this folder that the
+          unified ledger has not seen activity on within the staleness
+          window. Hidden when count is 0 so casual users never see it;
+          power users get one-click access to a cleanup view. Toggling
+          composes with the text filter above and the existing
+          select/cut/delete flows in the file list. */}
+      {staleCount !== undefined && staleCount > 0 && onToggleStale && (
+        <button
+          type="button"
+          onClick={onToggleStale}
+          aria-pressed={staleActive ?? false}
+          aria-label={
+            staleActive
+              ? `Showing ${staleCount} stale files (click to show all)`
+              : `${staleCount} stale files in this folder (click to filter)`
+          }
+          title={
+            staleActive
+              ? "Click to show all files"
+              : `Show only the ${staleCount} files no engine has touched in 30+ days`
+          }
+          className={cn(
+            "flex items-center gap-1 h-5 px-2 rounded-full shrink-0",
+            "text-[length:var(--font-size-xs)] transition-colors",
+            "border focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]",
+            staleActive
+              ? "border-amber-500 bg-amber-500/15 text-amber-700 dark:text-amber-300"
+              : "border-[var(--color-border)] text-[color:var(--color-text-tertiary)] hover:bg-[var(--color-hover-bg)] hover:text-[color:var(--color-text)]",
+          )}
+          data-testid="stale-files-chip"
+        >
+          <Wind className="h-3 w-3" aria-hidden="true" />
+          <span className="tabular-nums">{staleCount}</span>
+          <span>stale</span>
+        </button>
+      )}
+      {/* Smart Archive — one-click cleanup. Visible only when the stale
+          chip is currently active AND there are still stale files to
+          act on AND the parent has wired a handler. Reuses the existing
+          safety / undo plumbing through the parent's handleArchiveStale
+          so this button stays presentational. */}
+      {staleActive && staleCount !== undefined && staleCount > 0 && onArchiveStale && (
+        <button
+          type="button"
+          onClick={onArchiveStale}
+          aria-label={`Archive ${staleCount} stale files into a dated subfolder`}
+          title={`Move all ${staleCount} stale files into .archive/{YYYY-MM}/ — fully undoable`}
+          className={cn(
+            "flex items-center gap-1 h-5 px-2 rounded-full shrink-0",
+            "text-[length:var(--font-size-xs)] transition-colors",
+            "border border-amber-500 bg-amber-500 text-white",
+            "hover:bg-amber-600 hover:border-amber-600",
+            "focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]",
+          )}
+          data-testid="stale-archive-button"
+        >
+          <Archive className="h-3 w-3" aria-hidden="true" />
+          <span>Archive</span>
+        </button>
       )}
       <span
         className="text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)] shrink-0"

@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useFileManagerStore, type ViewMode } from "@/stores/file-manager-store";
+import {
+  useFileManagerStore,
+  type ViewMode,
+} from "@/stores/file-manager-store";
+import { formatBytes } from "@/lib/format-bytes";
 import { useUIStore } from "@/stores/ui-store";
 import { useAiStore, type AiExecutionResult } from "@/stores/ai-store";
 import { useAutomationStore } from "@/stores/automation-store";
@@ -8,6 +12,24 @@ import { useTerminalStore } from "@/stores/terminal-store";
 import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { loadSmartDestinations, fileExtension, type SmartDestination } from "@/hooks/use-smart-destinations";
 import { assessBeforeExecute } from "@/lib/safety";
+import { copyToClipboardWithToast } from "@/lib/clipboard";
+import { reportOperationFailure } from "@/lib/op-error-toast";
+import {
+  computeListBytes,
+  computeSelectionBytes,
+  formatPaneStatsLabel,
+} from "@/lib/selection-stats";
+import { archiveExtractDest } from "@/lib/archive-paths";
+import {
+  useDriveSpace,
+  useAllDrives,
+  invalidateDriveCache,
+  refreshDriveCacheIfStale,
+} from "@/hooks/use-drive-space";
+import {
+  formatDriveSpace,
+  formatDriveSpaceDetail,
+} from "@/lib/drive-space";
 import {
   dispatchLedgerPath,
   deriveLabel,
@@ -31,8 +53,9 @@ import { ConnectionPanel } from "./connection-panel";
 import { SyncPanel } from "./sync-panel";
 import { PreviewPane } from "./preview-pane";
 import { TransferHistoryPanel } from "./transfer-history-panel";
-import { ArchiveBrowser } from "./archive-browser";
+import { ArchiveBrowser, CreateArchiveDialog } from "./archive-browser";
 import { TextEditorModal } from "./text-editor-modal";
+import { CompareFilesModal, type CompareData } from "./compare-files-modal";
 import { IntegrityTools } from "./integrity-tools";
 import {
   dispatchRefresh,
@@ -50,7 +73,12 @@ import { SinceLastSeenToast, type LedgerSinceSummary } from "./since-last-seen-t
 import { ActivityTimelinePanel } from "./activity-timeline-panel";
 import { useActivityTimelineStore } from "@/stores/activity-timeline-store";
 import { LineagePanel } from "./lineage-panel";
-import { useLineageStore } from "@/stores/lineage-store";
+import { useLineageStore, type FileLineage } from "@/stores/lineage-store";
+import {
+  inferPathRecall,
+  describePathRecall,
+  type PathRecallInfo,
+} from "@/lib/path-recall";
 import { PathJumpDialog } from "./path-jump-dialog";
 import { usePathJumpStore } from "@/stores/path-jump-store";
 import { SafetyInterlockDialog } from "./safety-interlock-dialog";
@@ -268,6 +296,37 @@ export function FileManager() {
   const toggleSyncBrowsing = useFileManagerStore((s) => s.toggleSyncBrowsing);
   const singlePaneMode = useFileManagerStore((s) => s.singlePaneMode);
 
+  // Iter 17: live drive list for the sidebar's Devices section. The
+  // hook reuses iter-16's 30s-TTL cache, so this single subscription
+  // amortises across the status-bar free-space lookup and any other
+  // mount-table consumer. The mapping below normalises the backend
+  // field names (`mount_point`, `total_bytes`, `free_bytes`) to the
+  // older `path`/`totalSpace`/`freeSpace` shape `SidebarNav` was
+  // built around — kept inline because it's the *only* place the
+  // two shapes meet, and a one-purpose helper would be more cognitive
+  // overhead than the four-key object literal it replaces.
+  const allDrives = useAllDrives();
+  const sidebarDrives = useMemo(
+    () =>
+      allDrives.map((d) => ({
+        name: d.name,
+        path: d.mount_point,
+        totalSpace: d.total_bytes,
+        freeSpace: d.free_bytes,
+        removable: d.removable,
+        // Iter 19: pre-compute the rich tooltip at the boundary where
+        // backend snake_case meets frontend camelCase. Reuses iter 16's
+        // `formatDriveSpaceDetail` so the sidebar hover and the
+        // status-bar free-space hover speak the same language. Falls
+        // back to "name (mount_point)" when the drive has no space
+        // accounting (network mounts, optical drives) so power users
+        // can still see the full mount path on hover.
+        tooltip:
+          formatDriveSpaceDetail(d) ?? `${d.name} (${d.mount_point})`,
+      })),
+    [allDrives],
+  );
+
   // Toolbar customization (#14)
   const toolbarItems = useUIStore((s) => s.toolbarItems);
   const setToolbarItems = useUIStore((s) => s.setToolbarItems);
@@ -422,6 +481,16 @@ export function FileManager() {
     files: string[];
   } | null>(null);
 
+  // Iter 41: Compress to archive. Mirrors the integrity-tools modal
+  // pattern (singleton state at FileManager scope; `null` means
+  // closed; FilePane signals up via the new `onCompress` prop).
+  // Hosts the `CreateArchiveDialog` orphan that was already built in
+  // archive-browser.tsx — backend `archive_create` IPC has been
+  // wired since T-062, only the entry point was missing.
+  const [createArchiveSources, setCreateArchiveSources] = useState<
+    string[] | null
+  >(null);
+
   const handleSaveWorkspace = useCallback(() => {
     const name = window.prompt("Save workspace as:", `Workspace ${workspaces.length + 1}`);
     if (name?.trim()) {
@@ -549,6 +618,53 @@ export function FileManager() {
       });
     }
   }, [popUndo]);
+
+  // Universal Time-Travel Redo — symmetric mirror of `handleUndo`. Cmd+Shift+Z
+  // re-applies the most recent undone operation via the ledger-backed
+  // `redo_last` command. Pure additive: users who never press Cmd+Shift+Z
+  // see no change. Outside Tauri this is a no-op (the demo undo stack has
+  // no redo concept), matching the behaviour of every other ledger-bound
+  // shortcut in this file.
+  const handleRedo = useCallback(async () => {
+    if (!isTauriAvailable()) return;
+    try {
+      const outcome = await tauriInvoke<{
+        success: boolean;
+        correlation_id: string;
+        kind: string;
+        summary: string;
+        item_count: number;
+      }>("redo_last", undefined, {
+        success: false,
+        correlation_id: "",
+        kind: "",
+        summary: "Nothing to redo",
+        item_count: 0,
+      });
+      useUIStore.getState().addStructuredError({
+        what: outcome.success
+          ? `Redid ${outcome.kind}`
+          : "Nothing to redo",
+        why: outcome.success
+          ? outcome.summary
+          : "There is no undone operation to re-apply.",
+        appDid: outcome.success
+          ? `Re-applied ${outcome.item_count} item(s) via operation ledger`
+          : "No-op",
+        userAction: outcome.success
+          ? "Press Cmd+Shift+Z again to redo the next most recent undo"
+          : "Undo an operation first (Cmd+Z), then Cmd+Shift+Z will replay it",
+      });
+    } catch (err) {
+      console.error("Redo failed:", err);
+      useUIStore.getState().addStructuredError({
+        what: "Redo failed",
+        why: String(err),
+        appDid: "The backend rejected the redo request",
+        userAction: "Check the Activity Timeline for the most recent undo and verify the source files still exist",
+      });
+    }
+  }, []);
 
   // Iter 46: single-path dispatch handler that routes any ledger
   // path through the shared `dispatchLedgerPath` helper. Used by:
@@ -707,6 +823,33 @@ export function FileManager() {
     void loadAutomationRules();
   }, [loadAutomationRules]);
 
+  // Iter 18: opportunistically refresh the drive list and free-space
+  // numbers when the user returns to the window. Solves the "I plugged
+  // in a USB while UFOP was in the background" gap from iter 17 — the
+  // sidebar would otherwise wait up to 30s (iter-16 cache TTL) before
+  // noticing the new mount. Same wire also keeps the status-bar
+  // free-space honest when a long-running background transfer mutates
+  // disk usage off-screen.
+  //
+  // Mirrors the pull-on-attention pattern in `activity-timeline-panel.tsx`
+  // (search "onFocus") — focus + visibilitychange together cover both
+  // app-switch (Cmd+Tab) and desktop-switch / minimise-restore on every
+  // platform. Throttled to 5s so rapid focus toggling doesn't thrash
+  // the IPC: a stale-enough cache invalidates, a fresh one does nothing.
+  useEffect(() => {
+    const STALE_AFTER_MS = 5_000;
+    const onAttention = () => {
+      if (document.visibilityState !== "visible") return;
+      refreshDriveCacheIfStale(STALE_AFTER_MS);
+    };
+    window.addEventListener("focus", onAttention);
+    document.addEventListener("visibilitychange", onAttention);
+    return () => {
+      window.removeEventListener("focus", onAttention);
+      document.removeEventListener("visibilitychange", onAttention);
+    };
+  }, []);
+
   // Global keyboard shortcuts
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
@@ -745,6 +888,14 @@ export function FileManager() {
       if ((e.metaKey || e.ctrlKey) && e.key === "z" && !e.shiftKey) {
         e.preventDefault();
         handleUndo();
+      }
+      // Cmd+Shift+Z to redo — symmetric Cmd+Z pair via the ledger-backed
+      // `redo_last` IPC. Matches the universal redo gesture used by every
+      // major editor and browser; pure additive (no change for users who
+      // never undo).
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "z" || e.key === "Z")) {
+        e.preventDefault();
+        handleRedo();
       }
       // Cmd+Shift+A to toggle AI panel (T-043)
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "A") {
@@ -1010,6 +1161,30 @@ export function FileManager() {
           }
         }
       }
+      // Cmd+Shift+G ("Get history") \u2014 toggle the Lineage Panel for the
+      // first selected file. Symmetric mirror of Cmd+Shift+P: if the
+      // panel is open, close it; otherwise open on the active selection
+      // (or no-op when nothing is selected \u2014 silent because a toast on
+      // every misfire of an unfocused shortcut would be noisy). Reads
+      // selection inline from the store so the binding stays TDZ-safe
+      // alongside the other helpers further down the file. Pairs with
+      // the existing right-click "Show File History" + activity-dot
+      // click \u2014 same backend command (`get_file_lineage`), now a
+      // keyboard gesture too.
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "G") {
+        e.preventDefault();
+        const lineageStore = useLineageStore.getState();
+        if (lineageStore.pendingPath !== null) {
+          lineageStore.close();
+        } else {
+          const fmStore = useFileManagerStore.getState();
+          const pane = fmStore.getActivePane();
+          const sel = fmStore.selectedPaths[pane.id];
+          if (sel && sel.length > 0) {
+            lineageStore.beginRequest(sel[0]);
+          }
+        }
+      }
       // Cmd+Shift+C — Copy the active pane's selection (or the
       // current directory path when nothing is selected) to the
       // system clipboard, one path per line. Fixes the pre-existing
@@ -1191,7 +1366,7 @@ export function FileManager() {
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [toggleSidebar, undoStack, toggleAiPanel, toggleTerminalPanel, toggleActivityTimeline, handleUndo, handleSaveWorkspace, handleJumpLastTouched]);
+  }, [toggleSidebar, undoStack, toggleAiPanel, toggleTerminalPanel, toggleActivityTimeline, handleUndo, handleRedo, handleSaveWorkspace, handleJumpLastTouched]);
 
   // "What happened while you were away?" — single mount-time ledger
   // summary call. Reads events added since the last session and shows a
@@ -1320,6 +1495,22 @@ export function FileManager() {
           window.dispatchEvent(new CustomEvent("ufop:refresh-directory"));
         },
         onUndo: handleUndo,
+        onRedo: handleRedo,
+        // Mirror of the Cmd+Shift+G keyboard binding — same toggle
+        // semantics, same selection lookup, same store action. Routing
+        // both surfaces through one inline closure keeps the palette
+        // entry and the shortcut from drifting.
+        onShowFileHistory: () => {
+          const lineageStore = useLineageStore.getState();
+          if (lineageStore.pendingPath !== null) {
+            lineageStore.close();
+            return;
+          }
+          const path = getFirstSelectedPath();
+          if (path !== null) {
+            lineageStore.beginRequest(path);
+          }
+        },
         onSetTheme: (theme) =>
           useUIStore.getState().setTheme(theme as "light" | "dark" | "system"),
         onSetViewMode: (mode) => {
@@ -1328,37 +1519,73 @@ export function FileManager() {
         },
         onSaveWorkspace: handleSaveWorkspace,
         onLoadWorkspace: () => setWorkspaceMenuOpen(true),
+        // Command-palette copy actions — previously each one silently
+        // swallowed success and failure (try { ... } catch {}). They
+        // now route through the shared `copyToClipboardWithToast`
+        // helper so a user firing Copy Path via the palette gets the
+        // same visible feedback as firing it via the context menu.
+        // IPC-resolved variants explicitly distinguish a backend
+        // rejection from a clipboard-write failure.
         onCopyPath: async () => {
           const path = getFirstSelectedPath();
-          if (path) {
-            try { await navigator.clipboard.writeText(path); } catch {}
-          }
+          if (!path) return;
+          await copyToClipboardWithToast(path, "Copy Path");
         },
         onCopyRemotePath: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
+          let resolved: string;
           try {
             const result = await tauriInvoke<{ path: string }>("copy_remote_path", { path, remoteBase: null });
-            await navigator.clipboard.writeText(result.path);
-          } catch {}
+            resolved = result.path;
+          } catch (err) {
+            useUIStore.getState().addStructuredError({
+              what: "Copy Remote Path failed",
+              why: err instanceof Error ? err.message : "Backend rejected the request",
+              appDid: "Did not write anything to the clipboard",
+              userAction: "Confirm a remote base is configured for this connection",
+            });
+            return;
+          }
+          await copyToClipboardWithToast(resolved, "Copy Remote Path");
         },
         onCopyUrl: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
+          let resolved: string;
           try {
             const result = await tauriInvoke<{ path: string }>("copy_url", { path, protocol: "local", host: "localhost", port: null, username: null });
-            await navigator.clipboard.writeText(result.path);
-          } catch {}
+            resolved = result.path;
+          } catch (err) {
+            useUIStore.getState().addStructuredError({
+              what: "Copy URL failed",
+              why: err instanceof Error ? err.message : "Backend rejected the request",
+              appDid: "Did not write anything to the clipboard",
+              userAction: "Try the simple Copy Path action instead",
+            });
+            return;
+          }
+          await copyToClipboardWithToast(resolved, "Copy URL");
         },
         onCopyRelativePath: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
           const store = useFileManagerStore.getState();
           const basePath = store.getActivePath(store.activePaneIndex);
+          let resolved: string;
           try {
             const result = await tauriInvoke<{ path: string }>("copy_relative_path", { path, basePath });
-            await navigator.clipboard.writeText(result.path);
-          } catch {}
+            resolved = result.path;
+          } catch (err) {
+            useUIStore.getState().addStructuredError({
+              what: "Copy Relative Path failed",
+              why: err instanceof Error ? err.message : "Backend rejected the request",
+              appDid: "Did not write anything to the clipboard",
+              userAction: "Confirm the current pane has a valid base path",
+            });
+            return;
+          }
+          await copyToClipboardWithToast(resolved, "Copy Relative Path");
         },
         onOpenInEditor: async () => {
           const path = getFirstSelectedPath();
@@ -1596,7 +1823,7 @@ export function FileManager() {
         },
       }),
     ],
-    [quickflowCommands, toggleSidebar, handleUndo, handleSaveWorkspace, getFirstSelectedPath, getAllSelectedPaths, toggleAutomationPanel, automationPanelOpen, toggleActivityTimeline, favorites, handleJumpLastTouched],
+    [quickflowCommands, toggleSidebar, handleUndo, handleRedo, handleSaveWorkspace, getFirstSelectedPath, getAllSelectedPaths, toggleAutomationPanel, automationPanelOpen, toggleActivityTimeline, favorites, handleJumpLastTouched],
   );
 
   return (
@@ -1845,6 +2072,33 @@ export function FileManager() {
             aria-label="File navigation sidebar"
           >
             <SidebarNav
+              drives={sidebarDrives}
+              onEjectDrive={async (mountPoint) => {
+                if (!isTauriAvailable()) return;
+                const driveLabel =
+                  sidebarDrives.find((d) => d.path === mountPoint)?.name ??
+                  mountPoint;
+                try {
+                  await tauriInvoke("eject_drive", { mountPoint });
+                  // Bust the iter-16 drive cache so the just-ejected
+                  // volume disappears from the sidebar and the
+                  // status-bar free-space indicator immediately.
+                  invalidateDriveCache();
+                  useUIStore.getState().addStructuredError({
+                    what: `Ejected ${driveLabel}`,
+                    why: "The drive's mount table entry was unmounted",
+                    appDid:
+                      "Unmounted the volume so it's safe to disconnect physically",
+                    userAction:
+                      "Wait for the OS to spin the drive down, then unplug it",
+                  });
+                } catch (err) {
+                  reportOperationFailure("Eject drive", err, {
+                    userAction:
+                      "Make sure no files on the drive are open in this or any other app",
+                  });
+                }
+              }}
               onNavigate={(path) => {
                 const store = useFileManagerStore.getState();
                 const paneIndex = store.activePaneIndex;
@@ -1899,6 +2153,7 @@ export function FileManager() {
                   onVerifyIntegrity={(files, dir) =>
                     setIntegrityToolsOpen({ dir, files })
                   }
+                  onCompress={(files) => setCreateArchiveSources(files)}
                 />
               )}
             />
@@ -2166,6 +2421,29 @@ export function FileManager() {
         </div>
       )}
 
+      {/* Iter 41: Create Archive dialog. The component itself already
+          owns its overlay chrome (fixed full-screen wrapper inside
+          `CreateArchiveDialog`), so we only gate mounting on the
+          non-null sources state. `onComplete` fires the standard
+          path-aware refresh so any pane viewing the destination
+          directory immediately shows the new archive file. */}
+      {createArchiveSources !== null && (
+        <CreateArchiveDialog
+          sourcePaths={createArchiveSources}
+          isOpen={true}
+          onClose={() => setCreateArchiveSources(null)}
+          onComplete={(result) => {
+            if (result.success && result.archive_path) {
+              const parent = result.archive_path.substring(
+                0,
+                result.archive_path.lastIndexOf("/"),
+              );
+              if (parent) dispatchRefresh([parent]);
+            }
+          }}
+        />
+      )}
+
       {/* Iter 32: Text Editor modal. Hosts the long-orphaned
           `TextEditor` (234 LOC) via `TextEditorModal` which
           bridges the editor's pure-UI contract to the two IPCs
@@ -2366,6 +2644,12 @@ interface FilePaneProps {
    *  tab is pre-populated with the user's current selection
    *  (or the right-clicked entry when nothing is selected). */
   onVerifyIntegrity: (files: string[], dir: string) => void;
+  /** Iter 41: open the `CreateArchiveDialog` (long-orphaned tail of
+   *  the iter 31 archive integration) pre-filled with the right-
+   *  clicked selection. Singleton modal lives at FileManager scope so
+   *  both panes share one dialog instance — same pattern as
+   *  `onArchiveBrowse` / `onVerifyIntegrity` above. */
+  onCompress: (files: string[]) => void;
 }
 
 function FilePane({
@@ -2374,6 +2658,7 @@ function FilePane({
   onArchiveBrowse,
   onTextEdit,
   onVerifyIntegrity,
+  onCompress,
 }: FilePaneProps) {
   const pane = useFileManagerStore((s) => s.panes[paneIndex]);
   const navigateTab = useFileManagerStore((s) => s.navigateTab);
@@ -2390,6 +2675,17 @@ function FilePane({
   const [focusedIndex, setFocusedIndex] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Path Recall — when loadDirectory fails because the path no
+  // longer exists, the existing fallback silently substitutes
+  // demo content. That's confusing: the user can't tell whether
+  // they're seeing real data or stale. We layer the unified
+  // ledger's lineage engine ON TOP of the existing fallback to
+  // answer the universal "where did my file go?" question.
+  //
+  // The state is `null` whenever there is nothing useful to say
+  // (no error, or no events in the ledger). The pure helper
+  // `inferPathRecall` decides — see `@/lib/path-recall`.
+  const [pathRecall, setPathRecall] = useState<PathRecallInfo | null>(null);
 
   // Feature 2: Git status (#46)
   const [gitStatus, setGitStatus] = useState<Record<string, string>>({});
@@ -2424,24 +2720,46 @@ function FilePane({
     comment: string;
   } | null>(null);
 
-  // Feature 2: Folder size calculation (#83)
-  const [_folderSizes, setFolderSizes] = useState<Record<string, number>>({});
+  // Feature 2: Folder size calculation (#83) — pane-local cache of
+  // computed recursive folder sizes. Keyed by absolute folder path.
+  // Populated by the "Calculate Size" context-menu action via
+  // `handleCalculateSize`; consumed by `<FileList folderSizes={...}>`
+  // to surface the cached value in the Size column once computed.
+  // Lives in pane state because freshly listed directories don't
+  // pre-compute size (that would walk the whole tree on every
+  // navigation — too expensive); the user opts in per folder.
+  const [folderSizes, setFolderSizes] = useState<Record<string, number>>({});
 
   // Feature 3: Quick Select (#71)
   const [quickSelectOpen, setQuickSelectOpen] = useState(false);
   const [quickSelectPattern, setQuickSelectPattern] = useState("");
 
-  // Compare files state (#47)
-  const [_compareData, setCompareData] = useState<{left: string, right: string, leftName: string, rightName: string} | null>(null);
+  // Compare files state (#47) — populated by `handleCompareFiles`
+  // when the user picks "Compare Selected" with two files; consumed
+  // by the `<CompareFilesModal>` mounted at the end of this pane's
+  // JSX tree. Each pane owns its own compare state, mirroring how
+  // every other pane-local feature (filter text, focused index,
+  // gitStatus) works.
+  const [compareData, setCompareData] = useState<CompareData | null>(null);
 
   // Feature 5: Per-folder view defaults debounce timer (#13)
   const folderViewSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Load directory contents ──
 
+  // Cancellation token for the in-flight Path Recall lineage fetch.
+  // Each loadDirectory call increments this; a lineage resolution
+  // whose token no longer matches is discarded, so rapid navigation
+  // can never show recall info for a path the user already left.
+  const pathRecallTokenRef = useRef(0);
+
   const loadDirectory = useCallback(async (path: string) => {
     setLoading(true);
     setError(null);
+    setPathRecall(null);
+    // Bump the recall token before any async work so any earlier
+    // in-flight lineage fetch becomes a no-op when it resolves.
+    const token = ++pathRecallTokenRef.current;
     try {
       if (isTauriAvailable()) {
         const entries = await tauriInvoke<FileEntryData[]>("list_directory", { path });
@@ -2453,6 +2771,30 @@ function FilePane({
       console.error("Failed to list directory:", err);
       setError(String(err));
       setFiles(generateDemoFiles(path));
+      // Path Recall — ask the ledger whether it has any history for
+      // this path so we can show the user where it went. Fail-soft:
+      // any error during the lineage fetch is silently swallowed,
+      // leaving pathRecall=null and the user with the existing
+      // demo-files behaviour. The IPC already exists and is read-
+      // only (one SQL scan), so this adds no operational cost.
+      if (isTauriAvailable()) {
+        try {
+          const lineage = await tauriInvokeSafe<FileLineage | null>(
+            "get_file_lineage",
+            { path },
+            null,
+          );
+          // Stale-result guard: another loadDirectory call may have
+          // started while we were awaiting. Compare the captured
+          // token against the latest ref value — only the most
+          // recent loader is allowed to set pathRecall.
+          if (token === pathRecallTokenRef.current) {
+            setPathRecall(inferPathRecall(lineage, path));
+          }
+        } catch {
+          /* lineage best-effort; keep demo-files fallback */
+        }
+      }
     } finally {
       setLoading(false);
       setFocusedIndex(0);
@@ -2662,6 +3004,25 @@ function FilePane({
   const { selectedPaths, handleSelect, selectAll, invertSelection } =
     useFileSelection(pane.id, visibleFiles);
 
+  // Status-bar stats — publish folder + selection tallies into the store
+  // every time the file list or selection changes. The store applies
+  // equality-shortcircuit so the global status bar's subscriber stays
+  // quiet between irrelevant renders. Uses `visibleFiles` (post-filter,
+  // post-hidden) so the counts match what the user can actually see —
+  // matching Finder's "5 of 27 items" convention when a filter is on.
+  useEffect(() => {
+    const folder = computeListBytes(visibleFiles);
+    const sel = computeSelectionBytes(visibleFiles, selectedPaths);
+    useFileManagerStore.getState().setPaneStats(pane.id, {
+      totalCount: folder.count,
+      totalBytes: folder.bytes,
+      totalHasDir: folder.hasDir,
+      selectedCount: sel.count,
+      selectedBytes: sel.bytes,
+      selectedHasDir: sel.hasDir,
+    });
+  }, [visibleFiles, selectedPaths, pane.id]);
+
   // Drag and drop
   const { handleDragOver, handleDrop } = useFileDragDrop(pane.id);
 
@@ -2759,8 +3120,7 @@ function FilePane({
     };
 
     const size = await calculateRecursive(folderPath);
-    setFolderSizes(prev => ({ ...prev, [folderPath]: size }));
-    console.log(`Folder size for ${folderPath}: ${size} bytes`);
+    setFolderSizes((prev) => ({ ...prev, [folderPath]: size }));
   }, []);
 
   // Conflict check helper
@@ -2813,7 +3173,9 @@ function FilePane({
         // (harmless for copy but needed for symmetry with move).
         // Unrelated panes skip the reload.
         dispatchRefresh([currentPath, otherPath]);
-      } catch (err) { console.error("Copy failed:", err); }
+      } catch (err) {
+        reportOperationFailure("Copy", err);
+      }
     } else { console.log("Copy (demo mode):", selectedPaths); }
   }, [selectedPaths, paneIndex, pushUndo, checkConflicts, currentPath]);
 
@@ -2845,7 +3207,9 @@ function FilePane({
         // `loadDirectory(currentPath)` only refreshed the source
         // pane, leaving the destination pane showing stale state.
         dispatchRefresh([currentPath, otherPath]);
-      } catch (err) { console.error("Move failed:", err); }
+      } catch (err) {
+        reportOperationFailure("Move", err);
+      }
     } else { console.log("Cut (demo mode):", selectedPaths); }
   }, [selectedPaths, paneIndex, pushUndo, currentPath, checkConflicts]);
 
@@ -2870,7 +3234,12 @@ function FilePane({
         // same directory (e.g. after Open-in-Other-Pane from
         // iter 11) will notice the deletion automatically.
         dispatchRefresh([currentPath, ...selectedPaths]);
-      } catch (err) { console.error("Delete failed:", err); }
+      } catch (err) {
+        reportOperationFailure("Delete", err, {
+          userAction:
+            "Check the files aren't locked by another app and you have permission to remove them",
+        });
+      }
     } else { console.log("Delete (demo mode):", selectedPaths); }
   }, [selectedPaths, pushUndo, currentPath]);
 
@@ -2910,7 +3279,14 @@ function FilePane({
         // Iter 19: path-aware refresh so any other pane viewing
         // these paths (or their parent directory) also updates.
         dispatchRefresh([currentPath, ...paths]);
-      } catch (err) { console.error("Permanent delete failed:", err); }
+      } catch (err) {
+        reportOperationFailure("Permanent delete", err, {
+          appDid:
+            "Did not change anything on disk; the files were NOT removed",
+          userAction:
+            "Check file permissions and that no app is holding the files open",
+        });
+      }
     } else { console.log("Delete permanently (demo mode):", paths); }
   }, [currentPath]);
 
@@ -2928,7 +3304,12 @@ function FilePane({
           // path is a child of the parent, so the helper's prefix
           // match kicks in).
           dispatchRefresh([filePath, newPath]);
-        } catch (err) { console.error("Rename failed:", err); }
+        } catch (err) {
+          reportOperationFailure("Rename", err, {
+            userAction:
+              "Check the new name doesn't already exist and contains no path separators",
+          });
+        }
       }
     } else { console.log("Rename (demo mode):", filePath); }
   }, [pushUndo]);
@@ -2942,7 +3323,9 @@ function FilePane({
         // originals. Passing both selectedPaths and currentPath
         // covers every pane that might be viewing either.
         dispatchRefresh([currentPath, ...selectedPaths]);
-      } catch (err) { console.error("Duplicate failed:", err); }
+      } catch (err) {
+        reportOperationFailure("Duplicate", err);
+      }
     } else { console.log("Duplicate (demo mode):", selectedPaths); }
   }, [selectedPaths, currentPath]);
 
@@ -2958,7 +3341,12 @@ function FilePane({
           // listings change; passing newPath as well for any pane
           // that might already be viewing it (unusual but safe).
           dispatchRefresh([currentPath, newPath]);
-        } catch (err) { console.error("Create directory failed:", err); }
+        } catch (err) {
+          reportOperationFailure("Create folder", err, {
+            userAction:
+              "Check the name doesn't conflict with an existing item and you have write permission",
+          });
+        }
       }
     } else { console.log("New Folder (demo mode) in", currentPath); }
   }, [currentPath, pushUndo]);
@@ -2973,7 +3361,12 @@ function FilePane({
           pushUndo({ id: `mkfile-${Date.now()}`, type: "create_file", sourcePaths: [], destPaths: [newPath], timestamp: Date.now() });
           // Iter 19: same pattern as handleNewFolder.
           dispatchRefresh([currentPath, newPath]);
-        } catch (err) { console.error("Create file failed:", err); }
+        } catch (err) {
+          reportOperationFailure("Create file", err, {
+            userAction:
+              "Check the name doesn't conflict with an existing item and you have write permission",
+          });
+        }
       }
     } else { console.log("New File (demo mode) in", currentPath); }
   }, [currentPath, pushUndo]);
@@ -2985,7 +3378,7 @@ function FilePane({
 
     if (isTauriAvailable()) {
       try {
-        metadata = await tauriInvoke("get_file_metadata", { path: filePath });
+        metadata = await tauriInvoke<Record<string, unknown>>("get_file_metadata", { path: filePath });
       } catch (err) {
         console.error("Get info failed:", err);
       }
@@ -3077,26 +3470,83 @@ function FilePane({
   // Copy as script handler
   const handleCopyAsScript = useCallback(async () => {
     if (selectedPaths.length === 0) return;
+    let script: string;
     if (isTauriAvailable()) {
       try {
-        const script = await tauriInvoke<string>("generate_script", {
+        script = await tauriInvoke<string>("generate_script", {
           operation: "copy",
           sourcePaths: selectedPaths,
           destPath: null,
           options: null,
         });
-        await navigator.clipboard.writeText(script);
       } catch (err) {
-        console.error("Copy as script failed:", err);
+        useUIStore.getState().addStructuredError({
+          what: "Copy as Script failed",
+          why: err instanceof Error ? err.message : "Script generation failed",
+          appDid: "Did not write anything to the clipboard",
+          userAction: "Confirm the selection is non-empty and try again",
+        });
+        return;
       }
     } else {
-      const script = selectedPaths
-        .map((p) => `cp -r "${p}" .`)
-        .join("\n");
-      await navigator.clipboard.writeText(script);
-      console.log("Copy as script (demo mode):", script);
+      script = selectedPaths.map((p) => `cp -r "${p}" .`).join("\n");
     }
+    await copyToClipboardWithToast(script, "Copy as Script");
   }, [selectedPaths]);
+
+  // Iter 15: "Extract Here" right-click handler. Mirror of iter 14's
+  // Compress wiring — uses the same `archive_extract` IPC the
+  // ArchiveBrowser modal calls, with `dest_dir` computed to a same-
+  // name subfolder so contents don't clobber files in the parent.
+  // Routes failures through `reportOperationFailure` for the standard
+  // structured toast; success fires a path-aware refresh so any pane
+  // viewing the parent directory shows the new folder immediately.
+  const handleExtractHere = useCallback(
+    async (archivePath: string) => {
+      const destDir = archiveExtractDest(archivePath);
+      if (!isTauriAvailable()) return;
+      try {
+        const result = await tauriInvoke<{
+          success: boolean;
+          files_processed: number;
+          errors: string[];
+        }>("archive_extract", {
+          params: {
+            archive_path: archivePath,
+            dest_dir: destDir,
+            password: null,
+            selected_entries: null,
+          },
+        });
+        if (!result.success) {
+          useUIStore.getState().addStructuredError({
+            what: "Extract failed",
+            why: result.errors.join("\n") || "The backend reported no progress",
+            appDid: "Did not create any files",
+            userAction:
+              "If the archive is password-protected, double-click it to open the browser and supply a password",
+          });
+          return;
+        }
+        const parent = destDir.substring(0, destDir.lastIndexOf("/")) || "/";
+        dispatchRefresh([parent]);
+        useUIStore.getState().addStructuredError({
+          what: `Extracted ${result.files_processed} item${
+            result.files_processed === 1 ? "" : "s"
+          }`,
+          why: `Archive contents placed in ${destDir}`,
+          appDid: "Refreshed the parent directory so the new folder appears",
+          userAction: "Open the new folder to inspect the extracted contents",
+        });
+      } catch (err) {
+        reportOperationFailure("Extract Here", err, {
+          userAction:
+            "Verify the archive isn't corrupted; password-protected archives need the ArchiveBrowser modal",
+        });
+      }
+    },
+    [],
+  );
 
   // Edit remote (#44)
   const handleEditRemote = useCallback(async () => {
@@ -3110,53 +3560,83 @@ function FilePane({
     } else { console.log("Edit Remote (demo mode):", filePath); }
   }, [selectedPaths]);
 
-  // Copy Path handlers
+  // Copy Path handlers — every one of these previously swallowed
+  // both success and failure silently (try/catch with an empty
+  // `catch {}`). They now route through `copyToClipboardWithToast`
+  // so the user gets visible confirmation on success and an
+  // actionable error toast on failure. The transform-then-copy
+  // handlers (remote / url / relative) still surface a structured
+  // error if their backend IPC fails before the clipboard write —
+  // they explicitly distinguish "IPC failed" from "clipboard failed".
   const handleCopyPath = useCallback(async () => {
     if (selectedPaths.length === 0) return;
-    const path = selectedPaths[0];
-    try {
-      await navigator.clipboard.writeText(path);
-    } catch {}
+    await copyToClipboardWithToast(selectedPaths[0], "Copy Path");
   }, [selectedPaths]);
 
   const handleCopyRemotePath = useCallback(async () => {
     if (selectedPaths.length === 0) return;
-    const path = selectedPaths[0];
+    let resolved: string;
     try {
       const result = await tauriInvoke<{ path: string }>("copy_remote_path", {
-        path,
+        path: selectedPaths[0],
         remoteBase: null,
       });
-      await navigator.clipboard.writeText(result.path);
-    } catch {}
+      resolved = result.path;
+    } catch (err) {
+      useUIStore.getState().addStructuredError({
+        what: "Copy Remote Path failed",
+        why: err instanceof Error ? err.message : "Backend rejected the request",
+        appDid: "Did not write anything to the clipboard",
+        userAction: "Confirm a remote base is configured for this connection",
+      });
+      return;
+    }
+    await copyToClipboardWithToast(resolved, "Copy Remote Path");
   }, [selectedPaths]);
 
   const handleCopyUrl = useCallback(async () => {
     if (selectedPaths.length === 0) return;
-    const path = selectedPaths[0];
+    let resolved: string;
     try {
       const result = await tauriInvoke<{ path: string }>("copy_url", {
-        path,
+        path: selectedPaths[0],
         protocol: "local",
         host: "localhost",
         port: null,
         username: null,
       });
-      await navigator.clipboard.writeText(result.path);
-    } catch {}
+      resolved = result.path;
+    } catch (err) {
+      useUIStore.getState().addStructuredError({
+        what: "Copy URL failed",
+        why: err instanceof Error ? err.message : "Backend rejected the request",
+        appDid: "Did not write anything to the clipboard",
+        userAction: "Try the simple Copy Path action instead",
+      });
+      return;
+    }
+    await copyToClipboardWithToast(resolved, "Copy URL");
   }, [selectedPaths]);
 
   const handleCopyRelativePath = useCallback(async () => {
-    const basePath = currentPath;
     if (selectedPaths.length === 0) return;
-    const path = selectedPaths[0];
+    let resolved: string;
     try {
       const result = await tauriInvoke<{ path: string }>("copy_relative_path", {
-        path,
-        basePath,
+        path: selectedPaths[0],
+        basePath: currentPath,
       });
-      await navigator.clipboard.writeText(result.path);
-    } catch {}
+      resolved = result.path;
+    } catch (err) {
+      useUIStore.getState().addStructuredError({
+        what: "Copy Relative Path failed",
+        why: err instanceof Error ? err.message : "Backend rejected the request",
+        appDid: "Did not write anything to the clipboard",
+        userAction: "Confirm the current pane has a valid base path",
+      });
+      return;
+    }
+    await copyToClipboardWithToast(resolved, "Copy Relative Path");
   }, [selectedPaths, currentPath]);
 
   // Open With / Open in Editor handlers
@@ -3348,11 +3828,63 @@ function FilePane({
           const files = selectedPaths.length > 0 ? selectedPaths : [entry.path];
           onVerifyIntegrity(files, currentPath);
         },
+        // Iter 41: Compress to archive. Same selection-snapshot rule
+        // as Verify Integrity above — if the user has a selection the
+        // dialog uses it; otherwise it falls back to the single right-
+        // clicked entry.
+        onCompress: () => {
+          const files = selectedPaths.length > 0 ? selectedPaths : [entry.path];
+          onCompress(files);
+        },
+        // Iter 15: Extract Here. Only wired when the right-clicked
+        // entry is an archive file — the gating happens here so the
+        // context-menu doesn't need to inspect file types itself,
+        // matching the iter-39 onCompareFiles / onEditRemote
+        // pattern. Direct action — no dialog; for password-
+        // protected archives the user double-clicks instead.
+        onExtract:
+          !entry.is_dir && isArchivePath(entry.path)
+            ? () => handleExtractHere(entry.path)
+            : undefined,
         // Show File History — opens the lineage panel for this exact path.
         // The panel fetches once via `get_file_lineage`, then self-hides on
         // Escape or its own close button. No state persists between calls.
         onShowHistory: () => {
           useLineageStore.getState().beginRequest(entry.path);
+        },
+        // Show Folder Activity — opens the Activity Timeline pre-filtered
+        // to events under this folder. The panel's own filter chip is
+        // dismissible, and `openWithPreset` also clears any prior
+        // engine / failed / correlation filter so the user starts from
+        // the same "show me everything in this folder" baseline every
+        // time, not whatever filter happened to be active before.
+        onShowFolderActivity: entry.is_dir
+          ? () => {
+              useActivityTimelineStore.getState().openWithPreset({
+                pathFilter: entry.path,
+                engineFilter: "all",
+                failedOnly: false,
+                correlationFilter: null,
+              });
+            }
+          : undefined,
+        // Reveal in the native OS file manager. Backend chooses the
+        // platform-specific subprocess (`open -R` / `explorer /select`
+        // / `xdg-open` on the parent dir). Routes failures through
+        // the standard structured-toast surface used by the rest of
+        // the destructive-op handlers — invisible silence here would
+        // be hostile (the user clicks the action and "nothing
+        // happens" is the worst possible feedback).
+        onRevealInOs: async () => {
+          if (!isTauriAvailable()) return;
+          try {
+            await tauriInvoke("reveal_in_os", { path: entry.path });
+          } catch (err) {
+            reportOperationFailure("Show in Finder/Explorer", err, {
+              userAction:
+                "Check the file still exists and your OS file manager is on PATH",
+            });
+          }
         },
         // Smart Send-To: ledger-derived frecency-ranked destinations.
         smartDestinations,
@@ -3360,7 +3892,7 @@ function FilePane({
       });
       onContextMenu({ position: { x: event.clientX, y: event.clientY }, items });
     },
-    [selectedPaths, currentPath, handleOpen, handleCopy, handleCut, handleDelete, handleDeletePermanently, handleRename, handleDuplicate, handleNewFolder, handleNewFile, handleGetInfo, handleCalculateSize, handleEditRemote, handleCompareFiles, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, selectAll, invertSelection, onContextMenu, loadDirectory, isGitRepo, handleSendTo, onVerifyIntegrity],
+    [selectedPaths, currentPath, handleOpen, handleCopy, handleCut, handleDelete, handleDeletePermanently, handleRename, handleDuplicate, handleNewFolder, handleNewFile, handleGetInfo, handleCalculateSize, handleEditRemote, handleCompareFiles, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, selectAll, invertSelection, onContextMenu, loadDirectory, isGitRepo, handleSendTo, onVerifyIntegrity, onCompress, handleExtractHere],
   );
 
   // Keyboard shortcuts for compare (#47) and quick select (#71)
@@ -3483,6 +4015,60 @@ function FilePane({
         </div>
       )}
 
+      {/* Path Recall — ledger-powered "where did my file go?" banner.
+          Rendered only when (a) the most recent loadDirectory call
+          failed and (b) the unified ledger has a usable history for
+          the path. Closes the cognitive gap left by the demo-files
+          fallback by telling the user precisely why the pane is
+          empty, what happened to the original file, and (when the
+          ledger knows) where it lives now. */}
+      {pathRecall && (
+        <div
+          className="flex items-start gap-2 px-3 py-2 text-[length:var(--font-size-xs)] bg-amber-500/10 border-b border-amber-500/20"
+          role="status"
+          aria-live="polite"
+          data-testid="path-recall-banner"
+        >
+          <div className="mt-0.5 text-amber-500" aria-hidden="true">📍</div>
+          <div className="flex-1 min-w-0">
+            <div className="font-medium text-[color:var(--color-text)]">
+              This path {describePathRecall(pathRecall)}
+            </div>
+            <div className="text-[10px] text-[color:var(--color-text-muted)]">
+              Last seen {formatRelativeTime(pathRecall.lastSeenIso)}
+            </div>
+          </div>
+          <div className="flex flex-shrink-0 items-center gap-1">
+            {pathRecall.alternateLocation && (
+              <button
+                type="button"
+                onClick={() => handleNavigate(pathRecall.alternateLocation!)}
+                className="rounded px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300 hover:bg-amber-500/20 focus:outline-none focus:ring-1 focus:ring-amber-500/40"
+                data-testid="path-recall-jump"
+              >
+                Jump there
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => useLineageStore.getState().beginRequest(currentPath)}
+              className="rounded px-2 py-0.5 text-[11px] text-[color:var(--color-text-muted)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover-bg,rgba(255,255,255,0.06))] focus:outline-none focus:ring-1 focus:ring-sky-500/40"
+              data-testid="path-recall-lineage"
+            >
+              Show lineage
+            </button>
+            <button
+              type="button"
+              onClick={() => setPathRecall(null)}
+              aria-label="Dismiss path recall"
+              className="rounded p-0.5 text-[color:var(--color-text-muted)] hover:text-[color:var(--color-text)]"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
+
       <FileList
         files={visibleFiles}
         viewMode={pane.viewMode}
@@ -3495,6 +4081,10 @@ function FilePane({
         gitStatus={gitStatus}
         activityMap={activityMap}
         groupBy={pane.groupBy}
+        folderSizes={folderSizes}
+        onActivityDotClick={(path) =>
+          useLineageStore.getState().beginRequest(path)
+        }
       />
 
       {/* Feature 5: Get Info dialog with editable comments (#82) */}
@@ -3538,6 +4128,14 @@ function FilePane({
           </div>
         </div>
       )}
+
+      {/* Compare Files modal — finally renders the previously
+          orphaned `_compareData` state. The pane owns its own
+          compare modal so each pane's "Compare Selected" action
+          opens in-place; the modal renders nothing when data is
+          null, so the second pane's instance has zero runtime cost
+          unless its own user invokes Compare. */}
+      <CompareFilesModal data={compareData} onClose={() => setCompareData(null)} />
     </div>
   );
 }
@@ -3586,13 +4184,22 @@ function ViewModeSelector() {
 // Status bar
 // ──────────────────────────────────────────────
 
-/** Stable empty array to avoid re-render loops with React 19 + Zustand */
-const EMPTY_PATHS: string[] = [];
-
 function StatusBarContent() {
-  const selectedPaths = useFileManagerStore(
-    (s) => s.selectedPaths[s.panes[s.activePaneIndex].id] ?? EMPTY_PATHS,
+  const paneStats = useFileManagerStore(
+    (s) => s.paneStats[s.panes[s.activePaneIndex].id] ?? null,
   );
+
+  // Iter 16: active pane's current path drives the free-space lookup.
+  // Reading via the standard `panes[i].tabs.find(t => t.id === ...)`
+  // pattern stays consistent with how FilePane resolves its own
+  // `currentPath` — same source of truth, no risk of divergence.
+  const activePath = useFileManagerStore((s) => {
+    const pane = s.panes[s.activePaneIndex];
+    return pane.tabs.find((t) => t.id === pane.activeTabId)?.path ?? "";
+  });
+  const drive = useDriveSpace(activePath);
+  const driveLabel = drive ? formatDriveSpace(drive) : null;
+  const driveDetail = drive ? formatDriveSpaceDetail(drive) : null;
 
   const [appVersion, setAppVersion] = useState<string>("UFOP v0.1.0");
   const [platformInfo, setPlatformInfo] = useState<{ os: string; arch: string; version: string } | null>(null);
@@ -3671,11 +4278,38 @@ function StatusBarContent() {
 
   return (
     <>
-      <span className="text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)]">
-        {selectedPaths.length > 0
-          ? `${selectedPaths.length} item${selectedPaths.length !== 1 ? "s" : ""} selected`
-          : "Ready"}
-      </span>
+      {/* Left cluster: iter-13 summary + iter-16 free-space share a
+          single flex group so the outer `justify-between` keeps three
+          siblings (left cluster, pulse, right cluster) regardless of
+          whether the free-space indicator is rendered. Without this
+          wrapper, adding a 4th top-level child would respace the bar. */}
+      <div className="flex items-center gap-3">
+        <span
+          className="text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)]"
+          data-testid="status-bar-summary"
+          aria-live="polite"
+        >
+          {formatPaneStatsLabel(paneStats, formatBytes)}
+        </span>
+
+        {/* Iter 16: free-space indicator. Renders only when the
+            active pane is on a recognised mount AND that mount
+            reports accounting (`total_bytes > 0`). The terse "X GB
+            free" sits next to the iter-13 summary; the rich
+            "{drive name}: X free of Y" lives in the tooltip so
+            casual users see the glanceable number while power
+            users get the full picture on hover. */}
+        {driveLabel && (
+          <span
+            className="text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)] cursor-help"
+            data-testid="status-bar-free-space"
+            title={driveDetail ?? undefined}
+            aria-label={driveDetail ?? driveLabel}
+          >
+            {driveLabel}
+          </span>
+        )}
+      </div>
 
       {/* Engine Pulse — ambient cross-engine activity heartbeat */}
       <EnginePulseIndicator />

@@ -1,6 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
-import { FileList, formatFileSize, formatDate, type FileEntryData } from "@/components/file-list";
+import { render, screen, fireEvent } from "@testing-library/react";
+import {
+  FileList,
+  formatFileSize,
+  formatDate,
+  ActivityDot,
+  type FileEntryData,
+} from "@/components/file-list";
 import { filterFiles } from "@/components/filter-bar";
 
 // ── T-007: Directory Listing tests ──
@@ -144,6 +150,113 @@ describe("T-007: FileList rendering", () => {
     render(<FileList files={mockFiles} viewMode="detail" />);
     const grid = screen.getByRole("grid", { name: /file listing/i });
     expect(grid).toBeInTheDocument();
+  });
+
+});
+
+// ── ActivityDot — drill-in vs. ambient indicator contract ──
+//
+// Tested directly (instead of through FileList) because the file
+// list's TanStack virtualizers don't materialize rows in jsdom
+// without a measurable parent height, so dots never reach the DOM
+// via the integration path.
+describe("ActivityDot", () => {
+  const info = {
+    lastSeen: "2024-01-14T11:00:00Z",
+    hitCount: 2,
+    ageBucket: "today" as const,
+    ageLabel: "2h ago",
+  };
+
+  it("renders as a non-interactive span by default (no onClick)", () => {
+    const { container } = render(<ActivityDot info={info} />);
+    // No button when there's no click handler.
+    expect(container.querySelector("button")).toBeNull();
+    // The visible element is a span with the title text.
+    expect(container.querySelector("span")?.getAttribute("title")).toMatch(
+      /2h ago.*2 touches/,
+    );
+  });
+
+  it("renders as a button with focus styles when onClick is provided", () => {
+    const onClick = vi.fn();
+    render(<ActivityDot info={info} onClick={onClick} />);
+    const btn = screen.getByTestId("activity-dot");
+    expect(btn.tagName).toBe("BUTTON");
+    expect(btn.getAttribute("aria-label")).toMatch(/click to show file history/);
+  });
+
+  it("invokes onClick exactly once on activation", () => {
+    const onClick = vi.fn();
+    render(<ActivityDot info={info} onClick={onClick} />);
+    fireEvent.click(screen.getByTestId("activity-dot"));
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops click propagation so parent row select/open does not also fire", () => {
+    const onClick = vi.fn();
+    const onParent = vi.fn();
+    render(
+      <div onClick={onParent}>
+        <ActivityDot info={info} onClick={onClick} />
+      </div>,
+    );
+    fireEvent.click(screen.getByTestId("activity-dot"));
+    expect(onClick).toHaveBeenCalledTimes(1);
+    // The parent row handler must NOT fire — clicking the dot is
+    // "show history", not "select the file".
+    expect(onParent).not.toHaveBeenCalled();
+  });
+
+  it("propagates engine-aware tooltip text into the interactive label", () => {
+    const onClick = vi.fn();
+    render(
+      <ActivityDot
+        info={{ ...info, hitCount: 1, lastEngine: "transfer" }}
+        onClick={onClick}
+      />,
+    );
+    const btn = screen.getByTestId("activity-dot");
+    expect(btn.getAttribute("aria-label")).toMatch(/Transfer.*1 touch/);
+  });
+
+  it("includes the last_kind in the tooltip when provided", () => {
+    // Surfaces e.g. "Sync rename · 2h ago · 2 touches" so users see
+    // WHAT happened, not just which engine did something. The kind
+    // string from the backend (`copy`, `rename`, `sync.file`) is
+    // surfaced verbatim — no client-side mapping. This test locks the
+    // composition order so the tooltip stays readable across all kinds.
+    const { container } = render(
+      <ActivityDot
+        info={{
+          ...info,
+          lastEngine: "sync",
+          lastKind: "rename",
+        }}
+      />,
+    );
+    const title = container.querySelector("span")?.getAttribute("title") ?? "";
+    expect(title).toMatch(/Sync rename/);
+    expect(title).toMatch(/2h ago/);
+    expect(title).toMatch(/2 touches/);
+  });
+
+  it("falls back to the engine-only label when last_kind is absent", () => {
+    // Older backend payloads omit `last_kind`. The dot must still
+    // produce a coherent tooltip — this test locks the fallback shape
+    // so a deploy where the frontend lands before the Rust SQL change
+    // doesn't render a broken "Sync undefined · ..." label.
+    const { container } = render(
+      <ActivityDot
+        info={{
+          ...info,
+          lastEngine: "sync",
+          lastKind: null,
+        }}
+      />,
+    );
+    const title = container.querySelector("span")?.getAttribute("title") ?? "";
+    expect(title).toMatch(/^Sync:/);
   });
 });
 
