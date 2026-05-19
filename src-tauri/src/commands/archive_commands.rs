@@ -187,13 +187,18 @@ pub async fn archive_create(params: CreateArchiveParams) -> Result<ArchiveOpResu
         None
     };
 
-    // Execute archive creation
+    // Execute archive creation. The earlier validation guarantees `fmt` is
+    // in the allow-list, so the catch-all arm is dead under correct logic —
+    // but returning a structured Err instead of panicking keeps the IPC
+    // handler alive if the two lists ever drift apart.
     let result = match fmt.as_str() {
         "zip" => create_zip(&params.output_path, &params.source_paths, params.password.as_deref()),
         "tar" => create_tar(&params.output_path, &params.source_paths, false),
         "tar.gz" | "tgz" => create_tar(&params.output_path, &params.source_paths, true),
         "7z" => create_7z(&params.output_path, &params.source_paths, params.password.as_deref()),
-        _ => unreachable!(),
+        _ => Err(format!(
+            "archive_create: format '{fmt}' passed allow-list but no handler matched — validation and match arms are out of sync"
+        ).into()),
     };
 
     match result {

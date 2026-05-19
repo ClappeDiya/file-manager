@@ -1,30 +1,39 @@
 #!/usr/bin/env bash
-# check-command-unwraps.sh — flag `.unwrap()` / `.expect(` calls inside the
-# body of a `#[tauri::command]` function (outside of `#[cfg(test)]` blocks).
+# check-command-unwraps.sh — flag any panic-prone construct inside the body
+# of a `#[tauri::command]` function (outside of `#[cfg(test)]` blocks).
+# Originally flagged only `.unwrap()` / `.expect(`; iter 29 extended scope
+# to the panic-macro family that has identical IPC blast radius.
 #
 # Why this exists:
 #   CLAUDE.md states: "All async Rust errors return `Result<T, AppError>` —
-#   never use `.unwrap()` in command handlers". An unwrap that fires inside
-#   a Tauri command panics the host runtime — the frontend gets an opaque
-#   IPC error and the user's session is poisoned for that command's whole
-#   subsystem. The compiler can't catch this. Same DNA as iter 5/9/10/11:
-#   a stated invariant the type system does not enforce.
+#   never use `.unwrap()` in command handlers". Any construct that panics
+#   inside a Tauri command crashes the host runtime — the frontend gets
+#   an opaque IPC error and the user's session is poisoned for that
+#   command's whole subsystem. The compiler can't catch this. Same DNA
+#   as iter 5/9–28: a stated invariant the type system does not enforce.
 #
-#   Currently the codebase has zero violations in command bodies (all 100+
-#   unwraps in commands/ are inside #[cfg(test)] modules where panic-on-fail
-#   is the idiomatic test assertion). The point of this check is to LOCK IN
-#   that discipline — any future regression is caught at the verify gate.
+#   Currently the codebase has zero violations in command bodies (all
+#   unwraps/expects/panics in commands/ are inside #[cfg(test)] modules
+#   where panic-on-fail is the idiomatic test assertion). The point of
+#   this check is to LOCK IN that discipline — any future regression is
+#   caught at the verify gate.
 #
-# What it flags:
+# What it flags (inside a `#[tauri::command]` body, outside `#[cfg(test)]`):
 #   * `.unwrap()` — including `\n.unwrap()` (multi-line method chain)
 #   * `.expect(` — including `.expect("msg")` form
-#   inside the body of a function decorated with `#[tauri::command]` that
-#   is not itself nested in a `#[cfg(test)]` module/block.
+#   * `panic!(`        (iter 29)
+#   * `unreachable!(`  (iter 29 — "this code path is impossible" panics)
+#   * `todo!(`         (iter 29 — should never reach prod in a command)
+#   * `unimplemented!(` (iter 29 — same as todo!)
 #
 # What it ALLOWS:
 #   * `.unwrap_or(...)`, `.unwrap_or_default()`, `.unwrap_or_else(...)` —
 #     these do NOT panic.
-#   * Anything inside `#[cfg(test)]` — unwrap is idiomatic for test setup.
+#   * `debug_assert!()`, `assert!()` — invariant checks; intentional and
+#     idiomatic. The "obvious-error" macros above are different: they
+#     declare "this state should never occur" but ship anyway.
+#   * Anything inside `#[cfg(test)]` — unwrap/panic is idiomatic for test
+#     setup.
 #   * Anything in non-command helper functions (those are not on the IPC
 #     boundary; their panic propagates to a caller that may handle it).
 #   * Doc comments, line comments, block comments, string literals — same
@@ -54,7 +63,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --list)  LIST=true; shift ;;
     -h|--help)
-      sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,53p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "Unknown arg: $1 (try --help)"; exit 2 ;;
@@ -81,11 +90,13 @@ fi
 #     as a "cmd_zone" — its body is scanned for forbidden calls.
 #   * If a cmd_zone is wholly inside a test_zone, it is skipped.
 #   * Within a cmd_zone, an offending call is `.unwrap()` (NOT followed by
-#     `_or`, since `.unwrap_or(...)` is a distinct method) or `.expect(`.
+#     `_or`, since `.unwrap_or(...)` is a distinct method), `.expect(`, or
+#     a word-bounded panic-macro: `panic!(`, `unreachable!(`, `todo!(`,
+#     `unimplemented!(`.
 #
 # Emits one line per violation:
 #   FILE:LINE:COL  COMMAND_NAME  KIND  EXCERPT
-# Where KIND is `unwrap` or `expect`.
+# Where KIND ∈ { unwrap, expect, panic, unreachable, todo, unimplemented }.
 # ---------------------------------------------------------------------------
 AWK_FILE="$(mktemp -t check-command-unwraps.XXXXXX.awk)"
 trap 'rm -f "$AWK_FILE"' EXIT
@@ -178,7 +189,7 @@ function scan_line(line, lineno,    exe, name, col, excerpt, sig, parts, n2, i) 
 # .expect( while inside an active cmd zone (not nested in a test zone).
 # By doing both in one pass we correctly handle bodies that begin AND end
 # on the same line.
-function walk_and_scan(exe, lineno,    i, n, c, name, excerpt) {
+function walk_and_scan(exe, lineno,    i, n, c, name, excerpt, prev) {
   n = length(exe)
   i = 1
   while (i <= n) {
@@ -187,7 +198,8 @@ function walk_and_scan(exe, lineno,    i, n, c, name, excerpt) {
     # Forbidden-call detection at THIS position (only when inside a cmd
     # zone that is not itself within a test zone). `.unwrap()` is exactly
     # 9 chars; `.unwrap_or...` starts `.unwrap_` so the literal-substring
-    # comparison naturally excludes the safe variants.
+    # comparison naturally excludes the safe variants. Panic-macro names
+    # are matched on a word boundary so `mypanic!` doesn't trip.
     name = active_cmd_name()
     if (name != "" && !in_any_test_zone()) {
       if (substr(exe, i, 9) == ".unwrap()") {
@@ -196,6 +208,25 @@ function walk_and_scan(exe, lineno,    i, n, c, name, excerpt) {
       } else if (substr(exe, i, 8) == ".expect(") {
         excerpt = trim(exe)
         printf "%s:%d:%d\t%s\texpect\t%s\n", filename, lineno, i, name, excerpt
+      } else {
+        # Panic-macro family. Require word boundary on the left (so
+        # tokens like `mypanic!` or `_panic!` don't match).
+        prev = (i == 1 ? " " : substr(exe, i - 1, 1))
+        if (prev !~ /[A-Za-z0-9_]/) {
+          if (substr(exe, i, 7) == "panic!(") {
+            excerpt = trim(exe)
+            printf "%s:%d:%d\t%s\tpanic\t%s\n", filename, lineno, i, name, excerpt
+          } else if (substr(exe, i, 13) == "unreachable!(") {
+            excerpt = trim(exe)
+            printf "%s:%d:%d\t%s\tunreachable\t%s\n", filename, lineno, i, name, excerpt
+          } else if (substr(exe, i, 6) == "todo!(") {
+            excerpt = trim(exe)
+            printf "%s:%d:%d\t%s\ttodo\t%s\n", filename, lineno, i, name, excerpt
+          } else if (substr(exe, i, 15) == "unimplemented!(") {
+            excerpt = trim(exe)
+            printf "%s:%d:%d\t%s\tunimplemented\t%s\n", filename, lineno, i, name, excerpt
+          }
+        }
       }
     }
 
@@ -350,11 +381,12 @@ fi
 count="$(wc -l < "$findings_file" | tr -d ' ')"
 
 if [[ "$count" -eq 0 ]]; then
-  echo "OK: ${#files[@]} command file(s) scanned, 0 unwrap()/expect() in command bodies"
+  echo "OK: ${#files[@]} command file(s) scanned, 0 panic-prone constructs in command bodies"
   exit 0
 fi
 
-echo "FAIL: $count occurrence(s) of .unwrap()/.expect() inside a #[tauri::command] body" >&2
+echo "FAIL: $count panic-prone construct(s) inside a #[tauri::command] body" >&2
+echo "      (kinds: unwrap, expect, panic!, unreachable!, todo!, unimplemented!)" >&2
 echo "      (use .map_err(...)? or .ok_or_else(|| AppError::...)? instead — see CLAUDE.md)" >&2
 while IFS=$'\t' read -r loc cmd kind excerpt; do
   echo "  $loc  fn $cmd ($kind)" >&2
