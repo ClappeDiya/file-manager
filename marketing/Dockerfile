@@ -21,6 +21,7 @@ RUN pnpm install --frozen-lockfile --filter marketing... --prod=false
 # build: produce .next/standalone output
 # ---------------------------------------------------------------------------
 FROM deps AS build
+COPY CHANGELOG.md CHANGELOG.md
 COPY packages/design-tokens packages/design-tokens
 COPY packages/ui-components packages/ui-components
 COPY marketing marketing
