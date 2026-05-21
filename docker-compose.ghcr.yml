@@ -36,7 +36,7 @@ services:
     expose:
       - "3002"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3002/ > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3002/ > /dev/null || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -51,10 +51,12 @@ services:
       - "traefik.http.middlewares.filemanager-redirect-https.redirectscheme.scheme=https"
       - "traefik.http.middlewares.filemanager-redirect-https.redirectscheme.permanent=true"
       # HTTPS service
-      - "traefik.http.routers.filemanager-marketing.rule=Host(`filemanager.clappe.com`) || Host(`www.filemanager.clappe.com`) || Host(`docs.filemanager.clappe.com`)"
-      - "traefik.http.routers.filemanager-marketing.entrypoints=websecure"
-      - "traefik.http.routers.filemanager-marketing.tls=true"
-      - "traefik.http.routers.filemanager-marketing.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.filemanager-marketing-https.rule=Host(`filemanager.clappe.com`) || Host(`www.filemanager.clappe.com`) || Host(`docs.filemanager.clappe.com`)"
+      - "traefik.http.routers.filemanager-marketing-https.entrypoints=websecure"
+      - "traefik.http.routers.filemanager-marketing-https.priority=100"
+      - "traefik.http.routers.filemanager-marketing-https.service=filemanager-marketing"
+      - "traefik.http.routers.filemanager-marketing-https.tls=true"
+      - "traefik.http.routers.filemanager-marketing-https.tls.certresolver=letsencrypt"
       - "traefik.http.services.filemanager-marketing.loadbalancer.server.port=3002"
     networks:
       - dokploy-network
@@ -75,7 +77,7 @@ services:
     expose:
       - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -90,10 +92,12 @@ services:
       - "traefik.http.middlewares.filemanager-releases-redirect-https.redirectscheme.scheme=https"
       - "traefik.http.middlewares.filemanager-releases-redirect-https.redirectscheme.permanent=true"
       # HTTPS service
-      - "traefik.http.routers.filemanager-releases.rule=Host(`releases.filemanager.clappe.com`)"
-      - "traefik.http.routers.filemanager-releases.entrypoints=websecure"
-      - "traefik.http.routers.filemanager-releases.tls=true"
-      - "traefik.http.routers.filemanager-releases.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.filemanager-releases-https.rule=Host(`releases.filemanager.clappe.com`)"
+      - "traefik.http.routers.filemanager-releases-https.entrypoints=websecure"
+      - "traefik.http.routers.filemanager-releases-https.priority=100"
+      - "traefik.http.routers.filemanager-releases-https.service=filemanager-releases"
+      - "traefik.http.routers.filemanager-releases-https.tls=true"
+      - "traefik.http.routers.filemanager-releases-https.tls.certresolver=letsencrypt"
       - "traefik.http.services.filemanager-releases.loadbalancer.server.port=8080"
     networks:
       - dokploy-network
