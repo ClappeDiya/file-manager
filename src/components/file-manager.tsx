@@ -20,6 +20,7 @@ import {
   formatPaneStatsLabel,
 } from "@/lib/selection-stats";
 import { archiveExtractDest } from "@/lib/archive-paths";
+import { resolveFileActionKey } from "@/lib/file-action-keys";
 import {
   useDriveSpace,
   useAllDrives,
@@ -3895,7 +3896,9 @@ function FilePane({
     [selectedPaths, currentPath, handleOpen, handleCopy, handleCut, handleDelete, handleDeletePermanently, handleRename, handleDuplicate, handleNewFolder, handleNewFile, handleGetInfo, handleCalculateSize, handleEditRemote, handleCompareFiles, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, selectAll, invertSelection, onContextMenu, loadDirectory, isGitRepo, handleSendTo, onVerifyIntegrity, onCompress, handleExtractHere],
   );
 
-  // Keyboard shortcuts for compare (#47) and quick select (#71)
+  // Keyboard shortcuts for compare (#47), quick select (#71), and the
+  // file-action keys (F2 / Delete / ⌘⌫) the palette + cheat sheet have
+  // always advertised but never bound.
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key === "=") {
@@ -3906,10 +3909,44 @@ function FilePane({
         e.preventDefault();
         setQuickSelectOpen(prev => !prev);
       }
+      // F2 → Rename, Delete / ⌘⌫ → Move to Trash. These shortcuts have
+      // shipped as hints on the command-palette and cheat-sheet entries
+      // since those features landed, but no handler ever bound the keys,
+      // so pressing them did nothing. `resolveFileActionKey` is a pure,
+      // unit-tested predicate that owns the destructive-key safety
+      // rules: it stays silent while a text field is focused (so typing
+      // keeps Backspace/Delete), ignores bare Backspace, and leaves the
+      // Shift+Delete "permanent delete" gesture unbound. Both reuse the
+      // pane's existing handlers, so the Safety Interlock and undo entry
+      // come for free. F2 is a single-item action (rename one selected
+      // item); batch renaming many keeps its own global ⌘⇧R shortcut.
+      const activeEl = document.activeElement as HTMLElement | null;
+      const inTextEntry =
+        activeEl?.tagName === "INPUT" ||
+        activeEl?.tagName === "TEXTAREA" ||
+        activeEl?.isContentEditable === true;
+      const fileAction = resolveFileActionKey(e, inTextEntry);
+      if (fileAction) {
+        // Only the focused pane reacts. In dual-pane mode BOTH FilePane
+        // instances mount this window listener, so without an active-pane
+        // guard a single Delete would trash selections in both panes at
+        // once. Single-pane mode mounts only pane 0, and toggling to it
+        // doesn't reset activePaneIndex, so treat the lone pane as active.
+        const fm = useFileManagerStore.getState();
+        if (fm.singlePaneMode || fm.activePaneIndex === paneIndex) {
+          if (fileAction === "trash" && selectedPaths.length > 0) {
+            e.preventDefault();
+            void handleDelete();
+          } else if (fileAction === "rename" && selectedPaths.length === 1) {
+            e.preventDefault();
+            void handleRename(selectedPaths[0]);
+          }
+        }
+      }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectedPaths, handleCompareFiles]);
+  }, [selectedPaths, handleCompareFiles, handleDelete, handleRename, paneIndex]);
 
   return (
     <div
