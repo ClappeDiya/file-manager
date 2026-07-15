@@ -583,6 +583,86 @@ mod tests {
         );
     }
 
+
+    /// Delete a folder of `per_round` files, `rounds` times, through the real
+    /// engine.
+    #[cfg(test)]
+    async fn seed_real_folder_deletes(ledger: &OperationLedger, rounds: usize, per_round: usize) {
+        for round in 0..rounds {
+            let dir = tempfile::tempdir().unwrap();
+            let folder = dir.path().join(format!("proj{round}"));
+            std::fs::create_dir_all(&folder).unwrap();
+            for i in 0..per_round {
+                std::fs::write(folder.join(format!("f{i}.txt")), b"x").unwrap();
+            }
+            crate::commands::file_ops_commands::delete_files_impl(
+                vec![folder.to_string_lossy().to_string()],
+                true,
+                ledger,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// The interlock assesses intents in files — one folder is one path but
+    /// forty files. The ledger recorded the *path* count, so a user who
+    /// routinely deleted a 40-file folder had a median of 1 and was told their
+    /// next identical delete was "40x your usual": the two sides of the ratio
+    /// were measuring different things.
+    #[tokio::test]
+    async fn a_routine_folder_delete_is_not_flagged_as_unusual() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let ledger = OperationLedger::new(repo.pool().clone());
+        seed_real_folder_deletes(&ledger, 3, 40).await;
+
+        let interlock = SafetyInterlock::new(ledger);
+        let assessment = interlock
+            .assess(&OperationIntent {
+                engine: "fs".to_string(),
+                kind: "delete_permanent".to_string(),
+                affected_files: 40,
+                total_bytes: 0,
+                subject_path: None,
+                summary: None,
+            })
+            .await;
+
+        assert_eq!(
+            assessment.baseline_median_files, 40,
+            "the baseline must be in files, like the intent it is compared to"
+        );
+        assert_eq!(
+            assessment.level,
+            RiskLevel::Low,
+            "this user deletes exactly this folder shape routinely; reasons: {:?}",
+            assessment.reasons
+        );
+    }
+
+    /// Counterweight: folder-shaped history must not hide a genuinely big one.
+    #[tokio::test]
+    async fn an_unusually_large_folder_delete_is_still_flagged() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let ledger = OperationLedger::new(repo.pool().clone());
+        seed_real_folder_deletes(&ledger, 3, 40).await;
+
+        let interlock = SafetyInterlock::new(ledger);
+        let assessment = interlock
+            .assess(&OperationIntent {
+                engine: "fs".to_string(),
+                kind: "delete_permanent".to_string(),
+                affected_files: 1200,
+                total_bytes: 0,
+                subject_path: None,
+                summary: None,
+            })
+            .await;
+
+        assert_eq!(assessment.level, RiskLevel::High, "{:?}", assessment.reasons);
+        assert!(assessment.requires_confirmation);
+    }
+
     /// Record `count` real permanent deletes through the FS engine, so the
     /// baseline is built from rows the engine actually writes.
     #[cfg(test)]

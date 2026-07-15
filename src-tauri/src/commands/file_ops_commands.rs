@@ -43,15 +43,35 @@ pub(crate) async fn record_fs_ok(
     dests: &[String],
     correlation_id: &str,
 ) {
+    let paths_touched = sources.len().max(dests.len()).max(1) as u64;
+    record_fs_ok_with_count(ledger, kind, sources, dests, correlation_id, paths_touched).await
+}
+
+/// As [`record_fs_ok`], but stating how many files the operation really touched.
+///
+/// The two numbers differ the moment a path is a directory: deleting one folder
+/// is one path and forty files. The Safety Interlock's baseline is in files and
+/// its intents are measured in files, so any operation that can be handed a
+/// directory has to record files — otherwise the median is a count of paths,
+/// the intent is a count of files, and the ratio divides one by the other. A
+/// user who routinely deletes a 40-file folder was told it was "40× your usual".
+pub(crate) async fn record_fs_ok_with_count(
+    ledger: &OperationLedger,
+    kind: &str,
+    sources: &[String],
+    dests: &[String],
+    correlation_id: &str,
+    affected_files: u64,
+) {
     // Pair sources to dests where possible; otherwise record each side alone.
     let pair_count = sources.len().max(dests.len()).max(1);
     // Every row of a batch also states how many files the *operation* touched.
-    // A row is one file, so without this the Safety Interlock's baseline reads
+    // A row is one path, so without this the Safety Interlock's baseline reads
     // one file per event (`extract_file_count` falls back to 1), its "what does
     // this user normally do" median is permanently 1, and its adaptive ratio
     // collapses into "any batch of 25+ is 25× normal" — a High-risk alarm on
     // routine work, explained with a median the user never had.
-    let details = serde_json::json!({ "affected_files": pair_count }).to_string();
+    let details = serde_json::json!({ "affected_files": affected_files }).to_string();
     for i in 0..pair_count {
         let subject = sources.get(i).cloned();
         let target = dests.get(i).cloned();
@@ -235,6 +255,28 @@ fn accumulate_affected(path: &Path, cap: u64, acc: &mut AffectedFiles) {
             return;
         }
     }
+}
+
+/// Files under `paths`, for recording what an operation actually touched.
+///
+/// Must be called *before* the operation runs: a move or delete leaves nothing
+/// behind to count afterwards. Shares the walk and the ceiling with
+/// [`count_affected_files`], so the number the interlock assesses and the number
+/// the ledger records are produced the same way and stay comparable.
+pub(crate) fn measure_paths(paths: &[String]) -> u64 {
+    let cap = crate::safety::DESTRUCTIVE_VOLUME_HARD_CAP.saturating_add(1);
+    let mut acc = AffectedFiles {
+        files: 0,
+        bytes: 0,
+        capped: false,
+    };
+    for path in paths {
+        accumulate_affected(Path::new(path), cap, &mut acc);
+        if acc.capped {
+            break;
+        }
+    }
+    acc.files
 }
 
 /// Count the files a selection really touches, for the Safety Interlock.
@@ -429,6 +471,8 @@ pub async fn move_files_impl(
         ));
     }
 
+    // Measure first: once moved, the sources are gone from their old paths.
+    let affected_files = measure_paths(&source_paths);
     let mut dest_paths = Vec::new();
     let mut moved_sources = Vec::new();
 
@@ -446,7 +490,8 @@ pub async fn move_files_impl(
     }
 
     let undo_id = Uuid::new_v4().to_string();
-    record_fs_ok(ledger, "move", &source_paths, &dest_paths, &undo_id).await;
+    record_fs_ok_with_count(ledger, "move", &source_paths, &dest_paths, &undo_id, affected_files)
+        .await;
 
     Ok(FileOpResult {
         success: true,
@@ -642,6 +687,8 @@ pub async fn delete_files_impl(
     ledger: &OperationLedger,
 ) -> Result<FileOpResult, AppError> {
     let kind = if permanent { "delete_permanent" } else { "delete_trash" };
+    // Measure first: after the loop there is nothing left on disk to count.
+    let affected_files = measure_paths(&paths);
     let mut deleted = Vec::new();
 
     for path in &paths {
@@ -659,7 +706,7 @@ pub async fn delete_files_impl(
     }
 
     let undo_id = Uuid::new_v4().to_string();
-    record_fs_ok(ledger, kind, &paths, &[], &undo_id).await;
+    record_fs_ok_with_count(ledger, kind, &paths, &[], &undo_id, affected_files).await;
 
     Ok(FileOpResult {
         success: true,
