@@ -115,6 +115,13 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
 
     // Initialize sync manager (T-039..T-042)
     let sync_mgr = SyncManager::new();
+    // Restore saved pairs and re-arm their triggers. Non-fatal, matching the
+    // automation-rule load below: a corrupt row must not stop the app booting.
+    // The in-memory fallback path deliberately does not do this — its DB is
+    // created fresh each boot, so there is never anything to load.
+    if let Err(e) = sync_mgr.load_pairs_from_db(&repo).await {
+        tracing::warn!("Failed to load sync pairs (non-fatal): {e}");
+    }
 
     // Initialize peer manager (T-031) and server transfer manager (T-033)
     let peer_mgr = PeerManager::new();

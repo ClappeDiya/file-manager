@@ -6,6 +6,7 @@
 use crate::core::error::AppError;
 use crate::core::types::*;
 use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
+use crate::storage::Repository;
 use crate::sync_engine::SyncManager;
 use tauri::State;
 use uuid::Uuid;
@@ -66,6 +67,7 @@ pub async fn create_sync_pair(
     time_offset_secs: Option<i64>,
     manager: State<'_, SyncManager>,
     ledger: State<'_, OperationLedger>,
+    repo: State<'_, Repository>,
 ) -> Result<SyncPair, AppError> {
     let sync_mode = SyncMode::from_str_lossy(&mode);
 
@@ -109,6 +111,9 @@ pub async fn create_sync_pair(
 
     use crate::core::traits::SyncOperations;
     let created = manager.create_pair(pair).await?;
+    // Persist before reporting success: a pair the user sees in the list but
+    // that never reached the DB is exactly the silent loss this fixes.
+    manager.save_pair_to_db(&repo, &created).await?;
     record_sync(
         &ledger,
         "create_pair",
@@ -177,10 +182,12 @@ pub async fn delete_sync_pair(
     pair_id: String,
     manager: State<'_, SyncManager>,
     ledger: State<'_, OperationLedger>,
+    repo: State<'_, Repository>,
 ) -> Result<(), AppError> {
     let id = parse_uuid(&pair_id)?;
     use crate::core::traits::SyncOperations;
     manager.delete_pair(id).await?;
+    manager.delete_pair_from_db(&repo, id).await?;
     record_sync(
         &ledger,
         "delete_pair",
@@ -209,12 +216,15 @@ pub async fn list_sync_pairs(
 pub async fn update_sync_pair(
     pair_json: String,
     manager: State<'_, SyncManager>,
+    repo: State<'_, Repository>,
 ) -> Result<SyncPair, AppError> {
     let pair: SyncPair = serde_json::from_str(&pair_json).map_err(|e| AppError::Sync {
         message: format!("Invalid sync pair data: {}", e),
         advice: "Check the sync pair configuration.".to_string(),
     })?;
-    manager.update_pair(pair).await
+    let updated = manager.update_pair(pair).await?;
+    manager.save_pair_to_db(&repo, &updated).await?;
+    Ok(updated)
 }
 
 /// Run a sync for a pair.
@@ -223,9 +233,26 @@ pub async fn run_sync(
     pair_id: String,
     manager: State<'_, SyncManager>,
     ledger: State<'_, OperationLedger>,
+    repo: State<'_, Repository>,
 ) -> Result<SyncReport, AppError> {
     let id = parse_uuid(&pair_id)?;
     let result = manager.execute_sync(id).await;
+
+    // `execute_sync` stamps `last_run` on the in-memory pair. Without this the
+    // field would silently revert to its last-saved value on restart — the
+    // partial-persistence trap where the DB drifts from what the user sees.
+    // Best-effort: a failed write must not turn a successful sync into an error.
+    {
+        use crate::core::traits::SyncOperations;
+        if let Ok(pairs) = manager.list_pairs().await {
+            if let Some(pair) = pairs.into_iter().find(|p| p.id == id) {
+                if let Err(e) = manager.save_pair_to_db(&repo, &pair).await {
+                    tracing::warn!("Failed to persist last_run for sync pair {id}: {e}");
+                }
+            }
+        }
+    }
+
     match &result {
         Ok(report) => {
             let status = match report.status {

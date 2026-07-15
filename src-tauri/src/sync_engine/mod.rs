@@ -21,7 +21,7 @@ pub mod watcher;
 use crate::core::error::AppError;
 use crate::core::traits::{BoxFuture, SyncOperations};
 use crate::core::types::*;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -486,6 +486,193 @@ impl Default for SyncManager {
     }
 }
 
+// ── Persistence ──────────────────────────────────────────────────────────
+//
+// Sync pairs were pure in-memory state: `create_pair` inserted into a HashMap
+// and nothing ever wrote to SQLite, so every pair a user configured vanished
+// on the next launch — silently, with no error and no export
+// (`export_all_settings` reads `list_pairs()`, so it exported nothing too).
+//
+// The `sync_pairs` table has existed since schema v1 and was deliberately
+// evolved twice since (v4 added trigger_mode / cron_expr / filter_json /
+// conflict_policy / verify_mode / checksum_enabled / created_at; v8 added
+// time_offset_secs) — its columns map 1:1 onto `SyncPair`, and every enum
+// involved already carries the `as_str()` / `from_str_lossy()` pair this
+// needs. Everything was in place except the read and the write.
+//
+// Mirrors `AutomationManager::{save_rule, delete_rule, load_rules_from_db}`:
+// the manager holds no pool, the caller passes the `Repository` in. That keeps
+// `SyncManager::new()` unchanged, so every existing caller and test still
+// compiles, and persistence stays opt-in per call site.
+impl SyncManager {
+    /// Insert-or-update one pair. Called by the sync commands after any
+    /// mutation so the DB is the source of truth across restarts.
+    pub async fn save_pair_to_db(
+        &self,
+        repo: &crate::storage::Repository,
+        pair: &SyncPair,
+    ) -> Result<(), AppError> {
+        let p = pair.clone();
+        repo.pool()
+            .execute(move |conn| {
+                let filter_json = serde_json::to_string(&p.filter).unwrap_or_else(|_| "{}".into());
+                // `trigger_mode` stores the discriminant and `cron_expr` the
+                // payload, matching the two columns v4 created for exactly this.
+                let cron_expr = match &p.trigger {
+                    SyncTrigger::Scheduled { cron_expr } => Some(cron_expr.clone()),
+                    _ => None,
+                };
+                conn.execute(
+                    "INSERT INTO sync_pairs (id, name, source_path, dest_path, mode, enabled, \
+                     last_run, trigger_mode, cron_expr, filter_json, conflict_policy, \
+                     verify_mode, checksum_enabled, created_at, time_offset_secs) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                     name = excluded.name, source_path = excluded.source_path, \
+                     dest_path = excluded.dest_path, mode = excluded.mode, \
+                     enabled = excluded.enabled, last_run = excluded.last_run, \
+                     trigger_mode = excluded.trigger_mode, cron_expr = excluded.cron_expr, \
+                     filter_json = excluded.filter_json, \
+                     conflict_policy = excluded.conflict_policy, \
+                     verify_mode = excluded.verify_mode, \
+                     checksum_enabled = excluded.checksum_enabled, \
+                     time_offset_secs = excluded.time_offset_secs",
+                    rusqlite::params![
+                        p.id.to_string(),
+                        p.name,
+                        p.source_path,
+                        p.dest_path,
+                        p.mode.as_str(),
+                        p.enabled as i32,
+                        p.last_run.map(|t| t.to_rfc3339()),
+                        p.trigger.as_str(),
+                        cron_expr,
+                        filter_json,
+                        p.conflict_policy.as_str(),
+                        p.verify_mode.as_str(),
+                        p.checksum_enabled as i32,
+                        p.created_at.to_rfc3339(),
+                        p.time_offset_secs,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Remove one pair's row. The `ON DELETE CASCADE` on `sync_state` /
+    /// `sync_reports` clears their history with it.
+    pub async fn delete_pair_from_db(
+        &self,
+        repo: &crate::storage::Repository,
+        pair_id: Uuid,
+    ) -> Result<(), AppError> {
+        let id = pair_id.to_string();
+        repo.pool()
+            .execute(move |conn| {
+                conn.execute("DELETE FROM sync_pairs WHERE id = ?1", rusqlite::params![id])?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Restore every saved pair into memory at startup and re-arm its trigger,
+    /// so a watch/scheduled pair is as live after a restart as it was when the
+    /// user created it. Returns how many were loaded.
+    pub async fn load_pairs_from_db(
+        &self,
+        repo: &crate::storage::Repository,
+    ) -> Result<usize, AppError> {
+        let pairs: Vec<SyncPair> = repo
+            .pool()
+            .execute(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, source_path, dest_path, mode, enabled, last_run, \
+                     trigger_mode, cron_expr, filter_json, conflict_policy, verify_mode, \
+                     checksum_enabled, created_at, time_offset_secs \
+                     FROM sync_pairs ORDER BY created_at ASC",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    let id: String = row.get(0)?;
+                    let mode: String = row.get(4)?;
+                    let last_run: Option<String> = row.get(6)?;
+                    let trigger_mode: String = row.get(7)?;
+                    let cron_expr: Option<String> = row.get(8)?;
+                    let filter_json: String = row.get(9)?;
+                    let conflict_policy: String = row.get(10)?;
+                    let verify_mode: String = row.get(11)?;
+                    let created_at: String = row.get(13)?;
+
+                    Ok(SyncPair {
+                        // A row we cannot parse is a row we cannot honour, but
+                        // one bad pair must not cost the user all the others —
+                        // fall back per-field rather than dropping the row.
+                        id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::new_v4()),
+                        name: row.get(1)?,
+                        source_path: row.get(2)?,
+                        dest_path: row.get(3)?,
+                        mode: SyncMode::from_str_lossy(&mode),
+                        enabled: row.get::<_, i32>(5)? != 0,
+                        last_run: last_run
+                            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                            .map(|t| t.with_timezone(&Utc)),
+                        trigger: match trigger_mode.as_str() {
+                            "scheduled" => SyncTrigger::Scheduled {
+                                cron_expr: cron_expr.unwrap_or_else(|| "0 * * * *".to_string()),
+                            },
+                            other => SyncTrigger::from_str_lossy(other),
+                        },
+                        filter: serde_json::from_str(&filter_json).unwrap_or_default(),
+                        conflict_policy: SyncConflictPolicy::from_str_lossy(&conflict_policy),
+                        verify_mode: SyncVerifyMode::from_str_lossy(&verify_mode),
+                        checksum_enabled: row.get::<_, i32>(12)? != 0,
+                        created_at: DateTime::parse_from_rfc3339(&created_at)
+                            .map(|t| t.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now()),
+                        time_offset_secs: row.get(14)?,
+                    })
+                })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r?);
+                }
+                Ok(out)
+            })
+            .await?;
+
+        let count = pairs.len();
+        {
+            let mut map = self.pairs.write().await;
+            for pair in &pairs {
+                map.insert(pair.id, pair.clone());
+            }
+        }
+
+        // Re-arm triggers outside the lock, exactly as `create_pair` does.
+        for pair in &pairs {
+            if !pair.enabled {
+                continue;
+            }
+            match &pair.trigger {
+                SyncTrigger::Watch => {
+                    if let Err(e) = self.start_watcher(pair.id).await {
+                        tracing::warn!("Failed to restore watcher for {}: {}", pair.id, e);
+                    }
+                }
+                SyncTrigger::Scheduled { cron_expr } => {
+                    if let Err(e) = self.scheduler.add_schedule(pair.id, cron_expr) {
+                        tracing::warn!("Failed to restore schedule for {}: {}", pair.id, e);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        tracing::info!("Loaded {} sync pair(s) from database", count);
+        Ok(count)
+    }
+}
+
 impl SyncOperations for SyncManager {
     fn create_pair(&self, pair: SyncPair) -> BoxFuture<'_, Result<SyncPair, AppError>> {
         Box::pin(async move {
@@ -579,6 +766,120 @@ mod tests {
     use super::*;
     use crate::core::types::SyncMode;
     use tempfile::TempDir;
+
+    /// The regression this guards: sync pairs lived only in a HashMap, so every
+    /// pair a user configured was gone on the next launch — silently, while the
+    /// `sync_pairs` table sat empty beside a schema built and twice-migrated for
+    /// exactly this data.
+    ///
+    /// Round-trips through a real SQLite DB and asserts every column, so it also
+    /// pins the SyncPair↔schema mapping rather than just "a row came back".
+    #[tokio::test]
+    async fn sync_pairs_survive_a_restart() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let pair = SyncPair {
+            name: "Photos backup".to_string(),
+            source_path: "/src/photos".to_string(),
+            dest_path: "/dst/photos".to_string(),
+            mode: SyncMode::Mirror,
+            enabled: true,
+            trigger: SyncTrigger::Scheduled {
+                cron_expr: "0 0 */6 * * * *".to_string(),
+            },
+            conflict_policy: SyncConflictPolicy::NewestWins,
+            verify_mode: SyncVerifyMode::Full,
+            checksum_enabled: true,
+            time_offset_secs: Some(-42),
+            filter: SyncFilter {
+                exclude_patterns: vec!["*.tmp".to_string()],
+                ..SyncFilter::default()
+            },
+            ..SyncPair::default()
+        };
+
+        SyncManager::new().save_pair_to_db(&repo, &pair).await.unwrap();
+
+        // A brand-new manager stands in for the next app launch.
+        let restarted = SyncManager::new();
+        assert_eq!(restarted.load_pairs_from_db(&repo).await.unwrap(), 1);
+
+        let loaded = restarted.pairs.read().await;
+        let got = loaded.get(&pair.id).expect("pair missing after restart");
+        assert_eq!(got.name, "Photos backup");
+        assert_eq!(got.source_path, "/src/photos");
+        assert_eq!(got.dest_path, "/dst/photos");
+        assert_eq!(got.mode, SyncMode::Mirror);
+        assert!(got.enabled);
+        assert!(got.checksum_enabled);
+        assert_eq!(got.time_offset_secs, Some(-42));
+        assert_eq!(got.conflict_policy.as_str(), "newest_wins");
+        assert_eq!(got.verify_mode.as_str(), "full");
+        assert_eq!(got.filter.exclude_patterns, vec!["*.tmp".to_string()]);
+        // The cron payload lives in its own column; losing it would silently
+        // downgrade a 6-hourly sync to the "0 * * * *" fallback.
+        match &got.trigger {
+            SyncTrigger::Scheduled { cron_expr } => assert_eq!(cron_expr, "0 0 */6 * * * *"),
+            other => panic!("trigger did not round-trip: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn saving_the_same_pair_twice_updates_rather_than_duplicates() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = SyncManager::new();
+        let mut pair = SyncPair {
+            name: "First".to_string(),
+            ..SyncPair::default()
+        };
+        mgr.save_pair_to_db(&repo, &pair).await.unwrap();
+        pair.name = "Renamed".to_string();
+        mgr.save_pair_to_db(&repo, &pair).await.unwrap();
+
+        let restarted = SyncManager::new();
+        assert_eq!(restarted.load_pairs_from_db(&repo).await.unwrap(), 1);
+        assert_eq!(
+            restarted.pairs.read().await.get(&pair.id).unwrap().name,
+            "Renamed"
+        );
+    }
+
+    /// `last_run` is stamped in memory by `execute_sync`, so it is the field
+    /// most likely to drift from the DB. `run_sync` saves the pair afterwards;
+    /// this pins that the column survives the round-trip at all.
+    #[tokio::test]
+    async fn last_run_round_trips() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let ran_at = Utc::now();
+        let pair = SyncPair {
+            last_run: Some(ran_at),
+            ..SyncPair::default()
+        };
+        SyncManager::new().save_pair_to_db(&repo, &pair).await.unwrap();
+
+        let restarted = SyncManager::new();
+        restarted.load_pairs_from_db(&repo).await.unwrap();
+        let loaded = restarted.pairs.read().await;
+        let got = loaded.get(&pair.id).unwrap();
+
+        // RFC3339 keeps sub-second precision, but compare at second resolution
+        // so the assertion cannot hinge on formatting round-off.
+        assert_eq!(
+            got.last_run.map(|t| t.timestamp()),
+            Some(ran_at.timestamp())
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_pairs_do_not_come_back_on_restart() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = SyncManager::new();
+        let pair = SyncPair::default();
+        mgr.save_pair_to_db(&repo, &pair).await.unwrap();
+        mgr.delete_pair_from_db(&repo, pair.id).await.unwrap();
+
+        let restarted = SyncManager::new();
+        assert_eq!(restarted.load_pairs_from_db(&repo).await.unwrap(), 0);
+    }
 
     fn make_test_pair(src: &std::path::Path, dst: &std::path::Path) -> SyncPair {
         SyncPair {
