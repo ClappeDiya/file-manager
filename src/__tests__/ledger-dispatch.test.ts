@@ -22,6 +22,7 @@
  * Pure, no React, no Tauri, no timers — `now` is injected.
  */
 import { describe, it, expect } from "vitest";
+import { FS_INTENT_KIND } from "@/lib/fs-kinds";
 import {
   pickJumpRingTarget,
   JUMP_RING_CYCLE_WINDOW_MS,
@@ -287,8 +288,23 @@ describe("labelForKind", () => {
     expect(labelForKind("duplicate").label).toBe("duplicated");
   });
 
-  it("maps delete to 'deleted'", () => {
-    expect(labelForKind("delete").label).toBe("deleted");
+  it("maps the engine's delete kinds to plain language", () => {
+    // "delete" is not a kind the engine writes; delete_trash used to fall
+    // through to the default branch and render as the raw "delete trash".
+    expect(labelForKind(FS_INTENT_KIND.deleteTrash).label).toBe("deleted");
+    expect(labelForKind(FS_INTENT_KIND.deletePermanent).label).toBe(
+      "permanently deleted",
+    );
+  });
+
+  it("never renders a delete kind as its raw identifier", () => {
+    for (const kind of [
+      FS_INTENT_KIND.deleteTrash,
+      FS_INTENT_KIND.deletePermanent,
+    ]) {
+      expect(labelForKind(kind).label).not.toContain("_");
+      expect(labelForKind(kind).label).not.toContain("trash");
+    }
   });
 
   it("maps both create_file and create_folder to 'created'", () => {

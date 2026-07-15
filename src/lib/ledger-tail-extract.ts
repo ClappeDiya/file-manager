@@ -36,6 +36,8 @@
  *   nothing has landed yet; we wait for the `ok` follow-up event.
  */
 
+import { FS_INTENT_KIND } from "@/lib/fs-kinds";
+
 /** Wire format returned by `ledger_recent` \u2014 mirror of
  *  `LedgerEvent` in `src-tauri/src/ledger/mod.rs`. */
 export interface LedgerEventWire {
@@ -64,11 +66,14 @@ export interface LedgerEventWire {
  * inferred \u2014 see the module doc for why.
  */
 export const MUTATION_KINDS: ReadonlySet<string> = new Set([
-  // File ops (frontend-initiated)
+  // File ops (frontend-initiated). The delete kinds come from the shared
+  // source rather than being spelled here: this set previously listed
+  // "delete"/"purge", which the engine has never written, so no delete ever
+  // triggered a refresh.
   "copy",
   "move",
-  "delete",
-  "purge",
+  FS_INTENT_KIND.deleteTrash,
+  FS_INTENT_KIND.deletePermanent,
   "rename",
   "duplicate",
   "create_file",

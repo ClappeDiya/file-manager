@@ -20,6 +20,7 @@
  * Pure unit tests: no React, no Tauri, no timers.
  */
 import { describe, it, expect } from "vitest";
+import { FS_INTENT_KIND } from "../lib/fs-kinds";
 import {
   processTailBatch,
   isMutationKind,
@@ -60,8 +61,8 @@ describe("isMutationKind", () => {
     for (const k of [
       "copy",
       "move",
-      "delete",
-      "purge",
+      FS_INTENT_KIND.deleteTrash,
+      FS_INTENT_KIND.deletePermanent,
       "rename",
       "duplicate",
       "create_file",
@@ -78,6 +79,14 @@ describe("isMutationKind", () => {
     expect(isMutationKind("transfer")).toBe(true);
     expect(isMutationKind("sync_pull")).toBe(true);
     expect(isMutationKind("automation_run")).toBe(true);
+  });
+
+  it("does not accept delete kinds the engine never writes", () => {
+    // This set listed "delete"/"purge" — the vocabulary the UI used before
+    // the interlock fix. The engine writes delete_trash/delete_permanent, so
+    // no delete ever passed this gate and no delete ever refreshed a pane.
+    expect(isMutationKind("delete")).toBe(false);
+    expect(isMutationKind("purge")).toBe(false);
   });
 
   it("rejects read-only and unknown kinds", () => {
@@ -115,6 +124,20 @@ describe("processTailBatch", () => {
     // must not surprise the user with "X things happened while you
     // were away" (iter 21 explicit guarantee).
     expect(out.backendSummary).toBeNull();
+  });
+
+  it("refreshes the pane when a file is deleted elsewhere", () => {
+    // The user-visible bug: delete a file in one pane and the other pane
+    // showing the same directory kept listing it, because delete_trash was
+    // not a known mutation kind and its path never reached affectedPaths.
+    for (const kind of [
+      FS_INTENT_KIND.deleteTrash,
+      FS_INTENT_KIND.deletePermanent,
+    ]) {
+      const events = [ev("new-1", kind, "/shared/gone.txt"), ev("seen", "copy", "/x")];
+      const out = processTailBatch(events, "seen");
+      expect(out.affectedPaths).toEqual(["/shared/gone.txt"]);
+    }
   });
 
   it("watermark unchanged when newest event matches watermark", () => {
@@ -200,7 +223,7 @@ describe("processTailBatch", () => {
   it("handles events with missing subject or target safely", () => {
     const events = [
       ev("new-2", "create_folder", "/new-dir", null),
-      ev("new-1", "delete", null, "/deleted"),
+      ev("new-1", FS_INTENT_KIND.deleteTrash, null, "/deleted"),
       ev("old", "move", "/a", "/b"),
     ];
     const out = processTailBatch(events, "old");
