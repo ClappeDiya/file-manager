@@ -22,11 +22,11 @@ import {
 } from "./simple-sidebar";
 import { ThemeSwitcher } from "@/components/theme-switcher";
 import { ActivityFeed } from "@/components/activity-feed";
+import { NotificationBell } from "@/components/notification-bell";
 import {
   FolderOpen,
   PanelLeft,
   HelpCircle,
-  Bell,
 } from "lucide-react";
 
 interface SimpleModeWrapperProps {
@@ -65,14 +65,10 @@ export function SimpleModeWrapper({
   const sidebarOpen = useUIStore((s) => s.sidebarOpen);
   const sidebarWidth = useUIStore((s) => s.sidebarWidth);
   const toggleSidebar = useUIStore((s) => s.toggleSidebar);
-  const structuredErrors = useUIStore((s) => s.structuredErrors);
-  const dismissError = useUIStore((s) => s.dismissError);
   const [activeSection, setActiveSection] = useState<SimpleNavSection>("files");
-  const [showNotifications, setShowNotifications] = useState(false);
 
-  const undismissedErrors = structuredErrors.filter((e) => !e.dismissed);
-
-  // In advanced mode, just render the file manager directly
+  // In advanced mode, just render the file manager directly. FileManager
+  // mounts its own NotificationBell, so structured errors stay visible.
   if (appMode === "advanced") {
     return <>{fileManager}</>;
   }
@@ -163,56 +159,9 @@ export function SimpleModeWrapper({
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Notifications for structured errors */}
-          {undismissedErrors.length > 0 && (
-            <div className="relative">
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => setShowNotifications(!showNotifications)}
-                aria-label={`${undismissedErrors.length} notification${undismissedErrors.length !== 1 ? "s" : ""}`}
-              >
-                <Bell className="h-4 w-4" aria-hidden="true" />
-                <span className="absolute -top-1 -right-1 h-4 w-4 rounded-full bg-[var(--color-error)] text-[10px] text-white flex items-center justify-center">
-                  {undismissedErrors.length}
-                </span>
-              </Button>
-
-              {showNotifications && (
-                <div className="absolute right-0 top-full mt-2 w-80 max-h-96 overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg z-50">
-                  <div className="p-3 border-b border-[var(--color-border)]">
-                    <h3 className="text-sm font-semibold text-[color:var(--color-text)]">
-                      Notifications
-                    </h3>
-                  </div>
-                  {undismissedErrors.map((error) => (
-                    <div
-                      key={error.id}
-                      className="p-3 border-b border-[var(--color-border)] last:border-b-0"
-                    >
-                      <p className="text-sm font-medium text-[color:var(--color-text)]">
-                        {error.what}
-                      </p>
-                      <p className="text-xs text-[color:var(--color-text-secondary)] mt-1">
-                        {error.why}
-                      </p>
-                      {error.userAction && (
-                        <p className="text-xs text-[color:var(--color-primary)] mt-1">
-                          {error.userAction}
-                        </p>
-                      )}
-                      <button
-                        className="text-xs text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)] mt-1"
-                        onClick={() => dismissError(error.id)}
-                      >
-                        Dismiss
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+          {/* Structured-error notifications. Shared with Advanced mode, which
+              mounts the same component in the FileManager toolbar. */}
+          <NotificationBell />
 
           <Button
             variant="ghost"

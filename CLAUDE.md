@@ -24,7 +24,7 @@ pnpm test:watch       # Vitest watch mode (same as above)
 ```bash
 cd src-tauri
 cargo check           # Fast compilation check (no codegen)
-cargo test --lib      # Run all library tests (~733 tests)
+cargo test --lib      # Run all library tests (~857 tests)
 cargo test --lib automation  # Run tests matching "automation"
 cargo clippy          # Lint (if installed)
 ```
@@ -100,3 +100,34 @@ All 17 protocol connectors implement the `Connector` trait: `connect()`, `discon
 ### Transfer Engine Three-Layer Architecture
 
 Layer 1 (throughput): Worker pool + pipeline. Layer 2 (integrity): xxHash3/SHA-256 checksums + Merkle tree. Layer 3 (crash recovery): Journal + chunk bitmap + atomic rename. `TransferManager::recover_from_journal()` runs on startup.
+
+## Testing
+
+- Always add a regression test when fixing a bug — reproduce the failure first, then fix.
+- Account for DRF serializer behavior when writing assertions (e.g. `EmailField` being dropped from payloads) anywhere a Django/DRF backend is exercised.
+
+## Shipping Workflow
+
+When asked to commit / push / PR / merge:
+
+1. Branch off the work (never commit directly to `master`).
+2. Exclude screenshot / report / artifact files from commits.
+3. Open a PR, then merge and sync `master`.
+4. If the original branch hits conflicts, prefer a clean cherry-picked PR.
+
+## Deployment Verification
+
+**Never declare a deploy successful on green status alone — success means every route is verified clean.** See `pnpm`/`cargo`/`admin:dev` commands above for the build surfaces this gates.
+
+Run the deploy-verify-heal pipeline on every production deploy:
+
+1. **Pre-flight** — check for container-name conflicts and stale Traefik/proxy config (the usual causes of a green-but-broken deploy) and resolve them automatically before promoting.
+2. **Deploy** the latest commit.
+3. **Verify** — once live, drive a browser (Playwright / Chrome DevTools MCP) across **all** routes; assert zero console errors and no 502s.
+4. **Heal** — on any failed route, diagnose the root cause (e.g. stale Traefik config), fix, redeploy, and re-verify.
+5. **Clean up** — prune reclaimable Docker space safely.
+6. **Report** — per-route screenshots with pass/fail evidence; surface every failure explicitly.
+
+## Recurring Improvement Loops
+
+Periodically re-run quality gates against the live codebase rather than waiting for failures: `engineering-audit` / `tauri-audit` for completion and production-readiness checks, `/code-review` for diff-level correctness, and the Deployment Verification pipeline above after each release. Treat findings as the next loop's work-list.
