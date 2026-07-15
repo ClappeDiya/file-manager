@@ -45,6 +45,13 @@ pub(crate) async fn record_fs_ok(
 ) {
     // Pair sources to dests where possible; otherwise record each side alone.
     let pair_count = sources.len().max(dests.len()).max(1);
+    // Every row of a batch also states how many files the *operation* touched.
+    // A row is one file, so without this the Safety Interlock's baseline reads
+    // one file per event (`extract_file_count` falls back to 1), its "what does
+    // this user normally do" median is permanently 1, and its adaptive ratio
+    // collapses into "any batch of 25+ is 25× normal" — a High-risk alarm on
+    // routine work, explained with a median the user never had.
+    let details = serde_json::json!({ "affected_files": pair_count }).to_string();
     for i in 0..pair_count {
         let subject = sources.get(i).cloned();
         let target = dests.get(i).cloned();
@@ -57,7 +64,8 @@ pub(crate) async fn record_fs_ok(
         let mut ev = RecordEvent::new(LedgerEngine::Fs, kind)
             .status(LedgerStatus::Ok)
             .summary(summary)
-            .correlation(correlation_id);
+            .correlation(correlation_id)
+            .details_json(details.clone());
         if let Some(s) = subject {
             ev = ev.subject(s);
         }
