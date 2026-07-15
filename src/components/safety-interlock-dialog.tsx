@@ -150,7 +150,10 @@ export function SafetyInterlockDialog() {
 
           {assessment.baseline_sample_size > 0 && (
             <p className="mt-3 text-[11px] text-[color:var(--color-text-muted)]">
-              Baseline: {assessment.baseline_sample_size} prior {intent.kind} run
+              {/* The raw ledger kind ("delete_trash") is an engineering
+                  identifier, not copy. `intent.summary` above already says what
+                  this operation is, so the count alone reads cleaner here. */}
+              Baseline: {assessment.baseline_sample_size} prior run
               {assessment.baseline_sample_size === 1 ? "" : "s"} · median{" "}
               {assessment.baseline_median_files} file
               {assessment.baseline_median_files === 1 ? "" : "s"}
