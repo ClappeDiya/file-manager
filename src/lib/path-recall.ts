@@ -35,6 +35,7 @@
  * the lineage shows only operations that don't relocate (e.g. copies
  * away to other places, leaving the original where it was).
  */
+import { FS_INTENT_KIND } from "@/lib/fs-kinds";
 import type { FileLineage, LineageEvent } from "@/stores/lineage-store";
 
 export interface PathRecallInfo {
@@ -57,8 +58,14 @@ export interface PathRecallInfo {
 /** Event kinds whose semantics we know how to phrase to the user.
  *  Anything else is reported by its raw kind. Kept narrow to avoid
  *  inventing wrong-sounding language for engine-specific kinds. */
-const RELOCATION_KINDS: ReadonlySet<string> = new Set(["move", "rename"]);
-const DELETION_KINDS: ReadonlySet<string> = new Set(["delete", "purge"]);
+const RELOCATION_KINDS: ReadonlySet<string> = new Set([
+  FS_INTENT_KIND.move,
+  "rename",
+]);
+const DELETION_KINDS: ReadonlySet<string> = new Set([
+  FS_INTENT_KIND.deleteTrash,
+  FS_INTENT_KIND.deletePermanent,
+]);
 
 /** True when the event represents a *successful* state change on
  *  disk that we can confidently report. Failed/cancelled events are
@@ -130,7 +137,14 @@ export function inferPathRecall(
  *  every consumer phrases the same situation identically. */
 export function describePathRecall(info: PathRecallInfo): string {
   const kind = info.lastEvent.kind;
-  if (info.wasDeleted) return "was deleted";
+  // Trash and permanent delete are separate kinds precisely because one is
+  // recoverable and the other is not; that is the single most useful thing to
+  // tell someone hunting for a file, so don't flatten it to "was deleted".
+  if (info.wasDeleted) {
+    return kind === FS_INTENT_KIND.deleteTrash
+      ? "was moved to the Trash"
+      : "was permanently deleted";
+  }
   if (RELOCATION_KINDS.has(kind) && info.alternateLocation) {
     const verb = kind === "rename" ? "renamed to" : "moved to";
     return `was ${verb} ${info.alternateLocation}`;

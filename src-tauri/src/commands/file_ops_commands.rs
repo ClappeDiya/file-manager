@@ -124,8 +124,13 @@ pub(crate) async fn record_fs_failed(
         .summary(format!("{kind} failed: {reason}"))
         .correlation(Uuid::new_v4().to_string())
         .details_json(details);
-    if let Some(first) = paths.first() {
-        ev = ev.subject(first.clone());
+    // Blame a specific path only when there is exactly one it could be. From
+    // here we cannot tell which entry of a batch failed, and since the batch
+    // records the entries that did land, `paths[0]` is more likely one that
+    // *succeeded* — blaming it would contradict that path's own ok row. The
+    // full list stays in details_json either way.
+    if let [only] = paths {
+        ev = ev.subject(only.clone());
     }
     ledger.record(ev).await;
 }
@@ -1511,9 +1516,71 @@ mod tests {
 
         let events = ledger.recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].subject_path.as_deref(), Some("/a/0.txt"));
+        // ...and by the same reasoning it cannot name which one failed, so it
+        // names none of them rather than blaming the first.
+        assert_eq!(events[0].subject_path, None);
         // The full list stays recoverable from details_json.
         assert!(events[0].details_json.contains("/a/4.txt"));
+    }
+
+    #[tokio::test]
+    async fn record_fs_failed_still_blames_the_path_when_there_is_only_one() {
+        let ledger = migrated_ledger().await;
+        let err = AppError::file_op("Failed to copy /a/b.txt: denied", "Check permissions.");
+        record_fs_failed(&ledger, "copy", &["/a/b.txt".to_string()], &err).await;
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(
+            events[0].subject_path.as_deref(),
+            Some("/a/b.txt"),
+            "a single-path op has exactly one candidate; attribute it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_batch_never_says_the_same_path_both_moved_and_failed() {
+        // The whole point: walk the real command path (impl + failure wrapper)
+        // and check the two rows a partial batch produces do not contradict
+        // each other about a.txt.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dest = dir.path().join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(src.join("a.txt"), b"x").unwrap();
+        fs::write(src.join("b.txt"), b"x").unwrap();
+        fs::write(dest.join("b.txt"), b"collision").unwrap();
+
+        let ledger = migrated_ledger().await;
+        let sources: Vec<String> = ["a.txt", "b.txt"]
+            .iter()
+            .map(|n| src.join(n).to_string_lossy().to_string())
+            .collect();
+
+        let outcome = move_files_impl(
+            sources.clone(),
+            dest.to_string_lossy().to_string(),
+            &ledger,
+        )
+        .await;
+        let result = with_fs_failure_record(&ledger, "move", &sources, outcome).await;
+        assert!(result.is_err(), "collision on b.txt fails the batch");
+
+        let events = ledger.recent(10).await.unwrap();
+        let blaming_a: Vec<_> = events
+            .iter()
+            .filter(|e| e.subject_path.as_deref() == Some(sources[0].as_str()))
+            .collect();
+        assert_eq!(
+            blaming_a.len(),
+            1,
+            "a.txt should appear once, not as both ok and failed"
+        );
+        assert_eq!(blaming_a[0].status, "ok", "a.txt actually moved");
+        assert!(
+            events.iter().any(|e| e.status == "failed"),
+            "the batch failure is still recorded, just not pinned to a.txt"
+        );
     }
 
     #[tokio::test]
