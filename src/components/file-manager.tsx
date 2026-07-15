@@ -11,7 +11,7 @@ import { useSpacesStore } from "@/stores/spaces-store";
 import { useTerminalStore } from "@/stores/terminal-store";
 import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { loadSmartDestinations, fileExtension, type SmartDestination } from "@/hooks/use-smart-destinations";
-import { assessBeforeExecute } from "@/lib/safety";
+import { assessBeforeExecute, FS_INTENT_KIND } from "@/lib/safety";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
 import { reportOperationFailure } from "@/lib/op-error-toast";
 import {
@@ -2963,7 +2963,7 @@ function FilePane({
       const result = await assessBeforeExecute(
         {
           engine: "fs",
-          kind: "move",
+          kind: FS_INTENT_KIND.move,
           affected_files: stalePaths.length,
           total_bytes: 0,
           subject_path: currentPath,
@@ -3192,7 +3192,7 @@ function FilePane({
         const result = await assessBeforeExecute(
           {
             engine: "fs",
-            kind: "move",
+            kind: FS_INTENT_KIND.move,
             affected_files: selectedPaths.length,
             total_bytes: 0,
             subject_path: currentPath,
@@ -3221,7 +3221,7 @@ function FilePane({
         const result = await assessBeforeExecute(
           {
             engine: "fs",
-            kind: "delete",
+            kind: FS_INTENT_KIND.deleteTrash,
             affected_files: selectedPaths.length,
             total_bytes: 0,
             subject_path: currentPath,
@@ -3259,7 +3259,7 @@ function FilePane({
         const result = await assessBeforeExecute(
           {
             engine: "fs",
-            kind: "purge",
+            kind: FS_INTENT_KIND.deletePermanent,
             affected_files: paths.length,
             total_bytes: 0,
             subject_path: currentPath,
@@ -3712,7 +3712,7 @@ function FilePane({
         const result = await assessBeforeExecute(
           {
             engine: "fs",
-            kind: "move",
+            kind: FS_INTENT_KIND.move,
             affected_files: selectedPaths.length,
             total_bytes: 0,
             subject_path: currentPath,

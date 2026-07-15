@@ -24,6 +24,28 @@
 import { tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useSafetyStore } from "@/stores/safety-store";
 
+/**
+ * The `kind` values the Rust FS engine writes to the operation ledger, as
+ * emitted by `src-tauri/src/commands/file_ops_commands.rs`.
+ *
+ * `OperationIntent.kind` MUST be one of these for any fs intent. The interlock
+ * uses the kind verbatim as its baseline lookup key (`WHERE kind = ?`), so a
+ * kind the engine never records matches zero rows and yields an empty baseline.
+ *
+ * These two vocabularies drifted once already: the UI sent `"delete"` and
+ * `"purge"` while the engine recorded `"delete_trash"` and `"delete_permanent"`.
+ * Every delete assessment therefore ran against a permanently empty baseline —
+ * so the interlock told the user "first-ever delete of this kind on this device"
+ * on every single delete of 25+ files, and its adaptive ratio logic never once
+ * ran for a delete. Naming the kinds here keeps the intent side single-sourced;
+ * `fs-intent-kinds.test.ts` pins the exact strings against the Rust writer.
+ */
+export const FS_INTENT_KIND = {
+  move: "move",
+  deleteTrash: "delete_trash",
+  deletePermanent: "delete_permanent",
+} as const;
+
 /** Wire-format mirror of `safety::OperationIntent` in Rust. */
 export interface OperationIntent {
   engine: string;

@@ -63,11 +63,37 @@ const HIGH_MULTIPLIER: f64 = 10.0;
 /// A destructive kind with no baseline at all still trips Medium, because
 /// "first time the user has ever deleted anything this large" is exactly
 /// the moment a confirmation is most valuable.
+///
+/// These must be the kinds the engines actually *write to the ledger*, not a
+/// parallel vocabulary — [`OperationIntent::kind`] is matched here by exact
+/// equality AND used verbatim as the ledger baseline lookup key. `delete_trash`
+/// and `delete_permanent` are what `file_ops_commands` records; the bare
+/// `delete` / `trash` / `purge` spellings are kept because they are a policy
+/// allowlist other callers may still use, but no FS write site emits them.
 const DESTRUCTIVE_KINDS: &[&str] = &[
     "delete", "trash", "purge", "mass_delete",
+    "delete_trash", "delete_permanent",
     "mirror", "overwrite", "rollback", "wipe",
     "replace", "move", "rename_batch",
 ];
+
+/// Human-readable name for a ledger kind, for use in the confirmation copy.
+///
+/// The wire/ledger kinds are engineering identifiers (`delete_permanent`), but
+/// [`RiskAssessment::reasons`] is rendered verbatim in the interlock dialog —
+/// the highest-stakes copy in the app. Unknown kinds fall through to the raw
+/// identifier, which is exactly what the reasons said before this existed, so
+/// a new kind degrades to the old behaviour rather than to a wrong label.
+fn kind_label(kind: &str) -> &str {
+    match kind {
+        "delete_trash" => "move to Trash",
+        "delete_permanent" => "permanent delete",
+        "create_folder" => "folder creation",
+        "create_file" => "file creation",
+        "edit_text" => "text edit",
+        other => other,
+    }
+}
 
 /// A description of an operation the user is about to run. The caller fills
 /// this in from whatever data it has at the moment it's about to invoke an
@@ -283,8 +309,8 @@ impl SafetyInterlock {
             && level == RiskLevel::Low
         {
             reasons.push(format!(
-                "First-ever {} of this kind on this device, and it touches {} files.",
-                intent.kind, intent.affected_files
+                "First-ever {} on this device, and it touches {} files.",
+                kind_label(&intent.kind), intent.affected_files
             ));
             level = RiskLevel::Medium;
         }
@@ -295,13 +321,13 @@ impl SafetyInterlock {
             if ratio >= HIGH_MULTIPLIER && level != RiskLevel::High {
                 reasons.push(format!(
                     "This operation touches {} files — {:.0}× your usual {} (median {} files over last {} runs).",
-                    intent.affected_files, ratio, intent.kind, median_files, sample_size
+                    intent.affected_files, ratio, kind_label(&intent.kind), median_files, sample_size
                 ));
                 level = RiskLevel::High;
             } else if ratio >= MEDIUM_MULTIPLIER && level == RiskLevel::Low {
                 reasons.push(format!(
                     "This operation touches {} files — {:.0}× your usual {} (median {} files).",
-                    intent.affected_files, ratio, intent.kind, median_files
+                    intent.affected_files, ratio, kind_label(&intent.kind), median_files
                 ));
                 level = RiskLevel::Medium;
             }
@@ -315,7 +341,7 @@ impl SafetyInterlock {
                 reasons.push(format!(
                     "Byte volume is {:.0}× your usual {} (median {}).",
                     ratio,
-                    intent.kind,
+                    kind_label(&intent.kind),
                     format_bytes(median_bytes)
                 ));
                 level = RiskLevel::High;
@@ -323,7 +349,7 @@ impl SafetyInterlock {
                 reasons.push(format!(
                     "Byte volume is {:.0}× your usual {} (median {}).",
                     ratio,
-                    intent.kind,
+                    kind_label(&intent.kind),
                     format_bytes(median_bytes)
                 ));
                 level = RiskLevel::Medium;
@@ -336,7 +362,8 @@ impl SafetyInterlock {
             } else {
                 format!(
                     "Within your usual pattern for {} operations ({} prior runs in baseline).",
-                    intent.kind, sample_size
+                    kind_label(&intent.kind),
+                    sample_size
                 )
             });
         }
@@ -522,6 +549,72 @@ mod tests {
             assessment.requires_confirmation,
             "failed attempts inflated the baseline and suppressed the warning"
         );
+    }
+
+    /// The interlock uses `intent.kind` verbatim as its ledger baseline lookup
+    /// key, so the kind the FS engine *writes* and the kind an intent *carries*
+    /// must be the same string. They drifted: the UI sent "delete"/"purge"
+    /// while the engine recorded "delete_trash"/"delete_permanent", so every
+    /// delete assessed against an empty baseline and claimed "first-ever
+    /// delete" forever, while the adaptive ratio logic never ran at all.
+    ///
+    /// This drives the real engine rather than asserting on a hand-written
+    /// string, so it keeps holding if the engine's kinds are ever renamed.
+    #[tokio::test]
+    async fn fs_delete_baseline_sees_what_the_engine_actually_wrote() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let ledger = OperationLedger::new(repo.pool().clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("a.txt");
+        std::fs::write(&victim, b"x").unwrap();
+        crate::commands::file_ops_commands::delete_files_impl(
+            vec![victim.to_string_lossy().to_string()],
+            true,
+            &ledger,
+        )
+        .await
+        .unwrap();
+
+        let recorded_kind = ledger.recent(10).await.unwrap()[0].kind.clone();
+        // Pins the exact wire string the frontend must send. `FS_INTENT_KIND`
+        // in src/lib/safety.ts holds the other half of this contract.
+        assert_eq!(recorded_kind, "delete_permanent");
+        assert!(
+            DESTRUCTIVE_KINDS.contains(&recorded_kind.as_str()),
+            "engine writes '{recorded_kind}' but the interlock does not treat it as destructive"
+        );
+
+        let interlock = SafetyInterlock::new(ledger);
+        let assessment = interlock
+            .assess(&OperationIntent {
+                engine: "fs".to_string(),
+                kind: recorded_kind.clone(),
+                affected_files: 30,
+                total_bytes: 0,
+                subject_path: None,
+                summary: None,
+            })
+            .await;
+
+        assert_eq!(
+            assessment.baseline_sample_size, 1,
+            "the engine wrote a '{recorded_kind}' row the interlock could not see"
+        );
+        assert!(
+            !assessment.reasons.iter().any(|r| r.contains("First-ever")),
+            "a delete with precedent must not be reported as first-ever: {:?}",
+            assessment.reasons
+        );
+    }
+
+    #[test]
+    fn kind_label_humanises_identifiers_and_passes_unknowns_through() {
+        assert_eq!(kind_label("delete_trash"), "move to Trash");
+        assert_eq!(kind_label("delete_permanent"), "permanent delete");
+        // An unrecognised kind degrades to the raw identifier — the same text
+        // the reasons carried before kind_label existed — never a wrong label.
+        assert_eq!(kind_label("some_future_kind"), "some_future_kind");
     }
 
     fn make_interlock() -> SafetyInterlock {
