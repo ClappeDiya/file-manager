@@ -1,102 +1,75 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file is the **Codex adapter** for the UFOP repository. It tells Codex how
+to find its way around without duplicating what already lives in `CLAUDE.md`.
 
-## Project Overview
+- **Canonical project knowledge** → `CLAUDE.md` (architecture, conventions,
+  end-to-end checklist for adding a feature). Read it first.
+- **Skills** Codex can load → `.agents/skills/` (Claude-format skills, kept in
+  sync from `.claude/skills/` so both runtimes see the same playbooks).
+- **Codex-only configuration** → `.codex/` (this directory holds Codex's
+  `config.toml` and `agents/`, and is the only Codex-specific surface).
 
-Unified File Operations Platform (UFOP) — a cross-platform desktop file manager with transfer, sync, and governance capabilities. Three integrated components: Tauri desktop app (React + Rust), Next.js admin console, and CLI.
+## Project map
 
-## Commands
-
-### Desktop App (Tauri + React/Vite)
-```bash
-pnpm dev              # Start Vite dev server (port 1420) — frontend only, no Tauri
-pnpm tauri:dev        # Start full Tauri desktop app in dev mode (Rust + React)
-pnpm build            # Production build (frontend only)
-pnpm tauri:build      # Build native desktop binary
-pnpm lint             # ESLint on src/
-pnpm format           # Prettier on src/
-pnpm test             # Vitest (watch mode)
-pnpm test:watch       # Vitest watch mode (same as above)
+```
+.
+├── AGENTS.md              ← this file (Codex adapter)
+├── CLAUDE.md              ← canonical project guidance — read first
+├── README.md, CHANGELOG.md, CONTRIBUTING.md, LICENSE
+├── PRD-V5-Definitive.md   ← product spec
+├── .codex/
+│   ├── config.toml        ← Codex CLI configuration (tracked)
+│   └── agents/            ← Codex agent definitions (.toml)
+├── .agents/
+│   └── skills/            ← Claude-format skills usable by Codex
+├── .claude/               ← Claude Code config (gitignored)
+├── src/                   ← React + Vite desktop UI
+│   ├── file-manager.tsx   ← root orchestrator
+│   ├── components/, stores/, hooks/, lib/
+├── src-tauri/             ← Rust core engine (Tauri 2.0)
+│   ├── src/commands/      ← #[tauri::command] handlers (~30 modules)
+│   ├── src/storage/       ← SQLite pool + migrations + repository
+│   ├── src/connectors/    ← 17 protocol connectors
+│   └── src/core/          ← AppError, traits
+├── admin/                 ← Next.js admin console (port 3001 dev)
+├── marketing/             ← Marketing site
+├── cli/                   ← UFOP CLI
+├── packages/
+│   ├── design-tokens/     ← @ufop/design-tokens
+│   └── ui-components/     ← @ufop/ui-components
+├── docs/, planning/, scripts/, public/
+└── docker-compose.ghcr.yml, releases-proxy/, ai-agents/
 ```
 
-### Rust Backend
-```bash
-cd src-tauri
-cargo check           # Fast compilation check (no codegen)
-cargo test --lib      # Run all library tests (~733 tests)
-cargo test --lib automation  # Run tests matching "automation"
-cargo clippy          # Lint (if installed)
-```
+## Where Codex differs from Claude
 
-### Admin Console (Next.js)
-```bash
-pnpm admin:dev        # Start admin console on port 3001
-```
+- **Skills directory.** Codex loads skills from `.agents/skills/` (not
+  `.codex/skills/`). The files are the same Markdown-with-frontmatter format
+  Claude uses, kept in sync from `.claude/skills/` — when you update a skill,
+  edit `.claude/skills/<name>/SKILL.md` and re-copy it into `.agents/skills/`.
+- **Agent definitions.** Claude agents are `.md` files in `.claude/agents/`;
+  Codex agents are `.toml` files in `.codex/agents/`. There are no agents
+  defined yet — add one by dropping a `<name>.toml` into `.codex/agents/` with
+  a `developer_instructions = """..."""` block.
+- **Configuration.** Codex reads `.codex/config.toml`. Treat it as
+  team-shared; per-developer overrides go in `*.local.toml` (gitignored).
+- **Permissions and secrets.** Codex's `.codex/auth.json` and any local
+  override files are gitignored. Never commit them.
 
-### Package Manager
-pnpm 10.27.0. Monorepo with workspaces: root, `packages/design-tokens`, `packages/ui-components`, `admin`.
+## Conventions and runtime context
 
-## Architecture
+All conventions — IPC boundary, AppState pattern, error model, serde tag
+rules, migration version-count assertions, the "adding a new feature"
+checklist, and the connector / transfer-engine architecture — are documented
+in `CLAUDE.md` and apply identically when Codex is driving. Defer to that
+file rather than restating it here.
 
-### IPC Boundary (Most Important Pattern)
-Frontend communicates with Rust via Tauri IPC commands. Every backend operation goes through this boundary:
+## Common commands
 
-- **Rust side**: `#[tauri::command]` functions in `src-tauri/src/commands/*.rs`, registered in `lib.rs` `invoke_handler`
-- **Frontend side**: `tauriInvoke<T>("command_name", { args })` from `src/hooks/use-tauri.ts`
-- **Fallback**: `tauriInvokeSafe<T>()` never throws — returns fallback value when outside Tauri (enables browser testing)
-- **Detection**: `isTauriAvailable()` checks for `__TAURI__` in window
+See `CLAUDE.md` § Commands for the full list. Short reference:
 
-### Rust Backend (`src-tauri/src/`)
-
-**Module registration**: Every engine module must be declared as `pub mod` in `lib.rs`.
-
-**AppState pattern**: All managers are initialized in `initialize_app_state()`, stored in an `AppState` struct, then individually registered via `.manage()` on the Tauri builder. There are TWO init paths — the normal path and an in-memory fallback — both must include every manager.
-
-**Command modules** (`commands/`): ~30 modules, one per feature area. Every `.rs` file needs a `pub mod` entry in `commands/mod.rs` and its commands registered in the `invoke_handler` macro in `lib.rs`.
-
-**Error handling** (`core/error.rs`): `AppError` enum with `{ message, advice }` fields. Every error variant carries a user-facing explanation and suggested fix. Stack traces never leak to frontend. The `Internal` variant sanitizes messages.
-
-**Traits** (`core/traits.rs`): Async traits using `BoxFuture<'_, Result<T, AppError>>` for dependency injection. Key traits: `FsOperations`, `TransferOperations`, `SyncOperations`, `StorageOperations`.
-
-**Database** (`storage/pool.rs`): Single SQLite connection wrapped in `Arc<Mutex<Connection>>`. All DB operations go through `pool.execute(|conn| { ... })` which runs on `tokio::task::spawn_blocking`. WAL mode, foreign keys enabled, 5s busy timeout.
-
-**Migrations** (`storage/migrations.rs`): Versioned SQL scripts in `all_migrations()` vector. When adding a migration, update version count in test assertions (both `migrations.rs` and `repository.rs`).
-
-### Frontend (`src/`)
-
-**State management**: Zustand stores in `src/stores/`. Stores using `persist()` middleware save to localStorage. Tests must reset store state in `beforeEach`.
-
-**Component hierarchy**: `file-manager.tsx` is the root orchestrator — imports and renders all panels (AI, Automation, Terminal), sidebar, dual-pane layout, command palette, and context menus.
-
-**Path aliases**: `@/` maps to `./src/`, `@ufop/design-tokens` and `@ufop/ui-components` map to workspace packages.
-
-**UI library**: shadcn/ui + React Aria + Tailwind CSS. Icons from lucide-react. Shared design tokens via `@ufop/design-tokens`.
-
-### Adding a New Feature (End-to-End Checklist)
-
-1. **Rust engine**: Create `src-tauri/src/{feature}_engine/mod.rs` with data structures and manager
-2. **Commands**: Create `src-tauri/src/commands/{feature}_commands.rs` with `#[tauri::command]` functions
-3. **Wire commands**: Add `pub mod` in `commands/mod.rs`, import in `lib.rs`, add to `invoke_handler`
-4. **AppState**: Add manager field to `AppState`, initialize in BOTH init paths, add `.manage()` call
-5. **Migration**: Add new version to `all_migrations()`, update test assertions for version count
-6. **Frontend store**: Create `src/stores/{feature}-store.ts` with Zustand + TypeScript types matching Rust serde output
-7. **Component**: Create `src/components/{feature}-panel.tsx`, import and render in `file-manager.tsx`
-8. **Toolbar**: Add entry to `ALL_TOOLBAR_ITEMS` array, add toggle button in toolbar JSX
-9. **Command palette**: Add entries in `command-palette.tsx` (`getDefaultCommands` actions object)
-
-### Key Conventions
-
-- Rust enums use `#[serde(tag = "type", rename_all = "snake_case")]` — TypeScript discriminated unions must match these exact snake_case `type` values
-- `Option<T>` in Rust serializes as `T | null` in JSON — use `T | null` in TypeScript (not `T | undefined`)
-- All async Rust errors return `Result<T, AppError>` — never use `.unwrap()` in command handlers
-- Toolbar items array (`ALL_TOOLBAR_ITEMS`) controls the toolbar customizer UI — every panel toggle needs an entry
-- Frontend works outside Tauri with fallback data — always provide a fallback parameter to `tauriInvoke`
-
-### Connector Protocol Pattern (`connectors/`)
-
-All 17 protocol connectors implement the `Connector` trait: `connect()`, `disconnect()`, `list_remote()`, `is_connected()`. New connectors follow this pattern and register in `ConnectorRegistry`.
-
-### Transfer Engine Three-Layer Architecture
-
-Layer 1 (throughput): Worker pool + pipeline. Layer 2 (integrity): xxHash3/SHA-256 checksums + Merkle tree. Layer 3 (crash recovery): Journal + chunk bitmap + atomic rename. `TransferManager::recover_from_journal()` runs on startup.
+- Desktop UI: `pnpm dev`, `pnpm tauri:dev`, `pnpm lint`, `pnpm test`, `pnpm build`
+- Rust core: `cd src-tauri && cargo check && cargo test --lib`
+- Admin console: `pnpm admin:dev`
+- Package manager: pnpm 10.27.0 (workspaces: root, `packages/*`, `admin/`)

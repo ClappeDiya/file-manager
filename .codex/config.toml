@@ -1,0 +1,31 @@
+# Codex CLI configuration for the UFOP repository.
+#
+# This file is committed and shared by the team. Keep it minimal and safe.
+# Per-developer overrides go in *.local.toml (gitignored). Secrets and
+# authentication tokens live in .codex/auth.json (also gitignored) — never
+# add them here.
+#
+# Canonical project guidance lives in CLAUDE.md. This file is the Codex
+# entry point; AGENTS.md explains the Codex/Claude split.
+
+# Default model. Override per-session with `codex --model <name>` or in a
+# *.local.toml without editing this file.
+model = "gpt-5-codex"
+
+# Require Codex to ask before any tool call that can mutate the filesystem,
+# run a command, or talk to the network. Tighten or loosen via
+# `codex --approval-policy <mode>` for one-off sessions.
+approval_policy = "on-request"
+
+# Allow writes inside the workspace, but block writes elsewhere on the host.
+# Use `danger-full-access` only when you know what you're doing.
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+# Block outbound network from the sandbox by default. Individual sessions
+# can override with `codex --full-auto` or per-tool approvals.
+network_access = false
+
+# Auto-discover Codex agent definitions in this folder.
+[agents]
+directory = ".codex/agents"

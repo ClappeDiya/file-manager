@@ -1,4 +1,4 @@
-use crate::commands::file_ops_commands::record_fs_ok;
+use crate::commands::file_ops_commands::{record_fs_ok, with_fs_failure_record};
 use crate::core::error::AppError;
 use crate::core::types::FileEntry;
 use crate::fs_engine;
@@ -108,11 +108,23 @@ pub async fn read_text_file_full(path: String) -> Result<String, AppError> {
 ///   - audit exports / undo history
 /// The recording is fail-open by construction (see `record_fs_ok`),
 /// so a transient ledger DB hiccup can never block the user's save.
+/// Iter 36: a failed save is now recorded too, via the same
+/// `_impl` + wrapper split the rest of the FS commands use.
 #[tauri::command]
 pub async fn write_text_file_full(
     path: String,
     content: String,
     ledger: tauri::State<'_, OperationLedger>,
+) -> Result<(), AppError> {
+    let paths = vec![path.clone()];
+    let outcome = write_text_file_full_impl(path, content, &ledger).await;
+    with_fs_failure_record(&ledger, "edit_text", &paths, outcome).await
+}
+
+pub async fn write_text_file_full_impl(
+    path: String,
+    content: String,
+    ledger: &OperationLedger,
 ) -> Result<(), AppError> {
     if content.len() as u64 > TEXT_EDITOR_MAX_BYTES {
         return Err(AppError::validation(format!(
@@ -158,6 +170,6 @@ pub async fn write_text_file_full(
     // timeline (unlike batch operations which share an id across
     // paired records).
     let correlation_id = uuid::Uuid::new_v4().to_string();
-    record_fs_ok(&ledger, "edit_text", &[], &[path], &correlation_id).await;
+    record_fs_ok(ledger, "edit_text", &[], &[path], &correlation_id).await;
     Ok(())
 }

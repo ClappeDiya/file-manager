@@ -45,6 +45,14 @@ src-tauri/WixTools/
 # Claude Code
 .claude/
 
+# Codex CLI — config.toml and agents/ are tracked; secrets and local
+# overrides are not.
+.codex/auth.json
+.codex/*.local.toml
+.codex/history/
+.codex/log/
+.codex/sessions/
+
 # Generated
 icon.png
 *.pyc

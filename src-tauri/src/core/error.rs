@@ -58,6 +58,12 @@ struct ErrorPayload {
     advice: String,
 }
 
+/// The only text an [`AppError::Internal`] is ever allowed to show a user.
+/// Shared by the `Serialize` impl (IPC boundary) and [`AppError::user_message`]
+/// (ledger / persistence boundary) so the two sanitisation paths cannot drift.
+const INTERNAL_SANITIZED_MESSAGE: &str = "An unexpected error occurred.";
+const INTERNAL_SANITIZED_ADVICE: &str = "If this persists, restart the application.";
+
 impl Serialize for AppError {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -111,11 +117,29 @@ impl Serialize for AppError {
             },
             Self::Internal { .. } => ErrorPayload {
                 error_type: "internal",
-                message: "An unexpected error occurred.".to_string(),
-                advice: "If this persists, restart the application.".to_string(),
+                message: INTERNAL_SANITIZED_MESSAGE.to_string(),
+                advice: INTERNAL_SANITIZED_ADVICE.to_string(),
             },
         };
         payload.serialize(serializer)
+    }
+}
+
+impl AppError {
+    /// The user-facing text for this error, sanitised exactly like the IPC
+    /// boundary sanitises it (see the `Serialize` impl above): `Internal`
+    /// never reveals its real message.
+    ///
+    /// `Display` (via `thiserror`) is NOT safe for this — `Internal` is
+    /// declared `#[error("{message}")]`, so `to_string()` returns the raw
+    /// internal text. Use `user_message` anywhere an error is shown to or
+    /// persisted for a user; most notably the operation ledger, whose rows
+    /// are rendered verbatim in the Activity Timeline.
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::Internal { .. } => INTERNAL_SANITIZED_MESSAGE.to_string(),
+            other => other.to_string(),
+        }
     }
 }
 
@@ -236,6 +260,20 @@ impl From<serde_json::Error> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_message_sanitizes_internal_but_keeps_the_rest() {
+        // `Display` is unsafe for Internal — it is declared `#[error("{message}")]`,
+        // so to_string() returns the raw text. user_message must not.
+        let internal = AppError::internal("secret: user:hunter2@db-host");
+        assert!(internal.to_string().contains("hunter2"));
+        assert_eq!(internal.user_message(), INTERNAL_SANITIZED_MESSAGE);
+
+        // Every other variant is already user-facing and passes through.
+        let file_op = AppError::file_op("Failed to copy /a/b.txt", "Check permissions.");
+        assert!(file_op.user_message().contains("/a/b.txt"));
+        assert!(file_op.user_message().contains("Check permissions."));
+    }
 
     #[test]
     fn test_internal_error_does_not_leak() {
