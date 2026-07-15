@@ -205,6 +205,11 @@ pub fn check_mount_capability(protocol: &str) -> MountCapability {
 }
 
 /// Manages mounts using native OS commands and persists state in SQLite.
+///
+/// `Clone` is cheap and shares state — the only field is an `Arc`. Cloning is
+/// what lets startup hand a handle to the background auto-mount task before the
+/// manager is moved into Tauri's managed state.
+#[derive(Clone)]
 pub struct MountManager {
     /// Active mounts keyed by mount ID.
     mounts: Arc<RwLock<HashMap<Uuid, VirtualMount>>>,
@@ -574,6 +579,78 @@ impl MountManager {
     }
 
     /// List all active and saved mounts.
+    /// Re-mount every saved config flagged `auto_mount`, honouring the promise
+    /// in this module's header ("persisted in SQLite for auto-mount on startup")
+    /// and the "Auto-mount" checkbox in the mount dialog.
+    ///
+    /// Until this existed there was no restore path at all: `save_mount_config`
+    /// wrote the flag and `list_mounts` read it back purely to render "Auto",
+    /// so the checkbox was decorative — the user ticked it, restarted, and
+    /// nothing mounted.
+    ///
+    /// Returns `(mounted, failed)` counts. Never returns `Err`: a mount that
+    /// fails (server down, credentials expired, mount point gone) is logged and
+    /// skipped, because one unreachable server must not cost the user the rest.
+    /// Callers must run this OFF the startup path — `mount_remote` shells out to
+    /// `mount_smbfs`/`sshfs`, which can block for a long time on an unreachable
+    /// host, and app boot must never wait on a network mount.
+    pub async fn auto_mount_saved(
+        &self,
+        repo: &Repository,
+        connection_mgr: &ConnectionManager,
+    ) -> (usize, usize) {
+        let configs: Vec<(String, String)> = match repo
+            .pool()
+            .execute(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT connection_id, mount_point FROM mount_configs \
+                     WHERE auto_mount = 1 ORDER BY created_at ASC",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(rows)
+            })
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("Auto-mount: could not read saved mounts: {e}");
+                return (0, 0);
+            }
+        };
+
+        let (mut mounted, mut failed) = (0usize, 0usize);
+        for (connection_id, mount_point) in configs {
+            let Ok(cid) = Uuid::parse_str(&connection_id) else {
+                tracing::warn!("Auto-mount: skipping config with invalid connection id {connection_id}");
+                failed += 1;
+                continue;
+            };
+            // `mount_remote` is idempotent enough for this: it rejects a
+            // duplicate mount point that is already Mounted, so a race with a
+            // manual mount degrades to a logged skip rather than a double mount.
+            match self.mount_remote(cid, mount_point.clone(), repo, connection_mgr).await {
+                Ok(_) => {
+                    mounted += 1;
+                    tracing::info!("Auto-mounted {mount_point}");
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!("Auto-mount of {mount_point} failed (non-fatal): {e}");
+                }
+            }
+        }
+
+        if mounted > 0 || failed > 0 {
+            tracing::info!("Auto-mount complete: {mounted} mounted, {failed} failed");
+        }
+        (mounted, failed)
+    }
+
     pub async fn list_mounts(
         &self,
         repo: &Repository,
@@ -752,6 +829,83 @@ impl Default for MountManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a repo + connection manager for the auto-mount tests. The
+    /// credential store skips the keychain in debug builds, so this stays
+    /// hermetic and never prompts.
+    async fn auto_mount_fixture() -> (crate::storage::Repository, ConnectionManager) {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let conns = ConnectionManager::new(
+            repo.clone(),
+            std::sync::Arc::new(crate::security::CredentialStore::new()),
+        );
+        (repo, conns)
+    }
+
+    async fn insert_config(repo: &crate::storage::Repository, mount_point: &str, auto: bool) {
+        let mp = mount_point.to_string();
+        repo.pool()
+            .execute(move |conn| {
+                conn.execute(
+                    "INSERT INTO mount_configs (id, connection_id, mount_point, auto_mount, status) \
+                     VALUES (?1, ?2, ?3, ?4, 'unmounted')",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        // A connection that does not exist: mount_remote fails at
+                        // its connection lookup and never shells out to
+                        // mount_smbfs/sshfs, so the test touches no real mounts.
+                        Uuid::new_v4().to_string(),
+                        mp,
+                        auto as i32,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The regression: `auto_mount` was written and read back only to render
+    /// "Auto" in the list. No restore path existed, so the checkbox was
+    /// decorative — tick it, restart, nothing mounts.
+    #[tokio::test]
+    async fn auto_mount_attempts_only_flagged_configs() {
+        let (repo, conns) = auto_mount_fixture().await;
+        insert_config(&repo, "/mnt/auto", true).await;
+        insert_config(&repo, "/mnt/manual", false).await;
+
+        let (mounted, failed) = MountManager::new().auto_mount_saved(&repo, &conns).await;
+
+        assert_eq!(mounted, 0, "no real connection exists, so none can mount");
+        assert_eq!(
+            failed, 1,
+            "exactly the auto_mount=1 row may be attempted; the manual one must be left alone"
+        );
+    }
+
+    /// One unreachable server must not stop the others being tried, and must
+    /// never propagate an error into app startup.
+    #[tokio::test]
+    async fn auto_mount_survives_failures_and_never_errors() {
+        let (repo, conns) = auto_mount_fixture().await;
+        for i in 0..3 {
+            insert_config(&repo, &format!("/mnt/auto{i}"), true).await;
+        }
+
+        let (mounted, failed) = MountManager::new().auto_mount_saved(&repo, &conns).await;
+
+        assert_eq!(mounted, 0);
+        assert_eq!(failed, 3, "every flagged config is attempted despite failures");
+    }
+
+    #[tokio::test]
+    async fn auto_mount_is_a_noop_with_nothing_saved() {
+        let (repo, conns) = auto_mount_fixture().await;
+        assert_eq!(
+            MountManager::new().auto_mount_saved(&repo, &conns).await,
+            (0, 0)
+        );
+    }
 
     #[test]
     fn test_mount_status_roundtrip() {
