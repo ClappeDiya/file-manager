@@ -36,6 +36,36 @@ import { useSafetyStore } from "@/stores/safety-store";
 export { FS_INTENT_KIND } from "./fs-kinds";
 export type { FsIntentKind } from "./fs-kinds";
 
+/** Wire mirror of `AffectedFiles` in `commands::file_ops_commands`. */
+interface AffectedFiles {
+  files: number;
+  bytes: number;
+  capped: boolean;
+}
+
+/**
+ * Measure what a selection would really touch, for an {@link OperationIntent}.
+ *
+ * A selection of one folder is one item but can be ten thousand files, and the
+ * interlock reasons about files. Passing the item count meant a folder delete
+ * looked like a one-file operation and stayed under every threshold.
+ *
+ * Falls back to the item count — today's behaviour — when the count is
+ * unavailable (outside Tauri, or if the walk fails). The interlock is advisory
+ * and fails open by design elsewhere; refusing to act because we couldn't
+ * measure would be a worse trade than assessing on a low estimate.
+ */
+export async function measureSelection(
+  paths: string[],
+): Promise<{ files: number; bytes: number }> {
+  const measured = await tauriInvokeSafe<AffectedFiles>(
+    "count_affected_files",
+    { paths },
+    { files: paths.length, bytes: 0, capped: false },
+  );
+  return { files: measured.files, bytes: measured.bytes };
+}
+
 /** Wire-format mirror of `safety::OperationIntent` in Rust. */
 export interface OperationIntent {
   engine: string;

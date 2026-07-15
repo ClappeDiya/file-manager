@@ -193,6 +193,78 @@ pub async fn copy_files(
     with_fs_failure_record(&ledger, "copy", &source_paths, outcome).await
 }
 
+/// What a selection would actually touch on disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AffectedFiles {
+    /// Files under the selection, descending into directories.
+    pub files: u64,
+    /// Total bytes of those files.
+    pub bytes: u64,
+    /// The walk stopped early, so `files` is a floor rather than the total.
+    pub capped: bool,
+}
+
+/// Add `path` (recursively, if a directory) to `acc`, stopping at `cap`.
+///
+/// Uses `symlink_metadata` so a symlink counts as the one entry it is: this
+/// measures blast radius, and following links would both double-count and
+/// invite a cycle. Unreadable entries are skipped — deciding whether to show a
+/// confirmation is better done on an approximate count than not at all.
+fn accumulate_affected(path: &Path, cap: u64, acc: &mut AffectedFiles) {
+    if acc.files >= cap {
+        acc.capped = true;
+        return;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.is_dir() {
+        acc.files += 1;
+        acc.bytes += meta.len();
+        if acc.files >= cap {
+            acc.capped = true;
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        accumulate_affected(&entry.path(), cap, acc);
+        if acc.capped {
+            return;
+        }
+    }
+}
+
+/// Count the files a selection really touches, for the Safety Interlock.
+///
+/// The interlock reasons about blast radius, but the UI only knows how many
+/// *items* are selected. Deleting one folder holding 10,000 files looked like a
+/// one-file operation and sailed under every threshold, while selecting 25 loose
+/// files tripped the dialog — the check fired on the harmless case and waved the
+/// catastrophic one through.
+///
+/// Walks no further than just past the interlock's ceiling: above it the verdict
+/// is High whatever the exact number is, so counting a million-file tree would
+/// be latency in front of a dialog that already knows its answer.
+#[tauri::command]
+pub async fn count_affected_files(paths: Vec<String>) -> Result<AffectedFiles, AppError> {
+    let cap = crate::safety::DESTRUCTIVE_VOLUME_HARD_CAP.saturating_add(1);
+    let mut acc = AffectedFiles {
+        files: 0,
+        bytes: 0,
+        capped: false,
+    };
+    for path in &paths {
+        accumulate_affected(Path::new(path), cap, &mut acc);
+        if acc.capped {
+            break;
+        }
+    }
+    Ok(acc)
+}
+
 /// First free `"<stem> (copy)"` / `"<stem> (copy N)"` name for `src` inside `dir`.
 ///
 /// Shared by copy (which only needs it on a name collision) and duplicate
@@ -1987,6 +2059,85 @@ mod tests {
                 "error message should reference the missing path, got: {message}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn counting_a_folder_sees_the_files_inside_it_not_one_item() {
+        // The whole point: one selected folder is one item but many files, and
+        // the interlock thresholds are in files. Counting items meant deleting
+        // a full folder scored 1 and stayed under every threshold.
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join("project");
+        let nested = folder.join("src").join("deep");
+        fs::create_dir_all(&nested).unwrap();
+        for i in 0..30 {
+            fs::write(folder.join(format!("f{i}.txt")), b"abcd").unwrap();
+        }
+        for i in 0..12 {
+            fs::write(nested.join(format!("n{i}.rs")), b"ab").unwrap();
+        }
+
+        let got = count_affected_files(vec![folder.to_string_lossy().to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(got.files, 42, "30 top-level + 12 nested");
+        assert_eq!(got.bytes, 30 * 4 + 12 * 2);
+        assert!(!got.capped);
+    }
+
+    #[tokio::test]
+    async fn counting_stops_once_past_the_interlock_ceiling() {
+        // Above the ceiling the verdict is High regardless, so the walk stops:
+        // an exact count of a huge tree is latency in front of a dialog that
+        // already knows its answer.
+        let dir = tempdir().unwrap();
+        let cap = crate::safety::DESTRUCTIVE_VOLUME_HARD_CAP;
+        let mut acc = AffectedFiles {
+            files: cap - 1,
+            bytes: 0,
+            capped: false,
+        };
+        fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        fs::write(dir.path().join("b.txt"), b"x").unwrap();
+
+        accumulate_affected(dir.path(), cap, &mut acc);
+        assert!(acc.capped, "walk must stop at the ceiling");
+        assert_eq!(acc.files, cap, "and not keep counting past it");
+    }
+
+    #[tokio::test]
+    async fn counting_tolerates_paths_it_cannot_read() {
+        // This decides whether to show a confirmation. A vanished path must not
+        // fail the measurement and take the dialog down with it.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("real.txt"), b"xyz").unwrap();
+
+        let got = count_affected_files(vec![
+            dir.path().join("real.txt").to_string_lossy().to_string(),
+            dir.path().join("ghost.txt").to_string_lossy().to_string(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(got.files, 1);
+        assert_eq!(got.bytes, 3);
+    }
+
+    #[tokio::test]
+    async fn counting_a_plain_selection_matches_the_item_count() {
+        // The common case must not change: N loose files are N files.
+        let dir = tempdir().unwrap();
+        let paths: Vec<String> = (0..5)
+            .map(|i| {
+                let p = dir.path().join(format!("f{i}.txt"));
+                fs::write(&p, b"z").unwrap();
+                p.to_string_lossy().to_string()
+            })
+            .collect();
+
+        let got = count_affected_files(paths.clone()).await.unwrap();
+        assert_eq!(got.files as usize, paths.len());
     }
 
     #[tokio::test]

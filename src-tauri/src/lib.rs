@@ -550,6 +550,7 @@ pub fn run() {
             file_ops_commands::move_files,
             file_ops_commands::rename_file,
             file_ops_commands::duplicate_files,
+            file_ops_commands::count_affected_files,
             file_ops_commands::delete_files,
             file_ops_commands::create_directory,
             file_ops_commands::ensure_directory,

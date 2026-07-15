@@ -42,7 +42,7 @@ const DESTRUCTIVE_VOLUME_FLOOR: u64 = 25;
 /// A single-shot operation touching more files than this deserves
 /// confirmation even for a user whose baseline is also large, because the
 /// blast radius of a mistake at this scale is catastrophic.
-const DESTRUCTIVE_VOLUME_HARD_CAP: u64 = 5_000;
+pub(crate) const DESTRUCTIVE_VOLUME_HARD_CAP: u64 = 5_000;
 
 /// Absolute ceiling for raw bytes (10 GiB) that always trips High on
 /// transfer-shaped operations, even if the user has done larger transfers

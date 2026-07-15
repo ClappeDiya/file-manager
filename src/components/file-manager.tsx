@@ -11,7 +11,7 @@ import { useSpacesStore } from "@/stores/spaces-store";
 import { useTerminalStore } from "@/stores/terminal-store";
 import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { loadSmartDestinations, fileExtension, type SmartDestination } from "@/hooks/use-smart-destinations";
-import { assessBeforeExecute, FS_INTENT_KIND } from "@/lib/safety";
+import { assessBeforeExecute, measureSelection, FS_INTENT_KIND } from "@/lib/safety";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
 import { reportOperationFailure } from "@/lib/op-error-toast";
 import {
@@ -2975,12 +2975,13 @@ function FilePane({
       // `ensure_directory` call first; it's a no-op when the dir
       // already exists.
       await tauriInvoke("ensure_directory", { path: destDir });
+      const measured = await measureSelection(stalePaths);
       const result = await assessBeforeExecute(
         {
           engine: "fs",
           kind: FS_INTENT_KIND.move,
-          affected_files: stalePaths.length,
-          total_bytes: 0,
+          affected_files: measured.files,
+          total_bytes: measured.bytes,
           subject_path: currentPath,
           summary: `Archive ${stalePaths.length} stale file${stalePaths.length === 1 ? "" : "s"} → .archive/${yyyy}-${mm}/`,
         },
@@ -3204,12 +3205,13 @@ function FilePane({
         const otherPath = store.getActivePath(otherPaneIndex);
         const proceed = await checkConflicts(selectedPaths, otherPath);
         if (!proceed) return;
+        const measured = await measureSelection(selectedPaths);
         const result = await assessBeforeExecute(
           {
             engine: "fs",
             kind: FS_INTENT_KIND.move,
-            affected_files: selectedPaths.length,
-            total_bytes: 0,
+            affected_files: measured.files,
+            total_bytes: measured.bytes,
             subject_path: currentPath,
             summary: `Move ${selectedPaths.length} item${selectedPaths.length === 1 ? "" : "s"} → ${otherPath}`,
           },
@@ -3233,12 +3235,13 @@ function FilePane({
     if (selectedPaths.length === 0) return;
     if (isTauriAvailable()) {
       try {
+        const measured = await measureSelection(selectedPaths);
         const result = await assessBeforeExecute(
           {
             engine: "fs",
             kind: FS_INTENT_KIND.deleteTrash,
-            affected_files: selectedPaths.length,
-            total_bytes: 0,
+            affected_files: measured.files,
+            total_bytes: measured.bytes,
             subject_path: currentPath,
             summary: `Move ${selectedPaths.length} item${selectedPaths.length === 1 ? "" : "s"} to Trash`,
           },
@@ -3271,12 +3274,13 @@ function FilePane({
         // Safety Interlock runs AFTER the inline confirm so the user has
         // two independent decision points for hard deletes: the OS-style
         // name list confirm, and the anomaly-aware interlock.
+        const measured = await measureSelection(paths);
         const result = await assessBeforeExecute(
           {
             engine: "fs",
             kind: FS_INTENT_KIND.deletePermanent,
-            affected_files: paths.length,
-            total_bytes: 0,
+            affected_files: measured.files,
+            total_bytes: measured.bytes,
             subject_path: currentPath,
             summary: `Permanently delete ${paths.length} item${paths.length === 1 ? "" : "s"}`,
           },
@@ -3724,12 +3728,13 @@ function FilePane({
       try {
         const proceed = await checkConflicts(selectedPaths, destDir);
         if (!proceed) return;
+        const measured = await measureSelection(selectedPaths);
         const result = await assessBeforeExecute(
           {
             engine: "fs",
             kind: FS_INTENT_KIND.move,
-            affected_files: selectedPaths.length,
-            total_bytes: 0,
+            affected_files: measured.files,
+            total_bytes: measured.bytes,
             subject_path: currentPath,
             summary: `Send ${selectedPaths.length} item${selectedPaths.length === 1 ? "" : "s"} → ${destDir}`,
           },
