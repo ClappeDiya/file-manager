@@ -2,7 +2,7 @@ use crate::core::error::AppError;
 use crate::core::types::FileEntry;
 use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -180,6 +180,73 @@ pub async fn copy_files(
     with_fs_failure_record(&ledger, "copy", &source_paths, outcome).await
 }
 
+/// First free `"<stem> (copy)"` / `"<stem> (copy N)"` name for `src` inside `dir`.
+///
+/// Shared by copy (which only needs it on a name collision) and duplicate
+/// (which always renames, since it writes beside the original).
+fn next_available_copy_name(dir: &Path, src: &Path) -> Result<PathBuf, AppError> {
+    let stem = src
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let ext = src
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+
+    for counter in 1..=1000 {
+        let new_name = if counter == 1 {
+            format!("{stem} (copy){ext}")
+        } else {
+            format!("{stem} (copy {counter}){ext}")
+        };
+        let candidate = dir.join(&new_name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(AppError::file_op(
+        "Too many copies",
+        "Clean up duplicate files first.",
+    ))
+}
+
+/// Copy a single entry into `dest_dir`, returning the path it landed at.
+fn copy_one(source: &str, dest_path: &Path) -> Result<String, AppError> {
+    let src = Path::new(source);
+    if !src.exists() {
+        return Err(AppError::file_op(
+            format!("Source not found: {source}"),
+            "The file or folder may have been moved or deleted.",
+        ));
+    }
+
+    let file_name = src
+        .file_name()
+        .ok_or_else(|| AppError::file_op("Invalid source path", "Check the file path."))?;
+    let mut target = dest_path.join(file_name);
+
+    // Handle name conflicts by appending " (copy)" or " (copy N)"
+    if target.exists() {
+        target = next_available_copy_name(dest_path, src)?;
+    }
+
+    if src.is_dir() {
+        copy_dir_recursive(src, &target)?;
+    } else {
+        std::fs::copy(src, &target).map_err(|e| {
+            AppError::file_op(
+                format!("Failed to copy {}: {e}", src.display()),
+                "Check disk space and permissions.",
+            )
+        })?;
+    }
+
+    Ok(target.to_string_lossy().to_string())
+}
+
 pub async fn copy_files_impl(
     source_paths: Vec<String>,
     dest_dir: String,
@@ -194,60 +261,19 @@ pub async fn copy_files_impl(
     }
 
     let mut dest_paths = Vec::new();
+    let mut copied_sources = Vec::new();
 
     for source in &source_paths {
-        let src = Path::new(source);
-        if !src.exists() {
-            return Err(AppError::file_op(
-                format!("Source not found: {source}"),
-                "The file or folder may have been moved or deleted.",
-            ));
-        }
-
-        let file_name = src
-            .file_name()
-            .ok_or_else(|| AppError::file_op("Invalid source path", "Check the file path."))?;
-        let mut target = dest_path.join(file_name);
-
-        // Handle name conflicts by appending " (copy)" or " (copy N)"
-        if target.exists() {
-            let stem = target
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let ext = target
-                .extension()
-                .map(|e| format!(".{}", e.to_string_lossy()))
-                .unwrap_or_default();
-
-            let mut counter = 1;
-            loop {
-                let new_name = if counter == 1 {
-                    format!("{stem} (copy){ext}")
-                } else {
-                    format!("{stem} (copy {counter}){ext}")
-                };
-                target = dest_path.join(&new_name);
-                if !target.exists() {
-                    break;
-                }
-                counter += 1;
+        match copy_one(source, dest_path) {
+            Ok(target) => {
+                dest_paths.push(target);
+                copied_sources.push(source.clone());
+            }
+            Err(err) => {
+                record_fs_partial(ledger, "copy", &copied_sources, &dest_paths).await;
+                return Err(err);
             }
         }
-
-        if src.is_dir() {
-            copy_dir_recursive(src, &target)?;
-        } else {
-            std::fs::copy(src, &target).map_err(|e| {
-                AppError::file_op(
-                    format!("Failed to copy {}: {e}", src.display()),
-                    "Check disk space and permissions.",
-                )
-            })?;
-        }
-
-        dest_paths.push(target.to_string_lossy().to_string());
     }
 
     let undo_id = Uuid::new_v4().to_string();
@@ -422,69 +448,53 @@ pub async fn duplicate_files(
     with_fs_failure_record(&ledger, "duplicate", &paths, outcome).await
 }
 
+/// Duplicate a single entry beside itself, returning the path it landed at.
+fn duplicate_one(path: &str) -> Result<String, AppError> {
+    let src = Path::new(path);
+    if !src.exists() {
+        return Err(AppError::file_op(
+            format!("Not found: {path}"),
+            "The file or folder may have been moved or deleted.",
+        ));
+    }
+
+    let parent = src.parent().ok_or_else(|| {
+        AppError::file_op("Cannot duplicate root", "Cannot duplicate the root directory.")
+    })?;
+    let target = next_available_copy_name(parent, src)?;
+
+    if src.is_dir() {
+        copy_dir_recursive(src, &target)?;
+    } else {
+        std::fs::copy(src, &target).map_err(|e| {
+            AppError::file_op(
+                format!("Failed to duplicate: {e}"),
+                "Check disk space and permissions.",
+            )
+        })?;
+    }
+
+    Ok(target.to_string_lossy().to_string())
+}
+
 pub async fn duplicate_files_impl(
     paths: Vec<String>,
     ledger: &OperationLedger,
 ) -> Result<FileOpResult, AppError> {
     let mut dest_paths = Vec::new();
+    let mut duplicated_sources = Vec::new();
 
     for path in &paths {
-        let src = Path::new(path);
-        if !src.exists() {
-            return Err(AppError::file_op(
-                format!("Not found: {path}"),
-                "The file or folder may have been moved or deleted.",
-            ));
-        }
-
-        let parent = src.parent().ok_or_else(|| {
-            AppError::file_op("Cannot duplicate root", "Cannot duplicate the root directory.")
-        })?;
-
-        let stem = src
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let ext = src
-            .extension()
-            .map(|e| format!(".{}", e.to_string_lossy()))
-            .unwrap_or_default();
-
-        let mut counter = 1;
-        let target;
-        loop {
-            let new_name = if counter == 1 {
-                format!("{stem} (copy){ext}")
-            } else {
-                format!("{stem} (copy {counter}){ext}")
-            };
-            let candidate = parent.join(&new_name);
-            if !candidate.exists() {
-                target = candidate;
-                break;
+        match duplicate_one(path) {
+            Ok(target) => {
+                dest_paths.push(target);
+                duplicated_sources.push(path.clone());
             }
-            counter += 1;
-            if counter > 1000 {
-                return Err(AppError::file_op(
-                    "Too many copies",
-                    "Clean up duplicate files first.",
-                ));
+            Err(err) => {
+                record_fs_partial(ledger, "duplicate", &duplicated_sources, &dest_paths).await;
+                return Err(err);
             }
         }
-
-        if src.is_dir() {
-            copy_dir_recursive(src, &target)?;
-        } else {
-            std::fs::copy(src, &target).map_err(|e| {
-                AppError::file_op(
-                    format!("Failed to duplicate: {e}"),
-                    "Check disk space and permissions.",
-                )
-            })?;
-        }
-
-        dest_paths.push(target.to_string_lossy().to_string());
     }
 
     let undo_id = Uuid::new_v4().to_string();
@@ -1989,5 +1999,99 @@ mod tests {
         assert_eq!(ids[0], ids[1], "one batch is one undoable group");
         assert!(events.iter().all(|e| e.status == "ok"));
         assert!(events.iter().all(|e| e.kind == "delete_trash"));
+    }
+
+    #[tokio::test]
+    async fn copy_records_the_files_that_landed_before_the_batch_aborted() {
+        // Copy never collides (it renames to "(copy N)"), so it aborts on a
+        // missing source, a full disk or a permission error — leaving stray
+        // files at the destination that undo has to be able to reach.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dest = dir.path().join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(src.join("a.txt"), b"x").unwrap();
+
+        let ledger = migrated_ledger().await;
+        let sources = vec![
+            src.join("a.txt").to_string_lossy().to_string(),
+            src.join("ghost.txt").to_string_lossy().to_string(),
+        ];
+
+        let result =
+            copy_files_impl(sources.clone(), dest.to_string_lossy().to_string(), &ledger).await;
+
+        assert!(result.is_err(), "missing source should fail the batch");
+        assert!(dest.join("a.txt").exists(), "a.txt did copy; test premise");
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(events.len(), 1, "only the landed copy should be recorded");
+        assert_eq!(events[0].kind, "copy");
+        assert_eq!(events[0].status, "ok");
+        assert_eq!(events[0].subject_path.as_deref(), Some(sources[0].as_str()));
+        assert_eq!(
+            events[0].target_path.as_deref(),
+            Some(dest.join("a.txt").to_string_lossy().as_ref()),
+        );
+        assert!(
+            events[0]
+                .correlation_id
+                .as_deref()
+                .is_some_and(|c| !c.is_empty()),
+            "the stray copy needs an undo id so the user can clean it up"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_records_the_files_that_landed_before_the_batch_aborted() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+        let ledger = migrated_ledger().await;
+        let paths = vec![
+            dir.path().join("a.txt").to_string_lossy().to_string(),
+            dir.path().join("ghost.txt").to_string_lossy().to_string(),
+        ];
+
+        let result = duplicate_files_impl(paths.clone(), &ledger).await;
+
+        assert!(result.is_err(), "missing source should fail the batch");
+        assert!(
+            dir.path().join("a (copy).txt").exists(),
+            "a.txt did duplicate; test premise"
+        );
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(events.len(), 1, "only the landed duplicate is recorded");
+        assert_eq!(events[0].kind, "duplicate");
+        assert_eq!(events[0].status, "ok");
+        assert_eq!(events[0].subject_path.as_deref(), Some(paths[0].as_str()));
+    }
+
+    #[test]
+    fn next_available_copy_name_keeps_the_established_naming() {
+        // copy and duplicate shared this loop verbatim; both must keep naming
+        // files exactly as they did before it was extracted.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"x").unwrap();
+
+        let first = next_available_copy_name(dir.path(), &src).unwrap();
+        assert_eq!(first.file_name().unwrap(), "a (copy).txt");
+
+        fs::write(&first, b"x").unwrap();
+        let second = next_available_copy_name(dir.path(), &src).unwrap();
+        assert_eq!(second.file_name().unwrap(), "a (copy 2).txt");
+    }
+
+    #[test]
+    fn next_available_copy_name_handles_extensionless_names() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("README");
+        fs::write(&src, b"x").unwrap();
+
+        let first = next_available_copy_name(dir.path(), &src).unwrap();
+        assert_eq!(first.file_name().unwrap(), "README (copy)");
     }
 }
