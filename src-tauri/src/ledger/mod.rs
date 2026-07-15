@@ -372,6 +372,37 @@ impl OperationLedger {
             .await
     }
 
+    /// Every row sharing a correlation id, newest-first.
+    ///
+    /// A logical operation writes one row per file, so a correlation group has
+    /// no bounded size and cannot be assembled from a recency window without
+    /// silently truncating the operation — undoing a 50-file copy would then
+    /// reverse only the handful of rows that fit. Callers that act on a whole
+    /// group (undo/redo) must load it through here. Served by
+    /// `idx_oplog_correlation`, and there is deliberately no LIMIT: a group is
+    /// the unit, and capping it would reintroduce the truncation.
+    pub async fn by_correlation(
+        &self,
+        correlation_id: String,
+    ) -> Result<Vec<LedgerEvent>, AppError> {
+        self.pool
+            .execute(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, occurred_at, engine, kind, status,
+                            subject_path, target_path, bytes,
+                            correlation_id, summary, details_json, undo_token
+                     FROM operation_ledger
+                     WHERE correlation_id = ?1
+                     ORDER BY occurred_at DESC, id DESC",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![correlation_id], row_to_event)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
     /// Filtered query. All filter fields are AND-combined.
     pub async fn query(&self, q: LedgerQuery) -> Result<Vec<LedgerEvent>, AppError> {
         let limit = q.limit.unwrap_or(200).clamp(1, 1000);

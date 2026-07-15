@@ -126,10 +126,31 @@ pub async fn list_undoable(
     list_undoable_impl(&ledger, limit).await
 }
 
-/// Raw rows to pull in order to assemble `limit` groups. Each group can span
-/// several rows (one per source/dest pair), so 10x is a generous upper bound.
+/// Raw rows to pull in order to *find* `limit` groups.
+///
+/// This window is only ever enough to identify which groups are the most
+/// recent — never to act on one. A group holds one row per file, so anything
+/// that reverses or replays a group must load it in full via
+/// [`OperationLedger::by_correlation`]; see [`with_full_group`].
 fn undo_scan_limit(limit: u32) -> u32 {
     (limit * 10).min(1000)
+}
+
+/// Re-read `op` from every row in its correlation group.
+///
+/// The recency window that surfaced `op` may have held only part of it: a
+/// 20-file copy writes 20 rows, and `undo_scan_limit(1)` fetches 10, so acting
+/// on the windowed group would reverse 10 files and leave the other 10 —
+/// splitting a moved batch across two directories while reporting success.
+async fn with_full_group(
+    ledger: &OperationLedger,
+    op: UndoableOp,
+    assemble: fn(&[LedgerEvent]) -> Vec<UndoableOp>,
+) -> Result<UndoableOp, AppError> {
+    let rows = ledger.by_correlation(op.correlation_id.clone()).await?;
+    // The fallback cannot trigger — `op` came from rows carrying this id — but
+    // degrading to the windowed group beats an unwrap here.
+    Ok(assemble(&rows).into_iter().next().unwrap_or(op))
 }
 
 pub async fn list_undoable_impl(
@@ -208,7 +229,10 @@ pub async fn undo_last(
 ) -> Result<UndoOutcome, AppError> {
     let rows = ledger.recent(undo_scan_limit(1)).await?;
     match decide_undo_last(&rows) {
-        UndoLastDecision::Proceed(op) => perform_undo(op, &ledger).await,
+        UndoLastDecision::Proceed(op) => {
+            let op = with_full_group(&ledger, op, assemble_undoable_groups).await?;
+            perform_undo(op, &ledger).await
+        }
         UndoLastDecision::Blocked { kind } => Ok(UndoOutcome {
             success: false,
             correlation_id: String::new(),
@@ -235,8 +259,10 @@ pub async fn undo_by_correlation(
     correlation_id: String,
     ledger: State<'_, OperationLedger>,
 ) -> Result<UndoOutcome, AppError> {
-    let ops = list_undoable_impl(&ledger, 100).await?;
-    let Some(op) = ops.into_iter().find(|o| o.correlation_id == correlation_id) else {
+    // Query the group directly: it is named, so there is no reason to scan the
+    // recent tail hoping it is still in the window.
+    let rows = ledger.by_correlation(correlation_id.clone()).await?;
+    let Some(op) = assemble_undoable_groups(&rows).into_iter().next() else {
         return Err(AppError::file_op(
             format!("No undoable operation found with id {correlation_id}"),
             "It may have already been undone, or may be older than the 30-day ledger retention.",
@@ -336,6 +362,7 @@ pub async fn redo_last(
             item_count: 0,
         });
     };
+    let op = with_full_group(&ledger, op, assemble_redoable_groups).await?;
     perform_redo(op, &ledger).await
 }
 
@@ -345,8 +372,9 @@ pub async fn redo_by_correlation(
     correlation_id: String,
     ledger: State<'_, OperationLedger>,
 ) -> Result<RedoOutcome, AppError> {
-    let ops = list_redoable_impl(&ledger, 100).await?;
-    let Some(op) = ops.into_iter().find(|o| o.correlation_id == correlation_id) else {
+    // Mirror of `undo_by_correlation`: the group is named, so query it.
+    let rows = ledger.by_correlation(correlation_id.clone()).await?;
+    let Some(op) = assemble_redoable_groups(&rows).into_iter().next() else {
         return Err(AppError::file_op(
             format!("No redoable operation found with id {correlation_id}"),
             "It may have already been redone, or may be older than the 30-day ledger retention.",
@@ -605,6 +633,65 @@ mod tests {
             details_json: "{}".to_string(),
             undo_token: None,
         }
+    }
+
+
+    /// Seed `count` copy rows sharing one correlation id — the shape a real
+    /// batch copy writes: one row per file.
+    async fn seed_batch_copy(ledger: &OperationLedger, cid: &str, count: usize) {
+        for i in 0..count {
+            ledger
+                .record(
+                    RecordEvent::new(LedgerEngine::Fs, "copy")
+                        .correlation(cid)
+                        .subject(format!("/src/f{i}.txt"))
+                        .target(format!("/dst/f{i}.txt"))
+                        .summary("copy"),
+                )
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn undo_covers_every_file_in_a_batch_bigger_than_the_scan_window() {
+        // A group holds one row per file, so the recency window that finds the
+        // group holds only part of it. Acting on the windowed group would undo
+        // the first 10 files of a 20-file batch and report success — for a
+        // move, that splits the batch across two directories.
+        let ledger = fresh_ledger().await;
+        seed_batch_copy(&ledger, "big-1", 20).await;
+
+        let rows = ledger.recent(undo_scan_limit(1)).await.unwrap();
+        let windowed = assemble_undoable_groups(&rows).into_iter().next().unwrap();
+        assert_eq!(
+            windowed.source_paths.len(),
+            10,
+            "premise: the scan window really does truncate the group"
+        );
+
+        let full = with_full_group(&ledger, windowed, assemble_undoable_groups)
+            .await
+            .unwrap();
+        assert_eq!(
+            full.source_paths.len(),
+            20,
+            "undo must act on every file in the batch, not just the window"
+        );
+        assert_eq!(full.dest_paths.len(), 20);
+        assert_eq!(full.correlation_id, "big-1");
+    }
+
+    #[tokio::test]
+    async fn by_correlation_returns_only_the_named_group() {
+        let ledger = fresh_ledger().await;
+        seed_batch_copy(&ledger, "wanted", 12).await;
+        seed_batch_copy(&ledger, "other", 12).await;
+
+        let rows = ledger.by_correlation("wanted".to_string()).await.unwrap();
+        assert_eq!(rows.len(), 12);
+        assert!(rows
+            .iter()
+            .all(|r| r.correlation_id.as_deref() == Some("wanted")));
     }
 
     #[test]
