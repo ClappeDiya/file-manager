@@ -126,16 +126,96 @@ pub async fn list_undoable(
     list_undoable_impl(&ledger, limit).await
 }
 
+/// Raw rows to pull in order to *find* `limit` groups.
+///
+/// This window is only ever enough to identify which groups are the most
+/// recent — never to act on one. A group holds one row per file, so anything
+/// that reverses or replays a group must load it in full via
+/// [`OperationLedger::by_correlation`]; see [`with_full_group`].
+fn undo_scan_limit(limit: u32) -> u32 {
+    (limit * 10).min(1000)
+}
+
+/// Re-read `op` from every row in its correlation group.
+///
+/// The recency window that surfaced `op` may have held only part of it: a
+/// 20-file copy writes 20 rows, and `undo_scan_limit(1)` fetches 10, so acting
+/// on the windowed group would reverse 10 files and leave the other 10 —
+/// splitting a moved batch across two directories while reporting success.
+async fn with_full_group(
+    ledger: &OperationLedger,
+    op: UndoableOp,
+    assemble: fn(&[LedgerEvent]) -> Vec<UndoableOp>,
+) -> Result<UndoableOp, AppError> {
+    let rows = ledger.by_correlation(op.correlation_id.clone()).await?;
+    // The fallback cannot trigger — `op` came from rows carrying this id — but
+    // degrading to the windowed group beats an unwrap here.
+    Ok(assemble(&rows).into_iter().next().unwrap_or(op))
+}
+
 pub async fn list_undoable_impl(
     ledger: &OperationLedger,
     limit: u32,
 ) -> Result<Vec<UndoableOp>, AppError> {
-    // Pull more raw rows than groups we want, because each group can span
-    // several rows (one per source/dest pair). 10x is a generous upper bound.
-    let raw_limit = (limit * 10).min(1000);
-    let rows = ledger.recent(raw_limit).await?;
+    let rows = ledger.recent(undo_scan_limit(limit)).await?;
     let groups = assemble_undoable_groups(&rows);
     Ok(groups.into_iter().take(limit as usize).collect())
+}
+
+/// True for the ledger's own undo/redo bookkeeping rows. They are fs-engine
+/// events like any other, so anything asking "what did the user last do?"
+/// has to step over them.
+fn is_marker_kind(kind: &str) -> bool {
+    kind == FS_UNDONE_KIND || kind == FS_REDONE_KIND
+}
+
+/// The kind of the most recent operation the *user* performed — ignoring
+/// bookkeeping markers, and ignoring anything that never landed.
+fn newest_user_fs_kind(rows: &[LedgerEvent]) -> Option<&str> {
+    rows.iter()
+        .find(|r| {
+            r.engine == "fs"
+                && r.status == "ok"
+                && !is_marker_kind(&r.kind)
+                && r.correlation_id.is_some()
+        })
+        .map(|r| r.kind.as_str())
+}
+
+/// What [`undo_last`] should do for a given ledger tail.
+#[derive(Debug)]
+enum UndoLastDecision {
+    /// The last thing the user did is not reversible. Undo says so rather
+    /// than reaching past it to something older.
+    Blocked { kind: String },
+    /// Reverse this group.
+    Proceed(UndoableOp),
+    /// Nothing reversible on record.
+    Nothing,
+}
+
+/// Split out from [`undo_last`] so the "which operation does Cmd+Z act on?"
+/// rule is testable without a database or Tauri state.
+///
+/// Cmd+Z means "reverse what I just did". Deletes are deliberately not in
+/// [`UNDOABLE_FS_KINDS`] — a trashed file's location is not recorded and a
+/// permanent delete is gone — so without this check, undoing after a delete
+/// silently reversed whatever *older* operation happened to still be in the
+/// scan window, e.g. un-doing an earlier copy the user never asked to touch.
+/// Refusing is both honest and the safer of the two, and the timeline's
+/// per-entry Undo button remains for deliberately reaching back.
+fn decide_undo_last(rows: &[LedgerEvent]) -> UndoLastDecision {
+    if let Some(kind) = newest_user_fs_kind(rows) {
+        if !UNDOABLE_FS_KINDS.contains(&kind) {
+            return UndoLastDecision::Blocked {
+                kind: kind.to_string(),
+            };
+        }
+    }
+    match assemble_undoable_groups(rows).into_iter().next() {
+        Some(op) => UndoLastDecision::Proceed(op),
+        None => UndoLastDecision::Nothing,
+    }
 }
 
 /// Undo the single most recent undoable op across all engines.
@@ -147,17 +227,30 @@ pub async fn list_undoable_impl(
 pub async fn undo_last(
     ledger: State<'_, OperationLedger>,
 ) -> Result<UndoOutcome, AppError> {
-    let ops = list_undoable_impl(&ledger, 1).await?;
-    let Some(op) = ops.into_iter().next() else {
-        return Ok(UndoOutcome {
+    let rows = ledger.recent(undo_scan_limit(1)).await?;
+    match decide_undo_last(&rows) {
+        UndoLastDecision::Proceed(op) => {
+            let op = with_full_group(&ledger, op, assemble_undoable_groups).await?;
+            perform_undo(op, &ledger).await
+        }
+        UndoLastDecision::Blocked { kind } => Ok(UndoOutcome {
+            success: false,
+            correlation_id: String::new(),
+            summary: format!(
+                "The last operation ({}) can't be undone",
+                crate::safety::kind_label(&kind)
+            ),
+            kind,
+            item_count: 0,
+        }),
+        UndoLastDecision::Nothing => Ok(UndoOutcome {
             success: false,
             correlation_id: String::new(),
             kind: String::new(),
             summary: "Nothing to undo".to_string(),
             item_count: 0,
-        });
-    };
-    perform_undo(op, &ledger).await
+        }),
+    }
 }
 
 /// Undo a specific correlation group (the "Undo" button in the timeline).
@@ -166,8 +259,10 @@ pub async fn undo_by_correlation(
     correlation_id: String,
     ledger: State<'_, OperationLedger>,
 ) -> Result<UndoOutcome, AppError> {
-    let ops = list_undoable_impl(&ledger, 100).await?;
-    let Some(op) = ops.into_iter().find(|o| o.correlation_id == correlation_id) else {
+    // Query the group directly: it is named, so there is no reason to scan the
+    // recent tail hoping it is still in the window.
+    let rows = ledger.by_correlation(correlation_id.clone()).await?;
+    let Some(op) = assemble_undoable_groups(&rows).into_iter().next() else {
         return Err(AppError::file_op(
             format!("No undoable operation found with id {correlation_id}"),
             "It may have already been undone, or may be older than the 30-day ledger retention.",
@@ -267,6 +362,7 @@ pub async fn redo_last(
             item_count: 0,
         });
     };
+    let op = with_full_group(&ledger, op, assemble_redoable_groups).await?;
     perform_redo(op, &ledger).await
 }
 
@@ -276,8 +372,9 @@ pub async fn redo_by_correlation(
     correlation_id: String,
     ledger: State<'_, OperationLedger>,
 ) -> Result<RedoOutcome, AppError> {
-    let ops = list_redoable_impl(&ledger, 100).await?;
-    let Some(op) = ops.into_iter().find(|o| o.correlation_id == correlation_id) else {
+    // Mirror of `undo_by_correlation`: the group is named, so query it.
+    let rows = ledger.by_correlation(correlation_id.clone()).await?;
+    let Some(op) = assemble_redoable_groups(&rows).into_iter().next() else {
         return Err(AppError::file_op(
             format!("No redoable operation found with id {correlation_id}"),
             "It may have already been redone, or may be older than the 30-day ledger retention.",
@@ -535,6 +632,148 @@ mod tests {
             summary: format!("{kind}: {}", subject.unwrap_or("?")),
             details_json: "{}".to_string(),
             undo_token: None,
+        }
+    }
+
+
+    /// Seed `count` copy rows sharing one correlation id — the shape a real
+    /// batch copy writes: one row per file.
+    async fn seed_batch_copy(ledger: &OperationLedger, cid: &str, count: usize) {
+        for i in 0..count {
+            ledger
+                .record(
+                    RecordEvent::new(LedgerEngine::Fs, "copy")
+                        .correlation(cid)
+                        .subject(format!("/src/f{i}.txt"))
+                        .target(format!("/dst/f{i}.txt"))
+                        .summary("copy"),
+                )
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn undo_covers_every_file_in_a_batch_bigger_than_the_scan_window() {
+        // A group holds one row per file, so the recency window that finds the
+        // group holds only part of it. Acting on the windowed group would undo
+        // the first 10 files of a 20-file batch and report success — for a
+        // move, that splits the batch across two directories.
+        let ledger = fresh_ledger().await;
+        seed_batch_copy(&ledger, "big-1", 20).await;
+
+        let rows = ledger.recent(undo_scan_limit(1)).await.unwrap();
+        let windowed = assemble_undoable_groups(&rows).into_iter().next().unwrap();
+        assert_eq!(
+            windowed.source_paths.len(),
+            10,
+            "premise: the scan window really does truncate the group"
+        );
+
+        let full = with_full_group(&ledger, windowed, assemble_undoable_groups)
+            .await
+            .unwrap();
+        assert_eq!(
+            full.source_paths.len(),
+            20,
+            "undo must act on every file in the batch, not just the window"
+        );
+        assert_eq!(full.dest_paths.len(), 20);
+        assert_eq!(full.correlation_id, "big-1");
+    }
+
+    #[tokio::test]
+    async fn by_correlation_returns_only_the_named_group() {
+        let ledger = fresh_ledger().await;
+        seed_batch_copy(&ledger, "wanted", 12).await;
+        seed_batch_copy(&ledger, "other", 12).await;
+
+        let rows = ledger.by_correlation("wanted".to_string()).await.unwrap();
+        assert_eq!(rows.len(), 12);
+        assert!(rows
+            .iter()
+            .all(|r| r.correlation_id.as_deref() == Some("wanted")));
+    }
+
+    #[test]
+    fn undo_after_a_delete_refuses_instead_of_reversing_an_older_operation() {
+        // The dangerous case: the user copies, then deletes, then hits Cmd+Z
+        // expecting the deleted files back. Deletes aren't reversible, and
+        // reaching past one would silently delete the earlier copies instead.
+        for delete_kind in ["delete_trash", "delete_permanent"] {
+            let rows = vec![
+                ev(delete_kind, "c2", Some("/docs/gone.txt"), None),
+                ev("copy", "c1", Some("/a/f.txt"), Some("/b/f.txt")),
+            ];
+            match decide_undo_last(&rows) {
+                UndoLastDecision::Blocked { kind } => assert_eq!(kind, delete_kind),
+                other => panic!("expected Blocked for {delete_kind}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn undo_still_reverses_the_last_operation_when_it_is_undoable() {
+        let rows = vec![
+            ev("move", "c2", Some("/a/f.txt"), Some("/b/f.txt")),
+            ev("copy", "c1", Some("/x"), Some("/y")),
+        ];
+        match decide_undo_last(&rows) {
+            UndoLastDecision::Proceed(op) => {
+                assert_eq!(op.kind, "move");
+                assert_eq!(op.correlation_id, "c2");
+            }
+            other => panic!("expected Proceed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undo_bookkeeping_markers_are_not_the_users_last_operation() {
+        // An fs.undone marker is an fs row too. If it were mistaken for the
+        // last user operation, its kind isn't undoable and Cmd+Z would refuse
+        // forever after the first undo.
+        let rows = vec![
+            ev(FS_UNDONE_KIND, "c1", Some("/a/f.txt"), None),
+            ev("copy", "c1", Some("/a/f.txt"), Some("/b/f.txt")),
+            ev("rename", "c0", Some("/old"), Some("/new")),
+        ];
+        assert_eq!(newest_user_fs_kind(&rows), Some("copy"));
+        // c1 is undone, so the next undoable group is the older rename.
+        match decide_undo_last(&rows) {
+            UndoLastDecision::Proceed(op) => assert_eq!(op.correlation_id, "c0"),
+            other => panic!("expected Proceed on the older group, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undo_ignores_a_delete_that_never_landed() {
+        // A failed delete changed nothing, so it must not block undoing the
+        // copy that really was the user's last effective operation.
+        let rows = vec![
+            LedgerEvent {
+                status: "failed".to_string(),
+                ..ev("delete_trash", "c2", Some("/docs/locked.txt"), None)
+            },
+            ev("copy", "c1", Some("/a"), Some("/b")),
+        ];
+        match decide_undo_last(&rows) {
+            UndoLastDecision::Proceed(op) => assert_eq!(op.kind, "copy"),
+            other => panic!("expected Proceed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undo_reports_nothing_on_an_empty_ledger() {
+        assert!(matches!(decide_undo_last(&[]), UndoLastDecision::Nothing));
+    }
+
+    #[test]
+    fn blocked_delete_kinds_are_phrased_for_humans() {
+        // The refusal text is rendered verbatim; it must not leak the raw
+        // engine identifier the way the timeline badge used to.
+        for kind in ["delete_trash", "delete_permanent"] {
+            let label = crate::safety::kind_label(kind);
+            assert_ne!(label, kind, "{kind} needs a human label");
+            assert!(!label.contains('_'));
         }
     }
 

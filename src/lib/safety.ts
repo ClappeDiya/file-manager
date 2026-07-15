@@ -25,26 +25,46 @@ import { tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useSafetyStore } from "@/stores/safety-store";
 
 /**
- * The `kind` values the Rust FS engine writes to the operation ledger, as
- * emitted by `src-tauri/src/commands/file_ops_commands.rs`.
- *
- * `OperationIntent.kind` MUST be one of these for any fs intent. The interlock
+ * `OperationIntent.kind` MUST be one of these for any fs intent: the interlock
  * uses the kind verbatim as its baseline lookup key (`WHERE kind = ?`), so a
  * kind the engine never records matches zero rows and yields an empty baseline.
  *
- * These two vocabularies drifted once already: the UI sent `"delete"` and
- * `"purge"` while the engine recorded `"delete_trash"` and `"delete_permanent"`.
- * Every delete assessment therefore ran against a permanently empty baseline —
- * so the interlock told the user "first-ever delete of this kind on this device"
- * on every single delete of 25+ files, and its adaptive ratio logic never once
- * ran for a delete. Naming the kinds here keeps the intent side single-sourced;
- * `fs-intent-kinds.test.ts` pins the exact strings against the Rust writer.
+ * Re-exported from `fs-kinds` — path recall needs the same vocabulary, and this
+ * module pulls in the safety store, which a pure inference module should not
+ * have to import just to name a delete.
  */
-export const FS_INTENT_KIND = {
-  move: "move",
-  deleteTrash: "delete_trash",
-  deletePermanent: "delete_permanent",
-} as const;
+export { FS_INTENT_KIND } from "./fs-kinds";
+export type { FsIntentKind } from "./fs-kinds";
+
+/** Wire mirror of `AffectedFiles` in `commands::file_ops_commands`. */
+interface AffectedFiles {
+  files: number;
+  bytes: number;
+  capped: boolean;
+}
+
+/**
+ * Measure what a selection would really touch, for an {@link OperationIntent}.
+ *
+ * A selection of one folder is one item but can be ten thousand files, and the
+ * interlock reasons about files. Passing the item count meant a folder delete
+ * looked like a one-file operation and stayed under every threshold.
+ *
+ * Falls back to the item count — today's behaviour — when the count is
+ * unavailable (outside Tauri, or if the walk fails). The interlock is advisory
+ * and fails open by design elsewhere; refusing to act because we couldn't
+ * measure would be a worse trade than assessing on a low estimate.
+ */
+export async function measureSelection(
+  paths: string[],
+): Promise<{ files: number; bytes: number }> {
+  const measured = await tauriInvokeSafe<AffectedFiles>(
+    "count_affected_files",
+    { paths },
+    { files: paths.length, bytes: 0, capped: false },
+  );
+  return { files: measured.files, bytes: measured.bytes };
+}
 
 /** Wire-format mirror of `safety::OperationIntent` in Rust. */
 export interface OperationIntent {

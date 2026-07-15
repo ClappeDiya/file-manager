@@ -11,7 +11,7 @@ import { useSpacesStore } from "@/stores/spaces-store";
 import { useTerminalStore } from "@/stores/terminal-store";
 import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { loadSmartDestinations, fileExtension, type SmartDestination } from "@/hooks/use-smart-destinations";
-import { assessBeforeExecute, FS_INTENT_KIND } from "@/lib/safety";
+import { assessBeforeExecute, measureSelection, FS_INTENT_KIND } from "@/lib/safety";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
 import { reportOperationFailure } from "@/lib/op-error-toast";
 import {
@@ -595,20 +595,35 @@ export function FileManager() {
       if (outcome.success) popUndo();
       // Surface result via the existing structured-error toast channel so
       // we don't introduce a new notification system.
-      useUIStore.getState().addStructuredError({
-        what: outcome.success
-          ? `Undid ${outcome.kind}`
-          : "Nothing to undo",
-        why: outcome.success
-          ? outcome.summary
-          : "The operation ledger has no reversible entries from this or prior sessions.",
-        appDid: outcome.success
-          ? `Reversed ${outcome.item_count} item(s) via operation ledger`
-          : "No-op",
-        userAction: outcome.success
-          ? "Press Cmd+Z again to undo the next most recent operation"
-          : "Perform a file operation first, then Cmd+Z will reverse it",
-      });
+      //
+      // `success: false` covers two different situations, which the backend
+      // tells apart by whether it filled `kind`: nothing is on record, or the
+      // last thing you did can't be reversed (a delete). The second must not
+      // be reported as "nothing to undo" — the operation very much happened.
+      const ui = useUIStore.getState();
+      if (outcome.success) {
+        ui.addStructuredError({
+          what: `Undid ${outcome.kind}`,
+          why: outcome.summary,
+          appDid: `Reversed ${outcome.item_count} item(s) via operation ledger`,
+          userAction: "Press Cmd+Z again to undo the next most recent operation",
+        });
+      } else if (outcome.kind !== "") {
+        ui.addStructuredError({
+          what: outcome.summary,
+          why: "Undo reverses your most recent operation, and this one cannot be reversed.",
+          appDid: "No-op — nothing was changed",
+          userAction:
+            "Restore it from the Trash, or use the Activity Timeline's per-entry Undo to reverse an earlier operation deliberately",
+        });
+      } else {
+        ui.addStructuredError({
+          what: "Nothing to undo",
+          why: "The operation ledger has no reversible entries from this or prior sessions.",
+          appDid: "No-op",
+          userAction: "Perform a file operation first, then Cmd+Z will reverse it",
+        });
+      }
     } catch (err) {
       console.error("Undo failed:", err);
       useUIStore.getState().addStructuredError({
@@ -2960,12 +2975,13 @@ function FilePane({
       // `ensure_directory` call first; it's a no-op when the dir
       // already exists.
       await tauriInvoke("ensure_directory", { path: destDir });
+      const measured = await measureSelection(stalePaths);
       const result = await assessBeforeExecute(
         {
           engine: "fs",
           kind: FS_INTENT_KIND.move,
-          affected_files: stalePaths.length,
-          total_bytes: 0,
+          affected_files: measured.files,
+          total_bytes: measured.bytes,
           subject_path: currentPath,
           summary: `Archive ${stalePaths.length} stale file${stalePaths.length === 1 ? "" : "s"} → .archive/${yyyy}-${mm}/`,
         },
@@ -3189,12 +3205,13 @@ function FilePane({
         const otherPath = store.getActivePath(otherPaneIndex);
         const proceed = await checkConflicts(selectedPaths, otherPath);
         if (!proceed) return;
+        const measured = await measureSelection(selectedPaths);
         const result = await assessBeforeExecute(
           {
             engine: "fs",
             kind: FS_INTENT_KIND.move,
-            affected_files: selectedPaths.length,
-            total_bytes: 0,
+            affected_files: measured.files,
+            total_bytes: measured.bytes,
             subject_path: currentPath,
             summary: `Move ${selectedPaths.length} item${selectedPaths.length === 1 ? "" : "s"} → ${otherPath}`,
           },
@@ -3218,12 +3235,13 @@ function FilePane({
     if (selectedPaths.length === 0) return;
     if (isTauriAvailable()) {
       try {
+        const measured = await measureSelection(selectedPaths);
         const result = await assessBeforeExecute(
           {
             engine: "fs",
             kind: FS_INTENT_KIND.deleteTrash,
-            affected_files: selectedPaths.length,
-            total_bytes: 0,
+            affected_files: measured.files,
+            total_bytes: measured.bytes,
             subject_path: currentPath,
             summary: `Move ${selectedPaths.length} item${selectedPaths.length === 1 ? "" : "s"} to Trash`,
           },
@@ -3256,12 +3274,13 @@ function FilePane({
         // Safety Interlock runs AFTER the inline confirm so the user has
         // two independent decision points for hard deletes: the OS-style
         // name list confirm, and the anomaly-aware interlock.
+        const measured = await measureSelection(paths);
         const result = await assessBeforeExecute(
           {
             engine: "fs",
             kind: FS_INTENT_KIND.deletePermanent,
-            affected_files: paths.length,
-            total_bytes: 0,
+            affected_files: measured.files,
+            total_bytes: measured.bytes,
             subject_path: currentPath,
             summary: `Permanently delete ${paths.length} item${paths.length === 1 ? "" : "s"}`,
           },
@@ -3709,12 +3728,13 @@ function FilePane({
       try {
         const proceed = await checkConflicts(selectedPaths, destDir);
         if (!proceed) return;
+        const measured = await measureSelection(selectedPaths);
         const result = await assessBeforeExecute(
           {
             engine: "fs",
             kind: FS_INTENT_KIND.move,
-            affected_files: selectedPaths.length,
-            total_bytes: 0,
+            affected_files: measured.files,
+            total_bytes: measured.bytes,
             subject_path: currentPath,
             summary: `Send ${selectedPaths.length} item${selectedPaths.length === 1 ? "" : "s"} → ${destDir}`,
           },

@@ -27,6 +27,7 @@
  * path to `onNavigateDir`.
  */
 import { tauriInvokeSafe } from "@/hooks/use-tauri";
+import { FS_INTENT_KIND } from "@/lib/fs-kinds";
 
 interface MetaPartial {
   is_dir: boolean;
@@ -77,8 +78,13 @@ export function labelForKind(kind: string): { label: string; tone: string } {
       return { label: "renamed", tone: "bg-violet-500/15 text-violet-400" };
     case "duplicate":
       return { label: "duplicated", tone: "bg-sky-500/15 text-sky-400" };
-    case "delete":
+    case FS_INTENT_KIND.deleteTrash:
       return { label: "deleted", tone: "bg-rose-500/15 text-rose-400" };
+    case FS_INTENT_KIND.deletePermanent:
+      return {
+        label: "permanently deleted",
+        tone: "bg-rose-500/15 text-rose-400",
+      };
     case "create_file":
     case "create_folder":
       return { label: "created", tone: "bg-emerald-500/15 text-emerald-400" };

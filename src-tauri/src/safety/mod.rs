@@ -30,6 +30,7 @@
 
 use crate::ledger::{LedgerEngine, LedgerEvent, LedgerQuery, LedgerStatus, OperationLedger, RecordEvent};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Absolute floor for "destructive" file counts. Any delete/overwrite that
 /// touches fewer than this number of files never escalates to Medium on
@@ -41,7 +42,7 @@ const DESTRUCTIVE_VOLUME_FLOOR: u64 = 25;
 /// A single-shot operation touching more files than this deserves
 /// confirmation even for a user whose baseline is also large, because the
 /// blast radius of a mistake at this scale is catastrophic.
-const DESTRUCTIVE_VOLUME_HARD_CAP: u64 = 5_000;
+pub(crate) const DESTRUCTIVE_VOLUME_HARD_CAP: u64 = 5_000;
 
 /// Absolute ceiling for raw bytes (10 GiB) that always trips High on
 /// transfer-shaped operations, even if the user has done larger transfers
@@ -84,7 +85,7 @@ const DESTRUCTIVE_KINDS: &[&str] = &[
 /// the highest-stakes copy in the app. Unknown kinds fall through to the raw
 /// identifier, which is exactly what the reasons said before this existed, so
 /// a new kind degrades to the old behaviour rather than to a wrong label.
-fn kind_label(kind: &str) -> &str {
+pub(crate) fn kind_label(kind: &str) -> &str {
     match kind {
         "delete_trash" => "move to Trash",
         "delete_permanent" => "permanent delete",
@@ -319,9 +320,14 @@ impl SafetyInterlock {
         if sample_size > 0 && median_files > 0 && intent.affected_files >= DESTRUCTIVE_VOLUME_FLOOR {
             let ratio = intent.affected_files as f64 / median_files as f64;
             if ratio >= HIGH_MULTIPLIER && level != RiskLevel::High {
+                let runs = distinct_runs(baseline);
                 reasons.push(format!(
-                    "This operation touches {} files — {:.0}× your usual {} (median {} files over last {} runs).",
-                    intent.affected_files, ratio, kind_label(&intent.kind), median_files, sample_size
+                    "This operation touches {} files — {:.0}× your usual {} (median {} files over your last {}).",
+                    intent.affected_files,
+                    ratio,
+                    kind_label(&intent.kind),
+                    median_files,
+                    pluralize_runs(runs)
                 ));
                 level = RiskLevel::High;
             } else if ratio >= MEDIUM_MULTIPLIER && level == RiskLevel::Low {
@@ -412,6 +418,32 @@ fn compute_intent_hash(intent: &OperationIntent) -> String {
 ///   file.
 ///
 /// Returns `(0, 0)` if the baseline is empty.
+/// How many distinct operations the baseline sample actually represents.
+///
+/// The sample is a row window, and a file operation writes one row per file —
+/// so 50 rows can be a single 50-file delete. Reporting the row count as "runs"
+/// told the user they had done 50 deletes when they had done one.
+fn distinct_runs(events: &[LedgerEvent]) -> usize {
+    let ids: HashSet<&str> = events
+        .iter()
+        .filter_map(|e| e.correlation_id.as_deref())
+        .collect();
+    // Rows predating correlation ids still count for something.
+    if ids.is_empty() {
+        events.len()
+    } else {
+        ids.len()
+    }
+}
+
+fn pluralize_runs(runs: usize) -> String {
+    if runs == 1 {
+        "1 run".to_string()
+    } else {
+        format!("{runs} runs")
+    }
+}
+
 fn compute_medians(events: &[LedgerEvent]) -> (u64, u64) {
     if events.is_empty() {
         return (0, 0);
@@ -548,6 +580,172 @@ mod tests {
         assert!(
             assessment.requires_confirmation,
             "failed attempts inflated the baseline and suppressed the warning"
+        );
+    }
+
+
+    /// Delete a folder of `per_round` files, `rounds` times, through the real
+    /// engine.
+    #[cfg(test)]
+    async fn seed_real_folder_deletes(ledger: &OperationLedger, rounds: usize, per_round: usize) {
+        for round in 0..rounds {
+            let dir = tempfile::tempdir().unwrap();
+            let folder = dir.path().join(format!("proj{round}"));
+            std::fs::create_dir_all(&folder).unwrap();
+            for i in 0..per_round {
+                std::fs::write(folder.join(format!("f{i}.txt")), b"x").unwrap();
+            }
+            crate::commands::file_ops_commands::delete_files_impl(
+                vec![folder.to_string_lossy().to_string()],
+                true,
+                ledger,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// The interlock assesses intents in files — one folder is one path but
+    /// forty files. The ledger recorded the *path* count, so a user who
+    /// routinely deleted a 40-file folder had a median of 1 and was told their
+    /// next identical delete was "40x your usual": the two sides of the ratio
+    /// were measuring different things.
+    #[tokio::test]
+    async fn a_routine_folder_delete_is_not_flagged_as_unusual() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let ledger = OperationLedger::new(repo.pool().clone());
+        seed_real_folder_deletes(&ledger, 3, 40).await;
+
+        let interlock = SafetyInterlock::new(ledger);
+        let assessment = interlock
+            .assess(&OperationIntent {
+                engine: "fs".to_string(),
+                kind: "delete_permanent".to_string(),
+                affected_files: 40,
+                total_bytes: 0,
+                subject_path: None,
+                summary: None,
+            })
+            .await;
+
+        assert_eq!(
+            assessment.baseline_median_files, 40,
+            "the baseline must be in files, like the intent it is compared to"
+        );
+        assert_eq!(
+            assessment.level,
+            RiskLevel::Low,
+            "this user deletes exactly this folder shape routinely; reasons: {:?}",
+            assessment.reasons
+        );
+    }
+
+    /// Counterweight: folder-shaped history must not hide a genuinely big one.
+    #[tokio::test]
+    async fn an_unusually_large_folder_delete_is_still_flagged() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let ledger = OperationLedger::new(repo.pool().clone());
+        seed_real_folder_deletes(&ledger, 3, 40).await;
+
+        let interlock = SafetyInterlock::new(ledger);
+        let assessment = interlock
+            .assess(&OperationIntent {
+                engine: "fs".to_string(),
+                kind: "delete_permanent".to_string(),
+                affected_files: 1200,
+                total_bytes: 0,
+                subject_path: None,
+                summary: None,
+            })
+            .await;
+
+        assert_eq!(assessment.level, RiskLevel::High, "{:?}", assessment.reasons);
+        assert!(assessment.requires_confirmation);
+    }
+
+    /// Record `count` real permanent deletes through the FS engine, so the
+    /// baseline is built from rows the engine actually writes.
+    #[cfg(test)]
+    async fn seed_real_deletes(ledger: &OperationLedger, rounds: usize, per_round: usize) {
+        for round in 0..rounds {
+            let dir = tempfile::tempdir().unwrap();
+            let paths: Vec<String> = (0..per_round)
+                .map(|i| {
+                    let p = dir.path().join(format!("{round}-{i}.txt"));
+                    std::fs::write(&p, b"x").unwrap();
+                    p.to_string_lossy().to_string()
+                })
+                .collect();
+            crate::commands::file_ops_commands::delete_files_impl(paths, true, ledger)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// `compute_medians` reads how many files an operation touched out of
+    /// `details_json` — but nothing ever wrote that field, so every event fell
+    /// back to 1 (`extract_file_count`'s default). The median was therefore
+    /// permanently 1 for every engine and every user, and Rule 3 collapsed from
+    /// "unusual compared to your history" into "any batch of 25+ files is 25x
+    /// normal": a High-risk alarm on entirely routine work, explained with a
+    /// median the user never had.
+    ///
+    /// Drives the real engine so it keeps holding if the recorder changes.
+    #[tokio::test]
+    async fn a_routine_batch_delete_is_not_flagged_as_unusual() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let ledger = OperationLedger::new(repo.pool().clone());
+        // This user deletes ~40 files at a time, habitually.
+        seed_real_deletes(&ledger, 2, 40).await;
+
+        let interlock = SafetyInterlock::new(ledger);
+        let assessment = interlock
+            .assess(&OperationIntent {
+                engine: "fs".to_string(),
+                kind: "delete_permanent".to_string(),
+                affected_files: 30,
+                total_bytes: 0,
+                subject_path: None,
+                summary: None,
+            })
+            .await;
+
+        assert_eq!(
+            assessment.level,
+            RiskLevel::Low,
+            "30 files is smaller than this user's usual delete; reasons: {:?}",
+            assessment.reasons
+        );
+        assert!(!assessment.requires_confirmation);
+    }
+
+    /// The counterweight to the test above: teaching the baseline what "normal"
+    /// means must not blunt the alarm for something genuinely abnormal.
+    #[tokio::test]
+    async fn an_unusually_large_delete_is_still_flagged() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let ledger = OperationLedger::new(repo.pool().clone());
+        seed_real_deletes(&ledger, 2, 40).await;
+
+        let interlock = SafetyInterlock::new(ledger);
+        let assessment = interlock
+            .assess(&OperationIntent {
+                engine: "fs".to_string(),
+                kind: "delete_permanent".to_string(),
+                affected_files: 2000,
+                total_bytes: 0,
+                subject_path: None,
+                summary: None,
+            })
+            .await;
+
+        assert_eq!(assessment.level, RiskLevel::High, "{:?}", assessment.reasons);
+        assert!(assessment.requires_confirmation);
+        // And it must describe the history truthfully: two runs, not 50 rows.
+        assert!(
+            assessment.reasons.iter().any(|r| r.contains("2 runs")),
+            "expected an honest run count, got {:?}",
+            assessment.reasons
         );
     }
 

@@ -2,7 +2,7 @@ use crate::core::error::AppError;
 use crate::core::types::FileEntry;
 use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -17,6 +17,25 @@ use uuid::Uuid;
 /// Iter 35: exposed `pub(crate)` so `fs_commands::write_text_file_full` can
 /// use the same recording path as the rest of the FS engine, keeping the
 /// audit format uniform across copy/move/rename/create_file/edit_text.
+/// Record the portion of a batch that actually landed before the batch aborted.
+///
+/// A batch that fails partway has still moved or deleted the entries it got to.
+/// Recording that prefix keeps the timeline honest about what is on disk, and —
+/// because undo is ledger-driven — keeps the completed work undoable. Records
+/// nothing when the batch failed on its first entry.
+pub(crate) async fn record_fs_partial(
+    ledger: &OperationLedger,
+    kind: &str,
+    sources: &[String],
+    dests: &[String],
+) {
+    if sources.is_empty() {
+        return;
+    }
+    let undo_id = Uuid::new_v4().to_string();
+    record_fs_ok(ledger, kind, sources, dests, &undo_id).await;
+}
+
 pub(crate) async fn record_fs_ok(
     ledger: &OperationLedger,
     kind: &str,
@@ -24,8 +43,35 @@ pub(crate) async fn record_fs_ok(
     dests: &[String],
     correlation_id: &str,
 ) {
+    let paths_touched = sources.len().max(dests.len()).max(1) as u64;
+    record_fs_ok_with_count(ledger, kind, sources, dests, correlation_id, paths_touched).await
+}
+
+/// As [`record_fs_ok`], but stating how many files the operation really touched.
+///
+/// The two numbers differ the moment a path is a directory: deleting one folder
+/// is one path and forty files. The Safety Interlock's baseline is in files and
+/// its intents are measured in files, so any operation that can be handed a
+/// directory has to record files — otherwise the median is a count of paths,
+/// the intent is a count of files, and the ratio divides one by the other. A
+/// user who routinely deletes a 40-file folder was told it was "40× your usual".
+pub(crate) async fn record_fs_ok_with_count(
+    ledger: &OperationLedger,
+    kind: &str,
+    sources: &[String],
+    dests: &[String],
+    correlation_id: &str,
+    affected_files: u64,
+) {
     // Pair sources to dests where possible; otherwise record each side alone.
     let pair_count = sources.len().max(dests.len()).max(1);
+    // Every row of a batch also states how many files the *operation* touched.
+    // A row is one path, so without this the Safety Interlock's baseline reads
+    // one file per event (`extract_file_count` falls back to 1), its "what does
+    // this user normally do" median is permanently 1, and its adaptive ratio
+    // collapses into "any batch of 25+ is 25× normal" — a High-risk alarm on
+    // routine work, explained with a median the user never had.
+    let details = serde_json::json!({ "affected_files": affected_files }).to_string();
     for i in 0..pair_count {
         let subject = sources.get(i).cloned();
         let target = dests.get(i).cloned();
@@ -38,7 +84,8 @@ pub(crate) async fn record_fs_ok(
         let mut ev = RecordEvent::new(LedgerEngine::Fs, kind)
             .status(LedgerStatus::Ok)
             .summary(summary)
-            .correlation(correlation_id);
+            .correlation(correlation_id)
+            .details_json(details.clone());
         if let Some(s) = subject {
             ev = ev.subject(s);
         }
@@ -105,8 +152,13 @@ pub(crate) async fn record_fs_failed(
         .summary(format!("{kind} failed: {reason}"))
         .correlation(Uuid::new_v4().to_string())
         .details_json(details);
-    if let Some(first) = paths.first() {
-        ev = ev.subject(first.clone());
+    // Blame a specific path only when there is exactly one it could be. From
+    // here we cannot tell which entry of a batch failed, and since the batch
+    // records the entries that did land, `paths[0]` is more likely one that
+    // *succeeded* — blaming it would contradict that path's own ok row. The
+    // full list stays in details_json either way.
+    if let [only] = paths {
+        ev = ev.subject(only.clone());
     }
     ledger.record(ev).await;
 }
@@ -161,6 +213,167 @@ pub async fn copy_files(
     with_fs_failure_record(&ledger, "copy", &source_paths, outcome).await
 }
 
+/// What a selection would actually touch on disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AffectedFiles {
+    /// Files under the selection, descending into directories.
+    pub files: u64,
+    /// Total bytes of those files.
+    pub bytes: u64,
+    /// The walk stopped early, so `files` is a floor rather than the total.
+    pub capped: bool,
+}
+
+/// Add `path` (recursively, if a directory) to `acc`, stopping at `cap`.
+///
+/// Uses `symlink_metadata` so a symlink counts as the one entry it is: this
+/// measures blast radius, and following links would both double-count and
+/// invite a cycle. Unreadable entries are skipped — deciding whether to show a
+/// confirmation is better done on an approximate count than not at all.
+fn accumulate_affected(path: &Path, cap: u64, acc: &mut AffectedFiles) {
+    if acc.files >= cap {
+        acc.capped = true;
+        return;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.is_dir() {
+        acc.files += 1;
+        acc.bytes += meta.len();
+        if acc.files >= cap {
+            acc.capped = true;
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        accumulate_affected(&entry.path(), cap, acc);
+        if acc.capped {
+            return;
+        }
+    }
+}
+
+/// Files under `paths`, for recording what an operation actually touched.
+///
+/// Must be called *before* the operation runs: a move or delete leaves nothing
+/// behind to count afterwards. Shares the walk and the ceiling with
+/// [`count_affected_files`], so the number the interlock assesses and the number
+/// the ledger records are produced the same way and stay comparable.
+pub(crate) fn measure_paths(paths: &[String]) -> u64 {
+    let cap = crate::safety::DESTRUCTIVE_VOLUME_HARD_CAP.saturating_add(1);
+    let mut acc = AffectedFiles {
+        files: 0,
+        bytes: 0,
+        capped: false,
+    };
+    for path in paths {
+        accumulate_affected(Path::new(path), cap, &mut acc);
+        if acc.capped {
+            break;
+        }
+    }
+    acc.files
+}
+
+/// Count the files a selection really touches, for the Safety Interlock.
+///
+/// The interlock reasons about blast radius, but the UI only knows how many
+/// *items* are selected. Deleting one folder holding 10,000 files looked like a
+/// one-file operation and sailed under every threshold, while selecting 25 loose
+/// files tripped the dialog — the check fired on the harmless case and waved the
+/// catastrophic one through.
+///
+/// Walks no further than just past the interlock's ceiling: above it the verdict
+/// is High whatever the exact number is, so counting a million-file tree would
+/// be latency in front of a dialog that already knows its answer.
+#[tauri::command]
+pub async fn count_affected_files(paths: Vec<String>) -> Result<AffectedFiles, AppError> {
+    let cap = crate::safety::DESTRUCTIVE_VOLUME_HARD_CAP.saturating_add(1);
+    let mut acc = AffectedFiles {
+        files: 0,
+        bytes: 0,
+        capped: false,
+    };
+    for path in &paths {
+        accumulate_affected(Path::new(path), cap, &mut acc);
+        if acc.capped {
+            break;
+        }
+    }
+    Ok(acc)
+}
+
+/// First free `"<stem> (copy)"` / `"<stem> (copy N)"` name for `src` inside `dir`.
+///
+/// Shared by copy (which only needs it on a name collision) and duplicate
+/// (which always renames, since it writes beside the original).
+fn next_available_copy_name(dir: &Path, src: &Path) -> Result<PathBuf, AppError> {
+    let stem = src
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let ext = src
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+
+    for counter in 1..=1000 {
+        let new_name = if counter == 1 {
+            format!("{stem} (copy){ext}")
+        } else {
+            format!("{stem} (copy {counter}){ext}")
+        };
+        let candidate = dir.join(&new_name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(AppError::file_op(
+        "Too many copies",
+        "Clean up duplicate files first.",
+    ))
+}
+
+/// Copy a single entry into `dest_dir`, returning the path it landed at.
+fn copy_one(source: &str, dest_path: &Path) -> Result<String, AppError> {
+    let src = Path::new(source);
+    if !src.exists() {
+        return Err(AppError::file_op(
+            format!("Source not found: {source}"),
+            "The file or folder may have been moved or deleted.",
+        ));
+    }
+
+    let file_name = src
+        .file_name()
+        .ok_or_else(|| AppError::file_op("Invalid source path", "Check the file path."))?;
+    let mut target = dest_path.join(file_name);
+
+    // Handle name conflicts by appending " (copy)" or " (copy N)"
+    if target.exists() {
+        target = next_available_copy_name(dest_path, src)?;
+    }
+
+    if src.is_dir() {
+        copy_dir_recursive(src, &target)?;
+    } else {
+        std::fs::copy(src, &target).map_err(|e| {
+            AppError::file_op(
+                format!("Failed to copy {}: {e}", src.display()),
+                "Check disk space and permissions.",
+            )
+        })?;
+    }
+
+    Ok(target.to_string_lossy().to_string())
+}
+
 pub async fn copy_files_impl(
     source_paths: Vec<String>,
     dest_dir: String,
@@ -175,60 +388,19 @@ pub async fn copy_files_impl(
     }
 
     let mut dest_paths = Vec::new();
+    let mut copied_sources = Vec::new();
 
     for source in &source_paths {
-        let src = Path::new(source);
-        if !src.exists() {
-            return Err(AppError::file_op(
-                format!("Source not found: {source}"),
-                "The file or folder may have been moved or deleted.",
-            ));
-        }
-
-        let file_name = src
-            .file_name()
-            .ok_or_else(|| AppError::file_op("Invalid source path", "Check the file path."))?;
-        let mut target = dest_path.join(file_name);
-
-        // Handle name conflicts by appending " (copy)" or " (copy N)"
-        if target.exists() {
-            let stem = target
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let ext = target
-                .extension()
-                .map(|e| format!(".{}", e.to_string_lossy()))
-                .unwrap_or_default();
-
-            let mut counter = 1;
-            loop {
-                let new_name = if counter == 1 {
-                    format!("{stem} (copy){ext}")
-                } else {
-                    format!("{stem} (copy {counter}){ext}")
-                };
-                target = dest_path.join(&new_name);
-                if !target.exists() {
-                    break;
-                }
-                counter += 1;
+        match copy_one(source, dest_path) {
+            Ok(target) => {
+                dest_paths.push(target);
+                copied_sources.push(source.clone());
+            }
+            Err(err) => {
+                record_fs_partial(ledger, "copy", &copied_sources, &dest_paths).await;
+                return Err(err);
             }
         }
-
-        if src.is_dir() {
-            copy_dir_recursive(src, &target)?;
-        } else {
-            std::fs::copy(src, &target).map_err(|e| {
-                AppError::file_op(
-                    format!("Failed to copy {}: {e}", src.display()),
-                    "Check disk space and permissions.",
-                )
-            })?;
-        }
-
-        dest_paths.push(target.to_string_lossy().to_string());
     }
 
     let undo_id = Uuid::new_v4().to_string();
@@ -254,6 +426,38 @@ pub async fn move_files(
     with_fs_failure_record(&ledger, "move", &source_paths, outcome).await
 }
 
+/// Move a single entry into `dest_dir`, returning the path it landed at.
+fn move_one(source: &str, dest_path: &Path) -> Result<String, AppError> {
+    let src = Path::new(source);
+    if !src.exists() {
+        return Err(AppError::file_op(
+            format!("Source not found: {source}"),
+            "The file or folder may have been moved or deleted.",
+        ));
+    }
+
+    let file_name = src
+        .file_name()
+        .ok_or_else(|| AppError::file_op("Invalid source path", "Check the file path."))?;
+    let target = dest_path.join(file_name);
+
+    if target.exists() {
+        return Err(AppError::file_op(
+            format!("File already exists at destination: {}", target.display()),
+            "Rename the file or choose a different destination.",
+        ));
+    }
+
+    std::fs::rename(src, &target).map_err(|e| {
+        AppError::file_op(
+            format!("Failed to move {}: {e}", src.display()),
+            "Check permissions. If moving across drives, this may require a copy + delete.",
+        )
+    })?;
+
+    Ok(target.to_string_lossy().to_string())
+}
+
 pub async fn move_files_impl(
     source_paths: Vec<String>,
     dest_dir: String,
@@ -267,41 +471,27 @@ pub async fn move_files_impl(
         ));
     }
 
+    // Measure first: once moved, the sources are gone from their old paths.
+    let affected_files = measure_paths(&source_paths);
     let mut dest_paths = Vec::new();
+    let mut moved_sources = Vec::new();
 
     for source in &source_paths {
-        let src = Path::new(source);
-        if !src.exists() {
-            return Err(AppError::file_op(
-                format!("Source not found: {source}"),
-                "The file or folder may have been moved or deleted.",
-            ));
+        match move_one(source, dest_path) {
+            Ok(target) => {
+                dest_paths.push(target);
+                moved_sources.push(source.clone());
+            }
+            Err(err) => {
+                record_fs_partial(ledger, "move", &moved_sources, &dest_paths).await;
+                return Err(err);
+            }
         }
-
-        let file_name = src
-            .file_name()
-            .ok_or_else(|| AppError::file_op("Invalid source path", "Check the file path."))?;
-        let target = dest_path.join(file_name);
-
-        if target.exists() {
-            return Err(AppError::file_op(
-                format!("File already exists at destination: {}", target.display()),
-                "Rename the file or choose a different destination.",
-            ));
-        }
-
-        std::fs::rename(src, &target).map_err(|e| {
-            AppError::file_op(
-                format!("Failed to move {}: {e}", src.display()),
-                "Check permissions. If moving across drives, this may require a copy + delete.",
-            )
-        })?;
-
-        dest_paths.push(target.to_string_lossy().to_string());
     }
 
     let undo_id = Uuid::new_v4().to_string();
-    record_fs_ok(ledger, "move", &source_paths, &dest_paths, &undo_id).await;
+    record_fs_ok_with_count(ledger, "move", &source_paths, &dest_paths, &undo_id, affected_files)
+        .await;
 
     Ok(FileOpResult {
         success: true,
@@ -388,69 +578,53 @@ pub async fn duplicate_files(
     with_fs_failure_record(&ledger, "duplicate", &paths, outcome).await
 }
 
+/// Duplicate a single entry beside itself, returning the path it landed at.
+fn duplicate_one(path: &str) -> Result<String, AppError> {
+    let src = Path::new(path);
+    if !src.exists() {
+        return Err(AppError::file_op(
+            format!("Not found: {path}"),
+            "The file or folder may have been moved or deleted.",
+        ));
+    }
+
+    let parent = src.parent().ok_or_else(|| {
+        AppError::file_op("Cannot duplicate root", "Cannot duplicate the root directory.")
+    })?;
+    let target = next_available_copy_name(parent, src)?;
+
+    if src.is_dir() {
+        copy_dir_recursive(src, &target)?;
+    } else {
+        std::fs::copy(src, &target).map_err(|e| {
+            AppError::file_op(
+                format!("Failed to duplicate: {e}"),
+                "Check disk space and permissions.",
+            )
+        })?;
+    }
+
+    Ok(target.to_string_lossy().to_string())
+}
+
 pub async fn duplicate_files_impl(
     paths: Vec<String>,
     ledger: &OperationLedger,
 ) -> Result<FileOpResult, AppError> {
     let mut dest_paths = Vec::new();
+    let mut duplicated_sources = Vec::new();
 
     for path in &paths {
-        let src = Path::new(path);
-        if !src.exists() {
-            return Err(AppError::file_op(
-                format!("Not found: {path}"),
-                "The file or folder may have been moved or deleted.",
-            ));
-        }
-
-        let parent = src.parent().ok_or_else(|| {
-            AppError::file_op("Cannot duplicate root", "Cannot duplicate the root directory.")
-        })?;
-
-        let stem = src
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let ext = src
-            .extension()
-            .map(|e| format!(".{}", e.to_string_lossy()))
-            .unwrap_or_default();
-
-        let mut counter = 1;
-        let target;
-        loop {
-            let new_name = if counter == 1 {
-                format!("{stem} (copy){ext}")
-            } else {
-                format!("{stem} (copy {counter}){ext}")
-            };
-            let candidate = parent.join(&new_name);
-            if !candidate.exists() {
-                target = candidate;
-                break;
+        match duplicate_one(path) {
+            Ok(target) => {
+                dest_paths.push(target);
+                duplicated_sources.push(path.clone());
             }
-            counter += 1;
-            if counter > 1000 {
-                return Err(AppError::file_op(
-                    "Too many copies",
-                    "Clean up duplicate files first.",
-                ));
+            Err(err) => {
+                record_fs_partial(ledger, "duplicate", &duplicated_sources, &dest_paths).await;
+                return Err(err);
             }
         }
-
-        if src.is_dir() {
-            copy_dir_recursive(src, &target)?;
-        } else {
-            std::fs::copy(src, &target).map_err(|e| {
-                AppError::file_op(
-                    format!("Failed to duplicate: {e}"),
-                    "Check disk space and permissions.",
-                )
-            })?;
-        }
-
-        dest_paths.push(target.to_string_lossy().to_string());
     }
 
     let undo_id = Uuid::new_v4().to_string();
@@ -480,45 +654,59 @@ pub async fn delete_files(
     with_fs_failure_record(&ledger, kind, &paths, outcome).await
 }
 
+/// Delete a single existing entry, to the OS trash unless `permanent`.
+fn delete_one(p: &Path, permanent: bool) -> Result<(), AppError> {
+    if !permanent {
+        // Move to OS trash
+        // On macOS, move to ~/.Trash
+        // On Linux, use freedesktop trash spec
+        // On Windows, use shell API
+        return move_to_trash(p);
+    }
+
+    if p.is_dir() {
+        std::fs::remove_dir_all(p).map_err(|e| {
+            AppError::file_op(
+                format!("Failed to delete directory {}: {e}", p.display()),
+                "Check that the directory is not in use and you have permission.",
+            )
+        })
+    } else {
+        std::fs::remove_file(p).map_err(|e| {
+            AppError::file_op(
+                format!("Failed to delete file {}: {e}", p.display()),
+                "Check that the file is not in use and you have permission.",
+            )
+        })
+    }
+}
+
 pub async fn delete_files_impl(
     paths: Vec<String>,
     permanent: bool,
     ledger: &OperationLedger,
 ) -> Result<FileOpResult, AppError> {
+    let kind = if permanent { "delete_permanent" } else { "delete_trash" };
+    // Measure first: after the loop there is nothing left on disk to count.
+    let affected_files = measure_paths(&paths);
+    let mut deleted = Vec::new();
+
     for path in &paths {
         let p = Path::new(path);
         if !p.exists() {
             continue; // Already gone, skip silently
         }
 
-        if permanent {
-            if p.is_dir() {
-                std::fs::remove_dir_all(p).map_err(|e| {
-                    AppError::file_op(
-                        format!("Failed to delete directory {}: {e}", p.display()),
-                        "Check that the directory is not in use and you have permission.",
-                    )
-                })?;
-            } else {
-                std::fs::remove_file(p).map_err(|e| {
-                    AppError::file_op(
-                        format!("Failed to delete file {}: {e}", p.display()),
-                        "Check that the file is not in use and you have permission.",
-                    )
-                })?;
-            }
-        } else {
-            // Move to OS trash
-            // On macOS, move to ~/.Trash
-            // On Linux, use freedesktop trash spec
-            // On Windows, use shell API
-            move_to_trash(p)?;
+        if let Err(err) = delete_one(p, permanent) {
+            record_fs_partial(ledger, kind, &deleted, &[]).await;
+            return Err(err);
         }
+
+        deleted.push(path.clone());
     }
 
     let undo_id = Uuid::new_v4().to_string();
-    let kind = if permanent { "delete_permanent" } else { "delete_trash" };
-    record_fs_ok(ledger, kind, &paths, &[], &undo_id).await;
+    record_fs_ok_with_count(ledger, kind, &paths, &[], &undo_id, affected_files).await;
 
     Ok(FileOpResult {
         success: true,
@@ -1455,9 +1643,71 @@ mod tests {
 
         let events = ledger.recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].subject_path.as_deref(), Some("/a/0.txt"));
+        // ...and by the same reasoning it cannot name which one failed, so it
+        // names none of them rather than blaming the first.
+        assert_eq!(events[0].subject_path, None);
         // The full list stays recoverable from details_json.
         assert!(events[0].details_json.contains("/a/4.txt"));
+    }
+
+    #[tokio::test]
+    async fn record_fs_failed_still_blames_the_path_when_there_is_only_one() {
+        let ledger = migrated_ledger().await;
+        let err = AppError::file_op("Failed to copy /a/b.txt: denied", "Check permissions.");
+        record_fs_failed(&ledger, "copy", &["/a/b.txt".to_string()], &err).await;
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(
+            events[0].subject_path.as_deref(),
+            Some("/a/b.txt"),
+            "a single-path op has exactly one candidate; attribute it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_batch_never_says_the_same_path_both_moved_and_failed() {
+        // The whole point: walk the real command path (impl + failure wrapper)
+        // and check the two rows a partial batch produces do not contradict
+        // each other about a.txt.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dest = dir.path().join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(src.join("a.txt"), b"x").unwrap();
+        fs::write(src.join("b.txt"), b"x").unwrap();
+        fs::write(dest.join("b.txt"), b"collision").unwrap();
+
+        let ledger = migrated_ledger().await;
+        let sources: Vec<String> = ["a.txt", "b.txt"]
+            .iter()
+            .map(|n| src.join(n).to_string_lossy().to_string())
+            .collect();
+
+        let outcome = move_files_impl(
+            sources.clone(),
+            dest.to_string_lossy().to_string(),
+            &ledger,
+        )
+        .await;
+        let result = with_fs_failure_record(&ledger, "move", &sources, outcome).await;
+        assert!(result.is_err(), "collision on b.txt fails the batch");
+
+        let events = ledger.recent(10).await.unwrap();
+        let blaming_a: Vec<_> = events
+            .iter()
+            .filter(|e| e.subject_path.as_deref() == Some(sources[0].as_str()))
+            .collect();
+        assert_eq!(
+            blaming_a.len(),
+            1,
+            "a.txt should appear once, not as both ok and failed"
+        );
+        assert_eq!(blaming_a[0].status, "ok", "a.txt actually moved");
+        assert!(
+            events.iter().any(|e| e.status == "failed"),
+            "the batch failure is still recorded, just not pinned to a.txt"
+        );
     }
 
     #[tokio::test]
@@ -1856,5 +2106,265 @@ mod tests {
                 "error message should reference the missing path, got: {message}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn counting_a_folder_sees_the_files_inside_it_not_one_item() {
+        // The whole point: one selected folder is one item but many files, and
+        // the interlock thresholds are in files. Counting items meant deleting
+        // a full folder scored 1 and stayed under every threshold.
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join("project");
+        let nested = folder.join("src").join("deep");
+        fs::create_dir_all(&nested).unwrap();
+        for i in 0..30 {
+            fs::write(folder.join(format!("f{i}.txt")), b"abcd").unwrap();
+        }
+        for i in 0..12 {
+            fs::write(nested.join(format!("n{i}.rs")), b"ab").unwrap();
+        }
+
+        let got = count_affected_files(vec![folder.to_string_lossy().to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(got.files, 42, "30 top-level + 12 nested");
+        assert_eq!(got.bytes, 30 * 4 + 12 * 2);
+        assert!(!got.capped);
+    }
+
+    #[tokio::test]
+    async fn counting_stops_once_past_the_interlock_ceiling() {
+        // Above the ceiling the verdict is High regardless, so the walk stops:
+        // an exact count of a huge tree is latency in front of a dialog that
+        // already knows its answer.
+        let dir = tempdir().unwrap();
+        let cap = crate::safety::DESTRUCTIVE_VOLUME_HARD_CAP;
+        let mut acc = AffectedFiles {
+            files: cap - 1,
+            bytes: 0,
+            capped: false,
+        };
+        fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        fs::write(dir.path().join("b.txt"), b"x").unwrap();
+
+        accumulate_affected(dir.path(), cap, &mut acc);
+        assert!(acc.capped, "walk must stop at the ceiling");
+        assert_eq!(acc.files, cap, "and not keep counting past it");
+    }
+
+    #[tokio::test]
+    async fn counting_tolerates_paths_it_cannot_read() {
+        // This decides whether to show a confirmation. A vanished path must not
+        // fail the measurement and take the dialog down with it.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("real.txt"), b"xyz").unwrap();
+
+        let got = count_affected_files(vec![
+            dir.path().join("real.txt").to_string_lossy().to_string(),
+            dir.path().join("ghost.txt").to_string_lossy().to_string(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(got.files, 1);
+        assert_eq!(got.bytes, 3);
+    }
+
+    #[tokio::test]
+    async fn counting_a_plain_selection_matches_the_item_count() {
+        // The common case must not change: N loose files are N files.
+        let dir = tempdir().unwrap();
+        let paths: Vec<String> = (0..5)
+            .map(|i| {
+                let p = dir.path().join(format!("f{i}.txt"));
+                fs::write(&p, b"z").unwrap();
+                p.to_string_lossy().to_string()
+            })
+            .collect();
+
+        let got = count_affected_files(paths.clone()).await.unwrap();
+        assert_eq!(got.files as usize, paths.len());
+    }
+
+    #[tokio::test]
+    async fn move_records_the_files_that_landed_before_the_batch_aborted() {
+        // A name collision partway through a batch is an everyday error, and it
+        // leaves the earlier files already relocated. Those moves have to reach
+        // the ledger or the timeline lies and undo cannot reach them.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dest = dir.path().join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(src.join(name), b"x").unwrap();
+        }
+        // b.txt already exists at the destination: the batch aborts on entry 2.
+        fs::write(dest.join("b.txt"), b"other").unwrap();
+
+        let ledger = migrated_ledger().await;
+        let sources: Vec<String> = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|n| src.join(n).to_string_lossy().to_string())
+            .collect();
+
+        let result = move_files_impl(
+            sources.clone(),
+            dest.to_string_lossy().to_string(),
+            &ledger,
+        )
+        .await;
+
+        assert!(result.is_err(), "collision on b.txt should fail the batch");
+        assert!(dest.join("a.txt").exists(), "a.txt did move; test premise");
+        assert!(!src.join("a.txt").exists(), "a.txt left its source");
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(events.len(), 1, "only the landed move should be recorded");
+        assert_eq!(events[0].engine, "fs");
+        assert_eq!(events[0].kind, "move");
+        assert_eq!(events[0].status, "ok");
+        assert_eq!(events[0].subject_path.as_deref(), Some(sources[0].as_str()));
+        assert_eq!(
+            events[0].target_path.as_deref(),
+            Some(dest.join("a.txt").to_string_lossy().as_ref()),
+            "the recorded target is where the file actually landed"
+        );
+        assert!(
+            events[0]
+                .correlation_id
+                .as_deref()
+                .is_some_and(|c| !c.is_empty()),
+            "the landed work needs an undo id; undo is ledger-driven"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_fs_partial_records_nothing_when_nothing_landed() {
+        // Aborting on the very first entry means the disk is untouched. A row
+        // here would invent work that never happened — and offer undo for it.
+        let ledger = migrated_ledger().await;
+        record_fs_partial(&ledger, "move", &[], &[]).await;
+
+        let events = ledger.recent(10).await.unwrap();
+        assert!(events.is_empty(), "expected no rows, got {}", events.len());
+    }
+
+    #[tokio::test]
+    async fn record_fs_partial_groups_the_landed_work_under_one_undo_id() {
+        let ledger = migrated_ledger().await;
+        record_fs_partial(
+            &ledger,
+            "delete_trash",
+            &["/a/0.txt".to_string(), "/a/1.txt".to_string()],
+            &[],
+        )
+        .await;
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(events.len(), 2, "one row per landed path");
+        let ids: Vec<_> = events
+            .iter()
+            .map(|e| e.correlation_id.clone().unwrap_or_default())
+            .collect();
+        assert!(!ids[0].is_empty(), "landed work needs an undo id");
+        assert_eq!(ids[0], ids[1], "one batch is one undoable group");
+        assert!(events.iter().all(|e| e.status == "ok"));
+        assert!(events.iter().all(|e| e.kind == "delete_trash"));
+    }
+
+    #[tokio::test]
+    async fn copy_records_the_files_that_landed_before_the_batch_aborted() {
+        // Copy never collides (it renames to "(copy N)"), so it aborts on a
+        // missing source, a full disk or a permission error — leaving stray
+        // files at the destination that undo has to be able to reach.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dest = dir.path().join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(src.join("a.txt"), b"x").unwrap();
+
+        let ledger = migrated_ledger().await;
+        let sources = vec![
+            src.join("a.txt").to_string_lossy().to_string(),
+            src.join("ghost.txt").to_string_lossy().to_string(),
+        ];
+
+        let result =
+            copy_files_impl(sources.clone(), dest.to_string_lossy().to_string(), &ledger).await;
+
+        assert!(result.is_err(), "missing source should fail the batch");
+        assert!(dest.join("a.txt").exists(), "a.txt did copy; test premise");
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(events.len(), 1, "only the landed copy should be recorded");
+        assert_eq!(events[0].kind, "copy");
+        assert_eq!(events[0].status, "ok");
+        assert_eq!(events[0].subject_path.as_deref(), Some(sources[0].as_str()));
+        assert_eq!(
+            events[0].target_path.as_deref(),
+            Some(dest.join("a.txt").to_string_lossy().as_ref()),
+        );
+        assert!(
+            events[0]
+                .correlation_id
+                .as_deref()
+                .is_some_and(|c| !c.is_empty()),
+            "the stray copy needs an undo id so the user can clean it up"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_records_the_files_that_landed_before_the_batch_aborted() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+        let ledger = migrated_ledger().await;
+        let paths = vec![
+            dir.path().join("a.txt").to_string_lossy().to_string(),
+            dir.path().join("ghost.txt").to_string_lossy().to_string(),
+        ];
+
+        let result = duplicate_files_impl(paths.clone(), &ledger).await;
+
+        assert!(result.is_err(), "missing source should fail the batch");
+        assert!(
+            dir.path().join("a (copy).txt").exists(),
+            "a.txt did duplicate; test premise"
+        );
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(events.len(), 1, "only the landed duplicate is recorded");
+        assert_eq!(events[0].kind, "duplicate");
+        assert_eq!(events[0].status, "ok");
+        assert_eq!(events[0].subject_path.as_deref(), Some(paths[0].as_str()));
+    }
+
+    #[test]
+    fn next_available_copy_name_keeps_the_established_naming() {
+        // copy and duplicate shared this loop verbatim; both must keep naming
+        // files exactly as they did before it was extracted.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"x").unwrap();
+
+        let first = next_available_copy_name(dir.path(), &src).unwrap();
+        assert_eq!(first.file_name().unwrap(), "a (copy).txt");
+
+        fs::write(&first, b"x").unwrap();
+        let second = next_available_copy_name(dir.path(), &src).unwrap();
+        assert_eq!(second.file_name().unwrap(), "a (copy 2).txt");
+    }
+
+    #[test]
+    fn next_available_copy_name_handles_extensionless_names() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("README");
+        fs::write(&src, b"x").unwrap();
+
+        let first = next_available_copy_name(dir.path(), &src).unwrap();
+        assert_eq!(first.file_name().unwrap(), "README (copy)");
     }
 }

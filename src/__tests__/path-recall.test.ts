@@ -5,7 +5,8 @@
  * The tests cover:
  *   - "no useful info" cases (empty lineage, no matching events)
  *   - relocation cases (move, rename) → alternateLocation populated
- *   - deletion cases (delete, purge) → wasDeleted=true, alt=null
+ *   - deletion cases (delete_trash, delete_permanent) → wasDeleted=true,
+ *     alt=null, phrased by recoverability
  *   - copy-from cases → alt=null (the file is still where it was)
  *   - failed events excluded (they're history, not state)
  *   - the most-recent event wins when multiple touch the path
@@ -14,6 +15,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { inferPathRecall, describePathRecall } from "@/lib/path-recall";
+import { FS_INTENT_KIND } from "@/lib/fs-kinds";
 import type { FileLineage, LineageEvent } from "@/stores/lineage-store";
 
 function makeEvent(overrides: Partial<LineageEvent> = {}): LineageEvent {
@@ -91,10 +93,10 @@ describe("inferPathRecall", () => {
     expect(info!.alternateLocation).toBe("/Users/me/Downloads/report-final.pdf");
   });
 
-  it("sets wasDeleted and clears alternateLocation for a delete event", () => {
+  it("sets wasDeleted and clears alternateLocation for a trash delete", () => {
     const lineage = makeLineage([
       makeEvent({
-        kind: "delete",
+        kind: FS_INTENT_KIND.deleteTrash,
         subject_path: original,
         target_path: null,
       }),
@@ -104,10 +106,10 @@ describe("inferPathRecall", () => {
     expect(info!.alternateLocation).toBeNull();
   });
 
-  it("sets wasDeleted=true for a purge of the original path", () => {
+  it("sets wasDeleted=true for a permanent delete of the original path", () => {
     const lineage = makeLineage([
       makeEvent({
-        kind: "purge",
+        kind: FS_INTENT_KIND.deletePermanent,
         subject_path: original,
         target_path: null,
       }),
@@ -205,16 +207,28 @@ describe("inferPathRecall", () => {
 });
 
 describe("describePathRecall", () => {
-  it('describes deletes as "was deleted"', () => {
+  it("tells the user a trashed file is still recoverable", () => {
     const lineage = makeLineage([
       makeEvent({
-        kind: "delete",
+        kind: FS_INTENT_KIND.deleteTrash,
         subject_path: "/x/y.txt",
         target_path: null,
       }),
     ]);
     const info = inferPathRecall(lineage, "/x/y.txt")!;
-    expect(describePathRecall(info)).toBe("was deleted");
+    expect(describePathRecall(info)).toBe("was moved to the Trash");
+  });
+
+  it("does not imply a permanently deleted file is recoverable", () => {
+    const lineage = makeLineage([
+      makeEvent({
+        kind: FS_INTENT_KIND.deletePermanent,
+        subject_path: "/x/y.txt",
+        target_path: null,
+      }),
+    ]);
+    const info = inferPathRecall(lineage, "/x/y.txt")!;
+    expect(describePathRecall(info)).toBe("was permanently deleted");
   });
 
   it("describes moves with the new location", () => {
@@ -251,5 +265,32 @@ describe("describePathRecall", () => {
     ]);
     const info = inferPathRecall(lineage, "/a/file.txt")!;
     expect(describePathRecall(info)).toBe("was last copied from here");
+  });
+});
+
+describe("ledger kind coupling", () => {
+  // This module hardcoded "delete"/"purge" — a vocabulary the engine never
+  // wrote — so wasDeleted was permanently false and a user hunting a deleted
+  // file was shown the raw kind ("last delete_trash event recorded"). It
+  // type-checked and its tests passed, because the tests invented the same
+  // kinds the code did. Pin the real ones against the shared source.
+  it("does not treat kinds the engine never writes as deletions", () => {
+    for (const invented of ["delete", "purge"]) {
+      const lineage = makeLineage([
+        makeEvent({ kind: invented, subject_path: "/x/y.txt", target_path: null }),
+      ]);
+      expect(inferPathRecall(lineage, "/x/y.txt")!.wasDeleted).toBe(false);
+    }
+  });
+
+  it("phrases every delete kind the engine writes, never its raw identifier", () => {
+    for (const kind of [FS_INTENT_KIND.deleteTrash, FS_INTENT_KIND.deletePermanent]) {
+      const lineage = makeLineage([
+        makeEvent({ kind, subject_path: "/x/y.txt", target_path: null }),
+      ]);
+      const phrase = describePathRecall(inferPathRecall(lineage, "/x/y.txt")!);
+      expect(phrase).not.toContain(kind);
+      expect(phrase).toMatch(/Trash|permanently deleted/);
+    }
   });
 });
