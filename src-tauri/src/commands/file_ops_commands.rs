@@ -49,6 +49,85 @@ pub(crate) async fn record_fs_ok(
     }
 }
 
+/// DRY helper: record a *failed* filesystem operation in the unified ledger.
+///
+/// The mirror of [`record_fs_ok`], and the reason the FS engine stopped being
+/// the only engine that reported nothing but successes. Transfer, sync and
+/// automation have always written [`LedgerStatus::Failed`]; FS did not, so a
+/// copy or delete that the OS rejected left no trace at all — the Activity
+/// Timeline showed the successes and silently omitted the failure.
+///
+/// # Why this lives in the `#[tauri::command]` wrapper, not the `_impl`
+///
+/// The `_impl` bodies report failure with `?`, which returns before any
+/// recording code placed after the work could run. Capturing the `Err` in the
+/// wrapper instead means not one `_impl` body changes, so the success path
+/// keeps its exact current behaviour.
+///
+/// Each mutating `_impl` is called only by its own wrapper and by this file's
+/// tests (the split exists so tests can pass a plain `&OperationLedger` rather
+/// than a `tauri::State`), so the wrapper covers every production call path —
+/// there is no route into the FS engine that skips this recording.
+///
+/// # Why one row, not one per path
+///
+/// [`record_fs_ok`] fans out one row per subject/target pair because every pair
+/// provably succeeded. A failure carries no such guarantee: the impls abort on
+/// the first bad file, so of five paths some may have been processed and the
+/// rest never attempted. Emitting five "failed" rows would assert something we
+/// did not observe. We record one row for the operation, name the first path as
+/// the subject, and keep the full list in `details_json`.
+///
+/// `paths` is whatever the operation acted on — sources for copy/move/delete,
+/// the target for create_folder/create_file. Both end up as the row's subject,
+/// which is what [`OperationLedger::events_touching_path`] matches on.
+///
+/// Fail-open like `record_fs_ok`: [`OperationLedger::record`] swallows DB
+/// errors, so a ledger outage can never turn one error into a different one.
+pub(crate) async fn record_fs_failed(
+    ledger: &OperationLedger,
+    kind: &str,
+    paths: &[String],
+    err: &AppError,
+) {
+    // `user_message`, not `to_string`: ledger rows are rendered verbatim in the
+    // Activity Timeline, so an `Internal` error must be sanitised here exactly
+    // as it is at the IPC boundary.
+    let reason = err.user_message();
+    let details = serde_json::json!({
+        "error": reason,
+        "paths": paths,
+    })
+    .to_string();
+
+    let mut ev = RecordEvent::new(LedgerEngine::Fs, kind)
+        .status(LedgerStatus::Failed)
+        .summary(format!("{kind} failed: {reason}"))
+        .correlation(Uuid::new_v4().to_string())
+        .details_json(details);
+    if let Some(first) = paths.first() {
+        ev = ev.subject(first.clone());
+    }
+    ledger.record(ev).await;
+}
+
+/// Run a filesystem command wrapper, recording a ledger failure if it errors.
+///
+/// Success is already recorded inside each `_impl` by [`record_fs_ok`]; this
+/// only adds the missing `Err` half, so every FS command gains failure
+/// reporting by wrapping its existing call in one place.
+pub(crate) async fn with_fs_failure_record<T>(
+    ledger: &OperationLedger,
+    kind: &str,
+    paths: &[String],
+    outcome: Result<T, AppError>,
+) -> Result<T, AppError> {
+    if let Err(err) = &outcome {
+        record_fs_failed(ledger, kind, paths, err).await;
+    }
+    outcome
+}
+
 /// Result of a file operation, used for undo support.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileOpResult {
@@ -78,7 +157,8 @@ pub async fn copy_files(
     dest_dir: String,
     ledger: tauri::State<'_, OperationLedger>,
 ) -> Result<FileOpResult, AppError> {
-    copy_files_impl(source_paths, dest_dir, &ledger).await
+    let outcome = copy_files_impl(source_paths.clone(), dest_dir, &ledger).await;
+    with_fs_failure_record(&ledger, "copy", &source_paths, outcome).await
 }
 
 pub async fn copy_files_impl(
@@ -170,7 +250,8 @@ pub async fn move_files(
     dest_dir: String,
     ledger: tauri::State<'_, OperationLedger>,
 ) -> Result<FileOpResult, AppError> {
-    move_files_impl(source_paths, dest_dir, &ledger).await
+    let outcome = move_files_impl(source_paths.clone(), dest_dir, &ledger).await;
+    with_fs_failure_record(&ledger, "move", &source_paths, outcome).await
 }
 
 pub async fn move_files_impl(
@@ -238,7 +319,9 @@ pub async fn rename_file(
     new_name: String,
     ledger: tauri::State<'_, OperationLedger>,
 ) -> Result<FileOpResult, AppError> {
-    rename_file_impl(path, new_name, &ledger).await
+    let sources = vec![path.clone()];
+    let outcome = rename_file_impl(path, new_name, &ledger).await;
+    with_fs_failure_record(&ledger, "rename", &sources, outcome).await
 }
 
 pub async fn rename_file_impl(
@@ -301,7 +384,8 @@ pub async fn duplicate_files(
     paths: Vec<String>,
     ledger: tauri::State<'_, OperationLedger>,
 ) -> Result<FileOpResult, AppError> {
-    duplicate_files_impl(paths, &ledger).await
+    let outcome = duplicate_files_impl(paths.clone(), &ledger).await;
+    with_fs_failure_record(&ledger, "duplicate", &paths, outcome).await
 }
 
 pub async fn duplicate_files_impl(
@@ -389,7 +473,11 @@ pub async fn delete_files(
     permanent: bool,
     ledger: tauri::State<'_, OperationLedger>,
 ) -> Result<FileOpResult, AppError> {
-    delete_files_impl(paths, permanent, &ledger).await
+    // Mirror the kind the impl records on success, so a failed delete lands
+    // under the same kind as a successful one in the timeline.
+    let kind = if permanent { "delete_permanent" } else { "delete_trash" };
+    let outcome = delete_files_impl(paths.clone(), permanent, &ledger).await;
+    with_fs_failure_record(&ledger, kind, &paths, outcome).await
 }
 
 pub async fn delete_files_impl(
@@ -447,7 +535,9 @@ pub async fn create_directory(
     path: String,
     ledger: tauri::State<'_, OperationLedger>,
 ) -> Result<FileOpResult, AppError> {
-    create_directory_impl(path, &ledger).await
+    let paths = vec![path.clone()];
+    let outcome = create_directory_impl(path, &ledger).await;
+    with_fs_failure_record(&ledger, "create_folder", &paths, outcome).await
 }
 
 /// Idempotent directory creation. Returns success whether the directory
@@ -465,7 +555,9 @@ pub async fn ensure_directory(
     path: String,
     ledger: tauri::State<'_, OperationLedger>,
 ) -> Result<FileOpResult, AppError> {
-    ensure_directory_impl(path, &ledger).await
+    let paths = vec![path.clone()];
+    let outcome = ensure_directory_impl(path, &ledger).await;
+    with_fs_failure_record(&ledger, "create_folder", &paths, outcome).await
 }
 
 pub async fn ensure_directory_impl(
@@ -545,7 +637,9 @@ pub async fn create_file(
     path: String,
     ledger: tauri::State<'_, OperationLedger>,
 ) -> Result<FileOpResult, AppError> {
-    create_file_impl(path, &ledger).await
+    let paths = vec![path.clone()];
+    let outcome = create_file_impl(path, &ledger).await;
+    with_fs_failure_record(&ledger, "create_file", &paths, outcome).await
 }
 
 pub async fn create_file_impl(
@@ -1324,6 +1418,87 @@ mod tests {
     fn test_ledger() -> OperationLedger {
         let pool = DbPool::open_in_memory().unwrap();
         OperationLedger::new(pool)
+    }
+
+    /// A ledger whose `operation_ledger` table actually exists, for the tests
+    /// that assert on persisted rows rather than just exercising the command
+    /// path. `test_ledger()` above is deliberately un-migrated (record() is
+    /// fail-open), which is fine for callers that never read back.
+    async fn migrated_ledger() -> OperationLedger {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        OperationLedger::new(repo.pool().clone())
+    }
+
+    #[tokio::test]
+    async fn record_fs_failed_writes_a_failed_row() {
+        let ledger = migrated_ledger().await;
+        let err = AppError::file_op("Failed to copy /a/b.txt: denied", "Check permissions.");
+        record_fs_failed(&ledger, "copy", &["/a/b.txt".to_string()], &err).await;
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(events.len(), 1, "expected exactly one failure row");
+        assert_eq!(events[0].engine, "fs");
+        assert_eq!(events[0].kind, "copy");
+        assert_eq!(events[0].status, "failed");
+        assert_eq!(events[0].subject_path.as_deref(), Some("/a/b.txt"));
+        assert!(events[0].summary.contains("copy failed"));
+    }
+
+    #[tokio::test]
+    async fn record_fs_failed_emits_one_row_per_operation_not_per_path() {
+        // The impls abort on the first bad file, so we cannot claim each of the
+        // five paths failed — only that the operation did.
+        let ledger = migrated_ledger().await;
+        let paths: Vec<String> = (0..5).map(|i| format!("/a/{i}.txt")).collect();
+        let err = AppError::file_op("Failed to move /a/2.txt: denied", "Check permissions.");
+        record_fs_failed(&ledger, "move", &paths, &err).await;
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].subject_path.as_deref(), Some("/a/0.txt"));
+        // The full list stays recoverable from details_json.
+        assert!(events[0].details_json.contains("/a/4.txt"));
+    }
+
+    #[tokio::test]
+    async fn record_fs_failed_sanitizes_internal_errors() {
+        // Ledger rows are rendered verbatim in the Activity Timeline, so an
+        // Internal error must not leak its real text into the DB.
+        let ledger = migrated_ledger().await;
+        let err = AppError::internal("connection string user:hunter2@db-host");
+        record_fs_failed(&ledger, "delete_trash", &["/a/b.txt".to_string()], &err).await;
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        let row = format!("{}{}", events[0].summary, events[0].details_json);
+        assert!(!row.contains("hunter2"), "internal error text leaked: {row}");
+        assert!(row.contains("An unexpected error occurred."));
+    }
+
+    #[tokio::test]
+    async fn with_fs_failure_record_is_silent_on_success() {
+        let ledger = migrated_ledger().await;
+        let outcome: Result<u8, AppError> = Ok(7);
+        let passed = with_fs_failure_record(&ledger, "copy", &["/a".to_string()], outcome)
+            .await
+            .unwrap();
+
+        assert_eq!(passed, 7, "the Ok value must pass through untouched");
+        assert!(
+            ledger.recent(10).await.unwrap().is_empty(),
+            "success is recorded by record_fs_ok inside the impl, not here"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_fs_failure_record_records_and_propagates_the_error() {
+        let ledger = migrated_ledger().await;
+        let outcome: Result<u8, AppError> =
+            Err(AppError::file_op("Source not found: /a", "It may have moved."));
+        let returned = with_fs_failure_record(&ledger, "move", &["/a".to_string()], outcome).await;
+
+        assert!(returned.is_err(), "the original error must still propagate");
+        assert_eq!(ledger.recent(10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

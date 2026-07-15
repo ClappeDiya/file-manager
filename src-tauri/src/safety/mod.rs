@@ -188,6 +188,21 @@ impl SafetyInterlock {
             }
         };
 
+        // Only completed work describes "what the user normally does". A delete
+        // that errored out never removed 10k files, so counting it would inflate
+        // the median and desensitise the very check this baseline exists for.
+        //
+        // The ledger's other two inference surfaces already filter the same way
+        // in Rust (`suggester.rs` skips non-ok events, `pinner.rs` takes an
+        // accept_statuses list), and `extension_destinations` does it in SQL
+        // (`AND status = 'ok'`). This keeps the fourth consistent with them —
+        // and fixes a latent bug: transfer and sync have always written Failed
+        // rows, so their baselines have been silently polluted all along.
+        let baseline: Vec<LedgerEvent> = baseline
+            .into_iter()
+            .filter(|e| e.status == LedgerStatus::Ok.as_str())
+            .collect();
+
         self.classify(intent, &baseline, intent_hash)
     }
 
@@ -450,6 +465,63 @@ mod tests {
             details_json: details.to_string(),
             undo_token: None,
         }
+    }
+
+    /// Regression guard for the FS-failure recording added alongside this
+    /// filter. Before it, `assess()` fed every row of the last 50 — including
+    /// failures — into the median. A user who repeatedly failed to delete a
+    /// huge folder would have raised their own baseline until the interlock
+    /// stopped warning about exactly the operation that kept going wrong.
+    #[tokio::test]
+    async fn assess_excludes_failed_events_from_the_baseline() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let ledger = OperationLedger::new(repo.pool().clone());
+
+        // History: the user normally deletes ~2 files, but has three failed
+        // attempts at 10_000 files sitting in the ledger.
+        for _ in 0..3 {
+            ledger
+                .record(
+                    RecordEvent::new(LedgerEngine::Fs, "delete_trash")
+                        .status(LedgerStatus::Ok)
+                        .details_json(r#"{"affected_files":2}"#),
+                )
+                .await;
+        }
+        for _ in 0..3 {
+            ledger
+                .record(
+                    RecordEvent::new(LedgerEngine::Fs, "delete_trash")
+                        .status(LedgerStatus::Failed)
+                        .details_json(r#"{"affected_files":10000}"#),
+                )
+                .await;
+        }
+
+        let interlock = SafetyInterlock::new(ledger);
+        let assessment = interlock
+            .assess(&OperationIntent {
+                engine: "fs".to_string(),
+                kind: "delete_trash".to_string(),
+                affected_files: 200,
+                total_bytes: 0,
+                subject_path: None,
+                summary: None,
+            })
+            .await;
+
+        // Only the three ok rows may inform the baseline.
+        assert_eq!(
+            assessment.baseline_sample_size, 3,
+            "failed rows must not count toward the baseline sample"
+        );
+        // 200 files against a median of 2 is a 100x jump on a destructive kind:
+        // it must still be flagged, which is only true if the 10k failures were
+        // excluded from the median.
+        assert!(
+            assessment.requires_confirmation,
+            "failed attempts inflated the baseline and suppressed the warning"
+        );
     }
 
     fn make_interlock() -> SafetyInterlock {
