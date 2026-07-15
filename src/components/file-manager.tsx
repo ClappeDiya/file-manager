@@ -595,20 +595,35 @@ export function FileManager() {
       if (outcome.success) popUndo();
       // Surface result via the existing structured-error toast channel so
       // we don't introduce a new notification system.
-      useUIStore.getState().addStructuredError({
-        what: outcome.success
-          ? `Undid ${outcome.kind}`
-          : "Nothing to undo",
-        why: outcome.success
-          ? outcome.summary
-          : "The operation ledger has no reversible entries from this or prior sessions.",
-        appDid: outcome.success
-          ? `Reversed ${outcome.item_count} item(s) via operation ledger`
-          : "No-op",
-        userAction: outcome.success
-          ? "Press Cmd+Z again to undo the next most recent operation"
-          : "Perform a file operation first, then Cmd+Z will reverse it",
-      });
+      //
+      // `success: false` covers two different situations, which the backend
+      // tells apart by whether it filled `kind`: nothing is on record, or the
+      // last thing you did can't be reversed (a delete). The second must not
+      // be reported as "nothing to undo" — the operation very much happened.
+      const ui = useUIStore.getState();
+      if (outcome.success) {
+        ui.addStructuredError({
+          what: `Undid ${outcome.kind}`,
+          why: outcome.summary,
+          appDid: `Reversed ${outcome.item_count} item(s) via operation ledger`,
+          userAction: "Press Cmd+Z again to undo the next most recent operation",
+        });
+      } else if (outcome.kind !== "") {
+        ui.addStructuredError({
+          what: outcome.summary,
+          why: "Undo reverses your most recent operation, and this one cannot be reversed.",
+          appDid: "No-op — nothing was changed",
+          userAction:
+            "Restore it from the Trash, or use the Activity Timeline's per-entry Undo to reverse an earlier operation deliberately",
+        });
+      } else {
+        ui.addStructuredError({
+          what: "Nothing to undo",
+          why: "The operation ledger has no reversible entries from this or prior sessions.",
+          appDid: "No-op",
+          userAction: "Perform a file operation first, then Cmd+Z will reverse it",
+        });
+      }
     } catch (err) {
       console.error("Undo failed:", err);
       useUIStore.getState().addStructuredError({

@@ -84,7 +84,7 @@ const DESTRUCTIVE_KINDS: &[&str] = &[
 /// the highest-stakes copy in the app. Unknown kinds fall through to the raw
 /// identifier, which is exactly what the reasons said before this existed, so
 /// a new kind degrades to the old behaviour rather than to a wrong label.
-fn kind_label(kind: &str) -> &str {
+pub(crate) fn kind_label(kind: &str) -> &str {
     match kind {
         "delete_trash" => "move to Trash",
         "delete_permanent" => "permanent delete",
