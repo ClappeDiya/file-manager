@@ -141,6 +141,19 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
 
     // Initialize mount manager (Finder-mounted remote storage)
     let mount_mgr = MountManager::new();
+    // Restore mounts the user flagged "Auto-mount". Spawned, never awaited:
+    // mounting shells out to mount_smbfs/sshfs, which blocks for a long time on
+    // an unreachable host, and app boot must not wait on the network. Clones are
+    // cheap (Arc / Repository handle) and must be taken here, before these are
+    // moved into managed state below.
+    {
+        let mounts = mount_mgr.clone();
+        let mount_repo = repo.clone();
+        let mount_conns = connection_mgr.clone();
+        tokio::spawn(async move {
+            mounts.auto_mount_saved(&mount_repo, &mount_conns).await;
+        });
+    }
 
     // Initialize editor state (external editor mappings and file watch)
     let editor_state = std::sync::Arc::new(commands::editor_commands::EditorState::new());
