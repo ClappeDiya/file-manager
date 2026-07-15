@@ -89,6 +89,7 @@ import { useFileSelection, useFileDragDrop } from "@/hooks/use-file-selection";
 import { cn } from "@ufop/ui-components";
 import { Button, Badge } from "@ufop/ui-components";
 import { ThemeSwitcher } from "./theme-switcher";
+import { NotificationBell } from "./notification-bell";
 import {
   FolderOpen,
   PanelLeft,
@@ -2021,6 +2022,10 @@ export function FileManager() {
           )}
           {/* In Simple Mode the outer SimpleModeWrapper renders the ThemeSwitcher; suppress duplicate. */}
           {appMode !== "simple" && toolbarItems.includes("theme") && <ThemeSwitcher />}
+          {/* Same rule for the notification bell: SimpleModeWrapper owns it in
+              Simple Mode, but that wrapper early-returns in Advanced Mode, so
+              without this mount structured errors would have no render surface. */}
+          {appMode !== "simple" && <NotificationBell />}
         </div>
 
         {/* Toolbar Customizer (#14) */}

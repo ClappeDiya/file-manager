@@ -24,7 +24,7 @@ pnpm test:watch       # Vitest watch mode (same as above)
 ```bash
 cd src-tauri
 cargo check           # Fast compilation check (no codegen)
-cargo test --lib      # Run all library tests (~733 tests)
+cargo test --lib      # Run all library tests (~857 tests)
 cargo test --lib automation  # Run tests matching "automation"
 cargo clippy          # Lint (if installed)
 ```
