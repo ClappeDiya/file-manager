@@ -17,6 +17,25 @@ use uuid::Uuid;
 /// Iter 35: exposed `pub(crate)` so `fs_commands::write_text_file_full` can
 /// use the same recording path as the rest of the FS engine, keeping the
 /// audit format uniform across copy/move/rename/create_file/edit_text.
+/// Record the portion of a batch that actually landed before the batch aborted.
+///
+/// A batch that fails partway has still moved or deleted the entries it got to.
+/// Recording that prefix keeps the timeline honest about what is on disk, and —
+/// because undo is ledger-driven — keeps the completed work undoable. Records
+/// nothing when the batch failed on its first entry.
+pub(crate) async fn record_fs_partial(
+    ledger: &OperationLedger,
+    kind: &str,
+    sources: &[String],
+    dests: &[String],
+) {
+    if sources.is_empty() {
+        return;
+    }
+    let undo_id = Uuid::new_v4().to_string();
+    record_fs_ok(ledger, kind, sources, dests, &undo_id).await;
+}
+
 pub(crate) async fn record_fs_ok(
     ledger: &OperationLedger,
     kind: &str,
@@ -254,6 +273,38 @@ pub async fn move_files(
     with_fs_failure_record(&ledger, "move", &source_paths, outcome).await
 }
 
+/// Move a single entry into `dest_dir`, returning the path it landed at.
+fn move_one(source: &str, dest_path: &Path) -> Result<String, AppError> {
+    let src = Path::new(source);
+    if !src.exists() {
+        return Err(AppError::file_op(
+            format!("Source not found: {source}"),
+            "The file or folder may have been moved or deleted.",
+        ));
+    }
+
+    let file_name = src
+        .file_name()
+        .ok_or_else(|| AppError::file_op("Invalid source path", "Check the file path."))?;
+    let target = dest_path.join(file_name);
+
+    if target.exists() {
+        return Err(AppError::file_op(
+            format!("File already exists at destination: {}", target.display()),
+            "Rename the file or choose a different destination.",
+        ));
+    }
+
+    std::fs::rename(src, &target).map_err(|e| {
+        AppError::file_op(
+            format!("Failed to move {}: {e}", src.display()),
+            "Check permissions. If moving across drives, this may require a copy + delete.",
+        )
+    })?;
+
+    Ok(target.to_string_lossy().to_string())
+}
+
 pub async fn move_files_impl(
     source_paths: Vec<String>,
     dest_dir: String,
@@ -268,36 +319,19 @@ pub async fn move_files_impl(
     }
 
     let mut dest_paths = Vec::new();
+    let mut moved_sources = Vec::new();
 
     for source in &source_paths {
-        let src = Path::new(source);
-        if !src.exists() {
-            return Err(AppError::file_op(
-                format!("Source not found: {source}"),
-                "The file or folder may have been moved or deleted.",
-            ));
+        match move_one(source, dest_path) {
+            Ok(target) => {
+                dest_paths.push(target);
+                moved_sources.push(source.clone());
+            }
+            Err(err) => {
+                record_fs_partial(ledger, "move", &moved_sources, &dest_paths).await;
+                return Err(err);
+            }
         }
-
-        let file_name = src
-            .file_name()
-            .ok_or_else(|| AppError::file_op("Invalid source path", "Check the file path."))?;
-        let target = dest_path.join(file_name);
-
-        if target.exists() {
-            return Err(AppError::file_op(
-                format!("File already exists at destination: {}", target.display()),
-                "Rename the file or choose a different destination.",
-            ));
-        }
-
-        std::fs::rename(src, &target).map_err(|e| {
-            AppError::file_op(
-                format!("Failed to move {}: {e}", src.display()),
-                "Check permissions. If moving across drives, this may require a copy + delete.",
-            )
-        })?;
-
-        dest_paths.push(target.to_string_lossy().to_string());
     }
 
     let undo_id = Uuid::new_v4().to_string();
@@ -480,44 +514,56 @@ pub async fn delete_files(
     with_fs_failure_record(&ledger, kind, &paths, outcome).await
 }
 
+/// Delete a single existing entry, to the OS trash unless `permanent`.
+fn delete_one(p: &Path, permanent: bool) -> Result<(), AppError> {
+    if !permanent {
+        // Move to OS trash
+        // On macOS, move to ~/.Trash
+        // On Linux, use freedesktop trash spec
+        // On Windows, use shell API
+        return move_to_trash(p);
+    }
+
+    if p.is_dir() {
+        std::fs::remove_dir_all(p).map_err(|e| {
+            AppError::file_op(
+                format!("Failed to delete directory {}: {e}", p.display()),
+                "Check that the directory is not in use and you have permission.",
+            )
+        })
+    } else {
+        std::fs::remove_file(p).map_err(|e| {
+            AppError::file_op(
+                format!("Failed to delete file {}: {e}", p.display()),
+                "Check that the file is not in use and you have permission.",
+            )
+        })
+    }
+}
+
 pub async fn delete_files_impl(
     paths: Vec<String>,
     permanent: bool,
     ledger: &OperationLedger,
 ) -> Result<FileOpResult, AppError> {
+    let kind = if permanent { "delete_permanent" } else { "delete_trash" };
+    let mut deleted = Vec::new();
+
     for path in &paths {
         let p = Path::new(path);
         if !p.exists() {
             continue; // Already gone, skip silently
         }
 
-        if permanent {
-            if p.is_dir() {
-                std::fs::remove_dir_all(p).map_err(|e| {
-                    AppError::file_op(
-                        format!("Failed to delete directory {}: {e}", p.display()),
-                        "Check that the directory is not in use and you have permission.",
-                    )
-                })?;
-            } else {
-                std::fs::remove_file(p).map_err(|e| {
-                    AppError::file_op(
-                        format!("Failed to delete file {}: {e}", p.display()),
-                        "Check that the file is not in use and you have permission.",
-                    )
-                })?;
-            }
-        } else {
-            // Move to OS trash
-            // On macOS, move to ~/.Trash
-            // On Linux, use freedesktop trash spec
-            // On Windows, use shell API
-            move_to_trash(p)?;
+        if let Err(err) = delete_one(p, permanent) {
+            record_fs_partial(ledger, kind, &deleted, &[]).await;
+            return Err(err);
         }
+
+        deleted.push(path.clone());
     }
 
     let undo_id = Uuid::new_v4().to_string();
-    let kind = if permanent { "delete_permanent" } else { "delete_trash" };
     record_fs_ok(ledger, kind, &paths, &[], &undo_id).await;
 
     Ok(FileOpResult {
@@ -1856,5 +1902,92 @@ mod tests {
                 "error message should reference the missing path, got: {message}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn move_records_the_files_that_landed_before_the_batch_aborted() {
+        // A name collision partway through a batch is an everyday error, and it
+        // leaves the earlier files already relocated. Those moves have to reach
+        // the ledger or the timeline lies and undo cannot reach them.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dest = dir.path().join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(src.join(name), b"x").unwrap();
+        }
+        // b.txt already exists at the destination: the batch aborts on entry 2.
+        fs::write(dest.join("b.txt"), b"other").unwrap();
+
+        let ledger = migrated_ledger().await;
+        let sources: Vec<String> = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|n| src.join(n).to_string_lossy().to_string())
+            .collect();
+
+        let result = move_files_impl(
+            sources.clone(),
+            dest.to_string_lossy().to_string(),
+            &ledger,
+        )
+        .await;
+
+        assert!(result.is_err(), "collision on b.txt should fail the batch");
+        assert!(dest.join("a.txt").exists(), "a.txt did move; test premise");
+        assert!(!src.join("a.txt").exists(), "a.txt left its source");
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(events.len(), 1, "only the landed move should be recorded");
+        assert_eq!(events[0].engine, "fs");
+        assert_eq!(events[0].kind, "move");
+        assert_eq!(events[0].status, "ok");
+        assert_eq!(events[0].subject_path.as_deref(), Some(sources[0].as_str()));
+        assert_eq!(
+            events[0].target_path.as_deref(),
+            Some(dest.join("a.txt").to_string_lossy().as_ref()),
+            "the recorded target is where the file actually landed"
+        );
+        assert!(
+            events[0]
+                .correlation_id
+                .as_deref()
+                .is_some_and(|c| !c.is_empty()),
+            "the landed work needs an undo id; undo is ledger-driven"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_fs_partial_records_nothing_when_nothing_landed() {
+        // Aborting on the very first entry means the disk is untouched. A row
+        // here would invent work that never happened — and offer undo for it.
+        let ledger = migrated_ledger().await;
+        record_fs_partial(&ledger, "move", &[], &[]).await;
+
+        let events = ledger.recent(10).await.unwrap();
+        assert!(events.is_empty(), "expected no rows, got {}", events.len());
+    }
+
+    #[tokio::test]
+    async fn record_fs_partial_groups_the_landed_work_under_one_undo_id() {
+        let ledger = migrated_ledger().await;
+        record_fs_partial(
+            &ledger,
+            "delete_trash",
+            &["/a/0.txt".to_string(), "/a/1.txt".to_string()],
+            &[],
+        )
+        .await;
+
+        let events = ledger.recent(10).await.unwrap();
+        assert_eq!(events.len(), 2, "one row per landed path");
+        let ids: Vec<_> = events
+            .iter()
+            .map(|e| e.correlation_id.clone().unwrap_or_default())
+            .collect();
+        assert!(!ids[0].is_empty(), "landed work needs an undo id");
+        assert_eq!(ids[0], ids[1], "one batch is one undoable group");
+        assert!(events.iter().all(|e| e.status == "ok"));
+        assert!(events.iter().all(|e| e.kind == "delete_trash"));
     }
 }
