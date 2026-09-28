@@ -25,6 +25,8 @@ export interface SyncPair {
   checksum_enabled: boolean;
   created_at: string;
   time_offset_secs: number | null;
+  /** Robocopy-equivalent copy options (see components/robocopy-options.tsx). */
+  copy_options?: import("@/lib/copy-options").CopyOptions;
 }
 
 export interface SyncFilter {
@@ -86,6 +88,8 @@ export interface SyncReport {
   health: string;
   error_messages: string[];
   resumed: boolean;
+  /** Robocopy-compatible exit code bitmask (1 copied, 2 extras, 4 mismatches, 8 failures). */
+  exit_code?: number;
 }
 
 export interface SyncConflictItem {
@@ -141,6 +145,7 @@ interface SyncState {
     conflictPolicy?: string;
     verifyMode?: string;
     checksumEnabled?: boolean;
+    optionsJson?: string;
   }) => Promise<SyncPair>;
   deletePair: (pairId: string) => Promise<void>;
   updatePair: (pairJson: string) => Promise<SyncPair>;
@@ -212,6 +217,7 @@ export const useSyncStore = create<SyncState>((set, get) => ({
         conflictPolicy: params.conflictPolicy || null,
         verifyMode: params.verifyMode || null,
         checksumEnabled: params.checksumEnabled || false,
+        optionsJson: params.optionsJson || null,
       });
       await get().loadPairs();
       return pair;

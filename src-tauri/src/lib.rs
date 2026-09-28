@@ -454,6 +454,8 @@ pub fn run() {
             sync_commands::detect_time_offset,
             // Sync Filter Presets
             sync_commands::get_sync_filter_presets,
+            sync_commands::parse_robocopy_command,
+            sync_commands::robocopy_command_preview,
             // Peer discovery and transfer (T-031)
             peer_commands::peer_start_discovery,
             peer_commands::peer_stop_discovery,

@@ -1135,7 +1135,7 @@ export function getDefaultCommands(actions: {
       id: "open-sync",
       label: "Sync Pairs\u2026",
       description:
-        "Manage sync pairs \u2014 health indicators, dry-run preview, conflict resolution, reports, rollback",
+        "Manage sync pairs \u2014 Robocopy-style copy jobs, health indicators, dry-run preview, conflict resolution, reports, rollback",
       icon: <FolderSync className="h-4 w-4" />,
       shortcut: `${cmd}\u21E7H`,
       category: "Navigation",
@@ -1155,6 +1155,9 @@ export function getDefaultCommands(actions: {
         "one-way",
         "two-way",
         "backup",
+        "robocopy",
+        "copy job",
+        "scheduled copy",
       ],
     },
     // Transfer History (Journal) \u2014 iter 30 surfaced the 284-LOC

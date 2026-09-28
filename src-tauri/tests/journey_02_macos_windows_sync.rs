@@ -33,6 +33,7 @@ fn make_two_way_pair(src: &std::path::Path, dst: &std::path::Path) -> SyncPair {
         checksum_enabled: false,
         created_at: Utc::now(),
         time_offset_secs: None,
+        copy_options: Default::default(),
     }
 }
 

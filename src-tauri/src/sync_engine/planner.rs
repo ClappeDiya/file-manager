@@ -19,18 +19,66 @@ pub struct FileMeta {
     pub size: u64,
     pub modified: Option<DateTime<Utc>>,
     pub is_dir: bool,
+    /// Entry is a symbolic link recorded as-is (`SymlinkMode::CopyLink`).
+    pub is_symlink: bool,
+    /// Hidden: a dot-file, or the Windows hidden attribute.
+    pub hidden: bool,
+    pub readonly: bool,
 }
 
 /// Recursively walk a directory and collect file metadata.
 pub fn walk_directory(root: &Path) -> Result<Vec<FileMeta>, AppError> {
+    walk_directory_with(root, &CopyOptions::default())
+}
+
+/// Walk a directory honouring the Robocopy-style selection options:
+/// /S, /LEV:n, /XD and symlink handling (/XJ, /SL).
+pub fn walk_directory_with(root: &Path, opts: &CopyOptions) -> Result<Vec<FileMeta>, AppError> {
     let mut entries = Vec::new();
-    walk_recursive(root, root, &mut entries)?;
+    // /LEV:n counts the root as level 1; without /S only the root is copied.
+    let max_depth = match (opts.copy_subdirs, opts.max_depth) {
+        (false, _) => 1,
+        (true, 0) => u32::MAX,
+        (true, n) => n,
+    };
+    walk_recursive(root, root, 1, max_depth, opts, &mut entries)?;
     Ok(entries)
+}
+
+fn is_hidden(name: &str, _metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if _metadata.file_attributes() & 0x2 != 0 {
+            return true;
+        }
+    }
+    name.starts_with('.')
+}
+
+/// True when a directory is excluded by /XD — matched against its name or its
+/// path relative to the sync root.
+pub fn dir_excluded(relative_path: &str, opts: &CopyOptions) -> bool {
+    if opts.exclude_dirs.is_empty() {
+        return false;
+    }
+    let name = Path::new(relative_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(relative_path);
+    let normalized = relative_path.replace('\\', "/");
+    opts.exclude_dirs.iter().any(|pat| {
+        let pat = pat.trim().trim_end_matches(['/', '\\']).replace('\\', "/");
+        !pat.is_empty() && (glob_match(&pat, name) || glob_match(&pat, &normalized))
+    })
 }
 
 fn walk_recursive(
     root: &Path,
     current: &Path,
+    depth: u32,
+    max_depth: u32,
+    opts: &CopyOptions,
     entries: &mut Vec<FileMeta>,
 ) -> Result<(), AppError> {
     let read_dir = std::fs::read_dir(current).map_err(|e| AppError::Sync {
@@ -45,16 +93,42 @@ fn walk_recursive(
         })?;
 
         let path = entry.path();
-        let metadata = std::fs::metadata(&path).map_err(|e| AppError::Sync {
-            message: format!("Cannot read metadata for {}: {}", path.display(), e),
-            advice: "Check file permissions.".to_string(),
-        })?;
-
         let relative = path
             .strip_prefix(root)
             .unwrap_or(&path)
             .to_string_lossy()
             .to_string();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        let link_meta = std::fs::symlink_metadata(&path).map_err(|e| AppError::Sync {
+            message: format!("Cannot read metadata for {}: {}", path.display(), e),
+            advice: "Check file permissions.".to_string(),
+        })?;
+
+        if link_meta.file_type().is_symlink() {
+            match opts.symlinks {
+                SymlinkMode::Skip => continue,
+                SymlinkMode::CopyLink if cfg!(unix) => {
+                    entries.push(FileMeta {
+                        relative_path: relative,
+                        absolute_path: path,
+                        size: 0,
+                        modified: link_meta.modified().ok().map(DateTime::<Utc>::from),
+                        is_dir: false,
+                        is_symlink: true,
+                        hidden: is_hidden(&name, &link_meta),
+                        readonly: false,
+                    });
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        let metadata = std::fs::metadata(&path).map_err(|e| AppError::Sync {
+            message: format!("Cannot read metadata for {}: {}", path.display(), e),
+            advice: "Check file permissions.".to_string(),
+        })?;
 
         let modified = metadata
             .modified()
@@ -62,14 +136,20 @@ fn walk_recursive(
             .map(DateTime::<Utc>::from);
 
         if metadata.is_dir() {
+            if depth >= max_depth || dir_excluded(&relative, opts) {
+                continue;
+            }
             entries.push(FileMeta {
                 relative_path: relative.clone(),
                 absolute_path: path.clone(),
                 size: 0,
                 modified,
                 is_dir: true,
+                is_symlink: false,
+                hidden: is_hidden(&name, &metadata),
+                readonly: false,
             });
-            walk_recursive(root, &path, entries)?;
+            walk_recursive(root, &path, depth + 1, max_depth, opts, entries)?;
         } else {
             entries.push(FileMeta {
                 relative_path: relative,
@@ -77,11 +157,53 @@ fn walk_recursive(
                 size: metadata.len(),
                 modified,
                 is_dir: false,
+                is_symlink: false,
+                hidden: is_hidden(&name, &metadata),
+                readonly: metadata.permissions().readonly(),
             });
         }
     }
 
     Ok(())
+}
+
+/// Compare two timestamps with the /FFT (2 s) and /DST (1 h) tolerances.
+pub fn times_equal(
+    a: Option<DateTime<Utc>>,
+    b: Option<DateTime<Utc>>,
+    opts: &CopyOptions,
+) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let diff_ms = (a - b).num_milliseconds().abs();
+            let tolerance_ms = if opts.fat_time_tolerance { 2_000 } else { 0 };
+            if diff_ms <= tolerance_ms {
+                return true;
+            }
+            opts.dst_tolerance && (diff_ms - 3_600_000).abs() <= tolerance_ms.max(1_000)
+        }
+        (a, b) => a == b,
+    }
+}
+
+/// Why a source file is excluded by attribute or age options, if it is.
+fn option_exclusion(file: &FileMeta, opts: &CopyOptions, now: DateTime<Utc>) -> Option<&'static str> {
+    if opts.exclude_hidden && file.hidden {
+        return Some("Hidden file excluded (/XA:H)");
+    }
+    if opts.exclude_readonly && file.readonly {
+        return Some("Read-only file excluded (/XA:R)");
+    }
+    if let Some(modified) = file.modified {
+        let age = now - modified;
+        if opts.max_age_days > 0 && age > chrono::Duration::days(opts.max_age_days as i64) {
+            return Some("Older than maximum age (/MAXAGE)");
+        }
+        if opts.min_age_days > 0 && age < chrono::Duration::days(opts.min_age_days as i64) {
+            return Some("Newer than minimum age (/MINAGE)");
+        }
+    }
+    None
 }
 
 /// Check if a file path matches the sync filter criteria.
@@ -204,10 +326,13 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
         });
     }
 
+    let opts = &pair.copy_options;
+    let now = Utc::now();
+
     // Walk both directories
-    let source_files = walk_directory(source_root)?;
+    let source_files = walk_directory_with(source_root, opts)?;
     let dest_files = if dest_root.exists() {
-        walk_directory(dest_root)?
+        walk_directory_with(dest_root, opts)?
     } else {
         Vec::new()
     };
@@ -233,20 +358,26 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
     let mut path_warnings = Vec::new();
     let mut total_bytes: u64 = 0;
 
+    let skip_entry = |rel_path: &str, src: &FileMeta, reason: &str| SyncDiffEntry {
+        relative_path: rel_path.to_string(),
+        action: SyncAction::Skip,
+        source_size: Some(src.size),
+        dest_size: dest_map.get(rel_path).map(|d| d.size),
+        source_modified: src.modified,
+        dest_modified: dest_map.get(rel_path).and_then(|d| d.modified),
+        reason: reason.to_string(),
+        path_length_warning: None,
+    };
+
     // Process source files
     for (rel_path, src) in &source_map {
         // Apply filter
         if !matches_filter(rel_path, src.size, &pair.filter) {
-            skipped.push(SyncDiffEntry {
-                relative_path: rel_path.to_string(),
-                action: SyncAction::Skip,
-                source_size: Some(src.size),
-                dest_size: dest_map.get(rel_path).map(|d| d.size),
-                source_modified: src.modified,
-                dest_modified: dest_map.get(rel_path).and_then(|d| d.modified),
-                reason: "Excluded by filter".to_string(),
-                path_length_warning: None,
-            });
+            skipped.push(skip_entry(rel_path, src, "Excluded by filter"));
+            continue;
+        }
+        if let Some(reason) = option_exclusion(src, opts, now) {
+            skipped.push(skip_entry(rel_path, src, reason));
             continue;
         }
 
@@ -263,21 +394,34 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
                 (mtime, _) => mtime,
             };
 
-            let changed = match pair.verify_mode {
+            let same_time = times_equal(src.modified, adjusted_dest_modified, opts);
+            let differs = match pair.verify_mode {
                 SyncVerifyMode::None => false,
-                SyncVerifyMode::Fast => {
-                    src.size != dest.size || src.modified != adjusted_dest_modified
-                }
-                SyncVerifyMode::Full => {
-                    // For full mode in preview, use size+mtime as approximation
-                    // (actual checksum comparison happens during execution)
-                    src.size != dest.size || src.modified != adjusted_dest_modified
-                }
+                // Full mode previews with size+mtime; checksums run at execution.
+                SyncVerifyMode::Fast | SyncVerifyMode::Full => src.size != dest.size || !same_time,
             };
+            let changed = differs || opts.include_same;
+
+            if changed && differs {
+                // Robocopy-style comparison exclusions (/XC, /XO, /XN).
+                let reason = if same_time && opts.exclude_changed {
+                    Some("Changed file excluded (/XC)")
+                } else if !same_time && src.modified < adjusted_dest_modified && opts.exclude_older {
+                    Some("Source is older than destination (/XO)")
+                } else if !same_time && src.modified > adjusted_dest_modified && opts.exclude_newer {
+                    Some("Source is newer than destination (/XN)")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    skipped.push(skip_entry(rel_path, src, reason));
+                    continue;
+                }
+            }
 
             if changed {
                 // Check for conflict in two-way mode
-                if pair.mode == SyncMode::TwoWay {
+                if pair.mode == SyncMode::TwoWay && differs {
                     // Both sides changed = conflict
                     let is_conflict = dest.modified.is_some()
                         && src.modified.is_some()
@@ -310,7 +454,11 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
                     dest_size: Some(dest.size),
                     source_modified: src.modified,
                     dest_modified: dest.modified,
-                    reason: "File changed (size or modification time differs)".to_string(),
+                    reason: if differs {
+                        "File changed (size or modification time differs)".to_string()
+                    } else {
+                        "Identical file re-copied (/IS)".to_string()
+                    },
                     path_length_warning: path_warning.clone(),
                 };
                 total_bytes += src.size;
@@ -319,6 +467,8 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
                     path_warnings.push(entry);
                 }
             }
+        } else if opts.exclude_lonely {
+            skipped.push(skip_entry(rel_path, src, "Not present at destination (/XL)"));
         } else {
             // New file at source
             let entry = SyncDiffEntry {
@@ -339,10 +489,16 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
         }
     }
 
+    // Mirror always purges; /PURGE adds it to one-way and backup modes; /XX
+    // turns it off everywhere. Two-way never purges — extras flow back instead.
+    let purge_extras = pair.mode != SyncMode::TwoWay
+        && (pair.mode == SyncMode::Mirror || opts.purge)
+        && !opts.exclude_extra;
+
     // Process deletions (files in dest not in source)
     match pair.mode {
-        SyncMode::Mirror => {
-            // Mirror mode: delete files in dest that are not in source
+        _ if purge_extras => {
+            // Delete files in dest that are not in source
             for (rel_path, dest) in &dest_map {
                 if !source_map.contains_key(rel_path) {
                     deletions.push(SyncDiffEntry {
@@ -352,7 +508,11 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
                         dest_size: Some(dest.size),
                         source_modified: None,
                         dest_modified: dest.modified,
-                        reason: "Not present in source (mirror mode)".to_string(),
+                        reason: if pair.mode == SyncMode::Mirror {
+                            "Not present in source (mirror mode)".to_string()
+                        } else {
+                            "Not present in source (/PURGE)".to_string()
+                        },
                         path_length_warning: None,
                     });
                 }
@@ -362,7 +522,8 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
             // Two-way: files only in dest should be copied to source (treated as additions in reverse)
             for (rel_path, dest) in &dest_map {
                 if !source_map.contains_key(rel_path)
-                    && matches_filter(rel_path, dest.size, &pair.filter) {
+                    && matches_filter(rel_path, dest.size, &pair.filter)
+                    && option_exclusion(dest, opts, now).is_none() {
                         additions.push(SyncDiffEntry {
                             relative_path: rel_path.to_string(),
                             action: SyncAction::Add,
@@ -378,9 +539,43 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
             }
         }
         _ => {
-            // OneWay, VersionedBackup: no deletions from dest
+            // OneWay, VersionedBackup, or /XX: no deletions from dest
         }
     }
+
+    // Directory tree: /E creates empty source directories at the destination;
+    // purging removes destination directories the source no longer has.
+    let source_dirs: std::collections::HashSet<&str> = source_files
+        .iter()
+        .filter(|f| f.is_dir)
+        .map(|f| f.relative_path.as_str())
+        .collect();
+    let dest_dirs: std::collections::HashSet<&str> = dest_files
+        .iter()
+        .filter(|f| f.is_dir)
+        .map(|f| f.relative_path.as_str())
+        .collect();
+    let mut dirs_to_create: Vec<String> = if opts.include_empty_dirs || opts.create_only {
+        source_dirs
+            .iter()
+            .filter(|d| !dest_dirs.contains(*d))
+            .map(|d| d.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    dirs_to_create.sort();
+    let mut dirs_to_remove: Vec<String> = if purge_extras {
+        dest_dirs
+            .iter()
+            .filter(|d| !source_dirs.contains(*d))
+            .map(|d| d.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Deepest first so children go before parents.
+    dirs_to_remove.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| b.cmp(a)));
 
     let duration = start.elapsed();
 
@@ -401,6 +596,8 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
         skipped,
         conflicts,
         path_warnings,
+        dirs_to_create,
+        dirs_to_remove,
     })
 }
 
@@ -543,6 +740,7 @@ mod tests {
             checksum_enabled: false,
             created_at: Utc::now(),
             time_offset_secs: None,
+            copy_options: CopyOptions::default(),
         };
 
         let preview = compute_preview(&pair).unwrap();
@@ -571,6 +769,7 @@ mod tests {
             checksum_enabled: false,
             created_at: Utc::now(),
             time_offset_secs: None,
+            copy_options: CopyOptions::default(),
         };
 
         let preview = compute_preview(&pair).unwrap();
@@ -597,6 +796,7 @@ mod tests {
             checksum_enabled: false,
             created_at: Utc::now(),
             time_offset_secs: None,
+            copy_options: CopyOptions::default(),
         };
 
         let preview = compute_preview(&pair).unwrap();
@@ -627,6 +827,7 @@ mod tests {
             checksum_enabled: false,
             created_at: Utc::now(),
             time_offset_secs: None,
+            copy_options: CopyOptions::default(),
         };
 
         let preview = compute_preview(&pair).unwrap();
@@ -656,6 +857,8 @@ mod tests {
             skipped: Vec::new(),
             conflicts: Vec::new(),
             path_warnings: Vec::new(),
+            dirs_to_create: Vec::new(),
+            dirs_to_remove: Vec::new(),
             total_additions: 1,
             total_modifications: 0,
             total_deletions: 0,

@@ -12,6 +12,20 @@
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
+import {
+  CopyPresetPicker,
+  RobocopyCommandPreview,
+  RobocopyImport,
+  RobocopyOptionsSection,
+} from "@/components/robocopy-options";
+import {
+  DEFAULT_COPY_OPTIONS,
+  applyPreset,
+  countChangedOptions,
+  describeExitCode,
+  type CopyOptions,
+  type RobocopyJob,
+} from "@/lib/copy-options";
 
 // ── Types ──
 
@@ -30,6 +44,7 @@ interface SyncPair {
   checksum_enabled: boolean;
   created_at: string;
   time_offset_secs: number | null;
+  copy_options?: CopyOptions;
 }
 
 interface SyncFilter {
@@ -91,6 +106,7 @@ interface SyncReport {
   health: string;
   error_messages: string[];
   resumed: boolean;
+  exit_code?: number;
 }
 
 interface SyncConflictItem {
@@ -230,6 +246,8 @@ export function SyncPanel() {
     maxSize: 0,
     minSize: 0,
     timeOffsetSecs: null as number | null,
+    copyOptions: DEFAULT_COPY_OPTIONS as CopyOptions,
+    presetId: null as string | null,
   });
 
   // Time offset auto-detection state (used for inline display)
@@ -269,6 +287,7 @@ export function SyncPanel() {
         verifyMode: createForm.verifyMode,
         checksumEnabled: createForm.checksumEnabled,
         timeOffsetSecs: createForm.timeOffsetSecs,
+        optionsJson: JSON.stringify(createForm.copyOptions),
       });
 
       setView("list");
@@ -290,6 +309,8 @@ export function SyncPanel() {
         maxSize: 0,
         minSize: 0,
         timeOffsetSecs: null,
+        copyOptions: DEFAULT_COPY_OPTIONS,
+        presetId: null,
       });
       _setDetectedOffset(null);
     } catch (e: any) {
@@ -713,6 +734,27 @@ function CreatePairView({
         </button>
       </div>
 
+      <RobocopyImport
+        onImport={(job: RobocopyJob) =>
+          setForm({
+            ...form,
+            name: form.name || "Imported Robocopy job",
+            sourcePath: job.source_path,
+            destPath: job.dest_path,
+            mode: job.mode,
+            trigger: job.trigger,
+            cronExpr: job.cron_expr ?? form.cronExpr,
+            includePatterns: job.filter.include_patterns.join(", "),
+            excludePatterns: job.filter.exclude_patterns.join(", "),
+            maxSize: job.filter.max_size,
+            minSize: job.filter.min_size,
+            copyOptions: job.copy_options,
+            presetId: null,
+            advancedMode: true,
+          })
+        }
+      />
+
       <label className="block text-xs text-zinc-600 dark:text-zinc-400">
         Name
         <input
@@ -759,6 +801,18 @@ function CreatePairView({
           <option value="versioned_backup">Versioned Backup</option>
         </select>
       </label>
+
+      <CopyPresetPicker
+        activeId={form.presetId}
+        onPick={(preset) =>
+          setForm({
+            ...form,
+            mode: preset.mode,
+            copyOptions: applyPreset(preset),
+            presetId: preset.id,
+          })
+        }
+      />
 
       <label className="block text-xs text-zinc-600 dark:text-zinc-400">
         Trigger
@@ -995,6 +1049,42 @@ function CreatePairView({
             <p className="text-[10px] text-zinc-400">
               Compensates for clock differences between local and remote. Prevents false change detection.
             </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+              Copy options
+              {countChangedOptions(form.copyOptions) > 0 && (
+                <span className="ml-1.5 rounded-full bg-blue-100 dark:bg-blue-900/40 px-1.5 text-[10px] text-blue-700 dark:text-blue-300">
+                  {countChangedOptions(form.copyOptions)} changed
+                </span>
+              )}
+            </div>
+            <RobocopyOptionsSection
+              options={form.copyOptions}
+              mode={form.mode}
+              onChange={(copyOptions) => setForm({ ...form, copyOptions, presetId: null })}
+            />
+            <RobocopyCommandPreview
+              sourcePath={form.sourcePath}
+              destPath={form.destPath}
+              mode={form.mode}
+              filter={{
+                include_patterns: form.includePatterns
+                  ? form.includePatterns.split(",").map((x: string) => x.trim()).filter(Boolean)
+                  : [],
+                exclude_patterns: form.excludePatterns
+                  ? form.excludePatterns.split(",").map((x: string) => x.trim()).filter(Boolean)
+                  : [],
+                include_regex: [],
+                exclude_regex: [],
+                min_size: form.minSize,
+                max_size: form.maxSize,
+                file_types: [],
+                exclude_file_types: [],
+              }}
+              options={form.copyOptions}
+            />
           </div>
         </>
       )}
@@ -1275,6 +1365,11 @@ function ReportsView({
             </div>
             <div>Status: {report.status}</div>
             {report.resumed && <div>Resumed from interruption</div>}
+            {report.exit_code !== undefined && (
+              <div className="col-span-2" title="Robocopy-compatible exit code">
+                Exit code {report.exit_code}: {describeExitCode(report.exit_code)}
+              </div>
+            )}
           </div>
 
           {report.error_messages.length > 0 && (

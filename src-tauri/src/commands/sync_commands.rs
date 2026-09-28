@@ -65,6 +65,7 @@ pub async fn create_sync_pair(
     verify_mode: Option<String>,
     checksum_enabled: Option<bool>,
     time_offset_secs: Option<i64>,
+    options_json: Option<String>,
     manager: State<'_, SyncManager>,
     ledger: State<'_, OperationLedger>,
     repo: State<'_, Repository>,
@@ -83,6 +84,14 @@ pub async fn create_sync_pair(
     let filter: SyncFilter = filter_json
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
+
+    let copy_options: CopyOptions = match options_json {
+        Some(j) => serde_json::from_str(&j).map_err(|e| AppError::Sync {
+            message: format!("Invalid copy options: {}", e),
+            advice: "Check the pair's advanced copy options.".to_string(),
+        })?,
+        None => CopyOptions::default(),
+    };
 
     let policy = conflict_policy
         .map(|s| SyncConflictPolicy::from_str_lossy(&s))
@@ -107,6 +116,7 @@ pub async fn create_sync_pair(
         checksum_enabled: checksum_enabled.unwrap_or(false),
         created_at: chrono::Utc::now(),
         time_offset_secs,
+        copy_options,
     };
 
     use crate::core::traits::SyncOperations;
@@ -485,4 +495,38 @@ pub async fn validate_sync_cron(
 #[tauri::command]
 pub async fn get_sync_filter_presets() -> Result<Vec<crate::sync_engine::FilterPreset>, AppError> {
     Ok(crate::sync_engine::get_filter_presets())
+}
+
+// ── Robocopy compatibility ──
+
+/// Translate a pasted Robocopy command line into sync-pair settings.
+#[tauri::command]
+pub async fn parse_robocopy_command(
+    command: String,
+) -> Result<crate::sync_engine::robocopy::RobocopyJob, AppError> {
+    crate::sync_engine::robocopy::parse_command(&command)
+}
+
+/// Show the Robocopy command equivalent to a pair's settings.
+#[tauri::command]
+pub async fn robocopy_command_preview(
+    source_path: String,
+    dest_path: String,
+    mode: String,
+    filter_json: Option<String>,
+    options_json: Option<String>,
+) -> Result<String, AppError> {
+    let filter: SyncFilter = filter_json
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default();
+    let options: CopyOptions = options_json
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default();
+    Ok(crate::sync_engine::robocopy::to_command(
+        &source_path,
+        &dest_path,
+        SyncMode::from_str_lossy(&mode),
+        &filter,
+        &options,
+    ))
 }

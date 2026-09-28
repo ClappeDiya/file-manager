@@ -11,9 +11,11 @@
 //! - Partial failure continuation and resumable sync
 
 pub mod conflict;
+pub mod copier;
 pub mod executor;
 pub mod planner;
 pub mod report;
+pub mod robocopy;
 pub mod rollback;
 pub mod scheduler;
 pub mod watcher;
@@ -516,6 +518,8 @@ impl SyncManager {
         repo.pool()
             .execute(move |conn| {
                 let filter_json = serde_json::to_string(&p.filter).unwrap_or_else(|_| "{}".into());
+                let options_json =
+                    serde_json::to_string(&p.copy_options).unwrap_or_else(|_| "{}".into());
                 // `trigger_mode` stores the discriminant and `cron_expr` the
                 // payload, matching the two columns v4 created for exactly this.
                 let cron_expr = match &p.trigger {
@@ -525,8 +529,8 @@ impl SyncManager {
                 conn.execute(
                     "INSERT INTO sync_pairs (id, name, source_path, dest_path, mode, enabled, \
                      last_run, trigger_mode, cron_expr, filter_json, conflict_policy, \
-                     verify_mode, checksum_enabled, created_at, time_offset_secs) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+                     verify_mode, checksum_enabled, created_at, time_offset_secs, options_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
                      ON CONFLICT(id) DO UPDATE SET \
                      name = excluded.name, source_path = excluded.source_path, \
                      dest_path = excluded.dest_path, mode = excluded.mode, \
@@ -536,7 +540,8 @@ impl SyncManager {
                      conflict_policy = excluded.conflict_policy, \
                      verify_mode = excluded.verify_mode, \
                      checksum_enabled = excluded.checksum_enabled, \
-                     time_offset_secs = excluded.time_offset_secs",
+                     time_offset_secs = excluded.time_offset_secs, \
+                     options_json = excluded.options_json",
                     rusqlite::params![
                         p.id.to_string(),
                         p.name,
@@ -553,6 +558,7 @@ impl SyncManager {
                         p.checksum_enabled as i32,
                         p.created_at.to_rfc3339(),
                         p.time_offset_secs,
+                        options_json,
                     ],
                 )?;
                 Ok(())
@@ -589,7 +595,7 @@ impl SyncManager {
                 let mut stmt = conn.prepare(
                     "SELECT id, name, source_path, dest_path, mode, enabled, last_run, \
                      trigger_mode, cron_expr, filter_json, conflict_policy, verify_mode, \
-                     checksum_enabled, created_at, time_offset_secs \
+                     checksum_enabled, created_at, time_offset_secs, options_json \
                      FROM sync_pairs ORDER BY created_at ASC",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -602,6 +608,7 @@ impl SyncManager {
                     let conflict_policy: String = row.get(10)?;
                     let verify_mode: String = row.get(11)?;
                     let created_at: String = row.get(13)?;
+                    let options_json: String = row.get(15)?;
 
                     Ok(SyncPair {
                         // A row we cannot parse is a row we cannot honour, but
@@ -630,6 +637,7 @@ impl SyncManager {
                             .map(|t| t.with_timezone(&Utc))
                             .unwrap_or_else(|_| Utc::now()),
                         time_offset_secs: row.get(14)?,
+                        copy_options: serde_json::from_str(&options_json).unwrap_or_default(),
                     })
                 })?;
                 let mut out = Vec::new();
@@ -790,6 +798,13 @@ mod tests {
             verify_mode: SyncVerifyMode::Full,
             checksum_enabled: true,
             time_offset_secs: Some(-42),
+            copy_options: CopyOptions {
+                threads: 8,
+                retries: 3,
+                exclude_dirs: vec!["node_modules".to_string()],
+                run_hours: "2200-0600".to_string(),
+                ..CopyOptions::default()
+            },
             filter: SyncFilter {
                 exclude_patterns: vec!["*.tmp".to_string()],
                 ..SyncFilter::default()
@@ -812,6 +827,7 @@ mod tests {
         assert!(got.enabled);
         assert!(got.checksum_enabled);
         assert_eq!(got.time_offset_secs, Some(-42));
+        assert_eq!(got.copy_options, pair.copy_options);
         assert_eq!(got.conflict_policy.as_str(), "newest_wins");
         assert_eq!(got.verify_mode.as_str(), "full");
         assert_eq!(got.filter.exclude_patterns, vec!["*.tmp".to_string()]);
@@ -897,6 +913,7 @@ mod tests {
             checksum_enabled: false,
             created_at: Utc::now(),
             time_offset_secs: None,
+            copy_options: CopyOptions::default(),
         }
     }
 

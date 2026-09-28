@@ -704,6 +704,141 @@ pub struct SyncFilter {
     pub exclude_file_types: Vec<String>,
 }
 
+/// How symbolic links / junctions are treated during a sync (Robocopy /XJ, /SL).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SymlinkMode {
+    /// Follow the link and copy what it points to (Robocopy default).
+    #[default]
+    Follow,
+    /// Skip links entirely (/XJ, /XJD, /XJF).
+    Skip,
+    /// Recreate the link itself at the destination (/SL). Unix only; falls
+    /// back to `Follow` elsewhere.
+    CopyLink,
+}
+
+/// Robocopy-equivalent copy options for a sync pair.
+///
+/// Every field defaults to "off", so a pair created before these existed
+/// (or with `{}` stored) behaves exactly as it always has.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CopyOptions {
+    // ── Selection ──
+    /// Recurse into subdirectories (/S). `false` = top-level files only.
+    pub copy_subdirs: bool,
+    /// Also create empty directories at the destination (/E).
+    pub include_empty_dirs: bool,
+    /// Only descend this many levels (/LEV:n). 0 = unlimited.
+    pub max_depth: u32,
+    /// Directory names or relative-path globs to skip entirely (/XD).
+    pub exclude_dirs: Vec<String>,
+    /// Skip files last modified more than N days ago (/MAXAGE:n). 0 = off.
+    pub max_age_days: u32,
+    /// Skip files modified within the last N days (/MINAGE:n). 0 = off.
+    pub min_age_days: u32,
+    /// Skip hidden files — dot-files, or the Windows hidden attribute (/XA:H).
+    pub exclude_hidden: bool,
+    /// Skip read-only files (/XA:R).
+    pub exclude_readonly: bool,
+    /// Symbolic link handling (/XJ, /SL).
+    pub symlinks: SymlinkMode,
+
+    // ── Comparison ──
+    /// Don't overwrite a destination file that is newer than the source (/XO).
+    pub exclude_older: bool,
+    /// Don't overwrite a destination file that is older than the source (/XN).
+    pub exclude_newer: bool,
+    /// Skip files whose timestamp matches but size differs (/XC).
+    pub exclude_changed: bool,
+    /// Only update files that already exist at the destination (/XL).
+    pub exclude_lonely: bool,
+    /// Re-copy files even when they look identical (/IS).
+    pub include_same: bool,
+    /// Treat timestamps within 2 seconds as equal — FAT/network shares (/FFT).
+    pub fat_time_tolerance: bool,
+    /// Treat an exact 1-hour timestamp difference as equal (/DST).
+    pub dst_tolerance: bool,
+
+    // ── Destination cleanup ──
+    /// Delete destination files that no longer exist in the source (/PURGE).
+    /// Mirror mode always does this.
+    pub purge: bool,
+    /// Never delete extra destination files, even in mirror mode (/XX).
+    pub exclude_extra: bool,
+
+    // ── Copy behaviour ──
+    /// Preserve file modification times (/COPY:T). On by default.
+    pub copy_timestamps: bool,
+    /// Preserve directory modification times (/DCOPY:T).
+    pub copy_dir_timestamps: bool,
+    /// Delete each source file after it is copied (/MOV).
+    pub move_files: bool,
+    /// Like `move_files`, and also remove emptied source directories (/MOVE).
+    pub move_dirs: bool,
+    /// Create the directory tree and zero-length files only (/CREATE).
+    pub create_only: bool,
+    /// Copy through a `.ufop-partial` file that resumes after interruption (/Z).
+    pub restartable: bool,
+
+    // ── Reliability & performance ──
+    /// Retries per failed file (/R:n).
+    pub retries: u32,
+    /// Seconds to wait between retries (/W:n).
+    pub retry_wait_secs: u32,
+    /// Parallel copy threads (/MT:n). 1 = sequential.
+    pub threads: u32,
+    /// Milliseconds to pause after every 64 KiB block to free bandwidth (/IPG:n).
+    pub inter_packet_gap_ms: u32,
+    /// Only copy between these local times, "HHMM-HHMM" (/RH). Empty = any time.
+    pub run_hours: String,
+
+    // ── Logging ──
+    /// Write a Robocopy-style log to this file (/LOG). Empty = no log.
+    pub log_file: String,
+    /// Append to the log instead of overwriting it (/LOG+).
+    pub log_append: bool,
+}
+
+impl Default for CopyOptions {
+    fn default() -> Self {
+        Self {
+            copy_subdirs: true,
+            include_empty_dirs: false,
+            max_depth: 0,
+            exclude_dirs: Vec::new(),
+            max_age_days: 0,
+            min_age_days: 0,
+            exclude_hidden: false,
+            exclude_readonly: false,
+            symlinks: SymlinkMode::Follow,
+            exclude_older: false,
+            exclude_newer: false,
+            exclude_changed: false,
+            exclude_lonely: false,
+            include_same: false,
+            fat_time_tolerance: false,
+            dst_tolerance: false,
+            purge: false,
+            exclude_extra: false,
+            copy_timestamps: true,
+            copy_dir_timestamps: false,
+            move_files: false,
+            move_dirs: false,
+            create_only: false,
+            restartable: false,
+            retries: 0,
+            retry_wait_secs: 30,
+            threads: 1,
+            inter_packet_gap_ms: 0,
+            run_hours: String::new(),
+            log_file: String::new(),
+            log_append: false,
+        }
+    }
+}
+
 /// Sync conflict resolution policy (7 policies per T-041).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -813,6 +948,9 @@ pub struct SyncPair {
     /// Positive = server is ahead, negative = server is behind.
     #[serde(default)]
     pub time_offset_secs: Option<i64>,
+    /// Robocopy-equivalent copy options.
+    #[serde(default)]
+    pub copy_options: CopyOptions,
 }
 
 impl Default for SyncPair {
@@ -832,6 +970,7 @@ impl Default for SyncPair {
             checksum_enabled: false,
             created_at: Utc::now(),
             time_offset_secs: None,
+            copy_options: CopyOptions::default(),
         }
     }
 }
@@ -924,6 +1063,12 @@ pub struct SyncPreview {
     pub total_conflicts: u64,
     /// Total bytes to transfer
     pub total_bytes: u64,
+    /// Directories to create at the destination (/E empty dirs, /CREATE).
+    #[serde(default)]
+    pub dirs_to_create: Vec<String>,
+    /// Extra destination directories to remove when purging (/PURGE, /MIR).
+    #[serde(default)]
+    pub dirs_to_remove: Vec<String>,
 }
 
 /// A conflict item for the ask-mode resolution UI (T-041).
@@ -993,6 +1138,10 @@ pub struct SyncReport {
     pub error_messages: Vec<String>,
     /// Whether the sync was resumed from interruption
     pub resumed: bool,
+    /// Robocopy-compatible exit code bitmask: 1 = files copied,
+    /// 2 = extra destination files, 4 = mismatches, 8 = failures, 16 = fatal.
+    #[serde(default)]
+    pub exit_code: u8,
 }
 
 /// Resumable sync state for crash recovery (T-042).

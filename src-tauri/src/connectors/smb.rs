@@ -256,7 +256,9 @@ impl SmbConnector {
         password: Option<&str>,
         config: &SmbConfig,
     ) -> Command {
-        let _smb_path = format!("//{host}/{share}");
+        // Only the Linux branch uses the plain share path.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let smb_path = format!("//{host}/{share}");
 
         #[cfg(target_os = "macos")]
         {
