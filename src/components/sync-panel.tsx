@@ -12,6 +12,8 @@
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
+import { SyncProgressCard } from "@/components/sync-progress-card";
+import { SyncComparison } from "@/components/sync-comparison";
 import {
   CopyPresetPicker,
   RobocopyCommandPreview,
@@ -75,6 +77,8 @@ interface SyncPreview {
   total_skipped: number;
   total_conflicts: number;
   total_bytes: number;
+  dirs_to_create?: string[];
+  dirs_to_remove?: string[];
 }
 
 interface SyncDiffEntry {
@@ -200,6 +204,7 @@ export function SyncPanel() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [syncRunning, setSyncRunning] = useState(false);
+  const [runningPairId, setRunningPairId] = useState<string | null>(null);
 
   // Load pairs on mount
   const loadPairs = useCallback(async () => {
@@ -340,6 +345,7 @@ export function SyncPanel() {
 
   const handleRunSync = async (pairId: string) => {
     setSyncRunning(true);
+    setRunningPairId(pairId);
     setError(null);
     try {
       const report = await tauriInvoke<SyncReport>("run_sync", { pairId });
@@ -350,6 +356,7 @@ export function SyncPanel() {
       setError(e?.message || "Sync failed");
     } finally {
       setSyncRunning(false);
+      setRunningPairId(null);
     }
   };
 
@@ -482,6 +489,12 @@ export function SyncPanel() {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-2">
+        {runningPairId && (
+          <SyncProgressCard
+            pairId={runningPairId}
+            pairName={pairs.find((p) => p.id === runningPairId)?.name ?? "sync pair"}
+          />
+        )}
         {view === "list" && (
           <PairListView
             pairs={pairs}
@@ -1108,7 +1121,7 @@ function CreatePairView({
   );
 }
 
-function PreviewView({
+export function PreviewView({
   preview,
   onProceed,
   onCancel,
@@ -1122,6 +1135,9 @@ function PreviewView({
   loading: boolean;
 }) {
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
+  const [tab, setTab] = useState<"summary" | "compare">("summary");
+  const deleteCount = preview.total_deletions + (preview.dirs_to_remove?.length ?? 0);
+  const [deleteAck, setDeleteAck] = useState(false);
 
   const categories = [
     {
@@ -1176,8 +1192,26 @@ function PreviewView({
         Total: {formatBytes(preview.total_bytes)} to transfer
       </div>
 
+      <div className="flex gap-1 text-xs" role="tablist" aria-label="Preview view">
+        {(["summary", "compare"] as const).map((t) => (
+          <button
+            key={t}
+            role="tab"
+            aria-selected={tab === t}
+            onClick={() => setTab(t)}
+            className={`px-2 py-1 rounded ${
+              tab === t ? "bg-blue-500 text-white" : "bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400"
+            }`}
+          >
+            {t === "summary" ? "Summary" : "Side by side"}
+          </button>
+        ))}
+      </div>
+
+      {tab === "compare" && <SyncComparison preview={preview} />}
+
       {/* Category Summaries */}
-      <div className="space-y-1">
+      <div className={`space-y-1 ${tab === "compare" ? "hidden" : ""}`}>
         {categories.map((cat) => (
           <div key={cat.key}>
             <button
@@ -1238,11 +1272,27 @@ function PreviewView({
         </div>
       )}
 
+      {/* Deleting is the one step a sync can't quietly take back. */}
+      {deleteCount > 0 && (
+        <label className="flex items-start gap-2 p-2 rounded bg-red-50 dark:bg-red-900/20 text-xs text-red-800 dark:text-red-300">
+          <input
+            type="checkbox"
+            checked={deleteAck}
+            onChange={(e) => setDeleteAck(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            I understand {deleteCount} item{deleteCount === 1 ? "" : "s"} will be deleted from the
+            destination. You can undo this with Rollback for 7 days.
+          </span>
+        </label>
+      )}
+
       {/* Action Buttons */}
       <div className="flex gap-2 pt-2">
         <button
           onClick={onProceed}
-          disabled={loading}
+          disabled={loading || (deleteCount > 0 && !deleteAck)}
           className="flex-1 px-3 py-1.5 text-xs rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50"
         >
           {loading ? "Syncing..." : "Proceed"}

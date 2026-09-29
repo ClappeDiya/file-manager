@@ -19,6 +19,7 @@
     "docs:ipc": "bash scripts/dump-ipc-commands.sh",
     "docs:ipc:check": "bash scripts/dump-ipc-commands.sh --check",
     "docs:ipc:verify": "bash scripts/dump-ipc-commands.sh --verify",
+    "ipc:args": "bash scripts/check-ipc-args.sh",
     "appstate:verify": "bash scripts/check-appstate.sh",
     "config:check": "bash scripts/check-tauri-config.sh",
     "migrations:check": "bash scripts/check-migrations.sh",
@@ -61,7 +62,7 @@
     "react-aria": "^3.47.0",
     "react-aria-components": "^1.16.0",
     "react-dom": "^19.2.4",
-    "react-router-dom": "^7.13.1",
+    "react-router-dom": "^7.18.4",
     "tailwind-merge": "^3.5.0",
     "zustand": "^5.0.11"
   },

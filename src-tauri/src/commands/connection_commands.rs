@@ -351,21 +351,53 @@ pub async fn list_ssh_agents(
 /// in the OS keychain.
 #[tauri::command]
 pub async fn import_from_third_party(
-    file_path: String,
+    file_path: Option<String>,
+    file_content: Option<String>,
+    file_name: Option<String>,
     source_app: Option<String>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<crate::connectors::import_profiles::ThirdPartyImportResult, AppError> {
     use crate::connectors::import_profiles;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    let path = Path::new(&file_path);
+    // The UI hands over the file's contents (a browser file picker has no
+    // path); the parsers read from disk and sniff the extension, so stage the
+    // contents under the original file name.
+    let staged: Option<PathBuf> = match (&file_path, file_content) {
+        (Some(_), _) => None,
+        (None, Some(content)) => {
+            let name = file_name
+                .as_deref()
+                .and_then(|n| Path::new(n).file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "import.txt".to_string());
+            let dir = std::env::temp_dir().join(format!("ufop-import-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir)?;
+            let p = dir.join(name);
+            std::fs::write(&p, content)?;
+            Some(p)
+        }
+        (None, None) => {
+            return Err(AppError::validation("Choose a file to import."));
+        }
+    };
+    let path_buf = staged
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(file_path.as_deref().unwrap_or_default()));
+    let path = path_buf.as_path();
 
     // Parse the file using the appropriate parser
-    let imported = if let Some(ref app) = source_app {
-        import_profiles::parse_with_hint(path, app)?
+    let parsed = if let Some(ref app) = source_app {
+        import_profiles::parse_with_hint(path, app)
     } else {
-        import_profiles::detect_and_parse(path)?
+        import_profiles::detect_and_parse(path)
     };
+    if let Some(p) = &staged {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+    let imported = parsed?;
 
     let source = source_app.clone().unwrap_or_else(|| {
         imported

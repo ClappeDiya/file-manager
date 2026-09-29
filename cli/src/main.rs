@@ -93,6 +93,20 @@ pub enum Commands {
         parallel: u32,
     },
 
+    /// Robocopy-compatible copy: `ufop copy <src> <dst> [files…] [/switches…]`
+    ///
+    /// Takes Robocopy's switches (/MIR /E /XO /XD /MT:8 /R:3 /W:5 /Z /L
+    /// /LOG+:file /MON:n …) and returns Robocopy's exit codes: 0 nothing to
+    /// do, 1 copied, 2 extras, 4 mismatches, 8 failures, 16 fatal.
+    #[command(
+        after_help = "Examples:\n  ufop copy C:\\Data D:\\Backup /MIR /R:3 /W:5 /MT:8\n  ufop copy ~/Photos /mnt/nas/photos *.jpg /E /XO /LOG+:photos.log\n  ufop copy src dst /L          (list only, change nothing)"
+    )]
+    Copy {
+        /// Source, destination, optional file patterns, then Robocopy switches
+        #[arg(required = true, num_args = 2.., value_name = "ARGS")]
+        args: Vec<String>,
+    },
+
     /// Manage sync pairs
     #[command(subcommand)]
     Sync(SyncCommands),
@@ -335,6 +349,9 @@ async fn main() -> ExitCode {
                 src, dest, overwrite, resume, verify, parallel,
                 &format, dry_run, rate_limit,
             ).await
+        }
+        Commands::Copy { args } => {
+            commands::copy::execute(args, &format, dry_run, rate_limit).await
         }
         Commands::Sync(cmd) => {
             commands::sync::execute(cmd, &format, dry_run).await

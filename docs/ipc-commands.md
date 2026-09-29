@@ -161,7 +161,7 @@ macro; if you add a new one here, register it there too.
 - `vault_decrypt_file`
 - `vault_encrypt_file`
 
-## `file_ops_commands` (24 commands)
+## `file_ops_commands` (25 commands)
 
 - `cloud_delete_permanently`
 - `cloud_delete_to_trash`
@@ -170,6 +170,7 @@ macro; if you add a new one here, register it there too.
 - `copy_relative_path`
 - `copy_remote_path`
 - `copy_url`
+- `count_affected_files`
 - `create_directory`
 - `create_file`
 - `create_symlink`
@@ -377,16 +378,18 @@ macro; if you add a new one here, register it there too.
 - `generate_ssh_key`
 - `list_ssh_keys`
 
-## `state_commands` (5 commands)
+## `state_commands` (6 commands)
 
 - `get_config`
+- `list_config`
 - `load_workspace_state`
 - `reset_database`
 - `save_workspace_state`
 - `set_config`
 
-## `sync_commands` (20 commands)
+## `sync_commands` (24 commands)
 
+- `cancel_sync`
 - `create_sync_pair`
 - `delete_sync_pair`
 - `detect_time_offset`
@@ -397,9 +400,12 @@ macro; if you add a new one here, register it there too.
 - `get_sync_conflicts`
 - `get_sync_filter_presets`
 - `get_sync_health`
+- `get_sync_progress`
 - `get_sync_reports`
 - `list_sync_pairs`
+- `parse_robocopy_command`
 - `resolve_sync_conflict`
+- `robocopy_command_preview`
 - `rollback_sync`
 - `run_sync`
 - `start_sync_watcher`
@@ -488,4 +494,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 359 commands across 38 modules.
+**Surface:** 365 commands across 38 modules.

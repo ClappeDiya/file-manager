@@ -36,12 +36,9 @@ pub async fn execute(
         return Ok(2);
     }
 
-    match format {
-        OutputFormat::Human => {
-            println!("\n  Scanning for duplicates in: {path}");
-            println!("  Minimum file size: {} bytes\n", min_size);
-        }
-        _ => {}
+    if let OutputFormat::Human = format {
+        println!("\n  Scanning for duplicates in: {path}");
+        println!("  Minimum file size: {} bytes\n", min_size);
     }
 
     // Phase 1: Group files by size (fast pass)
@@ -53,12 +50,9 @@ pub async fn execute(
     // Remove size groups with only one file
     size_groups.retain(|_, files| files.len() > 1);
 
-    match format {
-        OutputFormat::Human => {
-            println!("  Scanned {total_files} files");
-            println!("  {} size groups with potential duplicates", size_groups.len());
-        }
-        _ => {}
+    if let OutputFormat::Human = format {
+        println!("  Scanned {total_files} files");
+        println!("  {} size groups with potential duplicates", size_groups.len());
     }
 
     // Phase 2: Hash files within same-size groups
@@ -211,7 +205,7 @@ fn apply_action(
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for group in groups {
-        let mut files_with_meta: Vec<(String, std::fs::Metadata)> = group
+        let files_with_meta: Vec<(String, std::fs::Metadata)> = group
             .files
             .iter()
             .filter_map(|f| {

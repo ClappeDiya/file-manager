@@ -70,7 +70,7 @@ pub async fn execute(
             if password.is_some() && !["zip", "7z"].contains(&fmt.as_str()) {
                 output::print_warning(
                     format,
-                    &format!("Password encryption is only supported for ZIP and 7Z formats"),
+                    "Password encryption is only supported for ZIP and 7Z formats",
                 );
             }
 

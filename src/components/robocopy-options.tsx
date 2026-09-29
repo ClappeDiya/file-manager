@@ -11,7 +11,9 @@ import { useEffect, useState, type ReactNode } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 
 import {
+  ATTRIBUTE_LETTERS,
   COPY_PRESETS,
+  isWindowsPlatform,
   type CopyOptions,
   type CopyPreset,
   type RobocopyJob,
@@ -224,14 +226,48 @@ export function RobocopyImport({ onImport }: { onImport: (job: RobocopyJob) => v
 
 // ── All options, grouped and collapsed ──
 
+function AttrField({
+  label,
+  flag,
+  value,
+  onChange,
+}: {
+  label: string;
+  flag: string;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const invalid = !ATTRIBUTE_LETTERS.test(value);
+  return (
+    <label className="flex items-center justify-between gap-2 text-xs text-zinc-600 dark:text-zinc-400">
+      <span>
+        {label}
+        <Switch flag={flag} />
+      </span>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value.toUpperCase().replace(/\s/g, ""))}
+        aria-invalid={invalid}
+        maxLength={9}
+        className={`${inputCls} w-20 font-mono uppercase ${invalid ? "border-red-400" : ""}`}
+        placeholder="RASH"
+      />
+    </label>
+  );
+}
+
 export function RobocopyOptionsSection({
   options,
   onChange,
   mode,
+  windows = isWindowsPlatform(),
 }: {
   options: CopyOptions;
   onChange: (o: CopyOptions) => void;
   mode: string;
+  /** Show the NTFS-only options (defaults to the current platform). */
+  windows?: boolean;
 }) {
   const set = <K extends keyof CopyOptions>(k: K, v: CopyOptions[K]) =>
     onChange({ ...options, [k]: v });
@@ -313,6 +349,23 @@ export function RobocopyOptionsSection({
         <NumberField label="Parallel copies" flag="/MT" value={options.threads} min={1} max={128} unit="threads" onChange={(v) => set("threads", v)} />
         <NumberField label="Slow down to save bandwidth" flag="/IPG" value={options.inter_packet_gap_ms} unit="ms" onChange={(v) => set("inter_packet_gap_ms", v)} />
       </Group>
+
+      {windows && (
+        <Group title="Windows permissions & attributes">
+          <Check label="Copy permissions (ACLs)" flag="/COPY:S" checked={options.copy_security} onChange={(v) => set("copy_security", v)} />
+          <Check label="Copy owner (needs administrator)" flag="/COPY:O" checked={options.copy_owner} onChange={(v) => set("copy_owner", v)} />
+          <Check label="Copy auditing info (needs administrator)" flag="/COPY:U" checked={options.copy_auditing} onChange={(v) => set("copy_auditing", v)} />
+          <Check label="Only files marked for archiving" flag="/A" checked={options.archive_only} onChange={(v) => set("archive_only", v)} />
+          <Check label="…and clear the archive mark after copying" flag="/M" checked={options.archive_reset} onChange={(v) => set("archive_reset", v)} />
+          <Check label="Fix dates on unchanged files" flag="/TIMFIX" checked={options.fix_timestamps} onChange={(v) => set("fix_timestamps", v)} />
+          <Check label="Fix permissions on unchanged files" flag="/SECFIX" checked={options.fix_security} onChange={(v) => set("fix_security", v)} />
+          <AttrField label="Only files with attributes" flag="/IA" value={options.include_attributes} onChange={(v) => set("include_attributes", v)} />
+          <AttrField label="Skip files with attributes" flag="/XA" value={options.exclude_attributes} onChange={(v) => set("exclude_attributes", v)} />
+          <AttrField label="Add attributes to copies" flag="/A+" value={options.add_attributes} onChange={(v) => set("add_attributes", v)} />
+          <AttrField label="Remove attributes from copies" flag="/A-" value={options.remove_attributes} onChange={(v) => set("remove_attributes", v)} />
+          <p className="text-[10px] text-zinc-400">Letters: R read-only, A archive, S system, H hidden, C compressed, N not indexed, E encrypted, T temporary, O offline.</p>
+        </Group>
+      )}
 
       <Group title="Time window & log">
         <label className="block text-xs text-zinc-600 dark:text-zinc-400">

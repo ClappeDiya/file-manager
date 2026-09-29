@@ -107,3 +107,33 @@ describe("RobocopyImport", () => {
     expect(await screen.findByText(/not available/i)).toBeInTheDocument();
   });
 });
+
+describe("Windows-only options", () => {
+  it("are hidden off Windows and shown on Windows", () => {
+    const { rerender } = render(
+      <RobocopyOptionsSection options={DEFAULT_COPY_OPTIONS} onChange={vi.fn()} mode="one_way" windows={false} />,
+    );
+    expect(screen.queryByText("Windows permissions & attributes")).toBeNull();
+    rerender(
+      <RobocopyOptionsSection options={DEFAULT_COPY_OPTIONS} onChange={vi.fn()} mode="one_way" windows />,
+    );
+    expect(screen.getByText("Windows permissions & attributes")).toBeInTheDocument();
+  });
+
+  it("uppercases attribute letters and flags invalid ones", () => {
+    const onChange = vi.fn();
+    render(
+      <RobocopyOptionsSection
+        options={{ ...DEFAULT_COPY_OPTIONS, exclude_attributes: "Q" }}
+        onChange={onChange}
+        mode="one_way"
+        windows
+      />,
+    );
+    const skip = screen.getByLabelText(/Skip files with attributes/);
+    expect(skip).toHaveAttribute("aria-invalid", "true");
+    fireEvent.change(screen.getByLabelText(/Only files with attributes/), { target: { value: "r s" } });
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ include_attributes: "RS" }));
+  });
+});
+

@@ -9,8 +9,8 @@
 //! - Run-hours windows (/RH)
 //! - Robocopy-style run logs (/LOG, /LOG+)
 
-use crate::core::error::AppError;
-use crate::core::types::*;
+use crate::error::AppError;
+use crate::sync_types::*;
 use chrono::{Local, Timelike};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -84,7 +84,37 @@ pub fn copy_file(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<u64, AppE
             set_mtime(dst, modified);
         }
     }
+    // /COPY:SOU, /A+ /A-, /M — Windows only; a no-op elsewhere.
+    super::winattr::after_copy(src, dst, opts)?;
     Ok(bytes)
+}
+
+/// Reject option values the engine would otherwise have to guess about.
+pub fn validate_options(opts: &CopyOptions) -> Result<(), AppError> {
+    if !opts.run_hours.trim().is_empty() && parse_run_hours(&opts.run_hours).is_none() {
+        return Err(sync_err(
+            format!(
+                "\"{}\" is not a valid run-hours window.",
+                opts.run_hours.trim()
+            ),
+            "Use HHMM-HHMM, for example 2200-0600.",
+        ));
+    }
+    for letters in [
+        &opts.include_attributes,
+        &opts.exclude_attributes,
+        &opts.add_attributes,
+        &opts.remove_attributes,
+    ] {
+        super::winattr::parse_letters(letters)?;
+    }
+    if opts.threads == 0 || opts.threads > 128 {
+        return Err(sync_err(
+            format!("{} parallel copies is out of range.", opts.threads),
+            "Use between 1 and 128 threads.",
+        ));
+    }
+    Ok(())
 }
 
 /// Block copy with optional resume (/Z) and inter-packet gap (/IPG).
@@ -297,11 +327,16 @@ pub fn write_log(pair: &SyncPair, report: &SyncReport, lines: &[String]) -> Resu
 
     let sep = "-".repeat(78);
     let mut out = String::new();
-    out.push_str(&format!("{sep}\n   UFOP Sync :: Robocopy-compatible log\n{sep}\n"));
+    out.push_str(&format!(
+        "{sep}\n   UFOP Sync :: Robocopy-compatible log\n{sep}\n"
+    ));
     out.push_str(&format!("  Started : {}\n", report.started_at.to_rfc2822()));
     out.push_str(&format!("   Source : {}\n", pair.source_path));
     out.push_str(&format!("     Dest : {}\n", pair.dest_path));
-    out.push_str(&format!("  Options : {}\n{sep}\n", super::robocopy::options_summary(pair)));
+    out.push_str(&format!(
+        "  Options : {}\n{sep}\n",
+        super::robocopy::options_summary(pair)
+    ));
     for line in lines {
         out.push_str(line);
         out.push('\n');
@@ -447,5 +482,30 @@ mod tests {
         };
         copy_file(&src, &dst, &opts).unwrap();
         assert_eq!(fs::read_link(&dst).unwrap(), PathBuf::from("target.txt"));
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    #[test]
+    fn validates_options() {
+        assert!(validate_options(&CopyOptions::default()).is_ok());
+        let bad_hours = CopyOptions {
+            run_hours: "late".into(),
+            ..Default::default()
+        };
+        assert!(validate_options(&bad_hours).is_err());
+        let bad_attr = CopyOptions {
+            include_attributes: "Z".into(),
+            ..Default::default()
+        };
+        assert!(validate_options(&bad_attr).is_err());
+        let bad_threads = CopyOptions {
+            threads: 0,
+            ..Default::default()
+        };
+        assert!(validate_options(&bad_threads).is_err());
     }
 }

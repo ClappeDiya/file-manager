@@ -6,7 +6,7 @@
 //! filter the timeline down to a single correlation-id trace. What was
 //! missing was a way to answer the question every user actually asks:
 //!
-//!     "OK but what actually happened in this operation?"
+//! > "OK but what actually happened in this operation?"
 //!
 //! The raw event list answers that technically — N rows, each with a
 //! timestamp and an engine-specific summary — but not intuitively. The

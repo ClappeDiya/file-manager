@@ -96,101 +96,68 @@ pub async fn execute(
 }
 
 fn compute_hash(path: &Path, algorithm: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let mut file = std::fs::File::open(path)?;
-    let mut buf = vec![0u8; 64 * 1024];
-
+    use md5::Digest;
+    let file = std::fs::File::open(path)?;
     match algorithm {
-        "md5" => {
-            use std::fmt::Write;
-            // Simple MD5 implementation using basic operations
-            let mut hasher = Md5Context::new();
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 { break; }
-                hasher.update(&buf[..n]);
-            }
-            Ok(hasher.finalize_hex())
-        }
-        "sha1" => {
-            // SHA-1 - use a simple computation
-            let mut hasher = Sha1Context::new();
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 { break; }
-                hasher.update(&buf[..n]);
-            }
-            Ok(hasher.finalize_hex())
-        }
-        "sha256" => {
-            let mut hasher = Sha256Context::new();
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 { break; }
-                hasher.update(&buf[..n]);
-            }
-            Ok(hasher.finalize_hex())
-        }
-        _ => Err(format!("Unsupported algorithm: {algorithm}").into()),
+        "md5" => stream_hex(file, md5::Md5::new()),
+        "sha1" => stream_hex(file, sha1::Sha1::new()),
+        "sha256" => stream_hex(file, sha2::Sha256::new()),
+        _ => Err(format!("Unsupported algorithm: {algorithm} (use md5, sha1 or sha256)").into()),
     }
 }
 
-// Minimal hash implementations using standard Rust
-// In production these would use the sha2/md-5 crates from src-tauri
-
-struct Md5Context {
-    data: Vec<u8>,
-}
-
-impl Md5Context {
-    fn new() -> Self { Self { data: Vec::new() } }
-    fn update(&mut self, data: &[u8]) { self.data.extend_from_slice(data); }
-    fn finalize_hex(&self) -> String {
-        // Use a simple hash for CLI - actual crypto in the Tauri backend
-        let mut hash = [0u8; 16];
-        let mut state: u64 = 0x6a09e667f3bcc908;
-        for (i, &byte) in self.data.iter().enumerate() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(byte as u64).wrapping_add(i as u64);
+/// Hash a file in 64 KiB blocks (constant memory, any file size).
+fn stream_hex<D: md5::Digest>(
+    mut file: std::fs::File,
+    mut hasher: D,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
         }
-        for i in 0..16 {
-            hash[i] = ((state >> (i * 4)) & 0xFF) as u8;
-            state = state.wrapping_mul(2862933555777941757).wrapping_add(1);
-        }
-        hash.iter().map(|b| format!("{b:02x}")).collect()
+        hasher.update(&buf[..n]);
     }
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-struct Sha1Context { data: Vec<u8> }
-impl Sha1Context {
-    fn new() -> Self { Self { data: Vec::new() } }
-    fn update(&mut self, data: &[u8]) { self.data.extend_from_slice(data); }
-    fn finalize_hex(&self) -> String {
-        let mut hash = [0u8; 20];
-        let mut state: u64 = 0x67452301efcdab89;
-        for (i, &byte) in self.data.iter().enumerate() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(byte as u64).wrapping_add(i as u64);
-        }
-        for i in 0..20 {
-            hash[i] = ((state >> (i * 3)) & 0xFF) as u8;
-            state = state.wrapping_mul(2862933555777941757).wrapping_add(1);
-        }
-        hash.iter().map(|b| format!("{b:02x}")).collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash_of(content: &[u8], algorithm: &str) -> String {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("f");
+        std::fs::write(&p, content).unwrap();
+        compute_hash(&p, algorithm).unwrap()
     }
-}
 
-struct Sha256Context { data: Vec<u8> }
-impl Sha256Context {
-    fn new() -> Self { Self { data: Vec::new() } }
-    fn update(&mut self, data: &[u8]) { self.data.extend_from_slice(data); }
-    fn finalize_hex(&self) -> String {
-        let mut hash = [0u8; 32];
-        let mut state: u64 = 0x6a09e667f3bcc908;
-        for (i, &byte) in self.data.iter().enumerate() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(byte as u64).wrapping_add(i as u64);
-        }
-        for i in 0..32 {
-            hash[i] = ((state >> (i * 2)) & 0xFF) as u8;
-            state = state.wrapping_mul(2862933555777941757).wrapping_add(1);
-        }
-        hash.iter().map(|b| format!("{b:02x}")).collect()
+    #[test]
+    fn matches_standard_test_vectors() {
+        assert_eq!(hash_of(b"abc", "md5"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(hash_of(b"abc", "sha1"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            hash_of(b"abc", "sha256"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(hash_of(b"", "md5"), "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[test]
+    fn multi_block_files_hash_correctly() {
+        // 1,000,000 × 'a' is a standard SHA-256 vector and spans many blocks.
+        assert_eq!(
+            hash_of(&vec![b'a'; 1_000_000], "sha256"),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_algorithm() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("f");
+        std::fs::write(&p, "x").unwrap();
+        assert!(compute_hash(&p, "crc32").is_err());
     }
 }

@@ -606,7 +606,7 @@ pub fn auto_detect_profile(path: &str) -> String {
     // Local filesystem detection by OS
     #[cfg(target_os = "windows")]
     {
-        return "windows-ntfs".to_string();
+        "windows-ntfs".to_string()
     }
 
     #[cfg(target_os = "macos")]
@@ -616,12 +616,12 @@ pub fn auto_detect_profile(path: &str) -> String {
 
     #[cfg(target_os = "linux")]
     {
-        return "ext4".to_string();
+        "ext4".to_string()
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
-        return "strict-enterprise".to_string();
+        "strict-enterprise".to_string()
     }
 }
 
