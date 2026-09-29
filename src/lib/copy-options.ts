@@ -36,6 +36,18 @@ export interface CopyOptions {
   threads: number;
   inter_packet_gap_ms: number;
   run_hours: string;
+  // Windows-only (ignored on macOS and Linux)
+  archive_only: boolean;
+  archive_reset: boolean;
+  include_attributes: string;
+  exclude_attributes: string;
+  add_attributes: string;
+  remove_attributes: string;
+  copy_security: boolean;
+  copy_owner: boolean;
+  copy_auditing: boolean;
+  fix_timestamps: boolean;
+  fix_security: boolean;
   log_file: string;
   log_append: boolean;
 }
@@ -70,6 +82,17 @@ export const DEFAULT_COPY_OPTIONS: CopyOptions = {
   threads: 1,
   inter_packet_gap_ms: 0,
   run_hours: "",
+  archive_only: false,
+  archive_reset: false,
+  include_attributes: "",
+  exclude_attributes: "",
+  add_attributes: "",
+  remove_attributes: "",
+  copy_security: false,
+  copy_owner: false,
+  copy_auditing: false,
+  fix_timestamps: false,
+  fix_security: false,
   log_file: "",
   log_append: false,
 };
@@ -88,6 +111,10 @@ export interface RobocopyJob {
   };
   copy_options: CopyOptions;
   list_only: boolean;
+  /** /MON:n — re-run after n changes (the desktop app watches instead). */
+  monitor_changes?: number | null;
+  /** /MOT:m — re-run every m minutes (the desktop app schedules instead). */
+  monitor_minutes?: number | null;
   ignored: string[];
   unsupported: string[];
 }
@@ -165,3 +192,11 @@ export function countChangedOptions(options: CopyOptions): number {
   ).length;
 }
 
+
+/** True on Windows, where NTFS attribute and permission options apply. */
+export function isWindowsPlatform(): boolean {
+  return typeof navigator !== "undefined" && /win/i.test(navigator.platform || navigator.userAgent);
+}
+
+/** Attribute letters Robocopy understands (RASHCNETO). */
+export const ATTRIBUTE_LETTERS = /^[RASHCNETO]*$/i;

@@ -5,8 +5,8 @@
 //! scripts and scheduled jobs across unchanged. `to_command` goes the other
 //! way and shows the equivalent Robocopy command for any pair.
 
-use crate::core::error::AppError;
-use crate::core::types::*;
+use crate::error::AppError;
+use crate::sync_types::*;
 use serde::{Deserialize, Serialize};
 
 /// A Robocopy command translated into sync-pair settings.
@@ -22,6 +22,12 @@ pub struct RobocopyJob {
     pub copy_options: CopyOptions,
     /// /L — the user asked for a list-only run; suggest a preview.
     pub list_only: bool,
+    /// /MON:n — re-run when at least this many changes are seen.
+    #[serde(default)]
+    pub monitor_changes: Option<u32>,
+    /// /MOT:m — re-run every m minutes if anything changed.
+    #[serde(default)]
+    pub monitor_minutes: Option<u32>,
     /// Switches that only affect Robocopy's console output (ignored).
     pub ignored: Vec<String>,
     /// Switches with no cross-platform equivalent, with an explanation each.
@@ -78,12 +84,22 @@ fn age_days(value: Option<&str>, flag: &str) -> Result<u32, AppError> {
         return Ok(n as u32);
     }
     let s = n.to_string();
-    let date = chrono::NaiveDate::parse_from_str(&s, "%Y%m%d").map_err(|_| AppError::Configuration {
-        message: format!("{flag}:{s} is not a valid day count or YYYYMMDD date"),
-        advice: "Use a number of days (e.g. 30) or a date like 20240131.".to_string(),
-    })?;
+    let date =
+        chrono::NaiveDate::parse_from_str(&s, "%Y%m%d").map_err(|_| AppError::Configuration {
+            message: format!("{flag}:{s} is not a valid day count or YYYYMMDD date"),
+            advice: "Use a number of days (e.g. 30) or a date like 20240131.".to_string(),
+        })?;
     let days = (chrono::Local::now().date_naive() - date).num_days().max(0);
     Ok(days as u32)
+}
+
+/// Note a switch that is honoured on Windows and does nothing elsewhere.
+fn windows_only(notes: &mut Vec<String>, arg: &str) {
+    if !super::winattr::SUPPORTED {
+        notes.push(format!(
+            "{arg}: only takes effect on Windows (NTFS attributes and permissions); ignored on this computer."
+        ));
+    }
 }
 
 /// Parse a Robocopy command line.
@@ -99,7 +115,11 @@ pub fn parse_command(cmd: &str) -> Result<RobocopyJob, AppError> {
     {
         args.remove(0);
     }
+    parse_args(&args)
+}
 
+/// Parse already-split Robocopy arguments: `<src> <dst> [files…] [/switches…]`.
+pub fn parse_args(args: &[String]) -> Result<RobocopyJob, AppError> {
     let mut positional = Vec::new();
     let mut job = RobocopyJob {
         source_path: String::new(),
@@ -114,6 +134,8 @@ pub fn parse_command(cmd: &str) -> Result<RobocopyJob, AppError> {
             ..Default::default()
         },
         list_only: false,
+        monitor_changes: None,
+        monitor_minutes: None,
         ignored: Vec::new(),
         unsupported: Vec::new(),
     };
@@ -129,7 +151,7 @@ pub fn parse_command(cmd: &str) -> Result<RobocopyJob, AppError> {
     }
     let mut ctx = ListCtx::None;
 
-    for arg in &args {
+    for arg in args {
         if !is_switch(arg) {
             match ctx {
                 ListCtx::ExcludeFiles => job.filter.exclude_patterns.push(arg.clone()),
@@ -199,15 +221,43 @@ pub fn parse_command(cmd: &str) -> Result<RobocopyJob, AppError> {
             "XD" => ctx = ListCtx::ExcludeDirs,
             "IF" => ctx = ListCtx::IncludeFiles,
             "XA" => {
+                let mut rest = String::new();
                 for c in value.unwrap_or("").chars() {
                     match c.to_ascii_uppercase() {
                         'H' => o.exclude_hidden = true,
                         'R' => o.exclude_readonly = true,
-                        other => job.unsupported.push(format!(
-                            "/XA:{other}: only H (hidden) and R (read-only) attributes are portable."
-                        )),
+                        other => rest.push(other),
                     }
                 }
+                if !rest.is_empty() {
+                    super::winattr::parse_letters(&rest)?;
+                    o.exclude_attributes = rest;
+                    windows_only(&mut job.unsupported, arg);
+                }
+            }
+            "IA" => {
+                let v = value.unwrap_or("").to_ascii_uppercase();
+                super::winattr::parse_letters(&v)?;
+                o.include_attributes = v;
+                windows_only(&mut job.unsupported, arg);
+            }
+            "A+" | "A-" => {
+                let v = value.unwrap_or("").to_ascii_uppercase();
+                super::winattr::parse_letters(&v)?;
+                if name == "A+" {
+                    o.add_attributes = v;
+                } else {
+                    o.remove_attributes = v;
+                }
+                windows_only(&mut job.unsupported, arg);
+            }
+            "A" => {
+                o.archive_only = true;
+                windows_only(&mut job.unsupported, arg);
+            }
+            "M" => {
+                o.archive_reset = true;
+                windows_only(&mut job.unsupported, arg);
             }
             "XJ" | "XJD" | "XJF" => o.symlinks = SymlinkMode::Skip,
             "SL" | "SJ" => o.symlinks = SymlinkMode::CopyLink,
@@ -239,33 +289,55 @@ pub fn parse_command(cmd: &str) -> Result<RobocopyJob, AppError> {
                 o.log_append = true;
             }
             "L" => job.list_only = true,
-            "MON" => job.trigger = "watch".to_string(),
+            "MON" => {
+                job.trigger = "watch".to_string();
+                job.monitor_changes = Some(num(value, "/MON")?.max(1) as u32);
+            }
             "MOT" => {
-                let m = num(value, "/MOT")?.clamp(1, 59);
+                let m = num(value, "/MOT")?.max(1);
+                job.monitor_minutes = Some(m as u32);
                 job.trigger = "scheduled".to_string();
-                job.cron_expr = Some(format!("0 */{m} * * * * *"));
+                // Cron can only express "every m minutes" up to 59.
+                job.cron_expr = Some(format!("0 */{} * * * * *", m.clamp(1, 59)));
             }
             "COPY" => {
                 let flags = value.unwrap_or("DAT").to_ascii_uppercase();
                 o.copy_timestamps = flags.contains('T');
-                for c in flags.chars().filter(|c| "SOUX".contains(*c)) {
-                    job.unsupported.push(format!(
-                        "/COPY:{c}: Windows security/owner/auditing info isn't copied; file permissions are."
-                    ));
+                o.copy_security = flags.contains('S');
+                o.copy_owner = flags.contains('O');
+                o.copy_auditing = flags.contains('U');
+                if flags.chars().any(|c| "SOU".contains(c)) {
+                    windows_only(&mut job.unsupported, arg);
+                }
+                if flags.contains('X') {
+                    job.ignored.push("/COPY:X (alternate data streams are skipped anyway)".to_string());
                 }
             }
             "DCOPY" => o.copy_dir_timestamps = value.unwrap_or("").to_ascii_uppercase().contains('T'),
             "NODCOPY" => o.copy_dir_timestamps = false,
-            "COPYALL" | "SEC" | "SECFIX" => {
+            "SEC" => {
                 o.copy_timestamps = true;
-                job.unsupported.push(format!(
-                    "{arg}: Windows ACLs/owner/auditing aren't copied; data, timestamps and permissions are."
-                ));
+                o.copy_security = true;
+                windows_only(&mut job.unsupported, arg);
             }
-            "TIMFIX" => o.copy_timestamps = true,
-            "A" | "M" | "IA" | "A+" | "A-" => job.unsupported.push(format!(
-                "{arg}: the Windows archive attribute isn't portable; use age or pattern filters instead."
-            )),
+            "COPYALL" => {
+                o.copy_timestamps = true;
+                o.copy_security = true;
+                o.copy_owner = true;
+                o.copy_auditing = true;
+                windows_only(&mut job.unsupported, arg);
+            }
+            "SECFIX" => {
+                o.fix_security = true;
+                if !(o.copy_security || o.copy_owner || o.copy_auditing) {
+                    o.copy_security = true;
+                }
+                windows_only(&mut job.unsupported, arg);
+            }
+            "TIMFIX" => {
+                o.copy_timestamps = true;
+                o.fix_timestamps = true;
+            }
             "EFSRAW" | "COMPRESS" | "J" | "NOOFFLOAD" | "256" | "SPARSE" | "NOCLONE" => job
                 .ignored
                 .push(format!("{arg} (Windows copy-engine tuning; not needed)")),
@@ -344,7 +416,7 @@ pub fn to_command(
     if o.restartable {
         parts.push("/Z".into());
     }
-    if !o.copy_timestamps {
+    if !(o.copy_timestamps || o.copy_security || o.copy_owner || o.copy_auditing) {
         parts.push("/COPY:DA".into());
     }
     if o.copy_dir_timestamps {
@@ -371,6 +443,7 @@ pub fn to_command(
     if o.exclude_hidden {
         xa.push('H');
     }
+    xa.push_str(o.exclude_attributes.trim());
     if !xa.is_empty() {
         parts.push(format!("/XA:{xa}"));
     }
@@ -398,6 +471,42 @@ pub fn to_command(
     if !o.exclude_dirs.is_empty() {
         parts.push("/XD".into());
         parts.extend(o.exclude_dirs.iter().map(|p| quote(p)));
+    }
+    let mut copy_flags = String::from("DA");
+    if o.copy_timestamps {
+        copy_flags.push('T');
+    }
+    for (on, c) in [
+        (o.copy_security, 'S'),
+        (o.copy_owner, 'O'),
+        (o.copy_auditing, 'U'),
+    ] {
+        if on {
+            copy_flags.push(c);
+        }
+    }
+    if copy_flags.len() > 3 {
+        parts.push(format!("/COPY:{copy_flags}"));
+    }
+    if o.fix_timestamps {
+        parts.push("/TIMFIX".into());
+    }
+    if o.fix_security {
+        parts.push("/SECFIX".into());
+    }
+    if o.archive_reset {
+        parts.push("/M".into());
+    } else if o.archive_only {
+        parts.push("/A".into());
+    }
+    for (letters, flag) in [
+        (&o.include_attributes, "/IA:"),
+        (&o.add_attributes, "/A+:"),
+        (&o.remove_attributes, "/A-:"),
+    ] {
+        if !letters.trim().is_empty() {
+            parts.push(format!("{flag}{}", letters.trim()));
+        }
     }
     parts.push(format!("/R:{}", o.retries));
     parts.push(format!("/W:{}", o.retry_wait_secs));
@@ -455,18 +564,27 @@ mod tests {
 
     #[test]
     fn parses_move_age_and_attrs() {
-        let job = parse_command("robocopy src dst /MOVE /MAXAGE:30 /MINAGE:2 /XA:HRS /XO /XL /MT").unwrap();
+        let job = parse_command("robocopy src dst /MOVE /MAXAGE:30 /MINAGE:2 /XA:HRS /XO /XL /MT")
+            .unwrap();
         let o = &job.copy_options;
         assert!(o.move_files && o.move_dirs);
         assert_eq!((o.max_age_days, o.min_age_days), (30, 2));
         assert!(o.exclude_hidden && o.exclude_readonly && o.exclude_older && o.exclude_lonely);
         assert_eq!(o.threads, 8);
-        assert_eq!(job.unsupported.len(), 1); // /XA:S
+        // /XA:S is honoured on Windows and noted as Windows-only elsewhere.
+        assert_eq!(o.exclude_attributes, "S");
+        assert_eq!(
+            job.unsupported.len(),
+            usize::from(!super::super::winattr::SUPPORTED)
+        );
     }
 
     #[test]
     fn monitor_switches_set_trigger() {
-        assert_eq!(parse_command("robocopy a b /MON:1").unwrap().trigger, "watch");
+        assert_eq!(
+            parse_command("robocopy a b /MON:1").unwrap().trigger,
+            "watch"
+        );
         let j = parse_command("robocopy a b /MOT:15").unwrap();
         assert_eq!(j.trigger, "scheduled");
         assert_eq!(j.cron_expr.as_deref(), Some("0 */15 * * * * *"));
@@ -483,10 +601,64 @@ mod tests {
     fn round_trips_through_to_command() {
         let original = "robocopy src dst /E /XO /XA:H /MAX:1000 /XF *.bak /XD tmp /R:2 /W:1 /MT:4 /RH:2200-0600";
         let job = parse_command(original).unwrap();
-        let cmd = to_command(&job.source_path, &job.dest_path, job.mode, &job.filter, &job.copy_options);
+        let cmd = to_command(
+            &job.source_path,
+            &job.dest_path,
+            job.mode,
+            &job.filter,
+            &job.copy_options,
+        );
         let again = parse_command(&cmd).unwrap();
         assert_eq!(again.copy_options, job.copy_options);
         assert_eq!(again.filter.exclude_patterns, job.filter.exclude_patterns);
         assert_eq!(again.filter.max_size, 1000);
+    }
+
+    #[test]
+    fn parses_windows_switches_and_round_trips() {
+        let job = parse_command(
+            "robocopy a b /E /COPY:DATSOU /M /IA:RS /A+:R /A-:H /TIMFIX /SECFIX /XA:T",
+        )
+        .unwrap();
+        let o = &job.copy_options;
+        assert!(o.copy_security && o.copy_owner && o.copy_auditing && o.copy_timestamps);
+        assert!(o.archive_reset && o.fix_timestamps && o.fix_security);
+        assert_eq!(o.include_attributes, "RS");
+        assert_eq!(
+            (o.add_attributes.as_str(), o.remove_attributes.as_str()),
+            ("R", "H")
+        );
+        assert_eq!(o.exclude_attributes, "T");
+        if !super::super::winattr::SUPPORTED {
+            assert!(job
+                .unsupported
+                .iter()
+                .all(|n| n.contains("only takes effect on Windows")));
+        }
+        let cmd = to_command("a", "b", job.mode, &job.filter, o);
+        assert!(cmd.contains("/COPY:DATSOU"), "{cmd}");
+        let again = parse_command(&cmd).unwrap();
+        assert_eq!(&again.copy_options, o);
+    }
+
+    #[test]
+    fn copyall_and_bad_attribute_letters() {
+        let o = parse_command("robocopy a b /COPYALL").unwrap().copy_options;
+        assert!(o.copy_security && o.copy_owner && o.copy_auditing);
+        assert!(parse_command("robocopy a b /IA:Q").is_err());
+    }
+
+    #[test]
+    fn parse_args_keeps_spaces_and_monitor_values() {
+        let args: Vec<String> = ["C:\\My Data", "D:\\Back up", "/MIR", "/MON:3", "/MOT:90"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let job = parse_args(&args).unwrap();
+        assert_eq!(job.source_path, "C:\\My Data");
+        assert_eq!(job.dest_path, "D:\\Back up");
+        assert_eq!(job.monitor_changes, Some(3));
+        assert_eq!(job.monitor_minutes, Some(90));
+        assert_eq!(job.cron_expr.as_deref(), Some("0 */59 * * * * *"));
     }
 }

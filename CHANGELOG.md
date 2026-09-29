@@ -7,12 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Robocopy feature parity for sync pairs: selection (`/S /E /LEV /XD /MAXAGE /MINAGE /XA /XJ /SL`), comparison (`/XO /XN /XC /XL /IS /FFT /DST`), cleanup (`/PURGE /XX /MOV /MOVE /CREATE`), copy engine (`/COPY:T /DCOPY:T /Z /IPG /R /W /MT /RH`), `/LOG[+]`, Robocopy exit codes, and "paste a Robocopy command" import with one-click presets.
+- Windows-only Robocopy switches: `/COPY:S /COPY:O /COPY:U` (`/SEC`, `/COPYALL`), `/A /M /IA /XA:<letters> /A+ /A-`, plus `/TIMFIX` and `/SECFIX` (all platforms for timestamps).
+- `ufop copy <src> <dst> [files] [/switches]` in the CLI — the same engine as the desktop app, Robocopy exit codes, `/L` list-only, `/MON` and `/MOT` monitoring, Ctrl+C stops after the current file.
+- Live sync progress (bar, current file, time left) with a Cancel button; one run per pair at a time.
+- Side-by-side Source | Destination preview before a sync, and a required confirmation when a run will delete files.
+- `list_config` command so the settings viewer shows stored configuration.
+
+### Fixed
+
+- Mirror runs deleted the rollback snapshots they had just taken (stored inside the destination); snapshots and quarantine now live in the app data folder, and `.sync-rollback`, `.sync-quarantine` and `.ufop-partial` are never synced or purged.
+- "Rollback", the quarantine list and "Ask" conflicts never had data: the executor's snapshots, quarantined files and pending conflicts are now recorded, and resolving a conflict applies the choice to the file.
+- Copies didn't keep file dates, so every sync re-copied everything; conflict resolution now copies with dates too.
+- Windows: transfers failed at the durability step ("Access denied" from a read-only `sync_all`); drive detection used the removed `wmic` and found no drives; SMB share listing sent credentials to `net view`, which doesn't accept them; the file watcher aborted on a misaligned pointer in `notify` 6 (now 8).
+- Linux build broke on `smb_path`; `narrator` doctest failed to compile.
+- 15 features whose frontend call didn't match the backend's arguments and failed every time: rename, SSH config lookup, third-party connection import, transfer preflight, auto re-upload of edited remote files, S3 lifecycle rules (which also crashed the view) and object versions, transfer-history search (results were never shown) and cleanup-by-age, duplicate resolution (was a no-op), CloudFront calls, settings viewer.
+- CLI: `ufop checksum` printed made-up hashes for MD5, SHA-1 and SHA-256; the CLI didn't compile.
+
 ### Security
+
+- Closed every open advisory: Next.js 15.5.26 (admin, marketing; incl. two critical RCEs), `react-router` 7.18, `uuid` 11, `postcss` via a `next>postcss` override, `nanoid`, `browserslist`, `sharp`, `@babel/core`; Rust `suppaftp` 10 (FTP CRLF command injection), `rustls` 0.23.45, `rustls-webpki` 0.103.15, `h2` 0.4.19, `quick-xml` 0.41. Both suppression lists are now empty.
 
 - Bumped Next.js 15.5.12 → 15.5.18 in `admin/` and `marketing/` to close 8 high-severity advisories: DoS via Server Components (GHSA-q4gf-8mx6-v5v3, GHSA-8h8q-6873-q5fj), Middleware/Proxy bypass in App Router and Pages Router (GHSA-36qx-fr4f-26g5 et al.). Verify-gate `audit` stage threshold raised from `critical` to `high` to lock in the protection.
 - Verify-gate `audit` stage threshold raised from `high` to `moderate`. Added a structured GHSA suppression list to `scripts/check-pnpm-audit.sh` with one entry: `GHSA-qx2v-qp2m-jg93` (PostCSS XSS via Next.js's bundled-and-pinned `postcss@8.4.31`). The advisory is uncorrectable from this repo — Next 16.2.6 still pins the same vulnerable version — so the suppression carries a justification and a quarterly review date (`2026-08-19`). Each suppression follows the same convention as the iter 24/25 allowlists: justification + review window required.
 
 ### Tooling
+
+- New verify stages: `ipc-args` (every `tauriInvoke` call's argument names match its Rust command — found the 15 broken calls above), `clippy` (`-D warnings`), `core` and `cli` (shared engine and CLI: clippy + tests), `win-check` (clippy against `x86_64-pc-windows-gnu`, skipped without the toolchain), and `cargo-test` now runs integration and doc tests too.
+- The sync engine and `AppError` moved to a new `crates/ufop-core` crate shared by the desktop app and the CLI.
 
 - New verify-gate stage `ws-deps` (`scripts/check-workspace-deps.sh`, `pnpm ws-deps:check`) fails the gate when a shared dependency is **installed** at different MAJOR versions across workspace members. The check reads `pnpm-lock.yaml` to compare **resolved** versions rather than declared ranges; this suppresses the noise where two members declare different carets (`^19.0.0` vs `^19.2.4`) that resolve to the same installed version. Falls back to declared-range comparison only when no lockfile is present (fresh-clone usability). Two known-intentional major splits (`tailwindcss`, `tailwind-merge` — v3 in Next.js apps until Next 16 ships v4 support, v4 in the Tauri shell) are allowlisted in-script with a justification.
 - New verify-gate stage `csp` (`scripts/check-tauri-csp.sh`, `pnpm csp:check`) parses `app.security.csp` from `src-tauri/tauri.conf.json` and fails the gate on regressions to the WebView Content-Security-Policy: missing `default-src`, `'unsafe-inline'` or `'unsafe-eval'` in `script-src` (directly or inherited via `default-src`), bare `*` wildcards in any directive, or `data:` scheme in `script-src`. `style-src 'unsafe-inline'` is accepted (industry convention for Tailwind/shadcn runtime style injection). Catches the textbook "added 'unsafe-inline' for one debug session and forgot to revert" XSS-defense regression.

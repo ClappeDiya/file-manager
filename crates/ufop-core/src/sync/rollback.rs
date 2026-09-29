@@ -3,8 +3,8 @@
 //! Before any delete or overwrite, the original file is backed up.
 //! Users can undo the last sync run within 7 days.
 
-use crate::core::error::AppError;
-use crate::core::types::*;
+use crate::error::AppError;
+use crate::sync_types::*;
 use chrono::Utc;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -91,10 +91,7 @@ impl RollbackManager {
 }
 
 /// Undo a sync run by restoring all snapshot files.
-pub fn rollback_sync_run(
-    snapshots: &[SyncSnapshot],
-    dest_root: &Path,
-) -> Result<u64, AppError> {
+pub fn rollback_sync_run(snapshots: &[SyncSnapshot], dest_root: &Path) -> Result<u64, AppError> {
     let mut restored: u64 = 0;
 
     for snapshot in snapshots.iter().rev() {
@@ -149,10 +146,7 @@ pub fn is_rollback_valid(snapshots: &[SyncSnapshot]) -> bool {
 }
 
 /// Clean up rollback data older than the specified number of days.
-pub fn cleanup_rollback_data(
-    rollback_base_dir: &Path,
-    max_age_days: u32,
-) -> Result<u64, AppError> {
+pub fn cleanup_rollback_data(rollback_base_dir: &Path, max_age_days: u32) -> Result<u64, AppError> {
     if !rollback_base_dir.exists() {
         return Ok(0);
     }
@@ -185,11 +179,7 @@ pub fn cleanup_rollback_data(
         if let Some(mod_time) = modified {
             if mod_time < cutoff {
                 if let Err(e) = fs::remove_dir_all(&path) {
-                    tracing::warn!(
-                        "Cannot remove old rollback data {}: {}",
-                        path.display(),
-                        e
-                    );
+                    tracing::warn!("Cannot remove old rollback data {}: {}", path.display(), e);
                 } else {
                     cleaned += 1;
                 }
@@ -270,7 +260,10 @@ mod tests {
 
         // "Sync" overwrites the file
         fs::write(&original, "overwritten by sync").unwrap();
-        assert_eq!(fs::read_to_string(&original).unwrap(), "overwritten by sync");
+        assert_eq!(
+            fs::read_to_string(&original).unwrap(),
+            "overwritten by sync"
+        );
 
         // Rollback
         let restored = rollback_sync_run(&mgr.snapshots, &dest).unwrap();

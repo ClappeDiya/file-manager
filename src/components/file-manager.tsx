@@ -1421,10 +1421,10 @@ export function FileManager() {
           // Auto-enqueue re-upload for changed files
           if (file.remote_path && file.temp_path) {
             await tauriInvoke("enqueue_transfer", {
-              sourcePath: file.temp_path,
-              destPath: file.remote_path,
+              source: file.temp_path,
+              dest: file.remote_path,
               totalBytes: 0,
-            }).catch(() => {});
+            }).catch((e) => console.error("Re-upload of edited file failed:", e));
           }
         }
       } catch {}
@@ -3290,13 +3290,9 @@ function FilePane({
             summary: `Permanently delete ${paths.length} item${paths.length === 1 ? "" : "s"}`,
           },
           async () => {
-            // Use cloud_delete_permanently for cloud provider files,
-            // otherwise fall back to delete_files with permanent=true.
-            try {
-              await tauriInvoke("cloud_delete_permanently", { paths });
-            } catch {
-              await tauriInvoke("delete_files", { paths, permanent: true });
-            }
+            // Paths here are filesystem paths; cloud objects are deleted by
+            // id through the connector views (cloud_delete_permanently).
+            await tauriInvoke("delete_files", { paths, permanent: true });
             return true;
           },
         );
@@ -3317,12 +3313,12 @@ function FilePane({
 
   const handleRename = useCallback(async (filePath: string) => {
     if (isTauriAvailable()) {
-      const oldName = filePath.split("/").pop() || "";
+      const oldName = filePath.split(/[\\/]/).pop() || "";
       const newName = window.prompt("Enter new name:", oldName);
       if (newName && newName !== oldName) {
         try {
-          await tauriInvoke("rename_file", { sourcePath: filePath, newName });
-          const newPath = filePath.replace(/[^/]+$/, newName);
+          await tauriInvoke("rename_file", { path: filePath, newName });
+          const newPath = filePath.replace(/[^\\/]+$/, newName);
           pushUndo({ id: `rename-${Date.now()}`, type: "rename", sourcePaths: [filePath], destPaths: [newPath], timestamp: Date.now() });
           // Iter 19: passing both old and new paths so any pane
           // viewing the parent directory refreshes (because either
@@ -4314,7 +4310,7 @@ function StatusBarContent() {
   const loadConfig = async () => {
     if (!isTauriAvailable()) return;
     try {
-      const cfg = await tauriInvoke<Record<string, string>>("get_config", undefined, {});
+      const cfg = await tauriInvoke<Record<string, string>>("list_config");
       setConfigEntries(cfg);
     } catch (e: any) { setConfigError(e?.message || "Failed to load config"); }
   };

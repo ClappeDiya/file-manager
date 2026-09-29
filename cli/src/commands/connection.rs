@@ -109,11 +109,8 @@ pub async fn execute(
                 .map(|c| c.uri.clone())
                 .unwrap_or_else(|| target.clone());
 
-            match format {
-                OutputFormat::Human => {
-                    println!("  Testing connection to {uri}...");
-                }
-                _ => {}
+            if let OutputFormat::Human = format {
+                println!("  Testing connection to {uri}...");
             }
 
             // Attempt basic connectivity check
@@ -151,7 +148,7 @@ pub async fn execute(
             // For non-HTTP protocols, report as untestable from CLI alone
             output::print_warning(
                 format,
-                &format!("Connection test for protocol not available in CLI. Use the desktop app for full testing."),
+                "Connection test for protocol not available in CLI. Use the desktop app for full testing.",
             );
             Ok(0)
         }

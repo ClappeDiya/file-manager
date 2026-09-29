@@ -138,11 +138,11 @@ pub async fn execute(
                     }
 
                     // Check filename length
-                    if filename.as_bytes().len() > 255 {
+                    if filename.len() > 255 {
                         issues.push(CompatIssue {
                             severity: "error".into(),
                             platform: "linux".into(),
-                            message: format!("Filename exceeds 255 bytes ({} bytes)", filename.as_bytes().len()),
+                            message: format!("Filename exceeds 255 bytes ({} bytes)", filename.len()),
                             suggestion: Some("Shorten the filename".into()),
                         });
                     }

@@ -92,6 +92,7 @@ pub async fn create_sync_pair(
         })?,
         None => CopyOptions::default(),
     };
+    crate::sync_engine::copier::validate_options(&copy_options)?;
 
     let policy = conflict_policy
         .map(|s| SyncConflictPolicy::from_str_lossy(&s))
@@ -232,6 +233,7 @@ pub async fn update_sync_pair(
         message: format!("Invalid sync pair data: {}", e),
         advice: "Check the sync pair configuration.".to_string(),
     })?;
+    crate::sync_engine::copier::validate_options(&pair.copy_options)?;
     let updated = manager.update_pair(pair).await?;
     manager.save_pair_to_db(&repo, &updated).await?;
     Ok(updated)
@@ -529,4 +531,27 @@ pub async fn robocopy_command_preview(
         &filter,
         &options,
     ))
+}
+
+// ── Live progress ──
+
+/// Progress of a running sync, or `null` when the pair isn't syncing.
+#[tauri::command]
+pub async fn get_sync_progress(
+    pair_id: String,
+    manager: State<'_, SyncManager>,
+) -> Result<Option<crate::sync_engine::executor::SyncProgress>, AppError> {
+    let id = parse_uuid(&pair_id)?;
+    Ok(manager.get_progress(id))
+}
+
+/// Ask a running sync to stop after its current file. Returns false when
+/// the pair wasn't running.
+#[tauri::command]
+pub async fn cancel_sync(
+    pair_id: String,
+    manager: State<'_, SyncManager>,
+) -> Result<bool, AppError> {
+    let id = parse_uuid(&pair_id)?;
+    Ok(manager.cancel_sync(id).await)
 }

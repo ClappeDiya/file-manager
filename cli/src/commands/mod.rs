@@ -2,6 +2,7 @@ pub mod archive;
 pub mod checksum;
 pub mod compat;
 pub mod connection;
+pub mod copy;
 pub mod duplicates;
 pub mod login;
 pub mod rename;

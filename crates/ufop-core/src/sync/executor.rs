@@ -3,16 +3,100 @@
 //! Uses the planner for diff computation, conflict resolver for conflicts,
 //! and supports partial failure continuation and resumable state.
 
-use crate::core::error::AppError;
-use crate::core::types::*;
-use crate::sync_engine::conflict::{self, ConflictAction};
-use crate::sync_engine::copier;
-use crate::sync_engine::planner;
-use crate::sync_engine::rollback::RollbackManager;
+use crate::error::AppError;
+use crate::sync::conflict::{self, ConflictAction};
+use crate::sync::copier;
+use crate::sync::planner;
+use crate::sync::rollback::RollbackManager;
+use crate::sync_types::*;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+/// Live progress of a running sync, polled by the UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncProgress {
+    pub pair_id: Uuid,
+    pub run_id: Uuid,
+    /// "planning", "copying" or "finishing"
+    pub phase: String,
+    pub files_done: u64,
+    pub files_total: u64,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub current_file: Option<String>,
+    pub started_at: chrono::DateTime<Utc>,
+    pub cancel_requested: bool,
+}
+
+/// Callback receiving progress snapshots (called from worker threads).
+pub type ProgressFn = Arc<dyn Fn(&SyncProgress) + Send + Sync>;
+
+/// Optional observers for a run: a progress callback and a cancel flag.
+#[derive(Default, Clone)]
+pub struct RunHooks {
+    pub progress: Option<ProgressFn>,
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl RunHooks {
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+}
+
+/// Everything a run produced besides the report: rollback snapshots, files
+/// moved to quarantine, and conflicts waiting for the user ("Ask" policy).
+#[derive(Debug, Clone)]
+pub struct RunOutcome {
+    pub report: SyncReport,
+    pub snapshots: Vec<SyncSnapshot>,
+    pub quarantined: Vec<QuarantineEntry>,
+    pub pending_conflicts: Vec<SyncConflictItem>,
+}
+
+/// Thread-safe progress counters shared by parallel copy workers.
+struct Tracker<'a> {
+    hooks: &'a RunHooks,
+    base: SyncProgress,
+    files_done: AtomicU64,
+    bytes_done: AtomicU64,
+    current: Mutex<Option<String>>,
+}
+
+impl Tracker<'_> {
+    fn emit(&self, phase: &str) {
+        if let Some(cb) = &self.hooks.progress {
+            let mut p = self.base.clone();
+            p.phase = phase.to_string();
+            p.files_done = self.files_done.load(Ordering::Relaxed);
+            p.bytes_done = self.bytes_done.load(Ordering::Relaxed);
+            p.current_file = self.current.lock().ok().and_then(|c| c.clone());
+            p.cancel_requested = self.hooks.cancelled();
+            cb(&p);
+        }
+    }
+
+    fn start_file(&self, path: &str) {
+        if let Ok(mut c) = self.current.lock() {
+            *c = Some(path.to_string());
+        }
+        self.emit("copying");
+    }
+
+    fn finish_file(&self, bytes: u64) {
+        self.files_done.fetch_add(1, Ordering::Relaxed);
+        self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
+        self.emit("copying");
+    }
+}
 
 /// Execution state for a running sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +126,14 @@ pub struct ExecutorConfig {
 
 /// Execute a sync run and return a report.
 pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
+    execute_sync_with(config, &RunHooks::default()).map(|o| o.report)
+}
+
+/// Execute a sync run with progress reporting and cancellation.
+pub fn execute_sync_with(
+    config: &ExecutorConfig,
+    hooks: &RunHooks,
+) -> Result<RunOutcome, AppError> {
     let started_at = Utc::now();
     let pair = &config.pair;
     let opts = &pair.copy_options;
@@ -59,6 +151,21 @@ pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
     }
 
     // Phase 1: Plan
+    let planning = SyncProgress {
+        pair_id: pair.id,
+        run_id: config.run_id,
+        phase: "planning".to_string(),
+        files_done: 0,
+        files_total: 0,
+        bytes_done: 0,
+        bytes_total: 0,
+        current_file: None,
+        started_at,
+        cancel_requested: false,
+    };
+    if let Some(cb) = &hooks.progress {
+        cb(&planning);
+    }
     let preview = planner::compute_preview(pair)?;
 
     // Phase 2: Ensure destination exists
@@ -74,13 +181,22 @@ pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
     let rollback_dir = config
         .rollback_dir
         .clone()
-        .unwrap_or_else(|| dest_root.join(".sync-rollback").join(config.run_id.to_string()));
+        // Never inside the destination: a mirror run would treat the
+        // snapshots as extra files and delete them.
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("ufop-sync-rollback")
+                .join(pair.id.to_string())
+                .join(config.run_id.to_string())
+        });
     let mut rollback = RollbackManager::new(config.run_id, pair.id, &rollback_dir);
 
     let mut files_added: u64 = 0;
     let mut files_modified: u64 = 0;
     let mut files_deleted: u64 = 0;
-    let mut files_skipped: u64 = 0;
+    // Files the plan left alone (filters, /XO, /XL…) count as skipped too,
+    // so the report agrees with the preview.
+    let mut files_skipped: u64 = preview.total_skipped;
     let mut conflicts_resolved: u64 = 0;
     let mut errors: u32 = 0;
     let mut bytes_transferred: u64 = 0;
@@ -111,18 +227,33 @@ pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
     }
 
     let start_index = config.resume_from.unwrap_or(0) as usize;
+    let tracker = Tracker {
+        hooks,
+        base: SyncProgress {
+            files_total: (operations.len() + preview.conflicts.len()) as u64,
+            bytes_total: preview.total_bytes,
+            ..planning
+        },
+        files_done: AtomicU64::new(0),
+        bytes_done: AtomicU64::new(0),
+        current: Mutex::new(None),
+    };
+    tracker.emit("copying");
+    let mut was_cancelled: bool;
+    let mut quarantined: Vec<QuarantineEntry> = Vec::new();
+    let mut pending_conflicts: Vec<SyncConflictItem> = Vec::new();
     let mut outcomes: Vec<(usize, Result<OperationResult, AppError>)> = Vec::new();
 
     // /MT: new files need no rollback snapshot, so they copy in parallel.
     // Resumed runs stay sequential to keep the resume index meaningful.
-    let parallel_adds = if opts.threads > 1 && start_index == 0 && pair.mode != SyncMode::VersionedBackup {
-        preview.additions.len()
-    } else {
-        0
-    };
+    let parallel_adds =
+        if opts.threads > 1 && start_index == 0 && pair.mode != SyncMode::VersionedBackup {
+            preview.additions.len()
+        } else {
+            0
+        };
     if parallel_adds > 0 {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::sync::Mutex;
+        use std::sync::atomic::AtomicUsize;
         let next = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
         let results = Mutex::new(Vec::new());
@@ -130,7 +261,7 @@ pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| loop {
-                    if stop.load(Ordering::Relaxed) {
+                    if stop.load(Ordering::Relaxed) || hooks.cancelled() {
                         break;
                     }
                     let idx = next.fetch_add(1, Ordering::Relaxed);
@@ -142,7 +273,12 @@ pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
                         break;
                     }
                     let entry = &preview.additions[idx];
+                    tracker.start_file(&entry.relative_path);
                     let r = copier::with_retries(opts, || add_file(pair, entry));
+                    tracker.finish_file(match &r {
+                        Ok(OperationResult::Added(b)) => *b,
+                        _ => 0,
+                    });
                     if r.is_err() && !config.continue_on_error {
                         stop.store(true, Ordering::Relaxed);
                     }
@@ -158,19 +294,26 @@ pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
     }
 
     let mut halted = outcomes.iter().any(|(_, r)| r.is_err()) && !config.continue_on_error;
-    let mut stopped_for_hours = parallel_adds > 0 && outcomes.len() < parallel_adds && !halted;
+    was_cancelled = hooks.cancelled();
+    let mut stopped_for_hours =
+        parallel_adds > 0 && outcomes.len() < parallel_adds && !halted && !was_cancelled;
 
     // Phase 3: Execute operations
-    if !halted && !stopped_for_hours {
+    if !halted && !stopped_for_hours && !was_cancelled {
         for (idx, (entry, op_type)) in operations.iter().enumerate() {
             if idx < start_index.max(parallel_adds) {
                 continue;
+            }
+            if hooks.cancelled() {
+                was_cancelled = true;
+                break;
             }
             if !copier::within_run_hours(opts) {
                 stopped_for_hours = true;
                 break;
             }
 
+            tracker.start_file(&entry.relative_path);
             let result = copier::with_retries(opts, || {
                 execute_single_operation(
                     pair,
@@ -179,6 +322,10 @@ pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
                     &mut rollback,
                     config.quarantine_dir.as_deref(),
                 )
+            });
+            tracker.finish_file(match &result {
+                Ok(OperationResult::Added(b)) | Ok(OperationResult::Modified(b)) => *b,
+                _ => 0,
             });
             let failed = result.is_err();
             outcomes.push((idx, result));
@@ -246,15 +393,34 @@ pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
         ));
     }
 
+    if was_cancelled {
+        let done = tracker.files_done.load(Ordering::Relaxed);
+        error_messages.push(format!(
+            "Cancelled after {} of {} items; run again to finish.",
+            done, tracker.base.files_total
+        ));
+    }
+
     // Handle conflicts from preview
-    if !halted && !stopped_for_hours {
+    if !halted && !stopped_for_hours && !was_cancelled {
         for entry in &preview.conflicts {
+            if hooks.cancelled() {
+                was_cancelled = true;
+                break;
+            }
+            tracker.start_file(&entry.relative_path);
             let result = execute_conflict_resolution(
                 pair,
                 entry,
                 &mut rollback,
                 config.quarantine_dir.as_deref(),
+                &mut quarantined,
+                &mut pending_conflicts,
             );
+            tracker.finish_file(match &result {
+                Ok(OperationResult::ConflictResolved(b)) => *b,
+                _ => 0,
+            });
 
             match result {
                 Ok(op_result) => match op_result {
@@ -278,6 +444,31 @@ pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
         }
     }
 
+    // /TIMFIX, /SECFIX: bring unchanged files' timestamps and security in line.
+    if !was_cancelled {
+        for rel in &preview.fixups {
+            let src = Path::new(&pair.source_path).join(rel);
+            let dst = dest_root.join(rel);
+            if opts.fix_timestamps {
+                if let Ok(modified) = fs::metadata(&src).and_then(|m| m.modified()) {
+                    copier::set_mtime(&dst, modified);
+                }
+            }
+            if opts.fix_security {
+                let security_only = CopyOptions {
+                    archive_reset: false,
+                    add_attributes: String::new(),
+                    remove_attributes: String::new(),
+                    ..opts.clone()
+                };
+                if let Err(e) = super::winattr::after_copy(&src, &dst, &security_only) {
+                    errors += 1;
+                    error_messages.push(format!("{}: {}", rel, e));
+                }
+            }
+        }
+    }
+
     // /PURGE, /MIR: drop destination directories the source no longer has.
     // `remove_dir` only removes empty ones, so nothing unplanned is lost.
     for dir in &preview.dirs_to_remove {
@@ -286,13 +477,19 @@ pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
         }
     }
 
+    if let Ok(mut c) = tracker.current.lock() {
+        *c = None;
+    }
+    tracker.emit("finishing");
     finish_directories(pair, opts);
 
     let ended_at = Utc::now();
     let duration_ms = (ended_at - started_at).num_milliseconds().max(0) as u64;
 
     // Determine status
-    let status = if errors == 0 {
+    let status = if was_cancelled {
+        SyncRunStatus::Cancelled
+    } else if errors == 0 {
         SyncRunStatus::Success
     } else if files_added + files_modified + files_deleted > 0 {
         SyncRunStatus::PartialSuccess
@@ -306,6 +503,7 @@ pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
         SyncRunStatus::Success => SyncHealth::Green,
         SyncRunStatus::PartialSuccess => SyncHealth::Yellow,
         SyncRunStatus::Failed => SyncHealth::Red,
+        SyncRunStatus::Cancelled => SyncHealth::Yellow,
         _ => SyncHealth::Gray,
     };
 
@@ -348,7 +546,12 @@ pub fn execute_sync(config: &ExecutorConfig) -> Result<SyncReport, AppError> {
         tracing::warn!("Could not write sync log for {}: {}", pair.name, e);
     }
 
-    Ok(report)
+    Ok(RunOutcome {
+        report,
+        snapshots: rollback.snapshots,
+        quarantined,
+        pending_conflicts,
+    })
 }
 
 /// Count destination files the source lacks (reported as extras under /XX).
@@ -490,12 +693,16 @@ fn execute_single_operation(
 }
 
 /// Execute conflict resolution for a conflicted file.
+#[allow(clippy::too_many_arguments)]
 fn execute_conflict_resolution(
     pair: &SyncPair,
     entry: &SyncDiffEntry,
     rollback: &mut RollbackManager,
     quarantine_dir: Option<&Path>,
+    quarantined: &mut Vec<QuarantineEntry>,
+    pending: &mut Vec<SyncConflictItem>,
 ) -> Result<OperationResult, AppError> {
+    let opts = &pair.copy_options;
     let source_root = Path::new(&pair.source_path);
     let dest_root = Path::new(&pair.dest_path);
     let source_file = source_root.join(&entry.relative_path);
@@ -518,50 +725,103 @@ fn execute_conflict_resolution(
             if dest_file.exists() {
                 rollback.snapshot_file(&entry.relative_path, &dest_file)?;
             }
-            let bytes = fs::copy(&source_file, &dest_file).map_err(|e| AppError::Sync {
-                message: format!("Copy failed: {}", e),
-                advice: "Check permissions.".to_string(),
-            })?;
+            let bytes = copier::copy_file(&source_file, &dest_file, opts)?;
             Ok(OperationResult::ConflictResolved(bytes))
         }
         ConflictAction::KeepDest => Ok(OperationResult::Skipped),
         ConflictAction::CopyToConflictPath => {
-            if let Some(parent) = result.resolved_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let bytes =
-                fs::copy(&source_file, &result.resolved_path).map_err(|e| AppError::Sync {
-                    message: format!("Copy to conflict path failed: {}", e),
-                    advice: "Check permissions.".to_string(),
-                })?;
+            let bytes = copier::copy_file(&source_file, &result.resolved_path, opts)?;
             Ok(OperationResult::ConflictResolved(bytes))
         }
         ConflictAction::Skip => Ok(OperationResult::Skipped),
         ConflictAction::Quarantine => {
             if dest_file.exists() {
                 conflict::quarantine_file(&dest_file, &result.resolved_path)?;
+                quarantined.push(QuarantineEntry {
+                    id: Uuid::new_v4(),
+                    pair_id: pair.id,
+                    original_path: entry.relative_path.clone(),
+                    quarantine_path: result.resolved_path.to_string_lossy().to_string(),
+                    source_size: entry.source_size.unwrap_or(0),
+                    dest_size: entry.dest_size.unwrap_or(0),
+                    source_modified: entry.source_modified,
+                    dest_modified: entry.dest_modified,
+                    quarantined_at: Utc::now(),
+                    resolved: false,
+                });
             }
-            // Also copy source to dest
-            let bytes = fs::copy(&source_file, &dest_file).map_err(|e| AppError::Sync {
-                message: format!("Copy failed after quarantine: {}", e),
-                advice: "Check permissions.".to_string(),
-            })?;
+            let bytes = copier::copy_file(&source_file, &dest_file, opts)?;
             Ok(OperationResult::ConflictResolved(bytes))
         }
         ConflictAction::AskUser => {
-            // Deferred: skip for now, will be resolved via UI
+            // Left untouched until the user picks a resolution in the UI.
+            pending.push(SyncConflictItem {
+                id: Uuid::new_v4(),
+                pair_id: pair.id,
+                relative_path: entry.relative_path.clone(),
+                source_size: entry.source_size.unwrap_or(0),
+                dest_size: entry.dest_size.unwrap_or(0),
+                source_modified: entry.source_modified,
+                dest_modified: entry.dest_modified,
+                resolution: None,
+                created_at: Utc::now(),
+            });
             Ok(OperationResult::Skipped)
         }
     }
 }
 
+/// Apply a resolution the user picked for an "Ask" conflict. Returns the
+/// rollback snapshots and any quarantine entry the resolution produced.
+pub fn apply_manual_resolution(
+    pair: &SyncPair,
+    item: &SyncConflictItem,
+    policy: SyncConflictPolicy,
+    quarantine_dir: &Path,
+    rollback_dir: &Path,
+) -> Result<(Vec<SyncSnapshot>, Vec<QuarantineEntry>), AppError> {
+    if policy == SyncConflictPolicy::Ask {
+        return Err(AppError::Sync {
+            message: "Choose how to resolve this conflict.".to_string(),
+            advice:
+                "Pick Source wins, Destination wins, Newest wins, Keep both, Skip or Quarantine."
+                    .to_string(),
+        });
+    }
+    let run_id = Uuid::new_v4();
+    let resolving = SyncPair {
+        conflict_policy: policy,
+        ..pair.clone()
+    };
+    let entry = SyncDiffEntry {
+        relative_path: item.relative_path.clone(),
+        action: SyncAction::Conflict,
+        source_size: Some(item.source_size),
+        dest_size: Some(item.dest_size),
+        source_modified: item.source_modified,
+        dest_modified: item.dest_modified,
+        reason: "Manual resolution".to_string(),
+        path_length_warning: None,
+    };
+    let mut rollback =
+        RollbackManager::new(run_id, pair.id, &rollback_dir.join(run_id.to_string()));
+    let mut quarantined = Vec::new();
+    let mut pending = Vec::new();
+    execute_conflict_resolution(
+        &resolving,
+        &entry,
+        &mut rollback,
+        Some(quarantine_dir),
+        &mut quarantined,
+        &mut pending,
+    )?;
+    Ok((rollback.snapshots, quarantined))
+}
+
 /// Generate a versioned path for versioned backup mode.
 /// e.g., "file.txt" -> "file.v2.txt" (incrementing version)
 fn generate_versioned_path(path: &Path) -> PathBuf {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = path.extension().and_then(|s| s.to_str());
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
@@ -581,10 +841,7 @@ fn generate_versioned_path(path: &Path) -> PathBuf {
 }
 
 /// Verify sync results using checksum comparison (T-042).
-pub fn verify_sync(
-    pair: &SyncPair,
-    _report: &SyncReport,
-) -> Result<Vec<String>, AppError> {
+pub fn verify_sync(pair: &SyncPair, _report: &SyncReport) -> Result<Vec<String>, AppError> {
     if !pair.checksum_enabled && pair.verify_mode == SyncVerifyMode::None {
         return Ok(Vec::new());
     }
@@ -604,10 +861,7 @@ pub fn verify_sync(
         let dest_file = dest_root.join(&file.relative_path);
         if !dest_file.exists() {
             if pair.mode == SyncMode::OneWay || pair.mode == SyncMode::Mirror {
-                mismatches.push(format!(
-                    "Missing at destination: {}",
-                    file.relative_path
-                ));
+                mismatches.push(format!("Missing at destination: {}", file.relative_path));
             }
             continue;
         }
@@ -643,10 +897,7 @@ pub fn verify_sync(
                     let src_hash = compute_file_hash(&file.absolute_path)?;
                     let dst_hash = compute_file_hash(&dest_file)?;
                     if src_hash != dst_hash {
-                        mismatches.push(format!(
-                            "Checksum mismatch: {}",
-                            file.relative_path
-                        ));
+                        mismatches.push(format!("Checksum mismatch: {}", file.relative_path));
                     }
                 }
             }
@@ -742,7 +993,11 @@ mod tests {
         let src = TempDir::new().unwrap();
         let dst = TempDir::new().unwrap();
 
-        fs::write(src.path().join("file.txt"), "updated content that is longer").unwrap();
+        fs::write(
+            src.path().join("file.txt"),
+            "updated content that is longer",
+        )
+        .unwrap();
         fs::write(dst.path().join("file.txt"), "old").unwrap();
 
         let pair = make_test_pair(src.path(), dst.path());
@@ -899,26 +1154,29 @@ mod tests {
         fs::write(dst.path().join("file.txt"), "different content!!").unwrap();
 
         let pair = make_test_pair(src.path(), dst.path());
-        let mismatches = verify_sync(&pair, &SyncReport {
-            id: Uuid::new_v4(),
-            pair_id: pair.id,
-            pair_name: "Test".to_string(),
-            started_at: Utc::now(),
-            ended_at: Utc::now(),
-            duration_ms: 0,
-            files_added: 0,
-            files_modified: 0,
-            files_deleted: 0,
-            files_skipped: 0,
-            conflicts_resolved: 0,
-            errors: 0,
-            bytes_transferred: 0,
-            status: SyncRunStatus::Success,
-            health: SyncHealth::Green,
-            error_messages: vec![],
-            resumed: false,
-            exit_code: 0,
-        })
+        let mismatches = verify_sync(
+            &pair,
+            &SyncReport {
+                id: Uuid::new_v4(),
+                pair_id: pair.id,
+                pair_name: "Test".to_string(),
+                started_at: Utc::now(),
+                ended_at: Utc::now(),
+                duration_ms: 0,
+                files_added: 0,
+                files_modified: 0,
+                files_deleted: 0,
+                files_skipped: 0,
+                conflicts_resolved: 0,
+                errors: 0,
+                bytes_transferred: 0,
+                status: SyncRunStatus::Success,
+                health: SyncHealth::Green,
+                error_messages: vec![],
+                resumed: false,
+                exit_code: 0,
+            },
+        )
         .unwrap();
 
         assert!(!mismatches.is_empty());
@@ -1034,7 +1292,10 @@ mod tests {
         assert_eq!(preview.total_additions + preview.total_modifications, 0);
         assert!(preview.skipped.iter().any(|e| e.reason.contains("/XO")));
         assert!(preview.skipped.iter().any(|e| e.reason.contains("/XL")));
-        assert_eq!(fs::read_to_string(dst.path().join("old.txt")).unwrap(), "newer dest");
+        assert_eq!(
+            fs::read_to_string(dst.path().join("old.txt")).unwrap(),
+            "newer dest"
+        );
     }
 
     #[test]
@@ -1115,11 +1376,20 @@ mod tests {
         fs::write(dst.path().join("a.txt"), "same").unwrap();
         let t = std::time::SystemTime::now() - std::time::Duration::from_secs(100);
         copier::set_mtime(&src.path().join("a.txt"), t);
-        copier::set_mtime(&dst.path().join("a.txt"), t + std::time::Duration::from_secs(1));
+        copier::set_mtime(
+            &dst.path().join("a.txt"),
+            t + std::time::Duration::from_secs(1),
+        );
         let mut pair = make_test_pair(src.path(), dst.path());
-        assert_eq!(planner::compute_preview(&pair).unwrap().total_modifications, 1);
+        assert_eq!(
+            planner::compute_preview(&pair).unwrap().total_modifications,
+            1
+        );
         pair.copy_options.fat_time_tolerance = true;
-        assert_eq!(planner::compute_preview(&pair).unwrap().total_modifications, 0);
+        assert_eq!(
+            planner::compute_preview(&pair).unwrap().total_modifications,
+            0
+        );
     }
 
     #[test]
@@ -1158,5 +1428,48 @@ mod tests {
             rollback_dir: None,
         });
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn robocopy_timfix_realigns_unchanged_files() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "same").unwrap();
+        fs::write(dst.path().join("a.txt"), "same").unwrap();
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(500);
+        copier::set_mtime(&src.path().join("a.txt"), t);
+        copier::set_mtime(
+            &dst.path().join("a.txt"),
+            t + std::time::Duration::from_secs(1),
+        );
+        let mut pair = make_test_pair(src.path(), dst.path());
+        // With /FFT the 1 s drift counts as "same", so nothing is copied…
+        pair.copy_options.fat_time_tolerance = true;
+        pair.copy_options.fix_timestamps = true;
+        let preview = planner::compute_preview(&pair).unwrap();
+        assert_eq!(preview.total_modifications, 0);
+        assert_eq!(preview.fixups, vec!["a.txt".to_string()]);
+        // …but /TIMFIX still lines the timestamps up exactly.
+        run_with(pair);
+        assert_eq!(
+            fs::metadata(dst.path().join("a.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            t
+        );
+    }
+
+    #[test]
+    fn report_counts_filtered_files_as_skipped() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("keep.txt"), "k").unwrap();
+        fs::write(src.path().join("skip.log"), "s").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.filter.exclude_patterns = vec!["*.log".to_string()];
+        let report = run_with(pair);
+        assert_eq!(report.files_added, 1);
+        assert_eq!(report.files_skipped, 1);
     }
 }

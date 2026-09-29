@@ -4,8 +4,8 @@
 //! size+mtime (fast) or checksum (full), applies selective filters,
 //! and produces a `SyncPreview` without touching the filesystem.
 
-use crate::core::error::AppError;
-use crate::core::types::*;
+use crate::error::AppError;
+use crate::sync_types::*;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,6 +24,8 @@ pub struct FileMeta {
     /// Hidden: a dot-file, or the Windows hidden attribute.
     pub hidden: bool,
     pub readonly: bool,
+    /// Raw NTFS attribute bits (always 0 off Windows).
+    pub attributes: u32,
 }
 
 /// Recursively walk a directory and collect file metadata.
@@ -54,6 +56,16 @@ fn is_hidden(name: &str, _metadata: &std::fs::Metadata) -> bool {
         }
     }
     name.starts_with('.')
+}
+
+/// Folders the sync engine itself has written into sync roots, and in-flight
+/// restartable copies. Never synced, never purged: purging an older
+/// `.sync-rollback` would destroy the snapshots a rollback needs, and purging
+/// a `.ufop-partial` would throw away the progress /Z exists to keep.
+pub const INTERNAL_DIRS: [&str; 2] = [".sync-rollback", ".sync-quarantine"];
+
+pub fn is_internal_entry(name: &str) -> bool {
+    INTERNAL_DIRS.contains(&name) || name.ends_with(super::copier::PARTIAL_SUFFIX)
 }
 
 /// True when a directory is excluded by /XD — matched against its name or its
@@ -99,6 +111,9 @@ fn walk_recursive(
             .to_string_lossy()
             .to_string();
         let name = entry.file_name().to_string_lossy().to_string();
+        if is_internal_entry(&name) {
+            continue;
+        }
 
         let link_meta = std::fs::symlink_metadata(&path).map_err(|e| AppError::Sync {
             message: format!("Cannot read metadata for {}: {}", path.display(), e),
@@ -118,6 +133,7 @@ fn walk_recursive(
                         is_symlink: true,
                         hidden: is_hidden(&name, &link_meta),
                         readonly: false,
+                        attributes: super::winattr::attributes_of(&link_meta),
                     });
                     continue;
                 }
@@ -130,10 +146,7 @@ fn walk_recursive(
             advice: "Check file permissions.".to_string(),
         })?;
 
-        let modified = metadata
-            .modified()
-            .ok()
-            .map(DateTime::<Utc>::from);
+        let modified = metadata.modified().ok().map(DateTime::<Utc>::from);
 
         if metadata.is_dir() {
             if depth >= max_depth || dir_excluded(&relative, opts) {
@@ -148,6 +161,7 @@ fn walk_recursive(
                 is_symlink: false,
                 hidden: is_hidden(&name, &metadata),
                 readonly: false,
+                attributes: super::winattr::attributes_of(&metadata),
             });
             walk_recursive(root, &path, depth + 1, max_depth, opts, entries)?;
         } else {
@@ -160,6 +174,7 @@ fn walk_recursive(
                 is_symlink: false,
                 hidden: is_hidden(&name, &metadata),
                 readonly: metadata.permissions().readonly(),
+                attributes: super::winattr::attributes_of(&metadata),
             });
         }
     }
@@ -168,11 +183,7 @@ fn walk_recursive(
 }
 
 /// Compare two timestamps with the /FFT (2 s) and /DST (1 h) tolerances.
-pub fn times_equal(
-    a: Option<DateTime<Utc>>,
-    b: Option<DateTime<Utc>>,
-    opts: &CopyOptions,
-) -> bool {
+pub fn times_equal(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>, opts: &CopyOptions) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => {
             let diff_ms = (a - b).num_milliseconds().abs();
@@ -187,12 +198,19 @@ pub fn times_equal(
 }
 
 /// Why a source file is excluded by attribute or age options, if it is.
-fn option_exclusion(file: &FileMeta, opts: &CopyOptions, now: DateTime<Utc>) -> Option<&'static str> {
+fn option_exclusion(
+    file: &FileMeta,
+    opts: &CopyOptions,
+    now: DateTime<Utc>,
+) -> Option<&'static str> {
     if opts.exclude_hidden && file.hidden {
         return Some("Hidden file excluded (/XA:H)");
     }
     if opts.exclude_readonly && file.readonly {
         return Some("Read-only file excluded (/XA:R)");
+    }
+    if let Some(reason) = super::winattr::attribute_exclusion(file.attributes, opts) {
+        return Some(reason);
     }
     if let Some(modified) = file.modified {
         let age = now - modified;
@@ -263,7 +281,11 @@ pub fn matches_filter(relative_path: &str, size: u64, filter: &SyncFilter) -> bo
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        if !filter.file_types.iter().any(|t| t.eq_ignore_ascii_case(ext)) {
+        if !filter
+            .file_types
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(ext))
+        {
             return false;
         }
     }
@@ -357,6 +379,7 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
     let mut conflicts = Vec::new();
     let mut path_warnings = Vec::new();
     let mut total_bytes: u64 = 0;
+    let mut fixups: Vec<String> = Vec::new();
 
     let skip_entry = |rel_path: &str, src: &FileMeta, reason: &str| SyncDiffEntry {
         relative_path: rel_path.to_string(),
@@ -388,9 +411,7 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
             // File exists at destination - check if changed
             // Apply time offset compensation for clock skew
             let adjusted_dest_modified = match (dest.modified, pair.time_offset_secs) {
-                (Some(mtime), Some(offset)) => {
-                    Some(mtime + chrono::Duration::seconds(offset))
-                }
+                (Some(mtime), Some(offset)) => Some(mtime + chrono::Duration::seconds(offset)),
                 (mtime, _) => mtime,
             };
 
@@ -406,9 +427,11 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
                 // Robocopy-style comparison exclusions (/XC, /XO, /XN).
                 let reason = if same_time && opts.exclude_changed {
                     Some("Changed file excluded (/XC)")
-                } else if !same_time && src.modified < adjusted_dest_modified && opts.exclude_older {
+                } else if !same_time && src.modified < adjusted_dest_modified && opts.exclude_older
+                {
                     Some("Source is older than destination (/XO)")
-                } else if !same_time && src.modified > adjusted_dest_modified && opts.exclude_newer {
+                } else if !same_time && src.modified > adjusted_dest_modified && opts.exclude_newer
+                {
                     Some("Source is newer than destination (/XN)")
                 } else {
                     None
@@ -466,9 +489,15 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
                 if path_warning.is_some() {
                     path_warnings.push(entry);
                 }
+            } else if opts.fix_timestamps || opts.fix_security {
+                fixups.push(rel_path.to_string());
             }
         } else if opts.exclude_lonely {
-            skipped.push(skip_entry(rel_path, src, "Not present at destination (/XL)"));
+            skipped.push(skip_entry(
+                rel_path,
+                src,
+                "Not present at destination (/XL)",
+            ));
         } else {
             // New file at source
             let entry = SyncDiffEntry {
@@ -523,19 +552,20 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
             for (rel_path, dest) in &dest_map {
                 if !source_map.contains_key(rel_path)
                     && matches_filter(rel_path, dest.size, &pair.filter)
-                    && option_exclusion(dest, opts, now).is_none() {
-                        additions.push(SyncDiffEntry {
-                            relative_path: rel_path.to_string(),
-                            action: SyncAction::Add,
-                            source_size: None,
-                            dest_size: Some(dest.size),
-                            source_modified: None,
-                            dest_modified: dest.modified,
-                            reason: "New file in destination (two-way sync)".to_string(),
-                            path_length_warning: check_path_length(&pair.source_path, rel_path),
-                        });
-                        total_bytes += dest.size;
-                    }
+                    && option_exclusion(dest, opts, now).is_none()
+                {
+                    additions.push(SyncDiffEntry {
+                        relative_path: rel_path.to_string(),
+                        action: SyncAction::Add,
+                        source_size: None,
+                        dest_size: Some(dest.size),
+                        source_modified: None,
+                        dest_modified: dest.modified,
+                        reason: "New file in destination (two-way sync)".to_string(),
+                        path_length_warning: check_path_length(&pair.source_path, rel_path),
+                    });
+                    total_bytes += dest.size;
+                }
             }
         }
         _ => {
@@ -598,6 +628,7 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
         path_warnings,
         dirs_to_create,
         dirs_to_remove,
+        fixups,
     })
 }
 
@@ -605,13 +636,24 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
 pub fn export_preview_csv(preview: &SyncPreview) -> Result<String, AppError> {
     let mut wtr = csv::Writer::from_writer(Vec::new());
 
-    wtr.write_record(["Action", "Path", "Source Size", "Dest Size", "Source Modified", "Dest Modified", "Reason", "Warning"])
-        .map_err(|e| AppError::Sync {
-            message: format!("CSV export error: {}", e),
-            advice: "Try again.".to_string(),
-        })?;
+    wtr.write_record([
+        "Action",
+        "Path",
+        "Source Size",
+        "Dest Size",
+        "Source Modified",
+        "Dest Modified",
+        "Reason",
+        "Warning",
+    ])
+    .map_err(|e| AppError::Sync {
+        message: format!("CSV export error: {}", e),
+        advice: "Try again.".to_string(),
+    })?;
 
-    let all_entries = preview.additions.iter()
+    let all_entries = preview
+        .additions
+        .iter()
         .chain(preview.modifications.iter())
         .chain(preview.deletions.iter())
         .chain(preview.skipped.iter())
@@ -623,8 +665,14 @@ pub fn export_preview_csv(preview: &SyncPreview) -> Result<String, AppError> {
             entry.relative_path.clone(),
             entry.source_size.map(|s| s.to_string()).unwrap_or_default(),
             entry.dest_size.map(|s| s.to_string()).unwrap_or_default(),
-            entry.source_modified.map(|t| t.to_rfc3339()).unwrap_or_default(),
-            entry.dest_modified.map(|t| t.to_rfc3339()).unwrap_or_default(),
+            entry
+                .source_modified
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default(),
+            entry
+                .dest_modified
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default(),
             entry.reason.clone(),
             entry.path_length_warning.clone().unwrap_or_default(),
         ])
@@ -648,8 +696,8 @@ pub fn export_preview_csv(preview: &SyncPreview) -> Result<String, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
     fn setup_dirs() -> (TempDir, TempDir) {
         let src = TempDir::new().unwrap();
@@ -859,6 +907,7 @@ mod tests {
             path_warnings: Vec::new(),
             dirs_to_create: Vec::new(),
             dirs_to_remove: Vec::new(),
+            fixups: Vec::new(),
             total_additions: 1,
             total_modifications: 0,
             total_deletions: 0,

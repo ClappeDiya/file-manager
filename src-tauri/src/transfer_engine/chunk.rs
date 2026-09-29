@@ -277,13 +277,17 @@ mod tests {
 
     #[test]
     fn test_temp_path() {
+        // Built with the platform's separator so it holds on Windows too.
+        let expect = |dir: &str, name: &str| {
+            std::path::Path::new(dir).join(name).to_string_lossy().to_string()
+        };
         assert_eq!(
             temp_path_for("/home/user/file.txt"),
-            "/home/user/.file.txt.ufop-partial"
+            expect("/home/user", ".file.txt.ufop-partial")
         );
         assert_eq!(
             temp_path_for("/data/report.pdf"),
-            "/data/.report.pdf.ufop-partial"
+            expect("/data", ".report.pdf.ufop-partial")
         );
     }
 
