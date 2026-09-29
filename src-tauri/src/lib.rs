@@ -353,6 +353,7 @@ pub fn run() {
             state_commands::save_workspace_state,
             state_commands::load_workspace_state,
             state_commands::get_config,
+            state_commands::list_config,
             state_commands::set_config,
             state_commands::reset_database,
             // Confirmation tokens for destructive operations
@@ -454,6 +455,10 @@ pub fn run() {
             sync_commands::detect_time_offset,
             // Sync Filter Presets
             sync_commands::get_sync_filter_presets,
+            sync_commands::parse_robocopy_command,
+            sync_commands::robocopy_command_preview,
+            sync_commands::get_sync_progress,
+            sync_commands::cancel_sync,
             // Peer discovery and transfer (T-031)
             peer_commands::peer_start_discovery,
             peer_commands::peer_stop_discovery,

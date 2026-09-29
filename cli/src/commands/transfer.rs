@@ -18,6 +18,7 @@ struct TransferResult {
     verified: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     src: String,
     dest: String,

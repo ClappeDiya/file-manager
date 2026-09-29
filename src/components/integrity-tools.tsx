@@ -436,11 +436,14 @@ function DuplicatePanel({ currentDirectory }: { currentDirectory: string }) {
     setError(null);
     setResolveMessage(null);
     try {
-      const keepPath = action === "keep_selected" ? (selectedKeepPaths[groupHash] || "") : "";
-      const result = await tauriInvoke<{ resolved_count: number; freed_bytes: number }>(
-        "integrity_resolve_duplicates",
-        { groupHash, keepPath, action }
-      );
+      const keepPath = action === "keep_selected" ? (selectedKeepPaths[groupHash] || null) : null;
+      const paths = scanResult?.groups.find((g) => g.hash === groupHash)?.files.map((f) => f.path) ?? [];
+      const result = await tauriInvoke<{
+        resolved_count: number;
+        freed_bytes: number;
+        kept: string | null;
+        removed: string[];
+      }>("integrity_resolve_duplicates", { groupHash, action, keepPath, paths });
       setResolveMessage(
         `Resolved: ${result.resolved_count} file(s) removed, ${formatBytes(result.freed_bytes)} freed.`
       );

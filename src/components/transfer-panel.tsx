@@ -61,12 +61,6 @@ interface TransferHistoryRecord {
   checksum_verified: boolean;
 }
 
-interface TransferHistoryFilter {
-  query?: string;
-  status?: string;
-  limit?: number;
-}
-
 interface ConflictCheckResult {
   has_conflict: boolean;
   source_path: string;
@@ -418,14 +412,29 @@ function TransferSettings({
   onSetChecksumAlgorithm: (algorithm: string) => void;
   onSetRetryPolicy: (maxRetries: number, backoffSeconds: number[]) => void;
   onSetConflictPolicy: (policy: string) => void;
-  onSearchHistory: (query: string) => void;
+  onSearchHistory: (query: string) => Promise<TransferHistoryRecord[]>;
   onExportHistory: (format: string) => void;
-  onCleanupHistory: (days: number) => void;
+  onCleanupHistory: (days: number) => Promise<number | null>;
   onSaveAllSettings: (config: TransferConfig) => void;
 }) {
   const [maxRetries, setMaxRetries] = useState(config.max_retries);
   const [historySearch, setHistorySearch] = useState("");
   const [cleanupDays, setCleanupDays] = useState(30);
+  const [historyResults, setHistoryResults] = useState<TransferHistoryRecord[] | null>(null);
+  const [historyMessage, setHistoryMessage] = useState<string | null>(null);
+  const runHistorySearch = async () => {
+    setHistoryMessage(null);
+    setHistoryResults(await onSearchHistory(historySearch));
+  };
+  const runHistoryCleanup = async () => {
+    const removed = await onCleanupHistory(cleanupDays);
+    setHistoryMessage(
+      removed === null
+        ? "Cleanup failed. Try again."
+        : `Removed ${removed} record${removed === 1 ? "" : "s"} older than ${cleanupDays} day${cleanupDays === 1 ? "" : "s"}.`,
+    );
+    if (historyResults) setHistoryResults(await onSearchHistory(historySearch));
+  };
 
   // Completion hooks state – loaded from and saved to backend
   const [showNotification, setShowNotification] = useState(true);
@@ -671,14 +680,14 @@ function TransferSettings({
               value={historySearch}
               onChange={(e) => setHistorySearch(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") onSearchHistory(historySearch);
+                if (e.key === "Enter") runHistorySearch();
               }}
               placeholder="Search history..."
               className="w-36 text-xs px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
               aria-label="Search transfer history"
             />
             <button
-              onClick={() => onSearchHistory(historySearch)}
+              onClick={runHistorySearch}
               className="text-xs px-2 py-0.5 rounded bg-blue-500 text-white hover:bg-blue-600"
               type="button"
             >
@@ -704,7 +713,7 @@ function TransferSettings({
             />
             <span className="text-xs text-gray-500 dark:text-gray-400">days</span>
             <button
-              onClick={() => onCleanupHistory(cleanupDays)}
+              onClick={runHistoryCleanup}
               className="text-xs px-2 py-0.5 rounded text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30"
               type="button"
               title="Delete history records older than specified days"
@@ -713,6 +722,32 @@ function TransferSettings({
             </button>
           </div>
         </div>
+        {historyMessage && (
+          <div className="mt-1.5 text-[11px] text-gray-600 dark:text-gray-400" role="status">
+            {historyMessage}
+          </div>
+        )}
+        {historyResults && (
+          <div className="mt-1.5" data-testid="history-results">
+            {historyResults.length === 0 ? (
+              <div className="text-[11px] text-gray-500">No matching transfers.</div>
+            ) : (
+              <ul className="max-h-40 overflow-y-auto divide-y divide-gray-100 dark:divide-gray-800 text-[11px]">
+                {historyResults.map((r) => (
+                  <li key={r.id} className="py-1 flex items-center gap-2">
+                    <span className="truncate flex-1" title={`${r.source_path} → ${r.dest_path}`}>
+                      {r.source_path.split(/[\\/]/).pop()} → {r.dest_path}
+                    </span>
+                    <span className="shrink-0 text-gray-500">{r.status}</span>
+                    <span className="shrink-0 text-gray-400 tabular-nums">
+                      {new Date(r.started_at).toLocaleDateString()}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -768,9 +803,9 @@ function TransferPanelFull({
   onSetItemConflictPolicy: (jobId: string, policy: string) => void;
   onReorder: (jobId: string, newSortOrder: number) => void;
   onResolveConflict: (job: TransferJob) => void;
-  onSearchHistory: (query: string) => void;
+  onSearchHistory: (query: string) => Promise<TransferHistoryRecord[]>;
   onExportHistory: (format: string) => void;
-  onCleanupHistory: (days: number) => void;
+  onCleanupHistory: (days: number) => Promise<number | null>;
   onSaveAllSettings: (config: TransferConfig) => void;
   showFailedOnly: boolean;
   onToggleShowFailed: () => void;
@@ -1324,17 +1359,16 @@ export function TransferPanel() {
     []
   );
 
-  const handleSearchHistory = useCallback(async (query: string) => {
+  const handleSearchHistory = useCallback(async (query: string): Promise<TransferHistoryRecord[]> => {
     try {
-      const filter: TransferHistoryFilter = { query: query || undefined, limit: 100 };
-      const results = await tauriInvoke<TransferHistoryRecord[]>(
+      return await tauriInvoke<TransferHistoryRecord[]>(
         "search_transfer_history",
-        { filter },
+        { pathContains: query.trim() || null, limit: 100 },
         []
       );
-      console.log("Transfer history search results:", results);
     } catch (err) {
       console.error("Failed to search transfer history:", err);
+      return [];
     }
   }, []);
 
@@ -1356,12 +1390,12 @@ export function TransferPanel() {
     }
   }, []);
 
-  const handleCleanupHistory = useCallback(async (days: number) => {
+  const handleCleanupHistory = useCallback(async (days: number): Promise<number | null> => {
     try {
-      const removed = await tauriInvoke<number>("cleanup_transfer_history", { olderThanDays: days }, 0);
-      console.log(`Cleaned up ${removed} transfer history records`);
+      return await tauriInvoke<number>("cleanup_transfer_history", { olderThanDays: days }, 0);
     } catch (err) {
       console.error("Failed to cleanup transfer history:", err);
+      return null;
     }
   }, []);
 

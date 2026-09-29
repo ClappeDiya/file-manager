@@ -772,7 +772,7 @@ fn detect_drives_linux() -> Result<Vec<DriveInfo>, AppError> {
 
         let name = mount_point
             .split('/')
-            .last()
+            .next_back()
             .unwrap_or(&mount_point)
             .to_string();
         let name = if name.is_empty() {
@@ -836,31 +836,64 @@ fn is_removable_linux(device: &str) -> bool {
 
 #[cfg(target_os = "windows")]
 fn detect_drives_windows() -> Result<Vec<DriveInfo>, AppError> {
+    // Win32 volume APIs directly: `wmic` is deprecated and missing from
+    // current Windows 11 installs, which left the drive list empty.
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    };
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32 = 3;
+    const DRIVE_REMOTE: u32 = 4;
+    const DRIVE_CDROM: u32 = 5;
+    const FILE_READ_ONLY_VOLUME: u32 = 0x0008_0000;
+
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let from_wide = |buf: &[u16]| -> String {
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..end])
+    };
+
     let mut drives = Vec::new();
+    // SAFETY: every pointer passed below is a valid, NUL-terminated buffer or
+    // an out-param that lives for the duration of the call.
+    let mask = unsafe { GetLogicalDrives() };
+    for i in 0..26u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i as u8) as char;
+        let caption = format!("{letter}:");
+        let root = wide(&format!("{letter}:\\"));
 
-    // Use wmic to list drives
-    let output = Command::new("wmic")
-        .arg("logicaldisk")
-        .arg("get")
-        .arg("caption,drivetype,filesystem,freespace,size,volumename")
-        .arg("/format:csv")
-        .output()
-        .map_err(|e| AppError::internal(format!("wmic failed: {e}")))?;
+        let drive_type_code = unsafe { GetDriveTypeW(root.as_ptr()) };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    for line in stdout.lines().skip(2) {
-        let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() < 7 {
+        let (mut free, mut total, mut total_free) = (0u64, 0u64, 0u64);
+        let has_space =
+            unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut free, &mut total, &mut total_free) } != 0;
+        if !has_space && drive_type_code == DRIVE_CDROM {
+            // Empty optical drive: nothing to browse.
             continue;
         }
 
-        let caption = fields[1].trim();
-        let drive_type_code: u32 = fields[2].trim().parse().unwrap_or(0);
-        let filesystem = fields[3].trim();
-        let free_space: u64 = fields[4].trim().parse().unwrap_or(0);
-        let total_size: u64 = fields[5].trim().parse().unwrap_or(0);
-        let volume_name = fields[6].trim();
+        let mut label_buf = [0u16; 261];
+        let mut fs_buf = [0u16; 261];
+        let mut serial = 0u32;
+        let mut max_component = 0u32;
+        let mut flags = 0u32;
+        let has_info = unsafe {
+            GetVolumeInformationW(
+                root.as_ptr(),
+                label_buf.as_mut_ptr(),
+                label_buf.len() as u32,
+                &mut serial,
+                &mut max_component,
+                &mut flags,
+                fs_buf.as_mut_ptr(),
+                fs_buf.len() as u32,
+            )
+        } != 0;
+        let volume_name = if has_info { from_wide(&label_buf) } else { String::new() };
+        let filesystem = if has_info { from_wide(&fs_buf) } else { String::new() };
 
         let name = if volume_name.is_empty() {
             format!("Local Disk ({})", caption)
@@ -869,30 +902,30 @@ fn detect_drives_windows() -> Result<Vec<DriveInfo>, AppError> {
         };
 
         let drive_type = match drive_type_code {
-            2 => DriveType::External,  // Removable
-            3 => DriveType::Internal,  // Fixed
-            4 => DriveType::Network,   // Network
-            5 => DriveType::Optical,   // CD-ROM
+            DRIVE_REMOVABLE => DriveType::External,
+            DRIVE_FIXED => DriveType::Internal,
+            DRIVE_REMOTE => DriveType::Network,
+            DRIVE_CDROM => DriveType::Optical,
             _ => DriveType::Unknown,
         };
 
         drives.push(DriveInfo {
             name,
-            mount_point: caption.to_string(),
-            device: caption.to_string(),
-            total_bytes: total_size,
-            free_bytes: free_space,
-            used_bytes: total_size.saturating_sub(free_space),
-            filesystem: FilesystemType::from_str(filesystem),
+            mount_point: caption.clone(),
+            device: caption,
+            total_bytes: total,
+            free_bytes: free,
+            used_bytes: total.saturating_sub(free),
+            filesystem: FilesystemType::from_str(&filesystem),
             drive_type,
-            removable: drive_type_code == 2,
-            read_only: false,
+            removable: drive_type_code == DRIVE_REMOVABLE,
+            read_only: has_info && flags & FILE_READ_ONLY_VOLUME != 0,
             label: if volume_name.is_empty() {
                 None
             } else {
-                Some(volume_name.to_string())
+                Some(volume_name)
             },
-            uuid: None,
+            uuid: has_info.then(|| format!("{serial:08X}")),
         });
     }
 

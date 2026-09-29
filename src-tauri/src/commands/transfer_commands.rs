@@ -484,9 +484,14 @@ pub async fn export_transfer_history(
 /// Clean up old transfer history records.
 #[tauri::command]
 pub async fn cleanup_transfer_history(
+    older_than_days: Option<u32>,
     history: State<'_, TransferHistory>,
 ) -> Result<u32, AppError> {
-    history.cleanup_old_records().await
+    match older_than_days {
+        // The user's "older than N days" choice; without one, the default retention.
+        Some(days) => history.cleanup_older_than(days.max(1)).await,
+        None => history.cleanup_old_records().await,
+    }
 }
 
 // ── Three-Layer Architecture Commands ──

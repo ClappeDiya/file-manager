@@ -12,6 +12,22 @@
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
+import { SyncProgressCard } from "@/components/sync-progress-card";
+import { SyncComparison } from "@/components/sync-comparison";
+import {
+  CopyPresetPicker,
+  RobocopyCommandPreview,
+  RobocopyImport,
+  RobocopyOptionsSection,
+} from "@/components/robocopy-options";
+import {
+  DEFAULT_COPY_OPTIONS,
+  applyPreset,
+  countChangedOptions,
+  describeExitCode,
+  type CopyOptions,
+  type RobocopyJob,
+} from "@/lib/copy-options";
 
 // ── Types ──
 
@@ -30,6 +46,7 @@ interface SyncPair {
   checksum_enabled: boolean;
   created_at: string;
   time_offset_secs: number | null;
+  copy_options?: CopyOptions;
 }
 
 interface SyncFilter {
@@ -60,6 +77,8 @@ interface SyncPreview {
   total_skipped: number;
   total_conflicts: number;
   total_bytes: number;
+  dirs_to_create?: string[];
+  dirs_to_remove?: string[];
 }
 
 interface SyncDiffEntry {
@@ -91,6 +110,7 @@ interface SyncReport {
   health: string;
   error_messages: string[];
   resumed: boolean;
+  exit_code?: number;
 }
 
 interface SyncConflictItem {
@@ -184,6 +204,7 @@ export function SyncPanel() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [syncRunning, setSyncRunning] = useState(false);
+  const [runningPairId, setRunningPairId] = useState<string | null>(null);
 
   // Load pairs on mount
   const loadPairs = useCallback(async () => {
@@ -230,6 +251,8 @@ export function SyncPanel() {
     maxSize: 0,
     minSize: 0,
     timeOffsetSecs: null as number | null,
+    copyOptions: DEFAULT_COPY_OPTIONS as CopyOptions,
+    presetId: null as string | null,
   });
 
   // Time offset auto-detection state (used for inline display)
@@ -269,6 +292,7 @@ export function SyncPanel() {
         verifyMode: createForm.verifyMode,
         checksumEnabled: createForm.checksumEnabled,
         timeOffsetSecs: createForm.timeOffsetSecs,
+        optionsJson: JSON.stringify(createForm.copyOptions),
       });
 
       setView("list");
@@ -290,6 +314,8 @@ export function SyncPanel() {
         maxSize: 0,
         minSize: 0,
         timeOffsetSecs: null,
+        copyOptions: DEFAULT_COPY_OPTIONS,
+        presetId: null,
       });
       _setDetectedOffset(null);
     } catch (e: any) {
@@ -319,6 +345,7 @@ export function SyncPanel() {
 
   const handleRunSync = async (pairId: string) => {
     setSyncRunning(true);
+    setRunningPairId(pairId);
     setError(null);
     try {
       const report = await tauriInvoke<SyncReport>("run_sync", { pairId });
@@ -329,6 +356,7 @@ export function SyncPanel() {
       setError(e?.message || "Sync failed");
     } finally {
       setSyncRunning(false);
+      setRunningPairId(null);
     }
   };
 
@@ -461,6 +489,12 @@ export function SyncPanel() {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-2">
+        {runningPairId && (
+          <SyncProgressCard
+            pairId={runningPairId}
+            pairName={pairs.find((p) => p.id === runningPairId)?.name ?? "sync pair"}
+          />
+        )}
         {view === "list" && (
           <PairListView
             pairs={pairs}
@@ -713,6 +747,27 @@ function CreatePairView({
         </button>
       </div>
 
+      <RobocopyImport
+        onImport={(job: RobocopyJob) =>
+          setForm({
+            ...form,
+            name: form.name || "Imported Robocopy job",
+            sourcePath: job.source_path,
+            destPath: job.dest_path,
+            mode: job.mode,
+            trigger: job.trigger,
+            cronExpr: job.cron_expr ?? form.cronExpr,
+            includePatterns: job.filter.include_patterns.join(", "),
+            excludePatterns: job.filter.exclude_patterns.join(", "),
+            maxSize: job.filter.max_size,
+            minSize: job.filter.min_size,
+            copyOptions: job.copy_options,
+            presetId: null,
+            advancedMode: true,
+          })
+        }
+      />
+
       <label className="block text-xs text-zinc-600 dark:text-zinc-400">
         Name
         <input
@@ -759,6 +814,18 @@ function CreatePairView({
           <option value="versioned_backup">Versioned Backup</option>
         </select>
       </label>
+
+      <CopyPresetPicker
+        activeId={form.presetId}
+        onPick={(preset) =>
+          setForm({
+            ...form,
+            mode: preset.mode,
+            copyOptions: applyPreset(preset),
+            presetId: preset.id,
+          })
+        }
+      />
 
       <label className="block text-xs text-zinc-600 dark:text-zinc-400">
         Trigger
@@ -996,6 +1063,42 @@ function CreatePairView({
               Compensates for clock differences between local and remote. Prevents false change detection.
             </p>
           </div>
+
+          <div className="space-y-1.5">
+            <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+              Copy options
+              {countChangedOptions(form.copyOptions) > 0 && (
+                <span className="ml-1.5 rounded-full bg-blue-100 dark:bg-blue-900/40 px-1.5 text-[10px] text-blue-700 dark:text-blue-300">
+                  {countChangedOptions(form.copyOptions)} changed
+                </span>
+              )}
+            </div>
+            <RobocopyOptionsSection
+              options={form.copyOptions}
+              mode={form.mode}
+              onChange={(copyOptions) => setForm({ ...form, copyOptions, presetId: null })}
+            />
+            <RobocopyCommandPreview
+              sourcePath={form.sourcePath}
+              destPath={form.destPath}
+              mode={form.mode}
+              filter={{
+                include_patterns: form.includePatterns
+                  ? form.includePatterns.split(",").map((x: string) => x.trim()).filter(Boolean)
+                  : [],
+                exclude_patterns: form.excludePatterns
+                  ? form.excludePatterns.split(",").map((x: string) => x.trim()).filter(Boolean)
+                  : [],
+                include_regex: [],
+                exclude_regex: [],
+                min_size: form.minSize,
+                max_size: form.maxSize,
+                file_types: [],
+                exclude_file_types: [],
+              }}
+              options={form.copyOptions}
+            />
+          </div>
         </>
       )}
 
@@ -1018,7 +1121,7 @@ function CreatePairView({
   );
 }
 
-function PreviewView({
+export function PreviewView({
   preview,
   onProceed,
   onCancel,
@@ -1032,6 +1135,9 @@ function PreviewView({
   loading: boolean;
 }) {
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
+  const [tab, setTab] = useState<"summary" | "compare">("summary");
+  const deleteCount = preview.total_deletions + (preview.dirs_to_remove?.length ?? 0);
+  const [deleteAck, setDeleteAck] = useState(false);
 
   const categories = [
     {
@@ -1086,8 +1192,26 @@ function PreviewView({
         Total: {formatBytes(preview.total_bytes)} to transfer
       </div>
 
+      <div className="flex gap-1 text-xs" role="tablist" aria-label="Preview view">
+        {(["summary", "compare"] as const).map((t) => (
+          <button
+            key={t}
+            role="tab"
+            aria-selected={tab === t}
+            onClick={() => setTab(t)}
+            className={`px-2 py-1 rounded ${
+              tab === t ? "bg-blue-500 text-white" : "bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400"
+            }`}
+          >
+            {t === "summary" ? "Summary" : "Side by side"}
+          </button>
+        ))}
+      </div>
+
+      {tab === "compare" && <SyncComparison preview={preview} />}
+
       {/* Category Summaries */}
-      <div className="space-y-1">
+      <div className={`space-y-1 ${tab === "compare" ? "hidden" : ""}`}>
         {categories.map((cat) => (
           <div key={cat.key}>
             <button
@@ -1148,11 +1272,27 @@ function PreviewView({
         </div>
       )}
 
+      {/* Deleting is the one step a sync can't quietly take back. */}
+      {deleteCount > 0 && (
+        <label className="flex items-start gap-2 p-2 rounded bg-red-50 dark:bg-red-900/20 text-xs text-red-800 dark:text-red-300">
+          <input
+            type="checkbox"
+            checked={deleteAck}
+            onChange={(e) => setDeleteAck(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            I understand {deleteCount} item{deleteCount === 1 ? "" : "s"} will be deleted from the
+            destination. You can undo this with Rollback for 7 days.
+          </span>
+        </label>
+      )}
+
       {/* Action Buttons */}
       <div className="flex gap-2 pt-2">
         <button
           onClick={onProceed}
-          disabled={loading}
+          disabled={loading || (deleteCount > 0 && !deleteAck)}
           className="flex-1 px-3 py-1.5 text-xs rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50"
         >
           {loading ? "Syncing..." : "Proceed"}
@@ -1275,6 +1415,11 @@ function ReportsView({
             </div>
             <div>Status: {report.status}</div>
             {report.resumed && <div>Resumed from interruption</div>}
+            {report.exit_code !== undefined && (
+              <div className="col-span-2" title="Robocopy-compatible exit code">
+                Exit code {report.exit_code}: {describeExitCode(report.exit_code)}
+              </div>
+            )}
           </div>
 
           {report.error_messages.length > 0 && (

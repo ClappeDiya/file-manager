@@ -64,6 +64,22 @@ impl Repository {
             .await
     }
 
+    /// Every configuration entry, sorted by key.
+    pub async fn list_config(&self) -> Result<std::collections::BTreeMap<String, String>, AppError> {
+        self.pool
+            .execute(|conn| {
+                let mut stmt = conn.prepare("SELECT key, value FROM config ORDER BY key")?;
+                let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+                let mut out = std::collections::BTreeMap::new();
+                for r in rows {
+                    let (k, v) = r?;
+                    out.insert(k, v);
+                }
+                Ok(out)
+            })
+            .await
+    }
+
     pub async fn set_config(&self, key: &str, value: &str) -> Result<(), AppError> {
         let key = key.to_string();
         let value = value.to_string();
@@ -791,7 +807,19 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
+    }
+
+    #[tokio::test]
+    async fn test_list_config_returns_every_entry_sorted() {
+        let repo = Repository::open_in_memory().await.unwrap();
+        repo.set_config("zeta", "1").await.unwrap();
+        repo.set_config("alpha", "2").await.unwrap();
+        let all = repo.list_config().await.unwrap();
+        let keys: Vec<_> = all.keys().cloned().collect();
+        assert!(keys.windows(2).all(|w| w[0] <= w[1]), "sorted");
+        assert_eq!(all.get("alpha").map(String::as_str), Some("2"));
+        assert_eq!(all.get("zeta").map(String::as_str), Some("1"));
     }
 
     #[tokio::test]

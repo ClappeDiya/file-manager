@@ -526,7 +526,7 @@ function ConnectionForm({
     try {
       const result = await tauriInvoke<SshConfigResult | null>(
         "resolve_ssh_config",
-        { host: host.trim() },
+        { hostAlias: host.trim() },
         null
       );
       if (result) {
@@ -1553,6 +1553,7 @@ export function ConnectionPanel() {
           try {
             await tauriInvoke("import_from_third_party", {
               fileContent: reader.result as string,
+              fileName: file.name,
               sourceApp: pendingImportSource,
             });
             refresh();

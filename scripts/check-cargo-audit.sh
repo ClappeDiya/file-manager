@@ -11,14 +11,9 @@
 #   any of `admin/`'s ~1500 npm dependencies. Iter 22 added the JS-side
 #   scanner; iter 30 adds the symmetric Rust-side scanner.
 #
-# Standing findings (suppressed below, see RUSTSEC_IGNORE):
-#   * RUSTSEC-2026-0098, 0099, 0104 — three bugs in
-#     `rustls-webpki 0.103.10`, all reached via
-#     `tauri 2.10.3 → reqwest → rustls-platform-verifier → rustls-webpki`.
-#     Fixed in `rustls-webpki >= 0.103.13`. Uncorrectable from this
-#     repo's Cargo.toml — only a Tauri 2.10.x patch (or 2.11) that bumps
-#     reqwest can close them. 60-day review window: re-check Tauri's
-#     release notes and bump if a patched Tauri exists.
+# Standing findings: none. (RUSTSEC-2026-0098/0099/0104 in rustls-webpki
+#     were closed by a lockfile update to 0.103.15 — the Tauri range already
+#     allowed it; no Tauri bump was needed.)
 #
 # Behaviour:
 #   * Exit 0 when every advisory is suppressed, OR when none are found,
@@ -51,15 +46,8 @@ cd "$ROOT"
 # on each entry's scheduled date.
 # ---------------------------------------------------------------------------
 RUSTSEC_IGNORE=$(cat <<'EOF'
-# rustls-webpki 0.103.10 — three TLS validation bugs. All reached only
-# through `tauri 2.10.3 → reqwest 0.13.2 → rustls-platform-verifier 0.6.2
-# → rustls-webpki 0.103.10`. Fixed in rustls-webpki >= 0.103.13.
-# Uncorrectable from this repo's Cargo.toml; the fix has to ship in a
-# Tauri release that bumps its reqwest pin. Re-check 2026-07-19 and bump
-# Tauri if a patched 2.10.x or 2.11 is out.
-RUSTSEC-2026-0098|rustls-webpki name-constraints URI bug — Tauri-transitive, fix needs Tauri reqwest bump|2026-07-19
-RUSTSEC-2026-0099|rustls-webpki name-constraints wildcard bug — Tauri-transitive, fix needs Tauri reqwest bump|2026-07-19
-RUSTSEC-2026-0104|rustls-webpki CRL parsing panic — Tauri-transitive, fix needs Tauri reqwest bump|2026-07-19
+# (none — rustls-webpki 0098/0099/0104 were closed by `cargo update` to
+# 0.103.15; add new entries as id|reason|review-by-YYYY-MM-DD)
 EOF
 )
 
