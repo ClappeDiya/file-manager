@@ -262,38 +262,173 @@ pub async fn integrity_find_duplicates(
     })
 }
 
-/// Resolve duplicates according to a strategy.
-#[tauri::command]
-pub async fn integrity_resolve_duplicates(
-    actions: Vec<DuplicateAction>,
-) -> Result<Vec<String>, AppError> {
-    let deleted = Vec::new();
+/// Result of resolving one duplicate group.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DuplicateResolution {
+    pub resolved_count: usize,
+    pub freed_bytes: u64,
+    pub kept: Option<String>,
+    pub removed: Vec<String>,
+}
 
-    for action in &actions {
-        // Re-scan to find matching group
-        // In production, groups would be cached
-        let strategy = action.strategy.as_str();
-
-        match strategy {
-            "keep-newest" | "keep-largest" | "keep-by-path" | "delete-all" => {
-                // This is a simplified implementation
-                // The frontend provides the full group data
-                if let Some(ref keep) = action.keep_path {
-                    tracing::info!(
-                        "Resolving duplicates for hash {}: keep {keep}, strategy {strategy}",
-                        action.group_hash
-                    );
-                }
-            }
-            _ => {
+/// Pick which file of a verified duplicate group survives.
+fn choose_keeper(
+    files: &[(String, u64, Option<std::time::SystemTime>)],
+    action: &str,
+    keep_path: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    match action {
+        "keep_newest" => Ok(files
+            .iter()
+            .max_by_key(|(_, _, m)| *m)
+            .map(|(p, _, _)| p.clone())),
+        "keep_largest" => Ok(files
+            .iter()
+            .max_by_key(|(_, size, _)| *size)
+            .map(|(p, _, _)| p.clone())),
+        "keep_selected" => {
+            let keep = keep_path.filter(|k| !k.is_empty()).ok_or_else(|| {
+                AppError::validation("Choose which copy to keep first.")
+            })?;
+            if !files.iter().any(|(p, _, _)| p == keep) {
                 return Err(AppError::validation(format!(
-                    "Unknown strategy: {strategy}"
+                    "\"{keep}\" is not one of the matching copies in this group."
                 )));
             }
+            Ok(Some(keep.to_string()))
+        }
+        "delete_all" => Ok(None),
+        other => Err(AppError::validation(format!("Unknown strategy: {other}"))),
+    }
+}
+
+/// Resolve one duplicate group: keep one copy (or none, for `delete_all`)
+/// and delete the rest.
+///
+/// Every file is re-hashed first and only files whose content still matches
+/// `group_hash` are touched, so a file edited since the scan is never lost.
+#[tauri::command]
+pub async fn integrity_resolve_duplicates(
+    group_hash: String,
+    action: String,
+    keep_path: Option<String>,
+    paths: Vec<String>,
+) -> Result<DuplicateResolution, AppError> {
+    tokio::task::spawn_blocking(move || {
+        resolve_duplicates_blocking(&group_hash, &action, keep_path.as_deref(), &paths)
+    })
+    .await
+    .map_err(|e| AppError::internal(format!("Duplicate resolution task failed: {e}")))?
+}
+
+fn resolve_duplicates_blocking(
+    group_hash: &str,
+    action: &str,
+    keep_path: Option<&str>,
+    paths: &[String],
+) -> Result<DuplicateResolution, AppError> {
+    let mut verified = Vec::new();
+    for p in paths {
+        let Ok(meta) = std::fs::metadata(p) else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if compute_hash(p, "sha256").map(|h| h == group_hash).unwrap_or(false) {
+            verified.push((p.clone(), meta.len(), meta.modified().ok()));
         }
     }
+    if verified.len() < 2 && action != "delete_all" {
+        return Err(AppError::validation(
+            "These files are no longer duplicates (they changed or were removed since the scan). Scan again.",
+        ));
+    }
 
-    Ok(deleted)
+    let kept = choose_keeper(&verified, action, keep_path)?;
+    let mut removed = Vec::new();
+    let mut freed_bytes = 0;
+    for (path, size, _) in &verified {
+        if Some(path) == kept.as_ref() {
+            continue;
+        }
+        std::fs::remove_file(path).map_err(|e| {
+            AppError::file_op(
+                format!("Could not delete {path}: {e}"),
+                "Check that the file isn't open elsewhere and that you can modify it.",
+            )
+        })?;
+        freed_bytes += size;
+        removed.push(path.clone());
+    }
+    Ok(DuplicateResolution {
+        resolved_count: removed.len(),
+        freed_bytes,
+        kept,
+        removed,
+    })
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    fn group(dir: &Path, names: &[&str], content: &str) -> (String, Vec<String>) {
+        let paths: Vec<String> = names
+            .iter()
+            .map(|n| {
+                let p = dir.join(n);
+                std::fs::write(&p, content).unwrap();
+                p.to_string_lossy().to_string()
+            })
+            .collect();
+        (compute_hash(&paths[0], "sha256").unwrap(), paths)
+    }
+
+    #[test]
+    fn keeps_selected_and_deletes_the_rest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (hash, paths) = group(dir.path(), &["a", "b", "c"], "same");
+        let r = resolve_duplicates_blocking(&hash, "keep_selected", Some(&paths[1]), &paths).unwrap();
+        assert_eq!(r.resolved_count, 2);
+        assert_eq!(r.freed_bytes, 8);
+        assert_eq!(r.kept.as_deref(), Some(paths[1].as_str()));
+        assert!(Path::new(&paths[1]).exists());
+        assert!(!Path::new(&paths[0]).exists() && !Path::new(&paths[2]).exists());
+    }
+
+    #[test]
+    fn never_deletes_a_file_that_changed_since_the_scan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (hash, paths) = group(dir.path(), &["a", "b", "c"], "same");
+        std::fs::write(&paths[2], "edited since scan").unwrap();
+        let r = resolve_duplicates_blocking(&hash, "keep_newest", None, &paths).unwrap();
+        assert_eq!(r.resolved_count, 1);
+        assert!(Path::new(&paths[2]).exists(), "edited file untouched");
+        assert_eq!(
+            [&paths[0], &paths[1]].iter().filter(|p| Path::new(p).exists()).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn refuses_when_no_longer_duplicates_and_validates_input() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (hash, paths) = group(dir.path(), &["a", "b"], "same");
+        assert!(resolve_duplicates_blocking(&hash, "keep_selected", None, &paths).is_err());
+        assert!(resolve_duplicates_blocking(&hash, "keep_selected", Some("/elsewhere"), &paths).is_err());
+        assert!(resolve_duplicates_blocking(&hash, "shred", None, &paths).is_err());
+        std::fs::remove_file(&paths[1]).unwrap();
+        assert!(resolve_duplicates_blocking(&hash, "keep_newest", None, &paths).is_err());
+        assert!(Path::new(&paths[0]).exists());
+    }
+
+    #[test]
+    fn delete_all_removes_every_verified_copy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (hash, paths) = group(dir.path(), &["a", "b"], "same");
+        let r = resolve_duplicates_blocking(&hash, "delete_all", None, &paths).unwrap();
+        assert_eq!(r.resolved_count, 2);
+        assert!(r.kept.is_none());
+    }
 }
 
 // ── Tag commands ──

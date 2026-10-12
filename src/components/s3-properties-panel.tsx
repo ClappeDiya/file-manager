@@ -44,12 +44,18 @@ interface S3BucketSettings {
   acceleration_enabled: boolean;
 }
 
+/** Mirrors `S3LifecycleRule` in src-tauri/src/connectors/s3.rs. */
 interface LifecycleRule {
   id: string;
   prefix: string;
-  transitions: string;
-  expiration: string;
-  status: string;
+  enabled: boolean;
+  transitions: { days: number; storage_class: string }[];
+  expiration_days: number | null;
+  abort_incomplete_multipart_days: number | null;
+}
+
+function describeTransitions(rule: LifecycleRule): string {
+  return rule.transitions.map((t) => `${t.storage_class} after ${t.days}d`).join(", ");
 }
 
 interface NewLifecycleRule {
@@ -550,14 +556,18 @@ function LifecycleRulesSection({
     setSubmitting(true);
     onError("");
     try {
-      await tauriInvoke("s3_put_lifecycle_rule", {
-        connectionId,
-        ruleId: newRule.id,
+      const rule: LifecycleRule = {
+        id: newRule.id,
         prefix: newRule.prefix,
-        transitionDays: newRule.transition_days,
-        transitionStorageClass: newRule.transition_storage_class,
-        expirationDays: newRule.expiration_days,
-      });
+        enabled: true,
+        transitions:
+          newRule.transition_days != null
+            ? [{ days: newRule.transition_days, storage_class: newRule.transition_storage_class }]
+            : [],
+        expiration_days: newRule.expiration_days,
+        abort_incomplete_multipart_days: null,
+      };
+      await tauriInvoke("s3_put_lifecycle_rule", { connectionId, rule });
       setNewRule({
         id: "",
         prefix: "",
@@ -627,17 +637,19 @@ function LifecycleRulesSection({
                       <td className="py-1 pr-2 truncate max-w-[60px]" title={rule.prefix}>
                         {rule.prefix || "*"}
                       </td>
-                      <td className="py-1 pr-2">{rule.transitions || "-"}</td>
-                      <td className="py-1 pr-2">{rule.expiration || "-"}</td>
+                      <td className="py-1 pr-2">{describeTransitions(rule) || "-"}</td>
+                      <td className="py-1 pr-2">
+                        {rule.expiration_days != null ? `${rule.expiration_days}d` : "-"}
+                      </td>
                       <td className="py-1 pr-2">
                         <span
                           className={`inline-block px-1.5 py-0.5 rounded text-xs ${
-                            rule.status === "Enabled"
+                            rule.enabled
                               ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
                               : "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400"
                           }`}
                         >
-                          {rule.status}
+                          {rule.enabled ? "Enabled" : "Disabled"}
                         </span>
                       </td>
                       <td className="py-1 text-right">
@@ -781,11 +793,10 @@ function LifecycleRulesSection({
 
 // ── CloudFront Section (advanced only) ──
 
+// CloudFront is account-wide, so this section doesn't take a connection id.
 function CloudFrontSection({
-  connectionId,
   onError,
 }: {
-  connectionId: string;
   onError: (msg: string) => void;
 }) {
   const [distributions, setDistributions] = useState<CloudFrontDistribution[]>(
@@ -802,8 +813,9 @@ function CloudFrontSection({
     setLoading(true);
     try {
       const result = await tauriInvoke<CloudFrontDistribution[]>(
+        // CloudFront is account-wide: the S3 connector's credentials decide.
         "s3_list_distributions",
-        { connectionId },
+        undefined,
         [],
       );
       setDistributions(result);
@@ -812,7 +824,7 @@ function CloudFrontSection({
     } finally {
       setLoading(false);
     }
-  }, [connectionId, onError]);
+  }, [onError]);
 
   useEffect(() => {
     fetchDistributions();
@@ -832,7 +844,6 @@ function CloudFrontSection({
     onError("");
     try {
       await tauriInvoke("s3_create_invalidation", {
-        connectionId,
         distributionId: invalidationDistId,
         paths,
       });
@@ -949,7 +960,7 @@ function FileVersionsSection({
     try {
       const result = await tauriInvoke<FileVersion[]>(
         "list_file_versions",
-        { connectionId, key: objectKey },
+        { protocol: "s3", fileId: objectKey, connectionId },
         [],
       );
       setVersions(result);
@@ -969,9 +980,10 @@ function FileVersionsSection({
     onError("");
     try {
       await tauriInvoke("restore_file_version", {
-        connectionId,
-        key: objectKey,
+        protocol: "s3",
+        fileId: objectKey,
         versionId,
+        connectionId,
       });
       await fetchVersions();
     } catch (err) {
@@ -1438,7 +1450,6 @@ export default function S3PropertiesPanel({
 
             {/* CloudFront Distributions */}
             <CloudFrontSection
-              connectionId={connectionId}
               onError={setError}
             />
           </>

@@ -37,6 +37,14 @@ pub async fn get_config(
     StorageOperations::get_config(repo.inner(), &key).await
 }
 
+/// List every configuration value (the settings viewer).
+#[tauri::command]
+pub async fn list_config(
+    repo: State<'_, Repository>,
+) -> Result<std::collections::BTreeMap<String, String>, AppError> {
+    repo.list_config().await
+}
+
 /// Set a configuration value.
 #[tauri::command]
 pub async fn set_config(

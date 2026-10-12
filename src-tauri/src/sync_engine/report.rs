@@ -155,6 +155,7 @@ mod tests {
             health: SyncHealth::Green,
             error_messages: vec![],
             resumed: false,
+            exit_code: 0,
         }
     }
 

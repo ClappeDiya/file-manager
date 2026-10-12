@@ -315,7 +315,12 @@ impl TransferHistory {
 
     /// Clean up records older than the retention period.
     pub async fn cleanup_old_records(&self) -> Result<u32, AppError> {
-        let cutoff = Utc::now() - Duration::days(self.retention_days as i64);
+        self.cleanup_older_than(self.retention_days).await
+    }
+
+    /// Delete records that started more than `days` days ago.
+    pub async fn cleanup_older_than(&self, days: u32) -> Result<u32, AppError> {
+        let cutoff = Utc::now() - Duration::days(days as i64);
         let cutoff_str = cutoff.to_rfc3339();
         self.pool
             .execute(move |conn| {
@@ -412,6 +417,29 @@ mod tests {
             speed_bps: 100000,
             eta_seconds: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_older_than_honours_the_chosen_age() {
+        let pool = setup_db().await;
+        let history = TransferHistory::new(pool);
+        let old = make_test_job(TransferStatus::Completed);
+        let recent = make_test_job(TransferStatus::Completed);
+        history
+            .record_transfer(&old, Utc::now() - Duration::days(40), Some(1), false, None, None)
+            .await
+            .unwrap();
+        history
+            .record_transfer(&recent, Utc::now() - Duration::days(5), Some(1), false, None, None)
+            .await
+            .unwrap();
+
+        // The default retention (90 days) would keep both; 30 days removes one.
+        assert_eq!(history.cleanup_old_records().await.unwrap(), 0);
+        assert_eq!(history.cleanup_older_than(30).await.unwrap(), 1);
+        let left = history.search(TransferHistoryFilter::default()).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, recent.id);
     }
 
     #[tokio::test]

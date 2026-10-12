@@ -276,7 +276,13 @@ pub async fn sync_to_disk(path: &str) -> Result<(), AppError> {
 }
 
 fn sync_to_disk_blocking(path: &str) -> Result<(), AppError> {
-    let file = std::fs::File::open(path).map_err(|e| AppError::Transfer {
+    // Windows' FlushFileBuffers needs a handle with write access; a
+    // read-only open fails with "Access denied" on every transfer.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(cfg!(windows))
+        .open(path)
+        .map_err(|e| AppError::Transfer {
         message: format!("Cannot open file for sync: {e}"),
         advice: "Check file exists.".to_string(),
     })?;

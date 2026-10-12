@@ -178,11 +178,8 @@ pub async fn execute(
                 return Ok(0);
             }
 
-            match format {
-                OutputFormat::Human => {
-                    println!("  Running sync pair '{name}'...");
-                }
-                _ => {}
+            if let OutputFormat::Human = format {
+                println!("  Running sync pair '{name}'...");
             }
 
             // Try API

@@ -59,15 +59,9 @@ cd "$ROOT"
 # Comments and empty lines are ignored.
 # ---------------------------------------------------------------------------
 GHSA_IGNORE=$(cat <<'EOF'
-# PostCSS XSS via Unescaped </style> in CSS Stringify Output.
-# Standing path: admin>next>postcss. Next.js bundles postcss as an
-# exact pin (`"postcss": "8.4.31"` in next@^15 and next@^16 as of
-# 2026-05-19), so the vulnerable version cannot be displaced by
-# bumping admin's own postcss devDep — only an upstream Next.js
-# release that bumps its bundled postcss to >=8.5.10 can close this.
-# Recheck quarterly; remove this line when `pnpm audit` no longer
-# reports it.
-GHSA-qx2v-qp2m-jg93|PostCSS XSS via Next.js transitive — Next pins postcss@8.4.31, uncorrectable here|2026-08-19
+# (none — GHSA-qx2v-qp2m-jg93, postcss via next, is closed by the
+# `next>postcss` override in pnpm-workspace.yaml; add new entries as
+# GHSA-id|reason|review-by-YYYY-MM-DD)
 EOF
 )
 

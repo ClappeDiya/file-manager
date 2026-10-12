@@ -3,8 +3,8 @@
 //! Policies: ask, source_wins, dest_wins, newest_wins,
 //!           create_conflict_copy, skip, quarantine.
 
-use crate::core::error::AppError;
-use crate::core::types::*;
+use crate::error::AppError;
+use crate::sync_types::*;
 use chrono::Utc;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -158,10 +158,7 @@ pub fn generate_conflict_path(original: &Path) -> PathBuf {
 }
 
 /// Execute the quarantine action: move the destination file to quarantine directory.
-pub fn quarantine_file(
-    dest_path: &Path,
-    quarantine_path: &Path,
-) -> Result<(), AppError> {
+pub fn quarantine_file(dest_path: &Path, quarantine_path: &Path) -> Result<(), AppError> {
     if let Some(parent) = quarantine_path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::Sync {
             message: format!("Cannot create quarantine directory: {}", e),
@@ -202,15 +199,11 @@ pub fn create_conflict_log_entry(
         ("dest_size".to_string(), dest_size.to_string()),
         (
             "source_modified".to_string(),
-            source_modified
-                .map(|t| t.to_rfc3339())
-                .unwrap_or_default(),
+            source_modified.map(|t| t.to_rfc3339()).unwrap_or_default(),
         ),
         (
             "dest_modified".to_string(),
-            dest_modified
-                .map(|t| t.to_rfc3339())
-                .unwrap_or_default(),
+            dest_modified.map(|t| t.to_rfc3339()).unwrap_or_default(),
         ),
         ("result_path".to_string(), result_path.to_string()),
     ]
@@ -328,10 +321,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.action, ConflictAction::CopyToConflictPath);
-        assert!(result
-            .resolved_path
-            .to_string_lossy()
-            .contains("(conflict"));
+        assert!(result.resolved_path.to_string_lossy().contains("(conflict"));
     }
 
     #[test]

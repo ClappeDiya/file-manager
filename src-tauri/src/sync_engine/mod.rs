@@ -10,13 +10,12 @@
 //! - Checksum verification (fast and full modes)
 //! - Partial failure continuation and resumable sync
 
-pub mod conflict;
-pub mod executor;
-pub mod planner;
 pub mod report;
-pub mod rollback;
 pub mod scheduler;
 pub mod watcher;
+
+// The engine itself lives in `ufop-core` (shared with the CLI).
+pub use ufop_core::sync::{conflict, copier, executor, planner, robocopy, rollback, winattr};
 
 use crate::core::error::AppError;
 use crate::core::traits::{BoxFuture, SyncOperations};
@@ -135,11 +134,37 @@ pub struct SyncManager {
     resume_states: Arc<RwLock<HashMap<Uuid, SyncResumeState>>>,
     watcher_mgr: Arc<watcher::WatcherManager>,
     scheduler: Arc<scheduler::SyncScheduler>,
+    /// Where rollback snapshots and quarantined files live. Always outside
+    /// every sync root, so a mirror run can never purge them.
+    state_dir: PathBuf,
+    /// Cancel flags of runs in progress, by pair.
+    running: Arc<RwLock<HashMap<Uuid, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// Latest progress of each run in progress, by pair.
+    progress: Arc<std::sync::Mutex<HashMap<Uuid, executor::SyncProgress>>>,
+}
+
+/// Default location for sync state: the app data dir, else the temp dir.
+fn default_state_dir() -> PathBuf {
+    // Unit tests must never write into the developer's real app data.
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("ufop-sync-test-{}", std::process::id()));
+    }
+    directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
+        .map(|d| d.data_dir().join("sync"))
+        .unwrap_or_else(|| std::env::temp_dir().join("ufop-sync"))
 }
 
 impl SyncManager {
     pub fn new() -> Self {
+        Self::with_state_dir(default_state_dir())
+    }
+
+    /// A manager that keeps rollback and quarantine data under `state_dir`.
+    pub fn with_state_dir(state_dir: PathBuf) -> Self {
         Self {
+            state_dir,
+            running: Arc::new(RwLock::new(HashMap::new())),
+            progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pairs: Arc::new(RwLock::new(HashMap::new())),
             reports: Arc::new(RwLock::new(HashMap::new())),
             snapshots: Arc::new(RwLock::new(HashMap::new())),
@@ -178,6 +203,31 @@ impl SyncManager {
         planner::export_preview_csv(&preview)
     }
 
+    fn rollback_root(&self, pair_id: Uuid) -> PathBuf {
+        self.state_dir.join("rollback").join(pair_id.to_string())
+    }
+
+    fn quarantine_root(&self, pair_id: Uuid) -> PathBuf {
+        self.state_dir.join("quarantine").join(pair_id.to_string())
+    }
+
+    /// Latest progress of a running sync, or `None` when it isn't running.
+    pub fn get_progress(&self, pair_id: Uuid) -> Option<executor::SyncProgress> {
+        self.progress.lock().ok().and_then(|m| m.get(&pair_id).cloned())
+    }
+
+    /// Ask a running sync to stop after the file it is copying.
+    /// Returns false when the pair isn't running.
+    pub async fn cancel_sync(&self, pair_id: Uuid) -> bool {
+        match self.running.read().await.get(&pair_id) {
+            Some(flag) => {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Execute a sync run for a pair.
     pub async fn execute_sync(&self, pair_id: Uuid) -> Result<SyncReport, AppError> {
         let pair = {
@@ -195,36 +245,27 @@ impl SyncManager {
             });
         }
 
-        let run_id = Uuid::new_v4();
+        // One run per pair at a time: two runs over the same folders would
+        // race on every file.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut running = self.running.write().await;
+            if running.contains_key(&pair_id) {
+                return Err(AppError::Sync {
+                    message: format!("\"{}\" is already syncing.", pair.name),
+                    advice: "Wait for the current run to finish, or cancel it.".to_string(),
+                });
+            }
+            running.insert(pair_id, cancel.clone());
+        }
 
-        // Check for resume state
-        let resume_from = {
-            let resume_states = self.resume_states.read().await;
-            resume_states
-                .get(&pair_id)
-                .map(|s| s.last_completed_index)
-        };
+        let result = self.run_pair(pair.clone(), cancel).await;
 
-        let quarantine_dir = PathBuf::from(&pair.dest_path)
-            .join(".sync-quarantine");
-
-        let config = executor::ExecutorConfig {
-            pair: pair.clone(),
-            run_id,
-            continue_on_error: true,
-            resume_from,
-            quarantine_dir: Some(quarantine_dir),
-            rollback_dir: None,
-        };
-
-        // Run on blocking thread
-        let config_clone = config.clone();
-        let report = tokio::task::spawn_blocking(move || executor::execute_sync(&config_clone))
-            .await
-            .map_err(|e| AppError::Sync {
-                message: format!("Sync execution task failed: {}", e),
-                advice: "Try again.".to_string(),
-            })??;
+        self.running.write().await.remove(&pair_id);
+        if let Ok(mut p) = self.progress.lock() {
+            p.remove(&pair_id);
+        }
+        let report = result?;
 
         // Update pair last_run
         {
@@ -272,6 +313,96 @@ impl SyncManager {
         }
 
         Ok(report)
+    }
+
+    /// Run the executor on a blocking thread and file away what it produced.
+    async fn run_pair(
+        &self,
+        pair: SyncPair,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<SyncReport, AppError> {
+        let pair_id = pair.id;
+        let run_id = Uuid::new_v4();
+
+        // Check for resume state
+        let resume_from = {
+            let resume_states = self.resume_states.read().await;
+            resume_states
+                .get(&pair_id)
+                .map(|s| s.last_completed_index)
+        };
+
+        let config = executor::ExecutorConfig {
+            pair: pair.clone(),
+            run_id,
+            continue_on_error: true,
+            resume_from,
+            quarantine_dir: Some(self.quarantine_root(pair_id)),
+            rollback_dir: Some(self.rollback_root(pair_id).join(run_id.to_string())),
+        };
+
+        // Rollback is only offered for 7 days; don't keep data past that.
+        if let Err(e) = rollback::cleanup_rollback_data(&self.rollback_root(pair_id), 7) {
+            tracing::warn!("Rollback cleanup failed for {pair_id}: {e}");
+        }
+
+        let progress_map = self.progress.clone();
+        let hooks = executor::RunHooks {
+            progress: Some(Arc::new(move |p: &executor::SyncProgress| {
+                if let Ok(mut m) = progress_map.lock() {
+                    m.insert(p.pair_id, p.clone());
+                }
+            })),
+            cancel: Some(cancel),
+        };
+
+        let outcome = tokio::task::spawn_blocking(move || executor::execute_sync_with(&config, &hooks))
+            .await
+            .map_err(|e| AppError::Sync {
+                message: format!("Sync execution task failed: {}", e),
+                advice: "Try again.".to_string(),
+            })??;
+
+        // Keep the newest run's snapshots so "Rollback" undoes exactly that
+        // run; older runs' snapshot folders can never be restored, so drop them.
+        if !outcome.snapshots.is_empty() {
+            let root = self.rollback_root(pair_id);
+            let keep = run_id.to_string();
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    if entry.file_name().to_string_lossy() != keep {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+            self.snapshots
+                .write()
+                .await
+                .insert(pair_id, outcome.snapshots.clone());
+        }
+        if !outcome.quarantined.is_empty() {
+            self.quarantine
+                .write()
+                .await
+                .entry(pair_id)
+                .or_default()
+                .extend(outcome.quarantined.clone());
+        }
+        if !outcome.pending_conflicts.is_empty() {
+            let mut conflicts = self.conflicts.write().await;
+            for item in &outcome.pending_conflicts {
+                // Don't queue the same unresolved file twice.
+                let exists = conflicts.iter().any(|c| {
+                    c.pair_id == item.pair_id
+                        && c.relative_path == item.relative_path
+                        && c.resolution.is_none()
+                });
+                if !exists {
+                    conflicts.push(item.clone());
+                }
+            }
+        }
+        Ok(outcome.report)
     }
 
     /// Rollback the last sync run for a pair.
@@ -401,22 +532,68 @@ impl SyncManager {
             .collect()
     }
 
-    /// Resolve a conflict manually.
+    /// Resolve a conflict manually: apply the chosen policy to the file now.
     pub async fn resolve_conflict_item(
         &self,
         conflict_id: Uuid,
         resolution: SyncConflictPolicy,
     ) -> Result<(), AppError> {
-        let mut conflicts = self.conflicts.write().await;
-        if let Some(item) = conflicts.iter_mut().find(|c| c.id == conflict_id) {
-            item.resolution = Some(resolution);
-            Ok(())
-        } else {
-            Err(AppError::Sync {
-                message: "Conflict item not found.".to_string(),
-                advice: "The conflict may have already been resolved.".to_string(),
-            })
+        let item = {
+            let conflicts = self.conflicts.read().await;
+            conflicts
+                .iter()
+                .find(|c| c.id == conflict_id && c.resolution.is_none())
+                .cloned()
+                .ok_or_else(|| AppError::Sync {
+                    message: "Conflict item not found.".to_string(),
+                    advice: "The conflict may have already been resolved.".to_string(),
+                })?
+        };
+        let pair = self
+            .pairs
+            .read()
+            .await
+            .get(&item.pair_id)
+            .cloned()
+            .ok_or_else(|| AppError::Sync {
+                message: "The sync pair for this conflict no longer exists.".to_string(),
+                advice: "Dismiss the conflict; there is nothing left to sync.".to_string(),
+            })?;
+
+        let quarantine_dir = self.quarantine_root(pair.id);
+        let rollback_dir = self.rollback_root(pair.id);
+        let item_clone = item.clone();
+        let (snapshots, quarantined) = tokio::task::spawn_blocking(move || {
+            executor::apply_manual_resolution(
+                &pair,
+                &item_clone,
+                resolution,
+                &quarantine_dir,
+                &rollback_dir,
+            )
+        })
+        .await
+        .map_err(|e| AppError::Sync {
+            message: format!("Conflict resolution task failed: {}", e),
+            advice: "Try again.".to_string(),
+        })??;
+
+        if !snapshots.is_empty() {
+            self.snapshots.write().await.insert(item.pair_id, snapshots);
         }
+        if !quarantined.is_empty() {
+            self.quarantine
+                .write()
+                .await
+                .entry(item.pair_id)
+                .or_default()
+                .extend(quarantined);
+        }
+        let mut conflicts = self.conflicts.write().await;
+        if let Some(c) = conflicts.iter_mut().find(|c| c.id == conflict_id) {
+            c.resolution = Some(resolution);
+        }
+        Ok(())
     }
 
     /// Update sync pair configuration.
@@ -516,6 +693,8 @@ impl SyncManager {
         repo.pool()
             .execute(move |conn| {
                 let filter_json = serde_json::to_string(&p.filter).unwrap_or_else(|_| "{}".into());
+                let options_json =
+                    serde_json::to_string(&p.copy_options).unwrap_or_else(|_| "{}".into());
                 // `trigger_mode` stores the discriminant and `cron_expr` the
                 // payload, matching the two columns v4 created for exactly this.
                 let cron_expr = match &p.trigger {
@@ -525,8 +704,8 @@ impl SyncManager {
                 conn.execute(
                     "INSERT INTO sync_pairs (id, name, source_path, dest_path, mode, enabled, \
                      last_run, trigger_mode, cron_expr, filter_json, conflict_policy, \
-                     verify_mode, checksum_enabled, created_at, time_offset_secs) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+                     verify_mode, checksum_enabled, created_at, time_offset_secs, options_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
                      ON CONFLICT(id) DO UPDATE SET \
                      name = excluded.name, source_path = excluded.source_path, \
                      dest_path = excluded.dest_path, mode = excluded.mode, \
@@ -536,7 +715,8 @@ impl SyncManager {
                      conflict_policy = excluded.conflict_policy, \
                      verify_mode = excluded.verify_mode, \
                      checksum_enabled = excluded.checksum_enabled, \
-                     time_offset_secs = excluded.time_offset_secs",
+                     time_offset_secs = excluded.time_offset_secs, \
+                     options_json = excluded.options_json",
                     rusqlite::params![
                         p.id.to_string(),
                         p.name,
@@ -553,6 +733,7 @@ impl SyncManager {
                         p.checksum_enabled as i32,
                         p.created_at.to_rfc3339(),
                         p.time_offset_secs,
+                        options_json,
                     ],
                 )?;
                 Ok(())
@@ -589,7 +770,7 @@ impl SyncManager {
                 let mut stmt = conn.prepare(
                     "SELECT id, name, source_path, dest_path, mode, enabled, last_run, \
                      trigger_mode, cron_expr, filter_json, conflict_policy, verify_mode, \
-                     checksum_enabled, created_at, time_offset_secs \
+                     checksum_enabled, created_at, time_offset_secs, options_json \
                      FROM sync_pairs ORDER BY created_at ASC",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -602,6 +783,7 @@ impl SyncManager {
                     let conflict_policy: String = row.get(10)?;
                     let verify_mode: String = row.get(11)?;
                     let created_at: String = row.get(13)?;
+                    let options_json: String = row.get(15)?;
 
                     Ok(SyncPair {
                         // A row we cannot parse is a row we cannot honour, but
@@ -630,6 +812,7 @@ impl SyncManager {
                             .map(|t| t.with_timezone(&Utc))
                             .unwrap_or_else(|_| Utc::now()),
                         time_offset_secs: row.get(14)?,
+                        copy_options: serde_json::from_str(&options_json).unwrap_or_default(),
                     })
                 })?;
                 let mut out = Vec::new();
@@ -790,6 +973,13 @@ mod tests {
             verify_mode: SyncVerifyMode::Full,
             checksum_enabled: true,
             time_offset_secs: Some(-42),
+            copy_options: CopyOptions {
+                threads: 8,
+                retries: 3,
+                exclude_dirs: vec!["node_modules".to_string()],
+                run_hours: "2200-0600".to_string(),
+                ..CopyOptions::default()
+            },
             filter: SyncFilter {
                 exclude_patterns: vec!["*.tmp".to_string()],
                 ..SyncFilter::default()
@@ -812,6 +1002,7 @@ mod tests {
         assert!(got.enabled);
         assert!(got.checksum_enabled);
         assert_eq!(got.time_offset_secs, Some(-42));
+        assert_eq!(got.copy_options, pair.copy_options);
         assert_eq!(got.conflict_policy.as_str(), "newest_wins");
         assert_eq!(got.verify_mode.as_str(), "full");
         assert_eq!(got.filter.exclude_patterns, vec!["*.tmp".to_string()]);
@@ -897,6 +1088,7 @@ mod tests {
             checksum_enabled: false,
             created_at: Utc::now(),
             time_offset_secs: None,
+            copy_options: CopyOptions::default(),
         }
     }
 
@@ -1096,5 +1288,157 @@ mod tests {
 
         // Original and versioned copy should both exist
         assert!(dst.path().join("doc.txt").exists());
+    }
+
+    // ── Rollback / quarantine / conflicts / progress (regressions) ──
+
+    fn temp_pair(src: &std::path::Path, dst: &std::path::Path, mode: SyncMode) -> SyncPair {
+        SyncPair {
+            name: "Regression".to_string(),
+            source_path: src.to_string_lossy().to_string(),
+            dest_path: dst.to_string_lossy().to_string(),
+            mode,
+            ..SyncPair::default()
+        }
+    }
+
+    async fn mgr_with(pair: &SyncPair) -> (SyncManager, tempfile::TempDir) {
+        let state = tempfile::TempDir::new().unwrap();
+        let mgr = SyncManager::with_state_dir(state.path().to_path_buf());
+        mgr.create_pair(pair.clone()).await.unwrap();
+        (mgr, state)
+    }
+
+    #[tokio::test]
+    async fn mirror_rollback_survives_and_restores() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        std::fs::write(dst.path().join("extra.txt"), "precious").unwrap();
+        let pair = temp_pair(src.path(), dst.path(), SyncMode::Mirror);
+        let (mgr, state) = mgr_with(&pair).await;
+
+        let report = mgr.execute_sync(pair.id).await.unwrap();
+        assert_eq!(report.files_deleted, 1);
+        // Snapshots live in the state dir, never inside the destination.
+        assert!(!dst.path().join(".sync-rollback").exists());
+        assert!(state.path().join("rollback").exists());
+
+        // A second mirror run must not destroy what rollback needs.
+        mgr.execute_sync(pair.id).await.unwrap();
+        let restored = mgr.rollback_last_run(pair.id).await.unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(std::fs::read_to_string(dst.path().join("extra.txt")).unwrap(), "precious");
+    }
+
+    #[tokio::test]
+    async fn mirror_never_purges_internal_folders_or_partials() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dst.path().join(".sync-rollback/old-run")).unwrap();
+        std::fs::write(dst.path().join(".sync-rollback/old-run/a.txt"), "snap").unwrap();
+        std::fs::write(dst.path().join("big.bin.ufop-partial"), "half").unwrap();
+        let pair = temp_pair(src.path(), dst.path(), SyncMode::Mirror);
+        let (mgr, _state) = mgr_with(&pair).await;
+        let report = mgr.execute_sync(pair.id).await.unwrap();
+        assert_eq!(report.files_deleted, 0);
+        assert!(dst.path().join(".sync-rollback/old-run/a.txt").exists());
+        assert!(dst.path().join("big.bin.ufop-partial").exists());
+    }
+
+    fn make_two_way_conflict(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::write(src.join("doc.txt"), "source version, longer").unwrap();
+        std::fs::write(dst.join("doc.txt"), "dest version").unwrap();
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        copier::set_mtime(&dst.join("doc.txt"), t);
+    }
+
+    #[tokio::test]
+    async fn ask_conflicts_are_queued_and_resolution_is_applied() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        make_two_way_conflict(src.path(), dst.path());
+        let mut pair = temp_pair(src.path(), dst.path(), SyncMode::TwoWay);
+        pair.conflict_policy = SyncConflictPolicy::Ask;
+        let (mgr, _state) = mgr_with(&pair).await;
+
+        mgr.execute_sync(pair.id).await.unwrap();
+        let pending = mgr.get_pending_conflicts().await;
+        assert_eq!(pending.len(), 1);
+        // Re-running doesn't queue the same file twice.
+        mgr.execute_sync(pair.id).await.unwrap();
+        assert_eq!(mgr.get_pending_conflicts().await.len(), 1);
+
+        mgr.resolve_conflict_item(pending[0].id, SyncConflictPolicy::SourceWins)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("doc.txt")).unwrap(),
+            "source version, longer"
+        );
+        assert!(mgr.get_pending_conflicts().await.is_empty());
+        // The overwrite can be undone.
+        assert_eq!(mgr.rollback_last_run(pair.id).await.unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(dst.path().join("doc.txt")).unwrap(), "dest version");
+    }
+
+    #[tokio::test]
+    async fn quarantine_entries_are_recorded_outside_destination() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        make_two_way_conflict(src.path(), dst.path());
+        let mut pair = temp_pair(src.path(), dst.path(), SyncMode::TwoWay);
+        pair.conflict_policy = SyncConflictPolicy::Quarantine;
+        let (mgr, state) = mgr_with(&pair).await;
+        mgr.execute_sync(pair.id).await.unwrap();
+        let q = mgr.get_quarantine(pair.id).await;
+        assert_eq!(q.len(), 1);
+        assert!(q[0].quarantine_path.starts_with(&*state.path().to_string_lossy()));
+        assert!(!dst.path().join(".sync-quarantine").exists());
+    }
+
+    #[tokio::test]
+    async fn cancel_and_progress_and_single_run() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        for i in 0..5 {
+            std::fs::write(src.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let pair = temp_pair(src.path(), dst.path(), SyncMode::OneWay);
+        let (mgr, _state) = mgr_with(&pair).await;
+        assert!(!mgr.cancel_sync(pair.id).await, "nothing running yet");
+        assert!(mgr.get_progress(pair.id).is_none());
+
+        // A pre-set cancel flag stops the run before any file is copied.
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        mgr.running.write().await.insert(pair.id, flag.clone());
+        assert!(mgr.execute_sync(pair.id).await.is_err(), "second run is refused");
+        mgr.running.write().await.remove(&pair.id);
+        let report = mgr.run_pair(pair.clone(), flag).await.unwrap();
+        assert_eq!(report.status, SyncRunStatus::Cancelled);
+        assert_eq!(report.files_added, 0);
+
+        // A normal run reports progress with the right totals.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let config = executor::ExecutorConfig {
+            pair: pair.clone(),
+            run_id: Uuid::new_v4(),
+            continue_on_error: true,
+            resume_from: None,
+            quarantine_dir: None,
+            rollback_dir: None,
+        };
+        let hooks = executor::RunHooks {
+            progress: Some(Arc::new(move |p: &executor::SyncProgress| {
+                seen2.lock().unwrap().push(p.clone());
+            })),
+            cancel: None,
+        };
+        let outcome = executor::execute_sync_with(&config, &hooks).unwrap();
+        assert_eq!(outcome.report.files_added, 5);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.first().unwrap().phase, "planning");
+        assert_eq!(seen.last().unwrap().phase, "finishing");
+        assert!(seen.iter().any(|p| p.files_total == 5 && p.files_done == 5));
     }
 }

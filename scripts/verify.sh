@@ -23,6 +23,11 @@
 #   3. ipc-verify    scripts/dump-ipc-commands.sh    — Tauri IPC contract (both
 #                                                       directions: Rust handler
 #                                                       ↔ frontend tauriInvoke)
+#   3b. ipc-args     scripts/check-ipc-args.sh       — tauriInvoke argument
+#                                                       NAMES ↔ the Rust
+#                                                       command's parameters
+#                                                       (missing required /
+#                                                       unknown keys)
 #   4. appstate      scripts/check-appstate.sh       — AppState fields ↔
 #                                                       .manage() wiring
 #   5. tauri-config  scripts/check-tauri-config.sh   — release-readiness sanity
@@ -143,10 +148,24 @@
 #                                                       supplies an
 #                                                       explicit <T> type
 #                                                       arg (iter 34)
-#  28. test          pnpm test                       — Vitest (frontend, ~44 files)
+#  28. test          pnpm test                       — Vitest (frontend, ~49 files)
 #  29. cargo         cargo check --workspace         — Rust type-check
-#  30. cargo-test    cargo test --lib                — Rust unit tests
-#  31. build         pnpm build                      — Vite production bundle
+#  30. clippy        cargo clippy --all-targets -D warnings
+#                                                    — desktop crate lints
+#  31. core          crates/ufop-core: clippy -D warnings + cargo test
+#                                                    — shared sync/copy engine
+#  32. cli           cli: clippy -D warnings + cargo test
+#                                                    — `ufop` CLI
+#  33. cargo-test    cargo test                      — Rust unit + integration
+#                                                       (tests/journey_*) +
+#                                                       doc tests
+#  34. win-check     cargo clippy --target x86_64-pc-windows-gnu
+#                                                    — Windows-only code
+#                                                       (#[cfg(windows)]) never
+#                                                       compiles on macOS/Linux;
+#                                                       skipped when the target
+#                                                       isn't installed
+#  35. build         pnpm build                      — Vite production bundle
 #
 # Stages 3–19 are sub-second-to-~1s source-text/registry checks. They
 # catch silent runtime failures (typo'd `tauriInvoke<T>("name")` callsites,
@@ -184,7 +203,7 @@ while [[ $# -gt 0 ]]; do
     --ci) CI_MODE=true; shift ;;
     --only) ONLY="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,135p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "Unknown arg: $1 (try --help)"; exit 2 ;;
@@ -218,7 +237,7 @@ run_stage() {
     STAGE_NAMES+=("$name"); STAGE_STATUS+=("skip"); STAGE_SECONDS+=("0")
     return
   fi
-  if [[ "$FAST" == true && ( "$name" == "cargo-test" || "$name" == "build" ) ]]; then
+  if [[ "$FAST" == true && ( "$name" == "cargo-test" || "$name" == "build" || "$name" == "win-check" ) ]]; then
     printf '%b==> %s%b %s(skipped in --fast)%s\n' "$C_BOLD" "$name" "$C_RESET" "$C_DIM" "$C_RESET"
     STAGE_NAMES+=("$name"); STAGE_STATUS+=("skip"); STAGE_SECONDS+=("0")
     return
@@ -251,6 +270,7 @@ run_stage() {
 run_stage "lint"         "pnpm lint"
 run_stage "typecheck"    "pnpm exec tsc --noEmit"
 run_stage "ipc-verify"   "bash scripts/dump-ipc-commands.sh --verify"
+run_stage "ipc-args"     "bash scripts/check-ipc-args.sh"
 run_stage "appstate"     "bash scripts/check-appstate.sh"
 run_stage "tauri-config" "bash scripts/check-tauri-config.sh"
 run_stage "migrations"   "bash scripts/check-migrations.sh"
@@ -277,7 +297,11 @@ run_stage "env-example"  "bash scripts/check-env-example-drift.sh"
 run_stage "invoke-types" "bash scripts/check-tauri-invoke-types.sh"
 run_stage "test"         "pnpm test"
 run_stage "cargo"        "cd src-tauri && cargo check --workspace"
-run_stage "cargo-test"   "cd src-tauri && cargo test --lib"
+run_stage "clippy"       "cd src-tauri && cargo clippy --all-targets -- -D warnings"
+run_stage "core"         "cd crates/ufop-core && cargo clippy --all-targets -- -D warnings && cargo test"
+run_stage "cli"          "cd cli && cargo clippy --all-targets -- -D warnings && cargo test"
+run_stage "cargo-test"   "cd src-tauri && cargo test"
+run_stage "win-check"    "bash scripts/check-windows-build.sh"
 run_stage "build"        "pnpm build"
 
 # ---------------------------------------------------------------------------

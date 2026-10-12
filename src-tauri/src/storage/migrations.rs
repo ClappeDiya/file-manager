@@ -72,8 +72,19 @@ fn all_migrations() -> Vec<Migration> {
             description: "Operation Ledger - unified append-only event store across all engines",
             sql: V11_SCHEMA,
         },
+        Migration {
+            version: 12,
+            description: "Sync pairs - Robocopy-equivalent copy options",
+            sql: V12_SCHEMA,
+        },
     ]
 }
+
+/// Schema v12: per-pair Robocopy-equivalent copy options, stored as JSON so
+/// new options never need another column. `{}` deserializes to the defaults.
+const V12_SCHEMA: &str = r#"
+ALTER TABLE sync_pairs ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}';
+"#;
 
 /// Schema v11: Operation Ledger - unified append-only event store across all engines.
 ///
@@ -658,7 +669,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 11);
+        assert_eq!(applied, 12);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -688,7 +699,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 11);
+        assert_eq!(first, 12);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -701,7 +712,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 11);
+        assert_eq!(current_version(&conn).unwrap(), 12);
     }
 
     #[test]

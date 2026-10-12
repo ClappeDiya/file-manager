@@ -47,6 +47,10 @@ Frontend communicates with Rust via Tauri IPC commands. Every backend operation 
 - **Fallback**: `tauriInvokeSafe<T>()` never throws — returns fallback value when outside Tauri (enables browser testing)
 - **Detection**: `isTauriAvailable()` checks for `__TAURI__` in window
 
+### Shared engine (`crates/ufop-core/`)
+
+The sync/copy engine (planner, Robocopy-compatible copier and parser, executor, rollback, conflicts, Windows attributes/ACLs), the sync data types and `AppError` live here, with no GUI dependencies. `src-tauri` re-exports them (`crate::core::error`, `crate::core::types`, `crate::sync_engine::{planner, copier, …}`), and the `ufop` CLI (`cli/`) uses them for `ufop copy`. Test with `cd crates/ufop-core && cargo test`.
+
 ### Rust Backend (`src-tauri/src/`)
 
 **Module registration**: Every engine module must be declared as `pub mod` in `lib.rs`.

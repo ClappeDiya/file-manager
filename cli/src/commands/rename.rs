@@ -5,7 +5,7 @@ use crate::OutputFormat;
 use serde::Serialize;
 use std::path::Path;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct RenamePreview {
     original: String,
     renamed: String,
@@ -20,6 +20,7 @@ struct RenameReport {
     previews: Vec<RenamePreview>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     path: String,
     pattern: Option<String>,
@@ -243,26 +244,20 @@ pub async fn execute(
             }
         }
 
-        match format {
-            OutputFormat::Human => {
-                println!();
-                output::print_success(
-                    format,
-                    &format!("{success_count} file(s) renamed, {fail_count} failed"),
-                );
-            }
-            _ => {}
+        if let OutputFormat::Human = format {
+            println!();
+            output::print_success(
+                format,
+                &format!("{success_count} file(s) renamed, {fail_count} failed"),
+            );
         }
 
         if fail_count > 0 {
             return Ok(1); // Partial failure
         }
     } else if dry_run {
-        match format {
-            OutputFormat::Human => {
-                println!("\n  [dry-run] No files were renamed\n");
-            }
-            _ => {}
+        if let OutputFormat::Human = format {
+            println!("\n  [dry-run] No files were renamed\n");
         }
     }
 

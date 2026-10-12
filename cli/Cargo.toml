@@ -11,22 +11,25 @@ name = "ufop"
 path = "src/main.rs"
 
 [dependencies]
+# Same sync/copy engine as the desktop app (Robocopy-compatible `ufop copy`).
+ufop-core = { path = "../crates/ufop-core" }
 clap = { version = "4", features = ["derive", "env", "color"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "native-tls"] }
-indicatif = "0.17"
-console = "0.15"
-dialoguer = "0.11"
+indicatif = "0.18"
 dirs = "6"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-colored = "3"
-tabled = "0.17"
 regex = "1"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

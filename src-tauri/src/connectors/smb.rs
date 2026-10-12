@@ -256,7 +256,9 @@ impl SmbConnector {
         password: Option<&str>,
         config: &SmbConfig,
     ) -> Command {
-        let _smb_path = format!("//{host}/{share}");
+        // Only the Linux branch uses the plain share path.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let smb_path = format!("//{host}/{share}");
 
         #[cfg(target_os = "macos")]
         {
@@ -705,16 +707,26 @@ impl SmbConnector {
 
             #[cfg(target_os = "windows")]
             {
+                // `net view` has no credential options: authenticate an IPC$
+                // session first, list, then drop the session again.
+                let ipc = format!("\\\\{host}\\IPC$");
+                let authenticated = match (&username, &password) {
+                    (Some(user), Some(pass)) => Command::new("net")
+                        .args(["use", &ipc, pass, &format!("/user:{user}")])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false),
+                    _ => false,
+                };
+
                 let mut cmd = Command::new("net");
                 cmd.arg("view").arg(format!("\\\\{host}"));
 
-                if let (Some(user), Some(pass)) = (&username, &password) {
-                    cmd.arg(format!("/user:{user}"));
-                    // Windows net view doesn't accept password directly;
-                    // the session must already be authenticated.
+                let listed = cmd.output();
+                if authenticated {
+                    let _ = Command::new("net").args(["use", &ipc, "/delete", "/y"]).output();
                 }
-
-                match cmd.output() {
+                match listed {
                     Ok(out) => {
                         let stdout = String::from_utf8_lossy(&out.stdout);
                         for line in stdout.lines() {
@@ -971,6 +983,7 @@ impl Connector for SmbConnector {
 // ──────────────────────────────────────────────
 
 /// URL-encode a string for SMB URLs.
+#[cfg(any(target_os = "macos", test))]
 fn urlencoded(s: &str) -> String {
     s.replace('%', "%25")
         .replace(' ', "%20")

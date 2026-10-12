@@ -2,3 +2,9 @@ packages:
   - "packages/*"
   - "admin"
   - "marketing"
+
+# Security overrides for transitive dependencies we can't bump directly.
+# next@15 pins postcss 8.4.31 exactly (GHSA-qx2v-qp2m-jg93 and friends,
+# fixed in 8.5.10); 8.5 is a drop-in for Next's internal CSS pipeline.
+overrides:
+  "next>postcss": "^8.5.10"

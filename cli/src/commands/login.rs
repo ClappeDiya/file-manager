@@ -12,7 +12,7 @@ pub async fn execute(
     let mut config = CliConfig::load();
 
     // Set server URL if provided
-    if let Some(url) = server {
+    if let Some(url) = &server {
         config.api_url = Some(url.clone());
         output::print_success(format, &format!("API server set to {url}"));
     }

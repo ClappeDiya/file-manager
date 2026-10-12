@@ -303,6 +303,7 @@ export function DeviceSidebar({
     const source = drives.find((d) => d.drive_type === "internal" && !d.removable);
     if (!source) return;
     setPreflightDrive(drive.device);
+    // Check the destination can take everything on the source drive.
     const result = await handlePreflight(source.mount_point, drive.mount_point, source.used_bytes);
     setPreflightResult(result);
   }, [drives, handlePreflight]);
