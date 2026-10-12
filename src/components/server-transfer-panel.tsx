@@ -14,6 +14,7 @@
  */
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import { errorText } from "@/lib/error-text";
 
 // ── Types (mirrors Rust types) ──
 
@@ -128,7 +129,7 @@ function CreateTransferForm({
       setPreview(result);
     } catch (err) {
       console.error("Preview failed:", err);
-      setError(err instanceof Error ? err.message : "Preview failed");
+      setError(errorText(err, "Preview failed"));
     } finally {
       setPreviewLoading(false);
     }
@@ -174,7 +175,7 @@ function CreateTransferForm({
         onCreated();
       } catch (err) {
         console.error("Create failed:", err);
-        setError(err instanceof Error ? err.message : "Create failed");
+        setError(errorText(err, "Create failed"));
       } finally {
         setCreating(false);
       }

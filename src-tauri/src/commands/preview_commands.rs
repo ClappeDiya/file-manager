@@ -44,6 +44,7 @@ pub enum PreviewType {
     Archive,
     Exif,
     Binary,
+    Directory,
     TooLarge,
     Unsupported,
 }
@@ -259,6 +260,22 @@ pub async fn preview_file(path: String) -> Result<PreviewResult, AppError> {
         },
         exif: None,
     };
+
+    // Directories: list the immediate children instead of hex-dumping nothing.
+    if meta.is_dir() {
+        let listing = list_directory_preview(file_path);
+        return Ok(PreviewResult {
+            path,
+            file_name,
+            file_size: 0,
+            mime_type: "inode/directory".into(),
+            preview_type: PreviewType::Directory,
+            content: Some(listing),
+            metadata: file_meta,
+            is_metadata_only: false,
+            render_hint: "directory".into(),
+        });
+    }
 
     // Large file: metadata only
     if file_size > METADATA_ONLY_SIZE {
@@ -506,6 +523,37 @@ fn read_jpeg_dimensions(path: &str) -> Result<(Option<u32>, Option<u32>), AppErr
     Ok((None, None))
 }
 
+const DIR_PREVIEW_MAX_ENTRIES: usize = 200;
+
+/// One entry per line (folders first, suffixed with `/`), capped, with a
+/// trailing summary line when truncated or empty.
+fn list_directory_preview(dir: &Path) -> String {
+    let mut names: Vec<(bool, String)> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                (is_dir, e.file_name().to_string_lossy().to_string())
+            })
+            .collect(),
+        Err(e) => return format!("(cannot read folder: {e})"),
+    };
+    if names.is_empty() {
+        return "(empty folder)".into();
+    }
+    names.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+    let total = names.len();
+    let mut out: Vec<String> = names
+        .into_iter()
+        .take(DIR_PREVIEW_MAX_ENTRIES)
+        .map(|(d, n)| if d { format!("{n}/") } else { n })
+        .collect();
+    if total > DIR_PREVIEW_MAX_ENTRIES {
+        out.push(format!("… and {} more", total - DIR_PREVIEW_MAX_ENTRIES));
+    }
+    out.join("\n")
+}
+
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -518,5 +566,27 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn preview_of_directory_lists_children_not_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let r = preview_file(dir.path().to_string_lossy().to_string()).await.unwrap();
+        assert!(matches!(r.preview_type, PreviewType::Directory));
+        assert_eq!(r.content.as_deref(), Some("sub/\na.txt"));
+    }
+
+    #[tokio::test]
+    async fn preview_of_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = preview_file(dir.path().to_string_lossy().to_string()).await.unwrap();
+        assert_eq!(r.content.as_deref(), Some("(empty folder)"));
     }
 }

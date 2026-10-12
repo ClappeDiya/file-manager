@@ -27,12 +27,77 @@ use crate::core::types::{
     TransferJob, TransferPriority, TransferProgress, TransferStatus, VerifyTier,
 };
 use crate::storage::pool::DbPool;
+use crate::transfer_engine::history::TransferHistory;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{watch, Mutex, Notify, RwLock};
 use uuid::Uuid;
+
+/// Cooperative pause/cancel signal for a running transfer job.
+///
+/// Workers check it at chunk boundaries; `Notify` wakes them on resume or
+/// cancel. Created once per job (lazily via [`TransferManager::control`]) so
+/// signalling a job that has not started yet still lands.
+#[derive(Debug, Default)]
+pub struct JobControl {
+    cancelled: AtomicBool,
+    paused: AtomicBool,
+    notify: Notify,
+}
+
+impl JobControl {
+    /// Cancel the transfer. Also clears pause so parked workers wake up.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.paused.store(false, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    /// Hold the transfer at the next chunk boundary.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Resume a paused transfer.
+    pub fn unpause(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    /// Clear both flags — required when a job is re-queued (retry), so flags
+    /// from its previous run don't abort the new one.
+    pub fn reset(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.cancelled.store(false, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Park until unpaused. Callers must check `is_cancelled` after this
+    /// returns — cancel wakes paused workers too.
+    pub async fn wait_if_paused(&self) {
+        loop {
+            if !self.paused.load(Ordering::SeqCst) {
+                return;
+            }
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register the waiter before re-checking the flag so a pause→resume
+            // flip between check and await can't be missed.
+            notified.as_mut().enable();
+            if !self.paused.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 /// Post-transfer completion actions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +159,19 @@ pub struct TransferManager {
     worker_pool: Arc<WorkerPool>,
     /// Transfer journal for crash recovery (Option: set after DB init)
     journal: Arc<RwLock<Option<TransferJournal>>>,
+
+    /// Cooperative pause/cancel signals, one per job.
+    controls: Arc<RwLock<HashMap<Uuid, Arc<JobControl>>>>,
+
+    /// Jobs with a live executor task — guards against double-runs when a
+    /// mid-flight-paused job is resumed (which re-spawns a runner).
+    executors: Arc<Mutex<HashSet<Uuid>>>,
+
+    /// Transfer history sink (Option: set after DB init, same as the journal).
+    /// Every job that reaches a terminal status gets recorded so the
+    /// Transfer History panel reflects real executions — without this the
+    /// panel could only ever render "No transfer history".
+    history: Arc<RwLock<Option<TransferHistory>>>,
 }
 
 impl TransferManager {
@@ -114,7 +192,195 @@ impl TransferManager {
             config: Arc::new(RwLock::new(config)),
             worker_pool: Arc::new(worker_pool),
             journal: Arc::new(RwLock::new(None)),
+            controls: Arc::new(RwLock::new(HashMap::new())),
+            executors: Arc::new(Mutex::new(HashSet::new())),
+            history: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Attach the history sink. Called once from app init, right after the
+    /// journal — the DB pool exists by then in both init paths.
+    pub async fn set_history(&self, history: TransferHistory) {
+        *self.history.write().await = Some(history);
+    }
+
+    /// Get the pause/cancel control for a job, creating it if needed.
+    pub async fn control(&self, job_id: Uuid) -> Arc<JobControl> {
+        self.controls
+            .write()
+            .await
+            .entry(job_id)
+            .or_insert_with(|| Arc::new(JobControl::default()))
+            .clone()
+    }
+
+    /// Spawn the executor task for a queued job unless one is already alive.
+    /// Called by the enqueue command and by resume (a paused-before-start job
+    /// has no executor left, so resume must start one).
+    pub async fn spawn_runner(&self, job_id: Uuid) {
+        {
+            let mut set = self.executors.lock().await;
+            if !set.insert(job_id) {
+                return;
+            }
+        }
+        let runner = self.clone();
+        tokio::spawn(async move {
+            runner.run_local_job(job_id).await;
+            runner.executors.lock().await.remove(&job_id);
+        });
+    }
+
+    /// Execute a queued local-file job through the three-layer pipeline
+    /// (chunked copy, checksum verification, journal) and record the outcome.
+    ///
+    /// Remote endpoints are not handled here; they go through the connector
+    /// commands. Existing destinations are never overwritten: such jobs fail
+    /// with an explanation instead.
+    pub async fn run_local_job(&self, job_id: Uuid) {
+        let started_at = Utc::now();
+        let started = std::time::Instant::now();
+        if let Err(message) = self.run_local_job_inner(job_id).await {
+            // A cancelled job already has its final status — don't overwrite it.
+            if !self.control(job_id).await.is_cancelled() {
+                let _ = self.fail_job(job_id, &message).await;
+            }
+        }
+        self.record_history(job_id, started_at, started.elapsed()).await;
+    }
+
+    /// Write a terminal-state job to transfer history. Completed, failed and
+    /// cancelled executions all belong in the audit trail; anything still
+    /// mid-flight (queued/active/paused — possible when a runner exits early
+    /// on a job that was never really started) is skipped.
+    async fn record_history(
+        &self,
+        job_id: Uuid,
+        started_at: chrono::DateTime<Utc>,
+        elapsed: std::time::Duration,
+    ) {
+        let Some(history) = self.history.read().await.clone() else {
+            return;
+        };
+        let Some(job) = self.jobs.read().await.get(&job_id).cloned() else {
+            return;
+        };
+        if !matches!(
+            job.status,
+            TransferStatus::Completed | TransferStatus::Failed | TransferStatus::Cancelled
+        ) {
+            return;
+        }
+        let checksum_match = match (&job.source_checksum, &job.dest_checksum) {
+            (Some(src), Some(dst)) => Some(src == dst),
+            _ => None,
+        };
+        let _ = history
+            .record_transfer(
+                &job,
+                started_at,
+                Some(elapsed.as_millis() as u64),
+                job.verify_checksum,
+                checksum_match,
+                None,
+            )
+            .await;
+    }
+
+    async fn run_local_job_inner(&self, job_id: Uuid) -> Result<(), String> {
+        let control = self.control(job_id).await;
+        let (source, dest) = {
+            let mut map = self.jobs.write().await;
+            let job = map.get_mut(&job_id).ok_or_else(|| "Transfer job not found".to_string())?;
+            if job.status != TransferStatus::Queued {
+                return Ok(());
+            }
+            job.status = TransferStatus::Active;
+            job.updated_at = Utc::now();
+            (job.source_path.clone(), job.dest_path.clone())
+        };
+        if control.is_cancelled() {
+            return Ok(());
+        }
+
+        let meta = tokio::fs::metadata(&source)
+            .await
+            .map_err(|e| format!("Cannot read source {source}: {e}. For remote servers use the Connections panel."))?;
+        if !meta.is_file() {
+            return Err(format!("{source} is a folder; the queue transfers single files."));
+        }
+        // The queue runner is strictly local→local. A remote-looking
+        // destination (sftp://, webdav://, …) used to fall through to
+        // create_dir_all and would even materialise a literal "sftp:"
+        // directory on disk. Remote transfers go through the connector
+        // commands, so reject these up front.
+        if dest.contains("://") {
+            return Err(format!(
+                "{dest} is a remote destination; the queue only transfers to local paths. Use the Connections panel."
+            ));
+        }
+        let size = meta.len();
+
+        // A destination that is (or ends like) a directory receives the source's file name.
+        let dest_is_dir = dest.ends_with('/') || tokio::fs::metadata(&dest).await.map(|m| m.is_dir()).unwrap_or(false);
+        let dest_file = if dest_is_dir {
+            let name = std::path::Path::new(&source)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .ok_or_else(|| "Source has no file name".to_string())?;
+            format!("{}/{}", dest.trim_end_matches('/'), name)
+        } else {
+            dest.clone()
+        };
+        if tokio::fs::metadata(&dest_file).await.is_ok() {
+            return Err(format!("{dest_file} already exists; it was not overwritten."));
+        }
+        if let Some(parent) = std::path::Path::new(&dest_file).parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("Cannot create destination folder: {e}"))?;
+        }
+
+        {
+            let mut map = self.jobs.write().await;
+            if let Some(job) = map.get_mut(&job_id) {
+                job.total_bytes = size;
+                job.dest_path = dest_file.clone();
+            }
+        }
+
+        let journal = self
+            .try_journal()
+            .await
+            .ok_or_else(|| "Transfer journal is not ready yet; try again in a moment.".to_string())?;
+        let config = self.config().await;
+        let tier = config.default_verify_tier;
+        let result = pipeline::execute_file_transfer(
+            &source,
+            &dest_file,
+            size,
+            tier,
+            &config,
+            &journal,
+            self.worker_pool(),
+            &job_id.to_string(),
+            None,
+            Some(control),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let _ = self.update_progress(job_id, result.file_size, result.speed_bps).await;
+        // Persist the pipeline's verified hashes on the job so history can
+        // report whether source and destination actually matched.
+        let _ = self
+            .set_job_checksums(
+                job_id,
+                Some(result.source_hash),
+                Some(result.dest_hash),
+            )
+            .await;
+        self.complete_job(job_id).await.map_err(|e| e.to_string())
     }
 
     /// Initialize the journal backend. Must be called after DB is available.
@@ -405,6 +671,11 @@ impl TransferManager {
             job.error_message = None;
         }
         job.updated_at = Utc::now();
+        drop(map);
+        if can_retry {
+            // A cancelled/failed job's control may still carry stale flags.
+            self.control(job_id).await.reset();
+        }
         Ok(can_retry)
     }
 
@@ -424,20 +695,26 @@ impl TransferManager {
         Ok(std::time::Duration::from_secs(secs))
     }
 
-    pub async fn retry_all_failed(&self) -> Result<u32, AppError> {
+    /// Re-queue every failed job that still has retries left. Returns the
+    /// re-queued job ids so the caller can spawn runners for them.
+    pub async fn retry_all_failed(&self) -> Result<Vec<Uuid>, AppError> {
         let policy = self.retry_policy.read().await.clone();
         let mut map = self.jobs.write().await;
-        let mut count = 0u32;
+        let mut requeued = Vec::new();
         for job in map.values_mut() {
             if job.status == TransferStatus::Failed && job.retry_count < policy.max_retries {
                 job.status = TransferStatus::Queued;
                 job.error_message = None;
                 job.retry_count += 1;
                 job.updated_at = Utc::now();
-                count += 1;
+                requeued.push(job.id);
             }
         }
-        Ok(count)
+        drop(map);
+        for id in &requeued {
+            self.control(*id).await.reset();
+        }
+        Ok(requeued)
     }
 
     pub async fn list_failed_jobs(&self) -> Result<Vec<TransferJob>, AppError> {
@@ -554,6 +831,10 @@ impl TransferOperations for TransferManager {
 
             let mut map = self.jobs.write().await;
             map.insert(job.id, job.clone());
+            drop(map);
+            // Create its control eagerly so pause/cancel before the executor
+            // starts still land.
+            let _ = self.control(job.id).await;
             tracing::info!("Transfer enqueued: {}", job.id);
             Ok(job)
         })
@@ -566,6 +847,13 @@ impl TransferOperations for TransferManager {
                 message: format!("Transfer job {job_id} not found."),
                 advice: "The transfer may have already completed or been removed.".to_string(),
             })?;
+            // Pausing a finished job must not corrupt its status.
+            if !matches!(
+                job.status,
+                TransferStatus::Queued | TransferStatus::Active
+            ) {
+                return Ok(());
+            }
             job.status = TransferStatus::Paused;
             job.updated_at = Utc::now();
             job.speed_bps = 0;
@@ -580,20 +868,32 @@ impl TransferOperations for TransferManager {
                 status: TransferStatus::Paused,
                 error_message: None,
             };
+            drop(map);
             let _ = self.progress_tx.send(Some(progress));
+            self.control(job_id).await.pause();
             Ok(())
         })
     }
 
     fn resume(&self, job_id: Uuid) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
-            let mut map = self.jobs.write().await;
-            let job = map.get_mut(&job_id).ok_or_else(|| AppError::Transfer {
-                message: format!("Transfer job {job_id} not found."),
-                advice: "The transfer may have already completed or been removed.".to_string(),
-            })?;
-            job.status = TransferStatus::Queued;
-            job.updated_at = Utc::now();
+            {
+                let mut map = self.jobs.write().await;
+                let job = map.get_mut(&job_id).ok_or_else(|| AppError::Transfer {
+                    message: format!("Transfer job {job_id} not found."),
+                    advice: "The transfer may have already completed or been removed.".to_string(),
+                })?;
+                if job.status != TransferStatus::Paused {
+                    return Ok(());
+                }
+                job.status = TransferStatus::Queued;
+                job.updated_at = Utc::now();
+            }
+            self.control(job_id).await.unpause();
+            // A job paused before its executor started has no live runner, so
+            // resume must spawn one. Mid-flight pauses keep theirs; the
+            // executor-slot guard makes this a no-op then.
+            self.spawn_runner(job_id).await;
             Ok(())
         })
     }
@@ -605,6 +905,13 @@ impl TransferOperations for TransferManager {
                 message: format!("Transfer job {job_id} not found."),
                 advice: "The transfer may have already completed or been removed.".to_string(),
             })?;
+            // Cancelling a finished job must not corrupt its status.
+            if matches!(
+                job.status,
+                TransferStatus::Completed | TransferStatus::Failed | TransferStatus::Cancelled
+            ) {
+                return Ok(());
+            }
             job.status = TransferStatus::Cancelled;
             job.updated_at = Utc::now();
             job.speed_bps = 0;
@@ -619,7 +926,11 @@ impl TransferOperations for TransferManager {
                 status: TransferStatus::Cancelled,
                 error_message: None,
             };
+            drop(map);
             let _ = self.progress_tx.send(Some(progress));
+            // Signal the running executor: parked workers wake, in-flight
+            // chunks stop at the next boundary.
+            self.control(job_id).await.cancel();
             Ok(())
         })
     }
@@ -675,11 +986,18 @@ mod tests {
         assert_eq!(j.status, TransferStatus::Paused);
 
         mgr.resume(job.id).await.unwrap();
+        // Resume now actually re-runs the job: it must have left Paused, and
+        // may already be Active or Failed ("/a" does not exist).
         let j = mgr.get_job(job.id).await.unwrap().unwrap();
-        assert_eq!(j.status, TransferStatus::Queued);
+        assert!(matches!(
+            j.status,
+            TransferStatus::Queued | TransferStatus::Active | TransferStatus::Failed
+        ));
 
-        mgr.cancel(job.id).await.unwrap();
-        let j = mgr.get_job(job.id).await.unwrap().unwrap();
+        // Cancel a job with no live executor — deterministic end state.
+        let job2 = mgr.enqueue("/c", "/d", 10).await.unwrap();
+        mgr.cancel(job2.id).await.unwrap();
+        let j = mgr.get_job(job2.id).await.unwrap().unwrap();
         assert_eq!(j.status, TransferStatus::Cancelled);
     }
 
@@ -825,8 +1143,8 @@ mod tests {
         mgr.fail_job(j1.id, "err").await.unwrap();
         mgr.fail_job(j2.id, "err").await.unwrap();
 
-        let count = mgr.retry_all_failed().await.unwrap();
-        assert_eq!(count, 2);
+        let requeued = mgr.retry_all_failed().await.unwrap();
+        assert_eq!(requeued.len(), 2);
 
         let failed = mgr.list_failed_jobs().await.unwrap();
         assert!(failed.is_empty());
@@ -946,5 +1264,268 @@ mod tests {
         mgr.init_journal(pool).await;
         let count = mgr.recover_from_journal().await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    async fn mgr_with_journal() -> TransferManager {
+        let mgr = TransferManager::new();
+        let pool = crate::storage::pool::DbPool::open_in_memory().unwrap();
+        pool.execute(|conn| {
+            crate::storage::migrations::run_migrations(conn)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        mgr.init_journal(pool).await;
+        mgr
+    }
+
+    /// Regression: enqueue used to only record a Queued job that never ran.
+    /// run_local_job must actually copy the bytes and mark the job Completed.
+    #[tokio::test]
+    async fn test_run_local_job_copies_file() {
+        let mgr = mgr_with_journal().await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("payload.bin");
+        let dst = dir.path().join("out").join("payload.bin");
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &bytes).unwrap();
+
+        let job = mgr
+            .enqueue(src.to_str().unwrap(), dst.to_str().unwrap(), bytes.len() as u64)
+            .await
+            .unwrap();
+        mgr.run_local_job(job.id).await;
+
+        let j = mgr.get_job(job.id).await.unwrap().unwrap();
+        assert_eq!(j.status, TransferStatus::Completed);
+        assert_eq!(j.transferred_bytes, bytes.len() as u64);
+        assert_eq!(std::fs::read(&dst).unwrap(), bytes);
+    }
+
+    /// Regression: `record_transfer` existed but had no callers, so the
+    /// Transfer History panel could only ever render "No transfer history".
+    /// A finished job must leave a history row, including the checksum
+    /// verdict the pipeline already computed.
+    #[tokio::test]
+    async fn test_run_local_job_records_history() {
+        let mgr = TransferManager::new();
+        let pool = crate::storage::pool::DbPool::open_in_memory().unwrap();
+        pool.execute(|conn| {
+            crate::storage::migrations::run_migrations(conn)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        mgr.init_journal(pool.clone()).await;
+        let history = TransferHistory::new(pool);
+        mgr.set_history(history.clone()).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.bin");
+        let dst = dir.path().join("b.bin");
+        std::fs::write(&src, b"history me").unwrap();
+
+        let job = mgr
+            .enqueue(src.to_str().unwrap(), dst.to_str().unwrap(), 10)
+            .await
+            .unwrap();
+        mgr.run_local_job(job.id).await;
+
+        let records = history
+            .search(crate::core::types::TransferHistoryFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, job.id);
+        assert_eq!(records[0].status, TransferStatus::Completed);
+        assert_eq!(records[0].transferred_bytes, 10);
+        assert_eq!(records[0].checksum_match, Some(true));
+    }
+
+    /// Regression: remote destinations must fail fast. Previously a
+    /// `sftp://…` dest fell through to `create_dir_all`, materialising a
+    /// literal `sftp:` directory on local disk and "succeeding" into a
+    /// junk path.
+    #[tokio::test]
+    async fn test_run_local_job_rejects_remote_dest() {
+        let mgr = mgr_with_journal().await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.bin");
+        std::fs::write(&src, b"data").unwrap();
+
+        let job = mgr
+            .enqueue(src.to_str().unwrap(), "sftp://example.com/dir/a.bin", 4)
+            .await
+            .unwrap();
+        mgr.run_local_job(job.id).await;
+
+        let j = mgr.get_job(job.id).await.unwrap().unwrap();
+        assert_eq!(j.status, TransferStatus::Failed);
+        assert!(j
+            .error_message
+            .unwrap_or_default()
+            .contains("remote destination"));
+        assert!(!std::path::Path::new("sftp:").exists());
+    }
+
+    #[tokio::test]
+    async fn test_run_local_job_directory_destination() {
+        let mgr = mgr_with_journal().await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("report.txt");
+        let dstdir = dir.path().join("inbox");
+        std::fs::create_dir_all(&dstdir).unwrap();
+        std::fs::write(&src, b"hello queue").unwrap();
+
+        let job = mgr
+            .enqueue(src.to_str().unwrap(), dstdir.to_str().unwrap(), 11)
+            .await
+            .unwrap();
+        mgr.run_local_job(job.id).await;
+
+        let j = mgr.get_job(job.id).await.unwrap().unwrap();
+        assert_eq!(j.status, TransferStatus::Completed);
+        assert_eq!(
+            std::fs::read(dstdir.join("report.txt")).unwrap(),
+            b"hello queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_local_job_never_overwrites() {
+        let mgr = mgr_with_journal().await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("new.bin");
+        let dst = dir.path().join("existing.bin");
+        std::fs::write(&src, b"new data").unwrap();
+        std::fs::write(&dst, b"original").unwrap();
+
+        let job = mgr
+            .enqueue(src.to_str().unwrap(), dst.to_str().unwrap(), 8)
+            .await
+            .unwrap();
+        mgr.run_local_job(job.id).await;
+
+        let j = mgr.get_job(job.id).await.unwrap().unwrap();
+        assert_eq!(j.status, TransferStatus::Failed);
+        assert!(j.error_message.unwrap().contains("already exists"));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"original");
+    }
+
+    #[tokio::test]
+    async fn test_run_local_job_missing_source_fails() {
+        let mgr = mgr_with_journal().await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("nope.bin");
+        let dst = dir.path().join("out.bin");
+
+        let job = mgr
+            .enqueue(src.to_str().unwrap(), dst.to_str().unwrap(), 0)
+            .await
+            .unwrap();
+        mgr.run_local_job(job.id).await;
+
+        let j = mgr.get_job(job.id).await.unwrap().unwrap();
+        assert_eq!(j.status, TransferStatus::Failed);
+        assert!(j.error_message.unwrap().contains("Cannot read source"));
+        assert!(!dst.exists());
+    }
+
+    async fn wait_until(mut f: impl FnMut() -> bool, what: &str) {
+        for _ in 0..500 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Pause must actually hold a running transfer at a chunk boundary, and
+    /// resume must let the same executor finish — not strand the job.
+    #[tokio::test]
+    async fn test_run_local_job_pause_resume() {
+        let mgr = mgr_with_journal().await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("paused.bin");
+        let dst = dir.path().join("paused-out.bin");
+        let bytes: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &bytes).unwrap();
+
+        let job = mgr
+            .enqueue(src.to_str().unwrap(), dst.to_str().unwrap(), bytes.len() as u64)
+            .await
+            .unwrap();
+
+        // Arm the flag before the executor starts so it parks deterministically
+        // inside the pipeline (wait_if_paused at the chunk boundary).
+        let control = mgr.control(job.id).await;
+        control.pause();
+        mgr.spawn_runner(job.id).await;
+
+        let dst_str = dst.to_str().unwrap().to_string();
+        let tmp = chunk::temp_path_for(&dst_str);
+        // Wait until the transfer is genuinely in-flight (temp preallocated).
+        wait_until(|| std::path::Path::new(&tmp).exists(), "temp file to appear").await;
+
+        mgr.pause(job.id).await.unwrap();
+        let j = mgr.get_job(job.id).await.unwrap().unwrap();
+        assert_eq!(j.status, TransferStatus::Paused);
+
+        mgr.resume(job.id).await.unwrap();
+
+        // The parked worker wakes and the same copy finishes.
+        for _ in 0..500 {
+            let j = mgr.get_job(job.id).await.unwrap().unwrap();
+            if j.status == TransferStatus::Completed {
+                assert_eq!(std::fs::read(&dst).unwrap(), bytes);
+                return;
+            }
+            assert_ne!(j.status, TransferStatus::Failed, "job failed: {:?}", j.error_message);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("job did not complete after resume");
+    }
+
+    /// Cancel must stop a running transfer, remove the partial temp file, and
+    /// leave the destination untouched.
+    #[tokio::test]
+    async fn test_run_local_job_cancel_cleans_up() {
+        let mgr = mgr_with_journal().await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("victim.bin");
+        let dst = dir.path().join("victim-out.bin");
+        std::fs::write(&src, vec![7u8; 2_000_000]).unwrap();
+
+        let job = mgr
+            .enqueue(src.to_str().unwrap(), dst.to_str().unwrap(), 2_000_000)
+            .await
+            .unwrap();
+
+        // Park the executor mid-flight so cancel lands while temp exists.
+        let control = mgr.control(job.id).await;
+        control.pause();
+        mgr.spawn_runner(job.id).await;
+
+        let dst_str = dst.to_str().unwrap().to_string();
+        let tmp = chunk::temp_path_for(&dst_str);
+        wait_until(|| std::path::Path::new(&tmp).exists(), "temp file to appear").await;
+
+        mgr.cancel(job.id).await.unwrap();
+
+        // The executor wakes, aborts, removes the temp file and exits.
+        wait_until(|| !std::path::Path::new(&tmp).exists(), "temp file to be removed").await;
+        wait_until(
+            || {
+                let set = mgr.executors.try_lock().ok();
+                set.map(|s| !s.contains(&job.id)).unwrap_or(false)
+            },
+            "executor to exit",
+        )
+        .await;
+
+        let j = mgr.get_job(job.id).await.unwrap().unwrap();
+        assert_eq!(j.status, TransferStatus::Cancelled);
+        assert!(!dst.exists());
     }
 }

@@ -12,6 +12,7 @@ use crate::core::types::{ChunkSpec, ChunkStatus, TransferConfig, VerifyTier};
 use crate::transfer_engine::chunk;
 use crate::transfer_engine::journal::TransferJournal;
 use crate::transfer_engine::verification;
+use crate::transfer_engine::JobControl;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
@@ -75,11 +76,21 @@ pub async fn transfer_chunk(
     journal: Option<&TransferJournal>,
     job_id: Option<&str>,
     semaphore: &Arc<Semaphore>,
+    control: Option<Arc<JobControl>>,
 ) -> Result<ChunkResult, AppError> {
     let _permit = semaphore.acquire().await.map_err(|_| AppError::Transfer {
         message: "Worker pool exhausted".to_string(),
         advice: "Too many concurrent transfers. Try again later.".to_string(),
     })?;
+
+    // Cooperative pause/cancel at the chunk boundary. Queued workers park
+    // here; cancelled ones bail before touching the filesystem.
+    if let Some(c) = &control {
+        c.wait_if_paused().await;
+        if c.is_cancelled() {
+            return Err(cancelled_error());
+        }
+    }
 
     let start = std::time::Instant::now();
 
@@ -363,6 +374,25 @@ pub fn should_use_direct_io(file_size: u64, config: &TransferConfig) -> bool {
 /// Progress callback type for chunk completion.
 pub type ProgressCallback = Box<dyn Fn(u32, u64, u64) + Send + Sync>;
 
+fn cancelled_error() -> AppError {
+    AppError::Transfer {
+        message: "Transfer cancelled".to_string(),
+        advice: "The transfer was cancelled before it finished.".to_string(),
+    }
+}
+
+/// Mark the journal entry cancelled and remove the partially written temp
+/// file. The destination file is never touched (writes go to the temp path).
+async fn abort_transfer(
+    journal: &TransferJournal,
+    job_id: &str,
+    temp_path: &str,
+) -> AppError {
+    let _ = journal.cancel_job(job_id).await;
+    let _ = tokio::fs::remove_file(temp_path).await;
+    cancelled_error()
+}
+
 /// Execute a complete file transfer with the three-layer architecture.
 ///
 /// Steps:
@@ -385,8 +415,15 @@ pub async fn execute_file_transfer(
     worker_pool: &WorkerPool,
     job_id: &str,
     on_progress: Option<&ProgressCallback>,
+    control: Option<Arc<JobControl>>,
 ) -> Result<TransferResult, AppError> {
     let start = std::time::Instant::now();
+
+    if let Some(c) = &control {
+        if c.is_cancelled() {
+            return Err(cancelled_error());
+        }
+    }
 
     // Step 1: Detect media type and compute chunks
     let media_source = chunk::detect_media_type(source_path);
@@ -445,8 +482,16 @@ pub async fn execute_file_transfer(
             Some(journal),
             Some(job_id),
             &semaphore,
+            control.clone(),
         )
-        .await?;
+        .await;
+        let result = match result {
+            Err(e) if control.as_ref().is_some_and(|c| c.is_cancelled()) => {
+                let _ = e;
+                return Err(abort_transfer(journal, job_id, &temp_path).await);
+            }
+            other => other?,
+        };
 
         total_transferred += result.bytes_transferred;
         all_verified = all_verified && result.verified;
@@ -472,6 +517,7 @@ pub async fn execute_file_transfer(
             let config = config.clone();
             let job_id_str = job_id.to_string();
             let journal = journal.clone();
+            let control = control.clone();
 
             tokio::spawn(async move {
                 let result = transfer_chunk(
@@ -483,6 +529,7 @@ pub async fn execute_file_transfer(
                     Some(&journal),
                     Some(&job_id_str),
                     &sem,
+                    control,
                 )
                 .await;
                 let _ = tx.send(result).await;
@@ -504,9 +551,22 @@ pub async fn execute_file_transfer(
                     chunk_results.push(cr);
                 }
                 Err(e) => {
+                    if control.as_ref().is_some_and(|c| c.is_cancelled()) {
+                        // Drain in-flight workers so nothing writes after the
+                        // temp file is removed, then clean up.
+                        while rx.recv().await.is_some() {}
+                        return Err(abort_transfer(journal, job_id, &temp_path).await);
+                    }
                     // Mark job as failed on any chunk error
                     journal.fail_job(job_id, &e.to_string()).await?;
                     return Err(e);
+                }
+            }
+            if let Some(c) = &control {
+                c.wait_if_paused().await;
+                if c.is_cancelled() {
+                    while rx.recv().await.is_some() {}
+                    return Err(abort_transfer(journal, job_id, &temp_path).await);
                 }
             }
         }
@@ -739,6 +799,7 @@ mod tests {
             None,
             None,
             &semaphore,
+            None,
         )
         .await
         .unwrap();
@@ -785,6 +846,7 @@ mod tests {
             None,
             None,
             &semaphore,
+            None,
         )
         .await
         .unwrap();
@@ -822,6 +884,7 @@ mod tests {
             &journal,
             &worker_pool,
             "test-transfer-1",
+            None,
             None,
         )
         .await
@@ -862,6 +925,7 @@ mod tests {
             &journal,
             &worker_pool,
             "test-transfer-2",
+            None,
             None,
         )
         .await

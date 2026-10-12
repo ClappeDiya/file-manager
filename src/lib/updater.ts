@@ -12,6 +12,7 @@
 
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { errorText } from "@/lib/error-text";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -220,7 +221,7 @@ export const useUpdater = create<UpdaterState>()(
         } catch (err) {
           set({
             status: "error",
-            error: err instanceof Error ? err.message : "Update check failed",
+            error: errorText(err, "Update check failed"),
             lastChecked: new Date().toISOString(),
           });
         }
@@ -251,7 +252,7 @@ export const useUpdater = create<UpdaterState>()(
           // The Tauri updater will prompt for restart or auto-restart
           // depending on the platform configuration
         } catch (err) {
-          const errorMessage = err instanceof Error ? err.message : "Download failed";
+          const errorMessage = errorText(err, "Download failed");
 
           set({
             status: "error",

@@ -143,7 +143,7 @@ struct DavEntry {
 
 /// HTTP client session for WebDAV.
 struct WebDavSession {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
     base_url: String,
     auth_header: Option<(String, String)>,
 }
@@ -280,108 +280,104 @@ impl WebDavConnector {
 
     /// Parse a PROPFIND XML response into DavEntry objects.
     fn parse_propfind_response(xml: &str, _base_url: &str) -> Vec<DavEntry> {
-        // Simple XML parser for WebDAV PROPFIND multistatus responses.
-        // We parse the essential properties without a full XML parser dependency.
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
+
+        // Servers disagree on namespace prefixes (d:, D:, lp1:, none) and put
+        // attributes on <response>, so match on local names only.
+        let mut reader = Reader::from_str(xml);
         let mut entries = Vec::new();
+        let mut current: Option<DavEntry> = None;
+        let mut field: Option<String> = None;
 
-        // Split by <d:response> or <D:response> elements
-        let response_tag_variants = ["<d:response>", "<D:response>", "<response "];
-        let response_end_variants = ["</d:response>", "</D:response>", "</response>"];
-
-        let xml_lower = xml.to_lowercase();
-        let mut pos = 0;
-
-        while pos < xml_lower.len() {
-            // Find next response element
-            let start = response_tag_variants
-                .iter()
-                .filter_map(|tag| {
-                    xml_lower[pos..].find(&tag.to_lowercase()).map(|p| p + pos)
-                })
-                .min();
-
-            let Some(response_start) = start else {
-                break;
-            };
-
-            let end = response_end_variants
-                .iter()
-                .filter_map(|tag| {
-                    xml_lower[response_start..].find(&tag.to_lowercase()).map(|p| p + response_start + tag.len())
-                })
-                .min();
-
-            let Some(response_end) = end else {
-                break;
-            };
-
-            let response_block = &xml[response_start..response_end];
-
-            // Extract href
-            let href = Self::extract_xml_value(response_block, "href")
-                .unwrap_or_default();
-
-            // Check if it's a collection
-            let is_collection = response_block.to_lowercase().contains("<d:collection")
-                || response_block.to_lowercase().contains("<d:collection/")
-                || response_block.contains("<collection");
-
-            // Extract content length
-            let content_length: u64 = Self::extract_xml_value(response_block, "getcontentlength")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-
-            // Extract last modified
-            let last_modified = Self::extract_xml_value(response_block, "getlastmodified")
-                .and_then(|s| DateTime::parse_from_rfc2822(&s).ok())
-                .map(|dt| dt.with_timezone(&Utc));
-
-            // Extract creation date
-            let created = Self::extract_xml_value(response_block, "creationdate")
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|dt| dt.with_timezone(&Utc));
-
-            // Extract etag
-            let etag = Self::extract_xml_value(response_block, "getetag");
-
-            // Extract content type
-            let content_type = Self::extract_xml_value(response_block, "getcontenttype");
-
-            entries.push(DavEntry {
-                href,
-                is_collection,
-                content_length,
-                last_modified,
-                created,
-                etag,
-                content_type,
-            });
-
-            pos = response_end;
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(e)) => {
+                    let name = String::from_utf8_lossy(e.local_name().as_ref()).to_lowercase();
+                    match name.as_str() {
+                        "response" => {
+                            current = Some(DavEntry {
+                                href: String::new(),
+                                is_collection: false,
+                                content_length: 0,
+                                last_modified: None,
+                                created: None,
+                                etag: None,
+                                content_type: None,
+                            });
+                        }
+                        "collection" => {
+                            if let Some(c) = current.as_mut() {
+                                c.is_collection = true;
+                            }
+                        }
+                        "href" | "getcontentlength" | "getlastmodified" | "creationdate" | "getetag"
+                        | "getcontenttype" => field = Some(name),
+                        _ => {}
+                    }
+                }
+                Ok(Event::Empty(e)) => {
+                    if e.local_name().as_ref().eq_ignore_ascii_case(b"collection") {
+                        if let Some(c) = current.as_mut() {
+                            c.is_collection = true;
+                        }
+                    }
+                }
+                Ok(Event::Text(t)) => {
+                    if let (Some(c), Some(f)) = (current.as_mut(), field.as_deref()) {
+                        let text = t.decode().map(|c| c.to_string()).unwrap_or_default();
+                        let text = text.trim();
+                        match f {
+                            "href" => c.href = text.to_string(),
+                            "getcontentlength" => c.content_length = text.parse().unwrap_or(0),
+                            "getlastmodified" => {
+                                c.last_modified = DateTime::parse_from_rfc2822(text).ok().map(|d| d.with_timezone(&Utc))
+                            }
+                            "creationdate" => {
+                                c.created = DateTime::parse_from_rfc3339(text).ok().map(|d| d.with_timezone(&Utc))
+                            }
+                            "getetag" => c.etag = Some(text.to_string()),
+                            "getcontenttype" => c.content_type = Some(text.to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(Event::End(e)) => {
+                    field = None;
+                    if e.local_name().as_ref().eq_ignore_ascii_case(b"response") {
+                        if let Some(c) = current.take() {
+                            entries.push(c);
+                        }
+                    }
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                _ => {}
+            }
         }
 
         entries
     }
 
-    /// Extract a value from an XML element (simple parser, handles common DAV namespaces).
+    /// Text of the first element whose local name is `element_name`, ignoring namespace prefixes.
     fn extract_xml_value(xml: &str, element_name: &str) -> Option<String> {
-        let xml_lower = xml.to_lowercase();
-        let name_lower = element_name.to_lowercase();
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
 
-        // Try various namespace prefixes
-        let prefixes = ["d:", "D:", "dav:", "DAV:", ""];
-        for prefix in &prefixes {
-            let open_tag = format!("<{prefix}{name_lower}>");
-            let close_tag = format!("</{prefix}{name_lower}>");
-
-            if let Some(start) = xml_lower.find(&open_tag.to_lowercase()) {
-                let value_start = start + open_tag.len();
-                if let Some(end) = xml_lower[value_start..].find(&close_tag.to_lowercase()) {
-                    return Some(xml[value_start..value_start + end].trim().to_string());
+        let mut reader = Reader::from_str(xml);
+        let mut inside = false;
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(e)) if e.local_name().as_ref().eq_ignore_ascii_case(element_name.as_bytes()) => {
+                    inside = true;
                 }
+                Ok(Event::Text(t)) if inside => {
+                    return t.decode().ok().map(|c| c.trim().to_string());
+                }
+                Ok(Event::End(_)) if inside => return None,
+                Ok(Event::Eof) | Err(_) => return None,
+                _ => {}
             }
         }
-        None
     }
 
     /// Convert a DavEntry to a FileEntry.
@@ -430,7 +426,11 @@ impl WebDavConnector {
             advice: "Connect to the server first.".to_string(),
         })?;
 
-        let url = Self::build_url(&dav.base_url, path);
+        // A collection URL must end in "/", or servers answer 301 (redirects are off).
+        let mut url = Self::build_url(&dav.base_url, path);
+        if !url.ends_with('/') {
+            url.push('/');
+        }
 
         let propfind_body = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -455,7 +455,7 @@ impl WebDavConnector {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        let response = request.send().map_err(|e| AppError::Connection {
+        let response = request.send().await.map_err(|e| AppError::Connection {
             message: format!("WebDAV PROPFIND failed for {url}: {e}"),
             advice: "Check network connection and server availability.".to_string(),
         })?;
@@ -474,7 +474,7 @@ impl WebDavConnector {
             });
         }
 
-        let body = response.text().map_err(|e| AppError::Connection {
+        let body = response.text().await.map_err(|e| AppError::Connection {
             message: format!("Failed to read PROPFIND response: {e}"),
             advice: "Server may have returned invalid data.".to_string(),
         })?;
@@ -544,7 +544,7 @@ impl WebDavConnector {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        let response = request.send().map_err(|e| AppError::Connection {
+        let response = request.send().await.map_err(|e| AppError::Connection {
             message: format!("WebDAV PUT failed for {url}: {e}"),
             advice: "Check network connection and server availability.".to_string(),
         })?;
@@ -610,7 +610,7 @@ impl WebDavConnector {
                 if let Some((ref key, ref value)) = dav.auth_header {
                     request = request.header(key.as_str(), value.as_str());
                 }
-                let _ = request.send();
+                let _ = request.send().await;
 
                 // Upload chunks
                 let mut offset: u64 = 0;
@@ -631,7 +631,7 @@ impl WebDavConnector {
                         request = request.header(key.as_str(), value.as_str());
                     }
 
-                    let response = request.send().map_err(|e| AppError::Connection {
+                    let response = request.send().await.map_err(|e| AppError::Connection {
                         message: format!("Chunk upload {chunk_index} failed: {e}"),
                         advice: "Check network connection.".to_string(),
                     })?;
@@ -661,7 +661,7 @@ impl WebDavConnector {
                 if let Some((ref key, ref value)) = dav.auth_header {
                     request = request.header(key.as_str(), value.as_str());
                 }
-                let _ = request.send();
+                let _ = request.send().await;
             }
             WebDavCompat::Standard => {
                 // Standard WebDAV: just PUT the whole thing
@@ -671,7 +671,7 @@ impl WebDavConnector {
                 if let Some((ref key, ref value)) = dav.auth_header {
                     request = request.header(key.as_str(), value.as_str());
                 }
-                let response = request.send().map_err(|e| AppError::Connection {
+                let response = request.send().await.map_err(|e| AppError::Connection {
                     message: format!("WebDAV upload failed: {e}"),
                     advice: "Check network connection.".to_string(),
                 })?;
@@ -716,7 +716,7 @@ impl WebDavConnector {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        let response = request.send().map_err(|e| AppError::Connection {
+        let response = request.send().await.map_err(|e| AppError::Connection {
             message: format!("WebDAV GET failed for {url}: {e}"),
             advice: "Check network connection and server availability.".to_string(),
         })?;
@@ -732,7 +732,7 @@ impl WebDavConnector {
             });
         }
 
-        let data = response.bytes().map_err(|e| AppError::Connection {
+        let data = response.bytes().await.map_err(|e| AppError::Connection {
             message: format!("Failed to read response body: {e}"),
             advice: "Connection may have been interrupted.".to_string(),
         })?;
@@ -788,7 +788,7 @@ impl WebDavConnector {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        let response = request.send().map_err(|e| AppError::Connection {
+        let response = request.send().await.map_err(|e| AppError::Connection {
             message: format!("WebDAV MKCOL failed for {url}: {e}"),
             advice: "Check network connection.".to_string(),
         })?;
@@ -823,7 +823,7 @@ impl WebDavConnector {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        let response = request.send().map_err(|e| AppError::Connection {
+        let response = request.send().await.map_err(|e| AppError::Connection {
             message: format!("WebDAV DELETE failed for {url}: {e}"),
             advice: "Check network connection.".to_string(),
         })?;
@@ -863,7 +863,7 @@ impl WebDavConnector {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        let response = request.send().map_err(|e| AppError::Connection {
+        let response = request.send().await.map_err(|e| AppError::Connection {
             message: format!("WebDAV MOVE failed: {e}"),
             advice: "Check network connection.".to_string(),
         })?;
@@ -903,7 +903,7 @@ impl WebDavConnector {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        let response = request.send().map_err(|e| AppError::Connection {
+        let response = request.send().await.map_err(|e| AppError::Connection {
             message: format!("WebDAV COPY failed: {e}"),
             advice: "Check network connection.".to_string(),
         })?;
@@ -954,7 +954,7 @@ impl WebDavConnector {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        let response = request.send().map_err(|e| AppError::Connection {
+        let response = request.send().await.map_err(|e| AppError::Connection {
             message: format!("WebDAV LOCK failed for {url}: {e}"),
             advice: "The server may not support locking.".to_string(),
         })?;
@@ -967,7 +967,7 @@ impl WebDavConnector {
         }
 
         // Extract lock token from response
-        let body = response.text().unwrap_or_default();
+        let body = response.text().await.unwrap_or_default();
         let lock_token = Self::extract_xml_value(&body, "locktoken")
             .or_else(|| Self::extract_xml_value(&body, "href"))
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -1016,7 +1016,7 @@ impl WebDavConnector {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        let response = request.send().map_err(|e| AppError::Connection {
+        let response = request.send().await.map_err(|e| AppError::Connection {
             message: format!("WebDAV UNLOCK failed for {url}: {e}"),
             advice: "Check network connection.".to_string(),
         })?;
@@ -1095,23 +1095,19 @@ impl super::Connector for WebDavConnector {
             let user_agent = config.user_agent.clone();
             let auth_method = config.auth_method.clone();
 
-            let client = tokio::task::spawn_blocking(move || {
-                let mut builder = reqwest::blocking::Client::builder()
+            let client = {
+                let builder = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(request_timeout as u64))
                     .connect_timeout(std::time::Duration::from_secs(connect_timeout as u64))
                     .user_agent(&user_agent)
-                    .danger_accept_invalid_certs(accept_invalid_certs);
-
-                // Disable redirect following for WebDAV
-                builder = builder.redirect(reqwest::redirect::Policy::none());
-
+                    .danger_accept_invalid_certs(accept_invalid_certs)
+                    // Disable redirect following for WebDAV
+                    .redirect(reqwest::redirect::Policy::none());
                 builder.build().map_err(|e| AppError::Connection {
                     message: format!("Failed to create HTTP client: {e}"),
                     advice: "Check TLS/SSL configuration.".to_string(),
-                })
-            })
-            .await
-            .map_err(|e| AppError::internal(format!("HTTP client task panicked: {e}")))??;
+                })?
+            };
 
             // Build auth header
             let auth_header = Self::build_auth_header(&auth_method);
@@ -1121,7 +1117,7 @@ impl super::Connector for WebDavConnector {
             let auth_header_clone = auth_header.clone();
             let client_clone = client.clone();
 
-            let server_info = tokio::task::spawn_blocking(move || {
+            let server_info = async move {
                 let mut request = client_clone
                     .request(reqwest::Method::OPTIONS, &validated_url_clone);
 
@@ -1129,7 +1125,7 @@ impl super::Connector for WebDavConnector {
                     request = request.header(key.as_str(), value.as_str());
                 }
 
-                let response = request.send().map_err(|e| AppError::Connection {
+                let response = request.send().await.map_err(|e| AppError::Connection {
                     message: format!("Cannot reach WebDAV server at {validated_url_clone}: {e}"),
                     advice: "Check the URL and network connectivity.".to_string(),
                 })?;
@@ -1155,9 +1151,8 @@ impl super::Connector for WebDavConnector {
                     .map(|s| s.to_string());
 
                 Ok::<_, AppError>((dav_header, server_header))
-            })
-            .await
-            .map_err(|e| AppError::internal(format!("OPTIONS request task panicked: {e}")))??;
+            }
+            .await?;
 
             // Detect server type
             let (dav_header, server_header) = server_info;
@@ -1206,11 +1201,10 @@ impl super::Connector for WebDavConnector {
                 }
             }
 
-            // Drop session
-            {
-                let mut session = self.session.lock().await;
-                *session = None;
-            }
+            // Drop session. A `reqwest::Client` owns its own runtime, and
+            // dropping that inside an async task panics, so drop it on a blocking thread.
+            let old_session = self.session.lock().await.take();
+            let _ = tokio::task::spawn_blocking(move || drop(old_session)).await;
 
             self.connected.store(false, Ordering::SeqCst);
             self.bytes_sent.store(0, Ordering::Relaxed);
@@ -1233,6 +1227,53 @@ impl super::Connector for WebDavConnector {
 
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    fn connect_with_secret(&self, profile: &ConnectionProfile, secret: Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + '_>> {
+        let mut profile = profile.clone();
+        Box::pin(async move {
+            {
+                let mut cfg = self.config.write().await;
+                cfg.auth_method = match (profile.username.clone().filter(|u| !u.is_empty()), secret) {
+                    (Some(username), Some(password)) => WebDavAuthMethod::Basic { username, password },
+                    _ => WebDavAuthMethod::None,
+                };
+                // The host may be a full URL ("http://host:8080/dav"); its scheme
+                // decides TLS, since the form has no separate field for it.
+                let host = profile.host.clone();
+                if let Some(rest) = host.strip_prefix("http://").or_else(|| host.strip_prefix("https://")) {
+                    cfg.allow_insecure_http = host.starts_with("http://");
+                    let rest = rest.trim_end_matches('/');
+                    let (authority, path) = rest.split_once('/').map(|(a, p)| (a, format!("/{p}"))).unwrap_or((rest, String::new()));
+                    let base_path = if profile.remote_path == "/" { path } else { format!("{path}{}", profile.remote_path) };
+                    cfg.base_url = format!("{}://{authority}{base_path}", if host.starts_with("http://") { "http" } else { "https" });
+                    profile.host = authority.to_string();
+                } else {
+                    cfg.base_url = String::new();
+                }
+            }
+            super::Connector::connect(self, &profile).await
+        })
+    }
+
+    fn upload(&self, local_path: &str, remote_path: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (l, r) = (local_path.to_string(), remote_path.to_string());
+        Box::pin(async move { self.upload_file(&l, &r, None).await })
+    }
+
+    fn download(&self, remote_path: &str, local_path: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (r, l) = (remote_path.to_string(), local_path.to_string());
+        Box::pin(async move { self.download_file(&r, &l, None).await })
+    }
+
+    fn make_directory(&self, remote_path: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
+        Box::pin(async move { self.mkdir(&r).await })
+    }
+
+    fn remove(&self, remote_path: &str, _is_dir: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
+        Box::pin(async move { self.delete(&r).await })
     }
 }
 
@@ -1375,6 +1416,31 @@ mod tests {
     fn test_extract_xml_value_not_found() {
         let xml = "<d:response></d:response>";
         assert_eq!(WebDavConnector::extract_xml_value(xml, "href"), None);
+    }
+
+    #[test]
+    fn test_parse_propfind_apache_style_with_attributes_and_custom_prefixes() {
+        // Apache mod_dav: attributes on <response>, props under an `lp1:` prefix.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+<D:response xmlns:lp1="DAV:" xmlns:lp2="http://apache.org/dav/props/">
+<D:href>/dir/</D:href>
+<D:propstat><D:prop><lp1:resourcetype><D:collection/></lp1:resourcetype>
+<lp1:getlastmodified>Mon, 12 Oct 2026 00:04:52 GMT</lp1:getlastmodified></D:prop></D:propstat>
+</D:response>
+<D:response xmlns:lp1="DAV:">
+<D:href>/dir/a%20b.bin</D:href>
+<D:propstat><D:prop><lp1:resourcetype/><lp1:getcontentlength>3000000</lp1:getcontentlength>
+<lp1:getetag>"x"</lp1:getetag></D:prop></D:propstat>
+</D:response>
+</D:multistatus>"#;
+        let entries = WebDavConnector::parse_propfind_response(xml, "http://h/dir");
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_collection);
+        assert!(entries[0].last_modified.is_some());
+        assert!(!entries[1].is_collection);
+        assert_eq!(entries[1].content_length, 3_000_000);
+        assert_eq!(entries[1].href, "/dir/a%20b.bin");
     }
 
     #[test]

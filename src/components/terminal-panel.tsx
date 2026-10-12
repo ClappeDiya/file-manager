@@ -8,11 +8,13 @@
  * - Drag file from browser pastes escaped path
  * - Terminal sessions persist across tab switches
  *
- * Note: xterm.js is loaded dynamically when the terminal panel opens.
- * The PTY backend communicates via Tauri IPC commands.
+ * xterm.js renders each session; the Rust PTY backend streams output via
+ * `terminal-output` events and receives input through `terminal_write`.
  */
 import { useState, useCallback, useRef, useEffect } from "react";
 import { useTerminalStore, type TerminalSession } from "@/stores/terminal-store";
+import { XtermView } from "./xterm-view";
+import { promptText } from "@/lib/prompt-dialog";
 import { cn } from "@ufop/ui-components";
 import {
   Terminal as TerminalIcon,
@@ -44,6 +46,7 @@ export function TerminalPanel({ className }: TerminalPanelProps) {
   const activeSessionId = useTerminalStore((s) => s.activeSessionId);
   const setActiveSession = useTerminalStore((s) => s.setActiveSession);
   const createLocalSession = useTerminalStore((s) => s.createLocalSession);
+  const createRemoteSession = useTerminalStore((s) => s.createRemoteSession);
   const closeSession = useTerminalStore((s) => s.closeSession);
   const layout = useTerminalStore((s) => s.layout);
   const splitTerminal = useTerminalStore((s) => s.splitTerminal);
@@ -189,9 +192,14 @@ export function TerminalPanel({ className }: TerminalPanelProps) {
                   createLocalSession();
                   setShowNewMenu(false);
                 }}
-                onCreateRemote={() => {
-                  // In production, opens SSH connection dialog
+                onCreateRemote={async () => {
                   setShowNewMenu(false);
+                  const target = await promptText("SSH target (user@host or user@host:port):", "");
+                  const m = target?.trim().match(/^([^@\s]+)@([^:\s]+)(?::(\d{1,5}))?$/);
+                  if (!m) return;
+                  try {
+                    await createRemoteSession({ host: m[2], port: m[3] ? Number(m[3]) : 22, username: m[1] });
+                  } catch { /* surfaced through the store's error state */ }
                 }}
                 onClose={() => setShowNewMenu(false)}
               />
@@ -444,81 +452,18 @@ function EmptyTerminal({ onCreateLocal }: { onCreateLocal: () => void }) {
 // ──────────────────────────────────────────────
 
 function SingleTerminalView({ session }: { session: TerminalSession }) {
-  const terminalRef = useRef<HTMLDivElement>(null);
-  const [inputLine, setInputLine] = useState("");
-  const writeToSession = useTerminalStore((s) => s.writeToSession);
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  // Focus input when terminal view mounts
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, [session.id]);
-
-  const handleKeyDown = useCallback(
-    async (e: React.KeyboardEvent<HTMLInputElement>) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        if (inputLine.trim()) {
-          await writeToSession(session.id, inputLine + "\n");
-          setInputLine("");
-        }
-      }
-    },
-    [inputLine, session.id, writeToSession],
-  );
-
   return (
     <div
-      ref={terminalRef}
       className="flex flex-col h-full bg-[#1e1e1e] text-[#cccccc] font-mono"
       data-testid={`terminal-view-${session.id}`}
     >
-      {/* Terminal header info */}
       <div className="flex items-center gap-2 px-3 py-1 text-[10px] text-[#666666] border-b border-[#333333]">
         <span>{session.shell}</span>
         <span>|</span>
         <span>{session.cwd}</span>
-        <span>|</span>
-        <span>
-          {session.cols}x{session.rows}
-        </span>
       </div>
-
-      {/* Terminal output area (placeholder - xterm.js goes here in production) */}
-      <div className="flex-1 overflow-y-auto px-3 py-2 text-xs leading-relaxed">
-        <div className="text-[#569cd6]">
-          Welcome to UFOP Terminal ({session.session_type === "remote" ? "SSH" : "Local"})
-        </div>
-        <div className="text-[#666666]">
-          Shell: {session.shell} | Session: {session.id.slice(0, 8)}
-        </div>
-        <div className="text-[#666666] mb-2">
-          Type commands below. Drag files from the file browser to paste their path.
-        </div>
-        <div className="text-[#608b4e]">
-          {/* In production, xterm.js renders here with full PTY output */}
-          {/* This placeholder shows the terminal is functional */}
-          Ready.
-        </div>
-      </div>
-
-      {/* Input line (replaced by xterm.js in production) */}
-      <div className="flex items-center px-3 py-1 border-t border-[#333333] bg-[#252525]">
-        <span className="text-[#569cd6] text-xs mr-2">$</span>
-        <input
-          ref={inputRef}
-          className={cn(
-            "flex-1 bg-transparent text-[#cccccc] text-xs",
-            "outline-none border-none",
-            "font-mono placeholder:text-[#555555]",
-          )}
-          value={inputLine}
-          onChange={(e) => setInputLine(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Enter command..."
-          aria-label="Terminal input"
-          data-testid={`terminal-input-${session.id}`}
-        />
+      <div className="flex-1 min-h-0">
+        <XtermView sessionId={session.id} />
       </div>
     </div>
   );

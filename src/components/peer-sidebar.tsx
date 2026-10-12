@@ -40,6 +40,7 @@ import {
   ArrowUpDown,
   XCircle,
 } from "lucide-react";
+import { errorText } from "@/lib/error-text";
 
 // ──────────────────────────────────────────────
 // Types (matching Rust peer module)
@@ -1244,7 +1245,7 @@ function ManualConnectForm({
         onClose();
       } catch (err) {
         setError(
-          err instanceof Error ? err.message : "Failed to connect",
+          errorText(err, "Failed to connect"),
         );
       } finally {
         setConnecting(false);

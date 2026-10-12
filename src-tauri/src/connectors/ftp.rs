@@ -9,7 +9,7 @@
 //! - Multiple connections for parallel chunk transfers (FTP limitation: single stream per connection)
 
 use crate::core::error::AppError;
-use crate::core::types::{ConnectionProfile, FileEntry};
+use crate::core::types::{ConnectionProfile, ConnectionProtocol, FileEntry};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1083,6 +1083,46 @@ impl super::Connector for FtpConnector {
 
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    fn connect_with_secret(&self, profile: &ConnectionProfile, secret: Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + '_>> {
+        let profile = profile.clone();
+        Box::pin(async move {
+            {
+                let mut cfg = self.config.write().await;
+                cfg.username = profile.username.clone().unwrap_or_else(|| "anonymous".to_string());
+                cfg.password = secret.unwrap_or_default();
+                // "ftp" is plain by definition; only "ftps" negotiates TLS.
+                cfg.tls_mode = match (profile.protocol, profile.port) {
+                    (ConnectionProtocol::Ftps, Some(990)) => FtpTlsMode::Implicit,
+                    (ConnectionProtocol::Ftps, _) => FtpTlsMode::Explicit,
+                    _ => FtpTlsMode::None,
+                };
+            }
+            super::Connector::connect(self, &profile).await
+        })
+    }
+
+    fn upload(&self, local_path: &str, remote_path: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (l, r) = (local_path.to_string(), remote_path.to_string());
+        Box::pin(async move { self.upload_file(&l, &r, None).await })
+    }
+
+    fn download(&self, remote_path: &str, local_path: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (r, l) = (remote_path.to_string(), local_path.to_string());
+        Box::pin(async move { self.download_file(&r, &l, None).await })
+    }
+
+    fn make_directory(&self, remote_path: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
+        Box::pin(async move { self.mkdir(&r).await })
+    }
+
+    fn remove(&self, remote_path: &str, is_dir: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
+        Box::pin(async move {
+            if is_dir { self.delete_directory(&r).await } else { self.delete_file(&r).await }
+        })
     }
 }
 

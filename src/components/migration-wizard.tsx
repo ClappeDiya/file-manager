@@ -26,6 +26,8 @@ import {
   RefreshCw,
   Database,
 } from "lucide-react";
+import { errorText } from "@/lib/error-text";
+import { confirmText } from "@/lib/prompt-dialog";
 
 // ──────────────────────────────────────────────
 // Types
@@ -279,11 +281,16 @@ export function MigrationWizard({
 
   // Handle close
   const handleClose = useCallback(() => {
+    // window.confirm never appears in the Tauri webview — use the in-app
+    // confirm dialog (async, so the close decision is deferred).
     if (step === "executing" && progress?.phase === "transferring") {
-      // Warn about active transfer
-      if (!confirm("A transfer is in progress. Are you sure you want to close?")) {
-        return;
-      }
+      void confirmText("A transfer is in progress. Are you sure you want to close?").then((ok) => {
+        if (ok) {
+          resetWizard();
+          onClose();
+        }
+      });
+      return;
     }
     resetWizard();
     onClose();
@@ -301,31 +308,33 @@ export function MigrationWizard({
       setSource(src);
       setError(null);
 
-      if (wizardType === "computer") {
-        // For computer migration, go straight to folder selection
-        setStep("select-folders");
-        if (onScanFolders) {
-          setLoading(true);
-          try {
-            const scanned = await onScanFolders(src.id);
-            setFolders(scanned);
-          } catch (err) {
-            setError(
-              err instanceof Error ? err.message : "Failed to scan folders",
-            );
-          } finally {
-            setLoading(false);
-          }
+      // Scan the source's folders for every wizard type — previously this
+      // only ran for "computer", leaving drive/backup flows stuck on an
+      // empty folder list.
+      if (onScanFolders) {
+        setLoading(true);
+        try {
+          const scanned = await onScanFolders(src.id);
+          setFolders(scanned);
+        } catch (err) {
+          setError(
+            errorText(err, "Failed to scan folders"),
+          );
+        } finally {
+          setLoading(false);
         }
-      } else {
-        // For drive migration and backup, need to select destination too
+      }
+      // For drive/backup the destination is picked on the same screen —
+      // only advance once both ends are chosen, otherwise `destination`
+      // stays null and Analyze can never appear.
+      if (wizardType === "computer" || destination) {
         setStep("select-folders");
       }
     },
-    [wizardType, onScanFolders],
+    [wizardType, destination, onScanFolders],
   );
 
-  // Select destination
+  // Select destination — advance once both source and destination exist
   const handleSelectDestination = useCallback(
     (dest: MigrationSource) => {
       setDestination({
@@ -336,8 +345,11 @@ export function MigrationWizard({
         freeBytes: dest.freeBytes,
         filesystem: dest.filesystem,
       });
+      if (source) {
+        setStep("select-folders");
+      }
     },
-    [],
+    [source],
   );
 
   // Toggle folder selection
@@ -384,7 +396,7 @@ export function MigrationWizard({
       }
       setStep("space-analysis");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Analysis failed");
+      setError(errorText(err, "Analysis failed"));
     } finally {
       setLoading(false);
     }
@@ -445,7 +457,7 @@ export function MigrationWizard({
         pollProgress();
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Migration failed");
+      setError(errorText(err, "Migration failed"));
       setProgress((prev) =>
         prev ? { ...prev, phase: "failed" } : null,
       );
@@ -854,7 +866,10 @@ function SourceSelector({
               : "No drives detected."}
           </p>
         ) : (
-          <div className="space-y-2">
+          // Bounded scroll area: with many drives, an unbounded list
+          // pushes the destination section below the fold where it can't
+          // be reached.
+          <div className="space-y-2 max-h-[220px] overflow-y-auto pr-1">
             {sources.map((src) => (
               <button
                 key={src.id}
@@ -899,7 +914,7 @@ function SourceSelector({
           <h3 className="text-[length:var(--font-size-sm)] font-semibold text-[color:var(--color-text)] mb-2">
             Select Destination Drive
           </h3>
-          <div className="space-y-2">
+          <div className="space-y-2 max-h-[220px] overflow-y-auto pr-1">
             {drives
               .filter((d) => d.id !== selectedSource?.id)
               .map((dest) => (

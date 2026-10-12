@@ -12,6 +12,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
+import { errorText } from "@/lib/error-text";
 
 // ── Types ──
 
@@ -131,7 +132,7 @@ export function ArchiveBrowser({ archivePath, onClose, onExtractComplete }: Arch
       setCurrentPath(subPath);
       setSelectedEntries(new Set());
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     } finally {
       setIsLoading(false);
     }
@@ -182,7 +183,7 @@ export function ArchiveBrowser({ archivePath, onClose, onExtractComplete }: Arch
         setError(result.errors.join("\n"));
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     } finally {
       setIsExtracting(false);
       setShowPasswordPrompt(false);
@@ -215,7 +216,7 @@ export function ArchiveBrowser({ archivePath, onClose, onExtractComplete }: Arch
       setArchiveInfo(info);
       setShowInfo(true);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     } finally {
       setInfoLoading(false);
     }
@@ -518,7 +519,7 @@ export function CreateArchiveDialog({
         setError(res.errors.join("\n"));
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     } finally {
       setIsCreating(false);
     }

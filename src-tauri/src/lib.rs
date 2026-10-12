@@ -102,8 +102,9 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     let credential_store = std::sync::Arc::new(CredentialStore::new());
     let connection_mgr = ConnectionManager::new(repo.clone(), credential_store);
 
-    // Initialize transfer history
+    // Initialize transfer history and let the manager record terminal jobs
     let transfer_history = TransferHistory::new(repo.pool().clone());
+    transfer_mgr.set_history(transfer_history.clone()).await;
 
     // Initialize connector registry (SFTP, FTP, WebDAV, SMB, NFS, Local)
     let connector_registry = ConnectorRegistry::new();
@@ -135,6 +136,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
 
     // Initialize vault manager for encrypted vaults (T-047)
     let vault_mgr = VaultManager::new();
+    vault_mgr.set_pool(repo.pool().clone()).await;
 
     // Initialize master password manager
     let master_pw_mgr = MasterPasswordManager::new();
@@ -268,6 +270,13 @@ pub fn run() {
                 let credential_store = std::sync::Arc::new(CredentialStore::new());
                 let connection_mgr = ConnectionManager::new(repo.clone(), credential_store);
                 let transfer_history = TransferHistory::new(repo.pool().clone());
+                let transfer_mgr = TransferManager::new();
+                let vault_mgr = VaultManager::new();
+                rt2.block_on(async {
+                    transfer_mgr.init_journal(repo.pool().clone()).await;
+                    transfer_mgr.set_history(transfer_history.clone()).await;
+                    vault_mgr.set_pool(repo.pool().clone()).await;
+                });
                 let ledger = OperationLedger::new(repo.pool().clone());
                 let safety_interlock = SafetyInterlock::new(ledger.clone());
                 let narrator = OperationNarrator::new(ledger.clone());
@@ -276,7 +285,7 @@ pub fn run() {
                 automation_mgr.set_ledger(ledger.clone());
                 AppState {
                     repo,
-                    transfer_mgr: TransferManager::new(),
+                    transfer_mgr,
                     connection_mgr,
                     transfer_history,
                     connector_registry: ConnectorRegistry::new(),
@@ -285,7 +294,7 @@ pub fn run() {
                     server_transfer_mgr: ServerTransferManager::new(),
                     ai_assistant: AiAssistant::new(),
                     terminal_mgr: TerminalManager::new(),
-                    vault_mgr: VaultManager::new(),
+                    vault_mgr,
                     master_pw_mgr: MasterPasswordManager::new(),
                     mount_mgr: MountManager::new(),
                     s3_connector: std::sync::Arc::new(S3Connector::new()),
@@ -347,6 +356,7 @@ pub fn run() {
             // Filesystem
             fs_commands::list_directory,
             fs_commands::pick_folder,
+            fs_commands::pick_files,
             fs_commands::read_text_file_full,
             fs_commands::write_text_file_full,
             // State management
@@ -421,6 +431,10 @@ pub fn run() {
             connector_commands::connector_disconnect,
             connector_commands::connector_list_remote,
             connector_commands::connector_is_connected,
+            connector_commands::connector_upload,
+            connector_commands::connector_download,
+            connector_commands::connector_make_directory,
+            connector_commands::connector_remove,
             connector_commands::connector_list_protocols,
             // SMB/CIFS (T-023)
             drive_commands::smb_discover_shares,
@@ -511,6 +525,7 @@ pub fn run() {
             terminal_commands::terminal_close_session,
             terminal_commands::terminal_write,
             terminal_commands::terminal_resize,
+            terminal_commands::terminal_read_scrollback,
             terminal_commands::terminal_set_layout,
             terminal_commands::terminal_get_layout,
             terminal_commands::terminal_escape_path,

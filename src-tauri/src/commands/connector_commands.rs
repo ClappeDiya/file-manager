@@ -3,7 +3,7 @@
 //! These commands expose SFTP, FTP/FTPS, and WebDAV connector operations to the frontend.
 //! The ConnectorRegistry is used to dispatch operations to the correct connector.
 
-use crate::connectors::ConnectorRegistry;
+use crate::connectors::{Connector, ConnectionManager, ConnectorRegistry};
 use crate::core::error::AppError;
 use crate::core::types::{ConnectionProfile, ConnectionProtocol, FileEntry};
 use tauri::State;
@@ -16,14 +16,22 @@ pub async fn connector_connect(
     port: Option<u16>,
     username: Option<String>,
     remote_path: Option<String>,
+    connection_id: Option<String>,
     registry: State<'_, ConnectorRegistry>,
+    manager: State<'_, ConnectionManager>,
 ) -> Result<(), AppError> {
     let connector = registry
         .get(&protocol)
         .ok_or_else(|| AppError::Connection {
             message: format!("Unsupported protocol: {protocol}"),
-            advice: "Use one of: sftp, ftp, ftps, webdav, smb, nfs, local.".to_string(),
+            advice: "Use one of: sftp, ftp, ftps, webdav, s3, smb, nfs, local.".to_string(),
         })?;
+
+    // The secret (password / access secret / key path) lives in the credential store.
+    let secret = match connection_id.as_deref().map(uuid::Uuid::parse_str) {
+        Some(Ok(id)) => manager.get_password(id).await.unwrap_or(None),
+        _ => None,
+    };
 
     let profile = ConnectionProfile {
         id: uuid::Uuid::new_v4(),
@@ -58,7 +66,79 @@ pub async fn connector_connect(
         symlink_policy: None,
     };
 
-    connector.connect(&profile).await
+    connector.connect_with_secret(&profile, secret).await
+}
+
+fn require_connector(
+    registry: &ConnectorRegistry,
+    protocol: &str,
+) -> Result<std::sync::Arc<dyn Connector>, AppError> {
+    registry.get(protocol).ok_or_else(|| AppError::Connection {
+        message: format!("Unsupported protocol: {protocol}"),
+        advice: "Use one of: sftp, ftp, ftps, webdav, s3, smb, nfs, local.".to_string(),
+    })
+}
+
+fn require_connected(connector: &dyn Connector) -> Result<(), AppError> {
+    if connector.is_connected() {
+        Ok(())
+    } else {
+        Err(AppError::Connection {
+            message: "Not connected to the server.".to_string(),
+            advice: "Connect from the Connections panel first.".to_string(),
+        })
+    }
+}
+
+/// Upload a local file to the connected server; returns bytes written.
+#[tauri::command]
+pub async fn connector_upload(
+    protocol: String,
+    local_path: String,
+    remote_path: String,
+    registry: State<'_, ConnectorRegistry>,
+) -> Result<u64, AppError> {
+    let connector = require_connector(&registry, &protocol)?;
+    require_connected(connector.as_ref())?;
+    connector.upload(&local_path, &remote_path).await
+}
+
+/// Download a remote file from the connected server; returns bytes written.
+#[tauri::command]
+pub async fn connector_download(
+    protocol: String,
+    remote_path: String,
+    local_path: String,
+    registry: State<'_, ConnectorRegistry>,
+) -> Result<u64, AppError> {
+    let connector = require_connector(&registry, &protocol)?;
+    require_connected(connector.as_ref())?;
+    connector.download(&remote_path, &local_path).await
+}
+
+/// Create a directory on the connected server.
+#[tauri::command]
+pub async fn connector_make_directory(
+    protocol: String,
+    remote_path: String,
+    registry: State<'_, ConnectorRegistry>,
+) -> Result<(), AppError> {
+    let connector = require_connector(&registry, &protocol)?;
+    require_connected(connector.as_ref())?;
+    connector.make_directory(&remote_path).await
+}
+
+/// Delete a file or empty directory on the connected server.
+#[tauri::command]
+pub async fn connector_remove(
+    protocol: String,
+    remote_path: String,
+    is_dir: bool,
+    registry: State<'_, ConnectorRegistry>,
+) -> Result<(), AppError> {
+    let connector = require_connector(&registry, &protocol)?;
+    require_connected(connector.as_ref())?;
+    connector.remove(&remote_path, is_dir).await
 }
 
 /// Disconnect from a remote server.

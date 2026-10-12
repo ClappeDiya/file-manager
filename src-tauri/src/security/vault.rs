@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use crate::core::error::AppError;
 use crate::security::encryption::{self, EncryptionKey};
+use crate::storage::pool::DbPool;
 use crate::security::kdf::{self, KdfParams, Password, Salt};
 
 /// Vault metadata filename.
@@ -164,6 +165,10 @@ pub struct VaultManager {
     unlocked: Arc<RwLock<HashMap<Uuid, UnlockedVault>>>,
     /// Enterprise encryption policies.
     policies: Arc<RwLock<Vec<EncryptionPolicy>>>,
+    /// DB pool for the known-vault registry (Option: set after DB init).
+    /// Without it `list_vaults` could only see vaults the caller happened
+    /// to scan — freshly created vaults were invisible even while unlocked.
+    pool: Arc<RwLock<Option<DbPool>>>,
 }
 
 /// Internal state for an unlocked vault.
@@ -189,6 +194,57 @@ impl VaultManager {
         Self {
             unlocked: Arc::new(RwLock::new(HashMap::new())),
             policies: Arc::new(RwLock::new(Vec::new())),
+            pool: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Attach the DB pool so vault paths can persist across sessions.
+    /// Called once from app init, mirroring `init_journal`.
+    pub async fn set_pool(&self, pool: DbPool) {
+        *self.pool.write().await = Some(pool);
+    }
+
+    /// Vault paths the app has seen, persisted in the `config` table.
+    async fn known_paths(&self) -> Vec<String> {
+        let Some(pool) = self.pool.read().await.clone() else {
+            return Vec::new();
+        };
+        pool.execute(|conn| {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM config WHERE key = 'known_vault_paths'",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok();
+            Ok(raw
+                .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
+                .unwrap_or_default())
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Remember a vault path so `list_vaults` can always find it again.
+    /// Best-effort: a registry miss must never fail a vault operation.
+    async fn remember_path(&self, path: &str) {
+        let mut paths = self.known_paths().await;
+        if paths.iter().any(|p| p == path) {
+            return;
+        }
+        paths.push(path.to_string());
+        if let Some(pool) = self.pool.read().await.clone() {
+            let json = serde_json::to_string(&paths).unwrap_or_default();
+            let _ = pool
+                .execute(move |conn| {
+                    conn.execute(
+                        "INSERT INTO config (key, value) VALUES ('known_vault_paths', ?1)
+                         ON CONFLICT(key) DO UPDATE SET value = ?1",
+                        rusqlite::params![json],
+                    )?;
+                    Ok(())
+                })
+                .await;
         }
     }
 
@@ -272,6 +328,7 @@ impl VaultManager {
             let mut vaults = self.unlocked.write().await;
             vaults.insert(vault_id, unlocked);
         }
+        self.remember_path(path).await;
 
         tracing::info!("Created encrypted vault '{}' at {}", name, path);
 
@@ -361,6 +418,7 @@ impl VaultManager {
                 metadata,
             });
         }
+        self.remember_path(path).await;
 
         tracing::info!("Unlocked vault '{}' at {}", info.name, path);
         Ok(info)
@@ -380,12 +438,24 @@ impl VaultManager {
         }
     }
 
-    /// List all known vaults at given paths.
+    /// List all known vaults: every unlocked vault plus every remembered
+    /// path, plus whatever extra `scan_paths` the caller provides.
     pub async fn list_vaults(&self, scan_paths: &[String]) -> Result<Vec<VaultInfo>, AppError> {
         let mut vaults = Vec::new();
         let unlocked = self.unlocked.read().await;
 
-        for path in scan_paths {
+        // Unlocked vaults must always be listed — they are live state, and
+        // without this branch a freshly created vault stayed invisible.
+        let mut paths: Vec<String> = unlocked
+            .values()
+            .map(|v| v.path.to_string_lossy().to_string())
+            .collect();
+        paths.extend(self.known_paths().await);
+        paths.extend(scan_paths.iter().cloned());
+        paths.sort();
+        paths.dedup();
+
+        for path in &paths {
             let vault_path = PathBuf::from(path);
             let meta_path = vault_path.join(VAULT_META_FILE);
             if meta_path.exists() {
@@ -968,6 +1038,54 @@ mod tests {
             .unwrap();
         assert_eq!(info2.id, info.id);
         assert_eq!(info2.status, VaultStatus::Unlocked);
+    }
+
+    /// Regression: `list_vaults(&[])` used to return nothing even right
+    /// after `create_vault` — it only scanned caller-provided paths and
+    /// ignored live unlocked state plus the persisted registry. The
+    /// Vault panel calls it with `scanPaths: []`, so every vault was
+    /// permanently invisible.
+    #[tokio::test]
+    async fn test_vault_list_includes_created_without_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_path = dir.path().join("listed_vault");
+        let manager = VaultManager::new();
+        // A pool is required for the persisted registry; the unlocked-state
+        // branch alone already covers live vaults.
+        let pool = crate::storage::pool::DbPool::open_in_memory().unwrap();
+        pool.execute(|conn| {
+            crate::storage::migrations::run_migrations(conn)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        manager.set_pool(pool.clone()).await;
+
+        let info = manager
+            .create_vault(
+                &vault_path.to_string_lossy(),
+                "Listed Vault",
+                "my_password_123".to_string(),
+                vec![],
+                vec![],
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Unlocked vault is listed with no scan paths at all…
+        let listed = manager.list_vaults(&[]).await.unwrap();
+        assert!(listed.iter().any(|v| v.id == info.id));
+        assert!(listed.iter().any(|v| v.status == VaultStatus::Unlocked));
+
+        // …and a fresh manager with no unlocked state still finds it via
+        // the persisted registry — sharing the same pool models a restart
+        // with a surviving database.
+        let manager2 = VaultManager::new();
+        manager2.set_pool(pool).await;
+        let listed2 = manager2.list_vaults(&[]).await.unwrap();
+        assert!(listed2.iter().any(|v| v.id == info.id));
+        assert!(listed2.iter().all(|v| v.status == VaultStatus::Locked));
     }
 
     #[tokio::test]

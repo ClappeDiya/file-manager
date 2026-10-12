@@ -27,6 +27,7 @@ import {
   ChevronRight,
   AlertTriangle,
 } from "lucide-react";
+import { errorText } from "@/lib/error-text";
 
 // ──────────────────────────────────────────────
 // Types (matching Rust DriveInfo)
@@ -220,7 +221,7 @@ export function DeviceSidebar({
       const result = await onDetectDrives();
       setDrives(result);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to detect drives");
+      setError(errorText(err, "Failed to detect drives"));
     } finally {
       setLoading(false);
     }
@@ -285,11 +286,12 @@ export function DeviceSidebar({
     }
   }, [listSmbShares]);
 
-  // Transfer preflight check
-  const handlePreflight = useCallback(async (sourcePath: string, destPath: string) => {
+  // Transfer preflight check. `totalBytes` is required by the backend —
+  // omitting it makes the invoke throw and the check silently return null.
+  const handlePreflight = useCallback(async (sourcePath: string, destPath: string, totalBytes: number) => {
     if (!isTauriAvailable()) return null;
     try {
-      return await tauriInvoke<PreflightResultData>("transfer_preflight", { sourcePath, destPath });
+      return await tauriInvoke<PreflightResultData>("transfer_preflight", { sourcePath, destPath, totalBytes });
     } catch (err) {
       console.error("Preflight check failed:", err);
       return null;
@@ -301,7 +303,7 @@ export function DeviceSidebar({
     const source = drives.find((d) => d.drive_type === "internal" && !d.removable);
     if (!source) return;
     setPreflightDrive(drive.device);
-    const result = await handlePreflight(source.mount_point, drive.mount_point);
+    const result = await handlePreflight(source.mount_point, drive.mount_point, source.used_bytes);
     setPreflightResult(result);
   }, [drives, handlePreflight]);
 

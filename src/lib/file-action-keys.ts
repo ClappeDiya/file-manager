@@ -85,3 +85,50 @@ export function resolveFileActionKey(
 
   return null;
 }
+
+export type FileTransferKey = "select_all" | "copy" | "cut" | "paste" | "copy_to_pane" | "move_to_pane";
+
+/**
+ * ⌘/Ctrl+Shift+N → New Folder (Finder convention). Advertised on the
+ * context-menu entry, palette command and cheat sheet for ages, but no
+ * keydown handler ever implemented it — pressing it did nothing (the
+ * same keystroke was hidden-bound to the Connections panel, a genuine
+ * double-binding bug: one gesture, two advertised owners, one fired).
+ * Bound in the active pane's keydown handler via this predicate.
+ *
+ * Case-insensitive on purpose: on macOS, AppKit reports the *unshifted*
+ * character for Cmd-modified key events, so ⌘⇧N arrives as `e.key ===
+ * "n"`, not `"N"`. Every shift-letter shortcut in the app was dead in
+ * the installed build until this normalization was applied.
+ */
+export function resolveNewFolderKey(
+  e: KeyGesture,
+  textEntryFocused: boolean,
+): boolean {
+  if (textEntryFocused) return false;
+  return (
+    (e.metaKey || e.ctrlKey) && e.shiftKey && !e.altKey && e.key.toLowerCase() === "n"
+  );
+}
+
+/**
+ * Resolve selection / transfer shortcuts: ⌘/Ctrl+A, ⌘/Ctrl+C (copy),
+ * ⌘/Ctrl+X (cut), ⌘/Ctrl+V (paste), F5 (copy to other pane) and F6 (move
+ * to other pane).
+ */
+export function resolveFileTransferKey(
+  e: KeyGesture,
+  textEntryFocused: boolean,
+): FileTransferKey | null {
+  if (textEntryFocused) return null;
+  const mod = (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey;
+  const key = e.key.toLowerCase();
+  if (mod && key === "a") return "select_all";
+  if (mod && key === "c") return "copy";
+  if (mod && key === "x") return "cut";
+  if (mod && key === "v") return "paste";
+  const bare = !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey;
+  if (bare && e.key === "F5") return "copy_to_pane";
+  if (bare && e.key === "F6") return "move_to_pane";
+  return null;
+}

@@ -48,6 +48,7 @@ import {
   Upload,
   History,
   ShieldCheck,
+  SlidersHorizontal,
 } from "lucide-react";
 
 // ──────────────────────────────────────────────
@@ -740,6 +741,10 @@ export function getDefaultCommands(actions: {
    *  numbering, case transformation, undo). No-op with a toast
    *  when the selection is empty. */
   onBatchRename?: () => void;
+  /** Enqueue the selected files as transfer-engine jobs to a picked
+   *  destination — the only user-facing path that feeds the Transfer
+   *  Queue (previously the engine queue had zero producers). */
+  onQueueCopyTo?: () => void;
   /** Open the Connection Manager panel \u2014 saved profiles,
    *  quick-connect, connection test, third-party import, and
    *  the 17-protocol registry (SFTP, S3, Google Drive, WebDAV,
@@ -758,6 +763,19 @@ export function getDefaultCommands(actions: {
    *  orphaned 284-LOC component that complements the transfer
    *  engine's journal + crash-recovery layer. */
   onOpenTransferHistory?: () => void;
+  /** Open the Encrypted Vault panel (vault-panel.tsx — another
+   *  zero-importer orphan until now). */
+  onOpenVault?: () => void;
+  /** Open the Migration Wizard (migration-wizard.tsx — orphaned,
+   *  self-modal overlay). */
+  onOpenMigration?: () => void;
+  /** Toggle the Transfer Queue dock (transfer-panel.tsx — the engine
+   *  queue UI, orphaned until now). */
+  onToggleTransferQueue?: () => void;
+  /** Toggle the toolbar customizer popover — the ui-store had the
+   *  toggle and the popover had the markup, but no control anywhere
+   *  called it, so the customizer was unreachable. */
+  onCustomizeToolbar?: () => void;
   /** Open the Integrity Tools panel — four tabs covering
    *  checksum computation (MD5 / SHA-1 / SHA-256), checksum
    *  verification, duplicate detection, tags and labels, and
@@ -1256,7 +1274,7 @@ export function getDefaultCommands(actions: {
       description:
         "Teleport to a recently touched ledger path — \u2318\u21E7L cycles forward, \u2318\u21E7\u2325L cycles back, the current folder is always skipped",
       icon: <History className="h-4 w-4" />,
-      shortcut: `${cmd}\u21E7L`,
+      shortcut: `${cmd}\u21E7U`,
       // Iter 48: surface the reverse cycling gesture in the
       // keyboard cheat sheet (?). Secondary shortcuts don't
       // show up in ⌘K itself — the palette stays one row per
@@ -1300,7 +1318,7 @@ export function getDefaultCommands(actions: {
       description:
         "Manage saved connections (SFTP, S3, Google Drive, WebDAV, SMB, FTP, Azure, GCS, Dropbox, \u2026)",
       icon: <Globe className="h-4 w-4" />,
-      shortcut: `${cmd}\u21E7N`,
+      shortcut: `${cmd}\u21E7U`,
       category: "Navigation",
       action: actions.onOpenConnections || (() => {}),
       keywords: [
@@ -1322,6 +1340,70 @@ export function getDefaultCommands(actions: {
         "manager",
         "new connection",
       ],
+    },
+    {
+      id: "open-vault",
+      label: "Encrypted Vault…",
+      description:
+        "Manage encrypted vaults — create, unlock, mount, lock",
+      icon: <Shield className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onOpenVault || (() => {}),
+      keywords: [
+        "vault",
+        "encrypt",
+        "encrypted",
+        "secure",
+        "lock",
+        "unlock",
+        "password",
+      ],
+    },
+    {
+      id: "open-migration",
+      label: "Migration Wizard…",
+      description:
+        "Move files and settings from another computer or drive",
+      icon: <ArrowRight className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onOpenMigration || (() => {}),
+      keywords: [
+        "migration",
+        "migrate",
+        "wizard",
+        "move",
+        "transfer computer",
+        "new mac",
+        "restore",
+      ],
+    },
+    {
+      id: "toggle-transfer-queue",
+      label: "Transfer Queue",
+      description:
+        "Show the transfer engine queue — pause, resume, cancel, retry, throttle",
+      icon: <ArrowRight className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onToggleTransferQueue || (() => {}),
+      keywords: [
+        "transfer",
+        "queue",
+        "jobs",
+        "pause",
+        "resume",
+        "cancel",
+        "retry",
+        "throttle",
+      ],
+    },
+    {
+      id: "customize-toolbar",
+      label: "Customize Toolbar…",
+      description: "Choose which buttons appear in the toolbar",
+      icon: <SlidersHorizontal className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onCustomizeToolbar || (() => {}),
+      keywords: ["toolbar", "customize", "buttons", "layout", "quickflows"],
     },
     // Settings \u2014 iter 26 wired the long-orphaned `SettingsPanel`
     // (1354 LOC with 9+ backend commands already registered) to
@@ -1536,6 +1618,24 @@ export function getDefaultCommands(actions: {
         "numbering",
         "multi rename",
         "mass rename",
+      ],
+    },
+    {
+      id: "queue-copy",
+      label: "Queue Copy to Destination…",
+      description:
+        "Enqueue selected files as transfer-queue jobs (verified, resumable, pauseable)",
+      icon: <ArrowRight className="h-4 w-4" />,
+      category: "File Operations",
+      action: actions.onQueueCopyTo || (() => {}),
+      keywords: [
+        "queue copy",
+        "transfer queue",
+        "enqueue",
+        "copy files",
+        "copy to",
+        "background copy",
+        "verified copy",
       ],
     },
     // Duplicate Tab \u2014 clones the active tab as a fresh tab in the

@@ -20,7 +20,8 @@ import {
   formatPaneStatsLabel,
 } from "@/lib/selection-stats";
 import { archiveExtractDest } from "@/lib/archive-paths";
-import { resolveFileActionKey } from "@/lib/file-action-keys";
+import { pickFolder } from "@/lib/folder-picker";
+import { resolveFileActionKey, resolveFileTransferKey, resolveNewFolderKey } from "@/lib/file-action-keys";
 import {
   useDriveSpace,
   useAllDrives,
@@ -68,6 +69,16 @@ import {
 import { useLedgerTailPoll } from "@/hooks/use-ledger-tail-poll";
 import { AiPanel } from "./ai-panel";
 import { AutomationPanel } from "./automation-panel";
+import { VaultPanel } from "./vault-panel";
+import { TransferPanel } from "./transfer-panel";
+import {
+  MigrationWizard,
+  type MigrationConfig,
+  type MigrationFolder,
+  type MigrationProgress,
+  type MigrationSummary,
+  type SpaceAnalysis,
+} from "./migration-wizard";
 import { SmartSpaceWizard } from "./smart-space-wizard";
 import { TerminalPanel } from "./terminal-panel";
 import { SinceLastSeenToast, type LedgerSinceSummary } from "./since-last-seen-toast";
@@ -81,9 +92,14 @@ import {
   type PathRecallInfo,
 } from "@/lib/path-recall";
 import { PathJumpDialog } from "./path-jump-dialog";
+import { useClearFilterOnNavigate } from "@/hooks/use-clear-filter-on-navigate";
+import { useFileClipboardStore } from "@/stores/file-clipboard-store";
+import { PromptDialogHost } from "./prompt-dialog-host";
+import { promptText, confirmText } from "@/lib/prompt-dialog";
 import { usePathJumpStore } from "@/stores/path-jump-store";
 import { SafetyInterlockDialog } from "./safety-interlock-dialog";
 import { EnginePulseIndicator } from "./engine-pulse-indicator";
+import { errorText } from "@/lib/error-text";
 import { useDirectoryActivity, useRecentlyTouchedSet } from "@/hooks/use-directory-activity";
 import { useFileSelection, useFileDragDrop } from "@/hooks/use-file-selection";
 import { cn } from "@ufop/ui-components";
@@ -108,6 +124,7 @@ import {
   FolderDown,
   Zap,
   Layers,
+  X,
 } from "lucide-react";
 
 // Toolbar customization definition (#14)
@@ -245,6 +262,24 @@ const jumpRing: {
   distinctPaths: string[];
 } = { index: 0, lastPressTime: 0, distinctPaths: [] };
 
+// ── Migration wizard run state (module-scope; see bridge below) ──────
+interface MigrationRunState {
+  phase: MigrationProgress["phase"];
+  currentFile: string;
+  filesCompleted: number;
+  filesTotal: number;
+  bytesTransferred: number;
+  bytesTotal: number;
+  failedCount: number;
+  failedPaths: string[];
+  errors: string[];
+  startedAt: number;
+  filesTransferred: number;
+  folderBytes: Map<string, number>;
+}
+let migrationRun: MigrationRunState | null = null;
+let migrationRunDest: string | null = null;
+
 export function FileManager() {
   const appMode = useUIStore((s) => s.appMode);
   const sidebarOpen = useUIStore((s) => s.sidebarOpen);
@@ -365,6 +400,269 @@ export function FileManager() {
   // `batchRenameFiles`: the keyboard handler in the useEffect
   // below needs the setter in scope.
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Two more orphaned panels surfaced the same way as Connections/Sync:
+  // vault-panel.tsx (1421 LOC) and migration-wizard.tsx (1626 LOC) had
+  // zero importers — the features existed but no UI path reached them.
+  const [vaultOpen, setVaultOpen] = useState(false);
+  const [transfersOpen, setTransfersOpen] = useState(false);
+  const [migrationOpen, setMigrationOpen] = useState(false);
+  // Drive inventory for the migration wizard — fetched lazily when the
+  // wizard opens via the real `detect_drives` IPC (T-025). Without this
+  // the wizard could only ever show "No drives detected".
+  const [migrationDrives, setMigrationDrives] = useState<Array<{
+    id: string; name: string; type: "drive";
+    mountPoint: string; totalBytes: number; freeBytes: number; filesystem: string;
+  }>>([]);
+  useEffect(() => {
+    if (!migrationOpen) return;
+    void tauriInvokeSafe<Array<{
+      name: string; mount_point: string; device: string;
+      total_bytes: number; free_bytes: number; filesystem: string;
+    }>>("detect_drives", undefined, []).then((drives) => {
+      setMigrationDrives(
+        drives.map((d) => ({
+          id: d.mount_point,
+          name: d.name,
+          type: "drive" as const,
+          mountPoint: d.mount_point,
+          totalBytes: d.total_bytes,
+          freeBytes: d.free_bytes,
+          filesystem: d.filesystem,
+        })),
+      );
+    });
+  }, [migrationOpen]);
+
+  // ── Migration wizard real-backend bridge ──────────────────────────
+  // The wizard is a UI shell; these callbacks wire it to the real IPC
+  // surface (list_directory, count_affected_files, transfer_preflight,
+  // copy_files). Shared run state lives module-scope (FileManager is a
+  // singleton) so the wizard's progress polling sees live values —
+  // the react-hooks/immutability rule forbids mutating refs.
+
+  const handleMigrationScan = useCallback(
+    async (sourceId: string): Promise<MigrationFolder[]> => {
+      const entries = await tauriInvoke<FileEntryData[]>("list_directory", {
+        path: sourceId,
+      });
+      const dirs = entries.filter((e) => e.is_dir && !e.is_hidden);
+      return Promise.all(
+        dirs.map(async (d) => {
+          const a = await tauriInvokeSafe<{ files: number; bytes: number }>(
+            "count_affected_files",
+            { paths: [d.path] },
+            { files: 0, bytes: 0 },
+          );
+          return {
+            path: d.path,
+            name: d.name,
+            size: a.bytes,
+            fileCount: a.files,
+            selected: false,
+          };
+        }),
+      );
+    },
+    [],
+  );
+
+  const handleMigrationAnalyze = useCallback(
+    async (
+      sourceId: string,
+      destId: string,
+      folders: string[],
+    ): Promise<SpaceAnalysis> => {
+      const sizes = await Promise.all(
+        folders.map((p) =>
+          tauriInvokeSafe<{ files: number; bytes: number }>(
+            "count_affected_files",
+            { paths: [p] },
+            { files: 0, bytes: 0 },
+          ),
+        ),
+      );
+      const totalBytes = sizes.reduce((n, s) => n + s.bytes, 0);
+      const pf = await tauriInvoke<{
+        can_proceed: boolean;
+        warnings: Array<{ code: string; message: string; detail: string | null }>;
+        errors: Array<{ code: string; message: string; detail: string | null }>;
+        dest_drive: { free_bytes: number; total_bytes: number } | null;
+      }>("transfer_preflight", {
+        sourcePath: sourceId,
+        destPath: destId,
+        totalBytes,
+      });
+      const destFree = pf.dest_drive?.free_bytes ?? 0;
+      const destTotal = pf.dest_drive?.total_bytes ?? 0;
+      // Seed the run state so progress polling has real byte totals even
+      // before execution begins.
+      migrationRun = {
+        phase: "preparing",
+        currentFile: "",
+        filesCompleted: 0,
+        filesTotal: folders.length,
+        bytesTransferred: 0,
+        bytesTotal: totalBytes,
+        failedCount: 0,
+        failedPaths: [],
+        errors: [],
+        startedAt: 0,
+        filesTransferred: 0,
+        folderBytes: new Map(folders.map((p, i) => [p, sizes[i]?.bytes ?? 0])),
+      };
+      return {
+        totalSelectedBytes: totalBytes,
+        destFreeBytes: destFree,
+        destTotalBytes: destTotal,
+        hasEnoughSpace: pf.can_proceed && destFree >= totalBytes,
+        spaceAfterTransfer: destFree - totalBytes,
+        duplicateBytes: 0,
+        duplicateCount: 0,
+        compatIssues: [
+          ...pf.errors.map((e) => ({
+            severity: "error" as const,
+            code: e.code,
+            message: e.message,
+            detail: e.detail ?? undefined,
+          })),
+          ...pf.warnings.map((w) => ({
+            severity: "warning" as const,
+            code: w.code,
+            message: w.message,
+            detail: w.detail ?? undefined,
+          })),
+        ],
+      };
+    },
+    [],
+  );
+
+  const handleMigrationExecute = useCallback(
+    async (config: MigrationConfig) => {
+      const run = migrationRun ?? {
+        phase: "preparing" as const,
+        currentFile: "",
+        filesCompleted: 0,
+        filesTotal: config.folders.length,
+        bytesTransferred: 0,
+        bytesTotal: 0,
+        failedCount: 0,
+        failedPaths: [] as string[],
+        errors: [] as string[],
+        startedAt: 0,
+        filesTransferred: 0,
+        folderBytes: new Map<string, number>(),
+      };
+      migrationRun = run;
+      migrationRunDest = config.destId;
+      run.phase = "transferring";
+      run.startedAt = Date.now();
+      run.filesCompleted = 0;
+      run.filesTotal = config.folders.length;
+      run.bytesTransferred = 0;
+      run.failedCount = 0;
+      run.failedPaths = [];
+      run.errors = [];
+      run.filesTransferred = 0;
+      for (const folder of config.folders) {
+        run.currentFile = folder;
+        try {
+          const res = await tauriInvoke<{ dest_paths: string[] }>(
+            "copy_files",
+            { sourcePaths: [folder], destDir: config.destId },
+          );
+          run.filesCompleted += 1;
+          run.filesTransferred += res.dest_paths.length;
+          run.bytesTransferred += run.folderBytes.get(folder) ?? 0;
+        } catch (err) {
+          run.failedCount += 1;
+          run.failedPaths.push(folder);
+          run.errors.push(`${folder}: ${errorText(err, "copy failed")}`);
+        }
+      }
+      run.phase = run.failedCount === run.filesTotal ? "failed" : "complete";
+    },
+    [],
+  );
+
+  const handleMigrationProgress = useCallback(async (): Promise<MigrationProgress> => {
+    const r = migrationRun;
+    if (!r) {
+      return {
+        currentFile: "",
+        filesCompleted: 0,
+        filesTotal: 0,
+        bytesTransferred: 0,
+        bytesTotal: 0,
+        speedBps: 0,
+        etaSeconds: null,
+        failedCount: 0,
+        phase: "preparing",
+      };
+    }
+    const elapsedSec = r.startedAt > 0 ? (Date.now() - r.startedAt) / 1000 : 0;
+    const speed = elapsedSec > 0 ? r.bytesTransferred / elapsedSec : 0;
+    const remaining = r.bytesTotal - r.bytesTransferred;
+    return {
+      currentFile: r.currentFile,
+      filesCompleted: r.filesCompleted,
+      filesTotal: r.filesTotal,
+      bytesTransferred: r.bytesTransferred,
+      bytesTotal: r.bytesTotal,
+      speedBps: speed,
+      etaSeconds: speed > 0 ? remaining / speed : null,
+      failedCount: r.failedCount,
+      phase: r.phase,
+    };
+  }, []);
+
+  const handleMigrationSummary = useCallback(async (): Promise<MigrationSummary> => {
+    const r = migrationRun;
+    const dur = r && r.startedAt > 0 ? Date.now() - r.startedAt : 0;
+    return {
+      totalFiles: r?.filesTotal ?? 0,
+      totalBytes: r?.bytesTotal ?? 0,
+      filesTransferred: r?.filesTransferred ?? 0,
+      bytesTransferred: r?.bytesTransferred ?? 0,
+      filesFailed: r?.failedCount ?? 0,
+      filesSkipped: 0,
+      durationMs: dur,
+      averageSpeedBps: dur > 0 && r ? r.bytesTransferred / (dur / 1000) : 0,
+      errors: r?.errors ?? [],
+      warnings: [],
+      verificationPassed: (r?.failedCount ?? 0) === 0,
+      resumed: false,
+    };
+  }, []);
+
+  const handleMigrationRetry = useCallback(async () => {
+    const r = migrationRun;
+    const dest = migrationRunDest;
+    if (!r || !dest || r.failedPaths.length === 0) return;
+    const retry = [...r.failedPaths];
+    r.failedPaths = [];
+    r.failedCount = 0;
+    r.errors = [];
+    r.phase = "transferring";
+    for (const folder of retry) {
+      r.currentFile = folder;
+      try {
+        const res = await tauriInvoke<{ dest_paths: string[] }>(
+          "copy_files",
+          { sourcePaths: [folder], destDir: dest },
+        );
+        r.filesCompleted += 1;
+        r.filesTransferred += res.dest_paths.length;
+        r.bytesTransferred += r.folderBytes.get(folder) ?? 0;
+      } catch (err) {
+        r.failedCount += 1;
+        r.failedPaths.push(folder);
+        r.errors.push(`${folder}: ${errorText(err, "copy failed")}`);
+      }
+    }
+    r.phase = r.failedCount === r.filesTotal ? "failed" : "complete";
+  }, []);
+
   // Iter 27: Connection manager modal state. ConnectionPanel is
   // 1941 LOC of production-ready UI for managing connection
   // profiles across the 17 connector protocols (SFTP, S3,
@@ -373,7 +671,7 @@ export function FileManager() {
   // OpenStack Swift, MinIO). All 17 Tauri commands it uses are
   // pre-registered in the Rust backend; the component itself
   // just had zero importers. Iter 27 surfaces it via
-  // Cmd+Shift+N and a palette entry. Same TDZ-safe placement
+  // Cmd+Shift+U and a palette entry. Same TDZ-safe placement
   // as the iter 25/26 orphan dialogs.
   const [connectionsOpen, setConnectionsOpen] = useState(false);
   // Iter 28: Sync panel modal state. SyncPanel is 1454 LOC of
@@ -493,8 +791,8 @@ export function FileManager() {
     string[] | null
   >(null);
 
-  const handleSaveWorkspace = useCallback(() => {
-    const name = window.prompt("Save workspace as:", `Workspace ${workspaces.length + 1}`);
+  const handleSaveWorkspace = useCallback(async () => {
+    const name = await promptText("Save workspace as:", `Workspace ${workspaces.length + 1}`);
     if (name?.trim()) {
       saveWorkspace(name.trim());
     }
@@ -534,9 +832,7 @@ export function FileManager() {
         }
       }
     } else if (action === "vault") {
-      // Open vault panel — no separate panel toggle exists yet, but we could open AI panel
-      // For now, just log
-      console.log("Intent: open vault for", result.entity_id);
+      setVaultOpen(true);
     } else if (action.startsWith("sync:") || action.startsWith("transfer:")) {
       // Show a toast-like message via structured error (info level)
       const uiStore = useUIStore.getState();
@@ -897,7 +1193,7 @@ export function FileManager() {
         }
       }
       // Cmd+B to toggle sidebar
-      if ((e.metaKey || e.ctrlKey) && e.key === "b") {
+      if ((e.metaKey || e.ctrlKey) && e.key === "b" && !e.shiftKey) {
         e.preventDefault();
         toggleSidebar();
       }
@@ -910,12 +1206,12 @@ export function FileManager() {
       // `redo_last` IPC. Matches the universal redo gesture used by every
       // major editor and browser; pure additive (no change for users who
       // never undo).
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "z" || e.key === "Z")) {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "z") {
         e.preventDefault();
         handleRedo();
       }
       // Cmd+Shift+A to toggle AI panel (T-043)
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "A") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "a") {
         e.preventDefault();
         toggleAiPanel();
       }
@@ -925,7 +1221,7 @@ export function FileManager() {
         toggleTerminalPanel();
       }
       // Cmd+Shift+Y to toggle Activity Timeline (unified ledger viewer)
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "Y") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "y") {
         e.preventDefault();
         toggleActivityTimeline();
       }
@@ -933,11 +1229,11 @@ export function FileManager() {
       // searches every path the unified ledger has ever seen, across
       // connectors and sessions. Zero cognitive overload: invisible
       // until pressed.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "O") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") {
         e.preventDefault();
         usePathJumpStore.getState().open();
       }
-      // Cmd+Shift+L — "Jump to Last Touched" Jump Ring. Iter 42
+      // Cmd+Shift+U — "Jump to Last Touched" Jump Ring. Iter 42
       // introduced the one-keystroke teleport; iter 43 upgrades
       // it into an alt-tab-style cycler. First press skips the
       // current active tab's path and goes to the newest
@@ -959,7 +1255,7 @@ export function FileManager() {
         (e.metaKey || e.ctrlKey) &&
         e.shiftKey &&
         !e.altKey &&
-        e.key === "L"
+        e.key.toLowerCase() === "l"
       ) {
         e.preventDefault();
         void handleJumpLastTouched("forward");
@@ -974,12 +1270,12 @@ export function FileManager() {
         void handleJumpLastTouched("reverse");
       }
       // Cmd+Shift+. to toggle hidden files (#85)
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === ".") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "." || e.key === ">")) {
         e.preventDefault();
         useFileManagerStore.getState().toggleHiddenFiles();
       }
       // Cmd+Shift+S to save workspace
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "S") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "s") {
         e.preventDefault();
         handleSaveWorkspace();
       }
@@ -988,7 +1284,7 @@ export function FileManager() {
       // closed-tab ring buffer and revives the snapshot bit-exact (path,
       // label, full back/forward stack). No-op when the ring is empty,
       // so the shortcut is always safe to bind.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "T") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "t") {
         e.preventDefault();
         const store = useFileManagerStore.getState();
         store.reopenClosedTab(store.activePaneIndex);
@@ -999,7 +1295,7 @@ export function FileManager() {
       // tabs come back via T, working selections come back via the
       // palette's "Recall Stash" entry. Surfaces a tiny toast on success
       // so the user gets feedback without opening the palette.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "M") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "m") {
         e.preventDefault();
         const stash = useFileManagerStore.getState().stashCurrentSelection();
         if (stash) {
@@ -1018,7 +1314,7 @@ export function FileManager() {
       // drag-drop populates: zero new state surface, one new keystroke.
       // Surfaces a structured-error toast so the user gets feedback
       // (added/removed) without needing the sidebar to be visible.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "B") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "b") {
         e.preventDefault();
         const result = useFileManagerStore
           .getState()
@@ -1044,7 +1340,7 @@ export function FileManager() {
       // Reuses `addTab` so the new tab's history bookkeeping matches
       // every other tab — DRY. Surfaces a structured-error toast on
       // success so the user gets immediate feedback.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "E") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "e") {
         e.preventDefault();
         const store = useFileManagerStore.getState();
         const result = store.openInOtherPane(store.activePaneIndex);
@@ -1067,7 +1363,7 @@ export function FileManager() {
       // its original iteration \u2014 iter 25 surfaces it so users can
       // actually reach it. Guards against the empty-selection
       // case so the shortcut is a no-op when nothing is selected.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "R") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "r") {
         e.preventDefault();
         // Read the selection inline from the store rather than
         // via `getAllSelectedPaths` \u2014 this useEffect runs above
@@ -1093,16 +1389,17 @@ export function FileManager() {
         e.preventDefault();
         setSettingsOpen((open) => !open);
       }
-      // Cmd+Shift+N \u2014 open the Connection Manager. Surfaces
+      // Cmd+Shift+U \u2014 open the Connection Manager. Surfaces
       // the long-orphaned `ConnectionPanel` (1941 LOC managing
       // saved profiles, quick-connect, connection test, SSH
       // config import, third-party import, protocol list) for
       // the 17-connector protocol registry. All 17 Tauri
       // commands it needs are already registered in the Rust
-      // backend \u2014 the component just had zero importers. N
-      // mnemonic = "New connection" which matches the most
-      // common entry path into the dialog.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "N") {
+      // backend \u2014 the component just had zero importers. U
+      // mnemonic = "Url" (Cmd+Shift+N belongs to New Folder,
+      // matching Finder and every menu/palette advertisement;
+      // Cmd+Shift+L is the Jump Ring).
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "u") {
         e.preventDefault();
         setConnectionsOpen((open) => !open);
       }
@@ -1114,7 +1411,7 @@ export function FileManager() {
       // Rust backend \u2014 the component just had zero importers.
       // H mnemonic = "sync Health" which matches the panel's
       // primary UX (health dots + health scores).
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "H") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "h") {
         e.preventDefault();
         setSyncOpen((open) => !open);
       }
@@ -1127,7 +1424,7 @@ export function FileManager() {
       // cleanup_transfer_history) were pre-registered; the component
       // just had zero importers until iter 30. Pure toggle — no
       // selection required, no context-dependent no-op.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "J") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "j") {
         e.preventDefault();
         setTransferHistoryOpen((open) => !open);
       }
@@ -1144,7 +1441,7 @@ export function FileManager() {
       // Reads the active pane's current directory from the
       // store so the Duplicates / Smart Folder tabs have a
       // default base path. Toggle closes on second press.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "I") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "i") {
         e.preventDefault();
         setIntegrityToolsOpen((prev) => {
           if (prev !== null) return null;
@@ -1164,7 +1461,7 @@ export function FileManager() {
       // closes. Press 3 with a NEW selection \u2192 re-opens on
       // the new file. Reads selection inline from the store
       // to avoid TDZ with helpers declared below.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "P") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "p") {
         e.preventDefault();
         const uiStore = useUIStore.getState();
         if (uiStore.previewPanelOpen) {
@@ -1188,7 +1485,7 @@ export function FileManager() {
       // the existing right-click "Show File History" + activity-dot
       // click \u2014 same backend command (`get_file_lineage`), now a
       // keyboard gesture too.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "G") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "g") {
         e.preventDefault();
         const lineageStore = useLineageStore.getState();
         if (lineageStore.pendingPath !== null) {
@@ -1210,7 +1507,7 @@ export function FileManager() {
       // fallback ensures the gesture is always useful — never a
       // confusing no-op. Reuses `navigator.clipboard.writeText`
       // exactly like every other copy-path action in the palette.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "C") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "c") {
         e.preventDefault();
         const { paths, source } = useFileManagerStore
           .getState()
@@ -1259,7 +1556,7 @@ export function FileManager() {
       // truth for tab birth — DRY). K mnemonic = "Klone" (D, the
       // more obvious choice, is taken by the pre-existing toggle-
       // single-pane-mode handler in dual-pane-layout.tsx).
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "K") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "k") {
         e.preventDefault();
         const store = useFileManagerStore.getState();
         const result = store.duplicateActiveTab(store.activePaneIndex);
@@ -1282,7 +1579,7 @@ export function FileManager() {
       // (Filter Echo) to complete the "make these two views
       // comparable" workflow. Silent no-op when both panes already
       // match (idempotent gesture, no useless toast).
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "V") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "v") {
         e.preventDefault();
         const store = useFileManagerStore.getState();
         const result = store.mirrorViewToOtherPane(store.activePaneIndex);
@@ -1308,7 +1605,7 @@ export function FileManager() {
       // other pane — no retyping. No-op (silent) when the source
       // filter is empty so the gesture never wipes the other side's
       // filter by accident.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "F") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "f") {
         e.preventDefault();
         const store = useFileManagerStore.getState();
         const result = store.echoFilterToOtherPane(store.activePaneIndex);
@@ -1330,7 +1627,7 @@ export function FileManager() {
       // visible). Pairs with Cmd+Shift+E (Open in Other Pane, iter 11):
       // mirror a folder, realise the source/target sides are wrong,
       // hit Cmd+Shift+X to flip — no clicks, no menu hunting.
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "X") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "x") {
         e.preventDefault();
         const result = useFileManagerStore.getState().swapPanes();
         if (result) {
@@ -1418,12 +1715,17 @@ export function FileManager() {
         }>>("check_watched_files", undefined, []);
 
         for (const file of changed) {
-          // Auto-enqueue re-upload for changed files
-          if (file.remote_path && file.temp_path) {
-            await tauriInvoke("enqueue_transfer", {
-              sourcePath: file.temp_path,
-              destPath: file.remote_path,
-              totalBytes: 0,
+          // Auto re-upload for changed remote-edit files. This used to
+          // enqueue a local-queue job whose dest was the remote path —
+          // the local runner can't reach remote targets and would even
+          // create junk "sftp:" directories locally. `connector_upload`
+          // is the real path: it resolves the live connector from the
+          // registry and pushes the bytes.
+          if (file.remote_path && file.temp_path && file.protocol) {
+            await tauriInvoke("connector_upload", {
+              protocol: file.protocol,
+              localPath: file.temp_path,
+              remotePath: file.remote_path,
             }).catch(() => {});
           }
         }
@@ -1558,7 +1860,7 @@ export function FileManager() {
           } catch (err) {
             useUIStore.getState().addStructuredError({
               what: "Copy Remote Path failed",
-              why: err instanceof Error ? err.message : "Backend rejected the request",
+              why: errorText(err, "Backend rejected the request"),
               appDid: "Did not write anything to the clipboard",
               userAction: "Confirm a remote base is configured for this connection",
             });
@@ -1576,7 +1878,7 @@ export function FileManager() {
           } catch (err) {
             useUIStore.getState().addStructuredError({
               what: "Copy URL failed",
-              why: err instanceof Error ? err.message : "Backend rejected the request",
+              why: errorText(err, "Backend rejected the request"),
               appDid: "Did not write anything to the clipboard",
               userAction: "Try the simple Copy Path action instead",
             });
@@ -1596,7 +1898,7 @@ export function FileManager() {
           } catch (err) {
             useUIStore.getState().addStructuredError({
               what: "Copy Relative Path failed",
-              why: err instanceof Error ? err.message : "Backend rejected the request",
+              why: errorText(err, "Backend rejected the request"),
               appDid: "Did not write anything to the clipboard",
               userAction: "Confirm the current pane has a valid base path",
             });
@@ -1765,6 +2067,18 @@ export function FileManager() {
         onOpenTransferHistory: () => {
           setTransferHistoryOpen(true);
         },
+        onOpenVault: () => {
+          setVaultOpen(true);
+        },
+        onOpenMigration: () => {
+          setMigrationOpen(true);
+        },
+        onToggleTransferQueue: () => {
+          setTransfersOpen((v) => !v);
+        },
+        onCustomizeToolbar: () => {
+          useUIStore.getState().toggleToolbarCustomizer();
+        },
         onOpenIntegrityTools: () => {
           // Snapshot the active pane's current directory the same
           // way the Cmd+Shift+I keyboard handler does, so palette-
@@ -1808,6 +2122,54 @@ export function FileManager() {
             return;
           }
           setBatchRenameFiles(paths);
+        },
+        onQueueCopyTo: () => {
+          // Feeds the transfer-engine queue from a real selection —
+          // before this, `enqueue_transfer` had zero production
+          // callers and the queue was dead UI.
+          void (async () => {
+            const paths = getAllSelectedPaths();
+            const store = useFileManagerStore.getState();
+            const pane = store.getActivePane();
+            const tab = pane.tabs.find((t) => t.id === pane.activeTabId);
+            // One directory listing yields is_dir + size for the whole
+            // selection (the pane's `files` array isn't in the store).
+            const listing = tab
+              ? await tauriInvoke<FileEntryData[]>("list_directory", {
+                  path: tab.path,
+                }).catch(() => [] as FileEntryData[])
+              : [];
+            const selected = listing.filter(
+              (f) => paths.includes(f.path) && !f.is_dir,
+            );
+            if (selected.length === 0) {
+              useUIStore.getState().addStructuredError({
+                what: "Queue Copy needs selected files",
+                why: "Nothing is selected, or the selection is only folders",
+                appDid:
+                  "Skipped the destination picker because the engine queue transfers single files",
+                userAction:
+                  "Select one or more files (not folders) and try again",
+              });
+              return;
+            }
+            const dest = await pickFolder("Choose destination for queued copy");
+            if (!dest) return;
+            let queued = 0;
+            for (const f of selected) {
+              try {
+                await tauriInvoke("enqueue_transfer", {
+                  source: f.path,
+                  dest,
+                  totalBytes: f.size,
+                });
+                queued += 1;
+              } catch (err) {
+                reportOperationFailure("Queue copy", err);
+              }
+            }
+            if (queued > 0) setTransfersOpen(true);
+          })();
         },
         onDuplicateActiveTab: () => {
           const store = useFileManagerStore.getState();
@@ -2195,6 +2557,7 @@ export function FileManager() {
       {/* Smart Space Wizard */}
       {spacesWizardOpen && <SmartSpaceWizard onClose={closeSpacesWizard} />}
 
+      <PromptDialogHost />
       {/* Instant Jump — Cmd+Shift+O universal path recall.
           Iter 37: wired to the iter-31/32 contextual-routing
           infrastructure so path hits that are FILES (which the
@@ -2213,6 +2576,25 @@ export function FileManager() {
 
       {/* Safety Interlock — context-aware confirmation for anomalous ops */}
       <SafetyInterlockDialog />
+
+      {/* Transfer queue dock — the real engine queue (pause / resume /
+          cancel / retry / throttle). Was an orphaned component. */}
+      {transfersOpen && (
+        <div
+          className="relative shrink-0 border-t border-[var(--color-border)] bg-[var(--color-bg)]"
+          style={{ height: "220px" }}
+        >
+          <button
+            onClick={() => setTransfersOpen(false)}
+            className="absolute right-2 top-2 z-10 rounded p-1 text-[color:var(--color-text-tertiary)] hover:bg-[var(--color-hover-bg)]"
+            aria-label="Close transfer queue"
+            title="Close transfer queue"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+          <TransferPanel />
+        </div>
+      )}
 
       <footer
         className="relative flex items-center justify-between border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-4"
@@ -2301,7 +2683,7 @@ export function FileManager() {
             className="w-[min(1100px,95vw)] h-[min(800px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="relative h-full">
+            <div className="relative h-full pt-9">
               <button
                 className="absolute top-3 right-4 z-10 h-7 w-7 flex items-center justify-center rounded text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover)]"
                 onClick={() => setSyncOpen(false)}
@@ -2349,7 +2731,7 @@ export function FileManager() {
             className="w-[min(1100px,95vw)] h-[min(800px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="relative h-full">
+            <div className="relative h-full pt-9">
               <button
                 className="absolute top-3 right-4 z-10 h-7 w-7 flex items-center justify-center rounded text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover)]"
                 onClick={() => setTransferHistoryOpen(false)}
@@ -2517,7 +2899,7 @@ export function FileManager() {
             className="w-[min(1100px,95vw)] h-[min(800px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="relative h-full">
+            <div className="relative h-full pt-9">
               <button
                 className="absolute top-3 right-4 z-10 h-7 w-7 flex items-center justify-center rounded text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover)]"
                 onClick={() => setConnectionsOpen(false)}
@@ -2559,7 +2941,7 @@ export function FileManager() {
             className="w-[min(900px,95vw)] h-[min(720px,90vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="relative h-full">
+            <div className="relative h-full pt-9">
               <button
                 className="absolute top-3 right-4 z-10 h-7 w-7 flex items-center justify-center rounded text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover)]"
                 onClick={() => setSettingsOpen(false)}
@@ -2580,6 +2962,61 @@ export function FileManager() {
           </div>
         </div>
       )}
+
+      {/* Encrypted Vault — vault-panel.tsx (1421 LOC) was fully built
+          but had zero importers, the same orphan pattern as
+          Connections/Sync/Settings. Surfaced via the command palette
+          and the AI intent bar's "vault" action. */}
+      {vaultOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Encrypted Vault"
+          data-testid="vault-backdrop"
+          onClick={() => setVaultOpen(false)}
+        >
+          <div
+            className="w-[min(900px,95vw)] h-[min(720px,90vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="relative h-full pt-9">
+              <button
+                className="absolute top-3 right-4 z-10 h-7 w-7 flex items-center justify-center rounded text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover)]"
+                onClick={() => setVaultOpen(false)}
+                aria-label="Close vault"
+              >
+                <svg
+                  className="w-4 h-4"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                >
+                  <path d="M18 6L6 18M6 6l12 12" />
+                </svg>
+              </button>
+              <VaultPanel />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Migration Wizard — migration-wizard.tsx (1626 LOC) was also an
+          orphan with zero importers. It renders its own full-screen
+          overlay (`open` prop), so it mounts bare here; its callbacks
+          are all optional until real peer/drive discovery is wired. */}
+      <MigrationWizard
+        open={migrationOpen}
+        onClose={() => setMigrationOpen(false)}
+        availableDrives={migrationDrives}
+        onScanFolders={handleMigrationScan}
+        onAnalyzeSpace={handleMigrationAnalyze}
+        onExecute={handleMigrationExecute}
+        onGetProgress={handleMigrationProgress}
+        onGetSummary={handleMigrationSummary}
+        onRetryFailed={handleMigrationRetry}
+      />
 
       {batchRenameFiles && (
         <div
@@ -2885,6 +3322,8 @@ function FilePane({
     return () => window.removeEventListener(REFRESH_EVENT, handler);
   }, [currentPath, loadDirectory]);
 
+  useClearFilterOnNavigate(paneIndex, currentPath);
+
   // Apply filter
   const filteredFiles = useMemo(
     () => filterFiles(files, pane.filterText),
@@ -3023,7 +3462,7 @@ function FilePane({
   }, [staleFilteredFiles, showHiddenFiles]);
 
   // Selection
-  const { selectedPaths, handleSelect, selectAll, invertSelection } =
+  const { selectedPaths, handleSelect, handleKeyboardSelect, selectAll, invertSelection } =
     useFileSelection(pane.id, visibleFiles);
 
   // Status-bar stats — publish folder + selection tallies into the store
@@ -3146,7 +3585,7 @@ function FilePane({
   }, []);
 
   // Conflict check helper
-  const checkConflicts = useCallback(async (sourcePaths: string[], destDir: string): Promise<boolean> => {
+  const checkConflicts = useCallback(async (sourcePaths: string[], destDir: string, mode: "copy" | "move" = "copy"): Promise<boolean> => {
     if (!isTauriAvailable()) return true;
     for (const sourcePath of sourcePaths) {
       const fileName = sourcePath.split("/").pop() || "";
@@ -3166,8 +3605,11 @@ function FilePane({
           if (conflict.source_newer) details.push("Source is newer");
           if (conflict.size_differs) details.push("File sizes differ");
 
+          // Neither route overwrites: copy keeps both (new name), move refuses.
           const proceed = confirm(
-            `Conflict detected for "${fileName}":\n${details.join("\n")}\n\nDo you want to overwrite?`
+            mode === "copy"
+              ? `"${fileName}" already exists in the destination:\n${details.join("\n")}\n\nKeep both? The copy will get a new name.`
+              : `"${fileName}" already exists in the destination:\n${details.join("\n")}\n\nThe move will fail for this item. Continue anyway?`
           );
           if (!proceed) return false;
         }
@@ -3179,38 +3621,27 @@ function FilePane({
   }, []);
 
   // File operations
-  const handleCopy = useCallback(async () => {
-    if (selectedPaths.length === 0) return;
-    if (isTauriAvailable()) {
-      try {
-        const store = useFileManagerStore.getState();
-        const otherPaneIndex = paneIndex === 0 ? 1 : 0;
-        const otherPath = store.getActivePath(otherPaneIndex);
-        const proceed = await checkConflicts(selectedPaths, otherPath);
-        if (!proceed) return;
-        await tauriInvoke("copy_files", { sourcePaths: selectedPaths, destDir: otherPath });
-        pushUndo({ id: `copy-${Date.now()}`, type: "copy", sourcePaths: selectedPaths, destPaths: selectedPaths.map((p) => `${otherPath}/${p.split("/").pop()}`), timestamp: Date.now() });
-        // Iter 18: path-aware refresh. `otherPath` covers the
-        // destination pane; `currentPath` covers the source pane
-        // (harmless for copy but needed for symmetry with move).
-        // Unrelated panes skip the reload.
-        dispatchRefresh([currentPath, otherPath]);
-      } catch (err) {
-        reportOperationFailure("Copy", err);
-      }
-    } else { console.log("Copy (demo mode):", selectedPaths); }
-  }, [selectedPaths, paneIndex, pushUndo, checkConflicts, currentPath]);
-
-  const handleCut = useCallback(async () => {
-    if (selectedPaths.length === 0) return;
-    if (isTauriAvailable()) {
-      try {
-        const store = useFileManagerStore.getState();
-        const otherPaneIndex = paneIndex === 0 ? 1 : 0;
-        const otherPath = store.getActivePath(otherPaneIndex);
-        const proceed = await checkConflicts(selectedPaths, otherPath);
-        if (!proceed) return;
-        const measured = await measureSelection(selectedPaths);
+  /**
+   * Copy or move `paths` into `destDir`. Shared by Paste (clipboard) and the
+   * direct "to other pane" transfers so conflict checks, the Safety Interlock,
+   * undo entries and pane refreshes behave identically on every route.
+   */
+  const transferPaths = useCallback(async (paths: string[], destDir: string, mode: "copy" | "move"): Promise<boolean> => {
+    if (paths.length === 0) return false;
+    const label = mode === "copy" ? "Copy" : "Move";
+    if (!isTauriAvailable()) { console.log(`${label} (demo mode):`, paths); return false; }
+    try {
+      // Copying into the folder an item already lives in just makes a
+      // "(copy)" sibling, so there is nothing to confirm.
+      const parentOf = (p: string) => p.slice(0, p.lastIndexOf("/")) || "/";
+      const needsCheck = paths.filter((p) => parentOf(p) !== destDir);
+      if (needsCheck.length > 0 && !(await checkConflicts(needsCheck, destDir, mode))) return false;
+      const destPaths = paths.map((p) => `${destDir === "/" ? "" : destDir}/${p.split("/").pop()}`);
+      if (mode === "copy") {
+        await tauriInvoke("copy_files", { sourcePaths: paths, destDir });
+        pushUndo({ id: `copy-${Date.now()}`, type: "copy", sourcePaths: paths, destPaths, timestamp: Date.now() });
+      } else {
+        const measured = await measureSelection(paths);
         const result = await assessBeforeExecute(
           {
             engine: "fs",
@@ -3218,23 +3649,58 @@ function FilePane({
             affected_files: measured.files,
             total_bytes: measured.bytes,
             subject_path: currentPath,
-            summary: `Move ${selectedPaths.length} item${selectedPaths.length === 1 ? "" : "s"} → ${otherPath}`,
+            summary: `Move ${paths.length} item${paths.length === 1 ? "" : "s"} → ${destDir}`,
           },
-          () => tauriInvoke("move_files", { sourcePaths: selectedPaths, destDir: otherPath }),
+          () => tauriInvoke("move_files", { sourcePaths: paths, destDir }),
         );
-        if (result === null) return;
-        pushUndo({ id: `move-${Date.now()}`, type: "move", sourcePaths: selectedPaths, destPaths: selectedPaths.map((p) => `${otherPath}/${p.split("/").pop()}`), timestamp: Date.now() });
-        // Iter 18: path-aware refresh covering BOTH the source
-        // pane (files left) AND the destination pane (files
-        // arrived). Fixes the pre-iter-18 bug where a direct
-        // `loadDirectory(currentPath)` only refreshed the source
-        // pane, leaving the destination pane showing stale state.
-        dispatchRefresh([currentPath, otherPath]);
-      } catch (err) {
-        reportOperationFailure("Move", err);
+        if (result === null) return false;
+        pushUndo({ id: `move-${Date.now()}`, type: "move", sourcePaths: paths, destPaths, timestamp: Date.now() });
       }
-    } else { console.log("Cut (demo mode):", selectedPaths); }
-  }, [selectedPaths, paneIndex, pushUndo, currentPath, checkConflicts]);
+      // Path-aware refresh: the source pane(s) and the destination pane(s).
+      dispatchRefresh([currentPath, destDir, ...paths]);
+      return true;
+    } catch (err) {
+      reportOperationFailure(label, err);
+      return false;
+    }
+  }, [pushUndo, checkConflicts, currentPath]);
+
+  const otherPanePath = useCallback(() => {
+    const store = useFileManagerStore.getState();
+    return store.getActivePath(paneIndex === 0 ? 1 : 0);
+  }, [paneIndex]);
+
+  /** Copy / Cut only record the selection; Paste performs the transfer. */
+  const handleCopy = useCallback(async () => {
+    if (selectedPaths.length === 0) return;
+    useFileClipboardStore.getState().set(selectedPaths, "copy");
+  }, [selectedPaths]);
+
+  const handleCut = useCallback(async () => {
+    if (selectedPaths.length === 0) return;
+    useFileClipboardStore.getState().set(selectedPaths, "cut");
+  }, [selectedPaths]);
+
+  const handlePaste = useCallback(async () => {
+    const { paths, mode, clear } = useFileClipboardStore.getState();
+    if (paths.length === 0) return;
+    if (mode === "cut") {
+      // Moving an item into the folder it already lives in is a no-op.
+      const movable = paths.filter((p) => p.slice(0, p.lastIndexOf("/")) !== (currentPath === "/" ? "" : currentPath));
+      if (movable.length === 0) { clear(); return; }
+      if (await transferPaths(movable, currentPath, "move")) clear();
+    } else {
+      await transferPaths(paths, currentPath, "copy");
+    }
+  }, [currentPath, transferPaths]);
+
+  const handleCopyToOtherPane = useCallback(async () => {
+    await transferPaths(selectedPaths, otherPanePath(), "copy");
+  }, [selectedPaths, transferPaths, otherPanePath]);
+
+  const handleMoveToOtherPane = useCallback(async () => {
+    await transferPaths(selectedPaths, otherPanePath(), "move");
+  }, [selectedPaths, transferPaths, otherPanePath]);
 
   const handleDelete = useCallback(async () => {
     if (selectedPaths.length === 0) return;
@@ -3270,8 +3736,10 @@ function FilePane({
   const handleDeletePermanently = useCallback(async (paths: string[]) => {
     if (paths.length === 0) return;
     const fileNames = paths.map((p) => p.split("/").pop()).join(", ");
-    const confirmed = window.confirm(
-      `Permanently delete ${paths.length} item(s)?\n\n${fileNames}\n\nThis action cannot be undone.`
+    const confirmed = await confirmText(
+      `Permanently delete ${paths.length} item(s)?\n\n${fileNames}\n\nThis action cannot be undone.`,
+      "Delete",
+      true,
     );
     if (!confirmed) return;
     if (isTauriAvailable()) {
@@ -3318,7 +3786,7 @@ function FilePane({
   const handleRename = useCallback(async (filePath: string) => {
     if (isTauriAvailable()) {
       const oldName = filePath.split("/").pop() || "";
-      const newName = window.prompt("Enter new name:", oldName);
+      const newName = await promptText("Enter new name:", oldName);
       if (newName && newName !== oldName) {
         try {
           await tauriInvoke("rename_file", { sourcePath: filePath, newName });
@@ -3356,7 +3824,7 @@ function FilePane({
 
   const handleNewFolder = useCallback(async () => {
     if (isTauriAvailable()) {
-      const name = window.prompt("New folder name:", "New Folder");
+      const name = await promptText("New folder name:", "New Folder");
       if (name) {
         try {
           const newPath = `${currentPath === "/" ? "" : currentPath}/${name}`;
@@ -3378,7 +3846,7 @@ function FilePane({
 
   const handleNewFile = useCallback(async () => {
     if (isTauriAvailable()) {
-      const name = window.prompt("New file name:", "untitled.txt");
+      const name = await promptText("New file name:", "untitled.txt");
       if (name) {
         try {
           const newPath = `${currentPath === "/" ? "" : currentPath}/${name}`;
@@ -3438,7 +3906,7 @@ function FilePane({
   // Set permissions (chmod) handler
   const handleSetPermissions = useCallback(async () => {
     if (selectedPaths.length === 0) return;
-    const mode = window.prompt("Enter permissions (octal):", "755");
+    const mode = await promptText("Enter permissions (octal):", "755");
     if (!mode?.trim()) return;
     if (isTauriAvailable()) {
       try {
@@ -3467,7 +3935,7 @@ function FilePane({
   const handleCreateSymlink = useCallback(async () => {
     if (selectedPaths.length !== 1) return;
     const target = selectedPaths[0];
-    const linkName = window.prompt(
+    const linkName = await promptText(
       "Enter path for the symbolic link:",
       target + ".link"
     );
@@ -3507,7 +3975,7 @@ function FilePane({
       } catch (err) {
         useUIStore.getState().addStructuredError({
           what: "Copy as Script failed",
-          why: err instanceof Error ? err.message : "Script generation failed",
+          why: errorText(err, "Script generation failed"),
           appDid: "Did not write anything to the clipboard",
           userAction: "Confirm the selection is non-empty and try again",
         });
@@ -3610,7 +4078,7 @@ function FilePane({
     } catch (err) {
       useUIStore.getState().addStructuredError({
         what: "Copy Remote Path failed",
-        why: err instanceof Error ? err.message : "Backend rejected the request",
+        why: errorText(err, "Backend rejected the request"),
         appDid: "Did not write anything to the clipboard",
         userAction: "Confirm a remote base is configured for this connection",
       });
@@ -3634,7 +4102,7 @@ function FilePane({
     } catch (err) {
       useUIStore.getState().addStructuredError({
         what: "Copy URL failed",
-        why: err instanceof Error ? err.message : "Backend rejected the request",
+        why: errorText(err, "Backend rejected the request"),
         appDid: "Did not write anything to the clipboard",
         userAction: "Try the simple Copy Path action instead",
       });
@@ -3655,7 +4123,7 @@ function FilePane({
     } catch (err) {
       useUIStore.getState().addStructuredError({
         what: "Copy Relative Path failed",
-        why: err instanceof Error ? err.message : "Backend rejected the request",
+        why: errorText(err, "Backend rejected the request"),
         appDid: "Did not write anything to the clipboard",
         userAction: "Confirm the current pane has a valid base path",
       });
@@ -3793,7 +4261,9 @@ function FilePane({
         selectionCount: selectedPaths.length || 1,
         onCopy: handleCopy,
         onCut: handleCut,
-        onPaste: () => { console.log("Paste into", currentPath); },
+        onPaste: handlePaste,
+        onCopyToOtherPane: handleCopyToOtherPane,
+        onMoveToOtherPane: handleMoveToOtherPane,
         onDelete: handleDelete,
         onDeletePermanently: () => handleDeletePermanently(selectedPaths.length > 0 ? selectedPaths : [entry.path]),
         onRename: () => handleRename(entry.path),
@@ -3918,7 +4388,7 @@ function FilePane({
       });
       onContextMenu({ position: { x: event.clientX, y: event.clientY }, items });
     },
-    [selectedPaths, currentPath, handleOpen, handleCopy, handleCut, handleDelete, handleDeletePermanently, handleRename, handleDuplicate, handleNewFolder, handleNewFile, handleGetInfo, handleCalculateSize, handleEditRemote, handleCompareFiles, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, selectAll, invertSelection, onContextMenu, loadDirectory, isGitRepo, handleSendTo, onVerifyIntegrity, onCompress, handleExtractHere],
+    [selectedPaths, currentPath, handleOpen, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleDelete, handleDeletePermanently, handleRename, handleDuplicate, handleNewFolder, handleNewFile, handleGetInfo, handleCalculateSize, handleEditRemote, handleCompareFiles, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, selectAll, invertSelection, onContextMenu, loadDirectory, isGitRepo, handleSendTo, onVerifyIntegrity, onCompress, handleExtractHere],
   );
 
   // Keyboard shortcuts for compare (#47), quick select (#71), and the
@@ -3930,7 +4400,7 @@ function FilePane({
         e.preventDefault();
         if (selectedPaths.length === 2) { handleCompareFiles(); }
       }
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "S") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "s") {
         e.preventDefault();
         setQuickSelectOpen(prev => !prev);
       }
@@ -3950,6 +4420,38 @@ function FilePane({
         activeEl?.tagName === "INPUT" ||
         activeEl?.tagName === "TEXTAREA" ||
         activeEl?.isContentEditable === true;
+      // ⌘⇧N → New Folder (Finder convention). The context menu,
+      // command palette and cheat sheet have advertised this
+      // binding since the feature shipped, but no handler ever
+      // implemented it — pressing it did nothing. Bound here in
+      // the pane handler so it creates the folder in the active
+      // pane and never while a text field has focus.
+      if (resolveNewFolderKey(e, inTextEntry)) {
+        const fmState = useFileManagerStore.getState();
+        if (fmState.singlePaneMode || fmState.activePaneIndex === paneIndex) {
+          e.preventDefault();
+          void handleNewFolder();
+        }
+      }
+      const transferKey = resolveFileTransferKey(e, inTextEntry);
+      if (transferKey) {
+        const fmState = useFileManagerStore.getState();
+        if (fmState.singlePaneMode || fmState.activePaneIndex === paneIndex) {
+          if (transferKey === "select_all") {
+            e.preventDefault();
+            selectAll();
+          } else if (transferKey === "paste") {
+            e.preventDefault();
+            void handlePaste();
+          } else if (selectedPaths.length > 0) {
+            e.preventDefault();
+            if (transferKey === "copy") void handleCopy();
+            else if (transferKey === "cut") void handleCut();
+            else if (transferKey === "copy_to_pane") void handleCopyToOtherPane();
+            else void handleMoveToOtherPane();
+          }
+        }
+      }
       const fileAction = resolveFileActionKey(e, inTextEntry);
       if (fileAction) {
         // Only the focused pane reacts. In dual-pane mode BOTH FilePane
@@ -3971,7 +4473,7 @@ function FilePane({
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectedPaths, handleCompareFiles, handleDelete, handleRename, paneIndex]);
+  }, [selectedPaths, handleCompareFiles, handleDelete, handleRename, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleNewFolder, selectAll, paneIndex]);
 
   return (
     <div
@@ -4136,6 +4638,7 @@ function FilePane({
         viewMode={pane.viewMode}
         selectedPaths={selectedPaths}
         onSelect={handleSelect}
+        onKeyboardSelect={handleKeyboardSelect}
         onOpen={handleOpen}
         onContextMenu={handleContextMenu}
         focusedIndex={focusedIndex}

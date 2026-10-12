@@ -222,6 +222,16 @@ pub struct S3ObjectVersion {
     pub is_delete_marker: bool,
 }
 
+/// `host[:port]` of a URL (the port only when it is not the scheme default),
+/// i.e. exactly what an HTTP client sends in the `Host` header.
+fn url_authority(u: &url::Url) -> Option<String> {
+    let host = u.host_str()?;
+    Some(match u.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    })
+}
+
 /// S3 authentication credentials.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct S3Credentials {
@@ -2209,7 +2219,7 @@ impl S3Connector {
             if let Some(ref ep) = creds.endpoint {
                 url::Url::parse(ep)
                     .ok()
-                    .and_then(|u| u.host_str().map(|h| h.to_string()))
+                    .and_then(|u| url_authority(&u))
                     .unwrap_or_else(|| format!("s3.{}.amazonaws.com", creds.region))
             } else {
                 format!("s3.{}.amazonaws.com", creds.region)
@@ -2217,7 +2227,7 @@ impl S3Connector {
         } else if let Some(ref ep) = creds.endpoint {
             let host = url::Url::parse(ep)
                 .ok()
-                .and_then(|u| u.host_str().map(|h| h.to_string()))
+                .and_then(|u| url_authority(&u))
                 .unwrap_or_else(|| format!("s3.{}.amazonaws.com", creds.region));
             format!("{bucket}.{host}")
         } else {
@@ -2271,12 +2281,19 @@ impl S3Connector {
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let credential_scope = format!("{}/{}/s3/aws4_request", date_stamp, creds.region);
 
-        let host = if canonical_path.starts_with('/') && canonical_path.len() > 1 {
-            // Extract bucket from path for path-style
+        // Path-style requests (and the bucket listing at "/") go to the endpoint
+        // itself, so the signed Host must match it, port included.
+        let host = if creds.endpoint.is_some() && (creds.path_style || canonical_path == "/") {
             let endpoint = self.effective_endpoint(creds);
             url::Url::parse(&endpoint)
                 .ok()
-                .and_then(|u| u.host_str().map(|h| h.to_string()))
+                .and_then(|u| url_authority(&u))
+                .unwrap_or_else(|| format!("s3.{}.amazonaws.com", creds.region))
+        } else if canonical_path.starts_with('/') && canonical_path.len() > 1 {
+            let endpoint = self.effective_endpoint(creds);
+            url::Url::parse(&endpoint)
+                .ok()
+                .and_then(|u| url_authority(&u))
                 .unwrap_or_else(|| format!("s3.{}.amazonaws.com", creds.region))
         } else {
             format!("s3.{}.amazonaws.com", creds.region)
@@ -2648,14 +2665,112 @@ impl Connector for S3Connector {
                 let parts: Vec<&str> = path.splitn(2, '/').collect();
                 let bucket = parts[0];
                 let prefix = if parts.len() > 1 { parts[1] } else { "" };
-                self.list_objects(bucket, prefix, Some("/")).await
+                // With a "/" delimiter a folder prefix must end in "/", otherwise the
+                // listing returns the folder itself instead of its contents.
+                let prefix = if prefix.is_empty() || prefix.ends_with('/') { prefix.to_string() } else { format!("{prefix}/") };
+                self.list_objects(bucket, &prefix, Some("/")).await
             }
         })
     }
 
     fn is_connected(&self) -> bool {
-        // Note: this blocks briefly; in practice, use async check
-        false // Conservative default; actual check would need async
+        self.state.try_read().map(|s| s.is_some()).unwrap_or(true)
+    }
+
+    fn connect_with_secret(
+        &self,
+        profile: &ConnectionProfile,
+        secret: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let profile = profile.clone();
+        Box::pin(async move {
+            let host = profile.host.trim().trim_end_matches('/').to_string();
+            // Host forms: a bare region ("eu-west-1"), an AWS/custom hostname, or a
+            // full URL ("http://localhost:9000") for S3-compatible servers.
+            let (region, endpoint, path_style) = if host.starts_with("http://") || host.starts_with("https://") {
+                ("us-east-1".to_string(), Some(host), true)
+            } else if host.contains('.') {
+                let aws = host.ends_with("amazonaws.com");
+                ("us-east-1".to_string(), Some(format!("https://{host}")), !aws)
+            } else {
+                (host, None, false)
+            };
+            let creds = S3Credentials {
+                access_key_id: profile.username.clone().unwrap_or_default(),
+                secret_access_key: secret.unwrap_or_default(),
+                region,
+                endpoint,
+                path_style,
+                session_token: None,
+            };
+            self.connect_with_credentials(creds).await?;
+            // Fail now (bad keys, unreachable endpoint) rather than on first browse.
+            if let Err(e) = self.list_buckets().await {
+                *self.state.write().await = None;
+                return Err(e);
+            }
+            Ok(())
+        })
+    }
+
+    fn upload(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (l, r) = (local_path.to_string(), remote_path.to_string());
+        Box::pin(async move {
+            let (bucket, key) = super::split_bucket_key(&r)?;
+            let data = tokio::fs::read(&l).await.map_err(|e| AppError::file_op(
+                format!("Cannot read {l}: {e}"),
+                "Check the file exists and is readable.",
+            ))?;
+            let n = data.len() as u64;
+            self.upload_file(&bucket, &key, data).await?;
+            Ok(n)
+        })
+    }
+
+    fn download(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (r, l) = (remote_path.to_string(), local_path.to_string());
+        Box::pin(async move {
+            let (bucket, key) = super::split_bucket_key(&r)?;
+            let data = self.download_object(&bucket, &key, None).await?;
+            tokio::fs::write(&l, &data).await.map_err(|e| AppError::file_op(
+                format!("Cannot write {l}: {e}"),
+                "Check the destination folder exists and is writable.",
+            ))?;
+            Ok(data.len() as u64)
+        })
+    }
+
+    fn make_directory(
+        &self,
+        remote_path: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.trim_end_matches('/').to_string();
+        Box::pin(async move {
+            // Object stores have no real folders: an empty "key/" object is the convention.
+            let (bucket, key) = super::split_bucket_key(&r)?;
+            self.put_object(&bucket, &format!("{key}/"), &[]).await.map(|_| ())
+        })
+    }
+
+    fn remove(
+        &self,
+        remote_path: &str,
+        is_dir: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
+        Box::pin(async move {
+            let (bucket, key) = super::split_bucket_key(&r)?;
+            let key = if is_dir && !key.ends_with('/') { format!("{key}/") } else { key };
+            self.delete_object(&bucket, &key).await
+        })
     }
 }
 

@@ -23,3 +23,14 @@ export async function pickFolder(title?: string): Promise<string | null> {
   const path = window.prompt(title ?? "Enter folder path:");
   return path && path.trim() ? path.trim() : null;
 }
+
+/** Native multi-file picker; returns [] when cancelled or outside Tauri. */
+export async function pickFiles(title?: string): Promise<string[]> {
+  if (!isTauriAvailable()) return [];
+  try {
+    return (await tauriInvoke<string[]>("pick_files", { title: title ?? "Select Files" })) ?? [];
+  } catch (err) {
+    console.error("File picker IPC failed:", err);
+    return [];
+  }
+}

@@ -161,7 +161,15 @@ function TransferPanelMini({
   const totalSpeed = activeJobs.reduce((sum, j) => sum + j.speed_bps, 0);
   const pct = totalBytes > 0 ? (transferredBytes / totalBytes) * 100 : 0;
 
-  if (activeJobs.length === 0) return null;
+  if (activeJobs.length === 0) {
+    // The panel is docked in a fixed-height strip — an explicit idle
+    // state beats a blank box.
+    return (
+      <div className="flex h-full items-center justify-center text-xs text-gray-500 dark:text-gray-400">
+        Transfer queue — no active or queued jobs
+      </div>
+    );
+  }
 
   return (
     <button

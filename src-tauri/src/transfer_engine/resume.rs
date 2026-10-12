@@ -106,6 +106,7 @@ pub async fn resume_transfer(
             Some(journal),
             Some(&job.job_id),
             &semaphore,
+            None,
         )
         .await?;
 
@@ -353,6 +354,7 @@ mod tests {
             &journal,
             &worker_pool,
             "resume-test-1",
+            None,
             None,
         )
         .await

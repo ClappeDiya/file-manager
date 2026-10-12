@@ -45,6 +45,8 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { tauriInvoke, isTauriAvailable } from "@/hooks/use-tauri";
 import { dispatchRefresh } from "@/lib/refresh-affected";
 import { TextEditor } from "./text-editor";
+import { errorText } from "@/lib/error-text";
+import { confirmText } from "@/lib/prompt-dialog";
 
 /** Shape of the `get_file_metadata` IPC response that this wrapper
  *  actually uses. The real `FileEntry` type carries more fields, but
@@ -188,7 +190,7 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
       })
       .catch((err) => {
         if (!cancelled) {
-          const msg = err instanceof Error ? err.message : String(err);
+          const msg = errorText(err);
           setError(msg);
           setLoading(false);
         }
@@ -269,7 +271,7 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
         }
         await writeAndRefreshBaseline(nextContent);
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = errorText(err);
         // Iter 34: the conflict sentinel does NOT populate the
         // red saveError banner because the amber conflict banner
         // is already displayed and describes the situation. Real
@@ -293,7 +295,7 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
       await writeAndRefreshBaseline(pendingContent);
       setPendingContent(null);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = errorText(err);
       setSaveError(msg);
     }
   }, [pendingContent, writeAndRefreshBaseline]);
@@ -317,7 +319,7 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
       setBaselineMtime(meta.modified);
       setReloadCounter((n) => n + 1);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = errorText(err);
       setSaveError(msg);
     }
   }, [filePath]);
@@ -333,16 +335,16 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
   // therefore stays stable across keystrokes — which is critical
   // because iter 33 gives it to `TextEditor` as `onClose` and we
   // don't want the editor to see a new close handler every time
-  // the user types a character. `window.confirm` is a synchronous
-  // native prompt; the codebase already uses it in `file-manager
-  // .tsx` for new-folder conflict checks, so the pattern is
-  // established.
+  // the user types a character.
   const handleClose = useCallback(() => {
     if (dirtyRef.current) {
-      const ok = window.confirm(
-        "You have unsaved changes. Close without saving?",
-      );
-      if (!ok) return;
+      // `window.confirm` is unsupported in the Tauri webview — the in-app
+      // confirm dialog resolves asynchronously and closes on accept.
+      void confirmText("You have unsaved changes. Close without saving?", "Close")
+        .then((ok) => {
+          if (ok) onClose();
+        });
+      return;
     }
     onClose();
   }, [onClose]);

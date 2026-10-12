@@ -26,6 +26,3 @@ sandbox_mode = "workspace-write"
 # can override with `codex --full-auto` or per-tool approvals.
 network_access = false
 
-# Auto-discover Codex agent definitions in this folder.
-[agents]
-directory = ".codex/agents"
