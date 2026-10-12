@@ -21,6 +21,7 @@ import {
 } from "@/lib/selection-stats";
 import { archiveExtractDest } from "@/lib/archive-paths";
 import { pickFolder } from "@/lib/folder-picker";
+import { planPaneCopy, awaitPaneCopyJobs } from "@/lib/pane-copy";
 import { resolveFileActionKey, resolveFileTransferKey, resolveNewFolderKey } from "@/lib/file-action-keys";
 import {
   useDriveSpace,
@@ -2537,6 +2538,7 @@ export function FileManager() {
                     setIntegrityToolsOpen({ dir, files })
                   }
                   onCompress={(files) => setCreateArchiveSources(files)}
+                  onShowTransfers={() => setTransfersOpen(true)}
                 />
               )}
             />
@@ -3108,6 +3110,11 @@ interface FilePaneProps {
    *  both panes share one dialog instance — same pattern as
    *  `onArchiveBrowse` / `onVerifyIntegrity` above. */
   onCompress: (files: string[]) => void;
+  /** Opens the transfer-queue dock. `transferPaths` calls this after
+   *  enqueueing pane-to-pane file copies so the engine's progress bar
+   *  and completion state are visible the moment jobs land — the dock
+   *  lives at FileManager scope (same lift pattern as `onCompress`). */
+  onShowTransfers: () => void;
 }
 
 function FilePane({
@@ -3117,6 +3124,7 @@ function FilePane({
   onTextEdit,
   onVerifyIntegrity,
   onCompress,
+  onShowTransfers,
 }: FilePaneProps) {
   const pane = useFileManagerStore((s) => s.panes[paneIndex]);
   const navigateTab = useFileManagerStore((s) => s.navigateTab);
@@ -3606,7 +3614,7 @@ function FilePane({
           if (conflict.size_differs) details.push("File sizes differ");
 
           // Neither route overwrites: copy keeps both (new name), move refuses.
-          const proceed = confirm(
+          const proceed = await confirmText(
             mode === "copy"
               ? `"${fileName}" already exists in the destination:\n${details.join("\n")}\n\nKeep both? The copy will get a new name.`
               : `"${fileName}" already exists in the destination:\n${details.join("\n")}\n\nThe move will fail for this item. Continue anyway?`
@@ -3636,10 +3644,62 @@ function FilePane({
       const parentOf = (p: string) => p.slice(0, p.lastIndexOf("/")) || "/";
       const needsCheck = paths.filter((p) => parentOf(p) !== destDir);
       if (needsCheck.length > 0 && !(await checkConflicts(needsCheck, destDir, mode))) return false;
-      const destPaths = paths.map((p) => `${destDir === "/" ? "" : destDir}/${p.split("/").pop()}`);
+      const prefix = destDir === "/" ? "" : destDir;
+      const destPaths = paths.map((p) => `${prefix}/${p.split("/").pop()}`);
       if (mode === "copy") {
-        await tauriInvoke("copy_files", { sourcePaths: paths, destDir });
-        pushUndo({ id: `copy-${Date.now()}`, type: "copy", sourcePaths: paths, destPaths, timestamp: Date.now() });
+        // Files ride the transfer engine so pane copies get a real
+        // progress bar, pause/resume/cancel and a verified history row —
+        // the old copy_files route completed invisibly. Directories stay
+        // on copy_files (the engine moves single files only).
+        const parentDirs = [...new Set(paths.map(parentOf))];
+        const entryByPath = new Map<string, { is_dir: boolean; size: number }>();
+        for (const dir of parentDirs) {
+          try {
+            for (const e of await tauriInvoke<FileEntryData[]>("list_directory", { path: dir })) {
+              entryByPath.set(e.path, e);
+            }
+          } catch {
+            // Unclassifiable paths are treated as files; if the engine
+            // rejects them the queue shows the failure instead of a
+            // silent no-op.
+          }
+        }
+        const destNames = new Set(
+          await tauriInvoke<FileEntryData[]>("list_directory", { path: destDir })
+            .then((entries) => entries.map((e) => e.name))
+            .catch(() => [] as string[]),
+        );
+        const { dirPaths, fileJobs } = planPaneCopy(paths, destDir, entryByPath, destNames);
+        if (dirPaths.length > 0) {
+          await tauriInvoke("copy_files", { sourcePaths: dirPaths, destDir });
+        }
+        const jobIds: string[] = [];
+        for (const job of fileJobs) {
+          const created = await tauriInvoke<{ id: string }>("enqueue_transfer", {
+            source: job.source,
+            dest: job.dest,
+            totalBytes: job.totalBytes,
+          });
+          jobIds.push(created.id);
+        }
+        if (fileJobs.length > 0) {
+          onShowTransfers();
+          // The engine is async with no finish event — poll until each
+          // job settles, refreshing the destination pane as files land
+          // so the copy leaves visible evidence of completion.
+          void awaitPaneCopyJobs(jobIds, () =>
+            tauriInvoke<{ id: string; status: string }[]>("list_transfers", undefined, []),
+            { onSettle: () => dispatchRefresh([destDir]) },
+          ).then(() => dispatchRefresh([destDir]));
+        }
+        const jobDestBySource = new Map(fileJobs.map((j) => [j.source, j.dest]));
+        pushUndo({
+          id: `copy-${Date.now()}`,
+          type: "copy",
+          sourcePaths: paths,
+          destPaths: paths.map((p) => jobDestBySource.get(p) ?? `${prefix}/${p.split("/").pop()}`),
+          timestamp: Date.now(),
+        });
       } else {
         const measured = await measureSelection(paths);
         const result = await assessBeforeExecute(
@@ -3663,7 +3723,7 @@ function FilePane({
       reportOperationFailure(label, err);
       return false;
     }
-  }, [pushUndo, checkConflicts, currentPath]);
+  }, [pushUndo, checkConflicts, currentPath, onShowTransfers]);
 
   const otherPanePath = useCallback(() => {
     const store = useFileManagerStore.getState();
