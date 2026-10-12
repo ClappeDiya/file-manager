@@ -79,6 +79,71 @@ pub trait Connector: Send + Sync {
         path: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<FileEntry>, AppError>> + Send + '_>>;
     fn is_connected(&self) -> bool;
+
+    /// Connect using a secret held in the credential store (password, access
+    /// secret, or private-key path, depending on the protocol). Connectors
+    /// that need no secret fall back to [`Connector::connect`].
+    fn connect_with_secret(
+        &self,
+        profile: &ConnectionProfile,
+        _secret: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        self.connect(profile)
+    }
+
+    /// Upload a local file to `remote_path`; returns bytes written.
+    fn upload(
+        &self,
+        _local_path: &str,
+        _remote_path: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, AppError>> + Send + '_>> {
+        Box::pin(async { Err(unsupported_op("upload")) })
+    }
+
+    /// Download `remote_path` to a local file; returns bytes written.
+    fn download(
+        &self,
+        _remote_path: &str,
+        _local_path: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, AppError>> + Send + '_>> {
+        Box::pin(async { Err(unsupported_op("download")) })
+    }
+
+    /// Create a remote directory.
+    fn make_directory(
+        &self,
+        _remote_path: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        Box::pin(async { Err(unsupported_op("create folder")) })
+    }
+
+    /// Delete a remote file or (empty) directory.
+    fn remove(
+        &self,
+        _remote_path: &str,
+        _is_dir: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        Box::pin(async { Err(unsupported_op("delete")) })
+    }
+}
+
+fn unsupported_op(what: &str) -> AppError {
+    AppError::Connection {
+        message: format!("{what} is not supported for this connection type yet."),
+        advice: "Use SFTP, FTP/FTPS, WebDAV or S3 for remote file operations.".to_string(),
+    }
+}
+
+/// Split an S3-style path (`/bucket/key/with/slashes`) into bucket and key.
+pub(crate) fn split_bucket_key(path: &str) -> Result<(String, String), AppError> {
+    let trimmed = path.trim_start_matches('/');
+    match trimmed.split_once('/') {
+        Some((bucket, key)) if !bucket.is_empty() && !key.is_empty() => Ok((bucket.to_string(), key.to_string())),
+        _ => Err(AppError::Connection {
+            message: format!("'{path}' is not a bucket/key path."),
+            advice: "Use a path like /my-bucket/folder/file.txt.".to_string(),
+        }),
+    }
 }
 
 /// Registry that maps protocols to connector implementations.
@@ -201,5 +266,121 @@ mod tests {
         assert!(reg.get_by_protocol(ConnectionProtocol::OneDrive).is_some());
         assert!(reg.get_by_protocol(ConnectionProtocol::AzureBlob).is_some());
         assert!(reg.get_by_protocol(ConnectionProtocol::Swift).is_some());
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    //! Live round-trip tests against real servers. They are skipped unless
+    //! `UFOP_LIVE=1`, so `cargo test` stays hermetic. Servers (see docs): SFTP on
+    //! :2222, FTP on :2121, WebDAV on :8080, S3 (adobe/s3mock) on :9090.
+    use super::*;
+    use crate::core::types::ConnectionProtocol;
+
+    fn live() -> bool {
+        std::env::var("UFOP_LIVE").map(|v| v == "1").unwrap_or(false)
+    }
+
+    fn profile(protocol: ConnectionProtocol, host: &str, port: Option<u16>, user: &str, remote_path: &str) -> ConnectionProfile {
+        ConnectionProfile {
+            id: uuid::Uuid::new_v4(),
+            name: "live".into(),
+            protocol,
+            host: host.into(),
+            port,
+            username: Some(user.into()),
+            credential_ref: None,
+            remote_path: remote_path.into(),
+            created_at: chrono::Utc::now(),
+            last_used: None,
+            group_id: None,
+            bandwidth_limit_bps: 0,
+            conflict_policy: None,
+            retry_policy: None,
+            verify_checksums: false,
+            checksum_algorithm: None,
+            proxy_type: None,
+            proxy_host: None,
+            proxy_port: None,
+            proxy_username: None,
+            proxy_password: None,
+            default_local_dir: None,
+            default_remote_dir: None,
+            charset: None,
+            default_file_mode: None,
+            default_dir_mode: None,
+            ftp_use_mlsd: None,
+            ftp_force_passive_ip: None,
+            ftp_post_login_commands: None,
+            symlink_policy: None,
+        }
+    }
+
+    /// connect → mkdir → upload (multi-MB, patterned) → list → download → byte-compare → delete.
+    async fn round_trip(protocol: &str, p: ConnectionProfile, secret: Option<&str>, dir: &str) {
+        let registry = ConnectorRegistry::new();
+        let c = registry.get(protocol).unwrap();
+        c.connect_with_secret(&p, secret.map(String::from)).await.unwrap_or_else(|e| panic!("{protocol} connect: {e}"));
+        assert!(c.is_connected(), "{protocol} should report connected");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("payload.bin");
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+        std::fs::write(&src, &data).unwrap();
+
+        let sub = format!("{dir}/ufop-{}", uuid::Uuid::new_v4().simple());
+        c.make_directory(&sub).await.unwrap_or_else(|e| panic!("{protocol} mkdir: {e}"));
+        let remote = format!("{sub}/payload.bin");
+        let sent = c.upload(src.to_str().unwrap(), &remote).await.unwrap_or_else(|e| panic!("{protocol} upload: {e}"));
+        assert_eq!(sent, data.len() as u64, "{protocol} upload byte count");
+
+        let listing = c.list_remote(&sub).await.unwrap_or_else(|e| panic!("{protocol} list: {e}"));
+        assert!(listing.iter().any(|f| f.name == "payload.bin"), "{protocol} listing missing file: {listing:?}");
+
+        let dst = tmp.path().join("back.bin");
+        let got = c.download(&remote, dst.to_str().unwrap()).await.unwrap_or_else(|e| panic!("{protocol} download: {e}"));
+        assert_eq!(got, data.len() as u64, "{protocol} download byte count");
+        assert_eq!(std::fs::read(&dst).unwrap(), data, "{protocol} content must round-trip exactly");
+
+        c.remove(&remote, false).await.unwrap_or_else(|e| panic!("{protocol} remove file: {e}"));
+        let after = c.list_remote(&sub).await.unwrap();
+        assert!(!after.iter().any(|f| f.name == "payload.bin"), "{protocol} file should be gone");
+        c.disconnect().await.unwrap();
+        assert!(!c.is_connected());
+    }
+
+    #[tokio::test]
+    async fn live_sftp_round_trip() {
+        if !live() { return; }
+        // "localhost" also exercises DNS resolution, not just numeric addresses.
+        round_trip("sftp", profile(ConnectionProtocol::Sftp, "localhost", Some(2222), "ufop", "/upload"), Some("ufop123"), "/upload").await;
+    }
+
+    #[tokio::test]
+    async fn live_ftp_round_trip() {
+        if !live() { return; }
+        round_trip("ftp", profile(ConnectionProtocol::Ftp, "127.0.0.1", Some(2121), "ufop", "/"), Some("ufop123"), "").await;
+    }
+
+    #[tokio::test]
+    async fn live_webdav_round_trip() {
+        if !live() { return; }
+        round_trip("webdav", profile(ConnectionProtocol::WebDav, "http://localhost:8080", None, "ufop", "/"), Some("ufop123"), "").await;
+    }
+
+    #[tokio::test]
+    async fn live_s3_round_trip() {
+        if !live() { return; }
+        round_trip("s3", profile(ConnectionProtocol::S3, "http://localhost:9090", None, "ufopadmin", "/"), Some("ufopadmin123"), "/ufop-bucket").await;
+    }
+
+    #[tokio::test]
+    async fn sftp_wrong_password_is_rejected() {
+        if !live() { return; }
+        let registry = ConnectorRegistry::new();
+        let c = registry.get("sftp").unwrap();
+        let r = c.connect_with_secret(&profile(ConnectionProtocol::Sftp, "localhost", Some(2222), "ufop", "/upload"), Some("nope".into())).await;
+        assert!(r.is_err());
+        assert!(!c.is_connected());
     }
 }

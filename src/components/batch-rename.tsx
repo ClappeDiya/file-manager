@@ -12,6 +12,7 @@
  */
 import { useState, useCallback, useEffect, useRef } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import { errorText } from "@/lib/error-text";
 
 // ── Types ──
 
@@ -95,7 +96,7 @@ export function BatchRename({ files, onClose, onComplete }: BatchRenameProps) {
       const result = await tauriInvoke<RenamePreviewEntry[]>("batch_rename_preview", { params });
       setPreview(result);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     } finally {
       setIsLoading(false);
     }
@@ -131,7 +132,7 @@ export function BatchRename({ files, onClose, onComplete }: BatchRenameProps) {
       }
       onComplete?.(result);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     } finally {
       setIsApplying(false);
     }
@@ -146,7 +147,7 @@ export function BatchRename({ files, onClose, onComplete }: BatchRenameProps) {
       setLastUndoId(null);
       fetchPreview();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   };
 

@@ -293,6 +293,14 @@ impl SftpConnector {
         known.insert(key, entry);
     }
 
+    /// Resolve `host:port`, accepting both numeric addresses and DNS names.
+    fn resolve_addr(addr: &str) -> std::io::Result<std::net::SocketAddr> {
+        use std::net::ToSocketAddrs;
+        addr.to_socket_addrs()?.next().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses found for host")
+        })
+    }
+
     /// Establish TCP connection with optional jump host.
     fn establish_tcp(
         host: &str,
@@ -304,7 +312,7 @@ impl SftpConnector {
             // Connect to jump host first
             let jump_addr = format!("{}:{}", jump.host, jump.port);
             let jump_tcp = std::net::TcpStream::connect_timeout(
-                &jump_addr.parse().map_err(|e| AppError::Connection {
+                &Self::resolve_addr(&jump_addr).map_err(|e| AppError::Connection {
                     message: format!("Invalid jump host address {jump_addr}: {e}"),
                     advice: "Check the jump host address and port.".to_string(),
                 })?,
@@ -347,7 +355,7 @@ impl SftpConnector {
             drop(channel);
             drop(jump_session);
             let tcp = std::net::TcpStream::connect_timeout(
-                &target_addr.parse().map_err(|e| AppError::Connection {
+                &Self::resolve_addr(&target_addr).map_err(|e| AppError::Connection {
                     message: format!("Invalid target address {target_addr}: {e}"),
                     advice: "Check the host address and port.".to_string(),
                 })?,
@@ -362,7 +370,7 @@ impl SftpConnector {
             // Direct connection
             let addr = format!("{host}:{port}");
             let tcp = std::net::TcpStream::connect_timeout(
-                &addr.parse().map_err(|e| AppError::Connection {
+                &Self::resolve_addr(&addr).map_err(|e| AppError::Connection {
                     message: format!("Invalid address {addr}: {e}"),
                     advice: "Check the host address and port.".to_string(),
                 })?,
@@ -1103,16 +1111,17 @@ impl super::Connector for SftpConnector {
                     advice: "System error, try again.".to_string(),
                 })?);
 
-                // Set keepalive
-                if keepalive > 0 {
-                    session.set_keepalive(true, keepalive);
-                }
-
                 // SSH handshake
                 session.handshake().map_err(|e| AppError::Connection {
                     message: format!("SSH handshake failed: {e}"),
                     advice: "Check that the server supports SSH.".to_string(),
                 })?;
+
+                // Keepalive must be configured AFTER the handshake: enabling it
+                // earlier makes libssh2 fail the key exchange against modern servers.
+                if keepalive > 0 {
+                    session.set_keepalive(true, keepalive);
+                }
 
                 // Get host key info before authentication
                 let host_key_info = Self::get_host_key_info(&session);
@@ -1245,6 +1254,72 @@ impl super::Connector for SftpConnector {
 
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    fn connect_with_secret(
+        &self,
+        profile: &ConnectionProfile,
+        secret: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + '_>> {
+        let profile = profile.clone();
+        Box::pin(async move {
+            {
+                let mut cfg = self.config.write().await;
+                // A stored secret that is an existing file is a private key
+                // (the connection form stores the picked key path there);
+                // anything else is a password; no secret means the SSH agent.
+                cfg.auth_method = match secret.filter(|s| !s.is_empty()) {
+                    Some(s) if Path::new(&s).is_file() => {
+                        SshAuthMethod::PublicKey { private_key_path: s, passphrase: None }
+                    }
+                    Some(s) => SshAuthMethod::Password { password: s },
+                    None => SshAuthMethod::Agent,
+                };
+                // There is no host-key prompt in the UI, so an unseen host would
+                // otherwise be rejected forever; trust on first use instead.
+                if matches!(cfg.host_key_verification, HostKeyVerification::StrictKnownHosts) {
+                    cfg.host_key_verification = HostKeyVerification::TrustOnFirstUse;
+                }
+            }
+            super::Connector::connect(self, &profile).await
+        })
+    }
+
+    fn upload(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (l, r) = (local_path.to_string(), remote_path.to_string());
+        Box::pin(async move { self.upload_file(&l, &r, None).await })
+    }
+
+    fn download(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (r, l) = (remote_path.to_string(), local_path.to_string());
+        Box::pin(async move { self.download_file(&r, &l, None).await })
+    }
+
+    fn make_directory(
+        &self,
+        remote_path: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
+        Box::pin(async move { self.mkdir(&r, 0o755).await })
+    }
+
+    fn remove(
+        &self,
+        remote_path: &str,
+        is_dir: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
+        Box::pin(async move {
+            if is_dir { self.delete_directory(&r).await } else { self.delete_file(&r).await }
+        })
     }
 }
 

@@ -448,14 +448,49 @@ fn move_one(source: &str, dest_path: &Path) -> Result<String, AppError> {
         ));
     }
 
-    std::fs::rename(src, &target).map_err(|e| {
-        AppError::file_op(
-            format!("Failed to move {}: {e}", src.display()),
-            "Check permissions. If moving across drives, this may require a copy + delete.",
-        )
-    })?;
+    match std::fs::rename(src, &target) {
+        Ok(()) => {}
+        Err(e) if is_cross_device_error(&e) => move_by_copy_and_delete(src, &target)?,
+        Err(e) => {
+            return Err(AppError::file_op(
+                format!("Failed to move {}: {e}", src.display()),
+                "Check permissions and that the destination is writable.",
+            ))
+        }
+    }
 
     Ok(target.to_string_lossy().to_string())
+}
+
+/// `rename(2)` cannot cross filesystems (EXDEV on Unix, ERROR_NOT_SAME_DEVICE on Windows).
+fn is_cross_device_error(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(18) if cfg!(unix)) || matches!(e.raw_os_error(), Some(17) if cfg!(windows))
+}
+
+/// Move across filesystems: copy, then remove the source only once the copy succeeded.
+fn move_by_copy_and_delete(src: &Path, target: &Path) -> Result<(), AppError> {
+    let copied = if src.is_dir() {
+        copy_dir_recursive(src, target)
+    } else {
+        std::fs::copy(src, target).map(|_| ()).map_err(|e| {
+            AppError::file_op(
+                format!("Failed to copy {} while moving: {e}", src.display()),
+                "Check disk space and permissions.",
+            )
+        })
+    };
+    if let Err(err) = copied {
+        // Don't leave a partial copy behind; the source is untouched.
+        let _ = if target.is_dir() { std::fs::remove_dir_all(target) } else { std::fs::remove_file(target) };
+        return Err(err);
+    }
+    let removed = if src.is_dir() { std::fs::remove_dir_all(src) } else { std::fs::remove_file(src) };
+    removed.map_err(|e| {
+        AppError::file_op(
+            format!("Copied {} but could not remove the original: {e}", src.display()),
+            "The destination copy is complete; delete the original manually.",
+        )
+    })
 }
 
 pub async fn move_files_impl(
@@ -1594,6 +1629,32 @@ fn is_default_port(protocol: &str, port: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cross_device_fallback_moves_file_and_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_file = tmp.path().join("a.txt");
+        std::fs::write(&src_file, b"hello").unwrap();
+        let dst_file = tmp.path().join("b.txt");
+        super::move_by_copy_and_delete(&src_file, &dst_file).unwrap();
+        assert!(!src_file.exists());
+        assert_eq!(std::fs::read(&dst_file).unwrap(), b"hello");
+
+        let src_dir = tmp.path().join("d");
+        std::fs::create_dir_all(src_dir.join("n")).unwrap();
+        std::fs::write(src_dir.join("n/f.txt"), b"x").unwrap();
+        let dst_dir = tmp.path().join("d2");
+        super::move_by_copy_and_delete(&src_dir, &dst_dir).unwrap();
+        assert!(!src_dir.exists());
+        assert_eq!(std::fs::read(dst_dir.join("n/f.txt")).unwrap(), b"x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exdev_is_detected_as_cross_device() {
+        assert!(super::is_cross_device_error(&std::io::Error::from_raw_os_error(18)));
+        assert!(!super::is_cross_device_error(&std::io::Error::from_raw_os_error(13)));
+    }
+
     use super::*;
     use crate::storage::DbPool;
     use std::fs;

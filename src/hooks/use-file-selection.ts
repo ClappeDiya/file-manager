@@ -1,9 +1,20 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import type { FileEntryData } from "@/components/file-list";
 
 /** Stable empty array to avoid re-render loops with React 19 + Zustand */
 const EMPTY_PATHS: string[] = [];
+
+/**
+ * Inclusive range between `anchor` and `target` in list order. Returns just
+ * `[target]` when either end is not in the list (e.g. after navigation).
+ */
+export function computeRangeSelection(allPaths: string[], anchor: string | null, target: string): string[] {
+  const a = anchor === null ? -1 : allPaths.indexOf(anchor);
+  const b = allPaths.indexOf(target);
+  if (a === -1 || b === -1) return [target];
+  return allPaths.slice(Math.min(a, b), Math.max(a, b) + 1);
+}
 
 /**
  * Hook for managing file selection with multi-select support.
@@ -26,6 +37,10 @@ export function useFileSelection(paneId: string, files: FileEntryData[]) {
    * Handle click-based selection.
    * Implements standard OS-like selection behavior.
    */
+  // Range selections grow from a fixed anchor (the last plainly-clicked /
+  // keyboard-selected item) and REPLACE the previous range, like Finder.
+  const anchorRef = useRef<string | null>(null);
+
   const handleSelect = useCallback(
     (path: string, event: React.MouseEvent) => {
       const isMetaKey = event.metaKey || event.ctrlKey;
@@ -37,40 +52,37 @@ export function useFileSelection(paneId: string, files: FileEntryData[]) {
       }
 
       if (isMetaKey) {
-        // Cmd/Ctrl+Click: toggle individual item
+        anchorRef.current = path;
         if (selectedPaths.includes(path)) {
           removeFromSelection(paneId, path);
         } else {
           addToSelection(paneId, path);
         }
       } else if (isShiftKey) {
-        // Shift+Click: range select
-        if (selectedPaths.length === 0) {
-          setSelection(paneId, [path]);
-        } else {
-          const lastSelected = selectedPaths[selectedPaths.length - 1];
-          const allPaths = files.map((f) => f.path);
-          const startIdx = allPaths.indexOf(lastSelected);
-          const endIdx = allPaths.indexOf(path);
-
-          if (startIdx !== -1 && endIdx !== -1) {
-            const min = Math.min(startIdx, endIdx);
-            const max = Math.max(startIdx, endIdx);
-            const rangePaths = allPaths.slice(min, max + 1);
-
-            // Merge with existing selection
-            const merged = new Set([...selectedPaths, ...rangePaths]);
-            setSelection(paneId, [...merged]);
-          } else {
-            setSelection(paneId, [path]);
-          }
-        }
+        const anchor = anchorRef.current ?? selectedPaths[selectedPaths.length - 1] ?? null;
+        if (anchorRef.current === null) anchorRef.current = anchor ?? path;
+        setSelection(paneId, computeRangeSelection(files.map((f) => f.path), anchor, path));
       } else {
-        // Normal click: select single
+        anchorRef.current = path;
         setSelection(paneId, [path]);
       }
     },
     [paneId, selectedPaths, files, setSelection, addToSelection, removeFromSelection],
+  );
+
+  /** Arrow-key navigation: plain moves select the item, Shift extends the range. */
+  const handleKeyboardSelect = useCallback(
+    (path: string, extend: boolean) => {
+      if (extend) {
+        const anchor = anchorRef.current ?? selectedPaths[0] ?? null;
+        if (anchorRef.current === null) anchorRef.current = anchor ?? path;
+        setSelection(paneId, computeRangeSelection(files.map((f) => f.path), anchor, path));
+      } else {
+        anchorRef.current = path;
+        setSelection(paneId, [path]);
+      }
+    },
+    [paneId, selectedPaths, files, setSelection],
   );
 
   /**
@@ -102,6 +114,7 @@ export function useFileSelection(paneId: string, files: FileEntryData[]) {
   return {
     selectedPaths,
     handleSelect,
+    handleKeyboardSelect,
     selectAll,
     invertSelection,
     deselectAll,

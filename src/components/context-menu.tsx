@@ -174,6 +174,7 @@ export function ContextMenu({ items, position, onClose }: ContextMenuProps) {
     if (adjustedPosition.y + menuHeight > window.innerHeight) {
       adjustedPosition.y = window.innerHeight - menuHeight - 8;
     }
+    adjustedPosition.y = Math.max(8, adjustedPosition.y);
   }
 
   return (
@@ -189,6 +190,8 @@ export function ContextMenu({ items, position, onClose }: ContextMenuProps) {
       style={{
         left: adjustedPosition.x,
         top: adjustedPosition.y,
+        maxHeight: `calc(100vh - ${adjustedPosition.y + 8}px)`,
+        overflowY: "auto",
       }}
       role="menu"
       aria-label="Context menu"
@@ -270,6 +273,9 @@ export function getFileContextMenuItems(options: {
   selectionCount: number;
   onCopy: () => void;
   onCut: () => void;
+  /** Direct pane-to-pane transfers (dual-pane workflows). */
+  onCopyToOtherPane?: () => void;
+  onMoveToOtherPane?: () => void;
   onPaste: () => void;
   onDelete: () => void;
   onRename: () => void;
@@ -509,6 +515,25 @@ export function getFileContextMenuItems(options: {
       shortcut: `${cmdKey}X`,
       action: options.onCut,
     });
+
+    if (options.onCopyToOtherPane) {
+      items.push({
+        id: "copy-to-other-pane",
+        label: "Copy to Other Pane",
+        icon: <Copy className="h-3.5 w-3.5" />,
+        shortcut: "F5",
+        action: options.onCopyToOtherPane,
+      });
+    }
+    if (options.onMoveToOtherPane) {
+      items.push({
+        id: "move-to-other-pane",
+        label: "Move to Other Pane",
+        icon: <Scissors className="h-3.5 w-3.5" />,
+        shortcut: "F6",
+        action: options.onMoveToOtherPane,
+      });
+    }
 
     // Smart Send-To — ledger-derived frecency-ranked destinations for
     // files with this extension. Hidden entirely when the ledger has

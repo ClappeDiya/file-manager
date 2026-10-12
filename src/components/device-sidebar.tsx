@@ -27,6 +27,7 @@ import {
   ChevronRight,
   AlertTriangle,
 } from "lucide-react";
+import { errorText } from "@/lib/error-text";
 
 // ──────────────────────────────────────────────
 // Types (matching Rust DriveInfo)
@@ -220,7 +221,7 @@ export function DeviceSidebar({
       const result = await onDetectDrives();
       setDrives(result);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to detect drives");
+      setError(errorText(err, "Failed to detect drives"));
     } finally {
       setLoading(false);
     }
@@ -285,7 +286,8 @@ export function DeviceSidebar({
     }
   }, [listSmbShares]);
 
-  // Transfer preflight check
+  // Transfer preflight check. `totalBytes` is required by the backend —
+  // omitting it makes the invoke throw and the check silently return null.
   const handlePreflight = useCallback(async (sourcePath: string, destPath: string, totalBytes: number) => {
     if (!isTauriAvailable()) return null;
     try {

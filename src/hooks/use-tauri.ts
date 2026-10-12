@@ -14,7 +14,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 /** Check if the Tauri IPC bridge is available (i.e., running inside Tauri). */
 export function isTauriAvailable(): boolean {
-  return typeof window !== "undefined" && "__TAURI__" in window;
+  return typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || "__TAURI__" in window);
 }
 
 /** React hook that returns whether Tauri IPC is available. Stable across renders. */

@@ -22,7 +22,7 @@
  * the tests can pass plain objects.
  */
 import { describe, it, expect } from "vitest";
-import { resolveFileActionKey } from "../lib/file-action-keys";
+import { resolveFileActionKey, resolveNewFolderKey } from "../lib/file-action-keys";
 
 type Gesture = Parameters<typeof resolveFileActionKey>[0];
 
@@ -92,5 +92,35 @@ describe("resolveFileActionKey — unrelated keys", () => {
     expect(resolveFileActionKey(key({ key: "a" }), false)).toBeNull();
     expect(resolveFileActionKey(key({ key: "Enter" }), false)).toBeNull();
     expect(resolveFileActionKey(key({ key: "ArrowDown" }), false)).toBeNull();
+  });
+});
+
+describe("resolveNewFolderKey — ⌘⇧N New Folder", () => {
+  it("maps ⌘+Shift+N", () => {
+    expect(resolveNewFolderKey(key({ key: "N", metaKey: true, shiftKey: true }), false)).toBe(true);
+  });
+
+  it("maps ⌘+Shift+N when e.key is lowercase (macOS reports the unshifted char under Cmd)", () => {
+    // Regression: AppKit's `characters` drops the shift flag when Cmd is
+    // held, so WKWebView delivers ⌘⇧N as e.key === "n". An uppercase-only
+    // comparison left the shortcut dead in the installed app.
+    expect(resolveNewFolderKey(key({ key: "n", metaKey: true, shiftKey: true }), false)).toBe(true);
+  });
+
+  it("maps Ctrl+Shift+N (Windows/Linux)", () => {
+    expect(resolveNewFolderKey(key({ key: "N", ctrlKey: true, shiftKey: true }), false)).toBe(true);
+  });
+
+  it("never fires while a text field is focused", () => {
+    expect(resolveNewFolderKey(key({ key: "N", metaKey: true, shiftKey: true }), true)).toBe(false);
+  });
+
+  it("requires shift — bare ⌘N is not a folder gesture", () => {
+    expect(resolveNewFolderKey(key({ key: "N", metaKey: true }), false)).toBe(false);
+  });
+
+  it("rejects Alt variants and unrelated keys", () => {
+    expect(resolveNewFolderKey(key({ key: "N", metaKey: true, shiftKey: true, altKey: true }), false)).toBe(false);
+    expect(resolveNewFolderKey(key({ key: "M", metaKey: true, shiftKey: true }), false)).toBe(false);
   });
 });

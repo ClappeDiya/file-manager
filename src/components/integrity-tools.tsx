@@ -13,6 +13,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
+import { errorText } from "@/lib/error-text";
 
 // ── Types ──
 
@@ -213,7 +214,7 @@ function ChecksumPanel({ selectedFiles }: { selectedFiles: string[] }) {
       });
       setVerifyResult(result);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   };
 
@@ -342,7 +343,7 @@ function QuickChecksumTool() {
       });
       setResult(hash);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     } finally {
       setIsComputing(false);
     }
@@ -416,7 +417,7 @@ function DuplicatePanel({ currentDirectory }: { currentDirectory: string }) {
       });
       setScanResult(result);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     } finally {
       setIsScanning(false);
     }
@@ -457,7 +458,7 @@ function DuplicatePanel({ currentDirectory }: { currentDirectory: string }) {
         });
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     } finally {
       setResolving(null);
     }
@@ -651,7 +652,7 @@ function TagPanel({ selectedFiles }: { selectedFiles: string[] }) {
       const result = await tauriInvoke<FileTag[]>("integrity_list_tags", undefined, []);
       setTags(result);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   }, []);
 
@@ -666,7 +667,7 @@ function TagPanel({ selectedFiles }: { selectedFiles: string[] }) {
       });
       setFileInfo(result);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   }, [selectedFiles]);
 
@@ -685,7 +686,7 @@ function TagPanel({ selectedFiles }: { selectedFiles: string[] }) {
       setNewTagName("");
       loadTags();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   };
 
@@ -694,7 +695,7 @@ function TagPanel({ selectedFiles }: { selectedFiles: string[] }) {
       await tauriInvoke("integrity_delete_tag", { tagId });
       loadTags();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   };
 
@@ -710,7 +711,7 @@ function TagPanel({ selectedFiles }: { selectedFiles: string[] }) {
       loadFileInfo();
       loadTags();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   };
 
@@ -724,7 +725,7 @@ function TagPanel({ selectedFiles }: { selectedFiles: string[] }) {
       setNewLabel("");
       loadFileInfo();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   };
 
@@ -737,7 +738,7 @@ function TagPanel({ selectedFiles }: { selectedFiles: string[] }) {
       });
       loadFileInfo();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   };
 
@@ -885,7 +886,7 @@ function SmartFolderPanel({ currentDirectory }: { currentDirectory: string }) {
       const result = await tauriInvoke<SmartFolder[]>("integrity_list_smart_folders", undefined, []);
       setFolders(result);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   }, []);
 
@@ -917,7 +918,7 @@ function SmartFolderPanel({ currentDirectory }: { currentDirectory: string }) {
       setIsCreating(false);
       loadFolders();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   };
 
@@ -926,7 +927,7 @@ function SmartFolderPanel({ currentDirectory }: { currentDirectory: string }) {
       await tauriInvoke("integrity_delete_smart_folder", { folderId: id });
       loadFolders();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   };
 
@@ -935,7 +936,7 @@ function SmartFolderPanel({ currentDirectory }: { currentDirectory: string }) {
       const results = await tauriInvoke<string[]>("integrity_run_smart_folder", { folderId: id });
       setFolderResults((prev) => ({ ...prev, [id]: results }));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     }
   };
 

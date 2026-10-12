@@ -6,8 +6,12 @@
 use crate::core::error::AppError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use base64::Engine as _;
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex as StdMutex};
+use tauri::Emitter;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -74,15 +78,156 @@ pub struct RemoteTerminalParams {
 /// Manages terminal sessions (local and remote).
 pub struct TerminalManager {
     sessions: Arc<RwLock<HashMap<String, TerminalSession>>>,
-    output_buffers: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    ptys: Arc<StdMutex<HashMap<String, PtyHandle>>>,
     layout: Arc<RwLock<Option<TerminalLayout>>>,
+}
+
+/// Replay buffer kept per session so a re-opened panel can restore its screen.
+const SCROLLBACK_MAX: usize = 512 * 1024;
+
+/// A live pseudo-terminal: the master side, its input writer and the child shell.
+pub(crate) struct PtyHandle {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    scrollback: Arc<StdMutex<Scrollback>>,
+}
+
+/// Recent output plus the total number of bytes ever produced, so a viewer can
+/// splice replay and live events without duplicating or dropping output.
+#[derive(Default)]
+struct Scrollback {
+    buf: Vec<u8>,
+    total: u64,
+}
+
+impl Drop for PtyHandle {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+/// Spawn `program` on a new PTY. `on_output` is called from a reader thread
+/// with each chunk of raw bytes; `on_exit` once when the child's output ends.
+pub(crate) fn spawn_pty(
+    program: &str,
+    args: &[String],
+    cwd: &str,
+    cols: u16,
+    rows: u16,
+    on_output: impl Fn(&[u8], u64) + Send + 'static,
+    on_exit: impl FnOnce() + Send + 'static,
+) -> Result<PtyHandle, AppError> {
+    let pty_err = |what: &str, e: &dyn std::fmt::Display| AppError::State {
+        message: format!("Terminal: {what}: {e}"),
+        advice: "Check that the shell exists and is executable, then try again.".to_string(),
+    };
+    let pair = native_pty_system()
+        .openpty(PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| pty_err("cannot open pty", &e))?;
+
+    let mut cmd = CommandBuilder::new(program);
+    cmd.args(args);
+    if std::path::Path::new(cwd).is_dir() {
+        cmd.cwd(cwd);
+    }
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+
+    let child = pair.slave.spawn_command(cmd).map_err(|e| pty_err("cannot start shell", &e))?;
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader().map_err(|e| pty_err("cannot read pty", &e))?;
+    let writer = pair.master.take_writer().map_err(|e| pty_err("cannot write pty", &e))?;
+    let scrollback = Arc::new(StdMutex::new(Scrollback::default()));
+
+    let sb = scrollback.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut offset = 0;
+                    if let Ok(mut sb) = sb.lock() {
+                        offset = sb.total;
+                        sb.total += n as u64;
+                        sb.buf.extend_from_slice(&buf[..n]);
+                        if sb.buf.len() > SCROLLBACK_MAX {
+                            let excess = sb.buf.len() - SCROLLBACK_MAX;
+                            sb.buf.drain(..excess);
+                        }
+                    }
+                    on_output(&buf[..n], offset);
+                }
+            }
+        }
+        on_exit();
+    });
+
+    Ok(PtyHandle { master: pair.master, writer, child, scrollback })
+}
+
+#[derive(Clone, Serialize)]
+struct TerminalOutputEvent {
+    session_id: String,
+    /// Base64 of the raw bytes (keeps multi-byte UTF-8 sequences intact across chunks).
+    data: String,
+    /// Total bytes the session had produced before this chunk.
+    offset: u64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct TerminalScrollback {
+    /// Base64 of the buffered output.
+    data: String,
+    /// Total bytes produced so far; live events with `offset < end_offset` are already included.
+    end_offset: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct TerminalExitEvent {
+    session_id: String,
+}
+
+fn spawn_for_app(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    program: &str,
+    args: &[String],
+    cwd: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<PtyHandle, AppError> {
+    let (a1, a2) = (app.clone(), app.clone());
+    let (id1, id2) = (session_id.to_string(), session_id.to_string());
+    spawn_pty(
+        program,
+        args,
+        cwd,
+        cols,
+        rows,
+        move |bytes, offset| {
+            let _ = a1.emit(
+                "terminal-output",
+                TerminalOutputEvent {
+                    session_id: id1.clone(),
+                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    offset,
+                },
+            );
+        },
+        move || {
+            let _ = a2.emit("terminal-exit", TerminalExitEvent { session_id: id2 });
+        },
+    )
 }
 
 impl TerminalManager {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            output_buffers: Arc::new(RwLock::new(HashMap::new())),
+            ptys: Arc::new(StdMutex::new(HashMap::new())),
             layout: Arc::new(RwLock::new(None)),
         }
     }
@@ -128,45 +273,70 @@ impl Default for TerminalManager {
 
 // ── Tauri Commands ──
 
-/// Create a new local terminal session.
+/// Create a new local terminal session backed by a real PTY.
 #[tauri::command]
 pub async fn terminal_create_local(
     cwd: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
+    app: tauri::AppHandle,
     manager: tauri::State<'_, TerminalManager>,
 ) -> Result<TerminalSession, AppError> {
     let shell = TerminalManager::default_shell();
     let working_dir = cwd.unwrap_or_else(TerminalManager::default_cwd);
+    let (cols, rows) = (cols.unwrap_or(80), rows.unwrap_or(24));
 
     let session = TerminalSession {
         id: Uuid::new_v4().to_string(),
-        title: format!("Terminal - {}", shell.split('/').next_back().unwrap_or(&shell)),
+        title: format!("Terminal - {}", shell.rsplit(['/', '\\']).next().unwrap_or(&shell)),
         session_type: TerminalType::Local,
         shell: shell.clone(),
-        cwd: working_dir,
+        cwd: working_dir.clone(),
         created_at: Utc::now(),
         active: true,
-        cols: cols.unwrap_or(80),
-        rows: rows.unwrap_or(24),
+        cols,
+        rows,
     };
 
-    let mut sessions = manager.sessions.write().await;
-    sessions.insert(session.id.clone(), session.clone());
+    #[cfg(unix)]
+    let args = vec!["-l".to_string()];
+    #[cfg(not(unix))]
+    let args: Vec<String> = Vec::new();
+    let handle = spawn_for_app(&app, &session.id, &shell, &args, &working_dir, cols, rows)?;
+    manager.ptys.lock().map_err(lock_err)?.insert(session.id.clone(), handle);
+    manager.sessions.write().await.insert(session.id.clone(), session.clone());
 
-    let mut buffers = manager.output_buffers.write().await;
-    buffers.insert(session.id.clone(), Vec::new());
-
-    tracing::info!(
-        "Created local terminal session {} with shell {}",
-        session.id,
-        shell
-    );
-
+    tracing::info!("Created local terminal session {} with shell {}", session.id, shell);
     Ok(session)
 }
 
-/// Create a new remote terminal session (SSH).
+fn lock_err<T>(_: std::sync::PoisonError<T>) -> AppError {
+    AppError::State {
+        message: "Terminal state is unavailable".to_string(),
+        advice: "Restart the application.".to_string(),
+    }
+}
+
+/// Reject host/user values that ssh would parse as options or that contain
+/// characters outside the set valid in hostnames, IPs and unix user names.
+fn validate_ssh_token(kind: &str, value: &str, allow_colon: bool) -> Result<(), AppError> {
+    let ok = !value.is_empty()
+        && !value.starts_with('-')
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@') || (allow_colon && c == ':')
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::Configuration {
+            message: format!("Invalid SSH {kind}: '{value}'"),
+            advice: format!("Use only letters, digits, '.', '_' and '-' in the {kind}."),
+        })
+    }
+}
+
+/// Create a new remote terminal session by running the system `ssh` client on
+/// a PTY, so keys, agents, known_hosts and password prompts all behave as usual.
 #[tauri::command]
 pub async fn terminal_create_remote(
     host: String,
@@ -175,8 +345,14 @@ pub async fn terminal_create_remote(
     connection_id: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
+    app: tauri::AppHandle,
     manager: tauri::State<'_, TerminalManager>,
 ) -> Result<TerminalSession, AppError> {
+    validate_ssh_token("host", &host, true)?;
+    validate_ssh_token("username", &username, false)?;
+    let _ = connection_id;
+    let (cols, rows) = (cols.unwrap_or(80), rows.unwrap_or(24));
+
     let session = TerminalSession {
         id: Uuid::new_v4().to_string(),
         title: format!("SSH: {}@{}", username, host),
@@ -185,26 +361,23 @@ pub async fn terminal_create_remote(
         cwd: format!("{}@{}:{}", username, host, port),
         created_at: Utc::now(),
         active: true,
-        cols: cols.unwrap_or(80),
-        rows: rows.unwrap_or(24),
+        cols,
+        rows,
     };
 
-    let mut sessions = manager.sessions.write().await;
-    sessions.insert(session.id.clone(), session.clone());
+    let args = vec![
+        "-p".to_string(),
+        port.to_string(),
+        "-o".to_string(),
+        "ServerAliveInterval=30".to_string(),
+        format!("{username}@{host}"),
+    ];
+    let cwd = TerminalManager::default_cwd();
+    let handle = spawn_for_app(&app, &session.id, "ssh", &args, &cwd, cols, rows)?;
+    manager.ptys.lock().map_err(lock_err)?.insert(session.id.clone(), handle);
+    manager.sessions.write().await.insert(session.id.clone(), session.clone());
 
-    let mut buffers = manager.output_buffers.write().await;
-    buffers.insert(session.id.clone(), Vec::new());
-
-    tracing::info!(
-        "Created remote terminal session {} for {}@{}:{}",
-        session.id,
-        username,
-        host,
-        port
-    );
-
-    let _ = connection_id; // Used for credential lookup in production
-
+    tracing::info!("Created remote terminal session {} for {}@{}:{}", session.id, username, host, port);
     Ok(session)
 }
 
@@ -217,7 +390,7 @@ pub async fn terminal_list_sessions(
     Ok(sessions.values().cloned().collect())
 }
 
-/// Close a terminal session.
+/// Close a terminal session, killing its shell.
 #[tauri::command]
 pub async fn terminal_close_session(
     session_id: String,
@@ -225,8 +398,7 @@ pub async fn terminal_close_session(
 ) -> Result<(), AppError> {
     let mut sessions = manager.sessions.write().await;
     if sessions.remove(&session_id).is_some() {
-        let mut buffers = manager.output_buffers.write().await;
-        buffers.remove(&session_id);
+        manager.ptys.lock().map_err(lock_err)?.remove(&session_id);
         tracing::info!("Closed terminal session {}", session_id);
         Ok(())
     } else {
@@ -237,32 +409,32 @@ pub async fn terminal_close_session(
     }
 }
 
-/// Send input to a terminal session.
+fn missing_session(session_id: &str) -> AppError {
+    AppError::State {
+        message: format!("Terminal session '{}' not found", session_id),
+        advice: "Create a new terminal session.".to_string(),
+    }
+}
+
+/// Send input (keystrokes / pasted text) to a terminal session's PTY.
 #[tauri::command]
 pub async fn terminal_write(
     session_id: String,
     data: String,
     manager: tauri::State<'_, TerminalManager>,
 ) -> Result<(), AppError> {
-    let sessions = manager.sessions.read().await;
-    if !sessions.contains_key(&session_id) {
-        return Err(AppError::State {
-            message: format!("Terminal session '{}' not found", session_id),
-            advice: "Create a new terminal session.".to_string(),
-        });
-    }
-
-    // In production, this writes to the PTY stdin.
-    // For now, we simulate echo back.
-    let mut buffers = manager.output_buffers.write().await;
-    if let Some(buffer) = buffers.get_mut(&session_id) {
-        buffer.push(data);
-    }
-
-    Ok(())
+    let mut ptys = manager.ptys.lock().map_err(lock_err)?;
+    let pty = ptys.get_mut(&session_id).ok_or_else(|| missing_session(&session_id))?;
+    pty.writer
+        .write_all(data.as_bytes())
+        .and_then(|_| pty.writer.flush())
+        .map_err(|e| AppError::State {
+            message: format!("Could not write to terminal: {e}"),
+            advice: "The shell may have exited. Open a new terminal.".to_string(),
+        })
 }
 
-/// Resize a terminal session.
+/// Resize a terminal session's PTY (sends SIGWINCH to the foreground process).
 #[tauri::command]
 pub async fn terminal_resize(
     session_id: String,
@@ -271,17 +443,34 @@ pub async fn terminal_resize(
     manager: tauri::State<'_, TerminalManager>,
 ) -> Result<(), AppError> {
     let mut sessions = manager.sessions.write().await;
-    if let Some(session) = sessions.get_mut(&session_id) {
-        session.cols = cols;
-        session.rows = rows;
-        // In production, this sends SIGWINCH / resizes the PTY
-        Ok(())
-    } else {
-        Err(AppError::State {
-            message: format!("Terminal session '{}' not found", session_id),
-            advice: "Create a new terminal session.".to_string(),
-        })
+    let session = sessions.get_mut(&session_id).ok_or_else(|| missing_session(&session_id))?;
+    session.cols = cols;
+    session.rows = rows;
+    let ptys = manager.ptys.lock().map_err(lock_err)?;
+    if let Some(pty) = ptys.get(&session_id) {
+        pty.master
+            .resize(PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 })
+            .map_err(|e| AppError::State {
+                message: format!("Could not resize terminal: {e}"),
+                advice: "Try again.".to_string(),
+            })?;
     }
+    Ok(())
+}
+
+/// Buffered output of a session (base64) so a re-mounted view can restore its screen.
+#[tauri::command]
+pub async fn terminal_read_scrollback(
+    session_id: String,
+    manager: tauri::State<'_, TerminalManager>,
+) -> Result<TerminalScrollback, AppError> {
+    let ptys = manager.ptys.lock().map_err(lock_err)?;
+    let pty = ptys.get(&session_id).ok_or_else(|| missing_session(&session_id))?;
+    let sb = pty.scrollback.lock().map_err(lock_err)?;
+    Ok(TerminalScrollback {
+        data: base64::engine::general_purpose::STANDARD.encode(&sb.buf),
+        end_offset: sb.total,
+    })
 }
 
 /// Set the terminal split layout.
@@ -382,5 +571,61 @@ mod tests {
     #[test]
     fn test_terminal_manager_creation() {
         let _mgr = TerminalManager::new();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_runs_a_command_and_reports_exit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let handle = spawn_pty(
+            "/bin/sh",
+            &["-c".to_string(), "echo UFOP_PTY_OK".to_string()],
+            "/",
+            80,
+            24,
+            move |b, _| {
+                let _ = tx.send(b.to_vec());
+            },
+            move || {
+                let _ = done_tx.send(());
+            },
+        )
+        .unwrap();
+        done_rx.recv_timeout(Duration::from_secs(10)).expect("pty should report exit");
+        let out: Vec<u8> = rx.try_iter().flatten().collect();
+        assert!(String::from_utf8_lossy(&out).contains("UFOP_PTY_OK"));
+        assert!(String::from_utf8_lossy(&handle.scrollback.lock().unwrap().buf).contains("UFOP_PTY_OK"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_input_reaches_the_shell_and_resize_works() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let mut handle = spawn_pty("/bin/sh", &[], "/", 80, 24, move |b, _| { let _ = tx.send(b.to_vec()); }, || {}).unwrap();
+        handle.master.resize(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 }).unwrap();
+        handle.writer.write_all(b"echo UFOP_$((20+22))\n").unwrap();
+        handle.writer.flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = String::new();
+        while Instant::now() < deadline && !seen.contains("UFOP_42") {
+            if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(200)) {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        }
+        assert!(seen.contains("UFOP_42"), "shell output was: {seen:?}");
+    }
+
+    #[test]
+    fn ssh_tokens_reject_option_injection() {
+        assert!(validate_ssh_token("host", "example.com", true).is_ok());
+        assert!(validate_ssh_token("host", "::1", true).is_ok());
+        assert!(validate_ssh_token("host", "-oProxyCommand=evil", true).is_err());
+        assert!(validate_ssh_token("username", "bob;rm", false).is_err());
+        assert!(validate_ssh_token("username", "", false).is_err());
     }
 }

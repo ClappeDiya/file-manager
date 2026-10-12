@@ -46,7 +46,7 @@ export function DualPaneLayout({
         }
       }
       // Cmd+Shift+D to toggle dual pane
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "D") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "d") {
         e.preventDefault();
         toggleSinglePaneMode();
       }

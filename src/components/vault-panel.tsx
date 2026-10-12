@@ -19,10 +19,21 @@ interface VaultInfo {
   id: string;
   name: string;
   path: string;
-  is_unlocked: boolean;
+  /** Rust `VaultStatus` serializes snake_case: "unlocked" | "locked" | "needs_rekey". */
+  status: string;
+  file_count: number;
+  total_size: number;
   created_at: string;
+  last_accessed: string | null;
   cryptomator_compat: boolean;
+  encrypt_patterns: string[];
 }
+
+/** The previous interface declared `is_unlocked`, which the Rust side
+ *  never sends — it emits `status` instead — so every vault row
+ *  rendered as locked forever (grey dot, "Unlock" label) even while
+ *  the manager counted it unlocked. Derive the boolean from `status`. */
+const isUnlocked = (v: VaultInfo) => v.status === "unlocked";
 
 interface TransportSecurityCheck {
   secure: boolean;
@@ -231,9 +242,9 @@ function VaultItem({
         <div className="flex items-center gap-2">
           <span
             className={`w-2 h-2 rounded-full flex-shrink-0 ${
-              vault.is_unlocked ? "bg-green-500" : "bg-gray-400"
+              isUnlocked(vault) ? "bg-green-500" : "bg-gray-400"
             }`}
-            title={vault.is_unlocked ? "Unlocked" : "Locked"}
+            title={isUnlocked(vault) ? "Unlocked" : "Locked"}
           />
           <span className="text-sm font-medium truncate">{vault.name}</span>
           {vault.cryptomator_compat && (
@@ -248,14 +259,14 @@ function VaultItem({
         onClick={() => onToggleLock(vault)}
         disabled={toggling}
         className={`text-xs px-2 py-1 rounded ml-2 ${
-          vault.is_unlocked
+          isUnlocked(vault)
             ? "hover:bg-red-100 dark:hover:bg-red-900/30 text-red-600 dark:text-red-400"
             : "hover:bg-green-100 dark:hover:bg-green-900/30 text-green-600 dark:text-green-400"
         } disabled:opacity-50`}
         type="button"
-        title={vault.is_unlocked ? "Lock vault" : "Unlock vault"}
+        title={isUnlocked(vault) ? "Lock vault" : "Unlock vault"}
       >
-        {toggling ? "..." : vault.is_unlocked ? "Lock" : "Unlock"}
+        {toggling ? "..." : isUnlocked(vault) ? "Lock" : "Unlock"}
       </button>
     </div>
   );
@@ -1161,7 +1172,7 @@ export function VaultPanel() {
 
   const handleToggleLock = useCallback(
     async (vault: VaultInfo) => {
-      if (vault.is_unlocked) {
+      if (isUnlocked(vault)) {
         // Lock the vault
         setTogglingIds((prev) => new Set([...prev, vault.id]));
         try {
@@ -1318,7 +1329,7 @@ export function VaultPanel() {
       </div>
 
       {/* Bottom sections (shown when a vault is selected and unlocked) */}
-      {selectedVault && selectedVault.is_unlocked && (
+      {selectedVault && isUnlocked(selectedVault) && (
         <div className="border-t border-gray-200 dark:border-gray-700">
           {/* Section Tabs */}
           <div className="flex border-b border-gray-200 dark:border-gray-700">
@@ -1384,7 +1395,7 @@ export function VaultPanel() {
       )}
 
       {/* Transport & Policies always accessible when no unlocked vault selected */}
-      {(!selectedVault || !selectedVault.is_unlocked) && (
+      {(!selectedVault || !isUnlocked(selectedVault)) && (
         <div className="border-t border-gray-200 dark:border-gray-700">
           <div className="flex border-b border-gray-200 dark:border-gray-700">
             <button

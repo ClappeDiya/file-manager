@@ -49,6 +49,30 @@ pub async fn pick_folder(
     })
 }
 
+/// Open a native file picker (multi-select) and return the chosen paths;
+/// an empty list means the user cancelled. Same oneshot pattern as `pick_folder`.
+#[tauri::command]
+pub async fn pick_files(
+    window: tauri::Window,
+    title: Option<String>,
+) -> Result<Vec<String>, AppError> {
+    use tauri::Manager;
+    use tauri_plugin_dialog::DialogExt;
+
+    let dialog = window.app_handle().dialog().file();
+    #[cfg(any(windows, target_os = "macos"))]
+    let dialog = dialog.set_parent(&window);
+    let dialog = if let Some(t) = title { dialog.set_title(t) } else { dialog };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dialog.pick_files(move |files| {
+        let _ = tx.send(files.unwrap_or_default().into_iter().map(|p| p.to_string()).collect::<Vec<_>>());
+    });
+    rx.await.map_err(|_| AppError::Internal {
+        message: "File picker was cancelled or failed to respond".to_string(),
+    })
+}
+
 /// Maximum byte size for full-content text read/write. Matches the
 /// `MAX_FILE_SIZE` constant in `src/components/text-editor.tsx` so
 /// the backend and frontend agree on the 1 MB in-app-editor ceiling.

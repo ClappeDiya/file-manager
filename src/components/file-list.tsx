@@ -237,6 +237,8 @@ interface FileListProps {
   className?: string;
   selectedPaths?: string[];
   onSelect?: (path: string, event: React.MouseEvent) => void;
+  /** Arrow/Home/End navigation landed on `path`; `extend` is true while Shift is held. */
+  onKeyboardSelect?: (path: string, extend: boolean) => void;
   onOpen?: (entry: FileEntryData) => void;
   onContextMenu?: (entry: FileEntryData, event: React.MouseEvent) => void;
   /** Index of the focused item for keyboard nav */
@@ -281,6 +283,7 @@ export function FileList({
   className,
   selectedPaths = [],
   onSelect,
+  onKeyboardSelect,
   onOpen,
   onContextMenu,
   focusedIndex = 0,
@@ -301,6 +304,7 @@ export function FileList({
         className={className}
         selectedPaths={selectedPaths}
         onSelect={onSelect}
+        onKeyboardSelect={onKeyboardSelect}
         onOpen={onOpen}
         onContextMenu={onContextMenu}
         focusedIndex={focusedIndex}
@@ -318,6 +322,7 @@ export function FileList({
       className={className}
       selectedPaths={selectedPaths}
       onSelect={onSelect}
+      onKeyboardSelect={onKeyboardSelect}
       onOpen={onOpen}
       onContextMenu={onContextMenu}
       focusedIndex={focusedIndex}
@@ -483,6 +488,8 @@ interface FileTableViewProps {
   className?: string;
   selectedPaths: string[];
   onSelect?: (path: string, event: React.MouseEvent) => void;
+  /** Arrow/Home/End navigation landed on `path`; `extend` is true while Shift is held. */
+  onKeyboardSelect?: (path: string, extend: boolean) => void;
   onOpen?: (entry: FileEntryData) => void;
   onContextMenu?: (entry: FileEntryData, event: React.MouseEvent) => void;
   focusedIndex: number;
@@ -511,6 +518,7 @@ function FileTableView({
   className,
   selectedPaths,
   onSelect,
+  onKeyboardSelect,
   onOpen,
   onContextMenu,
   focusedIndex,
@@ -834,9 +842,11 @@ function FileTableView({
       if (newIndex !== focusedIndex) {
         onFocusedIndexChange?.(newIndex);
         virtualizer.scrollToIndex(newIndex, { align: "auto" });
+        const target = rows[newIndex]?.original;
+        if (target) onKeyboardSelect?.(target.path, e.shiftKey);
       }
     },
-    [focusedIndex, rows, rowHeight, onOpen, onFocusedIndexChange, onContextMenu, virtualizer],
+    [focusedIndex, rows, rowHeight, onOpen, onFocusedIndexChange, onKeyboardSelect, onContextMenu, virtualizer],
   );
 
   return (
@@ -1142,6 +1152,8 @@ interface FileGridViewProps {
   className?: string;
   selectedPaths: string[];
   onSelect?: (path: string, event: React.MouseEvent) => void;
+  /** Arrow/Home/End navigation landed on `path`; `extend` is true while Shift is held. */
+  onKeyboardSelect?: (path: string, extend: boolean) => void;
   onOpen?: (entry: FileEntryData) => void;
   onContextMenu?: (entry: FileEntryData, event: React.MouseEvent) => void;
   focusedIndex: number;
@@ -1163,6 +1175,7 @@ function FileGridView({
   className,
   selectedPaths,
   onSelect,
+  onKeyboardSelect,
   onOpen,
   onContextMenu,
   focusedIndex,
@@ -1278,9 +1291,11 @@ function FileGridView({
         // Scroll the row containing the new index into view
         const targetRow = Math.floor(newIndex / cols);
         rowVirtualizer.scrollToIndex(targetRow, { align: "auto" });
+        const target = files[newIndex];
+        if (target) onKeyboardSelect?.(target.path, e.shiftKey);
       }
     },
-    [focusedIndex, files, columnCount, onOpen, onFocusedIndexChange, onContextMenu, rowVirtualizer],
+    [focusedIndex, files, columnCount, onOpen, onFocusedIndexChange, onKeyboardSelect, onContextMenu, rowVirtualizer],
   );
 
   return (

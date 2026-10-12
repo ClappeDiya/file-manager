@@ -54,6 +54,8 @@ pub async fn enqueue_transfer(
     ledger: State<'_, OperationLedger>,
 ) -> Result<TransferJob, AppError> {
     let job = manager.enqueue(&source, &dest, total_bytes).await?;
+    // Run it: a queued job otherwise never starts.
+    manager.spawn_runner(job.id).await;
     record_xfer(
         &ledger,
         "enqueue",
@@ -284,6 +286,8 @@ pub async fn retry_transfer(
     let id = parse_uuid(&job_id)?;
     let allowed = manager.increment_retry(id).await?;
     if allowed {
+        // Re-queued jobs need an executor, just like fresh enqueues.
+        manager.spawn_runner(id).await;
         record_xfer(
             &ledger,
             "retry",
@@ -305,7 +309,11 @@ pub async fn retry_all_failed(
     manager: State<'_, TransferManager>,
     ledger: State<'_, OperationLedger>,
 ) -> Result<u32, AppError> {
-    let count = manager.retry_all_failed().await?;
+    let requeued = manager.retry_all_failed().await?;
+    let count = requeued.len() as u32;
+    for id in requeued {
+        manager.spawn_runner(id).await;
+    }
     if count > 0 {
         record_xfer(
             &ledger,

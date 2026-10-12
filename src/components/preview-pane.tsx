@@ -18,6 +18,7 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import { errorText } from "@/lib/error-text";
 
 // ── Types ──
 
@@ -254,7 +255,7 @@ export function PreviewPane({ filePath, isOpen, onToggle, width = 360, protocol,
       })
       .catch((e) => {
         if (abortRef.current !== requestId) return;
-        setError(e instanceof Error ? e.message : String(e));
+        setError(errorText(e));
         setIsLoading(false);
       });
   }, [filePath, isOpen]);
@@ -700,6 +701,16 @@ function PreviewContent({ preview, exif: _exif }: { preview: PreviewResult; exif
           <div className="text-sm font-medium mb-2">Archive Contents</div>
           <pre className="text-xs font-mono bg-surface-secondary p-3 rounded overflow-auto max-h-[60vh] whitespace-pre-wrap">
             {preview.content || "(empty archive)"}
+          </pre>
+        </div>
+      );
+
+    case "directory":
+      return (
+        <div className="p-3">
+          <div className="text-sm font-medium mb-2">Folder Contents</div>
+          <pre className="text-xs font-mono bg-surface-secondary p-3 rounded overflow-auto max-h-[60vh] whitespace-pre-wrap">
+            {preview.content || "(empty folder)"}
           </pre>
         </div>
       );

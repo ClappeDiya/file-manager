@@ -13,6 +13,9 @@
  */
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import { pickFiles, pickFolder } from "@/lib/folder-picker";
+import { promptText, confirmText } from "@/lib/prompt-dialog";
+import { errorText } from "@/lib/error-text";
 
 // ── Types (mirrors Rust types) ──
 
@@ -1240,6 +1243,7 @@ export function ConnectionPanel() {
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
   const [browsing, setBrowsing] = useState(false);
   const [browseError, setBrowseError] = useState<string | null>(null);
+  const [transferStatus, setTransferStatus] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -1396,6 +1400,7 @@ export function ConnectionPanel() {
           port: conn.port,
           username: conn.username,
           remotePath: conn.remote_path,
+          connectionId: id,
         });
 
         // 3. List remote directory contents
@@ -1416,7 +1421,7 @@ export function ConnectionPanel() {
       } catch (err) {
         console.error("Failed to connect:", err);
         setBrowseError(
-          err instanceof Error ? err.message : String(err)
+          errorText(err)
         );
       } finally {
         setBrowsing(false);
@@ -1462,7 +1467,7 @@ export function ConnectionPanel() {
         setRemotePath(path);
       } catch (err) {
         setBrowseError(
-          err instanceof Error ? err.message : "Browse failed"
+          errorText(err)
         );
       } finally {
         setBrowsing(false);
@@ -1477,6 +1482,101 @@ export function ConnectionPanel() {
     const conn = connections.find((c) => c.id === connectedId);
     return conn?.name || connectedId;
   }, [connectedId, connections]);
+
+  const joinRemote = (dir: string, name: string) => (dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`);
+
+  const reloadRemote = useCallback(async () => {
+    if (!connectedProtocol) return;
+    const files = await tauriInvoke<RemoteFileEntry[]>(
+      "connector_list_remote",
+      { protocol: connectedProtocol, path: remotePath },
+      [],
+    );
+    setRemoteFiles(files);
+  }, [connectedProtocol, remotePath]);
+
+  const handleUpload = useCallback(async () => {
+    if (!connectedProtocol) return;
+    const files = await pickFiles("Select files to upload");
+    if (files.length === 0) return;
+    setBrowseError(null);
+    let done = 0;
+    try {
+      for (const local of files) {
+        const name = local.split(/[\\/]/).pop() || local;
+        setTransferStatus(`Uploading ${name} (${done + 1}/${files.length})...`);
+        await tauriInvoke("connector_upload", {
+          protocol: connectedProtocol,
+          localPath: local,
+          remotePath: joinRemote(remotePath, name),
+        });
+        done++;
+      }
+      setTransferStatus(`Uploaded ${done} file${done === 1 ? "" : "s"}.`);
+      await reloadRemote();
+    } catch (err) {
+      setTransferStatus(null);
+      setBrowseError(`Upload failed after ${done}/${files.length}: ${errorText(err)}`);
+    }
+  }, [connectedProtocol, remotePath, reloadRemote]);
+
+  const handleDownload = useCallback(async (entry: RemoteFileEntry) => {
+    if (!connectedProtocol) return;
+    const dir = await pickFolder(`Choose where to save ${entry.name}`);
+    if (!dir) return;
+    setBrowseError(null);
+    setTransferStatus(`Downloading ${entry.name}...`);
+    try {
+      const bytes = await tauriInvoke<number>("connector_download", {
+        protocol: connectedProtocol,
+        remotePath: entry.path,
+        localPath: `${dir.replace(/\/$/, "")}/${entry.name}`,
+      });
+      setTransferStatus(`Downloaded ${entry.name} (${formatFileSize(bytes)}) to ${dir}.`);
+    } catch (err) {
+      setTransferStatus(null);
+      setBrowseError(`Download failed: ${errorText(err)}`);
+    }
+  }, [connectedProtocol]);
+
+  const handleRemoteMkdir = useCallback(async () => {
+    if (!connectedProtocol) return;
+    const name = (await promptText("New remote folder name:", "New Folder"))?.trim();
+    if (!name) return;
+    setBrowseError(null);
+    try {
+      await tauriInvoke("connector_make_directory", {
+        protocol: connectedProtocol,
+        remotePath: joinRemote(remotePath, name),
+      });
+      setTransferStatus(`Created folder ${name}.`);
+      await reloadRemote();
+    } catch (err) {
+      setBrowseError(`Create folder failed: ${errorText(err)}`);
+    }
+  }, [connectedProtocol, remotePath, reloadRemote]);
+
+  const handleRemoteDelete = useCallback(async (entry: RemoteFileEntry) => {
+    if (!connectedProtocol) return;
+    const ok = await confirmText(
+      `Delete ${entry.is_dir ? "folder" : "file"} "${entry.name}" from the server? This cannot be undone.`,
+      "Delete",
+      true,
+    );
+    if (!ok) return;
+    setBrowseError(null);
+    try {
+      await tauriInvoke("connector_remove", {
+        protocol: connectedProtocol,
+        remotePath: entry.path,
+        isDir: entry.is_dir,
+      });
+      setTransferStatus(`Deleted ${entry.name}.`);
+      await reloadRemote();
+    } catch (err) {
+      setBrowseError(`Delete failed: ${errorText(err)}`);
+    }
+  }, [connectedProtocol, reloadRemote]);
 
   const handleExport = useCallback(async () => {
     try {
@@ -1542,7 +1642,7 @@ export function ConnectionPanel() {
             setImportError(null);
           } catch (err) {
             console.error("UFOP import failed:", err);
-            setImportError(err instanceof Error ? err.message : String(err));
+            setImportError(errorText(err));
           }
         };
         reader.readAsText(file);
@@ -1560,7 +1660,7 @@ export function ConnectionPanel() {
             setImportError(null);
           } catch (err) {
             console.error(`${pendingImportSource} import failed:`, err);
-            setImportError(err instanceof Error ? err.message : String(err));
+            setImportError(errorText(err));
           }
         };
         reader.readAsText(file);
@@ -1865,7 +1965,31 @@ export function ConnectionPanel() {
                 Loading...
               </span>
             )}
+            <div className="ml-auto flex items-center gap-1 flex-shrink-0">
+              <button
+                onClick={handleUpload}
+                className="text-xs px-2 py-0.5 rounded bg-blue-500 text-white hover:bg-blue-600"
+                type="button"
+                data-testid="remote-upload"
+              >
+                Upload
+              </button>
+              <button
+                onClick={handleRemoteMkdir}
+                className="text-xs px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700"
+                type="button"
+                data-testid="remote-new-folder"
+              >
+                New Folder
+              </button>
+            </div>
           </div>
+
+          {transferStatus && !browseError && (
+            <div className="px-3 py-1.5 text-xs text-green-700 dark:text-green-400 bg-green-50 dark:bg-green-900/20 border-b border-gray-200 dark:border-gray-700" data-testid="remote-status">
+              {transferStatus}
+            </div>
+          )}
 
           {/* Error display */}
           {browseError && (
@@ -1889,14 +2013,14 @@ export function ConnectionPanel() {
                 return a.name.localeCompare(b.name);
               })
               .map((entry) => (
+                <div key={entry.path} className="flex items-center border-b border-gray-100 dark:border-gray-800 last:border-b-0 group">
                 <button
-                  key={entry.path}
                   onClick={() => {
                     if (entry.is_dir) {
                       handleBrowse(entry.path);
                     }
                   }}
-                  className={`w-full text-left flex items-center justify-between px-3 py-1.5 text-sm border-b border-gray-100 dark:border-gray-800 last:border-b-0 ${
+                  className={`flex-1 min-w-0 text-left flex items-center justify-between px-3 py-1.5 text-sm ${
                     entry.is_dir
                       ? "hover:bg-blue-50 dark:hover:bg-blue-900/20 cursor-pointer"
                       : "hover:bg-gray-50 dark:hover:bg-gray-800/30 cursor-default"
@@ -1931,6 +2055,29 @@ export function ConnectionPanel() {
                     )}
                   </div>
                 </button>
+                <div className="flex items-center gap-1 pr-2 flex-shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+                  {!entry.is_dir && (
+                    <button
+                      onClick={() => handleDownload(entry)}
+                      className="text-xs px-1.5 py-0.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+                      type="button"
+                      aria-label={`Download ${entry.name}`}
+                      data-testid={`remote-download-${entry.name}`}
+                    >
+                      Download
+                    </button>
+                  )}
+                  <button
+                    onClick={() => handleRemoteDelete(entry)}
+                    className="text-xs px-1.5 py-0.5 rounded text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20"
+                    type="button"
+                    aria-label={`Delete ${entry.name}`}
+                    data-testid={`remote-delete-${entry.name}`}
+                  >
+                    Delete
+                  </button>
+                </div>
+                </div>
               ))}
           </div>
         </div>

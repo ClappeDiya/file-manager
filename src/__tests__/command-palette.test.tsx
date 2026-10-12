@@ -208,4 +208,25 @@ describe("T-013: getDefaultCommands", () => {
     cmd?.action();
     expect(onNewFolder).toHaveBeenCalled();
   });
+
+  // Regression: the transfer queue dock and its only producer were
+  // unreachable — the palette must expose both the queue toggle and
+  // the "queue copy" action that feeds `enqueue_transfer`.
+  it("exposes the transfer queue toggle command", () => {
+    const onToggleTransferQueue = vi.fn();
+    const commands = getDefaultCommands({ onToggleTransferQueue });
+    const cmd = commands.find((c) => c.id === "toggle-transfer-queue");
+    expect(cmd).toBeDefined();
+    cmd?.action();
+    expect(onToggleTransferQueue).toHaveBeenCalled();
+  });
+
+  it("exposes the queue-copy producer command", () => {
+    const onQueueCopyTo = vi.fn();
+    const commands = getDefaultCommands({ onQueueCopyTo });
+    const cmd = commands.find((c) => c.id === "queue-copy");
+    expect(cmd).toBeDefined();
+    cmd?.action();
+    expect(onQueueCopyTo).toHaveBeenCalled();
+  });
 });
