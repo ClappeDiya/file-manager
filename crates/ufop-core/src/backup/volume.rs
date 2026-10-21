@@ -47,7 +47,11 @@ impl VolumeKind {
 const TS_FMT: &str = "%Y%m%dT%H%M%SZ";
 
 fn ext(cipher: &VolumeCipher) -> &'static str {
-    if cipher.is_encrypted() { ".aes" } else { "" }
+    match (cipher.is_encrypted(), cipher.module_name().as_str()) {
+        (false, _) => "",
+        (true, "gpg") => ".gpg",
+        (true, _) => ".aes",
+    }
 }
 
 pub fn block_volume_name(prefix: &str, cipher: &VolumeCipher) -> String {
@@ -73,7 +77,7 @@ pub fn verification_file_name(prefix: &str) -> String {
 /// Classify a remote file belonging to `prefix`.
 pub fn classify(prefix: &str, name: &str) -> Option<VolumeKind> {
     let rest = name.strip_prefix(prefix)?.strip_prefix('-')?;
-    let rest = rest.strip_suffix(".aes").unwrap_or(rest);
+    let rest = rest.strip_suffix(".aes").or_else(|| rest.strip_suffix(".gpg")).unwrap_or(rest);
     let (_, kind) = rest.rsplit_once('.')?;
     VolumeKind::parse(kind)
 }
@@ -99,6 +103,12 @@ pub struct RepoHeader {
     /// Container format of block volumes (older repositories: UFOP).
     #[serde(default)]
     pub volume_format: VolumeFormat,
+    /// `aes` (or empty, older repositories) or `gpg`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub encryption_module: String,
+    /// GPG key encryption: the recipients (informational; empty = symmetric).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpg_recipients: Vec<String>,
 }
 
 /// Accumulates blocks for one dblock volume.
@@ -328,6 +338,7 @@ mod tests {
         assert_eq!(classify("ufop", "ufop-repo.json"), None);
         assert_eq!(classify("other", &b), None);
         assert_eq!(classify("ufop", "ufop-x.dlist.aes"), Some(VolumeKind::FileList));
+        assert_eq!(classify("ufop", "ufop-x.dblock.gpg"), Some(VolumeKind::Block));
     }
 
     #[test]

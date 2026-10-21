@@ -38,6 +38,30 @@ impl Default for KdfParams {
 }
 
 impl KdfParams {
+    /// Check the parameters are usable and not dangerously weak.
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !(8 * 1024..=4 * 1024 * 1024).contains(&self.memory_kib) {
+            return Err(AppError::validation("Argon2 memory must be between 8 MiB and 4 GiB"));
+        }
+        if !(1..=50).contains(&self.iterations) {
+            return Err(AppError::validation("Argon2 iterations must be between 1 and 50"));
+        }
+        if !(1..=64).contains(&self.parallelism) || self.memory_kib < 8 * self.parallelism {
+            return Err(AppError::validation("Argon2 parallelism must be between 1 and 64"));
+        }
+        Ok(())
+    }
+
+    /// Named cost profiles.
+    pub fn preset(name: &str) -> Option<Self> {
+        Some(match name {
+            "interactive" => Self { memory_kib: 19 * 1024, iterations: 2, parallelism: 1 },
+            "default" => Self::default(),
+            "sensitive" => Self { memory_kib: 256 * 1024, iterations: 4, parallelism: 4 },
+            _ => return None,
+        })
+    }
+
     /// Cheap parameters for tests only.
     pub fn insecure_fast() -> Self {
         Self { memory_kib: 1024, iterations: 1, parallelism: 1 }
@@ -133,6 +157,9 @@ impl VolumeCipher {
     /// Value stored in `repo.json` that proves a passphrase is right without
     /// downloading a volume.
     pub fn key_check(&self) -> Result<Option<String>, AppError> {
+        if let Some(m) = &self.external {
+            return Ok(Some(hex::encode(m.seal(KEY_CHECK_PLAINTEXT)?)));
+        }
         match &self.key {
             None => Ok(None),
             Some(k) => {
@@ -143,6 +170,11 @@ impl VolumeCipher {
     }
 
     pub fn verify_key_check(&self, check: &str) -> Result<(), AppError> {
+        if let Some(m) = &self.external {
+            let raw = hex::decode(check).map_err(|_| enc_err("Repository key check is malformed"))?;
+            let pt = m.open(&raw).map_err(|_| AppError::encryption("The backup passphrase or key is incorrect", "Enter the passphrase (or import the key) used when this backup was created."))?;
+            return if pt == KEY_CHECK_PLAINTEXT { Ok(()) } else { Err(enc_err("Repository key check mismatch")) };
+        }
         let k = self.key.as_ref().ok_or_else(|| {
             AppError::validation("This backup is encrypted; a passphrase is required")
         })?;

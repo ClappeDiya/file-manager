@@ -236,6 +236,18 @@ pub fn check_transport_security(
         }
     }
 
+    if security.certificate_pinning {
+        let bad: Vec<&String> = security.pinned_fingerprints.iter().filter(|f| normalize_fingerprint(f).is_none()).collect();
+        if security.pinned_fingerprints.is_empty() {
+            check.secure = false;
+            check.errors.push("Certificate pinning is on but no fingerprint is pinned".into());
+            check.recommendations.push("Fetch the server's certificate fingerprint and pin it.".into());
+        } else if !bad.is_empty() {
+            check.secure = false;
+            check.errors.push(format!("Invalid pinned fingerprint(s): {}", bad.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+    }
+
     check
 }
 
@@ -300,6 +312,167 @@ pub fn is_encrypted_port(protocol: ConnectionProtocol, port: u16) -> bool {
         ConnectionProtocol::Ftps => true,
         _ => true,
     }
+}
+
+// ── rustls client configuration: CA trust and certificate pinning ──
+
+/// Normalize a SHA-256 certificate fingerprint (`AB:CD:…`, spaces, any case)
+/// to 64 lowercase hex characters; `None` if it is not one.
+pub fn normalize_fingerprint(s: &str) -> Option<String> {
+    let h: String = s.chars().filter(|c| !matches!(c, ':' | ' ' | '-')).collect::<String>().to_ascii_lowercase();
+    (h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit())).then_some(h)
+}
+
+/// SHA-256 of a DER certificate, lowercase hex.
+pub fn cert_fingerprint(der: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(der))
+}
+
+fn provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    std::sync::Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// Accepts only certificates whose SHA-256 fingerprint is pinned; the
+/// handshake signature is still verified against the presented key.
+#[derive(Debug)]
+struct PinVerifier {
+    pins: Vec<String>,
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+    /// When set, the presented leaf's fingerprint is recorded (probe mode).
+    seen: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinVerifier {
+    fn verify_server_cert(
+        &self,
+        ee: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let fp = cert_fingerprint(ee.as_ref());
+        if let Some(seen) = &self.seen {
+            if let Ok(mut g) = seen.lock() {
+                *g = Some(fp.clone());
+            }
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+        if self.pins.contains(&fp) {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(format!("certificate fingerprint {fp} does not match any pinned fingerprint")))
+        }
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Accepts the exact certificate(s) from a PEM bundle; otherwise normal
+/// validation (covers self-signed leaves given as "trusted CA").
+#[derive(Debug)]
+struct ExactOrWebPki {
+    exact: Vec<Vec<u8>>,
+    inner: std::sync::Arc<rustls::client::WebPkiServerVerifier>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for ExactOrWebPki {
+    fn verify_server_cert(
+        &self,
+        ee: &rustls::pki_types::CertificateDer<'_>,
+        im: &[rustls::pki_types::CertificateDer<'_>],
+        name: &rustls::pki_types::ServerName<'_>,
+        ocsp: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if self.exact.iter().any(|p| p.as_slice() == ee.as_ref()) {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+        self.inner.verify_server_cert(ee, im, name, ocsp, now)
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(m, c, d)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(m, c, d)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Build a rustls client configuration.
+///
+/// - `pins` non-empty: only certificates with one of these SHA-256
+///   fingerprints are accepted (strict pinning, chain not consulted);
+/// - `accept_invalid`: any certificate (test setups only);
+/// - otherwise web PKI roots plus the certificates in `ca_pem`.
+pub fn client_config(accept_invalid: bool, ca_pem: Option<&str>, pins: &[String]) -> Result<rustls::ClientConfig, AppError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    if !pins.is_empty() {
+        let pins: Vec<String> = pins
+            .iter()
+            .map(|p| normalize_fingerprint(p).ok_or_else(|| AppError::validation(format!("'{p}' is not a SHA-256 certificate fingerprint (64 hex digits)"))))
+            .collect::<Result<_, _>>()?;
+        return Ok(rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(PinVerifier { pins, provider: provider(), seen: None }))
+            .with_no_client_auth());
+    }
+    if accept_invalid {
+        return Ok(rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(PinVerifier { pins: vec![], provider: provider(), seen: Some(Default::default()) }))
+            .with_no_client_auth());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut exact: Vec<Vec<u8>> = Vec::new();
+    if let Some(pem) = ca_pem.filter(|p| !p.trim().is_empty()) {
+        for c in rustls_pemfile::certs(&mut pem.as_bytes()).flatten() {
+            exact.push(c.as_ref().to_vec());
+            let _ = roots.add(c);
+        }
+        if exact.is_empty() {
+            return Err(AppError::validation("The trusted certificate is not valid PEM"));
+        }
+    }
+    let webpki = rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(roots)).build().map_err(|e| AppError::internal(format!("TLS setup: {e}")))?;
+    if exact.is_empty() {
+        return Ok(rustls::ClientConfig::builder().with_webpki_verifier(webpki).with_no_client_auth());
+    }
+    Ok(rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(ExactOrWebPki { exact, inner: webpki }))
+        .with_no_client_auth())
+}
+
+/// Connect to `host:port`, complete a TLS handshake without validating the
+/// certificate, and return the server certificate's SHA-256 fingerprint —
+/// for the user to compare and pin.
+pub async fn fetch_fingerprint(host: &str, port: u16, timeout: std::time::Duration) -> Result<String, AppError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let seen: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(PinVerifier { pins: vec![], provider: provider(), seen: Some(seen.clone()) }))
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| AppError::validation(format!("Invalid server name '{host}'")))?;
+    let conn = async {
+        let tcp = tokio::net::TcpStream::connect((host, port)).await.map_err(|e| AppError::connection(format!("Connecting to {host}:{port}: {e}"), "Check the host and port."))?;
+        tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg)).connect(name, tcp).await.map_err(|e| AppError::connection(format!("TLS with {host}:{port} failed: {e}"), "Check that the port speaks TLS."))
+    };
+    tokio::time::timeout(timeout, conn).await.map_err(|_| AppError::connection(format!("{host}:{port} timed out"), "Check the host and port."))??;
+    let fp = seen.lock().ok().and_then(|g| g.clone());
+    fp.ok_or_else(|| AppError::connection(format!("{host}:{port} sent no certificate"), "Check the host and port."))
 }
 
 #[cfg(test)]
@@ -464,5 +637,46 @@ mod tests {
         let restored: TransportSecurity = serde_json::from_str(&json).unwrap();
         assert_eq!(ts.min_tls_version, restored.min_tls_version);
         assert_eq!(ts.require_encryption, restored.require_encryption);
+    }
+}
+
+#[cfg(test)]
+mod pinning_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pins_are_enforced_for_http_clients() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let der = cert.cert.der().to_vec();
+        let fp = cert_fingerprint(&der);
+        let cfg = axum_server::tls_rustls::RustlsConfig::from_pem(cert.cert.pem().into_bytes(), cert.key_pair.serialize_pem().into_bytes()).await.unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "pinned-ok" }));
+        tokio::spawn(axum_server::from_tcp_rustls(l, cfg).serve(app.into_make_service()));
+
+        assert_eq!(fetch_fingerprint("localhost", port, std::time::Duration::from_secs(5)).await.unwrap(), fp);
+        let url = format!("https://localhost:{port}/");
+        let get = |pins: Vec<String>| {
+            let url = url.clone();
+            async move {
+                let c = crate::backup_engine::stores::http::client(&crate::backup_engine::stores::http::TlsOptions { pinned_sha256: pins, ..Default::default() })?;
+                c.get(&url).send().await.map_err(|e| AppError::internal(e.to_string()))?.text().await.map_err(|e| AppError::internal(e.to_string()))
+            }
+        };
+        // Pinned (colon form accepted): the self-signed server is trusted.
+        let colon = fp.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap().to_ascii_uppercase()).collect::<Vec<_>>().join(":");
+        assert_eq!(get(vec![colon]).await.unwrap(), "pinned-ok");
+        // Another pin, or no pin (web PKI), is refused.
+        assert!(get(vec!["00".repeat(32)]).await.is_err());
+        assert!(get(vec![]).await.is_err());
+        assert!(client_config(false, None, &["nope".into()]).is_err());
+
+        let sec = TransportSecurity { certificate_pinning: true, ..TransportSecurity::default() };
+        let check = check_transport_security(ConnectionProtocol::WebDav, "localhost", Some(port), &sec);
+        assert!(!check.secure && check.errors.iter().any(|e| e.contains("no fingerprint")));
+        let sec = TransportSecurity { certificate_pinning: true, pinned_fingerprints: vec![fp], ..TransportSecurity::default() };
+        assert!(check_transport_security(ConnectionProtocol::WebDav, "https://localhost", Some(443), &sec).errors.is_empty());
     }
 }

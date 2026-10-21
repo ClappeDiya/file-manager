@@ -23,6 +23,7 @@ import { BackupAdvancedOptions } from "./backup-advanced-options";
 import { BackupReplicas } from "./backup-replicas";
 import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
 import { LogOutputsEditor, NotificationsEditor, ReportExtras } from "./backup-notifications";
+import { JobSecretProviders } from "./backup-secret-providers";
 
 interface ConnectionProfile {
   id: string;
@@ -658,6 +659,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
             </Section>
             <NotificationsEditor value={job.notifications} onChange={(notifications) => patch({ notifications })} />
             <LogOutputsEditor value={job.log_outputs} onChange={(log_outputs) => patch({ log_outputs })} />
+            <JobSecretProviders jobId={job.id} value={job.secret_providers} onChange={(secret_providers) => patch({ secret_providers })} />
           </>
         )}
       </div>

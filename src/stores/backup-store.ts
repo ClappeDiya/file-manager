@@ -119,6 +119,11 @@ export interface BackupOptions {
   remote_case_insensitive: boolean;
   snapshot_policy: SnapshotPolicy;
   snapshot: SnapshotOptions;
+  /** Volume encryption for a new repository (existing ones keep theirs). */
+  encryption_module: "aes" | "gpg";
+  gpg: GpgOptions;
+  /** Argon2id cost for a new AES repository; null = app default. */
+  kdf: KdfParams | null;
   object_lock: ObjectLockOptions | null;
 }
 
@@ -224,6 +229,8 @@ export interface ReportConfig {
   ca_pem: string | null;
   retry_delay_ms: number;
   min_log_level: LogLevel;
+  /** SHA-256 fingerprints; when set, only these certificates are accepted. */
+  pinned_sha256: string[];
 }
 
 export type TlsMode = "start_tls" | "implicit" | "none";
@@ -231,6 +238,7 @@ export type TlsMode = "start_tls" | "implicit" | "none";
 export interface CertPolicy {
   accept_invalid_certs: boolean;
   ca_pem: string | null;
+  pinned_sha256: string[];
 }
 
 export type NotificationChannel =
@@ -259,6 +267,79 @@ export interface LogOutputs {
   file_max_mb: number;
   system_log: boolean;
   system_filter: LogFilter;
+}
+
+export interface KdfParams {
+  memory_kib: number;
+  iterations: number;
+  parallelism: number;
+}
+
+export const KDF_PRESETS: Record<string, KdfParams> = {
+  interactive: { memory_kib: 19 * 1024, iterations: 2, parallelism: 1 },
+  default: { memory_kib: 65536, iterations: 3, parallelism: 4 },
+  sensitive: { memory_kib: 256 * 1024, iterations: 4, parallelism: 4 },
+};
+
+export interface GpgOptions {
+  /** Encrypt to these keys; empty = symmetric with the passphrase. */
+  recipients: string[];
+  executable: string;
+  homedir: string;
+}
+
+export interface CryptReport {
+  input_bytes: number;
+  output_bytes: number;
+  chunks: number;
+}
+
+export interface TlsOptions {
+  accept_invalid_certs: boolean;
+  ca_pem: string | null;
+  pinned_sha256: string[];
+}
+
+export type SecretProviderKind =
+  | { type: "env"; prefix: string }
+  | { type: "file"; path: string }
+  | { type: "pass"; executable: string; prefix: string }
+  | { type: "vault"; address: string; mount: string; path: string; namespace: string; kv_version: number; tls: TlsOptions }
+  | { type: "aws_secrets_manager"; region: string; access_key_id: string; endpoint: string; secret_id: string; tls: TlsOptions }
+  | { type: "gcp_secret_manager"; project: string; endpoint: string; tls: TlsOptions }
+  | { type: "azure_key_vault"; vault_url: string; tenant_id: string; client_id: string; authority: string; tls: TlsOptions };
+
+/** A secret provider (kind flattened); its own credential lives under `credential_id`. */
+export type SecretProvider = SecretProviderKind & {
+  id: string;
+  name: string;
+  credential_id: string;
+  enabled: boolean;
+  /** Used by every job; otherwise only by jobs that select it. */
+  global: boolean;
+};
+
+export interface SecretSettings {
+  providers: SecretProvider[];
+  cache: "none" | "memory" | "persistent";
+  cache_ttl_secs: number;
+}
+
+export interface SecretProviderTest {
+  provider_id: string;
+  provider: string;
+  kind: string;
+  ok: boolean;
+  has_credential: boolean;
+  latency_ms: number;
+  found: string[];
+  missing: string[];
+  errors: string[];
+}
+
+export interface PlaceholderReport {
+  placeholders: { name: string; provider: string | null; from_cache: boolean; error: string | null }[];
+  providers: string[];
 }
 
 export interface BugReport {
@@ -356,6 +437,8 @@ export interface BackupJob {
   replicas: Replica[];
   notifications: BackupNotification[];
   log_outputs: LogOutputs;
+  /** Secret providers used by this job besides the global ones (ids). */
+  secret_providers: string[];
   prevent_sleep: boolean;
   notify_on: string[];
   created_at: string;
@@ -732,6 +815,9 @@ export function newBackupJob(): BackupJob {
       remote_case_insensitive: false,
       snapshot_policy: "off",
       snapshot: { lvm_size: "10%ORIGIN", vss_provider: null, vss_exclude_writers: [], mount_root: null },
+      encryption_module: "aes",
+      gpg: { recipients: [], executable: "", homedir: "" },
+      kdf: null,
       object_lock: null,
     },
     retention: { type: "keep_all" },
@@ -753,6 +839,7 @@ export function newBackupJob(): BackupJob {
       ca_pem: null,
       retry_delay_ms: 500,
       min_log_level: "info",
+      pinned_sha256: [],
     },
     throttle: { upload_bps: 0, download_bps: 0 },
     retry: { retries: 3, delay_ms: 2000, exponential: true, max_delay_ms: 60000 },
@@ -763,6 +850,7 @@ export function newBackupJob(): BackupJob {
     local_transfer: { use_move: true, verify_size: true, sync_writes: false },
     replicas: [],
     notifications: [],
+    secret_providers: [],
     log_outputs: { file: null, file_filter: newLogFilter(), file_max_mb: 10, system_log: false, system_filter: { ...newLogFilter(), min_level: "warning" } },
     prevent_sleep: true,
     notify_on: ["warning", "error"],

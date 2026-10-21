@@ -169,6 +169,9 @@ pub struct ReportConfig {
     /// Lowest log level included in reports.
     #[serde(default)]
     pub min_log_level: LogLevel,
+    /// SHA-256 certificate fingerprints; when set, only these are accepted.
+    #[serde(default)]
+    pub pinned_sha256: Vec<String>,
 }
 
 fn default_retry_delay() -> u64 {
@@ -193,6 +196,7 @@ impl Default for ReportConfig {
             ca_pem: None,
             retry_delay_ms: 500,
             min_log_level: LogLevel::Info,
+            pinned_sha256: Vec::new(),
         }
     }
 }
@@ -216,7 +220,12 @@ pub async fn send_reports(cfg: &ReportConfig, result: &str, vars: &BTreeMap<Stri
         return Vec::new();
     }
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30)).danger_accept_invalid_certs(cfg.accept_invalid_certs);
-    if let Some(pem) = cfg.ca_pem.as_deref().filter(|p| !p.trim().is_empty()) {
+    if !cfg.pinned_sha256.is_empty() {
+        match crate::security::tls::client_config(false, None, &cfg.pinned_sha256) {
+            Ok(tls) => builder = reqwest::Client::builder().timeout(Duration::from_secs(30)).use_preconfigured_tls(tls),
+            Err(e) => return vec![e.user_message()],
+        }
+    } else if let Some(pem) = cfg.ca_pem.as_deref().filter(|p| !p.trim().is_empty()) {
         match reqwest::Certificate::from_pem(pem.as_bytes()) {
             Ok(c) => builder = builder.add_root_certificate(c),
             Err(e) => return vec![format!("Invalid callback CA certificate: {e}")],

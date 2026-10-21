@@ -32,6 +32,12 @@ pub struct RepoArgs {
     /// Environment variable holding the passphrase
     #[arg(long, default_value = "UFOP_PASSPHRASE")]
     pub passphrase_env: String,
+    /// File whose first line is the passphrase
+    #[arg(long, conflicts_with = "passphrase")]
+    pub passphrase_file: Option<PathBuf>,
+    /// Secret provider for `$name` passphrases: env://PREFIX, file:///path or pass://folder (repeatable)
+    #[arg(long = "secret-provider", env = "UFOP_SECRET_PROVIDER", value_delimiter = ',')]
+    pub secret_providers: Vec<String>,
     /// Store volumes unencrypted
     #[arg(long)]
     pub no_encryption: bool,
@@ -40,12 +46,25 @@ pub struct RepoArgs {
     pub prefix: String,
 }
 
+/// Report a configuration problem and exit (exit code 2, like other usage errors).
+fn fail(msg: &str) -> ! {
+    eprintln!("error: {msg}");
+    std::process::exit(2)
+}
+
 impl RepoArgs {
     fn passphrase(&self) -> Option<String> {
         if self.no_encryption {
             return None;
         }
-        self.passphrase.clone().or_else(|| std::env::var(&self.passphrase_env).ok()).filter(|p| !p.is_empty())
+        let raw = match &self.passphrase_file {
+            Some(f) => match std::fs::read_to_string(f) {
+                Ok(t) => t.lines().next().map(|l| l.trim_end_matches('\r').to_string()),
+                Err(e) => fail(&format!("cannot read --passphrase-file {}: {e}", f.display())),
+            },
+            None => self.passphrase.clone().or_else(|| std::env::var(&self.passphrase_env).ok()),
+        };
+        raw.filter(|p| !p.is_empty()).map(|p| crate::secrets::resolve(&p, &self.secret_providers).unwrap_or_else(|e| fail(&e)))
     }
 
     fn db_path(&self) -> PathBuf {
@@ -141,6 +160,28 @@ pub struct EngineArgs {
     /// VSS writer class GUID to exclude (repeatable)
     #[arg(long = "vss-exclude-writer")]
     pub vss_exclude_writers: Vec<String>,
+    /// Volume encryption for a new backup: aes | gpg
+    #[arg(long, default_value = "aes")]
+    pub encryption_module: String,
+    /// GPG: encrypt to this key (repeatable; none = symmetric with the passphrase)
+    #[arg(long = "gpg-recipient")]
+    pub gpg_recipients: Vec<String>,
+    /// GPG keyring folder (default: $GNUPGHOME)
+    #[arg(long, default_value = "")]
+    pub gpg_homedir: String,
+    /// gpg executable (default: $UFOP_GPG or gpg)
+    #[arg(long, default_value = "")]
+    pub gpg_executable: String,
+    /// Argon2id cost for a new AES backup: interactive | default | sensitive
+    #[arg(long)]
+    pub kdf_preset: Option<String>,
+    /// Argon2id memory in KiB (overrides the preset)
+    #[arg(long)]
+    pub kdf_memory_kib: Option<u32>,
+    #[arg(long)]
+    pub kdf_iterations: Option<u32>,
+    #[arg(long)]
+    pub kdf_parallelism: Option<u32>,
 }
 
 fn parse_enum<T: serde::de::DeserializeOwned>(flag: &str, v: &str) -> Result<T, ufop_core::error::AppError> {
@@ -149,6 +190,20 @@ fn parse_enum<T: serde::de::DeserializeOwned>(flag: &str, v: &str) -> Result<T, 
 }
 
 impl EngineArgs {
+    fn kdf(&self) -> Result<Option<KdfParams>, ufop_core::error::AppError> {
+        let base = match self.kdf_preset.as_deref() {
+            Some(p) => Some(KdfParams::preset(p).ok_or_else(|| ufop_core::error::AppError::validation(format!("Unknown --kdf-preset '{p}' (interactive, default, sensitive)")))?),
+            None => None,
+        };
+        if base.is_none() && self.kdf_memory_kib.is_none() && self.kdf_iterations.is_none() && self.kdf_parallelism.is_none() {
+            return Ok(None);
+        }
+        let b = base.unwrap_or_default();
+        let k = KdfParams { memory_kib: self.kdf_memory_kib.unwrap_or(b.memory_kib), iterations: self.kdf_iterations.unwrap_or(b.iterations), parallelism: self.kdf_parallelism.unwrap_or(b.parallelism) };
+        k.validate()?;
+        Ok(Some(k))
+    }
+
     fn snapshot_options(&self) -> ufop_core::backup::snapshot::SnapshotOptions {
         ufop_core::backup::snapshot::SnapshotOptions {
             lvm_size: self.lvm_snapshot_size.clone(),
@@ -186,9 +241,74 @@ impl EngineArgs {
             auto_vacuum_interval_days: self.vacuum_interval_days,
             snapshot_policy: parse_enum("snapshot-policy", &self.snapshot_policy)?,
             snapshot: self.snapshot_options(),
+            encryption_module: parse_enum("encryption-module", &self.encryption_module)?,
+            gpg: ufop_core::backup::GpgOptions { recipients: self.gpg_recipients.clone(), executable: self.gpg_executable.clone(), homedir: self.gpg_homedir.clone() },
+            kdf: self.kdf()?,
             ..o
         })
     }
+}
+
+/// Passphrase sources for `crypt` commands.
+#[derive(Args, Debug, Clone)]
+pub struct PassArgs {
+    /// Environment variable holding the passphrase
+    #[arg(long, default_value = "UFOP_PASSPHRASE")]
+    pub passphrase_env: String,
+    /// File whose first line is the passphrase
+    #[arg(long)]
+    pub passphrase_file: Option<PathBuf>,
+    /// Secret provider for `$name` passphrases (env://, file://, pass://)
+    #[arg(long = "secret-provider", env = "UFOP_SECRET_PROVIDER", value_delimiter = ',')]
+    pub secret_providers: Vec<String>,
+}
+
+impl PassArgs {
+    fn get(&self) -> Option<String> {
+        RepoArgs {
+            dest: String::new(),
+            dbpath: None,
+            passphrase: None,
+            passphrase_env: self.passphrase_env.clone(),
+            passphrase_file: self.passphrase_file.clone(),
+            secret_providers: self.secret_providers.clone(),
+            no_encryption: false,
+            prefix: String::new(),
+        }
+        .passphrase()
+    }
+}
+
+/// Standalone encryption (`.ufopenc`) and manual volume decryption.
+#[derive(Subcommand, Debug)]
+pub enum CryptCommands {
+    /// Encrypt a file (AES-256-GCM, Argon2id key, authenticated 4 MiB chunks)
+    Encrypt {
+        input: PathBuf,
+        output: PathBuf,
+        #[command(flatten)]
+        pass: PassArgs,
+        /// interactive | default | sensitive
+        #[arg(long, default_value = "default")]
+        kdf_preset: String,
+    },
+    /// Decrypt a .ufopenc file
+    Decrypt {
+        input: PathBuf,
+        output: PathBuf,
+        #[command(flatten)]
+        pass: PassArgs,
+    },
+    /// Decrypt one backup volume with its repository header (<prefix>-repo.json)
+    DecryptVolume {
+        volume: PathBuf,
+        /// The repository header file from the destination
+        #[arg(long)]
+        header: PathBuf,
+        output: PathBuf,
+        #[command(flatten)]
+        pass: PassArgs,
+    },
 }
 
 /// Recovery tool steps (work without the job database).
@@ -412,6 +532,11 @@ pub enum BackupCommands {
     Db {
         #[command(subcommand)]
         cmd: DbCommands,
+    },
+    /// Encrypt or decrypt files with the backup cipher; decrypt single volumes
+    Crypt {
+        #[command(subcommand)]
+        cmd: CryptCommands,
     },
     /// Create and remove a test snapshot of the sources, listing every step
     SnapshotTest {
@@ -760,6 +885,20 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
                     Ok(0)
                 }
             }
+        }
+        BackupCommands::Crypt { cmd } => {
+            use ufop_core::backup::filecrypt;
+            let need = |p: Option<String>| p.ok_or_else(|| ufop_core::error::AppError::validation("Set the passphrase (--passphrase-env, --passphrase-file)"));
+            let (title, r) = match cmd {
+                CryptCommands::Encrypt { input, output, pass, kdf_preset } => {
+                    let kdf = KdfParams::preset(&kdf_preset).ok_or_else(|| ufop_core::error::AppError::validation(format!("Unknown --kdf-preset '{kdf_preset}'")))?;
+                    ("Encrypted", filecrypt::encrypt_file(&input, &output, &need(pass.get())?, kdf)?)
+                }
+                CryptCommands::Decrypt { input, output, pass } => ("Decrypted", filecrypt::decrypt_file(&input, &output, &need(pass.get())?)?),
+                CryptCommands::DecryptVolume { volume, header, output, pass } => ("Volume decrypted", filecrypt::decrypt_volume(&volume, &header, &output, pass.get().as_deref())?),
+            };
+            ok(emit(format, title, &r))?;
+            Ok(0)
         }
         BackupCommands::Db { cmd } => match cmd {
             DbCommands::Info { dbpath } => {

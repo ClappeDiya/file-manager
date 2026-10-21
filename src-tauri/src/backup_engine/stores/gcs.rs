@@ -37,11 +37,11 @@ impl Default for GcsConfig {
 }
 
 #[derive(Deserialize)]
-struct ServiceAccount {
-    client_email: String,
-    private_key: String,
+pub(crate) struct ServiceAccount {
+    pub client_email: String,
+    pub private_key: String,
     #[serde(default = "default_token_uri")]
-    token_uri: String,
+    pub token_uri: String,
 }
 
 fn default_token_uri() -> String {
@@ -106,8 +106,14 @@ impl GcsStore {
         Ok(Self { http: http::client(&cfg.tls)?, cfg, cred, token: Mutex::new(None), base })
     }
 
-    /// RS256-signed JWT for the service account.
     fn jwt(sa: &ServiceAccount) -> Result<String, AppError> {
+        service_account_jwt(sa, "https://www.googleapis.com/auth/devstorage.full_control")
+    }
+}
+
+/// RS256-signed JWT bearer assertion for a service account and scope.
+pub(crate) fn service_account_jwt(sa: &ServiceAccount, scope: &str) -> Result<String, AppError> {
+    {
         let pem = sa.private_key.replace("\\n", "\n");
         let der: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
         let der = base64::engine::general_purpose::STANDARD.decode(der.trim()).map_err(|_| AppError::validation("The service-account private key is not valid PEM"))?;
@@ -116,7 +122,7 @@ impl GcsStore {
         let header = b64url(br#"{"alg":"RS256","typ":"JWT"}"#);
         let claims = serde_json::json!({
             "iss": sa.client_email,
-            "scope": "https://www.googleapis.com/auth/devstorage.full_control",
+            "scope": scope,
             "aud": sa.token_uri,
             "iat": now,
             "exp": now + 3600,
@@ -128,7 +134,9 @@ impl GcsStore {
             .map_err(|_| AppError::internal("JWT signing failed"))?;
         Ok(format!("{input}.{}", b64url(&sig)))
     }
+}
 
+impl GcsStore {
     async fn bearer(&self) -> Result<String, AppError> {
         match &self.cred {
             Cred::Token(t) => Ok(t.clone()),

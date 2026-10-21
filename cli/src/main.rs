@@ -10,6 +10,7 @@
 mod commands;
 mod config;
 mod output;
+mod secrets;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::process::ExitCode;

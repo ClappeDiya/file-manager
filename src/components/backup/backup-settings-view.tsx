@@ -17,6 +17,7 @@ import {
 } from "@/stores/backup-store";
 import { BackupAdvancedOptions } from "./backup-advanced-options";
 import { Banner, Btn, Field, PathInput, Section } from "./backup-ui";
+import { SecretProvidersEditor } from "./backup-secret-providers";
 
 const EMPTY: GlobalDefaults = { options: {}, throttle: null, retry: null };
 
@@ -219,6 +220,7 @@ export function BackupSettingsView() {
     <div className="p-3 space-y-3" data-testid="backup-settings">
       <DestinationLibrary />
       <DatabaseTools />
+      <SecretProvidersEditor />
       <DefaultsEditor />
     </div>
   );

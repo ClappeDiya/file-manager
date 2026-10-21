@@ -67,6 +67,14 @@ impl<'a> Repo<'a> {
         kdf: KdfParams,
     ) -> Result<Self, AppError> {
         let header_name = volume::repo_header_name(&options.prefix);
+        let gpg_from_options = || {
+            std::sync::Arc::new(super::gpg::GpgModule {
+                executable: options.gpg.executable.clone(),
+                homedir: options.gpg.homedir.clone(),
+                passphrase: passphrase.filter(|p| !p.is_empty()).map(String::from),
+                recipients: options.gpg.recipients.clone(),
+            })
+        };
         let listing = if create && !options.dry_run {
             backend.create_folder()?;
             backend.list()?
@@ -84,12 +92,27 @@ impl<'a> Repo<'a> {
             if header.format_version > REPO_FORMAT_VERSION {
                 return Err(AppError::validation(format!("This backup was written by a newer version (format {}); update the app", header.format_version)));
             }
+            let external = match external {
+                None if header.encrypted && header.encryption_module == "gpg" => Some(VolumeCipher::external(std::sync::Arc::new(super::gpg::GpgModule { recipients: header.gpg_recipients.clone(), ..(*gpg_from_options()).clone() }))),
+                other => other,
+            };
             let cipher = header_cipher(&header, passphrase, external)?;
             (header, cipher)
         } else {
             if !create {
                 return Err(AppError::file_op(format!("No backup found at {}", backend.describe()), "Check the destination and file-name prefix."));
             }
+            let kdf = options.kdf.unwrap_or(kdf);
+            kdf.validate().or_else(|e| if kdf == KdfParams::insecure_fast() { Ok(()) } else { Err(e) })?;
+            let external = match external {
+                None if options.encryption_module == super::EncryptionModuleKind::Gpg => {
+                    if options.gpg.recipients.is_empty() && passphrase.is_none_or(|p| p.is_empty()) {
+                        return Err(AppError::validation("GPG encryption needs a passphrase or at least one recipient key"));
+                    }
+                    Some(VolumeCipher::external(gpg_from_options()))
+                }
+                other => other,
+            };
             let (cipher, salt) = match (external, passphrase.filter(|p| !p.is_empty())) {
                 (Some(ext), _) => (ext, None),
                 (None, Some(p)) => {
@@ -104,11 +127,13 @@ impl<'a> Repo<'a> {
                 encrypted: cipher.is_encrypted(),
                 salt,
                 kdf: aes.then_some(kdf),
-                key_check: if aes { cipher.key_check()? } else { None },
+                key_check: if cipher.is_encrypted() { cipher.key_check()? } else { None },
                 block_size: options.block_size.max(1024),
                 block_hash: options.block_hash,
                 file_hash: options.file_hash,
                 volume_format: options.volume_format,
+                encryption_module: if aes { "aes".into() } else if cipher.is_encrypted() { cipher.module_name() } else { String::new() },
+                gpg_recipients: if cipher.module_name() == "gpg" { options.gpg.recipients.clone() } else { Vec::new() },
             };
             if !options.dry_run {
                 backend.create_folder()?;
@@ -261,8 +286,24 @@ pub fn header_cipher(header: &RepoHeader, passphrase: Option<&str>, external: Op
     if header.format_version > REPO_FORMAT_VERSION {
         return Err(AppError::validation(format!("This backup was written by a newer version (format {}); update the app", header.format_version)));
     }
+    let external = match external {
+        None if header.encrypted && header.encryption_module == "gpg" => Some(VolumeCipher::external(std::sync::Arc::new(super::gpg::GpgModule {
+            passphrase: passphrase.filter(|p| !p.is_empty()).map(String::from),
+            recipients: header.gpg_recipients.clone(),
+            ..Default::default()
+        }))),
+        other => other,
+    };
     Ok(match (header.encrypted, external) {
-        (true, Some(ext)) => ext,
+        (true, Some(ext)) => {
+            // Key-encrypted GPG backups are written by machines that may not
+            // hold the secret key, so only symmetric checks are verified.
+            let key_only = header.encryption_module == "gpg" && !header.gpg_recipients.is_empty();
+            if let Some(kc) = header.key_check.as_deref().filter(|_| !key_only) {
+                ext.verify_key_check(kc)?;
+            }
+            ext
+        }
         (true, None) => {
             let pass = passphrase.filter(|p| !p.is_empty()).ok_or_else(|| AppError::validation("This backup is encrypted; enter its passphrase"))?;
             let salt = hex::decode(header.salt.as_deref().unwrap_or_default()).map_err(|_| AppError::validation("Repository header salt is malformed"))?;
@@ -1370,6 +1411,82 @@ mod tests {
         let e = run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll,
             Some("nope"), KdfParams::insecure_fast(), &OpContext::new());
         assert!(e.is_err());
+    }
+
+    #[test]
+    fn gpg_symmetric_backup_restore_and_recreate() {
+        if std::process::Command::new("gpg").arg("--version").output().is_err() {
+            return;
+        }
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        write(src.path(), "secret.txt", b"gpg protected payload");
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        let o = BackupOptions {
+            encryption_module: crate::backup::EncryptionModuleKind::Gpg,
+            gpg: crate::backup::GpgOptions { homedir: home.path().to_string_lossy().into(), ..Default::default() },
+            ..opts()
+        };
+        assert!(run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, None, KdfParams::insecure_fast(), &OpContext::new()).is_err(), "needs a passphrase or recipients");
+        let r = run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("gpg-pass"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let header: RepoHeader = serde_json::from_slice(&std::fs::read(dst.path().join("ufop-repo.json")).unwrap()).unwrap();
+        assert_eq!((header.encrypted, header.encryption_module.as_str(), header.salt.is_none()), (true, "gpg", true));
+        // Volumes are OpenPGP messages, not readable as plain zip/ufop data.
+        let vol = std::fs::read_dir(dst.path()).unwrap().flatten().find(|e| e.file_name().to_string_lossy().contains("dblock")).unwrap().path();
+        assert!(!String::from_utf8_lossy(&std::fs::read(vol).unwrap()).contains("gpg protected payload"));
+
+        // A fresh machine: rebuild the database from the destination, then restore.
+        std::env::set_var("GNUPGHOME", home.path());
+        let fresh = BackupDb::open_in_memory().unwrap();
+        crate::backup::maintenance::recreate_database(&be, &fresh, Some("gpg-pass"), "ufop", &OpContext::new()).unwrap();
+        assert!(crate::backup::maintenance::recreate_database(&be, &BackupDb::open_in_memory().unwrap(), Some("wrong"), "ufop", &OpContext::new()).is_err());
+        let repo = Repo::open(&be, &fresh, Some("gpg-pass"), &o, false, KdfParams::insecure_fast()).unwrap();
+        let rr = crate::backup::run_restore(&repo, &crate::backup::RestoreOptions { target: Some(out.path().into()), ..Default::default() }, &OpContext::new()).unwrap();
+        assert!(rr.errors.is_empty(), "{:?}", rr.errors);
+        let restored = walk_find(out.path(), "secret.txt").unwrap();
+        assert_eq!(std::fs::read(restored).unwrap(), b"gpg protected payload");
+    }
+
+    fn walk_find(dir: &std::path::Path, name: &str) -> Option<PathBuf> {
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.file_name().is_some_and(|n| n == name) {
+                return Some(p);
+            }
+            if p.is_dir() {
+                if let Some(f) = walk_find(&p, name) {
+                    return Some(f);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn kdf_settings_are_validated_and_recorded() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(src.path(), "f", b"x");
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        let weak = BackupOptions { kdf: Some(KdfParams { memory_kib: 1024, iterations: 1, parallelism: 2 }), ..opts() };
+        assert!(run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &weak, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).is_err());
+        let custom = KdfParams { memory_kib: 8 * 1024, iterations: 2, parallelism: 1 };
+        let o = BackupOptions { kdf: Some(custom), ..opts() };
+        run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        let header: RepoHeader = serde_json::from_slice(&std::fs::read(dst.path().join("ufop-repo.json")).unwrap()).unwrap();
+        assert_eq!((header.kdf, header.encryption_module.as_str(), header.format_version), (Some(custom), "aes", REPO_FORMAT_VERSION));
+        assert_eq!(KdfParams::preset("interactive").unwrap().memory_kib, 19 * 1024);
+        assert!(KdfParams::preset("sensitive").unwrap().validate().is_ok() && KdfParams::preset("x").is_none());
     }
 
     #[test]

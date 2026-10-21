@@ -9,7 +9,7 @@ fn env(k: &str) -> Option<String> {
 }
 
 fn ca(path: &str) -> CertPolicy {
-    CertPolicy { accept_invalid_certs: false, ca_pem: Some(std::fs::read_to_string(path).unwrap()) }
+    CertPolicy { accept_invalid_certs: false, ca_pem: Some(std::fs::read_to_string(path).unwrap()), pinned_sha256: vec![] }
 }
 
 #[tokio::test]

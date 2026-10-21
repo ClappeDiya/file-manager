@@ -4,7 +4,7 @@
  * cadence. Each field maps 1:1 onto `BackupOptions` in ufop-core.
  */
 import { inputCls } from "@/lib/backup-helpers";
-import type { BackupOptions, LockMode, SnapshotPolicy, UsnPolicy, VolumeFormat, ZipMethod } from "@/stores/backup-store";
+import { KDF_PRESETS, type BackupOptions, type LockMode, type SnapshotPolicy, type UsnPolicy, type VolumeFormat, type ZipMethod } from "@/stores/backup-store";
 import { Check, Field, Section } from "./backup-ui";
 
 const lines = (v: string) => v.split("\n").map((s) => s.trim()).filter(Boolean);
@@ -21,8 +21,62 @@ export function BackupAdvancedOptions({
   locked: boolean;
   onChange: (p: Partial<BackupOptions>) => void;
 }) {
+  const preset = o.kdf ? (Object.entries(KDF_PRESETS).find(([, k]) => k.memory_kib === o.kdf!.memory_kib && k.iterations === o.kdf!.iterations && k.parallelism === o.kdf!.parallelism)?.[0] ?? "custom") : "app";
   return (
     <>
+      <Section title="Encryption method" hint="Applies when the backup is created; an existing backup keeps its method and key settings.">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <Field label="Cipher">
+            <select data-testid="opt-encryption-module" className={inputCls} disabled={locked} value={o.encryption_module} onChange={(e) => onChange({ encryption_module: e.target.value as BackupOptions["encryption_module"] })}>
+              <option value="aes">AES-256-GCM (built in)</option>
+              <option value="gpg">GPG / OpenPGP (needs GnuPG)</option>
+            </select>
+          </Field>
+          {o.encryption_module === "aes" && (
+            <Field label="Key derivation (Argon2id)" hint="Stronger settings slow down passphrase guessing and opening the backup.">
+              <select
+                data-testid="opt-kdf"
+                className={inputCls}
+                disabled={locked}
+                value={preset}
+                onChange={(e) => onChange({ kdf: e.target.value === "app" ? null : e.target.value === "custom" ? (o.kdf ?? KDF_PRESETS.default) : KDF_PRESETS[e.target.value] })}
+              >
+                <option value="app">App default</option>
+                <option value="interactive">Interactive (19 MiB, 2 passes)</option>
+                <option value="default">Standard (64 MiB, 3 passes)</option>
+                <option value="sensitive">Sensitive (256 MiB, 4 passes)</option>
+                <option value="custom">Custom…</option>
+              </select>
+            </Field>
+          )}
+        </div>
+        {o.encryption_module === "aes" && preset === "custom" && o.kdf && (
+          <div className="grid grid-cols-3 gap-2">
+            <Field label="Memory (KiB, ≥ 8192)">
+              <input className={inputCls} type="number" min={8192} value={o.kdf.memory_kib} onChange={(e) => onChange({ kdf: { ...o.kdf!, memory_kib: num(e.target.value, 8192, 4 * 1024 * 1024) } })} />
+            </Field>
+            <Field label="Passes (1–50)">
+              <input className={inputCls} type="number" min={1} max={50} value={o.kdf.iterations} onChange={(e) => onChange({ kdf: { ...o.kdf!, iterations: num(e.target.value, 1, 50) } })} />
+            </Field>
+            <Field label="Lanes (1–64)">
+              <input className={inputCls} type="number" min={1} max={64} value={o.kdf.parallelism} onChange={(e) => onChange({ kdf: { ...o.kdf!, parallelism: num(e.target.value, 1, 64) } })} />
+            </Field>
+          </div>
+        )}
+        {o.encryption_module === "gpg" && (
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            <Field label="Recipient keys (one per line)" hint="Empty = symmetric with the backup passphrase. With keys, restores need the secret key.">
+              <textarea data-testid="opt-gpg-recipients" className={`${inputCls} font-mono`} rows={2} value={o.gpg.recipients.join("\n")} onChange={(e) => onChange({ gpg: { ...o.gpg, recipients: lines(e.target.value) } })} />
+            </Field>
+            <Field label="Keyring folder (empty = default)">
+              <input className={inputCls} value={o.gpg.homedir} onChange={(e) => onChange({ gpg: { ...o.gpg, homedir: e.target.value } })} />
+            </Field>
+            <Field label="gpg executable (empty = gpg)">
+              <input className={inputCls} value={o.gpg.executable} onChange={(e) => onChange({ gpg: { ...o.gpg, executable: e.target.value } })} />
+            </Field>
+          </div>
+        )}
+      </Section>
       <Section title="Volume format" hint="ZIP volumes open with any ZIP tool when unencrypted. Fixed after the first backup.">
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
           <Field label="Container">

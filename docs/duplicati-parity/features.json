@@ -2991,48 +2991,48 @@
    "cat": 13,
    "name": "Live progress reporting",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 5,
-   "verify": "",
+   "verify": "tests",
    "note": "Live progress in UI; no periodic HTTP progress",
-   "evidence": ""
+   "evidence": "backup_engine tests, CLI and vitest suites; bug-report leak test, diagnostics vs real local repo + TCP/TLS probe, sync_runs migration v16 (ce25528)"
   },
   {
    "n": 249,
    "cat": 13,
    "name": "File and console log outputs",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 5,
-   "verify": "",
+   "verify": "live",
    "note": "Console tracing only; log viewer exists but nothing writes log files",
-   "evidence": ""
+   "evidence": "Per-job rotating log file (tests) + CLI --log-level/--log-file verified end to end (ce25528)"
   },
   {
    "n": 250,
    "cat": 13,
    "name": "Windows Event Log",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 5,
-   "verify": "",
+   "verify": "device",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "Windows ReportEventW (cross-compiled x86_64-pc-windows-gnu); syslog path tested on Linux (ce25528)"
   },
   {
    "n": 251,
    "cat": 13,
    "name": "Log severity and tag filters",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 5,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "backup_engine tests, CLI and vitest suites; bug-report leak test, diagnostics vs real local repo + TCP/TLS probe, sync_runs migration v16 (ce25528)"
   },
   {
    "n": 252,
@@ -3051,12 +3051,12 @@
    "cat": 13,
    "name": "SMTP email reports",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 5,
-   "verify": "",
+   "verify": "live",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "Native SMTP (STARTTLS+AUTH) verified against aiosmtpd; XMPP STARTTLS+SASL verified against Prosody; job editor channels + Send test (ce25528)"
   },
   {
    "n": 254,
@@ -3087,36 +3087,36 @@
    "cat": 13,
    "name": "Callback retry and certificate policy",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 5,
-   "verify": "",
+   "verify": "tests",
    "note": "Retries and accept-invalid-certs; no pinning",
-   "evidence": ""
+   "evidence": "backup_engine tests, CLI and vitest suites; bug-report leak test, diagnostics vs real local repo + TCP/TLS probe, sync_runs migration v16 (ce25528)"
   },
   {
    "n": 257,
    "cat": 13,
    "name": "Telegram",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 5,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "Telegram Bot API client; API-level tests; job editor + Send test (ce25528)"
   },
   {
    "n": 258,
    "cat": 13,
    "name": "Jabber/XMPP",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 5,
-   "verify": "",
+   "verify": "live",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "Native SMTP (STARTTLS+AUTH) verified against aiosmtpd; XMPP STARTTLS+SASL verified against Prosody; job editor channels + Send test (ce25528)"
   },
   {
    "n": 259,
@@ -3135,12 +3135,12 @@
    "cat": 13,
    "name": "Message templates and custom fields",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 5,
-   "verify": "",
+   "verify": "tests",
    "note": "{{var}} templates and extra fields; no Handlebars or template files",
-   "evidence": ""
+   "evidence": "backup_engine tests, CLI and vitest suites; bug-report leak test, diagnostics vs real local repo + TCP/TLS probe, sync_runs migration v16 (ce25528)"
   },
   {
    "n": 261,
@@ -3159,36 +3159,36 @@
    "cat": 13,
    "name": "Bug-report export",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 5,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "backup_engine tests, CLI and vitest suites; bug-report leak test, diagnostics vs real local repo + TCP/TLS probe, sync_runs migration v16 (ce25528)"
   },
   {
    "n": 263,
    "cat": 13,
    "name": "Database and network diagnostics",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 5,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "backup_engine tests, CLI and vitest suites; bug-report leak test, diagnostics vs real local repo + TCP/TLS probe, sync_runs migration v16 (ce25528)"
   },
   {
    "n": 264,
    "cat": 13,
    "name": "Stored sync-run history (Canary)",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 5,
-   "verify": "",
+   "verify": "tests",
    "note": "Sync has reports, not this feature",
-   "evidence": ""
+   "evidence": "backup_engine tests, CLI and vitest suites; bug-report leak test, diagnostics vs real local repo + TCP/TLS probe, sync_runs migration v16 (ce25528)"
   },
   {
    "n": 265,
@@ -3543,12 +3543,12 @@
    "cat": 14,
    "name": "Path redaction in reports",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 5,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "backup_engine tests, CLI and vitest suites; bug-report leak test, diagnostics vs real local repo + TCP/TLS probe, sync_runs migration v16 (ce25528)"
   },
   {
    "n": 295,

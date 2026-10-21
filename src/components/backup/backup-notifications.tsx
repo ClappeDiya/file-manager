@@ -25,13 +25,14 @@ const LEVELS: LogLevel[] = ["info", "warning", "error"];
 const SECRET_LABEL: Record<NotificationChannel["type"], string> = { email: "SMTP password", telegram: "Bot token", xmpp: "Account password" };
 
 export function newNotification(type: NotificationChannel["type"]): BackupNotification {
-  const base = { send_on: ["warning", "error"], credential_id: crypto.randomUUID(), template: "", cert: { accept_invalid_certs: false, ca_pem: null } };
+  const base = { send_on: ["warning", "error"], credential_id: crypto.randomUUID(), template: "", cert: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } };
   if (type === "telegram") return { type, chat_id: "", api_base: "", ...base };
   if (type === "xmpp") return { type, jid: "", to: "", host: "", port: null, tls: "start_tls", ...base };
   return { type: "email", host: "", port: null, tls: "start_tls", username: "", from: "", to: [], subject: "UFOP {{operation}} {{result}}: {{name}}", ...base };
 }
 
 const splitList = (s: string) => s.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
+const splitPins = (s: string) => s.split(/[,\s]+/).filter(Boolean);
 const portValue = (v: string) => (v.trim() === "" ? null : Math.min(65535, Math.max(1, Number(v) || 1)));
 
 function TlsSelect({ value, onChange }: { value: TlsMode; onChange: (t: TlsMode) => void }) {
@@ -173,6 +174,9 @@ function NotificationCard({ n, onChange, onRemove }: { n: BackupNotification; on
       <Field label="Trusted CA or server certificate (PEM, optional)">
         <textarea className={`${inputCls} font-mono`} rows={2} value={n.cert.ca_pem ?? ""} onChange={(e) => set({ cert: { ...n.cert, ca_pem: e.target.value.trim() ? e.target.value : null } })} />
       </Field>
+      <Field label="Pinned SHA-256 fingerprints (optional)" hint="When set, only these certificates are accepted.">
+        <input className={`${inputCls} font-mono`} value={(n.cert.pinned_sha256 ?? []).join(", ")} onChange={(e) => set({ cert: { ...n.cert, pinned_sha256: splitPins(e.target.value) } })} />
+      </Field>
       {msg && (
         <Banner tone={msg.tone} onClose={() => setMsg(null)}>
           {msg.text}
@@ -227,6 +231,9 @@ export function ReportExtras({ reports, onChange }: { reports: ReportConfig; onC
       </div>
       <Field label="Trusted CA or server certificate for report URLs (PEM, optional)">
         <textarea className={`${inputCls} font-mono`} rows={2} value={reports.ca_pem ?? ""} onChange={(e) => onChange({ ...reports, ca_pem: e.target.value.trim() ? e.target.value : null })} />
+      </Field>
+      <Field label="Pinned SHA-256 fingerprints for report URLs (optional)" hint="When set, only these certificates are accepted.">
+        <input className={`${inputCls} font-mono`} value={(reports.pinned_sha256 ?? []).join(", ")} onChange={(e) => onChange({ ...reports, pinned_sha256: splitPins(e.target.value) })} />
       </Field>
     </div>
   );

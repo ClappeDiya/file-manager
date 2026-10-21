@@ -20,6 +20,7 @@ pub mod policy;
 pub mod portability;
 pub mod power;
 pub mod schedule;
+pub mod secrets;
 pub mod stores;
 
 use crate::connectors::ConnectionManager;
@@ -219,6 +220,12 @@ pub struct BackupJob {
     /// Log file and system log outputs.
     #[serde(default)]
     pub log_outputs: logs::LogOutputs,
+    /// Secret providers used by this job besides the global ones (ids).
+    #[serde(default)]
+    pub secret_providers: Vec<String>,
+    /// Resolved secret values, masked in run logs (never serialized).
+    #[serde(skip)]
+    pub(crate) masked_values: Vec<String>,
     /// Keep the computer awake while this job's operations run.
     pub prevent_sleep: bool,
     /// Results that raise a desktop notification: `success`, `warning`, `error`.
@@ -254,6 +261,8 @@ impl Default for BackupJob {
             replicas: Vec::new(),
             notifications: Vec::new(),
             log_outputs: logs::LogOutputs::default(),
+            secret_providers: Vec::new(),
+            masked_values: Vec::new(),
             prevent_sleep: true,
             notify_on: vec!["warning".into(), "error".into()],
             created_at: now.clone(),
@@ -270,6 +279,12 @@ impl BackupJob {
         }
         if self.sources.iter().all(|s| s.trim().is_empty()) {
             return Err(AppError::validation("Add at least one source folder"));
+        }
+        if let Some(k) = &self.options.kdf {
+            k.validate()?;
+        }
+        if self.options.encryption_module == ufop_core::backup::EncryptionModuleKind::Gpg && !self.encrypted {
+            return Err(AppError::validation("GPG encryption needs encryption turned on"));
         }
         match &self.destination {
             BackupDestination::Local { path, .. } if path.trim().is_empty() => {
@@ -542,6 +557,7 @@ struct Inner {
     policy: std::sync::RwLock<policy::ModulePolicy>,
     secrets: std::sync::OnceLock<SettingsStore>,
     notifier: std::sync::OnceLock<Notifier>,
+    secret_cache: secrets::SecretCache,
 }
 
 /// Desktop notification sink: (title, body, status).
@@ -595,6 +611,7 @@ impl BackupManager {
                 policy: std::sync::RwLock::new(policy::ModulePolicy::from_env()),
                 secrets: std::sync::OnceLock::new(),
                 notifier: std::sync::OnceLock::new(),
+                secret_cache: secrets::SecretCache::default(),
             }),
         }
     }
@@ -710,7 +727,9 @@ impl BackupManager {
                 self.store_secret(&job.id, &p).await?;
             }
         }
-        if job.encrypted && self.passphrase(&job.id).await?.is_none() {
+        // The stored value, unresolved: saving must not depend on secret providers.
+        let gpg_keys = job.options.encryption_module == ufop_core::backup::EncryptionModuleKind::Gpg && !job.options.gpg.recipients.is_empty();
+        if job.encrypted && !gpg_keys && self.store_get(&format!("{PASS_KEY_PREFIX}{}", job.id)).await?.is_none() {
             return Err(AppError::validation("An encrypted backup needs a passphrase (or turn encryption off)"));
         }
         self.persist(&job).await?;
@@ -746,11 +765,8 @@ impl BackupManager {
     }
 
     pub async fn passphrase(&self, job_id: &str) -> Result<Option<String>, AppError> {
-        let key = format!("{PASS_KEY_PREFIX}{job_id}");
-        match self.secret_db() {
-            Some(db) => db.get_secret(&key).await,
-            None => self.inner.creds.retrieve(&key).await,
-        }
+        let v = self.store_get(&format!("{PASS_KEY_PREFIX}{job_id}")).await?;
+        self.resolve_stored(v).await
     }
 
     /// Store (or, with an empty value, remove) a cloud destination's secret.
@@ -773,19 +789,196 @@ impl BackupManager {
     }
 
     async fn destination_secret(&self, credential_id: &str) -> Result<Option<String>, AppError> {
+        Box::pin(self.destination_secret_raw(credential_id)).await
+    }
+
+    /// A stored secret; a value written as `$name` is read from the secret providers.
+    async fn destination_secret_raw(&self, credential_id: &str) -> Result<Option<String>, AppError> {
         if credential_id.is_empty() {
             return Ok(None);
         }
-        let key = format!("{DEST_KEY_PREFIX}{credential_id}");
-        match self.secret_db() {
-            Some(db) => db.get_secret(&key).await,
-            None => self.inner.creds.retrieve(&key).await,
+        let v = self.store_get(&format!("{DEST_KEY_PREFIX}{credential_id}")).await?;
+        // Provider credentials themselves are never resolved (no recursion).
+        if v.as_deref().is_some_and(|s| !secrets::placeholders(s).is_empty()) {
+            let settings = self.secret_settings().await?;
+            if settings.providers.iter().any(|p| p.credential_id == credential_id) {
+                return Ok(v);
+            }
+            return Box::pin(self.resolve_stored(v)).await;
         }
+        Ok(v)
     }
 
     /// Whether a secret is stored for a destination (never returns it).
     pub async fn has_destination_secret(&self, credential_id: &str) -> Result<bool, AppError> {
         Ok(self.destination_secret(credential_id).await?.is_some_and(|s| !s.is_empty()))
+    }
+
+    // ── Secret providers and placeholders ──
+
+    pub async fn secret_settings(&self) -> Result<secrets::SecretSettings, AppError> {
+        Ok(self.config_get(secrets::SETTINGS_KEY).await?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+    }
+
+    pub async fn set_secret_settings(&self, mut s: secrets::SecretSettings) -> Result<secrets::SecretSettings, AppError> {
+        for p in &mut s.providers {
+            if p.id.trim().is_empty() {
+                p.id = uuid::Uuid::new_v4().to_string();
+            }
+            if p.kind.needs_credential() && p.credential_id.trim().is_empty() {
+                p.credential_id = uuid::Uuid::new_v4().to_string();
+            }
+        }
+        s.validate()?;
+        self.config_set(secrets::SETTINGS_KEY, serde_json::to_string(&s)?).await?;
+        self.inner.secret_cache.clear();
+        Ok(s)
+    }
+
+    async fn store_get(&self, key: &str) -> Result<Option<String>, AppError> {
+        match self.secret_db() {
+            Some(db) => db.get_secret(key).await,
+            None => self.inner.creds.retrieve(key).await,
+        }
+    }
+
+    async fn store_set(&self, key: &str, value: &str) -> Result<(), AppError> {
+        match self.secret_db() {
+            Some(db) => db.set_secret(key, value).await,
+            None => self.inner.creds.store(key, value).await,
+        }
+    }
+
+    /// Resolve one secret through `providers` (in order). Returns the value,
+    /// the provider name and whether it came from the cache.
+    async fn resolve_secret(&self, settings: &secrets::SecretSettings, providers: &[&secrets::SecretProvider], name: &str) -> Result<(String, String, bool), AppError> {
+        let ttl = std::time::Duration::from_secs(settings.cache_ttl_secs.max(1));
+        let mut errors = Vec::new();
+        for p in providers {
+            if settings.cache != secrets::CacheMode::None {
+                if let Some(v) = self.inner.secret_cache.get(&p.id, name, ttl) {
+                    return Ok((v, p.name.clone(), true));
+                }
+            }
+            let cred = if p.kind.needs_credential() { self.destination_secret(&p.credential_id).await? } else { None };
+            match secrets::lookup(p, cred.as_deref(), name).await {
+                Ok(Some(v)) => {
+                    if settings.cache != secrets::CacheMode::None {
+                        self.inner.secret_cache.put(&p.id, name, &v);
+                    }
+                    if settings.cache == secrets::CacheMode::Persistent {
+                        let entry = serde_json::json!({ "value": v, "at": Utc::now().to_rfc3339() }).to_string();
+                        if let Err(e) = self.store_set(&format!("backup-secret-cache:{}:{name}", p.id), &entry).await {
+                            tracing::warn!("Could not persist cached secret: {e}");
+                        }
+                    }
+                    return Ok((v, p.name.clone(), false));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // An unreachable provider falls back to the persistent cache.
+                    if settings.cache == secrets::CacheMode::Persistent {
+                        if let Some(entry) = self.store_get(&format!("backup-secret-cache:{}:{name}", p.id)).await.ok().flatten() {
+                            if let Some(v) = serde_json::from_str::<serde_json::Value>(&entry).ok().and_then(|e| e["value"].as_str().map(String::from)) {
+                                return Ok((v, p.name.clone(), true));
+                            }
+                        }
+                    }
+                    errors.push(format!("{}: {}", p.name, e.user_message()));
+                }
+            }
+        }
+        Err(AppError::validation(if providers.is_empty() {
+            format!("Secret '${name}' is used but no secret provider is configured")
+        } else if errors.is_empty() {
+            format!("Secret '${name}' was not found in: {}", providers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "))
+        } else {
+            format!("Secret '${name}' could not be read ({})", errors.join("; "))
+        }))
+    }
+
+    /// Replace `$name` / `${name}` placeholders in a job with their secrets.
+    pub async fn resolve_job_secrets(&self, job: &BackupJob) -> Result<BackupJob, AppError> {
+        let mut v = serde_json::to_value(job)?;
+        let names = secrets::collect(&v);
+        if names.is_empty() {
+            return Ok(job.clone());
+        }
+        let settings = self.secret_settings().await?;
+        let providers = settings.for_job(&job.secret_providers);
+        let mut values = HashMap::new();
+        for n in names {
+            let (val, _, _) = self.resolve_secret(&settings, &providers, &n).await?;
+            values.insert(n, val);
+        }
+        secrets::apply(&mut v, &values);
+        let mut out: BackupJob = serde_json::from_value(v)?;
+        out.masked_values = values.into_values().filter(|v| v.len() >= 3).collect();
+        out.stats = job.stats.clone();
+        Ok(out)
+    }
+
+    /// Resolve a stored credential written as a placeholder (`$name`).
+    async fn resolve_stored(&self, value: Option<String>) -> Result<Option<String>, AppError> {
+        let Some(v) = value else { return Ok(None) };
+        let names = secrets::placeholders(&v);
+        if names.is_empty() {
+            return Ok(Some(v));
+        }
+        let settings = self.secret_settings().await?;
+        let providers = settings.for_job(&[]);
+        let mut values = HashMap::new();
+        for n in names {
+            values.insert(n.clone(), self.resolve_secret(&settings, &providers, &n).await?.0);
+        }
+        Ok(Some(secrets::substitute(&v, &values)))
+    }
+
+    /// Test providers: credentials present, latency, which `probe` names exist.
+    pub async fn test_secret_providers(&self, provider_id: Option<String>, probe: Vec<String>) -> Result<Vec<secrets::ProviderTest>, AppError> {
+        let settings = self.secret_settings().await?;
+        let mut out = Vec::new();
+        for p in settings.providers.iter().filter(|p| provider_id.as_deref().is_none_or(|id| id == p.id)) {
+            let mut t = secrets::ProviderTest { provider_id: p.id.clone(), provider: p.name.clone(), kind: p.kind.label().into(), ..Default::default() };
+            let cred = if p.kind.needs_credential() { self.destination_secret(&p.credential_id).await? } else { None };
+            t.has_credential = !p.kind.needs_credential() || cred.as_deref().is_some_and(|c| !c.is_empty());
+            if !t.has_credential {
+                t.errors.push("The provider's credential is not stored".into());
+            }
+            let started = std::time::Instant::now();
+            let names = if probe.is_empty() { vec!["__ufop_connectivity_probe__".to_string()] } else { probe.clone() };
+            for n in &names {
+                match secrets::lookup(p, cred.as_deref(), n).await {
+                    Ok(Some(_)) => t.found.push(n.clone()),
+                    Ok(None) => t.missing.push(n.clone()),
+                    Err(e) => t.errors.push(format!("{n}: {}", e.user_message())),
+                }
+            }
+            t.latency_ms = (started.elapsed().as_secs_f64() * 1000.0 / names.len() as f64 * 10.0).round() / 10.0;
+            if probe.is_empty() {
+                t.missing.clear();
+            }
+            t.ok = t.errors.is_empty() && t.has_credential && (probe.is_empty() || t.missing.is_empty());
+            out.push(t);
+        }
+        Ok(out)
+    }
+
+    /// Placeholders a job uses and where each resolves (values never returned).
+    pub async fn job_placeholders(&self, job_id: &str) -> Result<secrets::PlaceholderReport, AppError> {
+        let job = self.effective_job(job_id).await?;
+        let names = secrets::collect(&serde_json::to_value(&job)?);
+        let settings = self.secret_settings().await?;
+        let providers = settings.for_job(&job.secret_providers);
+        let mut r = secrets::PlaceholderReport { providers: providers.iter().map(|p| p.name.clone()).collect(), ..Default::default() };
+        for n in names {
+            let st = match self.resolve_secret(&settings, &providers, &n).await {
+                Ok((_, p, cached)) => secrets::PlaceholderStatus { name: n, provider: Some(p), from_cache: cached, error: None },
+                Err(e) => secrets::PlaceholderStatus { name: n, provider: None, from_cache: false, error: Some(e.user_message()) },
+            };
+            r.placeholders.push(st);
+        }
+        Ok(r)
     }
 
     /// Route run results to OS notifications (set by the desktop app).
@@ -1360,6 +1553,10 @@ impl BackupManager {
         if let BackupOperation::Restore { overrides, .. } = &op {
             overrides.apply(&mut job);
         }
+        match self.resolve_job_secrets(&job).await {
+            Ok(j) => job = j,
+            Err(e) => return self.record(&job, op_name, started, Err(e), log).await,
+        }
         let _awake = job.prevent_sleep.then(|| power::SleepInhibitor::acquire(&format!("UFOP {op_name}: {}", job.name)));
         let is_backup = matches!(op, BackupOperation::Backup { .. });
 
@@ -1493,6 +1690,15 @@ impl BackupManager {
             }
         }
 
+        let (summary, err) = if job.masked_values.is_empty() {
+            (summary, err)
+        } else {
+            let mask = |t: &str| job.masked_values.iter().fold(t.to_string(), |acc, v| acc.replace(v.as_str(), "***"));
+            for l in &mut log {
+                l.message = mask(&l.message);
+            }
+            (mask(&summary), err.map(|e| mask(&e)))
+        };
         let run = BackupRun {
             id: uuid::Uuid::new_v4().to_string(),
             job_id: job.id.clone(),
@@ -1805,7 +2011,7 @@ impl BackupManager {
     /// Check the job database against the destination and measure the
     /// network path. `throughput_kb` = 0 skips the upload/download test.
     pub async fn diagnose(&self, job_id: &str, network: bool, throughput_kb: u32) -> Result<diagnostics::Diagnostics, AppError> {
-        let job = self.effective_job(job_id).await?;
+        let job = self.resolve_job_secrets(&self.effective_job(job_id).await?).await?;
         let mut d = diagnostics::Diagnostics::default();
         if network {
             if let Some((host, port, tls)) = self.destination_endpoint(&job.destination).await? {
@@ -1852,6 +2058,27 @@ impl BackupManager {
 
     pub async fn recovery_restore(&self, folder: String, version: usize, paths: Vec<String>, target: String) -> Result<recovery::RecoveryRestoreReport, AppError> {
         blocking(move || recovery::restore(Path::new(&folder), version, &paths, Path::new(&target), &OpContext::new())).await
+    }
+
+    // ── Standalone file encryption ──
+
+    pub async fn crypt_file(&self, decrypt: bool, input: String, output: String, passphrase: String, preset: Option<String>) -> Result<ufop_core::backup::filecrypt::CryptReport, AppError> {
+        if passphrase.is_empty() {
+            return Err(AppError::validation("Enter a passphrase"));
+        }
+        let kdf = match preset.as_deref() {
+            None | Some("") => self.inner.kdf,
+            Some(p) => KdfParams::preset(p).ok_or_else(|| AppError::validation(format!("Unknown key-derivation preset '{p}'")))?,
+        };
+        blocking(move || {
+            let (i, o) = (Path::new(&input), Path::new(&output));
+            if decrypt { ufop_core::backup::filecrypt::decrypt_file(i, o, &passphrase) } else { ufop_core::backup::filecrypt::encrypt_file(i, o, &passphrase, kdf) }
+        })
+        .await
+    }
+
+    pub async fn decrypt_volume(&self, volume: String, header: String, output: String, passphrase: Option<String>) -> Result<ufop_core::backup::filecrypt::CryptReport, AppError> {
+        blocking(move || ufop_core::backup::filecrypt::decrypt_volume(Path::new(&volume), Path::new(&header), Path::new(&output), passphrase.as_deref().filter(|p| !p.is_empty()))).await
     }
 
     pub async fn recovery_convert(&self, folder: String, out: BackupDestination, opts: recovery::ConvertOptions) -> Result<recovery::ConvertReport, AppError> {

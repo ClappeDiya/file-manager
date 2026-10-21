@@ -34,6 +34,8 @@ pub struct CertPolicy {
     pub accept_invalid_certs: bool,
     /// Extra trusted CA / self-signed certificate (PEM).
     pub ca_pem: Option<String>,
+    /// SHA-256 fingerprints; when set, only these certificates are accepted.
+    pub pinned_sha256: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,68 +116,7 @@ pub fn redact_paths(text: &str, roots: &[String]) -> String {
 }
 
 pub(crate) fn tls_config(cert: &CertPolicy) -> Result<Arc<rustls::ClientConfig>, AppError> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    if cert.accept_invalid_certs {
-        #[derive(Debug)]
-        struct AcceptAll;
-        impl rustls::client::danger::ServerCertVerifier for AcceptAll {
-            fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-            fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
-            }
-        }
-        return Ok(Arc::new(rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(AcceptAll)).with_no_client_auth()));
-    }
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut pinned: Vec<Vec<u8>> = Vec::new();
-    if let Some(pem) = cert.ca_pem.as_deref().filter(|p| !p.trim().is_empty()) {
-        for c in rustls_pemfile::certs(&mut pem.as_bytes()).flatten() {
-            pinned.push(c.as_ref().to_vec());
-            // A CA certificate also works as an extra root; a self-signed
-            // leaf does not, which the pin below covers.
-            let _ = roots.add(c);
-        }
-        if pinned.is_empty() {
-            return Err(AppError::validation("The trusted certificate is not valid PEM"));
-        }
-    }
-    let webpki = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots)).build().map_err(|e| AppError::internal(format!("TLS setup: {e}")))?;
-    if pinned.is_empty() {
-        return Ok(Arc::new(rustls::ClientConfig::builder().with_webpki_verifier(webpki).with_no_client_auth()));
-    }
-    /// Accepts the exact pinned certificate(s); otherwise normal validation.
-    #[derive(Debug)]
-    struct Pinned {
-        pins: Vec<Vec<u8>>,
-        inner: Arc<rustls::client::WebPkiServerVerifier>,
-    }
-    impl rustls::client::danger::ServerCertVerifier for Pinned {
-        fn verify_server_cert(&self, ee: &rustls::pki_types::CertificateDer<'_>, im: &[rustls::pki_types::CertificateDer<'_>], name: &rustls::pki_types::ServerName<'_>, ocsp: &[u8], now: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-            if self.pins.iter().any(|p| p.as_slice() == ee.as_ref()) {
-                return Ok(rustls::client::danger::ServerCertVerified::assertion());
-            }
-            self.inner.verify_server_cert(ee, im, name, ocsp, now)
-        }
-        fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            self.inner.verify_tls12_signature(m, c, d)
-        }
-        fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            self.inner.verify_tls13_signature(m, c, d)
-        }
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            self.inner.supported_verify_schemes()
-        }
-    }
-    Ok(Arc::new(rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(Pinned { pins: pinned, inner: webpki })).with_no_client_auth()))
+    crate::security::tls::client_config(cert.accept_invalid_certs, cert.ca_pem.as_deref(), &cert.pinned_sha256).map(Arc::new)
 }
 
 trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -320,7 +261,7 @@ pub async fn send_email(host: &str, port: Option<u16>, tls: TlsMode, username: &
 
 pub async fn send_telegram(api_base: &str, token: &str, chat_id: &str, text: &str, cert: &CertPolicy) -> Result<(), AppError> {
     let base = if api_base.is_empty() { "https://api.telegram.org" } else { api_base.trim_end_matches('/') };
-    let http = super::stores::http::client(&super::stores::http::TlsOptions { accept_invalid_certs: cert.accept_invalid_certs, ca_pem: cert.ca_pem.clone() })?;
+    let http = super::stores::http::client(&super::stores::http::TlsOptions { accept_invalid_certs: cert.accept_invalid_certs, ca_pem: cert.ca_pem.clone(), pinned_sha256: cert.pinned_sha256.clone() })?;
     // Telegram limits messages to 4096 characters.
     let text: String = text.chars().take(4000).collect();
     let r = http.post(format!("{base}/bot{token}/sendMessage")).json(&serde_json::json!({ "chat_id": chat_id, "text": text, "disable_web_page_preview": true })).send().await.map_err(|e| super::stores::http::net("Telegram", e))?;

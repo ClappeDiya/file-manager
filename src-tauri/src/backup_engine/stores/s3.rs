@@ -107,7 +107,7 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     m.finalize().into_bytes().to_vec()
 }
 
-fn sha_hex(data: &[u8]) -> String {
+pub(crate) fn sha_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 

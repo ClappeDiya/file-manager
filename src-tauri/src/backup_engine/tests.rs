@@ -570,3 +570,200 @@ async fn test_notification_reports_channel_errors() {
     let e = m.test_notification(n).await.unwrap_err();
     assert!(e.user_message().contains("bot token is missing"), "{}", e.user_message());
 }
+
+fn provider(id: &str, kind: secrets::ProviderKind) -> secrets::SecretProvider {
+    secrets::SecretProvider { id: id.into(), name: id.into(), kind, credential_id: format!("cred-{id}"), enabled: true, global: true }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn placeholders_resolve_from_file_provider_and_are_masked() {
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"x").unwrap();
+    let sfile = t.path().join("secrets.env");
+    std::fs::write(&sfile, "BACKUP_PASS=correct horse\nHOOK_TOKEN=tok-9f8e7d\n").unwrap();
+    let m = manager(t.path()).await;
+    m.set_secret_settings(secrets::SecretSettings { providers: vec![provider("file", secrets::ProviderKind::File { path: sfile.to_string_lossy().into() })], cache: secrets::CacheMode::Persistent, cache_ttl_secs: 3600 }).await.unwrap();
+
+    let mut jb = job(&src, &t.path().join("dst"));
+    // The script echoes the token; the run log must not show it.
+    jb.scripts.run_before = Some(if cfg!(windows) { "echo LOG:INFO token ${HOOK_TOKEN}".into() } else { "echo 'LOG:INFO token ${HOOK_TOKEN}'".into() });
+    let j = m.save_job(jb, Some("$BACKUP_PASS".into())).await.unwrap();
+    assert_eq!(m.passphrase(&j.id).await.unwrap().as_deref(), Some("correct horse"), "stored passphrase placeholder resolves");
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    let log = serde_json::to_string(&r.log).unwrap();
+    assert!(log.contains("token ***") && !log.contains("tok-9f8e7d"), "{log}");
+    assert_eq!(m.get_job(&j.id).await.unwrap().scripts.run_before.unwrap().matches("${HOOK_TOKEN}").count(), 1, "stored job keeps the placeholder");
+
+    let rep = m.job_placeholders(&j.id).await.unwrap();
+    assert_eq!(rep.placeholders.len(), 1);
+    assert_eq!(rep.placeholders[0].provider.as_deref(), Some("file"));
+
+    // Provider unreachable: the persistent cache keeps runs working.
+    std::fs::remove_file(&sfile).unwrap();
+    m.inner.secret_cache.clear();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+
+    // Unknown placeholder: the run fails with a clear error, nothing leaks.
+    let mut j2 = m.get_job(&j.id).await.unwrap();
+    j2.reports.http_urls = vec!["https://example.invalid/${MISSING_ONE}".into()];
+    let j2 = m.save_job(j2, None).await.unwrap();
+    let e = m.execute(&j2.id, BackupOperation::Backup { dry_run: false }).await.unwrap_err();
+    assert!(e.user_message().contains("MISSING_ONE"), "{}", e.user_message());
+    assert_eq!(m.run_history(Some(j2.id.clone()), 1).await.unwrap()[0].status, "error");
+
+    let tests = m.test_secret_providers(None, vec!["HOOK_TOKEN".into()]).await.unwrap();
+    assert!(!tests[0].ok && !tests[0].errors.is_empty(), "file is gone: {tests:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gcp_and_azure_secret_providers_against_api_mocks() {
+    use axum::{extract::Path as P, routing::{get, post}, Json, Router};
+    let app = Router::new()
+        .route(
+            "/v1/projects/{proj}/secrets/{id}/versions/{ver}",
+            get(|P((proj, id, ver)): P<(String, String, String)>| async move {
+                use base64::Engine;
+                assert_eq!(ver, "latest:access");
+                if proj != "demo" || id != "db" {
+                    return Err(axum::http::StatusCode::NOT_FOUND);
+                }
+                Ok(Json(serde_json::json!({ "payload": { "data": base64::engine::general_purpose::STANDARD.encode(r#"{"user":"u1","pass":"gcp-pass"}"#) } })))
+            }),
+        )
+        .route("/google-token", post(|body: String| async move {
+            assert!(body.contains("jwt-bearer") && body.contains("assertion="));
+            Json(serde_json::json!({ "access_token": "ya29.from-jwt", "expires_in": 3600 }))
+        }))
+        .route("/tenant-1/oauth2/v2.0/token", post(|body: String| async move {
+            assert!(body.contains("client_secret=azsecret") && body.contains("vault.azure.net"));
+            Json(serde_json::json!({ "access_token": "az-token" }))
+        }))
+        .route(
+            "/secrets/{name}",
+            get(|P(name): P<String>, h: axum::http::HeaderMap| async move {
+                assert_eq!(h["authorization"], "Bearer az-token");
+                if name == "smtp-pass" { Ok(Json(serde_json::json!({ "value": "az-value" }))) } else { Err(axum::http::StatusCode::NOT_FOUND) }
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+    let t = tempfile::tempdir().unwrap();
+    let m = manager(t.path()).await;
+    let s = m
+        .set_secret_settings(secrets::SecretSettings {
+            providers: vec![
+                provider("gcp", secrets::ProviderKind::GcpSecretManager { project: "demo".into(), endpoint: base.clone(), tls: Default::default() }),
+                provider("az", secrets::ProviderKind::AzureKeyVault { vault_url: base.clone(), tenant_id: "tenant-1".into(), client_id: "app".into(), authority: base.clone(), tls: Default::default() }),
+            ],
+            cache: secrets::CacheMode::None,
+            cache_ttl_secs: 60,
+        })
+        .await
+        .unwrap();
+    m.set_destination_secret("cred-gcp", "ya29.access-token").await.unwrap();
+    m.set_destination_secret("cred-az", "azsecret").await.unwrap();
+    let ps = s.for_job(&[]);
+    assert_eq!(m.resolve_secret(&s, &ps, "db#pass").await.unwrap().0, "gcp-pass");
+    let (v, by, _) = m.resolve_secret(&s, &ps, "smtp_pass").await.unwrap();
+    assert_eq!((v.as_str(), by.as_str()), ("az-value", "az"), "falls through to Azure, _ maps to -");
+    assert!(m.resolve_secret(&s, &ps, "nothing").await.unwrap_err().user_message().contains("not found in: gcp, az"));
+    let tests = m.test_secret_providers(None, vec![]).await.unwrap();
+    assert!(tests.iter().all(|t| t.ok && t.has_credential), "{tests:?}");
+
+    // Service-account key: a signed JWT is exchanged for a token first.
+    let key = t.path().join("sa.pem");
+    if std::process::Command::new("openssl").args(["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out"]).arg(&key).output().is_ok_and(|o| o.status.success()) {
+        let sa = serde_json::json!({ "client_email": "ufop@demo.iam", "private_key": std::fs::read_to_string(&key).unwrap(), "token_uri": format!("{base}/google-token") });
+        m.set_destination_secret("cred-gcp", &sa.to_string()).await.unwrap();
+        assert_eq!(m.resolve_secret(&s, &ps, "db#user").await.unwrap().0, "u1");
+    }
+}
+
+/// Real services: Vault dev server, moto Secrets Manager, and `pass`.
+#[tokio::test(flavor = "multi_thread")]
+async fn vault_aws_and_pass_secret_providers_against_real_servers() {
+    let t = tempfile::tempdir().unwrap();
+    let m = manager(t.path()).await;
+    let mut providers = Vec::new();
+    let mut checks: Vec<(&str, &str)> = Vec::new();
+    if let Ok(v) = std::env::var("UFOP_TEST_VAULT") {
+        let (addr, token) = v.split_once('|').unwrap();
+        providers.push(provider("vault", secrets::ProviderKind::Vault { address: addr.into(), mount: "secret".into(), path: "ufop".into(), namespace: String::new(), kv_version: 2, tls: Default::default() }));
+        providers.push(provider("vault1", secrets::ProviderKind::Vault { address: addr.into(), mount: "kv1".into(), path: "app".into(), namespace: String::new(), kv_version: 1, tls: Default::default() }));
+        m.set_destination_secret("cred-vault", token).await.unwrap();
+        m.set_destination_secret("cred-vault1", token).await.unwrap();
+        checks.extend([("db_pass", "hunter2"), ("token", "t1-legacy")]);
+    }
+    if let Ok(ep) = std::env::var("UFOP_TEST_S3") {
+        providers.push(provider("aws", secrets::ProviderKind::AwsSecretsManager { region: "us-east-1".into(), access_key_id: "AKIDUFOP".into(), endpoint: ep, secret_id: String::new(), tls: Default::default() }));
+        m.set_destination_secret("cred-aws", "ufopsecret").await.unwrap();
+        checks.extend([("ufop/smtp", "sm-plain-value"), ("ufop/bundle#api_key", "sm-key")]);
+    }
+    if let Ok(w) = std::env::var("UFOP_TEST_PASS") {
+        providers.push(provider("pass", secrets::ProviderKind::Pass { executable: w, prefix: "ufop".into() }));
+        checks.push(("smtp", "pass-secret-1"));
+    }
+    if providers.is_empty() {
+        return;
+    }
+    let s = m.set_secret_settings(secrets::SecretSettings { providers, cache: secrets::CacheMode::Memory, cache_ttl_secs: 60 }).await.unwrap();
+    let ps = s.for_job(&[]);
+    for (name, want) in checks {
+        assert_eq!(m.resolve_secret(&s, &ps, name).await.unwrap().0, want, "{name}");
+    }
+    assert!(m.resolve_secret(&s, &ps, "definitely-missing").await.is_err());
+    let tests = m.test_secret_providers(None, vec![]).await.unwrap();
+    assert!(tests.iter().all(|t| t.ok), "{tests:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gpg_job_kdf_validation_and_file_crypt() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst, out) = (t.path().join("src"), t.path().join("dst"), t.path().join("out"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"through gpg").unwrap();
+    let m = manager(t.path()).await;
+
+    let mut weak = job(&src, &dst);
+    weak.options.kdf = Some(KdfParams { memory_kib: 64, iterations: 1, parallelism: 1 });
+    assert!(m.save_job(weak, Some("pw".into())).await.is_err(), "weak KDF refused");
+
+    if std::process::Command::new("gpg").arg("--version").output().is_ok() {
+        let home = t.path().join("gnupg");
+        std::fs::create_dir_all(&home).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut jb = job(&src, &dst);
+        jb.options.encryption_module = ufop_core::backup::EncryptionModuleKind::Gpg;
+        jb.options.gpg.homedir = home.to_string_lossy().into();
+        let j = m.save_job(jb, Some("gpg-pw".into())).await.unwrap();
+        let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+        assert_eq!(r.status, "success", "{:?}", r.log);
+        assert!(std::fs::read_dir(&dst).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with(".dblock.gpg")));
+        let rr = m.execute(&j.id, BackupOperation::Restore { options: RestoreOptions { target: Some(out.clone()), ..Default::default() }, overrides: RestoreOverrides::default() }).await.unwrap();
+        assert_eq!(rr.report["files_restored"], 1, "{:?}", rr.log);
+        // Key mode needs no stored passphrase.
+        let mut keyed = job(&src, &t.path().join("dst2"));
+        keyed.options.encryption_module = ufop_core::backup::EncryptionModuleKind::Gpg;
+        keyed.options.gpg.recipients = vec!["someone@example.invalid".into()];
+        assert!(m.save_job(keyed, None).await.is_ok());
+    }
+
+    let (plain, enc, dec) = (t.path().join("p.bin"), t.path().join("p.ufopenc"), t.path().join("p.out"));
+    std::fs::write(&plain, vec![9u8; 100_000]).unwrap();
+    let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+    m.crypt_file(false, s(&plain), s(&enc), "file-pw".into(), Some("interactive".into())).await.unwrap();
+    assert!(m.crypt_file(true, s(&enc), s(&dec), "nope".into(), None).await.is_err());
+    m.crypt_file(true, s(&enc), s(&dec), "file-pw".into(), None).await.unwrap();
+    assert_eq!(std::fs::read(&dec).unwrap(), vec![9u8; 100_000]);
+    assert!(m.crypt_file(false, s(&plain), s(&enc), String::new(), None).await.is_err());
+}

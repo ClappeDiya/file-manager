@@ -213,6 +213,36 @@ pub async fn backup_cleanup_databases(delete_orphans: bool, vacuum: bool, mgr: S
 }
 
 #[tauri::command]
+pub async fn backup_crypt_file(decrypt: bool, input: String, output: String, passphrase: String, preset: Option<String>, mgr: State<'_, BackupManager>) -> Result<ufop_core::backup::filecrypt::CryptReport, AppError> {
+    mgr.crypt_file(decrypt, input, output, passphrase, preset).await
+}
+
+#[tauri::command]
+pub async fn backup_decrypt_volume(volume: String, header: String, output: String, passphrase: Option<String>, mgr: State<'_, BackupManager>) -> Result<ufop_core::backup::filecrypt::CryptReport, AppError> {
+    mgr.decrypt_volume(volume, header, output, passphrase).await
+}
+
+#[tauri::command]
+pub async fn backup_get_secret_settings(mgr: State<'_, BackupManager>) -> Result<crate::backup_engine::secrets::SecretSettings, AppError> {
+    mgr.secret_settings().await
+}
+
+#[tauri::command]
+pub async fn backup_set_secret_settings(settings: crate::backup_engine::secrets::SecretSettings, mgr: State<'_, BackupManager>) -> Result<crate::backup_engine::secrets::SecretSettings, AppError> {
+    mgr.set_secret_settings(settings).await
+}
+
+#[tauri::command]
+pub async fn backup_test_secret_providers(provider_id: Option<String>, names: Option<Vec<String>>, mgr: State<'_, BackupManager>) -> Result<Vec<crate::backup_engine::secrets::ProviderTest>, AppError> {
+    mgr.test_secret_providers(provider_id, names.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub async fn backup_job_placeholders(job_id: String, mgr: State<'_, BackupManager>) -> Result<crate::backup_engine::secrets::PlaceholderReport, AppError> {
+    mgr.job_placeholders(&job_id).await
+}
+
+#[tauri::command]
 pub async fn backup_test_notification(notification: crate::backup_engine::notify::Notification, mgr: State<'_, BackupManager>) -> Result<(), AppError> {
     mgr.test_notification(notification).await
 }

@@ -18,7 +18,9 @@ pub mod backend;
 pub mod crypto;
 pub mod db;
 pub mod engine;
+pub mod filecrypt;
 pub mod filters;
+pub mod gpg;
 pub mod maintenance;
 pub mod meta;
 pub mod mirror;
@@ -254,6 +256,33 @@ pub struct BackupOptions {
     /// Read sources from a VSS / LVM / APFS snapshot.
     pub snapshot_policy: snapshot::SnapshotPolicy,
     pub snapshot: snapshot::SnapshotOptions,
+    /// Volume encryption for new repositories (existing ones keep theirs).
+    pub encryption_module: EncryptionModuleKind,
+    pub gpg: GpgOptions,
+    /// Argon2id cost for new AES repositories (`None` = the app default).
+    pub kdf: Option<crypto::KdfParams>,
+}
+
+/// How volumes are encrypted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptionModuleKind {
+    /// Built-in AES-256-GCM with an Argon2id-derived key.
+    #[default]
+    Aes,
+    /// OpenPGP through the `gpg` executable.
+    Gpg,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GpgOptions {
+    /// Encrypt to these keys; empty = symmetric with the passphrase.
+    pub recipients: Vec<String>,
+    /// `gpg` binary (empty = `$UFOP_GPG` or `gpg`).
+    pub executable: String,
+    /// Keyring folder (empty = default / `$GNUPGHOME`).
+    pub homedir: String,
 }
 
 impl Default for BackupOptions {
@@ -308,6 +337,9 @@ impl Default for BackupOptions {
             object_lock: None,
             snapshot_policy: snapshot::SnapshotPolicy::Off,
             snapshot: snapshot::SnapshotOptions::default(),
+            encryption_module: EncryptionModuleKind::Aes,
+            gpg: GpgOptions::default(),
+            kdf: None,
         }
     }
 }

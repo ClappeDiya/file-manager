@@ -10,12 +10,58 @@ import { inputCls } from "@/lib/backup-helpers";
 import { errorText, type CloudConfig, type CloudProviderInfo } from "@/stores/backup-store";
 import { Banner, Btn, Check, Field } from "./backup-ui";
 
-type FieldDef = { key: string; label: string; kind?: "text" | "number" | "bool" | "select"; options?: string[]; hint?: string; path?: string[] };
+/** Read a TLS server's certificate fingerprint so it can be compared and pinned. */
+export function FingerprintFetcher({ onPin }: { onPin: (fingerprint: string) => void }) {
+  const [target, setTarget] = useState("");
+  const [fp, setFp] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const fetchIt = async () => {
+    setErr(null);
+    setFp(null);
+    const m = /^(?:https?:\/\/)?([^/:]+)(?::(\d+))?/.exec(target.trim());
+    if (!m) return setErr("Enter host or host:port");
+    try {
+      setFp(await tauriInvoke<string>("tls_fetch_fingerprint", { host: m[1], port: Number(m[2] ?? 443) }));
+    } catch (e) {
+      setErr(errorText(e));
+    }
+  };
+  return (
+    <div className="space-y-1" data-testid="fingerprint-fetcher">
+      <div className="flex gap-1 items-end">
+        <Field label="Server certificate fingerprint">
+          <input className={inputCls} value={target} placeholder="storage.example.com:443" onChange={(e) => setTarget(e.target.value)} data-testid="fingerprint-target" />
+        </Field>
+        <Btn testId="fingerprint-get" disabled={!target.trim()} onClick={() => void fetchIt()}>
+          Get fingerprint
+        </Btn>
+      </div>
+      {fp && (
+        <div className="flex gap-2 items-center text-[11px] font-mono break-all">
+          <span data-testid="fingerprint-value">{fp}</span>
+          <Btn testId="fingerprint-pin" onClick={() => onPin(fp)}>
+            Pin
+          </Btn>
+        </div>
+      )}
+      {err && <div className="text-xs text-red-600">{err}</div>}
+    </div>
+  );
+}
+
+type FieldDef = { key: string; label: string; kind?: "text" | "number" | "bool" | "select" | "list"; options?: string[]; hint?: string; path?: string[] };
+
+/** Transport options shared by every HTTP provider (`TlsOptions` in Rust). */
+const TLS_FIELDS: FieldDef[] = [
+  { key: "accept_invalid_certs", label: "Accept invalid TLS certificates (test setups only)", kind: "bool", path: ["tls"] },
+  { key: "ca_pem", label: "Trusted CA certificate (PEM)", path: ["tls"] },
+  { key: "pinned_sha256", label: "Pinned certificate SHA-256 fingerprints", kind: "list", path: ["tls"], hint: "Only these certificates are accepted. Comma-separated; use Get fingerprint on the server." },
+];
 
 /** Per-provider fields and defaults (identical to the Rust `Default`s). */
-export const PROVIDER_FIELDS: Record<string, { defaults: Record<string, unknown>; fields: FieldDef[] }> = {
+const BASE_FIELDS: Record<string, { defaults: Record<string, unknown>; fields: FieldDef[] }> = {
   s3: {
-    defaults: { preset: "aws", endpoint: "", region: "us-east-1", bucket: "", prefix: "", access_key_id: "", path_style: false, storage_class: "", part_size_mb: 64, cold_storage: { restore_days: 3, tier: "Standard", wait_minutes: 0 }, create_with_object_lock: false, tls: { accept_invalid_certs: false, ca_pem: null } },
+    defaults: { preset: "aws", endpoint: "", region: "us-east-1", bucket: "", prefix: "", access_key_id: "", path_style: false, storage_class: "", part_size_mb: 64, cold_storage: { restore_days: 3, tier: "Standard", wait_minutes: 0 }, create_with_object_lock: false, tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } },
     fields: [
       { key: "preset", label: "Service", kind: "select", options: ["aws", "idrive_e2", "storj", "aliyun_oss", "tencent_cos", "wasabi", "minio", "custom"] },
       { key: "endpoint", label: "Endpoint (empty = from service + region)", hint: "e.g. https://s3.example.com or http://127.0.0.1:9000" },
@@ -30,11 +76,10 @@ export const PROVIDER_FIELDS: Record<string, { defaults: Record<string, unknown>
       { key: "restore_days", label: "Archive restore: days available", kind: "number", path: ["cold_storage"] },
       { key: "tier", label: "Archive restore tier", kind: "select", options: ["Standard", "Bulk", "Expedited"], path: ["cold_storage"] },
       { key: "wait_minutes", label: "Wait for archive restores (minutes, 0 = fail fast)", kind: "number", path: ["cold_storage"] },
-      { key: "accept_invalid_certs", label: "Accept invalid TLS certificates (test setups only)", kind: "bool", path: ["tls"] },
     ],
   },
   azure: {
-    defaults: { account: "", container: "", prefix: "", endpoint: "", access_tier: "", block_size_mb: 4, rehydrate_priority: "Standard", tls: { accept_invalid_certs: false, ca_pem: null } },
+    defaults: { account: "", container: "", prefix: "", endpoint: "", access_tier: "", block_size_mb: 4, rehydrate_priority: "Standard", tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } },
     fields: [
       { key: "account", label: "Storage account" },
       { key: "container", label: "Container" },
@@ -46,7 +91,7 @@ export const PROVIDER_FIELDS: Record<string, { defaults: Record<string, unknown>
     ],
   },
   gcs: {
-    defaults: { bucket: "", prefix: "", project: "", storage_class: "", endpoint: "", checksums: true, tls: { accept_invalid_certs: false, ca_pem: null } },
+    defaults: { bucket: "", prefix: "", project: "", storage_class: "", endpoint: "", checksums: true, tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } },
     fields: [
       { key: "bucket", label: "Bucket" },
       { key: "prefix", label: "Folder" },
@@ -58,7 +103,7 @@ export const PROVIDER_FIELDS: Record<string, { defaults: Record<string, unknown>
   },
   b2: { defaults: { key_id: "", bucket: "", prefix: "", api_url: "" }, fields: [{ key: "key_id", label: "Key id" }, { key: "bucket", label: "Bucket" }, { key: "prefix", label: "Folder" }] },
   swift: {
-    defaults: { auth_url: "", auth_version: "3", username: "", user_domain: "Default", project: "", project_domain: "Default", region: "", container: "", prefix: "", tls: { accept_invalid_certs: false, ca_pem: null } },
+    defaults: { auth_url: "", auth_version: "3", username: "", user_domain: "Default", project: "", project_domain: "Default", region: "", container: "", prefix: "", tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } },
     fields: [
       { key: "auth_url", label: "Auth URL", hint: "Keystone: https://…/v3" },
       { key: "auth_version", label: "Auth version", kind: "select", options: ["3", "1"] },
@@ -100,6 +145,10 @@ export const PROVIDER_FIELDS: Record<string, { defaults: Record<string, unknown>
     ],
   },
 };
+
+export const PROVIDER_FIELDS: Record<string, { defaults: Record<string, unknown>; fields: FieldDef[] }> = Object.fromEntries(
+  Object.entries(BASE_FIELDS).map(([k, v]) => [k, "tls" in v.defaults ? { ...v, fields: [...v.fields, ...TLS_FIELDS] } : v]),
+);
 
 export function newCloudConfig(provider: string): CloudConfig {
   return { provider, ...structuredClone(PROVIDER_FIELDS[provider]?.defaults ?? {}) } as CloudConfig;
@@ -183,6 +232,17 @@ export function CloudDestinationForm({
           const v = get(values, f);
           const update = (nv: unknown) => onChange(set(values, f, nv) as unknown as CloudConfig);
           if (f.kind === "bool") return <Check key={f.key} label={f.label} checked={Boolean(v)} onChange={update} />;
+          if (f.kind === "list")
+            return (
+              <Field key={(f.path ?? []).concat(f.key).join(".")} label={f.label} hint={f.hint}>
+                <input
+                  className={`${inputCls} font-mono`}
+                  value={Array.isArray(v) ? v.join(", ") : ""}
+                  onChange={(e) => update(e.target.value.split(/[,\s]+/).filter(Boolean))}
+                  data-testid={`cloud-${f.key}`}
+                />
+              </Field>
+            );
           return (
             <Field key={(f.path ?? []).concat(f.key).join(".")} label={f.label} hint={f.hint}>
               {f.kind === "select" ? (
@@ -206,6 +266,15 @@ export function CloudDestinationForm({
           );
         })}
       </div>
+      {"tls" in values && (
+        <FingerprintFetcher
+          onPin={(fp) => {
+            const tls = values.tls as { pinned_sha256?: string[] };
+            const pins = tls.pinned_sha256 ?? [];
+            if (!pins.includes(fp)) onChange({ ...values, tls: { ...tls, pinned_sha256: [...pins, fp] } } as unknown as CloudConfig);
+          }}
+        />
+      )}
       <Field label={`Credentials${info ? ` — ${info.secret}` : ""}`} hint={hasSecret ? "Stored. Enter a new value to replace it." : "Not stored yet."}>
         <textarea data-testid="cloud-secret" className={`${inputCls} font-mono`} rows={2} value={secret} onChange={(e) => setSecret(e.target.value)} autoComplete="off" />
       </Field>

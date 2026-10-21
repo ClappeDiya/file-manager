@@ -12,9 +12,19 @@ pub struct TlsOptions {
     pub accept_invalid_certs: bool,
     /// Extra PEM CA certificate to trust (e.g. a private S3 endpoint).
     pub ca_pem: Option<String>,
+    /// SHA-256 certificate fingerprints; when set, only these are accepted.
+    pub pinned_sha256: Vec<String>,
 }
 
 pub fn client(tls: &TlsOptions) -> Result<reqwest::Client, AppError> {
+    if !tls.pinned_sha256.is_empty() {
+        let cfg = crate::security::tls::client_config(false, None, &tls.pinned_sha256)?;
+        return reqwest::Client::builder()
+            .use_preconfigured_tls(cfg)
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| AppError::internal(format!("HTTP client: {e}")));
+    }
     let mut b = reqwest::Client::builder()
         .use_rustls_tls()
         .connect_timeout(Duration::from_secs(30))

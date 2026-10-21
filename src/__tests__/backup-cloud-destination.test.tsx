@@ -53,3 +53,19 @@ describe("cloud destination", () => {
     expect(JSON.stringify(cfg)).not.toContain("s3cr3t");
   });
 });
+
+describe("certificate pinning", () => {
+  it("fetches a server fingerprint and pins it into tls.pinned_sha256", async () => {
+    const fp = "ab".repeat(32);
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, a: unknown) => (cmd === "tls_fetch_fingerprint" ? fp : base(cmd, a)));
+    const onChange = vi.fn();
+    render(<CloudDestinationForm config={newCloudConfig("s3")} credentialId="c1" onChange={onChange} />);
+    fireEvent.change(screen.getByTestId("fingerprint-target"), { target: { value: "https://minio.local:9000/bucket" } });
+    fireEvent.click(screen.getByTestId("fingerprint-get"));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("tls_fetch_fingerprint", { host: "minio.local", port: 9000 }));
+    fireEvent.click(await screen.findByTestId("fingerprint-pin"));
+    expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ provider: "s3", tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [fp] } }));
+    expect(PROVIDER_FIELDS.azure.fields.some((f) => f.key === "pinned_sha256")).toBe(true);
+  });
+});
