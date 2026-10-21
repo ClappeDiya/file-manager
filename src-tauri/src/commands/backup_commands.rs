@@ -5,6 +5,7 @@ use crate::backup_engine::{
     api, portability, BackupDestination, BackupJob, BackupManager, BackupOperation, BackupRun,
     Fileset, OperationResult, SchedulerStatus,
 };
+use crate::backup_engine::defaults::{GlobalDefaults, SavedDestination};
 use crate::core::error::AppError;
 use tauri::State;
 use ufop_core::backup::crypto::{self, PassphraseStrength};
@@ -151,6 +152,52 @@ pub async fn backup_direct_restore(destination: BackupDestination, passphrase: O
 #[tauri::command]
 pub async fn backup_discover_remote_config(destination: BackupDestination, passphrase: Option<String>, prefix: Option<String>, mgr: State<'_, BackupManager>) -> Result<Option<serde_json::Value>, AppError> {
     mgr.discover_remote_config(destination, passphrase, prefix.unwrap_or_else(|| "ufop".into())).await
+}
+
+#[tauri::command]
+pub async fn backup_get_global_defaults(mgr: State<'_, BackupManager>) -> Result<GlobalDefaults, AppError> {
+    mgr.global_defaults().await
+}
+
+#[tauri::command]
+pub async fn backup_set_global_defaults(defaults: GlobalDefaults, mgr: State<'_, BackupManager>) -> Result<GlobalDefaults, AppError> {
+    mgr.set_global_defaults(defaults).await
+}
+
+/// The job as it runs, with global defaults applied.
+#[tauri::command]
+pub async fn backup_effective_job(id: String, mgr: State<'_, BackupManager>) -> Result<BackupJob, AppError> {
+    mgr.effective_job(&id).await
+}
+
+#[tauri::command]
+pub async fn backup_list_destinations(mgr: State<'_, BackupManager>) -> Result<Vec<SavedDestination>, AppError> {
+    mgr.list_destinations().await
+}
+
+#[tauri::command]
+pub async fn backup_save_destination(destination: SavedDestination, mgr: State<'_, BackupManager>) -> Result<SavedDestination, AppError> {
+    mgr.save_destination(destination).await
+}
+
+#[tauri::command]
+pub async fn backup_delete_destination(id: String, mgr: State<'_, BackupManager>) -> Result<(), AppError> {
+    mgr.delete_destination(&id).await
+}
+
+/// Continue an existing backup on this computer (history kept).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn backup_adopt_repository(
+    destination: BackupDestination,
+    passphrase: Option<String>,
+    prefix: Option<String>,
+    name: Option<String>,
+    sources: Option<Vec<String>>,
+    source_map: Option<Vec<(String, String)>>,
+    mgr: State<'_, BackupManager>,
+) -> Result<BackupJob, AppError> {
+    mgr.adopt_repository(destination, passphrase, prefix.unwrap_or_else(|| "ufop".into()), name, sources.unwrap_or_default(), source_map.unwrap_or_default()).await
 }
 
 #[tauri::command]

@@ -204,3 +204,82 @@ async fn maintenance_ops_and_source_release_script() {
     let r = m.execute(&j.id, BackupOperation::Verify { full: true }).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.log);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_repository_continues_history() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), vec![9u8; 30_000]).unwrap();
+    let m = manager(t.path()).await;
+    let mut jb = job(&src, &dst);
+    jb.store_config_remotely = true;
+    jb.remote_config_include_secrets = true;
+    jb.reports.http_urls = vec!["https://example.invalid/hook?token=x".into()];
+    let j = m.save_job(jb, Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+
+    // "New computer": fresh manager; the source moved to another folder.
+    let moved = t.path().join("moved");
+    std::fs::rename(&src, &moved).unwrap();
+    let t2 = tempfile::tempdir().unwrap();
+    let m2 = manager(t2.path()).await;
+    let dest = BackupDestination::Local { path: dst.to_string_lossy().into(), alternate_paths: vec![], marker_file: None };
+    assert!(m2.adopt_repository(dest.clone(), Some("wrong".into()), "ufop".into(), None, vec![], vec![]).await.is_err());
+    assert!(m2.list_jobs().await.is_empty(), "failed adoption leaves no job behind");
+    let adopted = m2
+        .adopt_repository(dest, Some("pw".into()), "ufop".into(), Some("Laptop".into()), vec![], vec![(src.to_string_lossy().into(), moved.to_string_lossy().into())])
+        .await
+        .unwrap();
+    assert_eq!(adopted.name, "Laptop");
+    assert_eq!(adopted.sources, vec![moved.to_string_lossy().to_string()]);
+    assert_eq!(adopted.stats.version_count, 1, "history continues");
+    assert_eq!(adopted.reports.http_urls.len(), 1, "secrets kept in encrypted config");
+    let r = m2.execute(&adopted.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(r.report["new_blocks"], 0, "data deduplicated against the old history");
+    assert_eq!(m2.list_versions(&adopted.id).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn global_defaults_and_destination_library() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("lib"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"x").unwrap();
+    let m = manager(t.path()).await;
+
+    let mut d = defaults::GlobalDefaults::default();
+    d.options.insert("upload_concurrency".into(), 5.into());
+    m.set_global_defaults(d).await.unwrap();
+    let mut bad = defaults::GlobalDefaults::default();
+    bad.options.insert("block_size".into(), 4096.into());
+    assert!(m.set_global_defaults(bad).await.is_err());
+
+    let lib = m
+        .save_destination(defaults::SavedDestination {
+            id: String::new(),
+            name: "NAS".into(),
+            destination: BackupDestination::Local { path: dst.to_string_lossy().into(), alternate_paths: vec![], marker_file: None },
+            created_at: String::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(m.list_destinations().await.unwrap().len(), 1);
+    let mut jb = job(&src, &dst);
+    jb.encrypted = false;
+    jb.destination = BackupDestination::Library { destination_id: lib.id.clone(), remote_path: "laptop".into() };
+    let j = m.save_job(jb, None).await.unwrap();
+    assert_eq!(m.effective_job(&j.id).await.unwrap().options.upload_concurrency, 5);
+    assert_eq!(m.get_job(&j.id).await.unwrap().options.upload_concurrency, 2, "stored job unchanged");
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert!(dst.join("laptop").join("ufop-repo.json").exists(), "library sub-folder used");
+    assert!(m.delete_destination(&lib.id).await.is_err(), "in use");
+
+    // Secrets in the remote config need encryption.
+    let mut jb = job(&src, &t.path().join("x"));
+    jb.encrypted = false;
+    jb.remote_config_include_secrets = true;
+    assert!(m.save_job(jb, None).await.is_err());
+}

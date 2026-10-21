@@ -39,6 +39,14 @@ pub fn stripped_config(job: &BackupJob) -> Result<serde_json::Value, AppError> {
     Ok(serde_json::to_value(j)?)
 }
 
+/// Job JSON including report URLs and scripts, for encrypted backups whose
+/// file lists are encrypted too (`remote_config_include_secrets`).
+pub fn full_config(job: &BackupJob) -> Result<serde_json::Value, AppError> {
+    let mut j = job.clone();
+    j.stats = JobStats::default();
+    Ok(serde_json::to_value(j)?)
+}
+
 /// Export a job. `passphrase` is included only when given;
 /// `export_passphrase` encrypts the whole file.
 pub fn export_job(job: &BackupJob, passphrase: Option<String>, export_passphrase: Option<&str>, include_stats: bool) -> Result<String, AppError> {
@@ -117,6 +125,10 @@ pub fn cli_command(job: &BackupJob) -> String {
         BackupDestination::Connection { connection_id, remote_path } => {
             parts.push("--dest".into());
             parts.push(quote(&format!("connection://{connection_id}{remote_path}")));
+        }
+        BackupDestination::Library { destination_id, remote_path } => {
+            parts.push("--dest".into());
+            parts.push(quote(&format!("library://{destination_id}/{remote_path}")));
         }
     }
     parts.push("--dbpath".into());

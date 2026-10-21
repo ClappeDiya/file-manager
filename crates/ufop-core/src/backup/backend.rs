@@ -202,7 +202,7 @@ impl Backend for LocalBackend {
 }
 
 /// Retry policy for backend operations.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetryPolicy {
     pub retries: u32,
@@ -229,7 +229,7 @@ impl RetryPolicy {
 }
 
 /// Bandwidth limits in bytes/second (0 = unlimited).
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Throttle {
     pub upload_bps: u64,

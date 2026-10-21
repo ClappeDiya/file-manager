@@ -22,6 +22,7 @@ import {
 import { BackupJobEditor } from "./backup-job-editor";
 import { BackupMaintenance } from "./backup-maintenance";
 import { BackupRestoreView, DirectRestore } from "./backup-restore-view";
+import { BackupSettingsView } from "./backup-settings-view";
 import { formatDate, inputCls, statusColor } from "@/lib/backup-helpers";
 import { Banner, Btn, Section } from "./backup-ui";
 
@@ -30,6 +31,7 @@ type View =
   | { kind: "history" }
   | { kind: "direct" }
   | { kind: "import" }
+  | { kind: "settings" }
   | { kind: "edit"; job: BackupJob }
   | { kind: "restore"; job: BackupJob }
   | { kind: "maintenance"; job: BackupJob };
@@ -93,7 +95,12 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
       </div>
       <div className="text-xs text-zinc-500 dark:text-zinc-400 mt-1 grid grid-cols-1 sm:grid-cols-2 gap-x-3">
         <div className="truncate" title={job.sources.join("\n")}>From: {job.sources.join(", ")}</div>
-        <div className="truncate">To: {job.destination.type === "local" ? job.destination.path : `connection ${job.destination.remote_path}`}</div>
+        <div className="truncate">To:{" "}
+          {job.destination.type === "local"
+            ? job.destination.path
+            : job.destination.type === "library"
+              ? `library destination${job.destination.remote_path ? ` / ${job.destination.remote_path}` : ""}`
+              : `connection ${job.destination.remote_path}`}</div>
         <div>Last run: {formatDate(job.stats.last_run_at)}</div>
         <div>Next: {next ? formatDate(next.next_run_at) : describeSchedule(job.schedule)}</div>
         <div>Source: {formatBytes(job.stats.source_size)} · Stored: {formatBytes(job.stats.backend_size)}</div>
@@ -269,6 +276,7 @@ export function BackupPanel() {
     { kind: "jobs", label: "Backups" },
     { kind: "history", label: "History" },
     { kind: "direct", label: "Restore from folder" },
+    { kind: "settings", label: "Defaults & destinations" },
   ];
 
   return (
@@ -351,6 +359,7 @@ export function BackupPanel() {
         )}
         {view.kind === "history" && <History />}
         {view.kind === "direct" && <DirectRestore />}
+        {view.kind === "settings" && <BackupSettingsView />}
         {view.kind === "import" && <ImportConfig onDone={(j) => setView(j ? (j.id ? { kind: "jobs" } : { kind: "edit", job: j }) : { kind: "jobs" })} />}
         {view.kind === "edit" && current && (
           <BackupJobEditor

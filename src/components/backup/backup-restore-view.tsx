@@ -295,6 +295,11 @@ export function DirectRestore() {
   const [opts, setOpts] = useState<RestoreOptions>({ ...DEFAULT_RESTORE_OPTIONS, target: "" });
   const [paths, setPaths] = useState("");
   const [config, setConfig] = useState<string | null>(null);
+  const [adoptName, setAdoptName] = useState("");
+  const [adoptSources, setAdoptSources] = useState("");
+  const [remapFrom, setRemapFrom] = useState("");
+  const [remapTo, setRemapTo] = useState("");
+  const [adopted, setAdopted] = useState<string | null>(null);
   const [report, setReport] = useState<RestoreReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -364,6 +369,42 @@ export function DirectRestore() {
             )}
           </div>
         )}
+      </Section>
+      <Section title="Continue this backup on this computer" hint="Creates a job for this backup, rebuilds its local index and keeps the version history; unchanged data is not uploaded again.">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <Field label="Job name (default: the stored one)">
+            <input className={inputCls} value={adoptName} onChange={(e) => setAdoptName(e.target.value)} data-testid="adopt-name" />
+          </Field>
+          <Field label="Source folders (one per line; default: the stored ones)">
+            <textarea className={`${inputCls} font-mono`} rows={2} value={adoptSources} onChange={(e) => setAdoptSources(e.target.value)} />
+          </Field>
+          <Field label="Old folder prefix (optional)" hint="e.g. C:\Users\old">
+            <input className={`${inputCls} font-mono`} value={remapFrom} onChange={(e) => setRemapFrom(e.target.value)} />
+          </Field>
+          <Field label="Replace with">
+            <input className={`${inputCls} font-mono`} value={remapTo} onChange={(e) => setRemapTo(e.target.value)} />
+          </Field>
+        </div>
+        <Btn
+          tone="primary"
+          testId="backup-adopt"
+          disabled={busy || (dest.type === "local" && !dest.path.trim())}
+          onClick={() =>
+            run(async () => {
+              const job = await tauriInvoke<BackupJob>("backup_adopt_repository", {
+                ...args,
+                name: adoptName.trim() || null,
+                sources: adoptSources.split("\n").map((s) => s.trim()).filter(Boolean),
+                sourceMap: remapFrom.trim() ? [[remapFrom.trim(), remapTo.trim()]] : [],
+              });
+              await useBackupStore.getState().loadJobs();
+              setAdopted(`Job “${job.name}” created with ${job.stats.version_count} existing version(s); the next backup continues the history.`);
+            })
+          }
+        >
+          {busy ? "Working…" : "Continue backup here"}
+        </Btn>
+        {adopted && <Banner tone="success" onClose={() => setAdopted(null)}>{adopted}</Banner>}
       </Section>
       {versions && (
         <Section title="Restore">

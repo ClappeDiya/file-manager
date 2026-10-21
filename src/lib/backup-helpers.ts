@@ -2,7 +2,7 @@
  * Non-component helpers for the Backup panel: filter-rule text format,
  * downloads and display formatting. (Folder picking: `@/lib/folder-picker`.)
  */
-import type { FilterRule } from "@/stores/backup-store";
+import type { BackupOptions, FilterRule } from "@/stores/backup-store";
 
 export const inputCls =
   "w-full px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-blue-500";
@@ -62,4 +62,17 @@ export function formatDate(s: string | null | undefined): string {
   if (!s) return "—";
   const d = new Date(s);
   return Number.isNaN(d.getTime()) ? s : d.toLocaleString();
+}
+
+/** Options that are per job by nature (the engine rejects global defaults for them). */
+const PER_JOB = new Set(["prefix", "block_size", "block_hash", "file_hash", "dry_run", "task_config", "changed_paths", "deleted_paths"]);
+
+/** Only the fields that differ from the built-in defaults become global defaults. */
+export function diffOptions(builtin: BackupOptions, edited: BackupOptions): Partial<BackupOptions> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(edited)) {
+    if (PER_JOB.has(k)) continue;
+    if (JSON.stringify(v) !== JSON.stringify((builtin as unknown as Record<string, unknown>)[k])) out[k] = v;
+  }
+  return out as Partial<BackupOptions>;
 }

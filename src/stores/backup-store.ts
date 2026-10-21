@@ -36,7 +36,23 @@ export interface SourceFilter {
 
 export type BackupDestination =
   | { type: "local"; path: string; alternate_paths: string[]; marker_file: string | null }
-  | { type: "connection"; connection_id: string; remote_path: string };
+  | { type: "connection"; connection_id: string; remote_path: string }
+  | { type: "library"; destination_id: string; remote_path: string };
+
+/** Named destination shared by several jobs. */
+export interface SavedDestination {
+  id: string;
+  name: string;
+  destination: Exclude<BackupDestination, { type: "library" }>;
+  created_at: string;
+}
+
+/** Defaults applied to every option a job leaves at the built-in value. */
+export interface GlobalDefaults {
+  options: Partial<BackupOptions>;
+  throttle: Throttle | null;
+  retry: RetryPolicy | null;
+}
 
 export type SymlinkPolicy = "store" | "follow" | "ignore";
 export type HardlinkPolicy = "all" | "first" | "none";
@@ -179,6 +195,8 @@ export interface BackupJob {
   retry: RetryPolicy;
   soft_delete_prefix: string | null;
   store_config_remotely: boolean;
+  remote_config_include_secrets: boolean;
+  network_timeout_secs: number;
   prevent_sleep: boolean;
   notify_on: string[];
   created_at: string;
@@ -489,6 +507,8 @@ export function newBackupJob(): BackupJob {
     retry: { retries: 3, delay_ms: 2000, exponential: true, max_delay_ms: 60000 },
     soft_delete_prefix: null,
     store_config_remotely: false,
+    remote_config_include_secrets: false,
+    network_timeout_secs: 0,
     prevent_sleep: true,
     notify_on: ["warning", "error"],
     created_at: now,

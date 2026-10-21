@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod connector_backend;
+pub mod defaults;
 pub mod hooks;
 pub mod policy;
 pub mod portability;
@@ -63,6 +64,13 @@ pub enum BackupDestination {
         #[serde(default)]
         remote_path: String,
     },
+    /// A named entry from the destination library; `remote_path` is an
+    /// optional sub-folder below it (so jobs can share one server).
+    Library {
+        destination_id: String,
+        #[serde(default)]
+        remote_path: String,
+    },
 }
 
 impl BackupDestination {
@@ -70,6 +78,7 @@ impl BackupDestination {
         match self {
             Self::Local { path, .. } => path.clone(),
             Self::Connection { connection_id, remote_path } => format!("connection {connection_id}:{remote_path}"),
+            Self::Library { destination_id, remote_path } => format!("library {destination_id}:{remote_path}"),
         }
     }
 }
@@ -108,8 +117,15 @@ pub struct BackupJob {
     pub retry: RetryPolicy,
     /// Rename volumes with this prefix instead of deleting them.
     pub soft_delete_prefix: Option<String>,
-    /// Embed this job's configuration (without secrets) in remote file lists.
+    /// Embed this job's configuration in remote file lists.
     pub store_config_remotely: bool,
+    /// Keep report URLs and script commands in the embedded configuration
+    /// (only for encrypted backups, where the file list is encrypted too).
+    #[serde(default)]
+    pub remote_config_include_secrets: bool,
+    /// Per-operation timeout for network destinations (0 = none).
+    #[serde(default)]
+    pub network_timeout_secs: u64,
     /// Keep the computer awake while this job's operations run.
     pub prevent_sleep: bool,
     /// Results that raise a desktop notification: `success`, `warning`, `error`.
@@ -139,6 +155,8 @@ impl Default for BackupJob {
             retry: RetryPolicy { retries: 3, delay_ms: 2000, exponential: true, max_delay_ms: 60_000 },
             soft_delete_prefix: None,
             store_config_remotely: false,
+            remote_config_include_secrets: false,
+            network_timeout_secs: 0,
             prevent_sleep: true,
             notify_on: vec!["warning".into(), "error".into()],
             created_at: now.clone(),
@@ -163,7 +181,13 @@ impl BackupJob {
             BackupDestination::Connection { connection_id, .. } if uuid::Uuid::parse_str(connection_id).is_err() => {
                 return Err(AppError::validation("Choose a saved connection as destination"))
             }
+            BackupDestination::Library { destination_id, .. } if destination_id.trim().is_empty() => {
+                return Err(AppError::validation("Choose a destination from the library"))
+            }
             _ => {}
+        }
+        if self.remote_config_include_secrets && !self.encrypted {
+            return Err(AppError::validation("Secrets can only be stored in the backup when it is encrypted"));
         }
         for s in &self.sources {
             if let BackupDestination::Local { path, .. } = &self.destination {
@@ -372,12 +396,13 @@ impl BackupManager {
     }
 
     async fn check_policy(&self, job: &BackupJob) -> Result<(), AppError> {
-        let protocol = match &job.destination {
+        let protocol = match self.resolve_destination(&job.destination).await? {
             BackupDestination::Local { .. } => "local".to_string(),
-            BackupDestination::Connection { connection_id, .. } => match (&self.inner.conns, uuid::Uuid::parse_str(connection_id)) {
+            BackupDestination::Connection { connection_id, .. } => match (&self.inner.conns, uuid::Uuid::parse_str(&connection_id)) {
                 (Some(c), Ok(id)) => c.get_connection(id).await?.map(|p| p.protocol.as_str().to_string()).unwrap_or_default(),
                 _ => String::new(),
             },
+            BackupDestination::Library { .. } => String::new(),
         };
         self.module_policy().check_job(&protocol, job.encrypted, job.options.compression_level > 0)
     }
@@ -559,6 +584,30 @@ impl BackupManager {
     // ── Destinations ──
 
     pub async fn backend_for(&self, dest: &BackupDestination, throttle: Throttle, retry: RetryPolicy, soft_delete: Option<String>) -> Result<Box<dyn Backend>, AppError> {
+        self.backend_with_timeout(dest, throttle, retry, soft_delete, 0).await
+    }
+
+    /// Resolve a library entry to its concrete destination (with sub-folder).
+    pub async fn resolve_destination(&self, dest: &BackupDestination) -> Result<BackupDestination, AppError> {
+        let BackupDestination::Library { destination_id, remote_path } = dest else { return Ok(dest.clone()) };
+        let entry = self.list_destinations().await?.into_iter().find(|d| &d.id == destination_id)
+            .ok_or_else(|| AppError::not_found("The library destination no longer exists"))?;
+        let sub = remote_path.trim().trim_matches(['/', '\\']);
+        Ok(match entry.destination {
+            BackupDestination::Local { path, alternate_paths, marker_file } if !sub.is_empty() => BackupDestination::Local {
+                path: Path::new(&path).join(sub).to_string_lossy().into_owned(),
+                alternate_paths: alternate_paths.iter().map(|p| Path::new(p).join(sub).to_string_lossy().into_owned()).collect(),
+                marker_file,
+            },
+            BackupDestination::Connection { connection_id, remote_path: base } if !sub.is_empty() => {
+                BackupDestination::Connection { connection_id, remote_path: format!("{}/{sub}", base.trim_end_matches('/')) }
+            }
+            other => other,
+        })
+    }
+
+    async fn backend_with_timeout(&self, dest: &BackupDestination, throttle: Throttle, retry: RetryPolicy, soft_delete: Option<String>, timeout_secs: u64) -> Result<Box<dyn Backend>, AppError> {
+        let dest = &self.resolve_destination(dest).await?;
         let raw: Box<dyn Backend> = match dest {
             BackupDestination::Local { path, alternate_paths, marker_file } => {
                 if alternate_paths.is_empty() && marker_file.is_none() {
@@ -574,8 +623,11 @@ impl BackupManager {
                 let id = uuid::Uuid::parse_str(connection_id).map_err(|_| AppError::validation("Invalid connection id"))?;
                 let profile = conns.get_connection(id).await?.ok_or_else(|| AppError::not_found("The destination connection no longer exists"))?;
                 let secret = conns.get_password(id).await.unwrap_or(None);
-                Box::new(connector_backend::ConnectorBackend::connect(&profile, secret, remote_path).await?)
+                let mut b = connector_backend::ConnectorBackend::connect(&profile, secret, remote_path).await?;
+                b.set_timeout((timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs)));
+                Box::new(b)
             }
+            BackupDestination::Library { .. } => return Err(AppError::validation("A library destination cannot point at another library entry")),
         };
         let b: Box<dyn Backend> = Box::new(RetryingBackend::new(raw, retry, throttle));
         Ok(match soft_delete.filter(|p| !p.is_empty()) {
@@ -585,7 +637,140 @@ impl BackupManager {
     }
 
     async fn build_backend(&self, job: &BackupJob) -> Result<Box<dyn Backend>, AppError> {
-        self.backend_for(&job.destination, job.throttle, job.retry, job.soft_delete_prefix.clone()).await
+        self.backend_with_timeout(&job.destination, job.throttle, job.retry, job.soft_delete_prefix.clone(), job.network_timeout_secs).await
+    }
+
+    // ── Shared settings: global defaults and destination library ──
+
+    async fn config_get(&self, key: &'static str) -> Result<Option<String>, AppError> {
+        self.inner.pool.execute(move |c| Ok(c.query_row("SELECT value FROM config WHERE key = ?1", [key], |r| r.get(0)).ok())).await
+    }
+
+    async fn config_set(&self, key: &'static str, value: String) -> Result<(), AppError> {
+        self.inner
+            .pool
+            .execute(move |c| {
+                c.execute(
+                    "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+                    rusqlite::params![key, value, Utc::now().to_rfc3339()],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn global_defaults(&self) -> Result<defaults::GlobalDefaults, AppError> {
+        Ok(self.config_get(defaults::DEFAULTS_KEY).await?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+    }
+
+    pub async fn set_global_defaults(&self, d: defaults::GlobalDefaults) -> Result<defaults::GlobalDefaults, AppError> {
+        d.validate()?;
+        self.config_set(defaults::DEFAULTS_KEY, serde_json::to_string(&d)?).await?;
+        Ok(d)
+    }
+
+    /// A job with the global defaults applied (what actually runs).
+    pub async fn effective_job(&self, job_id: &str) -> Result<BackupJob, AppError> {
+        let mut j = self.get_job(job_id).await?;
+        self.global_defaults().await?.apply(&mut j)?;
+        Ok(j)
+    }
+
+    pub async fn list_destinations(&self) -> Result<Vec<defaults::SavedDestination>, AppError> {
+        Ok(self.config_get(defaults::LIBRARY_KEY).await?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+    }
+
+    pub async fn save_destination(&self, mut d: defaults::SavedDestination) -> Result<defaults::SavedDestination, AppError> {
+        d.validate()?;
+        let mut all = self.list_destinations().await?;
+        if d.id.is_empty() {
+            d.id = uuid::Uuid::new_v4().to_string();
+            d.created_at = Utc::now().to_rfc3339();
+        }
+        match all.iter_mut().find(|x| x.id == d.id) {
+            Some(x) => *x = d.clone(),
+            None => all.push(d.clone()),
+        }
+        self.config_set(defaults::LIBRARY_KEY, serde_json::to_string(&all)?).await?;
+        Ok(d)
+    }
+
+    pub async fn delete_destination(&self, id: &str) -> Result<(), AppError> {
+        let users: Vec<String> = self.inner.jobs.read().await.values()
+            .filter(|j| matches!(&j.destination, BackupDestination::Library { destination_id, .. } if destination_id == id))
+            .map(|j| j.name.clone())
+            .collect();
+        if !users.is_empty() {
+            return Err(AppError::validation(format!("Still used by: {}", users.join(", "))));
+        }
+        let mut all = self.list_destinations().await?;
+        all.retain(|x| x.id != id);
+        self.config_set(defaults::LIBRARY_KEY, serde_json::to_string(&all)?).await
+    }
+
+    /// Continue an existing backup on this computer: create a job for the
+    /// repository (from its stored configuration when present), map old
+    /// source folders to new ones, and rebuild the local database from the
+    /// destination so the version history and deduplication carry on.
+    pub async fn adopt_repository(
+        &self,
+        dest: BackupDestination,
+        passphrase: Option<String>,
+        prefix: String,
+        name: Option<String>,
+        sources: Vec<String>,
+        source_map: Vec<(String, String)>,
+    ) -> Result<BackupJob, AppError> {
+        let stored = self.discover_remote_config(dest.clone(), passphrase.clone(), prefix.clone()).await?;
+        let mut job: BackupJob = match stored {
+            Some(v) => serde_json::from_value(v).map_err(|e| AppError::validation(format!("The stored configuration is unreadable: {e}")))?,
+            None => BackupJob::default(),
+        };
+        job.id = String::new();
+        job.stats = JobStats::default();
+        job.destination = dest;
+        job.options.prefix = prefix;
+        job.encrypted = passphrase.as_deref().is_some_and(|p| !p.is_empty());
+        if !job.encrypted {
+            job.remote_config_include_secrets = false;
+        }
+        if let Some(n) = name.filter(|n| !n.trim().is_empty()) {
+            job.name = n;
+        } else if job.name.trim().is_empty() {
+            job.name = "Continued backup".into();
+        }
+        if !sources.is_empty() {
+            job.sources = sources;
+        }
+        for s in job.sources.iter_mut() {
+            if let Some((from, to)) = source_map.iter().find(|(f, _)| !f.is_empty() && s.starts_with(f.as_str())) {
+                *s = format!("{to}{}", &s[from.len()..]);
+            }
+        }
+        if job.sources.is_empty() {
+            return Err(AppError::validation("No stored configuration found: give the source folders to back up"));
+        }
+        let job = self.save_job(job, passphrase.clone()).await?;
+        let result = async {
+            let backend = self.build_backend(&job).await?;
+            let db_path = self.job_db_path(&job.id);
+            let pfx = job.options.prefix.clone();
+            blocking(move || {
+                if let Some(d) = db_path.parent() {
+                    std::fs::create_dir_all(d)?;
+                }
+                let db = BackupDb::open(&db_path)?;
+                maintenance::recreate_database(backend.as_ref(), &db, passphrase.as_deref(), &pfx, &OpContext::new()).map(|_| ())
+            })
+            .await
+        }
+        .await;
+        if let Err(e) = result {
+            let _ = self.delete_job(&job.id, true, false).await;
+            return Err(e);
+        }
+        self.refresh_stats(&job.id, None).await;
+        self.get_job(&job.id).await
     }
 
     /// Test a destination; optionally create the folder. Returns the number of files present.
@@ -747,6 +932,10 @@ impl BackupManager {
         let started = Utc::now();
         let op_name = op.name();
         let mut log: Vec<LogLine> = Vec::new();
+        let mut job = job;
+        if let Err(e) = self.global_defaults().await.and_then(|d| d.apply(&mut job)) {
+            log.push(LogLine::warn(format!("Global defaults not applied: {}", e.user_message())));
+        }
         let _awake = job.prevent_sleep.then(|| power::SleepInhibitor::acquire(&format!("UFOP {op_name}: {}", job.name)));
         let is_backup = matches!(op, BackupOperation::Backup { .. });
 
@@ -1199,7 +1388,11 @@ fn run_core(
             let filter = job.filter.clone().compile()?;
             let mut opts = job.options.clone();
             opts.dry_run = dry_run;
-            opts.task_config = if job.store_config_remotely { Some(portability::stripped_config(job)?) } else { None };
+            opts.task_config = match (job.store_config_remotely, job.remote_config_include_secrets && job.encrypted) {
+                (false, _) => None,
+                (true, false) => Some(portability::stripped_config(job)?),
+                (true, true) => Some(portability::full_config(job)?),
+            };
             let sources: Vec<PathBuf> = job.sources.iter().map(PathBuf::from).collect();
             serde_json::to_value(ufop_core::backup::run_backup(backend, &db, &sources, &filter, &opts, &job.retention, pass, kdf, ctx)?)?
         }

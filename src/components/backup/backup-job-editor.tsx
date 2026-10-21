@@ -13,6 +13,7 @@ import {
   type FilterRule,
   type PassphraseStrength,
   type RetentionPolicy,
+  type SavedDestination,
   type SourcePreview,
 } from "@/stores/backup-store";
 import { inputCls, rulesToText, textToRules } from "@/lib/backup-helpers";
@@ -46,11 +47,13 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
   const [filterText, setFilterText] = useState<string | null>(null);
   const [preview, setPreview] = useState<SourcePreview | null>(null);
   const [connections, setConnections] = useState<ConnectionProfile[]>([]);
+  const [library, setLibrary] = useState<SavedDestination[]>([]);
   const isNew = job.id === "";
 
   useEffect(() => {
     void loadCapabilities();
     tauriInvoke<ConnectionProfile[]>("list_connections", undefined, []).then(setConnections).catch(() => setConnections([]));
+    tauriInvoke<SavedDestination[]>("backup_list_destinations", undefined, []).then(setLibrary).catch(() => setLibrary([]));
   }, [loadCapabilities]);
 
   useEffect(() => {
@@ -289,8 +292,28 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 <input type="radio" checked={dest.type === "connection"} onChange={() => setDest({ type: "connection", connection_id: "", remote_path: "" })} />
                 Saved connection
               </label>
+              <label className="flex items-center gap-1">
+                <input type="radio" checked={dest.type === "library"} onChange={() => setDest({ type: "library", destination_id: "", remote_path: "" })} />
+                Destination library
+              </label>
             </div>
-            {dest.type === "local" ? (
+            {dest.type === "library" ? (
+              <>
+                <Field label="Library destination" hint="Manage the library under Backups → Defaults & destinations.">
+                  <select data-testid="backup-dest-library" className={inputCls} value={dest.destination_id} onChange={(e) => setDest({ ...dest, destination_id: e.target.value })}>
+                    <option value="">Choose…</option>
+                    {library.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.name}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="Sub-folder (optional)" hint="Keeps this job's files apart when several jobs share the destination.">
+                  <input className={inputCls} value={dest.remote_path} onChange={(e) => setDest({ ...dest, remote_path: e.target.value })} />
+                </Field>
+              </>
+            ) : dest.type === "local" ? (
               <>
                 <Field label="Folder">
                   <PathInput value={dest.path} onChange={(v) => setDest({ ...dest, path: v })} placeholder="/Volumes/Backup/ufop or \\\\nas\\backups" testId="backup-dest-path" />
@@ -497,7 +520,15 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
               </div>
               <Check label="Compact automatically" checked={job.options.auto_compact} onChange={(v) => patchOpts({ auto_compact: v })} />
               <Check label="Upload an unencrypted verification manifest (sizes + SHA-256)" checked={job.options.upload_verification_file} onChange={(v) => patchOpts({ upload_verification_file: v })} />
-              <Check label="Store this job's configuration in the backup (without secrets)" checked={job.store_config_remotely} onChange={(v) => patch({ store_config_remotely: v })} hint="Lets you recreate the job from the destination after losing this computer." />
+              <Check label="Store this job's configuration in the backup" checked={job.store_config_remotely} onChange={(v) => patch({ store_config_remotely: v, remote_config_include_secrets: v && job.remote_config_include_secrets })} hint="Lets you recreate the job from the destination after losing this computer." />
+              {job.store_config_remotely && (
+                <Check
+                  label="Include report URLs and scripts (encrypted backups only)"
+                  checked={job.remote_config_include_secrets}
+                  onChange={(v) => patch({ remote_config_include_secrets: v && job.encrypted })}
+                  hint={job.encrypted ? "They are stored inside the encrypted file list." : "Turn on encryption to store secrets."}
+                />
+              )}
               <Field label="Soft-delete prefix (rename instead of delete)">
                 <input className={inputCls} value={job.soft_delete_prefix ?? ""} placeholder="e.g. deleted-" onChange={(e) => patch({ soft_delete_prefix: e.target.value || null })} />
               </Field>
@@ -512,6 +543,9 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 </Field>
                 <Field label="Retries">
                   <input className={inputCls} type="number" min={0} max={20} value={job.retry.retries} onChange={(e) => patch({ retry: { ...job.retry, retries: Math.max(0, Number(e.target.value)) } })} />
+                </Field>
+                <Field label="Network timeout per operation (s, 0 = none)">
+                  <input className={inputCls} type="number" min={0} value={job.network_timeout_secs} onChange={(e) => patch({ network_timeout_secs: Math.max(0, Math.floor(Number(e.target.value) || 0)) })} />
                 </Field>
                 <Field label="Retry delay (s)">
                   <input className={inputCls} type="number" min={0} value={Math.round(job.retry.delay_ms / 1000)} onChange={(e) => patch({ retry: { ...job.retry, delay_ms: Math.max(0, Number(e.target.value)) * 1000 } })} />

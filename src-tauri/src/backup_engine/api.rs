@@ -172,6 +172,22 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
         "backup_generate_passphrase" => ok(crypto::generate_passphrase(opt(a, "length")?.unwrap_or(32))),
         "backup_capabilities" => ok(capabilities(mgr)),
         "backup_preview_sources" => ok(preview_sources(arg(a, "job")?).await?),
+        "backup_get_global_defaults" => ok(mgr.global_defaults().await?),
+        "backup_set_global_defaults" => ok(mgr.set_global_defaults(arg(a, "defaults")?).await?),
+        "backup_effective_job" => ok(mgr.effective_job(&arg::<String>(a, "id")?).await?),
+        "backup_list_destinations" => ok(mgr.list_destinations().await?),
+        "backup_save_destination" => ok(mgr.save_destination(arg(a, "destination")?).await?),
+        "backup_delete_destination" => ok(mgr.delete_destination(&arg::<String>(a, "id")?).await?),
+        "backup_adopt_repository" => ok(mgr
+            .adopt_repository(
+                arg(a, "destination")?,
+                opt(a, "passphrase")?,
+                prefix()?,
+                opt(a, "name")?,
+                opt(a, "sources")?.unwrap_or_default(),
+                opt(a, "sourceMap")?.unwrap_or_default(),
+            )
+            .await?),
         other => Err(AppError::validation(format!("Unknown command '{other}'"))),
     }
 }
@@ -183,5 +199,7 @@ pub const COMMANDS: &[&str] = &[
     "backup_resume", "backup_list_versions", "backup_list_files", "backup_search", "backup_compare", "backup_run_history",
     "backup_prune_history", "backup_export_config", "backup_import_config", "backup_export_is_encrypted", "backup_export_cli",
     "backup_browse_remote", "backup_direct_restore", "backup_discover_remote_config", "backup_passphrase_strength",
-    "backup_generate_passphrase", "backup_capabilities", "backup_preview_sources",
+    "backup_generate_passphrase", "backup_capabilities", "backup_preview_sources", "backup_get_global_defaults",
+    "backup_set_global_defaults", "backup_effective_job", "backup_list_destinations", "backup_save_destination",
+    "backup_delete_destination", "backup_adopt_repository",
 ];

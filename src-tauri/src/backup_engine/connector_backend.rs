@@ -32,6 +32,7 @@ pub struct ConnectorBackend {
     dir: String,
     label: String,
     rt: Handle,
+    timeout: Option<std::time::Duration>,
 }
 
 impl ConnectorBackend {
@@ -52,7 +53,25 @@ impl ConnectorBackend {
             label: format!("{protocol}://{}{}", profile.host, dir),
             dir: dir.trim_end_matches('/').to_string(),
             rt: Handle::current(),
+            timeout: None,
         })
+    }
+
+    /// Fail an operation that takes longer than `t` (network timeout).
+    pub fn set_timeout(&mut self, t: Option<std::time::Duration>) {
+        self.timeout = t;
+    }
+
+    fn wait<T>(&self, what: &str, f: impl std::future::Future<Output = Result<T, AppError>>) -> Result<T, AppError> {
+        match self.timeout {
+            None => self.rt.block_on(f),
+            Some(t) => self.rt.block_on(async { tokio::time::timeout(t, f).await }).unwrap_or_else(|_| {
+                Err(AppError::connection(
+                    format!("{what} on {} timed out after {}s", self.label, t.as_secs()),
+                    "Check the connection or raise the job's network timeout.",
+                ))
+            }),
+        }
     }
 
     fn remote(&self, name: &str) -> String {
@@ -80,34 +99,34 @@ impl Backend for ConnectorBackend {
 
     fn list(&self) -> Result<Vec<RemoteFile>, AppError> {
         let dir = if self.dir.is_empty() { "/".to_string() } else { self.dir.clone() };
-        let entries = self.rt.block_on(self.connector.list_remote(&dir))?;
+        let entries = self.wait("Listing", self.connector.list_remote(&dir))?;
         Ok(entries.into_iter().filter(|e| !e.is_dir).map(|e| RemoteFile { name: e.name, size: e.size }).collect())
     }
 
     fn put(&self, name: &str, data: &[u8]) -> Result<(), AppError> {
         let tmp = Self::staging(name);
         std::fs::write(&tmp, data)?;
-        let r = self.rt.block_on(self.connector.upload(&tmp.to_string_lossy(), &self.remote(name)));
+        let r = self.wait("Upload", self.connector.upload(&tmp.to_string_lossy(), &self.remote(name)));
         let _ = std::fs::remove_file(&tmp);
         r.map(|_| ())
     }
 
     fn get(&self, name: &str) -> Result<Vec<u8>, AppError> {
         let tmp = Self::staging(name);
-        let r = self.rt.block_on(self.connector.download(&self.remote(name), &tmp.to_string_lossy()));
+        let r = self.wait("Download", self.connector.download(&self.remote(name), &tmp.to_string_lossy()));
         let data = r.and_then(|_| Ok(std::fs::read(&tmp)?));
         let _ = std::fs::remove_file(&tmp);
         data
     }
 
     fn delete(&self, name: &str) -> Result<(), AppError> {
-        self.rt.block_on(self.connector.remove(&self.remote(name), false))
+        self.wait("Delete", self.connector.remove(&self.remote(name), false))
     }
 
     fn create_folder(&self) -> Result<(), AppError> {
         if self.list().is_ok() {
             return Ok(());
         }
-        self.rt.block_on(self.connector.make_directory(&self.dir))
+        self.wait("Creating the folder", self.connector.make_directory(&self.dir))
     }
 }
