@@ -21,6 +21,7 @@ import { pickFolder } from "@/lib/folder-picker";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { BackupAdvancedOptions } from "./backup-advanced-options";
 import { BackupReplicas } from "./backup-replicas";
+import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
 
 interface ConnectionProfile {
   id: string;
@@ -298,8 +299,14 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 <input type="radio" checked={dest.type === "library"} onChange={() => setDest({ type: "library", destination_id: "", remote_path: "" })} />
                 Destination library
               </label>
+              <label className="flex items-center gap-1">
+                <input type="radio" data-testid="dest-cloud" checked={dest.type === "cloud"} onChange={() => setDest({ type: "cloud", config: newCloudConfig("s3"), credential_id: crypto.randomUUID() })} />
+                Cloud / network service
+              </label>
             </div>
-            {dest.type === "library" ? (
+            {dest.type === "cloud" ? (
+              <CloudDestinationForm config={dest.config} credentialId={dest.credential_id} onChange={(c) => setDest({ ...dest, config: c })} />
+            ) : dest.type === "library" ? (
               <>
                 <Field label="Library destination" hint="Manage the library under Backups → Defaults & destinations.">
                   <select data-testid="backup-dest-library" className={inputCls} value={dest.destination_id} onChange={(e) => setDest({ ...dest, destination_id: e.target.value })}>

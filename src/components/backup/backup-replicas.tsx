@@ -6,6 +6,7 @@
 import { inputCls } from "@/lib/backup-helpers";
 import type { BackupDestination, Replica, ReplicaSchedule, SavedDestination } from "@/stores/backup-store";
 import { Btn, Check, Field, PathInput, Section } from "./backup-ui";
+import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
 
 interface Conn {
   id: string;
@@ -40,14 +41,18 @@ function DestinationPicker({ value, onChange, connections, library }: { value: B
               ? { type: "local", path: "", alternate_paths: [], marker_file: null }
               : e.target.value === "connection"
                 ? { type: "connection", connection_id: "", remote_path: "" }
-                : { type: "library", destination_id: "", remote_path: "" },
+                : e.target.value === "cloud"
+                  ? { type: "cloud", config: newCloudConfig("s3"), credential_id: crypto.randomUUID() }
+                  : { type: "library", destination_id: "", remote_path: "" },
           )
         }
       >
         <option value="local">Folder / drive / mounted share</option>
         <option value="connection">Saved connection</option>
         <option value="library">Destination library</option>
+        <option value="cloud">Cloud / network service</option>
       </select>
+      {value.type === "cloud" && <CloudDestinationForm config={value.config} credentialId={value.credential_id} onChange={(c) => onChange({ ...value, config: c })} />}
       {value.type === "local" && <PathInput value={value.path} onChange={(p) => onChange({ ...value, path: p })} placeholder="/Volumes/Offsite" />}
       {value.type === "connection" && (
         <div className="grid grid-cols-2 gap-1">

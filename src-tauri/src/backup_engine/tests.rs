@@ -383,3 +383,34 @@ async fn replicas_mirror_after_backup_and_on_demand() {
     let r = m.execute(&j.id, BackupOperation::ApplyLocks { days: 1, mode: ufop_core::backup::backend::LockMode::Governance, all: false }).await;
     assert!(r.is_err_and(|e| e.user_message().contains("does not support object locks")));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cloud_destination_through_manager() {
+    if std::process::Command::new("rclone").arg("version").output().is_err() {
+        return;
+    }
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"to the cloud").unwrap();
+    let m = manager(t.path()).await;
+    let cloud = BackupDestination::Cloud {
+        config: stores::CloudConfig::Rclone(stores::rclone::RcloneConfig { remote: ":local:".into(), path: t.path().join("remote").to_string_lossy().into(), ..Default::default() }),
+        credential_id: "cred-1".into(),
+    };
+    m.set_destination_secret("cred-1", "unused-config-pass").await.unwrap();
+    assert!(m.has_destination_secret("cred-1").await.unwrap());
+    let mut jb = job(&src, &t.path().join("unused"));
+    jb.destination = cloud.clone();
+    let j = m.save_job(jb, Some("pw".into())).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert!(t.path().join("remote/ufop-repo.json").exists());
+    let out = t.path().join("out");
+    let rr = m.direct_restore(cloud, Some("pw".into()), "ufop".into(), RestoreOptions { target: Some(out.clone()), ..Default::default() }).await.unwrap();
+    assert_eq!(rr.files_restored, 1);
+    m.set_destination_secret("cred-1", "").await.unwrap();
+    assert!(!m.has_destination_secret("cred-1").await.unwrap());
+    assert!(m.set_destination_secret("", "x").await.is_err());
+    assert!(serde_json::to_value(stores::PROVIDERS).unwrap().as_array().unwrap().len() >= 13);
+}

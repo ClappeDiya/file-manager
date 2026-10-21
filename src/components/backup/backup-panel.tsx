@@ -102,7 +102,9 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
             ? job.destination.path
             : job.destination.type === "library"
               ? `library destination${job.destination.remote_path ? ` / ${job.destination.remote_path}` : ""}`
-              : `connection ${job.destination.remote_path}`}</div>
+              : job.destination.type === "cloud"
+                ? `${job.destination.config.provider} cloud destination`
+                : `connection ${job.destination.remote_path}`}</div>
         <div>Last run: {formatDate(job.stats.last_run_at)}</div>
         <div>Next: {next ? formatDate(next.next_run_at) : describeSchedule(job.schedule)}</div>
         <div>Source: {formatBytes(job.stats.source_size)} · Stored: {formatBytes(job.stats.backend_size)}</div>

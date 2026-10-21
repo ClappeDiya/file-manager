@@ -130,6 +130,10 @@ pub fn cli_command(job: &BackupJob) -> String {
             parts.push("--dest".into());
             parts.push(quote(&format!("library://{destination_id}/{remote_path}")));
         }
+        BackupDestination::Cloud { config, .. } => {
+            parts.push("--dest".into());
+            parts.push(quote(&config.describe()));
+        }
     }
     parts.push("--dbpath".into());
     parts.push(quote(&super::default_data_dir().join(format!("{}.sqlite", job.id)).to_string_lossy()));

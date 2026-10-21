@@ -125,7 +125,11 @@ function DestinationLibrary() {
           <li key={d.id} className="flex items-center gap-2 py-1">
             <span className="font-medium">{d.name}</span>
             <span className="text-zinc-500 truncate flex-1">
-              {d.destination.type === "local" ? d.destination.path : `connection ${d.destination.connection_id}:${d.destination.remote_path}`}
+              {d.destination.type === "local"
+                ? d.destination.path
+                : d.destination.type === "cloud"
+                  ? `${d.destination.config.provider} cloud destination`
+                  : `connection ${d.destination.connection_id}:${d.destination.remote_path}`}
             </span>
             <Btn tone="danger" onClick={() => void remove(d.id)}>
               Remove

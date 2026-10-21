@@ -35,6 +35,7 @@ directories = "6"
 # T-015/T-016: Bandwidth throttling, checksums, hashing
 md-5 = "0.10"
 sha2 = "0.10"
+sha1 = "0.10"
 digest = "0.10"
 # Transfer integrity: xxHash3 for fast hashing, ring for SHA-256
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

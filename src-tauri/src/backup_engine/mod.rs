@@ -16,6 +16,7 @@ pub mod policy;
 pub mod portability;
 pub mod power;
 pub mod schedule;
+pub mod stores;
 
 use crate::connectors::ConnectionManager;
 use crate::core::error::AppError;
@@ -65,6 +66,14 @@ pub enum BackupDestination {
         #[serde(default)]
         remote_path: String,
     },
+    /// A native cloud / network store (S3, Azure, GCS, B2, Swift, Dropbox,
+    /// Google Drive, Box, pCloud, OneDrive/SharePoint, Tahoe-LAFS, rclone,
+    /// SMB). The secret lives in the credential store under `credential_id`.
+    Cloud {
+        config: stores::CloudConfig,
+        #[serde(default)]
+        credential_id: String,
+    },
     /// A named entry from the destination library; `remote_path` is an
     /// optional sub-folder below it (so jobs can share one server).
     Library {
@@ -80,6 +89,7 @@ impl BackupDestination {
             Self::Local { path, .. } => path.clone(),
             Self::Connection { connection_id, remote_path } => format!("connection {connection_id}:{remote_path}"),
             Self::Library { destination_id, remote_path } => format!("library {destination_id}:{remote_path}"),
+            Self::Cloud { config, .. } => config.describe(),
         }
     }
 }
@@ -497,6 +507,7 @@ pub struct BackupManager {
 }
 
 const PASS_KEY_PREFIX: &str = "backup-passphrase:";
+const DEST_KEY_PREFIX: &str = "backup-destination-secret:";
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -559,6 +570,7 @@ impl BackupManager {
                 _ => String::new(),
             },
             BackupDestination::Library { .. } => String::new(),
+            BackupDestination::Cloud { config, .. } => config.provider().to_string(),
         };
         self.module_policy().check_job(&protocol, job.encrypted, job.options.compression_level > 0)
     }
@@ -695,6 +707,41 @@ impl BackupManager {
         }
     }
 
+    /// Store (or, with an empty value, remove) a cloud destination's secret.
+    pub async fn set_destination_secret(&self, credential_id: &str, secret: &str) -> Result<(), AppError> {
+        if credential_id.trim().is_empty() || credential_id.len() > 128 {
+            return Err(AppError::validation("Invalid credential id"));
+        }
+        let key = format!("{DEST_KEY_PREFIX}{credential_id}");
+        if secret.is_empty() {
+            if let Some(db) = self.secret_db() {
+                let _ = db.delete(&key).await;
+            }
+            let _ = self.inner.creds.delete(&key).await;
+            return Ok(());
+        }
+        match self.secret_db() {
+            Some(db) => db.set_secret(&key, secret).await,
+            None => self.inner.creds.store(&key, secret).await,
+        }
+    }
+
+    async fn destination_secret(&self, credential_id: &str) -> Result<Option<String>, AppError> {
+        if credential_id.is_empty() {
+            return Ok(None);
+        }
+        let key = format!("{DEST_KEY_PREFIX}{credential_id}");
+        match self.secret_db() {
+            Some(db) => db.get_secret(&key).await,
+            None => self.inner.creds.retrieve(&key).await,
+        }
+    }
+
+    /// Whether a secret is stored for a destination (never returns it).
+    pub async fn has_destination_secret(&self, credential_id: &str) -> Result<bool, AppError> {
+        Ok(self.destination_secret(credential_id).await?.is_some_and(|s| !s.is_empty()))
+    }
+
     /// Route run results to OS notifications (set by the desktop app).
     pub fn set_notifier(&self, n: Notifier) {
         let _ = self.inner.notifier.set(n);
@@ -800,6 +847,11 @@ impl BackupManager {
                 Box::new(b)
             }
             BackupDestination::Library { .. } => return Err(AppError::validation("A library destination cannot point at another library entry")),
+            BackupDestination::Cloud { config, credential_id } => {
+                let secret = self.destination_secret(credential_id).await?;
+                let store = stores::open(config, secret).await?;
+                Box::new(stores::StoreBackend::new(store, (timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs))))
+            }
         };
         let b: Box<dyn Backend> = Box::new(RetryingBackend::new(raw, retry, throttle));
         Ok(match soft_delete.filter(|p| !p.is_empty()) {

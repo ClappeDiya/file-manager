@@ -37,7 +37,19 @@ export interface SourceFilter {
 export type BackupDestination =
   | { type: "local"; path: string; alternate_paths: string[]; marker_file: string | null }
   | { type: "connection"; connection_id: string; remote_path: string }
-  | { type: "library"; destination_id: string; remote_path: string };
+  | { type: "library"; destination_id: string; remote_path: string }
+  | { type: "cloud"; config: CloudConfig; credential_id: string };
+
+/** Provider settings; `provider` selects the Rust `CloudConfig` variant. */
+export type CloudConfig = { provider: string } & Record<string, unknown>;
+
+export interface CloudProviderInfo {
+  id: string;
+  name: string;
+  secret: string;
+  verified: "emulator" | "real-server" | "cli" | "api-mock";
+  hidden: boolean;
+}
 
 /** Named destination shared by several jobs. */
 export interface SavedDestination {

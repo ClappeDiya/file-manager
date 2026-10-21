@@ -190,6 +190,9 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
         "backup_remote_put" => ok(mgr.remote_put(arg(a, "destination")?, arg(a, "localPath")?, arg(a, "name")?).await?),
         "backup_remote_delete" => ok(mgr.remote_delete(arg(a, "destination")?, arg(a, "name")?, opt(a, "force")?.unwrap_or(false)).await?),
         "backup_start_operation" => ok(mgr.start_operation(&arg::<String>(a, "id")?, arg(a, "operation")?).await?),
+        "backup_set_destination_secret" => ok(mgr.set_destination_secret(&arg::<String>(a, "credentialId")?, &arg::<String>(a, "secret")?).await?),
+        "backup_has_destination_secret" => ok(mgr.has_destination_secret(&arg::<String>(a, "credentialId")?).await?),
+        "backup_cloud_providers" => ok(super::stores::PROVIDERS.to_vec()),
         "backup_adopt_repository" => ok(mgr
             .adopt_repository(
                 arg(a, "destination")?,
@@ -213,5 +216,5 @@ pub const COMMANDS: &[&str] = &[
     "backup_browse_remote", "backup_direct_restore", "backup_discover_remote_config", "backup_passphrase_strength",
     "backup_generate_passphrase", "backup_capabilities", "backup_preview_sources", "backup_get_global_defaults",
     "backup_set_global_defaults", "backup_effective_job", "backup_list_destinations", "backup_save_destination",
-    "backup_delete_destination", "backup_adopt_repository", "backup_database_inventory", "backup_cleanup_databases", "backup_recovery_download", "backup_recovery_index", "backup_recovery_list", "backup_recovery_restore", "backup_recovery_convert", "backup_remote_list", "backup_remote_get", "backup_remote_put", "backup_remote_delete", "backup_start_operation",
+    "backup_delete_destination", "backup_adopt_repository", "backup_database_inventory", "backup_cleanup_databases", "backup_recovery_download", "backup_recovery_index", "backup_recovery_list", "backup_recovery_restore", "backup_recovery_convert", "backup_remote_list", "backup_remote_get", "backup_remote_put", "backup_remote_delete", "backup_start_operation", "backup_set_destination_secret", "backup_has_destination_secret", "backup_cloud_providers",
 ];

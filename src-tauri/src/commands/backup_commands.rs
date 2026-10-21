@@ -263,6 +263,21 @@ pub async fn backup_start_operation(id: String, operation: BackupOperation, mgr:
 }
 
 #[tauri::command]
+pub async fn backup_set_destination_secret(credential_id: String, secret: String, mgr: State<'_, BackupManager>) -> Result<(), AppError> {
+    mgr.set_destination_secret(&credential_id, &secret).await
+}
+
+#[tauri::command]
+pub async fn backup_has_destination_secret(credential_id: String, mgr: State<'_, BackupManager>) -> Result<bool, AppError> {
+    mgr.has_destination_secret(&credential_id).await
+}
+
+#[tauri::command]
+pub async fn backup_cloud_providers() -> Result<Vec<crate::backup_engine::stores::ProviderInfo>, AppError> {
+    Ok(crate::backup_engine::stores::PROVIDERS.to_vec())
+}
+
+#[tauri::command]
 pub async fn backup_passphrase_strength(passphrase: String) -> Result<PassphraseStrength, AppError> {
     Ok(crypto::passphrase_strength(&passphrase))
 }
