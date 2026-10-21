@@ -151,6 +151,9 @@ impl<'a> Repo<'a> {
 
     /// Delete a volume, its index link and PAR2 files remotely and locally.
     pub(crate) fn delete_volume_files(&self, name: &str) -> Result<(), AppError> {
+        if let Some(until) = self.locked_until(name)? {
+            return Err(AppError::state(format!("{name} is locked until {until}"), "Locked volumes can be deleted once the lock expires."));
+        }
         self.backend.delete(name)?;
         if let Some(list) = self.db.get_kv(&Self::par2_key(name))? {
             for n in serde_json::from_str::<Vec<String>>(&list).unwrap_or_default() {
@@ -158,6 +161,16 @@ impl<'a> Repo<'a> {
             }
         }
         self.db.delete_volume(name)
+    }
+
+    /// The lock expiry of a volume, when it is still locked.
+    pub fn locked_until(&self, name: &str) -> Result<Option<String>, AppError> {
+        Ok(self.db.volume_by_name(name)?.and_then(|v| v.lock_until).filter(|u| DateTime::parse_from_rfc3339(u).is_ok_and(|t| t > Utc::now())))
+    }
+
+    /// PAR2 file names recorded for a volume.
+    pub(crate) fn recovery_names(&self, name: &str) -> Result<Vec<String>, AppError> {
+        Ok(self.db.get_kv(&Self::par2_key(name))?.and_then(|l| serde_json::from_str(&l).ok()).unwrap_or_default())
     }
 
     /// Download a volume, check its recorded SHA-256 and, when PAR2 data
@@ -1219,6 +1232,11 @@ pub fn run_backup_with_cipher(
     }
     ctx.source_released();
 
+    if let (Some(l), false) = (opts.object_lock, opts.dry_run) {
+        // Lock before retention/compaction can touch anything.
+        let r = super::maintenance::apply_locks(&repo, l.days, l.mode, false)?;
+        report.errors.extend(r.errors);
+    }
     if !opts.dry_run {
         progress(ctx, Phase::Retention, 0, 0, 0, None);
         report.versions_deleted = super::maintenance::apply_retention(&repo, retention, opts.allow_full_removal)? as u64;

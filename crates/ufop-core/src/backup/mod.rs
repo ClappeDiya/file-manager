@@ -21,6 +21,7 @@ pub mod engine;
 pub mod filters;
 pub mod maintenance;
 pub mod meta;
+pub mod mirror;
 pub mod modules;
 pub mod par2;
 pub mod recovery;
@@ -123,6 +124,15 @@ pub enum UsnPolicy {
     On,
     /// Fail the backup when the journal cannot be used.
     Required,
+}
+
+/// Object-lock retention for uploaded volumes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObjectLockOptions {
+    /// Retention period from the time of upload.
+    pub days: u32,
+    pub mode: backend::LockMode,
 }
 
 /// Optional PAR2 recovery data for uploaded volumes.
@@ -239,6 +249,8 @@ pub struct BackupOptions {
     pub auto_vacuum_interval_days: Option<u32>,
     /// Compare remote file names case-insensitively.
     pub remote_case_insensitive: bool,
+    /// Lock every new volume against deletion (S3 Object Lock and similar).
+    pub object_lock: Option<ObjectLockOptions>,
     /// Read sources from a VSS / LVM / APFS snapshot.
     pub snapshot_policy: snapshot::SnapshotPolicy,
     pub snapshot: snapshot::SnapshotOptions,
@@ -293,6 +305,7 @@ impl Default for BackupOptions {
             auto_compact_interval_days: None,
             auto_vacuum_interval_days: None,
             remote_case_insensitive: false,
+            object_lock: None,
             snapshot_policy: snapshot::SnapshotPolicy::Off,
             snapshot: snapshot::SnapshotOptions::default(),
         }

@@ -185,6 +185,11 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
         "backup_recovery_list" => ok(mgr.recovery_list(arg(a, "folder")?).await?),
         "backup_recovery_restore" => ok(mgr.recovery_restore(arg(a, "folder")?, arg(a, "version")?, opt(a, "paths")?.unwrap_or_default(), arg(a, "target")?).await?),
         "backup_recovery_convert" => ok(mgr.recovery_convert(arg(a, "folder")?, arg(a, "destination")?, arg(a, "options")?).await?),
+        "backup_remote_list" => ok(mgr.remote_list(arg(a, "destination")?).await?),
+        "backup_remote_get" => ok(mgr.remote_get(arg(a, "destination")?, arg(a, "name")?, arg(a, "localPath")?).await?),
+        "backup_remote_put" => ok(mgr.remote_put(arg(a, "destination")?, arg(a, "localPath")?, arg(a, "name")?).await?),
+        "backup_remote_delete" => ok(mgr.remote_delete(arg(a, "destination")?, arg(a, "name")?, opt(a, "force")?.unwrap_or(false)).await?),
+        "backup_start_operation" => ok(mgr.start_operation(&arg::<String>(a, "id")?, arg(a, "operation")?).await?),
         "backup_adopt_repository" => ok(mgr
             .adopt_repository(
                 arg(a, "destination")?,
@@ -208,5 +213,5 @@ pub const COMMANDS: &[&str] = &[
     "backup_browse_remote", "backup_direct_restore", "backup_discover_remote_config", "backup_passphrase_strength",
     "backup_generate_passphrase", "backup_capabilities", "backup_preview_sources", "backup_get_global_defaults",
     "backup_set_global_defaults", "backup_effective_job", "backup_list_destinations", "backup_save_destination",
-    "backup_delete_destination", "backup_adopt_repository", "backup_database_inventory", "backup_cleanup_databases", "backup_recovery_download", "backup_recovery_index", "backup_recovery_list", "backup_recovery_restore", "backup_recovery_convert",
+    "backup_delete_destination", "backup_adopt_repository", "backup_database_inventory", "backup_cleanup_databases", "backup_recovery_download", "backup_recovery_index", "backup_recovery_list", "backup_recovery_restore", "backup_recovery_convert", "backup_remote_list", "backup_remote_get", "backup_remote_put", "backup_remote_delete", "backup_start_operation",
 ];

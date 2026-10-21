@@ -65,7 +65,51 @@ fn is_hidden(name: &str, _metadata: &std::fs::Metadata) -> bool {
 pub const INTERNAL_DIRS: [&str; 2] = [".sync-rollback", ".sync-quarantine"];
 
 pub fn is_internal_entry(name: &str) -> bool {
-    INTERNAL_DIRS.contains(&name) || name.ends_with(super::copier::PARTIAL_SUFFIX)
+    INTERNAL_DIRS.contains(&name) || name == INVENTORY_FILE || name.ends_with(super::copier::PARTIAL_SUFFIX)
+}
+
+/// Destination inventory written after a clean run (`TrustedInventory`).
+pub const INVENTORY_FILE: &str = ".ufop-sync-inventory.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct InventoryEntry {
+    path: String,
+    size: u64,
+    modified: Option<DateTime<Utc>>,
+}
+
+/// Read the recorded destination state, if any.
+pub fn load_inventory(dest_root: &Path) -> Option<Vec<FileMeta>> {
+    let data = std::fs::read(dest_root.join(INVENTORY_FILE)).ok()?;
+    let entries: Vec<InventoryEntry> = serde_json::from_slice(&data).ok()?;
+    Some(
+        entries
+            .into_iter()
+            .map(|e| FileMeta {
+                absolute_path: dest_root.join(&e.path),
+                relative_path: e.path,
+                size: e.size,
+                modified: e.modified,
+                is_dir: false,
+                is_symlink: false,
+                hidden: false,
+                readonly: false,
+                attributes: 0,
+            })
+            .collect(),
+    )
+}
+
+/// Record the destination state for the next `TrustedInventory` run.
+pub fn save_inventory(dest_root: &Path, files: &[FileMeta]) -> std::io::Result<()> {
+    let entries: Vec<InventoryEntry> = files
+        .iter()
+        .filter(|f| !f.is_dir)
+        .map(|f| InventoryEntry { path: f.relative_path.clone(), size: f.size, modified: f.modified })
+        .collect();
+    let tmp = dest_root.join(format!("{INVENTORY_FILE}.tmp"));
+    std::fs::write(&tmp, serde_json::to_vec(&entries)?)?;
+    std::fs::rename(tmp, dest_root.join(INVENTORY_FILE))
 }
 
 /// True when a directory is excluded by /XD — matched against its name or its
@@ -351,12 +395,16 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
     let opts = &pair.copy_options;
     let now = Utc::now();
 
-    // Walk both directories
+    // Walk the source; learn the destination per the pair's state mode.
     let source_files = walk_directory_with(source_root, opts)?;
-    let dest_files = if dest_root.exists() {
-        walk_directory_with(dest_root, opts)?
-    } else {
-        Vec::new()
+    let dest_files = match pair.dest_state {
+        _ if !dest_root.exists() => Vec::new(),
+        DestStateMode::BlindUpload => Vec::new(),
+        DestStateMode::TrustedInventory => match load_inventory(dest_root) {
+            Some(inv) => inv,
+            None => walk_directory_with(dest_root, opts)?,
+        },
+        DestStateMode::Scan => walk_directory_with(dest_root, opts)?,
     };
 
     // Build lookup maps by relative path
@@ -789,6 +837,7 @@ mod tests {
             created_at: Utc::now(),
             time_offset_secs: None,
             copy_options: CopyOptions::default(),
+            ..Default::default()
         };
 
         let preview = compute_preview(&pair).unwrap();
@@ -818,6 +867,7 @@ mod tests {
             created_at: Utc::now(),
             time_offset_secs: None,
             copy_options: CopyOptions::default(),
+            ..Default::default()
         };
 
         let preview = compute_preview(&pair).unwrap();
@@ -845,6 +895,7 @@ mod tests {
             created_at: Utc::now(),
             time_offset_secs: None,
             copy_options: CopyOptions::default(),
+            ..Default::default()
         };
 
         let preview = compute_preview(&pair).unwrap();
@@ -876,6 +927,7 @@ mod tests {
             created_at: Utc::now(),
             time_offset_secs: None,
             copy_options: CopyOptions::default(),
+            ..Default::default()
         };
 
         let preview = compute_preview(&pair).unwrap();

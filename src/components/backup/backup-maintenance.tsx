@@ -5,7 +5,8 @@
  */
 import { useState } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
-import { errorText, useBackupStore, type BackupJob, type BackupOperation, type OperationResult } from "@/stores/backup-store";
+import { errorText, useBackupStore, type BackupJob, type BackupOperation, type LockMode, type OperationResult, type RemoteFile } from "@/stores/backup-store";
+import { formatBytes } from "@/lib/format-bytes";
 import { downloadText, inputCls } from "@/lib/backup-helpers";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 
@@ -22,6 +23,17 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
   const [delLocal, setDelLocal] = useState(true);
   const [delRemote, setDelRemote] = useState(false);
   const [ctlVersion, setCtlVersion] = useState(0);
+  const [lockDays, setLockDays] = useState(30);
+  const [lockMode, setLockMode] = useState<LockMode>("governance");
+  const [files, setFiles] = useState<RemoteFile[] | null>(null);
+  const [filter, setFilter] = useState("");
+  const listFiles = async () => {
+    try {
+      setFiles(await tauriInvoke<RemoteFile[]>("backup_remote_list", { destination: job.destination }));
+    } catch (e) {
+      setError(errorText(e));
+    }
+  };
   const [ctlTarget, setCtlTarget] = useState("");
 
   const op = async (label: string, operation: BackupOperation) => {
@@ -71,6 +83,70 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
           {tool("Rebuild missing volumes", { type: "rebuild_missing" }, "Re-create lost data volumes from the source files still on this computer")}
           {tool("Purge broken files", { type: "purge_broken", dry_run: false }, "Remove unrecoverable files from history so backups can continue", "danger")}
         </div>
+      </Section>
+
+      {job.replicas.length > 0 && (
+        <Section title="Extra destinations" hint="Bring the copies up to date now.">
+          <div className="flex gap-1 flex-wrap">
+            {tool("Update all replicas", { type: "replicate", replica_id: null }, "Mirror the backup to every enabled extra destination")}
+            {job.replicas.map((r) => (
+              <span key={r.id}>{tool(`Update ${r.name}`, { type: "replicate", replica_id: r.id }, `Last copy: ${r.last_run ?? "never"} (${r.last_result ?? "—"})`)}</span>
+            ))}
+          </div>
+        </Section>
+      )}
+
+      <Section title="Object locks" hint="Lock volumes that are not locked yet, or extend every lock. Needs a destination with object-lock support.">
+        <div className="flex gap-2 items-end flex-wrap">
+          <Field label="Days">
+            <input className={inputCls} type="number" min={1} value={lockDays} onChange={(e) => setLockDays(Math.max(1, Number(e.target.value) || 1))} />
+          </Field>
+          <Field label="Mode">
+            <select className={inputCls} value={lockMode} onChange={(e) => setLockMode(e.target.value as LockMode)}>
+              <option value="governance">Governance</option>
+              <option value="compliance">Compliance</option>
+            </select>
+          </Field>
+          {tool("Lock unlocked volumes", { type: "apply_locks", days: lockDays, mode: lockMode, all: false }, "Lock volumes without an active lock")}
+          {tool("Extend all locks", { type: "apply_locks", days: lockDays, mode: lockMode, all: true }, "Set every volume's lock to the new expiry")}
+          {tool("List locks", { type: "list_locks" }, "Volumes with an active lock")}
+        </div>
+      </Section>
+
+      <Section title="Destination files" hint="Every file at this job's destination. Backup files cannot be deleted from here.">
+        <div className="flex gap-1 items-center">
+          <Btn testId="remote-list" onClick={() => void listFiles()}>
+            {files ? "Refresh" : "List files"}
+          </Btn>
+          {files && <input className={inputCls} placeholder="filter" value={filter} onChange={(e) => setFilter(e.target.value)} />}
+        </div>
+        {files && (
+          <ul className="text-xs max-h-48 overflow-auto font-mono" data-testid="remote-files">
+            {files
+              .filter((f) => !filter || f.name.includes(filter))
+              .map((f) => (
+                <li key={f.name} className="flex gap-2">
+                  <span className="truncate flex-1">{f.name}</span>
+                  <span className="text-zinc-500">{formatBytes(f.size)}</span>
+                  {!f.name.startsWith(`${job.options.prefix}-`) && (
+                    <button
+                      className="text-red-600"
+                      onClick={async () => {
+                        try {
+                          await tauriInvoke("backup_remote_delete", { destination: job.destination, name: f.name, force: false });
+                          await listFiles();
+                        } catch (e) {
+                          setError(errorText(e));
+                        }
+                      }}
+                    >
+                      delete
+                    </button>
+                  )}
+                </li>
+              ))}
+          </ul>
+        )}
       </Section>
 
       <Section title="Snapshot diagnostics" hint="Creates and immediately removes a test snapshot of this job's sources, listing every step.">

@@ -704,8 +704,9 @@ impl SyncManager {
                 conn.execute(
                     "INSERT INTO sync_pairs (id, name, source_path, dest_path, mode, enabled, \
                      last_run, trigger_mode, cron_expr, filter_json, conflict_policy, \
-                     verify_mode, checksum_enabled, created_at, time_offset_secs, options_json) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+                     verify_mode, checksum_enabled, created_at, time_offset_secs, options_json, \
+                     dest_state, checksum_algorithm) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) \
                      ON CONFLICT(id) DO UPDATE SET \
                      name = excluded.name, source_path = excluded.source_path, \
                      dest_path = excluded.dest_path, mode = excluded.mode, \
@@ -716,7 +717,9 @@ impl SyncManager {
                      verify_mode = excluded.verify_mode, \
                      checksum_enabled = excluded.checksum_enabled, \
                      time_offset_secs = excluded.time_offset_secs, \
-                     options_json = excluded.options_json",
+                     options_json = excluded.options_json, \
+                     dest_state = excluded.dest_state, \
+                     checksum_algorithm = excluded.checksum_algorithm",
                     rusqlite::params![
                         p.id.to_string(),
                         p.name,
@@ -734,6 +737,8 @@ impl SyncManager {
                         p.created_at.to_rfc3339(),
                         p.time_offset_secs,
                         options_json,
+                        serde_json::to_value(p.dest_state).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "scan".into()),
+                        serde_json::to_value(p.checksum_algorithm).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "xxh3".into()),
                     ],
                 )?;
                 Ok(())
@@ -770,7 +775,8 @@ impl SyncManager {
                 let mut stmt = conn.prepare(
                     "SELECT id, name, source_path, dest_path, mode, enabled, last_run, \
                      trigger_mode, cron_expr, filter_json, conflict_policy, verify_mode, \
-                     checksum_enabled, created_at, time_offset_secs, options_json \
+                     checksum_enabled, created_at, time_offset_secs, options_json, \
+                     dest_state, checksum_algorithm \
                      FROM sync_pairs ORDER BY created_at ASC",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -784,6 +790,8 @@ impl SyncManager {
                     let verify_mode: String = row.get(11)?;
                     let created_at: String = row.get(13)?;
                     let options_json: String = row.get(15)?;
+                    let dest_state: String = row.get(16)?;
+                    let checksum_algorithm: String = row.get(17)?;
 
                     Ok(SyncPair {
                         // A row we cannot parse is a row we cannot honour, but
@@ -813,6 +821,9 @@ impl SyncManager {
                             .unwrap_or_else(|_| Utc::now()),
                         time_offset_secs: row.get(14)?,
                         copy_options: serde_json::from_str(&options_json).unwrap_or_default(),
+                        dest_state: serde_json::from_value(serde_json::Value::String(dest_state)).unwrap_or_default(),
+                        checksum_algorithm: serde_json::from_value(serde_json::Value::String(checksum_algorithm)).unwrap_or_default(),
+                        ..Default::default()
                     })
                 })?;
                 let mut out = Vec::new();
@@ -1089,6 +1100,7 @@ mod tests {
             created_at: Utc::now(),
             time_offset_secs: None,
             copy_options: CopyOptions::default(),
+            ..Default::default()
         }
     }
 

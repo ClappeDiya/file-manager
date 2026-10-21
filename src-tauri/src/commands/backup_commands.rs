@@ -238,6 +238,31 @@ pub async fn backup_recovery_convert(folder: String, destination: BackupDestinat
 }
 
 #[tauri::command]
+pub async fn backup_remote_list(destination: BackupDestination, mgr: State<'_, BackupManager>) -> Result<Vec<ufop_core::backup::RemoteFile>, AppError> {
+    mgr.remote_list(destination).await
+}
+
+#[tauri::command]
+pub async fn backup_remote_get(destination: BackupDestination, name: String, local_path: String, mgr: State<'_, BackupManager>) -> Result<u64, AppError> {
+    mgr.remote_get(destination, name, local_path).await
+}
+
+#[tauri::command]
+pub async fn backup_remote_put(destination: BackupDestination, local_path: String, name: String, mgr: State<'_, BackupManager>) -> Result<u64, AppError> {
+    mgr.remote_put(destination, local_path, name).await
+}
+
+#[tauri::command]
+pub async fn backup_remote_delete(destination: BackupDestination, name: String, force: Option<bool>, mgr: State<'_, BackupManager>) -> Result<(), AppError> {
+    mgr.remote_delete(destination, name, force.unwrap_or(false)).await
+}
+
+#[tauri::command]
+pub async fn backup_start_operation(id: String, operation: BackupOperation, mgr: State<'_, BackupManager>) -> Result<String, AppError> {
+    mgr.start_operation(&id, operation).await
+}
+
+#[tauri::command]
 pub async fn backup_passphrase_strength(passphrase: String) -> Result<PassphraseStrength, AppError> {
     Ok(crypto::passphrase_strength(&passphrase))
 }

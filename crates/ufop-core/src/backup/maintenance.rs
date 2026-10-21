@@ -36,11 +36,18 @@ fn delete_fileset_ids(repo: &Repo, ids: &[i64], allow_full_removal: bool) -> Res
             "Refusing to delete the last remaining backup version (enable 'allow full removal' to override)",
         ));
     }
+    let mut n = 0;
     for f in &doomed {
+        // Locked versions stay until their lock expires.
+        if let Some(until) = repo.locked_until(&f.volume_name)? {
+            tracing::info!("Keeping version {} (locked until {until})", f.timestamp);
+            continue;
+        }
         repo.delete_volume_files(&f.volume_name)?;
         repo.db.delete_fileset(f.id)?;
+        n += 1;
     }
-    Ok(doomed.len())
+    Ok(n)
 }
 
 /// Apply a retention policy; returns how many versions were removed.
@@ -82,6 +89,9 @@ pub fn compact(repo: &Repo, opts: &BackupOptions, ctx: &OpContext) -> Result<Com
     let mut rewritten = Vec::new();
     for (name, size) in &volumes {
         ctx.check()?;
+        if repo.locked_until(name)?.is_some() {
+            continue;
+        }
         let blocks = by_volume.get(name).cloned().unwrap_or_default();
         let total: u64 = blocks.iter().map(|(_, s)| *s).sum();
         let used: Vec<&(String, u64)> = blocks.iter().filter(|(h, _)| referenced.contains(h)).collect();
@@ -459,6 +469,53 @@ pub fn extract_control_files(repo: &Repo, version: usize, target: &std::path::Pa
     Ok(out)
 }
 
+/// Result of [`apply_locks`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LockReport {
+    pub locked: usize,
+    pub already_locked: usize,
+    pub until: String,
+    pub errors: Vec<String>,
+}
+
+/// Lock volumes (and their PAR2 files) for `days`. With `all = false` only
+/// volumes without an active lock are touched (new uploads); `all = true`
+/// extends every lock (existing-volume administration).
+pub fn apply_locks(repo: &Repo, days: u32, mode: super::backend::LockMode, all: bool) -> Result<LockReport, AppError> {
+    if !repo.backend.supports_lock() {
+        return Err(AppError::validation(format!("{} does not support object locks", repo.backend.describe())));
+    }
+    let until = Utc::now() + chrono::Duration::days(days.max(1) as i64);
+    let mut r = LockReport { until: until.to_rfc3339(), ..Default::default() };
+    for v in repo.db.volumes(None)? {
+        if !all && repo.locked_until(&v.name)?.is_some() {
+            r.already_locked += 1;
+            continue;
+        }
+        let mut names = vec![v.name.clone()];
+        names.extend(repo.recovery_names(&v.name)?);
+        match names.iter().try_for_each(|n| repo.backend.lock(n, until, mode)) {
+            Ok(()) => {
+                repo.db.set_volume_lock(&v.name, Some(&r.until))?;
+                r.locked += 1;
+            }
+            Err(e) => r.errors.push(format!("{}: {}", v.name, e.user_message())),
+        }
+    }
+    Ok(r)
+}
+
+/// Volumes with an active lock: (name, until).
+pub fn list_locks(repo: &Repo) -> Result<Vec<(String, String)>, AppError> {
+    let mut out = Vec::new();
+    for v in repo.db.volumes(None)? {
+        if let Some(u) = repo.locked_until(&v.name)? {
+            out.push((v.name, u));
+        }
+    }
+    Ok(out)
+}
+
 /// A file that cannot be fully restored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokenFile {
@@ -795,5 +852,77 @@ mod tests {
         let written = extract_control_files(&repo, 0, &out.path().join("x")).unwrap();
         assert_eq!(written.len(), 1);
         assert_eq!(std::fs::read(&written[0]).unwrap(), b"hello control");
+    }
+
+    /// Write-once test destination: refuses deleting/overwriting locked files.
+    struct Worm {
+        inner: LocalBackend,
+        locks: std::sync::Mutex<HashMap<String, (DateTime<Utc>, crate::backup::backend::LockMode)>>,
+    }
+    impl crate::backup::Backend for Worm {
+        fn describe(&self) -> String {
+            "worm".into()
+        }
+        fn list(&self) -> Result<Vec<crate::backup::RemoteFile>, AppError> {
+            self.inner.list()
+        }
+        fn put(&self, n: &str, d: &[u8]) -> Result<(), AppError> {
+            if self.locks.lock().unwrap().contains_key(n) {
+                return Err(AppError::state("locked", "x"));
+            }
+            self.inner.put(n, d)
+        }
+        fn get(&self, n: &str) -> Result<Vec<u8>, AppError> {
+            self.inner.get(n)
+        }
+        fn delete(&self, n: &str) -> Result<(), AppError> {
+            if self.locks.lock().unwrap().get(n).is_some_and(|(u, _)| *u > Utc::now()) {
+                return Err(AppError::state(format!("{n} is locked"), "x"));
+            }
+            self.inner.delete(n)
+        }
+        fn create_folder(&self) -> Result<(), AppError> {
+            self.inner.create_folder()
+        }
+        fn supports_lock(&self) -> bool {
+            true
+        }
+        fn lock(&self, n: &str, u: DateTime<Utc>, m: crate::backup::backend::LockMode) -> Result<(), AppError> {
+            self.locks.lock().unwrap().insert(n.to_string(), (u, m));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn object_lock_protects_versions_from_retention_and_compaction() {
+        use crate::backup::backend::LockMode;
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let be = Worm { inner: LocalBackend::new(dst.path()), locks: Default::default() };
+        let db = BackupDb::open_in_memory().unwrap();
+        let opts = BackupOptions { object_lock: Some(crate::backup::ObjectLockOptions { days: 30, mode: LockMode::Compliance }), ..o() };
+        write(src.path(), "a", &vec![1u8; 3000]);
+        let r = run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &opts, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let n_vols = db.volumes(None).unwrap().len();
+        assert_eq!(be.locks.lock().unwrap().len(), n_vols, "every volume locked");
+        assert!(be.locks.lock().unwrap().values().all(|(_, m)| *m == LockMode::Compliance));
+        tick();
+        write(src.path(), "a", &vec![2u8; 3000]);
+        // Keep only 1 version: the old one is locked and must survive.
+        let r = run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &opts, &RetentionPolicy::KeepCount { count: 1 }, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.versions_deleted, 0);
+        assert_eq!(db.filesets().unwrap().len(), 2);
+        let repo = Repo::open(&be, &db, Some("pw"), &opts, false, KdfParams::insecure_fast()).unwrap();
+        assert!(delete_versions(&repo, &[1], false).unwrap() == 0);
+        assert_eq!(list_locks(&repo).unwrap().len(), db.volumes(None).unwrap().len());
+        // Existing-volume administration: extend all locks.
+        let ext = apply_locks(&repo, 60, LockMode::Governance, true).unwrap();
+        assert_eq!(ext.locked, db.volumes(None).unwrap().len());
+        // A destination without lock support is refused clearly.
+        let plain = LocalBackend::new(dst.path());
+        let repo2 = Repo::open(&plain, &db, Some("pw"), &opts, false, KdfParams::insecure_fast()).unwrap();
+        assert!(apply_locks(&repo2, 1, LockMode::Governance, false).is_err());
     }
 }

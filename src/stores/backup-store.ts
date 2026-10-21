@@ -107,6 +107,40 @@ export interface BackupOptions {
   remote_case_insensitive: boolean;
   snapshot_policy: SnapshotPolicy;
   snapshot: SnapshotOptions;
+  object_lock: ObjectLockOptions | null;
+}
+
+export type LockMode = "governance" | "compliance";
+
+export interface ObjectLockOptions {
+  days: number;
+  mode: LockMode;
+}
+
+export interface LocalTransfer {
+  use_move: boolean;
+  verify_size: boolean;
+  sync_writes: boolean;
+}
+
+export type ReplicaSchedule = { type: "after_backup" } | { type: "interval"; minutes: number } | { type: "manual" };
+
+export interface Replica {
+  id: string;
+  name: string;
+  destination: BackupDestination;
+  enabled: boolean;
+  schedule: ReplicaSchedule;
+  delete_extraneous: boolean;
+  verify: boolean;
+  throttle: Throttle;
+  last_run: string | null;
+  last_result: string | null;
+}
+
+export interface RemoteFile {
+  name: string;
+  size: number;
 }
 
 export type SnapshotPolicy = "off" | "auto" | "on" | "required";
@@ -216,6 +250,8 @@ export interface BackupJob {
   store_config_remotely: boolean;
   remote_config_include_secrets: boolean;
   network_timeout_secs: number;
+  local_transfer: LocalTransfer;
+  replicas: Replica[];
   prevent_sleep: boolean;
   notify_on: string[];
   created_at: string;
@@ -467,7 +503,10 @@ export type BackupOperation =
   | { type: "rebuild_missing" }
   | { type: "extract_control_files"; version: number; target: string }
   | { type: "auto_tune"; sample_volumes: number }
-  | { type: "snapshot_test" };
+  | { type: "snapshot_test" }
+  | { type: "replicate"; replica_id: string | null }
+  | { type: "apply_locks"; days: number; mode: LockMode; all: boolean }
+  | { type: "list_locks" };
 
 export interface PassphraseStrength {
   score: number;
@@ -581,6 +620,7 @@ export function newBackupJob(): BackupJob {
       remote_case_insensitive: false,
       snapshot_policy: "off",
       snapshot: { lvm_size: "10%ORIGIN", vss_provider: null, vss_exclude_writers: [], mount_root: null },
+      object_lock: null,
     },
     retention: { type: "keep_all" },
     schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false },
@@ -604,6 +644,8 @@ export function newBackupJob(): BackupJob {
     store_config_remotely: false,
     remote_config_include_secrets: false,
     network_timeout_secs: 0,
+    local_transfer: { use_move: true, verify_size: true, sync_writes: false },
+    replicas: [],
     prevent_sleep: true,
     notify_on: ["warning", "error"],
     created_at: now,

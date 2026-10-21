@@ -326,3 +326,60 @@ async fn database_tools_recovery_and_restore_overrides() {
     assert_eq!(rr.files_restored, 1);
     assert_eq!(std::fs::read(rt.join("src/a.txt")).unwrap(), b"recover me");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replicas_mirror_after_backup_and_on_demand() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst, rep) = (t.path().join("src"), t.path().join("dst"), t.path().join("replica"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), vec![5u8; 20_000]).unwrap();
+    let m = manager(t.path()).await;
+    let mut jb = job(&src, &dst);
+    jb.local_transfer = LocalTransfer { use_move: false, verify_size: true, sync_writes: true };
+    jb.replicas = vec![
+        Replica { name: "USB".into(), destination: BackupDestination::Local { path: rep.to_string_lossy().into(), alternate_paths: vec![], marker_file: None }, verify: true, ..Default::default() },
+        Replica { name: "Hourly".into(), destination: BackupDestination::Local { path: t.path().join("hourly").to_string_lossy().into(), alternate_paths: vec![], marker_file: None }, schedule: ReplicaSchedule::Interval { minutes: 60 }, ..Default::default() },
+    ];
+    let mut bad = jb.clone();
+    bad.replicas[0].destination = bad.destination.clone();
+    assert!(m.save_job(bad, Some("pw".into())).await.is_err(), "replica == primary rejected");
+    let j = m.save_job(jb, Some("pw".into())).await.unwrap();
+    assert!(j.replicas.iter().all(|r| !r.id.is_empty()));
+
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(r.report["replication"].as_array().unwrap().len(), 1, "only the after-backup replica ran");
+    assert!(rep.join("ufop-repo.json").exists());
+    assert!(!t.path().join("hourly").exists());
+    let j = m.get_job(&j.id).await.unwrap();
+    assert_eq!(j.replicas[0].last_result.as_deref(), Some("success"));
+
+    // The interval replica is due; the scheduler starts it.
+    assert_eq!(m.due_replicas(Utc::now()).await.len(), 1);
+    let r = m.execute(&j.id, BackupOperation::Replicate { replica_id: Some(j.replicas[1].id.clone()) }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert!(t.path().join("hourly/ufop-repo.json").exists());
+    assert!(m.due_replicas(Utc::now()).await.is_empty());
+
+    // Each replica restores independently.
+    let rep_dest = BackupDestination::Local { path: rep.to_string_lossy().into(), alternate_paths: vec![], marker_file: None };
+    let out = t.path().join("out");
+    let rr = m.direct_restore(rep_dest.clone(), Some("pw".into()), "ufop".into(), RestoreOptions { target: Some(out.clone()), ..Default::default() }).await.unwrap();
+    assert_eq!(rr.files_restored, 1);
+
+    // Direct destination file operations, with a guard for repository files.
+    let files = m.remote_list(j.destination.clone()).await.unwrap();
+    assert!(files.iter().any(|f| f.name == "ufop-repo.json"));
+    let lp = t.path().join("note.txt");
+    std::fs::write(&lp, b"hello").unwrap();
+    assert_eq!(m.remote_put(j.destination.clone(), lp.to_string_lossy().into(), "note.txt".into()).await.unwrap(), 5);
+    let back = t.path().join("note2.txt");
+    m.remote_get(j.destination.clone(), "note.txt".into(), back.to_string_lossy().into()).await.unwrap();
+    assert_eq!(std::fs::read(back).unwrap(), b"hello");
+    assert!(m.remote_delete(j.destination.clone(), "ufop-repo.json".into(), false).await.is_err());
+    m.remote_delete(j.destination.clone(), "note.txt".into(), false).await.unwrap();
+
+    // Lock admin needs a lock-capable destination.
+    let r = m.execute(&j.id, BackupOperation::ApplyLocks { days: 1, mode: ufop_core::backup::backend::LockMode::Governance, all: false }).await;
+    assert!(r.is_err_and(|e| e.user_message().contains("does not support object locks")));
+}

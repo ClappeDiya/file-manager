@@ -4,7 +4,7 @@
  * cadence. Each field maps 1:1 onto `BackupOptions` in ufop-core.
  */
 import { inputCls } from "@/lib/backup-helpers";
-import type { BackupOptions, SnapshotPolicy, UsnPolicy, VolumeFormat, ZipMethod } from "@/stores/backup-store";
+import type { BackupOptions, LockMode, SnapshotPolicy, UsnPolicy, VolumeFormat, ZipMethod } from "@/stores/backup-store";
 import { Check, Field, Section } from "./backup-ui";
 
 const lines = (v: string) => v.split("\n").map((s) => s.trim()).filter(Boolean);
@@ -40,6 +40,27 @@ export function BackupAdvancedOptions({
             </select>
           </Field>
         </div>
+      </Section>
+
+      <Section title="Immutability (object lock)" hint="Locks each new volume so nobody — including ransomware with your credentials — can delete or overwrite it before the lock expires. The destination must support object lock (e.g. an S3 bucket with Object Lock enabled).">
+        <Check
+          label="Lock new volumes"
+          checked={o.object_lock !== null}
+          onChange={(v) => onChange({ object_lock: v ? { days: 30, mode: "governance" } : null })}
+        />
+        {o.object_lock && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <Field label="Keep locked for (days)">
+              <input data-testid="opt-lock-days" className={inputCls} type="number" min={1} value={o.object_lock.days} onChange={(e) => onChange({ object_lock: { ...o.object_lock!, days: num(e.target.value, 1, 36500) } })} />
+            </Field>
+            <Field label="Mode" hint="Compliance locks cannot be removed by anyone, not even the account owner.">
+              <select className={inputCls} value={o.object_lock.mode} onChange={(e) => onChange({ object_lock: { ...o.object_lock!, mode: e.target.value as LockMode } })}>
+                <option value="governance">Governance</option>
+                <option value="compliance">Compliance</option>
+              </select>
+            </Field>
+          </div>
+        )}
       </Section>
 
       <Section title="PAR2 recovery data" hint="Uploads parity files next to each volume so damaged volumes repair themselves on restore. Needs the par2 tool.">

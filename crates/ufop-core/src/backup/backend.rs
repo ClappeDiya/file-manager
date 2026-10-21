@@ -18,6 +18,17 @@ pub struct RemoteFile {
 }
 
 /// Flat, name-addressed volume store.
+/// Object-lock (WORM) retention mode, as in S3 Object Lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LockMode {
+    /// Users with special permission can still remove the lock.
+    #[default]
+    Governance,
+    /// Nobody, including the account root, can delete before expiry.
+    Compliance,
+}
+
 /// Destination capacity in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quota {
@@ -44,6 +55,15 @@ pub trait Backend: Send + Sync {
     fn quota(&self) -> Option<Quota> {
         None
     }
+    /// Whether [`Backend::lock`] is available.
+    fn supports_lock(&self) -> bool {
+        false
+    }
+    /// Protect a volume against deletion and overwrite until `until`.
+    fn lock(&self, name: &str, until: chrono::DateTime<chrono::Utc>, mode: LockMode) -> Result<(), AppError> {
+        let _ = (name, until, mode);
+        Err(AppError::validation(format!("{} does not support object locks", self.describe())))
+    }
     /// Connectivity test: lists the folder. `create` makes it first.
     fn test(&self, create: bool) -> Result<usize, AppError> {
         if create {
@@ -62,6 +82,8 @@ impl<T: Backend + ?Sized> Backend for Box<T> {
     fn create_folder(&self) -> Result<(), AppError> { (**self).create_folder() }
     fn rename(&self, a: &str, b: &str) -> Result<(), AppError> { (**self).rename(a, b) }
     fn quota(&self) -> Option<Quota> { (**self).quota() }
+    fn supports_lock(&self) -> bool { (**self).supports_lock() }
+    fn lock(&self, n: &str, u: chrono::DateTime<chrono::Utc>, m: LockMode) -> Result<(), AppError> { (**self).lock(n, u, m) }
 }
 
 fn check_name(name: &str) -> Result<(), AppError> {
@@ -77,13 +99,16 @@ pub struct LocalBackend {
     root: PathBuf,
     /// Re-read the size after writing and fail on mismatch.
     pub verify_upload_size: bool,
-    /// Move semantics are irrelevant for in-memory volumes; kept for API parity.
+    /// Write to a temporary name and rename into place (atomic). Off writes
+    /// the final name directly, for shares where renames are slow or fail.
     pub use_move: bool,
+    /// Flush each file to disk before reporting success.
+    pub sync_writes: bool,
 }
 
 impl LocalBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), verify_upload_size: true, use_move: false }
+        Self { root: root.into(), verify_upload_size: true, use_move: true, sync_writes: false }
     }
 
     pub fn root(&self) -> &Path {
@@ -161,10 +186,22 @@ impl Backend for LocalBackend {
 
     fn put(&self, name: &str, data: &[u8]) -> Result<(), AppError> {
         check_name(name)?;
-        let tmp = self.root.join(format!(".{name}.partial"));
-        std::fs::write(&tmp, data)?;
         let dest = self.root.join(name);
-        std::fs::rename(&tmp, &dest)?;
+        let write = |p: &Path| -> std::io::Result<()> {
+            let mut f = std::fs::File::create(p)?;
+            std::io::Write::write_all(&mut f, data)?;
+            if self.sync_writes {
+                f.sync_all()?;
+            }
+            Ok(())
+        };
+        if self.use_move {
+            let tmp = self.root.join(format!(".{name}.partial"));
+            write(&tmp)?;
+            std::fs::rename(&tmp, &dest)?;
+        } else {
+            write(&dest)?;
+        }
         if self.verify_upload_size {
             let got = std::fs::metadata(&dest)?.len();
             if got != data.len() as u64 {
@@ -292,6 +329,12 @@ impl<B: Backend> Backend for RetryingBackend<B> {
     fn quota(&self) -> Option<Quota> {
         self.inner.quota()
     }
+    fn supports_lock(&self) -> bool {
+        self.inner.supports_lock()
+    }
+    fn lock(&self, n: &str, u: chrono::DateTime<chrono::Utc>, m: LockMode) -> Result<(), AppError> {
+        self.inner.lock(n, u, m)
+    }
     fn list(&self) -> Result<Vec<RemoteFile>, AppError> {
         self.retry("list", || self.inner.list())
     }
@@ -336,6 +379,12 @@ impl<B: Backend> Backend for SoftDeleteBackend<B> {
     }
     fn quota(&self) -> Option<Quota> {
         self.inner.quota()
+    }
+    fn supports_lock(&self) -> bool {
+        self.inner.supports_lock()
+    }
+    fn lock(&self, n: &str, u: chrono::DateTime<chrono::Utc>, m: LockMode) -> Result<(), AppError> {
+        self.inner.lock(n, u, m)
     }
     fn list(&self) -> Result<Vec<RemoteFile>, AppError> {
         Ok(self.inner.list()?.into_iter().filter(|f| !f.name.starts_with(&self.prefix)).collect())
@@ -405,6 +454,17 @@ pub fn test_backend_compatibility(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_put_modes() {
+        let d = tempfile::tempdir().unwrap();
+        for (mv, sync) in [(true, false), (false, true)] {
+            let b = LocalBackend { use_move: mv, sync_writes: sync, ..LocalBackend::new(d.path()) };
+            b.put(&format!("v-{mv}"), b"payload").unwrap();
+            assert_eq!(b.get(&format!("v-{mv}")).unwrap(), b"payload");
+        }
+        assert!(!std::fs::read_dir(d.path()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with(".partial")));
+    }
 
     #[test]
     fn local_backend_crud_and_names() {

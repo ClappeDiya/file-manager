@@ -87,8 +87,20 @@ fn all_migrations() -> Vec<Migration> {
             description: "Server auth tokens - refresh tokens and used sign-in tokens",
             sql: V14_SCHEMA,
         },
+        Migration {
+            version: 15,
+            description: "Sync pairs - destination-state mode and checksum algorithm",
+            sql: V15_SCHEMA,
+        },
     ]
 }
+
+/// Schema v15: how a sync pair learns the destination state (scan, trusted
+/// inventory, blind upload) and which hash full verification uses.
+const V15_SCHEMA: &str = r#"
+ALTER TABLE sync_pairs ADD COLUMN dest_state TEXT NOT NULL DEFAULT 'scan';
+ALTER TABLE sync_pairs ADD COLUMN checksum_algorithm TEXT NOT NULL DEFAULT 'xxh3';
+"#;
 
 /// Schema v14: `ufop-server` refresh tokens (stored as SHA-256 hashes) and
 /// redeemed one-time sign-in token ids.
@@ -718,7 +730,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 14);
+        assert_eq!(applied, 15);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -750,7 +762,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 14);
+        assert_eq!(first, 15);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -763,7 +775,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 14);
+        assert_eq!(current_version(&conn).unwrap(), 15);
     }
 
     #[test]

@@ -84,6 +84,72 @@ impl BackupDestination {
     }
 }
 
+/// How a local / mounted-share destination writes files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LocalTransfer {
+    /// Write to a temporary name, then rename (atomic). Off writes directly.
+    pub use_move: bool,
+    /// Re-read the size after writing.
+    pub verify_size: bool,
+    /// Flush every file to disk.
+    pub sync_writes: bool,
+}
+
+impl Default for LocalTransfer {
+    fn default() -> Self {
+        Self { use_move: true, verify_size: true, sync_writes: false }
+    }
+}
+
+/// When a replica is brought up to date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReplicaSchedule {
+    /// After every successful backup.
+    #[default]
+    AfterBackup,
+    /// Every `minutes`, independent of backups.
+    Interval { minutes: u32 },
+    /// Only when started by hand.
+    Manual,
+}
+
+/// An extra destination holding a full copy of the backup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Replica {
+    pub id: String,
+    pub name: String,
+    pub destination: BackupDestination,
+    pub enabled: bool,
+    pub schedule: ReplicaSchedule,
+    /// Remove files the primary no longer has (deleted versions).
+    pub delete_extraneous: bool,
+    /// Read every copied file back and compare.
+    pub verify: bool,
+    pub throttle: Throttle,
+    pub last_run: Option<String>,
+    pub last_result: Option<String>,
+}
+
+impl Default for Replica {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            destination: BackupDestination::Local { path: String::new(), alternate_paths: Vec::new(), marker_file: None },
+            enabled: true,
+            schedule: ReplicaSchedule::AfterBackup,
+            delete_extraneous: true,
+            verify: false,
+            throttle: Throttle::default(),
+            last_run: None,
+            last_result: None,
+        }
+    }
+}
+
 /// Last-run statistics shown on the dashboard.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -127,6 +193,12 @@ pub struct BackupJob {
     /// Per-operation timeout for network destinations (0 = none).
     #[serde(default)]
     pub network_timeout_secs: u64,
+    /// Write behaviour for local / mounted-share destinations.
+    #[serde(default)]
+    pub local_transfer: LocalTransfer,
+    /// Extra destinations kept in sync with the primary.
+    #[serde(default)]
+    pub replicas: Vec<Replica>,
     /// Keep the computer awake while this job's operations run.
     pub prevent_sleep: bool,
     /// Results that raise a desktop notification: `success`, `warning`, `error`.
@@ -158,6 +230,8 @@ impl Default for BackupJob {
             store_config_remotely: false,
             remote_config_include_secrets: false,
             network_timeout_secs: 0,
+            local_transfer: LocalTransfer::default(),
+            replicas: Vec::new(),
             prevent_sleep: true,
             notify_on: vec!["warning".into(), "error".into()],
             created_at: now.clone(),
@@ -186,6 +260,23 @@ impl BackupJob {
                 return Err(AppError::validation("Choose a destination from the library"))
             }
             _ => {}
+        }
+        for r in &self.replicas {
+            if r.destination == self.destination {
+                return Err(AppError::validation(format!("Replica '{}' points at the primary destination", r.name)));
+            }
+            match &r.destination {
+                BackupDestination::Local { path, .. } if path.trim().is_empty() => return Err(AppError::validation(format!("Choose a folder for replica '{}'", r.name))),
+                BackupDestination::Connection { connection_id, .. } if uuid::Uuid::parse_str(connection_id).is_err() => {
+                    return Err(AppError::validation(format!("Choose a connection for replica '{}'", r.name)))
+                }
+                _ => {}
+            }
+            if let ReplicaSchedule::Interval { minutes } = r.schedule {
+                if minutes < 5 {
+                    return Err(AppError::validation("Replica intervals must be at least 5 minutes"));
+                }
+            }
         }
         if self.remote_config_include_secrets && !self.encrypted {
             return Err(AppError::validation("Secrets can only be stored in the backup when it is encrypted"));
@@ -284,6 +375,15 @@ pub enum BackupOperation {
     AutoTune { sample_volumes: usize },
     /// Create and remove a test snapshot of the sources.
     SnapshotTest,
+    /// Lock volumes: only unlocked ones, or extend every lock (`all`).
+    ApplyLocks { days: u32, mode: ufop_core::backup::backend::LockMode, #[serde(default)] all: bool },
+    /// Volumes with an active lock.
+    ListLocks,
+    /// Bring one replica (or all enabled ones) up to date.
+    Replicate {
+        #[serde(default)]
+        replica_id: Option<String>,
+    },
 }
 
 impl BackupOperation {
@@ -304,6 +404,9 @@ impl BackupOperation {
             Self::ExtractControlFiles { .. } => "extract_control_files",
             Self::AutoTune { .. } => "autotune",
             Self::SnapshotTest => "snapshot_test",
+            Self::Replicate { .. } => "replicate",
+            Self::ApplyLocks { .. } => "apply_locks",
+            Self::ListLocks => "list_locks",
         }
     }
 }
@@ -518,6 +621,9 @@ impl BackupManager {
     pub async fn save_job(&self, mut job: BackupJob, passphrase: Option<String>) -> Result<BackupJob, AppError> {
         let existing = if job.id.is_empty() { None } else { self.inner.jobs.read().await.get(&job.id).cloned() };
         job.sources.retain(|s| !s.trim().is_empty());
+        for r in job.replicas.iter_mut().filter(|r| r.id.is_empty()) {
+            r.id = uuid::Uuid::new_v4().to_string();
+        }
         job.validate()?;
         self.check_policy(&job).await?;
         let now = Utc::now().to_rfc3339();
@@ -637,7 +743,7 @@ impl BackupManager {
     // ── Destinations ──
 
     pub async fn backend_for(&self, dest: &BackupDestination, throttle: Throttle, retry: RetryPolicy, soft_delete: Option<String>) -> Result<Box<dyn Backend>, AppError> {
-        self.backend_with_timeout(dest, throttle, retry, soft_delete, 0).await
+        self.backend_with_timeout(dest, throttle, retry, soft_delete, 0, LocalTransfer::default()).await
     }
 
     /// Resolve a library entry to its concrete destination (with sub-folder).
@@ -659,17 +765,30 @@ impl BackupManager {
         })
     }
 
-    async fn backend_with_timeout(&self, dest: &BackupDestination, throttle: Throttle, retry: RetryPolicy, soft_delete: Option<String>, timeout_secs: u64) -> Result<Box<dyn Backend>, AppError> {
+    #[allow(clippy::too_many_arguments)]
+    async fn backend_with_timeout(
+        &self,
+        dest: &BackupDestination,
+        throttle: Throttle,
+        retry: RetryPolicy,
+        soft_delete: Option<String>,
+        timeout_secs: u64,
+        local: LocalTransfer,
+    ) -> Result<Box<dyn Backend>, AppError> {
         let dest = &self.resolve_destination(dest).await?;
         let raw: Box<dyn Backend> = match dest {
             BackupDestination::Local { path, alternate_paths, marker_file } => {
-                if alternate_paths.is_empty() && marker_file.is_none() {
-                    Box::new(LocalBackend::new(path))
+                let mut b = if alternate_paths.is_empty() && marker_file.is_none() {
+                    LocalBackend::new(path)
                 } else {
                     let mut c = vec![path.clone()];
                     c.extend(alternate_paths.iter().cloned());
-                    Box::new(LocalBackend::discover(&c, marker_file.as_deref())?)
-                }
+                    LocalBackend::discover(&c, marker_file.as_deref())?
+                };
+                b.use_move = local.use_move;
+                b.verify_upload_size = local.verify_size;
+                b.sync_writes = local.sync_writes;
+                Box::new(b)
             }
             BackupDestination::Connection { connection_id, remote_path } => {
                 let conns = self.inner.conns.as_ref().ok_or_else(|| AppError::state("Connections are unavailable", "Restart the app."))?;
@@ -690,7 +809,155 @@ impl BackupManager {
     }
 
     async fn build_backend(&self, job: &BackupJob) -> Result<Box<dyn Backend>, AppError> {
-        self.backend_with_timeout(&job.destination, job.throttle, job.retry, job.soft_delete_prefix.clone(), job.network_timeout_secs).await
+        self.backend_with_timeout(&job.destination, job.throttle, job.retry, job.soft_delete_prefix.clone(), job.network_timeout_secs, job.local_transfer).await
+    }
+
+    // ── Direct destination file operations ──
+
+    /// Files at a destination (any files, not only backup volumes).
+    pub async fn remote_list(&self, dest: BackupDestination) -> Result<Vec<ufop_core::backup::RemoteFile>, AppError> {
+        let b = self.backend_for(&dest, Throttle::default(), RetryPolicy::default(), None).await?;
+        blocking(move || b.list()).await
+    }
+
+    /// Download one file from a destination to a local path.
+    pub async fn remote_get(&self, dest: BackupDestination, name: String, local_path: String) -> Result<u64, AppError> {
+        let b = self.backend_for(&dest, Throttle::default(), RetryPolicy::default(), None).await?;
+        blocking(move || {
+            let d = b.get(&name)?;
+            std::fs::write(&local_path, &d)?;
+            Ok(d.len() as u64)
+        })
+        .await
+    }
+
+    /// Upload a local file to a destination under `name`.
+    pub async fn remote_put(&self, dest: BackupDestination, local_path: String, name: String) -> Result<u64, AppError> {
+        let b = self.backend_for(&dest, Throttle::default(), RetryPolicy::default(), None).await?;
+        blocking(move || {
+            let d = std::fs::read(&local_path)?;
+            b.put(&name, &d)?;
+            Ok(d.len() as u64)
+        })
+        .await
+    }
+
+    /// Delete one file at a destination. Refuses repository files of a
+    /// configured job unless `force` (they would break that backup).
+    pub async fn remote_delete(&self, dest: BackupDestination, name: String, force: bool) -> Result<(), AppError> {
+        if !force {
+            let jobs = self.inner.jobs.read().await;
+            if let Some(j) = jobs.values().find(|j| j.destination == dest && name.starts_with(&format!("{}-", j.options.prefix))) {
+                return Err(AppError::validation(format!("{name} belongs to the backup '{}'; deleting it would damage that backup", j.name)));
+            }
+        }
+        let b = self.backend_for(&dest, Throttle::default(), RetryPolicy::default(), None).await?;
+        blocking(move || b.delete(&name)).await
+    }
+
+    // ── Replicas ──
+
+    /// Mirror the primary to its replicas (`only` = one replica id).
+    async fn replicate(&self, job: &BackupJob, only: Option<&str>, ctx: &OpContext) -> Result<serde_json::Value, AppError> {
+        let picked: Vec<Replica> = job.replicas.iter().filter(|r| match only {
+            Some(id) => r.id == id,
+            None => r.enabled,
+        }).cloned().collect();
+        if picked.is_empty() {
+            return Err(AppError::validation(match only {
+                Some(_) => "That replica does not exist",
+                None => "This job has no enabled replicas",
+            }));
+        }
+        let primary = self.build_backend(job).await?;
+        let mut targets = Vec::new();
+        let mut errors = Vec::new();
+        for r in picked {
+            match self.backend_with_timeout(&r.destination, r.throttle, job.retry, None, job.network_timeout_secs, job.local_transfer).await {
+                Ok(b) => targets.push((r, b)),
+                Err(e) => errors.push(format!("{}: {}", r.name, e.user_message())),
+            }
+        }
+        let prefix = job.options.prefix.clone();
+        let ctx2 = ctx.clone();
+        let results = blocking(move || {
+            Ok(targets
+                .into_iter()
+                .map(|(r, b)| {
+                    let o = ufop_core::backup::mirror::MirrorOptions { delete_extraneous: r.delete_extraneous, verify: r.verify, ..Default::default() };
+                    let res = ufop_core::backup::mirror::mirror(primary.as_ref(), b.as_ref(), &prefix, &o, &ctx2);
+                    (r, res)
+                })
+                .collect::<Vec<_>>())
+        })
+        .await?;
+        let now = Utc::now().to_rfc3339();
+        let mut out = Vec::new();
+        let mut outcome: HashMap<String, String> = HashMap::new();
+        for (r, res) in results {
+            match res {
+                Ok(rep) => {
+                    let status = if rep.errors.is_empty() { "success" } else { "error" };
+                    errors.extend(rep.errors.iter().map(|e| format!("{}: {e}", r.name)));
+                    outcome.insert(r.id.clone(), status.into());
+                    out.push(serde_json::json!({ "id": r.id, "name": r.name, "report": rep }));
+                }
+                Err(e) => {
+                    errors.push(format!("{}: {}", r.name, e.user_message()));
+                    outcome.insert(r.id.clone(), "error".into());
+                }
+            }
+        }
+        let snapshot = {
+            let mut jobs = self.inner.jobs.write().await;
+            jobs.get_mut(&job.id).map(|j| {
+                for r in j.replicas.iter_mut() {
+                    if let Some(st) = outcome.get(&r.id) {
+                        r.last_run = Some(now.clone());
+                        r.last_result = Some(st.clone());
+                    }
+                }
+                j.clone()
+            })
+        };
+        if let Some(j) = snapshot {
+            let _ = self.persist(&j).await;
+        }
+        Ok(serde_json::json!({ "replicas": out, "errors": errors }))
+    }
+
+    /// Replicas whose interval has elapsed: (job id, replica id).
+    async fn due_replicas(&self, now: DateTime<Utc>) -> Vec<(String, String)> {
+        let jobs = self.inner.jobs.read().await;
+        let mut out = Vec::new();
+        for j in jobs.values() {
+            for r in j.replicas.iter().filter(|r| r.enabled) {
+                if let ReplicaSchedule::Interval { minutes } = r.schedule {
+                    let last = r.last_run.as_deref().and_then(parse_ts);
+                    if last.is_none_or(|l| now - l >= chrono::Duration::minutes(minutes as i64)) {
+                        out.push((j.id.clone(), r.id.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Queue any operation in the background; returns the task id.
+    pub async fn start_operation(&self, job_id: &str, op: BackupOperation) -> Result<String, AppError> {
+        let job = self.get_job(job_id).await?;
+        if self.is_job_busy(job_id) {
+            return Err(AppError::state("This job is already queued or running", "Wait for it to finish or cancel it."));
+        }
+        let (task_id, cancel, progress) = self.register_task(&job, op.name());
+        let me = self.clone();
+        let tid = task_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = me.run_registered(job, op, tid.clone(), cancel, progress).await {
+                tracing::warn!("task {tid} failed: {e}");
+            }
+        });
+        Ok(task_id)
     }
 
     // ── Shared settings: global defaults and destination library ──
@@ -1030,7 +1297,44 @@ impl BackupManager {
                     lock(&sink).extend(lines);
                 });
             }
-            blocking(move || run_core(&job2, op, backend.as_ref(), &db_path, pass.as_deref(), kdf, &ctx)).await
+            if let BackupOperation::Replicate { replica_id } = &op {
+                return self.replicate(&job2, replica_id.as_deref(), &ctx).await;
+            }
+            let after: Vec<String> = if is_backup {
+                job2.replicas.iter().filter(|r| r.enabled && r.schedule == ReplicaSchedule::AfterBackup).map(|r| r.id.clone()).collect()
+            } else {
+                Vec::new()
+            };
+            let ctx2 = ctx.clone();
+            let mut v = blocking(move || run_core(&job2, op, backend.as_ref(), &db_path, pass.as_deref(), kdf, &ctx)).await?;
+            let clean = v.get("errors").and_then(|e| e.as_array()).is_none_or(|a| a.is_empty()) && v.get("dry_run") != Some(&serde_json::Value::Bool(true));
+            if clean {
+                let mut reps = Vec::new();
+                for id in after {
+                    match self.replicate(&job, Some(&id), &ctx2).await {
+                        Ok(r) => {
+                            if let (Some(errs), Some(o)) = (r.get("errors").and_then(|e| e.as_array()).cloned(), v.as_object_mut()) {
+                                // Replica problems surface as warnings of the backup.
+                                if let Some(w) = o.get_mut("warnings").and_then(|w| w.as_array_mut()) {
+                                    w.extend(errs.into_iter().map(|e| serde_json::Value::String(format!("Replica {}", e.as_str().unwrap_or_default()))));
+                                }
+                            }
+                            reps.push(r);
+                        }
+                        Err(e) => {
+                            if let Some(w) = v.get_mut("warnings").and_then(|w| w.as_array_mut()) {
+                                w.push(serde_json::Value::String(format!("Replica: {}", e.user_message())));
+                            }
+                        }
+                    }
+                }
+                if !reps.is_empty() {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("replication".into(), serde_json::Value::Array(reps));
+                    }
+                }
+            }
+            Ok(v)
         }
         .await;
 
@@ -1450,7 +1754,16 @@ impl BackupManager {
                 tracing::warn!("Scheduled backup {id} could not start: {e}");
             }
         }
-        due.len()
+        let reps = self.due_replicas(now).await;
+        for (job_id, rid) in &reps {
+            if self.is_job_busy(job_id) {
+                continue;
+            }
+            if let Err(e) = self.start_operation(job_id, BackupOperation::Replicate { replica_id: Some(rid.clone()) }).await {
+                tracing::warn!("Scheduled replication of {job_id} could not start: {e}");
+            }
+        }
+        due.len() + reps.len()
     }
 
     /// Start the background scheduler loop (idempotent).
@@ -1508,6 +1821,9 @@ fn summarize(op: &str, v: &serde_json::Value) -> String {
         "compact" => format!("{} removed, {} rewritten, {} reclaimed", n("volumes_removed"), n("volumes_rewritten"), human_bytes(n("bytes_reclaimed"))),
         "rebuild_missing" => format!("{} volume(s) rebuilt, {} block(s) recovered, {} unrecoverable", n("volumes_rebuilt"), n("blocks_recovered"), n("blocks_unrecoverable")),
         "extract_control_files" => format!("{} control file(s) extracted", v.get("files").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0)),
+        "apply_locks" => format!("{} volume(s) locked until {}", n("locked"), v.get("until").and_then(|u| u.as_str()).unwrap_or("")),
+        "list_locks" => format!("{} locked volume(s)", v.get("locks").and_then(|l| l.as_array()).map(|a| a.len()).unwrap_or(0)),
+        "replicate" => format!("{} replica(s) updated", v.get("replicas").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0)),
         "snapshot_test" if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => format!("{} snapshot created and removed", v.get("method").and_then(|m| m.as_str()).unwrap_or("")),
         "snapshot_test" => "Snapshot test failed".to_string(),
         "autotune" => format!("Best restore download concurrency: {} thread(s)", n("download_threads")),
@@ -1575,6 +1891,12 @@ fn run_core(
             let files = maintenance::extract_control_files(&open(false)?, version, Path::new(&target))?;
             serde_json::json!({ "files": files.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>() })
         }
+        BackupOperation::ApplyLocks { days, mode, all } => serde_json::to_value(maintenance::apply_locks(&open(false)?, days, mode, all)?)?,
+        BackupOperation::ListLocks => {
+            let l = maintenance::list_locks(&open(false)?)?;
+            serde_json::json!({ "locks": l.into_iter().map(|(n, u)| serde_json::json!({ "name": n, "until": u })).collect::<Vec<_>>() })
+        }
+        BackupOperation::Replicate { .. } => return Err(AppError::internal("replication runs in the manager")),
         BackupOperation::SnapshotTest => {
             let srcs: Vec<PathBuf> = job.sources.iter().map(PathBuf::from).collect();
             let d = ufop_core::backup::snapshot::diagnose(&srcs, &job.options.snapshot);

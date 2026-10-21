@@ -380,6 +380,25 @@ pub enum BackupCommands {
         #[arg(long, default_value_t = 0)]
         version: usize,
     },
+    /// Mirror a backup to another folder (a complete, restorable copy)
+    Mirror {
+        /// Source destination folder
+        #[arg(long)]
+        dest: String,
+        /// Target folder for the copy
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "ufop")]
+        prefix: String,
+        /// Keep files the source no longer has
+        #[arg(long)]
+        keep_extraneous: bool,
+        /// Read back and verify every copied file
+        #[arg(long)]
+        verify: bool,
+        #[arg(long, default_value_t = 2)]
+        threads: usize,
+    },
     /// Salvage data without the job database (download, index, list, restore, convert)
     Recovery {
         #[command(subcommand)]
@@ -679,6 +698,12 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             ok(emit(format, "Control files", &maintenance::extract_control_files(r, version, &target)?))?;
             Ok(0)
         }),
+        BackupCommands::Mirror { dest, to, prefix, keep_extraneous, verify, threads } => {
+            let o = ufop_core::backup::mirror::MirrorOptions { delete_extraneous: !keep_extraneous, verify, dry_run, threads };
+            let r = ufop_core::backup::mirror::mirror(&LocalBackend::new(&dest), &LocalBackend::new(&to), &prefix, &o, &progress_ctx(format))?;
+            ok(emit(format, "Mirror", &r))?;
+            Ok(if r.errors.is_empty() { 0 } else { 2 })
+        }
         BackupCommands::Recovery { cmd } => {
             use ufop_core::backup::recovery;
             let ctx = progress_ctx(format);

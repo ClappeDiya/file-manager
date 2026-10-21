@@ -1959,12 +1959,12 @@
    "cat": 9,
    "name": "Local destination transfer controls",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 4,
-   "verify": "",
+   "verify": "tests",
    "note": "Size check after write; no move-vs-copy choice",
-   "evidence": ""
+   "evidence": "mirror.rs + replicas manager test (after-backup, interval, manual, independent restore); sync dest-state/SHA-256 tests; local put modes; remote file ops test; CLI mirror e2e; UI tests"
   },
   {
    "n": 163,
@@ -2367,48 +2367,48 @@
    "cat": 10,
    "name": "Multiple destinations per backup",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 4,
-   "verify": "",
+   "verify": "tests",
    "note": "One destination per job",
-   "evidence": ""
+   "evidence": "mirror.rs + replicas manager test (after-backup, interval, manual, independent restore); sync dest-state/SHA-256 tests; local put modes; remote file ops test; CLI mirror e2e; UI tests"
   },
   {
    "n": 197,
    "cat": 10,
    "name": "Per-destination replication schedules",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 4,
-   "verify": "",
+   "verify": "tests",
    "note": "No replication",
-   "evidence": ""
+   "evidence": "mirror.rs + replicas manager test (after-backup, interval, manual, independent restore); sync dest-state/SHA-256 tests; local put modes; remote file ops test; CLI mirror e2e; UI tests"
   },
   {
    "n": 198,
    "cat": 10,
    "name": "Replication policies",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 4,
-   "verify": "",
+   "verify": "tests",
    "note": "No replication",
-   "evidence": ""
+   "evidence": "mirror.rs + replicas manager test (after-backup, interval, manual, independent restore); sync dest-state/SHA-256 tests; local put modes; remote file ops test; CLI mirror e2e; UI tests"
   },
   {
    "n": 199,
    "cat": 10,
    "name": "Repository mirroring utility",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 4,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "mirror.rs + replicas manager test (after-backup, interval, manual, independent restore); sync dest-state/SHA-256 tests; local put modes; remote file ops test; CLI mirror e2e; UI tests"
   },
   {
    "n": 200,
@@ -2427,12 +2427,12 @@
    "cat": 10,
    "name": "Sync destination-state modes",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 4,
-   "verify": "",
+   "verify": "tests",
    "note": "Sync scans both sides; no trusted-inventory or blind-upload modes",
-   "evidence": ""
+   "evidence": "mirror.rs + replicas manager test (after-backup, interval, manual, independent restore); sync dest-state/SHA-256 tests; local put modes; remote file ops test; CLI mirror e2e; UI tests"
   },
   {
    "n": 202,
@@ -2451,48 +2451,48 @@
    "cat": 10,
    "name": "Sync hash verification",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 4,
-   "verify": "",
+   "verify": "tests",
    "note": "xxHash3 checksums, not SHA-256",
-   "evidence": ""
+   "evidence": "mirror.rs + replicas manager test (after-backup, interval, manual, independent restore); sync dest-state/SHA-256 tests; local put modes; remote file ops test; CLI mirror e2e; UI tests"
   },
   {
    "n": 204,
    "cat": 10,
    "name": "Remote object locking",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "in_progress",
    "phase": 4,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "Engine lock API, auto-lock, lock-aware retention/compaction, lock admin verified with a WORM test backend; S3 Object Lock implementation pending (U5b)"
   },
   {
    "n": 205,
    "cat": 10,
    "name": "Object-lock mode selection",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "in_progress",
    "phase": 4,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "Engine lock API, auto-lock, lock-aware retention/compaction, lock admin verified with a WORM test backend; S3 Object Lock implementation pending (U5b)"
   },
   {
    "n": 206,
    "cat": 10,
    "name": "Existing-volume lock admin",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "in_progress",
    "phase": 4,
-   "verify": "",
+   "verify": "tests",
    "note": "DB has a lock_until column; nothing sets locks",
-   "evidence": ""
+   "evidence": "Engine lock API, auto-lock, lock-aware retention/compaction, lock admin verified with a WORM test backend; S3 Object Lock implementation pending (U5b)"
   },
   {
    "n": 207,
@@ -2919,12 +2919,12 @@
    "cat": 12,
    "name": "Direct backend file operations",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Connections panel has file ops; no backup-specific tool",
-   "evidence": ""
+   "evidence": "mirror.rs + replicas manager test (after-backup, interval, manual, independent restore); sync dest-state/SHA-256 tests; local put modes; remote file ops test; CLI mirror e2e; UI tests"
   },
   {
    "n": 243,

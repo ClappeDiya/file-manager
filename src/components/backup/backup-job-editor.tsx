@@ -20,6 +20,7 @@ import { inputCls, rulesToText, textToRules } from "@/lib/backup-helpers";
 import { pickFolder } from "@/lib/folder-picker";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { BackupAdvancedOptions } from "./backup-advanced-options";
+import { BackupReplicas } from "./backup-replicas";
 
 interface ConnectionProfile {
   id: string;
@@ -282,6 +283,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
         )}
 
         {step === "Destination" && (
+          <>
           <Section title="Destination">
             <div className="flex gap-2 text-xs">
               <label className="flex items-center gap-1">
@@ -324,6 +326,11 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 <Field label="Marker file (optional)" hint="Only use a destination that contains this file — protects against writing to the wrong removable drive.">
                   <input className={inputCls} value={dest.marker_file ?? ""} onChange={(e) => setDest({ ...dest, marker_file: e.target.value || null })} />
                 </Field>
+                <div className="flex gap-3 flex-wrap">
+                  <Check label="Write via temporary file + rename (atomic)" checked={job.local_transfer.use_move} onChange={(v) => patch({ local_transfer: { ...job.local_transfer, use_move: v } })} hint="Turn off for shares where renames are slow or blocked." />
+                  <Check label="Check file size after writing" checked={job.local_transfer.verify_size} onChange={(v) => patch({ local_transfer: { ...job.local_transfer, verify_size: v } })} />
+                  <Check label="Flush every file to disk" checked={job.local_transfer.sync_writes} onChange={(v) => patch({ local_transfer: { ...job.local_transfer, sync_writes: v } })} />
+                </div>
               </>
             ) : (
               <>
@@ -368,6 +375,8 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
               <input className={inputCls} value={job.options.prefix} onChange={(e) => patchOpts({ prefix: e.target.value.replace(/[^A-Za-z0-9_.]/g, "") })} />
             </Field>
           </Section>
+            <BackupReplicas replicas={job.replicas} onChange={(r) => patch({ replicas: r })} connections={connections} library={library} />
+          </>
         )}
 
         {step === "Schedule" && (

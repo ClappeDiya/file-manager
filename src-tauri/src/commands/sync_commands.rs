@@ -66,6 +66,8 @@ pub async fn create_sync_pair(
     checksum_enabled: Option<bool>,
     time_offset_secs: Option<i64>,
     options_json: Option<String>,
+    dest_state: Option<String>,
+    checksum_algorithm: Option<String>,
     manager: State<'_, SyncManager>,
     ledger: State<'_, OperationLedger>,
     repo: State<'_, Repository>,
@@ -118,6 +120,8 @@ pub async fn create_sync_pair(
         created_at: chrono::Utc::now(),
         time_offset_secs,
         copy_options,
+        dest_state: dest_state.and_then(|v| serde_json::from_value(serde_json::Value::String(v)).ok()).unwrap_or_default(),
+        checksum_algorithm: checksum_algorithm.and_then(|v| serde_json::from_value(serde_json::Value::String(v)).ok()).unwrap_or_default(),
     };
 
     use crate::core::traits::SyncOperations;
