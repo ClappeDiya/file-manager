@@ -139,3 +139,26 @@ async fn required_pre_script_failure_aborts() {
     assert_eq!(h[0].status, "error");
     assert!(h[0].log.iter().any(|l| l.message.contains("nope")));
 }
+
+#[tokio::test]
+async fn passphrase_persists_without_keychain() {
+    // Regression: without an OS keychain the credential store is memory-only,
+    // so a restarted server lost every job passphrase.
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    let repo = Repository::open_in_memory().await.unwrap();
+    let mk = || {
+        let m = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, t.path().join("dbs"), KdfParams::insecure_fast());
+        m.set_settings_store(SettingsStore::with_key(repo.pool().clone(), "settings-key").unwrap());
+        m
+    };
+    let first = mk();
+    let j = first.save_job(job(&src, &dst), Some("pw-123".into())).await.unwrap();
+    let restarted = mk();
+    restarted.load_from_db().await.unwrap();
+    assert_eq!(restarted.passphrase(&j.id).await.unwrap().as_deref(), Some("pw-123"));
+    // Stored encrypted, not in plain text.
+    let raw: String = repo.pool().execute(|c| Ok(c.query_row("SELECT value FROM config WHERE key LIKE 'backup-passphrase:%'", [], |r| r.get(0))?)).await.unwrap();
+    assert!(raw.starts_with("enc:v1:") && !raw.contains("pw-123"));
+}

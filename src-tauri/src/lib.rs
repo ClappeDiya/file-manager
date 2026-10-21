@@ -13,6 +13,7 @@ pub mod mount_engine;
 pub mod narrator;
 pub mod safety;
 pub mod security;
+pub mod server;
 pub mod storage;
 pub mod sync_engine;
 pub mod spaces_engine;
@@ -216,6 +217,12 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         Some(ledger.clone()),
         backup_engine::default_data_dir(),
     );
+    // Without an OS keychain, job passphrases persist in the (encrypted)
+    // settings store instead of process memory.
+    match crate::security::settings_store::SettingsStore::open(repo.pool().clone(), &credential_store, Default::default()).await {
+        Ok(store) => backup_mgr.set_settings_store(store),
+        Err(e) => tracing::warn!("Settings store unavailable (non-fatal): {e}"),
+    }
     if let Err(e) = backup_mgr.load_from_db().await {
         tracing::warn!("Failed to load backup jobs (non-fatal): {e}");
     }

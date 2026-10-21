@@ -8,14 +8,17 @@
 //! missed-run catch-up and pause/resume, pre/post scripts, HTTP report
 //! callbacks, run history (`backup_runs`) and the operation ledger.
 
+pub mod api;
 pub mod connector_backend;
 pub mod hooks;
+pub mod policy;
 pub mod portability;
 pub mod schedule;
 
 use crate::connectors::ConnectionManager;
 use crate::core::error::AppError;
 use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
+use crate::security::settings_store::SettingsStore;
 use crate::security::CredentialStore;
 use crate::storage::pool::DbPool;
 use chrono::{DateTime, Utc};
@@ -284,6 +287,8 @@ struct Inner {
     paused: Mutex<Option<Option<DateTime<Utc>>>>,
     scheduler_running: AtomicBool,
     kdf: KdfParams,
+    policy: std::sync::RwLock<policy::ModulePolicy>,
+    secrets: std::sync::OnceLock<SettingsStore>,
 }
 
 #[derive(Clone)]
@@ -330,8 +335,30 @@ impl BackupManager {
                 paused: Mutex::new(None),
                 scheduler_running: AtomicBool::new(false),
                 kdf,
+                policy: std::sync::RwLock::new(policy::ModulePolicy::from_env()),
+                secrets: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Replace the process-wide module allowlist.
+    pub fn set_module_policy(&self, p: policy::ModulePolicy) {
+        *self.inner.policy.write().unwrap_or_else(|e| e.into_inner()) = p;
+    }
+
+    pub fn module_policy(&self) -> policy::ModulePolicy {
+        self.inner.policy.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    async fn check_policy(&self, job: &BackupJob) -> Result<(), AppError> {
+        let protocol = match &job.destination {
+            BackupDestination::Local { .. } => "local".to_string(),
+            BackupDestination::Connection { connection_id, .. } => match (&self.inner.conns, uuid::Uuid::parse_str(connection_id)) {
+                (Some(c), Ok(id)) => c.get_connection(id).await?.map(|p| p.protocol.as_str().to_string()).unwrap_or_default(),
+                _ => String::new(),
+            },
+        };
+        self.module_policy().check_job(&protocol, job.encrypted, job.options.compression_level > 0)
     }
 
     fn job_db_path(&self, id: &str) -> PathBuf {
@@ -393,6 +420,7 @@ impl BackupManager {
         let existing = if job.id.is_empty() { None } else { self.inner.jobs.read().await.get(&job.id).cloned() };
         job.sources.retain(|s| !s.trim().is_empty());
         job.validate()?;
+        self.check_policy(&job).await?;
         let now = Utc::now().to_rfc3339();
         match &existing {
             Some(old) => {
@@ -413,11 +441,10 @@ impl BackupManager {
         }
         job.updated_at = now;
         if let Some(p) = passphrase {
-            let key = format!("{PASS_KEY_PREFIX}{}", job.id);
             if p.is_empty() {
-                let _ = self.inner.creds.delete(&key).await;
+                self.delete_secret(&job.id).await;
             } else {
-                self.inner.creds.store(&key, &p).await?;
+                self.store_secret(&job.id, &p).await?;
             }
         }
         if job.encrypted && self.passphrase(&job.id).await?.is_none() {
@@ -428,8 +455,44 @@ impl BackupManager {
         Ok(job)
     }
 
+    /// Passphrases go to the OS keychain when one is available, otherwise to
+    /// the settings store in the database (encrypted with the settings key
+    /// when there is one) so they survive restarts on headless machines.
+    fn secret_db(&self) -> Option<&SettingsStore> {
+        if self.inner.creds.is_keychain_available() {
+            None
+        } else {
+            self.inner.secrets.get()
+        }
+    }
+
+    async fn store_secret(&self, job_id: &str, value: &str) -> Result<(), AppError> {
+        let key = format!("{PASS_KEY_PREFIX}{job_id}");
+        match self.secret_db() {
+            Some(db) => db.set_secret(&key, value).await,
+            None => self.inner.creds.store(&key, value).await,
+        }
+    }
+
+    async fn delete_secret(&self, job_id: &str) {
+        let key = format!("{PASS_KEY_PREFIX}{job_id}");
+        if let Some(db) = self.secret_db() {
+            let _ = db.delete(&key).await;
+        }
+        let _ = self.inner.creds.delete(&key).await;
+    }
+
     pub async fn passphrase(&self, job_id: &str) -> Result<Option<String>, AppError> {
-        self.inner.creds.retrieve(&format!("{PASS_KEY_PREFIX}{job_id}")).await
+        let key = format!("{PASS_KEY_PREFIX}{job_id}");
+        match self.secret_db() {
+            Some(db) => db.get_secret(&key).await,
+            None => self.inner.creds.retrieve(&key).await,
+        }
+    }
+
+    /// Persist passphrases in the database when no OS keychain exists.
+    pub fn set_settings_store(&self, store: SettingsStore) {
+        let _ = self.inner.secrets.set(store);
     }
 
     /// Delete a job. Optionally remove its local database and/or all remote volumes.
@@ -462,7 +525,7 @@ impl BackupManager {
             c.execute("DELETE FROM backup_jobs WHERE id = ?1", [&key])?;
             Ok(())
         }).await?;
-        let _ = self.inner.creds.delete(&format!("{PASS_KEY_PREFIX}{id}")).await;
+        self.delete_secret(id).await;
         self.inner.jobs.write().await.remove(id);
         Ok(())
     }
@@ -672,6 +735,7 @@ impl BackupManager {
         }
 
         let result: Result<serde_json::Value, AppError> = async {
+            self.check_policy(&job).await?;
             let backend = self.build_backend(&job).await?;
             let pass = if job.encrypted { self.passphrase(&job.id).await? } else { None };
             if job.encrypted && pass.is_none() {

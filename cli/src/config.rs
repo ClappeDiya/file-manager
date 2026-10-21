@@ -10,6 +10,13 @@ pub struct CliConfig {
     pub token: Option<String>,
     pub default_format: Option<String>,
     pub connections: Vec<SavedConnection>,
+    /// `ufop server …`: base URL, access/automation token and refresh token.
+    #[serde(default)]
+    pub server_url: Option<String>,
+    #[serde(default)]
+    pub server_token: Option<String>,
+    #[serde(default)]
+    pub server_refresh: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +55,12 @@ impl CliConfig {
         }
         let content = toml::to_string_pretty(self)?;
         std::fs::write(&path, content)?;
+        // Holds credentials: owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 }

@@ -1,11 +1,20 @@
 import { isTauriAvailable, tauriInvoke } from "@/hooks/use-tauri";
 
+type FolderPickerImpl = (title: string) => Promise<string | null>;
+let customPicker: FolderPickerImpl | null = null;
+
+/** Let a host (the ufop-server web UI) supply its own folder browser. */
+export function setFolderPickerImpl(fn: FolderPickerImpl | null) {
+  customPicker = fn;
+}
+
 /**
  * Opens a native OS folder picker dialog via a dedicated Rust IPC command.
  * This avoids z-order and focus issues that occur when the JS dialog plugin
  * tries to open a native sheet behind a CSS modal overlay.
  */
 export async function pickFolder(title?: string): Promise<string | null> {
+  if (customPicker) return customPicker(title ?? "Select Folder");
   if (isTauriAvailable()) {
     try {
       const result = await tauriInvoke<string | null>("pick_folder", {

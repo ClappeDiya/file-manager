@@ -6,5 +6,6 @@
 #[cfg(feature = "backup")]
 pub mod backup;
 pub mod error;
+pub mod preload;
 pub mod sync;
 pub mod sync_types;

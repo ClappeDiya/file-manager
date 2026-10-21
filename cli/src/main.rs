@@ -111,6 +111,10 @@ pub enum Commands {
     #[command(subcommand)]
     Sync(SyncCommands),
 
+    /// Control a running ufop-server (login, run, pause, logs, health…)
+    #[command(subcommand)]
+    Server(commands::server::ServerCommands),
+
     /// Versioned, deduplicated, encrypted backups (run, restore, verify, repair…)
     #[command(subcommand)]
     Backup(commands::backup::BackupCommands),
@@ -319,7 +323,16 @@ fn parse_rate_limit(s: &str) -> u64 {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // Machine-wide defaults (arguments and environment) from the preload file.
+    let preload = ufop_core::preload::Preload::load();
+    if let Some(p) = &preload {
+        p.apply_env("ufop");
+    }
+    let argv: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse_from(match &preload {
+        Some(p) => p.merge_args("ufop", argv),
+        None => argv,
+    });
 
     // Initialize tracing based on verbosity
     let filter = match cli.verbose {
@@ -359,6 +372,9 @@ async fn main() -> ExitCode {
         }
         Commands::Sync(cmd) => {
             commands::sync::execute(cmd, &format, dry_run).await
+        }
+        Commands::Server(cmd) => {
+            commands::server::execute(cmd, &format).await
         }
         Commands::Backup(cmd) => {
             commands::backup::execute(cmd, &format, dry_run).await

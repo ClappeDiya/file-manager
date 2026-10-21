@@ -2,14 +2,12 @@
 //! configuration portability and the scheduler).
 
 use crate::backup_engine::{
-    connector_backend::BACKUP_PROTOCOLS, portability, BackupDestination, BackupJob, BackupManager, BackupOperation, BackupRun,
+    api, portability, BackupDestination, BackupJob, BackupManager, BackupOperation, BackupRun,
     Fileset, OperationResult, SchedulerStatus,
 };
 use crate::core::error::AppError;
-use serde::Serialize;
 use tauri::State;
 use ufop_core::backup::crypto::{self, PassphraseStrength};
-use ufop_core::backup::filters::FILTER_GROUPS;
 use ufop_core::backup::maintenance::{FoundFile, VersionComparison};
 use ufop_core::backup::{FileEntry, RestoreOptions, RestoreReport};
 
@@ -118,24 +116,13 @@ pub async fn backup_prune_history(days: u32, mgr: State<'_, BackupManager>) -> R
 /// `export_passphrase` encrypts the whole export.
 #[tauri::command]
 pub async fn backup_export_config(id: String, include_passphrase: bool, export_passphrase: Option<String>, include_stats: Option<bool>, mgr: State<'_, BackupManager>) -> Result<String, AppError> {
-    let job = mgr.get_job(&id).await?;
-    let pass = if include_passphrase { mgr.passphrase(&id).await? } else { None };
-    portability::export_job(&job, pass, export_passphrase.as_deref(), include_stats.unwrap_or(false))
-}
-
-#[derive(Serialize)]
-pub struct ImportPreview {
-    pub job: BackupJob,
-    pub has_passphrase: bool,
+    api::export_config(&mgr, &id, include_passphrase, export_passphrase.as_deref(), include_stats.unwrap_or(false)).await
 }
 
 /// Parse an export without saving it (for review), or save it immediately.
 #[tauri::command]
-pub async fn backup_import_config(json: String, export_passphrase: Option<String>, import_stats: Option<bool>, save: bool, mgr: State<'_, BackupManager>) -> Result<ImportPreview, AppError> {
-    let (job, pass) = portability::import_job(&json, export_passphrase.as_deref(), import_stats.unwrap_or(false))?;
-    let has_passphrase = pass.is_some();
-    let job = if save { mgr.save_job(job, pass).await? } else { job };
-    Ok(ImportPreview { job, has_passphrase })
+pub async fn backup_import_config(json: String, export_passphrase: Option<String>, import_stats: Option<bool>, save: bool, mgr: State<'_, BackupManager>) -> Result<api::ImportPreview, AppError> {
+    api::import_config(&mgr, &json, export_passphrase.as_deref(), import_stats.unwrap_or(false), save).await
 }
 
 #[tauri::command]
@@ -176,63 +163,13 @@ pub async fn backup_generate_passphrase(length: Option<usize>) -> Result<String,
     Ok(crypto::generate_passphrase(length.unwrap_or(32)))
 }
 
-#[derive(Serialize)]
-pub struct FilterGroupInfo {
-    pub name: String,
-    pub description: String,
-    pub patterns: Vec<String>,
-}
-
-#[derive(Serialize)]
-pub struct BackupCapabilities {
-    pub filter_groups: Vec<FilterGroupInfo>,
-    pub connection_protocols: Vec<String>,
-    pub default_no_compress_extensions: Vec<String>,
-}
-
 #[tauri::command]
-pub async fn backup_capabilities() -> Result<BackupCapabilities, AppError> {
-    Ok(BackupCapabilities {
-        filter_groups: FILTER_GROUPS
-            .iter()
-            .map(|(n, d, p)| FilterGroupInfo { name: n.to_string(), description: d.to_string(), patterns: p.iter().map(|s| s.to_string()).collect() })
-            .collect(),
-        connection_protocols: BACKUP_PROTOCOLS.iter().map(|s| s.to_string()).collect(),
-        default_no_compress_extensions: ufop_core::backup::default_no_compress_extensions(),
-    })
-}
-
-#[derive(Serialize)]
-pub struct SourcePreview {
-    pub files: u64,
-    pub folders: u64,
-    pub total_size: u64,
-    pub sample: Vec<String>,
-    pub warnings: Vec<String>,
+pub async fn backup_capabilities(mgr: State<'_, BackupManager>) -> Result<api::BackupCapabilities, AppError> {
+    Ok(api::capabilities(&mgr))
 }
 
 /// Count what the job's sources and filters select, without backing up.
 #[tauri::command]
-pub async fn backup_preview_sources(job: BackupJob) -> Result<SourcePreview, AppError> {
-    tokio::task::spawn_blocking(move || {
-        let filter = job.filter.clone().compile()?;
-        let sources: Vec<std::path::PathBuf> = job.sources.iter().filter(|s| !s.trim().is_empty()).map(Into::into).collect();
-        let (entries, warnings) = ufop_core::backup::engine::scan_sources(&sources, &filter, &job.options)?;
-        let mut p = SourcePreview { files: 0, folders: 0, total_size: 0, sample: Vec::new(), warnings };
-        for (_, e) in &entries {
-            match e.kind {
-                ufop_core::backup::EntryKind::Dir => p.folders += 1,
-                _ => {
-                    p.files += 1;
-                    p.total_size += e.size;
-                    if p.sample.len() < 50 {
-                        p.sample.push(e.path.clone());
-                    }
-                }
-            }
-        }
-        Ok(p)
-    })
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?
+pub async fn backup_preview_sources(job: BackupJob) -> Result<api::SourcePreview, AppError> {
+    api::preview_sources(job).await
 }

@@ -7,6 +7,7 @@ pub mod copy;
 pub mod duplicates;
 pub mod login;
 pub mod rename;
+pub mod server;
 pub mod status;
 pub mod sync;
 pub mod transfer;

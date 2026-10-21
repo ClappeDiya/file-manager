@@ -82,8 +82,27 @@ fn all_migrations() -> Vec<Migration> {
             description: "Backup engine - versioned backup jobs and run history",
             sql: V13_SCHEMA,
         },
+        Migration {
+            version: 14,
+            description: "Server auth tokens - refresh tokens and used sign-in tokens",
+            sql: V14_SCHEMA,
+        },
     ]
 }
+
+/// Schema v14: `ufop-server` refresh tokens (stored as SHA-256 hashes) and
+/// redeemed one-time sign-in token ids.
+const V14_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_tokens (
+    id          TEXT PRIMARY KEY NOT NULL,
+    kind        TEXT NOT NULL,
+    token_hash  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    revoked     INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_server_tokens_hash ON server_tokens(token_hash);
+"#;
 
 /// Schema v13: versioned (deduplicated, encrypted) backup jobs. The job
 /// definition is JSON so options can grow without migrations; each job's
@@ -699,7 +718,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 13);
+        assert_eq!(applied, 14);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -731,7 +750,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 13);
+        assert_eq!(first, 14);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -744,7 +763,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 13);
+        assert_eq!(current_version(&conn).unwrap(), 14);
     }
 
     #[test]

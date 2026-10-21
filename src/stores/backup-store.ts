@@ -7,7 +7,7 @@
  * `type`-tagged unions for tagged enums).
  */
 import { create } from "zustand";
-import { isTauriAvailable, tauriInvoke } from "@/hooks/use-tauri";
+import { isBackendAvailable, tauriInvoke } from "@/hooks/use-tauri";
 import { errorText } from "@/lib/error-text";
 
 export { errorText };
@@ -432,12 +432,12 @@ export const DEFAULT_RESTORE_OPTIONS: RestoreOptions = {
 const EMPTY_STATUS: SchedulerStatus = { running: false, paused: false, paused_until: null, tasks: [], next_runs: [] };
 
 /**
- * IPC call that uses `fallback` only outside Tauri (browser dev mode). Inside
- * Tauri, backend errors propagate so the panel can show them instead of an
+ * IPC call that uses `fallback` only without a backend (browser dev mode). With
+ * Tauri or `ufop-server`, backend errors propagate so the panel can show them instead of an
  * empty list that looks like "no data".
  */
 function ipc<T>(command: string, args: Record<string, unknown>, fallback: T): Promise<T> {
-  return isTauriAvailable() ? tauriInvoke<T>(command, args) : Promise.resolve(fallback);
+  return isBackendAvailable() ? tauriInvoke<T>(command, args) : Promise.resolve(fallback);
 }
 
 // ── Store ──

@@ -15,6 +15,7 @@ pub mod credential_store;
 pub mod encryption;
 pub mod kdf;
 pub mod master_password;
+pub mod settings_store;
 pub mod tls;
 pub mod vault;
 
