@@ -641,9 +641,32 @@ fn restore_symlink(e: &FileEntry, dest: &Path, opts: &RestoreOptions, warns: &mu
         }
         return Ok(());
     }
+    #[cfg(windows)]
+    {
+        if let Some(p) = dest.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        if std::fs::symlink_metadata(dest).is_ok() {
+            let _ = std::fs::remove_dir(dest).or_else(|_| std::fs::remove_file(dest));
+        }
+        if e.meta.as_ref().is_some_and(|m| m.junction) {
+            // Junctions need no special privilege.
+            return meta::create_junction(dest, target).map_err(|err| AppError::file_op(format!("Junction {}: {err}", dest.display()), "Check the target folder."));
+        }
+        let looks_dir = target.ends_with('\\') || Path::new(target).is_dir();
+        let r = if looks_dir { std::os::windows::fs::symlink_dir(target, dest) } else { std::os::windows::fs::symlink_file(target, dest) };
+        if let Err(err) = r {
+            warns.push(format!("Symbolic link {} → {target} not recreated: {err} (needs Developer Mode or administrator rights)", dest.display()));
+        }
+        return Ok(());
+    }
     #[allow(unreachable_code)]
     {
-        warns.push(format!("Symbolic link {} → {target} not recreated on this platform", dest.display()));
+        if e.meta.as_ref().is_some_and(|m| m.junction) {
+            warns.push(format!("Junction {} → {target} not recreated (NTFS only)", dest.display()));
+        } else {
+            warns.push(format!("Symbolic link {} → {target} not recreated on this platform", dest.display()));
+        }
         Ok(())
     }
 }

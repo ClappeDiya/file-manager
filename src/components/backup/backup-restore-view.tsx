@@ -19,6 +19,7 @@ import {
   type Fileset,
   type FoundFile,
   type RestoreOptions,
+  type RestoreOverrides,
   type RestoreReport,
   type VersionComparison,
 } from "@/stores/backup-store";
@@ -116,6 +117,7 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
   const [filter, setFilter] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [opts, setOpts] = useState<RestoreOptions>(DEFAULT_RESTORE_OPTIONS);
+  const [overrides, setOverrides] = useState<RestoreOverrides>({ download_bps: null, retries: null, network_timeout_secs: null });
   const [search, setSearch] = useState("");
   const [hits, setHits] = useState<FoundFile[] | null>(null);
   const [cmp, setCmp] = useState<VersionComparison | null>(null);
@@ -267,13 +269,27 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
 
       <Section title="Restore">
         <RestoreOptionsForm value={opts} onChange={setOpts} versionCount={versions.length} />
+        <details className="text-xs" data-testid="restore-overrides">
+          <summary className="cursor-pointer select-none">This restore only (overrides the job)</summary>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-2">
+            <Field label="Download limit (KB/s, empty = job setting)">
+              <input className={inputCls} type="number" min={0} value={overrides.download_bps == null ? "" : Math.round(overrides.download_bps / 1024)} onChange={(e) => setOverrides({ ...overrides, download_bps: e.target.value === "" ? null : Math.max(0, Number(e.target.value)) * 1024 })} />
+            </Field>
+            <Field label="Retries">
+              <input className={inputCls} type="number" min={0} max={20} value={overrides.retries ?? ""} onChange={(e) => setOverrides({ ...overrides, retries: e.target.value === "" ? null : Math.max(0, Number(e.target.value)) })} />
+            </Field>
+            <Field label="Network timeout (s)">
+              <input className={inputCls} type="number" min={0} value={overrides.network_timeout_secs ?? ""} onChange={(e) => setOverrides({ ...overrides, network_timeout_secs: e.target.value === "" ? null : Math.max(0, Number(e.target.value)) })} />
+            </Field>
+          </div>
+        </details>
         <Btn
           tone="primary"
           disabled={busy || (opts.target !== null && !opts.target.trim())}
           testId="backup-restore-run"
           onClick={() =>
             run(async () => {
-              const r = await execute(job.id, { type: "restore", options: { ...opts, version, paths: [...selected] } });
+              const r = await execute(job.id, { type: "restore", options: { ...opts, version, paths: [...selected] }, overrides });
               setReport(r.report as unknown as RestoreReport);
             })
           }

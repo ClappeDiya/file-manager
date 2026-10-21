@@ -46,7 +46,7 @@ RUN --mount=type=secret,id=ca --mount=type=bind,source=docker/with-ca.sh,target=
 FROM ${REGISTRY}/ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN --mount=type=secret,id=ca --mount=type=bind,source=docker/with-ca.sh,target=/with-ca.sh sh /with-ca.sh sh -c 'apt-get update && apt-get install -y --no-install-recommends \
-      libwebkit2gtk-4.1-0 libgtk-3-0t64 libayatana-appindicator3-1 libssl3t64 ca-certificates tini \
+      libwebkit2gtk-4.1-0 libgtk-3-0t64 libayatana-appindicator3-1 libssl3t64 ca-certificates tini par2 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home /data ufop && mkdir -p /data /source && chown ufop /data \
     && rm -f /etc/apt/apt.conf.d/99extra-ca'

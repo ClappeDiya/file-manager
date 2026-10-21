@@ -8,7 +8,7 @@ use crate::error::AppError;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS remote_volumes (
@@ -51,6 +51,31 @@ CREATE INDEX IF NOT EXISTS idx_files_fileset ON files(fileset_id);
 CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
+
+/// Current job-database schema version (`PRAGMA user_version`).
+pub const SCHEMA_VERSION: i32 = 2;
+
+/// Summary of a job database file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbInfo {
+    pub path: String,
+    pub schema_version: i32,
+    pub latest_schema: i32,
+    pub versions: u64,
+    pub volumes: u64,
+    pub blocks: u64,
+    pub files: u64,
+    pub size_bytes: u64,
+    pub integrity_ok: bool,
+    pub integrity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationReport {
+    pub from: i32,
+    pub to: i32,
+    pub backup_path: Option<String>,
+}
 
 /// A remote volume row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,13 +130,101 @@ impl BackupDb {
 
     fn init(conn: Connection) -> Result<Self, AppError> {
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
-        conn.execute_batch(SCHEMA)?;
-        // v2: extended metadata column (older job databases lack it).
-        let has_meta: bool = conn.prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'meta'")?.exists([])?;
-        if !has_meta {
-            conn.execute_batch("ALTER TABLE files ADD COLUMN meta TEXT")?;
-        }
+        Self::upgrade(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Schema version stored in the file (0 = empty file). Databases from
+    /// before versioning have tables but `user_version` 0: they count as 1.
+    fn stored_version(conn: &Connection) -> Result<i32, AppError> {
+        let v: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if v > 0 {
+            return Ok(v);
+        }
+        let has_tables: bool = conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'filesets'")?.exists([])?;
+        if !has_tables {
+            return Ok(0);
+        }
+        let has_meta: bool = conn.prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'meta'")?.exists([])?;
+        Ok(if has_meta { 2 } else { 1 })
+    }
+
+    /// Apply every migration after the stored version, in one transaction.
+    fn upgrade(conn: &Connection) -> Result<(i32, i32), AppError> {
+        let from = Self::stored_version(conn)?;
+        if from > SCHEMA_VERSION {
+            return Err(AppError::validation(format!(
+                "This backup database uses schema {from}, newer than this version supports ({SCHEMA_VERSION}); update the app"
+            )));
+        }
+        if from == SCHEMA_VERSION {
+            return Ok((from, from));
+        }
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let r = (|| -> Result<(), AppError> {
+            if from < 1 {
+                conn.execute_batch(SCHEMA)?;
+            }
+            if from < 2 {
+                // v2: extended metadata (xattrs, ACLs, Windows attributes).
+                let has_meta: bool = conn.prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'meta'")?.exists([])?;
+                if !has_meta {
+                    conn.execute_batch("ALTER TABLE files ADD COLUMN meta TEXT")?;
+                }
+            }
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+            Ok(())
+        })();
+        match r {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+        Ok((from, SCHEMA_VERSION))
+    }
+
+    /// Inspect a database file without changing it.
+    pub fn inspect(path: &Path) -> Result<DbInfo, AppError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let schema = Self::stored_version(&conn)?;
+        let count = |sql: &str| -> u64 { conn.query_row(sql, [], |r| r.get::<_, i64>(0)).map(|n| n as u64).unwrap_or(0) };
+        let size = ["", "-wal", "-shm"].iter().filter_map(|x| std::fs::metadata(format!("{}{x}", path.display())).ok()).map(|m| m.len()).sum();
+        let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap_or_else(|e| e.to_string());
+        Ok(DbInfo {
+            path: path.to_string_lossy().into_owned(),
+            schema_version: schema,
+            latest_schema: SCHEMA_VERSION,
+            versions: count("SELECT COUNT(*) FROM filesets"),
+            volumes: count("SELECT COUNT(*) FROM remote_volumes"),
+            blocks: count("SELECT COUNT(*) FROM blocks"),
+            files: count("SELECT COUNT(*) FROM files"),
+            size_bytes: size,
+            integrity_ok: integrity == "ok",
+            integrity,
+        })
+    }
+
+    /// Standalone migration: upgrade a database file in place, copying it
+    /// to `<file>.v<from>.bak` first when `backup` is set.
+    pub fn migrate(path: &Path, backup: bool) -> Result<MigrationReport, AppError> {
+        if !path.is_file() {
+            return Err(AppError::file_op(format!("{} does not exist", path.display()), "Check the database path."));
+        }
+        let before = Self::inspect(path)?;
+        let mut backup_path = None;
+        if backup && before.schema_version < SCHEMA_VERSION {
+            let conn = Connection::open(path)?;
+            let b = PathBuf::from(format!("{}.v{}.bak", path.display(), before.schema_version));
+            let _ = std::fs::remove_file(&b);
+            // VACUUM INTO writes a consistent copy even with a WAL present.
+            conn.execute("VACUUM INTO ?1", [b.to_string_lossy()])?;
+            backup_path = Some(b.to_string_lossy().into_owned());
+        }
+        let conn = Connection::open(path)?;
+        let (from, to) = Self::upgrade(&conn)?;
+        Ok(MigrationReport { from, to, backup_path })
     }
 
     pub fn begin(&self) -> Result<(), AppError> {
@@ -356,5 +469,39 @@ impl BackupDb {
             out.push(format!("{missing} referenced block(s) have no known volume"));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_legacy_database_and_refuses_newer() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("job.sqlite");
+        {
+            // A database from before schema versioning: v1 tables, no meta column.
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            c.execute_batch("ALTER TABLE files DROP COLUMN meta").unwrap_or(());
+            c.execute("INSERT INTO kv(key, value) VALUES ('x', 'y')", []).unwrap();
+        }
+        let info = BackupDb::inspect(&p).unwrap();
+        assert_eq!((info.schema_version, info.latest_schema), (1, SCHEMA_VERSION));
+        assert!(info.integrity_ok);
+        let r = BackupDb::migrate(&p, true).unwrap();
+        assert_eq!((r.from, r.to), (1, SCHEMA_VERSION));
+        let bak = r.backup_path.unwrap();
+        assert_eq!(BackupDb::inspect(Path::new(&bak)).unwrap().schema_version, 1, "backup keeps the old schema");
+        let db = BackupDb::open(&p).unwrap();
+        assert_eq!(db.get_kv("x").unwrap().as_deref(), Some("y"), "data survives");
+        drop(db);
+        assert_eq!(BackupDb::inspect(&p).unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(BackupDb::migrate(&p, true).unwrap().backup_path, None, "already current");
+
+        Connection::open(&p).unwrap().execute_batch("PRAGMA user_version = 99").unwrap();
+        assert!(BackupDb::open(&p).is_err());
+        assert!(BackupDb::migrate(&d.path().join("missing.sqlite"), false).is_err());
     }
 }

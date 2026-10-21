@@ -37,6 +37,7 @@ use ufop_core::backup::backend::{RetryPolicy, Throttle};
 use ufop_core::backup::crypto::KdfParams;
 use ufop_core::backup::db::BackupDb;
 use ufop_core::backup::engine::Repo;
+use ufop_core::backup::recovery;
 use ufop_core::backup::{
     maintenance, Backend, BackupOptions, LocalBackend, OpContext, Progress, RestoreOptions, RetentionPolicy, RetryingBackend,
     SoftDeleteBackend, SourceFilter,
@@ -211,12 +212,61 @@ impl BackupJob {
     }
 }
 
+/// One-off settings for a single restore (the job keeps its own).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RestoreOverrides {
+    /// Download limit in bytes/second (0 = unlimited).
+    pub download_bps: Option<u64>,
+    pub retries: Option<u32>,
+    pub network_timeout_secs: Option<u64>,
+}
+
+impl RestoreOverrides {
+    fn apply(&self, job: &mut BackupJob) {
+        if let Some(b) = self.download_bps {
+            job.throttle.download_bps = b;
+        }
+        if let Some(r) = self.retries {
+            job.retry.retries = r;
+        }
+        if let Some(t) = self.network_timeout_secs {
+            job.network_timeout_secs = t;
+        }
+    }
+}
+
+/// Database file of a job folder entry (inventory).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseEntry {
+    pub job_id: String,
+    /// `None` when no job uses this database (orphan).
+    pub job_name: Option<String>,
+    pub info: Option<ufop_core::backup::db::DbInfo>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DatabaseCleanupReport {
+    pub orphans_deleted: Vec<String>,
+    pub vacuumed: usize,
+    pub migrated: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub errors: Vec<String>,
+}
+
 /// Every operation the queue can run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackupOperation {
     Backup { dry_run: bool },
-    Restore { options: RestoreOptions },
+    Restore {
+        options: RestoreOptions,
+        /// Settings that apply to this restore only.
+        #[serde(default)]
+        overrides: RestoreOverrides,
+    },
     Verify { full: bool },
     Compact,
     Repair,
@@ -232,6 +282,8 @@ pub enum BackupOperation {
     ExtractControlFiles { version: usize, target: String },
     /// Benchmark restore download concurrency.
     AutoTune { sample_volumes: usize },
+    /// Create and remove a test snapshot of the sources.
+    SnapshotTest,
 }
 
 impl BackupOperation {
@@ -251,6 +303,7 @@ impl BackupOperation {
             Self::RebuildMissing => "rebuild_missing",
             Self::ExtractControlFiles { .. } => "extract_control_files",
             Self::AutoTune { .. } => "autotune",
+            Self::SnapshotTest => "snapshot_test",
         }
     }
 }
@@ -936,6 +989,9 @@ impl BackupManager {
         if let Err(e) = self.global_defaults().await.and_then(|d| d.apply(&mut job)) {
             log.push(LogLine::warn(format!("Global defaults not applied: {}", e.user_message())));
         }
+        if let BackupOperation::Restore { overrides, .. } = &op {
+            overrides.apply(&mut job);
+        }
         let _awake = job.prevent_sleep.then(|| power::SleepInhibitor::acquire(&format!("UFOP {op_name}: {}", job.name)));
         let is_backup = matches!(op, BackupOperation::Backup { .. });
 
@@ -1188,6 +1244,104 @@ impl BackupManager {
         .await
     }
 
+    // ── Local database tools ──
+
+    /// Every job database in the data folder, with its owner job (if any).
+    pub async fn database_inventory(&self) -> Result<Vec<DatabaseEntry>, AppError> {
+        let jobs: HashMap<String, String> = self.inner.jobs.read().await.values().map(|j| (j.id.clone(), j.name.clone())).collect();
+        let dir = self.inner.data_dir.clone();
+        blocking(move || {
+            let mut out = Vec::new();
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(_) => return Ok(out),
+            };
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let Some(id) = name.strip_suffix(".sqlite") else { continue };
+                let (info, error) = match BackupDb::inspect(&e.path()) {
+                    Ok(i) => (Some(i), None),
+                    Err(err) => (None, Some(err.user_message())),
+                };
+                out.push(DatabaseEntry { job_id: id.to_string(), job_name: jobs.get(id).cloned(), info, error });
+            }
+            out.sort_by(|a, b| a.job_name.cmp(&b.job_name).then(a.job_id.cmp(&b.job_id)));
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Delete orphan databases, upgrade old schemas and vacuum the rest.
+    /// Databases of jobs with a running or queued task are left alone.
+    pub async fn cleanup_databases(&self, delete_orphans: bool, vacuum: bool) -> Result<DatabaseCleanupReport, AppError> {
+        let inv = self.database_inventory().await?;
+        let busy: std::collections::HashSet<String> = lock(&self.inner.tasks).iter().map(|t| t.info.job_id.clone()).collect();
+        let dir = self.inner.data_dir.clone();
+        blocking(move || {
+            let mut r = DatabaseCleanupReport::default();
+            for e in inv {
+                let path = dir.join(format!("{}.sqlite", e.job_id));
+                let size = |p: &Path| -> u64 { ["", "-wal", "-shm"].iter().filter_map(|x| std::fs::metadata(format!("{}{x}", p.display())).ok()).map(|m| m.len()).sum() };
+                r.bytes_before += size(&path);
+                if busy.contains(&e.job_id) {
+                    r.bytes_after += size(&path);
+                    continue;
+                }
+                if e.job_name.is_none() {
+                    if delete_orphans {
+                        for ext in ["", "-wal", "-shm"] {
+                            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+                        }
+                        r.orphans_deleted.push(e.job_id);
+                    } else {
+                        r.bytes_after += size(&path);
+                    }
+                    continue;
+                }
+                if e.info.as_ref().is_some_and(|i| i.schema_version < i.latest_schema) {
+                    match BackupDb::migrate(&path, true) {
+                        Ok(_) => r.migrated += 1,
+                        Err(err) => r.errors.push(format!("{}: {}", e.job_id, err.user_message())),
+                    }
+                }
+                if vacuum {
+                    match BackupDb::open(&path).and_then(|db| db.vacuum()) {
+                        Ok(()) => r.vacuumed += 1,
+                        Err(err) => r.errors.push(format!("{}: {}", e.job_id, err.user_message())),
+                    }
+                }
+                r.bytes_after += size(&path);
+            }
+            Ok(r)
+        })
+        .await
+    }
+
+    // ── Recovery tool (no job database needed) ──
+
+    pub async fn recovery_download(&self, dest: BackupDestination, passphrase: Option<String>, prefix: String, folder: String, opts: recovery::DownloadOptions) -> Result<recovery::DownloadReport, AppError> {
+        let backend = self.backend_for(&dest, Throttle::default(), RetryPolicy::default(), None).await?;
+        blocking(move || recovery::download(backend.as_ref(), passphrase.as_deref(), &prefix, Path::new(&folder), &opts, &OpContext::new())).await
+    }
+
+    pub async fn recovery_index(&self, folder: String) -> Result<recovery::IndexReport, AppError> {
+        blocking(move || recovery::build_index(Path::new(&folder), &OpContext::new())).await
+    }
+
+    pub async fn recovery_list(&self, folder: String) -> Result<Vec<recovery::RecoveryVersion>, AppError> {
+        blocking(move || recovery::list_versions(Path::new(&folder))).await
+    }
+
+    pub async fn recovery_restore(&self, folder: String, version: usize, paths: Vec<String>, target: String) -> Result<recovery::RecoveryRestoreReport, AppError> {
+        blocking(move || recovery::restore(Path::new(&folder), version, &paths, Path::new(&target), &OpContext::new())).await
+    }
+
+    pub async fn recovery_convert(&self, folder: String, out: BackupDestination, opts: recovery::ConvertOptions) -> Result<recovery::ConvertReport, AppError> {
+        let backend = self.backend_for(&out, Throttle::default(), RetryPolicy::default(), None).await?;
+        let opts = recovery::ConvertOptions { kdf: self.inner.kdf, ..opts };
+        blocking(move || recovery::convert(Path::new(&folder), backend.as_ref(), &opts, &OpContext::new())).await
+    }
+
     /// Restore from any repository using only its credentials and passphrase.
     pub async fn direct_restore(&self, dest: BackupDestination, passphrase: Option<String>, prefix: String, options: RestoreOptions) -> Result<ufop_core::backup::RestoreReport, AppError> {
         let backend = self.backend_for(&dest, Throttle::default(), RetryPolicy::default(), None).await?;
@@ -1354,6 +1508,8 @@ fn summarize(op: &str, v: &serde_json::Value) -> String {
         "compact" => format!("{} removed, {} rewritten, {} reclaimed", n("volumes_removed"), n("volumes_rewritten"), human_bytes(n("bytes_reclaimed"))),
         "rebuild_missing" => format!("{} volume(s) rebuilt, {} block(s) recovered, {} unrecoverable", n("volumes_rebuilt"), n("blocks_recovered"), n("blocks_unrecoverable")),
         "extract_control_files" => format!("{} control file(s) extracted", v.get("files").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0)),
+        "snapshot_test" if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => format!("{} snapshot created and removed", v.get("method").and_then(|m| m.as_str()).unwrap_or("")),
+        "snapshot_test" => "Snapshot test failed".to_string(),
         "autotune" => format!("Best restore download concurrency: {} thread(s)", n("download_threads")),
         "recreate_database" => format!("{} version(s), {} block volume(s) indexed", n("versions"), n("block_volumes")),
         _ => format!("{op} completed"),
@@ -1396,7 +1552,7 @@ fn run_core(
             let sources: Vec<PathBuf> = job.sources.iter().map(PathBuf::from).collect();
             serde_json::to_value(ufop_core::backup::run_backup(backend, &db, &sources, &filter, &opts, &job.retention, pass, kdf, ctx)?)?
         }
-        BackupOperation::Restore { options } => serde_json::to_value(ufop_core::backup::run_restore(&open(false)?, &options, ctx)?)?,
+        BackupOperation::Restore { options, .. } => serde_json::to_value(ufop_core::backup::run_restore(&open(false)?, &options, ctx)?)?,
         BackupOperation::Verify { full } => {
             let samples = if full { None } else { Some(job.options.verify_samples.max(1)) };
             serde_json::to_value(maintenance::verify(&open(false)?, samples, full)?)?
@@ -1418,6 +1574,15 @@ fn run_core(
         BackupOperation::ExtractControlFiles { version, target } => {
             let files = maintenance::extract_control_files(&open(false)?, version, Path::new(&target))?;
             serde_json::json!({ "files": files.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>() })
+        }
+        BackupOperation::SnapshotTest => {
+            let srcs: Vec<PathBuf> = job.sources.iter().map(PathBuf::from).collect();
+            let d = ufop_core::backup::snapshot::diagnose(&srcs, &job.options.snapshot);
+            let mut v = serde_json::to_value(&d)?;
+            if let (Some(e), Some(o)) = (&d.error, v.as_object_mut()) {
+                o.insert("errors".into(), serde_json::json!([e]));
+            }
+            v
         }
         BackupOperation::AutoTune { sample_volumes } => serde_json::to_value(ufop_core::backup::restore::autotune(&open(false)?, sample_volumes.clamp(1, 50), ctx)?)?,
     };

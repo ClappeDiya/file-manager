@@ -4,7 +4,7 @@
  * cadence. Each field maps 1:1 onto `BackupOptions` in ufop-core.
  */
 import { inputCls } from "@/lib/backup-helpers";
-import type { BackupOptions, UsnPolicy, VolumeFormat, ZipMethod } from "@/stores/backup-store";
+import type { BackupOptions, SnapshotPolicy, UsnPolicy, VolumeFormat, ZipMethod } from "@/stores/backup-store";
 import { Check, Field, Section } from "./backup-ui";
 
 const lines = (v: string) => v.split("\n").map((s) => s.trim()).filter(Boolean);
@@ -52,6 +52,33 @@ export function BackupAdvancedOptions({
             <input className={`${inputCls} font-mono`} disabled={!o.par2.enabled} value={o.par2.binary} onChange={(e) => onChange({ par2: { ...o.par2, binary: e.target.value || "par2" } })} />
           </Field>
         </div>
+      </Section>
+
+      <Section title="Snapshots" hint="Read a frozen point-in-time copy so open or changing files are consistent: VSS on Windows, LVM on Linux, APFS on macOS (administrator/root rights needed). Test it from Maintenance.">
+        <Field label="Use a snapshot">
+          <select data-testid="opt-snapshot" className={inputCls} value={o.snapshot_policy} onChange={(e) => onChange({ snapshot_policy: e.target.value as SnapshotPolicy })}>
+            <option value="off">Off (read live files)</option>
+            <option value="auto">Auto (silently fall back)</option>
+            <option value="on">On (warn on fallback)</option>
+            <option value="required">Required (fail without it)</option>
+          </select>
+        </Field>
+        {o.snapshot_policy !== "off" && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <Field label="LVM snapshot size" hint="Extents like 10%ORIGIN or a size like 2G.">
+              <input className={`${inputCls} font-mono`} value={o.snapshot.lvm_size} onChange={(e) => onChange({ snapshot: { ...o.snapshot, lvm_size: e.target.value.trim() || "10%ORIGIN" } })} />
+            </Field>
+            <Field label="Mount folder for snapshots">
+              <input className={`${inputCls} font-mono`} value={o.snapshot.mount_root ?? ""} placeholder="system temp" onChange={(e) => onChange({ snapshot: { ...o.snapshot, mount_root: e.target.value || null } })} />
+            </Field>
+            <Field label="VSS provider id (GUID, optional)">
+              <input className={`${inputCls} font-mono`} value={o.snapshot.vss_provider ?? ""} onChange={(e) => onChange({ snapshot: { ...o.snapshot, vss_provider: e.target.value.trim() || null } })} />
+            </Field>
+            <Field label="Excluded VSS writer ids (one per line)" hint="See `vssadmin list writers`.">
+              <textarea className={`${inputCls} font-mono h-12`} value={o.snapshot.vss_exclude_writers.join("\n")} onChange={(e) => onChange({ snapshot: { ...o.snapshot, vss_exclude_writers: lines(e.target.value) } })} />
+            </Field>
+          </div>
+        )}
       </Section>
 
       <Section title="Metadata">

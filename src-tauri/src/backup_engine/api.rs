@@ -178,6 +178,13 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
         "backup_list_destinations" => ok(mgr.list_destinations().await?),
         "backup_save_destination" => ok(mgr.save_destination(arg(a, "destination")?).await?),
         "backup_delete_destination" => ok(mgr.delete_destination(&arg::<String>(a, "id")?).await?),
+        "backup_database_inventory" => ok(mgr.database_inventory().await?),
+        "backup_cleanup_databases" => ok(mgr.cleanup_databases(arg(a, "deleteOrphans")?, arg(a, "vacuum")?).await?),
+        "backup_recovery_download" => ok(mgr.recovery_download(arg(a, "destination")?, opt(a, "passphrase")?, prefix()?, arg(a, "folder")?, opt(a, "options")?.unwrap_or_default()).await?),
+        "backup_recovery_index" => ok(mgr.recovery_index(arg(a, "folder")?).await?),
+        "backup_recovery_list" => ok(mgr.recovery_list(arg(a, "folder")?).await?),
+        "backup_recovery_restore" => ok(mgr.recovery_restore(arg(a, "folder")?, arg(a, "version")?, opt(a, "paths")?.unwrap_or_default(), arg(a, "target")?).await?),
+        "backup_recovery_convert" => ok(mgr.recovery_convert(arg(a, "folder")?, arg(a, "destination")?, arg(a, "options")?).await?),
         "backup_adopt_repository" => ok(mgr
             .adopt_repository(
                 arg(a, "destination")?,
@@ -201,5 +208,5 @@ pub const COMMANDS: &[&str] = &[
     "backup_browse_remote", "backup_direct_restore", "backup_discover_remote_config", "backup_passphrase_strength",
     "backup_generate_passphrase", "backup_capabilities", "backup_preview_sources", "backup_get_global_defaults",
     "backup_set_global_defaults", "backup_effective_job", "backup_list_destinations", "backup_save_destination",
-    "backup_delete_destination", "backup_adopt_repository",
+    "backup_delete_destination", "backup_adopt_repository", "backup_database_inventory", "backup_cleanup_databases", "backup_recovery_download", "backup_recovery_index", "backup_recovery_list", "backup_recovery_restore", "backup_recovery_convert",
 ];

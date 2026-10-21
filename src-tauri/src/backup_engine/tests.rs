@@ -67,7 +67,7 @@ async fn backup_restore_history_and_queries() {
     assert!(m.list_files(&j.id, 0, None).await.unwrap().len() >= 3);
 
     let restore = RestoreOptions { target: Some(out.clone()), ..Default::default() };
-    let r = m.execute(&j.id, BackupOperation::Restore { options: restore }).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap();
     assert_eq!(r.report["files_restored"], 2);
     assert_eq!(std::fs::read(out.join("src/sub/b.txt")).unwrap(), b"beta");
 
@@ -282,4 +282,47 @@ async fn global_defaults_and_destination_library() {
     jb.encrypted = false;
     jb.remote_config_include_secrets = true;
     assert!(m.save_job(jb, None).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn database_tools_recovery_and_restore_overrides() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"recover me").unwrap();
+    let m = manager(t.path()).await;
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+
+    // Restore with one-off overrides (job settings untouched).
+    let out = t.path().join("out");
+    let ov = RestoreOverrides { download_bps: Some(10_000_000), retries: Some(0), network_timeout_secs: Some(30) };
+    let r = m.execute(&j.id, BackupOperation::Restore { options: RestoreOptions { target: Some(out.clone()), ..Default::default() }, overrides: ov }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(m.get_job(&j.id).await.unwrap().throttle.download_bps, 0);
+    let ser: BackupOperation = serde_json::from_str(r#"{"type":"restore","options":{}}"#).unwrap();
+    assert!(matches!(ser, BackupOperation::Restore { overrides, .. } if overrides == RestoreOverrides::default()), "overrides optional");
+
+    // Inventory and cleanup: an orphan database is found and removed.
+    std::fs::copy(m.job_db_path(&j.id), t.path().join("dbs").join("orphan.sqlite")).unwrap();
+    let inv = m.database_inventory().await.unwrap();
+    assert_eq!(inv.len(), 2);
+    assert!(inv.iter().any(|e| e.job_id == "orphan" && e.job_name.is_none()));
+    assert!(inv.iter().all(|e| e.info.as_ref().is_some_and(|i| i.integrity_ok)));
+    let c = m.cleanup_databases(true, true).await.unwrap();
+    assert_eq!(c.orphans_deleted, vec!["orphan".to_string()]);
+    assert_eq!(c.vacuumed, 1);
+    assert_eq!(m.database_inventory().await.unwrap().len(), 1);
+
+    // Recovery tool through the manager.
+    let dest = j.destination.clone();
+    let folder = t.path().join("rec").to_string_lossy().to_string();
+    let d = m.recovery_download(dest, Some("pw".into()), "ufop".into(), folder.clone(), Default::default()).await.unwrap();
+    assert!(d.failed.is_empty() && d.downloaded > 0);
+    m.recovery_index(folder.clone()).await.unwrap();
+    assert_eq!(m.recovery_list(folder.clone()).await.unwrap().len(), 1);
+    let rt = t.path().join("rec-out");
+    let rr = m.recovery_restore(folder.clone(), 0, vec![], rt.to_string_lossy().into()).await.unwrap();
+    assert_eq!(rr.files_restored, 1);
+    assert_eq!(std::fs::read(rt.join("src/a.txt")).unwrap(), b"recover me");
 }

@@ -73,6 +73,10 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
         </div>
       </Section>
 
+      <Section title="Snapshot diagnostics" hint="Creates and immediately removes a test snapshot of this job's sources, listing every step.">
+        {tool("Test snapshot", { type: "snapshot_test" }, "Check that VSS / LVM / APFS snapshots work for these sources")}
+      </Section>
+
       <Section title="Restore tuning" hint="Downloads a sample of volumes with 1, 2, 4 and 8 parallel readers (nothing is written) and reports the best setting for restores.">
         {tool("Run restore AutoTune", { type: "auto_tune", sample_volumes: 8 }, "Benchmark restore download concurrency")}
       </Section>

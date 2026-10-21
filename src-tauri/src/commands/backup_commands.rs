@@ -6,6 +6,8 @@ use crate::backup_engine::{
     Fileset, OperationResult, SchedulerStatus,
 };
 use crate::backup_engine::defaults::{GlobalDefaults, SavedDestination};
+use crate::backup_engine::{DatabaseCleanupReport, DatabaseEntry};
+use ufop_core::backup::recovery;
 use crate::core::error::AppError;
 use tauri::State;
 use ufop_core::backup::crypto::{self, PassphraseStrength};
@@ -198,6 +200,41 @@ pub async fn backup_adopt_repository(
     mgr: State<'_, BackupManager>,
 ) -> Result<BackupJob, AppError> {
     mgr.adopt_repository(destination, passphrase, prefix.unwrap_or_else(|| "ufop".into()), name, sources.unwrap_or_default(), source_map.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub async fn backup_database_inventory(mgr: State<'_, BackupManager>) -> Result<Vec<DatabaseEntry>, AppError> {
+    mgr.database_inventory().await
+}
+
+#[tauri::command]
+pub async fn backup_cleanup_databases(delete_orphans: bool, vacuum: bool, mgr: State<'_, BackupManager>) -> Result<DatabaseCleanupReport, AppError> {
+    mgr.cleanup_databases(delete_orphans, vacuum).await
+}
+
+#[tauri::command]
+pub async fn backup_recovery_download(destination: BackupDestination, passphrase: Option<String>, prefix: Option<String>, folder: String, options: Option<recovery::DownloadOptions>, mgr: State<'_, BackupManager>) -> Result<recovery::DownloadReport, AppError> {
+    mgr.recovery_download(destination, passphrase, prefix.unwrap_or_else(|| "ufop".into()), folder, options.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub async fn backup_recovery_index(folder: String, mgr: State<'_, BackupManager>) -> Result<recovery::IndexReport, AppError> {
+    mgr.recovery_index(folder).await
+}
+
+#[tauri::command]
+pub async fn backup_recovery_list(folder: String, mgr: State<'_, BackupManager>) -> Result<Vec<recovery::RecoveryVersion>, AppError> {
+    mgr.recovery_list(folder).await
+}
+
+#[tauri::command]
+pub async fn backup_recovery_restore(folder: String, version: usize, paths: Option<Vec<String>>, target: String, mgr: State<'_, BackupManager>) -> Result<recovery::RecoveryRestoreReport, AppError> {
+    mgr.recovery_restore(folder, version, paths.unwrap_or_default(), target).await
+}
+
+#[tauri::command]
+pub async fn backup_recovery_convert(folder: String, destination: BackupDestination, options: recovery::ConvertOptions, mgr: State<'_, BackupManager>) -> Result<recovery::ConvertReport, AppError> {
+    mgr.recovery_convert(folder, destination, options).await
 }
 
 #[tauri::command]

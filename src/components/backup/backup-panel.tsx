@@ -22,6 +22,7 @@ import {
 import { BackupJobEditor } from "./backup-job-editor";
 import { BackupMaintenance } from "./backup-maintenance";
 import { BackupRestoreView, DirectRestore } from "./backup-restore-view";
+import { BackupRecoveryView } from "./backup-recovery-view";
 import { BackupSettingsView } from "./backup-settings-view";
 import { formatDate, inputCls, statusColor } from "@/lib/backup-helpers";
 import { Banner, Btn, Section } from "./backup-ui";
@@ -32,6 +33,7 @@ type View =
   | { kind: "direct" }
   | { kind: "import" }
   | { kind: "settings" }
+  | { kind: "recovery" }
   | { kind: "edit"; job: BackupJob }
   | { kind: "restore"; job: BackupJob }
   | { kind: "maintenance"; job: BackupJob };
@@ -276,6 +278,7 @@ export function BackupPanel() {
     { kind: "jobs", label: "Backups" },
     { kind: "history", label: "History" },
     { kind: "direct", label: "Restore from folder" },
+    { kind: "recovery", label: "Recovery tool" },
     { kind: "settings", label: "Defaults & destinations" },
   ];
 
@@ -360,6 +363,7 @@ export function BackupPanel() {
         {view.kind === "history" && <History />}
         {view.kind === "direct" && <DirectRestore />}
         {view.kind === "settings" && <BackupSettingsView />}
+        {view.kind === "recovery" && <BackupRecoveryView />}
         {view.kind === "import" && <ImportConfig onDone={(j) => setView(j ? (j.id ? { kind: "jobs" } : { kind: "edit", job: j }) : { kind: "jobs" })} />}
         {view.kind === "edit" && current && (
           <BackupJobEditor

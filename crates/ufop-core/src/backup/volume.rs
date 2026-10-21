@@ -228,7 +228,8 @@ pub fn read_block_volume(payload: &[u8]) -> Result<HashMap<String, Vec<u8>>, App
         let mut out = HashMap::with_capacity(a.len());
         for i in 0..a.len() {
             let mut f = a.by_index(i).map_err(corrupt)?;
-            let mut v = Vec::with_capacity(f.size() as usize);
+            // Sizes come from the (possibly damaged) file: never trust them for allocation.
+            let mut v = Vec::with_capacity((f.size() as usize).min(payload.len().saturating_mul(4)).min(64 << 20));
             f.read_to_end(&mut v).map_err(|_| AppError::transfer("ZIP block volume is corrupt", "Run Verify and Repair on this backup."))?;
             out.insert(f.name().to_string(), v);
         }
@@ -242,6 +243,10 @@ pub fn read_block_volume(payload: &[u8]) -> Result<HashMap<String, Vec<u8>>, App
         Ok(s)
     };
     let count = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
+    // Each entry needs at least 6 bytes; a damaged count must not drive allocation.
+    if count > payload.len() / 6 {
+        return Err(corrupt());
+    }
     let mut out = HashMap::with_capacity(count);
     for _ in 0..count {
         let hl = take(&mut p, 1)?[0] as usize;
@@ -335,6 +340,18 @@ mod tests {
         assert_eq!(m["aa"], vec![7u8; 1000]);
         assert_eq!(m["bb"], b"xyz");
         assert!(read_block_volume(&[9, 0, 0, 0, 1]).is_err());
+    }
+
+    #[test]
+    fn corrupt_volume_is_rejected_without_huge_allocation() {
+        // Regression: a damaged count field made the reader reserve ~200 GB.
+        assert!(read_block_volume(b"corrupt").is_err());
+        assert!(read_block_volume(&[0xff, 0xff, 0xff, 0x7f, 1, 2, 3]).is_err());
+        let mut w = BlockVolumeWriter::new();
+        w.add("h".into(), b"data", 6).unwrap();
+        let mut v = w.finish();
+        v.truncate(v.len() - 2);
+        assert!(read_block_volume(&v).is_err());
     }
 
     #[test]

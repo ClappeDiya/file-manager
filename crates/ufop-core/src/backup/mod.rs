@@ -23,8 +23,10 @@ pub mod maintenance;
 pub mod meta;
 pub mod modules;
 pub mod par2;
+pub mod recovery;
 pub mod restore;
 pub mod retention;
+pub mod snapshot;
 pub mod usn;
 pub mod volume;
 
@@ -237,6 +239,9 @@ pub struct BackupOptions {
     pub auto_vacuum_interval_days: Option<u32>,
     /// Compare remote file names case-insensitively.
     pub remote_case_insensitive: bool,
+    /// Read sources from a VSS / LVM / APFS snapshot.
+    pub snapshot_policy: snapshot::SnapshotPolicy,
+    pub snapshot: snapshot::SnapshotOptions,
 }
 
 impl Default for BackupOptions {
@@ -288,6 +293,8 @@ impl Default for BackupOptions {
             auto_compact_interval_days: None,
             auto_vacuum_interval_days: None,
             remote_case_insensitive: false,
+            snapshot_policy: snapshot::SnapshotPolicy::Off,
+            snapshot: snapshot::SnapshotOptions::default(),
         }
     }
 }

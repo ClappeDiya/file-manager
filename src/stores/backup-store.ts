@@ -105,6 +105,25 @@ export interface BackupOptions {
   auto_compact_interval_days: number | null;
   auto_vacuum_interval_days: number | null;
   remote_case_insensitive: boolean;
+  snapshot_policy: SnapshotPolicy;
+  snapshot: SnapshotOptions;
+}
+
+export type SnapshotPolicy = "off" | "auto" | "on" | "required";
+
+export interface SnapshotOptions {
+  lvm_size: string;
+  vss_provider: string | null;
+  vss_exclude_writers: string[];
+  mount_root: string | null;
+}
+
+export interface SnapshotDiagnostics {
+  method: string;
+  ok: boolean;
+  mappings: [string, string][];
+  steps: string[];
+  error: string | null;
 }
 
 export type UsnPolicy = "off" | "auto" | "on" | "required";
@@ -361,8 +380,81 @@ export interface OperationResult {
   log: LogLine[];
 }
 
+/** One-off settings for a single restore. */
+export interface RestoreOverrides {
+  download_bps: number | null;
+  retries: number | null;
+  network_timeout_secs: number | null;
+}
+
+export interface DbInfo {
+  path: string;
+  schema_version: number;
+  latest_schema: number;
+  versions: number;
+  volumes: number;
+  blocks: number;
+  files: number;
+  size_bytes: number;
+  integrity_ok: boolean;
+  integrity: string;
+}
+
+export interface DatabaseEntry {
+  job_id: string;
+  job_name: string | null;
+  info: DbInfo | null;
+  error: string | null;
+}
+
+export interface DatabaseCleanupReport {
+  orphans_deleted: string[];
+  vacuumed: number;
+  migrated: number;
+  bytes_before: number;
+  bytes_after: number;
+  errors: string[];
+}
+
+export interface RecoveryDownloadReport {
+  downloaded: number;
+  skipped_existing: number;
+  bytes: number;
+  failed: string[];
+}
+
+export interface RecoveryIndexReport {
+  block_volumes: number;
+  blocks: number;
+  damaged: string[];
+}
+
+export interface RecoveryVersion {
+  version: number;
+  timestamp: string;
+  partial: boolean;
+  files: number;
+  volume: string;
+}
+
+export interface RecoveryRestoreReport {
+  version: string;
+  files_restored: number;
+  files_partial: string[];
+  folders_created: number;
+  bytes_written: number;
+  errors: string[];
+}
+
+export interface RecoveryConvertReport {
+  block_volumes: number;
+  file_lists: number;
+  bytes_uploaded: number;
+  skipped: string[];
+}
+
 export type BackupOperation =
-  | { type: "restore"; options: RestoreOptions }
+  | { type: "restore"; options: RestoreOptions; overrides?: RestoreOverrides }
   | { type: "verify"; full: boolean }
   | { type: "compact" }
   | { type: "repair" }
@@ -374,7 +466,8 @@ export type BackupOperation =
   | { type: "consistency" }
   | { type: "rebuild_missing" }
   | { type: "extract_control_files"; version: number; target: string }
-  | { type: "auto_tune"; sample_volumes: number };
+  | { type: "auto_tune"; sample_volumes: number }
+  | { type: "snapshot_test" };
 
 export interface PassphraseStrength {
   score: number;
@@ -486,6 +579,8 @@ export function newBackupJob(): BackupJob {
       auto_compact_interval_days: null,
       auto_vacuum_interval_days: null,
       remote_case_insensitive: false,
+      snapshot_policy: "off",
+      snapshot: { lvm_size: "10%ORIGIN", vss_provider: null, vss_exclude_writers: [], mount_root: null },
     },
     retention: { type: "keep_all" },
     schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false },

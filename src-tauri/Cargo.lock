@@ -6792,6 +6792,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
+ "windows",
  "windows-sys 0.59.0",
  "xattr",
  "xxhash-rust",

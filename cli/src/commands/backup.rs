@@ -129,6 +129,18 @@ pub struct EngineArgs {
     pub compact_interval_days: Option<u32>,
     #[arg(long)]
     pub vacuum_interval_days: Option<u32>,
+    /// Snapshot sources first: off | auto | on | required (VSS / LVM / APFS)
+    #[arg(long, default_value = "off")]
+    pub snapshot_policy: String,
+    /// LVM snapshot size (`10%ORIGIN`, `2G`)
+    #[arg(long, default_value = "10%ORIGIN")]
+    pub lvm_snapshot_size: String,
+    /// VSS provider GUID
+    #[arg(long)]
+    pub vss_provider: Option<String>,
+    /// VSS writer class GUID to exclude (repeatable)
+    #[arg(long = "vss-exclude-writer")]
+    pub vss_exclude_writers: Vec<String>,
 }
 
 fn parse_enum<T: serde::de::DeserializeOwned>(flag: &str, v: &str) -> Result<T, ufop_core::error::AppError> {
@@ -137,6 +149,15 @@ fn parse_enum<T: serde::de::DeserializeOwned>(flag: &str, v: &str) -> Result<T, 
 }
 
 impl EngineArgs {
+    fn snapshot_options(&self) -> ufop_core::backup::snapshot::SnapshotOptions {
+        ufop_core::backup::snapshot::SnapshotOptions {
+            lvm_size: self.lvm_snapshot_size.clone(),
+            vss_provider: self.vss_provider.clone(),
+            vss_exclude_writers: self.vss_exclude_writers.clone(),
+            mount_root: None,
+        }
+    }
+
     fn apply(&self, o: BackupOptions) -> Result<BackupOptions, ufop_core::error::AppError> {
         Ok(BackupOptions {
             volume_format: parse_enum("volume-format", &self.volume_format)?,
@@ -163,9 +184,77 @@ impl EngineArgs {
             remote_case_insensitive: self.case_insensitive_remote,
             auto_compact_interval_days: self.compact_interval_days,
             auto_vacuum_interval_days: self.vacuum_interval_days,
+            snapshot_policy: parse_enum("snapshot-policy", &self.snapshot_policy)?,
+            snapshot: self.snapshot_options(),
             ..o
         })
     }
+}
+
+/// Recovery tool steps (work without the job database).
+#[derive(Subcommand, Debug)]
+pub enum RecoveryCommands {
+    /// Download and decrypt every volume into a local folder (resumable)
+    Download {
+        #[command(flatten)]
+        repo: RepoArgs,
+        /// Local folder for the decrypted copy (keep it private)
+        folder: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        threads: usize,
+        /// Download everything again instead of continuing
+        #[arg(long)]
+        no_resume: bool,
+        /// Download limit in KB/s (0 = unlimited)
+        #[arg(long, default_value_t = 0)]
+        max_kbps: u64,
+    },
+    /// Index the downloaded block volumes
+    Index { folder: PathBuf },
+    /// List versions in the downloaded copy
+    List { folder: PathBuf },
+    /// Rebuild files from the downloaded copy (gaps zero-filled and reported)
+    Restore {
+        folder: PathBuf,
+        target: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        version: usize,
+        /// Paths/folders/wildcards (default: everything)
+        paths: Vec<String>,
+    },
+    /// Write the copy into a new repository with another format or passphrase
+    Convert {
+        folder: PathBuf,
+        /// Destination folder of the new repository
+        #[arg(long)]
+        out: String,
+        #[arg(long, default_value = "ufop")]
+        prefix: String,
+        #[arg(long, default_value = "ufop")]
+        volume_format: String,
+        #[arg(long, default_value = "deflate")]
+        zip_method: String,
+        #[arg(long, default_value_t = 6)]
+        compression_level: u32,
+        /// Environment variable with the new passphrase (unset = unencrypted)
+        #[arg(long, default_value = "UFOP_NEW_PASSPHRASE")]
+        new_passphrase_env: String,
+    },
+}
+
+/// Local job-database tools.
+#[derive(Subcommand, Debug)]
+pub enum DbCommands {
+    /// Schema version, counts, size and integrity of a job database
+    Info { dbpath: PathBuf },
+    /// Upgrade a job database to the current schema (copy kept as .v<N>.bak)
+    Migrate {
+        dbpath: PathBuf,
+        #[arg(long)]
+        no_backup: bool,
+    },
+    /// Reclaim free space in a job database
+    Vacuum { dbpath: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -290,6 +379,23 @@ pub enum BackupCommands {
         target: PathBuf,
         #[arg(long, default_value_t = 0)]
         version: usize,
+    },
+    /// Salvage data without the job database (download, index, list, restore, convert)
+    Recovery {
+        #[command(subcommand)]
+        cmd: RecoveryCommands,
+    },
+    /// Job-database tools (info, migrate, vacuum)
+    Db {
+        #[command(subcommand)]
+        cmd: DbCommands,
+    },
+    /// Create and remove a test snapshot of the sources, listing every step
+    SnapshotTest {
+        #[arg(long = "source", required = true)]
+        sources: Vec<String>,
+        #[command(flatten)]
+        engine: EngineArgs,
     },
     /// Benchmark restore download concurrency on sample volumes
     AutoTune {
@@ -573,6 +679,68 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             ok(emit(format, "Control files", &maintenance::extract_control_files(r, version, &target)?))?;
             Ok(0)
         }),
+        BackupCommands::Recovery { cmd } => {
+            use ufop_core::backup::recovery;
+            let ctx = progress_ctx(format);
+            match cmd {
+                RecoveryCommands::Download { repo, folder, threads, no_resume, max_kbps } => {
+                    let o = recovery::DownloadOptions { threads, resume: !no_resume, max_bytes_per_sec: max_kbps * 1024 };
+                    let r = recovery::download(&LocalBackend::new(&repo.dest), repo.passphrase().as_deref(), &repo.prefix, &folder, &o, &ctx)?;
+                    ok(emit(format, "Recovery download", &r))?;
+                    Ok(if r.failed.is_empty() { 0 } else { 1 })
+                }
+                RecoveryCommands::Index { folder } => {
+                    let r = recovery::build_index(&folder, &ctx)?;
+                    ok(emit(format, "Recovery index", &r))?;
+                    Ok(if r.damaged.is_empty() { 0 } else { 1 })
+                }
+                RecoveryCommands::List { folder } => {
+                    ok(emit(format, "Recovered versions (0 = newest)", &recovery::list_versions(&folder)?))?;
+                    Ok(0)
+                }
+                RecoveryCommands::Restore { folder, target, version, paths } => {
+                    let r = recovery::restore(&folder, version, &paths, &target, &ctx)?;
+                    ok(emit(format, "Recovery restore", &r))?;
+                    Ok(if r.files_partial.is_empty() && r.errors.is_empty() { 0 } else { 1 })
+                }
+                RecoveryCommands::Convert { folder, out, prefix, volume_format, zip_method, compression_level, new_passphrase_env } => {
+                    let o = recovery::ConvertOptions {
+                        prefix,
+                        volume_format: parse_enum("volume-format", &volume_format)?,
+                        zip_method: parse_enum("zip-method", &zip_method)?,
+                        compression_level,
+                        passphrase: std::env::var(&new_passphrase_env).ok().filter(|p| !p.is_empty()),
+                        kdf: KdfParams::default(),
+                    };
+                    ok(emit(format, "Converted repository", &recovery::convert(&folder, &LocalBackend::new(&out), &o, &ctx)?))?;
+                    Ok(0)
+                }
+            }
+        }
+        BackupCommands::Db { cmd } => match cmd {
+            DbCommands::Info { dbpath } => {
+                let i = BackupDb::inspect(&dbpath)?;
+                ok(emit(format, "Database", &i))?;
+                Ok(if i.integrity_ok { 0 } else { 2 })
+            }
+            DbCommands::Migrate { dbpath, no_backup } => {
+                ok(emit(format, "Database migration", &BackupDb::migrate(&dbpath, !no_backup)?))?;
+                Ok(0)
+            }
+            DbCommands::Vacuum { dbpath } => {
+                let before = BackupDb::inspect(&dbpath)?.size_bytes;
+                BackupDb::open(&dbpath)?.vacuum()?;
+                let after = BackupDb::inspect(&dbpath)?.size_bytes;
+                ok(emit(format, "Database vacuumed", &serde_json::json!({ "bytes_before": before, "bytes_after": after })))?;
+                Ok(0)
+            }
+        },
+        BackupCommands::SnapshotTest { sources, engine } => {
+            let srcs: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
+            let d = ufop_core::backup::snapshot::diagnose(&srcs, &engine.snapshot_options());
+            ok(emit(format, "Snapshot test", &d))?;
+            Ok(if d.ok { 0 } else { 2 })
+        }
         BackupCommands::AutoTune { repo, samples } => with_repo(&repo, |r, _| {
             ok(emit(format, "Restore AutoTune", &ufop_core::backup::restore::autotune(r, samples.clamp(1, 50), &OpContext::new())?))?;
             Ok(0)

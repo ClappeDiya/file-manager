@@ -31,12 +31,44 @@ pub struct ExtMeta {
     /// Windows security descriptor (owner, group, DACL) as SDDL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub win_sddl: Option<String>,
+    /// The link is an NTFS junction (mount point), not a symbolic link.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub junction: bool,
 }
 
 impl ExtMeta {
     pub fn is_empty(&self) -> bool {
         self == &Self::default()
     }
+}
+
+/// Reparse tag of an NTFS mount point (junction).
+pub const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+
+/// Whether `path` is an NTFS junction (always false off Windows).
+#[allow(unused_variables)]
+pub fn is_junction(path: &Path) -> bool {
+    #[cfg(windows)]
+    return win_sec::reparse_tag(path) == Some(IO_REPARSE_TAG_MOUNT_POINT);
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Recreate a junction at `link` pointing to the folder `target`.
+#[allow(unused_variables)]
+pub fn create_junction(link: &Path, target: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        // `\??\C:\x` (as read back from the reparse point) → `C:\x`.
+        let t = target.strip_prefix(r"\??\").unwrap_or(target);
+        let st = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(t).output()?;
+        if !st.status.success() {
+            return Err(std::io::Error::other(String::from_utf8_lossy(&st.stderr).trim().to_string()));
+        }
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "junctions exist only on Windows"))
 }
 
 /// Which metadata to capture.
@@ -46,6 +78,7 @@ pub struct MetaOptions {
     pub acls: bool,
 }
 
+#[cfg(unix)]
 fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
 }
@@ -53,6 +86,7 @@ fn b64() -> base64::engine::GeneralPurpose {
 /// Capture extended metadata for `path` (never follows symlinks).
 #[allow(unused_variables, unused_mut)]
 pub fn capture(path: &Path, opts: MetaOptions) -> ExtMeta {
+    #[cfg(unix)]
     use base64::Engine;
     let mut m = ExtMeta::default();
     #[cfg(unix)]
@@ -99,6 +133,7 @@ pub fn capture(path: &Path, opts: MetaOptions) -> ExtMeta {
 /// (e.g. `trusted.*` or ACL attributes without privileges).
 #[allow(unused_variables)]
 pub fn apply(path: &Path, m: &ExtMeta, acls: bool) -> Vec<String> {
+    #[cfg(unix)]
     use base64::Engine;
     let mut warn = Vec::new();
     #[cfg(unix)]
@@ -303,6 +338,26 @@ mod win_sec {
     };
     use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard, SetFileAttributesW, WIN32_FIND_STREAM_DATA};
 
+    /// Reparse tag of a file or folder, without following it.
+    pub fn reparse_tag(p: &Path) -> Option<u32> {
+        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ};
+        use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+        use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        let w = wide(p);
+        unsafe {
+            let h = CreateFileW(w.as_ptr(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, std::ptr::null_mut());
+            if h == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut ret = 0u32;
+            let ok = DeviceIoControl(h, FSCTL_GET_REPARSE_POINT, std::ptr::null(), 0, buf.as_mut_ptr() as *mut _, buf.len() as u32, &mut ret, std::ptr::null_mut());
+            CloseHandle(h);
+            (ok != 0 && ret >= 4).then(|| u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+        }
+    }
+
     fn wide(p: &Path) -> Vec<u16> {
         p.as_os_str().encode_wide().chain(Some(0)).collect()
     }
@@ -491,5 +546,17 @@ mod tests {
         set_symlink_mtime(&l, 1_000_000).unwrap();
         let md = std::fs::symlink_metadata(&l).unwrap();
         assert_eq!(md.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(), 1_000_000);
+    }
+
+    #[test]
+    fn junction_flag_serialises_only_when_set() {
+        assert_eq!(serde_json::to_string(&ExtMeta::default()).unwrap(), "{}");
+        let j = ExtMeta { junction: true, ..Default::default() };
+        let s = serde_json::to_string(&j).unwrap();
+        assert_eq!(s, r#"{"junction":true}"#);
+        assert_eq!(serde_json::from_str::<ExtMeta>(&s).unwrap(), j);
+        assert!(!is_junction(Path::new("/")));
+        #[cfg(not(windows))]
+        assert!(create_junction(Path::new("/tmp/x"), "/tmp").is_err());
     }
 }

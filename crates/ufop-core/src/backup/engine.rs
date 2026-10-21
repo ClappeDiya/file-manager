@@ -18,6 +18,7 @@ use super::{
     hash_bytes, meta, BackupOptions, EntryKind, FileEntry, FileHasher, HashAlgorithm, MissingSourcePolicy, OpContext, Phase, Progress, SymlinkPolicy,
     UsnPolicy, REPO_FORMAT_VERSION,
 };
+use super::snapshot::SnapshotPolicy;
 use crate::error::AppError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -83,17 +84,7 @@ impl<'a> Repo<'a> {
             if header.format_version > REPO_FORMAT_VERSION {
                 return Err(AppError::validation(format!("This backup was written by a newer version (format {}); update the app", header.format_version)));
             }
-            let cipher = match (header.encrypted, external) {
-                (true, Some(ext)) => ext,
-                (true, None) => {
-                    let pass = passphrase.filter(|p| !p.is_empty()).ok_or_else(|| AppError::validation("This backup is encrypted; enter its passphrase"))?;
-                    let salt = hex::decode(header.salt.as_deref().unwrap_or_default()).map_err(|_| AppError::validation("Repository header salt is malformed"))?;
-                    let c = VolumeCipher::derive(pass, &salt, header.kdf.unwrap_or_default())?;
-                    c.verify_key_check(header.key_check.as_deref().unwrap_or_default())?;
-                    c
-                }
-                (false, _) => VolumeCipher::plain(),
-            };
+            let cipher = header_cipher(&header, passphrase, external)?;
             (header, cipher)
         } else {
             if !create {
@@ -252,6 +243,24 @@ impl<'a> Repo<'a> {
     }
 }
 
+/// The volume cipher for an existing repository header.
+pub fn header_cipher(header: &RepoHeader, passphrase: Option<&str>, external: Option<VolumeCipher>) -> Result<VolumeCipher, AppError> {
+    if header.format_version > REPO_FORMAT_VERSION {
+        return Err(AppError::validation(format!("This backup was written by a newer version (format {}); update the app", header.format_version)));
+    }
+    Ok(match (header.encrypted, external) {
+        (true, Some(ext)) => ext,
+        (true, None) => {
+            let pass = passphrase.filter(|p| !p.is_empty()).ok_or_else(|| AppError::validation("This backup is encrypted; enter its passphrase"))?;
+            let salt = hex::decode(header.salt.as_deref().unwrap_or_default()).map_err(|_| AppError::validation("Repository header salt is malformed"))?;
+            let c = VolumeCipher::derive(pass, &salt, header.kdf.unwrap_or_default())?;
+            c.verify_key_check(header.key_check.as_deref().unwrap_or_default())?;
+            c
+        }
+        (false, _) => VolumeCipher::plain(),
+    })
+}
+
 /// Downloads a volume, checks it against its recorded SHA-256 and, when
 /// PAR2 recovery files exist, repairs (and re-uploads) a damaged copy.
 pub(crate) struct VolumeFetcher<'a> {
@@ -351,6 +360,8 @@ pub struct BackupReport {
     /// Paths rescanned in incremental (changed-path / USN) mode.
     pub rescanned_paths: u64,
     pub usn_used: bool,
+    /// Snapshot method used (`vss`, `lvm`, `apfs`), if any.
+    pub snapshot: Option<String>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
     pub duration_ms: u64,
@@ -472,6 +483,8 @@ pub(crate) fn mode_of(md: &std::fs::Metadata) -> Option<u32> {
 struct Scanner<'f> {
     filter: &'f SourceFilter,
     opts: &'f BackupOptions,
+    /// Read through this snapshot; entries keep the original paths.
+    snap: Option<&'f super::snapshot::Snapshot>,
     #[cfg_attr(not(unix), allow(dead_code))]
     seen_inodes: HashSet<(u64, u64)>,
     out: Vec<(PathBuf, FileEntry)>,
@@ -479,10 +492,14 @@ struct Scanner<'f> {
 }
 
 impl Scanner<'_> {
+    fn real(&self, path: &Path) -> PathBuf {
+        self.snap.map(|s| s.real(path)).unwrap_or_else(|| path.to_path_buf())
+    }
+
     fn entry(&self, path: &Path, kind: EntryKind, md: &std::fs::Metadata) -> FileEntry {
         let o = self.opts;
         let meta = (!o.skip_metadata && (o.backup_xattrs || o.backup_acls))
-            .then(|| meta::capture(path, meta::MetaOptions { xattrs: o.backup_xattrs, acls: o.backup_acls }))
+            .then(|| meta::capture(&self.real(path), meta::MetaOptions { xattrs: o.backup_xattrs, acls: o.backup_acls }))
             .filter(|m| !m.is_empty());
         FileEntry {
             path: path.to_string_lossy().into_owned(),
@@ -516,14 +533,15 @@ impl Scanner<'_> {
 
     /// Add one entry; returns the metadata when it is a directory to descend into.
     fn visit(&mut self, path: &Path) -> Option<std::fs::Metadata> {
-        let lmd = match std::fs::symlink_metadata(path) {
+        let real = self.real(path);
+        let lmd = match std::fs::symlink_metadata(&real) {
             Ok(m) => m,
             Err(e) => {
                 self.warnings.push(format!("Cannot read {}: {e}", path.display()));
                 return None;
             }
         };
-        if !self.opts.ignore_exclusion_xattrs && meta::has_exclusion_attribute(path) {
+        if !self.opts.ignore_exclusion_xattrs && meta::has_exclusion_attribute(&real) {
             return None;
         }
         let md = if lmd.file_type().is_symlink() {
@@ -534,11 +552,14 @@ impl Scanner<'_> {
                         return None;
                     }
                     let mut e = self.entry(path, EntryKind::Symlink, &lmd);
-                    e.symlink_target = std::fs::read_link(path).ok().map(|t| t.to_string_lossy().into_owned());
+                    e.symlink_target = std::fs::read_link(&real).ok().map(|t| t.to_string_lossy().into_owned());
+                    if meta::is_junction(&real) {
+                        e.meta.get_or_insert_with(Default::default).junction = true;
+                    }
                     self.out.push((path.to_path_buf(), e));
                     return None;
                 }
-                SymlinkPolicy::Follow => match std::fs::metadata(path) {
+                SymlinkPolicy::Follow => match std::fs::metadata(&real) {
                     Ok(m) => m,
                     Err(e) => {
                         self.warnings.push(format!("Broken link {}: {e}", path.display()));
@@ -559,7 +580,7 @@ impl Scanner<'_> {
         if md.is_file() && !self.hardlink_skip(&md) {
             self.out.push((path.to_path_buf(), self.entry(path, EntryKind::File, &md)));
             if self.opts.backup_alternate_streams {
-                for (name, size) in meta::alternate_streams(path) {
+                for (name, size) in meta::alternate_streams(&real) {
                     let sp = PathBuf::from(format!("{}:{name}", path.to_string_lossy()));
                     let mut e = self.entry(path, EntryKind::File, &md);
                     e.path = sp.to_string_lossy().into_owned();
@@ -573,9 +594,10 @@ impl Scanner<'_> {
     }
 
     fn children(&mut self, path: &Path) -> Vec<PathBuf> {
-        match std::fs::read_dir(path) {
+        match std::fs::read_dir(self.real(path)) {
             Ok(rd) => {
-                let mut c: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+                // Children keep original (logical) paths.
+                let mut c: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| path.join(e.file_name()))).collect();
                 c.sort();
                 c
             }
@@ -631,7 +653,11 @@ fn drop_empty_dirs(out: &mut Vec<(PathBuf, FileEntry)>) {
 
 /// Enumerate the selected source entries (also used for dry-run previews).
 pub fn scan_sources(sources: &[PathBuf], filter: &SourceFilter, opts: &BackupOptions) -> Result<ScanResult, AppError> {
-    let mut s = Scanner { filter, opts, seen_inodes: HashSet::new(), out: Vec::new(), warnings: Vec::new() };
+    scan_sources_in(sources, filter, opts, None)
+}
+
+fn scan_sources_in(sources: &[PathBuf], filter: &SourceFilter, opts: &BackupOptions, snap: Option<&super::snapshot::Snapshot>) -> Result<ScanResult, AppError> {
+    let mut s = Scanner { filter, opts, snap, seen_inodes: HashSet::new(), out: Vec::new(), warnings: Vec::new() };
     for src in check_sources(sources, opts, &mut s.warnings)? {
         s.walk(src, 0);
     }
@@ -654,7 +680,21 @@ pub fn scan_incremental(
     filter: &SourceFilter,
     opts: &BackupOptions,
 ) -> Result<(ScanResult, u64), AppError> {
-    let mut s = Scanner { filter, opts, seen_inodes: HashSet::new(), out: Vec::new(), warnings: Vec::new() };
+    scan_incremental_in(sources, prev, changed, shallow, deleted, filter, opts, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_incremental_in(
+    sources: &[PathBuf],
+    prev: &[FileEntry],
+    changed: &[String],
+    shallow: &[String],
+    deleted: &[String],
+    filter: &SourceFilter,
+    opts: &BackupOptions,
+    snap: Option<&super::snapshot::Snapshot>,
+) -> Result<(ScanResult, u64), AppError> {
+    let mut s = Scanner { filter, opts, snap, seen_inodes: HashSet::new(), out: Vec::new(), warnings: Vec::new() };
     let roots = check_sources(sources, opts, &mut s.warnings)?;
     let in_sources = |p: &Path| roots.iter().any(|r| p.starts_with(r));
     let changed: Vec<PathBuf> = changed.iter().map(PathBuf::from).filter(|p| in_sources(p)).collect();
@@ -673,13 +713,13 @@ pub fn scan_incremental(
     let prev_dirs: HashSet<&str> = prev.iter().filter(|e| e.kind == EntryKind::Dir).map(|e| e.path.as_str()).collect();
     let mut rescanned = 0u64;
     for c in &changed {
-        if c.exists() {
+        if s.real(c).exists() {
             s.walk(c, 0);
             rescanned += 1;
         }
     }
     for d in &shallow {
-        if !d.is_dir() {
+        if !s.real(d).is_dir() {
             // The folder itself went away: drop its subtree.
             kept.retain(|(p, _)| !p.starts_with(d));
             continue;
@@ -934,13 +974,30 @@ pub fn run_backup_with_cipher(
             },
         }
     }
+    // ── Snapshot (VSS / LVM / APFS) ──
+    let mut snapshot: Option<super::snapshot::Snapshot> = None;
+    if opts.snapshot_policy != SnapshotPolicy::Off && !opts.dry_run {
+        let live: Vec<PathBuf> = sources.iter().filter(|p| p.exists()).cloned().collect();
+        match super::snapshot::create(&live, &opts.snapshot) {
+            Ok(s) => {
+                report.snapshot = Some(s.method.clone());
+                snapshot = Some(s);
+            }
+            Err(e) => match opts.snapshot_policy {
+                SnapshotPolicy::Required => return Err(e),
+                SnapshotPolicy::On => report.warnings.push(format!("No snapshot ({}); reading live files", e.user_message())),
+                _ => tracing::info!("No snapshot: {}", e.user_message()),
+            },
+        }
+    }
+    let snap = snapshot.as_ref();
     let (mut entries, warnings) = match (&changed, prev_list.is_empty()) {
         (Some(c), false) => {
-            let (r, n) = scan_incremental(sources, &prev_list, c, &shallow, &opts.deleted_paths, filter, opts)?;
+            let (r, n) = scan_incremental_in(sources, &prev_list, c, &shallow, &opts.deleted_paths, filter, opts, snap)?;
             report.rescanned_paths = n;
             r
         }
-        _ => scan_sources(sources, filter, opts)?,
+        _ => scan_sources_in(sources, filter, opts, snap)?,
     };
     report.warnings.extend(warnings);
     if entries.iter().all(|(_, e)| e.kind == EntryKind::Dir) && !opts.allow_empty_source {
@@ -970,7 +1027,7 @@ pub fn run_backup_with_cipher(
             None => report.files_added += 1,
         }
         progress(ctx, Phase::Uploading, i as u64, total, report.bytes_examined, Some(&entry.path));
-        work.push_back((i, path.clone(), compress_level(path, opts)));
+        work.push_back((i, snap.map(|s| s.real(path)).unwrap_or_else(|| path.clone()), compress_level(path, opts)));
     }
 
     // ── Parallel read/hash/compress → dedup/pack → concurrent upload ──
@@ -1156,6 +1213,10 @@ pub fn run_backup_with_cipher(
         db.set_kv(USN_KEY, &serde_json::to_string(state)?)?;
     }
     // Sources are no longer needed: scripts may release snapshots/locks now.
+    // Sources fully read: release the snapshot before uploads finish.
+    if let Some(s) = snapshot.take() {
+        report.warnings.extend(s.release());
+    }
     ctx.source_released();
 
     if !opts.dry_run {
@@ -1561,5 +1622,26 @@ mod tests {
         restore_all(&be, &db, &o, None, out.path());
         let p = walkdir_file(out.path(), "tagged.txt");
         assert_eq!(xattr::get(p, "user.color").unwrap().as_deref(), Some(&b"blue"[..]));
+    }
+
+    #[test]
+    fn backup_reads_through_snapshot_but_keeps_original_paths() {
+        let src = tempfile::tempdir().unwrap();
+        let frozen = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        write(src.path(), "doc.txt", b"live, changing");
+        write(frozen.path(), "doc.txt", b"frozen snapshot copy");
+        crate::backup::snapshot::test_hook::set(vec![(src.path().to_path_buf(), frozen.path().to_path_buf())]);
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        let o = BackupOptions { snapshot_policy: crate::backup::snapshot::SnapshotPolicy::Required, ..opts() };
+        let r = run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll,
+            None, KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        assert_eq!(r.snapshot.as_deref(), Some("test"));
+        let files = db.files(db.filesets().unwrap()[0].id).unwrap();
+        assert!(files.iter().any(|f| f.path == src.path().join("doc.txt").to_string_lossy()), "original path recorded");
+        restore_all(&be, &db, &o, None, out.path());
+        assert_eq!(std::fs::read(walkdir_file(out.path(), "doc.txt")).unwrap(), b"frozen snapshot copy");
     }
 }

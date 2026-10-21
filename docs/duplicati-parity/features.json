@@ -75,12 +75,12 @@
    "cat": 1,
    "name": "Desktop tray integration",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 1,
-   "verify": "",
+   "verify": "device",
    "note": "No tray icon or tray menu",
-   "evidence": ""
+   "evidence": "Tray, autostart (--background), Windows service/systemd/launchd units, notifier, SleepInhibitor; needs a desktop session to verify"
   },
   {
    "n": 6,
@@ -111,24 +111,24 @@
    "cat": 1,
    "name": "OS service and login startup",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 1,
-   "verify": "",
+   "verify": "device",
    "note": "No autostart or service; schedules run only while the app is open",
-   "evidence": ""
+   "evidence": "Tray, autostart (--background), Windows service/systemd/launchd units, notifier, SleepInhibitor; needs a desktop session to verify"
   },
   {
    "n": 9,
    "cat": 1,
    "name": "Native OS notifications",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 1,
-   "verify": "",
+   "verify": "device",
    "note": "tauri-plugin-notification is loaded, but backup results don't trigger it",
-   "evidence": ""
+   "evidence": "Tray, autostart (--background), Windows service/systemd/launchd units, notifier, SleepInhibitor; needs a desktop session to verify"
   },
   {
    "n": 10,
@@ -255,12 +255,12 @@
    "cat": 2,
    "name": "Global defaults with per-job overrides",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Each job holds its own options; no shared defaults",
-   "evidence": ""
+   "evidence": "backup_engine::tests::{global_defaults_and_destination_library,adopt_repository_continues_history}; defaults.rs tests; Defaults & destinations view"
   },
   {
    "n": 21,
@@ -327,12 +327,12 @@
    "cat": 2,
    "name": "Stored-configuration secret policy",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Always strips secrets; no selectable modes",
-   "evidence": ""
+   "evidence": "backup_engine::tests::{global_defaults_and_destination_library,adopt_repository_continues_history}; defaults.rs tests; Defaults & destinations view"
   },
   {
    "n": 27,
@@ -351,24 +351,24 @@
    "cat": 2,
    "name": "Migration and history continuation",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Local DB can be rebuilt from remote; no guided migration",
-   "evidence": ""
+   "evidence": "backup_engine::tests::{global_defaults_and_destination_library,adopt_repository_continues_history}; defaults.rs tests; Defaults & destinations view"
   },
   {
    "n": 29,
    "cat": 2,
    "name": "Reusable destination connections",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Saved connections are reused; no separate destination library",
-   "evidence": ""
+   "evidence": "backup_engine::tests::{global_defaults_and_destination_library,adopt_repository_continues_history}; defaults.rs tests; Defaults & destinations view"
   },
   {
    "n": 30,
@@ -495,12 +495,12 @@
    "cat": 3,
    "name": "Exclusion extended attributes",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "macOS/Linux xattrs not read",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 41,
@@ -543,12 +543,12 @@
    "cat": 3,
    "name": "Advisory-lock handling",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not configurable",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 45,
@@ -567,60 +567,60 @@
    "cat": 3,
    "name": "Externally supplied changed paths",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not accepted",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 47,
    "cat": 3,
    "name": "NTFS USN change journal",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 2,
-   "verify": "",
+   "verify": "device",
    "note": "Not used",
-   "evidence": ""
+   "evidence": "Code compiles for Windows (x86_64-pc-windows-gnu) / macOS paths; needs a Windows NTFS / macOS device run to verify"
   },
   {
    "n": 48,
    "cat": 3,
    "name": "Metadata preservation",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Modification time and Unix mode only; no Windows attributes or ACLs",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 49,
    "cat": 3,
    "name": "macOS ACLs and file flags",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 2,
-   "verify": "",
+   "verify": "device",
    "note": "Not stored",
-   "evidence": ""
+   "evidence": "Code compiles for Windows (x86_64-pc-windows-gnu) / macOS paths; needs a Windows NTFS / macOS device run to verify"
   },
   {
    "n": 50,
    "cat": 3,
    "name": "NTFS alternate data streams",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 2,
-   "verify": "",
+   "verify": "device",
    "note": "Not stored",
-   "evidence": ""
+   "evidence": "Code compiles for Windows (x86_64-pc-windows-gnu) / macOS paths; needs a Windows NTFS / macOS device run to verify"
   },
   {
    "n": 51,
@@ -747,24 +747,24 @@
    "cat": 4,
    "name": "Compression level and method",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Deflate level 0\u20139 (0 = store); not ZIP containers",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 62,
    "cat": 4,
    "name": "ZIP implementation and ZIP64",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Own volume format instead of ZIP",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 63,
@@ -843,12 +843,12 @@
    "cat": 4,
    "name": "Additional control files",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not supported",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 70,
@@ -963,24 +963,24 @@
    "cat": 4,
    "name": "PAR2 protection",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 80,
    "cat": 4,
    "name": "PAR2 redundancy and repair",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 81,
@@ -1107,36 +1107,36 @@
    "cat": 5,
    "name": "Symlink metadata restoration",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Links recreated (Unix); their metadata is not",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 92,
    "cat": 5,
    "name": "Multi-version / unique-content restore",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 93,
    "cat": 5,
    "name": "Local block reuse, correct-file skipping",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Matching files skipped; local blocks not reused",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 94,
@@ -1251,12 +1251,12 @@
    "cat": 5,
    "name": "Missing block-volume reconstruction",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 104,
@@ -2571,12 +2571,12 @@
    "cat": 11,
    "name": "Battery-aware scheduling",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 1,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "power.rs tests (pmset/sysfs parsing), schedule skip_on_battery"
   },
   {
    "n": 214,
@@ -2607,12 +2607,12 @@
    "cat": 11,
    "name": "Early-release script hook",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 217,
@@ -2715,12 +2715,12 @@
    "cat": 11,
    "name": "Developer builds and extensions",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Open Backend trait; builds from source",
-   "evidence": ""
+   "evidence": "docs/EXTENDING.md + ModuleRegistry tests; cpu_intensity pacing in hashing workers"
   },
   {
    "n": 226,
@@ -2751,72 +2751,72 @@
    "cat": 12,
    "name": "Upload concurrency",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Uploads are sequential",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 229,
    "cat": 12,
    "name": "CPU intensity",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "docs/EXTENDING.md + ModuleRegistry tests; cpu_intensity pacing in hashing workers"
   },
   {
    "n": 230,
    "cat": 12,
    "name": "Worker-thread allocation",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Single-threaded engine",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 231,
    "cat": 12,
    "name": "Temp-file and read-buffer controls",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not configurable",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 232,
    "cat": 12,
    "name": "Restore pipeline concurrency",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 233,
    "cat": 12,
    "name": "Restore cache and free-space controls",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 234,
@@ -2847,60 +2847,60 @@
    "cat": 12,
    "name": "Network timeouts",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not configurable per job",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 237,
    "cat": 12,
    "name": "Background I/O priority",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 238,
    "cat": 12,
    "name": "Sleep prevention",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 1,
-   "verify": "",
+   "verify": "device",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "Tray, autostart (--background), Windows service/systemd/launchd units, notifier, SleepInhibitor; needs a desktop session to verify"
   },
   {
    "n": 239,
    "cat": 12,
    "name": "Quota and capacity warnings",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 240,
    "cat": 12,
    "name": "Automatic compaction and vacuum",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Auto compaction; vacuum only after compaction",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 241,
@@ -2931,12 +2931,12 @@
    "cat": 12,
    "name": "Restore AutoTune benchmark",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 244,
@@ -2955,24 +2955,24 @@
    "cat": 12,
    "name": "Legacy restore mode",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not applicable",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 246,
    "cat": 12,
    "name": "Case-insensitive remote names",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core backup tests (engine/restore/maintenance/meta/par2/modules) + CLI e2e (zip, par2 self-heal, multi-version, rebuild, control files, autotune, local blocks); exposed in job editor, restore, maintenance, CLI, RPC"
   },
   {
    "n": 247,

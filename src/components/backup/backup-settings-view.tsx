@@ -5,9 +5,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { diffOptions, inputCls } from "@/lib/backup-helpers";
+import { formatBytes } from "@/lib/format-bytes";
 import {
   errorText,
   newBackupJob,
+  type DatabaseCleanupReport,
+  type DatabaseEntry,
   type BackupOptions,
   type GlobalDefaults,
   type SavedDestination,
@@ -145,10 +148,73 @@ function DestinationLibrary() {
   );
 }
 
+function DatabaseTools() {
+  const [items, setItems] = useState<DatabaseEntry[] | null>(null);
+  const [msg, setMsg] = useState<{ tone: "error" | "success"; text: string } | null>(null);
+  const load = () =>
+    tauriInvoke<DatabaseEntry[]>("backup_database_inventory", undefined, [])
+      .then(setItems)
+      .catch((e) => setMsg({ tone: "error", text: errorText(e) }));
+  const cleanup = async (deleteOrphans: boolean) => {
+    try {
+      const r = await tauriInvoke<DatabaseCleanupReport>("backup_cleanup_databases", { deleteOrphans, vacuum: true });
+      setMsg({
+        tone: r.errors.length ? "error" : "success",
+        text: `${r.orphans_deleted.length} orphan(s) deleted, ${r.migrated} upgraded, ${r.vacuumed} vacuumed; ${formatBytes(r.bytes_before)} → ${formatBytes(r.bytes_after)}${r.errors.length ? `. ${r.errors.join("; ")}` : ""}`,
+      });
+      await load();
+    } catch (e) {
+      setMsg({ tone: "error", text: errorText(e) });
+    }
+  };
+  const orphans = items?.filter((i) => !i.job_name).length ?? 0;
+  return (
+    <Section title="Local databases" hint="Each job keeps a local index of its backup. Orphans belong to deleted jobs; old schemas are upgraded (a copy is kept).">
+      {msg && <Banner tone={msg.tone} onClose={() => setMsg(null)}>{msg.text}</Banner>}
+      <div className="flex gap-1 flex-wrap">
+        <Btn testId="db-inventory" onClick={() => void load()}>
+          Show databases
+        </Btn>
+        <Btn disabled={items === null} onClick={() => void cleanup(false)}>
+          Upgrade &amp; vacuum
+        </Btn>
+        <Btn tone="danger" disabled={orphans === 0} testId="db-cleanup" onClick={() => void cleanup(true)}>
+          Delete {orphans} orphan(s) &amp; vacuum
+        </Btn>
+      </div>
+      {items && (
+        <table className="w-full text-xs" data-testid="db-table">
+          <thead>
+            <tr className="text-left text-zinc-500">
+              <th className="font-normal">Job</th>
+              <th className="font-normal">Versions</th>
+              <th className="font-normal">Size</th>
+              <th className="font-normal">Schema</th>
+              <th className="font-normal">Integrity</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((d) => (
+              <tr key={d.job_id} className="border-t border-zinc-100 dark:border-zinc-800">
+                <td className="py-0.5">{d.job_name ?? <span className="text-amber-600">orphan {d.job_id.slice(0, 8)}</span>}</td>
+                <td>{d.info?.versions ?? "—"}</td>
+                <td>{d.info ? formatBytes(d.info.size_bytes) : "—"}</td>
+                <td>{d.info ? `${d.info.schema_version}/${d.info.latest_schema}` : "—"}</td>
+                <td className={d.info?.integrity_ok ? "text-green-600" : "text-red-600"}>{d.error ?? d.info?.integrity ?? "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Section>
+  );
+}
+
 export function BackupSettingsView() {
   return (
     <div className="p-3 space-y-3" data-testid="backup-settings">
       <DestinationLibrary />
+      <DatabaseTools />
       <DefaultsEditor />
     </div>
   );

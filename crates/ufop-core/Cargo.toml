@@ -11,7 +11,7 @@ default = []
 # `impl From<rusqlite::Error> for AppError`, for the desktop app's database.
 sqlite = ["dep:rusqlite"]
 # Deduplicated, compressed, encrypted versioned backup engine (`backup` module).
-backup = ["sqlite", "dep:aes-gcm", "dep:argon2", "dep:sha2", "dep:flate2", "dep:rand", "dep:hex", "dep:zip", "dep:base64"]
+backup = ["sqlite", "dep:windows", "dep:aes-gcm", "dep:argon2", "dep:sha2", "dep:flate2", "dep:rand", "dep:hex", "dep:zip", "dep:base64"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -53,6 +53,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Ioctl",
     "Win32_System_IO",
 ] }
+# VSS snapshots (COM IVssBackupComponents).
+windows = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Storage_Vss", "Win32_System_Com"] }
 
 [dev-dependencies]
 tempfile = "3"
