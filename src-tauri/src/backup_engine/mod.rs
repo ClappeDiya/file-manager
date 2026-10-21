@@ -1,0 +1,1101 @@
+//! Backup engine: named backup jobs on top of the deduplicating, encrypted
+//! repository engine in `ufop_core::backup`.
+//!
+//! This module adds what the desktop app needs around the core engine:
+//! persisted job definitions (`backup_jobs`), passphrases in the OS
+//! credential store, local-folder and connector destinations, a serialized
+//! task queue with live progress and cancellation, a scheduler with
+//! missed-run catch-up and pause/resume, pre/post scripts, HTTP report
+//! callbacks, run history (`backup_runs`) and the operation ledger.
+
+pub mod connector_backend;
+pub mod hooks;
+pub mod portability;
+pub mod schedule;
+
+use crate::connectors::ConnectionManager;
+use crate::core::error::AppError;
+use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
+use crate::security::CredentialStore;
+use crate::storage::pool::DbPool;
+use chrono::{DateTime, Utc};
+use hooks::{LogLine, ReportConfig, ScriptConfig};
+use rusqlite::params;
+use schedule::BackupSchedule;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{RwLock, Semaphore};
+use ufop_core::backup::backend::{RetryPolicy, Throttle};
+use ufop_core::backup::crypto::KdfParams;
+use ufop_core::backup::db::BackupDb;
+use ufop_core::backup::engine::Repo;
+use ufop_core::backup::{
+    maintenance, Backend, BackupOptions, LocalBackend, OpContext, Progress, RestoreOptions, RetentionPolicy, RetryingBackend,
+    SoftDeleteBackend, SourceFilter,
+};
+
+pub use ufop_core::backup::Fileset;
+
+/// Where a job's volumes are stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BackupDestination {
+    /// Local disk, removable drive or mounted share (UNC paths included).
+    Local {
+        path: String,
+        /// Fallback paths tried in order; `*` matches a drive letter/mount.
+        #[serde(default)]
+        alternate_paths: Vec<String>,
+        /// Only accept a path containing this marker file.
+        #[serde(default)]
+        marker_file: Option<String>,
+    },
+    /// A saved connection (SFTP, FTP/FTPS, WebDAV, S3).
+    Connection {
+        connection_id: String,
+        #[serde(default)]
+        remote_path: String,
+    },
+}
+
+impl BackupDestination {
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Local { path, .. } => path.clone(),
+            Self::Connection { connection_id, remote_path } => format!("connection {connection_id}:{remote_path}"),
+        }
+    }
+}
+
+/// Last-run statistics shown on the dashboard.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JobStats {
+    pub last_run_at: Option<String>,
+    pub last_result: Option<String>,
+    pub last_duration_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub last_scheduled_at: Option<String>,
+    pub version_count: u64,
+    pub source_size: u64,
+    pub backend_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackupJob {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub sources: Vec<String>,
+    pub filter: SourceFilter,
+    pub destination: BackupDestination,
+    /// Encrypt volumes with the passphrase kept in the credential store.
+    pub encrypted: bool,
+    pub options: BackupOptions,
+    pub retention: RetentionPolicy,
+    pub schedule: BackupSchedule,
+    pub scripts: ScriptConfig,
+    pub reports: ReportConfig,
+    pub throttle: Throttle,
+    pub retry: RetryPolicy,
+    /// Rename volumes with this prefix instead of deleting them.
+    pub soft_delete_prefix: Option<String>,
+    /// Embed this job's configuration (without secrets) in remote file lists.
+    pub store_config_remotely: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub stats: JobStats,
+}
+
+impl Default for BackupJob {
+    fn default() -> Self {
+        let now = Utc::now().to_rfc3339();
+        Self {
+            id: String::new(),
+            name: String::new(),
+            description: String::new(),
+            sources: Vec::new(),
+            filter: SourceFilter::default(),
+            destination: BackupDestination::Local { path: String::new(), alternate_paths: Vec::new(), marker_file: None },
+            encrypted: true,
+            options: BackupOptions::default(),
+            retention: RetentionPolicy::default(),
+            schedule: BackupSchedule::default(),
+            scripts: ScriptConfig::default(),
+            reports: ReportConfig::default(),
+            throttle: Throttle::default(),
+            retry: RetryPolicy { retries: 3, delay_ms: 2000, exponential: true, max_delay_ms: 60_000 },
+            soft_delete_prefix: None,
+            store_config_remotely: false,
+            created_at: now.clone(),
+            updated_at: now,
+            stats: JobStats::default(),
+        }
+    }
+}
+
+impl BackupJob {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.name.trim().is_empty() {
+            return Err(AppError::validation("Give the backup job a name"));
+        }
+        if self.sources.iter().all(|s| s.trim().is_empty()) {
+            return Err(AppError::validation("Add at least one source folder"));
+        }
+        match &self.destination {
+            BackupDestination::Local { path, .. } if path.trim().is_empty() => {
+                return Err(AppError::validation("Choose a destination folder"))
+            }
+            BackupDestination::Connection { connection_id, .. } if uuid::Uuid::parse_str(connection_id).is_err() => {
+                return Err(AppError::validation("Choose a saved connection as destination"))
+            }
+            _ => {}
+        }
+        for s in &self.sources {
+            if let BackupDestination::Local { path, .. } = &self.destination {
+                let (s, p) = (Path::new(s), Path::new(path));
+                if p.starts_with(s) {
+                    return Err(AppError::validation(format!(
+                        "The destination {} is inside the source {}; backups would include themselves",
+                        p.display(),
+                        s.display()
+                    )));
+                }
+            }
+        }
+        self.retention.validate()?;
+        self.schedule.validate()?;
+        self.filter.clone().compile()?;
+        if self.options.block_size < 1024 || self.options.volume_size < self.options.block_size {
+            return Err(AppError::validation("Block size must be ≥ 1 KiB and remote volume size ≥ block size"));
+        }
+        Ok(())
+    }
+}
+
+/// Every operation the queue can run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BackupOperation {
+    Backup { dry_run: bool },
+    Restore { options: RestoreOptions },
+    Verify { full: bool },
+    Compact,
+    Repair,
+    RecreateDatabase,
+    ListBroken,
+    PurgeBroken { dry_run: bool },
+    Purge { paths: Vec<String>, versions: Option<Vec<usize>>, dry_run: bool },
+    DeleteVersions { versions: Vec<usize>, allow_full_removal: bool },
+    Consistency,
+}
+
+impl BackupOperation {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Backup { .. } => "backup",
+            Self::Restore { .. } => "restore",
+            Self::Verify { .. } => "verify",
+            Self::Compact => "compact",
+            Self::Repair => "repair",
+            Self::RecreateDatabase => "recreate_database",
+            Self::ListBroken => "list_broken_files",
+            Self::PurgeBroken { .. } => "purge_broken_files",
+            Self::Purge { .. } => "purge",
+            Self::DeleteVersions { .. } => "delete_versions",
+            Self::Consistency => "consistency_check",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskInfo {
+    pub task_id: String,
+    pub job_id: String,
+    pub job_name: String,
+    pub operation: String,
+    /// `queued` or `running`.
+    pub state: String,
+    pub queued_at: String,
+    pub started_at: Option<String>,
+    pub progress: Option<Progress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerStatus {
+    pub running: bool,
+    pub paused: bool,
+    pub paused_until: Option<String>,
+    pub tasks: Vec<TaskInfo>,
+    pub next_runs: Vec<NextRun>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NextRun {
+    pub job_id: String,
+    pub job_name: String,
+    pub next_run_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupRun {
+    pub id: String,
+    pub job_id: String,
+    pub operation: String,
+    /// `success`, `warning`, `error` or `cancelled`.
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub summary: String,
+    pub report: serde_json::Value,
+    pub log: Vec<LogLine>,
+}
+
+/// Result returned to callers of [`BackupManager::execute`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationResult {
+    pub run_id: String,
+    pub status: String,
+    pub summary: String,
+    pub report: serde_json::Value,
+    pub log: Vec<LogLine>,
+}
+
+struct TaskSlot {
+    info: TaskInfo,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<Mutex<Option<Progress>>>,
+}
+
+struct Inner {
+    pool: DbPool,
+    creds: Arc<CredentialStore>,
+    conns: Option<ConnectionManager>,
+    ledger: Option<OperationLedger>,
+    data_dir: PathBuf,
+    jobs: RwLock<HashMap<String, BackupJob>>,
+    tasks: Mutex<Vec<TaskSlot>>,
+    gate: Semaphore,
+    /// `Some(None)` = paused indefinitely.
+    paused: Mutex<Option<Option<DateTime<Utc>>>>,
+    scheduler_running: AtomicBool,
+    kdf: KdfParams,
+}
+
+#[derive(Clone)]
+pub struct BackupManager {
+    inner: Arc<Inner>,
+}
+
+const PASS_KEY_PREFIX: &str = "backup-passphrase:";
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Default directory for per-job databases.
+pub fn default_data_dir() -> PathBuf {
+    directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
+        .map(|d| d.data_dir().join("backups"))
+        .unwrap_or_else(|| std::env::temp_dir().join("ufop-backups"))
+}
+
+impl BackupManager {
+    pub fn new(pool: DbPool, creds: Arc<CredentialStore>, conns: Option<ConnectionManager>, ledger: Option<OperationLedger>, data_dir: PathBuf) -> Self {
+        Self::with_kdf(pool, creds, conns, ledger, data_dir, KdfParams::default())
+    }
+
+    pub fn with_kdf(
+        pool: DbPool,
+        creds: Arc<CredentialStore>,
+        conns: Option<ConnectionManager>,
+        ledger: Option<OperationLedger>,
+        data_dir: PathBuf,
+        kdf: KdfParams,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                pool,
+                creds,
+                conns,
+                ledger,
+                data_dir,
+                jobs: RwLock::new(HashMap::new()),
+                tasks: Mutex::new(Vec::new()),
+                gate: Semaphore::new(1),
+                paused: Mutex::new(None),
+                scheduler_running: AtomicBool::new(false),
+                kdf,
+            }),
+        }
+    }
+
+    fn job_db_path(&self, id: &str) -> PathBuf {
+        self.inner.data_dir.join(format!("{id}.sqlite"))
+    }
+
+    // ── Job CRUD ──
+
+    pub async fn load_from_db(&self) -> Result<usize, AppError> {
+        let rows: Vec<String> = self
+            .inner
+            .pool
+            .execute(|c| {
+                let mut st = c.prepare("SELECT config_json FROM backup_jobs")?;
+                let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+                Ok(v)
+            })
+            .await?;
+        let mut jobs = self.inner.jobs.write().await;
+        for r in rows {
+            match serde_json::from_str::<BackupJob>(&r) {
+                Ok(j) => {
+                    jobs.insert(j.id.clone(), j);
+                }
+                Err(e) => tracing::warn!("Skipping unreadable backup job: {e}"),
+            }
+        }
+        Ok(jobs.len())
+    }
+
+    async fn persist(&self, job: &BackupJob) -> Result<(), AppError> {
+        let (id, name, json) = (job.id.clone(), job.name.clone(), serde_json::to_string(job)?);
+        self.inner
+            .pool
+            .execute(move |c| {
+                c.execute(
+                    "INSERT INTO backup_jobs(id, name, config_json) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(id) DO UPDATE SET name = excluded.name, config_json = excluded.config_json, updated_at = datetime('now')",
+                    params![id, name, json],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn list_jobs(&self) -> Vec<BackupJob> {
+        let mut v: Vec<BackupJob> = self.inner.jobs.read().await.values().cloned().collect();
+        v.sort_by_key(|j| j.name.to_lowercase());
+        v
+    }
+
+    pub async fn get_job(&self, id: &str) -> Result<BackupJob, AppError> {
+        self.inner.jobs.read().await.get(id).cloned().ok_or_else(|| AppError::not_found(format!("Backup job {id} not found")))
+    }
+
+    /// Create (empty id) or update a job. `passphrase`: `Some("")` clears it,
+    /// `None` keeps the stored one.
+    pub async fn save_job(&self, mut job: BackupJob, passphrase: Option<String>) -> Result<BackupJob, AppError> {
+        let existing = if job.id.is_empty() { None } else { self.inner.jobs.read().await.get(&job.id).cloned() };
+        job.sources.retain(|s| !s.trim().is_empty());
+        job.validate()?;
+        let now = Utc::now().to_rfc3339();
+        match &existing {
+            Some(old) => {
+                job.created_at = old.created_at.clone();
+                job.stats = old.stats.clone();
+                if old.options.block_size != job.options.block_size && old.stats.version_count > 0 {
+                    return Err(AppError::validation(
+                        "Block size cannot change after the first backup; create a new job for a new block size",
+                    ));
+                }
+            }
+            None => {
+                if job.id.is_empty() {
+                    job.id = uuid::Uuid::new_v4().to_string();
+                }
+                job.created_at = now.clone();
+            }
+        }
+        job.updated_at = now;
+        if let Some(p) = passphrase {
+            let key = format!("{PASS_KEY_PREFIX}{}", job.id);
+            if p.is_empty() {
+                let _ = self.inner.creds.delete(&key).await;
+            } else {
+                self.inner.creds.store(&key, &p).await?;
+            }
+        }
+        if job.encrypted && self.passphrase(&job.id).await?.is_none() {
+            return Err(AppError::validation("An encrypted backup needs a passphrase (or turn encryption off)"));
+        }
+        self.persist(&job).await?;
+        self.inner.jobs.write().await.insert(job.id.clone(), job.clone());
+        Ok(job)
+    }
+
+    pub async fn passphrase(&self, job_id: &str) -> Result<Option<String>, AppError> {
+        self.inner.creds.retrieve(&format!("{PASS_KEY_PREFIX}{job_id}")).await
+    }
+
+    /// Delete a job. Optionally remove its local database and/or all remote volumes.
+    pub async fn delete_job(&self, id: &str, delete_local_db: bool, delete_remote: bool) -> Result<(), AppError> {
+        if lock(&self.inner.tasks).iter().any(|t| t.info.job_id == id) {
+            return Err(AppError::state("This job has a running or queued operation", "Cancel it first."));
+        }
+        let job = self.get_job(id).await?;
+        if delete_remote {
+            let backend = self.build_backend(&job).await?;
+            let prefix = job.options.prefix.clone();
+            tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+                for f in backend.list()? {
+                    if f.name.starts_with(&format!("{prefix}-")) {
+                        backend.delete(&f.name)?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))??;
+        }
+        if delete_local_db {
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", self.job_db_path(id).display()));
+            }
+        }
+        let key = id.to_string();
+        self.inner.pool.execute(move |c| {
+            c.execute("DELETE FROM backup_jobs WHERE id = ?1", [&key])?;
+            Ok(())
+        }).await?;
+        let _ = self.inner.creds.delete(&format!("{PASS_KEY_PREFIX}{id}")).await;
+        self.inner.jobs.write().await.remove(id);
+        Ok(())
+    }
+
+    // ── Destinations ──
+
+    pub async fn backend_for(&self, dest: &BackupDestination, throttle: Throttle, retry: RetryPolicy, soft_delete: Option<String>) -> Result<Box<dyn Backend>, AppError> {
+        let raw: Box<dyn Backend> = match dest {
+            BackupDestination::Local { path, alternate_paths, marker_file } => {
+                if alternate_paths.is_empty() && marker_file.is_none() {
+                    Box::new(LocalBackend::new(path))
+                } else {
+                    let mut c = vec![path.clone()];
+                    c.extend(alternate_paths.iter().cloned());
+                    Box::new(LocalBackend::discover(&c, marker_file.as_deref())?)
+                }
+            }
+            BackupDestination::Connection { connection_id, remote_path } => {
+                let conns = self.inner.conns.as_ref().ok_or_else(|| AppError::state("Connections are unavailable", "Restart the app."))?;
+                let id = uuid::Uuid::parse_str(connection_id).map_err(|_| AppError::validation("Invalid connection id"))?;
+                let profile = conns.get_connection(id).await?.ok_or_else(|| AppError::not_found("The destination connection no longer exists"))?;
+                let secret = conns.get_password(id).await.unwrap_or(None);
+                Box::new(connector_backend::ConnectorBackend::connect(&profile, secret, remote_path).await?)
+            }
+        };
+        let b: Box<dyn Backend> = Box::new(RetryingBackend::new(raw, retry, throttle));
+        Ok(match soft_delete.filter(|p| !p.is_empty()) {
+            Some(p) => Box::new(SoftDeleteBackend::new(b, p)),
+            None => b,
+        })
+    }
+
+    async fn build_backend(&self, job: &BackupJob) -> Result<Box<dyn Backend>, AppError> {
+        self.backend_for(&job.destination, job.throttle, job.retry, job.soft_delete_prefix.clone()).await
+    }
+
+    /// Test a destination; optionally create the folder. Returns the number of files present.
+    pub async fn test_destination(&self, dest: &BackupDestination, create: bool) -> Result<usize, AppError> {
+        let b = self.backend_for(dest, Throttle::default(), RetryPolicy { retries: 0, ..Default::default() }, None).await?;
+        blocking(move || b.test(create)).await
+    }
+
+    pub async fn test_destination_compat(&self, dest: &BackupDestination, files: usize, max_size: usize) -> Result<Vec<String>, AppError> {
+        let b = self.backend_for(dest, Throttle::default(), RetryPolicy { retries: 0, ..Default::default() }, None).await?;
+        blocking(move || ufop_core::backup::backend::test_backend_compatibility(b.as_ref(), files.clamp(1, 20), 1024, max_size.clamp(1024, 16 << 20))).await
+    }
+
+    // ── Read-only queries on the local database ──
+
+    async fn with_db<T: Send + 'static>(&self, job_id: &str, f: impl FnOnce(&BackupDb) -> Result<T, AppError> + Send + 'static) -> Result<T, AppError> {
+        self.get_job(job_id).await?;
+        let path = self.job_db_path(job_id);
+        blocking(move || f(&BackupDb::open(&path)?)).await
+    }
+
+    pub async fn list_versions(&self, job_id: &str) -> Result<Vec<Fileset>, AppError> {
+        self.with_db(job_id, |db| db.filesets()).await
+    }
+
+    pub async fn list_files(&self, job_id: &str, version: usize, prefix: Option<String>) -> Result<Vec<ufop_core::backup::FileEntry>, AppError> {
+        self.with_db(job_id, move |db| {
+            let fs = db.fileset_by_version(version)?;
+            let mut files = db.files(fs.id)?;
+            if let Some(p) = prefix.filter(|p| !p.is_empty()) {
+                files.retain(|f| f.path.starts_with(&p));
+            }
+            files.truncate(20_000);
+            Ok(files)
+        })
+        .await
+    }
+
+    pub async fn search(&self, job_id: &str, pattern: String, version: Option<usize>) -> Result<Vec<maintenance::FoundFile>, AppError> {
+        self.with_db(job_id, move |db| maintenance::find(db, &pattern, version, 2000)).await
+    }
+
+    pub async fn compare(&self, job_id: &str, a: usize, b: usize) -> Result<maintenance::VersionComparison, AppError> {
+        self.with_db(job_id, move |db| maintenance::compare_versions(db, a, b)).await
+    }
+
+    // ── Operations ──
+
+    fn register_task(&self, job: &BackupJob, op: &str) -> (String, Arc<AtomicBool>, Arc<Mutex<Option<Progress>>>) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(None));
+        lock(&self.inner.tasks).push(TaskSlot {
+            info: TaskInfo {
+                task_id: id.clone(),
+                job_id: job.id.clone(),
+                job_name: job.name.clone(),
+                operation: op.to_string(),
+                state: "queued".into(),
+                queued_at: Utc::now().to_rfc3339(),
+                started_at: None,
+                progress: None,
+            },
+            cancel: cancel.clone(),
+            progress: progress.clone(),
+        });
+        (id, cancel, progress)
+    }
+
+    fn set_running(&self, task_id: &str) {
+        if let Some(t) = lock(&self.inner.tasks).iter_mut().find(|t| t.info.task_id == task_id) {
+            t.info.state = "running".into();
+            t.info.started_at = Some(Utc::now().to_rfc3339());
+        }
+    }
+
+    fn finish_task(&self, task_id: &str) {
+        lock(&self.inner.tasks).retain(|t| t.info.task_id != task_id);
+    }
+
+    /// Request cancellation of a task (or every task of a job).
+    pub fn cancel(&self, id: &str) -> bool {
+        let tasks = lock(&self.inner.tasks);
+        let mut hit = false;
+        for t in tasks.iter().filter(|t| t.info.task_id == id || t.info.job_id == id) {
+            t.cancel.store(true, Ordering::SeqCst);
+            hit = true;
+        }
+        hit
+    }
+
+    pub fn is_job_busy(&self, job_id: &str) -> bool {
+        lock(&self.inner.tasks).iter().any(|t| t.info.job_id == job_id)
+    }
+
+    /// Queue a backup in the background; returns the task id.
+    pub async fn start_backup(&self, job_id: &str, dry_run: bool) -> Result<String, AppError> {
+        let job = self.get_job(job_id).await?;
+        if self.is_job_busy(job_id) {
+            return Err(AppError::state("This job is already queued or running", "Wait for it to finish or cancel it."));
+        }
+        let (task_id, cancel, progress) = self.register_task(&job, "backup");
+        let me = self.clone();
+        let tid = task_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = me.run_registered(job, BackupOperation::Backup { dry_run }, tid.clone(), cancel, progress).await {
+                tracing::warn!("backup task {tid} failed: {e}");
+            }
+        });
+        Ok(task_id)
+    }
+
+    /// Run an operation and wait for its result.
+    pub async fn execute(&self, job_id: &str, op: BackupOperation) -> Result<OperationResult, AppError> {
+        let job = self.get_job(job_id).await?;
+        let (task_id, cancel, progress) = self.register_task(&job, op.name());
+        self.run_registered(job, op, task_id, cancel, progress).await
+    }
+
+    async fn run_registered(
+        &self,
+        job: BackupJob,
+        op: BackupOperation,
+        task_id: String,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<Mutex<Option<Progress>>>,
+    ) -> Result<OperationResult, AppError> {
+        let _permit = match self.inner.gate.acquire().await {
+            Ok(p) => p,
+            Err(_) => {
+                self.finish_task(&task_id);
+                return Err(AppError::state("The backup queue is shut down", "Restart the app."));
+            }
+        };
+        self.set_running(&task_id);
+        let r = self.run_operation(job, op, cancel, progress).await;
+        self.finish_task(&task_id);
+        r
+    }
+
+    fn script_env(job: &BackupJob, op: &str, event: &str) -> BTreeMap<String, String> {
+        let mut env = BTreeMap::new();
+        env.insert("UFOP_EVENTNAME".into(), event.into());
+        env.insert("UFOP_OPERATIONNAME".into(), op.into());
+        env.insert("UFOP_BACKUP_ID".into(), job.id.clone());
+        env.insert("UFOP_BACKUP_NAME".into(), job.name.clone());
+        env.insert("UFOP_REMOTEURL".into(), job.destination.describe());
+        env.insert("UFOP_LOCALPATH".into(), job.sources.join(std::path::MAIN_SEPARATOR_STR));
+        env
+    }
+
+    async fn run_operation(
+        &self,
+        job: BackupJob,
+        op: BackupOperation,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<Mutex<Option<Progress>>>,
+    ) -> Result<OperationResult, AppError> {
+        let started = Utc::now();
+        let op_name = op.name();
+        let mut log: Vec<LogLine> = Vec::new();
+        let is_backup = matches!(op, BackupOperation::Backup { .. });
+
+        if is_backup {
+            if let Some(cmd) = job.scripts.run_before.as_deref().filter(|c| !c.trim().is_empty()) {
+                let out = hooks::run_script(cmd, &Self::script_env(&job, op_name, "BEFORE"), job.scripts.timeout_secs).await?;
+                log.extend(out.log.clone());
+                if job.scripts.run_before_required && !out.succeeded() {
+                    let err = AppError::state("The required pre-backup script failed", "Fix the script or make it optional.");
+                    return self.record(&job, op_name, started, Err(err), log).await;
+                }
+            }
+        }
+
+        let result: Result<serde_json::Value, AppError> = async {
+            let backend = self.build_backend(&job).await?;
+            let pass = if job.encrypted { self.passphrase(&job.id).await? } else { None };
+            if job.encrypted && pass.is_none() {
+                return Err(AppError::validation("This job's passphrase is missing from the credential store; edit the job to set it"));
+            }
+            let db_path = self.job_db_path(&job.id);
+            let kdf = self.inner.kdf;
+            let job2 = job.clone();
+            let prog = progress.clone();
+            let ctx = OpContext::new().with_cancel_flag(cancel.clone()).with_progress(move |p| *lock(&prog) = Some(p.clone()));
+            blocking(move || run_core(&job2, op, backend.as_ref(), &db_path, pass.as_deref(), kdf, &ctx)).await
+        }
+        .await;
+
+        if cancel.load(Ordering::SeqCst) {
+            log.push(LogLine::warn("Operation was cancelled"));
+        }
+        self.record(&job, op_name, started, result, log).await
+    }
+
+    async fn record(
+        &self,
+        job: &BackupJob,
+        op: &str,
+        started: DateTime<Utc>,
+        result: Result<serde_json::Value, AppError>,
+        mut log: Vec<LogLine>,
+    ) -> Result<OperationResult, AppError> {
+        let finished = Utc::now();
+        let (status, summary, report, err) = match &result {
+            Ok(v) => {
+                let errors = v.get("errors").and_then(|e| e.as_array()).map(|a| a.len()).unwrap_or(0);
+                let warnings = v.get("warnings").and_then(|e| e.as_array()).map(|a| a.len()).unwrap_or(0);
+                for w in v.get("warnings").and_then(|e| e.as_array()).into_iter().flatten() {
+                    log.push(LogLine::warn(w.as_str().unwrap_or_default()));
+                }
+                for e in v.get("errors").and_then(|e| e.as_array()).into_iter().flatten() {
+                    log.push(LogLine::error(e.as_str().unwrap_or_default()));
+                }
+                let status = if errors > 0 { "error" } else if warnings > 0 { "warning" } else { "success" };
+                (status.to_string(), summarize(op, v), v.clone(), None)
+            }
+            Err(e) => {
+                let msg = e.user_message();
+                log.push(LogLine::error(msg.clone()));
+                let status = if msg.contains("cancelled") { "cancelled" } else { "error" };
+                (status.to_string(), msg.clone(), serde_json::json!({}), Some(msg))
+            }
+        };
+
+        // Post-operation script gets the result.
+        if op == "backup" {
+            if let Some(cmd) = job.scripts.run_after.as_deref().filter(|c| !c.trim().is_empty()) {
+                let mut env = Self::script_env(job, op, "AFTER");
+                env.insert("UFOP_PARSED_RESULT".into(), status.clone());
+                let rf = std::env::temp_dir().join(format!("ufop-result-{}.txt", uuid::Uuid::new_v4().simple()));
+                let body = if job.scripts.result_format == "text" { summary.clone() } else { report.to_string() };
+                if std::fs::write(&rf, body).is_ok() {
+                    env.insert("UFOP_RESULTFILE".into(), rf.to_string_lossy().into_owned());
+                }
+                if let Ok(out) = hooks::run_script(cmd, &env, job.scripts.timeout_secs).await {
+                    log.extend(out.log);
+                }
+                let _ = std::fs::remove_file(rf);
+            }
+        }
+
+        let run = BackupRun {
+            id: uuid::Uuid::new_v4().to_string(),
+            job_id: job.id.clone(),
+            operation: op.to_string(),
+            status: status.clone(),
+            started_at: started.to_rfc3339(),
+            finished_at: Some(finished.to_rfc3339()),
+            summary: summary.clone(),
+            report: report.clone(),
+            log: log.clone(),
+        };
+        self.insert_run(&run).await?;
+        self.refresh_stats(&job.id, Some((&run, err.clone(), (finished - started).num_milliseconds().max(0) as u64))).await;
+
+        // Reports and ledger are fail-open.
+        let mut vars = BTreeMap::new();
+        vars.insert("name".into(), job.name.clone());
+        vars.insert("operation".into(), op.to_string());
+        vars.insert("result".into(), status.clone());
+        vars.insert("machine".into(), job.reports.machine_name.clone().unwrap_or_else(hooks::machine_name));
+        vars.insert("backup_id".into(), job.reports.backup_id.clone().unwrap_or_else(|| job.id.clone()));
+        vars.insert("duration".into(), format!("{}s", (finished - started).num_seconds()));
+        vars.insert("files".into(), report.get("files_examined").map(|v| v.to_string()).unwrap_or_default());
+        vars.insert("bytes".into(), report.get("bytes_uploaded").map(|v| v.to_string()).unwrap_or_default());
+        vars.insert("errors".into(), err.clone().unwrap_or_default());
+        let mut payload = report.clone();
+        if let Some(o) = payload.as_object_mut() {
+            let lines: Vec<&LogLine> = log.iter().take(job.reports.max_log_lines).collect();
+            o.insert("log".into(), serde_json::to_value(lines).unwrap_or_default());
+        }
+        for f in hooks::send_reports(&job.reports, &status, &vars, payload).await {
+            tracing::warn!("{f}");
+        }
+        if let Some(ledger) = &self.inner.ledger {
+            let st = match status.as_str() {
+                "error" => LedgerStatus::Failed,
+                "cancelled" => LedgerStatus::Cancelled,
+                _ => LedgerStatus::Ok,
+            };
+            let mut ev = RecordEvent::new(LedgerEngine::Backup, format!("backup.{op}"))
+                .status(st)
+                .correlation(job.id.clone())
+                .summary(format!("{}: {summary}", job.name))
+                .target(job.destination.describe());
+            if let Some(b) = report.get("bytes_uploaded").and_then(|v| v.as_i64()) {
+                ev = ev.bytes(b);
+            }
+            ledger.record(ev).await;
+        }
+
+        match (result, err) {
+            (Err(e), _) => Err(e),
+            _ => Ok(OperationResult { run_id: run.id, status, summary, report, log }),
+        }
+    }
+
+    async fn insert_run(&self, run: &BackupRun) -> Result<(), AppError> {
+        let r = run.clone();
+        let report = serde_json::to_string(&r.report)?;
+        let log = serde_json::to_string(&r.log)?;
+        self.inner
+            .pool
+            .execute(move |c| {
+                c.execute(
+                    "INSERT INTO backup_runs(id, job_id, operation, status, started_at, finished_at, summary, report_json, log_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![r.id, r.job_id, r.operation, r.status, r.started_at, r.finished_at, r.summary, report, log],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn run_history(&self, job_id: Option<String>, limit: u32) -> Result<Vec<BackupRun>, AppError> {
+        self.inner
+            .pool
+            .execute(move |c| {
+                let mut st = c.prepare(
+                    "SELECT id, job_id, operation, status, started_at, finished_at, summary, report_json, log_json FROM backup_runs
+                     WHERE (?1 IS NULL OR job_id = ?1) ORDER BY started_at DESC LIMIT ?2",
+                )?;
+                let v = st
+                    .query_map(params![job_id, limit.clamp(1, 1000)], |r| {
+                        Ok(BackupRun {
+                            id: r.get(0)?,
+                            job_id: r.get(1)?,
+                            operation: r.get(2)?,
+                            status: r.get(3)?,
+                            started_at: r.get(4)?,
+                            finished_at: r.get(5)?,
+                            summary: r.get(6)?,
+                            report: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
+                            log: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(v)
+            })
+            .await
+    }
+
+    /// Delete run history older than `days`.
+    pub async fn prune_history(&self, days: u32) -> Result<usize, AppError> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        self.inner.pool.execute(move |c| Ok(c.execute("DELETE FROM backup_runs WHERE started_at < ?1", [cutoff])?)).await
+    }
+
+    async fn refresh_stats(&self, job_id: &str, run: Option<(&BackupRun, Option<String>, u64)>) {
+        let path = self.job_db_path(job_id);
+        let counts = blocking(move || {
+            let db = BackupDb::open(&path)?;
+            let fs = db.filesets()?;
+            let backend: u64 = db.volumes(None)?.iter().map(|v| v.size).sum();
+            Ok((fs.len() as u64, fs.first().map(|f| f.total_size).unwrap_or(0), backend))
+        })
+        .await
+        .unwrap_or((0, 0, 0));
+        let snapshot = {
+            let mut jobs = self.inner.jobs.write().await;
+            let Some(job) = jobs.get_mut(job_id) else { return };
+            job.stats.version_count = counts.0;
+            job.stats.source_size = counts.1;
+            job.stats.backend_size = counts.2;
+            if let Some((r, err, ms)) = run {
+                if r.operation == "backup" {
+                    job.stats.last_run_at = r.finished_at.clone();
+                    job.stats.last_result = Some(r.status.clone());
+                    job.stats.last_duration_ms = Some(ms);
+                    job.stats.last_error = err;
+                }
+            }
+            job.clone()
+        };
+        if let Err(e) = self.persist(&snapshot).await {
+            tracing::warn!("Failed to persist backup stats: {e}");
+        }
+    }
+
+    // ── Direct restore without a configured job ──
+
+    /// List versions of any repository (rebuilds a temporary database).
+    pub async fn browse_remote(&self, dest: BackupDestination, passphrase: Option<String>, prefix: String) -> Result<Vec<Fileset>, AppError> {
+        let backend = self.backend_for(&dest, Throttle::default(), RetryPolicy::default(), None).await?;
+        blocking(move || {
+            let db = BackupDb::open_in_memory()?;
+            maintenance::recreate_database(backend.as_ref(), &db, passphrase.as_deref(), &prefix, &OpContext::new())?;
+            db.filesets()
+        })
+        .await
+    }
+
+    /// Restore from any repository using only its credentials and passphrase.
+    pub async fn direct_restore(&self, dest: BackupDestination, passphrase: Option<String>, prefix: String, options: RestoreOptions) -> Result<ufop_core::backup::RestoreReport, AppError> {
+        let backend = self.backend_for(&dest, Throttle::default(), RetryPolicy::default(), None).await?;
+        blocking(move || {
+            let db = BackupDb::open_in_memory()?;
+            maintenance::recreate_database(backend.as_ref(), &db, passphrase.as_deref(), &prefix, &OpContext::new())?;
+            let opts = BackupOptions { prefix, ..Default::default() };
+            let repo = Repo::open(backend.as_ref(), &db, passphrase.as_deref(), &opts, false, KdfParams::default())?;
+            ufop_core::backup::run_restore(&repo, &options, &OpContext::new())
+        })
+        .await
+    }
+
+    /// Read the job configuration embedded in a remote repository.
+    pub async fn discover_remote_config(&self, dest: BackupDestination, passphrase: Option<String>, prefix: String) -> Result<Option<serde_json::Value>, AppError> {
+        let backend = self.backend_for(&dest, Throttle::default(), RetryPolicy::default(), None).await?;
+        blocking(move || maintenance::read_remote_task_config(backend.as_ref(), passphrase.as_deref(), &prefix)).await
+    }
+
+    // ── Scheduler ──
+
+    pub fn pause(&self, minutes: Option<u32>) {
+        *lock(&self.inner.paused) = Some(minutes.map(|m| Utc::now() + chrono::Duration::minutes(m as i64)));
+    }
+
+    pub fn resume(&self) {
+        *lock(&self.inner.paused) = None;
+    }
+
+    fn is_paused(&self) -> bool {
+        let mut p = lock(&self.inner.paused);
+        match *p {
+            None => false,
+            Some(None) => true,
+            Some(Some(until)) if until > Utc::now() => true,
+            Some(Some(_)) => {
+                *p = None;
+                false
+            }
+        }
+    }
+
+    pub async fn status(&self) -> SchedulerStatus {
+        let tasks = lock(&self.inner.tasks)
+            .iter()
+            .map(|t| TaskInfo { progress: lock(&t.progress).clone(), ..t.info.clone() })
+            .collect();
+        let paused = self.is_paused();
+        let paused_until = lock(&self.inner.paused).and_then(|p| p.map(|t| t.to_rfc3339()));
+        let mut next_runs: Vec<NextRun> = self
+            .inner
+            .jobs
+            .read()
+            .await
+            .values()
+            .filter_map(|j| {
+                let last = j.stats.last_scheduled_at.as_deref().or(Some(j.created_at.as_str())).and_then(parse_ts)?;
+                let n = j.schedule.next_after(last)?;
+                Some(NextRun { job_id: j.id.clone(), job_name: j.name.clone(), next_run_at: n.max(Utc::now()).to_rfc3339() })
+            })
+            .collect();
+        next_runs.sort_by(|a, b| a.next_run_at.cmp(&b.next_run_at));
+        SchedulerStatus { running: self.inner.scheduler_running.load(Ordering::SeqCst), paused, paused_until, tasks, next_runs }
+    }
+
+    /// Jobs whose schedule slot has passed (missed runs included).
+    pub async fn due_jobs(&self, now: DateTime<Utc>) -> Vec<String> {
+        if self.is_paused() {
+            return Vec::new();
+        }
+        self.inner
+            .jobs
+            .read()
+            .await
+            .values()
+            .filter(|j| {
+                let last = j.stats.last_scheduled_at.as_deref().or(Some(j.created_at.as_str())).and_then(parse_ts);
+                last.is_some_and(|l| j.schedule.is_due(l, now)) && !self.is_job_busy(&j.id)
+            })
+            .map(|j| j.id.clone())
+            .collect()
+    }
+
+    /// One scheduler pass: start every due job.
+    pub async fn tick(&self) -> usize {
+        let now = Utc::now();
+        let due = self.due_jobs(now).await;
+        for id in &due {
+            let snapshot = {
+                let mut jobs = self.inner.jobs.write().await;
+                jobs.get_mut(id).map(|j| {
+                    j.stats.last_scheduled_at = Some(now.to_rfc3339());
+                    j.clone()
+                })
+            };
+            if let Some(j) = snapshot {
+                let _ = self.persist(&j).await;
+            }
+            if let Err(e) = self.start_backup(id, false).await {
+                tracing::warn!("Scheduled backup {id} could not start: {e}");
+            }
+        }
+        due.len()
+    }
+
+    /// Start the background scheduler loop (idempotent).
+    pub fn start_scheduler(&self) {
+        if self.inner.scheduler_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            // Small startup delay so app boot is not slowed by catch-up runs.
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            loop {
+                me.tick().await;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
+}
+
+fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s).ok().map(|t| t.with_timezone(&Utc))
+}
+
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, AppError> + Send + 'static) -> Result<T, AppError> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| AppError::internal(format!("backup worker panicked: {e}")))?
+}
+
+fn summarize(op: &str, v: &serde_json::Value) -> String {
+    let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    match op {
+        "backup" if v.get("skipped_unchanged").and_then(|b| b.as_bool()) == Some(true) => {
+            format!("No changes in {} files; no new version", n("files_examined"))
+        }
+        "backup" => format!(
+            "{} files examined, {} added, {} changed, {} deleted; {} uploaded{}",
+            n("files_examined"),
+            n("files_added"),
+            n("files_changed"),
+            n("files_deleted"),
+            human_bytes(n("bytes_uploaded")),
+            if v.get("dry_run").and_then(|b| b.as_bool()) == Some(true) { " (dry run)" } else { "" }
+        ),
+        "restore" => format!("{} files restored ({}), {} unchanged skipped", n("files_restored"), human_bytes(n("bytes_restored")), n("files_skipped_matching")),
+        "verify" => format!("{} volume(s) verified", n("checked")),
+        "compact" => format!("{} removed, {} rewritten, {} reclaimed", n("volumes_removed"), n("volumes_rewritten"), human_bytes(n("bytes_reclaimed"))),
+        "recreate_database" => format!("{} version(s), {} block volume(s) indexed", n("versions"), n("block_volumes")),
+        _ => format!("{op} completed"),
+    }
+}
+
+pub fn human_bytes(b: u64) -> String {
+    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 { format!("{b} B") } else { format!("{v:.1} {}", U[i]) }
+}
+
+/// Execute one operation against the core engine (blocking thread).
+fn run_core(
+    job: &BackupJob,
+    op: BackupOperation,
+    backend: &dyn Backend,
+    db_path: &Path,
+    pass: Option<&str>,
+    kdf: KdfParams,
+    ctx: &OpContext,
+) -> Result<serde_json::Value, AppError> {
+    let db = BackupDb::open(db_path)?;
+    let open = |create: bool| Repo::open(backend, &db, pass, &job.options, create, kdf);
+    let v = match op {
+        BackupOperation::Backup { dry_run } => {
+            let filter = job.filter.clone().compile()?;
+            let mut opts = job.options.clone();
+            opts.dry_run = dry_run;
+            opts.task_config = if job.store_config_remotely { Some(portability::stripped_config(job)?) } else { None };
+            let sources: Vec<PathBuf> = job.sources.iter().map(PathBuf::from).collect();
+            serde_json::to_value(ufop_core::backup::run_backup(backend, &db, &sources, &filter, &opts, &job.retention, pass, kdf, ctx)?)?
+        }
+        BackupOperation::Restore { options } => serde_json::to_value(ufop_core::backup::run_restore(&open(false)?, &options, ctx)?)?,
+        BackupOperation::Verify { full } => {
+            let samples = if full { None } else { Some(job.options.verify_samples.max(1)) };
+            serde_json::to_value(maintenance::verify(&open(false)?, samples, full)?)?
+        }
+        BackupOperation::Compact => serde_json::to_value(maintenance::compact(&open(false)?, &job.options, ctx)?)?,
+        BackupOperation::Repair => serde_json::to_value(maintenance::repair(&open(false)?)?)?,
+        BackupOperation::RecreateDatabase => serde_json::to_value(maintenance::recreate_database(backend, &db, pass, &job.options.prefix, ctx)?)?,
+        BackupOperation::ListBroken => serde_json::json!({ "files": maintenance::list_broken_files(&open(false)?)? }),
+        BackupOperation::PurgeBroken { dry_run } => serde_json::to_value(maintenance::purge_broken_files(&open(false)?, dry_run)?)?,
+        BackupOperation::Purge { paths, versions, dry_run } => {
+            serde_json::to_value(maintenance::purge(&open(false)?, &paths, versions.as_deref(), dry_run)?)?
+        }
+        BackupOperation::DeleteVersions { versions, allow_full_removal } => {
+            let n = maintenance::delete_versions(&open(false)?, &versions, allow_full_removal || job.options.allow_full_removal)?;
+            serde_json::json!({ "versions_deleted": n })
+        }
+        BackupOperation::Consistency => serde_json::to_value(open(false)?.consistency_check()?)?,
+    };
+    Ok(v)
+}
+
+#[cfg(test)]
+mod tests;

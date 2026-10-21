@@ -5843,13 +5843,19 @@ dependencies = [
 name = "ufop-core"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
+ "argon2",
  "chrono",
  "csv",
+ "flate2",
  "glob",
+ "hex",
+ "rand 0.8.5",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tracing",
  "uuid",

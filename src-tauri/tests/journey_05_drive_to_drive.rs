@@ -246,8 +246,8 @@ async fn journey5_retry_all_failed() {
     mgr.fail_job(j1.id, "error1").await.unwrap();
     mgr.fail_job(j2.id, "error2").await.unwrap();
 
-    let count = mgr.retry_all_failed().await.unwrap();
-    assert_eq!(count, 2);
+    let retried = mgr.retry_all_failed().await.unwrap();
+    assert_eq!(retried.len(), 2);
 
     let failed = mgr.list_failed_jobs().await.unwrap();
     assert!(failed.is_empty(), "No jobs should be in failed state after retry_all");

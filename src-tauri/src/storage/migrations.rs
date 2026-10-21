@@ -77,8 +77,38 @@ fn all_migrations() -> Vec<Migration> {
             description: "Sync pairs - Robocopy-equivalent copy options",
             sql: V12_SCHEMA,
         },
+        Migration {
+            version: 13,
+            description: "Backup engine - versioned backup jobs and run history",
+            sql: V13_SCHEMA,
+        },
     ]
 }
+
+/// Schema v13: versioned (deduplicated, encrypted) backup jobs. The job
+/// definition is JSON so options can grow without migrations; each job's
+/// block/version index lives in its own SQLite file next to the app DB.
+const V13_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS backup_jobs (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS backup_runs (
+    id          TEXT PRIMARY KEY NOT NULL,
+    job_id      TEXT NOT NULL,
+    operation   TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    summary     TEXT NOT NULL DEFAULT '',
+    report_json TEXT NOT NULL DEFAULT '{}',
+    log_json    TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_backup_runs_job ON backup_runs(job_id, started_at DESC);
+"#;
 
 /// Schema v12: per-pair Robocopy-equivalent copy options, stored as JSON so
 /// new options never need another column. `{}` deserializes to the defaults.
@@ -669,7 +699,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 12);
+        assert_eq!(applied, 13);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -692,6 +722,8 @@ mod tests {
         assert!(tables.contains(&"audit_events".to_string()));
         assert!(tables.contains(&"workspace_state".to_string()));
         assert!(tables.contains(&"mount_configs".to_string()));
+        assert!(tables.contains(&"backup_jobs".to_string()));
+        assert!(tables.contains(&"backup_runs".to_string()));
         assert!(tables.contains(&"_migrations".to_string()));
     }
 
@@ -699,7 +731,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 12);
+        assert_eq!(first, 13);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -712,7 +744,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 12);
+        assert_eq!(current_version(&conn).unwrap(), 13);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod ai_engine;
 pub mod automation_engine;
+pub mod backup_engine;
 pub mod commands;
 pub mod compat_engine;
 pub mod connectors;
@@ -20,8 +21,9 @@ pub mod transfer_engine;
 use ai_engine::AiAssistant;
 use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
+use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -64,6 +66,7 @@ struct AppState {
     safety_interlock: SafetyInterlock,
     narrator: OperationNarrator,
     quickflow_suggester: LedgerSuggester,
+    backup_mgr: BackupManager,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -100,7 +103,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
 
     // Initialize credential store and connection manager
     let credential_store = std::sync::Arc::new(CredentialStore::new());
-    let connection_mgr = ConnectionManager::new(repo.clone(), credential_store);
+    let connection_mgr = ConnectionManager::new(repo.clone(), credential_store.clone());
 
     // Initialize transfer history and let the manager record terminal jobs
     let transfer_history = TransferHistory::new(repo.pool().clone());
@@ -204,6 +207,20 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // automation panel. Pure derivation over existing ledger data.
     let quickflow_suggester = LedgerSuggester::new(ledger.clone());
 
+    // Versioned backup jobs: restore saved jobs, then arm the scheduler
+    // (which also catches up on runs missed while the app was closed).
+    let backup_mgr = BackupManager::new(
+        repo.pool().clone(),
+        credential_store.clone(),
+        Some(connection_mgr.clone()),
+        Some(ledger.clone()),
+        backup_engine::default_data_dir(),
+    );
+    if let Err(e) = backup_mgr.load_from_db().await {
+        tracing::warn!("Failed to load backup jobs (non-fatal): {e}");
+    }
+    backup_mgr.start_scheduler();
+
     Ok(AppState {
         repo,
         transfer_mgr,
@@ -229,6 +246,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         safety_interlock,
         narrator,
         quickflow_suggester,
+        backup_mgr,
     })
 }
 
@@ -268,7 +286,7 @@ pub fn run() {
                     .block_on(Repository::open_in_memory())
                     .expect("Failed to create in-memory database");
                 let credential_store = std::sync::Arc::new(CredentialStore::new());
-                let connection_mgr = ConnectionManager::new(repo.clone(), credential_store);
+                let connection_mgr = ConnectionManager::new(repo.clone(), credential_store.clone());
                 let transfer_history = TransferHistory::new(repo.pool().clone());
                 let transfer_mgr = TransferManager::new();
                 let vault_mgr = VaultManager::new();
@@ -283,6 +301,15 @@ pub fn run() {
                 let quickflow_suggester = LedgerSuggester::new(ledger.clone());
                 let mut automation_mgr = AutomationManager::new();
                 automation_mgr.set_ledger(ledger.clone());
+                // Backup jobs can still be created and run this session; the
+                // scheduler is not started because nothing persists.
+                let backup_mgr = BackupManager::new(
+                    repo.pool().clone(),
+                    credential_store,
+                    Some(connection_mgr.clone()),
+                    Some(ledger.clone()),
+                    backup_engine::default_data_dir(),
+                );
                 AppState {
                     repo,
                     transfer_mgr,
@@ -308,6 +335,7 @@ pub fn run() {
                     safety_interlock,
                     narrator,
                     quickflow_suggester,
+                    backup_mgr,
                 }
             }
         }
@@ -348,6 +376,7 @@ pub fn run() {
         .manage(app_state.safety_interlock)
         .manage(app_state.narrator)
         .manage(app_state.quickflow_suggester)
+        .manage(app_state.backup_mgr)
         .invoke_handler(tauri::generate_handler![
             // System
             system_commands::greet,
@@ -447,6 +476,36 @@ pub fn run() {
             drive_commands::transfer_preflight,
             drive_commands::eject_drive,
             // Sync engine (T-039..T-042)
+            // Versioned backups
+            backup_commands::backup_list_jobs,
+            backup_commands::backup_get_job,
+            backup_commands::backup_save_job,
+            backup_commands::backup_delete_job,
+            backup_commands::backup_test_destination,
+            backup_commands::backup_test_destination_compat,
+            backup_commands::backup_run,
+            backup_commands::backup_execute,
+            backup_commands::backup_cancel,
+            backup_commands::backup_status,
+            backup_commands::backup_pause,
+            backup_commands::backup_resume,
+            backup_commands::backup_list_versions,
+            backup_commands::backup_list_files,
+            backup_commands::backup_search,
+            backup_commands::backup_compare,
+            backup_commands::backup_run_history,
+            backup_commands::backup_prune_history,
+            backup_commands::backup_export_config,
+            backup_commands::backup_import_config,
+            backup_commands::backup_export_is_encrypted,
+            backup_commands::backup_export_cli,
+            backup_commands::backup_browse_remote,
+            backup_commands::backup_direct_restore,
+            backup_commands::backup_discover_remote_config,
+            backup_commands::backup_passphrase_strength,
+            backup_commands::backup_generate_passphrase,
+            backup_commands::backup_capabilities,
+            backup_commands::backup_preview_sources,
             sync_commands::create_sync_pair,
             sync_commands::delete_sync_pair,
             sync_commands::list_sync_pairs,

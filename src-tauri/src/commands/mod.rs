@@ -1,5 +1,6 @@
 pub mod ai_commands;
 pub mod automation_commands;
+pub mod backup_commands;
 pub mod archive_commands;
 pub mod confirmation_commands;
 pub mod aws_commands;

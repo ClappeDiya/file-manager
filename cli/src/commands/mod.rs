@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod backup;
 pub mod checksum;
 pub mod compat;
 pub mod connection;

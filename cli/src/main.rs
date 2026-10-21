@@ -111,6 +111,10 @@ pub enum Commands {
     #[command(subcommand)]
     Sync(SyncCommands),
 
+    /// Versioned, deduplicated, encrypted backups (run, restore, verify, repair…)
+    #[command(subcommand)]
+    Backup(commands::backup::BackupCommands),
+
     /// Check compatibility of paths across platforms
     Compat {
         /// Paths to check
@@ -355,6 +359,9 @@ async fn main() -> ExitCode {
         }
         Commands::Sync(cmd) => {
             commands::sync::execute(cmd, &format, dry_run).await
+        }
+        Commands::Backup(cmd) => {
+            commands::backup::execute(cmd, &format, dry_run).await
         }
         Commands::Compat { paths, targets } => {
             commands::compat::execute(paths, targets, &format).await

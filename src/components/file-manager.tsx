@@ -54,6 +54,7 @@ import { BatchRename } from "./batch-rename";
 import SettingsPanel from "./settings-panel";
 import { ConnectionPanel } from "./connection-panel";
 import { SyncPanel } from "./sync-panel";
+import { BackupPanel } from "./backup/backup-panel";
 import { PreviewPane } from "./preview-pane";
 import { TransferHistoryPanel } from "./transfer-history-panel";
 import { ArchiveBrowser, CreateArchiveDialog } from "./archive-browser";
@@ -126,6 +127,7 @@ import {
   Zap,
   Layers,
   X,
+  DatabaseBackup,
 } from "lucide-react";
 
 // Toolbar customization definition (#14)
@@ -140,6 +142,7 @@ const ALL_TOOLBAR_ITEMS = [
   { id: "automations", label: "Quickflows" },
   { id: "smart-spaces", label: "Smart Spaces" },
   { id: "sync-browse", label: "Sync Browse" },
+  { id: "backups", label: "Backups" },
 ];
 
 // ──────────────────────────────────────────────
@@ -688,6 +691,8 @@ export function FileManager() {
   // Iter 28 surfaces it via Cmd+Shift+H ("sync Health") and a
   // palette entry. Same TDZ-safe placement as iters 25\u201327.
   const [syncOpen, setSyncOpen] = useState(false);
+  // Versioned backups panel (jobs, restore, maintenance, history).
+  const [backupOpen, setBackupOpen] = useState(false);
   // Iter 29: PreviewPane orphan elevation. The 844-LOC
   // component was never imported anywhere AND the ui-store
   // already had a pre-existing half-wired slot
@@ -1416,6 +1421,12 @@ export function FileManager() {
         e.preventDefault();
         setSyncOpen((open) => !open);
       }
+      // Cmd+Alt+B — open the Backups panel. `e.code` because Alt
+      // changes the produced character on macOS.
+      if ((e.metaKey || e.ctrlKey) && e.altKey && !e.shiftKey && e.code === "KeyB") {
+        e.preventDefault();
+        setBackupOpen((open) => !open);
+      }
       // Cmd+Shift+J — Open the Transfer History panel (Journal).
       // Surfaces the long-orphaned `TransferHistoryPanel` (284 LOC)
       // that complements the transfer engine's journal/crash-recovery
@@ -2065,6 +2076,9 @@ export function FileManager() {
         onOpenSync: () => {
           setSyncOpen(true);
         },
+        onOpenBackups: () => {
+          setBackupOpen(true);
+        },
         onOpenTransferHistory: () => {
           setTransferHistoryOpen(true);
         },
@@ -2354,6 +2368,18 @@ export function FileManager() {
               data-testid="toggle-automation-panel"
             >
               <Zap className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
+          {toolbarItems.includes("backups") && (
+            <Button
+              variant={backupOpen ? "secondary" : "ghost"}
+              size="icon"
+              onClick={() => setBackupOpen((open) => !open)}
+              aria-label="Backups"
+              title="Backups (Cmd+Alt+B)"
+              data-testid="toggle-backups"
+            >
+              <DatabaseBackup className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
           {toolbarItems.includes("smart-spaces") && (
@@ -2702,6 +2728,36 @@ export function FileManager() {
                 </svg>
               </button>
               <SyncPanel />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Backups modal: versioned, deduplicated, encrypted backup jobs
+          with restore, maintenance and run history. Same
+          backdrop-click-to-close pattern as the Sync panel. */}
+      {backupOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Backups"
+          data-testid="backup-backdrop"
+          onClick={() => setBackupOpen(false)}
+        >
+          <div
+            className="w-[min(1100px,95vw)] h-[min(820px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="relative h-full pt-9">
+              <button
+                className="absolute top-3 right-4 z-10 h-7 w-7 flex items-center justify-center rounded text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover)]"
+                onClick={() => setBackupOpen(false)}
+                aria-label="Close Backups"
+              >
+                <X className="w-4 h-4" />
+              </button>
+              <BackupPanel />
             </div>
           </div>
         </div>
