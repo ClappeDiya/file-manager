@@ -40,11 +40,11 @@
    "name": "Installer and portable packages",
    "baseline": "D",
    "status": "present",
-   "work": "done",
+   "work": "verified",
    "phase": 0,
-   "verify": "tests",
+   "verify": "live",
    "note": "tauri.conf.json bundle targets \"all\" (msi, nsis, dmg, deb, rpm, AppImage); no signing config",
-   "evidence": ""
+   "evidence": "docker/ufop-server.Dockerfile built; container verified: login, job via REST, backup (ZIP+PAR2), restore byte-identical"
   },
   {
    "n": 3,
@@ -87,12 +87,12 @@
    "cat": 1,
    "name": "Docker deployment",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 1,
-   "verify": "",
+   "verify": "live",
    "note": "Docker files exist only for the marketing site",
-   "evidence": ""
+   "evidence": "docker/ufop-server.Dockerfile built; container verified: login, job via REST, backup (ZIP+PAR2), restore byte-identical"
   },
   {
    "n": 7,
@@ -639,72 +639,72 @@
    "cat": 3,
    "name": "Windows VSS snapshots",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 3,
-   "verify": "",
+   "verify": "device",
    "note": "Open files are read directly",
-   "evidence": ""
+   "evidence": "VSS COM (provider/writer control) + WMI fallback, LVM, APFS; command flows unit-tested, Windows cross-compiled+linked symbols present; needs admin on a real Windows/LVM/macOS host"
   },
   {
    "n": 53,
    "cat": 3,
    "name": "VSS provider and writer controls",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 3,
-   "verify": "",
+   "verify": "device",
    "note": "No VSS",
-   "evidence": ""
+   "evidence": "VSS COM (provider/writer control) + WMI fallback, LVM, APFS; command flows unit-tested, Windows cross-compiled+linked symbols present; needs admin on a real Windows/LVM/macOS host"
   },
   {
    "n": 54,
    "cat": 3,
    "name": "Linux LVM snapshots",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 3,
-   "verify": "",
+   "verify": "device",
    "note": "No snapshots",
-   "evidence": ""
+   "evidence": "VSS COM (provider/writer control) + WMI fallback, LVM, APFS; command flows unit-tested, Windows cross-compiled+linked symbols present; needs admin on a real Windows/LVM/macOS host"
   },
   {
    "n": 55,
    "cat": 3,
    "name": "macOS APFS snapshots",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 3,
-   "verify": "",
+   "verify": "device",
    "note": "No snapshots",
-   "evidence": ""
+   "evidence": "VSS COM (provider/writer control) + WMI fallback, LVM, APFS; command flows unit-tested, Windows cross-compiled+linked symbols present; needs admin on a real Windows/LVM/macOS host"
   },
   {
    "n": 56,
    "cat": 3,
    "name": "Snapshot failure policy",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 3,
-   "verify": "",
+   "verify": "tests",
    "note": "No snapshots",
-   "evidence": ""
+   "evidence": "snapshot policy test (engine reads through snapshot, original paths kept); diagnostics run live (reports missing LVM correctly)"
   },
   {
    "n": 57,
    "cat": 3,
    "name": "Snapshot diagnostics tool",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 3,
-   "verify": "",
+   "verify": "tests",
    "note": "No snapshots",
-   "evidence": ""
+   "evidence": "snapshot policy test (engine reads through snapshot, original paths kept); diagnostics run live (reports missing LVM correctly)"
   },
   {
    "n": 58,
@@ -1263,72 +1263,72 @@
    "cat": 5,
    "name": "RecoveryTool salvage",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "No separate recovery tool",
-   "evidence": ""
+   "evidence": "recovery.rs tests + CLI e2e (download/index/convert) + Python tool restore incl. damaged volume; db migrate tests; manager tests; UI tests"
   },
   {
    "n": 105,
    "cat": 5,
    "name": "Recovery resource and resume controls",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "No recovery tool",
-   "evidence": ""
+   "evidence": "recovery.rs tests + CLI e2e (download/index/convert) + Python tool restore incl. damaged volume; db migrate tests; manager tests; UI tests"
   },
   {
    "n": 106,
    "cat": 5,
    "name": "Recovery archive conversion",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "No recovery tool",
-   "evidence": ""
+   "evidence": "recovery.rs tests + CLI e2e (download/index/convert) + Python tool restore incl. damaged volume; db migrate tests; manager tests; UI tests"
   },
   {
    "n": 107,
    "cat": 5,
    "name": "Independent Python recovery",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not provided",
-   "evidence": ""
+   "evidence": "recovery.rs tests + CLI e2e (download/index/convert) + Python tool restore incl. damaged volume; db migrate tests; manager tests; UI tests"
   },
   {
    "n": 108,
    "cat": 5,
    "name": "Database schema migration tool",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "App migrations only; no standalone tool",
-   "evidence": ""
+   "evidence": "recovery.rs tests + CLI e2e (download/index/convert) + Python tool restore incl. damaged volume; db migrate tests; manager tests; UI tests"
   },
   {
    "n": 109,
    "cat": 5,
    "name": "Database inventory and cleanup",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "recovery.rs tests + CLI e2e (download/index/convert) + Python tool restore incl. damaged volume; db migrate tests; manager tests; UI tests"
   },
   {
    "n": 110,
@@ -1347,24 +1347,24 @@
    "cat": 5,
    "name": "Single-restore advanced settings (Canary)",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 2,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "recovery.rs tests + CLI e2e (download/index/convert) + Python tool restore incl. damaged volume; db migrate tests; manager tests; UI tests"
   },
   {
    "n": 112,
    "cat": 5,
    "name": "Windows junction-type preservation (Canary)",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 2,
-   "verify": "",
+   "verify": "device",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "Junction detection (FSCTL_GET_REPARSE_POINT) and mklink /J restore; Windows-only"
   },
   {
    "n": 113,

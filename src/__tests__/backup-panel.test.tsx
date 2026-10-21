@@ -177,7 +177,11 @@ describe("BackupPanel", () => {
     await waitFor(() =>
       expect(mockInvoke).toHaveBeenCalledWith("backup_execute", {
         id: "job-1",
-        operation: { type: "restore", options: expect.objectContaining({ version: 1, paths: ["/home/me/Docs/a.txt"], target: null, conflict: "overwrite" }) },
+        operation: {
+          type: "restore",
+          options: expect.objectContaining({ version: 1, paths: ["/home/me/Docs/a.txt"], target: null, conflict: "overwrite" }),
+          overrides: { download_bps: null, retries: null, network_timeout_secs: null },
+        },
       }),
     );
     expect(await screen.findByText(/Restored 1 file/)).toBeTruthy();
