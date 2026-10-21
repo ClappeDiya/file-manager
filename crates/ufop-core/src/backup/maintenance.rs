@@ -344,6 +344,121 @@ pub fn repair(repo: &Repo) -> Result<RepairReport, AppError> {
     Ok(r)
 }
 
+/// Result of [`rebuild_missing_block_volumes`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RebuildReport {
+    pub volumes_rebuilt: usize,
+    pub blocks_recovered: u64,
+    pub blocks_unrecoverable: u64,
+    /// Missing volumes whose blocks could not all be found locally.
+    pub incomplete_volumes: Vec<String>,
+}
+
+/// Rebuild block volumes that are missing from the destination by reading
+/// their blocks back from the source files still on this machine. Blocks
+/// found are re-uploaded in new volumes; a missing volume is forgotten once
+/// every one of its blocks is back.
+pub fn rebuild_missing_block_volumes(repo: &Repo, opts: &BackupOptions, ctx: &OpContext) -> Result<RebuildReport, AppError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let cons = repo.consistency_check()?;
+    let by_volume = repo.db.blocks_by_volume()?;
+    let missing: Vec<&String> = cons
+        .missing
+        .iter()
+        .chain(cons.size_mismatch.iter())
+        .filter(|n| volume::classify(&repo.prefix, n) == Some(VolumeKind::Block))
+        .collect();
+    let mut r = RebuildReport::default();
+    if missing.is_empty() {
+        return Ok(r);
+    }
+    let mut wanted: HashMap<String, &String> = HashMap::new();
+    for v in &missing {
+        for (h, _) in by_volume.get(*v).map(Vec::as_slice).unwrap_or_default() {
+            wanted.insert(h.clone(), *v);
+        }
+    }
+    let bs = repo.header.block_size.max(1);
+    let mut found: HashSet<String> = HashSet::new();
+    let mut pending = Pending::for_repo(repo, opts);
+    let mut scratch = super::engine::BackupReport::default();
+    let mut buf = vec![0u8; bs];
+    // Newest versions first: their files most likely still match.
+    'outer: for fs in repo.db.filesets()? {
+        for f in repo.db.files(fs.id)? {
+            ctx.check()?;
+            if f.kind != EntryKind::File || !f.blocks.iter().any(|b| wanted.contains_key(b) && !found.contains(b)) {
+                continue;
+            }
+            let Ok(mut file) = std::fs::File::open(&f.path) else { continue };
+            for (i, b) in f.blocks.iter().enumerate() {
+                if !wanted.contains_key(b) || found.contains(b) {
+                    continue;
+                }
+                if file.seek(SeekFrom::Start((i * bs) as u64)).is_err() {
+                    break;
+                }
+                let mut n = 0;
+                while n < bs {
+                    match file.read(&mut buf[n..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(k) => n += k,
+                    }
+                }
+                if n > 0 && hash_bytes(repo.header.block_hash, &buf[..n]) == *b {
+                    pending.add_block(b.clone(), &buf[..n], opts.compression_level)?;
+                    found.insert(b.clone());
+                    if pending.byte_size() >= opts.volume_size {
+                        flush(repo, &mut pending, opts, &mut scratch)?;
+                    }
+                }
+            }
+            if found.len() == wanted.len() {
+                break 'outer;
+            }
+        }
+    }
+    flush(repo, &mut pending, opts, &mut scratch)?;
+    r.blocks_recovered = found.len() as u64;
+    r.blocks_unrecoverable = (wanted.len() - found.len()) as u64;
+    for v in missing {
+        let complete = by_volume.get(v).map(Vec::as_slice).unwrap_or_default().iter().all(|(h, _)| found.contains(h));
+        if complete {
+            // Its blocks now point at the new volumes.
+            delete_block_volume(repo, v)?;
+            r.volumes_rebuilt += 1;
+        } else {
+            r.incomplete_volumes.push(v.clone());
+        }
+    }
+    Ok(r)
+}
+
+/// Control files stored with a version (read from the remote file list).
+pub fn control_files(repo: &Repo, version: usize) -> Result<Vec<volume::ControlFile>, AppError> {
+    let fs = repo.db.fileset_by_version(version)?;
+    let fl: FileListVolume = volume::open_json(&repo.cipher, &repo.get_volume(&fs.volume_name)?)?;
+    Ok(fl.control_files)
+}
+
+/// Write a version's control files into `target`; returns the paths written.
+pub fn extract_control_files(repo: &Repo, version: usize, target: &std::path::Path) -> Result<Vec<std::path::PathBuf>, AppError> {
+    use base64::Engine;
+    std::fs::create_dir_all(target)?;
+    let mut out = Vec::new();
+    for c in control_files(repo, version)? {
+        // Names are plain file names; never let one escape the target.
+        let name = std::path::Path::new(&c.name).file_name().map(|n| n.to_owned()).ok_or_else(|| AppError::validation(format!("Invalid control file name '{}'", c.name)))?;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&c.data)
+            .map_err(|e| AppError::transfer(format!("Control file {} is damaged: {e}", c.name), "Run Verify."))?;
+        let p = target.join(name);
+        std::fs::write(&p, data)?;
+        out.push(p);
+    }
+    Ok(out)
+}
+
 /// A file that cannot be fully restored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokenFile {
@@ -626,5 +741,59 @@ mod tests {
         let pb = purge_broken_files(&repo, false).unwrap();
         assert_eq!(pb.entries_removed, 1);
         assert!(list_broken_files(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rebuild_missing_block_volume_from_sources() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..5000u32).map(|i| (i * 13 % 251) as u8).collect();
+        write(src.path(), "a.bin", &data);
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        run(src.path(), &be, &db, &RetentionPolicy::KeepAll);
+        let gone: Vec<_> = std::fs::read_dir(dst.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains(".dblock")).collect();
+        assert!(!gone.is_empty());
+        for g in &gone {
+            std::fs::remove_file(g.path()).unwrap();
+        }
+        let repo = open(&be, &db);
+        assert!(!list_broken_files(&repo).unwrap().is_empty());
+        let r = rebuild_missing_block_volumes(&repo, &o(), &OpContext::new()).unwrap();
+        assert_eq!(r.volumes_rebuilt, gone.len());
+        assert_eq!(r.blocks_unrecoverable, 0);
+        assert!(repo.consistency_check().unwrap().is_clean());
+        assert!(list_broken_files(&repo).unwrap().is_empty());
+        let rr = run_restore(&repo, &RestoreOptions { target: Some(out.path().into()), ..Default::default() }, &OpContext::new()).unwrap();
+        assert!(rr.errors.is_empty(), "{:?}", rr.errors);
+        assert_eq!(std::fs::read(out.path().join(src.path().file_name().unwrap()).join("a.bin")).unwrap(), data);
+
+        // Source changed and volume lost again: reported, not faked.
+        write(src.path(), "a.bin", b"different");
+        for e in std::fs::read_dir(dst.path()).unwrap().flatten() {
+            if e.file_name().to_string_lossy().contains(".dblock") {
+                std::fs::remove_file(e.path()).unwrap();
+            }
+        }
+        let r = rebuild_missing_block_volumes(&repo, &o(), &OpContext::new()).unwrap();
+        assert!(r.blocks_unrecoverable > 0 && !r.incomplete_volumes.is_empty());
+    }
+
+    #[test]
+    fn control_files_extracted() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        write(src.path(), "f", b"1");
+        write(out.path(), "in/notes.txt", b"hello control");
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        let opts = BackupOptions { control_files: vec![out.path().join("in/notes.txt").to_string_lossy().into_owned()], ..o() };
+        run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &opts, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        let repo = open(&be, &db);
+        let written = extract_control_files(&repo, 0, &out.path().join("x")).unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(std::fs::read(&written[0]).unwrap(), b"hello control");
     }
 }

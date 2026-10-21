@@ -163,3 +163,44 @@ async fn passphrase_persists_without_keychain() {
     let raw: String = repo.pool().execute(|c| Ok(c.query_row("SELECT value FROM config WHERE key LIKE 'backup-passphrase:%'", [], |r| r.get(0))?)).await.unwrap();
     assert!(raw.starts_with("enc:v1:") && !raw.contains("pw-123"));
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn maintenance_ops_and_source_release_script() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.bin"), vec![3u8; 20_000]).unwrap();
+    let ctl = t.path().join("manifest.txt");
+    std::fs::write(&ctl, b"ctl").unwrap();
+    let marker = t.path().join("released");
+    let m = manager(t.path()).await;
+    let mut jb = job(&src, &dst);
+    jb.encrypted = false;
+    jb.options.control_files = vec![ctl.to_string_lossy().into()];
+    jb.scripts.run_on_source_release = Some(format!("touch {}", marker.display()));
+    let j = m.save_job(jb, None).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert!(marker.exists(), "source-release script ran");
+
+    let out = t.path().join("ctl-out");
+    let r = m.execute(&j.id, BackupOperation::ExtractControlFiles { version: 0, target: out.to_string_lossy().into() }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(std::fs::read(out.join("manifest.txt")).unwrap(), b"ctl");
+
+    let r = m.execute(&j.id, BackupOperation::AutoTune { sample_volumes: 2 }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert!(r.summary.contains("thread"));
+
+    for e in std::fs::read_dir(&dst).unwrap().flatten() {
+        if e.file_name().to_string_lossy().contains(".dblock") {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+    }
+    let r = m.execute(&j.id, BackupOperation::RebuildMissing).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert!(r.report["volumes_rebuilt"].as_u64().unwrap() >= 1);
+    let r = m.execute(&j.id, BackupOperation::Verify { full: true }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+}

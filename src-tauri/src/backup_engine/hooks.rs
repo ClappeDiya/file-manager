@@ -19,6 +19,10 @@ pub struct ScriptConfig {
     /// Abort the operation when the pre-script fails or times out.
     pub run_before_required: bool,
     pub run_after: Option<String>,
+    /// Run as soon as the backup has finished reading the sources (before
+    /// uploads complete), e.g. to release a snapshot or restart a service.
+    #[serde(default)]
+    pub run_on_source_release: Option<String>,
     /// 0 = 60 s default.
     pub timeout_secs: u64,
     /// `json` (default) or `text` for the result file given to post-scripts.

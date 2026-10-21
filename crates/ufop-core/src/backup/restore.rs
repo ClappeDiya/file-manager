@@ -436,6 +436,72 @@ pub fn run_restore(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext) -> Resul
     Ok(report)
 }
 
+/// Result of [`autotune`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AutoTune {
+    pub download_threads: usize,
+    pub file_threads: usize,
+    /// `(threads, MB/s)` per measured setting.
+    pub measurements: Vec<(usize, f64)>,
+    pub sample_bytes: u64,
+}
+
+/// Benchmark volume downloads with 1, 2, 4 and 8 parallel readers on a
+/// sample of block volumes and pick the smallest setting within 10% of
+/// the fastest. Nothing is written.
+pub fn autotune(repo: &Repo, sample_volumes: usize, ctx: &OpContext) -> Result<AutoTune, AppError> {
+    // Only volumes that are actually at the destination (missing ones are a repair matter).
+    let present: HashSet<String> = repo.backend.list()?.into_iter().map(|f| f.name).collect();
+    let mut vols: Vec<String> = repo.db.volumes(Some(volume::VolumeKind::Block))?.into_iter().map(|v| v.name).filter(|n| present.contains(n)).collect();
+    if vols.is_empty() {
+        return Err(AppError::validation("Run a backup first: there are no volumes to measure"));
+    }
+    vols.truncate(sample_volumes.max(1));
+    let mut info = Vec::new();
+    for v in &vols {
+        info.push((v.clone(), repo.volume_check_info(v)?));
+    }
+    let fetcher = repo.fetcher();
+    let cipher = &repo.cipher;
+    let mut t = AutoTune { file_threads: RestoreOptions::default().file_workers(), ..Default::default() };
+    for threads in [1usize, 2, 4, 8] {
+        ctx.check()?;
+        let next = AtomicU64::new(0);
+        let bytes = AtomicU64::new(0);
+        let failed = Mutex::new(None::<AppError>);
+        let start = std::time::Instant::now();
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                sc.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst) as usize;
+                    let Some((name, (hash, rec))) = info.get(i) else { return };
+                    match fetcher.fetch(name, hash.as_deref(), rec, false).and_then(|d| cipher.open(&d).map(|p| (d.len(), p))).and_then(|(n, p)| volume::read_block_volume(&p).map(|_| n)) {
+                        Ok(n) => {
+                            bytes.fetch_add(n as u64, Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            if let Ok(mut g) = failed.lock() {
+                                *g = Some(e);
+                            }
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = failed.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            return Err(e);
+        }
+        let b = bytes.load(Ordering::SeqCst);
+        t.sample_bytes = b;
+        let secs = start.elapsed().as_secs_f64().max(1e-6);
+        t.measurements.push((threads, b as f64 / 1_048_576.0 / secs));
+    }
+    let best = t.measurements.iter().map(|m| m.1).fold(0.0, f64::max);
+    t.download_threads = t.measurements.iter().find(|m| m.1 >= best * 0.9).map(|m| m.0).unwrap_or(2);
+    Ok(t)
+}
+
 /// Refuse to start when `path`'s volume has less than `need` bytes free.
 fn check_space(path: Option<&Path>, need: u64, what: &str) -> Result<(), AppError> {
     let Some(free) = path.and_then(meta::free_space) else { return Ok(()) };
@@ -780,5 +846,26 @@ mod tests {
         assert!(md.file_type().is_symlink());
         use std::os::unix::fs::MetadataExt;
         assert_eq!(md.mtime(), 1_000_000_000);
+    }
+
+    #[test]
+    fn autotune_measures_and_picks() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        for i in 0..6 {
+            write(src.path(), &format!("f{i}"), &vec![i as u8 + 1; 2500]);
+        }
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        backup(src.path(), &be, &db);
+        let t = autotune(&open(&be, &db), 4, &OpContext::new()).unwrap();
+        assert_eq!(t.measurements.len(), 4);
+        assert!([1, 2, 4, 8].contains(&t.download_threads));
+        assert!(t.sample_bytes > 0 && t.file_threads >= 1);
+        let empty = BackupDb::open_in_memory().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let be2 = LocalBackend::new(d2.path());
+        let r = Repo::open(&be2, &empty, None, &BackupOptions::default(), true, KdfParams::insecure_fast()).unwrap();
+        assert!(autotune(&r, 2, &OpContext::new()).is_err());
     }
 }

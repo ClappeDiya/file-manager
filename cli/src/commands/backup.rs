@@ -60,6 +60,114 @@ impl RepoArgs {
     }
 }
 
+/// Engine options beyond the basics (all optional).
+#[derive(Args, Debug, Clone, Default)]
+pub struct EngineArgs {
+    /// Volume container: ufop | zip (fixed after the first backup)
+    #[arg(long, default_value = "ufop")]
+    pub volume_format: String,
+    /// ZIP compression: deflate | stored | bzip2 | zstd
+    #[arg(long, default_value = "deflate")]
+    pub zip_method: String,
+    /// Upload PAR2 recovery files (needs the par2 tool)
+    #[arg(long)]
+    pub par2: bool,
+    #[arg(long, default_value_t = 10)]
+    pub par2_redundancy: u8,
+    /// Only rescan these paths (repeatable); everything else is taken from the previous version
+    #[arg(long = "changed-path")]
+    pub changed_paths: Vec<String>,
+    /// Paths known to be deleted since the previous version (repeatable)
+    #[arg(long = "deleted-path")]
+    pub deleted_paths: Vec<String>,
+    /// NTFS change journal: off | auto | on | required
+    #[arg(long, default_value = "off")]
+    pub usn_policy: String,
+    /// File stored with each version (repeatable)
+    #[arg(long = "control-file")]
+    pub control_files: Vec<String>,
+    /// Hashing threads (0 = auto)
+    #[arg(long, default_value_t = 0)]
+    pub hash_threads: usize,
+    #[arg(long, default_value_t = 2)]
+    pub upload_concurrency: usize,
+    /// 1–10; lower values pause between blocks to leave CPU for other work
+    #[arg(long, default_value_t = 10)]
+    pub cpu_intensity: u8,
+    #[arg(long)]
+    pub tempdir: Option<String>,
+    /// Read buffer in bytes (0 = default)
+    #[arg(long, default_value_t = 0)]
+    pub read_buffer_size: usize,
+    /// Low-priority disk and CPU use
+    #[arg(long)]
+    pub background_io: bool,
+    /// Quota in bytes for capacity warnings (default: destination free space)
+    #[arg(long)]
+    pub quota_size: Option<u64>,
+    #[arg(long, default_value_t = 10)]
+    pub quota_warning_percent: u8,
+    #[arg(long)]
+    pub no_quota_warning: bool,
+    /// Skip files with an advisory lock held by another program
+    #[arg(long)]
+    pub respect_advisory_locks: bool,
+    #[arg(long)]
+    pub no_xattrs: bool,
+    #[arg(long)]
+    pub no_acls: bool,
+    /// Back up NTFS alternate data streams
+    #[arg(long)]
+    pub alternate_streams: bool,
+    /// Back up items marked with exclusion attributes anyway
+    #[arg(long)]
+    pub ignore_exclusion_xattrs: bool,
+    /// The destination ignores name case
+    #[arg(long)]
+    pub case_insensitive_remote: bool,
+    #[arg(long)]
+    pub compact_interval_days: Option<u32>,
+    #[arg(long)]
+    pub vacuum_interval_days: Option<u32>,
+}
+
+fn parse_enum<T: serde::de::DeserializeOwned>(flag: &str, v: &str) -> Result<T, ufop_core::error::AppError> {
+    serde_json::from_value(serde_json::Value::String(v.to_ascii_lowercase()))
+        .map_err(|_| ufop_core::error::AppError::validation(format!("Invalid value '{v}' for --{flag}")))
+}
+
+impl EngineArgs {
+    fn apply(&self, o: BackupOptions) -> Result<BackupOptions, ufop_core::error::AppError> {
+        Ok(BackupOptions {
+            volume_format: parse_enum("volume-format", &self.volume_format)?,
+            zip_method: parse_enum("zip-method", &self.zip_method)?,
+            par2: ufop_core::backup::Par2Options { enabled: self.par2, redundancy_percent: self.par2_redundancy.clamp(1, 100), ..Default::default() },
+            changed_paths: (!self.changed_paths.is_empty()).then(|| self.changed_paths.clone()),
+            deleted_paths: self.deleted_paths.clone(),
+            usn_policy: parse_enum("usn-policy", &self.usn_policy)?,
+            control_files: self.control_files.clone(),
+            hash_threads: self.hash_threads,
+            upload_concurrency: self.upload_concurrency.max(1),
+            cpu_intensity: self.cpu_intensity.clamp(1, 10),
+            temp_dir: self.tempdir.clone(),
+            read_buffer_size: self.read_buffer_size,
+            background_io: self.background_io,
+            quota_size: self.quota_size,
+            quota_warning_percent: self.quota_warning_percent,
+            quota_disable: self.no_quota_warning,
+            respect_advisory_locks: self.respect_advisory_locks,
+            backup_xattrs: !self.no_xattrs,
+            backup_acls: !self.no_acls,
+            backup_alternate_streams: self.alternate_streams,
+            ignore_exclusion_xattrs: self.ignore_exclusion_xattrs,
+            remote_case_insensitive: self.case_insensitive_remote,
+            auto_compact_interval_days: self.compact_interval_days,
+            auto_vacuum_interval_days: self.vacuum_interval_days,
+            ..o
+        })
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum BackupCommands {
     /// Back up sources into the destination (creates it on first run)
@@ -99,6 +207,8 @@ pub enum BackupCommands {
         upload_unchanged: bool,
         #[arg(long)]
         no_auto_compact: bool,
+        #[command(flatten)]
+        engine: EngineArgs,
     },
     /// List backup versions
     List {
@@ -143,6 +253,50 @@ pub enum BackupCommands {
         preserve_full_paths: bool,
         #[arg(long)]
         skip_verify: bool,
+        /// Restore these versions side by side below --target (repeatable)
+        #[arg(long = "versions")]
+        versions: Vec<usize>,
+        /// With --versions: skip files identical to a newer restored version
+        #[arg(long)]
+        unique: bool,
+        /// Take matching blocks from files on this computer before downloading
+        #[arg(long)]
+        use_local_blocks: bool,
+        #[arg(long, default_value_t = 0)]
+        download_threads: usize,
+        #[arg(long, default_value_t = 0)]
+        file_threads: usize,
+        /// Sequential single-threaded restore
+        #[arg(long)]
+        legacy: bool,
+        #[arg(long)]
+        tempdir: Option<PathBuf>,
+        #[arg(long)]
+        skip_free_space_check: bool,
+        /// Do not re-apply extended attributes / Windows attributes
+        #[arg(long)]
+        no_metadata: bool,
+    },
+    /// Rebuild missing block volumes from the source files on this computer
+    RebuildMissing {
+        #[command(flatten)]
+        repo: RepoArgs,
+    },
+    /// Extract a version's control files into a folder
+    ControlFiles {
+        #[command(flatten)]
+        repo: RepoArgs,
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        version: usize,
+    },
+    /// Benchmark restore download concurrency on sample volumes
+    AutoTune {
+        #[command(flatten)]
+        repo: RepoArgs,
+        #[arg(long, default_value_t = 8)]
+        samples: usize,
     },
     /// Download and check volumes
     Verify {
@@ -296,7 +450,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
     match cmd {
         BackupCommands::Run {
             repo, sources, include, exclude, exclude_hidden, skip_files_larger_than, block_size, volume_size, compression_level,
-            keep_versions, keep_days, retention_policy, verify_samples, upload_unchanged, no_auto_compact,
+            keep_versions, keep_days, retention_policy, verify_samples, upload_unchanged, no_auto_compact, engine,
         } => {
             let pass = repo.passphrase();
             if pass.is_none() && !repo.no_encryption {
@@ -312,7 +466,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             filter.exclude_hidden = exclude_hidden;
             filter.max_file_size = skip_files_larger_than;
             let filter = filter.compile()?;
-            let opts = BackupOptions {
+            let opts = engine.apply(BackupOptions {
                 block_size,
                 volume_size,
                 compression_level,
@@ -321,7 +475,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
                 auto_compact: !no_auto_compact,
                 dry_run,
                 ..repo.options()
-            };
+            })?;
             let retention = parse_retention(keep_versions, keep_days, retention_policy);
             let be = LocalBackend::new(&repo.dest);
             let db = BackupDb::open(&repo.db_path())?;
@@ -343,13 +497,20 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             ok(emit(format, "Differences", &maintenance::compare_versions(db, base, compare)?))?;
             Ok(0)
         }),
-        BackupCommands::Restore { repo, paths, version, target, conflict, restore_permissions, preserve_full_paths, skip_verify } => {
+        BackupCommands::Restore {
+            repo, paths, version, target, conflict, restore_permissions, preserve_full_paths, skip_verify, versions, unique, use_local_blocks,
+            download_threads, file_threads, legacy, tempdir, skip_free_space_check, no_metadata,
+        } => {
             let conflict = match conflict.as_str() {
                 "rename" => ConflictPolicy::Rename,
                 "skip" => ConflictPolicy::Skip,
                 _ => ConflictPolicy::Overwrite,
             };
-            let opts = RestoreOptions { version, paths, target, conflict, restore_permissions, preserve_full_paths, skip_verify, dry_run, ..Default::default() };
+            let opts = RestoreOptions {
+                version, versions, unique_versions: unique, paths, target, conflict, restore_permissions, preserve_full_paths, skip_verify, dry_run,
+                use_local_blocks, download_threads, file_threads, legacy, temp_dir: tempdir, skip_free_space_check, restore_metadata: !no_metadata,
+                ..Default::default()
+            };
             // No local database? Rebuild a temporary one from the destination.
             let needs_recreate = !repo.db_path().exists();
             let be = LocalBackend::new(&repo.dest);
@@ -401,6 +562,19 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
         BackupCommands::Delete { repo, versions, allow_full_removal } => with_repo(&repo, |r, _| {
             let n = maintenance::delete_versions(r, &versions, allow_full_removal)?;
             ok(emit(format, "Deleted versions", &serde_json::json!({ "versions_deleted": n })))?;
+            Ok(0)
+        }),
+        BackupCommands::RebuildMissing { repo } => with_repo(&repo, |r, _| {
+            let rep = maintenance::rebuild_missing_block_volumes(r, &repo.options(), &progress_ctx(format))?;
+            ok(emit(format, "Rebuild missing volumes", &rep))?;
+            Ok(if rep.incomplete_volumes.is_empty() { 0 } else { 1 })
+        }),
+        BackupCommands::ControlFiles { repo, target, version } => with_repo(&repo, |r, _| {
+            ok(emit(format, "Control files", &maintenance::extract_control_files(r, version, &target)?))?;
+            Ok(0)
+        }),
+        BackupCommands::AutoTune { repo, samples } => with_repo(&repo, |r, _| {
+            ok(emit(format, "Restore AutoTune", &ufop_core::backup::restore::autotune(r, samples.clamp(1, 50), &OpContext::new())?))?;
             Ok(0)
         }),
         BackupCommands::TestDestination { dest, files } => {

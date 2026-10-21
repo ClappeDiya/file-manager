@@ -202,6 +202,12 @@ pub enum BackupOperation {
     Purge { paths: Vec<String>, versions: Option<Vec<usize>>, dry_run: bool },
     DeleteVersions { versions: Vec<usize>, allow_full_removal: bool },
     Consistency,
+    /// Rebuild missing block volumes from the source files.
+    RebuildMissing,
+    /// Write a version's control files into `target`.
+    ExtractControlFiles { version: usize, target: String },
+    /// Benchmark restore download concurrency.
+    AutoTune { sample_volumes: usize },
 }
 
 impl BackupOperation {
@@ -218,6 +224,9 @@ impl BackupOperation {
             Self::Purge { .. } => "purge",
             Self::DeleteVersions { .. } => "delete_versions",
             Self::Consistency => "consistency_check",
+            Self::RebuildMissing => "rebuild_missing",
+            Self::ExtractControlFiles { .. } => "extract_control_files",
+            Self::AutoTune { .. } => "autotune",
         }
     }
 }
@@ -752,6 +761,7 @@ impl BackupManager {
             }
         }
 
+        let release_log: Arc<Mutex<Vec<LogLine>>> = Arc::default();
         let result: Result<serde_json::Value, AppError> = async {
             self.check_policy(&job).await?;
             let backend = self.build_backend(&job).await?;
@@ -763,11 +773,23 @@ impl BackupManager {
             let kdf = self.inner.kdf;
             let job2 = job.clone();
             let prog = progress.clone();
-            let ctx = OpContext::new().with_cancel_flag(cancel.clone()).with_progress(move |p| *lock(&prog) = Some(p.clone()));
+            let mut ctx = OpContext::new().with_cancel_flag(cancel.clone()).with_progress(move |p| *lock(&prog) = Some(p.clone()));
+            if let Some(cmd) = job.scripts.run_on_source_release.clone().filter(|c| is_backup && !c.trim().is_empty()) {
+                // Runs on the engine thread; it waits so the log is complete.
+                let (env, timeout, handle, sink) = (Self::script_env(&job, op_name, "SOURCE_RELEASED"), job.scripts.timeout_secs, tokio::runtime::Handle::current(), release_log.clone());
+                ctx = ctx.with_source_released(move || {
+                    let lines = match handle.block_on(hooks::run_script(&cmd, &env, timeout)) {
+                        Ok(out) => out.log,
+                        Err(e) => vec![LogLine::warn(format!("Source-release script: {}", e.user_message()))],
+                    };
+                    lock(&sink).extend(lines);
+                });
+            }
             blocking(move || run_core(&job2, op, backend.as_ref(), &db_path, pass.as_deref(), kdf, &ctx)).await
         }
         .await;
 
+        log.append(&mut lock(&release_log));
         if cancel.load(Ordering::SeqCst) {
             log.push(LogLine::warn("Operation was cancelled"));
         }
@@ -1141,6 +1163,9 @@ fn summarize(op: &str, v: &serde_json::Value) -> String {
         "restore" => format!("{} files restored ({}), {} unchanged skipped", n("files_restored"), human_bytes(n("bytes_restored")), n("files_skipped_matching")),
         "verify" => format!("{} volume(s) verified", n("checked")),
         "compact" => format!("{} removed, {} rewritten, {} reclaimed", n("volumes_removed"), n("volumes_rewritten"), human_bytes(n("bytes_reclaimed"))),
+        "rebuild_missing" => format!("{} volume(s) rebuilt, {} block(s) recovered, {} unrecoverable", n("volumes_rebuilt"), n("blocks_recovered"), n("blocks_unrecoverable")),
+        "extract_control_files" => format!("{} control file(s) extracted", v.get("files").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0)),
+        "autotune" => format!("Best restore download concurrency: {} thread(s)", n("download_threads")),
         "recreate_database" => format!("{} version(s), {} block volume(s) indexed", n("versions"), n("block_volumes")),
         _ => format!("{op} completed"),
     }
@@ -1196,6 +1221,12 @@ fn run_core(
             serde_json::json!({ "versions_deleted": n })
         }
         BackupOperation::Consistency => serde_json::to_value(open(false)?.consistency_check()?)?,
+        BackupOperation::RebuildMissing => serde_json::to_value(maintenance::rebuild_missing_block_volumes(&open(false)?, &job.options, ctx)?)?,
+        BackupOperation::ExtractControlFiles { version, target } => {
+            let files = maintenance::extract_control_files(&open(false)?, version, Path::new(&target))?;
+            serde_json::json!({ "files": files.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>() })
+        }
+        BackupOperation::AutoTune { sample_volumes } => serde_json::to_value(ufop_core::backup::restore::autotune(&open(false)?, sample_volumes.clamp(1, 50), ctx)?)?,
     };
     Ok(v)
 }

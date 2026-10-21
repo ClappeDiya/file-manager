@@ -7,7 +7,7 @@ import { useState } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { errorText, useBackupStore, type BackupJob, type BackupOperation, type OperationResult } from "@/stores/backup-store";
 import { downloadText, inputCls } from "@/lib/backup-helpers";
-import { Banner, Btn, Check, Field, Section } from "./backup-ui";
+import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 
 
 export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDeleted: () => void }) {
@@ -21,6 +21,8 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
   const [cli, setCli] = useState<string | null>(null);
   const [delLocal, setDelLocal] = useState(true);
   const [delRemote, setDelRemote] = useState(false);
+  const [ctlVersion, setCtlVersion] = useState(0);
+  const [ctlTarget, setCtlTarget] = useState("");
 
   const op = async (label: string, operation: BackupOperation) => {
     setBusy(label);
@@ -66,8 +68,27 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
           {tool("Recreate database", { type: "recreate_database" }, "Rebuild the local database from the destination")}
           {tool("Compact now", { type: "compact" }, "Delete unused data and repack sparse volumes")}
           {tool("Preview purge of broken files", { type: "purge_broken", dry_run: true }, "Show what would be removed")}
+          {tool("Rebuild missing volumes", { type: "rebuild_missing" }, "Re-create lost data volumes from the source files still on this computer")}
           {tool("Purge broken files", { type: "purge_broken", dry_run: false }, "Remove unrecoverable files from history so backups can continue", "danger")}
         </div>
+      </Section>
+
+      <Section title="Restore tuning" hint="Downloads a sample of volumes with 1, 2, 4 and 8 parallel readers (nothing is written) and reports the best setting for restores.">
+        {tool("Run restore AutoTune", { type: "auto_tune", sample_volumes: 8 }, "Benchmark restore download concurrency")}
+      </Section>
+
+      <Section title="Control files" hint="Write the control files stored with a version into a folder.">
+        <div className="grid grid-cols-1 sm:grid-cols-[8rem_1fr] gap-2">
+          <Field label="Version (0 = newest)">
+            <input className={inputCls} type="number" min={0} value={ctlVersion} onChange={(e) => setCtlVersion(Math.max(0, Math.floor(Number(e.target.value) || 0)))} />
+          </Field>
+          <Field label="Target folder">
+            <PathInput value={ctlTarget} onChange={setCtlTarget} placeholder="/path/to/folder" testId="control-target" />
+          </Field>
+        </div>
+        <Btn disabled={!ctlTarget.trim() || busy !== null} testId="backup-op-extract_control_files" onClick={() => op("Extract control files", { type: "extract_control_files", version: ctlVersion, target: ctlTarget.trim() })}>
+          {busy === "Extract control files" ? "Working…" : "Extract control files"}
+        </Btn>
       </Section>
 
       <Section title="Remove files from history" hint="Paths, folders or wildcards (one per line). Removes them from every version.">

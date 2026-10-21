@@ -25,7 +25,8 @@ import {
 import { formatDate, inputCls } from "@/lib/backup-helpers";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 
-function RestoreOptionsForm({ value, onChange }: { value: RestoreOptions; onChange: (v: RestoreOptions) => void }) {
+function RestoreOptionsForm({ value, onChange, versionCount = 0 }: { value: RestoreOptions; onChange: (v: RestoreOptions) => void; versionCount?: number }) {
+  const n = (v: string, max: number) => Math.min(max, Math.max(0, Math.floor(Number(v) || 0)));
   return (
     <div className="space-y-2">
       <div className="flex gap-3 text-xs">
@@ -53,6 +54,36 @@ function RestoreOptionsForm({ value, onChange }: { value: RestoreOptions; onChan
       </Field>
       <Check label="Restore file permissions" checked={value.restore_permissions} onChange={(v) => onChange({ ...value, restore_permissions: v })} />
       <Check label="Recreate symbolic links" checked={value.restore_symlinks} onChange={(v) => onChange({ ...value, restore_symlinks: v })} />
+      <Check label="Restore extended attributes and Windows attributes" checked={value.restore_metadata} onChange={(v) => onChange({ ...value, restore_metadata: v })} />
+      {versionCount > 1 && value.target !== null && (
+        <>
+          <Check
+            label={`Restore all ${versionCount} versions side by side (one folder per version)`}
+            checked={value.versions.length > 0}
+            onChange={(v) => onChange({ ...value, versions: v ? Array.from({ length: versionCount }, (_, i) => i) : [] })}
+          />
+          {value.versions.length > 0 && (
+            <Check label="Only versions whose content changed" checked={value.unique_versions} onChange={(v) => onChange({ ...value, unique_versions: v })} />
+          )}
+        </>
+      )}
+      <Check label="Reuse matching data from files on this computer (download less)" checked={value.use_local_blocks} onChange={(v) => onChange({ ...value, use_local_blocks: v })} />
+      <details className="text-xs">
+        <summary className="cursor-pointer select-none">Performance and staging</summary>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
+          <Field label="Parallel downloads (0 = auto)">
+            <input className={inputCls} type="number" min={0} max={16} disabled={value.legacy} value={value.download_threads} onChange={(e) => onChange({ ...value, download_threads: n(e.target.value, 16) })} />
+          </Field>
+          <Field label="Parallel file writers (0 = auto)">
+            <input className={inputCls} type="number" min={0} max={32} disabled={value.legacy} value={value.file_threads} onChange={(e) => onChange({ ...value, file_threads: n(e.target.value, 32) })} />
+          </Field>
+          <Field label="Staging folder">
+            <input className={`${inputCls} font-mono`} value={value.temp_dir ?? ""} placeholder="system temp" onChange={(e) => onChange({ ...value, temp_dir: e.target.value || null })} />
+          </Field>
+        </div>
+        <Check label="Legacy mode (sequential, single-threaded)" checked={value.legacy} onChange={(v) => onChange({ ...value, legacy: v })} />
+        <Check label="Skip the free-space check" checked={value.skip_free_space_check} onChange={(v) => onChange({ ...value, skip_free_space_check: v })} />
+      </details>
       <Check label="Skip hash verification (recovery only)" checked={value.skip_verify} onChange={(v) => onChange({ ...value, skip_verify: v })} />
       <Check label="Dry run (only list what would be written)" checked={value.dry_run} onChange={(v) => onChange({ ...value, dry_run: v })} />
     </div>
@@ -63,7 +94,9 @@ function ReportView({ report }: { report: RestoreReport }) {
   return (
     <Banner tone={report.errors.length ? "warning" : "success"}>
       Restored {report.files_restored} file(s), {formatBytes(report.bytes_restored)}; {report.files_skipped_matching} already correct
-      {report.files_skipped_conflict > 0 && `, ${report.files_skipped_conflict} skipped (conflict)`}.
+      {report.files_skipped_conflict > 0 && `, ${report.files_skipped_conflict} skipped (conflict)`}
+      {report.files_skipped_duplicate > 0 && `, ${report.files_skipped_duplicate} identical to a newer version`}
+      {report.blocks_from_local > 0 && `; ${report.blocks_from_local} block(s) reused from local files`}.
       {report.planned.length > 0 && <div>Would write {report.planned.length} item(s).</div>}
       {report.errors.slice(0, 20).map((e) => (
         <div key={e} className="text-red-600">{e}</div>
@@ -233,7 +266,7 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
       </Section>
 
       <Section title="Restore">
-        <RestoreOptionsForm value={opts} onChange={setOpts} />
+        <RestoreOptionsForm value={opts} onChange={setOpts} versionCount={versions.length} />
         <Btn
           tone="primary"
           disabled={busy || (opts.target !== null && !opts.target.trim())}

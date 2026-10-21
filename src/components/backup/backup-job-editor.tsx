@@ -18,6 +18,7 @@ import {
 import { inputCls, rulesToText, textToRules } from "@/lib/backup-helpers";
 import { pickFolder } from "@/lib/folder-picker";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
+import { BackupAdvancedOptions } from "./backup-advanced-options";
 
 interface ConnectionProfile {
   id: string;
@@ -455,6 +456,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 <input className={inputCls} value={job.options.no_compress_extensions.join(", ")} onChange={(e) => patchOpts({ no_compress_extensions: e.target.value.split(",").map((s) => s.trim().replace(/^\./, "").toLowerCase()).filter(Boolean) })} />
               </Field>
             </Section>
+            <BackupAdvancedOptions options={job.options} locked={!isNew && job.stats.version_count > 0} onChange={patchOpts} />
             <Section title="Source handling">
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                 <Field label="Symbolic links">
@@ -529,6 +531,9 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
               <Check label="Required — abort the backup if this script fails" checked={job.scripts.run_before_required} onChange={(v) => patch({ scripts: { ...job.scripts, run_before_required: v } })} />
               <Field label="After backup" hint="UFOP_PARSED_RESULT holds success/warning/error; UFOP_RESULTFILE points at the result.">
                 <input className={`${inputCls} font-mono`} value={job.scripts.run_after ?? ""} onChange={(e) => patch({ scripts: { ...job.scripts, run_after: e.target.value || null } })} />
+              </Field>
+              <Field label="When sources are released" hint="Runs once all files are read, before uploads finish — e.g. to drop a snapshot or restart a service.">
+                <input className={`${inputCls} font-mono`} value={job.scripts.run_on_source_release ?? ""} onChange={(e) => patch({ scripts: { ...job.scripts, run_on_source_release: e.target.value || null } })} />
               </Field>
               <div className="grid grid-cols-2 gap-2">
                 <Field label="Timeout (s)">

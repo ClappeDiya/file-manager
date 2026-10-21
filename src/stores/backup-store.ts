@@ -65,6 +65,40 @@ export interface BackupOptions {
   dry_run: boolean;
   task_config: unknown | null;
   allow_full_removal: boolean;
+  ignore_exclusion_xattrs: boolean;
+  respect_advisory_locks: boolean;
+  changed_paths: string[] | null;
+  deleted_paths: string[];
+  usn_policy: UsnPolicy;
+  backup_xattrs: boolean;
+  backup_acls: boolean;
+  backup_alternate_streams: boolean;
+  volume_format: VolumeFormat;
+  zip_method: ZipMethod;
+  control_files: string[];
+  par2: Par2Options;
+  hash_threads: number;
+  upload_concurrency: number;
+  cpu_intensity: number;
+  temp_dir: string | null;
+  read_buffer_size: number;
+  background_io: boolean;
+  quota_size: number | null;
+  quota_warning_percent: number;
+  quota_disable: boolean;
+  auto_compact_interval_days: number | null;
+  auto_vacuum_interval_days: number | null;
+  remote_case_insensitive: boolean;
+}
+
+export type UsnPolicy = "off" | "auto" | "on" | "required";
+export type VolumeFormat = "ufop" | "zip";
+export type ZipMethod = "deflate" | "stored" | "bzip2" | "zstd";
+
+export interface Par2Options {
+  enabled: boolean;
+  redundancy_percent: number;
+  binary: string;
 }
 
 export type RetentionPolicy =
@@ -86,6 +120,7 @@ export interface ScriptConfig {
   run_before: string | null;
   run_before_required: boolean;
   run_after: string | null;
+  run_on_source_release: string | null;
   timeout_secs: number;
   result_format: string;
 }
@@ -195,14 +230,30 @@ export type ConflictPolicy = "overwrite" | "rename" | "skip";
 
 export interface RestoreOptions {
   version: number;
+  versions: number[];
+  unique_versions: boolean;
   paths: string[];
   target: string | null;
   preserve_full_paths: boolean;
   conflict: ConflictPolicy;
   restore_permissions: boolean;
   restore_symlinks: boolean;
+  restore_metadata: boolean;
   skip_verify: boolean;
   dry_run: boolean;
+  use_local_blocks: boolean;
+  download_threads: number;
+  file_threads: number;
+  legacy: boolean;
+  temp_dir: string | null;
+  skip_free_space_check: boolean;
+}
+
+export interface AutoTuneResult {
+  download_threads: number;
+  file_threads: number;
+  measurements: [number, number][];
+  sample_bytes: number;
 }
 
 export interface RestoreReport {
@@ -211,8 +262,10 @@ export interface RestoreReport {
   folders_created: number;
   files_skipped_matching: number;
   files_skipped_conflict: number;
+  files_skipped_duplicate: number;
   bytes_restored: number;
   volumes_downloaded: number;
+  blocks_from_local: number;
   planned: string[];
   warnings: string[];
   errors: string[];
@@ -300,7 +353,10 @@ export type BackupOperation =
   | { type: "purge_broken"; dry_run: boolean }
   | { type: "purge"; paths: string[]; versions: number[] | null; dry_run: boolean }
   | { type: "delete_versions"; versions: number[]; allow_full_removal: boolean }
-  | { type: "consistency" };
+  | { type: "consistency" }
+  | { type: "rebuild_missing" }
+  | { type: "extract_control_files"; version: number; target: string }
+  | { type: "auto_tune"; sample_volumes: number };
 
 export interface PassphraseStrength {
   score: number;
@@ -388,10 +444,34 @@ export function newBackupJob(): BackupJob {
       dry_run: false,
       task_config: null,
       allow_full_removal: false,
+      ignore_exclusion_xattrs: false,
+      respect_advisory_locks: false,
+      changed_paths: null,
+      deleted_paths: [],
+      usn_policy: "off",
+      backup_xattrs: true,
+      backup_acls: true,
+      backup_alternate_streams: false,
+      volume_format: "ufop",
+      zip_method: "deflate",
+      control_files: [],
+      par2: { enabled: false, redundancy_percent: 10, binary: "par2" },
+      hash_threads: 0,
+      upload_concurrency: 2,
+      cpu_intensity: 10,
+      temp_dir: null,
+      read_buffer_size: 0,
+      background_io: false,
+      quota_size: null,
+      quota_warning_percent: 10,
+      quota_disable: false,
+      auto_compact_interval_days: null,
+      auto_vacuum_interval_days: null,
+      remote_case_insensitive: false,
     },
     retention: { type: "keep_all" },
     schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false },
-    scripts: { run_before: null, run_before_required: false, run_after: null, timeout_secs: 60, result_format: "json" },
+    scripts: { run_before: null, run_before_required: false, run_after: null, run_on_source_release: null, timeout_secs: 60, result_format: "json" },
     reports: {
       http_urls: [],
       http_method: "POST",
@@ -428,14 +508,23 @@ export function newBackupJob(): BackupJob {
 
 export const DEFAULT_RESTORE_OPTIONS: RestoreOptions = {
   version: 0,
+  versions: [],
+  unique_versions: false,
   paths: [],
   target: null,
   preserve_full_paths: false,
   conflict: "overwrite",
   restore_permissions: false,
   restore_symlinks: true,
+  restore_metadata: true,
   skip_verify: false,
   dry_run: false,
+  use_local_blocks: false,
+  download_threads: 0,
+  file_threads: 0,
+  legacy: false,
+  temp_dir: null,
+  skip_free_space_check: false,
 };
 
 

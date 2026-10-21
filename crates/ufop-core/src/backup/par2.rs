@@ -59,6 +59,10 @@ impl Par2 {
         let out = Command::new(&self.opts.binary)
             .args(args)
             .current_dir(dir)
+            // Volumes are already processed in parallel; concurrent par2
+            // processes with spinning OpenMP pools slow each other ~40x.
+            .env("OMP_NUM_THREADS", "1")
+            .env("OMP_WAIT_POLICY", "PASSIVE")
             .output()
             .map_err(|e| err(format!("Could not run {}: {e}", self.opts.binary)))?;
         if !out.status.success() {
