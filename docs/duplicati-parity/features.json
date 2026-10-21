@@ -3231,24 +3231,24 @@
    "cat": 14,
    "name": "Format version and KDF settings",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 6,
-   "verify": "",
+   "verify": "tests",
    "note": "Argon2id parameters in repo header; not AES Crypt v3",
-   "evidence": ""
+   "evidence": "ufop-core/src-tauri/CLI/vitest suites: KDF presets+validation in header, .ufopenc tamper tests + CLI e2e, strict pin enforcement vs in-process TLS server, placeholder resolution+masking, cache fallback, provider diagnostics (ebfae47)"
   },
   {
    "n": 269,
    "cat": 14,
    "name": "GPG encryption",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 6,
-   "verify": "",
+   "verify": "live",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "GPG 2.4 symmetric+recipient volumes (engine, CLI, desktop); pass store via real pass+GnuPG; Vault 1.17 dev server KV v1/v2 (ebfae47)"
   },
   {
    "n": 270,
@@ -3267,12 +3267,12 @@
    "cat": 14,
    "name": "Standalone file encryption",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 6,
-   "verify": "",
+   "verify": "tests",
    "note": "Vault encrypt/decrypt exists; not the backup format",
-   "evidence": ""
+   "evidence": "ufop-core/src-tauri/CLI/vitest suites: KDF presets+validation in header, .ufopenc tamper tests + CLI e2e, strict pin enforcement vs in-process TLS server, placeholder resolution+masking, cache fallback, provider diagnostics (ebfae47)"
   },
   {
    "n": 272,
@@ -3351,12 +3351,12 @@
    "cat": 14,
    "name": "Certificate pinning",
    "baseline": "P",
-   "status": "partial",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 6,
-   "verify": "",
+   "verify": "tests",
    "note": "Pinning fields exist in tls.rs but aren't enforced",
-   "evidence": ""
+   "evidence": "ufop-core/src-tauri/CLI/vitest suites: KDF presets+validation in header, .ufopenc tamper tests + CLI e2e, strict pin enforcement vs in-process TLS server, placeholder resolution+masking, cache fallback, provider diagnostics (ebfae47)"
   },
   {
    "n": 279,
@@ -3411,12 +3411,12 @@
    "cat": 14,
    "name": "Secret placeholders",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 6,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core/src-tauri/CLI/vitest suites: KDF presets+validation in header, .ufopenc tamper tests + CLI e2e, strict pin enforcement vs in-process TLS server, placeholder resolution+masking, cache fallback, provider diagnostics (ebfae47)"
   },
   {
    "n": 284,
@@ -3435,96 +3435,96 @@
    "cat": 14,
    "name": "Environment/file secret providers",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 6,
-   "verify": "",
+   "verify": "tests",
    "note": "CLI reads passphrase from an env var only",
-   "evidence": ""
+   "evidence": "ufop-core/src-tauri/CLI/vitest suites: KDF presets+validation in header, .ufopenc tamper tests + CLI e2e, strict pin enforcement vs in-process TLS server, placeholder resolution+masking, cache fallback, provider diagnostics (ebfae47)"
   },
   {
    "n": 286,
    "cat": 14,
    "name": "Linux pass",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 6,
-   "verify": "",
+   "verify": "live",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "GPG 2.4 symmetric+recipient volumes (engine, CLI, desktop); pass store via real pass+GnuPG; Vault 1.17 dev server KV v1/v2 (ebfae47)"
   },
   {
    "n": 287,
    "cat": 14,
    "name": "HashiCorp Vault",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 6,
-   "verify": "",
+   "verify": "live",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "GPG 2.4 symmetric+recipient volumes (engine, CLI, desktop); pass store via real pass+GnuPG; Vault 1.17 dev server KV v1/v2 (ebfae47)"
   },
   {
    "n": 288,
    "cat": 14,
    "name": "AWS Secrets Manager",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 6,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "AWS Secrets Manager via SigV4 against moto (plain + JSON key) (ebfae47)"
   },
   {
    "n": 289,
    "cat": 14,
    "name": "Google Secret Manager",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 6,
-   "verify": "",
+   "verify": "account",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "Google Secret Manager (incl. SA JWT) and Azure Key Vault against API mocks; needs live accounts (ebfae47)"
   },
   {
    "n": 290,
    "cat": 14,
    "name": "Azure Key Vault",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 6,
-   "verify": "",
+   "verify": "account",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "Google Secret Manager (incl. SA JWT) and Azure Key Vault against API mocks; needs live accounts (ebfae47)"
   },
   {
    "n": 291,
    "cat": 14,
    "name": "Secret-provider scope and cache",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 6,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core/src-tauri/CLI/vitest suites: KDF presets+validation in header, .ufopenc tamper tests + CLI e2e, strict pin enforcement vs in-process TLS server, placeholder resolution+masking, cache fallback, provider diagnostics (ebfae47)"
   },
   {
    "n": 292,
    "cat": 14,
    "name": "Secret-provider diagnostics",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "verified",
    "phase": 6,
-   "verify": "",
+   "verify": "tests",
    "note": "Not implemented",
-   "evidence": ""
+   "evidence": "ufop-core/src-tauri/CLI/vitest suites: KDF presets+validation in header, .ufopenc tamper tests + CLI e2e, strict pin enforcement vs in-process TLS server, placeholder resolution+masking, cache fallback, provider diagnostics (ebfae47)"
   },
   {
    "n": 293,
