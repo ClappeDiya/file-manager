@@ -133,6 +133,9 @@ mod tests {
             queued_at: "".into(),
             started_at: None,
             progress: Some(ufop_core::backup::Progress { phase: ufop_core::backup::Phase::Uploading, files_processed: 5, files_total: 10, bytes_processed: 0, current_path: None }),
+            elapsed_secs: 0,
+            bytes_per_sec: 0,
+            eta_secs: None,
         });
         assert_eq!(describe(&s), "Running backup of Docs 50%");
     }

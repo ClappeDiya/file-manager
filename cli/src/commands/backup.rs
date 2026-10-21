@@ -255,6 +255,10 @@ pub enum DbCommands {
     },
     /// Reclaim free space in a job database
     Vacuum { dbpath: PathBuf },
+    /// Integrity and reference checks (exit 2 when problems are found)
+    Check { dbpath: PathBuf },
+    /// Copy for a bug report: paths hashed, job-config snapshots removed
+    Sanitize { dbpath: PathBuf, out: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -507,16 +511,29 @@ pub fn parse_retention(keep_versions: Option<u32>, keep_days: Option<u32>, polic
 
 fn progress_ctx(format: &OutputFormat) -> OpContext {
     let ctx = OpContext::new();
-    if matches!(format, OutputFormat::Human) {
+    let human = matches!(format, OutputFormat::Human);
+    if human {
         cancel_on_ctrl_c(ctx.clone());
-        ctx.with_progress(|p| {
-            if let Some(path) = &p.current_path {
+    }
+    ctx.with_progress(move |p| {
+        if let Some(path) = &p.current_path {
+            tracing::trace!(phase = ?p.phase, done = p.files_processed, total = p.files_total, "{path}");
+            if human {
                 eprint!("\r\x1b[2K{:?} {}/{} {}", p.phase, p.files_processed, p.files_total, truncate(path, 70));
             }
-        })
-    } else {
-        ctx
+        }
+    })
+}
+
+/// Send an operation's warnings and errors to the console/file log.
+fn log_outcome(op: &str, warnings: &[String], errors: &[String]) {
+    for w in warnings {
+        tracing::warn!(target: "ufop::backup", "{op}: {w}");
     }
+    for e in errors {
+        tracing::error!(target: "ufop::backup", "{op}: {e}");
+    }
+    tracing::info!(target: "ufop::backup", "{op} finished: {} warning(s), {} error(s)", warnings.len(), errors.len());
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -606,6 +623,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             let db = BackupDb::open(&repo.db_path())?;
             let srcs: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
             let r = run_backup(&be, &db, &srcs, &filter, &opts, &retention, pass.as_deref(), KdfParams::default(), &progress_ctx(format))?;
+            log_outcome("backup", &r.warnings, &r.errors);
             ok(emit(format, "Backup finished", &r))?;
             Ok(if !r.errors.is_empty() || r.partial { 2 } else if !r.warnings.is_empty() { 1 } else { 0 })
         }
@@ -646,6 +664,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             }
             let r = Repo::open(&be, &db, pass.as_deref(), &repo.options(), false, KdfParams::default())?;
             let rep = run_restore(&r, &opts, &progress_ctx(format))?;
+            log_outcome("restore", &rep.warnings, &rep.errors);
             ok(emit(format, "Restore finished", &rep))?;
             Ok(if rep.errors.is_empty() { 0 } else { 1 })
         }
@@ -759,6 +778,16 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
                 ok(emit(format, "Database vacuumed", &serde_json::json!({ "bytes_before": before, "bytes_after": after })))?;
                 Ok(0)
             }
+            DbCommands::Check { dbpath } => {
+                let problems = BackupDb::open(&dbpath)?.integrity_problems()?;
+                ok(emit(format, "Database check", &serde_json::json!({ "ok": problems.is_empty(), "problems": problems })))?;
+                Ok(if problems.is_empty() { 0 } else { 2 })
+            }
+            DbCommands::Sanitize { dbpath, out } => {
+                let r = BackupDb::open(&dbpath)?.export_sanitized(&out)?;
+                ok(emit(format, "Sanitized copy written", &serde_json::json!({ "out": out, "paths_obfuscated": r.paths_obfuscated, "settings_removed": r.settings_removed })))?;
+                Ok(0)
+            }
         },
         BackupCommands::SnapshotTest { sources, engine } => {
             let srcs: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
@@ -803,34 +832,23 @@ mod tests {
         let src = t.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("f.txt"), b"cli").unwrap();
-        let repo = RepoArgs {
-            dest: t.path().join("dest").to_string_lossy().into(),
-            dbpath: Some(t.path().join("db.sqlite")),
-            passphrase: Some("pw".into()),
-            passphrase_env: "UNUSED".into(),
-            no_encryption: false,
-            prefix: "ufop".into(),
-        };
-        let code = run(
-            BackupCommands::Run {
-                repo: repo.clone(), sources: vec![src.to_string_lossy().into()], include: vec![], exclude: vec!["*.tmp".into()],
-                exclude_hidden: false, skip_files_larger_than: None, block_size: 4096, volume_size: 1 << 20, compression_level: 6,
-                keep_versions: None, keep_days: None, retention_policy: None, verify_samples: 1, upload_unchanged: false, no_auto_compact: false,
-            },
-            &OutputFormat::Json,
-            false,
-        )
-        .unwrap();
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(subcommand)]
+            c: BackupCommands,
+        }
+        let parse = |args: &[&str]| <T as clap::Parser>::try_parse_from(std::iter::once("t").chain(args.iter().copied())).unwrap().c;
+        let dest = t.path().join("dest").to_string_lossy().into_owned();
+        let db = t.path().join("db.sqlite").to_string_lossy().into_owned();
+        let src_s = src.to_string_lossy().into_owned();
+        let run_cmd = parse(&["run", "--dest", &dest, "--dbpath", &db, "--passphrase", "pw", "--source", &src_s, "--exclude", "*.tmp", "--block-size", "4096", "--verify-samples", "1", "--no-quota-warning"]);
+        let code = run(run_cmd, &OutputFormat::Json, false).unwrap();
         assert_eq!(code, 0);
-        let fresh = RepoArgs { dbpath: Some(t.path().join("missing.sqlite")), ..repo };
+        let missing = t.path().join("missing.sqlite").to_string_lossy().into_owned();
         let out = t.path().join("out");
-        let code = run(
-            BackupCommands::Restore { repo: fresh, paths: vec![], version: 0, target: Some(out.clone()), conflict: "overwrite".into(),
-                restore_permissions: false, preserve_full_paths: false, skip_verify: false },
-            &OutputFormat::Json,
-            false,
-        )
-        .unwrap();
+        let out_s = out.to_string_lossy().into_owned();
+        let restore_cmd = parse(&["restore", "--dest", &dest, "--dbpath", &missing, "--passphrase", "pw", "--target", &out_s, "--conflict", "overwrite"]);
+        let code = run(restore_cmd, &OutputFormat::Json, false).unwrap();
         assert_eq!(code, 0);
         assert_eq!(std::fs::read(out.join("src/f.txt")).unwrap(), b"cli");
     }

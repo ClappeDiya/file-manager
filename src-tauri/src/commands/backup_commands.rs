@@ -213,6 +213,21 @@ pub async fn backup_cleanup_databases(delete_orphans: bool, vacuum: bool, mgr: S
 }
 
 #[tauri::command]
+pub async fn backup_test_notification(notification: crate::backup_engine::notify::Notification, mgr: State<'_, BackupManager>) -> Result<(), AppError> {
+    mgr.test_notification(notification).await
+}
+
+#[tauri::command]
+pub async fn backup_bug_report(job_id: String, out_path: String, mgr: State<'_, BackupManager>) -> Result<crate::backup_engine::bugreport::BugReport, AppError> {
+    mgr.bug_report(&job_id, out_path).await
+}
+
+#[tauri::command]
+pub async fn backup_diagnose(job_id: String, network: Option<bool>, throughput_kb: Option<u32>, mgr: State<'_, BackupManager>) -> Result<crate::backup_engine::diagnostics::Diagnostics, AppError> {
+    mgr.diagnose(&job_id, network.unwrap_or(true), throughput_kb.unwrap_or(0)).await
+}
+
+#[tauri::command]
 pub async fn backup_recovery_download(destination: BackupDestination, passphrase: Option<String>, prefix: Option<String>, folder: String, options: Option<recovery::DownloadOptions>, mgr: State<'_, BackupManager>) -> Result<recovery::DownloadReport, AppError> {
     mgr.recovery_download(destination, passphrase, prefix.unwrap_or_else(|| "ufop".into()), folder, options.unwrap_or_default()).await
 }

@@ -397,9 +397,12 @@ export function SyncPanel() {
 
   // ── Load Reports ──
 
-  const handleViewReports = async (pairId: string) => {
+  // Stored history (survives restarts); falls back to this session's runs.
+  const handleViewReports = async (pairId: string | null) => {
     try {
-      const result = await tauriInvoke<SyncReport[]>("get_sync_reports", { pairId });
+      const result = await tauriInvoke<SyncReport[]>("get_sync_run_history", { pairId, limit: 200 }).catch(() =>
+        pairId ? tauriInvoke<SyncReport[]>("get_sync_reports", { pairId }) : Promise.resolve([] as SyncReport[]),
+      );
       setReports(result);
       setView("reports");
     } catch (e: any) {
@@ -467,6 +470,17 @@ export function SyncPanel() {
             aria-label="Pair list view"
           >
             List
+          </button>
+          <button
+            onClick={() => void handleViewReports(null)}
+            className={`px-2 py-1 text-xs rounded ${
+              view === "reports"
+                ? "bg-blue-500 text-white"
+                : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+            }`}
+            aria-label="Run history"
+          >
+            History
           </button>
           <button
             onClick={() => setView("create")}

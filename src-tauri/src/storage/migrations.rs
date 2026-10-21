@@ -92,8 +92,27 @@ fn all_migrations() -> Vec<Migration> {
             description: "Sync pairs - destination-state mode and checksum algorithm",
             sql: V15_SCHEMA,
         },
+        Migration {
+            version: 16,
+            description: "Sync run history",
+            sql: V16_SCHEMA,
+        },
     ]
 }
+
+/// Schema v16: every finished sync run, kept across restarts.
+const V16_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id TEXT PRIMARY KEY,
+    pair_id TEXT NOT NULL,
+    pair_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    report_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sync_runs_pair ON sync_runs(pair_id, started_at DESC);
+"#;
 
 /// Schema v15: how a sync pair learns the destination state (scan, trusted
 /// inventory, blind upload) and which hash full verification uses.
@@ -730,7 +749,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 15);
+        assert_eq!(applied, 16);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -762,7 +781,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 15);
+        assert_eq!(first, 16);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -775,7 +794,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 15);
+        assert_eq!(current_version(&conn).unwrap(), 16);
     }
 
     #[test]

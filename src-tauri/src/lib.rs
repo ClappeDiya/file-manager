@@ -129,6 +129,9 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     if let Err(e) = sync_mgr.load_pairs_from_db(&repo).await {
         tracing::warn!("Failed to load sync pairs (non-fatal): {e}");
     }
+    if let Err(e) = sync_mgr.load_reports_from_db(&repo, 50).await {
+        tracing::warn!("Failed to load sync run history (non-fatal): {e}");
+    }
 
     // Initialize peer manager (T-031) and server transfer manager (T-033)
     let peer_mgr = PeerManager::new();
@@ -555,6 +558,9 @@ pub fn run() {
             backup_commands::backup_adopt_repository,
             backup_commands::backup_database_inventory,
             backup_commands::backup_cleanup_databases,
+            backup_commands::backup_bug_report,
+            backup_commands::backup_test_notification,
+            backup_commands::backup_diagnose,
             backup_commands::backup_recovery_download,
             backup_commands::backup_recovery_index,
             backup_commands::backup_recovery_list,
@@ -575,6 +581,8 @@ pub fn run() {
             sync_commands::list_sync_pairs,
             sync_commands::update_sync_pair,
             sync_commands::run_sync,
+            sync_commands::get_sync_run_history,
+            sync_commands::prune_sync_run_history,
             sync_commands::get_sync_health,
             sync_commands::sync_dry_run,
             sync_commands::export_sync_preview_csv,

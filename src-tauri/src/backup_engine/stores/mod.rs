@@ -159,6 +159,29 @@ impl CloudConfig {
         }
     }
 
+    /// The service's network endpoint `(host, port, tls)` for diagnostics;
+    /// `None` for rclone (the remote is opaque).
+    pub fn network_endpoint(&self) -> Option<(String, u16, bool)> {
+        let or = |v: &str, d: String| if v.trim().is_empty() { d } else { v.trim().to_string() };
+        let url = match self {
+            Self::S3(c) => or(&c.endpoint, s3::preset_endpoint(&c.preset, &c.region).or_else(|| s3::preset_endpoint("aws", &c.region)).unwrap_or_default()),
+            Self::Azure(c) => or(&c.endpoint, format!("https://{}.blob.core.windows.net", c.account)),
+            Self::Gcs(c) => or(&c.endpoint, "https://storage.googleapis.com".into()),
+            Self::B2(c) => or(&c.api_url, "https://api.backblazeb2.com".into()),
+            Self::Swift(c) => c.auth_url.clone(),
+            Self::Dropbox(c) => or(&c.api_base, "https://api.dropboxapi.com".into()),
+            Self::GoogleDrive(c) => or(&c.api_base, "https://www.googleapis.com".into()),
+            Self::Box(c) => or(&c.api_base, "https://api.box.com".into()),
+            Self::Pcloud(c) => or(&c.api_base, if c.region == "eu" { "https://eapi.pcloud.com".into() } else { "https://api.pcloud.com".into() }),
+            Self::OneDrive(c) => or(&c.api_base, "https://graph.microsoft.com".into()),
+            Self::TahoeLafs(c) => c.node_url.clone(),
+            Self::Rclone(_) => return None,
+            Self::Smb(c) => return Some((c.server.clone(), c.port.unwrap_or(445), false)),
+        };
+        let u = url::Url::parse(&url).ok()?;
+        Some((u.host_str()?.to_string(), u.port_or_known_default()?, u.scheme() == "https"))
+    }
+
     pub fn describe(&self) -> String {
         match self {
             Self::S3(c) => format!("s3://{}/{}", c.bucket, c.prefix),

@@ -6910,6 +6910,7 @@ dependencies = [
  "ring",
  "rusqlite",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha1",
@@ -6930,6 +6931,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-rustls",
  "tower-http",
  "tracing",
  "tracing-appender",
@@ -6939,10 +6941,12 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "webpki-roots",
  "windows-service",
  "windows-sys 0.59.0",
  "xxhash-rust",
  "zeroize",
+ "zip 2.6.1",
 ]
 
 [[package]]

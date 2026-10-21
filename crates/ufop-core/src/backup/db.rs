@@ -52,6 +52,46 @@ CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
 
+/// What [`BackupDb::export_sanitized`] changed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SanitizeReport {
+    pub paths_obfuscated: u64,
+    pub settings_removed: u64,
+}
+
+/// Replace each component of a path with a short salted hash, keeping the
+/// separators and a short alphanumeric extension.
+pub fn obfuscate_path(path: &str, salt: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut out = String::with_capacity(path.len());
+    let mut part = String::new();
+    let flush = |part: &mut String, out: &mut String| {
+        if part.is_empty() {
+            return;
+        }
+        let ext = part.rsplit_once('.').map(|(stem, e)| (stem, e)).filter(|(stem, e)| !stem.is_empty() && e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric())).map(|(_, e)| e.to_string());
+        let mut h = Sha256::new();
+        h.update(salt);
+        h.update(part.as_bytes());
+        out.push_str(&hex::encode(&h.finalize()[..6]));
+        if let Some(e) = ext {
+            out.push('.');
+            out.push_str(&e);
+        }
+        part.clear();
+    };
+    for ch in path.chars() {
+        if ch == '/' || ch == '\\' {
+            flush(&mut part, &mut out);
+            out.push(ch);
+        } else {
+            part.push(ch);
+        }
+    }
+    flush(&mut part, &mut out);
+    out
+}
+
 /// Current job-database schema version (`PRAGMA user_version`).
 pub const SCHEMA_VERSION: i32 = 2;
 
@@ -451,6 +491,34 @@ impl BackupDb {
         Ok(())
     }
 
+    /// Copy this database to `out` for a bug report: every path component and
+    /// symlink target is replaced by a salted hash (extensions kept), extended
+    /// metadata (ACLs, xattrs) is cleared, and job-config snapshots and change-journal state are dropped.
+    pub fn export_sanitized(&self, out: &Path) -> Result<SanitizeReport, AppError> {
+        if out.exists() {
+            std::fs::remove_file(out)?;
+        }
+        self.conn.execute("VACUUM INTO ?1", [out.to_string_lossy()])?;
+        let mut c = Connection::open(out)?;
+        let salt: [u8; 16] = rand::random();
+        let tx = c.transaction()?;
+        let mut rep = SanitizeReport::default();
+        {
+            let rows: Vec<(i64, String, Option<String>)> =
+                tx.prepare("SELECT id, path, symlink_target FROM files")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+            let mut up = tx.prepare("UPDATE files SET path = ?2, symlink_target = ?3, meta = NULL WHERE id = ?1")?;
+            for (id, path, target) in rows {
+                up.execute(params![id, obfuscate_path(&path, &salt), target.map(|t| obfuscate_path(&t, &salt))])?;
+                rep.paths_obfuscated += 1;
+            }
+            rep.settings_removed = tx.execute("DELETE FROM kv WHERE key LIKE 'dlist_extra:%' OR key = 'usn_state'", [])? as u64;
+            tx.execute("INSERT OR REPLACE INTO kv(key, value) VALUES ('bug_report_created', ?1)", [chrono::Utc::now().to_rfc3339()])?;
+        }
+        tx.commit()?;
+        c.execute_batch("VACUUM")?;
+        Ok(rep)
+    }
+
     /// SQLite VACUUM.
     pub fn vacuum(&self) -> Result<(), AppError> {
         Ok(self.conn.execute_batch("VACUUM")?)
@@ -503,5 +571,31 @@ mod tests {
         Connection::open(&p).unwrap().execute_batch("PRAGMA user_version = 99").unwrap();
         assert!(BackupDb::open(&p).is_err());
         assert!(BackupDb::migrate(&d.path().join("missing.sqlite"), false).is_err());
+    }
+
+    #[test]
+    fn sanitized_export_hides_paths_and_config() {
+        let d = tempfile::tempdir().unwrap();
+        let db = BackupDb::open(&d.path().join("job.sqlite")).unwrap();
+        let f = |p: &str, t: Option<&str>| FileEntry { path: p.into(), kind: EntryKind::File, size: 3, mtime: None, mode: None, hash: None, blocks: vec![], symlink_target: t.map(String::from), meta: None };
+        db.add_fileset("2026-01-01T00:00:00Z", "v.dlist", false, &[f("/home/alice/Secret Plans/budget.xlsx", None), f("C:\\Users\\alice\\link", Some("/home/alice/zzlinkdest"))]).unwrap();
+        db.set_kv("dlist_extra:2026", "{\"task_config\":\"password=hunter2\"}").unwrap();
+        db.set_kv("index:b1", "i1").unwrap();
+        let out = d.path().join("report.sqlite");
+        let rep = db.export_sanitized(&out).unwrap();
+        assert_eq!((rep.paths_obfuscated, rep.settings_removed), (2, 1));
+        let bytes = std::fs::read(&out).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        for leak in ["alice", "Secret", "budget", "hunter2", "zzlinkdest"] {
+            assert!(!text.contains(leak), "{leak} leaked into the bug report");
+        }
+        let r = BackupDb::open(&out).unwrap();
+        let files = r.files(r.filesets().unwrap()[0].id).unwrap();
+        assert!(files.iter().any(|e| e.path.starts_with('/') && e.path.ends_with(".xlsx") && e.path.matches('/').count() == 4));
+        assert!(files.iter().any(|e| e.path.matches('\\').count() == 3));
+        assert_eq!(r.get_kv("index:b1").unwrap().as_deref(), Some("i1"), "volume bookkeeping kept");
+        // Same component, same hash within one report.
+        let salt = [1u8; 16];
+        assert_eq!(obfuscate_path("/a/b", &salt).split('/').nth(1), obfuscate_path("/a/c", &salt).split('/').nth(1));
     }
 }

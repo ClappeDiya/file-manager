@@ -9,9 +9,13 @@
 //! callbacks, run history (`backup_runs`) and the operation ledger.
 
 pub mod api;
+pub mod bugreport;
 pub mod connector_backend;
 pub mod defaults;
+pub mod diagnostics;
 pub mod hooks;
+pub mod logs;
+pub mod notify;
 pub mod policy;
 pub mod portability;
 pub mod power;
@@ -209,6 +213,12 @@ pub struct BackupJob {
     /// Extra destinations kept in sync with the primary.
     #[serde(default)]
     pub replicas: Vec<Replica>,
+    /// Email / Telegram / XMPP notifications.
+    #[serde(default)]
+    pub notifications: Vec<notify::Notification>,
+    /// Log file and system log outputs.
+    #[serde(default)]
+    pub log_outputs: logs::LogOutputs,
     /// Keep the computer awake while this job's operations run.
     pub prevent_sleep: bool,
     /// Results that raise a desktop notification: `success`, `warning`, `error`.
@@ -242,6 +252,8 @@ impl Default for BackupJob {
             network_timeout_secs: 0,
             local_transfer: LocalTransfer::default(),
             replicas: Vec::new(),
+            notifications: Vec::new(),
+            log_outputs: logs::LogOutputs::default(),
             prevent_sleep: true,
             notify_on: vec!["warning".into(), "error".into()],
             created_at: now.clone(),
@@ -286,6 +298,20 @@ impl BackupJob {
                 if minutes < 5 {
                     return Err(AppError::validation("Replica intervals must be at least 5 minutes"));
                 }
+            }
+        }
+        self.log_outputs.file_filter.validate()?;
+        self.log_outputs.system_filter.validate()?;
+        for n in &self.notifications {
+            match &n.channel {
+                notify::Channel::Email { host, from, to, .. } if host.trim().is_empty() || from.trim().is_empty() || to.is_empty() => {
+                    return Err(AppError::validation("Email notifications need a server, a sender and at least one recipient"))
+                }
+                notify::Channel::Telegram { chat_id, .. } if chat_id.trim().is_empty() => return Err(AppError::validation("Telegram notifications need a chat id")),
+                notify::Channel::Xmpp { jid, to, .. } if !jid.contains('@') || to.trim().is_empty() => {
+                    return Err(AppError::validation("XMPP notifications need an account (user@domain) and a recipient"))
+                }
+                _ => {}
             }
         }
         if self.remote_config_include_secrets && !self.encrypted {
@@ -432,6 +458,26 @@ pub struct TaskInfo {
     pub queued_at: String,
     pub started_at: Option<String>,
     pub progress: Option<Progress>,
+    /// Seconds since the task started running.
+    #[serde(default)]
+    pub elapsed_secs: u64,
+    /// Average throughput while running (bytes/second).
+    #[serde(default)]
+    pub bytes_per_sec: u64,
+    /// Estimated seconds left, from the share of items already done.
+    #[serde(default)]
+    pub eta_secs: Option<u64>,
+}
+
+/// (bytes/second, ETA) from progress and elapsed time.
+pub fn progress_rate(p: &Progress, elapsed_secs: f64) -> (u64, Option<u64>) {
+    if elapsed_secs < 0.5 {
+        return (0, None);
+    }
+    let rate = (p.bytes_processed as f64 / elapsed_secs) as u64;
+    let eta = (p.files_total > 0 && p.files_processed > 0 && p.files_processed < p.files_total)
+        .then(|| (elapsed_secs * (p.files_total - p.files_processed) as f64 / p.files_processed as f64) as u64);
+    (rate, eta)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1205,6 +1251,9 @@ impl BackupManager {
                 queued_at: Utc::now().to_rfc3339(),
                 started_at: None,
                 progress: None,
+                elapsed_secs: 0,
+                bytes_per_sec: 0,
+                eta_secs: None,
             },
             cancel: cancel.clone(),
             progress: progress.clone(),
@@ -1469,13 +1518,38 @@ impl BackupManager {
         vars.insert("files".into(), report.get("files_examined").map(|v| v.to_string()).unwrap_or_default());
         vars.insert("bytes".into(), report.get("bytes_uploaded").map(|v| v.to_string()).unwrap_or_default());
         vars.insert("errors".into(), err.clone().unwrap_or_default());
+        for p in logs::write_run(&job.log_outputs, &job.name, op, &status, &summary, &log) {
+            tracing::warn!("{p}");
+        }
+        let lines: Vec<&LogLine> = log.iter().filter(|l| l.level >= job.reports.min_log_level).take(job.reports.max_log_lines).collect();
         let mut payload = report.clone();
         if let Some(o) = payload.as_object_mut() {
-            let lines: Vec<&LogLine> = log.iter().take(job.reports.max_log_lines).collect();
-            o.insert("log".into(), serde_json::to_value(lines).unwrap_or_default());
+            o.insert("log".into(), serde_json::to_value(&lines).unwrap_or_default());
+        }
+        let mut text = format!("{summary}\n");
+        for l in &lines {
+            text.push_str(&format!("{:?}: {}\n", l.level, l.message));
+        }
+        if job.reports.redact_paths {
+            // Redact through the serialized form so every string is covered.
+            let red = notify::redact_paths(&payload.to_string(), &job.sources);
+            payload = serde_json::from_str(&red).unwrap_or(payload);
+            text = notify::redact_paths(&text, &job.sources);
+            for v in vars.values_mut() {
+                *v = notify::redact_paths(v, &job.sources);
+            }
         }
         for f in hooks::send_reports(&job.reports, &status, &vars, payload).await {
             tracing::warn!("{f}");
+        }
+        if !job.notifications.is_empty() {
+            let mut list = Vec::new();
+            for n in &job.notifications {
+                list.push((n.clone(), self.destination_secret(&n.credential_id).await.unwrap_or(None)));
+            }
+            for f in notify::deliver(&list, &status, &vars, &text).await {
+                tracing::warn!("Notification failed: {f}");
+            }
         }
         if let Some(n) = self.inner.notifier.get() {
             if job.notify_on.iter().any(|s| s == &status) {
@@ -1673,6 +1747,94 @@ impl BackupManager {
         .await
     }
 
+    /// Send a test message through one notification channel.
+    pub async fn test_notification(&self, mut n: notify::Notification) -> Result<(), AppError> {
+        let secret = self.destination_secret(&n.credential_id).await?;
+        n.send_on = vec!["test".into()];
+        let vars: std::collections::BTreeMap<String, String> =
+            [("name", "Test"), ("operation", "test"), ("result", "test"), ("machine", "this computer")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        match notify::deliver(&[(n, secret)], "test", &vars, "This is a test notification from UFOP.").await.into_iter().next() {
+            Some(e) => Err(AppError::validation(e)),
+            None => Ok(()),
+        }
+    }
+
+    // ── Support: bug reports and diagnostics ──
+
+    /// Write a sanitized bug-report zip for a job (see [`bugreport`]).
+    pub async fn bug_report(&self, job_id: &str, out_path: String) -> Result<bugreport::BugReport, AppError> {
+        if out_path.trim().is_empty() {
+            return Err(AppError::validation("Choose where to save the bug report"));
+        }
+        let job = self.get_job(job_id).await?;
+        let runs = self.run_history(Some(job_id.to_string()), 20).await?;
+        let db = self.job_db_path(job_id);
+        blocking(move || {
+            let log = job.log_outputs.file.clone().filter(|f| !f.trim().is_empty()).map(PathBuf::from);
+            bugreport::create(Path::new(&out_path), &job, &db, &runs, log.as_deref())
+        })
+        .await
+    }
+
+    /// The network endpoint behind a destination, for diagnostics.
+    async fn destination_endpoint(&self, dest: &BackupDestination) -> Result<Option<(String, u16, bool)>, AppError> {
+        Ok(match self.resolve_destination(dest).await? {
+            BackupDestination::Cloud { config, .. } => config.network_endpoint(),
+            BackupDestination::Connection { connection_id, .. } => {
+                let Some(conns) = self.inner.conns.as_ref() else { return Ok(None) };
+                let Ok(id) = uuid::Uuid::parse_str(&connection_id) else { return Ok(None) };
+                conns.get_connection(id).await?.and_then(|p| {
+                    use crate::core::types::ConnectionProtocol as P;
+                    let (port, tls) = match p.protocol {
+                        P::Sftp => (22, false),
+                        P::Ftp => (21, false),
+                        P::Ftps => (990, false),
+                        P::WebDav | P::S3 | P::GoogleDrive | P::Dropbox | P::OneDrive | P::AzureBlob | P::Swift => (443, true),
+                        P::Smb => (445, false),
+                        P::Nfs => (2049, false),
+                        P::Local => return None,
+                    };
+                    let host = p.host.trim_start_matches("https://").trim_start_matches("http://").split('/').next().unwrap_or_default().to_string();
+                    (!host.is_empty()).then(|| (host, p.port.unwrap_or(port), tls))
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// Check the job database against the destination and measure the
+    /// network path. `throughput_kb` = 0 skips the upload/download test.
+    pub async fn diagnose(&self, job_id: &str, network: bool, throughput_kb: u32) -> Result<diagnostics::Diagnostics, AppError> {
+        let job = self.effective_job(job_id).await?;
+        let mut d = diagnostics::Diagnostics::default();
+        if network {
+            if let Some((host, port, tls)) = self.destination_endpoint(&job.destination).await? {
+                let timeout = std::time::Duration::from_secs(if job.network_timeout_secs > 0 { job.network_timeout_secs } else { 15 });
+                d.network = Some(diagnostics::probe(&host, port, tls, &notify::CertPolicy::default(), timeout).await);
+            }
+        }
+        let backend = self.build_backend(&job).await?;
+        let path = self.job_db_path(job_id);
+        let prefix = job.options.prefix.clone();
+        let size = (throughput_kb.min(64 * 1024) as usize) * 1024;
+        let (db, thr) = blocking(move || {
+            let db = if path.is_file() {
+                BackupDb::open(&path).and_then(|db| diagnostics::check_database(&db, BackupDb::inspect(&path).ok(), backend.as_ref(), &prefix)).map_err(|e| e.user_message())
+            } else {
+                Err("This job has no local database yet; run a backup or repair it first".to_string())
+            };
+            let thr = (size > 0).then(|| diagnostics::throughput(backend.as_ref(), size));
+            Ok((db, thr))
+        })
+        .await?;
+        match db {
+            Ok(c) => d.database = Some(c),
+            Err(e) => d.database_error = Some(e),
+        }
+        d.throughput = thr;
+        Ok(d)
+    }
+
     // ── Recovery tool (no job database needed) ──
 
     pub async fn recovery_download(&self, dest: BackupDestination, passphrase: Option<String>, prefix: String, folder: String, opts: recovery::DownloadOptions) -> Result<recovery::DownloadReport, AppError> {
@@ -1743,7 +1905,12 @@ impl BackupManager {
     pub async fn status(&self) -> SchedulerStatus {
         let tasks = lock(&self.inner.tasks)
             .iter()
-            .map(|t| TaskInfo { progress: lock(&t.progress).clone(), ..t.info.clone() })
+            .map(|t| {
+                let progress = lock(&t.progress).clone();
+                let elapsed = t.info.started_at.as_deref().and_then(parse_ts).map(|s| (Utc::now() - s).num_milliseconds().max(0) as f64 / 1000.0).unwrap_or(0.0);
+                let (bytes_per_sec, eta_secs) = progress.as_ref().map(|p| progress_rate(p, elapsed)).unwrap_or((0, None));
+                TaskInfo { progress, elapsed_secs: elapsed as u64, bytes_per_sec, eta_secs, ..t.info.clone() }
+            })
             .collect();
         let paused = self.is_paused();
         let paused_until = lock(&self.inner.paused).and_then(|p| p.map(|t| t.to_rfc3339()));

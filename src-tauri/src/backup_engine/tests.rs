@@ -414,3 +414,159 @@ async fn cloud_destination_through_manager() {
     assert!(m.set_destination_secret("", "x").await.is_err());
     assert!(serde_json::to_value(stores::PROVIDERS).unwrap().as_array().unwrap().len() >= 13);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_logs_notifications_and_redaction() {
+    use axum::{routing::post, Json, Router};
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let s2 = seen.clone();
+    let app = Router::new()
+        .route("/botTOK/sendMessage", post({ let s = s2.clone(); move |Json(v): Json<serde_json::Value>| { let s = s.clone(); async move { s.lock().unwrap().push(v); Json(serde_json::json!({ "ok": true })) } } }))
+        .route("/hook", post(move |Json(v): Json<serde_json::Value>| { let s = s2.clone(); async move { s.lock().unwrap().push(v); Json(serde_json::json!({})) } }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("secret-src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"x").unwrap();
+    let m = manager(t.path()).await;
+    let mut jb = job(&src, &dst);
+    jb.encrypted = false;
+    jb.sources.push(src.join("missing").to_string_lossy().into()); // → warning mentioning a path
+    jb.options.missing_source = ufop_core::backup::MissingSourcePolicy::Warn;
+    let log_path = t.path().join("logs/run.log");
+    jb.log_outputs = logs::LogOutputs { file: Some(log_path.to_string_lossy().into()), ..Default::default() };
+    jb.reports.http_urls = vec![format!("{base}/hook")];
+    jb.reports.send_on = vec!["warning".into()];
+    jb.reports.redact_paths = true;
+    jb.notifications = vec![notify::Notification {
+        channel: notify::Channel::Telegram { chat_id: "42".into(), api_base: base.clone() },
+        send_on: vec!["warning".into()],
+        credential_id: "tg".into(),
+        template: String::new(),
+        cert: Default::default(),
+    }];
+    m.set_destination_secret("tg", "TOK").await.unwrap();
+    let j = m.save_job(jb, None).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "warning", "{:?}", r.log);
+    let file = std::fs::read_to_string(&log_path).unwrap();
+    assert!(file.contains("backup warning") && file.contains("missing"), "{file}");
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got.len(), 2, "webhook + telegram");
+    let all = serde_json::to_string(&got).unwrap();
+    assert!(!all.contains("secret-src"), "paths redacted: {all}");
+    assert!(all.contains("[source:"));
+}
+
+#[test]
+fn progress_rate_and_eta() {
+    let p = Progress { phase: ufop_core::backup::Phase::Uploading, files_processed: 25, files_total: 100, bytes_processed: 10_000_000, current_path: None };
+    let (rate, eta) = progress_rate(&p, 10.0);
+    assert_eq!(rate, 1_000_000);
+    assert_eq!(eta, Some(30));
+    assert_eq!(progress_rate(&p, 0.1), (0, None), "too early to estimate");
+    let done = Progress { files_processed: 100, ..p };
+    assert_eq!(progress_rate(&done, 10.0).1, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bug_report_is_sanitized_and_diagnostics_detect_problems() {
+    use std::io::Read;
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("alicesecret"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("budgetzz.txt"), b"numbers").unwrap();
+    let m = manager(t.path()).await;
+    let mut jb = job(&src, &dst);
+    jb.reports.http_urls = vec!["https://hooks.example.com/notify?token=tok3n".into()];
+    jb.reports.extra_fields.insert("api_key".into(), "k3y".into());
+    jb.notifications = vec![notify::Notification {
+        channel: notify::Channel::Email { host: "smtp.example.com".into(), port: None, tls: Default::default(), username: "alice@example.com".into(), from: "alice@example.com".into(), to: vec!["bob@example.com".into()], subject: "s".into() },
+        send_on: vec!["error".into()],
+        credential_id: "c".into(),
+        template: String::new(),
+        cert: Default::default(),
+    }];
+    jb.log_outputs.file = Some(t.path().join("job.log").to_string_lossy().into());
+    let j = m.save_job(jb, Some("pw".into())).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+
+    let out = t.path().join("reports/bug.zip");
+    let rep = m.bug_report(&j.id, out.to_string_lossy().into()).await.unwrap();
+    assert!(rep.size > 0 && rep.paths_obfuscated >= 2 && rep.runs_included == 1);
+    for f in ["job.json", "runs.json", "database.sqlite", "system.json", "job.log"] {
+        assert!(rep.files.iter().any(|x| x == f), "{f} missing from {:?}", rep.files);
+    }
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+    let mut all = String::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).unwrap();
+        let mut b = Vec::new();
+        f.read_to_end(&mut b).unwrap();
+        let text = String::from_utf8_lossy(&b).into_owned();
+        for leak in ["alicesecret", "budgetzz", "tok3n", "k3y", "alice@example.com", "bob@example.com", t.path().to_str().unwrap()] {
+            let at = text.find(leak).map(|p| &text[p.saturating_sub(60)..(p + 60).min(text.len())]);
+            assert!(at.is_none(), "{leak} leaked into {}: {at:?}", f.name());
+        }
+        all.push_str(&text);
+    }
+    let text = all;
+    assert!(text.contains("hooks.example.com") && text.contains("app_version"));
+    assert!(m.bug_report(&j.id, " ".into()).await.is_err());
+
+    // Diagnostics: healthy, then a missing volume and an untracked file.
+    let d = m.diagnose(&j.id, true, 64).await.unwrap();
+    let db = d.database.clone().unwrap();
+    assert!(db.ok(), "{db:?}");
+    assert!(db.tracked_volumes >= 2 && d.network.is_none(), "local destinations have no network endpoint");
+    let thr = d.throughput.unwrap();
+    assert!(thr.verified && thr.error.is_none() && thr.list_ms.len() == 3 && thr.upload_bps > 0);
+    assert!(!std::fs::read_dir(&dst).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains("diagnostic")), "test file removed");
+    let vol = std::fs::read_dir(&dst).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).find(|n| n.contains("dblock")).unwrap();
+    std::fs::remove_file(dst.join(&vol)).unwrap();
+    std::fs::write(dst.join("ufop-stray.bin"), b"x").unwrap();
+    let db = m.diagnose(&j.id, false, 0).await.unwrap().database.unwrap();
+    assert_eq!(db.missing_remote, vec![vol]);
+    assert_eq!(db.untracked_remote, vec!["ufop-stray.bin".to_string()]);
+    assert!(!db.ok());
+}
+
+#[tokio::test]
+async fn network_probe_times_dns_tcp_and_tls() {
+    // Plain TCP against a local listener.
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move { while let Ok((_s, _)) = l.accept().await {} });
+    let n = diagnostics::probe("localhost", port, false, &notify::CertPolicy::default(), std::time::Duration::from_secs(5)).await;
+    assert!(n.error.is_none() && n.dns_ms.is_some() && n.tcp_ms.is_some() && !n.addresses.is_empty(), "{n:?}");
+    // TLS against a non-TLS listener fails the handshake but keeps the timings.
+    let n = diagnostics::probe("localhost", port, true, &notify::CertPolicy::default(), std::time::Duration::from_secs(2)).await;
+    assert!(n.tcp_ms.is_some() && n.tls_ms.is_none() && n.error.is_some());
+    let n = diagnostics::probe("no-such-host.invalid", 443, true, &notify::CertPolicy::default(), std::time::Duration::from_secs(5)).await;
+    assert!(n.error.unwrap().contains("DNS"));
+    // Endpoint mapping.
+    let s3 = stores::CloudConfig::S3(stores::s3::S3Config { region: "eu-west-1".into(), ..Default::default() });
+    assert_eq!(s3.network_endpoint(), Some(("s3.eu-west-1.amazonaws.com".into(), 443, true)));
+    let tahoe = stores::CloudConfig::TahoeLafs(stores::tahoe::TahoeConfig { node_url: "http://127.0.0.1:3456".into(), ..Default::default() });
+    assert_eq!(tahoe.network_endpoint(), Some(("127.0.0.1".into(), 3456, false)));
+}
+
+#[tokio::test]
+async fn test_notification_reports_channel_errors() {
+    let t = tempfile::tempdir().unwrap();
+    let m = manager(t.path()).await;
+    let n = notify::Notification {
+        channel: notify::Channel::Telegram { chat_id: "1".into(), api_base: String::new() },
+        send_on: vec![],
+        credential_id: "tg-missing".into(),
+        template: String::new(),
+        cert: Default::default(),
+    };
+    // Sent regardless of `send_on`; a missing bot token is reported, not swallowed.
+    let e = m.test_notification(n).await.unwrap_err();
+    assert!(e.user_message().contains("bot token is missing"), "{}", e.user_message());
+}

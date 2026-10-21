@@ -218,6 +218,96 @@ export interface ReportConfig {
   machine_name: string | null;
   backup_id: string | null;
   max_log_lines: number;
+  /** Replace file paths in reports and notifications with placeholders. */
+  redact_paths: boolean;
+  /** Trusted CA or pinned self-signed certificate (PEM). */
+  ca_pem: string | null;
+  retry_delay_ms: number;
+  min_log_level: LogLevel;
+}
+
+export type TlsMode = "start_tls" | "implicit" | "none";
+
+export interface CertPolicy {
+  accept_invalid_certs: boolean;
+  ca_pem: string | null;
+}
+
+export type NotificationChannel =
+  | { type: "email"; host: string; port: number | null; tls: TlsMode; username: string; from: string; to: string[]; subject: string }
+  | { type: "telegram"; chat_id: string; api_base: string }
+  | { type: "xmpp"; jid: string; to: string; host: string; port: number | null; tls: TlsMode };
+
+/** A notification channel (flattened) with its own result filter; the password or bot token lives under `credential_id`. */
+export type BackupNotification = NotificationChannel & {
+  send_on: string[];
+  credential_id: string;
+  template: string;
+  cert: CertPolicy;
+};
+
+export interface LogFilter {
+  min_level: LogLevel;
+  include_tags: string[];
+  exclude_tags: string[];
+  pattern: string;
+}
+
+export interface LogOutputs {
+  file: string | null;
+  file_filter: LogFilter;
+  file_max_mb: number;
+  system_log: boolean;
+  system_filter: LogFilter;
+}
+
+export interface BugReport {
+  path: string;
+  size: number;
+  files: string[];
+  paths_obfuscated: number;
+  runs_included: number;
+}
+
+export interface DatabaseCheck {
+  info: DbInfo | null;
+  problems: string[];
+  missing_remote: string[];
+  size_mismatch: string[];
+  untracked_remote: string[];
+  remote_files: number;
+  tracked_volumes: number;
+  check_ms: number;
+}
+
+export interface NetworkTiming {
+  host: string;
+  port: number;
+  tls: boolean;
+  addresses: string[];
+  dns_ms: number | null;
+  tcp_ms: number | null;
+  tls_ms: number | null;
+  tls_version: string | null;
+  error: string | null;
+}
+
+export interface Throughput {
+  list_ms: number[];
+  test_bytes: number;
+  upload_ms: number;
+  upload_bps: number;
+  download_ms: number;
+  download_bps: number;
+  verified: boolean;
+  error: string | null;
+}
+
+export interface Diagnostics {
+  database: DatabaseCheck | null;
+  database_error: string | null;
+  network: NetworkTiming | null;
+  throughput: Throughput | null;
 }
 
 export interface Throttle {
@@ -264,6 +354,8 @@ export interface BackupJob {
   network_timeout_secs: number;
   local_transfer: LocalTransfer;
   replicas: Replica[];
+  notifications: BackupNotification[];
+  log_outputs: LogOutputs;
   prevent_sleep: boolean;
   notify_on: string[];
   created_at: string;
@@ -385,6 +477,9 @@ export interface TaskInfo {
   queued_at: string;
   started_at: string | null;
   progress: Progress | null;
+  elapsed_secs: number;
+  bytes_per_sec: number;
+  eta_secs: number | null;
 }
 
 export interface NextRun {
@@ -406,6 +501,11 @@ export type LogLevel = "info" | "warning" | "error";
 export interface LogLine {
   level: LogLevel;
   message: string;
+  tag?: string | null;
+}
+
+export function newLogFilter(): LogFilter {
+  return { min_level: "info", include_tags: [], exclude_tags: [], pattern: "" };
 }
 
 export interface BackupRun {
@@ -649,6 +749,10 @@ export function newBackupJob(): BackupJob {
       machine_name: null,
       backup_id: null,
       max_log_lines: 100,
+      redact_paths: false,
+      ca_pem: null,
+      retry_delay_ms: 500,
+      min_log_level: "info",
     },
     throttle: { upload_bps: 0, download_bps: 0 },
     retry: { retries: 3, delay_ms: 2000, exponential: true, max_delay_ms: 60000 },
@@ -658,6 +762,8 @@ export function newBackupJob(): BackupJob {
     network_timeout_secs: 0,
     local_transfer: { use_move: true, verify_size: true, sync_writes: false },
     replicas: [],
+    notifications: [],
+    log_outputs: { file: null, file_filter: newLogFilter(), file_max_mb: 10, system_log: false, system_filter: { ...newLogFilter(), min_level: "warning" } },
     prevent_sleep: true,
     notify_on: ["warning", "error"],
     created_at: now,

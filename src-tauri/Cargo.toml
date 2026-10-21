@@ -36,6 +36,9 @@ directories = "6"
 md-5 = "0.10"
 sha2 = "0.10"
 sha1 = "0.10"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+rustls-pemfile = "2"
 digest = "0.10"
 # Transfer integrity: xxHash3 for fast hashing, ring for SHA-256
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
@@ -69,6 +72,7 @@ notify = { version = "8", features = ["macos_fsevent"] }
 cron = "0.12"
 glob = "0.3"
 regex = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # T-047: Encryption (in-transit and at-rest)
 aes-gcm = "0.10"
 argon2 = "0.5"
@@ -113,6 +117,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_System_Power",
+    "Win32_System_EventLog",
 ] }
 # ufop-server --windows-service / --install-service
 windows-service = "0.7"

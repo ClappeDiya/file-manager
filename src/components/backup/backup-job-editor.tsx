@@ -22,6 +22,7 @@ import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { BackupAdvancedOptions } from "./backup-advanced-options";
 import { BackupReplicas } from "./backup-replicas";
 import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
+import { LogOutputsEditor, NotificationsEditor, ReportExtras } from "./backup-notifications";
 
 interface ConnectionProfile {
   id: string;
@@ -653,7 +654,10 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 </Field>
               </div>
               <Check label="Accept invalid TLS certificates on report URLs" checked={job.reports.accept_invalid_certs} onChange={(v) => patch({ reports: { ...job.reports, accept_invalid_certs: v } })} />
+              <ReportExtras reports={job.reports} onChange={(reports) => patch({ reports })} />
             </Section>
+            <NotificationsEditor value={job.notifications} onChange={(notifications) => patch({ notifications })} />
+            <LogOutputsEditor value={job.log_outputs} onChange={(log_outputs) => patch({ log_outputs })} />
           </>
         )}
       </div>

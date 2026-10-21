@@ -684,6 +684,73 @@ impl Default for SyncManager {
 impl SyncManager {
     /// Insert-or-update one pair. Called by the sync commands after any
     /// mutation so the DB is the source of truth across restarts.
+    /// Record a finished run in the run history and trim each pair's history
+    /// to the newest `keep` runs (0 = keep all).
+    pub async fn save_report_to_db(&self, repo: &crate::storage::Repository, report: &SyncReport, keep: u32) -> Result<(), AppError> {
+        let r = report.clone();
+        let json = serde_json::to_string(&r)?;
+        repo.pool()
+            .execute(move |conn| {
+                let status = serde_json::to_value(r.status).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+                conn.execute(
+                    "INSERT OR REPLACE INTO sync_runs (id, pair_id, pair_name, status, started_at, ended_at, report_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![r.id.to_string(), r.pair_id.to_string(), r.pair_name, status, r.started_at.to_rfc3339(), r.ended_at.to_rfc3339(), json],
+                )?;
+                if keep > 0 {
+                    conn.execute(
+                        "DELETE FROM sync_runs WHERE pair_id = ?1 AND id NOT IN (SELECT id FROM sync_runs WHERE pair_id = ?1 ORDER BY started_at DESC LIMIT ?2)",
+                        rusqlite::params![r.pair_id.to_string(), keep],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Stored runs, newest first, optionally for one pair.
+    pub async fn run_history(&self, repo: &crate::storage::Repository, pair_id: Option<Uuid>, limit: u32) -> Result<Vec<SyncReport>, AppError> {
+        repo.pool()
+            .execute(move |conn| {
+                let mut st = conn.prepare("SELECT report_json FROM sync_runs WHERE (?1 IS NULL OR pair_id = ?1) ORDER BY started_at DESC LIMIT ?2")?;
+                let rows = st.query_map(rusqlite::params![pair_id.map(|p| p.to_string()), limit.clamp(1, 10_000)], |r| r.get::<_, String>(0))?;
+                Ok(rows.filter_map(|r| r.ok()).filter_map(|j| serde_json::from_str::<SyncReport>(&j).ok()).collect())
+            })
+            .await
+    }
+
+    /// One stored run by id.
+    pub async fn stored_report(&self, repo: &crate::storage::Repository, report_id: Uuid) -> Result<Option<SyncReport>, AppError> {
+        repo.pool()
+            .execute(move |conn| {
+                use rusqlite::OptionalExtension;
+                let j: Option<String> = conn.query_row("SELECT report_json FROM sync_runs WHERE id = ?1", [report_id.to_string()], |r| r.get(0)).optional()?;
+                Ok(j.and_then(|j| serde_json::from_str(&j).ok()))
+            })
+            .await
+    }
+
+    /// Delete stored runs older than `days`; returns how many were removed.
+    pub async fn prune_run_history(&self, repo: &crate::storage::Repository, days: u32) -> Result<usize, AppError> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        repo.pool().execute(move |conn| Ok(conn.execute("DELETE FROM sync_runs WHERE started_at < ?1", [cutoff])?)).await
+    }
+
+    /// Load the newest stored runs into memory (health and report views).
+    pub async fn load_reports_from_db(&self, repo: &crate::storage::Repository, per_pair: usize) -> Result<usize, AppError> {
+        let all = self.run_history(repo, None, 10_000).await?; // newest first
+        let mut map = self.reports.write().await;
+        let mut n = 0;
+        for r in all {
+            let v = map.entry(r.pair_id).or_default();
+            if v.len() >= per_pair || v.iter().any(|x| x.id == r.id) {
+                continue;
+            }
+            v.push(r);
+            n += 1;
+        }
+        Ok(n)
+    }
+
     pub async fn save_pair_to_db(
         &self,
         repo: &crate::storage::Repository,
@@ -823,7 +890,6 @@ impl SyncManager {
                         copy_options: serde_json::from_str(&options_json).unwrap_or_default(),
                         dest_state: serde_json::from_value(serde_json::Value::String(dest_state)).unwrap_or_default(),
                         checksum_algorithm: serde_json::from_value(serde_json::Value::String(checksum_algorithm)).unwrap_or_default(),
-                        ..Default::default()
                     })
                 })?;
                 let mut out = Vec::new();
@@ -968,6 +1034,39 @@ mod tests {
     ///
     /// Round-trips through a real SQLite DB and asserts every column, so it also
     /// pins the SyncPair↔schema mapping rather than just "a row came back".
+    #[tokio::test]
+    async fn sync_run_history_survives_a_restart_and_is_trimmed() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = SyncManager::new();
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), "alpha").unwrap();
+        let pair = make_test_pair(src.path(), dst.path());
+        mgr.create_pair(pair.clone()).await.unwrap();
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            std::fs::write(src.path().join(format!("f{i}.txt")), "x").unwrap();
+            let r = mgr.execute_sync(pair.id).await.unwrap();
+            mgr.save_report_to_db(&repo, &r, 2).await.unwrap();
+            ids.push(r.id);
+        }
+        let hist = mgr.run_history(&repo, Some(pair.id), 10).await.unwrap();
+        assert_eq!(hist.iter().map(|r| r.id).collect::<Vec<_>>(), vec![ids[2], ids[1]], "newest first, trimmed to 2");
+        assert!(mgr.run_history(&repo, Some(Uuid::new_v4()), 10).await.unwrap().is_empty());
+        assert_eq!(mgr.run_history(&repo, None, 1).await.unwrap().len(), 1);
+
+        let restarted = SyncManager::new();
+        assert_eq!(restarted.load_reports_from_db(&repo, 50).await.unwrap(), 2);
+        assert_eq!(restarted.stored_report(&repo, ids[1]).await.unwrap().unwrap().id, ids[1]);
+        assert!(restarted.stored_report(&repo, ids[0]).await.unwrap().is_none(), "trimmed");
+        let mem = restarted.get_reports(pair.id).await;
+        assert_eq!(mem[0].id, ids[2], "in-memory order matches live runs (newest first)");
+        assert_eq!(mem[0].files_added, hist[0].files_added);
+
+        assert_eq!(mgr.prune_run_history(&repo, 0).await.unwrap(), 2);
+        assert!(mgr.run_history(&repo, None, 10).await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn sync_pairs_survive_a_restart() {
         let repo = crate::storage::Repository::open_in_memory().await.unwrap();

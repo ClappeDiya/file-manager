@@ -29,9 +29,10 @@ pub struct ScriptConfig {
     pub result_format: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
+    #[default]
     Info,
     Warning,
     Error,
@@ -41,17 +42,24 @@ pub enum LogLevel {
 pub struct LogLine {
     pub level: LogLevel,
     pub message: String,
+    /// Source area (`engine`, `script`, `replica`, `report`, …) for filters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
 }
 
 impl LogLine {
     pub fn info(m: impl Into<String>) -> Self {
-        Self { level: LogLevel::Info, message: m.into() }
+        Self { level: LogLevel::Info, message: m.into(), tag: None }
     }
     pub fn warn(m: impl Into<String>) -> Self {
-        Self { level: LogLevel::Warning, message: m.into() }
+        Self { level: LogLevel::Warning, message: m.into(), tag: None }
     }
     pub fn error(m: impl Into<String>) -> Self {
-        Self { level: LogLevel::Error, message: m.into() }
+        Self { level: LogLevel::Error, message: m.into(), tag: None }
+    }
+    pub fn tagged(mut self, tag: &str) -> Self {
+        self.tag = Some(tag.to_string());
+        self
     }
 }
 
@@ -68,7 +76,7 @@ pub fn parse_script_log(output: &str) -> Vec<LogLine> {
                 "ERROR" => LogLevel::Error,
                 _ => return None,
             };
-            Some(LogLine { level, message: format!("script: {}", msg.trim()) })
+            Some(LogLine { level, message: format!("script: {}", msg.trim()), tag: Some("script".into()) })
         })
         .collect()
 }
@@ -149,6 +157,22 @@ pub struct ReportConfig {
     pub backup_id: Option<String>,
     /// Max log lines included.
     pub max_log_lines: usize,
+    /// Replace file paths in reports and notifications with placeholders.
+    #[serde(default)]
+    pub redact_paths: bool,
+    /// Trusted CA or pinned self-signed certificate for callback servers (PEM).
+    #[serde(default)]
+    pub ca_pem: Option<String>,
+    /// First retry delay (ms); doubles each attempt.
+    #[serde(default = "default_retry_delay")]
+    pub retry_delay_ms: u64,
+    /// Lowest log level included in reports.
+    #[serde(default)]
+    pub min_log_level: LogLevel,
+}
+
+fn default_retry_delay() -> u64 {
+    500
 }
 
 impl Default for ReportConfig {
@@ -165,6 +189,10 @@ impl Default for ReportConfig {
             machine_name: None,
             backup_id: None,
             max_log_lines: 100,
+            redact_paths: false,
+            ca_pem: None,
+            retry_delay_ms: 500,
+            min_log_level: LogLevel::Info,
         }
     }
 }
@@ -187,11 +215,14 @@ pub async fn send_reports(cfg: &ReportConfig, result: &str, vars: &BTreeMap<Stri
     if cfg.http_urls.is_empty() || !cfg.send_on.iter().any(|s| s == result) {
         return Vec::new();
     }
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .danger_accept_invalid_certs(cfg.accept_invalid_certs)
-        .build()
-    {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30)).danger_accept_invalid_certs(cfg.accept_invalid_certs);
+    if let Some(pem) = cfg.ca_pem.as_deref().filter(|p| !p.trim().is_empty()) {
+        match reqwest::Certificate::from_pem(pem.as_bytes()) {
+            Ok(c) => builder = builder.add_root_certificate(c),
+            Err(e) => return vec![format!("Invalid callback CA certificate: {e}")],
+        }
+    }
+    let client = match builder.build() {
         Ok(c) => c,
         Err(e) => return vec![format!("HTTP client: {e}")],
     };
@@ -225,7 +256,7 @@ pub async fn send_reports(cfg: &ReportConfig, result: &str, vars: &BTreeMap<Stri
                 Err(e) => last = e.to_string(),
             }
             if attempt < cfg.retries {
-                tokio::time::sleep(Duration::from_millis(500 * (1 << attempt.min(6)))).await;
+                tokio::time::sleep(Duration::from_millis(cfg.retry_delay_ms.max(1) * (1 << attempt.min(6)))).await;
             }
         }
         if !ok {

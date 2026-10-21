@@ -38,6 +38,12 @@ type View =
   | { kind: "restore"; job: BackupJob }
   | { kind: "maintenance"; job: BackupJob };
 
+function formatDuration(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+}
+
 function TaskQueue() {
   const { status, cancel } = useBackupStore();
   if (status.tasks.length === 0) return null;
@@ -52,6 +58,8 @@ function TaskQueue() {
               <span className="truncate">
                 <b>{t.job_name}</b> · {t.operation} · {t.state === "queued" ? "queued" : (p?.phase ?? "starting")}
                 {pct !== null && ` ${pct}%`}
+                {t.state === "running" && t.bytes_per_sec > 0 && ` · ${formatBytes(t.bytes_per_sec)}/s`}
+                {t.state === "running" && t.eta_secs != null && ` · ${formatDuration(t.eta_secs)} left`}
               </span>
               <button className="underline text-red-600 shrink-0" onClick={() => void cancel(t.task_id)}>
                 Cancel
