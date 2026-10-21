@@ -17,7 +17,7 @@ tauri-build = { version = "2", features = [] }
 # Shared error type + sync/copy engine (also used by the `ufop` CLI).
 ufop-core = { path = "../crates/ufop-core", features = ["sqlite", "backup"] }
 shlex = "1"
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
@@ -93,6 +93,7 @@ p12-keystore = "0.2.1"
 clap = { version = "4", features = ["derive", "env"] }
 time = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tauri-plugin-autostart = "=2.5.1"
 
 [dev-dependencies]
 tempfile = "3"
@@ -110,4 +111,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    "Win32_System_Power",
 ] }
+# ufop-server --windows-service / --install-service
+windows-service = "0.7"

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd agent for the UFOP backup server. See packaging/macos/README.md to install. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ufop.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/UFOP.app/Contents/MacOS/ufop-server</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/tmp/ufop-server.log</string>
+  <key>StandardErrorPath</key><string>/tmp/ufop-server.log</string>
+</dict>
+</plist>

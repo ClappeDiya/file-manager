@@ -18,6 +18,7 @@ pub mod storage;
 pub mod sync_engine;
 pub mod spaces_engine;
 pub mod transfer_engine;
+pub mod tray;
 
 use ai_engine::AiAssistant;
 use automation_engine::suggester::LedgerSuggester;
@@ -68,6 +69,7 @@ struct AppState {
     narrator: OperationNarrator,
     quickflow_suggester: LedgerSuggester,
     backup_mgr: BackupManager,
+    background_mode: tray::BackgroundMode,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -226,7 +228,9 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     if let Err(e) = backup_mgr.load_from_db().await {
         tracing::warn!("Failed to load backup jobs (non-fatal): {e}");
     }
-    backup_mgr.start_scheduler();
+    // The scheduler starts in Tauri's `setup` hook: this function runs on a
+    // throwaway runtime whose spawned tasks die when it is dropped.
+    let background_mode = tray::load_background_mode(&repo).await;
 
     Ok(AppState {
         repo,
@@ -254,6 +258,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         narrator,
         quickflow_suggester,
         backup_mgr,
+        background_mode,
     })
 }
 
@@ -343,6 +348,7 @@ pub fn run() {
                     narrator,
                     quickflow_suggester,
                     backup_mgr,
+                    background_mode: tray::BackgroundMode::default(),
                 }
             }
         }
@@ -350,6 +356,8 @@ pub fn run() {
 
     // Clone for shutdown hook
     let shutdown_repo = app_state.repo.clone();
+    let setup_backup_mgr = app_state.backup_mgr.clone();
+    let close_mode = app_state.background_mode.clone();
     let shutdown_transfer = app_state.transfer_mgr.clone();
 
     tauri::Builder::default()
@@ -359,6 +367,30 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--background"])))
+        .setup(move |app| {
+            use tauri::Manager;
+            use tauri_plugin_notification::NotificationExt;
+            let mgr = setup_backup_mgr.clone();
+            // Backup results → OS notifications (warnings and errors by default).
+            let handle = app.handle().clone();
+            mgr.set_notifier(std::sync::Arc::new(move |title: &str, body: &str, _status: &str| {
+                if let Err(e) = handle.notification().builder().title(title).body(body).show() {
+                    tracing::warn!("Backup notification failed: {e}");
+                }
+            }));
+            mgr.start_scheduler();
+            if let Err(e) = tray::setup(app, mgr) {
+                tracing::warn!("System tray unavailable (non-fatal): {e}");
+            }
+            // Launched at login: start hidden in the tray.
+            if std::env::args().any(|a| a == "--background") {
+                for w in app.webview_windows().values() {
+                    let _ = w.hide();
+                }
+            }
+            Ok(())
+        })
         .manage(app_state.repo)
         .manage(app_state.transfer_mgr)
         .manage(app_state.connection_mgr)
@@ -384,6 +416,7 @@ pub fn run() {
         .manage(app_state.narrator)
         .manage(app_state.quickflow_suggester)
         .manage(app_state.backup_mgr)
+        .manage(app_state.background_mode)
         .invoke_handler(tauri::generate_handler![
             // System
             system_commands::greet,
@@ -513,6 +546,8 @@ pub fn run() {
             backup_commands::backup_generate_passphrase,
             backup_commands::backup_capabilities,
             backup_commands::backup_preview_sources,
+            backup_commands::backup_get_desktop_settings,
+            backup_commands::backup_set_desktop_settings,
             sync_commands::create_sync_pair,
             sync_commands::delete_sync_pair,
             sync_commands::list_sync_pairs,
@@ -851,7 +886,16 @@ pub fn run() {
             // Operation Narrator (plain-language cross-engine story per correlation trace)
             narrator_commands::narrator_narrate_operation,
         ])
-        .on_window_event(move |_window, event| {
+        .on_window_event(move |window, event| {
+            // "Keep running in the tray": closing hides the window so
+            // scheduled backups continue.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if close_mode.enabled() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    return;
+                }
+            }
             if let tauri::WindowEvent::Destroyed = event {
                 tracing::info!("Window closing, persisting state...");
                 let repo = shutdown_repo.clone();

@@ -18,7 +18,8 @@ fn job(src: &Path, dst: &Path) -> BackupJob {
         name: "Docs".into(),
         sources: vec![src.to_string_lossy().into()],
         destination: BackupDestination::Local { path: dst.to_string_lossy().into(), alternate_paths: vec![], marker_file: None },
-        options: BackupOptions { block_size: 4096, volume_size: 64 * 1024, ..Default::default() },
+        // Host disk fullness must not turn results into warnings.
+        options: BackupOptions { block_size: 4096, volume_size: 64 * 1024, quota_disable: true, ..Default::default() },
         ..Default::default()
     }
 }
@@ -94,7 +95,7 @@ async fn background_backup_status_and_scheduler() {
     let m = manager(t.path()).await;
     let mut jb = job(&src, &dst);
     jb.encrypted = false;
-    jb.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, weekdays: vec![] };
+    jb.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, weekdays: vec![], skip_on_battery: false };
     let j = m.save_job(jb, None).await.unwrap();
 
     // Created "now": the next slot is in the future, so not due yet …

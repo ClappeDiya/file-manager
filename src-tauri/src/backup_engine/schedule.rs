@@ -16,11 +16,13 @@ pub struct BackupSchedule {
     pub interval_minutes: u32,
     /// Allowed weekdays, 0 = Monday … 6 = Sunday. Empty = every day.
     pub weekdays: Vec<u8>,
+    /// Skip scheduled runs while the computer runs on battery.
+    pub skip_on_battery: bool,
 }
 
 impl Default for BackupSchedule {
     fn default() -> Self {
-        Self { enabled: false, start_time: "02:00".into(), interval_minutes: 1440, weekdays: Vec::new() }
+        Self { enabled: false, start_time: "02:00".into(), interval_minutes: 1440, weekdays: Vec::new(), skip_on_battery: false }
     }
 }
 
@@ -88,7 +90,7 @@ mod tests {
 
     #[test]
     fn daily_next_and_catch_up() {
-        let s = BackupSchedule { enabled: true, start_time: "02:00".into(), interval_minutes: 1440, weekdays: vec![] };
+        let s = BackupSchedule { enabled: true, start_time: "02:00".into(), interval_minutes: 1440, weekdays: vec![], skip_on_battery: false };
         assert_eq!(s.next_after(local(2026, 3, 10, 1, 0)), Some(local(2026, 3, 10, 2, 0)));
         assert_eq!(s.next_after(local(2026, 3, 10, 2, 0)), Some(local(2026, 3, 11, 2, 0)));
         // Missed while offline: due immediately.
@@ -99,7 +101,7 @@ mod tests {
     #[test]
     fn hourly_with_weekdays() {
         // 2026-03-14 is a Saturday.
-        let s = BackupSchedule { enabled: true, start_time: "00:30".into(), interval_minutes: 60, weekdays: vec![0, 1, 2, 3, 4] };
+        let s = BackupSchedule { enabled: true, start_time: "00:30".into(), interval_minutes: 60, weekdays: vec![0, 1, 2, 3, 4], skip_on_battery: false };
         let n = s.next_after(local(2026, 3, 14, 10, 0)).unwrap();
         assert_eq!(n, local(2026, 3, 16, 0, 30));
         assert_eq!(s.next_after(local(2026, 3, 16, 10, 0)), Some(local(2026, 3, 16, 10, 30)));

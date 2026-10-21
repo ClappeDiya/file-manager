@@ -76,6 +76,13 @@ fn kind_str(k: EntryKind) -> &'static str {
     }
 }
 
+fn meta_json(f: &FileEntry) -> Result<Option<String>, AppError> {
+    Ok(match &f.meta {
+        Some(m) if !m.is_empty() => Some(serde_json::to_string(m)?),
+        _ => None,
+    })
+}
+
 fn kind_parse(s: &str) -> EntryKind {
     match s {
         "dir" => EntryKind::Dir,
@@ -99,6 +106,11 @@ impl BackupDb {
     fn init(conn: Connection) -> Result<Self, AppError> {
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
         conn.execute_batch(SCHEMA)?;
+        // v2: extended metadata column (older job databases lack it).
+        let has_meta: bool = conn.prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'meta'")?.exists([])?;
+        if !has_meta {
+            conn.execute_batch("ALTER TABLE files ADD COLUMN meta TEXT")?;
+        }
         Ok(Self { conn })
     }
 
@@ -206,8 +218,8 @@ impl BackupDb {
         )?;
         let id = self.conn.last_insert_rowid();
         let mut st = self.conn.prepare(
-            "INSERT INTO files(fileset_id, path, kind, size, mtime, mode, hash, blocks, symlink_target)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO files(fileset_id, path, kind, size, mtime, mode, hash, blocks, symlink_target, meta)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for f in files {
             st.execute(params![
@@ -219,7 +231,8 @@ impl BackupDb {
                 f.mode.map(|m| m as i64),
                 f.hash,
                 serde_json::to_string(&f.blocks)?,
-                f.symlink_target
+                f.symlink_target,
+                meta_json(f)?
             ])?;
         }
         Ok(id)
@@ -265,13 +278,13 @@ impl BackupDb {
             params![id, volume_name, files.len() as i64, total as i64],
         )?;
         let mut st = self.conn.prepare(
-            "INSERT INTO files(fileset_id, path, kind, size, mtime, mode, hash, blocks, symlink_target)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO files(fileset_id, path, kind, size, mtime, mode, hash, blocks, symlink_target, meta)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for f in files {
             st.execute(params![
                 id, f.path, kind_str(f.kind), f.size as i64, f.mtime, f.mode.map(|m| m as i64), f.hash,
-                serde_json::to_string(&f.blocks)?, f.symlink_target
+                serde_json::to_string(&f.blocks)?, f.symlink_target, meta_json(f)?
             ])?;
         }
         Ok(())
@@ -279,7 +292,7 @@ impl BackupDb {
 
     pub fn files(&self, fileset_id: i64) -> Result<Vec<FileEntry>, AppError> {
         let mut st = self.conn.prepare(
-            "SELECT path, kind, size, mtime, mode, hash, blocks, symlink_target FROM files WHERE fileset_id = ?1 ORDER BY path",
+            "SELECT path, kind, size, mtime, mode, hash, blocks, symlink_target, meta FROM files WHERE fileset_id = ?1 ORDER BY path",
         )?;
         let rows = st
             .query_map([fileset_id], |r| {
@@ -293,6 +306,7 @@ impl BackupDb {
                     hash: r.get(5)?,
                     blocks: serde_json::from_str(&blocks).unwrap_or_default(),
                     symlink_target: r.get(7)?,
+                    meta: r.get::<_, Option<String>>(8)?.and_then(|m| serde_json::from_str(&m).ok()),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

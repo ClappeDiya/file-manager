@@ -173,3 +173,32 @@ pub async fn backup_capabilities(mgr: State<'_, BackupManager>) -> Result<api::B
 pub async fn backup_preview_sources(job: BackupJob) -> Result<api::SourcePreview, AppError> {
     api::preview_sources(job).await
 }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct DesktopSettings {
+    /// Closing the window keeps UFOP running in the tray.
+    pub run_in_background: bool,
+    /// Start UFOP (hidden in the tray) when the user logs in.
+    pub start_at_login: bool,
+}
+
+#[tauri::command]
+pub async fn backup_get_desktop_settings(app: tauri::AppHandle, mode: State<'_, crate::tray::BackgroundMode>) -> Result<DesktopSettings, AppError> {
+    use tauri_plugin_autostart::ManagerExt;
+    Ok(DesktopSettings { run_in_background: mode.enabled(), start_at_login: app.autolaunch().is_enabled().unwrap_or(false) })
+}
+
+#[tauri::command]
+pub async fn backup_set_desktop_settings(
+    settings: DesktopSettings,
+    app: tauri::AppHandle,
+    mode: State<'_, crate::tray::BackgroundMode>,
+    repo: State<'_, crate::storage::Repository>,
+) -> Result<DesktopSettings, AppError> {
+    use tauri_plugin_autostart::ManagerExt;
+    crate::tray::save_background_mode(&repo, &mode, settings.run_in_background).await?;
+    let al = app.autolaunch();
+    let res = if settings.start_at_login { al.enable() } else { al.disable() };
+    res.map_err(|e| AppError::state(format!("Could not change start-at-login: {e}"), "Check that the app may register itself to start at login."))?;
+    backup_get_desktop_settings(app, mode).await
+}

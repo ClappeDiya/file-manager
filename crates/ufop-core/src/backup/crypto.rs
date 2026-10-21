@@ -44,15 +44,18 @@ impl KdfParams {
     }
 }
 
-/// Encryption material for one repository. `None` key = unencrypted.
+/// Encryption material for one repository. `None` key = unencrypted;
+/// `external` delegates to a pluggable [`super::modules::EncryptionModule`]
+/// (e.g. GPG).
 #[derive(Clone)]
 pub struct VolumeCipher {
     key: Option<[u8; 32]>,
+    external: Option<std::sync::Arc<dyn super::modules::EncryptionModule>>,
 }
 
 impl std::fmt::Debug for VolumeCipher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VolumeCipher").field("encrypted", &self.key.is_some()).finish()
+        f.debug_struct("VolumeCipher").field("encrypted", &self.is_encrypted()).field("module", &self.module_name()).finish()
     }
 }
 
@@ -73,11 +76,25 @@ fn enc_err(msg: &str) -> AppError {
 
 impl VolumeCipher {
     pub fn plain() -> Self {
-        Self { key: None }
+        Self { key: None, external: None }
+    }
+
+    /// Use a pluggable encryption module instead of built-in AES.
+    pub fn external(m: std::sync::Arc<dyn super::modules::EncryptionModule>) -> Self {
+        Self { key: None, external: Some(m) }
     }
 
     pub fn is_encrypted(&self) -> bool {
-        self.key.is_some()
+        self.key.is_some() || self.external.is_some()
+    }
+
+    /// `aes`, `none`, or the external module's name.
+    pub fn module_name(&self) -> String {
+        match (&self.external, &self.key) {
+            (Some(m), _) => m.name().to_string(),
+            (None, Some(_)) => "aes".into(),
+            (None, None) => "none".into(),
+        }
     }
 
     /// Derive the master key from a passphrase.
@@ -91,7 +108,7 @@ impl VolumeCipher {
         let mut key = [0u8; 32];
         a.hash_password_into(passphrase.as_bytes(), salt, &mut key)
             .map_err(|_| enc_err("Key derivation failed"))?;
-        Ok(Self { key: Some(key) })
+        Ok(Self { key: Some(key), external: None })
     }
 
     pub fn random_salt() -> Vec<u8> {
@@ -147,6 +164,12 @@ impl VolumeCipher {
 
     /// Wrap a payload into the volume wire format.
     pub fn seal(&self, payload: &[u8]) -> Result<Vec<u8>, AppError> {
+        if let Some(m) = &self.external {
+            let mut out = MAGIC.to_vec();
+            out.push(2);
+            out.extend(m.seal(payload)?);
+            return Ok(out);
+        }
         let mut out = Vec::with_capacity(payload.len() + 100);
         out.extend_from_slice(MAGIC);
         match &self.key {
@@ -192,6 +215,10 @@ impl VolumeCipher {
                 file_key.iter_mut().for_each(|b| *b = 0);
                 r
             }
+            2 => match &self.external {
+                Some(m) => m.open(&data[7..]),
+                None => Err(AppError::validation("This volume uses an external encryption module (e.g. GPG); configure it to read the backup")),
+            },
             _ => Err(enc_err("Unknown volume encryption flag")),
         }
     }

@@ -8,7 +8,7 @@
 //! dindex and dlist payloads are JSON.
 
 use super::crypto::VolumeCipher;
-use super::{FileEntry, HashAlgorithm};
+use super::{FileEntry, HashAlgorithm, VolumeFormat, ZipMethod};
 use crate::error::AppError;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use flate2::read::DeflateDecoder;
@@ -96,6 +96,9 @@ pub struct RepoHeader {
     pub block_size: usize,
     pub block_hash: HashAlgorithm,
     pub file_hash: HashAlgorithm,
+    /// Container format of block volumes (older repositories: UFOP).
+    #[serde(default)]
+    pub volume_format: VolumeFormat,
 }
 
 /// Accumulates blocks for one dblock volume.
@@ -103,6 +106,8 @@ pub struct RepoHeader {
 pub struct BlockVolumeWriter {
     entries: Vec<(String, u8, Vec<u8>)>,
     size: usize,
+    format: VolumeFormat,
+    zip_method: ZipMethod,
 }
 
 impl BlockVolumeWriter {
@@ -110,8 +115,29 @@ impl BlockVolumeWriter {
         Self::default()
     }
 
+    pub fn with_format(format: VolumeFormat, zip_method: ZipMethod) -> Self {
+        Self { format, zip_method, ..Default::default() }
+    }
+
+    /// Add a block encoded by [`encode_block`] (UFOP) or raw with flag
+    /// 1 = compress / 0 = store (ZIP). Lets worker threads compress in parallel.
+    pub fn add_encoded(&mut self, hash: String, flag: u8, data: Vec<u8>) {
+        self.size += data.len() + hash.len() + if self.format == VolumeFormat::Zip { 30 } else { 6 };
+        self.entries.push((hash, flag, data));
+    }
+
+    pub fn format(&self) -> VolumeFormat {
+        self.format
+    }
+
     /// Add a block; compresses it unless `level == 0` or compression does not help.
     pub fn add(&mut self, hash: String, data: &[u8], level: u32) -> Result<(), AppError> {
+        if self.format == VolumeFormat::Zip {
+            // Compressed by the ZIP writer in `finish`; flag 0 = store.
+            self.size += data.len() + hash.len() + 30;
+            self.entries.push((hash, (level > 0) as u8, data.to_vec()));
+            return Ok(());
+        }
         let (flag, stored) = if level == 0 {
             (0u8, data.to_vec())
         } else {
@@ -139,6 +165,9 @@ impl BlockVolumeWriter {
     }
 
     pub fn finish(self) -> Vec<u8> {
+        if self.format == VolumeFormat::Zip {
+            return self.finish_zip().unwrap_or_default();
+        }
         let mut out = Vec::with_capacity(self.size + 4);
         out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for (h, flag, d) in self.entries {
@@ -152,8 +181,59 @@ impl BlockVolumeWriter {
     }
 }
 
+/// Encode one block for a volume of `format`: UFOP compresses here
+/// (returns flag 1 = deflate or 0 = stored); ZIP keeps raw data and only
+/// records whether to compress.
+pub fn encode_block(format: VolumeFormat, data: &[u8], level: u32) -> Result<(u8, Vec<u8>), AppError> {
+    if format == VolumeFormat::Zip {
+        return Ok(((level > 0) as u8, data.to_vec()));
+    }
+    if level == 0 {
+        return Ok((0, data.to_vec()));
+    }
+    let mut e = DeflateEncoder::new(Vec::new(), Compression::new(level.min(9)));
+    e.write_all(data)?;
+    let c = e.finish()?;
+    Ok(if c.len() < data.len() { (1, c) } else { (0, data.to_vec()) })
+}
+
+impl BlockVolumeWriter {
+    fn finish_zip(self) -> Result<Vec<u8>, AppError> {
+        let method = match self.zip_method {
+            ZipMethod::Deflate => zip::CompressionMethod::Deflated,
+            ZipMethod::Stored => zip::CompressionMethod::Stored,
+            ZipMethod::Bzip2 => zip::CompressionMethod::Bzip2,
+            ZipMethod::Zstd => zip::CompressionMethod::Zstd,
+        };
+        let zerr = |e: zip::result::ZipError| AppError::internal(format!("zip write: {e}"));
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::with_capacity(self.size)));
+        for (h, compress, data) in self.entries {
+            let o = zip::write::SimpleFileOptions::default()
+                .compression_method(if compress == 1 { method } else { zip::CompressionMethod::Stored })
+                // ZIP64 is chosen automatically for large entries.
+                .large_file(data.len() as u64 >= u32::MAX as u64);
+            w.start_file(h, o).map_err(zerr)?;
+            w.write_all(&data)?;
+        }
+        Ok(w.finish().map_err(zerr)?.into_inner())
+    }
+}
+
 /// Decode a dblock payload into hash → raw (decompressed) block data.
+/// Accepts both the UFOP pack format and ZIP volumes.
 pub fn read_block_volume(payload: &[u8]) -> Result<HashMap<String, Vec<u8>>, AppError> {
+    if payload.starts_with(b"PK\x03\x04") || payload.starts_with(b"PK\x05\x06") {
+        let corrupt = |_| AppError::transfer("ZIP block volume is corrupt", "Run Verify and Repair on this backup.");
+        let mut a = zip::ZipArchive::new(std::io::Cursor::new(payload)).map_err(corrupt)?;
+        let mut out = HashMap::with_capacity(a.len());
+        for i in 0..a.len() {
+            let mut f = a.by_index(i).map_err(corrupt)?;
+            let mut v = Vec::with_capacity(f.size() as usize);
+            f.read_to_end(&mut v).map_err(|_| AppError::transfer("ZIP block volume is corrupt", "Run Verify and Repair on this backup."))?;
+            out.insert(f.name().to_string(), v);
+        }
+        return Ok(out);
+    }
     let corrupt = || AppError::transfer("Block volume is corrupt", "Run Verify and Repair on this backup.");
     let mut p = 0usize;
     let take = |p: &mut usize, n: usize| -> Result<&[u8], AppError> {
@@ -205,6 +285,17 @@ pub struct FileListVolume {
     /// Embedded job configuration (secrets stripped), when enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_config: Option<serde_json::Value>,
+    /// Extra files attached to this version (`control_files` option).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_files: Vec<ControlFile>,
+}
+
+/// An auxiliary file stored inside a file-list volume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlFile {
+    pub name: String,
+    /// Base64 content.
+    pub data: String,
 }
 
 pub fn seal_json<T: Serialize>(cipher: &VolumeCipher, v: &T) -> Result<Vec<u8>, AppError> {
@@ -244,5 +335,21 @@ mod tests {
         assert_eq!(m["aa"], vec![7u8; 1000]);
         assert_eq!(m["bb"], b"xyz");
         assert!(read_block_volume(&[9, 0, 0, 0, 1]).is_err());
+    }
+
+    #[test]
+    fn zip_volumes_all_methods() {
+        for m in [ZipMethod::Deflate, ZipMethod::Stored, ZipMethod::Bzip2, ZipMethod::Zstd] {
+            let mut w = BlockVolumeWriter::with_format(VolumeFormat::Zip, m);
+            w.add("aa".into(), &[7u8; 5000], 6).unwrap();
+            w.add("bb".into(), b"already-compressed", 0).unwrap();
+            let bytes = w.finish();
+            assert!(bytes.starts_with(b"PK"), "{m:?} produces a real ZIP");
+            let a = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+            assert_eq!(a.len(), 2);
+            let map = read_block_volume(&bytes).unwrap();
+            assert_eq!(map["aa"], vec![7u8; 5000]);
+            assert_eq!(map["bb"], b"already-compressed");
+        }
     }
 }

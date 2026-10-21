@@ -92,6 +92,7 @@
     },
     "os:default",
     "updater:default",
-    "notification:default"
+    "notification:default",
+    "autostart:default"
   ]
 }

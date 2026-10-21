@@ -18,6 +18,13 @@ pub struct RemoteFile {
 }
 
 /// Flat, name-addressed volume store.
+/// Destination capacity in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quota {
+    pub total: u64,
+    pub free: u64,
+}
+
 pub trait Backend: Send + Sync {
     /// Short human-readable description (`file:///…`, `sftp://…`).
     fn describe(&self) -> String;
@@ -32,6 +39,10 @@ pub trait Backend: Send + Sync {
         let d = self.get(from)?;
         self.put(to, &d)?;
         self.delete(from)
+    }
+    /// Destination capacity, when the backend can report it.
+    fn quota(&self) -> Option<Quota> {
+        None
     }
     /// Connectivity test: lists the folder. `create` makes it first.
     fn test(&self, create: bool) -> Result<usize, AppError> {
@@ -50,6 +61,7 @@ impl<T: Backend + ?Sized> Backend for Box<T> {
     fn delete(&self, n: &str) -> Result<(), AppError> { (**self).delete(n) }
     fn create_folder(&self) -> Result<(), AppError> { (**self).create_folder() }
     fn rename(&self, a: &str, b: &str) -> Result<(), AppError> { (**self).rename(a, b) }
+    fn quota(&self) -> Option<Quota> { (**self).quota() }
 }
 
 fn check_name(name: &str) -> Result<(), AppError> {
@@ -122,6 +134,10 @@ fn expand_drive_wildcard(pattern: &str) -> Vec<PathBuf> {
 impl Backend for LocalBackend {
     fn describe(&self) -> String {
         format!("file://{}", self.root.display())
+    }
+
+    fn quota(&self) -> Option<Quota> {
+        Some(Quota { total: super::meta::total_space(&self.root)?, free: super::meta::free_space(&self.root)? })
     }
 
     fn list(&self) -> Result<Vec<RemoteFile>, AppError> {
@@ -273,6 +289,9 @@ impl<B: Backend> Backend for RetryingBackend<B> {
     fn describe(&self) -> String {
         self.inner.describe()
     }
+    fn quota(&self) -> Option<Quota> {
+        self.inner.quota()
+    }
     fn list(&self) -> Result<Vec<RemoteFile>, AppError> {
         self.retry("list", || self.inner.list())
     }
@@ -314,6 +333,9 @@ impl<B: Backend> SoftDeleteBackend<B> {
 impl<B: Backend> Backend for SoftDeleteBackend<B> {
     fn describe(&self) -> String {
         self.inner.describe()
+    }
+    fn quota(&self) -> Option<Quota> {
+        self.inner.quota()
     }
     fn list(&self) -> Result<Vec<RemoteFile>, AppError> {
         Ok(self.inner.list()?.into_iter().filter(|f| !f.name.starts_with(&self.prefix)).collect())

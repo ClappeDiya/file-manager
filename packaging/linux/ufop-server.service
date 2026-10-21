@@ -1,0 +1,27 @@
+# systemd unit for the UFOP headless backup server.
+# Install:  sudo cp ufop-server.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#           sudo -u ufop ufop-server --data-dir /var/lib/ufop --set-password
+#           sudo systemctl enable --now ufop-server
+# Per-user (login session) variant: copy to ~/.config/systemd/user/ and drop User=/Group=.
+[Unit]
+Description=UFOP backup server
+Documentation=https://github.com/ClappeDiya/file-manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ufop
+Group=ufop
+Environment=UFOP_SERVER_DATADIR=/var/lib/ufop
+ExecStart=/usr/bin/ufop-server --data-dir /var/lib/ufop
+Restart=on-failure
+RestartSec=10
+StateDirectory=ufop
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

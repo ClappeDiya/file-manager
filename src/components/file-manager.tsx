@@ -693,6 +693,17 @@ export function FileManager() {
   const [syncOpen, setSyncOpen] = useState(false);
   // Versioned backups panel (jobs, restore, maintenance, history).
   const [backupOpen, setBackupOpen] = useState(false);
+  // The tray's "Backups…" item opens this panel.
+  useEffect(() => {
+    if (!isTauriAvailable()) return;
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/event").then(({ listen }) =>
+      listen("ufop://open-backups", () => setBackupOpen(true)).then((u) => {
+        unlisten = u;
+      }),
+    );
+    return () => unlisten?.();
+  }, []);
   // Iter 29: PreviewPane orphan elevation. The 844-LOC
   // component was never imported anywhere AND the ui-store
   // already had a pre-existing half-wired slot

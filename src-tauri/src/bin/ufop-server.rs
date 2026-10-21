@@ -92,6 +92,95 @@ struct Args {
     /// Do not run scheduled backups (API only)
     #[arg(long)]
     no_scheduler: bool,
+    /// Windows: register ufop-server as an automatic-start service with the
+    /// remaining arguments, then exit
+    #[arg(long)]
+    install_service: bool,
+    /// Windows: remove the service, then exit
+    #[arg(long)]
+    uninstall_service: bool,
+    /// Windows: run under the Service Control Manager (set by --install-service)
+    #[arg(long, hide = true)]
+    windows_service: bool,
+}
+
+/// Arguments forwarded to the service: everything except the install flag.
+fn service_args(argv: &[String]) -> Vec<String> {
+    argv.iter().skip(1).filter(|a| *a != "--install-service" && *a != "--uninstall-service").cloned().collect()
+}
+
+#[cfg(windows)]
+mod winsvc {
+    use std::ffi::OsString;
+    use std::time::Duration;
+    use windows_service::service::{
+        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState,
+        ServiceStatus, ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    use windows_service::{define_windows_service, service_dispatcher};
+
+    pub const NAME: &str = "ufop-server";
+
+    pub fn install(args: Vec<String>) -> windows_service::Result<()> {
+        let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)?;
+        let exe = std::env::current_exe().map_err(windows_service::Error::Winapi)?;
+        let mut launch: Vec<OsString> = vec!["--windows-service".into()];
+        launch.extend(args.into_iter().map(OsString::from));
+        let info = ServiceInfo {
+            name: NAME.into(),
+            display_name: "UFOP backup server".into(),
+            service_type: ServiceType::OWN_PROCESS,
+            start_type: ServiceStartType::AutoStart,
+            error_control: ServiceErrorControl::Normal,
+            executable_path: exe,
+            launch_arguments: launch,
+            dependencies: vec![],
+            account_name: None,
+            account_password: None,
+        };
+        let svc = mgr.create_service(&info, ServiceAccess::CHANGE_CONFIG)?;
+        svc.set_description("Runs scheduled UFOP backups and serves the backup web UI")?;
+        Ok(())
+    }
+
+    pub fn uninstall() -> windows_service::Result<()> {
+        let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let svc = mgr.open_service(NAME, ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS)?;
+        let _ = svc.stop();
+        svc.delete()
+    }
+
+    define_windows_service!(ffi_service_main, service_main);
+
+    pub fn run() -> windows_service::Result<()> {
+        service_dispatcher::start(NAME, ffi_service_main)
+    }
+
+    fn service_main(_args: Vec<OsString>) {
+        let handler = service_control_handler::register(NAME, |ev| match ev {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                std::process::exit(0);
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        });
+        let Ok(h) = handler else { return };
+        let _ = h.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Running,
+            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        });
+        // Process arguments (not the SCM start arguments) carry the configuration.
+        let argv: Vec<String> = std::env::args().collect();
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(super::run(argv));
+    }
 }
 
 fn read_password() -> String {
@@ -109,13 +198,37 @@ fn fail(msg: impl std::fmt::Display) -> ! {
     std::process::exit(2)
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.iter().any(|a| a == "--install-service" || a == "--uninstall-service" || a == "--windows-service") {
+        #[cfg(windows)]
+        {
+            let r = if argv.iter().any(|a| a == "--install-service") {
+                winsvc::install(service_args(&argv)).map(|_| println!("Service '{}' installed (automatic start).", winsvc::NAME))
+            } else if argv.iter().any(|a| a == "--uninstall-service") {
+                winsvc::uninstall().map(|_| println!("Service '{}' removed.", winsvc::NAME))
+            } else {
+                winsvc::run()
+            };
+            if let Err(e) = r {
+                fail(format!("Windows service error: {e}"));
+            }
+            return;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = service_args(&argv);
+            fail("Windows service options are only available on Windows; use packaging/linux/ufop-server.service or packaging/macos/com.ufop.server.plist");
+        }
+    }
+    tokio::runtime::Runtime::new().unwrap_or_else(|e| fail(e)).block_on(run(argv));
+}
+
+async fn run(argv: Vec<String>) {
     let preload = ufop_core::preload::Preload::load();
     if let Some(p) = &preload {
         p.apply_env("ufop-server");
     }
-    let argv: Vec<String> = std::env::args().collect();
     let argv = match &preload {
         Some(p) => p.merge_args("ufop-server", argv),
         None => argv,

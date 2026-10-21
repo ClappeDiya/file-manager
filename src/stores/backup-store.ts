@@ -79,6 +79,7 @@ export interface BackupSchedule {
   start_time: string;
   interval_minutes: number;
   weekdays: number[];
+  skip_on_battery: boolean;
 }
 
 export interface ScriptConfig {
@@ -143,6 +144,8 @@ export interface BackupJob {
   retry: RetryPolicy;
   soft_delete_prefix: string | null;
   store_config_remotely: boolean;
+  prevent_sleep: boolean;
+  notify_on: string[];
   created_at: string;
   updated_at: string;
   stats: JobStats;
@@ -325,6 +328,11 @@ export interface SourcePreview {
   warnings: string[];
 }
 
+export interface DesktopSettings {
+  run_in_background: boolean;
+  start_at_login: boolean;
+}
+
 export interface ImportPreview {
   job: BackupJob;
   has_passphrase: boolean;
@@ -382,7 +390,7 @@ export function newBackupJob(): BackupJob {
       allow_full_removal: false,
     },
     retention: { type: "keep_all" },
-    schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [] },
+    schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false },
     scripts: { run_before: null, run_before_required: false, run_after: null, timeout_secs: 60, result_format: "json" },
     reports: {
       http_urls: [],
@@ -401,6 +409,8 @@ export function newBackupJob(): BackupJob {
     retry: { retries: 3, delay_ms: 2000, exponential: true, max_delay_ms: 60000 },
     soft_delete_prefix: null,
     store_config_remotely: false,
+    prevent_sleep: true,
+    notify_on: ["warning", "error"],
     created_at: now,
     updated_at: now,
     stats: {

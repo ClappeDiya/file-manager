@@ -37,6 +37,8 @@ function backend(overrides: Record<string, (args: Record<string, unknown>) => un
     list_connections: () => [],
     backup_run: () => "task-1",
     backup_delete_job: () => null,
+    backup_get_desktop_settings: () => ({ run_in_background: false, start_at_login: false }),
+    backup_set_desktop_settings: (a) => a.settings,
     backup_pause: () => ({ ...STATUS, paused: true }),
     backup_save_job: (a) => ({ ...(a.job as BackupJob), id: "job-2" }),
     backup_list_versions: () => [
@@ -77,9 +79,9 @@ describe("backup helpers", () => {
   });
 
   it("describes schedules and retention", () => {
-    expect(describeSchedule({ enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [] })).toBe("Manual only");
-    expect(describeSchedule({ enabled: true, start_time: "02:00", interval_minutes: 1440, weekdays: [0, 4] })).toBe("daily from 02:00 on Mon, Fri");
-    expect(describeSchedule({ enabled: true, start_time: "00:30", interval_minutes: 60, weekdays: [] })).toBe("every 1 h from 00:30");
+    expect(describeSchedule({ enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false })).toBe("Manual only");
+    expect(describeSchedule({ enabled: true, start_time: "02:00", interval_minutes: 1440, weekdays: [0, 4], skip_on_battery: false })).toBe("daily from 02:00 on Mon, Fri");
+    expect(describeSchedule({ enabled: true, start_time: "00:30", interval_minutes: 60, weekdays: [], skip_on_battery: false })).toBe("every 1 h from 00:30");
     expect(describeRetention({ type: "keep_count", count: 5 })).toBe("Keep 5 version(s)");
   });
 
@@ -125,6 +127,16 @@ describe("BackupPanel", () => {
     expect(screen.getByText("2 version(s)")).toBeTruthy();
     fireEvent.click(screen.getByTestId("backup-run-now"));
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_run", { id: "job-1", dryRun: false }));
+  });
+
+  it("toggles tray mode and start at login", async () => {
+    backend();
+    render(<BackupPanel />);
+    const box = await screen.findByLabelText("Start at login");
+    fireEvent.click(box);
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("backup_set_desktop_settings", { settings: { run_in_background: false, start_at_login: true } }),
+    );
   });
 
   it("creates a job through the wizard", async () => {

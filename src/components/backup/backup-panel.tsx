@@ -7,7 +7,7 @@
  * - Run history with logs; configuration import; direct restore
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { tauriInvoke } from "@/hooks/use-tauri";
+import { isTauriAvailable, tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import {
   describeRetention,
@@ -16,6 +16,7 @@ import {
   newBackupJob,
   useBackupStore,
   type BackupJob,
+  type DesktopSettings,
   type ImportPreview,
 } from "@/stores/backup-store";
 import { BackupJobEditor } from "./backup-job-editor";
@@ -210,6 +211,34 @@ function ImportConfig({ onDone }: { onDone: (job: BackupJob | null) => void }) {
   );
 }
 
+/** Tray / start-at-login settings (desktop app only). */
+function DesktopToggles() {
+  const [s, setS] = useState<DesktopSettings | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    if (!isTauriAvailable()) return;
+    tauriInvoke<DesktopSettings>("backup_get_desktop_settings").then(setS).catch((e) => setErr(errorText(e)));
+  }, []);
+  if (!s) return null;
+  const update = (next: DesktopSettings) =>
+    tauriInvoke<DesktopSettings>("backup_set_desktop_settings", { settings: next })
+      .then(setS)
+      .catch((e) => setErr(errorText(e)));
+  return (
+    <span className="flex items-center gap-3" data-testid="backup-desktop-settings">
+      <label className="flex items-center gap-1" title="Closing the window keeps UFOP in the system tray so scheduled backups run">
+        <input type="checkbox" checked={s.run_in_background} onChange={(e) => void update({ ...s, run_in_background: e.target.checked })} />
+        Keep running in tray
+      </label>
+      <label className="flex items-center gap-1" title="Start UFOP hidden in the tray when you log in">
+        <input type="checkbox" checked={s.start_at_login} onChange={(e) => void update({ ...s, start_at_login: e.target.checked })} />
+        Start at login
+      </label>
+      {err && <span className="text-red-600">{err}</span>}
+    </span>
+  );
+}
+
 export function BackupPanel() {
   const { jobs, status, error, loadJobs, loadStatus, pause, resume, clearError, loading } = useBackupStore();
   const [view, setView] = useState<View>({ kind: "jobs" });
@@ -274,6 +303,7 @@ export function BackupPanel() {
               ? `Next: ${status.next_runs[0].job_name} at ${formatDate(status.next_runs[0].next_run_at)}`
               : "No scheduled backups"}
         </span>
+        <DesktopToggles />
         {status.paused ? (
           <Btn onClick={() => void resume()}>Resume</Btn>
         ) : (

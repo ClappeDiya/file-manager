@@ -13,6 +13,7 @@ pub mod connector_backend;
 pub mod hooks;
 pub mod policy;
 pub mod portability;
+pub mod power;
 pub mod schedule;
 
 use crate::connectors::ConnectionManager;
@@ -109,6 +110,10 @@ pub struct BackupJob {
     pub soft_delete_prefix: Option<String>,
     /// Embed this job's configuration (without secrets) in remote file lists.
     pub store_config_remotely: bool,
+    /// Keep the computer awake while this job's operations run.
+    pub prevent_sleep: bool,
+    /// Results that raise a desktop notification: `success`, `warning`, `error`.
+    pub notify_on: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
     pub stats: JobStats,
@@ -134,6 +139,8 @@ impl Default for BackupJob {
             retry: RetryPolicy { retries: 3, delay_ms: 2000, exponential: true, max_delay_ms: 60_000 },
             soft_delete_prefix: None,
             store_config_remotely: false,
+            prevent_sleep: true,
+            notify_on: vec!["warning".into(), "error".into()],
             created_at: now.clone(),
             updated_at: now,
             stats: JobStats::default(),
@@ -289,7 +296,11 @@ struct Inner {
     kdf: KdfParams,
     policy: std::sync::RwLock<policy::ModulePolicy>,
     secrets: std::sync::OnceLock<SettingsStore>,
+    notifier: std::sync::OnceLock<Notifier>,
 }
+
+/// Desktop notification sink: (title, body, status).
+pub type Notifier = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct BackupManager {
@@ -337,6 +348,7 @@ impl BackupManager {
                 kdf,
                 policy: std::sync::RwLock::new(policy::ModulePolicy::from_env()),
                 secrets: std::sync::OnceLock::new(),
+                notifier: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -488,6 +500,11 @@ impl BackupManager {
             Some(db) => db.get_secret(&key).await,
             None => self.inner.creds.retrieve(&key).await,
         }
+    }
+
+    /// Route run results to OS notifications (set by the desktop app).
+    pub fn set_notifier(&self, n: Notifier) {
+        let _ = self.inner.notifier.set(n);
     }
 
     /// Persist passphrases in the database when no OS keychain exists.
@@ -721,6 +738,7 @@ impl BackupManager {
         let started = Utc::now();
         let op_name = op.name();
         let mut log: Vec<LogLine> = Vec::new();
+        let _awake = job.prevent_sleep.then(|| power::SleepInhibitor::acquire(&format!("UFOP {op_name}: {}", job.name)));
         let is_backup = matches!(op, BackupOperation::Backup { .. });
 
         if is_backup {
@@ -835,6 +853,11 @@ impl BackupManager {
         }
         for f in hooks::send_reports(&job.reports, &status, &vars, payload).await {
             tracing::warn!("{f}");
+        }
+        if let Some(n) = self.inner.notifier.get() {
+            if job.notify_on.iter().any(|s| s == &status) {
+                n(&format!("Backup {status}: {}", job.name), &summary, &status);
+            }
         }
         if let Some(ledger) = &self.inner.ledger {
             let st = match status.as_str() {
@@ -1024,6 +1047,7 @@ impl BackupManager {
         if self.is_paused() {
             return Vec::new();
         }
+        let on_battery = power::on_battery() == Some(true);
         self.inner
             .jobs
             .read()
@@ -1031,7 +1055,12 @@ impl BackupManager {
             .values()
             .filter(|j| {
                 let last = j.stats.last_scheduled_at.as_deref().or(Some(j.created_at.as_str())).and_then(parse_ts);
-                last.is_some_and(|l| j.schedule.is_due(l, now)) && !self.is_job_busy(&j.id)
+                let due = last.is_some_and(|l| j.schedule.is_due(l, now)) && !self.is_job_busy(&j.id);
+                if due && on_battery && j.schedule.skip_on_battery {
+                    tracing::info!("Skipping scheduled backup '{}' while on battery", j.name);
+                    return false;
+                }
+                due
             })
             .map(|j| j.id.clone())
             .collect()
@@ -1065,14 +1094,24 @@ impl BackupManager {
             return;
         }
         let me = self.clone();
-        tokio::spawn(async move {
+        let fut = async move {
             // Small startup delay so app boot is not slowed by catch-up runs.
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
             loop {
                 me.tick().await;
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
-        });
+        };
+        // Inside a Tokio runtime (server, tests) use it; otherwise (Tauri
+        // `setup` on the main thread) use Tauri's long-lived runtime.
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn(fut);
+            }
+            Err(_) => {
+                tauri::async_runtime::spawn(fut);
+            }
+        }
     }
 }
 

@@ -37,8 +37,7 @@ fn delete_fileset_ids(repo: &Repo, ids: &[i64], allow_full_removal: bool) -> Res
         ));
     }
     for f in &doomed {
-        repo.backend.delete(&f.volume_name)?;
-        repo.db.delete_volume(&f.volume_name)?;
+        repo.delete_volume_files(&f.volume_name)?;
         repo.db.delete_fileset(f.id)?;
     }
     Ok(doomed.len())
@@ -63,12 +62,10 @@ pub struct CompactReport {
 }
 
 fn delete_block_volume(repo: &Repo, name: &str) -> Result<(), AppError> {
-    repo.backend.delete(name)?;
-    repo.db.delete_volume(name)?;
+    repo.delete_volume_files(name)?;
     let key = format!("index:{name}");
     if let Some(idx) = repo.db.get_kv(&key)? {
-        repo.backend.delete(&idx)?;
-        repo.db.delete_volume(&idx)?;
+        repo.delete_volume_files(&idx)?;
     }
     Ok(())
 }
@@ -80,7 +77,7 @@ pub fn compact(repo: &Repo, opts: &BackupOptions, ctx: &OpContext) -> Result<Com
     let volumes: HashMap<String, u64> =
         repo.db.volumes(Some(VolumeKind::Block))?.into_iter().map(|v| (v.name, v.size)).collect();
     let mut r = CompactReport::default();
-    let mut pending = Pending::new();
+    let mut pending = Pending::for_repo(repo, opts);
     let mut scratch = super::engine::BackupReport::default();
     let mut rewritten = Vec::new();
     for (name, size) in &volumes {
@@ -143,7 +140,7 @@ pub fn verify(repo: &Repo, samples: Option<usize>, full: bool) -> Result<VerifyR
     for v in vols {
         r.checked += 1;
         let res = (|| -> Result<(), AppError> {
-            let payload = repo.cipher.open(&repo.get_volume(&v.name)?)?;
+            let payload = repo.cipher.open(&repo.get_volume_ex(&v.name, false)?)?;
             match v.kind {
                 VolumeKind::Block => {
                     let m = volume::read_block_volume(&payload)?;
@@ -321,10 +318,7 @@ pub fn repair(repo: &Repo) -> Result<RepairReport, AppError> {
         match volume::classify(&repo.prefix, name) {
             Some(VolumeKind::FileList) => {
                 if let Some(fs) = filesets.iter().find(|f| &f.volume_name == name) {
-                    let fl = FileListVolume { timestamp: fs.timestamp.clone(), partial: fs.partial, files: repo.db.files(fs.id)?, task_config: None };
-                    let data = volume::seal_json(&repo.cipher, &fl)?;
-                    repo.backend.put(name, &data)?;
-                    repo.db.add_volume(name, VolumeKind::FileList, data.len() as u64, &hash_bytes(HashAlgorithm::Sha256, &data), "uploaded")?;
+                    repo.rewrite_filelist(&fs.timestamp, fs.partial, name, &repo.db.files(fs.id)?)?;
                     r.reuploaded.push(name.clone());
                 }
             }
@@ -389,10 +383,7 @@ fn affected_by(repo: &Repo, is_bad: impl Fn(Option<&str>) -> bool) -> Result<Vec
 }
 
 fn rewrite_fileset(repo: &Repo, fs: &super::Fileset, files: &[FileEntry]) -> Result<(), AppError> {
-    let fl = FileListVolume { timestamp: fs.timestamp.clone(), partial: fs.partial, files: files.to_vec(), task_config: None };
-    let data = volume::seal_json(&repo.cipher, &fl)?;
-    repo.backend.put(&fs.volume_name, &data)?;
-    repo.db.add_volume(&fs.volume_name, VolumeKind::FileList, data.len() as u64, &hash_bytes(HashAlgorithm::Sha256, &data), "uploaded")?;
+    repo.rewrite_filelist(&fs.timestamp, fs.partial, &fs.volume_name, files)?;
     repo.db.replace_fileset_files(fs.id, &fs.volume_name, files)
 }
 

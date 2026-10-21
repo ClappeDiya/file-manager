@@ -385,6 +385,12 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 </label>
               ))}
             </div>
+            <Check
+              label="Skip scheduled runs while on battery"
+              checked={job.schedule.skip_on_battery}
+              onChange={(v) => patch({ schedule: { ...job.schedule, skip_on_battery: v } })}
+            />
+            <Check label="Keep the computer awake while backing up" checked={job.prevent_sleep} onChange={(v) => patch({ prevent_sleep: v })} />
           </Section>
         )}
 
@@ -534,6 +540,18 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                     <option value="text">Text</option>
                   </select>
                 </Field>
+              </div>
+            </Section>
+            <Section title="Desktop notifications">
+              <div className="flex gap-3 text-xs">
+                {["success", "warning", "error"].map((r) => (
+                  <Check
+                    key={r}
+                    label={`On ${r}`}
+                    checked={job.notify_on.includes(r)}
+                    onChange={(v) => patch({ notify_on: v ? [...job.notify_on, r] : job.notify_on.filter((x) => x !== r) })}
+                  />
+                ))}
               </div>
             </Section>
             <Section title="HTTP reports" hint="Sent to every URL when a run ends with a selected result.">

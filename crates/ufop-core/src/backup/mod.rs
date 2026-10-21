@@ -20,8 +20,12 @@ pub mod db;
 pub mod engine;
 pub mod filters;
 pub mod maintenance;
+pub mod meta;
+pub mod modules;
+pub mod par2;
 pub mod restore;
 pub mod retention;
+pub mod usn;
 pub mod volume;
 
 pub use backend::{Backend, LocalBackend, RemoteFile, RetryingBackend, SoftDeleteBackend};
@@ -83,6 +87,59 @@ pub enum HashAlgorithm {
     Sha512,
 }
 
+/// Remote dblock container format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeFormat {
+    /// Compact UFOP block pack (per-block deflate).
+    #[default]
+    Ufop,
+    /// Standard ZIP archive (one entry per block, ZIP64 when needed).
+    Zip,
+}
+
+/// Compression method for ZIP volumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ZipMethod {
+    #[default]
+    Deflate,
+    Stored,
+    Bzip2,
+    Zstd,
+}
+
+/// Windows NTFS change-journal use for faster scanning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UsnPolicy {
+    #[default]
+    Off,
+    /// Use it when available, silently fall back to a full scan.
+    Auto,
+    /// Use it; warn when falling back.
+    On,
+    /// Fail the backup when the journal cannot be used.
+    Required,
+}
+
+/// Optional PAR2 recovery data for uploaded volumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Par2Options {
+    pub enabled: bool,
+    /// Redundancy percentage per volume (`par2 create -r`).
+    pub redundancy_percent: u8,
+    /// Path to the `par2` executable.
+    pub binary: String,
+}
+
+impl Default for Par2Options {
+    fn default() -> Self {
+        Self { enabled: false, redundancy_percent: 10, binary: "par2".into() }
+    }
+}
+
 /// Every tunable of a backup run. Defaults mirror sensible Duplicati defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -127,6 +184,59 @@ pub struct BackupOptions {
     pub task_config: Option<serde_json::Value>,
     /// Allow retention / delete to remove the very last version.
     pub allow_full_removal: bool,
+
+    // ── Selection and metadata ──
+    /// Ignore macOS Time Machine / `user.xdg.robots.backup` exclusion attributes.
+    pub ignore_exclusion_xattrs: bool,
+    /// Skip files another process holds an advisory (flock) lock on.
+    pub respect_advisory_locks: bool,
+    /// Only rescan these paths (files or folders); everything else is
+    /// carried over unchanged from the previous version.
+    pub changed_paths: Option<Vec<String>>,
+    /// Paths known to be deleted since the previous version.
+    pub deleted_paths: Vec<String>,
+    pub usn_policy: UsnPolicy,
+    /// Capture extended attributes.
+    pub backup_xattrs: bool,
+    /// Capture ACLs / security descriptors.
+    pub backup_acls: bool,
+    /// Capture NTFS alternate data streams (Windows).
+    pub backup_alternate_streams: bool,
+
+    // ── Volume format ──
+    pub volume_format: VolumeFormat,
+    pub zip_method: ZipMethod,
+    /// Extra files attached to each new file-list volume.
+    pub control_files: Vec<String>,
+    pub par2: Par2Options,
+
+    // ── Performance ──
+    /// Hashing/compression threads (0 = automatic).
+    pub hash_threads: usize,
+    /// Volumes uploaded concurrently (1 = synchronous).
+    pub upload_concurrency: usize,
+    /// 1 (gentlest) … 10 (full speed).
+    pub cpu_intensity: u8,
+    /// Folder for temporary files (default: the system temp folder).
+    pub temp_dir: Option<String>,
+    /// Source read buffer in bytes (0 = block size).
+    pub read_buffer_size: usize,
+    /// Lower CPU and I/O priority of worker threads.
+    pub background_io: bool,
+
+    // ── Capacity and maintenance ──
+    /// Assumed destination capacity when the backend cannot report one.
+    pub quota_size: Option<u64>,
+    /// Warn when free destination space falls below this percentage.
+    pub quota_warning_percent: u8,
+    /// Do not check destination capacity.
+    pub quota_disable: bool,
+    /// Compact at most this often (days); `None` = after every backup.
+    pub auto_compact_interval_days: Option<u32>,
+    /// Vacuum the local database at most this often (days).
+    pub auto_vacuum_interval_days: Option<u32>,
+    /// Compare remote file names case-insensitively.
+    pub remote_case_insensitive: bool,
 }
 
 impl Default for BackupOptions {
@@ -154,7 +264,45 @@ impl Default for BackupOptions {
             dry_run: false,
             task_config: None,
             allow_full_removal: false,
+            ignore_exclusion_xattrs: false,
+            respect_advisory_locks: false,
+            changed_paths: None,
+            deleted_paths: Vec::new(),
+            usn_policy: UsnPolicy::Off,
+            backup_xattrs: true,
+            backup_acls: true,
+            backup_alternate_streams: false,
+            volume_format: VolumeFormat::Ufop,
+            zip_method: ZipMethod::Deflate,
+            control_files: Vec::new(),
+            par2: Par2Options::default(),
+            hash_threads: 0,
+            upload_concurrency: 2,
+            cpu_intensity: 10,
+            temp_dir: None,
+            read_buffer_size: 0,
+            background_io: false,
+            quota_size: None,
+            quota_warning_percent: 10,
+            quota_disable: false,
+            auto_compact_interval_days: None,
+            auto_vacuum_interval_days: None,
+            remote_case_insensitive: false,
         }
+    }
+}
+
+impl BackupOptions {
+    /// Worker threads for hashing/compression after applying CPU intensity.
+    pub fn worker_threads(&self) -> usize {
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+        let base = if self.hash_threads > 0 { self.hash_threads } else { cores.min(8) };
+        let scaled = base * self.cpu_intensity.clamp(1, 10) as usize / 10;
+        scaled.max(1)
+    }
+
+    pub fn temp_root(&self) -> std::path::PathBuf {
+        self.temp_dir.as_ref().map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir)
     }
 }
 
@@ -203,6 +351,8 @@ type ProgressFn = Arc<dyn Fn(&Progress) + Send + Sync>;
 pub struct OpContext {
     cancel: Arc<AtomicBool>,
     progress: Option<ProgressFn>,
+    /// Called once the sources are no longer read (snapshot can be released).
+    released: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl OpContext {
@@ -218,6 +368,17 @@ impl OpContext {
     pub fn with_cancel_flag(mut self, flag: Arc<AtomicBool>) -> Self {
         self.cancel = flag;
         self
+    }
+
+    pub fn with_source_released(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
+        self.released = Some(Arc::new(f));
+        self
+    }
+
+    pub fn source_released(&self) {
+        if let Some(f) = &self.released {
+            f();
+        }
     }
 
     pub fn cancel(&self) {
@@ -270,6 +431,9 @@ pub struct FileEntry {
     /// Ordered block hashes (hex), files only.
     pub blocks: Vec<String>,
     pub symlink_target: Option<String>,
+    /// Extended attributes, ACLs, flags (absent in older backups).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<meta::ExtMeta>,
 }
 
 /// One backup version.
