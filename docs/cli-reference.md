@@ -496,6 +496,31 @@ ufop archive list backup.zip --json
 
 ---
 
+### `ufop mcp`
+
+Serve file tools to an AI client (Claude Desktop, Claude Code, any MCP client) over the Model Context Protocol on stdio. Every path is confined to the `--root` directories: paths are resolved and symlinks followed before the check, so `..`, absolute paths and links pointing outside are refused. Read-only unless `--allow-write`.
+
+```bash
+ufop mcp --root ~/Projects/reports                       # read-only
+ufop mcp --root ~/Inbox --root /srv/share --allow-write  # several roots, with write tools
+```
+
+Client configuration (e.g. `claude_desktop_config.json`):
+
+```json
+{ "mcpServers": { "ufop": { "command": "ufop", "args": ["mcp", "--root", "/home/me/Projects"], "env": { "UFOP_LOG_FILE": "/home/me/.ufop-mcp.log" } } } }
+```
+
+| Flag | Description |
+|------|-------------|
+| `--root <DIR>` | Directory the client may use (repeatable, required). Named after its last component (`docs`, `docs-2`, …). |
+| `--allow-write` | Also offer `write_file`, `create_directory`, `copy_file`, `move`, `delete` |
+| `--max-read-bytes <N>` | Largest read per call (default 4 MiB) |
+
+Tools: `list_roots`, `list_directory` (optionally recursive; symlinks listed, not followed), `get_file_info`, `read_text_file` (byte ranges; `encoding: base64` for binary), `search_files` (glob on names), `checksum` (sha256/sha1/md5); with `--allow-write`: `write_file` (atomic; `overwrite` to replace), `create_directory`, `copy_file`, `move`, `delete` (`recursive` for non-empty directories; roots and symlinks cannot be deleted or written through). Paths are `<root>:relative/path`, absolute inside a root, or relative to the first root. Tool annotations mark read-only and destructive tools. Each call is logged (tool, arguments, outcome) to the log (`--log-file` / `UFOP_LOG_FILE`); stdout carries only protocol messages.
+
+---
+
 ### `ufop status`
 
 Show server and platform status.

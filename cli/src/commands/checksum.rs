@@ -95,7 +95,7 @@ pub async fn execute(
     }
 }
 
-fn compute_hash(path: &Path, algorithm: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn compute_hash(path: &Path, algorithm: &str) -> Result<String, Box<dyn std::error::Error>> {
     use md5::Digest;
     let file = std::fs::File::open(path)?;
     match algorithm {

@@ -216,6 +216,9 @@ pub enum Commands {
     /// Show server/platform status
     Status,
 
+    /// Serve file tools to an AI client over the Model Context Protocol (stdio), confined to --root directories
+    Mcp(commands::mcp::McpArgs),
+
     /// Manage named profiles (servers, tokens, output format)
     #[command(subcommand)]
     Profile(commands::profile::ProfileCommands),
@@ -505,6 +508,9 @@ async fn main() -> ExitCode {
         }
         Commands::Status => {
             commands::status::execute(&format).await
+        }
+        Commands::Mcp(args) => {
+            commands::mcp::execute(args).await
         }
         Commands::Profile(cmd) => {
             commands::profile::execute(cmd, &format).await
