@@ -434,6 +434,27 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 15,
+    description: 'SCIM 2.0 provisioning tokens and resource links',
+    up(d) {
+      d.exec(`
+        CREATE TABLE scim_tokens (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, token_prefix TEXT NOT NULL,
+          default_role TEXT NOT NULL DEFAULT 'user', created_by TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT
+        );
+        CREATE TABLE scim_links (
+          org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, external_id TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          PRIMARY KEY (org_id, resource_type, resource_id)
+        );
+        CREATE UNIQUE INDEX idx_scim_links_external ON scim_links(org_id, resource_type, external_id) WHERE external_id IS NOT NULL;
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

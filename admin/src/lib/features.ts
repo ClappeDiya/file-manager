@@ -10,7 +10,7 @@ import { NextResponse } from 'next/server';
 
 export const FEATURES = {
   /** SCIM 2.0 user and group provisioning (/api/scim/v2). */
-  scim: false,
+  scim: true,
   /** Server-side CSV user import. */
   csvUserImport: false,
   /** Audit-log forwarding to a SIEM. */

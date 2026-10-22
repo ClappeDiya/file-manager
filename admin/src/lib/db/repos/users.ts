@@ -74,6 +74,7 @@ export function createUser(u: NewUser): UserRecord {
 }
 
 export interface UserUpdate {
+  email?: string;
   name?: string;
   role?: Role;
   isActive?: boolean;
@@ -88,6 +89,7 @@ export interface UserUpdate {
 }
 
 const COLUMNS: Record<keyof UserUpdate, string> = {
+  email: 'email',
   name: 'name',
   role: 'role',
   isActive: 'is_active',

@@ -14,10 +14,10 @@ const PUBLIC_PATHS = [
 
 /**
  * Endpoints that authenticate themselves and are called cross-site:
- * agents (bearer / report key) and SSO callbacks (signed state, SAML
+ * agents (bearer / report key), SCIM (bearer token) and SSO callbacks (signed state, SAML
  * signatures; the IdP posts the SAML response from its own origin).
  */
-const AGENT_PATHS = ['/api/agent/', '/api/ingest/', '/api/auth/sso/'];
+const AGENT_PATHS = ['/api/agent/', '/api/ingest/', '/api/auth/sso/', '/api/scim/'];
 
 /** Send a page request to sign-in, coming back to the same page afterwards. */
 function toLogin(request: NextRequest): NextResponse {

@@ -24,6 +24,7 @@ import { useToastStore } from '@/lib/stores/toast-store';
 import { z } from 'zod';
 import Link from 'next/link';
 import { ComingSoon } from '@/components/ui/coming-soon';
+import { ScimProvisioning } from '@/components/users/scim-provisioning';
 import { isEnabled } from '@/lib/features';
 
 const inviteSchema = z.object({
@@ -447,7 +448,9 @@ export default function UsersPage() {
             <Card>
               <CardContent>
                 <h3 className="text-lg font-semibold text-foreground mb-4">SCIM Provisioning (Enterprise)</h3>
-                {isEnabled('scim') ? null : (
+                {isEnabled('scim') ? (
+                  <ScimProvisioning />
+                ) : (
                   <ComingSoon
                     feature="scim"
                     description="Your identity provider will create, update and deactivate users and groups here automatically. Until then, use just-in-time provisioning in SSO settings."
