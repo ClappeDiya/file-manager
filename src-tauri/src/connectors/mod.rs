@@ -184,6 +184,56 @@ pub trait Connector: Send + Sync {
     }
 }
 
+/// Suffix of a file still being uploaded (`.<name>.ufop-part`).
+pub const STAGING_SUFFIX: &str = ".ufop-part";
+
+/// Where an upload to `remote` is written before it is renamed into place:
+/// a hidden sibling, so watchers and readers never see a half-written file.
+pub fn staging_path(remote: &str) -> String {
+    match remote.rsplit_once('/') {
+        Some((dir, name)) => format!("{dir}/.{name}{STAGING_SUFFIX}"),
+        None => format!(".{remote}{STAGING_SUFFIX}"),
+    }
+}
+
+/// Upload via a temporary name, then rename into place. If the rename
+/// fails (some servers won't rename over an existing file), the old file
+/// is removed and the rename retried. A failed upload leaves no partial
+/// file behind.
+pub(crate) async fn staged_upload<U, UF, R, RF, D, DF>(remote: &str, upload: U, rename: R, delete: D) -> Result<u64, AppError>
+where
+    U: FnOnce(String) -> UF,
+    UF: Future<Output = Result<u64, AppError>>,
+    R: Fn(String, String) -> RF,
+    RF: Future<Output = Result<(), AppError>>,
+    D: Fn(String) -> DF,
+    DF: Future<Output = Result<(), AppError>>,
+{
+    let temp = staging_path(remote);
+    let bytes = match upload(temp.clone()).await {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = delete(temp).await;
+            return Err(e);
+        }
+    };
+    if rename(temp.clone(), remote.to_string()).await.is_ok() {
+        return Ok(bytes);
+    }
+    let retried = match delete(remote.to_string()).await {
+        Ok(()) => rename(temp.clone(), remote.to_string()).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = retried {
+        let _ = delete(temp).await;
+        return Err(AppError::Connection {
+            message: format!("Uploaded, but could not move it into place as {remote}: {e}"),
+            advice: "Check you may rename and replace files in that folder.".into(),
+        });
+    }
+    Ok(bytes)
+}
+
 fn unsupported_op(what: &str) -> AppError {
     AppError::Connection {
         message: format!("{what} is not supported for this connection type yet."),
@@ -265,6 +315,70 @@ impl Default for ConnectorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_names() {
+        assert_eq!(staging_path("/in/report.pdf"), "/in/.report.pdf.ufop-part");
+        assert_eq!(staging_path("report.pdf"), ".report.pdf.ufop-part");
+    }
+
+    #[tokio::test]
+    async fn staged_upload_renames_replaces_and_cleans_up() {
+        use std::sync::Mutex;
+        let fs: Arc<Mutex<std::collections::HashMap<String, &'static str>>> = Default::default();
+        let log: Arc<Mutex<Vec<String>>> = Default::default();
+        // A server whose rename refuses to overwrite (like SFTP v3).
+        let server = |fail_upload: bool| {
+            let (fs, log) = (fs.clone(), log.clone());
+            let (fs2, log2, fs3, log3) = (fs.clone(), log.clone(), fs.clone(), log.clone());
+            (
+                move |p: String| {
+                    let (fs, log) = (fs.clone(), log.clone());
+                    async move {
+                        log.lock().unwrap().push(format!("up {p}"));
+                        fs.lock().unwrap().insert(p, "new");
+                        if fail_upload { Err(AppError::validation("network")) } else { Ok(3) }
+                    }
+                },
+                move |from: String, to: String| {
+                    let (fs, log) = (fs2.clone(), log2.clone());
+                    async move {
+                        log.lock().unwrap().push(format!("mv {from} {to}"));
+                        let mut m = fs.lock().unwrap();
+                        if m.contains_key(&to) {
+                            return Err(AppError::validation("exists"));
+                        }
+                        let v = m.remove(&from).unwrap();
+                        m.insert(to, v);
+                        Ok(())
+                    }
+                },
+                move |p: String| {
+                    let (fs, log) = (fs3.clone(), log3.clone());
+                    async move {
+                        log.lock().unwrap().push(format!("rm {p}"));
+                        fs.lock().unwrap().remove(&p);
+                        Ok(())
+                    }
+                },
+            )
+        };
+        let (u, r, d) = server(false);
+        assert_eq!(staged_upload("/d/a.txt", u, &r, &d).await.unwrap(), 3);
+        assert_eq!(fs.lock().unwrap().get("/d/a.txt"), Some(&"new"));
+        // Replacing an existing file: delete then rename.
+        fs.lock().unwrap().insert("/d/a.txt".into(), "old");
+        let (u, r, d) = server(false);
+        staged_upload("/d/a.txt", u, &r, &d).await.unwrap();
+        assert_eq!(fs.lock().unwrap().get("/d/a.txt"), Some(&"new"));
+        assert_eq!(fs.lock().unwrap().len(), 1, "no temp file left");
+        // Failed upload: the partial temp file is removed, the target untouched.
+        fs.lock().unwrap().insert("/d/a.txt".into(), "old");
+        let (u, r, d) = server(true);
+        assert!(staged_upload("/d/a.txt", u, &r, &d).await.is_err());
+        assert_eq!(fs.lock().unwrap().get("/d/a.txt"), Some(&"old"));
+        assert_eq!(fs.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn test_registry_creation() {

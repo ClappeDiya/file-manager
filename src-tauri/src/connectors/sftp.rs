@@ -1261,7 +1261,15 @@ impl super::Connector for SftpConnector {
         remote_path: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, AppError>> + Send + '_>> {
         let (l, r) = (local_path.to_string(), remote_path.to_string());
-        Box::pin(async move { self.upload_file(&l, &r, None).await })
+        Box::pin(async move {
+            super::staged_upload(
+                &r,
+                |temp| async move { self.upload_file(&l, &temp, None).await },
+                |from, to| async move { self.rename(&from, &to).await },
+                |p| async move { self.delete_file(&p).await },
+            )
+            .await
+        })
     }
 
     fn download(
