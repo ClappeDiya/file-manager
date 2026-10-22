@@ -163,6 +163,7 @@ pub async fn connector_list_remote(
     protocol: String,
     path: String,
     registry: State<'_, ConnectorRegistry>,
+    search: State<'_, crate::search_engine::SearchManager>,
 ) -> Result<Vec<FileEntry>, AppError> {
     let connector = registry
         .get(&protocol)
@@ -171,7 +172,28 @@ pub async fn connector_list_remote(
             advice: "Use one of: sftp, ftp, ftps, webdav, smb, nfs, local.".to_string(),
         })?;
 
-    connector.list_remote(&path).await
+    let entries = connector.list_remote(&path).await?;
+    // Remember what was seen, so global search can find it later. Local
+    // "remote" listings are already covered by the folder index.
+    if protocol != "local" {
+        let listing: Vec<_> = entries
+            .iter()
+            .map(|e| crate::search_engine::ListingEntry {
+                name: e.name.clone(),
+                path: e.path.clone(),
+                is_dir: e.is_dir,
+                size: e.size,
+                modified_ms: e.modified.map(|t| t.timestamp_millis()).unwrap_or(0),
+            })
+            .collect();
+        let index = search.index_arc();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = index.record_listing(&protocol, &path, &listing) {
+                tracing::debug!("Listing not recorded for search: {e}");
+            }
+        });
+    }
+    Ok(entries)
 }
 
 /// Check if a protocol connector is connected.

@@ -11,6 +11,7 @@ pub mod governance;
 pub mod ledger;
 pub mod lineage;
 pub mod metadata_engine;
+pub mod search_engine;
 pub mod mount_engine;
 pub mod narrator;
 pub mod safety;
@@ -75,6 +76,7 @@ struct AppState {
     background_mode: tray::BackgroundMode,
     audit_trail: security::audit::AuditTrail,
     metadata_store: metadata_engine::MetadataStore,
+    search_manager: search_engine::SearchManager,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -286,6 +288,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         background_mode,
         audit_trail,
         metadata_store: metadata_engine::MetadataStore::new(repo_for_metadata),
+        search_manager: search_engine::SearchManager::open_default(),
     })
 }
 
@@ -405,6 +408,9 @@ pub fn run() {
                 let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store), None);
                 AppState {
                     metadata_store: metadata_engine::MetadataStore::new(repo.clone()),
+                    search_manager: search_engine::SearchManager::new(
+                        search_engine::SearchIndex::open_in_memory().expect("in-memory SQLite"),
+                    ),
                     repo,
                     transfer_mgr,
                     connection_mgr,
@@ -510,6 +516,7 @@ pub fn run() {
         .manage(app_state.background_mode)
         .manage(app_state.audit_trail)
         .manage(app_state.metadata_store)
+        .manage(app_state.search_manager)
         .invoke_handler(tauri::generate_handler![
             // Security audit log (tamper-evident, append-only)
             audit_commands::verify_audit_log,
@@ -819,6 +826,12 @@ pub fn run() {
             commands::policy_commands::filename_policies_list,
             commands::policy_commands::filename_policies_save,
             commands::policy_commands::filename_policy_check,
+            commands::search_commands::search_index_roots,
+            commands::search_commands::search_index_add,
+            commands::search_commands::search_index_refresh,
+            commands::search_commands::search_index_remove,
+            commands::search_commands::search_index_cancel,
+            commands::search_commands::search_files_query,
             file_ops_commands::move_files,
             file_ops_commands::rename_file,
             file_ops_commands::duplicate_files,

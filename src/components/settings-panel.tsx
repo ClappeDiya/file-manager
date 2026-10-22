@@ -16,6 +16,7 @@ import { copyToClipboardWithToast } from "@/lib/clipboard";
 import { SecurityAuditSection } from "@/components/security-audit-section";
 import { TrustedSshHostsSection } from "@/components/trusted-ssh-hosts-section";
 import { FilenamePoliciesSection } from "@/components/filename-policies-section";
+import { SearchIndexFolders } from "@/components/search-index-folders";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
 
 // ── Types ──
@@ -1332,6 +1333,13 @@ export default function SettingsPanel({
         {/* Tamper-evident security audit log */}
         <Section title="Security Audit Log">
           <SecurityAuditSection />
+        </Section>
+
+        {/* Folders indexed for subfolder and content search */}
+        <Section title="Search Index">
+          <div className="pt-3">
+            <SearchIndexFolders />
+          </div>
         </Section>
 
         {/* Which names may be written where (enforced by the engines) */}

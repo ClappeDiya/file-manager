@@ -74,6 +74,8 @@ import { AiPanel } from "./ai-panel";
 import { AutomationPanel } from "./automation-panel";
 import { AutomationRuleEditor } from "./automation-rule-editor";
 import { CopyToManyDialog } from "./copy-to-many-dialog";
+import { IndexedSearchResults } from "./indexed-search-results";
+import type { SearchScope } from "@/stores/search-store";
 import { openCopyToMany } from "@/stores/copy-to-many-store";
 import { VaultPanel } from "./vault-panel";
 import { TransferPanel } from "./transfer-panel";
@@ -4311,11 +4313,19 @@ function FilePane({
     }
   }, [selectedPaths]);
 
-  // Feature 4: Content search handler (#69)
-  const handleContentSearch = useCallback((query: string, path: string) => {
-    console.log(`Content search: "${query}" in ${path}`);
-    // Content search requires backend support - log for now
-  }, []);
+  // Indexed search (names in all subfolders / file contents) from the
+  // filter bar; "This folder" keeps the live listing filter.
+  const [searchScope, setSearchScope] = useState<SearchScope>("folder");
+  const indexedQuery = searchScope !== "folder" && pane.filterText.trim().length >= 2 ? pane.filterText.trim() : null;
+  const handleOpenSearchHit = useCallback(
+    (path: string, isDir: boolean) => {
+      const store = useFileManagerStore.getState();
+      store.setFilterText(paneIndex, "");
+      setSearchScope("folder");
+      store.revealPath(paneIndex, path, isDir);
+    },
+    [paneIndex],
+  );
 
   // Smart Send-To handler — moves the current selection to a
   // ledger-suggested destination directory in one click. Reuses the
@@ -4649,12 +4659,16 @@ function FilePane({
         paneIndex={paneIndex}
         totalCount={files.length}
         filteredCount={visibleFiles.length}
-        onContentSearch={handleContentSearch}
+        scope={searchScope}
+        onScopeChange={setSearchScope}
         staleCount={staleCount}
         staleActive={staleOnly}
         onToggleStale={() => setStaleOnly((v) => !v)}
         onArchiveStale={handleArchiveStale}
       />
+      {indexedQuery && (
+        <IndexedSearchResults text={indexedQuery} root={currentPath} content={searchScope === "contents"} onOpen={handleOpenSearchHit} />
+      )}
 
       {/* Feature 3: Grouping dropdown (#77) - advanced mode only */}
       {appModePane === "advanced" && (

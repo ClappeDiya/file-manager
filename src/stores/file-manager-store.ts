@@ -248,6 +248,9 @@ export interface FileManagerState {
   unpinTab: (paneIndex: 0 | 1, tabId: string) => void;
   reorderTabs: (paneIndex: 0 | 1, fromIndex: number, toIndex: number) => void;
   navigateTab: (paneIndex: 0 | 1, tabId: string, path: string, label: string) => void;
+  /** Show `path` in a pane: open it if a folder, else open its folder and
+   *  select it (search hits, "reveal in folder"). */
+  revealPath: (paneIndex: 0 | 1, path: string, isDir: boolean) => void;
   /** Iter 20 — tab context menu. Close every non-pinned tab in this
    *  pane except `keepTabId`. Pinned tabs survive regardless of
    *  position. Each close pushes a snapshot onto the closed-tab ring
@@ -727,6 +730,16 @@ export const useFileManagerStore = create<FileManagerState>()(
           };
         });
         return stash;
+      },
+
+      revealPath: (paneIndex, path, isDir) => {
+        const pane = get().panes[paneIndex];
+        const tab = pane.tabs.find((t) => t.id === pane.activeTabId);
+        if (!tab) return;
+        const dir = isDir ? path : path.replace(/[\\/][^\\/]*$/, "") || "/";
+        const label = dir === "/" ? "Root" : dir.split(/[\\/]/).filter(Boolean).pop() || "Root";
+        get().navigateTab(paneIndex, tab.id, dir, label);
+        if (!isDir) get().setSelection(pane.id, [path]);
       },
 
       recallStash: (id, paneIndex) => {
