@@ -44,6 +44,8 @@ digest = "0.10"
 # Transfer integrity: xxHash3 for fast hashing, ring for SHA-256
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32fast = "1"
+# PAC proxy files.
+rquickjs = { version = "0.9", features = ["parallel"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 ring = "0.17"
 # Platform-specific low-level I/O
@@ -62,7 +64,7 @@ suppaftp = { version = "10", features = ["native-tls"] }
 # T-022: WebDAV - URL encoding
 urlencoding = "2"
 # T-026..T-030: Cloud connector dependencies
-reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "native-tls", "cookies", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "native-tls", "cookies", "rustls-tls", "socks"] }
 url = "2"
 hmac = "0.12"
 hex = "0.4"

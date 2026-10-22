@@ -15,6 +15,7 @@ pub mod editor_draft_commands;
 pub mod gpg_commands;
 pub mod operations_commands;
 pub mod policy_commands;
+pub mod proxy_commands;
 pub mod search_commands;
 pub mod share_commands;
 pub mod thumbnail_commands;

@@ -219,10 +219,10 @@ pub async fn send_reports(cfg: &ReportConfig, result: &str, vars: &BTreeMap<Stri
     if cfg.http_urls.is_empty() || !cfg.send_on.iter().any(|s| s == result) {
         return Vec::new();
     }
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30)).danger_accept_invalid_certs(cfg.accept_invalid_certs);
+    let mut builder = crate::net::builder().timeout(Duration::from_secs(30)).danger_accept_invalid_certs(cfg.accept_invalid_certs);
     if !cfg.pinned_sha256.is_empty() {
         match crate::security::tls::client_config(false, None, &cfg.pinned_sha256) {
-            Ok(tls) => builder = reqwest::Client::builder().timeout(Duration::from_secs(30)).use_preconfigured_tls(tls),
+            Ok(tls) => builder = crate::net::builder().timeout(Duration::from_secs(30)).use_preconfigured_tls(tls),
             Err(e) => return vec![e.user_message()],
         }
     } else if let Some(pem) = cfg.ca_pem.as_deref().filter(|p| !p.trim().is_empty()) {

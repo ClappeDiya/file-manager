@@ -147,7 +147,7 @@ impl GoogleDriveConnector {
     pub fn new() -> Self {
         Self {
             oauth: Arc::new(RwLock::new(None)),
-            http: reqwest::Client::new(),
+            http: crate::net::client(),
         }
     }
 

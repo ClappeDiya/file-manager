@@ -154,7 +154,7 @@ impl SwiftConnector {
 
     /// Authenticate and obtain a token via the configured auth method.
     async fn authenticate(config: &SwiftConfig) -> Result<(String, String, Option<DateTime<Utc>>), AppError> {
-        let client = reqwest::Client::builder()
+        let client = crate::net::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| AppError::connection(format!("HTTP client error: {e}"), "Check TLS configuration."))?;

@@ -143,7 +143,7 @@ pub struct AiAssistant {
 
 impl AiAssistant {
     pub fn new() -> Self {
-        let http_client = reqwest::Client::builder()
+        let http_client = crate::net::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_default();

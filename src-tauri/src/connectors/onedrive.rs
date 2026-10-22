@@ -178,7 +178,7 @@ impl OneDriveConnector {
     pub fn new() -> Self {
         Self {
             oauth: Arc::new(RwLock::new(None)),
-            http: reqwest::Client::new(),
+            http: crate::net::client(),
             account_type: Arc::new(RwLock::new(AccountType::Personal)),
         }
     }

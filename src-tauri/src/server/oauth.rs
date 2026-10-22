@@ -81,7 +81,7 @@ struct TokenResponse {
 
 impl OAuthBroker {
     pub fn new(cfg: BrokerConfig, store: Arc<dyn Backend>) -> Self {
-        Self { cfg: Arc::new(cfg), store, pending: Arc::new(Mutex::new(HashMap::new())), http: reqwest::Client::new() }
+        Self { cfg: Arc::new(cfg), store, pending: Arc::new(Mutex::new(HashMap::new())), http: crate::net::client() }
     }
 
     fn redirect_uri(&self) -> String {

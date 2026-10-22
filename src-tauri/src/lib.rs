@@ -11,6 +11,7 @@ pub mod governance;
 pub mod ledger;
 pub mod lineage;
 pub mod metadata_engine;
+pub mod net;
 pub mod search_engine;
 pub mod thumbnail_engine;
 pub mod mount_engine;
@@ -79,6 +80,7 @@ struct AppState {
     metadata_store: metadata_engine::MetadataStore,
     search_manager: search_engine::SearchManager,
     thumbnails: std::sync::Arc<thumbnail_engine::ThumbnailCache>,
+    credential_store: std::sync::Arc<CredentialStore>,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -292,6 +294,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         metadata_store: metadata_engine::MetadataStore::new(repo_for_metadata),
         search_manager: search_engine::SearchManager::open_default(),
         thumbnails: std::sync::Arc::new(thumbnail_engine::ThumbnailCache::open_default()),
+        credential_store: credential_store.clone(),
     })
 }
 
@@ -320,8 +323,10 @@ fn start_background_engines(app: tauri::AppHandle) {
     }));
 
     tauri::async_runtime::spawn(async move {
-        // Rules first, so no watcher or scheduled job runs unchecked.
+        // Rules and proxy first, so no watcher or scheduled job runs unchecked
+        // or connects around the proxy.
         commands::policy_commands::activate_stored(&app.state::<Repository>()).await;
+        commands::proxy_commands::activate_stored(&app.state::<Repository>(), &app.state::<std::sync::Arc<CredentialStore>>()).await;
         let automation = app.state::<AutomationManager>();
         if let Err(e) = automation.start_all_watchers().await {
             tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
@@ -408,13 +413,14 @@ pub fn run() {
                     credential_store.clone(),
                     "desktop",
                 ));
-                let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store), None);
+                let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), None);
                 AppState {
                     metadata_store: metadata_engine::MetadataStore::new(repo.clone()),
                     search_manager: search_engine::SearchManager::new(
                         search_engine::SearchIndex::open_in_memory().expect("in-memory SQLite"),
                     ),
                     thumbnails: std::sync::Arc::new(thumbnail_engine::ThumbnailCache::open_default()),
+                    credential_store: credential_store.clone(),
                     repo,
                     transfer_mgr,
                     connection_mgr,
@@ -522,6 +528,7 @@ pub fn run() {
         .manage(app_state.metadata_store)
         .manage(app_state.search_manager)
         .manage(app_state.thumbnails)
+        .manage(app_state.credential_store)
         .invoke_handler(tauri::generate_handler![
             // Security audit log (tamper-evident, append-only)
             audit_commands::verify_audit_log,
@@ -852,6 +859,9 @@ pub fn run() {
             commands::share_commands::connector_create_share_link,
             commands::operations_commands::operations_snapshot,
             commands::operations_commands::operations_cancel,
+            commands::proxy_commands::proxy_get,
+            commands::proxy_commands::proxy_set,
+            commands::proxy_commands::proxy_test,
             file_ops_commands::move_files,
             file_ops_commands::rename_file,
             file_ops_commands::duplicate_files,

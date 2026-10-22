@@ -19,6 +19,7 @@ import { FilenamePoliciesSection } from "@/components/filename-policies-section"
 import { SearchIndexFolders } from "@/components/search-index-folders";
 import { GpgKeysSection } from "@/components/gpg-keys-section";
 import { SharingPolicySection } from "@/components/sharing-policy-section";
+import { ProxySection } from "@/components/proxy-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
 
 // ── Types ──
@@ -1347,6 +1348,11 @@ export default function SettingsPanel({
         {/* Which names may be written where (enforced by the engines) */}
         <Section title="Filename Policies">
           <FilenamePoliciesSection />
+        </Section>
+
+        {/* Proxy for every outbound connection */}
+        <Section title="Network Proxy">
+          <ProxySection />
         </Section>
 
         {/* Which share links may be created from cloud connections */}

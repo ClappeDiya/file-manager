@@ -285,7 +285,7 @@ impl S3Connector {
 
     /// Connect using S3 credentials directly (not via ConnectionProfile).
     pub async fn connect_with_credentials(&self, creds: S3Credentials) -> Result<(), AppError> {
-        let http = reqwest::Client::builder()
+        let http = crate::net::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| AppError::Connection {

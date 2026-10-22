@@ -24,9 +24,9 @@ pub fn client(tls: &TlsOptions) -> Result<reqwest::Client, AppError> {
 pub fn builder(tls: &TlsOptions) -> Result<reqwest::ClientBuilder, AppError> {
     if !tls.pinned_sha256.is_empty() {
         let cfg = crate::security::tls::client_config(false, None, &tls.pinned_sha256)?;
-        return Ok(reqwest::Client::builder().use_preconfigured_tls(cfg).connect_timeout(Duration::from_secs(30)));
+        return Ok(crate::net::builder().use_preconfigured_tls(cfg).connect_timeout(Duration::from_secs(30)));
     }
-    let mut b = reqwest::Client::builder()
+    let mut b = crate::net::builder()
         .use_rustls_tls()
         .connect_timeout(Duration::from_secs(30))
         .danger_accept_invalid_certs(tls.accept_invalid_certs);

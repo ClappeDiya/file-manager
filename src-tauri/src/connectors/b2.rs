@@ -153,7 +153,7 @@ impl B2Connector {
         key_id: &str,
         application_key: &str,
     ) -> Result<(), AppError> {
-        let http = reqwest::Client::builder()
+        let http = crate::net::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| AppError::Connection {

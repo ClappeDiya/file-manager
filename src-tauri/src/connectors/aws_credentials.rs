@@ -293,7 +293,7 @@ pub fn list_all_profile_names() -> Vec<String> {
 async fn register_oidc_client(
     region: &str,
 ) -> Result<(String, String), AppError> {
-    let client = reqwest::Client::new();
+    let client = crate::net::client();
     let endpoint = format!(
         "https://oidc.{region}.amazonaws.com/client/register"
     );
@@ -358,7 +358,7 @@ pub async fn start_sso_auth(
     let (client_id, client_secret) = register_oidc_client(region).await?;
 
     // Step 2: Start device authorization
-    let client = reqwest::Client::new();
+    let client = crate::net::client();
     let endpoint = format!(
         "https://oidc.{region}.amazonaws.com/device_authorization"
     );
@@ -444,7 +444,7 @@ pub async fn poll_sso_token(
     client_secret: &str,
     region: &str,
 ) -> Result<SsoTokenResponse, AppError> {
-    let client = reqwest::Client::new();
+    let client = crate::net::client();
     let endpoint = format!("https://oidc.{region}.amazonaws.com/token");
 
     let body = serde_json::json!({
@@ -542,7 +542,7 @@ pub async fn get_sso_role_credentials(
     role_name: &str,
     region: &str,
 ) -> Result<AwsCredentials, AppError> {
-    let client = reqwest::Client::new();
+    let client = crate::net::client();
     let endpoint = format!(
         "https://portal.sso.{region}.amazonaws.com/federation/credentials?account_id={account_id}&role_name={role_name}"
     );
@@ -639,7 +639,7 @@ pub async fn assume_role_with_web_identity(
     session_name: Option<&str>,
 ) -> Result<AwsCredentials, AppError> {
     let session = session_name.unwrap_or("ufop-session");
-    let client = reqwest::Client::new();
+    let client = crate::net::client();
     let endpoint = format!("https://sts.{region}.amazonaws.com/");
 
     let params = [

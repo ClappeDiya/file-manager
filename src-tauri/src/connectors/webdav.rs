@@ -1096,7 +1096,7 @@ impl super::Connector for WebDavConnector {
             let auth_method = config.auth_method.clone();
 
             let client = {
-                let builder = reqwest::Client::builder()
+                let builder = crate::net::builder()
                     .timeout(std::time::Duration::from_secs(request_timeout as u64))
                     .connect_timeout(std::time::Duration::from_secs(connect_timeout as u64))
                     .user_agent(&user_agent)
