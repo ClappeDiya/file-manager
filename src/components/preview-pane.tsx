@@ -19,6 +19,8 @@ import { useState, useEffect, useRef, useMemo } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { errorText } from "@/lib/error-text";
+import { structuredKind } from "@/lib/structured-preview";
+import { StructuredPreview } from "@/components/structured-preview";
 
 // ── Types ──
 
@@ -640,7 +642,8 @@ function PreviewContent({ preview, exif: _exif }: { preview: PreviewResult; exif
     case "text": {
       const lang = getLanguageClass(preview.render_hint);
       const lines = preview.content?.split("\n") || [];
-      return (
+      const kind = structuredKind(preview.file_name);
+      const rawView = (
         <div className="p-2">
           <div className="flex items-center justify-between px-2 py-1 mb-1 text-xs text-text-tertiary bg-surface-secondary rounded-t">
             <span>{lang}</span>
@@ -655,6 +658,11 @@ function PreviewContent({ preview, exif: _exif }: { preview: PreviewResult; exif
             ))}
           </pre>
         </div>
+      );
+      return kind ? (
+        <StructuredPreview kind={kind} text={preview.content ?? ""} fileName={preview.file_name} path={preview.path} raw={rawView} />
+      ) : (
+        rawView
       );
     }
 
