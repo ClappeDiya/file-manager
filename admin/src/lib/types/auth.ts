@@ -59,7 +59,23 @@ export type Permission =
   | 'billing.write'
   | 'ai_governance.read'
   | 'ai_governance.write'
-  | 'sso.configure';
+  | 'sso.configure'
+  | 'orgs.read'
+  | 'orgs.write'
+  | 'groups.read'
+  | 'groups.write'
+  | 'fleet.read'
+  | 'fleet.write'
+  | 'fleet.enroll'
+  | 'alerts.read'
+  | 'alerts.write'
+  | 'credentials.write'
+  | 'remote.execute'
+  | 'ai.read'
+  | 'ai.write';
+
+/** Fleet / tenancy permissions added for the backup console. */
+const FLEET_ALL: Permission[] = ['orgs.read', 'orgs.write', 'groups.read', 'groups.write', 'fleet.read', 'fleet.write', 'fleet.enroll', 'alerts.read', 'alerts.write', 'credentials.write', 'remote.execute', 'ai.read', 'ai.write'];
 
 /** Default permissions per role */
 export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
@@ -70,6 +86,7 @@ export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
     'audit.read', 'audit.export', 'connectors.read', 'connectors.write',
     'workspaces.read', 'workspaces.write', 'billing.read', 'billing.write',
     'ai_governance.read', 'ai_governance.write', 'sso.configure',
+    ...FLEET_ALL,
   ],
   org_admin: [
     'admin.access', 'users.read', 'users.write', 'users.invite', 'users.deactivate',
@@ -78,27 +95,32 @@ export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
     'audit.read', 'audit.export', 'connectors.read', 'connectors.write',
     'workspaces.read', 'workspaces.write', 'billing.read',
     'ai_governance.read', 'ai_governance.write',
+    ...FLEET_ALL,
   ],
   security_admin: [
     'admin.access', 'users.read', 'devices.read',
     'policies.read', 'policies.write', 'approvals.read', 'approvals.approve', 'approvals.deny',
     'audit.read', 'audit.export', 'connectors.read',
     'ai_governance.read', 'ai_governance.write', 'sso.configure',
+    'orgs.read', 'groups.read', 'fleet.read', 'alerts.read', 'alerts.write', 'credentials.write', 'ai.read',
   ],
   approver: [
     'admin.access', 'approvals.read', 'approvals.approve', 'approvals.deny',
-    'audit.read',
+    'audit.read', 'fleet.read',
   ],
   operator: [
     'admin.access', 'users.read', 'devices.read', 'devices.write',
     'connectors.read', 'connectors.write', 'workspaces.read', 'workspaces.write',
     'audit.read',
+    'orgs.read', 'groups.read', 'fleet.read', 'fleet.write', 'fleet.enroll', 'alerts.read', 'remote.execute', 'ai.read',
   ],
-  user: [],
+  // Machine owners: see only machines their groups grant (access scoping).
+  user: ['admin.access', 'fleet.read', 'groups.read'],
   read_only_auditor: [
     'admin.access', 'users.read', 'devices.read',
     'policies.read', 'approvals.read', 'audit.read', 'audit.export',
     'connectors.read', 'workspaces.read',
+    'orgs.read', 'groups.read', 'fleet.read', 'alerts.read', 'ai.read',
   ],
 };
 

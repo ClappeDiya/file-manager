@@ -8,3 +8,7 @@ packages:
 # fixed in 8.5.10); 8.5 is a drop-in for Next's internal CSS pipeline.
 overrides:
   "next>postcss": "^8.5.10"
+
+# Native addons that must compile on install (the admin console's SQLite driver).
+onlyBuiltDependencies:
+  - better-sqlite3

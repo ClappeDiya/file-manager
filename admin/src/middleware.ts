@@ -1,13 +1,35 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { jwtVerify } from 'jose';
 
-const PUBLIC_PATHS = ['/login', '/api/auth/login', '/api/auth/logout', '/api/health'];
+const PUBLIC_PATHS = [
+  '/login',
+  '/invite/',
+  '/api/auth/login',
+  '/api/auth/logout',
+  '/api/auth/mfa/verify',
+  '/api/auth/sso/',
+  '/api/invitations/accept',
+  '/api/health',
+];
+
+/**
+ * Endpoints that authenticate themselves and are called cross-site:
+ * agents (bearer / report key) and SSO callbacks (signed state, SAML
+ * signatures; the IdP posts the SAML response from its own origin).
+ */
+const AGENT_PATHS = ['/api/agent/', '/api/ingest/', '/api/auth/sso/'];
 
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
-  // Allow public paths
-  if (PUBLIC_PATHS.some((p) => pathname.startsWith(p))) {
+  // Agent endpoints authenticate themselves (Authorization header / report key).
+  if (AGENT_PATHS.some((p) => pathname.startsWith(p))) {
+    return NextResponse.next();
+  }
+
+  // Public pages and auth endpoints still get the CSRF Origin check below for POSTs.
+  const isPublic = PUBLIC_PATHS.some((p) => pathname.startsWith(p));
+  if (isPublic && request.method === 'GET') {
     return NextResponse.next();
   }
 
@@ -40,6 +62,10 @@ export async function middleware(request: NextRequest) {
         return NextResponse.json({ error: 'CSRF validation failed: invalid Origin' }, { status: 403 });
       }
     }
+  }
+
+  if (isPublic) {
+    return NextResponse.next();
   }
 
   // Check session cookie

@@ -1,43 +1,19 @@
-import { NextResponse } from 'next/server';
-import { jwtVerify } from 'jose';
-import { cookies } from 'next/headers';
+import { NextRequest, NextResponse } from 'next/server';
+import { authenticate, isContext } from '@/lib/session';
+import { accessibleOrgs, getOrg, orgPath } from '@/lib/db/repos/orgs';
+import { publicUser } from '@/lib/db/repos/users';
 
-/** GET /api/auth/session - Validate session and return user */
-export async function GET() {
-  const jwtSecret = process.env.NEXTAUTH_SECRET;
-  if (!jwtSecret) {
-    console.error('NEXTAUTH_SECRET environment variable is not set');
-    return NextResponse.json(
-      { error: 'Server configuration error' },
-      { status: 500 }
-    );
-  }
-
-  const cookieStore = await cookies();
-  const sessionToken = cookieStore.get('ufop-admin-session')?.value;
-
-  if (!sessionToken) {
-    return NextResponse.json(
-      { error: 'No session found' },
-      { status: 401 }
-    );
-  }
-
-  try {
-    const secret = new TextEncoder().encode(jwtSecret);
-    const { payload } = await jwtVerify(sessionToken, secret);
-
-    return NextResponse.json({
-      user: {
-        email: payload.sub || '',
-        name: String(payload.name || ''),
-        role: String(payload.role || 'viewer'),
-      },
-    });
-  } catch {
-    return NextResponse.json(
-      { error: 'Session expired or invalid' },
-      { status: 401 }
-    );
-  }
+/** GET /api/auth/session — the signed-in user, current organization, role and permissions. */
+export async function GET(request: NextRequest) {
+  const ctx = await authenticate(request);
+  if (!isContext(ctx)) return ctx;
+  const org = getOrg(ctx.orgId)!;
+  return NextResponse.json({
+    user: { ...publicUser(ctx.user), role: ctx.role },
+    organization: { id: org.id, name: org.name, path: orgPath(org.id), status: org.status },
+    role: ctx.role,
+    permissions: ctx.permissions,
+    amr: ctx.amr,
+    organizations: accessibleOrgs(ctx.user.id).map(({ org: o, role }) => ({ id: o.id, name: o.name, path: orgPath(o.id), role, parentId: o.parentId })),
+  });
 }
