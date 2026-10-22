@@ -18,7 +18,7 @@ export const FEATURES = {
   /** Subscription and payment management. */
   billing: false,
   /** Outbound webhook subscriptions with delivery. */
-  webhooks: false,
+  webhooks: true,
   /** Org-level connector definitions (use Fleet → Credentials meanwhile). */
   connectors: false,
   /** Server-side sync-pair and transfer management. */

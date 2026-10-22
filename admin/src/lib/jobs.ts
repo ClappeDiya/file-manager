@@ -8,6 +8,7 @@ import { purgeOffboarded } from './db/repos/orgs';
 import { anchorAudit, appendAudit, listAnchors } from './db/repos/audit';
 import { runScheduledSummaries } from './ai';
 import { logger } from './utils/logger';
+import { startDelivery } from './delivery';
 
 let started = false;
 
@@ -24,6 +25,7 @@ export async function runJobsOnce(at = new Date()): Promise<{ missed: number; pu
 export function startJobs(intervalMs = 5 * 60_000): void {
   if (started || process.env.ADMIN_DISABLE_JOBS === '1') return;
   started = true;
+  startDelivery();
   const tick = () =>
     runJobsOnce().catch((e) => logger.error('jobs.failed', { error: e instanceof Error ? e.message : String(e) }));
   setTimeout(tick, 30_000).unref?.();

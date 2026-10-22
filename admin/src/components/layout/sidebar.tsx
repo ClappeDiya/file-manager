@@ -26,7 +26,7 @@ import {
   Sparkles,
   Building2,
   UsersRound,
-  Fingerprint, SlidersHorizontal } from 'lucide-react';
+  Fingerprint, SlidersHorizontal, Webhook } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 import { useAdminStore } from '@/lib/stores/admin-store';
 import { useAuthStore } from '@/lib/stores/auth-store';
@@ -54,6 +54,7 @@ const navItems: NavItem[] = [
   { id: 'app-settings', i18nKey: 'nav.appSettings', href: '/fleet/app-settings', icon: SlidersHorizontal, requiredPermission: 'fleet.read' },
   { id: 'credentials', i18nKey: 'nav.credentials', href: '/fleet/credentials', icon: KeyRound, requiredPermission: 'fleet.read' },
   { id: 'alerts', i18nKey: 'nav.alerts', href: '/alerts', icon: Bell, requiredPermission: 'alerts.read' },
+  { id: 'webhooks', i18nKey: 'nav.webhooks', href: '/integrations/webhooks', icon: Webhook, requiredPermission: 'alerts.read' },
   { id: 'ai-insights', i18nKey: 'nav.aiInsights', href: '/ai-insights', icon: Sparkles, requiredPermission: 'ai.read' },
   { id: 'organizations', i18nKey: 'nav.organizations', href: '/organizations', icon: Building2, requiredPermission: 'orgs.read' },
   { id: 'groups', i18nKey: 'nav.groups', href: '/groups', icon: UsersRound, requiredPermission: 'groups.read' },

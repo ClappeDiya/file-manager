@@ -31,6 +31,9 @@ const RESULT: Record<string, 'success' | 'warning' | 'error' | 'default' | 'info
   offboarding: 'warning',
   pending: 'info',
   accepted: 'success',
+  dead: 'error',
+  paused: 'warning',
+  disabled: 'default',
 };
 
 export function StatusBadge({ value }: { value: string | null }) {

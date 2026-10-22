@@ -10,8 +10,6 @@ import { listAudit, verifyAudit } from '@/lib/db/repos/audit';
 import { getAiGovernance } from '@/lib/db/repos/ai-governance';
 import { json, makeUser, req } from './helpers';
 import * as gov from '@/app/api/ai-governance/route';
-import * as webhooks from '@/app/api/webhooks/route';
-import * as webhookById from '@/app/api/webhooks/[id]/route';
 import * as sync from '@/app/api/sync/route';
 import * as transfers from '@/app/api/transfers/route';
 import * as connectors from '@/app/api/connectors/route';
@@ -92,9 +90,6 @@ describe('features without a backend', () => {
   it('answer 501 instead of storing data in memory', async () => {
     const admin = makeUser('ops@x.org', 'org_admin');
     const cases: [string, Promise<Response>][] = [
-      ['webhooks list', webhooks.GET(await req('GET', '/api/webhooks', { as: admin }))],
-      ['webhooks create', webhooks.POST(await req('POST', '/api/webhooks', { as: admin, body: { url: 'https://x', events: [] } }))],
-      ['webhook delete', webhookById.DELETE(await req('DELETE', '/api/webhooks/w1', { as: admin }), P('w1'))],
       ['sync', sync.GET(await req('GET', '/api/sync', { as: admin }))],
       ['transfers', transfers.GET(await req('GET', '/api/transfers', { as: admin }))],
       ['connectors', connectors.GET(await req('GET', '/api/connectors', { as: admin }))],

@@ -7,6 +7,7 @@
  * data: BackupReport}`), so clients can report without the agent.
  */
 import { db, newId, now, parseJson, type Row } from '../index';
+import { enqueueEvent } from './webhooks';
 
 export interface NormalizedReport {
   backupId: string;
@@ -132,6 +133,13 @@ export function ingestReport(orgId: string, machineId: string, rep: NormalizedRe
       );
     }
     d.prepare('UPDATE machines SET last_report_at = ? WHERE id = ?').run(now(), machineId);
+    if (rep.operation === 'backup') {
+      enqueueEvent(orgId, `backup.${rep.status}`, {
+        reportId: id, machineId, backupId: rep.backupId, backupName: rep.backupName, status: rep.status, finishedAt: rep.finishedAt, durationMs: rep.durationMs,
+        filesExamined: rep.filesExamined, filesAdded: rep.filesAdded, filesModified: rep.filesModified, filesDeleted: rep.filesDeleted, bytesUploaded: rep.bytesUploaded,
+        warnings: rep.warnings, errors: rep.errors, message: rep.message,
+      });
+    }
   })();
   return fromRow(d.prepare('SELECT * FROM backup_reports WHERE id = ?').get(id) as Row);
 }

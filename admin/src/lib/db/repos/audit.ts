@@ -9,6 +9,7 @@
  */
 import crypto from 'crypto';
 import { db, newId, now, parseJson, tx, type Row } from '../index';
+import { enqueueEvent } from './webhooks';
 import { sign, timingSafeEqualHex } from '../../crypto';
 
 export interface AuditInput {
@@ -132,6 +133,8 @@ export function appendAudit(e: AuditInput): AuditRecord {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(base.id, base.sequence, base.eventType, base.severity, base.timestamp, base.orgId, base.userId, base.userEmail, base.ipAddress, base.userAgent, base.description, JSON.stringify(metadata), integrityHash, base.previousHash);
+    // Same transaction: an audited action and its webhook deliveries are recorded together.
+    enqueueEvent(base.orgId, base.eventType, { auditId: base.id, severity: base.severity, description: base.description, actor: base.userEmail || null, resourceType: e.resourceType ?? null, resourceId: e.resourceId ?? null, metadata });
     return { ...base, organizationId: base.orgId, resourceType: e.resourceType, resourceId: e.resourceId, integrityHash };
   });
 }

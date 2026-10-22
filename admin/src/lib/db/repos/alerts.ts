@@ -1,5 +1,6 @@
 /** Alert rules and alert instances. Evaluation lives in lib/alerts.ts. */
 import { db, newId, now, parseJson, type Row } from '../index';
+import { enqueueEvent } from './webhooks';
 import { OrgError } from './orgs';
 import { normalizeTags } from './machines';
 
@@ -152,7 +153,9 @@ export function insertAlert(a: Omit<Alert, 'id' | 'createdAt' | 'lastNotifiedAt'
   db()
     .prepare('INSERT INTO alerts (id, org_id, rule_id, machine_id, backup_id, kind, severity, message, details, fingerprint, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .run(id, a.orgId, a.ruleId, a.machineId, a.backupId, a.kind, a.severity, a.message, JSON.stringify(a.details), a.fingerprint, now());
-  return alertFromRow(db().prepare('SELECT * FROM alerts WHERE id = ?').get(id) as Row);
+  const alert = alertFromRow(db().prepare('SELECT * FROM alerts WHERE id = ?').get(id) as Row);
+  enqueueEvent(a.orgId, 'alert.opened', { alertId: id, kind: a.kind, severity: a.severity, message: a.message, machineId: a.machineId, backupId: a.backupId, ruleId: a.ruleId });
+  return alert;
 }
 
 export function recordNotification(id: string, deliveries: { channelId: string; ok: boolean; error?: string }[]): void {
@@ -162,7 +165,9 @@ export function recordNotification(id: string, deliveries: { channelId: string; 
 }
 
 export function resolveAlert(id: string): void {
-  db().prepare('UPDATE alerts SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL').run(now(), id);
+  if (db().prepare('UPDATE alerts SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL').run(now(), id).changes === 0) return;
+  const a = alertFromRow(db().prepare('SELECT * FROM alerts WHERE id = ?').get(id) as Row);
+  enqueueEvent(a.orgId, 'alert.resolved', { alertId: id, kind: a.kind, severity: a.severity, message: a.message, machineId: a.machineId, backupId: a.backupId, ruleId: a.ruleId });
 }
 
 export function listAlerts(o: { orgIds: string[]; open?: boolean; machineIds?: string[]; limit?: number }): Alert[] {
