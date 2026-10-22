@@ -76,6 +76,8 @@ import { AutomationRuleEditor } from "./automation-rule-editor";
 import { CopyToManyDialog } from "./copy-to-many-dialog";
 import { IndexedSearchResults } from "./indexed-search-results";
 import { GpgDialog } from "./gpg-dialog";
+import { OperationsDrawer, OperationsIndicator } from "./operations-drawer";
+import { useOperationsStore } from "@/stores/operations-store";
 import { looksEncrypted, looksLikeSignature, useGpgDialog } from "@/stores/gpg-store";
 import type { SearchScope } from "@/stores/search-store";
 import { openCopyToMany } from "@/stores/copy-to-many-store";
@@ -133,6 +135,7 @@ import {
   Save,
   FolderDown,
   Zap,
+  Activity,
   Layers,
   X,
   DatabaseBackup,
@@ -151,6 +154,7 @@ const ALL_TOOLBAR_ITEMS = [
   { id: "smart-spaces", label: "Smart Spaces" },
   { id: "sync-browse", label: "Sync Browse" },
   { id: "backups", label: "Backups" },
+  { id: "operations", label: "Operations" },
 ];
 
 // ──────────────────────────────────────────────
@@ -1948,6 +1952,7 @@ export function FileManager() {
           } catch {}
         },
         onToggleAutomations: toggleAutomationPanel,
+        onToggleOperations: () => useOperationsStore.getState().toggle(),
         onCreateAutomation: () => {
           if (!automationPanelOpen) toggleAutomationPanel();
           useAutomationStore.getState().openEditor();
@@ -2390,6 +2395,18 @@ export function FileManager() {
               <Zap className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
+          {toolbarItems.includes("operations") && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => useOperationsStore.getState().toggle()}
+              aria-label="Show operations"
+              title="Operations (transfers, syncs, backups…)"
+              data-testid="toggle-operations"
+            >
+              <Activity className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
           {toolbarItems.includes("backups") && (
             <Button
               variant={backupOpen ? "secondary" : "ghost"}
@@ -2598,6 +2615,7 @@ export function FileManager() {
         <AutomationRuleEditor />
         <CopyToManyDialog />
         <GpgDialog />
+        <OperationsDrawer />
         {activityTimelineOpen && (
           <ActivityTimelinePanel onDispatchPath={handleDispatchLedgerPath} />
         )}
@@ -5030,6 +5048,7 @@ function StatusBarContent() {
       </div>
 
       {/* Engine Pulse — ambient cross-engine activity heartbeat */}
+      <OperationsIndicator />
       <EnginePulseIndicator />
 
       <div className="flex items-center gap-2">

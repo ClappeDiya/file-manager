@@ -701,6 +701,7 @@ export function getDefaultCommands(actions: {
   onOpenInEditor?: () => void;
   onOpenSettings?: () => void;
   onToggleAutomations?: () => void;
+  onToggleOperations?: () => void;
   onCreateAutomation?: () => void;
   onCreateSmartSpace?: () => void;
   onToggleActivityTimeline?: () => void;
@@ -1463,6 +1464,14 @@ export function getDefaultCommands(actions: {
         "privacy",
         "logs",
       ],
+    },
+    {
+      id: "toggle-operations",
+      label: "Show Operations (Transfers, Syncs, Backups)",
+      icon: <Zap className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onToggleOperations || (() => {}),
+      keywords: ["progress", "running", "queue", "activity", "jobs", "cancel"],
     },
     // Automations (Quickflows)
     {

@@ -850,6 +850,8 @@ pub fn run() {
             commands::share_commands::sharing_policy_get,
             commands::share_commands::sharing_policy_set,
             commands::share_commands::connector_create_share_link,
+            commands::operations_commands::operations_snapshot,
+            commands::operations_commands::operations_cancel,
             file_ops_commands::move_files,
             file_ops_commands::rename_file,
             file_ops_commands::duplicate_files,

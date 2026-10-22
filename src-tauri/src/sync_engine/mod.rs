@@ -216,6 +216,11 @@ impl SyncManager {
         self.progress.lock().ok().and_then(|m| m.get(&pair_id).cloned())
     }
 
+    /// Progress of every running sync.
+    pub fn all_progress(&self) -> Vec<executor::SyncProgress> {
+        self.progress.lock().map(|m| m.values().cloned().collect()).unwrap_or_default()
+    }
+
     /// Ask a running sync to stop after the file it is copying.
     /// Returns false when the pair isn't running.
     pub async fn cancel_sync(&self, pair_id: Uuid) -> bool {
