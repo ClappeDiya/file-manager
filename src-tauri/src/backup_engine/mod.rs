@@ -2108,7 +2108,7 @@ impl BackupManager {
                         P::WebDav | P::S3 | P::GoogleDrive | P::Dropbox | P::OneDrive | P::AzureBlob | P::Swift => (443, true),
                         P::Smb => (445, false),
                         P::Nfs => (2049, false),
-                        P::Local => return None,
+                        P::Local | P::Rclone => return None,
                     };
                     let host = p.host.trim_start_matches("https://").trim_start_matches("http://").split('/').next().unwrap_or_default().to_string();
                     (!host.is_empty()).then(|| (host, p.port.unwrap_or(port), tls))

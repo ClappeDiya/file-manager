@@ -248,3 +248,9 @@ pub async fn ensure_connected(
     }
     Ok(connector)
 }
+
+/// rclone remotes from the user's rclone config (`rclone listremotes`).
+#[tauri::command]
+pub async fn rclone_list_remotes() -> Result<Vec<crate::connectors::rclone::RcloneRemote>, AppError> {
+    crate::connectors::rclone::list_remotes().await
+}

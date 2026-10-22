@@ -20,6 +20,7 @@
 //! - Azure Blob Storage: SAS/AD auth, container/blob ops, access tiers, SAS URLs
 //! - OpenStack Swift: Keystone v3/TempAuth, container/object ops, SLO/DLO, TempURL
 
+pub mod rclone;
 pub mod connection_manager;
 pub mod known_hosts;
 pub mod ftp;
@@ -281,6 +282,7 @@ impl ConnectorRegistry {
         // Azure Blob Storage and OpenStack Swift
         registry.register("azure_blob", Arc::new(AzureBlobConnector::new()));
         registry.register("swift", Arc::new(SwiftConnector::new()));
+        registry.register("rclone", Arc::new(rclone::RcloneConnector::new()));
 
         registry
     }

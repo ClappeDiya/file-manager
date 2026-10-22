@@ -672,6 +672,8 @@ pub enum ConnectionProtocol {
     Local,
     AzureBlob,
     Swift,
+    /// Any rclone remote (GCS, Box, pCloud, Mega…).
+    Rclone,
 }
 
 impl ConnectionProtocol {
@@ -690,6 +692,7 @@ impl ConnectionProtocol {
             Self::Local => "local",
             Self::AzureBlob => "azure_blob",
             Self::Swift => "swift",
+            Self::Rclone => "rclone",
         }
     }
 
@@ -708,6 +711,7 @@ impl ConnectionProtocol {
             "local" => Self::Local,
             "azure_blob" => Self::AzureBlob,
             "swift" => Self::Swift,
+            "rclone" => Self::Rclone,
             _ => Self::Local,
         }
     }

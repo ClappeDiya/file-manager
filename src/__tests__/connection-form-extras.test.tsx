@@ -13,7 +13,8 @@ beforeAll(() => {
 beforeEach(() => {
   mockInvoke.mockReset().mockImplementation(async (cmd: string) => {
     if (cmd === "list_connections" || cmd === "list_connection_groups" || cmd === "list_aws_profiles") return [];
-    if (cmd === "connector_list_protocols") return ["sftp", "s3"];
+    if (cmd === "connector_list_protocols") return ["sftp", "s3", "rclone"];
+    if (cmd === "rclone_list_remotes") return [{ name: "gcs:", backend: "google cloud storage" }, { name: "box:", backend: "box" }];
     return undefined;
   });
 });
@@ -37,5 +38,19 @@ describe("connection form extras", () => {
       preset: null,
       assume_role: { role_arn: "arn:aws:iam::123456789012:role/Reader", external_id: "ext-42", session_name: null, duration_secs: 1800 },
     });
+  });
+
+  it("picks an rclone remote and saves it as the connection's remote", async () => {
+    const { container } = render(<ConnectionPanel />);
+    fireEvent.click(await screen.findByText("Add your first connection"));
+    const form = container.querySelector("form")!;
+    fireEvent.change(form.querySelector("select")!, { target: { value: "rclone" } });
+    const remote = (await screen.findByLabelText("rclone remote")) as HTMLSelectElement;
+    await waitFor(() => expect([...remote.options].map((o) => o.textContent)).toEqual(["Choose a remote…", "gcs: (google cloud storage)", "box: (box)"]));
+    fireEvent.change(remote, { target: { value: "box:" } });
+    fireEvent.submit(form);
+    await waitFor(() => expect(mockInvoke.mock.calls.some(([c]) => c === "save_connection")).toBe(true));
+    const args = mockInvoke.mock.calls.find(([c]) => c === "save_connection")![1];
+    expect([args.protocol, args.host, args.name, args.extras.rclone_remote]).toEqual(["rclone", "box:", "box", "box:"]);
   });
 });

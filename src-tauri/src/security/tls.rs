@@ -234,6 +234,11 @@ pub fn check_transport_security(
             // Local filesystem doesn't use network transport
             check.secure = true;
         }
+        ConnectionProtocol::Rclone => {
+            // rclone negotiates transport per backend (HTTPS for cloud APIs).
+            check.secure = true;
+            check.recommendations.push("Transport security is set by the rclone remote's backend; check `rclone config`.".to_string());
+        }
     }
 
     if security.certificate_pinning {
@@ -276,6 +281,7 @@ pub fn recommended_security(protocol: ConnectionProtocol) -> TransportSecurity {
         | ConnectionProtocol::OneDrive
         | ConnectionProtocol::AzureBlob
         | ConnectionProtocol::Swift => TransportSecurity::strict(),
+        ConnectionProtocol::Rclone => TransportSecurity::default(),
         ConnectionProtocol::Local => TransportSecurity {
             require_encryption: false,
             ..TransportSecurity::default()

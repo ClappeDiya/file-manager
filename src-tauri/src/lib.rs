@@ -862,6 +862,7 @@ pub fn run() {
             commands::proxy_commands::proxy_get,
             commands::proxy_commands::proxy_set,
             commands::proxy_commands::proxy_test,
+            commands::connector_commands::rclone_list_remotes,
             file_ops_commands::move_files,
             file_ops_commands::rename_file,
             file_ops_commands::duplicate_files,

@@ -141,6 +141,7 @@ impl ConnectionManager {
             ConnectionProtocol::AzureBlob => 443,
             ConnectionProtocol::Swift => 5000,
             ConnectionProtocol::Local => 0,
+            ConnectionProtocol::Rclone => 0,
         }
     }
 

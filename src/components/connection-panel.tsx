@@ -122,6 +122,7 @@ const FALLBACK_PROTOCOLS: ProtocolOption[] = [
   { value: "google_drive", label: "Google Drive", port: 443 },
   { value: "dropbox", label: "Dropbox", port: 443 },
   { value: "onedrive", label: "OneDrive", port: 443 },
+  { value: "rclone", label: "rclone (GCS, Box, Mega, 70+ more)", port: 0 },
 ];
 
 // Default port mapping for dynamically fetched protocols
@@ -501,6 +502,19 @@ function ConnectionForm({
   // S3-compatible preset selector
   const [selectedS3Preset, setSelectedS3Preset] = useState(initialData?.extras?.preset ?? "");
 
+  // rclone remotes from the user's rclone config
+  const [rcloneRemotes, setRcloneRemotes] = useState<{ name: string; backend: string }[] | null>(null);
+  const [rcloneError, setRcloneError] = useState<string | null>(null);
+  useEffect(() => {
+    if (protocol !== "rclone" || rcloneRemotes !== null) return;
+    tauriInvoke<{ name: string; backend: string }[]>("rclone_list_remotes")
+      .then((r) => setRcloneRemotes(r ?? []))
+      .catch((e) => {
+        setRcloneRemotes([]);
+        setRcloneError(errorText(e));
+      });
+  }, [protocol, rcloneRemotes]);
+
   // STS AssumeRole (S3): temporary credentials from the keys above
   const [roleArn, setRoleArn] = useState(initialData?.extras?.assume_role?.role_arn ?? "");
   const [externalId, setExternalId] = useState(initialData?.extras?.assume_role?.external_id ?? "");
@@ -599,6 +613,7 @@ function ConnectionForm({
   const isFtpProtocol = protocol === "ftp" || protocol === "ftps";
   const isSshProtocol = protocol === "sftp";
   const isAzureBlob = protocol === "azure_blob";
+  const isRclone = protocol === "rclone";
   const isSwift = protocol === "swift";
   const isS3 = protocol === "s3";
 
@@ -631,7 +646,7 @@ function ConnectionForm({
       defaultFileMode: isSshProtocol || isFtpProtocol ? defaultFileMode || null : null,
       defaultDirMode: isSshProtocol || isFtpProtocol ? defaultDirMode || null : null,
       extras: {
-        rclone_remote: initialData?.extras?.rclone_remote ?? null,
+        rclone_remote: protocol === "rclone" ? host.trim() || null : initialData?.extras?.rclone_remote ?? null,
         preset: isS3 ? selectedS3Preset || null : initialData?.extras?.preset ?? null,
         assume_role:
           isS3 && roleArn.trim()
@@ -781,6 +796,29 @@ function ConnectionForm({
               </p>
             ) : null;
           })()}
+        </div>
+      )}
+      {/* rclone remote picker */}
+      {isRclone && (
+        <div>
+          <label className="block text-xs font-medium mb-1" htmlFor="rclone-remote">rclone remote</label>
+          <select
+            id="rclone-remote"
+            value={rcloneRemotes?.some((r) => r.name === host) ? host : ""}
+            onChange={(e) => {
+              setHost(e.target.value);
+              if (!name) setName(e.target.value.replace(/:$/, ""));
+            }}
+            className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+          >
+            <option value="">{rcloneRemotes === null ? "Loading…" : rcloneRemotes.length ? "Choose a remote…" : "No remotes configured"}</option>
+            {rcloneRemotes?.map((r) => (
+              <option key={r.name} value={r.name}>{r.name} ({r.backend})</option>
+            ))}
+          </select>
+          <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">
+            {rcloneError ?? "Remotes come from `rclone config`. You can also type one in Host, e.g. gcs:my-bucket or :s3,provider=AWS:."}
+          </p>
         </div>
       )}
       {/* STS AssumeRole (S3 only) */}
