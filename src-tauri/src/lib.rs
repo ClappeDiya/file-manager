@@ -332,7 +332,7 @@ fn start_background_engines(app: tauri::AppHandle) {
         // or connects around the proxy.
         commands::policy_commands::activate_stored(&app.state::<Repository>()).await;
         commands::proxy_commands::activate_stored(&app.state::<Repository>(), &app.state::<std::sync::Arc<CredentialStore>>()).await;
-        managed_settings::activate_stored(&app.state::<Repository>(), &app.state::<AiAssistant>(), &app.state::<BackupManager>()).await;
+        managed_settings::activate_stored(&app.state::<Repository>(), &app.state::<AiAssistant>(), &app.state::<BackupManager>(), &app.state::<MountManager>()).await;
         let automation = app.state::<AutomationManager>();
         if let Err(e) = automation.start_all_watchers().await {
             tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
@@ -493,7 +493,7 @@ pub fn run() {
             setup_agent.host().set_managed_settings_handler(std::sync::Arc::new(move |settings| {
                 let h = apply_handle.clone();
                 Box::pin(async move {
-                    managed_settings::apply(&h.state::<Repository>(), &h.state::<std::sync::Arc<CredentialStore>>(), &h.state::<AiAssistant>(), &h.state::<BackupManager>(), settings).await
+                    managed_settings::apply(&h.state::<Repository>(), &h.state::<std::sync::Arc<CredentialStore>>(), &h.state::<AiAssistant>(), &h.state::<BackupManager>(), &h.state::<MountManager>(), settings).await
                 })
             }));
             fleet_agent::spawn(setup_agent.clone(), "unified-file-ops");
@@ -949,6 +949,10 @@ pub fn run() {
             mount_commands::list_mounts,
             mount_commands::get_mount_status,
             mount_commands::save_mount_config,
+            mount_commands::mount_policy,
+            mount_commands::mount_pin_offline,
+            mount_commands::mount_cache_usage,
+            mount_commands::mount_clear_cache,
             mount_commands::delete_mount_config,
             // Settings Export/Import & Sync
             settings_commands::export_all_settings,

@@ -138,6 +138,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "ufop-server share portal - links and their access log",
             sql: V24_SCHEMA,
         },
+        Migration {
+            version: 25,
+            description: "Mount options - cache mode, cache limits, read-only; mount error column",
+            sql: V25_SCHEMA,
+        },
     ]
 }
 
@@ -155,6 +160,14 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
 /// symlink policy, connector extras) as JSON; previously never saved.
 /// Schema v22: named `ufop-server` API tokens (SHA-256 hashes) with scopes
 /// (JSON list) and a mandatory expiry.
+/// Schema v25: per-mount options (`mount_engine::MountOptions` as JSON), and
+/// the `error_message` column the mount engine always wrote but v7 never
+/// created (every mount ended in a database error).
+const V25_SCHEMA: &str = r#"
+ALTER TABLE mount_configs ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE mount_configs ADD COLUMN error_message TEXT;
+"#;
+
 /// Schema v24: ufop-server share links (`server::shares`). Only a hash of
 /// each link's token is stored.
 const V24_SCHEMA: &str = r#"
@@ -954,7 +967,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 24);
+        assert_eq!(applied, 25);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -989,7 +1002,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 24);
+        assert_eq!(first, 25);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -1002,7 +1015,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 24);
+        assert_eq!(current_version(&conn).unwrap(), 25);
     }
 
     #[test]

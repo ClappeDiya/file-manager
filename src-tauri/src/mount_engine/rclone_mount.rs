@@ -69,17 +69,12 @@ pub fn spec_for(profile: &ConnectionProfile, secret: Option<&str>) -> Result<Rcl
     }
 }
 
-/// Arguments for `rclone mount`.
-pub fn mount_args(spec: &RcloneSpec, mount_point: &str) -> Vec<String> {
-    vec![
-        "mount".into(),
-        spec.source.clone(),
-        mount_point.into(),
-        "--vfs-cache-mode".into(),
-        "writes".into(),
-        "--dir-cache-time".into(),
-        "30s".into(),
-    ]
+/// Arguments for `rclone mount`; `flags` carry the cache and read-only options
+/// (`policy::rclone_flags`).
+pub fn mount_args(spec: &RcloneSpec, mount_point: &str, flags: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = vec!["mount".into(), spec.source.clone(), mount_point.into(), "--dir-cache-time".into(), "30s".into()];
+    v.extend(flags.iter().cloned());
+    v
 }
 
 /// What the OS needs for rclone mounts; `Err` is (tool, install hint).
@@ -129,10 +124,10 @@ pub struct RcloneProcesses {
 
 impl RcloneProcesses {
     /// Start `rclone mount` and wait until the mount point is live.
-    pub async fn mount(&self, id: uuid::Uuid, spec: &RcloneSpec, mount_point: &str) -> Result<(), String> {
+    pub async fn mount(&self, id: uuid::Uuid, spec: &RcloneSpec, mount_point: &str, flags: &[String]) -> Result<(), String> {
         let exe = std::env::var("UFOP_RCLONE").unwrap_or_else(|_| "rclone".into());
         let mut cmd = tokio::process::Command::new(exe);
-        cmd.args(mount_args(spec, mount_point)).envs(spec.env.iter().cloned()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        cmd.args(mount_args(spec, mount_point, flags)).envs(spec.env.iter().cloned()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| format!("Could not start rclone: {e}"))?;
         let deadline = tokio::time::Instant::now() + MOUNT_WAIT;
         loop {
@@ -208,7 +203,7 @@ mod tests {
         assert_eq!(env["RCLONE_CONFIG_UFOPMOUNT_SECRET_ACCESS_KEY"], "SECRET");
         assert_eq!(env["RCLONE_CONFIG_UFOPMOUNT_PROVIDER"], "Other");
         assert_eq!(env["RCLONE_CONFIG_UFOPMOUNT_ENDPOINT"], "https://abc.r2.cloudflarestorage.com");
-        assert!(!mount_args(&s, "/mnt/x").iter().any(|a| a.contains("SECRET")));
+        assert!(!mount_args(&s, "/mnt/x", &[]).iter().any(|a| a.contains("SECRET")));
         let aws = spec_for(&profile(ConnectionProtocol::S3, "eu-west-1"), Some("k")).unwrap();
         let env: HashMap<_, _> = aws.env.into_iter().collect();
         assert_eq!((env["RCLONE_CONFIG_UFOPMOUNT_REGION"].as_str(), env["RCLONE_CONFIG_UFOPMOUNT_PROVIDER"].as_str()), ("eu-west-1", "AWS"));
@@ -240,7 +235,7 @@ mod tests {
         let procs = RcloneProcesses::default();
         let id = uuid::Uuid::new_v4();
         let spec = RcloneSpec { source: format!(":local:{}", src.path().display()), env: vec![] };
-        if let Err(e) = procs.mount(id, &spec, &mpp).await {
+        if let Err(e) = procs.mount(id, &spec, &mpp, &[]).await {
             // FUSE present but not permitted (unprivileged container): nothing to verify.
             eprintln!("skipping: {e}");
             return;
@@ -252,6 +247,6 @@ mod tests {
         assert!(!procs.unmount(id, &mpp).await, "already gone");
         // A bad remote fails with rclone's message instead of hanging.
         let bad = RcloneSpec { source: "no-such-remote:".into(), env: vec![] };
-        assert!(procs.mount(uuid::Uuid::new_v4(), &bad, &mpp).await.is_err());
+        assert!(procs.mount(uuid::Uuid::new_v4(), &bad, &mpp, &[]).await.is_err());
     }
 }

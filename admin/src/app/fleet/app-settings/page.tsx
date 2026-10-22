@@ -18,6 +18,7 @@ import { useAuthStore } from '@/lib/stores/auth-store';
 import { useToastStore } from '@/lib/stores/toast-store';
 import { formatDateTime } from '@/lib/utils/format';
 import type { ManagedSettings, ManagedSettingsBody } from '@/lib/db/repos/managed-settings';
+import { MOUNT_CACHE_MODES, MOUNT_PROTOCOLS } from '@/lib/mount-profile';
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 type Tri = '' | 'on' | 'off';
@@ -41,6 +42,12 @@ interface Form {
   upKbps: string;
   downKbps: string;
   runs: string;
+  mountProtocols: string[] | null;
+  mountReadOnly: '' | 'on';
+  mountCache: '' | (typeof MOUNT_CACHE_MODES)[number];
+  mountCacheMb: string;
+  mountCacheHours: string;
+  mountRoot: string;
 }
 
 function toForm(s: ManagedSettings | null): Form {
@@ -60,6 +67,12 @@ function toForm(s: ManagedSettings | null): Form {
     upKbps: s?.transfers?.maxUploadKbps?.toString() ?? '',
     downKbps: s?.transfers?.maxDownloadKbps?.toString() ?? '',
     runs: s?.transfers?.maxConcurrentRuns?.toString() ?? '',
+    mountProtocols: s?.mounts?.allowedProtocols ?? null,
+    mountReadOnly: s?.mounts?.readOnly ? 'on' : '',
+    mountCache: s?.mounts?.cacheMode ?? '',
+    mountCacheMb: s?.mounts?.maxCacheMb?.toString() ?? '',
+    mountCacheHours: s?.mounts?.maxCacheAgeHours?.toString() ?? '',
+    mountRoot: s?.mounts?.mountRoot ?? '',
   };
 }
 
@@ -69,6 +82,14 @@ function toBody(f: Form): ManagedSettingsBody {
     proxy: f.proxyMode ? { mode: f.proxyMode, url: f.proxyUrl.trim(), pacUrl: f.pacUrl.trim(), noProxy: f.noProxy.split(/[\n,]/).map((h) => h.trim()).filter(Boolean) } : null,
     ai: { enabled: f.aiEnabled === 'off' ? false : null, allowCloud: f.aiCloud === 'off' ? false : null },
     transfers: { maxUploadKbps: num(f.upKbps), maxDownloadKbps: num(f.downKbps), maxConcurrentRuns: num(f.runs) },
+    mounts: {
+      allowedProtocols: f.mountProtocols,
+      readOnly: f.mountReadOnly === 'on' ? true : null,
+      cacheMode: f.mountCache || null,
+      maxCacheMb: num(f.mountCacheMb),
+      maxCacheAgeHours: num(f.mountCacheHours),
+      mountRoot: f.mountRoot.trim() || null,
+    },
   };
 }
 
@@ -187,12 +208,51 @@ export default function AppSettingsPage() {
             <CardDescription>Shared by every backup and restore on a machine. Leave empty for the machine&apos;s own setting.</CardDescription>
           </div>
         </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>Drive mounts</CardTitle>
+          </CardHeader>
+          <div className="space-y-3">
+            <label className="flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={form.mountProtocols !== null} onChange={(e) => set({ mountProtocols: e.target.checked ? ['rclone', 's3'] : null })} /> Only some kinds of drives may be mounted
+            </label>
+            {form.mountProtocols !== null && (
+              <div className="flex flex-wrap gap-1" role="group" aria-label="Allowed mount protocols">
+                {MOUNT_PROTOCOLS.map((p) => {
+                  const on = form.mountProtocols!.includes(p);
+                  return (
+                    <button
+                      key={p}
+                      type="button"
+                      aria-pressed={on}
+                      onClick={() => set({ mountProtocols: on ? form.mountProtocols!.filter((x) => x !== p) : [...form.mountProtocols!, p] })}
+                      className={`rounded border px-2 py-1 text-xs ${on ? 'border-primary bg-primary text-white' : 'border-border'}`}
+                    >
+                      {p}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            <Select label="Read-only" value={form.mountReadOnly} onChange={(e) => set({ mountReadOnly: e.target.value as Form['mountReadOnly'] })} options={[{ value: '', label: "User's choice" }, { value: 'on', label: 'Mount every drive read-only' }]} />
+            <Select
+              label="Cache mode (cloud drives)"
+              value={form.mountCache}
+              onChange={(e) => set({ mountCache: e.target.value as Form['mountCache'] })}
+              options={[{ value: '', label: "User's choice" }, { value: 'off', label: 'Off' }, { value: 'minimal', label: 'Minimal' }, { value: 'writes', label: 'Writes' }, { value: 'full', label: 'Full (offline use)' }]}
+            />
+            <Input label="Largest cache per drive (MB)" type="number" min={1} placeholder="User's choice" value={form.mountCacheMb} onChange={(e) => set({ mountCacheMb: e.target.value })} />
+            <Input label="Keep cached files (hours)" type="number" min={1} placeholder="User's choice" value={form.mountCacheHours} onChange={(e) => set({ mountCacheHours: e.target.value })} />
+            <Input label="Mount points inside" placeholder="User's choice, e.g. ~/Drives" value={form.mountRoot} onChange={(e) => set({ mountRoot: e.target.value })} />
+            <CardDescription>The mount profile applies to new mounts; limits cap what people choose, forced options replace it.</CardDescription>
+          </div>
+        </Card>
       </fieldset>
       {canWrite && (
         <div className="mt-4 flex gap-2">
           <Button onClick={() => void save(toBody(form))}>Save</Button>
           {s && (
-            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null })}>
+            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null })}>
               Stop managing
             </Button>
           )}

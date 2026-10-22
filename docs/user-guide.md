@@ -308,6 +308,15 @@ Simple mode provides step-by-step wizards for:
 
 ---
 
+### Mounting Drives
+
+*Mount drive* turns a saved connection into a folder (SMB, NFS and SFTP through the OS; cloud storage through rclone + FUSE). Cloud drives have cache options:
+
+- **Cache mode** — *Off* (always from the server), *Minimal* (open files only), *Writes* (default: uploads finish in the background), *Full* (whole files are kept, so they stay readable offline).
+- **Largest cache** and **Keep cached files** limit the space and age of the local copies; **Read-only** refuses changes.
+- With the full cache, **Make available offline** downloads a folder (or the whole drive) into the cache; the cache size shows per drive, and **Clear cache** frees it once the drive is unmounted.
+- Your organization's **mount profile** (from the management console) may allow only some kinds of drives, require read-only mounts or a cache mode, cap the cache, or require mount points inside a folder; the dialog shows it and locks the options it forces.
+
 ## Peer-to-Peer Transfers
 
 ### Discovery

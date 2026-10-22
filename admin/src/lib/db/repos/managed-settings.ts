@@ -1,12 +1,16 @@
 /**
  * App settings an organization manages on its desktops: update channel,
- * automatic checks and a blackout window, the proxy, and AI. Delivered with
+ * automatic checks and a blackout window, the proxy, AI, transfer caps and
+ * the mount profile (what drives may be mounted, and how). Delivered with
  * the policy bundle (`managedSettings`); `null` sections stay with the user.
  * The shape mirrors `ufop_core::agent::ManagedSettings` and is validated the
  * same way, so a desktop never receives settings it would reject.
  */
 import { db, now, parseJson, type Row } from '../index';
 import { OrgError } from './orgs';
+import { MOUNT_CACHE_MODES, MOUNT_PROTOCOLS, type ManagedMounts } from '../../mount-profile';
+
+export type { ManagedMounts };
 
 export interface BlackoutWindow {
   start: string;
@@ -20,7 +24,11 @@ export interface ManagedSettingsBody {
   ai: { enabled: boolean | null; allowCloud: boolean | null } | null;
   /** Machine-wide caps for backups and restores (KiB/s; 0 = unlimited). */
   transfers: { maxUploadKbps: number | null; maxDownloadKbps: number | null; maxConcurrentRuns: number | null } | null;
+  /** Mount profile: allowed protocols, read-only, forced cache mode and limits, mount root. */
+  mounts: ManagedMounts | null;
 }
+
+
 
 export const MAX_CONCURRENT_RUNS = 8;
 
@@ -41,7 +49,7 @@ const str = (v: unknown, n = 500) => (typeof v === 'string' ? v.trim().slice(0, 
 /** Validate and normalize a settings body (throws `OrgError` with a readable message). */
 export function normalizeManagedSettings(raw: unknown): ManagedSettingsBody {
   const b = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null };
+  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null, mounts: null };
   if (b.updates) {
     const u = b.updates as Record<string, unknown>;
     const channel = u.channel === null || u.channel === undefined || u.channel === '' ? null : u.channel;
@@ -80,6 +88,33 @@ export function normalizeManagedSettings(raw: unknown): ManagedSettingsBody {
     out.transfers = { maxUploadKbps: kbps(t.maxUploadKbps, 'The upload cap'), maxDownloadKbps: kbps(t.maxDownloadKbps, 'The download cap'), maxConcurrentRuns: runs as number | null };
     if (out.transfers.maxUploadKbps === null && out.transfers.maxDownloadKbps === null && out.transfers.maxConcurrentRuns === null) out.transfers = null;
   }
+  if (b.mounts) {
+    const m = b.mounts as Record<string, unknown>;
+    const positive = (v: unknown, what: string): number | null => {
+      if (v === null || v === undefined || v === '') return null;
+      if (!Number.isInteger(v) || (v as number) < 1) throw new OrgError(`${what} must be a whole number of at least 1`);
+      return v as number;
+    };
+    let allowedProtocols: string[] | null = null;
+    if (m.allowedProtocols !== null && m.allowedProtocols !== undefined) {
+      if (!Array.isArray(m.allowedProtocols)) throw new OrgError('Allowed protocols must be a list');
+      allowedProtocols = [...new Set(m.allowedProtocols.map((p) => String(p).trim().toLowerCase()).filter(Boolean))];
+      const unknown = allowedProtocols.filter((p) => !(MOUNT_PROTOCOLS as readonly string[]).includes(p));
+      if (unknown.length) throw new OrgError(`Unknown mount protocol: ${unknown.join(', ')}`);
+    }
+    const cacheMode = m.cacheMode === null || m.cacheMode === undefined || m.cacheMode === '' ? null : m.cacheMode;
+    if (cacheMode !== null && !(MOUNT_CACHE_MODES as readonly unknown[]).includes(cacheMode)) throw new OrgError(`The mount cache mode is ${MOUNT_CACHE_MODES.join(', ')}`);
+    const root = str(m.mountRoot, 1000);
+    out.mounts = {
+      allowedProtocols,
+      readOnly: triBool(m.readOnly, 'Read-only mounts'),
+      cacheMode: cacheMode as ManagedMounts['cacheMode'],
+      maxCacheMb: positive(m.maxCacheMb, 'The largest mount cache (MB)'),
+      maxCacheAgeHours: positive(m.maxCacheAgeHours, 'How long cached files are kept (hours)'),
+      mountRoot: root || null,
+    };
+    if (Object.values(out.mounts).every((v) => v === null)) out.mounts = null;
+  }
   if (b.ai) {
     const a = b.ai as Record<string, unknown>;
     out.ai = { enabled: triBool(a.enabled, 'AI enabled'), allowCloud: triBool(a.allowCloud, 'AI cloud models') };
@@ -96,8 +131,8 @@ function row(orgId: string): Row | undefined {
 export function getManagedSettings(orgId: string): ManagedSettings | null {
   const r = row(orgId);
   if (!r || r.settings === 'null') return null;
-  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null });
-  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
+  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null, mounts: null });
+  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, mounts: b.mounts ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
 }
 
 /**
@@ -106,7 +141,7 @@ export function getManagedSettings(orgId: string): ManagedSettings | null {
  */
 export function setManagedSettings(orgId: string, raw: unknown, by: string): ManagedSettings | null {
   const body = normalizeManagedSettings(raw);
-  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers;
+  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers && !body.mounts;
   const version = Number(row(orgId)?.version ?? 0) + 1;
   db()
     .prepare('INSERT INTO managed_settings (org_id, settings, version, updated_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(org_id) DO UPDATE SET settings = excluded.settings, version = excluded.version, updated_by = excluded.updated_by, updated_at = excluded.updated_at')
@@ -117,5 +152,5 @@ export function setManagedSettings(orgId: string, raw: unknown, by: string): Man
 /** What the agent receives: `null` when nothing is managed. */
 export function managedSettingsForAgent(orgId: string): (ManagedSettingsBody & { version: number }) | null {
   const s = getManagedSettings(orgId);
-  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers };
+  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers, mounts: s.mounts };
 }

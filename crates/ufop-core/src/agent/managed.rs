@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 pub const CHANNELS: [&str; 2] = ["stable", "beta"];
 pub const PROXY_MODES: [&str; 4] = ["system", "none", "manual", "pac"];
+/// rclone VFS cache modes, from none to whole files kept for offline use.
+pub const MOUNT_CACHE_MODES: [&str; 4] = ["off", "minimal", "writes", "full"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -17,6 +19,26 @@ pub struct ManagedSettings {
     pub ai: Option<ManagedAi>,
     /// Machine-wide caps for backups and restores.
     pub transfers: Option<ManagedTransfers>,
+    /// Rules for drive mounts (the mount profile).
+    pub mounts: Option<ManagedMounts>,
+}
+
+/// The organization's mount profile: what may be mounted and how.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ManagedMounts {
+    /// Protocols that may be mounted (`None` = any the app supports).
+    pub allowed_protocols: Option<Vec<String>>,
+    /// Mount everything read-only.
+    pub read_only: Option<bool>,
+    /// Cache mode every mount uses (`off`, `minimal`, `writes`, `full`).
+    pub cache_mode: Option<String>,
+    /// Largest cache per mount, in MB.
+    pub max_cache_mb: Option<u64>,
+    /// Cached files older than this are dropped, in hours.
+    pub max_cache_age_hours: Option<u32>,
+    /// Mount points must be inside this folder (`~` = the user's home).
+    pub mount_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +151,19 @@ impl ManagedSettings {
                 return Err(format!("Concurrent operations must be 1 to {MAX_CONCURRENT_RUNS}"));
             }
         }
+        if let Some(m) = &self.mounts {
+            if let Some(c) = &m.cache_mode {
+                if !MOUNT_CACHE_MODES.contains(&c.as_str()) {
+                    return Err(format!("Unknown mount cache mode '{c}'"));
+                }
+            }
+            if m.max_cache_mb == Some(0) || m.max_cache_age_hours == Some(0) {
+                return Err("Mount cache limits must be at least 1".into());
+            }
+            if m.mount_root.as_deref().is_some_and(|r| r.trim().is_empty()) {
+                return Err("The mount root must be a folder".into());
+            }
+        }
         if let Some(p) = &self.proxy {
             if !PROXY_MODES.contains(&p.mode.as_str()) {
                 return Err(format!("Unknown proxy mode '{}'", p.mode));
@@ -145,13 +180,25 @@ impl ManagedSettings {
 
     /// No section managed.
     pub fn is_empty(&self) -> bool {
-        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none()
+        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none() && self.mounts.is_none()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mount_profile_validates_and_parses_camel_case() {
+        let s: ManagedSettings = serde_json::from_str(r#"{"version":3,"mounts":{"allowedProtocols":["rclone"],"readOnly":true,"cacheMode":"full","maxCacheMb":2048,"maxCacheAgeHours":72,"mountRoot":"~/Drives"}}"#).unwrap();
+        let m = s.mounts.clone().unwrap();
+        assert_eq!((m.read_only, m.cache_mode.as_deref(), m.max_cache_mb, m.mount_root.as_deref()), (Some(true), Some("full"), Some(2048), Some("~/Drives")));
+        assert!(s.validate().is_ok() && !s.is_empty());
+        let bad = ManagedSettings { mounts: Some(ManagedMounts { cache_mode: Some("everything".into()), ..Default::default() }), ..Default::default() };
+        assert!(bad.validate().unwrap_err().contains("cache mode"));
+        let zero = ManagedSettings { mounts: Some(ManagedMounts { max_cache_mb: Some(0), ..Default::default() }), ..Default::default() };
+        assert!(zero.validate().is_err());
+    }
 
     fn w(start: &str, end: &str, days: &[u8]) -> BlackoutWindow {
         BlackoutWindow { start: start.into(), end: end.into(), days: days.to_vec() }

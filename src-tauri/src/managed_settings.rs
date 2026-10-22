@@ -6,6 +6,7 @@
 use crate::ai_engine::AiAssistant;
 use crate::backup_engine::BackupManager;
 use crate::commands::proxy_commands;
+use crate::mount_engine::MountManager;
 use crate::core::error::AppError;
 use crate::net::{self, ProxyMode, ProxySettings};
 use crate::security::CredentialStore;
@@ -30,7 +31,7 @@ fn proxy_settings(p: &ManagedProxy) -> Result<ProxySettings, AppError> {
 }
 
 /// Apply `settings` (or release them with `None`) and store them.
-pub async fn apply(repo: &Repository, creds: &CredentialStore, ai: &AiAssistant, backups: &BackupManager, settings: Option<ManagedSettings>) -> Result<(), AppError> {
+pub async fn apply(repo: &Repository, creds: &CredentialStore, ai: &AiAssistant, backups: &BackupManager, mounts: &MountManager, settings: Option<ManagedSettings>) -> Result<(), AppError> {
     if let Some(s) = &settings {
         s.validate().map_err(AppError::validation)?;
     }
@@ -46,6 +47,7 @@ pub async fn apply(repo: &Repository, creds: &CredentialStore, ai: &AiAssistant,
     }
     ai.set_managed(settings.as_ref().and_then(|s| s.ai.clone())).await;
     backups.set_managed_caps(settings.as_ref().and_then(|s| s.transfers.clone())).await;
+    mounts.set_managed(settings.as_ref().and_then(|s| s.mounts.clone())).await;
     let json = match &settings {
         Some(s) => serde_json::to_string(s)?,
         None => String::new(),
@@ -55,17 +57,18 @@ pub async fn apply(repo: &Repository, creds: &CredentialStore, ai: &AiAssistant,
 
 /// Startup: put the stored limits back in force (the proxy restores itself)
 /// and apply the transfer caps.
-pub async fn activate_stored(repo: &Repository, ai: &AiAssistant, backups: &BackupManager) {
+pub async fn activate_stored(repo: &Repository, ai: &AiAssistant, backups: &BackupManager, mounts: &MountManager) {
     let s = load(repo).await;
     ai.set_managed(s.as_ref().and_then(|s| s.ai.clone())).await;
-    backups.set_managed_caps(s.and_then(|s| s.transfers)).await;
+    backups.set_managed_caps(s.as_ref().and_then(|s| s.transfers.clone())).await;
+    mounts.set_managed(s.and_then(|s| s.mounts)).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use ufop_core::agent::{ManagedAi, ManagedTransfers, ManagedUpdates};
+    use ufop_core::agent::{ManagedAi, ManagedMounts, ManagedTransfers, ManagedUpdates};
 
     #[tokio::test]
     async fn applies_stores_and_releases() {
@@ -81,8 +84,10 @@ mod tests {
             proxy: Some(ManagedProxy { mode: "manual".into(), url: "http://proxy.corp:3128".into(), no_proxy: vec!["intranet".into()], ..Default::default() }),
             ai: Some(ManagedAi { enabled: Some(false), allow_cloud: None }),
             transfers: Some(ManagedTransfers { max_upload_kbps: Some(512), max_download_kbps: None, max_concurrent_runs: Some(3) }),
+            mounts: Some(ManagedMounts { read_only: Some(true), cache_mode: Some("full".into()), ..Default::default() }),
         };
-        apply(&repo, &creds, &ai, &backups, Some(s.clone())).await.unwrap();
+        let mounts = MountManager::with_cache_root(t.path().join("mount-cache"));
+        apply(&repo, &creds, &ai, &backups, &mounts, Some(s.clone())).await.unwrap();
         assert_eq!(load(&repo).await, Some(s));
         let p = net::current();
         assert!(p.managed && p.mode == ProxyMode::Manual && p.url == "http://proxy.corp:3128");
@@ -92,19 +97,23 @@ mod tests {
 
         // Restart: the AI limit comes back from storage.
         let ai2 = AiAssistant::new();
-        activate_stored(&repo, &ai2, &backups).await;
+        assert_eq!(mounts.managed().await.and_then(|m| m.read_only), Some(true));
+        let mounts2 = MountManager::with_cache_root(t.path().join("mount-cache"));
+        activate_stored(&repo, &ai2, &backups, &mounts2).await;
         assert!(!ai2.get_feature_toggles().await.ai_master_enabled);
+        assert_eq!(mounts2.managed().await.and_then(|m| m.cache_mode), Some("full".into()), "the mount profile survives a restart");
 
         // Invalid settings change nothing.
         let bad = ManagedSettings { version: 4, proxy: Some(ManagedProxy { mode: "pac".into(), ..Default::default() }), ..Default::default() };
-        assert!(apply(&repo, &creds, &ai, &backups, Some(bad)).await.is_err());
+        assert!(apply(&repo, &creds, &ai, &backups, &mounts, Some(bad)).await.is_err());
         assert_eq!(load(&repo).await.unwrap().version, 3);
 
-        apply(&repo, &creds, &ai, &backups, None).await.unwrap();
+        apply(&repo, &creds, &ai, &backups, &mounts, None).await.unwrap();
         assert_eq!(load(&repo).await, None);
         assert!(!net::current().managed, "the managed proxy is released");
         assert!(ai.get_feature_toggles().await.ai_master_enabled);
         assert_eq!(backups.effective_caps().await.concurrency(), 1, "caps released");
+        assert!(mounts.managed().await.is_none(), "mount profile released");
         let _ = net::apply(ProxySettings::default(), None);
     }
 }
