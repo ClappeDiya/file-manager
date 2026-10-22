@@ -166,6 +166,12 @@ pub async fn backup_set_global_defaults(defaults: GlobalDefaults, mgr: State<'_,
     mgr.set_global_defaults(defaults).await
 }
 
+/// The machine-wide caps in force (this machine's, with the console's on top).
+#[tauri::command]
+pub async fn backup_effective_caps(mgr: State<'_, BackupManager>) -> Result<crate::backup_engine::defaults::TransferCaps, AppError> {
+    Ok(mgr.effective_caps().await)
+}
+
 /// The job as it runs, with global defaults applied.
 #[tauri::command]
 pub async fn backup_effective_job(id: String, mgr: State<'_, BackupManager>) -> Result<BackupJob, AppError> {

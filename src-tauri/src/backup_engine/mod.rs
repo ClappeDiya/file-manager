@@ -554,7 +554,13 @@ struct Inner {
     data_dir: PathBuf,
     jobs: RwLock<HashMap<String, BackupJob>>,
     tasks: Mutex<Vec<TaskSlot>>,
+    /// Operations running at once (resized by the transfer caps).
     gate: Semaphore,
+    gate_size: Mutex<usize>,
+    /// One operation per job at a time, whatever the gate allows.
+    job_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Caps set by the console's managed settings.
+    managed_caps: Mutex<Option<ufop_core::agent::ManagedTransfers>>,
     /// `Some(None)` = paused indefinitely.
     paused: Mutex<Option<Option<DateTime<Utc>>>>,
     scheduler_running: AtomicBool,
@@ -638,6 +644,9 @@ impl BackupManager {
                 jobs: RwLock::new(HashMap::new()),
                 tasks: Mutex::new(Vec::new()),
                 gate: Semaphore::new(1),
+                gate_size: Mutex::new(1),
+                job_locks: Mutex::new(HashMap::new()),
+                managed_caps: Mutex::new(None),
                 paused: Mutex::new(None),
                 scheduler_running: AtomicBool::new(false),
                 kdf,
@@ -1344,7 +1353,45 @@ impl BackupManager {
     pub async fn set_global_defaults(&self, d: defaults::GlobalDefaults) -> Result<defaults::GlobalDefaults, AppError> {
         d.validate()?;
         self.config_set(defaults::DEFAULTS_KEY, serde_json::to_string(&d)?).await?;
+        self.refresh_caps().await;
         Ok(d)
+    }
+
+    /// The caps in force: the machine's own, with the console's on top.
+    pub async fn effective_caps(&self) -> defaults::TransferCaps {
+        let own = self.global_defaults().await.map(|d| d.caps).unwrap_or_default();
+        let managed = self.inner.managed_caps.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        own.with_managed(managed.as_ref())
+    }
+
+    /// Set (or clear) the console's caps and apply.
+    pub async fn set_managed_caps(&self, m: Option<ufop_core::agent::ManagedTransfers>) {
+        *self.inner.managed_caps.lock().unwrap_or_else(|e| e.into_inner()) = m;
+        self.refresh_caps().await;
+    }
+
+    /// Apply the effective caps: shared upload/download rates and the run gate.
+    pub async fn refresh_caps(&self) {
+        let caps = self.effective_caps().await;
+        ufop_core::backup::backend::GLOBAL_UPLOAD.set(caps.upload_bps);
+        ufop_core::backup::backend::GLOBAL_DOWNLOAD.set(caps.download_bps);
+        self.resize_gate(caps.concurrency());
+    }
+
+    fn resize_gate(&self, want: usize) {
+        let mut size = self.inner.gate_size.lock().unwrap_or_else(|e| e.into_inner());
+        if want > *size {
+            self.inner.gate.add_permits(want - *size);
+        } else if want < *size {
+            // Take the extra permits back as running operations release them.
+            let (inner, n) = (self.inner.clone(), (*size - want) as u32);
+            tokio::spawn(async move {
+                if let Ok(p) = inner.gate.acquire_many(n).await {
+                    p.forget();
+                }
+            });
+        }
+        *size = want;
     }
 
     /// A job with the global defaults applied (what actually runs).
@@ -1579,6 +1626,11 @@ impl BackupManager {
         cancel: Arc<AtomicBool>,
         progress: Arc<Mutex<Option<Progress>>>,
     ) -> Result<OperationResult, AppError> {
+        let job_lock = {
+            let mut locks = self.inner.job_locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks.entry(job.id.clone()).or_default().clone()
+        };
+        let _job_guard = job_lock.lock().await;
         let _permit = match self.inner.gate.acquire().await {
             Ok(p) => p,
             Err(_) => {

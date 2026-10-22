@@ -21,6 +21,7 @@ const managed: ManagedSettings = {
   updates: { channel: "beta", autoCheck: false, blackout: { start: "08:00", end: "18:00", days: [1, 2, 3, 4, 5] } },
   proxy: { mode: "pac", url: "", pacUrl: "https://wpad/p.pac", noProxy: [] },
   ai: { enabled: null, allowCloud: false },
+  transfers: { maxUploadKbps: 512, maxDownloadKbps: 0, maxConcurrentRuns: null },
 };
 
 describe("blackout window", () => {
@@ -48,6 +49,8 @@ describe("blackout window", () => {
       "No updates 08:00–18:00 (Mon, Tue, Wed, Thu, Fri)",
       "Proxy: pac (https://wpad/p.pac)",
       "AI: local models only",
+      "Total upload: 512 KB/s",
+      "Total download: unlimited",
     ]);
     expect(describeManaged(null)).toEqual([]);
   });

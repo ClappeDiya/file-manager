@@ -15,7 +15,21 @@ pub struct ManagedSettings {
     pub updates: Option<ManagedUpdates>,
     pub proxy: Option<ManagedProxy>,
     pub ai: Option<ManagedAi>,
+    /// Machine-wide caps for backups and restores.
+    pub transfers: Option<ManagedTransfers>,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ManagedTransfers {
+    /// KiB/s for all uploads together; `None` = the machine's own setting, 0 = unlimited.
+    pub max_upload_kbps: Option<u64>,
+    pub max_download_kbps: Option<u64>,
+    /// Operations that may run at the same time (1–8).
+    pub max_concurrent_runs: Option<u32>,
+}
+
+pub const MAX_CONCURRENT_RUNS: u32 = 8;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -110,6 +124,11 @@ impl ManagedSettings {
                 b.validate()?;
             }
         }
+        if let Some(t) = &self.transfers {
+            if t.max_concurrent_runs.is_some_and(|n| !(1..=MAX_CONCURRENT_RUNS).contains(&n)) {
+                return Err(format!("Concurrent operations must be 1 to {MAX_CONCURRENT_RUNS}"));
+            }
+        }
         if let Some(p) = &self.proxy {
             if !PROXY_MODES.contains(&p.mode.as_str()) {
                 return Err(format!("Unknown proxy mode '{}'", p.mode));
@@ -126,7 +145,7 @@ impl ManagedSettings {
 
     /// No section managed.
     pub fn is_empty(&self) -> bool {
-        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none()
+        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none()
     }
 }
 
@@ -174,6 +193,10 @@ mod tests {
         assert!(s.validate().is_ok());
         assert!(!s.is_empty());
         assert!(ManagedSettings::default().is_empty());
+        s.transfers = Some(ManagedTransfers { max_concurrent_runs: Some(9), ..Default::default() });
+        assert!(s.validate().unwrap_err().contains("Concurrent"));
+        s.transfers = Some(ManagedTransfers { max_concurrent_runs: Some(2), max_upload_kbps: Some(0), max_download_kbps: None });
+        assert!(s.validate().is_ok());
     }
 
     #[test]

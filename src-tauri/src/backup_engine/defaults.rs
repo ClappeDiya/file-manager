@@ -20,6 +20,41 @@ pub struct GlobalDefaults {
     pub options: serde_json::Map<String, serde_json::Value>,
     pub throttle: Option<Throttle>,
     pub retry: Option<RetryPolicy>,
+    /// Machine-wide caps (all jobs together).
+    pub caps: TransferCaps,
+}
+
+/// Machine-wide transfer caps; the console's managed settings can override each.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransferCaps {
+    /// Bytes per second for all uploads together (0 = unlimited).
+    pub upload_bps: u64,
+    pub download_bps: u64,
+    /// Operations that may run at the same time (0 = 1).
+    pub max_concurrent_runs: u32,
+}
+
+impl TransferCaps {
+    pub fn concurrency(&self) -> usize {
+        self.max_concurrent_runs.clamp(1, ufop_core::agent::MAX_CONCURRENT_RUNS) as usize
+    }
+
+    /// Each field the console manages replaces the machine's own.
+    pub fn with_managed(mut self, m: Option<&ufop_core::agent::ManagedTransfers>) -> Self {
+        if let Some(m) = m {
+            if let Some(k) = m.max_upload_kbps {
+                self.upload_bps = k * 1024;
+            }
+            if let Some(k) = m.max_download_kbps {
+                self.download_bps = k * 1024;
+            }
+            if let Some(n) = m.max_concurrent_runs {
+                self.max_concurrent_runs = n;
+            }
+        }
+        self
+    }
 }
 
 impl GlobalDefaults {
@@ -40,6 +75,9 @@ impl GlobalDefaults {
             o.extend(self.options.clone());
         }
         serde_json::from_value::<BackupOptions>(merged).map_err(|e| AppError::validation(format!("Invalid default value: {e}")))?;
+        if self.caps.max_concurrent_runs > ufop_core::agent::MAX_CONCURRENT_RUNS {
+            return Err(AppError::validation(format!("At most {} operations can run at the same time", ufop_core::agent::MAX_CONCURRENT_RUNS)));
+        }
         Ok(())
     }
 

@@ -18,7 +18,11 @@ export interface ManagedSettingsBody {
   updates: { channel: 'stable' | 'beta' | null; autoCheck: boolean | null; blackout: BlackoutWindow | null } | null;
   proxy: { mode: 'system' | 'none' | 'manual' | 'pac'; url: string; pacUrl: string; noProxy: string[] } | null;
   ai: { enabled: boolean | null; allowCloud: boolean | null } | null;
+  /** Machine-wide caps for backups and restores (KiB/s; 0 = unlimited). */
+  transfers: { maxUploadKbps: number | null; maxDownloadKbps: number | null; maxConcurrentRuns: number | null } | null;
 }
+
+export const MAX_CONCURRENT_RUNS = 8;
 
 export interface ManagedSettings extends ManagedSettingsBody {
   version: number;
@@ -37,7 +41,7 @@ const str = (v: unknown, n = 500) => (typeof v === 'string' ? v.trim().slice(0, 
 /** Validate and normalize a settings body (throws `OrgError` with a readable message). */
 export function normalizeManagedSettings(raw: unknown): ManagedSettingsBody {
   const b = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null };
+  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null };
   if (b.updates) {
     const u = b.updates as Record<string, unknown>;
     const channel = u.channel === null || u.channel === undefined || u.channel === '' ? null : u.channel;
@@ -64,6 +68,18 @@ export function normalizeManagedSettings(raw: unknown): ManagedSettingsBody {
     if (mode === 'pac' && !proxy.pacUrl) throw new OrgError('A PAC proxy needs the PAC file URL');
     out.proxy = proxy;
   }
+  if (b.transfers) {
+    const t = b.transfers as Record<string, unknown>;
+    const kbps = (v: unknown, what: string): number | null => {
+      if (v === null || v === undefined || v === '') return null;
+      if (!Number.isInteger(v) || (v as number) < 0) throw new OrgError(`${what} must be a whole number of KB/s (0 = unlimited)`);
+      return v as number;
+    };
+    const runs = t.maxConcurrentRuns === null || t.maxConcurrentRuns === undefined || t.maxConcurrentRuns === '' ? null : t.maxConcurrentRuns;
+    if (runs !== null && (!Number.isInteger(runs) || (runs as number) < 1 || (runs as number) > MAX_CONCURRENT_RUNS)) throw new OrgError(`Concurrent operations must be 1 to ${MAX_CONCURRENT_RUNS}`);
+    out.transfers = { maxUploadKbps: kbps(t.maxUploadKbps, 'The upload cap'), maxDownloadKbps: kbps(t.maxDownloadKbps, 'The download cap'), maxConcurrentRuns: runs as number | null };
+    if (out.transfers.maxUploadKbps === null && out.transfers.maxDownloadKbps === null && out.transfers.maxConcurrentRuns === null) out.transfers = null;
+  }
   if (b.ai) {
     const a = b.ai as Record<string, unknown>;
     out.ai = { enabled: triBool(a.enabled, 'AI enabled'), allowCloud: triBool(a.allowCloud, 'AI cloud models') };
@@ -80,8 +96,8 @@ function row(orgId: string): Row | undefined {
 export function getManagedSettings(orgId: string): ManagedSettings | null {
   const r = row(orgId);
   if (!r || r.settings === 'null') return null;
-  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null });
-  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
+  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null });
+  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
 }
 
 /**
@@ -90,7 +106,7 @@ export function getManagedSettings(orgId: string): ManagedSettings | null {
  */
 export function setManagedSettings(orgId: string, raw: unknown, by: string): ManagedSettings | null {
   const body = normalizeManagedSettings(raw);
-  const empty = !body.updates && !body.proxy && !body.ai;
+  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers;
   const version = Number(row(orgId)?.version ?? 0) + 1;
   db()
     .prepare('INSERT INTO managed_settings (org_id, settings, version, updated_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(org_id) DO UPDATE SET settings = excluded.settings, version = excluded.version, updated_by = excluded.updated_by, updated_at = excluded.updated_at')
@@ -101,5 +117,5 @@ export function setManagedSettings(orgId: string, raw: unknown, by: string): Man
 /** What the agent receives: `null` when nothing is managed. */
 export function managedSettingsForAgent(orgId: string): (ManagedSettingsBody & { version: number }) | null {
   const s = getManagedSettings(orgId);
-  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai };
+  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers };
 }

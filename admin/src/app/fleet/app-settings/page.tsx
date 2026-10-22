@@ -23,6 +23,7 @@ const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 type Tri = '' | 'on' | 'off';
 const tri = (v: boolean | null | undefined): Tri => (v === true ? 'on' : v === false ? 'off' : '');
 const fromTri = (v: Tri) => (v === 'on' ? true : v === 'off' ? false : null);
+const num = (v: string) => (v.trim() === '' ? null : Number(v));
 
 interface Form {
   channel: '' | 'stable' | 'beta';
@@ -37,6 +38,9 @@ interface Form {
   noProxy: string;
   aiEnabled: '' | 'off';
   aiCloud: '' | 'off';
+  upKbps: string;
+  downKbps: string;
+  runs: string;
 }
 
 function toForm(s: ManagedSettings | null): Form {
@@ -53,6 +57,9 @@ function toForm(s: ManagedSettings | null): Form {
     noProxy: (s?.proxy?.noProxy ?? []).join('\n'),
     aiEnabled: s?.ai?.enabled === false ? 'off' : '',
     aiCloud: s?.ai?.allowCloud === false ? 'off' : '',
+    upKbps: s?.transfers?.maxUploadKbps?.toString() ?? '',
+    downKbps: s?.transfers?.maxDownloadKbps?.toString() ?? '',
+    runs: s?.transfers?.maxConcurrentRuns?.toString() ?? '',
   };
 }
 
@@ -61,6 +68,7 @@ function toBody(f: Form): ManagedSettingsBody {
     updates: { channel: f.channel || null, autoCheck: fromTri(f.autoCheck), blackout: f.blackout ? { start: f.start, end: f.end, days: f.days } : null },
     proxy: f.proxyMode ? { mode: f.proxyMode, url: f.proxyUrl.trim(), pacUrl: f.pacUrl.trim(), noProxy: f.noProxy.split(/[\n,]/).map((h) => h.trim()).filter(Boolean) } : null,
     ai: { enabled: f.aiEnabled === 'off' ? false : null, allowCloud: f.aiCloud === 'off' ? false : null },
+    transfers: { maxUploadKbps: num(f.upKbps), maxDownloadKbps: num(f.downKbps), maxConcurrentRuns: num(f.runs) },
   };
 }
 
@@ -103,7 +111,7 @@ export default function AppSettingsPage() {
       <p className="mb-4 text-sm text-foreground-secondary">
         {s ? `Version ${s.version}, changed ${formatDateTime(s.updatedAt)} by ${s.updatedBy} · applied on ${data.upToDate} of ${data.desktops} desktops` : 'Nothing is managed yet.'}
       </p>
-      <fieldset disabled={!canWrite} className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+      <fieldset disabled={!canWrite} className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle>Updates</CardTitle>
@@ -168,12 +176,23 @@ export default function AppSettingsPage() {
             <Select label="Cloud models" value={form.aiCloud} onChange={(e) => set({ aiCloud: e.target.value as Form['aiCloud'] })} options={[{ value: '', label: "User's choice" }, { value: 'off', label: 'Local models only' }]} />
           </div>
         </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>Transfers</CardTitle>
+          </CardHeader>
+          <div className="space-y-3">
+            <Input label="Total upload (KB/s, 0 = unlimited)" type="number" min={0} placeholder="User's choice" value={form.upKbps} onChange={(e) => set({ upKbps: e.target.value })} />
+            <Input label="Total download (KB/s, 0 = unlimited)" type="number" min={0} placeholder="User's choice" value={form.downKbps} onChange={(e) => set({ downKbps: e.target.value })} />
+            <Input label="Operations at the same time (1–8)" type="number" min={1} max={8} placeholder="User's choice" value={form.runs} onChange={(e) => set({ runs: e.target.value })} />
+            <CardDescription>Shared by every backup and restore on a machine. Leave empty for the machine&apos;s own setting.</CardDescription>
+          </div>
+        </Card>
       </fieldset>
       {canWrite && (
         <div className="mt-4 flex gap-2">
           <Button onClick={() => void save(toBody(form))}>Save</Button>
           {s && (
-            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null })}>
+            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null })}>
               Stop managing
             </Button>
           )}

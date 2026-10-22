@@ -393,6 +393,13 @@ async fn managed_settings_apply_on_change_report_errors_and_release() {
 
     set(json!({ "version": 6, "ai": { "allowCloud": false } }), "s6");
     a.cycle().await.unwrap();
+    // A restarted agent applies the current settings again once.
+    let before = host.st().settings.len();
+    let restarted = agent(&host).await;
+    restarted.cycle().await.unwrap();
+    assert_eq!(host.st().settings.len(), before + 1);
+    restarted.cycle().await.unwrap();
+    assert_eq!(host.st().settings.len(), before + 1);
     a.unregister(false).await.unwrap();
     assert_eq!(host.st().settings.last().unwrap(), &None, "unregistering releases them");
 }

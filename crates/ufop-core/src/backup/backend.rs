@@ -250,6 +250,62 @@ pub struct Throttle {
 }
 
 /// Wraps a backend with retry/backoff and throttling.
+/// One machine-wide rate shared by every backend (all jobs together):
+/// each transfer reserves its share of the time line, so the sum of
+/// concurrent transfers stays at or below the rate.
+pub struct SharedRate {
+    bps: std::sync::atomic::AtomicU64,
+    next: std::sync::Mutex<Option<Instant>>,
+}
+
+impl SharedRate {
+    pub const fn new() -> Self {
+        Self { bps: std::sync::atomic::AtomicU64::new(0), next: std::sync::Mutex::new(None) }
+    }
+
+    /// Bytes per second; 0 = unlimited.
+    pub fn set(&self, bps: u64) {
+        self.bps.store(bps, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> u64 {
+        self.bps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How long a transfer of `bytes` that started at `started` must still
+    /// wait; reserves its slot.
+    pub fn reserve(&self, bytes: usize, started: Instant) -> Duration {
+        let bps = self.get();
+        if bps == 0 {
+            return Duration::ZERO;
+        }
+        let now = Instant::now();
+        let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        // Idle time is not banked: a slot starts no earlier than this transfer did.
+        let start = next.map_or(started, |n| n.max(started));
+        let end = start + Duration::from_secs_f64(bytes as f64 / bps as f64);
+        *next = Some(end);
+        end.saturating_duration_since(now)
+    }
+
+    fn wait(&self, bytes: usize, started: Instant) {
+        let d = self.reserve(bytes, started);
+        if !d.is_zero() {
+            std::thread::sleep(d);
+        }
+    }
+}
+
+impl Default for SharedRate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Machine-wide upload and download caps (on top of each job's own throttle).
+pub static GLOBAL_UPLOAD: SharedRate = SharedRate::new();
+pub static GLOBAL_DOWNLOAD: SharedRate = SharedRate::new();
+
 pub struct RetryingBackend<B: Backend> {
     inner: B,
     policy: RetryPolicy,
@@ -309,12 +365,14 @@ impl<B: Backend> Backend for RetryingBackend<B> {
         let t = Instant::now();
         self.retry("put", || self.inner.put(name, data))?;
         Self::pace(self.throttle.upload_bps, data.len(), t);
+        GLOBAL_UPLOAD.wait(data.len(), t);
         Ok(())
     }
     fn get(&self, name: &str) -> Result<Vec<u8>, AppError> {
         let t = Instant::now();
         let d = self.retry("get", || self.inner.get(name))?;
         Self::pace(self.throttle.download_bps, d.len(), t);
+        GLOBAL_DOWNLOAD.wait(d.len(), t);
         Ok(d)
     }
     fn delete(&self, name: &str) -> Result<(), AppError> {
@@ -421,6 +479,28 @@ pub fn test_backend_compatibility(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_rate_splits_the_cap_between_concurrent_transfers() {
+        let r = SharedRate::new();
+        let t = Instant::now();
+        assert_eq!(r.reserve(1_000_000, t), Duration::ZERO, "unlimited by default");
+        r.set(1000);
+        let waits: Vec<f64> = (0..3).map(|_| r.reserve(500, t).as_secs_f64()).collect();
+        // Three 500-byte transfers at 1000 B/s end at 0.5 s, 1.0 s and 1.5 s.
+        for (w, want) in waits.iter().zip([0.5, 1.0, 1.5]) {
+            assert!((w - want).abs() < 0.05, "{waits:?}");
+        }
+        // A transfer that already took longer than its share does not wait.
+        let r = SharedRate::new();
+        r.set(1_000_000);
+        let old = Instant::now() - Duration::from_secs(2);
+        assert_eq!(r.reserve(1000, old), Duration::ZERO);
+        // Idle time is not banked as credit.
+        assert!(r.reserve(1_000_000, Instant::now()).as_secs_f64() > 0.9);
+        r.set(0);
+        assert_eq!(r.reserve(1_000_000, Instant::now()), Duration::ZERO);
+    }
 
     #[test]
     fn local_put_modes() {

@@ -31,11 +31,18 @@ export interface ManagedAi {
   allowCloud: boolean | null;
 }
 
+export interface ManagedTransfers {
+  maxUploadKbps: number | null;
+  maxDownloadKbps: number | null;
+  maxConcurrentRuns: number | null;
+}
+
 export interface ManagedSettings {
   version: number;
   updates: ManagedUpdates | null;
   proxy: ManagedProxy | null;
   ai: ManagedAi | null;
+  transfers: ManagedTransfers | null;
 }
 
 export function loadManagedSettings(): Promise<ManagedSettings | null> {
@@ -77,5 +84,9 @@ export function describeManaged(m: ManagedSettings | null): string[] {
   if (m.proxy) out.push(`Proxy: ${m.proxy.mode}${m.proxy.mode === "manual" ? ` (${m.proxy.url})` : m.proxy.mode === "pac" ? ` (${m.proxy.pacUrl})` : ""}`);
   if (m.ai?.enabled === false) out.push("AI features: off");
   if (m.ai?.allowCloud === false) out.push("AI: local models only");
+  const kbps = (v: number) => (v === 0 ? "unlimited" : `${v} KB/s`);
+  if (m.transfers?.maxUploadKbps != null) out.push(`Total upload: ${kbps(m.transfers.maxUploadKbps)}`);
+  if (m.transfers?.maxDownloadKbps != null) out.push(`Total download: ${kbps(m.transfers.maxDownloadKbps)}`);
+  if (m.transfers?.maxConcurrentRuns != null) out.push(`Operations at the same time: ${m.transfers.maxConcurrentRuns}`);
   return out;
 }

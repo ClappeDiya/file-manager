@@ -600,7 +600,9 @@ impl<H: AgentHost> Agent<H> {
         }
         let mut settings_version = previous.managed_settings_version;
         let wanted = bundle.managed_settings.as_ref().map(|s| s.version).unwrap_or(0);
-        if wanted != settings_version {
+        // Also once per start: hosts that keep no copy get them back.
+        let first_sync = !self.policies_fetched.load(Ordering::SeqCst);
+        if wanted != settings_version || (first_sync && wanted > 0) {
             let r = match &bundle.managed_settings {
                 Some(s) => s.validate().map_err(AppError::validation),
                 None => Ok(()),

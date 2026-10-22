@@ -4,6 +4,7 @@
 //! update channel, automatic checks and the blackout window.
 
 use crate::ai_engine::AiAssistant;
+use crate::backup_engine::BackupManager;
 use crate::commands::proxy_commands;
 use crate::core::error::AppError;
 use crate::net::{self, ProxyMode, ProxySettings};
@@ -29,7 +30,7 @@ fn proxy_settings(p: &ManagedProxy) -> Result<ProxySettings, AppError> {
 }
 
 /// Apply `settings` (or release them with `None`) and store them.
-pub async fn apply(repo: &Repository, creds: &CredentialStore, ai: &AiAssistant, settings: Option<ManagedSettings>) -> Result<(), AppError> {
+pub async fn apply(repo: &Repository, creds: &CredentialStore, ai: &AiAssistant, backups: &BackupManager, settings: Option<ManagedSettings>) -> Result<(), AppError> {
     if let Some(s) = &settings {
         s.validate().map_err(AppError::validation)?;
     }
@@ -44,6 +45,7 @@ pub async fn apply(repo: &Repository, creds: &CredentialStore, ai: &AiAssistant,
         None => {}
     }
     ai.set_managed(settings.as_ref().and_then(|s| s.ai.clone())).await;
+    backups.set_managed_caps(settings.as_ref().and_then(|s| s.transfers.clone())).await;
     let json = match &settings {
         Some(s) => serde_json::to_string(s)?,
         None => String::new(),
@@ -51,48 +53,58 @@ pub async fn apply(repo: &Repository, creds: &CredentialStore, ai: &AiAssistant,
     repo.set_config(CONFIG_KEY, &json).await
 }
 
-/// Startup: put the stored limits back in force (the proxy restores itself).
-pub async fn activate_stored(repo: &Repository, ai: &AiAssistant) {
-    ai.set_managed(load(repo).await.and_then(|s| s.ai)).await;
+/// Startup: put the stored limits back in force (the proxy restores itself)
+/// and apply the transfer caps.
+pub async fn activate_stored(repo: &Repository, ai: &AiAssistant, backups: &BackupManager) {
+    let s = load(repo).await;
+    ai.set_managed(s.as_ref().and_then(|s| s.ai.clone())).await;
+    backups.set_managed_caps(s.and_then(|s| s.transfers)).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ufop_core::agent::{ManagedAi, ManagedUpdates};
+    use std::sync::Arc;
+    use ufop_core::agent::{ManagedAi, ManagedTransfers, ManagedUpdates};
 
     #[tokio::test]
     async fn applies_stores_and_releases() {
         let _lock = crate::net::tests::MODE_LOCK.lock().await;
         let repo = Repository::open_in_memory().await.unwrap();
-        let creds = CredentialStore::new();
+        let creds = Arc::new(CredentialStore::new());
         let ai = AiAssistant::new();
+        let t = tempfile::tempdir().unwrap();
+        let backups = BackupManager::with_kdf(repo.pool().clone(), creds.clone(), None, None, t.path().join("dbs"), ufop_core::backup::crypto::KdfParams::insecure_fast());
         let s = ManagedSettings {
             version: 3,
             updates: Some(ManagedUpdates { channel: Some("beta".into()), ..Default::default() }),
             proxy: Some(ManagedProxy { mode: "manual".into(), url: "http://proxy.corp:3128".into(), no_proxy: vec!["intranet".into()], ..Default::default() }),
             ai: Some(ManagedAi { enabled: Some(false), allow_cloud: None }),
+            transfers: Some(ManagedTransfers { max_upload_kbps: Some(512), max_download_kbps: None, max_concurrent_runs: Some(3) }),
         };
-        apply(&repo, &creds, &ai, Some(s.clone())).await.unwrap();
+        apply(&repo, &creds, &ai, &backups, Some(s.clone())).await.unwrap();
         assert_eq!(load(&repo).await, Some(s));
         let p = net::current();
         assert!(p.managed && p.mode == ProxyMode::Manual && p.url == "http://proxy.corp:3128");
         assert!(!ai.get_feature_toggles().await.ai_master_enabled);
+        let caps = backups.effective_caps().await;
+        assert_eq!((caps.upload_bps, caps.download_bps, caps.concurrency()), (512 * 1024, 0, 3));
 
         // Restart: the AI limit comes back from storage.
         let ai2 = AiAssistant::new();
-        activate_stored(&repo, &ai2).await;
+        activate_stored(&repo, &ai2, &backups).await;
         assert!(!ai2.get_feature_toggles().await.ai_master_enabled);
 
         // Invalid settings change nothing.
         let bad = ManagedSettings { version: 4, proxy: Some(ManagedProxy { mode: "pac".into(), ..Default::default() }), ..Default::default() };
-        assert!(apply(&repo, &creds, &ai, Some(bad)).await.is_err());
+        assert!(apply(&repo, &creds, &ai, &backups, Some(bad)).await.is_err());
         assert_eq!(load(&repo).await.unwrap().version, 3);
 
-        apply(&repo, &creds, &ai, None).await.unwrap();
+        apply(&repo, &creds, &ai, &backups, None).await.unwrap();
         assert_eq!(load(&repo).await, None);
         assert!(!net::current().managed, "the managed proxy is released");
         assert!(ai.get_feature_toggles().await.ai_master_enabled);
+        assert_eq!(backups.effective_caps().await.concurrency(), 1, "caps released");
         let _ = net::apply(ProxySettings::default(), None);
     }
 }

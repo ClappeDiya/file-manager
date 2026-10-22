@@ -330,7 +330,7 @@ fn start_background_engines(app: tauri::AppHandle) {
         // or connects around the proxy.
         commands::policy_commands::activate_stored(&app.state::<Repository>()).await;
         commands::proxy_commands::activate_stored(&app.state::<Repository>(), &app.state::<std::sync::Arc<CredentialStore>>()).await;
-        managed_settings::activate_stored(&app.state::<Repository>(), &app.state::<AiAssistant>()).await;
+        managed_settings::activate_stored(&app.state::<Repository>(), &app.state::<AiAssistant>(), &app.state::<BackupManager>()).await;
         let automation = app.state::<AutomationManager>();
         if let Err(e) = automation.start_all_watchers().await {
             tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
@@ -489,7 +489,7 @@ pub fn run() {
             setup_agent.host().set_managed_settings_handler(std::sync::Arc::new(move |settings| {
                 let h = apply_handle.clone();
                 Box::pin(async move {
-                    managed_settings::apply(&h.state::<Repository>(), &h.state::<std::sync::Arc<CredentialStore>>(), &h.state::<AiAssistant>(), settings).await
+                    managed_settings::apply(&h.state::<Repository>(), &h.state::<std::sync::Arc<CredentialStore>>(), &h.state::<AiAssistant>(), &h.state::<BackupManager>(), settings).await
                 })
             }));
             fleet_agent::spawn(setup_agent.clone(), "unified-file-ops");
@@ -689,6 +689,7 @@ pub fn run() {
             backup_commands::backup_photos_libraries,
             backup_commands::backup_photos_library_info,
             backup_commands::backup_get_global_defaults,
+            backup_commands::backup_effective_caps,
             backup_commands::backup_set_global_defaults,
             backup_commands::backup_effective_job,
             backup_commands::backup_list_destinations,

@@ -588,10 +588,13 @@ describe('audit trail of fleet actions', () => {
       { proxy: { mode: 'pac' } },
       { proxy: { mode: 'magic' } },
       { ai: { enabled: 'no' } },
+      { transfers: { maxConcurrentRuns: 9 } },
+      { transfers: { maxUploadKbps: -1 } },
+      { transfers: { maxDownloadKbps: 1.5 } },
     ]) expect((await put(admin, bad)).status).toBe(400);
 
     const ok = await json<{ settings: { version: number } }>(
-      await put(admin, { updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [5, 1, 1] } }, proxy: { mode: 'pac', pacUrl: 'https://wpad/p.pac', noProxy: [' intranet ', ''] }, ai: { allowCloud: false } }),
+      await put(admin, { updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [5, 1, 1] } }, proxy: { mode: 'pac', pacUrl: 'https://wpad/p.pac', noProxy: [' intranet ', ''] }, ai: { allowCloud: false }, transfers: { maxUploadKbps: 512, maxConcurrentRuns: 2 } }),
     );
     expect(ok.status).toBe(200);
     expect(ok.body.settings.version).toBe(1);
@@ -601,6 +604,7 @@ describe('audit trail of fleet actions', () => {
       updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [1, 5] } },
       proxy: { mode: 'pac', url: '', pacUrl: 'https://wpad/p.pac', noProxy: ['intranet'] },
       ai: { enabled: null, allowCloud: false },
+      transfers: { maxUploadKbps: 512, maxDownloadKbps: null, maxConcurrentRuns: 2 },
     });
     expect(b.policySetVersion).not.toBe(v0);
     const hbv = await json<{ policiesChanged: boolean }>(await hb(m.token, { policySetVersion: v0 }));

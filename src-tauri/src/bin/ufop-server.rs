@@ -288,6 +288,7 @@ async fn run(argv: Vec<String>) {
     if let Err(e) = mgr.load_from_db().await {
         fail(e);
     }
+    mgr.refresh_caps().await;
     if !a.no_scheduler {
         mgr.start_scheduler();
     }
@@ -298,6 +299,15 @@ async fn run(argv: Vec<String>) {
         None
     } else {
         let agent = fleet_agent::init_or_default(mgr.clone(), store.clone(), creds.clone(), "server").await;
+        // Of the console's app settings, the server applies the transfer caps.
+        let caps_mgr = mgr.clone();
+        agent.host().set_managed_settings_handler(Arc::new(move |settings| {
+            let m = caps_mgr.clone();
+            Box::pin(async move {
+                m.set_managed_caps(settings.and_then(|s| s.transfers)).await;
+                Ok(())
+            })
+        }));
         fleet_agent::spawn(agent.clone(), "ufop-server");
         Some(agent)
     };

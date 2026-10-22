@@ -90,6 +90,10 @@ desktops:
   is then read-only in the app's Settings and any saved proxy password is
   removed.
 - **AI**: turn AI features off, or keep AI on local models only.
+- **Transfers**: total upload and download rate for all backups and restores
+  on a machine together, and how many operations may run at the same time
+  (1–8; the same job never runs twice at once). Each one replaces the
+  machine's own setting (Backup → Settings → Machine-wide limits).
 
 Every setting left on *User's choice* stays with the user. Desktops pick up a
 change on their next heartbeat and keep the last settings while offline. The

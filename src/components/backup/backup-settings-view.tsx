@@ -14,18 +14,24 @@ import {
   type BackupOptions,
   type GlobalDefaults,
   type SavedDestination,
+  type TransferCaps,
 } from "@/stores/backup-store";
 import { BackupAdvancedOptions } from "./backup-advanced-options";
 import { Banner, Btn, Field, PathInput, Section } from "./backup-ui";
 import { SecretProvidersEditor } from "./backup-secret-providers";
 
-const EMPTY: GlobalDefaults = { options: {}, throttle: null, retry: null };
+const NO_CAPS: TransferCaps = { upload_bps: 0, download_bps: 0, max_concurrent_runs: 1 };
+const EMPTY: GlobalDefaults = { options: {}, throttle: null, retry: null, caps: NO_CAPS };
+const kb = (bps: number) => Math.round(bps / 1024);
 
 function DefaultsEditor() {
   const builtin = useMemo(() => newBackupJob().options, []);
   const [opts, setOpts] = useState<BackupOptions>(builtin);
   const [uploadKbps, setUploadKbps] = useState(0);
   const [downloadKbps, setDownloadKbps] = useState(0);
+  const [loaded, setLoaded] = useState<GlobalDefaults>(EMPTY);
+  const [caps, setCaps] = useState<TransferCaps>(NO_CAPS);
+  const [effective, setEffective] = useState<TransferCaps | null>(null);
   const [msg, setMsg] = useState<{ tone: "error" | "success"; text: string } | null>(null);
 
   useEffect(() => {
@@ -34,15 +40,20 @@ function DefaultsEditor() {
         setOpts({ ...builtin, ...d.options });
         setUploadKbps(Math.round((d.throttle?.upload_bps ?? 0) / 1024));
         setDownloadKbps(Math.round((d.throttle?.download_bps ?? 0) / 1024));
+        setLoaded(d);
+        setCaps({ ...NO_CAPS, ...d.caps });
       })
       .catch((e) => setMsg({ tone: "error", text: errorText(e) }));
+    void tauriInvoke<TransferCaps | null>("backup_effective_caps", undefined, null).then(setEffective);
   }, [builtin]);
 
   const changed = diffOptions(builtin, opts);
   const save = async () => {
     const throttle = uploadKbps || downloadKbps ? { upload_bps: uploadKbps * 1024, download_bps: downloadKbps * 1024 } : null;
     try {
-      await tauriInvoke("backup_set_global_defaults", { defaults: { options: changed, throttle, retry: null } satisfies GlobalDefaults });
+      // Keep what this editor does not show (the retry defaults).
+      await tauriInvoke("backup_set_global_defaults", { defaults: { options: changed, throttle, retry: loaded.retry, caps } satisfies GlobalDefaults });
+      setEffective(await tauriInvoke<TransferCaps | null>("backup_effective_caps", undefined, null));
       setMsg({ tone: "success", text: `Saved ${Object.keys(changed).length} default option(s).` });
     } catch (e) {
       setMsg({ tone: "error", text: errorText(e) });
@@ -70,6 +81,24 @@ function DefaultsEditor() {
             <input className={inputCls} type="number" min={0} value={downloadKbps} onChange={(e) => setDownloadKbps(Math.max(0, Number(e.target.value)))} />
           </Field>
         </div>
+      </Section>
+      <Section title="Machine-wide limits" hint="Shared by every job and restore on this machine, on top of each job's own limit.">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          <Field label="Total upload (KB/s, 0 = unlimited)">
+            <input aria-label="Total upload" className={inputCls} type="number" min={0} value={kb(caps.upload_bps)} onChange={(e) => setCaps({ ...caps, upload_bps: Math.max(0, Number(e.target.value)) * 1024 })} />
+          </Field>
+          <Field label="Total download (KB/s, 0 = unlimited)">
+            <input aria-label="Total download" className={inputCls} type="number" min={0} value={kb(caps.download_bps)} onChange={(e) => setCaps({ ...caps, download_bps: Math.max(0, Number(e.target.value)) * 1024 })} />
+          </Field>
+          <Field label="Operations at the same time (1–8)">
+            <input aria-label="Operations at the same time" className={inputCls} type="number" min={1} max={8} value={Math.max(1, caps.max_concurrent_runs)} onChange={(e) => setCaps({ ...caps, max_concurrent_runs: Math.min(8, Math.max(1, Number(e.target.value))) })} />
+          </Field>
+        </div>
+        {effective && (effective.upload_bps !== caps.upload_bps || effective.download_bps !== caps.download_bps || Math.max(1, effective.max_concurrent_runs) !== Math.max(1, caps.max_concurrent_runs)) && (
+          <p className="text-xs text-amber-700 dark:text-amber-400" data-testid="caps-managed">
+            Your organization sets: upload {kb(effective.upload_bps) || "unlimited"} KB/s, download {kb(effective.download_bps) || "unlimited"} KB/s, {Math.max(1, effective.max_concurrent_runs)} at a time.
+          </p>
+        )}
       </Section>
       <BackupAdvancedOptions options={opts} locked={false} onChange={(p) => setOpts({ ...opts, ...p })} />
       <div className="flex gap-1">

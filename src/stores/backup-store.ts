@@ -64,6 +64,15 @@ export interface GlobalDefaults {
   options: Partial<BackupOptions>;
   throttle: Throttle | null;
   retry: RetryPolicy | null;
+  /** Machine-wide caps (all jobs together). */
+  caps: TransferCaps;
+}
+
+/** Mirrors `defaults::TransferCaps` (0 = unlimited / one at a time). */
+export interface TransferCaps {
+  upload_bps: number;
+  download_bps: number;
+  max_concurrent_runs: number;
 }
 
 export type SymlinkPolicy = "store" | "follow" | "ignore";

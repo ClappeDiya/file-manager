@@ -848,3 +848,54 @@ async fn photos_library_job_backup_restore_and_commands() {
     }
     assert!(api::dispatch(&m, "backup_photos_library_info", &serde_json::json!({ "path": t.path().join("none.photoslibrary") })).await.is_err());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrency_cap_runs_jobs_in_parallel_but_never_one_job_twice() {
+    let t = tempfile::tempdir().unwrap();
+    let m = manager(t.path()).await;
+    let mk = |n: &str| {
+        let (src, dst) = (t.path().join(format!("src{n}")), t.path().join(format!("dst{n}")));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f"), n).unwrap();
+        let mut jb = job(&src, &dst);
+        jb.name = format!("job {n}");
+        jb.encrypted = false;
+        jb.scripts.run_before = Some("sleep 0.6".into());
+        jb
+    };
+    let a = m.save_job(mk("a"), None).await.unwrap();
+    let b = m.save_job(mk("b"), None).await.unwrap();
+    let both = |x: &str, y: &str| {
+        let (m1, m2, x, y) = (m.clone(), m.clone(), x.to_string(), y.to_string());
+        async move {
+            let t0 = std::time::Instant::now();
+            let (r1, r2) = tokio::join!(m1.execute(&x, BackupOperation::Backup { dry_run: false }), m2.execute(&y, BackupOperation::Backup { dry_run: false }));
+            r1.unwrap();
+            r2.unwrap();
+            t0.elapsed().as_secs_f64()
+        }
+    };
+
+    // Default: one operation at a time.
+    assert_eq!(m.effective_caps().await.concurrency(), 1);
+    assert!(both(&a.id, &b.id).await >= 1.15);
+
+    let mut d = m.global_defaults().await.unwrap();
+    d.caps = defaults::TransferCaps { upload_bps: 0, download_bps: 0, max_concurrent_runs: 2 };
+    m.set_global_defaults(d.clone()).await.unwrap();
+    assert!(both(&a.id, &b.id).await < 1.15, "two jobs run side by side");
+    assert!(both(&a.id, &a.id).await >= 1.15, "the same job never runs twice at once");
+
+    // The console's cap wins over the machine's; clearing it restores the machine's.
+    m.set_managed_caps(Some(ufop_core::agent::ManagedTransfers { max_concurrent_runs: Some(1), max_upload_kbps: Some(64), max_download_kbps: None })).await;
+    let caps = m.effective_caps().await;
+    assert_eq!((caps.concurrency(), caps.upload_bps), (1, 64 * 1024));
+    assert_eq!(ufop_core::backup::backend::GLOBAL_UPLOAD.get(), 64 * 1024);
+    m.set_managed_caps(None).await;
+    assert_eq!(m.effective_caps().await.concurrency(), 2);
+    assert_eq!(ufop_core::backup::backend::GLOBAL_UPLOAD.get(), 0);
+
+    d.caps.max_concurrent_runs = 9;
+    assert!(m.set_global_defaults(d).await.is_err());
+}
