@@ -246,6 +246,58 @@
           "dest_path": ""
         },
         "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "validate_batch",
+          "folder": "",
+          "rules": {
+            "members": [
+              {
+                "pattern": "orders_*.csv",
+                "min": 1,
+                "max": 10,
+                "min_bytes": 20
+              }
+            ],
+            "content": [
+              {
+                "pattern": "*.csv",
+                "check": {
+                  "type": "csv",
+                  "required_columns": [
+                    "id",
+                    "total"
+                  ],
+                  "min_rows": 1,
+                  "delimiter": ";"
+                }
+              },
+              {
+                "pattern": "SHA256SUMS",
+                "check": {
+                  "type": "sha256_manifest"
+                }
+              },
+              {
+                "pattern": "*.json",
+                "check": {
+                  "type": "json"
+                }
+              },
+              {
+                "pattern": "*",
+                "check": {
+                  "type": "not_empty"
+                }
+              }
+            ],
+            "no_extra_files": true
+          },
+          "report_folder": "/reports/{yyyy}",
+          "fail_on_invalid": true
+        },
+        "continue_on_error": false
       }
     ],
     "options": {

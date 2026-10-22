@@ -187,6 +187,25 @@ describe("presets", () => {
         { action: { type: "download_url", url: "https://example.com/{customer}.csv", dest_path: "/in/{yyyy}", file_name: null, overwrite: true, max_mb: 50, sha256: null, allow_private: false }, continue_on_error: false },
         { action: { type: "convert_image", format: "webp", max_width: 800, max_height: null, quality: null, dest_path: "/in/small" }, continue_on_error: false },
         { action: { type: "convert_document", to: "pdf", dest_path: "" }, continue_on_error: false },
+        {
+          action: {
+            type: "validate_batch",
+            folder: "",
+            rules: {
+              members: [{ pattern: "orders_*.csv", min: 1, max: 10, min_bytes: 20 }],
+              content: [
+                { pattern: "*.csv", check: { type: "csv", required_columns: ["id", "total"], min_rows: 1, delimiter: ";" } },
+                { pattern: "SHA256SUMS", check: { type: "sha256_manifest" } },
+                { pattern: "*.json", check: { type: "json" } },
+                { pattern: "*", check: { type: "not_empty" } },
+              ],
+              no_extra_files: true,
+            },
+            report_folder: "/reports/{yyyy}",
+            fail_on_invalid: true,
+          },
+          continue_on_error: false,
+        },
       ],
       options: { ...newRuleForm().options, source: { path: "/inbox", recursive: true, newest: 5, include_dirs: false }, priority: -1 },
     })), rules.length));

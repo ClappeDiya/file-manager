@@ -83,7 +83,34 @@ export type RuleAction =
   /** Resize and/or change an image's format; the result (in `dest_path`, empty = same folder) is handed on. */
   | { type: "convert_image"; format: ImageFormat | null; max_width: number | null; max_height: number | null; quality: number | null; dest_path: string }
   /** Convert an office document with LibreOffice; the result is handed on. */
-  | { type: "convert_document"; to: DocumentFormat; dest_path: string };
+  | { type: "convert_document"; to: DocumentFormat; dest_path: string }
+  /** Check a delivered batch against member and content rules (`automation_engine::validate`). */
+  | { type: "validate_batch"; folder: string; rules: BatchRules; report_folder: string | null; fail_on_invalid: boolean };
+
+/** `validate::MemberRule`: files matching `pattern` must number `min..=max`, each at least `min_bytes`. */
+export interface MemberRule {
+  pattern: string;
+  min: number;
+  max: number | null;
+  min_bytes: number | null;
+}
+
+export type ContentCheck =
+  | { type: "not_empty" }
+  | { type: "json" }
+  | { type: "csv"; required_columns: string[]; min_rows: number | null; delimiter: string | null }
+  | { type: "sha256_manifest" };
+
+export interface ContentRule {
+  pattern: string;
+  check: ContentCheck;
+}
+
+export interface BatchRules {
+  members: MemberRule[];
+  content: ContentRule[];
+  no_extra_files: boolean;
+}
 
 /** `convert_engine::IMAGE_FORMATS` */
 export const IMAGE_FORMATS = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] as const;

@@ -147,6 +147,7 @@ export const ACTION_TYPES: { type: RuleAction["type"]; label: string; advanced?:
   { type: "download_url", label: "Download a URL", advanced: true },
   { type: "convert_image", label: "Resize / convert an image" },
   { type: "convert_document", label: "Convert a document (LibreOffice)" },
+  { type: "validate_batch", label: "Validate a batch of files", advanced: true },
 ];
 
 export function defaultAction(type: RuleAction["type"]): RuleAction {
@@ -184,6 +185,8 @@ export function defaultAction(type: RuleAction["type"]): RuleAction {
       return { type, format: "jpeg", max_width: 1920, max_height: 1920, quality: 85, dest_path: "" };
     case "convert_document":
       return { type, to: "pdf", dest_path: "" };
+    case "validate_batch":
+      return { type, folder: "", rules: { members: [{ pattern: "*.csv", min: 1, max: null, min_bytes: null }], content: [], no_extra_files: false }, report_folder: null, fail_on_invalid: true };
   }
 }
 
@@ -307,6 +310,14 @@ function actionErrors(a: RuleAction, n: string): string[] {
     if (!a.format && !a.max_width && !a.max_height) errors.push(`${n}: choose a format or a largest size.`);
     for (const v of [a.max_width, a.max_height]) if (v !== null && !(v >= 1 && v <= 20_000)) errors.push(`${n}: sizes are 1–20000 pixels.`);
     if (a.quality !== null && !(a.quality >= 1 && a.quality <= 100)) errors.push(`${n}: quality is 1–100.`);
+  }
+  if (a.type === "validate_batch") {
+    const { members, content, no_extra_files } = a.rules;
+    if (members.length === 0 && content.length === 0 && !no_extra_files) errors.push(`${n}: add a member or content rule.`);
+    for (const p of [...members.map((m) => m.pattern), ...content.map((c) => c.pattern)]) {
+      if (!p.trim() || /[\\/]/.test(p)) errors.push(`${n}: '${p}' must be a file name pattern like *.csv.`);
+    }
+    for (const m of members) if (m.max !== null && m.max < m.min) errors.push(`${n}: '${m.pattern}' allows fewer files than it requires.`);
   }
   if (a.type === "download_url") {
     if (!/^https?:\/\/[^/\s]+/i.test(a.url.trim())) errors.push(`${n}: enter an http(s) URL to download.`);

@@ -16,6 +16,7 @@ pub mod scheduler;
 pub mod services;
 pub mod suggester;
 pub mod tauri_services;
+pub mod validate;
 pub mod webhook;
 pub mod workflow;
 
@@ -72,6 +73,10 @@ pub fn rule_from_definition(definition: &serde_json::Value) -> Result<Automation
         }
     }
     serde_json::from_value(v)
+}
+
+fn default_fail_on_invalid() -> bool {
+    true
 }
 
 /// The parts of a rule stored in `automation_rules.extra_json`.
@@ -376,6 +381,20 @@ pub enum RuleAction {
         to: String,
         #[serde(default)]
         dest_path: String,
+    },
+    /// Check a delivered batch (`automation_engine::validate`): the files in
+    /// `folder` (a template; empty = the triggering file's folder) against
+    /// member and content rules. Writes a report into `report_folder` when
+    /// set, and fails the step when the batch is invalid unless
+    /// `fail_on_invalid` is off.
+    ValidateBatch {
+        #[serde(default)]
+        folder: String,
+        rules: validate::BatchRules,
+        #[serde(default)]
+        report_folder: Option<String>,
+        #[serde(default = "default_fail_on_invalid")]
+        fail_on_invalid: bool,
     },
     /// Download a URL into a folder (`automation_engine::download`). URL,
     /// folder and file name are templates.
@@ -1628,9 +1647,13 @@ mod tests {
         let last = &rules[rules.len() - 2];
         assert_eq!(last.trigger, RuleTrigger::Webhook);
         assert!(matches!(last.condition_tree, Some(ConditionNode::Any { ref nodes }) if nodes.len() == 2));
-        assert_eq!(last.steps.len(), 4);
+        assert_eq!(last.steps.len(), 5);
         assert!(matches!(&last.steps[2].action, RuleAction::ConvertImage { format: Some(f), max_width: Some(800), max_height: None, quality: None, dest_path } if f == "webp" && dest_path == "/in/small"));
         assert!(matches!(&last.steps[3].action, RuleAction::ConvertDocument { to, dest_path } if to == "pdf" && dest_path.is_empty()));
+        let RuleAction::ValidateBatch { rules: batch, report_folder: Some(_), fail_on_invalid: true, .. } = &last.steps[4].action else { panic!("validate_batch") };
+        assert!(batch.no_extra_files && batch.members[0].max == Some(10) && batch.content.len() == 4);
+        assert!(matches!(&batch.content[0].check, validate::ContentCheck::Csv { required_columns, min_rows: Some(1), delimiter: Some(d) } if required_columns.len() == 2 && d == ";"));
+        assert!(batch.validate().is_ok());
         assert!(matches!(last.action, RuleAction::SendMessage { .. }));
         assert!(matches!(last.steps[0].action, RuleAction::RunCommand { .. }));
         assert!(matches!(&last.steps[1].action, RuleAction::DownloadUrl { url, overwrite: true, max_mb: 50, allow_private: false, .. } if url.contains("{customer}")));

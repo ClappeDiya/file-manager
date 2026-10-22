@@ -313,6 +313,7 @@ pub fn action_kind(action: &RuleAction) -> &'static str {
         RuleAction::DownloadUrl { .. } => "download_url",
         RuleAction::ConvertImage { .. } => "convert_image",
         RuleAction::ConvertDocument { .. } => "convert_document",
+        RuleAction::ValidateBatch { .. } => "validate_batch",
     }
 }
 
@@ -803,6 +804,30 @@ pub async fn dispatch(action: &RuleAction, triggered_file: Option<&str>, env: &E
             };
             crate::convert_engine::convert_document(&src, &target, to, std::time::Duration::from_secs(300)).await?;
             Ok(vec![target.to_string_lossy().into_owned()])
+        }
+
+        RuleAction::ValidateBatch { folder, rules, report_folder, fail_on_invalid } => {
+            let dir = if folder.trim().is_empty() {
+                let f = Path::new(triggered_file.ok_or("Choose the batch folder (no file started this run)")?);
+                if f.is_dir() { f.to_path_buf() } else { f.parent().ok_or("Cannot determine parent directory")?.to_path_buf() }
+            } else {
+                PathBuf::from(env.path(folder, triggered_file)?)
+            };
+            validate_automation_path(&dir, None)?;
+            let (rules, scan) = (rules.clone(), dir.clone());
+            let report = tokio::task::spawn_blocking(move || super::validate::validate_batch(&scan, &rules)).await.map_err(|e| format!("Validation failed: {e}"))??;
+            let mut affected: Vec<String> = triggered_file.map(|f| vec![f.to_string()]).unwrap_or_default();
+            if let Some(rf) = report_folder.as_deref().filter(|r| !r.trim().is_empty()) {
+                let out = PathBuf::from(env.path(rf, triggered_file)?);
+                validate_automation_path(&out, None)?;
+                let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "batch".into());
+                let base = format!("{name}-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
+                affected.push(super::validate::write_report(&report, &out, &base)?.to_string_lossy().into_owned());
+            }
+            if !report.ok && *fail_on_invalid {
+                return Err(report.summary());
+            }
+            Ok(affected)
         }
 
         RuleAction::Notify { title, body } => {
@@ -1408,6 +1433,37 @@ mod tests {
         let bad = execute_rule_action(&rule_steps(RuleAction::ConvertImage { format: None, max_width: None, max_height: None, quality: None, dest_path: String::new() }, vec![], RuleOptions::default()), src.to_str(), false).await;
         assert_eq!(bad.status, AutomationStatus::Failed);
         assert!(bad.error_message.unwrap().contains("format or a largest size"));
+    }
+
+    #[tokio::test]
+    async fn validate_batch_reports_and_fails_invalid_batches() {
+        use crate::automation_engine::validate::{BatchRules, ContentCheck, ContentRule, MemberRule};
+        let dir = tempfile::tempdir().unwrap();
+        let batch = dir.path().join("incoming");
+        write(&batch.join("orders.csv"), "id,total\n1,5\n");
+        write(&batch.join("batch.done"), "");
+        let reports = dir.path().join("reports");
+        let rules = BatchRules {
+            members: vec![MemberRule { pattern: "*.csv".into(), min: 1, max: None, min_bytes: None }, MemberRule { pattern: "invoice.pdf".into(), min: 1, max: None, min_bytes: None }],
+            content: vec![ContentRule { pattern: "*.csv".into(), check: ContentCheck::Csv { required_columns: vec!["total".into()], min_rows: Some(1), delimiter: None } }],
+            no_extra_files: false,
+        };
+        let action = |fail| RuleAction::ValidateBatch { folder: String::new(), rules: rules.clone(), report_folder: Some(format!("{}/{{yyyy}}", reports.display())), fail_on_invalid: fail };
+        // Started by the marker file: its folder is the batch.
+        let marker = batch.join("batch.done");
+        let log = execute_rule_action(&rule_steps(action(true), vec![], RuleOptions::default()), marker.to_str(), false).await;
+        assert_eq!(log.status, AutomationStatus::Failed);
+        let msg = log.error_message.unwrap();
+        assert!(msg.contains("Batch invalid (1 of 3 checks failed)") && msg.contains("invoice.pdf"), "{msg}");
+        let year = chrono::Utc::now().format("%Y").to_string();
+        let written: Vec<String> = std::fs::read_dir(reports.join(&year)).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(written.len(), 2, "{written:?}");
+        assert!(written.iter().all(|n| n.starts_with("incoming-") && (n.ends_with(".validation.json") || n.ends_with(".validation.txt"))));
+
+        // Report only: the step succeeds; once the batch is complete it is valid.
+        assert_eq!(execute_rule_action(&rule_steps(action(false), vec![], RuleOptions::default()), marker.to_str(), false).await.status, AutomationStatus::Success);
+        write(&batch.join("invoice.pdf"), "%PDF");
+        assert_eq!(execute_rule_action(&rule_steps(action(true), vec![], RuleOptions::default()), marker.to_str(), false).await.status, AutomationStatus::Success);
     }
 
     fn rule_steps(first: RuleAction, more: Vec<ActionStep>, options: RuleOptions) -> AutomationRule {

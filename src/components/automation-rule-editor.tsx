@@ -43,6 +43,7 @@ import {
   type RuleForm,
   linearSteps,
 } from "@/lib/automation-rule-model";
+import { BatchRulesEditor } from "@/components/batch-rules-editor";
 import {
   DOCUMENT_FORMATS,
   IMAGE_FORMATS,
@@ -454,6 +455,26 @@ function ActionFields({
         </div>
       );
     }
+    case "validate_batch":
+      if (!advanced) return <p className="text-xs text-[var(--color-text-muted)]">Switch to Advanced mode to edit batch validation.</p>;
+      return (
+        <div className="space-y-2">
+          <div>
+            <label className={label} htmlFor={id("vfolder")}>Batch folder (empty = the folder of the file that started the run)</label>
+            <FolderInput id={id("vfolder")} value={a.folder} onChange={(v) => onChange({ ...a, folder: v })} placeholder="Folder of the triggering file" />
+          </div>
+          <BatchRulesEditor rules={a.rules} onChange={(rules) => onChange({ ...a, rules })} />
+          <div>
+            <label className={label} htmlFor={id("vreport")}>Write a report into (optional)</label>
+            <FolderInput id={id("vreport")} value={a.report_folder ?? ""} onChange={(v) => onChange({ ...a, report_folder: v || null })} placeholder="No report file" />
+            {tokenHint}
+          </div>
+          <label className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={a.fail_on_invalid} onChange={(e) => onChange({ ...a, fail_on_invalid: e.target.checked })} /> An invalid batch fails this step (later steps, or a workflow&apos;s failure branch, react to it)
+          </label>
+          <p className="text-[11px] text-[var(--color-text-muted)]">Tip: start the rule when a marker file (such as <code>*.done</code>) arrives, so the whole batch is there.</p>
+        </div>
+      );
     case "convert_document":
       return (
         <div className="space-y-2">

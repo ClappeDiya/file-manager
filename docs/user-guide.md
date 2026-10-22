@@ -585,6 +585,14 @@ Right-click images (PNG, JPEG, WebP, GIF, BMP, TIFF) or documents (Word, Excel, 
 
 In automation rules, **Resize / convert an image** and **Convert a document** do the same for each file, into a folder template (empty = next to the file), following the rule's overwrite choice. Later steps work on the converted file, so *convert to PDF → upload* is two steps.
 
+## Automation: validating a batch
+
+In Advanced mode, **Validate a batch of files** checks a delivery — the files directly inside one folder (by default, the folder of the file that started the run; start the rule on a marker such as `*.done` so the batch is complete):
+
+- **Member rules:** files matching a name pattern (`orders_*.csv`, case-insensitive) must number at least / at most N and each be at least a size. *Other files make the batch invalid* rejects anything no rule names.
+- **Content checks** on matching files: not empty; valid JSON; CSV with required columns (case-insensitive), a minimum number of data rows and a delimiter; or a SHA-256 manifest (`sha256sum` format) whose listed files must exist in the batch and match.
+- **Report:** with a report folder (templates allowed), each run writes `<folder>-<time>.validation.json` and `.txt` listing every check. An invalid batch fails the step — the run history shows which checks failed, and a workflow's failure branch can move the batch to quarantine or send a message. Turn that off to only report.
+
 ## Automation: downloading a URL
 
 In Advanced mode, an automation rule can **Download a URL** into a folder. The URL, folder, file name and expected SHA-256 accept the same templates as other actions (`{name}`, `{yyyy}`, webhook fields …).

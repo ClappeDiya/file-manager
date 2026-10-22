@@ -146,6 +146,8 @@ function actionLabel(action: RuleAction): string {
       return [action.format ? `Convert to ${action.format.toUpperCase()}` : "Resize", action.max_width || action.max_height ? `≤ ${action.max_width ?? "∞"}×${action.max_height ?? "∞"}` : ""].filter(Boolean).join(" ");
     case "convert_document":
       return `Convert to ${action.to.toUpperCase()}`;
+    case "validate_batch":
+      return `Validate batch (${action.rules.members.length + action.rules.content.length} rules)`;
     case "replay_op": {
       // Operation Pin: a captured copy/move replayed verbatim. The
       // source list and destination both travel with the rule, so the
