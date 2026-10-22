@@ -177,6 +177,11 @@ impl AuthService {
         self.reset_jwt().await
     }
 
+    /// Folder policies of shared folders (see `folders`).
+    pub fn folder_policies(&self) -> super::folders::FolderPolicyStore {
+        super::folders::FolderPolicyStore::new(self.settings.pool().clone())
+    }
+
     /// Share links (see `shares`).
     pub fn shares(&self) -> super::shares::ShareStore {
         super::shares::ShareStore::new(self.settings.pool().clone())

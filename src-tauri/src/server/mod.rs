@@ -7,6 +7,7 @@
 
 pub mod api_tokens;
 pub mod auth;
+pub mod folders;
 pub mod oauth;
 pub mod openapi;
 pub mod shares;
@@ -709,6 +710,7 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/scheduler/resume", post(resume))
         .merge(oauth::protected_routes())
         .merge(shares::protected_routes())
+        .merge(folders::protected_routes())
         .route_layer(middleware::from_fn_with_state(st.clone(), require_auth));
     let mut app = public.merge(protected);
     if !st.cfg.api_only && st.cfg.webroot.is_some() {

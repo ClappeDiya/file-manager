@@ -661,6 +661,16 @@ Start the server with `--share-root <folder>` (repeatable, or `UFOP_SERVER_SHARE
 - Only a hash of the token is stored, so the link is shown once. Paths are confined to the shared folder after resolving symbolic links, dot-files are never listed or served, downloads are sent as attachments, uploads never overwrite (`name (2).ext`), and pages carry a strict Content-Security-Policy. The server's `--allowed-cidrs` and host checks apply to links too.
 - Every view, download, upload, refusal and wrong password is logged per link (`GET /api/v1/shares/{id}/events`, `ufop server shares log <id>`); links can be turned off at any time.
 
+### Folder policies
+
+Folders under `--share-root` can carry a policy (web UI *Share links → Folder policies*, `ufop server folders`, `/api/v1/folder-policies`); subfolders inherit, and for each setting the nearest folder that sets it wins:
+
+- **Lock** — the folder takes no uploads (existing upload links stop accepting files) and no new upload links.
+- **Accepted / blocked extensions** and the **largest upload** (the smaller of this and the link's limit applies). Refused files are skipped and reported; the rest of an upload goes through.
+- **Link rules** — links to the folder need a password, and/or must expire within N days.
+- **Intake order** — uploads keep their names (`name (2).ext` on a clash), get an arrival-time prefix (`2026-10-22T16-30-01.123Z name.pdf`), or a per-folder sequence number (`000042-name.pdf`), so listing by name lists by arrival.
+- **Copy** a folder's policy to another folder (`POST /api/v1/folder-policies/copy`); an empty policy removes a folder's own settings.
+
 A test fails the build when a route is added without an OpenAPI entry (or an entry outlives its route), and another checks every documented scope against the running server.
 
 ---

@@ -143,6 +143,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "Mount options - cache mode, cache limits, read-only; mount error column",
             sql: V25_SCHEMA,
         },
+        Migration {
+            version: 26,
+            description: "ufop-server folder policies - lock, extensions, limits, link rules, intake naming",
+            sql: V26_SCHEMA,
+        },
     ]
 }
 
@@ -160,6 +165,15 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
 /// symlink policy, connector extras) as JSON; previously never saved.
 /// Schema v22: named `ufop-server` API tokens (SHA-256 hashes) with scopes
 /// (JSON list) and a mandatory expiry.
+/// Schema v26: folder policies of folders ufop-server shares (`server::folders`).
+const V26_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_folder_policies (
+    path TEXT PRIMARY KEY NOT NULL,
+    settings TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
 /// Schema v25: per-mount options (`mount_engine::MountOptions` as JSON), and
 /// the `error_message` column the mount engine always wrote but v7 never
 /// created (every mount ended in a database error).
@@ -967,7 +981,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 25);
+        assert_eq!(applied, 26);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -1002,7 +1016,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 25);
+        assert_eq!(first, 26);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -1015,7 +1029,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 25);
+        assert_eq!(current_version(&conn).unwrap(), 26);
     }
 
     #[test]

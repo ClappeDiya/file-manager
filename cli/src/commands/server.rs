@@ -64,6 +64,48 @@ pub enum ServerCommands {
     /// Share links to files and folders under the server's --share-root
     #[command(subcommand)]
     Shares(ShareCommands),
+    /// Policies of shared folders: lock, accepted types, limits, link rules, intake naming
+    #[command(subcommand)]
+    Folders(FolderCommands),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FolderCommands {
+    /// Folders that have a policy of their own
+    List,
+    /// A folder's own policy and the one in force (with what it inherits)
+    Show { path: String },
+    /// Change a folder's own policy (only the options given change)
+    Set {
+        path: String,
+        /// Take no uploads and no upload links
+        #[arg(long, conflicts_with = "unlock")]
+        lock: bool,
+        #[arg(long)]
+        unlock: bool,
+        /// Accept only these extensions (comma-separated; "" = inherit)
+        #[arg(long, value_delimiter = ',')]
+        allow: Option<Vec<String>>,
+        /// Refuse these extensions (comma-separated; "" = inherit)
+        #[arg(long, value_delimiter = ',')]
+        block: Option<Vec<String>>,
+        /// Largest upload per file, in MB (0 = inherit)
+        #[arg(long)]
+        max_upload_mb: Option<i64>,
+        /// Links must have a password (true/false)
+        #[arg(long)]
+        require_password: Option<bool>,
+        /// Links must expire within N days (0 = inherit)
+        #[arg(long)]
+        max_link_days: Option<i64>,
+        /// How uploads are named: keep, timestamp or sequence
+        #[arg(long, value_parser = ["keep", "timestamp", "sequence"])]
+        intake: Option<String>,
+    },
+    /// Remove a folder's own policy (it inherits again)
+    Clear { path: String },
+    /// Copy one folder's own policy to another
+    Copy { from: String, to: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -119,6 +161,10 @@ pub enum TokenCommands {
     },
     /// Revoke a token by id
     Revoke { id: String },
+}
+
+fn urlencode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
 struct Client {
@@ -316,6 +362,47 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
             ServerCommands::IssueToken => {
                 let mut c = Client::new()?;
                 show(format, &c.call(reqwest::Method::POST, "/auth/automation-token", None).await?);
+                Ok(0)
+            }
+            ServerCommands::Folders(fc) => {
+                let mut c = Client::new()?;
+                let v = match fc {
+                    FolderCommands::List => c.call(reqwest::Method::GET, "/folder-policies", None).await?["policies"].clone(),
+                    FolderCommands::Show { path } => c.call(reqwest::Method::GET, &format!("/folder-policies/effective?path={}", urlencode(&path)), None).await?,
+                    FolderCommands::Clear { path } => c.call(reqwest::Method::PUT, "/folder-policies", Some(json!({"path": path, "policy": {}}))).await?,
+                    FolderCommands::Copy { from, to } => c.call(reqwest::Method::POST, "/folder-policies/copy", Some(json!({"from": from, "to": to}))).await?,
+                    FolderCommands::Set { path, lock, unlock, allow, block, max_upload_mb, require_password, max_link_days, intake } => {
+                        let cur = c.call(reqwest::Method::GET, &format!("/folder-policies/effective?path={}", urlencode(&path)), None).await?;
+                        let mut p = cur["own"].as_object().cloned().unwrap_or_default();
+                        let list = |v: Vec<String>| {
+                            let v: Vec<String> = v.into_iter().map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect();
+                            if v.is_empty() { Value::Null } else { json!(v) }
+                        };
+                        if lock || unlock {
+                            p.insert("locked".into(), json!(lock));
+                        }
+                        if let Some(a) = allow {
+                            p.insert("allowed_extensions".into(), list(a));
+                        }
+                        if let Some(b) = block {
+                            p.insert("blocked_extensions".into(), list(b));
+                        }
+                        if let Some(m) = max_upload_mb {
+                            p.insert("max_upload_mb".into(), if m == 0 { Value::Null } else { json!(m) });
+                        }
+                        if let Some(r) = require_password {
+                            p.insert("require_link_password".into(), json!(r));
+                        }
+                        if let Some(d) = max_link_days {
+                            p.insert("max_link_days".into(), if d == 0 { Value::Null } else { json!(d) });
+                        }
+                        if let Some(i) = intake {
+                            p.insert("intake_naming".into(), json!(i));
+                        }
+                        c.call(reqwest::Method::PUT, "/folder-policies", Some(json!({"path": path, "policy": p}))).await?
+                    }
+                };
+                show(format, &v);
                 Ok(0)
             }
             ServerCommands::Shares(sc) => {

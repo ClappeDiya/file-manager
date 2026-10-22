@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { errorText } from "@/lib/error-text";
 import { serverApi } from "@/lib/server-client";
+import { FolderPoliciesPanel } from "@/components/server/folder-policies-panel";
 
 export type ShareKind = "download" | "upload" | "both";
 
@@ -393,6 +394,7 @@ export function ShareLinksPanel({
           </table>
         )}
       </section>
+      <FolderPoliciesPanel pickFolder={pickFolder} />
       {log && (
         <section aria-label="Link activity">
           <h2 className="font-semibold mb-1">

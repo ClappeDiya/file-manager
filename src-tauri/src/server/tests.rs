@@ -443,3 +443,70 @@ async fn share_portal_links_downloads_uploads_and_passwords() {
     assert_eq!(anon.get(format!("{ourl}/dl")).send().await.unwrap().bytes().await.unwrap().as_ref(), b"%PDF report");
     assert_eq!(anon.get(format!("{ourl}/dl?p=../sub/a%20b.txt")).send().await.unwrap().status(), 404);
 }
+
+#[tokio::test]
+async fn folder_policies_lock_filter_name_and_constrain_links() {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path().canonicalize().unwrap();
+    std::fs::create_dir_all(r.join("inbox/invoices")).unwrap();
+    std::fs::create_dir_all(r.join("archive")).unwrap();
+    let s = start(ServerConfig { share_roots: vec![r.clone()], ..Default::default() }, None).await;
+    let tok = s.login().await;
+    let put = |path: &std::path::Path, policy: Value| s.client.put(format!("{}/api/v1/folder-policies", s.base)).bearer_auth(&tok).json(&json!({"path": path, "policy": policy})).send();
+
+    // The root's rules are inherited; the nearest setting wins.
+    assert_eq!(put(&r, json!({"blocked_extensions": ["exe"], "max_link_days": 30})).await.unwrap().status(), 200);
+    let inv = put(&r.join("inbox/invoices"), json!({"allowed_extensions": [".PDF"], "intake_naming": "sequence", "max_upload_mb": 1})).await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(inv["own"]["allowed_extensions"], json!(["pdf"]));
+    assert_eq!(inv["effective"]["blocked_extensions"], json!(["exe"]));
+    assert_eq!(inv["effective"]["max_link_days"], 30);
+    assert_eq!(put(&r.join("archive"), json!({"locked": true, "require_link_password": true})).await.unwrap().status(), 200);
+    assert_eq!(put(&std::path::PathBuf::from("/etc"), json!({"locked": true})).await.unwrap().status(), 400, "outside the share roots");
+    assert_eq!(put(&r, json!({"max_upload_mb": 0})).await.unwrap().status(), 400);
+
+    // Link rules: expiry within 30 days; locked folders take no upload links; passwords where required.
+    let mk = |body: Value| s.post("/api/v1/shares", &tok, body);
+    assert!(mk(json!({"name": "x", "path": r.join("inbox/invoices"), "kind": "upload"})).await.json::<Value>().await.unwrap()["message"].as_str().unwrap().contains("within 30 days"));
+    assert_eq!(mk(json!({"name": "x", "path": r.join("archive"), "kind": "upload", "password": "long enough pw", "expires_in_days": 5})).await.status(), 400);
+    assert!(mk(json!({"name": "x", "path": r.join("archive"), "expires_in_days": 5})).await.json::<Value>().await.unwrap()["message"].as_str().unwrap().contains("need a password"));
+    assert_eq!(mk(json!({"name": "x", "path": r.join("archive"), "password": "long enough pw", "expires_in_days": 5})).await.status(), 200);
+    let drop = mk(json!({"name": "Invoices", "path": r.join("inbox/invoices"), "kind": "upload", "expires_in_days": 7})).await.json::<Value>().await.unwrap();
+    let durl = format!("{}{}", s.base, drop["url"].as_str().unwrap());
+
+    // Uploads: accepted types only, numbered in arrival order, size cap from the folder.
+    let anon = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let file = |name: &'static str, body: Vec<u8>| reqwest::multipart::Part::bytes(body).file_name(name);
+    let up = anon
+        .post(format!("{durl}/upload"))
+        .multipart(reqwest::multipart::Form::new().part("file", file("a.pdf", b"1".to_vec())).part("file", file("evil.exe", b"x".to_vec())).part("file", file("notes.txt", b"t".to_vec())).part("file", file("b.PDF", b"2".to_vec())))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(up.status(), 303);
+    assert!(up.headers()["location"].to_str().unwrap().contains("uploaded=2&refused=2"));
+    let mut names: Vec<String> = std::fs::read_dir(r.join("inbox/invoices")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    assert_eq!(names, ["000001-a.pdf", "000002-b.PDF"]);
+    let only_bad = anon.post(format!("{durl}/upload")).multipart(reqwest::multipart::Form::new().part("file", file("x.exe", b"x".to_vec()))).send().await.unwrap();
+    assert_eq!(only_bad.status(), 415);
+    let big = anon.post(format!("{durl}/upload")).multipart(reqwest::multipart::Form::new().part("file", file("big.pdf", vec![0u8; 1024 * 1024 + 1]))).send().await.unwrap();
+    assert_eq!(big.status(), 413);
+    let page = anon.get(&durl).send().await.unwrap().text().await.unwrap();
+    assert!(page.contains("Accepted: .pdf") && page.contains("1.0 MB per file"), "{page}");
+
+    // Locking the folder stops uploads through existing links.
+    assert_eq!(put(&r.join("inbox"), json!({"locked": true})).await.unwrap().status(), 200);
+    assert_eq!(anon.post(format!("{durl}/upload")).multipart(reqwest::multipart::Form::new().part("file", file("c.pdf", b"3".to_vec()))).send().await.unwrap().status(), 423);
+    assert!(anon.get(&durl).send().await.unwrap().text().await.unwrap().contains("does not take uploads"));
+
+    // Copy a policy; read the effective one; an empty policy removes it.
+    let cp = s.post("/api/v1/folder-policies/copy", &tok, json!({"from": r.join("inbox/invoices"), "to": r.join("archive")})).await.json::<Value>().await.unwrap();
+    assert_eq!(cp["own"]["intake_naming"], "sequence");
+    assert_eq!(cp["effective"]["locked"], false, "the copy replaced the archive's own lock");
+    let eff = s.get(&format!("/api/v1/folder-policies/effective?path={}", r.join("inbox/invoices").display()), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(eff["effective"]["locked"], true, "inherited from inbox");
+    assert_eq!(eff["effective"]["sources"].as_array().unwrap().len(), 3);
+    assert_eq!(put(&r.join("inbox"), json!({})).await.unwrap().json::<Value>().await.unwrap()["own"], Value::Null);
+    assert_eq!(s.get("/api/v1/folder-policies", &tok).await.json::<Value>().await.unwrap()["policies"].as_array().unwrap().len(), 3);
+    assert_eq!(s.post("/api/v1/folder-policies/copy", &tok, json!({"from": r.join("inbox"), "to": r.join("archive")})).await.status(), 400, "nothing to copy");
+}

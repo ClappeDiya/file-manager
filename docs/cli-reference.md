@@ -510,6 +510,17 @@ ufop server shares revoke <id>
 
 `create` prints the full link once (only its hash is kept). Kinds: `download`, `upload` (drop box), `both`.
 
+Folder policies (inherited by subfolders):
+
+```bash
+ufop server folders set /srv/share/inbox --allow pdf,docx --intake sequence --max-upload-mb 200
+ufop server folders set /srv/share/archive --lock --require-password true --max-link-days 14
+ufop server folders show /srv/share/inbox/2026     # own policy, the one in force and its sources
+ufop server folders copy /srv/share/inbox /srv/share/hr
+ufop server folders clear /srv/share/archive
+ufop server folders list
+```
+
 ---
 
 ### `ufop mcp`

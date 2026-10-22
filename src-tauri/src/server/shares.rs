@@ -415,6 +415,8 @@ pub struct PathQuery {
     p: String,
     #[serde(default)]
     uploaded: Option<u32>,
+    #[serde(default)]
+    refused: Option<u32>,
 }
 
 /// The share for `token` when it is usable, else the page to show instead.
@@ -483,6 +485,9 @@ async fn view(State(st): State<ServerState>, AxPath(token): AxPath<String>, Quer
     if let Some(n) = qr.uploaded {
         body.push_str(&format!(r#"<p class="ok">Uploaded {n} file{}. Thank you!</p>"#, if n == 1 { "" } else { "s" }));
     }
+    if let Some(n) = qr.refused.filter(|n| *n > 0) {
+        body.push_str(&format!(r#"<p class="err">{n} file{} not accepted in this folder.</p>"#, if n == 1 { " was" } else { "s were" }));
+    }
     if let Some(m) = share.max_downloads {
         if share.downloads >= m && share.kind.lists() {
             body.push_str(r#"<p class="err">The download limit of this link has been reached.</p>"#);
@@ -532,12 +537,19 @@ async fn view(State(st): State<ServerState>, AxPath(token): AxPath<String>, Quer
         }
     }
     if share.kind.uploads() && target.is_dir() {
-        let limit = share.max_upload_bytes.unwrap_or(DEFAULT_UPLOAD_LIMIT) as u64;
-        body.push_str(&format!(
-            r#"<h2 style="font-size:16px;margin-top:20px">Upload files</h2><form method="post" enctype="multipart/form-data" action="{base}/upload?p={}"><input type="file" name="file" multiple required> <button class="btn" type="submit">Upload</button></form><p class="muted">Up to {} per file. Files with the same name are kept side by side.</p>"#,
-            q(&rel),
-            human(limit)
-        ));
+        let policy = super::folders::effective_for(&st, &target).await.unwrap_or_default();
+        if policy.locked {
+            body.push_str(r#"<p class="muted" style="margin-top:20px">This folder does not take uploads at the moment.</p>"#);
+        } else {
+            let limit = (share.max_upload_bytes.unwrap_or(DEFAULT_UPLOAD_LIMIT) as u64).min(policy.max_upload_mb.map_or(u64::MAX, |mb| mb as u64 * 1024 * 1024));
+            let types = policy.allowed_extensions.as_ref().map(|a| format!(" Accepted: {}.", a.iter().map(|e| format!(".{e}")).collect::<Vec<_>>().join(", "))).unwrap_or_default();
+            body.push_str(&format!(
+                r#"<h2 style="font-size:16px;margin-top:20px">Upload files</h2><form method="post" enctype="multipart/form-data" action="{base}/upload?p={}"><input type="file" name="file" multiple required> <button class="btn" type="submit">Upload</button></form><p class="muted">Up to {} per file.{} Files with the same name are kept side by side.</p>"#,
+                q(&rel),
+                human(limit),
+                html_escape(&types)
+            ));
+        }
     }
     page(StatusCode::OK, &share.name, &body)
 }
@@ -670,8 +682,18 @@ async fn upload(State(st): State<ServerState>, AxPath(token): AxPath<String>, Qu
         Ok(d) if d.is_dir() => d,
         _ => return message(StatusCode::NOT_FOUND, "Not found", "That folder is not part of this link."),
     };
-    let limit = share.max_upload_bytes.unwrap_or(DEFAULT_UPLOAD_LIMIT) as u64;
+    // The folder's policy: lock, accepted types, size cap, intake naming.
+    let policy = match super::folders::effective_for(&st, &dir).await {
+        Ok(p) => p,
+        Err(e) => return ApiError(e).into_response(),
+    };
+    if policy.locked {
+        store.record(&share.id, &ip, "refused", "folder is locked").await;
+        return message(StatusCode::LOCKED, "Folder locked", "This folder does not take uploads at the moment.");
+    }
+    let limit = (share.max_upload_bytes.unwrap_or(DEFAULT_UPLOAD_LIMIT) as u64).min(policy.max_upload_mb.map_or(u64::MAX, |mb| mb as u64 * 1024 * 1024));
     let mut saved = 0u32;
+    let mut refused: Vec<String> = Vec::new();
     loop {
         let mut field = match form.next_field().await {
             Ok(Some(f)) => f,
@@ -679,6 +701,13 @@ async fn upload(State(st): State<ServerState>, AxPath(token): AxPath<String>, Qu
             Err(e) => return message(StatusCode::BAD_REQUEST, "Upload failed", &e.body_text()),
         };
         let Some(name) = field.file_name().and_then(safe_name) else { continue };
+        if let Err(why) = policy.accepts(&name) {
+            // Drain the refused file and go on with the others.
+            while let Ok(Some(_)) = field.chunk().await {}
+            store.record(&share.id, &ip, "refused", &why).await;
+            refused.push(why);
+            continue;
+        }
         let tmp = dir.join(format!(".ufop-upload-{}", uuid::Uuid::new_v4().simple()));
         let mut out = match tokio::fs::File::create(&tmp).await {
             Ok(f) => f,
@@ -707,7 +736,11 @@ async fn upload(State(st): State<ServerState>, AxPath(token): AxPath<String>, Qu
             store.record(&share.id, &ip, "refused", &why).await;
             return message(code, "Upload failed", &why);
         }
-        let dest = free_name(&dir, &name);
+        // Intake naming and the move into place are serialized, so sequence
+        // numbers and timestamps follow arrival order.
+        let _intake = intake_lock().lock().await;
+        let named = super::folders::intake_name(policy.intake_naming, &name, chrono::Utc::now(), super::folders::next_sequence(&dir));
+        let dest = free_name(&dir, &named);
         if let Err(e) = tokio::fs::rename(&tmp, &dest).await {
             let _ = tokio::fs::remove_file(&tmp).await;
             return ApiError(AppError::from(e)).into_response();
@@ -716,7 +749,15 @@ async fn upload(State(st): State<ServerState>, AxPath(token): AxPath<String>, Qu
         store.record(&share.id, &ip, "upload", &format!("{} ({})", if rel.is_empty() { name.clone() } else { rel }, human(written))).await;
         saved += 1;
     }
-    Redirect::to(&format!("/s/{}?p={}&uploaded={saved}", q(&token), q(&rel_of(&share, &dir)))).into_response()
+    if saved == 0 && !refused.is_empty() {
+        return message(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Not accepted", &refused.join(" "));
+    }
+    Redirect::to(&format!("/s/{}?p={}&uploaded={saved}&refused={}", q(&token), q(&rel_of(&share, &dir)), refused.len())).into_response()
+}
+
+fn intake_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Public link routes (`/s/…`): no account, the token is the credential.
@@ -744,6 +785,19 @@ async fn list_shares(State(st): State<ServerState>) -> Result<Json<serde_json::V
 
 async fn create_share(State(st): State<ServerState>, Json(n): Json<NewShare>) -> Result<Json<serde_json::Value>, ApiError> {
     let roots = share_roots(&st)?;
+    // The folder's policy decides which links may exist.
+    let policy = super::folders::effective_for(&st, Path::new(&n.path)).await?;
+    if policy.locked && n.kind.uploads() {
+        return Err(bad("This folder is locked: it takes no upload links").into());
+    }
+    if policy.require_link_password && n.password.as_deref().map_or(true, str::is_empty) {
+        return Err(bad("Links to this folder need a password").into());
+    }
+    if let Some(max) = policy.max_link_days {
+        if n.expires_in_days.map_or(true, |d| d > max) {
+            return Err(bad(format!("Links to this folder must expire within {max} days")).into());
+        }
+    }
     let (share, token) = st.auth.shares().create(n, &roots).await?;
     tracing::info!("Created share link {} ({}) for {}", share.id, share.kind.as_str(), share.path);
     Ok(Json(serde_json::json!({ "share": share, "token": token, "url": format!("/s/{token}") })))

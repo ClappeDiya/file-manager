@@ -789,7 +789,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
     }
 
     #[tokio::test]
