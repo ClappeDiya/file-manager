@@ -132,6 +132,34 @@ const BASE_FIELDS: Record<string, { defaults: Record<string, unknown>; fields: F
     defaults: { remote: "", path: "", binary: "rclone", config_file: null, extra_args: [] },
     fields: [{ key: "remote", label: "Remote (from `rclone config`, e.g. mega)" }, { key: "path", label: "Folder" }, { key: "binary", label: "rclone executable" }],
   },
+  filen: {
+    defaults: { email: "", folder: "", use_trash: false, gateway_url: "", ingest_url: "", egest_url: "", tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } },
+    fields: [
+      { key: "email", label: "Account e-mail" },
+      { key: "folder", label: "Folder", hint: "Encrypted in Filen's own format; readable in Filen's apps. Auth version 2 accounts." },
+      { key: "use_trash", label: "Move deleted volumes to the Filen trash", kind: "bool" },
+    ],
+  },
+  drime: {
+    defaults: { folder: "", workspace_id: 0, page_size: 50, soft_delete: false, api_url: "", tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } },
+    fields: [
+      { key: "folder", label: "Folder" },
+      { key: "workspace_id", label: "Workspace id (0 = personal drive)", kind: "number" },
+      { key: "page_size", label: "Listing page size (1–100)", kind: "number" },
+      { key: "soft_delete", label: "Move deleted volumes to the Drime trash", kind: "bool" },
+    ],
+  },
+  movistar_cloud: {
+    defaults: { email: "", device_id: "", folder: "", list_limit: 2000, wait_for_validation: true, validation_timeout_secs: 600, validation_poll_secs: 2, base_url: "", upload_url: "", tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } },
+    fields: [
+      { key: "email", label: "Account e-mail" },
+      { key: "device_id", label: "Device id", hint: "The X-Deviceid request header of a signed-in micloud.movistar.es browser session (developer tools → Network)." },
+      { key: "folder", label: "Folder" },
+      { key: "list_limit", label: "Listing limit (items)", kind: "number" },
+      { key: "wait_for_validation", label: "Wait until each upload is validated", kind: "bool" },
+      { key: "validation_timeout_secs", label: "Validation timeout (seconds)", kind: "number" },
+    ],
+  },
   smb: {
     defaults: { server: "", share: "", path: "", username: "", domain: "", port: null, min_protocol: "SMB3", encrypt: false, binary: "smbclient" },
     fields: [

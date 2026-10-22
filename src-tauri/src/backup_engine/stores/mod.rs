@@ -20,9 +20,12 @@ use ufop_core::backup::{Backend, RemoteFile};
 
 pub mod azure;
 pub mod b2;
+pub mod drime;
+pub mod filen;
 pub mod gcs;
 pub mod graph;
 pub mod http;
+pub mod movistar;
 pub mod oauth_drive;
 pub mod rclone;
 pub mod s3;
@@ -138,6 +141,10 @@ pub enum CloudConfig {
     TahoeLafs(tahoe::TahoeConfig),
     Rclone(rclone::RcloneConfig),
     Smb(smb::SmbConfig),
+    /// Filen: end-to-end encrypted, in Filen's own format.
+    Filen(filen::FilenConfig),
+    Drime(drime::DrimeConfig),
+    MovistarCloud(movistar::MovistarConfig),
 }
 
 impl CloudConfig {
@@ -156,6 +163,9 @@ impl CloudConfig {
             Self::TahoeLafs(_) => "tahoe_lafs",
             Self::Rclone(_) => "rclone",
             Self::Smb(_) => "smb",
+            Self::Filen(_) => "filen",
+            Self::Drime(_) => "drime",
+            Self::MovistarCloud(_) => "movistar_cloud",
         }
     }
 
@@ -177,6 +187,9 @@ impl CloudConfig {
             Self::TahoeLafs(c) => c.node_url.clone(),
             Self::Rclone(_) => return None,
             Self::Smb(c) => return Some((c.server.clone(), c.port.unwrap_or(445), false)),
+            Self::Filen(c) => or(&c.gateway_url, "https://gateway.filen.io".into()),
+            Self::Drime(c) => or(&c.api_url, "https://app.drime.cloud/api/v1".into()),
+            Self::MovistarCloud(c) => or(&c.base_url, "https://micloud.movistar.es".into()),
         };
         let u = url::Url::parse(&url).ok()?;
         Some((u.host_str()?.to_string(), u.port_or_known_default()?, u.scheme() == "https"))
@@ -194,6 +207,9 @@ impl CloudConfig {
             Self::TahoeLafs(c) => format!("tahoe://{}", c.dir_cap.chars().take(24).collect::<String>()),
             Self::Rclone(c) => format!("rclone://{}:{}", c.remote, c.path),
             Self::Smb(c) => format!("smb://{}/{}/{}", c.server, c.share, c.path),
+            Self::Filen(c) => format!("filen://{}/{}", c.email, c.folder),
+            Self::Drime(c) => format!("drime://{}/{}", c.workspace_id, c.folder),
+            Self::MovistarCloud(c) => format!("movistarcloud://{}/{}", c.email, c.folder),
         }
     }
 }
@@ -227,6 +243,9 @@ pub const PROVIDERS: &[ProviderInfo] = &[
     ProviderInfo { id: "onedrive", name: "OneDrive / SharePoint / Microsoft 365 group", secret: "OAuth token JSON", verified: "api-mock", hidden: false },
     ProviderInfo { id: "box", name: "Box", secret: "OAuth token JSON", verified: "api-mock", hidden: true },
     ProviderInfo { id: "pcloud", name: "pCloud", secret: "OAuth access token", verified: "api-mock", hidden: true },
+    ProviderInfo { id: "filen", name: "Filen (end-to-end encrypted)", secret: "Account password, or JSON {\"password\", \"api_key\", \"two_factor_code\"}", verified: "api-mock", hidden: false },
+    ProviderInfo { id: "drime", name: "Drime Cloud", secret: "API token (account settings → Developers), or JSON {\"email\", \"password\"}", verified: "api-mock", hidden: false },
+    ProviderInfo { id: "movistar_cloud", name: "Movistar Cloud (MiCloud)", secret: "Account password", verified: "api-mock", hidden: true },
 ];
 
 /// Open the store for a configuration with its secret.
@@ -246,6 +265,9 @@ pub async fn open(config: &CloudConfig, secret: Option<String>) -> Result<Box<dy
         CloudConfig::TahoeLafs(c) => Box::new(tahoe::TahoeStore::new(c.clone())?),
         CloudConfig::Rclone(c) => Box::new(rclone::RcloneStore::new(c.clone(), secret)),
         CloudConfig::Smb(c) => Box::new(smb::SmbStore::new(c.clone(), secret)),
+        CloudConfig::Filen(c) => Box::new(filen::FilenStore::connect(c.clone(), need(secret)?).await?),
+        CloudConfig::Drime(c) => Box::new(drime::DrimeStore::new(c.clone(), need(secret)?)?),
+        CloudConfig::MovistarCloud(c) => Box::new(movistar::MovistarStore::new(c.clone(), need(secret)?)?),
     })
 }
 

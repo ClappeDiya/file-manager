@@ -17,8 +17,27 @@ Every destination below is available for primaries, replicas and the destination
 | OpenStack Swift | Keystone v3 / v1 auth, project, region, container | password | API-level tests |
 | Dropbox / Google Drive / Box / pCloud | folder (pCloud: US/EU region) | OAuth token JSON (refreshed automatically) | API-level tests incl. token refresh |
 | OneDrive / SharePoint / Microsoft 365 group | `me`, `site:<id>`, `group:<id>` or `drive:<id>`, folder | OAuth token JSON | API-level tests incl. 5 MiB upload-session chunks |
+| Filen (end-to-end encrypted) | account e-mail, folder, move deletions to trash | password, or JSON `{"password", "api_key", "two_factor_code"}` | API-level tests (gateway/ingest/egest mock that decrypts what it receives) + crypto test vectors from the SDK's code path |
+| Drime Cloud | folder, workspace id, page size, move deletions to trash | API token, or JSON `{"email", "password"}` | API-level tests incl. S3 multipart (5 MiB parts) and listings deeper than 20 pages |
+| Movistar Cloud (MiCloud) | account e-mail, browser device id, folder, listing limit, upload-validation wait | password | API-level tests incl. session expiry and upload validation |
 
-The provider picker labels each entry with its verification level. Providers only tested against API mocks are marked *untested* until someone runs them against the live service. Box and pCloud are hidden unless **Show untested providers** is on.
+The provider picker labels each entry with its verification level. Providers only tested against API mocks are marked *untested* until someone runs them against the live service. Box, pCloud and Movistar Cloud are hidden unless **Show untested providers** is on.
+
+### Filen
+
+Volumes are encrypted on this machine in Filen's own format, so they open in Filen's web, desktop and mobile apps. The format follows the official SDKs ([filen-sdk-ts](https://github.com/FilenCloudDienste/filen-sdk-ts), [filen-rs](https://github.com/FilenCloudDienste/filen-rs)):
+
+- **Accounts with auth version 2** (PBKDF2-SHA512, 200 000 rounds; what the SDK registers new accounts with). Version 1 is deprecated. Version 3 (Argon2id with a data-encryption key) is refused with a clear error, because its file-name hash uses an HMAC key that the two official SDKs derive differently; use the rclone bridge (`filen` backend) for those accounts.
+- **Metadata:** written as version `002`, the SDK's default; `002` and `003` are read.
+- **File data:** written as version 2 (32-character file key, AES-256-GCM per 1 MiB chunk, `iv ‖ ciphertext ‖ tag`); versions 2 and 3 are read.
+- **Two-factor accounts:** store the credentials as JSON with an `api_key` (from `filen-cli`). The password is still required, because the master key is derived from it.
+
+### Drime Cloud and Movistar Cloud
+
+Neither service publishes an API reference. Both stores follow Duplicati's backends ([DrimeCloud](https://github.com/duplicati/duplicati/tree/master/Duplicati/Library/Backend/DrimeCloud), [MovistarCloud](https://github.com/duplicati/duplicati/tree/master/Duplicati/Library/Backend/MovistarCloud)), which drive the same web APIs. Drime's quota comes from `user/space-usage`, as in [PyDrime](https://pypi.org/project/pydrime/).
+
+- **Drime** doesn't overwrite files: a re-uploaded volume replaces the old one by deleting it first. Folder listings are checked against the folder's item count, and an inconsistent listing is refused rather than used partially.
+- **Movistar Cloud's** listing API has no paging, so a listing that reaches the configured limit is refused. Deleted volumes go to the Movistar trash. Movistar closes the cloud storage of customers who leave Movistar.
 
 Credentials never go into the job configuration. Each cloud destination has a `credential_id`, and its secret is kept in the OS keychain or the encrypted settings store (`backup_set_destination_secret`).
 

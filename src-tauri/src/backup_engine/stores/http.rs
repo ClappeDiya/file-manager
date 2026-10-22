@@ -17,13 +17,14 @@ pub struct TlsOptions {
 }
 
 pub fn client(tls: &TlsOptions) -> Result<reqwest::Client, AppError> {
+    builder(tls)?.build().map_err(|e| AppError::internal(format!("HTTP client: {e}")))
+}
+
+/// A client builder with the TLS options applied (for callers that need more, e.g. a cookie jar).
+pub fn builder(tls: &TlsOptions) -> Result<reqwest::ClientBuilder, AppError> {
     if !tls.pinned_sha256.is_empty() {
         let cfg = crate::security::tls::client_config(false, None, &tls.pinned_sha256)?;
-        return reqwest::Client::builder()
-            .use_preconfigured_tls(cfg)
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| AppError::internal(format!("HTTP client: {e}")));
+        return Ok(reqwest::Client::builder().use_preconfigured_tls(cfg).connect_timeout(Duration::from_secs(30)));
     }
     let mut b = reqwest::Client::builder()
         .use_rustls_tls()
@@ -33,7 +34,7 @@ pub fn client(tls: &TlsOptions) -> Result<reqwest::Client, AppError> {
         let cert = reqwest::Certificate::from_pem(pem.as_bytes()).map_err(|e| AppError::validation(format!("Invalid CA certificate: {e}")))?;
         b = b.add_root_certificate(cert);
     }
-    b.build().map_err(|e| AppError::internal(format!("HTTP client: {e}")))
+    Ok(b)
 }
 
 pub fn net(what: &str, e: reqwest::Error) -> AppError {

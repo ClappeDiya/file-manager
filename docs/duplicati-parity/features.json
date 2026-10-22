@@ -2224,11 +2224,11 @@
    "name": "Filen",
    "baseline": "M",
    "status": "present",
-   "work": "blocked",
+   "work": "built",
    "phase": 4,
    "verify": "account",
    "note": "No connector",
-   "evidence": "Filen: client-side-encrypted proprietary API (usable via rclone >= 1.70 filen backend); Drime: no public API docs; Movistar Cloud: service discontinued"
+   "evidence": "Native Filen store (auth v2; Filen's own client-side encryption: metadata 002 written, 002/003 read; file data v2 written, v2/v3 read; 1 MiB AES-256-GCM chunks via ingest/egest) tested against an in-process gateway mock and SDK-derived crypto vectors; auth v3 refused (SDKs disagree on the name-hash key); needs a live account"
   },
   {
    "n": 185,
@@ -2236,11 +2236,11 @@
    "name": "Drime Cloud",
    "baseline": "M",
    "status": "present",
-   "work": "blocked",
+   "work": "built",
    "phase": 4,
    "verify": "account",
    "note": "No connector",
-   "evidence": "Filen: client-side-encrypted proprietary API (usable via rclone >= 1.70 filen backend); Drime: no public API docs; Movistar Cloud: service discontinued"
+   "evidence": "Native Drime Cloud store (API token or login; validated created_at-window listings; uploads/S3 multipart; download by hash; space-usage quota) tested against an in-process API mock following Duplicati's Drime backend; needs a live account"
   },
   {
    "n": 186,
@@ -2296,11 +2296,11 @@
    "name": "Movistar Cloud",
    "baseline": "M",
    "status": "present",
-   "work": "blocked",
+   "work": "built",
    "phase": 4,
    "verify": "account",
    "note": "No connector",
-   "evidence": "Filen: client-side-encrypted proprietary API (usable via rclone >= 1.70 filen backend); Drime: no public API docs; Movistar Cloud: service discontinued"
+   "evidence": "Native Movistar Cloud (MiCloud sapi) store (JSESSIONID+validationkey session with re-login, multipart upload + validation polling, signed downloads, soft delete, storage-space quota) tested against an in-process mock following Duplicati's MovistarCloud backend; hidden as untested; needs a live account"
   },
   {
    "n": 191,
