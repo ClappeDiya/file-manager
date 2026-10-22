@@ -21,6 +21,7 @@
 //! - OpenStack Swift: Keystone v3/TempAuth, container/object ops, SLO/DLO, TempURL
 
 pub mod connection_manager;
+pub mod known_hosts;
 pub mod ftp;
 pub mod import_profiles;
 pub mod local_drive;

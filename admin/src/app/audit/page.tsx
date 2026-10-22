@@ -23,6 +23,8 @@ import {
 } from '@/lib/types/audit';
 import { formatDateTime, formatRelativeTime } from '@/lib/utils/format';
 import type { AuditVerification } from '@/lib/db/repos/audit';
+import { ComingSoon } from '@/components/ui/coming-soon';
+import { isEnabled } from '@/lib/features';
 
 export default function AuditPage() {
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
@@ -409,6 +411,12 @@ export default function AuditPage() {
           <DialogTitle>SIEM Integration (Enterprise)</DialogTitle>
           <DialogDescription>Configure real-time audit log streaming to your SIEM</DialogDescription>
         </DialogHeader>
+        {!isEnabled('siemForwarding') ? (
+          <ComingSoon
+            feature="siemForwarding"
+            description="The audit log will stream to Splunk, syslog or any HTTPS collector with retries. Until then, export the log as JSON, CSV or syslog from Export."
+          />
+        ) : (
         <div className="space-y-4">
           <Select
             label="Integration Type"
@@ -465,9 +473,10 @@ export default function AuditPage() {
             <label htmlFor="siem-enabled" className="text-sm text-foreground">Enable SIEM Streaming</label>
           </div>
         </div>
+        )}
         <DialogFooter>
-          <Button variant="outline" onClick={() => setShowSIEMDialog(false)}>Cancel</Button>
-          <Button>Save Configuration</Button>
+          <Button variant="outline" onClick={() => setShowSIEMDialog(false)}>{isEnabled('siemForwarding') ? 'Cancel' : 'Close'}</Button>
+          {isEnabled('siemForwarding') && <Button>Save Configuration</Button>}
         </DialogFooter>
       </Dialog>
     </div>

@@ -63,68 +63,14 @@ pub struct DuplicateAction {
     pub keep_path: Option<String>, // For "keep-by-path"
 }
 
-// ── Tag types ──
+// ── Tags, labels, metadata, smart folders ──
+//
+// Persisted in SQLite by `metadata_engine` (they used to live in a
+// process-local map and were lost on quit).
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileTag {
-    pub id: String,
-    pub name: String,
-    pub color: String, // hex color
-    pub file_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileLabel {
-    pub path: String,
-    pub tags: Vec<String>,
-    pub labels: Vec<String>,
-}
-
-// ── Smart Folder types ──
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SmartFolder {
-    pub id: String,
-    pub name: String,
-    pub query: SmartFolderQuery,
-    pub icon: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SmartFolderQuery {
-    pub base_paths: Vec<String>,
-    pub name_pattern: Option<String>,
-    pub extension_filter: Option<Vec<String>>,
-    pub min_size: Option<u64>,
-    pub max_size: Option<u64>,
-    pub modified_after: Option<String>,
-    pub modified_before: Option<String>,
-    pub tags: Option<Vec<String>>,
-    pub labels: Option<Vec<String>>,
-    pub include_subdirs: bool,
-}
-
-// ── Tag & Label in-memory store (backed by SQLite) ──
-use std::sync::Mutex;
-
-struct IntegrityStore {
-    tags: HashMap<String, FileTag>,
-    file_tags: HashMap<String, Vec<String>>,     // path -> tag IDs
-    file_labels: HashMap<String, Vec<String>>,    // path -> labels
-    smart_folders: HashMap<String, SmartFolder>,
-}
-
-static STORE: std::sync::LazyLock<Mutex<IntegrityStore>> =
-    std::sync::LazyLock::new(|| {
-        Mutex::new(IntegrityStore {
-            tags: HashMap::new(),
-            file_tags: HashMap::new(),
-            file_labels: HashMap::new(),
-            smart_folders: HashMap::new(),
-        })
-    });
+pub use crate::metadata_engine::{FileLabel, FileTag, MetadataMatch, SmartFolder, SmartFolderQuery};
+use crate::metadata_engine::{MetadataSnapshot, MetadataStore};
+use tauri::State;
 
 // ── Checksum commands ──
 
@@ -438,52 +384,21 @@ mod resolve_tests {
 pub async fn integrity_create_tag(
     name: String,
     color: String,
+    store: State<'_, MetadataStore>,
 ) -> Result<FileTag, AppError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let tag = FileTag {
-        id: id.clone(),
-        name: name.clone(),
-        color,
-        file_count: 0,
-    };
-
-    let mut store = STORE.lock().map_err(|e| AppError::internal(format!("Lock error: {e}")))?;
-    if store.tags.values().any(|t| t.name == name) {
-        return Err(AppError::validation(format!("Tag '{name}' already exists")));
-    }
-    store.tags.insert(id, tag.clone());
-
-    Ok(tag)
+    store.create_tag(&name, &color).await
 }
 
-/// List all tags.
+/// List all tags with how many files carry each.
 #[tauri::command]
-pub async fn integrity_list_tags() -> Result<Vec<FileTag>, AppError> {
-    let store = STORE.lock().map_err(|e| AppError::internal(format!("Lock error: {e}")))?;
-    let mut tags: Vec<FileTag> = store.tags.values().cloned().collect();
-
-    // Update file counts
-    for tag in &mut tags {
-        tag.file_count = store
-            .file_tags
-            .values()
-            .filter(|t| t.contains(&tag.id))
-            .count();
-    }
-
-    Ok(tags)
+pub async fn integrity_list_tags(store: State<'_, MetadataStore>) -> Result<Vec<FileTag>, AppError> {
+    store.list_tags().await
 }
 
-/// Delete a tag.
+/// Delete a tag (and remove it from every file).
 #[tauri::command]
-pub async fn integrity_delete_tag(tag_id: String) -> Result<(), AppError> {
-    let mut store = STORE.lock().map_err(|e| AppError::internal(format!("Lock error: {e}")))?;
-    store.tags.remove(&tag_id);
-    // Remove tag from all files
-    for tags in store.file_tags.values_mut() {
-        tags.retain(|t| t != &tag_id);
-    }
-    Ok(())
+pub async fn integrity_delete_tag(tag_id: String, store: State<'_, MetadataStore>) -> Result<(), AppError> {
+    store.delete_tag(&tag_id).await
 }
 
 /// Add tags to a file.
@@ -491,26 +406,9 @@ pub async fn integrity_delete_tag(tag_id: String) -> Result<(), AppError> {
 pub async fn integrity_tag_file(
     path: String,
     tag_ids: Vec<String>,
+    store: State<'_, MetadataStore>,
 ) -> Result<FileLabel, AppError> {
-    let mut store = STORE.lock().map_err(|e| AppError::internal(format!("Lock error: {e}")))?;
-
-    {
-        let file_tags = store.file_tags.entry(path.clone()).or_default();
-        for tag_id in &tag_ids {
-            if !file_tags.contains(tag_id) {
-                file_tags.push(tag_id.clone());
-            }
-        }
-    }
-
-    let tags = store.file_tags.get(&path).cloned().unwrap_or_default();
-    let labels = store.file_labels.get(&path).cloned().unwrap_or_default();
-
-    Ok(FileLabel {
-        path,
-        tags,
-        labels,
-    })
+    store.tag_file(&path, &tag_ids).await
 }
 
 /// Remove tags from a file.
@@ -518,26 +416,15 @@ pub async fn integrity_tag_file(
 pub async fn integrity_untag_file(
     path: String,
     tag_ids: Vec<String>,
+    store: State<'_, MetadataStore>,
 ) -> Result<FileLabel, AppError> {
-    let mut store = STORE.lock().map_err(|e| AppError::internal(format!("Lock error: {e}")))?;
-
-    if let Some(file_tags) = store.file_tags.get_mut(&path) {
-        file_tags.retain(|t| !tag_ids.contains(t));
-    }
-
-    let tags = store.file_tags.get(&path).cloned().unwrap_or_default();
-    let labels = store.file_labels.get(&path).cloned().unwrap_or_default();
-
-    Ok(FileLabel { path, tags, labels })
+    store.untag_file(&path, &tag_ids).await
 }
 
-/// Get tags and labels for a file.
+/// Get tags, labels and key-value metadata for a file.
 #[tauri::command]
-pub async fn integrity_get_file_info(path: String) -> Result<FileLabel, AppError> {
-    let store = STORE.lock().map_err(|e| AppError::internal(format!("Lock error: {e}")))?;
-    let tags = store.file_tags.get(&path).cloned().unwrap_or_default();
-    let labels = store.file_labels.get(&path).cloned().unwrap_or_default();
-    Ok(FileLabel { path, tags, labels })
+pub async fn integrity_get_file_info(path: String, store: State<'_, MetadataStore>) -> Result<FileLabel, AppError> {
+    store.file_info(&path).await
 }
 
 /// Set a label on a file.
@@ -545,22 +432,9 @@ pub async fn integrity_get_file_info(path: String) -> Result<FileLabel, AppError
 pub async fn integrity_set_label(
     path: String,
     label: String,
+    store: State<'_, MetadataStore>,
 ) -> Result<FileLabel, AppError> {
-    let mut store = STORE.lock().map_err(|e| AppError::internal(format!("Lock error: {e}")))?;
-    {
-        let file_labels = store.file_labels.entry(path.clone()).or_default();
-        if !file_labels.contains(&label) {
-            file_labels.push(label);
-        }
-    }
-
-    let tags = store.file_tags.get(&path).cloned().unwrap_or_default();
-    let labels = store.file_labels.get(&path).cloned().unwrap_or_default();
-    Ok(FileLabel {
-        path,
-        tags,
-        labels,
-    })
+    store.set_label(&path, &label).await
 }
 
 /// Remove a label from a file.
@@ -568,14 +442,54 @@ pub async fn integrity_set_label(
 pub async fn integrity_remove_label(
     path: String,
     label: String,
+    store: State<'_, MetadataStore>,
 ) -> Result<FileLabel, AppError> {
-    let mut store = STORE.lock().map_err(|e| AppError::internal(format!("Lock error: {e}")))?;
-    if let Some(file_labels) = store.file_labels.get_mut(&path) {
-        file_labels.retain(|l| l != &label);
-    }
-    let tags = store.file_tags.get(&path).cloned().unwrap_or_default();
-    let labels = store.file_labels.get(&path).cloned().unwrap_or_default();
-    Ok(FileLabel { path, tags, labels })
+    store.remove_label(&path, &label).await
+}
+
+// ── Key-value metadata commands ──
+
+/// Set (or replace) a metadata value on a file.
+#[tauri::command]
+pub async fn integrity_set_metadata(
+    path: String,
+    key: String,
+    value: String,
+    store: State<'_, MetadataStore>,
+) -> Result<FileLabel, AppError> {
+    store.set_metadata(&path, &key, &value).await
+}
+
+/// Remove a metadata key from a file.
+#[tauri::command]
+pub async fn integrity_remove_metadata(
+    path: String,
+    key: String,
+    store: State<'_, MetadataStore>,
+) -> Result<FileLabel, AppError> {
+    store.remove_metadata(&path, &key).await
+}
+
+/// Find files by metadata. `key = None` searches every key; `contains`
+/// does a case-insensitive substring match; `under` limits to a folder.
+#[tauri::command]
+pub async fn integrity_search_metadata(
+    key: Option<String>,
+    value: String,
+    contains: Option<bool>,
+    under: Option<String>,
+    limit: Option<usize>,
+    store: State<'_, MetadataStore>,
+) -> Result<Vec<MetadataMatch>, AppError> {
+    store
+        .search_metadata(key.as_deref(), &value, contains.unwrap_or(true), under.as_deref(), limit.unwrap_or(500))
+        .await
+}
+
+/// Every metadata key in use, most used first.
+#[tauri::command]
+pub async fn integrity_metadata_keys(store: State<'_, MetadataStore>) -> Result<Vec<String>, AppError> {
+    store.metadata_keys().await
 }
 
 // ── Smart Folder commands ──
@@ -586,64 +500,52 @@ pub async fn integrity_create_smart_folder(
     name: String,
     query: SmartFolderQuery,
     icon: Option<String>,
+    store: State<'_, MetadataStore>,
 ) -> Result<SmartFolder, AppError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let folder = SmartFolder {
-        id: id.clone(),
-        name,
-        query,
-        icon,
-        created_at: now.clone(),
-        updated_at: now,
-    };
-
-    let mut store = STORE.lock().map_err(|e| AppError::internal(format!("Lock error: {e}")))?;
-    store.smart_folders.insert(id, folder.clone());
-
-    Ok(folder)
+    store.create_smart_folder(&name, query, icon).await
 }
 
 /// List all smart folders.
 #[tauri::command]
-pub async fn integrity_list_smart_folders() -> Result<Vec<SmartFolder>, AppError> {
-    let store = STORE.lock().map_err(|e| AppError::internal(format!("Lock error: {e}")))?;
-    Ok(store.smart_folders.values().cloned().collect())
+pub async fn integrity_list_smart_folders(store: State<'_, MetadataStore>) -> Result<Vec<SmartFolder>, AppError> {
+    store.list_smart_folders().await
 }
 
 /// Delete a smart folder.
 #[tauri::command]
-pub async fn integrity_delete_smart_folder(folder_id: String) -> Result<(), AppError> {
-    let mut store = STORE.lock().map_err(|e| AppError::internal(format!("Lock error: {e}")))?;
-    store.smart_folders.remove(&folder_id);
-    Ok(())
+pub async fn integrity_delete_smart_folder(folder_id: String, store: State<'_, MetadataStore>) -> Result<(), AppError> {
+    store.delete_smart_folder(&folder_id).await
 }
 
 /// Execute a smart folder query and return matching files.
 #[tauri::command]
 pub async fn integrity_run_smart_folder(
     folder_id: String,
+    store: State<'_, MetadataStore>,
 ) -> Result<Vec<String>, AppError> {
-    let store = STORE.lock().map_err(|e| AppError::internal(format!("Lock error: {e}")))?;
     let folder = store
-        .smart_folders
-        .get(&folder_id)
-        .ok_or_else(|| AppError::not_found(format!("Smart folder not found: {folder_id}")))?
-        .clone();
-    drop(store); // Release lock before I/O
+        .get_smart_folder(&folder_id)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Smart folder not found: {folder_id}")))?;
+    run_smart_query(&store, &folder.query).await
+}
 
-    let query = &folder.query;
-    let mut matches = Vec::new();
-
-    for base_path in &query.base_paths {
-        let root = Path::new(base_path);
-        if !root.exists() {
-            continue;
+/// Walk the query's base paths and return files matching every criterion.
+pub async fn run_smart_query(store: &MetadataStore, query: &SmartFolderQuery) -> Result<Vec<String>, AppError> {
+    let snapshot = store.snapshot(&query.base_paths).await?;
+    let query = query.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut matches = Vec::new();
+        for base_path in &query.base_paths {
+            let root = Path::new(base_path);
+            if root.exists() {
+                search_files(root, &query, &snapshot, &mut matches, query.include_subdirs)?;
+            }
         }
-        search_files(root, query, &mut matches, query.include_subdirs)?;
-    }
-
-    Ok(matches)
+        Ok(matches)
+    })
+    .await
+    .map_err(|e| AppError::internal(format!("Smart folder search failed: {e}")))?
 }
 
 // ── Internal helpers ──
@@ -671,11 +573,8 @@ fn compute_hash(path: &str, algorithm: &str) -> Result<String, AppError> {
             Ok(format!("{:x}", hasher.finalize()))
         }
         "sha1" => {
-            // SHA-1 is not available from sha2 crate; use SHA-256 and truncate
-            // to 20 bytes for an approximate checksum interface.
-            // For production-grade SHA-1, add the `sha1` crate.
             use digest::Digest;
-            let mut hasher = sha2::Sha256::new();
+            let mut hasher = sha1::Sha1::new();
             loop {
                 let n = file.read(&mut buf).map_err(|e| {
                     AppError::file_op(format!("Read error: {e}"), "")
@@ -683,8 +582,7 @@ fn compute_hash(path: &str, algorithm: &str) -> Result<String, AppError> {
                 if n == 0 { break; }
                 hasher.update(&buf[..n]);
             }
-            let result = hasher.finalize();
-            Ok(result.iter().take(20).map(|b| format!("{b:02x}")).collect())
+            Ok(format!("{:x}", hasher.finalize()))
         }
         "sha256" => {
             use digest::Digest;
@@ -735,6 +633,7 @@ fn collect_files_recursive(
 fn search_files(
     dir: &Path,
     query: &SmartFolderQuery,
+    snapshot: &MetadataSnapshot,
     matches: &mut Vec<String>,
     recurse: bool,
 ) -> Result<(), AppError> {
@@ -747,7 +646,7 @@ fn search_files(
         let path = entry.path();
 
         if path.is_dir() && recurse {
-            search_files(&path, query, matches, true)?;
+            search_files(&path, query, snapshot, matches, true)?;
             continue;
         }
 
@@ -797,21 +696,30 @@ fn search_files(
             }
         }
 
-        // Check tags
-        if let Some(ref required_tags) = query.tags {
-            let store = STORE.lock().map_err(|_| AppError::internal("Tag store lock poisoned"))?;
-            let file_tags = store.file_tags.get(&path.display().to_string());
-            if let Some(ft) = file_tags {
-                if !required_tags.iter().all(|t| ft.contains(t)) {
-                    continue;
-                }
-            } else {
-                continue; // No tags on file, but tags required
-            }
+        // Tags, labels and key-value metadata
+        if !snapshot.matches(&path.display().to_string(), query) {
+            continue;
         }
 
         matches.push(path.display().to_string());
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+
+    /// Regression: "sha1" returned a truncated SHA-256, so it never
+    /// matched a real SHA-1 manifest.
+    #[test]
+    fn sha1_is_real_sha1() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("abc.txt");
+        std::fs::write(&f, b"abc").unwrap();
+        let p = f.to_str().unwrap();
+        assert_eq!(compute_hash(p, "sha1").unwrap(), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(compute_hash(p, "SHA256").unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
 }

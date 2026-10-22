@@ -10,6 +10,9 @@ import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ComingSoon } from '@/components/ui/coming-soon';
+import { isEnabled } from '@/lib/features';
+import Link from 'next/link';
 
 interface Connector {
   id: string;
@@ -65,6 +68,22 @@ export default function ConnectorsPage() {
   const handleRemove = (id: string) => {
     setConnectors(prev => prev.filter(c => c.id !== id));
   };
+
+  // The form below used to keep connectors in page state and fake a
+  // successful test; it stays off until connectors are stored and tested
+  // server-side.
+  if (!isEnabled('connectors')) {
+    return (
+      <div>
+        <PageHeader title="Connectors" description="Manage storage connectors and integrations" />
+        <ComingSoon
+          feature="connectors"
+          description="Organization-wide connector definitions that machines pick up automatically. Today, share storage credentials with your machines from Fleet → Credentials."
+          action={<Link href="/fleet/credentials" className="text-sm font-medium text-primary hover:underline">Open Fleet credentials →</Link>}
+        />
+      </div>
+    );
+  }
 
   return (
     <div>

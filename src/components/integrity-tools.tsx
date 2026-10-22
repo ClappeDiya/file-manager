@@ -14,6 +14,7 @@ import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import { errorText } from "@/lib/error-text";
+import { MetadataEditor, MetadataSearch, type FileLabel } from "@/components/metadata-editor";
 
 // ── Types ──
 
@@ -62,11 +63,6 @@ interface FileTag {
   file_count: number;
 }
 
-interface FileLabel {
-  path: string;
-  tags: string[];
-  labels: string[];
-}
 
 interface SmartFolder {
   id: string;
@@ -860,8 +856,13 @@ function TagPanel({ selectedFiles }: { selectedFiles: string[] }) {
               </span>
             ))}
           </div>
+          <MetadataEditor path={selectedFiles[0]} />
         </div>
       )}
+
+      <div className="border-t border-border-primary pt-4">
+        <MetadataSearch />
+      </div>
 
       {error && <div className="text-sm text-red-600 dark:text-red-400">{error}</div>}
     </div>

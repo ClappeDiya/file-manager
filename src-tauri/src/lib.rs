@@ -10,6 +10,7 @@ pub mod fs_engine;
 pub mod governance;
 pub mod ledger;
 pub mod lineage;
+pub mod metadata_engine;
 pub mod mount_engine;
 pub mod narrator;
 pub mod safety;
@@ -73,6 +74,7 @@ struct AppState {
     fleet_agent: fleet_agent::FleetAgent,
     background_mode: tray::BackgroundMode,
     audit_trail: security::audit::AuditTrail,
+    metadata_store: metadata_engine::MetadataStore,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -184,12 +186,12 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // Initialize automation manager (Quickflows)
     let mut automation_mgr = AutomationManager::new();
     automation_mgr.set_ledger(ledger.clone());
+    automation_mgr.set_repo(repo.clone());
     if let Err(e) = automation_mgr.load_rules_from_db(&repo).await {
         tracing::warn!("Failed to load automation rules (non-fatal): {e}");
     }
-    if let Err(e) = automation_mgr.start_all_watchers().await {
-        tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
-    }
+    // Watchers and cron schedules start in `setup`: tasks spawned on this
+    // init runtime would die when it is dropped.
 
     // Initialize Smart Spaces manager
     let spaces_mgr = SpacesManager::new();
@@ -241,6 +243,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // Tamper-evident security audit log: anchors are signed with a key in
     // the OS keychain (or the encrypted settings store as a fallback).
     let agent_store = settings_store.clone().unwrap_or_else(|| crate::security::settings_store::SettingsStore::plain(repo.pool().clone()));
+    let repo_for_metadata = repo.clone();
     let audit_trail =
         security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), settings_store);
     if let Err(e) = backup_mgr.load_from_db().await {
@@ -282,7 +285,41 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         fleet_agent,
         background_mode,
         audit_trail,
+        metadata_store: metadata_engine::MetadataStore::new(repo_for_metadata),
     })
+}
+
+/// Start the long-running automation and sync triggers on the app runtime:
+/// file watchers and cron schedules for automation rules, and the cron loop
+/// for scheduled sync pairs. Both used to be armed but never run.
+fn start_background_engines(app: tauri::AppHandle) {
+    use tauri::Manager;
+    let automation = app.state::<AutomationManager>();
+    automation.set_services(std::sync::Arc::new(
+        automation_engine::tauri_services::TauriActionServices::new(app.clone()),
+    ));
+
+    let sync_app = app.clone();
+    app.state::<SyncManager>().start_scheduler(std::sync::Arc::new(move |pair_id: uuid::Uuid| {
+        let app = sync_app.clone();
+        tauri::async_runtime::spawn(async move {
+            let manager = app.state::<SyncManager>();
+            let ledger = app.state::<OperationLedger>();
+            let repo = app.state::<Repository>();
+            match commands::sync_commands::run_sync_pair(&manager, &ledger, &repo, &pair_id.to_string()).await {
+                Ok(report) => tracing::info!("Scheduled sync {} finished: {:?}", report.pair_name, report.status),
+                Err(e) => tracing::warn!("Scheduled sync {pair_id} failed: {e}"),
+            }
+        });
+    }));
+
+    tauri::async_runtime::spawn(async move {
+        let automation = app.state::<AutomationManager>();
+        if let Err(e) = automation.start_all_watchers().await {
+            tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
+        }
+        automation.start_scheduler();
+    });
 }
 
 /// Persist transfer queue and workspace state on shutdown.
@@ -336,6 +373,7 @@ pub fn run() {
                 let quickflow_suggester = LedgerSuggester::new(ledger.clone());
                 let mut automation_mgr = AutomationManager::new();
                 automation_mgr.set_ledger(ledger.clone());
+                automation_mgr.set_repo(repo.clone());
                 // Backup jobs can still be created and run this session; the
                 // scheduler is not started because nothing persists.
                 let backup_mgr = BackupManager::new(
@@ -356,6 +394,7 @@ pub fn run() {
                 ));
                 let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store), None);
                 AppState {
+                    metadata_store: metadata_engine::MetadataStore::new(repo.clone()),
                     repo,
                     transfer_mgr,
                     connection_mgr,
@@ -417,6 +456,7 @@ pub fn run() {
                 }
             }));
             mgr.start_scheduler();
+            start_background_engines(app.handle().clone());
             fleet_agent::spawn(setup_agent.clone(), "unified-file-ops");
             // Signed audit checkpoints: once at start-up, then hourly.
             tauri::async_runtime::spawn(setup_audit.clone().run_anchor_loop(security::audit::ANCHOR_INTERVAL));
@@ -459,6 +499,7 @@ pub fn run() {
         .manage(app_state.fleet_agent)
         .manage(app_state.background_mode)
         .manage(app_state.audit_trail)
+        .manage(app_state.metadata_store)
         .invoke_handler(tauri::generate_handler![
             // Security audit log (tamper-evident, append-only)
             audit_commands::verify_audit_log,
@@ -807,6 +848,10 @@ pub fn run() {
             integrity_commands::integrity_list_smart_folders,
             integrity_commands::integrity_delete_smart_folder,
             integrity_commands::integrity_run_smart_folder,
+            integrity_commands::integrity_set_metadata,
+            integrity_commands::integrity_remove_metadata,
+            integrity_commands::integrity_search_metadata,
+            integrity_commands::integrity_metadata_keys,
             // Mount Engine (Finder-mounted remote storage)
             mount_commands::check_mount_capability,
             mount_commands::mount_remote,
@@ -919,6 +964,8 @@ pub fn run() {
             // SSH Key Generation
             ssh_key_commands::generate_ssh_key,
             ssh_key_commands::list_ssh_keys,
+            ssh_key_commands::list_known_hosts,
+            ssh_key_commands::forget_known_host,
             // Automation engine (Quickflows)
             automation_commands::create_automation_rule,
             automation_commands::update_automation_rule,

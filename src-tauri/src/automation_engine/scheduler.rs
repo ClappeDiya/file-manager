@@ -6,9 +6,7 @@
 //! - Cooldown window prevents circular trigger chains
 
 use super::evaluator::evaluate_conditions;
-use super::executor::execute_rule_action;
-use super::{AutomationLog, AutomationRule, AutomationStatus, RuleAction, RuleCondition, RuleTrigger};
-use chrono::Utc;
+use super::{FireContext, RuleTrigger};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,6 +20,9 @@ const DEBOUNCE_MS: u64 = 2000;
 /// Cooldown per file per rule to prevent circular triggers (seconds).
 const COOLDOWN_SECS: u64 = 5;
 
+/// Trigger event recorded for watcher-driven runs.
+pub const EVENT_FILE: &str = "file";
+
 /// A handle to an active filesystem watcher. Dropping it stops the watcher.
 pub struct WatchHandle {
     pub rule_id: String,
@@ -29,19 +30,18 @@ pub struct WatchHandle {
 }
 
 /// Start a filesystem watcher for an automation rule.
-#[allow(clippy::too_many_arguments)]
-pub fn start_file_watcher(
+///
+/// Each matching event runs the rule through [`FireContext`], which reads
+/// the rule's *current* conditions and action, so edits apply without
+/// restarting the watcher, and history is persisted like a manual run.
+pub(crate) fn start_file_watcher(
     rule_id: String,
     watch_path: String,
     recursive: bool,
     trigger: RuleTrigger,
-    conditions: Vec<RuleCondition>,
-    action: RuleAction,
     exec_semaphore: Arc<tokio::sync::Semaphore>,
     cooldowns: Arc<RwLock<HashMap<String, Instant>>>,
-    rules: Arc<RwLock<Vec<AutomationRule>>>,
-    logs: Arc<RwLock<Vec<AutomationLog>>>,
-    ledger: Option<crate::ledger::OperationLedger>,
+    ctx: FireContext,
 ) -> Result<WatchHandle, crate::core::error::AppError> {
     let path = PathBuf::from(&watch_path);
 
@@ -52,7 +52,9 @@ pub fn start_file_watcher(
         });
     }
 
-    let (tx, rx) = std::sync::mpsc::channel::<Event>();
+    // Async channel: the event loop awaits instead of blocking a worker
+    // thread, and ends when the watcher (and with it `tx`) is dropped.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
 
     let mut watcher = RecommendedWatcher::new(
         move |result: Result<Event, notify::Error>| {
@@ -86,9 +88,8 @@ pub fn start_file_watcher(
         let mut last_event_time: Option<Instant> = None;
 
         loop {
-            // Check for events with a timeout
-            match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(event) => {
+            match rx.recv().await {
+                Some(event) => {
                     // Debounce: skip if we just processed an event
                     if let Some(last) = last_event_time {
                         if last.elapsed() < Duration::from_millis(DEBOUNCE_MS) {
@@ -132,8 +133,12 @@ pub fn start_file_watcher(
                             }
                         }
 
-                        // Evaluate conditions
-                        if !evaluate_conditions(&conditions, &path_str) {
+                        // Evaluate the rule's current conditions
+                        let Some(rule) = ctx.rule(&rule_id_clone).await else {
+                            tracing::info!("Rule '{}' no longer exists, stopping watcher", rule_id_clone);
+                            return;
+                        };
+                        if !evaluate_conditions(&rule.conditions, &path_str) {
                             tracing::debug!(
                                 "Conditions not met for '{}' in rule '{}'",
                                 path_str, rule_id_clone
@@ -142,12 +147,10 @@ pub fn start_file_watcher(
                         }
 
                         // Acquire semaphore permit for bounded concurrency
-                        let permit = exec_semaphore.clone().acquire_owned().await;
-                        if permit.is_err() {
+                        let Ok(_permit) = exec_semaphore.clone().acquire_owned().await else {
                             tracing::warn!("Automation semaphore closed, stopping watcher");
                             return;
-                        }
-                        let _permit = permit.unwrap();
+                        };
 
                         // Set cooldown
                         cooldowns
@@ -155,66 +158,17 @@ pub fn start_file_watcher(
                             .await
                             .insert(cooldown_key.clone(), Instant::now());
 
-                        // Build a temporary rule for execution
-                        let temp_rule = AutomationRule {
-                            id: rule_id_clone.clone(),
-                            name: format!("auto-{}", rule_id_clone),
-                            enabled: true,
-                            trigger: trigger.clone(),
-                            conditions: conditions.clone(),
-                            action: action.clone(),
-                            created_at: String::new(),
-                            updated_at: String::new(),
-                            last_triggered: None,
-                            trigger_count: 0,
-                            error_count: 0,
-                            last_error: None,
-                        };
-
-                        // Execute the action
-                        let log =
-                            execute_rule_action(&temp_rule, Some(&path_str), false).await;
-
-                        // Update rule stats
-                        {
-                            let mut rules_guard = rules.write().await;
-                            if let Some(r) = rules_guard.iter_mut().find(|r| r.id == rule_id_clone)
-                            {
-                                r.trigger_count += 1;
-                                r.last_triggered = Some(Utc::now().to_rfc3339());
-                                if log.status == AutomationStatus::Failed {
-                                    r.error_count += 1;
-                                    r.last_error = log.error_message.clone();
-                                } else {
-                                    r.error_count = 0;
-                                    r.last_error = None;
-                                }
-                            }
+                        if let Some(log) = ctx.fire_if_enabled(&rule_id_clone, Some(&path_str), EVENT_FILE).await {
+                            tracing::info!(
+                                "Automation '{}' executed for '{}': {:?}",
+                                rule_id_clone, path_str, log.status
+                            );
                         }
-
-                        // Store log
-                        logs.write().await.push(log.clone());
-
-                        // Emit unified-ledger event for the autonomous fire.
-                        // This is the ONLY way users see autonomous activity
-                        // in the cross-engine timeline. Fail-open.
-                        if let Some(led) = &ledger {
-                            super::record_automation_log(led, &log).await;
-                        }
-
-                        tracing::info!(
-                            "Automation '{}' executed for '{}': {:?}",
-                            rule_id_clone, path_str, log.status
-                        );
 
                         last_event_time = Some(Instant::now());
                     }
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // No events, continue loop (allows checking if watcher should stop)
-                    continue;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                None => {
                     tracing::info!("Watcher channel closed for rule '{}'", rule_id_clone);
                     return;
                 }

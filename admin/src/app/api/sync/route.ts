@@ -1,3 +1,4 @@
+import { isEnabled, notAvailable } from '@/lib/features';
 import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import { requireRole, isAuthorized } from '@/lib/utils/require-role';
@@ -30,6 +31,7 @@ const syncPairs: SyncPair[] = [];
 
 /** GET /api/sync - List sync pairs */
 export async function GET(request: NextRequest) {
+  if (!isEnabled('syncApi')) return notAvailable('syncApi');
   const authResult = await requireRole(request, 'viewer');
   if (!isAuthorized(authResult)) return authResult;
 
@@ -44,6 +46,7 @@ export async function GET(request: NextRequest) {
 
 /** POST /api/sync - Create a sync pair */
 export async function POST(request: NextRequest) {
+  if (!isEnabled('syncApi')) return notAvailable('syncApi');
   const authResult = await requireRole(request, 'manager');
   if (!isAuthorized(authResult)) return authResult;
 

@@ -126,6 +126,8 @@ function actionLabel(action: RuleAction): string {
       return "Run custom command";
     case "notify":
       return `Notify: ${action.title}`;
+    case "create_folder":
+      return `Create folder ${shortenPath(action.path)}`;
     case "replay_op": {
       // Operation Pin: a captured copy/move replayed verbatim. The
       // source list and destination both travel with the rule, so the

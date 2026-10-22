@@ -308,6 +308,19 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 7,
+    description: 'AI governance settings per organization',
+    up(d) {
+      d.exec(`
+        CREATE TABLE ai_governance (
+          org_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+          settings TEXT NOT NULL DEFAULT '{}',
+          updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+        );
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

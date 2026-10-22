@@ -14,6 +14,7 @@ import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useAiStore } from "@/stores/ai-store";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
 import { SecurityAuditSection } from "@/components/security-audit-section";
+import { TrustedSshHostsSection } from "@/components/trusted-ssh-hosts-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
 
 // ── Types ──
@@ -1330,6 +1331,11 @@ export default function SettingsPanel({
         {/* Tamper-evident security audit log */}
         <Section title="Security Audit Log">
           <SecurityAuditSection />
+        </Section>
+
+        {/* Persisted host keys (trust on first use) */}
+        <Section title="Trusted SSH Hosts">
+          <TrustedSshHostsSection />
         </Section>
 
         {/* Trusted SSH Host CAs */}

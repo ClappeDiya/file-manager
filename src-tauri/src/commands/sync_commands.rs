@@ -269,6 +269,19 @@ pub async fn run_sync(
     ledger: State<'_, OperationLedger>,
     repo: State<'_, Repository>,
 ) -> Result<SyncReport, AppError> {
+    run_sync_pair(&manager, &ledger, &repo, &pair_id).await
+}
+
+/// Run a sync pair and record it like a UI-started run: persist `last_run`
+/// and the report, and emit the ledger event. Shared by the `run_sync`
+/// command, scheduled syncs and automation actions.
+pub async fn run_sync_pair(
+    manager: &SyncManager,
+    ledger: &OperationLedger,
+    repo: &Repository,
+    pair_id: &str,
+) -> Result<SyncReport, AppError> {
+    let pair_id = pair_id.to_string();
     let id = parse_uuid(&pair_id)?;
     let result = manager.execute_sync(id).await;
 
@@ -280,7 +293,7 @@ pub async fn run_sync(
         use crate::core::traits::SyncOperations;
         if let Ok(pairs) = manager.list_pairs().await {
             if let Some(pair) = pairs.into_iter().find(|p| p.id == id) {
-                if let Err(e) = manager.save_pair_to_db(&repo, &pair).await {
+                if let Err(e) = manager.save_pair_to_db(repo, &pair).await {
                     tracing::warn!("Failed to persist last_run for sync pair {id}: {e}");
                 }
             }
@@ -288,7 +301,7 @@ pub async fn run_sync(
     }
 
     if let Ok(report) = &result {
-        if let Err(e) = manager.save_report_to_db(&repo, report, 500).await {
+        if let Err(e) = manager.save_report_to_db(repo, report, 500).await {
             tracing::warn!("Failed to store sync run history for {id}: {e}");
         }
     }
@@ -303,7 +316,7 @@ pub async fn run_sync(
                 SyncRunStatus::Running => LedgerStatus::Ok,
             };
             record_sync(
-                &ledger,
+                ledger,
                 "run",
                 status,
                 &pair_id,
@@ -324,7 +337,7 @@ pub async fn run_sync(
         }
         Err(e) => {
             record_sync(
-                &ledger,
+                ledger,
                 "run",
                 LedgerStatus::Failed,
                 &pair_id,

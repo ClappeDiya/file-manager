@@ -1,3 +1,4 @@
+import { isEnabled, notAvailable } from '@/lib/features';
 import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import { requireRole, isAuthorized } from '@/lib/utils/require-role';
@@ -55,6 +56,7 @@ const VALID_EVENTS = [
 
 /** GET /api/webhooks */
 export async function GET(request: NextRequest) {
+  if (!isEnabled('webhooks')) return notAvailable('webhooks');
   const authResult = await requireRole(request, 'manager');
   if (!isAuthorized(authResult)) return authResult;
 
@@ -70,6 +72,7 @@ export async function GET(request: NextRequest) {
 
 /** POST /api/webhooks */
 export async function POST(request: NextRequest) {
+  if (!isEnabled('webhooks')) return notAvailable('webhooks');
   const authResult = await requireRole(request, 'manager');
   if (!isAuthorized(authResult)) return authResult;
 

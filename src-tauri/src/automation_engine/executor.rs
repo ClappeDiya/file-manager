@@ -4,6 +4,7 @@
 //! sync_engine, archive_commands). Each action is a thin wrapper around
 //! existing platform capabilities.
 
+use super::services::{ActionServices, SERVICES_UNAVAILABLE};
 use super::{AutomationLog, AutomationRule, AutomationStatus, RuleAction};
 use chrono::Utc;
 use std::path::Path;
@@ -18,6 +19,18 @@ pub async fn execute_rule_action(
     rule: &AutomationRule,
     triggered_file: Option<&str>,
     dry_run: bool,
+) -> AutomationLog {
+    execute_rule_action_with(rule, triggered_file, dry_run, None).await
+}
+
+/// [`execute_rule_action`] with the engines that sync, transfer, command and
+/// notification actions delegate to. `None` makes those actions fail with an
+/// explanation rather than pretend to succeed.
+pub async fn execute_rule_action_with(
+    rule: &AutomationRule,
+    triggered_file: Option<&str>,
+    dry_run: bool,
+    services: Option<&dyn ActionServices>,
 ) -> AutomationLog {
     let started = Utc::now().to_rfc3339();
     let trigger_event = if let Some(file) = triggered_file {
@@ -40,7 +53,7 @@ pub async fn execute_rule_action(
         };
     }
 
-    let result = dispatch_action(&rule.action, triggered_file).await;
+    let result = dispatch_action_with(&rule.action, triggered_file, services).await;
 
     let (status, files_affected, error_message) = match result {
         Ok(affected) => (AutomationStatus::Success, affected, None),
@@ -88,10 +101,24 @@ fn validate_rename_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Dispatch an action to the appropriate engine.
+/// Dispatch an action without engine services (see [`dispatch_action_with`]).
+#[cfg(test)]
 async fn dispatch_action(
     action: &RuleAction,
     triggered_file: Option<&str>,
+) -> Result<Vec<String>, String> {
+    dispatch_action_with(action, triggered_file, None).await
+}
+
+fn require_services(services: Option<&dyn ActionServices>) -> Result<&dyn ActionServices, String> {
+    services.ok_or_else(|| SERVICES_UNAVAILABLE.to_string())
+}
+
+/// Dispatch an action to the appropriate engine.
+async fn dispatch_action_with(
+    action: &RuleAction,
+    triggered_file: Option<&str>,
+    services: Option<&dyn ActionServices>,
 ) -> Result<Vec<String>, String> {
     match action {
         RuleAction::MoveFile { dest_path } => {
@@ -218,17 +245,54 @@ async fn dispatch_action(
 
         RuleAction::CompressFolder { dest_path, format } => {
             let source = triggered_file.ok_or("No source for compress action")?;
-            // Delegate to the archive creation logic
-            // For now, create a basic zip using std::fs
-            let _ = (dest_path, format, source);
-            Err("Compress action requires archive engine integration — use RunSync or TransferToConnector instead".to_string())
+            let source_path = Path::new(source);
+            let dest_dir = Path::new(dest_path);
+            validate_automation_path(source_path, None)?;
+            validate_automation_path(dest_dir, None)?;
+            let fmt = format.trim().to_lowercase();
+            let ext = match fmt.as_str() {
+                "zip" | "tar" | "7z" => fmt.clone(),
+                "tar.gz" | "tgz" => "tar.gz".to_string(),
+                other => return Err(format!("Unsupported archive format '{other}'. Use zip, tar, tar.gz or 7z")),
+            };
+            if !dest_dir.exists() {
+                std::fs::create_dir_all(dest_dir)
+                    .map_err(|e| format!("Cannot create destination directory: {e}"))?;
+            }
+            let base = source_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("Cannot determine source name")?;
+            let target = dest_dir.join(format!("{base}.{ext}"));
+            let target = if target.exists() { find_unique_name(&target) } else { target };
+            let output = target.to_string_lossy().to_string();
+            let result = crate::commands::archive_commands::archive_create(
+                crate::commands::archive_commands::CreateArchiveParams {
+                    output_path: output.clone(),
+                    source_paths: vec![source.to_string()],
+                    format: fmt,
+                    password: None,
+                    compression_level: None,
+                },
+            )
+            .await
+            .map_err(|e| format!("Compress failed: {e}"))?;
+            if !result.success {
+                return Err(format!("Compress failed: {}", result.errors.join("; ")));
+            }
+            Ok(vec![output])
+        }
+
+        RuleAction::CreateFolder { path } => {
+            let dir = Path::new(path);
+            validate_automation_path(dir, None)?;
+            std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create folder: {e}"))?;
+            Ok(vec![path.clone()])
         }
 
         RuleAction::RunSync { sync_pair_id } => {
-            // This would be called via the SyncManager in the Tauri command layer.
-            // At this level, we log the intent; the command layer handles the actual dispatch.
-            tracing::info!("Automation triggering sync pair: {}", sync_pair_id);
-            Ok(vec![format!("sync_pair:{}", sync_pair_id)])
+            let outcome = require_services(services)?.run_sync(sync_pair_id).await?;
+            Ok(vec![format!("sync_pair:{sync_pair_id} ({outcome})")])
         }
 
         RuleAction::TransferToConnector {
@@ -237,22 +301,25 @@ async fn dispatch_action(
             remote_path,
         } => {
             let source = triggered_file.ok_or("No source file for transfer action")?;
-            tracing::info!(
-                "Automation triggering transfer: {} -> {}:{} via {}",
-                source, connection_id, remote_path, connector_protocol
-            );
-            Ok(vec![format!("transfer:{}:{}", connection_id, source)])
+            validate_automation_path(Path::new(source), None)?;
+            let remote = require_services(services)?
+                .transfer_to_connector(connector_protocol, connection_id, source, remote_path)
+                .await?;
+            Ok(vec![remote])
         }
 
         RuleAction::ExecuteCustomCommand { command_id } => {
-            tracing::info!("Automation triggering custom command: {}", command_id);
-            Ok(vec![format!("command:{}", command_id)])
+            let files = triggered_file.map(|f| vec![f.to_string()]).unwrap_or_default();
+            let outcome = require_services(services)?
+                .run_custom_command(command_id, files.clone())
+                .await?;
+            tracing::info!("Automation custom command {command_id}: {outcome}");
+            Ok(files)
         }
 
         RuleAction::Notify { title, body } => {
-            tracing::info!("Automation notification: {} - {}", title, body);
-            // OS notification is handled at the Tauri command layer
-            Ok(vec![])
+            require_services(services)?.notify(title, body).await?;
+            Ok(triggered_file.map(|f| vec![f.to_string()]).unwrap_or_default())
         }
 
         RuleAction::ReplayOp {
@@ -566,5 +633,151 @@ mod tests {
         assert!(result.is_err());
         // Source must NOT have been touched
         assert!(a.exists());
+    }
+
+    // ── Engine-backed actions (regression: these used to log and report
+    // success without doing anything) ──
+
+    use crate::automation_engine::services::mock::RecordingServices;
+    use crate::automation_engine::services::SERVICES_UNAVAILABLE;
+
+    fn rule_with(action: RuleAction) -> AutomationRule {
+        AutomationRule::new("t".into(), crate::automation_engine::RuleTrigger::Manual, action)
+    }
+
+    #[tokio::test]
+    async fn engine_actions_fail_without_services_instead_of_faking_success() {
+        let actions = vec![
+            RuleAction::RunSync { sync_pair_id: "p1".into() },
+            RuleAction::ExecuteCustomCommand { command_id: "c1".into() },
+            RuleAction::Notify { title: "a".into(), body: "b".into() },
+        ];
+        for action in actions {
+            let log = execute_rule_action(&rule_with(action.clone()), None, false).await;
+            assert_eq!(log.status, AutomationStatus::Failed, "{action:?} must not report success");
+            assert_eq!(log.error_message.as_deref(), Some(SERVICES_UNAVAILABLE));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x.txt");
+        std::fs::write(&f, "x").unwrap();
+        let transfer = RuleAction::TransferToConnector {
+            connector_protocol: "sftp".into(),
+            connection_id: "c".into(),
+            remote_path: "/in".into(),
+        };
+        let log = execute_rule_action(&rule_with(transfer), f.to_str(), false).await;
+        assert_eq!(log.status, AutomationStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn engine_actions_delegate_to_services() {
+        let svc = RecordingServices::default();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("report.csv");
+        std::fs::write(&f, "a,b").unwrap();
+        let file = f.to_str().unwrap();
+
+        let sync = execute_rule_action_with(
+            &rule_with(RuleAction::RunSync { sync_pair_id: "pair-9".into() }), None, false, Some(&svc),
+        ).await;
+        assert_eq!(sync.status, AutomationStatus::Success);
+
+        let transfer = execute_rule_action_with(
+            &rule_with(RuleAction::TransferToConnector {
+                connector_protocol: "sftp".into(),
+                connection_id: "conn-1".into(),
+                remote_path: "/upload/".into(),
+            }),
+            Some(file), false, Some(&svc),
+        ).await;
+        assert_eq!(transfer.status, AutomationStatus::Success);
+        assert_eq!(transfer.files_affected, vec!["/upload/report.csv".to_string()]);
+
+        let cmd = execute_rule_action_with(
+            &rule_with(RuleAction::ExecuteCustomCommand { command_id: "lint".into() }), Some(file), false, Some(&svc),
+        ).await;
+        assert_eq!(cmd.status, AutomationStatus::Success);
+
+        let note = execute_rule_action_with(
+            &rule_with(RuleAction::Notify { title: "New file".into(), body: "arrived".into() }), Some(file), false, Some(&svc),
+        ).await;
+        assert_eq!(note.status, AutomationStatus::Success);
+
+        assert_eq!(
+            svc.calls(),
+            vec![
+                "sync:pair-9".to_string(),
+                format!("transfer:sftp:conn-1:{file}->/upload/report.csv"),
+                format!("command:lint:{file}"),
+                "notify:New file:arrived".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn service_errors_are_reported_as_failures() {
+        let svc = RecordingServices { fail_with: Some("pair not found".into()), ..Default::default() };
+        let log = execute_rule_action_with(
+            &rule_with(RuleAction::RunSync { sync_pair_id: "nope".into() }), None, false, Some(&svc),
+        ).await;
+        assert_eq!(log.status, AutomationStatus::Failed);
+        assert_eq!(log.error_message.as_deref(), Some("pair not found"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_never_calls_services() {
+        let svc = RecordingServices::default();
+        let log = execute_rule_action_with(
+            &rule_with(RuleAction::RunSync { sync_pair_id: "p".into() }), None, true, Some(&svc),
+        ).await;
+        assert_eq!(log.status, AutomationStatus::Success);
+        assert!(svc.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn compress_folder_creates_a_real_archive() {
+        if std::process::Command::new("zip").arg("-v").output().is_err() {
+            eprintln!("zip not installed; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("photos");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.jpg"), b"jpeg").unwrap();
+        let out = dir.path().join("archives");
+
+        let action = RuleAction::CompressFolder {
+            dest_path: out.to_string_lossy().to_string(),
+            format: "zip".into(),
+        };
+        let first = dispatch_action(&action, src.to_str()).await.unwrap();
+        assert_eq!(first, vec![out.join("photos.zip").to_string_lossy().to_string()]);
+        assert!(out.join("photos.zip").metadata().unwrap().len() > 0);
+
+        // A second run never overwrites the first archive.
+        let second = dispatch_action(&action, src.to_str()).await.unwrap();
+        assert_eq!(second, vec![out.join("photos (2).zip").to_string_lossy().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn compress_folder_rejects_unknown_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let action = RuleAction::CompressFolder {
+            dest_path: dir.path().to_string_lossy().to_string(),
+            format: "rar".into(),
+        };
+        let err = dispatch_action(&action, dir.path().to_str()).await.unwrap_err();
+        assert!(err.contains("Unsupported archive format"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn create_folder_makes_missing_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a/b/c");
+        let action = RuleAction::CreateFolder { path: target.to_string_lossy().to_string() };
+        dispatch_action(&action, None).await.unwrap();
+        assert!(target.is_dir());
+        // Idempotent.
+        dispatch_action(&action, None).await.unwrap();
     }
 }

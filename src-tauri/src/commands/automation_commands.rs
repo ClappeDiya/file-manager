@@ -18,6 +18,7 @@ pub async fn create_automation_rule(
     mgr: State<'_, AutomationManager>,
 ) -> Result<AutomationRule, AppError> {
     mgr.save_rule(&repo, &rule).await?;
+    mgr.rearm(&rule).await?;
     tracing::info!("Created automation rule '{}' ({})", rule.name, rule.id);
     Ok(rule)
 }
@@ -29,6 +30,8 @@ pub async fn update_automation_rule(
     mgr: State<'_, AutomationManager>,
 ) -> Result<AutomationRule, AppError> {
     mgr.save_rule(&repo, &rule).await?;
+    // Restart the trigger so a changed watch path or cron takes effect.
+    mgr.rearm(&rule).await?;
     tracing::info!("Updated automation rule '{}' ({})", rule.name, rule.id);
     Ok(rule)
 }

@@ -35,6 +35,7 @@ export type RuleAction =
   | { type: "transfer_to_connector"; connector_protocol: string; connection_id: string; remote_path: string }
   | { type: "execute_custom_command"; command_id: string }
   | { type: "notify"; title: string; body: string }
+  | { type: "create_folder"; path: string }
   /** Replay a captured set of file operations exactly as the user once
    *  performed them. Created by the **Operation Pin** flow from a single
    *  ledger event — carries its own source list so the trigger doesn't

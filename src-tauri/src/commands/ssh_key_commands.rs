@@ -301,3 +301,23 @@ pub struct SshKeyInfo {
     pub public_key_path: String,
     pub algorithm: String,
 }
+
+// ── Trusted host keys ──
+
+/// SSH host keys the app trusts (accepted on first use). Keys trusted in
+/// `~/.ssh/known_hosts` are honoured too but not listed here.
+#[tauri::command]
+pub async fn list_known_hosts() -> Result<Vec<crate::connectors::known_hosts::KnownHostEntry>, AppError> {
+    Ok(crate::connectors::known_hosts::KnownHostsStore::shared().list().await)
+}
+
+/// Forget the trusted keys of a host so its new key can be accepted after a
+/// legitimate change (server rebuilt or re-keyed). Returns how many keys
+/// were removed.
+#[tauri::command]
+pub async fn forget_known_host(host: String, port: u16) -> Result<usize, AppError> {
+    crate::connectors::known_hosts::KnownHostsStore::shared()
+        .forget(&host, port)
+        .await
+        .map_err(|e| AppError::file_op(format!("Could not update the host-key store: {e}"), "Check that the app's data folder is writable."))
+}

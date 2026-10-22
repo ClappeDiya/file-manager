@@ -3999,8 +3999,9 @@ function FilePane({
         console.error("Get info failed:", err);
       }
       try {
-        const fileInfo = await tauriInvoke<{ label?: string }>("integrity_get_file_info", { path: filePath });
-        comment = fileInfo?.label || "";
+        // Comments are the file's "comment" metadata value.
+        const fileInfo = await tauriInvoke<{ metadata?: Record<string, string> }>("integrity_get_file_info", { path: filePath });
+        comment = fileInfo?.metadata?.comment ?? "";
       } catch { /* no comment yet */ }
     } else {
       metadata = { size: "4.2 KB", modified: new Date().toISOString(), type: "File" };
@@ -4013,7 +4014,7 @@ function FilePane({
   const handleSaveComment = useCallback(async (filePath: string, commentText: string) => {
     if (isTauriAvailable()) {
       try {
-        await tauriInvoke("integrity_set_label", { path: filePath, label: commentText });
+        await tauriInvoke("integrity_set_metadata", { path: filePath, key: "comment", value: commentText });
       } catch {
         try {
           await tauriInvoke("set_config", { key: `comment:${filePath}`, value: commentText });

@@ -103,6 +103,11 @@ fn all_migrations() -> Vec<Migration> {
             // The work needs SHA-256, so it runs in Rust: see `rust_step`.
             sql: "",
         },
+        Migration {
+            version: 18,
+            description: "File metadata - color tags, labels, key-value metadata, smart folders",
+            sql: V18_SCHEMA,
+        },
     ]
 }
 
@@ -115,6 +120,46 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
         _ => None,
     }
 }
+
+/// Schema v18: file metadata (previously held in memory and lost on quit).
+/// Rows are keyed by absolute path; see `metadata_engine`.
+const V18_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS file_tag_defs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    color TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS file_tag_links (
+    path TEXT NOT NULL,
+    tag_id TEXT NOT NULL REFERENCES file_tag_defs(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (path, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_file_tag_links_tag ON file_tag_links(tag_id);
+CREATE TABLE IF NOT EXISTS file_labels (
+    path TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (path, label)
+);
+CREATE TABLE IF NOT EXISTS file_metadata (
+    path TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (path, key)
+);
+CREATE INDEX IF NOT EXISTS idx_file_metadata_key_value ON file_metadata(key, value);
+CREATE TABLE IF NOT EXISTS smart_folders (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    query_json TEXT NOT NULL,
+    icon TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
 
 /// Schema v16: every finished sync run, kept across restarts.
 const V16_SCHEMA: &str = r#"
@@ -799,7 +844,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 17);
+        assert_eq!(applied, 18);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -824,6 +869,9 @@ mod tests {
         assert!(tables.contains(&"mount_configs".to_string()));
         assert!(tables.contains(&"backup_jobs".to_string()));
         assert!(tables.contains(&"backup_runs".to_string()));
+        for t in ["file_tag_defs", "file_tag_links", "file_labels", "file_metadata", "smart_folders"] {
+            assert!(tables.contains(&t.to_string()), "missing {t}");
+        }
         assert!(tables.contains(&"_migrations".to_string()));
     }
 
@@ -831,7 +879,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 17);
+        assert_eq!(first, 18);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -844,7 +892,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 17);
+        assert_eq!(current_version(&conn).unwrap(), 18);
     }
 
     #[test]

@@ -137,66 +137,45 @@ impl SyncScheduler {
         due
     }
 
-    /// Start the scheduler loop that checks for due schedules periodically.
+    /// Start the scheduler loop that checks for due schedules every 30 s.
     /// Returns immediately; the loop runs in a background thread.
     pub fn start(&self, callback: ScheduleCallback) {
-        let schedules = self.schedules.clone();
-        let running = self.running.clone();
+        self.start_with_interval(callback, std::time::Duration::from_secs(30));
+    }
 
+    /// [`start`](Self::start) with a custom poll interval (tests use a short one).
+    pub fn start_with_interval(&self, callback: ScheduleCallback, interval: std::time::Duration) {
         {
-            let mut r = running.lock().unwrap();
+            let mut r = match self.running.lock() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
             if *r {
                 return; // Already running
             }
             *r = true;
         }
 
-        let running_clone = running.clone();
-
+        let scheduler = self.clone_handles();
         std::thread::spawn(move || {
-            tracing::info!("Sync scheduler started");
-
-            loop {
-                {
-                    let r = running_clone.lock().unwrap();
-                    if !*r {
-                        break;
-                    }
+            tracing::info!("Cron scheduler started");
+            while scheduler.is_running() {
+                for id in scheduler.check_due() {
+                    tracing::info!("Scheduler triggering {}", id);
+                    callback(id);
                 }
-
-                let now = Utc::now();
-                let mut due_pairs = Vec::new();
-
-                if let Ok(mut schedules) = schedules.lock() {
-                    for (pair_id, entry) in schedules.iter_mut() {
-                        if !entry.enabled {
-                            continue;
-                        }
-
-                        if let Some(next_run) = entry.next_run {
-                            if now >= next_run {
-                                due_pairs.push(*pair_id);
-
-                                // Advance to next run
-                                if let Ok(schedule) = Schedule::from_str(&entry.cron_expr) {
-                                    entry.next_run = schedule.upcoming(Utc).next();
-                                }
-                            }
-                        }
-                    }
-                }
-
-                for pair_id in due_pairs {
-                    tracing::info!("Scheduler triggering sync for pair {}", pair_id);
-                    callback(pair_id);
-                }
-
-                // Sleep for 30 seconds between checks
-                std::thread::sleep(std::time::Duration::from_secs(30));
+                std::thread::sleep(interval);
             }
-
-            tracing::info!("Sync scheduler stopped");
+            tracing::info!("Cron scheduler stopped");
         });
+    }
+
+    /// A second handle onto the same schedule table and running flag.
+    fn clone_handles(&self) -> Self {
+        Self {
+            schedules: self.schedules.clone(),
+            running: self.running.clone(),
+        }
     }
 
     /// Stop the scheduler loop.
@@ -292,5 +271,25 @@ mod tests {
 
         scheduler.stop();
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    /// Regression: the loop must actually invoke the callback for due pairs.
+    #[test]
+    fn test_scheduler_fires_due_schedules() {
+        let scheduler = SyncScheduler::new();
+        let pair = Uuid::new_v4();
+        scheduler.add_schedule(pair, "* * * * * * *").unwrap(); // every second
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let sink = fired.clone();
+        scheduler.start_with_interval(
+            Arc::new(move |id: Uuid| sink.lock().unwrap().push(id)),
+            std::time::Duration::from_millis(100),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fired.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        scheduler.stop();
+        assert_eq!(fired.lock().unwrap().first(), Some(&pair));
     }
 }

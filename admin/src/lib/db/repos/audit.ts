@@ -139,6 +139,8 @@ export function appendAudit(e: AuditInput): AuditRecord {
 export interface AuditQuery {
   orgIds?: string[];
   eventType?: string;
+  /** Match every event type starting with this prefix, e.g. `ai.`. */
+  eventPrefix?: string;
   severity?: string;
   userId?: string;
   from?: string;
@@ -156,6 +158,7 @@ export function listAudit(q: AuditQuery = {}): { entries: AuditRecord[]; total: 
     args.push(...q.orgIds);
   }
   if (q.eventType) { where.push('event_type = ?'); args.push(q.eventType); }
+  if (q.eventPrefix) { where.push("event_type LIKE ? ESCAPE '\\'"); args.push(`${q.eventPrefix.replace(/[\\%_]/g, (c) => `\\${c}`)}%`); }
   if (q.severity) { where.push('severity = ?'); args.push(q.severity); }
   if (q.userId) { where.push('user_id = ?'); args.push(q.userId); }
   if (q.from) { where.push('timestamp >= ?'); args.push(q.from); }

@@ -22,6 +22,9 @@ import { useAuthStore } from '@/lib/stores/auth-store';
 import type { Invitation } from '@/lib/db/repos/invitations';
 import { useToastStore } from '@/lib/stores/toast-store';
 import { z } from 'zod';
+import Link from 'next/link';
+import { ComingSoon } from '@/components/ui/coming-soon';
+import { isEnabled } from '@/lib/features';
 
 const inviteSchema = z.object({
   email: z.string().trim().min(1, 'Email is required').email('Enter a valid email address'),
@@ -248,7 +251,13 @@ export default function UsersPage() {
               onChange={handleCSVImport}
               className="hidden"
             />
-            <Button variant="outline" size="sm" onClick={() => fileInputRef.current?.click()}>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!isEnabled('csvUserImport')}
+              title={isEnabled('csvUserImport') ? undefined : 'CSV import is coming soon. Use Invite User meanwhile.'}
+              onClick={() => fileInputRef.current?.click()}
+            >
               <Upload size={14} /> Import CSV
             </Button>
             <Button variant="outline" size="sm" onClick={handleCSVExport}>
@@ -425,49 +434,25 @@ export default function UsersPage() {
           <div className="grid gap-6 max-w-2xl">
             <Card>
               <CardContent>
-                <h3 className="text-lg font-semibold text-foreground mb-4">SAML 2.0 Configuration (Business)</h3>
-                <div className="space-y-4">
-                  <Input label="Entity ID / Issuer" placeholder="https://idp.example.com/saml/metadata" />
-                  <Input label="SSO URL" placeholder="https://idp.example.com/saml/sso" />
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-sm font-medium text-foreground">X.509 Certificate</label>
-                    <textarea
-                      className="w-full h-32 rounded-md border border-border bg-background px-3 py-2 text-sm font-mono placeholder:text-foreground-disabled focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-                      placeholder="Paste your IdP certificate here..."
-                    />
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <input type="checkbox" id="saml-enabled" className="rounded" />
-                    <label htmlFor="saml-enabled" className="text-sm text-foreground">Enable SAML SSO</label>
-                  </div>
-                  <Button>Save SAML Configuration</Button>
-                </div>
+                <h3 className="text-lg font-semibold text-foreground mb-2">Single sign-on (OIDC / SAML)</h3>
+                <p className="text-sm text-foreground-secondary mb-4">
+                  Identity providers, just-in-time accounts, group mapping and MFA requirements are configured per organization.
+                </p>
+                <Link href="/settings/sso" className="text-sm font-medium text-primary hover:underline">
+                  Open SSO settings →
+                </Link>
               </CardContent>
             </Card>
 
             <Card>
               <CardContent>
                 <h3 className="text-lg font-semibold text-foreground mb-4">SCIM Provisioning (Enterprise)</h3>
-                <div className="space-y-4">
-                  <Input
-                    label="SCIM Endpoint"
-                    value={`${typeof window !== 'undefined' ? window.location.origin : ''}/api/scim/v2`}
-                    readOnly
-                    hint="Provide this URL to your identity provider"
+                {isEnabled('scim') ? null : (
+                  <ComingSoon
+                    feature="scim"
+                    description="Your identity provider will create, update and deactivate users and groups here automatically. Until then, use just-in-time provisioning in SSO settings."
                   />
-                  <Input
-                    label="SCIM Bearer Token"
-                    type="password"
-                    value="••••••••••••••••"
-                    readOnly
-                    hint="Generate a token to enable SCIM provisioning"
-                  />
-                  <div className="flex items-center gap-2">
-                    <input type="checkbox" id="scim-enabled" className="rounded" />
-                    <label htmlFor="scim-enabled" className="text-sm text-foreground">Enable SCIM Provisioning</label>
-                  </div>
-                  <Button>Regenerate SCIM Token</Button>
-                </div>
+                )}
               </CardContent>
             </Card>
           </div>

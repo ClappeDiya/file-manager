@@ -355,12 +355,43 @@ impl S3Connector {
     }
 
     /// List objects in a bucket with optional prefix (virtual folder browsing).
+    ///
+    /// Follows `NextContinuationToken` until the listing is complete: a single
+    /// ListObjectsV2 call returns at most 1,000 keys, and stopping there made
+    /// large folders look silently truncated.
     pub async fn list_objects(
         &self,
         bucket: &str,
         prefix: &str,
         delimiter: Option<&str>,
     ) -> Result<Vec<FileEntry>, AppError> {
+        let mut entries = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = self.list_objects_page(bucket, prefix, delimiter, token.as_deref()).await?;
+            entries.extend(page.entries);
+            match page.next_token {
+                Some(next) if Some(&next) != token.as_ref() => token = Some(next),
+                Some(_) => {
+                    return Err(AppError::Connection {
+                        message: "S3 returned the same continuation token twice".to_string(),
+                        advice: "The server's listing is inconsistent; try again.".to_string(),
+                    })
+                }
+                None => break,
+            }
+        }
+        Ok(entries)
+    }
+
+    /// One ListObjectsV2 page.
+    async fn list_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        continuation_token: Option<&str>,
+    ) -> Result<ListPage, AppError> {
         let state = self.state.read().await;
         let state = state.as_ref().ok_or_else(|| AppError::Connection {
             message: "Not connected to S3".to_string(),
@@ -380,12 +411,10 @@ impl S3Connector {
         if let Some(delim) = delimiter {
             query_params.push(("delimiter", delim.to_string()));
         }
-
-        let query_string: String = query_params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, percent_encoding::percent_encode(v.as_bytes(), percent_encoding::NON_ALPHANUMERIC)))
-            .collect::<Vec<_>>()
-            .join("&");
+        if let Some(t) = continuation_token {
+            query_params.push(("continuation-token", t.to_string()));
+        }
+        let query_string = canonical_query(&query_params);
 
         let url = format!("{endpoint}{path}?{query_string}");
 
@@ -434,8 +463,16 @@ impl S3Connector {
             advice: "Try again.".to_string(),
         })?;
 
-        let entries = parse_list_objects_xml(&body, prefix);
-        Ok(entries)
+        let truncated = extract_xml_value(&body, "IsTruncated").is_some_and(|v| v.trim() == "true");
+        let next_token = if truncated {
+            Some(extract_xml_value(&body, "NextContinuationToken").ok_or_else(|| AppError::Connection {
+                message: "S3 listing is truncated but has no continuation token".to_string(),
+                advice: "The server may not support ListObjectsV2 pagination.".to_string(),
+            })?)
+        } else {
+            None
+        };
+        Ok(ListPage { entries: parse_list_objects_xml(&body, prefix), next_token })
     }
 
     /// Upload a file to S3. Uses multipart for files > 5MB.
@@ -2079,13 +2116,7 @@ impl S3Connector {
         let now = Utc::now();
         let (endpoint, path) = self.bucket_url(&state.credentials, bucket);
 
-        let query_string = format!(
-            "prefix={}&versions=",
-            percent_encoding::percent_encode(
-                key.as_bytes(),
-                percent_encoding::NON_ALPHANUMERIC
-            )
-        );
+        let query_string = canonical_query(&[("prefix", key.to_string()), ("versions", String::new())]);
 
         let url = format!("{endpoint}{path}?{query_string}");
 
@@ -2153,20 +2184,20 @@ impl S3Connector {
         let now = Utc::now();
         let (endpoint, path) = self.bucket_url(&state.credentials, bucket);
 
-        let encoded_key = percent_encoding::percent_encode(
-            key.as_bytes(),
-            percent_encoding::NON_ALPHANUMERIC,
-        );
+        // Same encoding for the URL and the signed path (`/` kept), or
+        // nested keys and keys with spaces fail SigV4.
+        let encoded_key = percent_encode_path(key);
         let url = format!("{endpoint}{path}{encoded_key}");
 
         let canonical_path = if state.credentials.path_style {
-            format!("/{bucket}/{key}")
+            format!("/{bucket}/{encoded_key}")
         } else {
-            format!("/{key}")
+            format!("/{encoded_key}")
         };
 
         let copy_source = format!(
-            "/{bucket}/{key}?versionId={version_id}"
+            "/{bucket}/{encoded_key}?versionId={}",
+            percent_encoding::percent_encode(version_id.as_bytes(), S3_ENCODE_SET)
         );
 
         let headers = self.sign_request(
@@ -2804,6 +2835,30 @@ const S3_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHAN
     .remove(b'_')
     .remove(b'~');
 
+/// One page of a ListObjectsV2 response.
+struct ListPage {
+    entries: Vec<FileEntry>,
+    next_token: Option<String>,
+}
+
+/// SigV4 canonical query string, also used verbatim as the request query:
+/// keys and values RFC 3986-encoded (unreserved characters kept, `/`
+/// encoded) and sorted by key. Unsorted or over-encoded queries (e.g. a `-`
+/// sent as `%2D`) make S3 reject the signature.
+fn canonical_query(params: &[(&str, String)]) -> String {
+    let mut pairs: Vec<(String, String)> = params
+        .iter()
+        .map(|(k, v)| {
+            (
+                percent_encoding::percent_encode(k.as_bytes(), S3_ENCODE_SET).to_string(),
+                percent_encoding::percent_encode(v.as_bytes(), S3_ENCODE_SET).to_string(),
+            )
+        })
+        .collect();
+    pairs.sort();
+    pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
+}
+
 fn percent_encode_path(path: &str) -> String {
     path.split('/')
         .map(|segment| {
@@ -2833,7 +2888,20 @@ fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].to_string())
+    Some(xml_unescape(&xml[start..end]))
+}
+
+/// Decode the five predefined XML entities (S3 escapes `&` in keys and
+/// tokens, and `"` in ETags).
+fn xml_unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn parse_list_buckets_xml(xml: &str) -> Vec<FileEntry> {
@@ -3529,5 +3597,152 @@ mod tests {
     #[test]
     fn test_multipart_threshold() {
         assert_eq!(MULTIPART_THRESHOLD, 5 * 1024 * 1024);
+    }
+
+    // ── ListObjectsV2 pagination (regression: listings stopped at 1,000) ──
+
+    /// Mock S3 that checks every request's SigV4 signature against the
+    /// reference signer and serves `pages` ListObjectsV2 pages of keys.
+    async fn mock_s3(pages: usize) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::http::{HeaderMap, Uri};
+        use std::collections::BTreeMap;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let app = axum::Router::new().fallback(move |uri: Uri, h: HeaderMap| {
+            let log = log.clone();
+            async move {
+                let query = uri.query().unwrap_or("").to_string();
+                log.lock().unwrap().push(query.clone());
+                let params: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                let mut signed = BTreeMap::new();
+                for k in ["host", "x-amz-content-sha256", "x-amz-date"] {
+                    signed.insert(k.to_string(), h[k].to_str().unwrap().to_string());
+                }
+                let expected = crate::backup_engine::stores::s3::sign_v4(
+                    "GET", uri.path(), &params, &signed, "UNSIGNED-PAYLOAD", "AKID", "SECRET", "us-east-1", "s3",
+                );
+                if h["authorization"].to_str().unwrap() != expected {
+                    return (axum::http::StatusCode::FORBIDDEN, "SignatureDoesNotMatch".to_string());
+                }
+                let page: usize = params
+                    .iter()
+                    .find(|(k, _)| k == "continuation-token")
+                    .map(|(_, v)| v.trim_start_matches("tok&").parse().unwrap())
+                    .unwrap_or(0);
+                let mut xml = String::from("<ListBucketResult>");
+                for i in 0..3 {
+                    xml.push_str(&format!("<Contents><Key>my-dir/p{page}-k{i}.txt</Key><Size>1</Size></Contents>"));
+                }
+                if page + 1 < pages {
+                    xml.push_str(&format!(
+                        "<IsTruncated>true</IsTruncated><NextContinuationToken>tok&amp;{}</NextContinuationToken>",
+                        page + 1
+                    ));
+                } else {
+                    xml.push_str("<IsTruncated>false</IsTruncated>");
+                }
+                xml.push_str("</ListBucketResult>");
+                (axum::http::StatusCode::OK, xml)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, seen)
+    }
+
+    async fn connected(endpoint: String) -> S3Connector {
+        let c = S3Connector::new();
+        c.connect_with_credentials(S3Credentials {
+            access_key_id: "AKID".into(),
+            secret_access_key: "SECRET".into(),
+            region: "us-east-1".into(),
+            endpoint: Some(endpoint),
+            path_style: true,
+            session_token: None,
+        })
+        .await
+        .unwrap();
+        c
+    }
+
+    #[tokio::test]
+    async fn list_objects_follows_continuation_tokens() {
+        let (base, seen) = mock_s3(3).await;
+        let c = connected(base).await;
+        let entries = c.list_objects("bucket", "my-dir/", Some("/")).await.unwrap();
+        assert_eq!(entries.len(), 9, "all three pages must be returned");
+        let queries = seen.lock().unwrap().clone();
+        assert_eq!(queries.len(), 3);
+        assert!(!queries[0].contains("continuation-token"));
+        // XML-escaped token is decoded, then re-encoded for the next request.
+        assert!(queries[1].contains("continuation-token=tok%261"), "{}", queries[1]);
+        assert!(queries[2].contains("continuation-token=tok%262"));
+    }
+
+    /// Regression: the query was unsorted and over-encoded (`-` as `%2D`),
+    /// so any listing with a delimiter or a dashed prefix failed SigV4.
+    #[tokio::test]
+    async fn list_objects_signs_a_canonical_query() {
+        let (base, seen) = mock_s3(1).await;
+        let c = connected(base).await;
+        c.list_objects("bucket", "my-dir/", Some("/")).await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            "delimiter=%2F&list-type=2&max-keys=1000&prefix=my-dir%2F"
+        );
+    }
+
+    #[test]
+    fn canonical_query_sorts_and_encodes_like_sigv4() {
+        assert_eq!(
+            canonical_query(&[("prefix", "a b/c-d_e.f~g".into()), ("versions", String::new())]),
+            "prefix=a%20b%2Fc-d_e.f~g&versions="
+        );
+    }
+
+    #[test]
+    fn xml_values_are_unescaped() {
+        assert_eq!(extract_xml_value("<Key>a&amp;b&lt;c</Key>", "Key").as_deref(), Some("a&b<c"));
+        assert_eq!(extract_xml_value("<ETag>&quot;x&quot;</ETag>", "ETag").as_deref(), Some("\"x\""));
+    }
+
+    /// Regression: the URL encoded `/` in nested keys while the signed path
+    /// used the raw key, so restoring `dir/my file.txt` failed SigV4.
+    #[tokio::test]
+    async fn restore_version_signs_nested_keys() {
+        use axum::http::{HeaderMap, Method, Uri};
+        use std::collections::BTreeMap;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let app = axum::Router::new().fallback(move |m: Method, uri: Uri, h: HeaderMap| {
+            let log = log.clone();
+            async move {
+                let mut signed = BTreeMap::new();
+                for k in ["host", "x-amz-content-sha256", "x-amz-date"] {
+                    signed.insert(k.to_string(), h[k].to_str().unwrap().to_string());
+                }
+                let expected = crate::backup_engine::stores::s3::sign_v4(
+                    m.as_str(), uri.path(), &[], &signed, "UNSIGNED-PAYLOAD", "AKID", "SECRET", "us-east-1", "s3",
+                );
+                log.lock().unwrap().push(format!("{} {}", uri.path(), h["x-amz-copy-source"].to_str().unwrap()));
+                if h["authorization"].to_str().unwrap() == expected {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::FORBIDDEN
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = connected(base).await;
+        c.restore_object_version("bucket", "dir/my file.txt", "v1").await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            "/bucket/dir/my%20file.txt /bucket/dir/my%20file.txt?versionId=v1"
+        );
     }
 }

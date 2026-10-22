@@ -502,6 +502,22 @@ impl SyncManager {
     }
 
     /// Add a scheduled sync pair.
+    /// Start the cron loop that runs scheduled pairs through `run`. Without
+    /// this, `Scheduled` triggers are armed but never fire.
+    pub fn start_scheduler(&self, run: scheduler::ScheduleCallback) {
+        self.scheduler.start(run);
+    }
+
+    /// Whether the cron loop is running.
+    pub fn scheduler_running(&self) -> bool {
+        self.scheduler.is_running()
+    }
+
+    #[cfg(test)]
+    fn start_scheduler_every(&self, run: scheduler::ScheduleCallback, interval: std::time::Duration) {
+        self.scheduler.start_with_interval(run, interval);
+    }
+
     pub async fn add_schedule(
         &self,
         pair_id: Uuid,
@@ -1250,6 +1266,35 @@ mod tests {
         let preview = mgr.dry_run(pair.id).await.unwrap();
         assert_eq!(preview.total_additions, 1);
         assert_eq!(preview.total_bytes, 5);
+    }
+
+    /// Regression: `Scheduled` pairs were armed but the cron loop was never
+    /// started, so they never ran. The loop now drives the run callback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduled_pair_runs_through_the_scheduler() {
+        let mgr = Arc::new(SyncManager::new());
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), "alpha").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.trigger = SyncTrigger::Scheduled { cron_expr: "* * * * * * *".into() };
+        mgr.create_pair(pair.clone()).await.unwrap();
+
+        let handle = tokio::runtime::Handle::current();
+        let runner = mgr.clone();
+        mgr.start_scheduler_every(
+            Arc::new(move |id: Uuid| {
+                let runner = runner.clone();
+                handle.spawn(async move { let _ = runner.execute_sync(id).await; });
+            }),
+            std::time::Duration::from_millis(100),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !dst.path().join("a.txt").exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        mgr.scheduler.stop();
+        assert!(dst.path().join("a.txt").exists(), "scheduled sync never ran");
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 use crate::core::error::AppError;
 use crate::core::types::FileEntry;
+use crate::metadata_engine::MetadataStore;
 use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -421,9 +422,12 @@ pub async fn move_files(
     source_paths: Vec<String>,
     dest_dir: String,
     ledger: tauri::State<'_, OperationLedger>,
+    metadata: tauri::State<'_, MetadataStore>,
 ) -> Result<FileOpResult, AppError> {
     let outcome = move_files_impl(source_paths.clone(), dest_dir, &ledger).await;
-    with_fs_failure_record(&ledger, "move", &source_paths, outcome).await
+    let result = with_fs_failure_record(&ledger, "move", &source_paths, outcome).await?;
+    metadata.follow_fs_op("move", &result.source_paths, &result.dest_paths, false).await;
+    Ok(result)
 }
 
 /// Move a single entry into `dest_dir`, returning the path it landed at.
@@ -543,10 +547,13 @@ pub async fn rename_file(
     path: String,
     new_name: String,
     ledger: tauri::State<'_, OperationLedger>,
+    metadata: tauri::State<'_, MetadataStore>,
 ) -> Result<FileOpResult, AppError> {
     let sources = vec![path.clone()];
     let outcome = rename_file_impl(path, new_name, &ledger).await;
-    with_fs_failure_record(&ledger, "rename", &sources, outcome).await
+    let result = with_fs_failure_record(&ledger, "rename", &sources, outcome).await?;
+    metadata.follow_fs_op("rename", &result.source_paths, &result.dest_paths, false).await;
+    Ok(result)
 }
 
 pub async fn rename_file_impl(
@@ -681,12 +688,16 @@ pub async fn delete_files(
     paths: Vec<String>,
     permanent: bool,
     ledger: tauri::State<'_, OperationLedger>,
+    metadata: tauri::State<'_, MetadataStore>,
 ) -> Result<FileOpResult, AppError> {
     // Mirror the kind the impl records on success, so a failed delete lands
     // under the same kind as a successful one in the timeline.
     let kind = if permanent { "delete_permanent" } else { "delete_trash" };
     let outcome = delete_files_impl(paths.clone(), permanent, &ledger).await;
-    with_fs_failure_record(&ledger, kind, &paths, outcome).await
+    let result = with_fs_failure_record(&ledger, kind, &paths, outcome).await?;
+    // Trashed items keep their metadata so an undo restores it intact.
+    metadata.follow_fs_op(kind, &result.source_paths, &result.dest_paths, false).await;
+    Ok(result)
 }
 
 /// Delete a single existing entry, to the OS trash unless `permanent`.
@@ -909,9 +920,22 @@ pub async fn create_file_impl(
     })
 }
 
-/// Undo a previous file operation by reversing it.
+/// Undo a previous file operation by reversing it; metadata follows moved
+/// and renamed files back.
 #[tauri::command]
 pub async fn undo_file_operation(
+    operation: String,
+    source_paths: Vec<String>,
+    dest_paths: Vec<String>,
+    metadata: tauri::State<'_, MetadataStore>,
+) -> Result<bool, AppError> {
+    let done = undo_file_operation_inner(operation.clone(), source_paths.clone(), dest_paths.clone()).await?;
+    metadata.follow_fs_op(&operation, &source_paths, &dest_paths, true).await;
+    Ok(done)
+}
+
+/// The filesystem part of [`undo_file_operation`].
+pub async fn undo_file_operation_inner(
     operation: String,
     source_paths: Vec<String>,
     dest_paths: Vec<String>,
@@ -998,6 +1022,18 @@ pub async fn undo_file_operation(
 /// why the redo could not complete.
 #[tauri::command]
 pub async fn redo_file_operation(
+    operation: String,
+    source_paths: Vec<String>,
+    dest_paths: Vec<String>,
+    metadata: tauri::State<'_, MetadataStore>,
+) -> Result<bool, AppError> {
+    let done = redo_file_operation_inner(operation.clone(), source_paths.clone(), dest_paths.clone()).await?;
+    metadata.follow_fs_op(&operation, &source_paths, &dest_paths, false).await;
+    Ok(done)
+}
+
+/// The filesystem part of [`redo_file_operation`].
+pub async fn redo_file_operation_inner(
     operation: String,
     source_paths: Vec<String>,
     dest_paths: Vec<String>,
@@ -2014,7 +2050,7 @@ mod tests {
         .await
         .unwrap();
 
-        let undo_result = undo_file_operation(
+        let undo_result = undo_file_operation_inner(
             result.operation,
             result.source_paths,
             result.dest_paths.clone(),
@@ -2040,7 +2076,7 @@ mod tests {
         .await
         .unwrap();
 
-        undo_file_operation(
+        undo_file_operation_inner(
             result.operation,
             result.source_paths,
             result.dest_paths,
@@ -2059,7 +2095,7 @@ mod tests {
         let l = test_ledger();
         let result = create_file_impl(file_path.clone(), &l).await.unwrap();
 
-        undo_file_operation(
+        undo_file_operation_inner(
             result.operation,
             result.source_paths,
             result.dest_paths,
