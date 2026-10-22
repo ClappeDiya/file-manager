@@ -7,6 +7,7 @@
 
 pub mod api_tokens;
 pub mod auth;
+pub mod dav;
 pub mod folders;
 pub mod oauth;
 pub mod openapi;
@@ -71,6 +72,10 @@ pub struct ServerConfig {
     pub hsts_include_subdomains: bool,
     /// Folders whose contents may be shared by link (`/s/…`); empty = sharing off.
     pub share_roots: Vec<PathBuf>,
+    /// Folders served read-only over WebDAV at `/dav/<name>/`; empty = off.
+    pub dav_roots: Vec<PathBuf>,
+    /// Client address ranges allowed to use WebDAV (on top of `allowed_clients`; empty = any).
+    pub dav_allowed_clients: ufop_core::netacl::IpAllowlist,
 }
 
 impl Default for ServerConfig {
@@ -90,6 +95,8 @@ impl Default for ServerConfig {
             hsts_max_age: 31_536_000,
             hsts_include_subdomains: false,
             share_roots: Vec::new(),
+            dav_roots: Vec::new(),
+            dav_allowed_clients: Default::default(),
         }
     }
 }
@@ -712,7 +719,7 @@ pub fn router(st: ServerState) -> Router {
         .merge(shares::protected_routes())
         .merge(folders::protected_routes())
         .route_layer(middleware::from_fn_with_state(st.clone(), require_auth));
-    let mut app = public.merge(protected);
+    let mut app = public.merge(protected).merge(dav::routes());
     if !st.cfg.api_only && st.cfg.webroot.is_some() {
         app = app.fallback(static_files);
     }

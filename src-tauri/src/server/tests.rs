@@ -510,3 +510,114 @@ async fn folder_policies_lock_filter_name_and_constrain_links() {
     assert_eq!(s.get("/api/v1/folder-policies", &tok).await.json::<Value>().await.unwrap()["policies"].as_array().unwrap().len(), 3);
     assert_eq!(s.post("/api/v1/folder-policies/copy", &tok, json!({"from": r.join("inbox"), "to": r.join("archive")})).await.status(), 400, "nothing to copy");
 }
+
+#[tokio::test]
+async fn webdav_is_read_only_authenticated_and_confined() {
+    let roots = tempfile::tempdir().unwrap();
+    let docs = roots.path().join("docs");
+    std::fs::create_dir_all(docs.join("sub dir")).unwrap();
+    std::fs::write(docs.join("hello.txt"), b"hello webdav").unwrap();
+    std::fs::write(docs.join("sub dir/a&b.txt"), b"x").unwrap();
+    std::fs::write(docs.join(".secret"), b"hidden").unwrap();
+    let outside = roots.path().join("outside.txt");
+    std::fs::write(&outside, b"outside").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, docs.join("escape.txt")).unwrap();
+
+    // Off unless --dav-root is given.
+    let off = start(ServerConfig::default(), None).await;
+    assert_eq!(off.client.get(format!("{}/dav/", off.base)).basic_auth("u", Some("server-password")).send().await.unwrap().status(), 404);
+
+    let s = start(ServerConfig { dav_roots: vec![docs.clone()], ..Default::default() }, None).await;
+    let m = |name: &str| reqwest::Method::from_bytes(name.as_bytes()).unwrap();
+    let dav = |method: &str, path: &str| s.client.request(m(method), format!("{}{path}", s.base));
+    let pw = |r: reqwest::RequestBuilder| r.basic_auth("anyone", Some("server-password"));
+
+    // OPTIONS needs no credentials and advertises class 1, read-only.
+    let r = dav("OPTIONS", "/dav/docs/").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["dav"], "1");
+    assert_eq!(r.headers()["allow"], "OPTIONS, GET, HEAD, PROPFIND");
+
+    // Credentials: none or wrong → 401 with a Basic challenge.
+    let r = dav("PROPFIND", "/dav/").header("Depth", "1").send().await.unwrap();
+    assert_eq!(r.status(), 401);
+    assert!(r.headers()["www-authenticate"].to_str().unwrap().starts_with("Basic realm="));
+    assert_eq!(dav("PROPFIND", "/dav/").basic_auth("u", Some("wrong")).header("Depth", "1").send().await.unwrap().status(), 401);
+
+    // Roots listing.
+    let r = pw(dav("PROPFIND", "/dav/")).header("Depth", "1").send().await.unwrap();
+    assert_eq!(r.status(), 207);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("<D:href>/dav/docs/</D:href>"), "{body}");
+
+    // Folder listing: depth 1, hidden files and symlinks out of the root left out, names escaped.
+    let body = pw(dav("PROPFIND", "/dav/docs")).header("Depth", "1").send().await.unwrap().text().await.unwrap();
+    assert!(body.contains("<D:href>/dav/docs/hello.txt</D:href>") && body.contains("<D:getcontentlength>12</D:getcontentlength>"), "{body}");
+    assert!(body.contains("<D:href>/dav/docs/sub%20dir/</D:href>") && body.contains("<D:collection/>"));
+    assert!(!body.contains(".secret") && !body.contains("escape.txt"), "{body}");
+    let body = pw(dav("PROPFIND", "/dav/docs/sub%20dir/")).header("Depth", "1").send().await.unwrap().text().await.unwrap();
+    assert!(body.contains("/dav/docs/sub%20dir/a%26b.txt") && body.contains("<D:displayname>a&amp;b.txt</D:displayname>"), "{body}");
+    // Depth 0 is only the resource itself; infinity is refused.
+    let body = pw(dav("PROPFIND", "/dav/docs/")).header("Depth", "0").send().await.unwrap().text().await.unwrap();
+    assert!(!body.contains("hello.txt"));
+    let r = pw(dav("PROPFIND", "/dav/docs/")).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+    assert!(r.text().await.unwrap().contains("propfind-finite-depth"));
+
+    // GET / HEAD / ranges / conditional.
+    let r = pw(dav("GET", "/dav/docs/hello.txt")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let etag = r.headers()["etag"].to_str().unwrap().to_string();
+    assert_eq!(r.headers()["accept-ranges"], "bytes");
+    assert_eq!(r.text().await.unwrap(), "hello webdav");
+    let r = pw(dav("GET", "/dav/docs/hello.txt")).header("Range", "bytes=6-").send().await.unwrap();
+    assert_eq!(r.status(), 206);
+    assert_eq!(r.headers()["content-range"], "bytes 6-11/12");
+    assert_eq!(r.text().await.unwrap(), "webdav");
+    assert_eq!(pw(dav("GET", "/dav/docs/hello.txt")).header("Range", "bytes=50-").send().await.unwrap().status(), 416);
+    assert_eq!(pw(dav("GET", "/dav/docs/hello.txt")).header("If-None-Match", &etag).send().await.unwrap().status(), 304);
+    let r = pw(dav("HEAD", "/dav/docs/hello.txt")).send().await.unwrap();
+    assert_eq!((r.status().as_u16(), r.headers()["content-length"].to_str().unwrap()), (200, "12"));
+    let r = pw(dav("GET", "/dav/docs/")).send().await.unwrap();
+    assert!(r.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+    assert!(r.text().await.unwrap().contains("href=\"/dav/docs/hello.txt\""));
+
+    // Confinement: hidden files, traversal, symlinks out of the root, unknown roots.
+    for p in ["/dav/docs/.secret", "/dav/docs/%2e%2e/outside.txt", "/dav/docs/escape.txt", "/dav/nope/hello.txt", "/dav/docs/missing"] {
+        assert_eq!(pw(dav("GET", p)).send().await.unwrap().status(), 404, "{p}");
+    }
+
+    // Read-only: every change is refused, authenticated or not, and nothing changes.
+    for method in ["PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK", "POST"] {
+        let r = pw(dav(method, "/dav/docs/hello.txt")).body("changed").send().await.unwrap();
+        assert_eq!(r.status(), 405, "{method}");
+        assert_eq!(r.headers()["allow"], "OPTIONS, GET, HEAD, PROPFIND");
+    }
+    assert_eq!(std::fs::read(docs.join("hello.txt")).unwrap(), b"hello webdav");
+
+    // API tokens (any scope) as the Basic password or a bearer; revocation applies at once.
+    let tok = s.login().await;
+    let minted = s.post("/api/v1/auth/api-tokens", &tok, json!({"name": "dav", "scope": "read", "expires_in_days": 1})).await.json::<Value>().await.unwrap();
+    let pat = minted["token"].as_str().unwrap().to_string();
+    assert_eq!(dav("GET", "/dav/docs/hello.txt").basic_auth("x", Some(&pat)).send().await.unwrap().status(), 200);
+    assert_eq!(dav("GET", "/dav/docs/hello.txt").bearer_auth(&tok).send().await.unwrap().status(), 200);
+    let id = minted["info"]["id"].as_str().unwrap();
+    s.client.delete(format!("{}/api/v1/auth/api-tokens/{id}", s.base)).bearer_auth(&tok).send().await.unwrap();
+    assert_eq!(dav("GET", "/dav/docs/hello.txt").basic_auth("x", Some(&pat)).send().await.unwrap().status(), 401);
+
+    // A password change forgets the remembered password immediately.
+    let r = s.client.put(format!("{}/api/v1/auth/password", s.base)).bearer_auth(&tok).json(&json!({"current_password": "server-password", "new_password": "another-password"})).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(pw(dav("GET", "/dav/docs/hello.txt")).send().await.unwrap().status(), 401);
+    assert_eq!(dav("GET", "/dav/docs/hello.txt").basic_auth("u", Some("another-password")).send().await.unwrap().status(), 200);
+
+    // --dav-allowed-cidrs narrows who may use WebDAV.
+    let narrowed = start(
+        ServerConfig { dav_roots: vec![docs.clone()], dav_allowed_clients: ufop_core::netacl::IpAllowlist::parse(&["10.0.0.0/8".to_string()]).unwrap(), ..Default::default() },
+        None,
+    )
+    .await;
+    assert_eq!(narrowed.client.get(format!("{}/dav/docs/hello.txt", narrowed.base)).basic_auth("u", Some("server-password")).send().await.unwrap().status(), 403);
+    assert_eq!(narrowed.client.get(format!("{}/api/v1/health", narrowed.base)).send().await.unwrap().status(), 200);
+}

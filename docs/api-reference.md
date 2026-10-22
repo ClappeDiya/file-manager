@@ -675,6 +675,15 @@ A test fails the build when a route is added without an OpenAPI entry (or an ent
 
 ---
 
+### WebDAV (read-only)
+
+Start the server with `--dav-root <folder>` (repeatable, or `UFOP_SERVER_DAV_ROOTS`) to serve folders read-only over WebDAV at `/dav/<folder name>/`; without it WebDAV is off. Any WebDAV client works (Windows *Map network drive*, macOS *Connect to Server*, rclone `webdav`, Cyberduck, `davfs2`):
+
+- **Methods:** `OPTIONS`, `PROPFIND` with `Depth: 0` or `1` (infinity is refused with `propfind-finite-depth`), `GET`/`HEAD` with single byte ranges, `ETag` and `If-None-Match`. `PUT`, `DELETE`, `MKCOL`, `COPY`, `MOVE`, `PROPPATCH`, `LOCK` and every other method get `405 Method Not Allowed`.
+- **Sign-in:** HTTP Basic with any user name and the server password or an API token (`ufop_pat_…`, any scope) as the password, or `Authorization: Bearer`. An accepted password is remembered for a minute; changing the password or resetting tokens forgets it, and a revoked API token stops working at once.
+- **Network:** `--allowed-cidrs` applies as everywhere; `--dav-allowed-cidrs` (or `UFOP_SERVER_DAV_ALLOWED_CIDRS`) restricts WebDAV further. Basic sends the password with every request, so use `--https` or a TLS reverse proxy when the server is reachable from other machines (the server warns otherwise).
+- **Confinement:** paths are resolved after following symlinks and must stay inside the folder; dot-files and links pointing outside are neither listed nor served.
+
 ## Tauri IPC Commands
 
 The desktop application uses Tauri IPC for communication between the frontend (React/TypeScript) and backend (Rust). These are not REST endpoints but are documented here for extension developers.

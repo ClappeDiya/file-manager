@@ -73,6 +73,12 @@ struct Args {
     /// Folder whose files and subfolders may be shared by link (repeat or comma-separate; default: sharing off)
     #[arg(long = "share-root", env = "UFOP_SERVER_SHARE_ROOTS", value_delimiter = ',')]
     share_roots: Vec<PathBuf>,
+    /// Folder served read-only over WebDAV at /dav/<folder name>/ (repeat or comma-separate; default: WebDAV off)
+    #[arg(long = "dav-root", env = "UFOP_SERVER_DAV_ROOTS", value_delimiter = ',')]
+    dav_roots: Vec<PathBuf>,
+    /// Client address ranges allowed to use WebDAV, on top of --allowed-cidrs (default: any)
+    #[arg(long, env = "UFOP_SERVER_DAV_ALLOWED_CIDRS", value_delimiter = ',')]
+    dav_allowed_cidrs: Vec<String>,
     #[arg(long, env = "UFOP_SERVER_PFX")]
     pfx: Option<PathBuf>,
     #[arg(long, env = "UFOP_SERVER_PFX_PASSWORD", default_value = "")]
@@ -359,7 +365,17 @@ async fn run(argv: Vec<String>) {
         hsts_include_subdomains: a.hsts_include_subdomains,
         allowed_clients: ufop_core::netacl::IpAllowlist::parse(&a.allowed_cidrs).unwrap_or_else(|e| fail(format!("--allowed-cidrs: {e}"))),
         share_roots: a.share_roots,
+        dav_roots: a.dav_roots,
+        dav_allowed_clients: ufop_core::netacl::IpAllowlist::parse(&a.dav_allowed_cidrs).unwrap_or_else(|e| fail(format!("--dav-allowed-cidrs: {e}"))),
     };
+    if !cfg.dav_roots.is_empty() {
+        let roots = ufop_core::confine::Roots::new(&cfg.dav_roots).unwrap_or_else(|e| fail(format!("--dav-root: {e}")));
+        let names: Vec<&str> = roots.list().iter().map(|r| r.name.as_str()).collect();
+        tracing::info!("WebDAV (read-only) at /dav/: {}", names.join(", "));
+        if matches!(cfg.tls, TlsMode::None) && !matches!(cfg.interface.as_str(), "loopback" | "") {
+            tracing::warn!("WebDAV is reachable over plain HTTP: passwords and tokens are sent unencrypted. Use --https or a TLS reverse proxy.");
+        }
+    }
     let st = ServerState { mgr, conns: Some(conns), auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent };
     if let Err(e) = server::serve(st).await {
         fail(e);
