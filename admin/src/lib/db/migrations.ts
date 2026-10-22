@@ -716,6 +716,16 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 33,
+    description: 'Read-only "view as" on sessions',
+    up(d) {
+      d.exec(`
+        ALTER TABLE sessions ADD COLUMN view_as_user_id TEXT;
+        ALTER TABLE sessions ADD COLUMN view_as_until TEXT;
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

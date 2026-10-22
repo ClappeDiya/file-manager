@@ -3,7 +3,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
   UserPlus, Upload, Download, Shield,
-  Mail, UserX, Trash2, Key, CalendarClock, HelpCircle,
+  Mail, UserX, Trash2, Key, CalendarClock, HelpCircle, Eye,
 } from 'lucide-react';
 import { PageHeader } from '@/components/layout/page-header';
 import { Button } from '@/components/ui/button';
@@ -27,7 +27,7 @@ import { ComingSoon } from '@/components/ui/coming-soon';
 import { ScimProvisioning } from '@/components/users/scim-provisioning';
 import { CsvImportDialog } from '@/components/users/csv-import-dialog';
 import { isEnabled } from '@/lib/features';
-import { api } from '@/lib/api-client';
+import { api, errorText } from '@/lib/api-client';
 import { MembershipExpiryDialog, RemoveMemberDialog, RemovedMembers } from '@/components/users/offboarding';
 import { ExplainAccessDialog } from '@/components/users/explain-access';
 import type { RemovedMember } from '@/lib/offboarding';
@@ -62,6 +62,8 @@ export default function UsersPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [importCsv, setImportCsv] = useState<string | null>(null);
   const _currentUser = useAuthStore((s) => s.user);
+  const canViewAs = useAuthStore((s) => s.checkPermission)('users.write');
+  const startViewAs = useAuthStore((s) => s.startViewAs);
   const notify = useToastStore((s) => s.notify);
 
   useEffect(() => {
@@ -350,6 +352,15 @@ export default function UsersPage() {
                         >
                           <HelpCircle size={14} className="text-foreground-secondary" />
                         </button>
+                        {canViewAs && user.id !== _currentUser?.id && user.isActive && (
+                          <button
+                            onClick={() => void startViewAs(user.id).then(() => notify(`Viewing the console as ${user.email} (read-only)`, 'success'), (e) => notify(errorText(e), 'error'))}
+                            className="p-1.5 rounded hover:bg-background-secondary"
+                            title="View as this member (read-only)"
+                          >
+                            <Eye size={14} className="text-foreground-secondary" />
+                          </button>
+                        )}
                         <button
                           onClick={() => setExpiring(user)}
                           className="p-1.5 rounded hover:bg-background-secondary"

@@ -18,6 +18,9 @@ export interface Session {
   expiresAt: string;
   revokedAt: string | null;
   revokedReason: string | null;
+  /** Viewing the console read-only as this user, until `viewAsUntil`. */
+  viewAsUserId: string | null;
+  viewAsUntil: string | null;
 }
 
 function fromRow(r: Row): Session {
@@ -33,6 +36,8 @@ function fromRow(r: Row): Session {
     expiresAt: r.expires_at as string,
     revokedAt: (r.revoked_at as string) ?? null,
     revokedReason: (r.revoked_reason as string) ?? null,
+    viewAsUserId: (r.view_as_user_id as string) ?? null,
+    viewAsUntil: (r.view_as_until as string) ?? null,
   };
 }
 
@@ -61,6 +66,15 @@ export function touchSession(s: Session, at = Date.now()): void {
 }
 
 /** The user re-authenticated in this session (step-up). */
+/** Start (or replace) viewing as `userId` until `until`. */
+export function startViewAs(id: string, userId: string, until: Date): void {
+  db().prepare('UPDATE sessions SET view_as_user_id = ?, view_as_until = ? WHERE id = ?').run(userId, until.toISOString(), id);
+}
+
+export function stopViewAs(id: string): void {
+  db().prepare('UPDATE sessions SET view_as_user_id = NULL, view_as_until = NULL WHERE id = ?').run(id);
+}
+
 export function markVerified(id: string, at = new Date()): void {
   db().prepare('UPDATE sessions SET verified_at = ? WHERE id = ?').run(at.toISOString(), id);
 }

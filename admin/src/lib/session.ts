@@ -16,7 +16,7 @@ import { getUser, type UserRecord } from './db/repos/users';
 import { accessibleOrgs, effectiveRole, getOrg } from './db/repos/orgs';
 import { getSecurity, needsSecondFactorSetup, sessionIdleMinutes } from './db/repos/security';
 import { clientIp, ipAllowed } from './netacl';
-import { createSession, getSession, revokeSession, touchSession } from './db/repos/sessions';
+import { createSession, getSession, revokeSession, stopViewAs, touchSession } from './db/repos/sessions';
 import { hasPasskeys } from './db/repos/passkeys';
 import { isBearerToken, peekApiToken, useApiToken } from './db/repos/api-tokens';
 import { logApiRequest } from './db/repos/api-log';
@@ -39,7 +39,12 @@ export interface AuthContext {
   tokenId: string | null;
   ip: string;
   userAgent: string;
+  /** Set while an administrator views the console as `user` (read-only). */
+  viewAs?: { actor: UserRecord; until: string } | null;
 }
+
+/** What may still be changed while viewing as someone: stopping, and signing out. */
+const VIEW_AS_WRITABLE = ['/api/view-as', '/api/auth/logout'];
 
 
 
@@ -119,7 +124,32 @@ export async function authenticate(req: NextRequest): Promise<AuthContext | Next
     if (admitted.reason === 'network') logRequest(req, 403, 'network not allowed', { orgId, tokenId: null, user, auth: 'session' });
     return admitted.denied;
   }
-  return { user, orgId, role: admitted.role, permissions: ROLE_PERMISSIONS[admitted.role] ?? [], amr, sid: session.id, verifiedAt: session.verifiedAt, tokenId: null, ip: admitted.ip, userAgent: req.headers.get('user-agent') ?? '' };
+  const ctx: AuthContext = { user, orgId, role: admitted.role, permissions: ROLE_PERMISSIONS[admitted.role] ?? [], amr, sid: session.id, verifiedAt: session.verifiedAt, tokenId: null, ip: admitted.ip, userAgent: req.headers.get('user-agent') ?? '' };
+  return session.viewAsUserId ? viewingAs(req, ctx, session) : ctx;
+}
+
+/**
+ * The context while an administrator views the console as another member:
+ * that member's identity and role, read permissions only, every change
+ * refused, and every request logged with the administrator's name. Ends by
+ * itself at `viewAsUntil`.
+ */
+function viewingAs(req: NextRequest, ctx: AuthContext, session: { id: string; viewAsUserId: string | null; viewAsUntil: string | null }): AuthContext | NextResponse {
+  const target = session.viewAsUserId ? getUser(session.viewAsUserId) : null;
+  const role = target?.isActive ? effectiveRole(target.id, ctx.orgId) : null;
+  if (!target || !role || !session.viewAsUntil || Date.parse(session.viewAsUntil) <= Date.now()) {
+    stopViewAs(session.id);
+    appendAudit({ orgId: ctx.orgId, userId: ctx.user.id, userEmail: ctx.user.email, userName: ctx.user.name, ipAddress: ctx.ip, userAgent: ctx.userAgent, eventType: 'user.view_as_end', description: `Stopped viewing as ${target?.email ?? 'a member'} (${!target || !role ? 'no longer a member' : 'time limit'})`, resourceType: 'user', resourceId: session.viewAsUserId ?? '' });
+    return ctx;
+  }
+  const path = req.nextUrl.pathname;
+  const writable = VIEW_AS_WRITABLE.some((p) => path === p || path.startsWith(`${p}/`));
+  logRequest(req, 200, `viewing as ${target.email}`, { orgId: ctx.orgId, tokenId: null, user: ctx.user, auth: 'session' });
+  if (!['GET', 'HEAD'].includes(req.method) && !writable) {
+    return NextResponse.json({ error: `Read-only: you are viewing the console as ${target.email}. Stop viewing as them to make changes.`, code: 'view_as_read_only' }, { status: 403 });
+  }
+  const permissions = (ROLE_PERMISSIONS[role] ?? []).filter((p) => p === 'admin.access' || p.endsWith('.read'));
+  return { ...ctx, user: target, role, permissions, viewAs: { actor: ctx.user, until: session.viewAsUntil } };
 }
 
 /**
@@ -241,11 +271,13 @@ export function canIn(ctx: AuthContext, orgId: string, p: Permission): boolean {
 }
 
 export function audit(ctx: AuthContext | null, e: AuditInput): void {
+  // While viewing as someone, the administrator is the one acting.
+  const who = ctx?.viewAs?.actor ?? ctx?.user;
   appendAudit({
     orgId: ctx?.orgId,
-    userId: ctx?.user.id,
-    userEmail: ctx?.user.email,
-    userName: ctx?.user.name,
+    userId: who?.id,
+    userEmail: who?.email,
+    userName: who?.name,
     ipAddress: ctx?.ip,
     userAgent: ctx?.userAgent,
     ...e,

@@ -5,6 +5,7 @@ import { useAuthStore } from '@/lib/stores/auth-store';
 import { useAdminStore } from '@/lib/stores/admin-store';
 import { Sidebar } from './sidebar';
 import { Header } from './header';
+import { ViewAsBanner } from './view-as-banner';
 import { Footer } from './footer';
 import { Toaster } from '@/components/ui/toaster';
 import { ReauthDialog } from '@/components/auth/reauth-dialog';
@@ -75,6 +76,7 @@ export function AdminShell({ children }: AdminShellProps) {
       </a>
       <Sidebar />
       <div className="flex flex-1 flex-col overflow-hidden">
+        <ViewAsBanner />
         <Header />
         <main id="admin-main" tabIndex={-1} className="flex-1 overflow-y-auto p-4 lg:p-6">
           {children}

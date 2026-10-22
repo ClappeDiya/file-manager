@@ -1,6 +1,7 @@
 'use client';
 
 import { create } from 'zustand';
+import { api } from '@/lib/api-client';
 import { persist } from 'zustand/middleware';
 import type { AdminUser, Permission, Role } from '../types/auth';
 import { hasPermission } from '../utils/permissions';
@@ -28,6 +29,8 @@ interface AuthState {
   permissions: Permission[] | null;
   organization: { id: string; name: string; path: string; status: string } | null;
   organizations: OrgSummary[];
+  /** Read-only "view as": the administrator really signed in, and until when. */
+  viewAs: { actor: { email: string; name: string }; until: string } | null;
   isAuthenticated: boolean;
   isLoading: boolean;
   isValidating: boolean;
@@ -42,6 +45,8 @@ interface AuthState {
   checkPermission: (permission: Permission) => boolean;
   setError: (error: string | null) => void;
   validateSession: () => Promise<void>;
+  startViewAs: (userId: string) => Promise<void>;
+  stopViewAs: () => Promise<void>;
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -51,6 +56,7 @@ export const useAuthStore = create<AuthState>()(
       permissions: null,
       organization: null,
       organizations: [],
+      viewAs: null,
       isAuthenticated: false,
       isLoading: false,
       isValidating: false,
@@ -130,6 +136,16 @@ export const useAuthStore = create<AuthState>()(
 
       setError: (error) => set({ error }),
 
+      startViewAs: async (userId) => {
+        await api('/api/view-as', { method: 'POST', body: { userId } });
+        await get().validateSession();
+      },
+
+      stopViewAs: async () => {
+        await api('/api/view-as', { method: 'DELETE' });
+        await get().validateSession();
+      },
+
       validateSession: async () => {
         set({ isValidating: true });
         try {
@@ -138,10 +154,10 @@ export const useAuthStore = create<AuthState>()(
             set({ user: null, permissions: null, isAuthenticated: false, isValidating: false });
             return;
           }
-          const { user, permissions, organization, organizations } = await response.json();
+          const { user, permissions, organization, organizations, viewAs } = await response.json();
           setDisplayTimeZone(user?.timeZone);
           followAccountLocale(user?.locale);
-          set({ user, permissions: permissions ?? null, organization: organization ?? null, organizations: organizations ?? [], isAuthenticated: true, isValidating: false });
+          set({ user, permissions: permissions ?? null, organization: organization ?? null, organizations: organizations ?? [], viewAs: viewAs ?? null, isAuthenticated: true, isValidating: false });
         } catch {
           set({ user: null, isAuthenticated: false, isValidating: false });
         }
