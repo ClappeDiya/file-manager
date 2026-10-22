@@ -26,12 +26,13 @@ import {
   Sparkles,
   Building2,
   UsersRound,
-  Fingerprint, SlidersHorizontal, Webhook, ShieldCheck, FileBarChart, Archive } from 'lucide-react';
+  Fingerprint, SlidersHorizontal, Webhook, ShieldCheck, FileBarChart, Archive, Palette } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 import { useAdminStore } from '@/lib/stores/admin-store';
 import { useAuthStore } from '@/lib/stores/auth-store';
 import type { Permission } from '@/lib/types/auth';
 import { useTranslate } from '@/lib/i18n';
+import { useBrandingStore } from '@/lib/stores/branding-store';
 
 interface NavItem {
   id: string;
@@ -71,10 +72,26 @@ const navItems: NavItem[] = [
   { id: 'sso', i18nKey: 'nav.sso', href: '/settings/sso', icon: Fingerprint, requiredPermission: 'sso.configure' },
   { id: 'security', i18nKey: 'nav.security', href: '/settings/security', icon: ShieldCheck, requiredPermission: 'users.read' },
   { id: 'retention', i18nKey: 'nav.retention', href: '/settings/retention', icon: Archive, requiredPermission: 'audit.read' },
+  { id: 'branding', i18nKey: 'nav.branding', href: '/settings/branding', icon: Palette, requiredPermission: 'orgs.write' },
 ];
+
+/** The organization's logo, else its initial on the brand color. */
+function BrandMark() {
+  const b = useBrandingStore((s) => s.branding);
+  if (b?.logo) {
+    return <img src={b.logo} alt={b.displayName} className="h-8 max-w-[8rem] object-contain" />;
+  }
+  return (
+    <div className="w-8 h-8 shrink-0 rounded-lg bg-primary flex items-center justify-center">
+      <span className="text-primary-foreground font-bold text-sm">{(b?.displayName || 'U').slice(0, 1).toUpperCase()}</span>
+    </div>
+  );
+}
 
 export function Sidebar() {
   const pathname = usePathname();
+  const branding = useBrandingStore((s) => s.branding);
+  const brandName = branding && branding.displayName !== 'UFOP' ? branding.displayName : null;
   const { sidebarCollapsed, toggleSidebar, sidebarMobileOpen, toggleMobileSidebar } = useAdminStore();
   const checkPermission = useAuthStore((s) => s.checkPermission);
   const t = useTranslate();
@@ -111,18 +128,12 @@ export function Sidebar() {
           sidebarCollapsed ? 'justify-center' : 'justify-between'
         )}>
           {!sidebarCollapsed && (
-            <Link href="/dashboard" className="flex items-center gap-2">
-              <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
-                <span className="text-primary-foreground font-bold text-sm">U</span>
-              </div>
-              <span className="font-semibold text-sidebar-text-active text-sm">UFOP Admin</span>
+            <Link href="/dashboard" className="flex items-center gap-2 min-w-0">
+              <BrandMark />
+              <span className="font-semibold text-sidebar-text-active text-sm truncate">{brandName ? brandName : 'UFOP Admin'}</span>
             </Link>
           )}
-          {sidebarCollapsed && (
-            <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
-              <span className="text-primary-foreground font-bold text-sm">U</span>
-            </div>
-          )}
+          {sidebarCollapsed && <BrandMark />}
         </div>
 
         {/* Navigation */}

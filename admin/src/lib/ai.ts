@@ -6,6 +6,7 @@
  * open alerts — no file paths beyond what reports already contain, and no
  * credentials. Each organization brings its own API key (sealed at rest).
  */
+import { effectiveBranding } from './branding';
 import crypto from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
 import { db, newId, now, parseJson, tx, type Row } from './db/index';
@@ -242,7 +243,7 @@ export async function runScheduledSummaries(at = new Date()): Promise<number> {
     db().prepare('UPDATE ai_settings SET last_run_at = ? WHERE org_id = ?').run(at.toISOString(), org.id);
     const r = await analyze(org.id, { kind: 'summary', days: s.schedule === 'daily' ? 1 : 7, by: 'scheduler' });
     n++;
-    if (r.content && s.channelIds.length) await deliverTo(org.id, s.channelIds, { subject: `[UFOP] ${s.schedule === 'daily' ? 'Daily' : 'Weekly'} backup summary — ${org.name}`, text: r.content, data: { event: 'ai_summary', reportId: r.id } });
+    if (r.content && s.channelIds.length) await deliverTo(org.id, s.channelIds, { subject: `[${effectiveBranding(org.id).displayName}] ${s.schedule === 'daily' ? 'Daily' : 'Weekly'} backup summary — ${org.name}`, text: r.content, data: { event: 'ai_summary', reportId: r.id } });
     appendAudit({ eventType: 'ai.summary', orgId: org.id, description: r.error ? `Scheduled AI summary failed: ${r.error}` : 'Scheduled AI summary created', resourceType: 'ai_report', resourceId: r.id, severity: r.error ? 'warning' : 'info' });
   }
   return n;

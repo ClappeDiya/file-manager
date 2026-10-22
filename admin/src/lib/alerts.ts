@@ -13,6 +13,7 @@
  * One open alert per (rule, machine, backup, kind); repeated triggers
  * re-notify only after the rule's cooldown.
  */
+import { renderTemplate } from './branding';
 import { getMachine, type Machine } from './db/repos/machines';
 import { listBackups, listReports, type StoredReport } from './db/repos/reports';
 import { insertAlert, listRules, mayNotify, openAlert, recordNotification, resolveAlert, type Alert, type AlertKind, type AlertRule } from './db/repos/alerts';
@@ -35,8 +36,15 @@ async function raise(rule: AlertRule, m: Machine, backupId: string, kind: AlertK
   const due = !existing || ((!existing.lastNotifiedAt || Date.now() - new Date(existing.lastNotifiedAt).getTime() >= rule.cooldownMinutes * 60_000) && mayNotify(existing));
   if (due && rule.channelIds.length) {
     const deliveries = await deliverTo(m.orgId, rule.channelIds, {
-      subject: `[UFOP] ${severity === 'critical' ? 'Critical' : 'Warning'}: ${message}`,
-      text: `${message}\n\nMachine: ${m.name}\nBackup: ${backupId}\nRule: ${rule.name}\nTime: ${new Date().toISOString()}\n${Object.entries(details).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\n')}`,
+      ...renderTemplate(m.orgId, 'alert', {
+        severity: severity === 'critical' ? 'Critical' : 'Warning',
+        message,
+        machine: m.name,
+        backup: backupId,
+        rule: rule.name,
+        time: new Date().toISOString(),
+        details: Object.entries(details).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\n'),
+      }),
       data: { event: 'alert', alertId: alert.id, kind, severity, machine: { id: m.id, name: m.name, tags: m.tags }, backupId, rule: { id: rule.id, name: rule.name }, details },
     });
     recordNotification(alert.id, deliveries);
@@ -50,7 +58,7 @@ async function resolve(rule: AlertRule, m: Machine, backupId: string, reason: st
   if (!a) return;
   resolveAlert(a.id);
   if (rule.params.notifyOnResolve && rule.channelIds.length) {
-    recordNotification(a.id, await deliverTo(m.orgId, rule.channelIds, { subject: `[UFOP] Resolved: ${a.message}`, text: `${a.message}\n\nResolved: ${reason}`, data: { event: 'alert_resolved', alertId: a.id, kind: a.kind } }));
+    recordNotification(a.id, await deliverTo(m.orgId, rule.channelIds, { ...renderTemplate(m.orgId, 'alert_resolved', { message: a.message, reason }), data: { event: 'alert_resolved', alertId: a.id, kind: a.kind } }));
   }
 }
 

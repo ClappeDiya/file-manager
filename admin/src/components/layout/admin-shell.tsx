@@ -9,6 +9,7 @@ import { Footer } from './footer';
 import { Toaster } from '@/components/ui/toaster';
 import { ReauthDialog } from '@/components/auth/reauth-dialog';
 import { useTranslate } from '@/lib/i18n';
+import { applyBrandColor, useBrandingStore } from '@/lib/stores/branding-store';
 
 interface AdminShellProps {
   children: React.ReactNode;
@@ -26,6 +27,14 @@ export function AdminShell({ children }: AdminShellProps) {
   useEffect(() => {
     void validateSession().finally(() => setCheckedOnce(true));
   }, [validateSession]);
+
+  // The organization's branding (reloaded when switching organization).
+  const orgId = useAuthStore((s) => s.user?.organizationId);
+  const loadBranding = useBrandingStore((s) => s.load);
+  useEffect(() => {
+    if (isAuthenticated && orgId) void loadBranding();
+    else applyBrandColor(null);
+  }, [isAuthenticated, orgId, loadBranding]);
 
   // Apply persisted theme as soon as the shell mounts so a reload no longer
   // resets back to the server-rendered default. When `theme === 'system'`

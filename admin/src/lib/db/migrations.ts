@@ -704,6 +704,18 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 32,
+    description: 'Organization branding and email templates',
+    up(d) {
+      d.exec(`
+        CREATE TABLE org_branding (
+          org_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+          settings TEXT NOT NULL, logo TEXT, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

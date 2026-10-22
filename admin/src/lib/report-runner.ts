@@ -6,6 +6,7 @@
  * channels: email gets the CSV attached (up to 1 MB) and a text table; chat
  * and webhooks get the summary and the run id.
  */
+import { effectiveBranding, renderTemplate } from './branding';
 import { db, newId, now, parseJson, type Row } from './db';
 import { OrgError, getOrg } from './db/repos/orgs';
 import { getChannel } from './db/repos/channels';
@@ -268,8 +269,11 @@ export async function runSchedule(s: ReportSchedule, by: string): Promise<Report
       s.orgId,
       s.channelIds,
       {
-        subject: `[UFOP] ${s.name} — ${org?.name ?? s.orgId}`,
-        text: `${renderReport(result, 'text')}${attach ? '' : `\n\nThe full report (${result.rows.length} rows) is too large to attach; download run ${run.id} from Reports.`}`,
+        ...renderTemplate(s.orgId, 'report', {
+          report: s.name,
+          organization: org?.name ?? s.orgId,
+          body: `${renderReport(result, 'text')}${attach ? '' : `\n\nThe full report (${result.rows.length} rows) is too large to attach; download run ${run.id} from Reports.`}`,
+        }),
         data: { event: 'report.run', reportId: def.id, runId: run.id, scheduleId: s.id, rows: result.rows.length, summary: result.summary },
         attachments: attach ? [{ filename: `${def.id}-${run.startedAt.slice(0, 10)}.${s.format}`, content: file, contentType: s.format === 'csv' ? 'text/csv' : 'application/json' }] : undefined,
       },
@@ -280,7 +284,7 @@ export async function runSchedule(s: ReportSchedule, by: string): Promise<Report
       s.orgId,
       s.channelIds,
       {
-        subject: `[UFOP] ${s.name} failed — ${org?.name ?? s.orgId}`,
+        subject: `[${effectiveBranding(s.orgId).displayName}] ${s.name} failed — ${org?.name ?? s.orgId}`,
         text: `The scheduled report could not be produced: ${run.error}`,
         data: { event: 'report.failed', reportId: def.id, runId: run.id, scheduleId: s.id },
       },

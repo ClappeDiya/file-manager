@@ -8,6 +8,7 @@ import crypto from 'crypto';
 import nodemailer from 'nodemailer';
 import { channelSecret, getChannel, listChannels, markDelivery, type Channel, type EmailConfig, type WebhookConfig } from './db/repos/channels';
 import { addToOutbox, dueOutbox, getOutboxEntry, recordOutboxAttempt } from './db/repos/outbox';
+import { brandedEmail, effectiveBranding, renderTemplate } from './branding';
 
 export interface Message {
   subject: string;
@@ -26,6 +27,12 @@ export interface Delivery {
   error?: string;
 }
 
+/** `"Name" <addr>` unless the configured From already has a name. */
+export function fromWithName(from: string, name: string): string {
+  if (!name || /<[^>]+>/.test(from)) return from;
+  return `"${name.replace(/["\\\r\n]/g, '')}" <${from}>`;
+}
+
 async function sendEmail(ch: Channel, m: Message): Promise<void> {
   const c = ch.config as EmailConfig;
   const password = channelSecret(ch.id);
@@ -42,7 +49,14 @@ async function sendEmail(ch: Channel, m: Message): Promise<void> {
   });
   const to = m.to ?? c.to;
   if (!to.length) throw new Error('No recipients');
-  await transport.sendMail({ from: c.from, to, subject: m.subject, text: m.text, attachments: m.attachments?.map((a) => ({ filename: a.filename, content: a.content, contentType: a.contentType })) });
+  const attachments = m.attachments?.map((a) => ({ filename: a.filename, content: a.content, contentType: a.contentType })) ?? [];
+  // Branded organizations get an HTML version (logo inline) and their footer and sender name.
+  if (effectiveBranding(ch.orgId).sourceOrgId) {
+    const b = brandedEmail(ch.orgId, m.subject, m.text);
+    await transport.sendMail({ from: fromWithName(c.from, b.fromName), to, subject: m.subject, text: b.text, html: b.html, attachments: [...attachments, ...b.attachments] });
+    return;
+  }
+  await transport.sendMail({ from: c.from, to, subject: m.subject, text: m.text, attachments });
 }
 
 async function postJson(url: string, body: string, headers: Record<string, string>): Promise<void> {
@@ -169,15 +183,7 @@ function accountMailChannel(orgIds: string[]): Channel | undefined {
 export async function sendPasswordResetEmail(orgIds: string[], to: string, link: string): Promise<{ sent: boolean; error?: string }> {
   const ch = accountMailChannel(orgIds);
   if (!ch) return { sent: false };
-  const d = await sendQueued(
-    ch,
-    {
-      to: [to],
-      subject: 'Reset your UFOP console password',
-      text: `Someone asked to reset the password of ${to} for the UFOP backup console.\n\nOpen this link within an hour to choose a new password:\n${link}\n\nIf this was not you, ignore this email; your password stays the same.`,
-    },
-    'password_reset',
-  );
+  const d = await sendQueued(ch, { to: [to], ...renderTemplate(ch.orgId, 'password_reset', { email: to, link }) }, 'password_reset');
   return { sent: d.ok, error: d.error };
 }
 
@@ -185,14 +191,6 @@ export async function sendPasswordResetEmail(orgIds: string[], to: string, link:
 export async function sendInvitationEmail(orgId: string, to: string, link: string, inviter: string): Promise<{ sent: boolean; error?: string }> {
   const ch = accountMailChannel([orgId]);
   if (!ch) return { sent: false };
-  const d = await sendQueued(
-    ch,
-    {
-      to: [to],
-      subject: 'You are invited to the UFOP backup console',
-      text: `${inviter} invited you to the UFOP backup console.\n\nOpen this link within 7 days to accept:\n${link}\n\nIf you did not expect this, ignore this email.`,
-    },
-    'invitation',
-  );
+  const d = await sendQueued(ch, { to: [to], ...renderTemplate(orgId, 'invitation', { inviter, link, email: to }) }, 'invitation');
   return { sent: d.ok, error: d.error };
 }
