@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { badRequest, isContext, requirePermission } from '@/lib/session';
-import { deleteExport, getExport } from '@/lib/exports';
+import { badRequest, isContext, requirePermission, type AuthContext } from '@/lib/session';
+import { deleteExport, getExport, type ExportJob } from '@/lib/exports';
 
 type P = { params: Promise<{ id: string }> };
 
 /** Exports are visible to the person who requested them. */
-async function own(request: NextRequest, id: string) {
+async function own(request: NextRequest, id: string): Promise<{ res: NextResponse } | { ctx: AuthContext; job: ExportJob }> {
   const ctx = await requirePermission(request);
   if (!isContext(ctx)) return { res: ctx };
   const job = getExport(ctx.orgId, id);
