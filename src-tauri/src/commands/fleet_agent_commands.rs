@@ -8,7 +8,7 @@ use crate::fleet_agent::loopback::{self, Loopback};
 use serde::Serialize;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
-use ufop_core::agent::{parse_tags, AgentStatus, ClaimPollResult, ClaimStatus};
+use ufop_core::agent::{parse_tags, AgentLimits, AgentStatus, ClaimPollResult, ClaimStatus};
 
 /// How long the browser sign-in may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -115,4 +115,16 @@ pub async fn fleet_agent_set_enabled(agent: State<'_, FleetAgent>, enabled: bool
 #[tauri::command]
 pub async fn fleet_agent_sync_now(agent: State<'_, FleetAgent>) -> Result<AgentStatus, AppError> {
     agent.sync_now().await
+}
+
+/// What this machine allows the console to do (set only from this machine).
+#[tauri::command]
+pub async fn fleet_agent_get_limits(agent: State<'_, FleetAgent>) -> Result<AgentLimits, AppError> {
+    Ok(agent.host().limits().await)
+}
+
+#[tauri::command]
+pub async fn fleet_agent_set_limits(agent: State<'_, FleetAgent>, limits: AgentLimits) -> Result<AgentLimits, AppError> {
+    agent.host().set_limits(&limits).await?;
+    Ok(agent.host().limits().await)
 }

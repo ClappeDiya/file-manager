@@ -10,12 +10,14 @@
 //! jobs and forwards run reports, queueing them while offline.
 
 #[doc(hidden)]
+pub mod limits;
 pub mod managed;
 pub mod mock;
 pub mod policy;
 pub mod protocol;
 pub mod runner;
 
+pub use limits::{AgentLimits, SymlinkPolicy};
 pub use managed::*;
 pub use protocol::*;
 pub use runner::*;

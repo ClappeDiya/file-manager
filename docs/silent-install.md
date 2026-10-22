@@ -97,7 +97,27 @@ page shows how many desktops applied the current version; failures appear in
 the audit log as `policy.apply_failed`. *Stop managing* gives every setting
 back to the users, as does unregistering a machine.
 
-## 4. Verify
+## 4. Limits the machine sets on the console
+
+The person (or IT image) controlling a machine can limit what the console may
+do there, under Settings → Managed by Console → *What the console may do on
+this machine*. These limits are local: the console cannot see or change them.
+
+- **Allowed folders**: job sources, local destinations and restore targets
+  sent by the console must be inside one of them (empty = anywhere).
+- **Symbolic links**: by default a path must really point inside an allowed
+  folder (links are resolved); *Judge the path as written* skips that.
+- **Read-only**: the console can view jobs and run backups and checks, but
+  cannot save or delete jobs, change defaults, restore files or delete backup
+  data. Fleet policies are reported as failed on such machines.
+- **Scripts**: untick to refuse jobs from the console that carry pre/post
+  scripts (commands that would run on this machine).
+
+Refused calls fail with a clear reason in the console's command history and
+policy status; nothing is changed on the machine. If the saved limits cannot
+be read, the agent refuses all changes until they are saved again.
+
+## 5. Verify
 
 - The machine appears under **Machines** with the link's tags.
 - Settings → Managed by Console on the machine shows the console, the

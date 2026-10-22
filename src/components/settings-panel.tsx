@@ -23,6 +23,7 @@ import { ProxySection } from "@/components/proxy-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
 import { DiagnosticsSection } from "@/components/diagnostics-section";
 import { ManagedSettingsNotice } from "@/components/managed-settings-notice";
+import { FleetAgentLimits } from "@/components/fleet-agent-limits";
 
 // ── Types ──
 
@@ -1335,6 +1336,7 @@ export default function SettingsPanel({
         <Section title="Managed by Console">
           <FleetAgentSection />
           <ManagedSettingsNotice />
+          <FleetAgentLimits />
         </Section>
 
         {/* Tamper-evident security audit log */}

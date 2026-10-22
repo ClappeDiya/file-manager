@@ -649,6 +649,8 @@ pub fn run() {
             fleet_agent_commands::fleet_agent_connect_start,
             fleet_agent_commands::fleet_agent_connect_finish,
             fleet_agent_commands::fleet_agent_connect_cancel,
+            fleet_agent_commands::fleet_agent_get_limits,
+            fleet_agent_commands::fleet_agent_set_limits,
             fleet_agent_commands::fleet_agent_poll_claim,
             fleet_agent_commands::fleet_agent_cancel_claim,
             fleet_agent_commands::fleet_agent_unregister,
