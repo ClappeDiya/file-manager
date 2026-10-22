@@ -7,6 +7,8 @@
 pub mod backup;
 #[cfg(feature = "agent")]
 pub mod agent;
+#[cfg(feature = "doctext")]
+pub mod doctext;
 pub mod error;
 pub mod fsutil;
 pub mod gpg;

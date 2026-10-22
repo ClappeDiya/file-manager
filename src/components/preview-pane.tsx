@@ -21,6 +21,7 @@ import { tauriInvoke } from "@/hooks/use-tauri";
 import { errorText } from "@/lib/error-text";
 import { structuredKind } from "@/lib/structured-preview";
 import { StructuredPreview } from "@/components/structured-preview";
+import { OfficePreview } from "@/components/office-preview";
 
 // ── Types ──
 
@@ -702,6 +703,9 @@ function PreviewContent({ preview, exif: _exif }: { preview: PreviewResult; exif
           <p className="text-sm text-text-tertiary">{preview.file_name}</p>
         </div>
       );
+
+    case "office":
+      return <OfficePreview path={preview.path} fileName={preview.file_name} text={preview.content} />;
 
     case "archive":
       return (

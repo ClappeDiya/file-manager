@@ -5,6 +5,8 @@
 //! bounded: when it grows past its byte budget the least recently used
 //! files (by access stamp, refreshed on every hit) are removed.
 
+pub mod office;
+
 use crate::core::error::AppError;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};

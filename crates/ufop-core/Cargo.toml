@@ -16,6 +16,8 @@ backup = ["sqlite", "dep:windows", "dep:aes-gcm", "dep:argon2", "dep:flate2", "d
 # Fleet agent: client side of the admin console's `/api/agent/*` protocol
 # (registration, claiming, heartbeats, commands, policies, reports).
 agent = ["dep:reqwest", "dep:tokio", "dep:base64"]
+# Text from office documents (docx/xlsx/pptx, OpenDocument, RTF) for previews and search.
+doctext = ["dep:zip"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

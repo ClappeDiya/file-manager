@@ -241,6 +241,17 @@ const SMART_OPEN_PREVIEW_EXT = [
   ".mov",
   ".webm",
   ".avi",
+  // Office documents (text at once, rendered page via the OS or LibreOffice)
+  ".docx",
+  ".doc",
+  ".xlsx",
+  ".xls",
+  ".pptx",
+  ".ppt",
+  ".odt",
+  ".ods",
+  ".odp",
+  ".rtf",
 ] as const;
 
 function isArchivePath(path: string): boolean {

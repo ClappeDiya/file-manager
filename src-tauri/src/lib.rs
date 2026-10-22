@@ -83,6 +83,7 @@ struct AppState {
     metadata_store: metadata_engine::MetadataStore,
     search_manager: search_engine::SearchManager,
     thumbnails: std::sync::Arc<thumbnail_engine::ThumbnailCache>,
+    office_renderer: std::sync::Arc<thumbnail_engine::office::OfficeRenderer>,
     credential_store: std::sync::Arc<CredentialStore>,
 }
 
@@ -297,6 +298,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         metadata_store: metadata_engine::MetadataStore::new(repo_for_metadata),
         search_manager: search_engine::SearchManager::open_default(),
         thumbnails: std::sync::Arc::new(thumbnail_engine::ThumbnailCache::open_default()),
+        office_renderer: std::sync::Arc::new(thumbnail_engine::office::OfficeRenderer::open_default()),
         credential_store: credential_store.clone(),
     })
 }
@@ -422,6 +424,7 @@ pub fn run() {
                         search_engine::SearchIndex::open_in_memory().expect("in-memory SQLite"),
                     ),
                     thumbnails: std::sync::Arc::new(thumbnail_engine::ThumbnailCache::open_default()),
+                    office_renderer: std::sync::Arc::new(thumbnail_engine::office::OfficeRenderer::open_default()),
                     credential_store: credential_store.clone(),
                     repo,
                     transfer_mgr,
@@ -538,6 +541,7 @@ pub fn run() {
         .manage(app_state.metadata_store)
         .manage(app_state.search_manager)
         .manage(app_state.thumbnails)
+        .manage(app_state.office_renderer)
         .manage(app_state.credential_store)
         .invoke_handler(tauri::generate_handler![
             // Security audit log (tamper-evident, append-only)
@@ -905,6 +909,7 @@ pub fn run() {
             batch_rename_commands::naming_preview,
             // Preview Engine (T-061)
             preview_commands::preview_file,
+            preview_commands::preview_office_render,
             preview_commands::preview_get_exif,
             // Archive Tools (T-062)
             archive_commands::archive_browse,

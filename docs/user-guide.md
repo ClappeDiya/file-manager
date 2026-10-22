@@ -383,7 +383,8 @@ The preview pane (toggled from the toolbar or View menu) renders:
 - **Images** - Inline preview with EXIF metadata display
 - **Text Files** - Syntax-highlighted content preview
 - **Audio/Video** - Playback controls
-- **Documents** - Rendered preview where supported
+- **PDF** - Rendered in place
+- **Office documents** (Word, Excel, PowerPoint, OpenDocument, RTF; legacy `.doc`/`.xls`/`.ppt`) - The document's text appears at once (spreadsheets as rows of cells, presentations slide by slide); the page itself is rendered by Quick Look on macOS or by LibreOffice when it is installed (any platform; set `UFOP_SOFFICE` to point at a non-standard install), then shown as a PDF with *Page* / *Text* tabs. Renders are cached until the file changes. Without a renderer the text stays, with *Open in default app*.
 
 ---
 
