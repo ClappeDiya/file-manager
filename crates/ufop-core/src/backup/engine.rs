@@ -22,7 +22,7 @@ use super::snapshot::SnapshotPolicy;
 use crate::error::AppError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -543,9 +543,17 @@ struct Scanner<'f> {
     seen_inodes: HashSet<(u64, u64)>,
     out: Vec<(PathBuf, FileEntry)>,
     warnings: Vec<String>,
+    /// Folder for generated files (Photos `albums.json`) that the backup
+    /// reads; `None` for previews, where nothing is read.
+    staging: Option<&'f Path>,
+    staged: usize,
 }
 
-impl Scanner<'_> {
+impl<'f> Scanner<'f> {
+    fn new(filter: &'f SourceFilter, opts: &'f BackupOptions, snap: Option<&'f super::snapshot::Snapshot>, staging: Option<&'f Path>) -> Self {
+        Scanner { filter, opts, snap, seen_inodes: HashSet::new(), out: Vec::new(), warnings: Vec::new(), staging, staged: 0 }
+    }
+
     fn real(&self, path: &Path) -> PathBuf {
         self.snap.map(|s| s.real(path)).unwrap_or_else(|| path.to_path_buf())
     }
@@ -662,6 +670,80 @@ impl Scanner<'_> {
         }
     }
 
+    /// Expand a Photos library into its originals (under stable logical
+    /// paths), the folders above them and the `albums.json` metadata file.
+    fn photos(&mut self, library: &Path) -> Result<(), AppError> {
+        if check_sources(std::slice::from_ref(&library.to_path_buf()), self.opts, &mut self.warnings)?.is_empty() {
+            return Ok(());
+        }
+        let export = super::photos::export(library, &self.opts.photos, &self.opts.temp_root())?;
+        self.warnings.extend(export.warnings.iter().cloned());
+        let root = export.root.clone();
+        let library_md = std::fs::metadata(library)?;
+        let skip_meta = self.opts.skip_metadata;
+        let file_entry = |path: &Path, kind: EntryKind, size: u64, md: Option<&std::fs::Metadata>| FileEntry {
+            path: path.to_string_lossy().into_owned(),
+            kind,
+            size,
+            mtime: md.filter(|_| !skip_meta).and_then(mtime_of),
+            mode: md.filter(|_| !skip_meta).and_then(mode_of),
+            hash: None,
+            blocks: Vec::new(),
+            symlink_target: None,
+            meta: None,
+        };
+        // Folder filters apply to the logical folders, as in a normal walk.
+        let mut dir_ok: HashMap<PathBuf, bool> = HashMap::new();
+        let mut files: Vec<(PathBuf, FileEntry)> = Vec::new();
+        for item in &export.items {
+            let blocked = item
+                .logical
+                .ancestors()
+                .skip(1)
+                .take_while(|a| a.starts_with(&root))
+                .any(|d| !*dir_ok.entry(d.to_path_buf()).or_insert_with(|| self.filter.accepts(d, &library_md)));
+            if blocked {
+                continue;
+            }
+            let md = match std::fs::metadata(&item.original) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.warnings.push(format!("Cannot read {}: {e}", item.original.display()));
+                    continue;
+                }
+            };
+            if !self.filter.accepts(&item.logical, &md) {
+                continue;
+            }
+            files.push((item.original.clone(), file_entry(&item.logical, EntryKind::File, md.len(), Some(&md))));
+        }
+        // Metadata file: regenerated every run, so no timestamp (identical
+        // content then means an identical entry and no spurious version).
+        let manifest = export.manifest_path();
+        let local = match self.staging {
+            Some(dir) => {
+                self.staged += 1;
+                let d = dir.join(self.staged.to_string());
+                std::fs::create_dir_all(&d)?;
+                let p = d.join(super::photos::MANIFEST_NAME);
+                std::fs::write(&p, &export.manifest)?;
+                p
+            }
+            None => manifest.clone(),
+        };
+        files.push((local, file_entry(&manifest, EntryKind::File, export.manifest.len() as u64, None)));
+        let dirs: BTreeSet<PathBuf> = files
+            .iter()
+            .flat_map(|(_, e)| Path::new(&e.path).ancestors().skip(1).take_while(|a| a.starts_with(&root)).map(Path::to_path_buf).collect::<Vec<_>>())
+            .collect();
+        for d in dirs {
+            let e = file_entry(&d, EntryKind::Dir, 0, None);
+            self.out.push((d, e));
+        }
+        self.out.extend(files);
+        Ok(())
+    }
+
     fn walk(&mut self, path: &Path, depth: usize) {
         if depth > 256 {
             self.warnings.push(format!("Skipping {}: directory nesting too deep", path.display()));
@@ -700,20 +782,71 @@ fn check_sources<'a>(sources: &'a [PathBuf], opts: &BackupOptions, warnings: &mu
     Ok(ok)
 }
 
+/// Split job sources into ordinary paths and `photos://` library paths.
+fn split_sources(sources: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut plain = Vec::new();
+    let mut libraries = Vec::new();
+    for s in sources {
+        match super::photos::parse_source(&s.to_string_lossy()) {
+            Some(lib) => libraries.push(lib),
+            None => plain.push(s.clone()),
+        }
+    }
+    (plain, libraries)
+}
+
+/// Temporary folder for generated source files, removed on drop.
+struct Staging(Option<PathBuf>);
+
+impl Staging {
+    fn new(needed: bool, opts: &BackupOptions) -> Result<Self, AppError> {
+        if !needed {
+            return Ok(Self(None));
+        }
+        let d = opts.temp_root().join(format!("ufop-staging-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&d)?;
+        Ok(Self(Some(d)))
+    }
+    fn path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if let Some(d) = &self.0 {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
 fn drop_empty_dirs(out: &mut Vec<(PathBuf, FileEntry)>) {
     let file_paths: Vec<PathBuf> = out.iter().filter(|(_, e)| e.kind != EntryKind::Dir).map(|(p, _)| p.clone()).collect();
     out.retain(|(p, e)| e.kind != EntryKind::Dir || file_paths.iter().any(|f| f.starts_with(p) && f != p));
 }
 
 /// Enumerate the selected source entries (also used for dry-run previews).
+///
+/// Photos library sources are expanded, but their `albums.json` is not
+/// written anywhere: its entry's local path is the logical one.
 pub fn scan_sources(sources: &[PathBuf], filter: &SourceFilter, opts: &BackupOptions) -> Result<ScanResult, AppError> {
-    scan_sources_in(sources, filter, opts, None)
+    scan_sources_in(sources, filter, opts, None, None)
 }
 
-fn scan_sources_in(sources: &[PathBuf], filter: &SourceFilter, opts: &BackupOptions, snap: Option<&super::snapshot::Snapshot>) -> Result<ScanResult, AppError> {
-    let mut s = Scanner { filter, opts, snap, seen_inodes: HashSet::new(), out: Vec::new(), warnings: Vec::new() };
-    for src in check_sources(sources, opts, &mut s.warnings)? {
+fn scan_sources_in(
+    sources: &[PathBuf],
+    filter: &SourceFilter,
+    opts: &BackupOptions,
+    snap: Option<&super::snapshot::Snapshot>,
+    staging: Option<&Path>,
+) -> Result<ScanResult, AppError> {
+    let (plain, libraries) = split_sources(sources);
+    let mut s = Scanner::new(filter, opts, snap, staging);
+    for src in check_sources(&plain, opts, &mut s.warnings)? {
         s.walk(src, 0);
+    }
+    for lib in &libraries {
+        s.photos(lib)?;
     }
     let mut out = s.out;
     if filter.exclude_empty_folders {
@@ -734,7 +867,7 @@ pub fn scan_incremental(
     filter: &SourceFilter,
     opts: &BackupOptions,
 ) -> Result<(ScanResult, u64), AppError> {
-    scan_incremental_in(sources, prev, changed, shallow, deleted, filter, opts, None)
+    scan_incremental_in(sources, prev, changed, shallow, deleted, filter, opts, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -747,20 +880,30 @@ fn scan_incremental_in(
     filter: &SourceFilter,
     opts: &BackupOptions,
     snap: Option<&super::snapshot::Snapshot>,
+    staging: Option<&Path>,
 ) -> Result<(ScanResult, u64), AppError> {
-    let mut s = Scanner { filter, opts, snap, seen_inodes: HashSet::new(), out: Vec::new(), warnings: Vec::new() };
-    let roots = check_sources(sources, opts, &mut s.warnings)?;
+    let (plain, libraries) = split_sources(sources);
+    let mut s = Scanner::new(filter, opts, snap, staging);
+    let roots = check_sources(&plain, opts, &mut s.warnings)?;
     let in_sources = |p: &Path| roots.iter().any(|r| p.starts_with(r));
     let changed: Vec<PathBuf> = changed.iter().map(PathBuf::from).filter(|p| in_sources(p)).collect();
     let shallow: Vec<PathBuf> = shallow.iter().map(PathBuf::from).filter(|p| in_sources(p)).collect();
     let deleted: Vec<PathBuf> = deleted.iter().map(PathBuf::from).collect();
+    // Photos libraries have no change list: they are always re-expanded
+    // (cheap: unchanged originals are recognised by size and timestamp).
+    let photo_roots: Vec<PathBuf> = libraries.iter().map(|l| super::photos::export_root(l)).collect();
+    for lib in &libraries {
+        s.photos(lib)?;
+    }
 
     // Keep previous entries outside the rescanned areas.
     let mut kept: Vec<(PathBuf, FileEntry)> = prev
         .iter()
         .filter(|e| {
             let p = Path::new(&e.path);
-            !changed.iter().chain(deleted.iter()).any(|c| p.starts_with(c)) && !shallow.iter().any(|d| p.parent() == Some(d.as_path()))
+            !changed.iter().chain(deleted.iter()).any(|c| p.starts_with(c))
+                && !shallow.iter().any(|d| p.parent() == Some(d.as_path()))
+                && !photo_roots.iter().any(|r| p.starts_with(r))
         })
         .map(|e| (PathBuf::from(&e.path), e.clone()))
         .collect();
@@ -1007,7 +1150,7 @@ pub fn run_backup_with_cipher(
     let mut changed: Option<Vec<String>> = opts.changed_paths.clone();
     if opts.usn_policy != UsnPolicy::Off && changed.is_none() && !prev_list.is_empty() {
         let state: super::usn::UsnState = db.get_kv(USN_KEY)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let srcs: Vec<String> = sources.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let srcs: Vec<String> = split_sources(sources).0.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         match super::usn::changes(&srcs, &state) {
             Ok(c) if c.full_scan_volumes.is_empty() => {
                 shallow = c.changed_dirs;
@@ -1031,7 +1174,7 @@ pub fn run_backup_with_cipher(
     // ── Snapshot (VSS / LVM / APFS) ──
     let mut snapshot: Option<super::snapshot::Snapshot> = None;
     if opts.snapshot_policy != SnapshotPolicy::Off && !opts.dry_run {
-        let live: Vec<PathBuf> = sources.iter().filter(|p| p.exists()).cloned().collect();
+        let live: Vec<PathBuf> = split_sources(sources).0.into_iter().filter(|p| p.exists()).collect();
         match super::snapshot::create(&live, &opts.snapshot) {
             Ok(s) => {
                 report.snapshot = Some(s.method.clone());
@@ -1045,13 +1188,15 @@ pub fn run_backup_with_cipher(
         }
     }
     let snap = snapshot.as_ref();
+    // Generated source files (Photos albums.json) live here until the run ends.
+    let staging = Staging::new(!split_sources(sources).1.is_empty(), opts)?;
     let (mut entries, warnings) = match (&changed, prev_list.is_empty()) {
         (Some(c), false) => {
-            let (r, n) = scan_incremental_in(sources, &prev_list, c, &shallow, &opts.deleted_paths, filter, opts, snap)?;
+            let (r, n) = scan_incremental_in(sources, &prev_list, c, &shallow, &opts.deleted_paths, filter, opts, snap, staging.path())?;
             report.rescanned_paths = n;
             r
         }
-        _ => scan_sources_in(sources, filter, opts, snap)?,
+        _ => scan_sources_in(sources, filter, opts, snap, staging.path())?,
     };
     report.warnings.extend(warnings);
     if entries.iter().all(|(_, e)| e.kind == EntryKind::Dir) && !opts.allow_empty_source {
@@ -1778,5 +1923,137 @@ mod tests {
         assert!(files.iter().any(|f| f.path == src.path().join("doc.txt").to_string_lossy()), "original path recorded");
         restore_all(&be, &db, &o, None, out.path());
         assert_eq!(std::fs::read(walkdir_file(out.path(), "doc.txt")).unwrap(), b"frozen snapshot copy");
+    }
+
+    fn photos_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+        use crate::backup::photos::fixture::{cd, library, Asset};
+        let modern = [
+            Asset { pk: 1, uuid: "AAAA1111-X", dir: "A", file: "AAAA1111-X.jpeg", original: Some("IMG_0001.JPG"), created: Some(cd(2023, 3, 14)), favorite: true, content: Some(b"first photo"), ..Default::default() },
+            Asset { pk: 2, uuid: "BBBB2222-X", dir: "B", file: "BBBB2222-X.jpeg", original: Some("IMG_0001.JPG"), created: Some(cd(2023, 3, 20)), content: Some(b"same name, other photo"), ..Default::default() },
+            Asset { pk: 3, uuid: "CCCC3333-X", dir: "C", file: "CCCC3333-X.mov", original: Some("Clip.MOV"), created: Some(cd(2024, 8, 1)), kind: 1, content: Some(b"video bytes"), ..Default::default() },
+            Asset { pk: 4, uuid: "DDDD4444-X", dir: "D", file: "DDDD4444-X.jpeg", original: Some("deleted.jpg"), created: Some(cd(2024, 1, 1)), trashed: true, content: Some(b"in the trash"), ..Default::default() },
+            Asset { pk: 5, uuid: "EEEE5555-X", dir: "E", file: "EEEE5555-X.jpeg", original: Some("secret.jpg"), created: Some(cd(2024, 1, 2)), hidden: true, content: Some(b"hidden photo"), ..Default::default() },
+            Asset { pk: 6, uuid: "FFFF6666-X", dir: "F", file: "FFFF6666-X.jpeg", original: Some("icloud.jpg"), created: Some(cd(2024, 1, 3)), content: None, ..Default::default() },
+        ];
+        let lib = library(dir, "Photos Library", false, &modern, &[(20, "Trip", 2, false, &[1, 2, 6]), (21, "Family", 2, false, &[3, 5])]);
+        let legacy = [Asset { pk: 1, uuid: "LEG-1", dir: "2016/07/04/20160704-101010", file: "IMG_0100.JPG", original: Some("IMG_0100.JPG"), created: Some(cd(2016, 7, 4)), content: Some(b"from Masters"), ..Default::default() }];
+        let old = library(dir, "Old Library", true, &legacy, &[(7, "Summer", 2, false, &[1])]);
+        (lib, old)
+    }
+
+    fn leftovers(tmp: &Path) -> Vec<String> {
+        std::fs::read_dir(tmp)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.starts_with("ufop-photos-") || n.starts_with("ufop-staging-"))
+            .collect()
+    }
+
+    #[test]
+    fn photos_library_backup_and_restore() {
+        use crate::backup::photos::{source_uri, Manifest};
+        let pics = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let (lib, old) = photos_fixture(pics.path());
+        let sources: Vec<PathBuf> = vec![source_uri(&lib).into(), source_uri(&old).into()];
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        let o = BackupOptions { temp_dir: Some(tmp.path().to_string_lossy().into_owned()), quota_disable: true, ..opts() };
+        let run = |o: &BackupOptions| run_backup(&be, &db, &sources, &SourceFilter::default(), o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+
+        let r = run(&o);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.files_added, 6, "3 modern + 1 legacy original + 2 albums.json (hidden, trashed and missing left out)");
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("icloud.jpg"), "{}", r.warnings[0]);
+        assert!(leftovers(tmp.path()).is_empty(), "temporary database copies and staging removed");
+
+        let root = pics.path().join("Photos Library (Photos export)");
+        let files = db.files(db.filesets().unwrap()[0].id).unwrap();
+        let has = |p: PathBuf| files.iter().any(|f| f.path == p.to_string_lossy());
+        assert!(has(root.join("Photos/2023/03/IMG_0001.JPG")));
+        assert!(has(root.join("Photos/2023/03/IMG_0001 (BBBB2222).JPG")));
+        assert!(has(root.join("Photos/2024/08/Clip.MOV")));
+        assert!(has(root.join("albums.json")));
+        assert!(has(root.join("Photos/2024")) && has(root.clone()), "folders recorded");
+        assert!(!files.iter().any(|f| f.path.contains("deleted.jpg") || f.path.contains("secret.jpg") || f.path.contains("icloud.jpg")));
+        assert!(!files.iter().any(|f| f.path.contains(".photoslibrary")), "only logical paths are recorded");
+
+        // Restore: a plain folder tree.
+        let rr = restore_all(&be, &db, &o, Some("pw"), out.path());
+        assert!(rr.errors.is_empty(), "{:?}", rr.errors);
+        let ex = out.path().join("Photos Library (Photos export)");
+        assert_eq!(std::fs::read(ex.join("Photos/2023/03/IMG_0001.JPG")).unwrap(), b"first photo");
+        assert_eq!(std::fs::read(ex.join("Photos/2023/03/IMG_0001 (BBBB2222).JPG")).unwrap(), b"same name, other photo");
+        assert_eq!(std::fs::read(ex.join("Photos/2024/08/Clip.MOV")).unwrap(), b"video bytes");
+        assert_eq!(std::fs::read(out.path().join("Old Library (Photos export)/Photos/2016/07/IMG_0100.JPG")).unwrap(), b"from Masters");
+        let m: Manifest = serde_json::from_slice(&std::fs::read(ex.join("albums.json")).unwrap()).unwrap();
+        let trip = m.albums.iter().find(|a| a.title == "Trip").unwrap();
+        assert_eq!(trip.assets, ["Photos/2023/03/IMG_0001.JPG", "Photos/2023/03/IMG_0001 (BBBB2222).JPG"]);
+        assert_eq!(m.albums.iter().find(|a| a.title == "Family").unwrap().assets, ["Photos/2024/08/Clip.MOV"]);
+        let a = m.assets.iter().find(|a| a.uuid == "AAAA1111-X").unwrap();
+        assert!(a.favorite);
+        assert_eq!(a.created.as_deref(), Some("2023-03-14T12:00:00+00:00"));
+        assert_eq!(a.albums, ["Trip"]);
+        for a in &m.assets {
+            assert!(ex.join(&a.path).is_file(), "manifest path {} restored", a.path);
+        }
+        let legacy: Manifest = serde_json::from_slice(&std::fs::read(out.path().join("Old Library (Photos export)/albums.json")).unwrap()).unwrap();
+        assert_eq!(legacy.albums[0].assets, ["Photos/2016/07/IMG_0100.JPG"]);
+
+        // Unchanged library: no new version (albums.json is deterministic).
+        let r2 = run(&o);
+        assert!(r2.skipped_unchanged, "{r2:?}");
+        assert_eq!(db.filesets().unwrap().len(), 1);
+
+        // Options: hidden + trashed + album filter.
+        let o3 = BackupOptions { photos: crate::backup::photos::PhotosOptions { include_hidden: true, include_trashed: true, albums: vec!["family".into()] }, ..o.clone() };
+        let r3 = run(&o3);
+        assert!(r3.version.is_some());
+        let files = db.files(db.filesets().unwrap()[0].id).unwrap();
+        let photos: Vec<&str> = files.iter().filter(|f| f.kind == EntryKind::File && !f.path.ends_with("albums.json")).map(|f| f.path.as_str()).collect();
+        assert_eq!(photos.len(), 2, "{photos:?}");
+        assert!(photos.iter().any(|p| p.ends_with("Clip.MOV")) && photos.iter().any(|p| p.ends_with("secret.jpg")));
+        assert!(r3.warnings.iter().any(|w| w.contains("no album named 'family'") && w.contains("Old Library")), "{:?}", r3.warnings);
+
+        // Incremental runs (changed paths) still re-expand the library.
+        let o4 = BackupOptions { changed_paths: Some(vec![]), ..o.clone() };
+        let r4 = run(&o4);
+        let files = db.files(db.filesets().unwrap()[0].id).unwrap();
+        assert!(r4.version.is_some());
+        assert!(files.iter().any(|f| f.path.ends_with("IMG_0001.JPG")) && !files.iter().any(|f| f.path.ends_with("secret.jpg")));
+        assert!(leftovers(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn photos_sources_mix_with_folders_and_honour_policies() {
+        use crate::backup::photos::source_uri;
+        let pics = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        write(src.path(), "notes.txt", b"plain file");
+        let (lib, _) = photos_fixture(pics.path());
+        let gone = pics.path().join("Gone.photoslibrary");
+        let o = opts();
+        let (entries, warnings) = scan_sources(&[src.path().into(), source_uri(&lib).into()], &SourceFilter::default(), &o).unwrap();
+        assert!(entries.iter().any(|(_, e)| e.path.ends_with("notes.txt")));
+        assert!(entries.iter().any(|(_, e)| e.path.ends_with("albums.json")));
+        assert_eq!(warnings.len(), 1);
+
+        // Missing library follows the missing-source policy.
+        assert!(scan_sources(&[source_uri(&gone).into()], &SourceFilter::default(), &o).is_err());
+        let warn = BackupOptions { missing_source: MissingSourcePolicy::Warn, ..opts() };
+        let (e, w) = scan_sources(&[src.path().into(), source_uri(&gone).into()], &SourceFilter::default(), &warn).unwrap();
+        assert!(e.iter().all(|(_, e)| !e.path.contains("Gone")));
+        assert!(w.iter().any(|w| w.contains("Gone.photoslibrary")));
+
+        // Filters see logical paths: excluding a year folder drops it.
+        let mut f = SourceFilter::default();
+        f.rules = vec![crate::backup::FilterRule { action: crate::backup::FilterAction::Exclude, kind: crate::backup::FilterKind::Wildcard, pattern: "*/Photos/2024/".into() }];
+        let f = f.compile().unwrap();
+        let (e, _) = scan_sources(&[source_uri(&lib).into()], &f, &o).unwrap();
+        assert!(!e.iter().any(|(_, e)| e.path.contains("2024")), "{:?}", e.iter().map(|x| &x.1.path).collect::<Vec<_>>());
+        assert!(e.iter().any(|(_, e)| e.path.contains("2023")));
     }
 }

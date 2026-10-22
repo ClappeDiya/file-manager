@@ -26,6 +26,7 @@ pub mod meta;
 pub mod mirror;
 pub mod modules;
 pub mod par2;
+pub mod photos;
 pub mod recovery;
 pub mod restore;
 pub mod retention;
@@ -261,6 +262,8 @@ pub struct BackupOptions {
     pub gpg: GpgOptions,
     /// Argon2id cost for new AES repositories (`None` = the app default).
     pub kdf: Option<crypto::KdfParams>,
+    /// What `photos://` (macOS Photos library) sources export.
+    pub photos: photos::PhotosOptions,
 }
 
 /// How volumes are encrypted.
@@ -340,6 +343,7 @@ impl Default for BackupOptions {
             encryption_module: EncryptionModuleKind::Aes,
             gpg: GpgOptions::default(),
             kdf: None,
+            photos: photos::PhotosOptions::default(),
         }
     }
 }

@@ -125,6 +125,36 @@ export interface BackupOptions {
   /** Argon2id cost for a new AES repository; null = app default. */
   kdf: KdfParams | null;
   object_lock: ObjectLockOptions | null;
+  /** What `photos://` (macOS Photos library) sources export. */
+  photos: PhotosOptions;
+}
+
+/** Rust `ufop_core::backup::photos::PhotosOptions`. */
+export interface PhotosOptions {
+  include_hidden: boolean;
+  include_trashed: boolean;
+  /** Only assets in these user albums (case-insensitive); empty = all. */
+  albums: string[];
+}
+
+/** A Photos library found in ~/Pictures (`backup_photos_libraries`). */
+export interface PhotosLibraryCandidate {
+  path: string;
+  name: string;
+  /** `photos://` job source. */
+  source: string;
+  has_database: boolean;
+  is_default: boolean;
+}
+
+/** `backup_photos_library_info`. */
+export interface PhotosLibraryInfo {
+  path: string;
+  assets: number;
+  hidden: number;
+  trashed: number;
+  albums: string[];
+  warnings: string[];
 }
 
 export type LockMode = "governance" | "compliance";
@@ -819,6 +849,7 @@ export function newBackupJob(): BackupJob {
       gpg: { recipients: [], executable: "", homedir: "" },
       kdf: null,
       object_lock: null,
+      photos: { include_hidden: false, include_trashed: false, albums: [] },
     },
     retention: { type: "keep_all" },
     schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false },

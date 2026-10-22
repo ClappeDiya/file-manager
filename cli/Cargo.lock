@@ -2129,6 +2129,7 @@ dependencies = [
  "md-5",
  "regex",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",

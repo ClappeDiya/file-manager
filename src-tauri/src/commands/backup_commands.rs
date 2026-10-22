@@ -337,6 +337,18 @@ pub async fn backup_capabilities(mgr: State<'_, BackupManager>) -> Result<api::B
     Ok(api::capabilities(&mgr))
 }
 
+/// Photos libraries found in `~/Pictures` (macOS; empty elsewhere).
+#[tauri::command]
+pub async fn backup_photos_libraries() -> Result<Vec<ufop_core::backup::photos::LibraryCandidate>, AppError> {
+    Ok(api::photos_libraries())
+}
+
+/// Asset counts and album titles of a Photos library (path or `photos://` URI).
+#[tauri::command]
+pub async fn backup_photos_library_info(path: String, temp_dir: Option<String>) -> Result<ufop_core::backup::photos::LibraryInfo, AppError> {
+    api::photos_library_info(path, temp_dir).await
+}
+
 /// Count what the job's sources and filters select, without backing up.
 #[tauri::command]
 pub async fn backup_preview_sources(job: BackupJob) -> Result<api::SourcePreview, AppError> {

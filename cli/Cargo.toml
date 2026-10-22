@@ -33,3 +33,5 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+# Synthetic Photos libraries in tests (same version ufop-core already links).
+rusqlite = { version = "0.35", features = ["bundled"] }

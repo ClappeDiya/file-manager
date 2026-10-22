@@ -767,3 +767,84 @@ async fn gpg_job_kdf_validation_and_file_crypt() {
     assert_eq!(std::fs::read(&dec).unwrap(), vec![9u8; 100_000]);
     assert!(m.crypt_file(false, s(&plain), s(&enc), String::new(), None).await.is_err());
 }
+
+/// Minimal Photos library (modern layout) built with the real table names.
+fn photos_library(dir: &Path) -> PathBuf {
+    let lib = dir.join("Photos Library.photoslibrary");
+    std::fs::create_dir_all(lib.join("database")).unwrap();
+    std::fs::create_dir_all(lib.join("originals/A")).unwrap();
+    std::fs::write(lib.join("originals/A/U1.jpeg"), b"beach").unwrap();
+    std::fs::write(lib.join("originals/A/U2.jpeg"), b"hidden").unwrap();
+    let c = rusqlite::Connection::open(lib.join("database/Photos.sqlite")).unwrap();
+    // 2024-06-01T12:00:00Z in Core Data seconds.
+    let created = 1_717_243_200 - 978_307_200;
+    c.execute_batch(&format!(
+        "CREATE TABLE ZASSET (Z_PK INTEGER PRIMARY KEY, ZDIRECTORY TEXT, ZFILENAME TEXT, ZUUID TEXT, ZDATECREATED REAL, ZTRASHEDSTATE INTEGER, ZHIDDEN INTEGER, ZFAVORITE INTEGER, ZKIND INTEGER, ZUNIFORMTYPEIDENTIFIER TEXT);
+         CREATE TABLE ZADDITIONALASSETATTRIBUTES (Z_PK INTEGER PRIMARY KEY, ZASSET INTEGER, ZORIGINALFILENAME TEXT, ZTIMEZONEOFFSET INTEGER);
+         CREATE TABLE ZGENERICALBUM (Z_PK INTEGER PRIMARY KEY, ZKIND INTEGER, ZTITLE TEXT, ZUUID TEXT, ZTRASHEDSTATE INTEGER);
+         CREATE TABLE Z_27ASSETS (Z_27ALBUMS INTEGER, Z_3ASSETS INTEGER, Z_FOK_3ASSETS INTEGER);
+         INSERT INTO ZASSET VALUES (1, 'A', 'U1.jpeg', 'U1', {created}, 0, 0, 1, 0, 'public.jpeg'), (2, 'A', 'U2.jpeg', 'U2', {created}, 0, 1, 0, 0, 'public.jpeg');
+         INSERT INTO ZADDITIONALASSETATTRIBUTES (ZASSET, ZORIGINALFILENAME, ZTIMEZONEOFFSET) VALUES (1, 'IMG_1000.JPG', 0), (2, 'IMG_1001.JPG', 0);
+         INSERT INTO ZGENERICALBUM VALUES (9, 2, 'Holiday', 'ALB9', 0);
+         INSERT INTO Z_27ASSETS VALUES (9, 1, 1024);"
+    ))
+    .unwrap();
+    lib
+}
+
+#[tokio::test]
+async fn photos_library_job_backup_restore_and_commands() {
+    let t = tempfile::tempdir().unwrap();
+    let (dst, out) = (t.path().join("dst"), t.path().join("out"));
+    let lib = photos_library(t.path());
+    let m = manager(t.path()).await;
+    let source = ufop_core::backup::photos::source_uri(&lib);
+
+    // A destination inside the library and a bare scheme are rejected.
+    let mut bad = job(&lib, &lib.join("backups"));
+    bad.sources = vec![source.clone()];
+    assert!(m.save_job(bad, Some("pw".into())).await.unwrap_err().user_message().contains("inside the source"));
+    let mut bare = job(&lib, &dst);
+    bare.sources = vec!["photos://".into()];
+    assert!(m.save_job(bare, Some("pw".into())).await.unwrap_err().user_message().contains(".photoslibrary"));
+
+    let mut j = job(&lib, &dst);
+    j.sources = vec![source.clone()];
+    let j = m.save_job(j, Some("pw".into())).await.unwrap();
+
+    let p = api::preview_sources(j.clone()).await.unwrap();
+    assert_eq!(p.files, 2, "one visible photo + albums.json: {:?}", p.sample);
+    assert!(p.sample.iter().any(|s| s.ends_with("IMG_1000.JPG")));
+
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert!(r.summary.contains("2 added"), "{}", r.summary);
+
+    let restore = RestoreOptions { target: Some(out.clone()), ..Default::default() };
+    let r = m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.report["files_restored"], 2);
+    let ex = out.join("Photos Library (Photos export)");
+    assert_eq!(std::fs::read(ex.join("Photos/2024/06/IMG_1000.JPG")).unwrap(), b"beach");
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(ex.join("albums.json")).unwrap()).unwrap();
+    assert_eq!(manifest["albums"][0]["title"], "Holiday");
+    assert_eq!(manifest["albums"][0]["assets"][0], "Photos/2024/06/IMG_1000.JPG");
+    assert_eq!(manifest["assets"][0]["favorite"], true);
+
+    // Hidden assets on request.
+    let mut j2 = m.get_job(&j.id).await.unwrap();
+    j2.options.photos.include_hidden = true;
+    let j2 = m.save_job(j2, None).await.unwrap();
+    let r = m.execute(&j2.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert!(r.summary.contains("1 added"), "{}", r.summary);
+
+    // Library commands through the shared dispatcher.
+    let info = api::dispatch(&m, "backup_photos_library_info", &serde_json::json!({ "path": source })).await.unwrap();
+    assert_eq!(info["assets"], 2);
+    assert_eq!(info["hidden"], 1);
+    assert_eq!(info["albums"], serde_json::json!(["Holiday"]));
+    let libs = api::dispatch(&m, "backup_photos_libraries", &serde_json::json!({})).await.unwrap();
+    if !cfg!(target_os = "macos") {
+        assert_eq!(libs, serde_json::json!([]));
+    }
+    assert!(api::dispatch(&m, "backup_photos_library_info", &serde_json::json!({ "path": t.path().join("none.photoslibrary") })).await.is_err());
+}

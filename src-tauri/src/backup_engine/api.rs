@@ -5,7 +5,7 @@ use super::{portability, BackupDestination, BackupJob, BackupManager, BackupOper
 use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use ufop_core::backup::crypto;
+use ufop_core::backup::{crypto, photos};
 use ufop_core::backup::filters::FILTER_GROUPS;
 use ufop_core::backup::RestoreOptions;
 
@@ -94,6 +94,28 @@ pub async fn preview_sources(job: BackupJob) -> Result<SourcePreview, AppError> 
     .map_err(|e| AppError::internal(e.to_string()))?
 }
 
+/// Photos libraries in the user's Pictures folder. Only macOS has them;
+/// elsewhere the list is empty and the user chooses a library path.
+pub fn photos_libraries() -> Vec<photos::LibraryCandidate> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    dirs::picture_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Pictures")))
+        .map(|d| photos::find_libraries(&d))
+        .unwrap_or_default()
+}
+
+/// Asset counts and album titles of a library (`path` or `photos://` URI).
+pub async fn photos_library_info(path: String, temp_dir: Option<String>) -> Result<photos::LibraryInfo, AppError> {
+    let lib = photos::parse_source(&path).unwrap_or_else(|| std::path::PathBuf::from(path.trim()));
+    if lib.as_os_str().is_empty() {
+        return Err(AppError::validation("Choose a Photos library"));
+    }
+    let tmp = temp_dir.filter(|t| !t.trim().is_empty()).map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    tokio::task::spawn_blocking(move || photos::library_info(&lib, &tmp)).await.map_err(|e| AppError::internal(e.to_string()))?
+}
+
 fn arg<T: for<'de> Deserialize<'de>>(args: &Value, key: &str) -> Result<T, AppError> {
     serde_json::from_value(args.get(key).cloned().unwrap_or(Value::Null))
         .map_err(|e| AppError::validation(format!("Invalid argument '{key}': {e}")))
@@ -172,6 +194,8 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
         "backup_generate_passphrase" => ok(crypto::generate_passphrase(opt(a, "length")?.unwrap_or(32))),
         "backup_capabilities" => ok(capabilities(mgr)),
         "backup_preview_sources" => ok(preview_sources(arg(a, "job")?).await?),
+        "backup_photos_libraries" => ok(photos_libraries()),
+        "backup_photos_library_info" => ok(photos_library_info(arg(a, "path")?, opt(a, "tempDir")?).await?),
         "backup_get_global_defaults" => ok(mgr.global_defaults().await?),
         "backup_set_global_defaults" => ok(mgr.set_global_defaults(arg(a, "defaults")?).await?),
         "backup_effective_job" => ok(mgr.effective_job(&arg::<String>(a, "id")?).await?),
@@ -226,4 +250,5 @@ pub const COMMANDS: &[&str] = &[
     "backup_generate_passphrase", "backup_capabilities", "backup_preview_sources", "backup_get_global_defaults",
     "backup_set_global_defaults", "backup_effective_job", "backup_list_destinations", "backup_save_destination",
     "backup_delete_destination", "backup_adopt_repository", "backup_database_inventory", "backup_cleanup_databases", "backup_bug_report", "backup_diagnose", "backup_test_notification", "backup_get_secret_settings", "backup_set_secret_settings", "backup_crypt_file", "backup_decrypt_volume", "backup_test_secret_providers", "backup_job_placeholders", "backup_recovery_download", "backup_recovery_index", "backup_recovery_list", "backup_recovery_restore", "backup_recovery_convert", "backup_remote_list", "backup_remote_get", "backup_remote_put", "backup_remote_delete", "backup_start_operation", "backup_set_destination_secret", "backup_has_destination_secret", "backup_cloud_providers",
+    "backup_photos_libraries", "backup_photos_library_info",
 ];

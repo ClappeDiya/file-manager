@@ -182,6 +182,15 @@ pub struct EngineArgs {
     pub kdf_iterations: Option<u32>,
     #[arg(long)]
     pub kdf_parallelism: Option<u32>,
+    /// Photos sources (`--source photos:///…/Lib.photoslibrary`): include hidden assets
+    #[arg(long)]
+    pub photos_include_hidden: bool,
+    /// Photos sources: include assets in Recently Deleted
+    #[arg(long)]
+    pub photos_include_trashed: bool,
+    /// Photos sources: only assets in this album (repeatable; title, case-insensitive)
+    #[arg(long = "photos-album")]
+    pub photos_albums: Vec<String>,
 }
 
 fn parse_enum<T: serde::de::DeserializeOwned>(flag: &str, v: &str) -> Result<T, ufop_core::error::AppError> {
@@ -244,6 +253,11 @@ impl EngineArgs {
             encryption_module: parse_enum("encryption-module", &self.encryption_module)?,
             gpg: ufop_core::backup::GpgOptions { recipients: self.gpg_recipients.clone(), executable: self.gpg_executable.clone(), homedir: self.gpg_homedir.clone() },
             kdf: self.kdf()?,
+            photos: ufop_core::backup::photos::PhotosOptions {
+                include_hidden: self.photos_include_hidden,
+                include_trashed: self.photos_include_trashed,
+                albums: self.photos_albums.clone(),
+            },
             ..o
         })
     }
@@ -387,7 +401,8 @@ pub enum BackupCommands {
     Run {
         #[command(flatten)]
         repo: RepoArgs,
-        /// Source folder or file (repeatable)
+        /// Source folder or file, or a macOS Photos library as
+        /// `photos:///path/Lib.photoslibrary` (repeatable)
         #[arg(long = "source", required = true)]
         sources: Vec<String>,
         /// Include filter: path, wildcard, [regex] or {group} (ordered, repeatable)
@@ -990,5 +1005,52 @@ mod tests {
         let code = run(restore_cmd, &OutputFormat::Json, false).unwrap();
         assert_eq!(code, 0);
         assert_eq!(std::fs::read(out.join("src/f.txt")).unwrap(), b"cli");
+    }
+
+    #[test]
+    fn photos_source_with_flags() {
+        let t = tempfile::tempdir().unwrap();
+        let lib = t.path().join("Lib.photoslibrary");
+        std::fs::create_dir_all(lib.join("database")).unwrap();
+        std::fs::create_dir_all(lib.join("originals/0")).unwrap();
+        std::fs::write(lib.join("originals/0/a.heic"), b"shown").unwrap();
+        std::fs::write(lib.join("originals/0/b.heic"), b"hidden").unwrap();
+        let c = rusqlite::Connection::open(lib.join("database/Photos.sqlite")).unwrap();
+        c.execute_batch(
+            "CREATE TABLE ZASSET (Z_PK INTEGER PRIMARY KEY, ZDIRECTORY TEXT, ZFILENAME TEXT, ZUUID TEXT, ZDATECREATED REAL, ZHIDDEN INTEGER, ZTRASHEDSTATE INTEGER);
+             INSERT INTO ZASSET VALUES (1, '0', 'a.heic', 'UA', 700000000, 0, 0), (2, '0', 'b.heic', 'UB', 700000000, 1, 0);",
+        )
+        .unwrap();
+        drop(c);
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(subcommand)]
+            c: BackupCommands,
+        }
+        let parse = |args: &[&str]| <T as clap::Parser>::try_parse_from(std::iter::once("t").chain(args.iter().copied())).unwrap().c;
+        let dest = t.path().join("dest").to_string_lossy().into_owned();
+        let db = t.path().join("db.sqlite").to_string_lossy().into_owned();
+        let src = format!("photos://{}", lib.to_string_lossy().replace(' ', "%20"));
+        let args = ["run", "--dest", &dest, "--dbpath", &db, "--no-encryption", "--source", &src, "--photos-include-hidden", "--photos-album", "Trip", "--no-quota-warning"];
+        match parse(&args) {
+            BackupCommands::Run { engine, .. } => {
+                let o = engine.apply(BackupOptions::default()).unwrap();
+                assert!(o.photos.include_hidden && !o.photos.include_trashed);
+                assert_eq!(o.photos.albums, ["Trip"]);
+            }
+            _ => panic!("expected run"),
+        }
+        // Without an album filter both originals and albums.json are stored.
+        let code = run(parse(&args[..args.len() - 3].iter().copied().chain(["--no-quota-warning"]).collect::<Vec<_>>()), &OutputFormat::Json, false).unwrap();
+        // Exit 1: this minimal schema lacks album / attribute tables, reported as warnings.
+        assert_eq!(code, 1);
+        let out = t.path().join("out");
+        let out_s = out.to_string_lossy().into_owned();
+        let code = run(parse(&["restore", "--dest", &dest, "--dbpath", &db, "--no-encryption", "--target", &out_s]), &OutputFormat::Json, false).unwrap();
+        assert_eq!(code, 0);
+        let ex = out.join("Lib (Photos export)");
+        assert_eq!(std::fs::read(ex.join("Photos/2023/03/a.heic")).unwrap(), b"shown");
+        assert_eq!(std::fs::read(ex.join("Photos/2023/03/b.heic")).unwrap(), b"hidden");
+        assert!(ex.join("albums.json").is_file());
     }
 }

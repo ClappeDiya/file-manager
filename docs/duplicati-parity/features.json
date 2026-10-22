@@ -627,12 +627,12 @@
    "cat": 3,
    "name": "macOS Photos library export",
    "baseline": "M",
-   "status": "missing",
-   "work": "todo",
+   "status": "present",
+   "work": "built",
    "phase": 2,
-   "verify": "",
-   "note": "Not supported",
-   "evidence": ""
+   "verify": "device",
+   "note": "photos:// source: originals exported as Photos/YYYY/MM/<original name> plus albums.json (albums, favourites, dates); hidden / Recently Deleted / album filter options; desktop picker and CLI flags (docs/backup-photos.md)",
+   "evidence": "ufop-core photos + engine fixture tests (modern originals/ and legacy Masters/ libraries, trashed, hidden, two albums, missing original) back up and restore; needs a run against a real macOS Photos library to verify"
   },
   {
    "n": 52,

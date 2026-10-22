@@ -24,6 +24,7 @@ import { BackupReplicas } from "./backup-replicas";
 import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
 import { LogOutputsEditor, NotificationsEditor, ReportExtras } from "./backup-notifications";
 import { JobSecretProviders } from "./backup-secret-providers";
+import { PhotosSourceSection } from "./backup-photos-source";
 
 interface ConnectionProfile {
   id: string;
@@ -157,7 +158,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
 
         {step === "Sources" && (
           <>
-            <Section title="Source folders and files" hint="One path per line.">
+            <Section title="Source folders and files" hint="One path per line. Photos libraries appear as photos:///path/Name.photoslibrary.">
               <textarea
                 className={`${inputCls} font-mono`}
                 rows={5}
@@ -200,6 +201,11 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 </div>
               )}
             </Section>
+
+            <PhotosSourceSection
+              job={job}
+              onChange={(sources, photos) => setJob((j) => ({ ...j, sources, options: { ...j.options, photos } }))}
+            />
 
             <Section title="Filters" hint="Evaluated top to bottom; the first match wins. Excluding a folder skips everything inside it.">
               <div className="flex gap-1">

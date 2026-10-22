@@ -333,8 +333,13 @@ impl BackupJob {
             return Err(AppError::validation("Secrets can only be stored in the backup when it is encrypted"));
         }
         for s in &self.sources {
+            let library = ufop_core::backup::photos::parse_source(s);
+            if ufop_core::backup::photos::is_photos_source(s) && library.is_none() {
+                return Err(AppError::validation("A Photos source needs the path of a .photoslibrary bundle (photos:///Users/me/Pictures/Photos Library.photoslibrary)"));
+            }
             if let BackupDestination::Local { path, .. } = &self.destination {
-                let (s, p) = (Path::new(s), Path::new(path));
+                let s = library.unwrap_or_else(|| PathBuf::from(s));
+                let (s, p) = (s.as_path(), Path::new(path));
                 if p.starts_with(s) {
                     return Err(AppError::validation(format!(
                         "The destination {} is inside the source {}; backups would include themselves",

@@ -575,6 +575,8 @@ pub fn run() {
             backup_commands::backup_generate_passphrase,
             backup_commands::backup_capabilities,
             backup_commands::backup_preview_sources,
+            backup_commands::backup_photos_libraries,
+            backup_commands::backup_photos_library_info,
             backup_commands::backup_get_global_defaults,
             backup_commands::backup_set_global_defaults,
             backup_commands::backup_effective_job,

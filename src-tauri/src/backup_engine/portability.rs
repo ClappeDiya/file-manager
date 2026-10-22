@@ -173,6 +173,18 @@ pub fn cli_command(job: &BackupJob) -> String {
     if job.filter.exclude_hidden {
         parts.push("--exclude-hidden".into());
     }
+    if job.sources.iter().any(|s| ufop_core::backup::photos::is_photos_source(s)) {
+        let p = &o.photos;
+        if p.include_hidden {
+            parts.push("--photos-include-hidden".into());
+        }
+        if p.include_trashed {
+            parts.push("--photos-include-trashed".into());
+        }
+        for a in &p.albums {
+            parts.push(format!("--photos-album={}", quote(a)));
+        }
+    }
     parts.join(" ")
 }
 
@@ -189,6 +201,18 @@ mod tests {
             stats: JobStats { version_count: 4, ..Default::default() },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn cli_command_carries_photos_options() {
+        let mut j = job();
+        assert!(!cli_command(&j).contains("--photos"));
+        j.sources = vec!["photos:///Users/me/Pictures/Photos Library.photoslibrary".into()];
+        j.options.photos = ufop_core::backup::photos::PhotosOptions { include_hidden: true, include_trashed: false, albums: vec!["Trip 2024".into()] };
+        let c = cli_command(&j);
+        assert!(c.contains("--source 'photos:///Users/me/Pictures/Photos Library.photoslibrary'"), "{c}");
+        assert!(c.contains("--photos-include-hidden") && !c.contains("--photos-include-trashed"));
+        assert!(c.contains("--photos-album='Trip 2024'"), "{c}");
     }
 
     #[test]
