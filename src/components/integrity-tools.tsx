@@ -16,6 +16,9 @@ import { formatBytes } from "@/lib/format-bytes";
 import { errorText } from "@/lib/error-text";
 import { MetadataEditor, MetadataSearch, type FileLabel } from "@/components/metadata-editor";
 
+/** Mirrors `HASH_ALGORITHMS` in integrity_commands.rs. */
+const HASH_ALGORITHMS = ["md5", "sha1", "sha256", "crc32", "xxh3"] as const;
+
 // ── Types ──
 
 interface ChecksumResult {
@@ -220,7 +223,7 @@ function ChecksumPanel({ selectedFiles }: { selectedFiles: string[] }) {
       <div>
         <label className="block text-sm font-medium mb-2">Algorithm</label>
         <div className="flex gap-2">
-          {["md5", "sha1", "sha256"].map((algo) => (
+          {HASH_ALGORITHMS.map((algo) => (
             <button
               key={algo}
               onClick={() => setAlgorithm(algo)}
@@ -357,7 +360,7 @@ function QuickChecksumTool() {
       />
       <div className="flex gap-2 items-center">
         <div className="flex gap-1">
-          {["md5", "sha1", "sha256"].map((algo) => (
+          {HASH_ALGORITHMS.map((algo) => (
             <button
               key={algo}
               onClick={() => setAlgorithm(algo)}

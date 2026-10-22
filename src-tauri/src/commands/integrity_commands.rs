@@ -550,54 +550,52 @@ pub async fn run_smart_query(store: &MetadataStore, query: &SmartFolderQuery) ->
 
 // ── Internal helpers ──
 
-fn compute_hash(path: &str, algorithm: &str) -> Result<String, AppError> {
+/// Checksum algorithms offered by the integrity tools.
+pub const HASH_ALGORITHMS: &[&str] = &["md5", "sha1", "sha256", "crc32", "xxh3"];
+
+/// Stream `path` through `update`, 64 KiB at a time.
+fn stream_file(path: &str, mut update: impl FnMut(&[u8])) -> Result<(), AppError> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path).map_err(|e| {
-        AppError::file_op(format!("Cannot open file: {e}"), "Check permissions")
-    })?;
-
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| AppError::file_op(format!("Cannot open file: {e}"), "Check permissions"))?;
     let mut buf = vec![0u8; 64 * 1024];
-    let algo = algorithm.to_lowercase();
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| AppError::file_op(format!("Read error: {e}"), "Check the file is readable"))?;
+        if n == 0 {
+            return Ok(());
+        }
+        update(&buf[..n]);
+    }
+}
 
-    match algo.as_str() {
-        "md5" => {
-            use digest::Digest;
-            let mut hasher = md5::Md5::new();
-            loop {
-                let n = file.read(&mut buf).map_err(|e| {
-                    AppError::file_op(format!("Read error: {e}"), "")
-                })?;
-                if n == 0 { break; }
-                hasher.update(&buf[..n]);
-            }
-            Ok(format!("{:x}", hasher.finalize()))
+fn digest_file<D: digest::Digest>(path: &str) -> Result<String, AppError> {
+    let mut hasher = D::new();
+    stream_file(path, |b| hasher.update(b))?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Lowercase hex checksum; CRC32 and xxh3 are zero-padded big-endian
+/// (8 and 16 hex digits), the form `cksum`-style tools and SFV files use.
+fn compute_hash(path: &str, algorithm: &str) -> Result<String, AppError> {
+    match algorithm.to_lowercase().as_str() {
+        "md5" => digest_file::<md5::Md5>(path),
+        "sha1" => digest_file::<sha1::Sha1>(path),
+        "sha256" => digest_file::<sha2::Sha256>(path),
+        "crc32" => {
+            let mut h = crc32fast::Hasher::new();
+            stream_file(path, |b| h.update(b))?;
+            Ok(format!("{:08x}", h.finalize()))
         }
-        "sha1" => {
-            use digest::Digest;
-            let mut hasher = sha1::Sha1::new();
-            loop {
-                let n = file.read(&mut buf).map_err(|e| {
-                    AppError::file_op(format!("Read error: {e}"), "")
-                })?;
-                if n == 0 { break; }
-                hasher.update(&buf[..n]);
-            }
-            Ok(format!("{:x}", hasher.finalize()))
-        }
-        "sha256" => {
-            use digest::Digest;
-            let mut hasher = sha2::Sha256::new();
-            loop {
-                let n = file.read(&mut buf).map_err(|e| {
-                    AppError::file_op(format!("Read error: {e}"), "")
-                })?;
-                if n == 0 { break; }
-                hasher.update(&buf[..n]);
-            }
-            Ok(format!("{:x}", hasher.finalize()))
+        "xxh3" => {
+            let mut h = xxhash_rust::xxh3::Xxh3::new();
+            stream_file(path, |b| h.update(b))?;
+            Ok(format!("{:016x}", h.digest()))
         }
         _ => Err(AppError::validation(format!(
-            "Unsupported algorithm: {algorithm}. Use: md5, sha1, sha256"
+            "Unsupported algorithm: {algorithm}. Use one of: {}",
+            HASH_ALGORITHMS.join(", ")
         ))),
     }
 }
@@ -721,5 +719,10 @@ mod hash_tests {
         let p = f.to_str().unwrap();
         assert_eq!(compute_hash(p, "sha1").unwrap(), "a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(compute_hash(p, "SHA256").unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(compute_hash(p, "md5").unwrap(), "900150983cd24fb0d6963f7d28e17f72");
+        // Standard check values for "abc".
+        assert_eq!(compute_hash(p, "crc32").unwrap(), "352441c2");
+        assert_eq!(compute_hash(p, "xxh3").unwrap(), "78af5f94892f3950");
+        assert!(compute_hash(p, "whirlpool").unwrap_err().to_string().contains("crc32"));
     }
 }

@@ -43,6 +43,7 @@ rustls-pemfile = "2"
 digest = "0.10"
 # Transfer integrity: xxHash3 for fast hashing, ring for SHA-256
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32fast = "1"
 ring = "0.17"
 # Platform-specific low-level I/O
 libc = "0.2"
