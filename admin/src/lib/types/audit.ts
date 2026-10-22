@@ -11,6 +11,10 @@ export type AuditEventType =
   | 'auth.reauth'
   | 'auth.reauth_failed'
   | 'user.retired_inactive'
+  | 'user.membership_expired'
+  | 'admin.user_restore'
+  | 'admin.user_purge'
+  | 'admin.user_expiry'
   | 'api_token.retired_inactive'
   | 'connection.create'
   | 'connection.update'
@@ -49,7 +53,7 @@ export const AUDIT_EVENT_CATEGORIES: Record<string, AuditEventType[]> = {
   Naming: ['naming.translation', 'naming.override'],
   Approvals: ['approval.request', 'approval.approve', 'approval.deny', 'approval.expire'],
   Policies: ['policy.create', 'policy.update', 'policy.delete', 'policy.violation'],
-  Admin: ['admin.user_invite', 'admin.user_deactivate', 'admin.user_remove', 'admin.role_change', 'admin.sso_configure', 'admin.settings_change'],
+  Admin: ['admin.user_invite', 'admin.user_deactivate', 'admin.user_remove', 'admin.role_change', 'admin.sso_configure', 'admin.settings_change', 'admin.user_restore', 'admin.user_purge', 'admin.user_expiry'],
 };
 
 export type AuditSeverity = 'info' | 'warning' | 'error' | 'critical';

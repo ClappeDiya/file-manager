@@ -530,6 +530,23 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 21,
+    description: 'Membership expiry; removed members kept for restore',
+    up(d) {
+      d.exec(`
+        ALTER TABLE org_memberships ADD COLUMN expires_at TEXT;
+        CREATE TABLE removed_members (
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          role TEXT NOT NULL, group_ids TEXT NOT NULL DEFAULT '[]', reason TEXT NOT NULL DEFAULT '',
+          removed_by TEXT NOT NULL DEFAULT '', removed_at TEXT NOT NULL, purge_after TEXT NOT NULL,
+          account_disabled INTEGER NOT NULL DEFAULT 0, reassigned_to TEXT,
+          PRIMARY KEY (user_id, org_id)
+        );
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

@@ -3,7 +3,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
   UserPlus, Upload, Download, Shield,
-  Mail, UserX, Trash2, Key,
+  Mail, UserX, Trash2, Key, CalendarClock,
 } from 'lucide-react';
 import { PageHeader } from '@/components/layout/page-header';
 import { Button } from '@/components/ui/button';
@@ -27,6 +27,11 @@ import { ComingSoon } from '@/components/ui/coming-soon';
 import { ScimProvisioning } from '@/components/users/scim-provisioning';
 import { CsvImportDialog } from '@/components/users/csv-import-dialog';
 import { isEnabled } from '@/lib/features';
+import { api } from '@/lib/api-client';
+import { MembershipExpiryDialog, RemoveMemberDialog, RemovedMembers } from '@/components/users/offboarding';
+import type { RemovedMember } from '@/lib/offboarding';
+
+type Member = AdminUser & { expiresAt?: string | null };
 
 const inviteSchema = z.object({
   email: z.string().trim().min(1, 'Email is required').email('Enter a valid email address'),
@@ -43,7 +48,11 @@ export default function UsersPage() {
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState<Role>('user');
   const [inviteErrors, setInviteErrors] = useState<{ email?: string; role?: string }>({});
-  const [users, setUsers] = useState<AdminUser[]>([]);
+  const [users, setUsers] = useState<Member[]>([]);
+  const [removed, setRemoved] = useState<RemovedMember[]>([]);
+  const [restoreDays, setRestoreDays] = useState(30);
+  const [removing, setRemoving] = useState<AdminUser | null>(null);
+  const [expiring, setExpiring] = useState<Member | null>(null);
   const [invitations, setInvitations] = useState<Invitation[]>([]);
   const [inviteLink, setInviteLink] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -59,7 +68,7 @@ export default function UsersPage() {
         if (!res.ok) throw new Error('Failed to fetch users');
         return res.json();
       })
-      .then((data) => { setUsers(data.users || []); setInvitations(data.invitations || []); setLoading(false); })
+      .then((data) => { setUsers(data.users || []); setInvitations(data.invitations || []); setRemoved(data.removed || []); setRestoreDays(data.restoreDays ?? 30); setLoading(false); })
       .catch((err) => { setError(err instanceof Error ? err.message : String(err)); setLoading(false); });
   }, []);
 
@@ -112,13 +121,8 @@ export default function UsersPage() {
 
   const handleRoleChange = async (userId: string, newRole: Role) => {
     try {
-      const response = await fetch('/api/users', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'set_role', userIds: [userId], role: newRole }),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+      // Through the API client: a role change may ask the admin to confirm it is them.
+      await api('/api/users', { method: 'PATCH', body: { action: 'set_role', userIds: [userId], role: newRole } });
       setUsers(users.map(u => u.id === userId ? { ...u, role: newRole } : u));
       notify('Role updated', 'success');
     } catch (err) {
@@ -156,21 +160,6 @@ export default function UsersPage() {
     }
   };
 
-  const handleRemove = async (userId: string) => {
-    try {
-      const response = await fetch('/api/users', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'remove', userIds: [userId] }),
-      });
-      if (!response.ok) throw new Error(`Request failed (${response.status})`);
-      setUsers(users.filter(u => u.id !== userId));
-      notify('User removed', 'success');
-    } catch (err) {
-      notify(`Could not remove user. ${err instanceof Error ? err.message : ''}`.trim(), 'error');
-    }
-  };
-
   const handleCSVImport = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
@@ -185,6 +174,7 @@ export default function UsersPage() {
       .then((data) => {
         setUsers(data.users || []);
         setInvitations(data.invitations || []);
+        setRemoved(data.removed || []);
       })
       .catch(() => undefined);
 
@@ -352,7 +342,14 @@ export default function UsersPage() {
                           <UserX size={14} className="text-foreground-secondary" />
                         </button>
                         <button
-                          onClick={() => handleRemove(user.id)}
+                          onClick={() => setExpiring(user)}
+                          className="p-1.5 rounded hover:bg-background-secondary"
+                          title={user.expiresAt ? `Membership ends ${new Date(user.expiresAt).toLocaleDateString()}` : 'Set membership end'}
+                        >
+                          <CalendarClock size={14} className={user.expiresAt ? 'text-warning' : 'text-foreground-secondary'} />
+                        </button>
+                        <button
+                          onClick={() => setRemoving(user)}
                           className="p-1.5 rounded hover:bg-error-bg"
                           title="Remove"
                         >
@@ -389,6 +386,15 @@ export default function UsersPage() {
               </ul>
             </Card>
           )}
+          <RemovedMembers removed={removed} onRestored={() => { void reloadUsers(); notify('Member restored', 'success'); }} />
+          <RemoveMemberDialog
+            user={removing}
+            members={users}
+            restoreDays={restoreDays}
+            onClose={() => setRemoving(null)}
+            onDone={() => { setRemoving(null); void reloadUsers(); notify('User removed', 'success'); }}
+          />
+          <MembershipExpiryDialog user={expiring} onClose={() => setExpiring(null)} onDone={() => { setExpiring(null); void reloadUsers(); notify('Membership end saved', 'success'); }} />
         </TabContent>
 
         <TabContent tabId="roles" activeTab={activeTab}>

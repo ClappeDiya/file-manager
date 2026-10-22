@@ -150,7 +150,11 @@ export interface Membership {
   orgId: string;
   role: Role;
   createdAt: string;
+  /** The membership ends then (see `offboarding.expireMemberships`). */
+  expiresAt: string | null;
 }
+
+const membershipFromRow = (r: Row): Membership => ({ userId: r.user_id as string, orgId: r.org_id as string, role: r.role as Role, createdAt: r.created_at as string, expiresAt: (r.expires_at as string) ?? null });
 
 export function setMembership(userId: string, orgId: string, role: Role): void {
   db()
@@ -163,11 +167,11 @@ export function removeMembership(userId: string, orgId: string): boolean {
 }
 
 export function membershipsOf(userId: string): Membership[] {
-  return (db().prepare('SELECT * FROM org_memberships WHERE user_id = ?').all(userId) as Row[]).map((r) => ({ userId: r.user_id as string, orgId: r.org_id as string, role: r.role as Role, createdAt: r.created_at as string }));
+  return (db().prepare('SELECT * FROM org_memberships WHERE user_id = ?').all(userId) as Row[]).map(membershipFromRow);
 }
 
 export function membersOf(orgId: string): Membership[] {
-  return (db().prepare('SELECT * FROM org_memberships WHERE org_id = ?').all(orgId) as Row[]).map((r) => ({ userId: r.user_id as string, orgId: r.org_id as string, role: r.role as Role, createdAt: r.created_at as string }));
+  return (db().prepare('SELECT * FROM org_memberships WHERE org_id = ?').all(orgId) as Row[]).map(membershipFromRow);
 }
 
 const rank = (r: Role | null | undefined) => (r ? (ROLE_HIERARCHY[r] ?? 0) : 0);

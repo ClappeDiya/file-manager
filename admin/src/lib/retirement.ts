@@ -2,17 +2,18 @@
  * Retiring inactive access: an organization can set `retireInactiveDays`
  * (Settings → Security). Members whose last activity — sign-in, session use
  * or API token use, else when they joined — is older are removed from the
- * organization (and the account is disabled when it belongs to no other);
+ * organization through `offboardMember` (restorable; the account is
+ * disabled when it belongs to no other);
  * API tokens unused that long are revoked. Owners are never retired, so an
  * organization cannot lose its last administrator this way. Runs with the
  * periodic jobs; every change is audited.
  */
 import { db, type Row } from './db';
-import { listOrgs, membersOf, membershipsOf, removeMembership } from './db/repos/orgs';
+import { listOrgs, membersOf } from './db/repos/orgs';
+import { offboardMember } from './offboarding';
 import { getSecurity } from './db/repos/security';
-import { getUser, updateUser } from './db/repos/users';
-import { revokeUserSessions } from './db/repos/sessions';
-import { listApiTokens, revokeApiToken, revokeUserApiTokens } from './db/repos/api-tokens';
+import { getUser } from './db/repos/users';
+import { listApiTokens, revokeApiToken } from './db/repos/api-tokens';
 import { appendAudit } from './db/repos/audit';
 
 const latest = (...ts: (string | null | undefined)[]) => Math.max(0, ...ts.filter((t): t is string => !!t).map((t) => new Date(t).getTime()));
@@ -40,13 +41,7 @@ export function retireInactive(at = new Date()): RetirementResult {
       if (m.role === 'org_owner' || lastActivity(m.userId, m.createdAt) >= cutoff) continue;
       const u = getUser(m.userId);
       if (!u) continue;
-      removeMembership(m.userId, org.id);
-      const disabled = membershipsOf(m.userId).length === 0;
-      if (disabled) {
-        updateUser(m.userId, { isActive: false });
-        revokeUserSessions(m.userId, 'retired after inactivity');
-        revokeUserApiTokens(m.userId);
-      }
+      const { accountDisabled: disabled } = offboardMember(org.id, m.userId, { by: 'system', reason: 'inactive' });
       out.members.push({ orgId: org.id, userId: m.userId, email: u.email, disabled });
       appendAudit({
         eventType: 'user.retired_inactive',

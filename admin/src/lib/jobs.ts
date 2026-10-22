@@ -1,7 +1,7 @@
 /**
  * Periodic console work, started once per server process from
- * src/instrumentation.ts: missed-backup alerts, offboarding purges, retiring
- * inactive members and API tokens, a daily signed audit checkpoint and
+ * src/instrumentation.ts: missed-backup alerts, offboarding purges, membership
+ * expiry and removed-member purges, retiring inactive members and API tokens, a daily signed audit checkpoint and
  * scheduled AI summaries.
  */
 import { evaluateMissed } from './alerts';
@@ -11,6 +11,7 @@ import { runScheduledSummaries } from './ai';
 import { logger } from './utils/logger';
 import { startDelivery } from './delivery';
 import { retireInactive } from './retirement';
+import { expireMemberships, purgeRemovedMembers } from './offboarding';
 
 let started = false;
 
@@ -18,6 +19,8 @@ export async function runJobsOnce(at = new Date()): Promise<{ missed: number; pu
   const missed = (await evaluateMissed(at.getTime())).length;
   const purged = purgeOffboarded(at);
   for (const id of purged) appendAudit({ eventType: 'org.purge', severity: 'critical', description: `Deleted offboarded organization ${id} and its data`, resourceType: 'organization', resourceId: id });
+  expireMemberships(at);
+  purgeRemovedMembers(at);
   const r = retireInactive(at);
   const retired = r.members.length + r.tokens.length;
   const last = listAnchors()[0];
