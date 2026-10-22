@@ -1,11 +1,10 @@
 /**
  * API request log: every request made with an API token (accepted or not)
  * and every request refused for its network, so administrators can see
- * which scripts call the console and why calls fail. Kept KEEP_DAYS days.
+ * which scripts call the console and why calls fail. Kept as long as the
+ * retention settings say (`lib/retention`).
  */
 import { db, newId, now, type Row } from '../index';
-
-export const KEEP_DAYS = 30;
 
 export interface ApiRequest {
   id: string;
@@ -75,10 +74,4 @@ export function listApiRequests(orgId: string, q: ApiRequestQuery = {}): { reque
     .prepare(`SELECT * FROM api_requests WHERE ${w} ORDER BY at DESC, rowid DESC LIMIT ? OFFSET ?`)
     .all(...args, Math.min(q.limit ?? 50, 500), q.offset ?? 0) as Row[];
   return { requests: rows.map(fromRow), total };
-}
-
-export function pruneApiRequests(at = new Date()): number {
-  return db()
-    .prepare('DELETE FROM api_requests WHERE at < ?')
-    .run(new Date(at.getTime() - KEEP_DAYS * 86_400_000).toISOString()).changes;
 }

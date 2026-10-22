@@ -26,7 +26,7 @@ import {
   Sparkles,
   Building2,
   UsersRound,
-  Fingerprint, SlidersHorizontal, Webhook, ShieldCheck, FileBarChart } from 'lucide-react';
+  Fingerprint, SlidersHorizontal, Webhook, ShieldCheck, FileBarChart, Archive } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 import { useAdminStore } from '@/lib/stores/admin-store';
 import { useAuthStore } from '@/lib/stores/auth-store';
@@ -70,6 +70,7 @@ const navItems: NavItem[] = [
   { id: 'billing', i18nKey: 'nav.billing', href: '/billing', icon: CreditCard, requiredPermission: 'billing.read' },
   { id: 'sso', i18nKey: 'nav.sso', href: '/settings/sso', icon: Fingerprint, requiredPermission: 'sso.configure' },
   { id: 'security', i18nKey: 'nav.security', href: '/settings/security', icon: ShieldCheck, requiredPermission: 'users.read' },
+  { id: 'retention', i18nKey: 'nav.retention', href: '/settings/retention', icon: Archive, requiredPermission: 'audit.read' },
 ];
 
 export function Sidebar() {

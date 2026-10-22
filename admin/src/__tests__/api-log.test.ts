@@ -4,7 +4,7 @@ import { db } from '@/lib/db';
 import { createOrg } from '@/lib/db/repos/orgs';
 import { createApiToken, revokeApiToken } from '@/lib/db/repos/api-tokens';
 import { setSecurity } from '@/lib/db/repos/security';
-import { pruneApiRequests } from '@/lib/db/repos/api-log';
+import { applyRetention } from '@/lib/retention';
 import { json, makeUser, req } from './helpers';
 import * as users from '@/app/api/users/route';
 import * as apiRequests from '@/app/api/api-requests/route';
@@ -51,7 +51,7 @@ describe('API request log', () => {
     db()
       .prepare('UPDATE api_requests SET at = ? WHERE org_id = ?')
       .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), org.id);
-    expect(pruneApiRequests()).toBeGreaterThanOrEqual(4);
+    expect(applyRetention().api_requests).toBeGreaterThanOrEqual(4);
     expect((await json<{ total: number }>(await apiRequests.GET(await req('GET', '/api/api-requests', { as: admin })))).body.total).toBe(0);
   });
 });

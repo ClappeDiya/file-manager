@@ -7,7 +7,7 @@
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
 import { channelSecret, getChannel, listChannels, markDelivery, type Channel, type EmailConfig, type WebhookConfig } from './db/repos/channels';
-import { addToOutbox, dueOutbox, getOutboxEntry, pruneOutbox, recordOutboxAttempt } from './db/repos/outbox';
+import { addToOutbox, dueOutbox, getOutboxEntry, recordOutboxAttempt } from './db/repos/outbox';
 
 export interface Message {
   subject: string;
@@ -143,7 +143,6 @@ export async function processOutbox(at = new Date()): Promise<number> {
       n++;
     }
   }
-  pruneOutbox();
   return n;
 }
 

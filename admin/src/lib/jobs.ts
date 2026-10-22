@@ -13,7 +13,7 @@ import { startDelivery } from './delivery';
 import { startSiemForwarding } from './siem';
 import { retireInactive } from './retirement';
 import { expireMemberships, purgeRemovedMembers } from './offboarding';
-import { pruneApiRequests } from './db/repos/api-log';
+import { applyRetention } from './retention';
 import { runDueSchedules } from './report-runner';
 
 let started = false;
@@ -24,11 +24,16 @@ export async function runJobsOnce(at = new Date()): Promise<{ missed: number; pu
   for (const id of purged) appendAudit({ eventType: 'org.purge', severity: 'critical', description: `Deleted offboarded organization ${id} and its data`, resourceType: 'organization', resourceId: id });
   expireMemberships(at);
   purgeRemovedMembers(at);
-  pruneApiRequests(at);
   const r = retireInactive(at);
   const retired = r.members.length + r.tokens.length;
   const last = listAnchors()[0];
   const anchored = !last || at.getTime() - new Date(last.createdAt).getTime() > 86_400_000 ? anchorAudit() !== null : false;
+  try {
+    applyRetention(at);
+  } catch (e) {
+    // A chain that does not verify is never pruned; the alert is in the log.
+    logger.error('retention.failed', { error: e instanceof Error ? e.message : String(e) });
+  }
   const summaries = await runScheduledSummaries(at);
   await runDueSchedules(at);
   return { missed, purged, retired, anchored, summaries };

@@ -41,6 +41,7 @@
     "groups": "Groups",
     "sso": "Single sign-on",
     "security": "Security",
+    "retention": "Retention",
     "account": "My account"
   },
   "shell": {

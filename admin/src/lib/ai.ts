@@ -15,7 +15,7 @@ import { listMachines } from './db/repos/machines';
 import { listBackups, listReports } from './db/repos/reports';
 import { listAlerts } from './db/repos/alerts';
 import { deliverTo } from './mailer';
-import { appendAudit, canonical, verifyAudit } from './db/repos/audit';
+import { appendAudit, canonical, lastAuditPrune, verifyAudit } from './db/repos/audit';
 
 export const DEFAULT_MODEL = 'claude-opus-5-5';
 
@@ -180,7 +180,8 @@ export function getTranscript(orgId: string, reportId: string): (AiTranscript & 
   const recorded = entry ? (parseJson<{ sha256?: string }>(entry.metadata, {}).sha256 ?? null) : null;
   const matches = !!recorded && recorded === transcriptHash(t);
   const chain = verifyAudit();
-  const reason = !entry ? 'The audit entry for this transcript is missing' : !matches ? 'The transcript was changed after it was recorded' : !chain.ok ? `The audit chain does not verify: ${chain.reason}` : null;
+  const pruned = !entry && (lastAuditPrune()?.throughSequence ?? 0) > 0 && db().prepare('SELECT 1 FROM audit_prunes WHERE created_at >= ?').get(t.createdAt);
+  const reason = !entry ? (pruned ? 'The audit entry for this transcript was removed by audit-log retention' : 'The audit entry for this transcript is missing') : !matches ? 'The transcript was changed after it was recorded' : !chain.ok ? `The audit chain does not verify: ${chain.reason}` : null;
   return { ...t, verification: { matches, chainOk: chain.ok, auditSequence: entry ? Number(entry.sequence) : null, reason } };
 }
 

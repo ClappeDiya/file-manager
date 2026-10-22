@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { isContext, requirePermission } from '@/lib/session';
-import { listApiRequests, KEEP_DAYS } from '@/lib/db/repos/api-log';
+import { listApiRequests } from '@/lib/db/repos/api-log';
+import { getRetention } from '@/lib/retention';
 
 /** GET /api/api-requests?tokenId=&result=ok|refused&limit=&offset= — API-token requests and refused requests of this organization. */
 export async function GET(request: NextRequest) {
@@ -15,6 +16,6 @@ export async function GET(request: NextRequest) {
       limit: Number(q.get('limit') ?? 50),
       offset: Number(q.get('offset') ?? 0),
     }),
-    keepDays: KEEP_DAYS,
+    keepDays: getRetention().api_requests,
   });
 }

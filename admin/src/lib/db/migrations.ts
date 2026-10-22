@@ -645,6 +645,25 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 28,
+    description: 'Log retention settings and anchored audit pruning',
+    up(d) {
+      d.exec(`
+        CREATE TABLE console_settings (
+          key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+        );
+        CREATE TABLE audit_prunes (
+          id TEXT PRIMARY KEY, through_sequence INTEGER NOT NULL, through_hash TEXT NOT NULL,
+          anchor_id TEXT NOT NULL, pruned INTEGER NOT NULL, created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+        );
+        CREATE TRIGGER audit_prune_no_update BEFORE UPDATE ON audit_prunes
+          BEGIN SELECT RAISE(ABORT, 'audit prune records are append-only'); END;
+        CREATE TRIGGER audit_prune_no_delete BEFORE DELETE ON audit_prunes
+          BEGIN SELECT RAISE(ABORT, 'audit prune records are append-only'); END;
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

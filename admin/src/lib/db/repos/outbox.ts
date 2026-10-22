@@ -119,7 +119,7 @@ export function discardOutbox(orgId: string, id: string): boolean {
   return db().prepare("UPDATE channel_outbox SET status = 'discarded', next_attempt_at = NULL WHERE org_id = ? AND id = ? AND status IN ('pending', 'dead')").run(orgId, id).changes > 0;
 }
 
-/** Drop sent/discarded messages older than `days` (they may hold addresses). */
+/** Drop sent/discarded messages older than `days` (scheduled cleanup uses the retention settings, `lib/retention`). */
 export function pruneOutbox(days = KEEP_DAYS, at = new Date()): number {
   return db().prepare("DELETE FROM channel_outbox WHERE status IN ('sent', 'discarded') AND created_at < ?").run(new Date(at.getTime() - days * 86_400_000).toISOString()).changes;
 }
