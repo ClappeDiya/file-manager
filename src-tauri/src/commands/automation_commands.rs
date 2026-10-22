@@ -17,6 +17,7 @@ pub async fn create_automation_rule(
     repo: State<'_, Repository>,
     mgr: State<'_, AutomationManager>,
 ) -> Result<AutomationRule, AppError> {
+    mgr.ensure_editable(&rule.id).await?;
     mgr.sanitize_incoming(&mut rule).await;
     mgr.save_rule(&repo, &rule).await?;
     mgr.rearm(&rule).await?;
@@ -30,6 +31,7 @@ pub async fn update_automation_rule(
     repo: State<'_, Repository>,
     mgr: State<'_, AutomationManager>,
 ) -> Result<AutomationRule, AppError> {
+    mgr.ensure_editable(&rule.id).await?;
     mgr.sanitize_incoming(&mut rule).await;
     if let Some(wf) = &rule.workflow {
         wf.validate().map_err(AppError::validation)?;
@@ -48,6 +50,7 @@ pub async fn delete_automation_rule(
     repo: State<'_, Repository>,
     mgr: State<'_, AutomationManager>,
 ) -> Result<(), AppError> {
+    mgr.ensure_editable(&rule_id).await?;
     mgr.delete_rule(&repo, &rule_id).await?;
     tracing::info!("Deleted automation rule {}", rule_id);
     Ok(())
@@ -80,6 +83,7 @@ pub async fn enable_automation_rule(
     repo: State<'_, Repository>,
     mgr: State<'_, AutomationManager>,
 ) -> Result<(), AppError> {
+    mgr.ensure_editable(&rule_id).await?;
     mgr.set_enabled(&repo, &rule_id, enabled).await?;
     tracing::info!(
         "Automation rule {} {}",
@@ -117,6 +121,7 @@ pub async fn approve_automation_command(
     repo: State<'_, Repository>,
     mgr: State<'_, AutomationManager>,
 ) -> Result<AutomationRule, AppError> {
+    mgr.ensure_editable(&rule_id).await?;
     mgr.approve_commands(&repo, &rule_id).await
 }
 
@@ -148,6 +153,7 @@ pub async fn rotate_automation_webhook(
     repo: State<'_, Repository>,
     mgr: State<'_, AutomationManager>,
 ) -> Result<WebhookInfo, AppError> {
+    mgr.ensure_editable(&rule_id).await?;
     let token = mgr.rotate_webhook_secret(&repo, &rule_id).await?;
     let addr = match mgr.webhook_addr() {
         Some(a) => a,
@@ -362,6 +368,7 @@ pub async fn automation_rule_revisions(rule_id: String, repo: State<'_, Reposito
 /// Put an earlier version of a rule back.
 #[tauri::command]
 pub async fn automation_restore_revision(rule_id: String, revision: i64, repo: State<'_, Repository>, mgr: State<'_, AutomationManager>) -> Result<AutomationRule, AppError> {
+    mgr.ensure_editable(&rule_id).await?;
     let rule = mgr.restore_revision(&repo, &rule_id, revision).await?;
     mgr.rearm(&rule).await?;
     Ok(rule)

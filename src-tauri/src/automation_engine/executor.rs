@@ -1052,6 +1052,7 @@ mod tests {
             steps: vec![],
             options: Default::default(),
             workflow: None,
+            managed_by: None,
         };
 
         let log = execute_rule_action(&rule, Some(source.to_str().unwrap()), true).await;

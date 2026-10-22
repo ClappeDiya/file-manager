@@ -48,6 +48,23 @@ interface Form {
   mountCacheMb: string;
   mountCacheHours: string;
   mountRoot: string;
+  workflows: WorkflowForm[];
+}
+
+interface WorkflowForm {
+  id: string;
+  name: string;
+  enabled: boolean;
+  ruleJson: string;
+}
+
+/** The rule as typed; text that isn't JSON goes to the server as-is so its error names the workflow. */
+function parseRule(text: string): Record<string, unknown> {
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return text as unknown as Record<string, unknown>;
+  }
 }
 
 function toForm(s: ManagedSettings | null): Form {
@@ -73,6 +90,7 @@ function toForm(s: ManagedSettings | null): Form {
     mountCacheMb: s?.mounts?.maxCacheMb?.toString() ?? '',
     mountCacheHours: s?.mounts?.maxCacheAgeHours?.toString() ?? '',
     mountRoot: s?.mounts?.mountRoot ?? '',
+    workflows: (s?.workflows ?? []).map((w) => ({ id: w.id, name: w.name, enabled: w.enabled, ruleJson: JSON.stringify(w.rule, null, 2) })),
   };
 }
 
@@ -90,6 +108,7 @@ function toBody(f: Form): ManagedSettingsBody {
       maxCacheAgeHours: num(f.mountCacheHours),
       mountRoot: f.mountRoot.trim() || null,
     },
+    workflows: f.workflows.length ? f.workflows.map((w) => ({ id: w.id.trim(), name: w.name.trim(), enabled: w.enabled, rule: parseRule(w.ruleJson) })) : null,
   };
 }
 
@@ -247,12 +266,48 @@ export default function AppSettingsPage() {
             <CardDescription>The mount profile applies to new mounts; limits cap what people choose, forced options replace it.</CardDescription>
           </div>
         </Card>
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Organization workflows</CardTitle>
+            <CardDescription>
+              Automation rules every desktop runs and nobody can edit there. In the desktop app, open a rule and choose “Copy as JSON”, then paste it here. Rules that run programs are refused.
+            </CardDescription>
+          </CardHeader>
+          <div className="space-y-4">
+            {form.workflows.map((w, i) => {
+              const patch = (p: Partial<WorkflowForm>) => set({ workflows: form.workflows.map((x, j) => (j === i ? { ...x, ...p } : x)) });
+              return (
+                <div key={i} role="group" aria-label={`Workflow ${i + 1}`} className="space-y-2 rounded border border-border p-3">
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <Input label="Name" value={w.name} onChange={(e) => patch({ name: e.target.value })} />
+                    <Input label="Id" placeholder="From the name" value={w.id} onChange={(e) => patch({ id: e.target.value })} />
+                  </div>
+                  <label className="flex flex-col gap-1 text-sm">
+                    Rule (JSON)
+                    <textarea className="min-h-32 rounded border border-border bg-background p-2 font-mono text-xs" spellCheck={false} value={w.ruleJson} onChange={(e) => patch({ ruleJson: e.target.value })} />
+                  </label>
+                  <div className="flex items-center justify-between">
+                    <label className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={w.enabled} onChange={(e) => patch({ enabled: e.target.checked })} /> Enabled
+                    </label>
+                    <Button variant="outline" onClick={() => set({ workflows: form.workflows.filter((_, j) => j !== i) })}>
+                      Remove
+                    </Button>
+                  </div>
+                </div>
+              );
+            })}
+            <Button variant="outline" onClick={() => set({ workflows: [...form.workflows, { id: '', name: '', enabled: true, ruleJson: '' }] })}>
+              Add workflow
+            </Button>
+          </div>
+        </Card>
       </fieldset>
       {canWrite && (
         <div className="mt-4 flex gap-2">
           <Button onClick={() => void save(toBody(form))}>Save</Button>
           {s && (
-            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null })}>
+            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null })}>
               Stop managing
             </Button>
           )}

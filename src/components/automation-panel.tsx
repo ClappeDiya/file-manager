@@ -41,6 +41,7 @@ import {
   Sparkles,
   Copy,
   Webhook,
+  Building2,
 } from "lucide-react";
 
 // ── NL Input Bar ──
@@ -240,6 +241,12 @@ function RuleCard({ rule }: RuleCardProps) {
             <span className="text-xs font-medium text-[color:var(--color-text)] truncate">
               {rule.name}
             </span>
+            {rule.managed_by && (
+              <Badge variant="secondary" className="text-[10px] px-1 py-0" title={`Managed by ${rule.managed_by}`}>
+                <Building2 className="h-2.5 w-2.5 mr-0.5" aria-hidden="true" />
+                Org
+              </Badge>
+            )}
             {rule.error_count > 0 && (
               <Badge variant="error" className="text-[10px] px-1 py-0">
                 {rule.error_count} err
@@ -259,6 +266,7 @@ function RuleCard({ rule }: RuleCardProps) {
           type="button"
           role="switch"
           aria-checked={rule.enabled}
+          disabled={!!rule.managed_by}
           onClick={(e) => {
             e.stopPropagation();
             toggleRule(rule.id, !rule.enabled);
@@ -267,7 +275,7 @@ function RuleCard({ rule }: RuleCardProps) {
             "inline-flex items-center justify-center h-6 w-6 rounded transition-theme focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]",
             rule.enabled ? "text-[color:var(--color-success)]" : "text-[var(--color-text-muted)] hover:text-[color:var(--color-text)]",
           )}
-          title={rule.enabled ? "Disable rule" : "Enable rule"}
+          title={rule.managed_by ? `Managed by ${rule.managed_by}` : rule.enabled ? "Disable rule" : "Enable rule"}
           aria-label={`Rule ${rule.name}: ${rule.enabled ? "enabled" : "disabled"}`}
         >
           {rule.enabled ? (
@@ -336,7 +344,7 @@ function RuleCard({ rule }: RuleCardProps) {
               className="h-6 text-[10px]"
             >
               <Pencil className="h-3 w-3 mr-1" />
-              Edit
+              {rule.managed_by ? "View" : "Edit"}
             </Button>
             <Button
               variant="ghost"
@@ -350,20 +358,22 @@ function RuleCard({ rule }: RuleCardProps) {
               <Copy className="h-3 w-3 mr-1" />
               Clone
             </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={(e) => {
-                e.stopPropagation();
-                if (confirm(`Delete rule "${rule.name}"?`)) {
-                  deleteRule(rule.id);
-                }
-              }}
-              className="h-6 text-[10px] text-red-400 hover:text-red-500"
-            >
-              <Trash2 className="h-3 w-3 mr-1" />
-              Delete
-            </Button>
+            {!rule.managed_by && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (confirm(`Delete rule "${rule.name}"?`)) {
+                    deleteRule(rule.id);
+                  }
+                }}
+                className="h-6 text-[10px] text-red-400 hover:text-red-500"
+              >
+                <Trash2 className="h-3 w-3 mr-1" />
+                Delete
+              </Button>
+            )}
           </div>
         </div>
       )}

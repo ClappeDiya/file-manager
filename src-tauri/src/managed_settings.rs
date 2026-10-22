@@ -4,6 +4,7 @@
 //! update channel, automatic checks and the blackout window.
 
 use crate::ai_engine::AiAssistant;
+use crate::automation_engine::AutomationManager;
 use crate::backup_engine::BackupManager;
 use crate::commands::proxy_commands;
 use crate::mount_engine::MountManager;
@@ -30,8 +31,21 @@ fn proxy_settings(p: &ManagedProxy) -> Result<ProxySettings, AppError> {
     Ok(ProxySettings { mode, url: p.url.clone(), pac_url: p.pac_url.clone(), no_proxy: p.no_proxy.clone(), username: String::new(), managed: true })
 }
 
-/// Apply `settings` (or release them with `None`) and store them.
-pub async fn apply(repo: &Repository, creds: &CredentialStore, ai: &AiAssistant, backups: &BackupManager, mounts: &MountManager, settings: Option<ManagedSettings>) -> Result<(), AppError> {
+/// The managers managed settings change.
+#[derive(Clone, Copy)]
+pub struct Targets<'a> {
+    pub repo: &'a Repository,
+    pub creds: &'a CredentialStore,
+    pub ai: &'a AiAssistant,
+    pub backups: &'a BackupManager,
+    pub mounts: &'a MountManager,
+    pub automation: &'a AutomationManager,
+}
+
+/// Apply `settings` (or release them with `None`) and store them; `org`
+/// names the owner of organization workflows.
+pub async fn apply(t: Targets<'_>, org: &str, settings: Option<ManagedSettings>) -> Result<(), AppError> {
+    let Targets { repo, creds, ai, backups, mounts, automation } = t;
     if let Some(s) = &settings {
         s.validate().map_err(AppError::validation)?;
     }
@@ -48,11 +62,19 @@ pub async fn apply(repo: &Repository, creds: &CredentialStore, ai: &AiAssistant,
     ai.set_managed(settings.as_ref().and_then(|s| s.ai.clone())).await;
     backups.set_managed_caps(settings.as_ref().and_then(|s| s.transfers.clone())).await;
     mounts.set_managed(settings.as_ref().and_then(|s| s.mounts.clone())).await;
+    // Organization workflows: installed read-only; none listed removes them.
+    let workflows = settings.as_ref().and_then(|s| s.workflows.clone()).unwrap_or_default();
+    let problems = automation.apply_org_workflows(repo, &workflows, org).await?;
     let json = match &settings {
         Some(s) => serde_json::to_string(s)?,
         None => String::new(),
     };
-    repo.set_config(CONFIG_KEY, &json).await
+    repo.set_config(CONFIG_KEY, &json).await?;
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::validation(format!("Some organization workflows were not installed: {}", problems.join("; "))))
+    }
 }
 
 /// Startup: put the stored limits back in force (the proxy restores itself)
@@ -68,7 +90,7 @@ pub async fn activate_stored(repo: &Repository, ai: &AiAssistant, backups: &Back
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use ufop_core::agent::{ManagedAi, ManagedMounts, ManagedTransfers, ManagedUpdates};
+    use ufop_core::agent::{ManagedAi, ManagedMounts, ManagedTransfers, ManagedUpdates, ManagedWorkflow};
 
     #[tokio::test]
     async fn applies_stores_and_releases() {
@@ -85,9 +107,20 @@ mod tests {
             ai: Some(ManagedAi { enabled: Some(false), allow_cloud: None }),
             transfers: Some(ManagedTransfers { max_upload_kbps: Some(512), max_download_kbps: None, max_concurrent_runs: Some(3) }),
             mounts: Some(ManagedMounts { read_only: Some(true), cache_mode: Some("full".into()), ..Default::default() }),
+            workflows: Some(vec![ManagedWorkflow {
+                id: "intake".into(),
+                name: "Org intake".into(),
+                enabled: false,
+                rule: serde_json::to_value(crate::automation_engine::AutomationRule::new("x".into(), crate::automation_engine::RuleTrigger::Manual, crate::automation_engine::RuleAction::CreateFolder { path: "/tmp/org-intake".into() })).unwrap(),
+            }]),
         };
+        let automation = AutomationManager::new();
         let mounts = MountManager::with_cache_root(t.path().join("mount-cache"));
-        apply(&repo, &creds, &ai, &backups, &mounts, Some(s.clone())).await.unwrap();
+        let targets = Targets { repo: &repo, creds: &creds, ai: &ai, backups: &backups, mounts: &mounts, automation: &automation };
+        apply(targets, "Acme", Some(s.clone())).await.unwrap();
+        let org_rule = automation.get_rule("org-intake").await.expect("org workflow installed");
+        assert_eq!((org_rule.name.as_str(), org_rule.managed_by.as_deref()), ("Org intake", Some("Acme")));
+        assert!(automation.ensure_editable("org-intake").await.is_err());
         assert_eq!(load(&repo).await, Some(s));
         let p = net::current();
         assert!(p.managed && p.mode == ProxyMode::Manual && p.url == "http://proxy.corp:3128");
@@ -105,10 +138,11 @@ mod tests {
 
         // Invalid settings change nothing.
         let bad = ManagedSettings { version: 4, proxy: Some(ManagedProxy { mode: "pac".into(), ..Default::default() }), ..Default::default() };
-        assert!(apply(&repo, &creds, &ai, &backups, &mounts, Some(bad)).await.is_err());
+        assert!(apply(targets, "Acme", Some(bad)).await.is_err());
         assert_eq!(load(&repo).await.unwrap().version, 3);
 
-        apply(&repo, &creds, &ai, &backups, &mounts, None).await.unwrap();
+        apply(targets, "Acme", None).await.unwrap();
+        assert!(automation.get_rule("org-intake").await.is_none(), "org workflows removed when no longer managed");
         assert_eq!(load(&repo).await, None);
         assert!(!net::current().managed, "the managed proxy is released");
         assert!(ai.get_feature_toggles().await.ai_master_enabled);

@@ -505,7 +505,9 @@ pub fn run() {
             setup_agent.host().set_managed_settings_handler(std::sync::Arc::new(move |settings| {
                 let h = apply_handle.clone();
                 Box::pin(async move {
-                    managed_settings::apply(&h.state::<Repository>(), &h.state::<std::sync::Arc<CredentialStore>>(), &h.state::<AiAssistant>(), &h.state::<BackupManager>(), &h.state::<MountManager>(), settings).await
+                    let org = h.state::<fleet_agent::FleetAgent>().status().organization;
+                    let targets = managed_settings::Targets { repo: &h.state::<Repository>(), creds: &h.state::<std::sync::Arc<CredentialStore>>(), ai: &h.state::<AiAssistant>(), backups: &h.state::<BackupManager>(), mounts: &h.state::<MountManager>(), automation: &h.state::<AutomationManager>() };
+                    managed_settings::apply(targets, &org, settings).await
                 })
             }));
             fleet_agent::spawn(setup_agent.clone(), "unified-file-ops");

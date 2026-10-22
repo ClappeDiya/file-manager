@@ -370,6 +370,23 @@ export function ruleActions(rule: AutomationRule): RuleAction[] {
   return rule.workflow ? workflowActions(rule.workflow) : [rule.action, ...(rule.steps ?? []).map((s) => s.action)];
 }
 
+const IDENTITY_AND_STATS = ["id", "name", "enabled", "created_at", "updated_at", "last_triggered", "trigger_count", "error_count", "last_error", "managed_by"] as const;
+
+/** A rule's portable definition ("Copy as JSON", pasted into the admin
+ * console as an organization workflow): what it does, without its identity,
+ * run statistics, command approval or webhook secret. */
+export function portableRule(rule: AutomationRule): Record<string, unknown> {
+  const def: Record<string, unknown> = { ...rule };
+  for (const k of IDENTITY_AND_STATS) delete def[k];
+  if (rule.options) {
+    const options: Partial<RuleOptions> = { ...rule.options };
+    delete options.command_approval;
+    delete options.webhook_secret_hash;
+    def.options = options;
+  }
+  return def;
+}
+
 export function runsCommands(rule: AutomationRule): boolean {
   return ruleActions(rule).some((a) => a.type === "run_command");
 }

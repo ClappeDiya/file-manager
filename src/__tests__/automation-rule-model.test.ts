@@ -13,6 +13,7 @@ import {
   defaultAction,
   formFromRule,
   newRuleForm,
+  portableRule,
   rowKey,
   ruleFromForm,
   runsCommands,
@@ -134,6 +135,17 @@ describe("commands and summaries", () => {
     expect(conditionsSummary({ ...base, conditions: [{ type: "older_than", seconds: 60 }, { type: "name_regex", pattern: "^a" }] })).toBe("age > 60s AND name =~ /^a/");
     const tree = { type: "any" as const, nodes: [{ type: "all" as const, nodes: [leaf("a"), leaf("b")] }, { type: "all" as const, nodes: [leaf("c"), { type: "not" as const, node: leaf("d") }] }] };
     expect(conditionsSummary({ ...base, condition_tree: tree })).toBe("(ext = a AND ext = b) OR (ext = c AND NOT ext = d)");
+  });
+
+  it("exports a portable definition without identity, stats, approvals or secrets", () => {
+    const rule: AutomationRule = { ...ruleFromForm(form()), trigger_count: 4, last_error: "x", managed_by: "Acme" };
+    rule.options = { ...rule.options!, command_approval: "fp", webhook_secret_hash: "h" };
+    const def = portableRule(rule);
+    for (const k of ["id", "name", "enabled", "created_at", "updated_at", "last_triggered", "trigger_count", "error_count", "last_error", "managed_by"]) expect(def).not.toHaveProperty(k);
+    expect(def).toMatchObject({ trigger: rule.trigger, action: rule.action, conditions: rule.conditions });
+    expect(def.options).not.toHaveProperty("command_approval");
+    expect(def.options).not.toHaveProperty("webhook_secret_hash");
+    expect(rule.options!.command_approval).toBe("fp");
   });
 
   it("has a default for every action type", () => {

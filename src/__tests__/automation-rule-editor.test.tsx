@@ -116,6 +116,30 @@ describe("AutomationRuleEditor", () => {
     await waitFor(() => expect(screen.queryByRole("region", { name: "Command approval" })).toBeNull());
   });
 
+  it("shows an organization's rule read-only and copies its portable definition", async () => {
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    render(<AutomationRuleEditor />);
+    open();
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Org rule" } });
+    fireEvent.change(screen.getByLabelText("Folder to watch", { selector: "input" }), { target: { value: "/in" } });
+    fireEvent.click(screen.getByText("Create rule"));
+    await waitFor(() => expect(lastSaved).not.toBeNull());
+    const rule = { ...lastSaved!, id: "org-tidy", managed_by: "Acme" };
+    act(() => useAutomationStore.setState({ rules: [rule], editorOpen: false }));
+    open(rule);
+    expect(screen.getByText("View rule")).toBeTruthy();
+    expect(screen.getByRole("note").textContent).toContain("Managed by Acme");
+    expect(screen.getByLabelText("Name").matches(":disabled")).toBe(true);
+    expect(screen.queryByText("Save changes")).toBeNull();
+    fireEvent.click(screen.getByText("Copy as JSON"));
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+    const copied = JSON.parse((writeText.mock.calls[0] as unknown as [string])[0]);
+    expect(copied).not.toHaveProperty("id");
+    expect(copied.trigger).toEqual(rule.trigger);
+    expect(await screen.findByText("Copied")).toBeTruthy();
+  });
+
   it("saves a URL download step in the engine's shape (advanced mode)", async () => {
     useUIStore.setState({ appMode: "advanced" });
     render(<AutomationRuleEditor />);

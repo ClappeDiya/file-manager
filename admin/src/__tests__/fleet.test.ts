@@ -585,6 +585,7 @@ describe('audit trail of fleet actions', () => {
   });
 
   it('manages app settings for desktops and delivers them with the policies', async () => {
+    const RULE = { trigger: { type: 'file_created', path: '~/Downloads' }, action: { type: 'move', destination: '~/Sorted' } };
     const admin = makeUser('ms-admin@x.org', 'org_admin');
     const auditor = makeUser('ms-auditor@x.org', 'read_only_auditor');
     const m = await enroll(admin, 'ms-desk');
@@ -610,10 +611,19 @@ describe('audit trail of fleet actions', () => {
       { mounts: { allowedProtocols: ['gopher'] } },
       { mounts: { maxCacheMb: 0 } },
       { mounts: { readOnly: 'yes' } },
+      { workflows: { name: 'x' } },
+      { workflows: [{ name: '', rule: RULE }] },
+      { workflows: [{ name: 'Bad id', id: 'no spaces', rule: RULE }] },
+      { workflows: [{ name: 'Not a rule', rule: { hello: 1 } }] },
+      { workflows: [{ name: 'Broken', rule: '{not json' }] },
+      { workflows: [{ name: 'Runs', rule: { ...RULE, action: { type: 'run_command', command: 'rm' } } }] },
+      { workflows: [{ name: 'Nested', rule: { ...RULE, workflow: { nodes: [{ kind: { type: 'action', action: { type: 'execute_custom_command' } } }] } } }] },
+      { workflows: [{ name: 'Same', rule: RULE }, { name: 'same', rule: RULE }] },
+      { workflows: Array.from({ length: 51 }, (_, i) => ({ name: `w${i}`, rule: RULE })) },
     ]) expect((await put(admin, bad)).status).toBe(400);
 
     const ok = await json<{ settings: { version: number } }>(
-      await put(admin, { updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [5, 1, 1] } }, proxy: { mode: 'pac', pacUrl: 'https://wpad/p.pac', noProxy: [' intranet ', ''] }, ai: { allowCloud: false }, transfers: { maxUploadKbps: 512, maxConcurrentRuns: 2 }, mounts: { allowedProtocols: ['S3', 'rclone', 's3'], readOnly: true, cacheMode: 'full', maxCacheMb: 2048, mountRoot: ' ~/Drives ' } }),
+      await put(admin, { updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [5, 1, 1] } }, proxy: { mode: 'pac', pacUrl: 'https://wpad/p.pac', noProxy: [' intranet ', ''] }, ai: { allowCloud: false }, transfers: { maxUploadKbps: 512, maxConcurrentRuns: 2 }, mounts: { allowedProtocols: ['S3', 'rclone', 's3'], readOnly: true, cacheMode: 'full', maxCacheMb: 2048, mountRoot: ' ~/Drives ' }, workflows: [{ name: 'Tidy Downloads!', rule: JSON.stringify(RULE) }, { id: 'archive', name: 'Archive', enabled: false, rule: RULE }] }),
     );
     expect(ok.status).toBe(200);
     expect(ok.body.settings.version).toBe(1);
@@ -625,6 +635,10 @@ describe('audit trail of fleet actions', () => {
       ai: { enabled: null, allowCloud: false },
       transfers: { maxUploadKbps: 512, maxDownloadKbps: null, maxConcurrentRuns: 2 },
       mounts: { allowedProtocols: ['s3', 'rclone'], readOnly: true, cacheMode: 'full', maxCacheMb: 2048, maxCacheAgeHours: null, mountRoot: '~/Drives' },
+      workflows: [
+        { id: 'tidy-downloads', name: 'Tidy Downloads!', enabled: true, rule: RULE },
+        { id: 'archive', name: 'Archive', enabled: false, rule: RULE },
+      ],
     });
     expect(b.policySetVersion).not.toBe(v0);
     const hbv = await json<{ policiesChanged: boolean }>(await hb(m.token, { policySetVersion: v0 }));

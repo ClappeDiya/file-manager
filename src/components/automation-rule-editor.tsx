@@ -12,7 +12,7 @@ import { WorkflowBuilder } from "@/components/workflow-builder";
 import { autoLayout } from "@/lib/workflow-model";
 import { refId } from "@/stores/schedule-store";
 import { useCallback, useEffect, useState } from "react";
-import { ArrowDown, ArrowUp, FlaskConical, Link2, Plus, ShieldCheck, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Building2, ClipboardCopy, FlaskConical, Link2, Plus, ShieldCheck, Trash2, X } from "lucide-react";
 import { Button } from "@ufop/ui-components";
 import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { useUIStore } from "@/stores/ui-store";
@@ -35,6 +35,7 @@ import {
   formFromRule,
   isFileTrigger,
   newRuleForm,
+  portableRule,
   rowKey,
   ruleFromForm,
   runsCommands,
@@ -474,6 +475,7 @@ export function AutomationRuleEditor() {
   const [connections, setConnections] = useState<Named[]>([]);
   const [customCommands, setCustomCommands] = useState<Named[]>([]);
   const [revisions, setRevisions] = useState<RuleRevision[]>([]);
+  const [copied, setCopied] = useState(false);
   const loadRules = useAutomationStore((s) => s.loadRules);
 
   useEffect(() => {
@@ -486,6 +488,7 @@ export function AutomationRuleEditor() {
     setSaved(existing ?? null);
     setWebhook(null);
     setSample("");
+    setCopied(false);
     void tauriInvokeSafe<Named[]>("list_sync_pairs", undefined, []).then(setSyncPairs);
     void tauriInvokeSafe<Named[]>("list_connections", undefined, []).then(setConnections);
     void tauriInvokeSafe<Named[]>("list_custom_commands", undefined, []).then(setCustomCommands);
@@ -529,7 +532,20 @@ export function AutomationRuleEditor() {
     if (log?.files_affected[0]) setSample(log.files_affected[0]);
   };
 
+  const copyJson = async () => {
+    const problems = validateForm(form);
+    setErrors(problems);
+    if (problems.length) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(portableRule(ruleFromForm(form)), null, 2));
+      setCopied(true);
+    } catch (e) {
+      setErrors([`Could not copy: ${errorText(e)}`]);
+    }
+  };
+
   const fileTrigger = isFileTrigger(form.trigger);
+  const managedBy = saved?.managed_by ?? null;
   const needsApproval = saved && runsCommands(saved) && !saved.options?.command_approval;
 
   return (
@@ -537,7 +553,7 @@ export function AutomationRuleEditor() {
       <div className="absolute inset-0 bg-black/50" aria-hidden="true" onClick={closeEditor} />
       <div className="relative z-10 flex max-h-[90vh] w-full max-w-2xl flex-col rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] shadow-2xl">
         <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
-          <h2 id="rule-editor-title" className="text-sm font-semibold">{form.id ? "Edit rule" : "New rule"}</h2>
+          <h2 id="rule-editor-title" className="text-sm font-semibold">{managedBy ? "View rule" : form.id ? "Edit rule" : "New rule"}</h2>
           <div className="flex items-center gap-2">
             {!form.id && (
               <select
@@ -562,6 +578,13 @@ export function AutomationRuleEditor() {
         </div>
 
         <div className="flex-1 space-y-4 overflow-y-auto px-4 py-3">
+          {managedBy && (
+            <p className="flex items-center gap-2 rounded border border-[var(--color-border)] bg-[var(--color-bg)] p-2 text-xs" role="note">
+              <Building2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              Managed by {managedBy}. Your organization sets this rule from its admin console; it can't be changed here.
+            </p>
+          )}
+          <fieldset disabled={!!managedBy} className="m-0 min-w-0 space-y-4 border-0 p-0">
           <div className="flex gap-3 items-end">
             <div className="flex-1">
               <label className={label} htmlFor="rule-name">Name</label>
@@ -960,6 +983,8 @@ export function AutomationRuleEditor() {
             </section>
           )}
 
+          </fieldset>
+
           {errors.length > 0 && (
             <ul className="text-xs text-red-500 space-y-0.5" role="alert">
               {errors.map((e) => (
@@ -970,12 +995,17 @@ export function AutomationRuleEditor() {
         </div>
 
         <div className="flex items-center justify-between border-t border-[var(--color-border)] px-4 py-3">
-          <Button variant="outline" size="sm" onClick={dryRun} disabled={busy}>
-            <FlaskConical className="h-3.5 w-3.5 mr-1" /> Dry run
-          </Button>
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" onClick={dryRun} disabled={busy}>
+              <FlaskConical className="h-3.5 w-3.5 mr-1" /> Dry run
+            </Button>
+            <Button variant="ghost" size="sm" onClick={copyJson} title="Copy the rule's definition, e.g. to add it as an organization workflow in the admin console">
+              <ClipboardCopy className="h-3.5 w-3.5 mr-1" /> {copied ? "Copied" : "Copy as JSON"}
+            </Button>
+          </div>
           <div className="flex gap-2">
             <Button variant="ghost" size="sm" onClick={closeEditor}>Close</Button>
-            <Button size="sm" onClick={save} disabled={busy}>{form.id ? "Save changes" : "Create rule"}</Button>
+            {!managedBy && <Button size="sm" onClick={save} disabled={busy}>{form.id ? "Save changes" : "Create rule"}</Button>}
           </div>
         </div>
       </div>

@@ -56,6 +56,22 @@ pub struct AutomationRule {
     /// When set, the rule runs this graph instead of `action` + `steps`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<workflow::Workflow>,
+    /// Organization that owns the rule (pushed from the console; read-only here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<String>,
+}
+
+/// A rule from its portable definition (what "Copy as JSON" exports): the
+/// trigger, conditions and actions, with identity and run stats optional.
+pub fn rule_from_definition(definition: &serde_json::Value) -> Result<AutomationRule, serde_json::Error> {
+    let mut v = definition.clone();
+    if let Some(o) = v.as_object_mut() {
+        let now = Utc::now().to_rfc3339();
+        for (k, d) in [("id", "".into()), ("name", "".into()), ("enabled", true.into()), ("conditions", serde_json::json!([])), ("created_at", now.clone().into()), ("updated_at", now.clone().into()), ("last_triggered", serde_json::Value::Null), ("trigger_count", 0.into()), ("error_count", 0.into()), ("last_error", serde_json::Value::Null)] {
+            o.entry(k).or_insert(d);
+        }
+    }
+    serde_json::from_value(v)
 }
 
 /// The parts of a rule stored in `automation_rules.extra_json`.
@@ -69,6 +85,8 @@ struct RuleExtra {
     options: RuleOptions,
     #[serde(default)]
     workflow: Option<workflow::Workflow>,
+    #[serde(default)]
+    managed_by: Option<String>,
 }
 
 /// One extra action of a multi-step rule.
@@ -180,6 +198,7 @@ impl AutomationRule {
             steps: Vec::new(),
             options: RuleOptions::default(),
             workflow: None,
+            managed_by: None,
         }
     }
 
@@ -677,6 +696,7 @@ async fn db_save_rule(repo: &crate::storage::Repository, rule: &AutomationRule) 
             steps: rule_clone.steps.clone(),
             options: rule_clone.options.clone(),
             workflow: rule_clone.workflow.clone(),
+            managed_by: rule_clone.managed_by.clone(),
         })
         .unwrap_or_else(|_| "{}".into());
 
@@ -885,6 +905,7 @@ impl AutomationManager {
                         steps: extra.steps,
                         options: extra.options,
                         workflow: extra.workflow,
+                        managed_by: extra.managed_by,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -1185,6 +1206,8 @@ impl AutomationManager {
         });
         rule.options.command_approval = still_approved;
         rule.options.webhook_secret_hash = stored.and_then(|s| s.options.webhook_secret_hash);
+        // Only managed settings make a rule the organization's.
+        rule.managed_by = None;
     }
 
     /// Approve the exact command lines a rule runs (after the user confirmed
@@ -1212,6 +1235,76 @@ impl AutomationManager {
         copy.options = RuleOptions { command_approval: None, webhook_secret_hash: None, ..src.options.clone() };
         self.save_rule(repo, &copy).await?;
         Ok(copy)
+    }
+
+    /// Refuse changing a rule the organization owns.
+    pub async fn ensure_editable(&self, rule_id: &str) -> Result<(), AppError> {
+        match self.get_rule(rule_id).await.and_then(|r| r.managed_by) {
+            Some(org) => Err(AppError::PermissionDenied {
+                message: format!("This rule is managed by {org} and cannot be changed here"),
+                advice: "Run it as it is, or duplicate it to make your own version.".into(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Install the organization's workflows (console-managed settings):
+    /// add or update each as a read-only rule `org-<id>`, and remove org rules
+    /// that are no longer listed. Returns problems with individual workflows
+    /// (those are skipped; the others still apply).
+    pub async fn apply_org_workflows(&self, repo: &crate::storage::Repository, workflows: &[ufop_core::agent::ManagedWorkflow], org: &str) -> Result<Vec<String>, AppError> {
+        let org = if org.trim().is_empty() { "your organization" } else { org.trim() };
+        let mut problems = Vec::new();
+        let mut wanted = std::collections::HashSet::new();
+        for wf in workflows {
+            let id = format!("org-{}", wf.id);
+            wanted.insert(id.clone());
+            if let Err(e) = wf.validate() {
+                problems.push(e);
+                continue;
+            }
+            let mut rule = match rule_from_definition(&wf.rule) {
+                Ok(r) => r,
+                Err(e) => {
+                    problems.push(format!("Workflow '{}' could not be read: {e}", wf.name));
+                    continue;
+                }
+            };
+            let existing = self.get_rule(&id).await;
+            rule.id = id.clone();
+            rule.name = wf.name.clone();
+            rule.enabled = wf.enabled;
+            rule.managed_by = Some(org.to_string());
+            rule.options.command_approval = None;
+            rule.options.webhook_secret_hash = None;
+            if command_approvals(&rule).is_some() {
+                problems.push(format!("Workflow '{}' runs a program; organization workflows cannot", wf.name));
+                continue;
+            }
+            if let Some(w) = &rule.workflow {
+                if let Err(e) = w.validate() {
+                    problems.push(format!("Workflow '{}': {e}", wf.name));
+                    continue;
+                }
+            }
+            if let Some(old) = &existing {
+                rule.created_at = old.created_at.clone();
+                (rule.trigger_count, rule.error_count, rule.last_triggered, rule.last_error) = (old.trigger_count, old.error_count, old.last_triggered.clone(), old.last_error.clone());
+                let same = |r: &AutomationRule| serde_json::to_value(AutomationRule { updated_at: String::new(), ..r.clone() }).ok();
+                if same(old) == same(&rule) {
+                    continue;
+                }
+                self.record_revision(repo, &id).await?;
+            }
+            rule.updated_at = Utc::now().to_rfc3339();
+            self.save_rule(repo, &rule).await?;
+            self.rearm(&rule).await?;
+        }
+        let gone: Vec<String> = self.rules.read().await.iter().filter(|r| r.managed_by.is_some() && !wanted.contains(&r.id)).map(|r| r.id.clone()).collect();
+        for id in gone {
+            self.delete_rule(repo, &id).await?;
+        }
+        Ok(problems)
     }
 
     /// Keep the stored version of `rule_id` as a revision before an edit
@@ -1409,9 +1502,62 @@ impl Default for AutomationManager {
 
 #[cfg(test)]
 mod tests {
-    /// Rules exactly as the desktop rule editor emits them (generated by
-    /// `src/__tests__/automation-rule-model.test.ts`): every one must load,
-    /// and the shapes the editor relies on must come through.
+    #[tokio::test]
+    async fn org_workflows_install_update_refuse_programs_and_uninstall() {
+        use ufop_core::agent::ManagedWorkflow;
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = AutomationManager::new();
+        let mine = AutomationRule::new("mine".into(), RuleTrigger::Manual, RuleAction::CreateFolder { path: "/m".into() });
+        mgr.save_rule(&repo, &mine).await.unwrap();
+        let rule = |p: &str| serde_json::to_value(AutomationRule::new("ignored".into(), RuleTrigger::Manual, RuleAction::CreateFolder { path: p.into() })).unwrap();
+        let wf = |id: &str, r: serde_json::Value| ManagedWorkflow { id: id.into(), name: format!("Org {id}"), enabled: true, rule: r };
+        let cmd = serde_json::to_value(AutomationRule::new("c".into(), RuleTrigger::Manual, RuleAction::RunCommand { program: "sh".into(), args: vec![], working_dir: None, timeout_secs: 5 })).unwrap();
+
+        let problems = mgr.apply_org_workflows(&repo, &[wf("a", rule("/a")), wf("b", rule("/b")), wf("evil", cmd)], "Acme").await.unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("runs a program"));
+        let a = mgr.get_rule("org-a").await.unwrap();
+        assert_eq!((a.name.as_str(), a.enabled, a.managed_by.as_deref()), ("Org a", true, Some("Acme")));
+        assert!(mgr.get_rule("org-evil").await.is_none());
+        assert!(mgr.ensure_editable("org-a").await.unwrap_err().to_string().contains("managed by Acme"));
+        assert!(mgr.ensure_editable(&mine.id).await.is_ok());
+
+        // An update keeps the run statistics (and the old version as a revision); an unchanged one is not rewritten.
+        mgr.rules.write().await.iter_mut().find(|r| r.id == "org-a").unwrap().trigger_count = 7;
+        let before = mgr.get_rule("org-b").await.unwrap().updated_at;
+        mgr.apply_org_workflows(&repo, &[wf("a", rule("/a2")), wf("b", rule("/b"))], "Acme").await.unwrap();
+        let a2 = mgr.get_rule("org-a").await.unwrap();
+        assert!(matches!(&a2.action, RuleAction::CreateFolder { path } if path == "/a2"));
+        assert_eq!(a2.trigger_count, 7);
+        assert_eq!(mgr.list_revisions(&repo, "org-a").await.unwrap().len(), 1);
+        assert_eq!(mgr.get_rule("org-b").await.unwrap().updated_at, before);
+
+        // Dropped by the organization: removed; the user's own rule stays.
+        mgr.apply_org_workflows(&repo, &[wf("b", rule("/b"))], "Acme").await.unwrap();
+        assert!(mgr.get_rule("org-a").await.is_none() && mgr.get_rule("org-b").await.is_some());
+        mgr.apply_org_workflows(&repo, &[], "Acme").await.unwrap();
+        assert!(mgr.get_rule("org-b").await.is_none());
+        assert!(mgr.get_rule(&mine.id).await.is_some());
+        // Persisted with its owner.
+        mgr.apply_org_workflows(&repo, &[wf("c", rule("/c"))], "").await.unwrap();
+        let reloaded = AutomationManager::new();
+        reloaded.load_rules_from_db(&repo).await.unwrap();
+        assert_eq!(reloaded.get_rule("org-c").await.unwrap().managed_by.as_deref(), Some("your organization"));
+
+        // The portable definition "Copy as JSON" exports (no identity or stats) installs too.
+        let portable = serde_json::json!({ "trigger": { "type": "manual" }, "action": { "type": "create_folder", "path": "/p" } });
+        assert!(mgr.apply_org_workflows(&repo, &[wf("p", portable)], "Acme").await.unwrap().is_empty());
+        let p = mgr.get_rule("org-p").await.unwrap();
+        assert_eq!((p.name.as_str(), p.trigger_count, p.conditions.len()), ("Org p", 0, 0));
+
+        // A rule the user sends can't claim an owner, or take an org rule's id.
+        let mut spoof = AutomationRule::new("spoof".into(), RuleTrigger::Manual, RuleAction::CreateFolder { path: "/s".into() });
+        spoof.managed_by = Some("Acme".into());
+        mgr.sanitize_incoming(&mut spoof).await;
+        assert!(spoof.managed_by.is_none());
+        assert!(mgr.ensure_editable("org-p").await.is_err());
+    }
+
     #[tokio::test]
     async fn revisions_are_kept_listed_and_restored() {
         let repo = crate::storage::Repository::open_in_memory().await.unwrap();
@@ -1438,6 +1584,9 @@ mod tests {
         assert!(mgr.list_revisions(&repo, &rule.id).await.unwrap().is_empty());
     }
 
+    /// Rules exactly as the desktop rule editor emits them (generated by
+    /// `src/__tests__/automation-rule-model.test.ts`): every one must load,
+    /// and the shapes the editor relies on must come through.
     #[test]
     fn editor_rules_deserialize() {
         let rules: Vec<AutomationRule> =

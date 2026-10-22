@@ -560,6 +560,7 @@ In Advanced mode, a rule's actions can be edited as a **workflow**: a graph inst
 - **Run graph:** a workflow run in the run history has a *Run graph* button that shows which steps succeeded, failed or were skipped.
 - **History:** every edit keeps the previous version of the rule (up to 50). Open the rule's *History* to restore one. Command approvals must be given again after a restore.
 - Workflows are checked when saved: no loops, known steps only, delays up to 24 hours, nested rules at most 4 deep and never running themselves. Programs (`Run a program`) inside a workflow need the same approval as in a list.
+- **Organization workflows:** rules your organization pushes from the admin console show an *Org* badge. They run like your own but can only be viewed, not edited, switched off or deleted; *Clone* makes an editable copy. *Copy as JSON* (rule editor) copies any rule's definition — without its run statistics, command approval or webhook secret — to paste into the console.
 
 ## Automation: downloading a URL
 

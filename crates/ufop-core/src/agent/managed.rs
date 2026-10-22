@@ -21,6 +21,64 @@ pub struct ManagedSettings {
     pub transfers: Option<ManagedTransfers>,
     /// Rules for drive mounts (the mount profile).
     pub mounts: Option<ManagedMounts>,
+    /// Automation rules (workflows) the organization owns on its desktops.
+    pub workflows: Option<Vec<ManagedWorkflow>>,
+}
+
+/// Most organization workflows per desktop, and the largest one (JSON bytes).
+pub const MAX_WORKFLOWS: usize = 50;
+pub const MAX_WORKFLOW_BYTES: usize = 256 * 1024;
+/// Actions an organization workflow may not contain: running programs is
+/// a decision for each desktop, not one pushed from the console.
+pub const FORBIDDEN_WORKFLOW_ACTIONS: [&str; 2] = ["run_command", "execute_custom_command"];
+
+/// An automation rule owned by the organization: installed read-only on
+/// every desktop (people can run it, not change it) and removed when the
+/// organization drops it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ManagedWorkflow {
+    /// Stable id (letters, digits, `-`, `_`).
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    /// The rule as the desktop app exports it (`AutomationRule` JSON).
+    pub rule: serde_json::Value,
+}
+
+impl ManagedWorkflow {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.is_empty() || self.id.len() > 64 || !self.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err(format!("Workflow id '{}' must be 1–64 letters, digits, '-' or '_'", self.id));
+        }
+        if self.name.trim().is_empty() || self.name.chars().count() > 200 {
+            return Err(format!("Workflow {} needs a name (up to 200 characters)", self.id));
+        }
+        if !self.rule.is_object() || self.rule.get("trigger").is_none() || self.rule.get("action").is_none() {
+            return Err(format!("Workflow '{}' is not an automation rule (export it from the desktop app)", self.name));
+        }
+        if serde_json::to_vec(&self.rule).map(|v| v.len()).unwrap_or(usize::MAX) > MAX_WORKFLOW_BYTES {
+            return Err(format!("Workflow '{}' is larger than {} KB", self.name, MAX_WORKFLOW_BYTES / 1024));
+        }
+        if let Some(t) = forbidden_action(&self.rule) {
+            return Err(format!("Workflow '{}' runs a program ({t}); organization workflows cannot", self.name));
+        }
+        Ok(())
+    }
+}
+
+/// The first forbidden action type anywhere in a rule's JSON.
+fn forbidden_action(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let Some(t) = m.get("type").and_then(|t| t.as_str()).filter(|t| FORBIDDEN_WORKFLOW_ACTIONS.contains(t)) {
+                return Some(t.to_string());
+            }
+            m.values().find_map(forbidden_action)
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(forbidden_action),
+        _ => None,
+    }
 }
 
 /// The organization's mount profile: what may be mounted and how.
@@ -164,6 +222,18 @@ impl ManagedSettings {
                 return Err("The mount root must be a folder".into());
             }
         }
+        if let Some(w) = &self.workflows {
+            if w.len() > MAX_WORKFLOWS {
+                return Err(format!("At most {MAX_WORKFLOWS} organization workflows"));
+            }
+            let mut ids = std::collections::HashSet::new();
+            for wf in w {
+                wf.validate()?;
+                if !ids.insert(wf.id.as_str()) {
+                    return Err(format!("Two workflows share the id '{}'", wf.id));
+                }
+            }
+        }
         if let Some(p) = &self.proxy {
             if !PROXY_MODES.contains(&p.mode.as_str()) {
                 return Err(format!("Unknown proxy mode '{}'", p.mode));
@@ -180,13 +250,28 @@ impl ManagedSettings {
 
     /// No section managed.
     pub fn is_empty(&self) -> bool {
-        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none() && self.mounts.is_none()
+        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none() && self.mounts.is_none() && self.workflows.is_none()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflows_validate() {
+        let rule = serde_json::json!({"name": "x", "trigger": {"type": "manual"}, "action": {"type": "notify", "title": "a", "body": "b"}});
+        let wf = |id: &str, rule: serde_json::Value| ManagedWorkflow { id: id.into(), name: "Intake".into(), enabled: true, rule };
+        let s: ManagedSettings = serde_json::from_value(serde_json::json!({"workflows": [{"id": "intake", "name": "Intake", "enabled": true, "rule": rule}]})).unwrap();
+        assert!(s.validate().is_ok() && !s.is_empty());
+        let bad = |w: ManagedWorkflow| ManagedSettings { workflows: Some(vec![w]), ..Default::default() }.validate().unwrap_err();
+        assert!(bad(wf("has space", rule.clone())).contains("letters"));
+        assert!(bad(wf("x", serde_json::json!({"trigger": {}}))).contains("not an automation rule"));
+        let cmd = serde_json::json!({"trigger": {"type": "manual"}, "action": {"type": "notify"}, "workflow": {"nodes": [{"id": "n1", "kind": "action", "action": {"type": "run_command", "program": "sh"}}]}});
+        assert!(bad(wf("x", cmd)).contains("runs a program (run_command)"));
+        let dup = ManagedSettings { workflows: Some(vec![wf("a", rule.clone()), wf("a", rule)]), ..Default::default() };
+        assert!(dup.validate().unwrap_err().contains("share the id"));
+    }
 
     #[test]
     fn mount_profile_validates_and_parses_camel_case() {

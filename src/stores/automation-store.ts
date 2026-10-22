@@ -138,6 +138,8 @@ export interface AutomationRule {
   options?: RuleOptions;
   /** When set, the rule runs this graph instead of `action` + `steps`. */
   workflow?: Workflow | null;
+  /** Organization that owns the rule (managed settings); read-only here. */
+  managed_by?: string | null;
 }
 
 /** `automation_engine::workflow`: a rule's actions as a DAG. */
