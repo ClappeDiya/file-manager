@@ -32,7 +32,7 @@ const registered: AgentStatus = {
 describe("fleet agent", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
-    useFleetAgentStore.setState({ status: UNREGISTERED, busy: false, error: "" });
+    useFleetAgentStore.setState({ status: UNREGISTERED, busy: false, error: "", connect: null });
     w.__TAURI__ = {};
     w.__TAURI_INTERNALS__ = {};
   });
@@ -50,9 +50,49 @@ describe("fleet agent", () => {
     expect(mockInvoke).not.toHaveBeenCalled();
   });
 
+  it("signs in with the browser and shows the page to approve while waiting", async () => {
+    let finish: (v: AgentStatus) => void = () => {};
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "fleet_agent_connect_start") return Promise.resolve({ url: "https://console.example.com/fleet/connect?state=s", browser_opened: false });
+      if (cmd === "fleet_agent_connect_finish") return new Promise((r) => (finish = r));
+      return Promise.resolve(UNREGISTERED);
+    });
+    render(<FleetAgentSection />);
+    fireEvent.change(screen.getByLabelText("Console URL"), { target: { value: " https://console.example.com " } });
+    fireEvent.change(screen.getByLabelText("Tags"), { target: { value: "lab" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with browser" }));
+    await waitFor(() => expect(screen.getByTestId("fleet-agent-signing-in")).toBeTruthy());
+    expect(screen.getByText("https://console.example.com/fleet/connect?state=s")).toBeTruthy();
+    expect(screen.getByText(/Open this page in your browser/)).toBeTruthy();
+    expect(mockInvoke).toHaveBeenCalledWith("fleet_agent_connect_start", { consoleUrl: "https://console.example.com" });
+    expect(mockInvoke).toHaveBeenCalledWith("fleet_agent_connect_finish", { tags: "lab" });
+    finish(registered);
+    await waitFor(() => expect(screen.getByTestId("fleet-agent-registered")).toBeTruthy());
+    expect(useFleetAgentStore.getState().connect).toBeNull();
+  });
+
+  it("cancels a browser sign-in and shows the reason", async () => {
+    let fail: (e: unknown) => void = () => {};
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "fleet_agent_connect_start") return Promise.resolve({ url: "https://c.example/fleet/connect", browser_opened: true });
+      if (cmd === "fleet_agent_connect_finish") return new Promise((_, rej) => (fail = rej));
+      return Promise.resolve(cmd === "fleet_agent_connect_cancel" ? null : UNREGISTERED);
+    });
+    render(<FleetAgentSection />);
+    fireEvent.change(screen.getByLabelText("Console URL"), { target: { value: "https://c.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with browser" }));
+    await waitFor(() => expect(screen.getByText("Approve the connection in your browser.")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("fleet_agent_connect_cancel", undefined));
+    fail({ message: "The browser sign-in was cancelled", advice: "Start it again when you are ready." });
+    await waitFor(() => expect(screen.getByText(/The browser sign-in was cancelled/)).toBeTruthy());
+    expect(screen.getByTestId("fleet-agent-unregistered")).toBeTruthy();
+  });
+
   it("registers with a link token", async () => {
     mockInvoke.mockImplementation(async (cmd: string) => (cmd === "fleet_agent_register" ? registered : UNREGISTERED));
     render(<FleetAgentSection />);
+    fireEvent.click(screen.getByLabelText(/Registration link/));
     fireEvent.change(screen.getByLabelText("Console URL"), { target: { value: " https://console.example.com " } });
     fireEvent.change(screen.getByLabelText("Registration token"), { target: { value: "ufop_reg_abc" } });
     fireEvent.change(screen.getByLabelText("Tags"), { target: { value: "lab, linux" } });

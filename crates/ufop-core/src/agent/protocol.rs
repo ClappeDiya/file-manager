@@ -358,6 +358,17 @@ impl AgentClient {
         Ok(r)
     }
 
+    /// Redeem a browser sign-in code (loopback redirect + PKCE) for an agent token.
+    pub async fn connect_token(&self, code: &str, code_verifier: &str, redirect_uri: &str, info: &ClientInfo, tags: &[String]) -> Result<Registration, ConsoleError> {
+        let r: Registration = self
+            .call("/api/agent/connect/token", None, Some(json!({ "code": code, "codeVerifier": code_verifier, "redirectUri": redirect_uri, "info": info, "tags": tags })), false)
+            .await?;
+        if r.machine_id.is_empty() || !r.agent_token.starts_with("ufop_agent_") {
+            return Err(ConsoleError::Invalid("no machine id or agent token".into()));
+        }
+        Ok(r)
+    }
+
     pub async fn start_claim(&self, info: &ClientInfo) -> Result<ClaimStart, ConsoleError> {
         let c: ClaimStart = self.call("/api/agent/claim", None, Some(json!({ "info": info })), false).await?;
         if c.claim_id.is_empty() || c.secret.is_empty() || c.code.is_empty() {

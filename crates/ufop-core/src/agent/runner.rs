@@ -331,6 +331,32 @@ impl<H: AgentHost> Agent<H> {
         self.finish_enrollment(client.base_url(), r.machine_id, r.agent_token, r.organization, r.heartbeat_seconds, tags, "link").await
     }
 
+    /// The console URL a browser sign-in starts at (`/fleet/connect`), for the
+    /// loopback `redirect_uri`, `state` and PKCE S256 `code_challenge`.
+    pub fn connect_url(&self, console_url: &str, redirect_uri: &str, state: &str, code_challenge: &str) -> Result<String, AppError> {
+        self.ensure_unregistered()?;
+        let base = normalize_console_url(console_url)?;
+        let info = self.host.client_info();
+        let mut u = reqwest::Url::parse(&format!("{base}/fleet/connect")).map_err(|e| AppError::validation(format!("Invalid console URL: {e}")))?;
+        u.query_pairs_mut()
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("state", state)
+            .append_pair("code_challenge", code_challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("hostname", &info.hostname)
+            .append_pair("name", info.name.as_deref().unwrap_or(&info.hostname));
+        Ok(u.to_string())
+    }
+
+    /// Finish a browser sign-in: redeem the code from the loopback redirect.
+    pub async fn register_with_code(&self, console_url: &str, code: &str, code_verifier: &str, redirect_uri: &str, tags: Vec<String>) -> Result<AgentStatus, AppError> {
+        self.ensure_unregistered()?;
+        let client = self.client(console_url)?;
+        let r = client.connect_token(code, code_verifier, redirect_uri, &self.host.client_info(), &tags).await?;
+        *lock(&self.claim) = None;
+        self.finish_enrollment(client.base_url(), r.machine_id, r.agent_token, r.organization, r.heartbeat_seconds, tags, "sso").await
+    }
+
     /// Start interactive claiming: show the returned code to the user.
     pub async fn start_claim(&self, console_url: &str) -> Result<ClaimStatus, AppError> {
         self.ensure_unregistered()?;

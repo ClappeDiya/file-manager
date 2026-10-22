@@ -337,6 +337,21 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 9,
+    description: 'Browser sign-in codes for desktop enrollment (loopback + PKCE)',
+    up(d) {
+      d.exec(`
+        CREATE TABLE desktop_connect_codes (
+          code_hash TEXT PRIMARY KEY,
+          org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          user_email TEXT NOT NULL, code_challenge TEXT NOT NULL, redirect_uri TEXT NOT NULL,
+          name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT
+        );
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

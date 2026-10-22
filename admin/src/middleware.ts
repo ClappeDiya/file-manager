@@ -19,6 +19,14 @@ const PUBLIC_PATHS = [
  */
 const AGENT_PATHS = ['/api/agent/', '/api/ingest/', '/api/auth/sso/'];
 
+/** Send a page request to sign-in, coming back to the same page afterwards. */
+function toLogin(request: NextRequest): NextResponse {
+  const login = new URL('/login', request.url);
+  const back = request.nextUrl.pathname + request.nextUrl.search;
+  if (back !== '/' && !back.startsWith('/login')) login.searchParams.set('redirect', back);
+  return NextResponse.redirect(login);
+}
+
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
@@ -74,7 +82,7 @@ export async function middleware(request: NextRequest) {
     if (pathname.startsWith('/api/')) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
-    return NextResponse.redirect(new URL('/login', request.url));
+    return toLogin(request);
   }
 
   // Security: fail if NEXTAUTH_SECRET is not configured
@@ -100,7 +108,7 @@ export async function middleware(request: NextRequest) {
     if (pathname.startsWith('/api/')) {
       return NextResponse.json({ error: 'Session expired' }, { status: 401 });
     }
-    const response = NextResponse.redirect(new URL('/login', request.url));
+    const response = toLogin(request);
     response.cookies.delete('ufop-admin-session');
     return response;
   }

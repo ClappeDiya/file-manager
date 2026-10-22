@@ -296,5 +296,7 @@ impl AgentHost for BackupHost {
     }
 }
 
+pub mod loopback;
+
 #[cfg(test)]
 mod tests;

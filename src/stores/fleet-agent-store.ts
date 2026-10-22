@@ -79,6 +79,12 @@ export function describeAgentError(err: unknown): string {
   return String(err);
 }
 
+/** Mirrors `fleet_agent_commands::ConnectStart`. */
+export interface ConnectStart {
+  url: string;
+  browser_opened: boolean;
+}
+
 interface FleetAgentState {
   status: AgentStatus;
   busy: boolean;
@@ -88,6 +94,11 @@ interface FleetAgentState {
   startClaim: (consoleUrl: string) => Promise<ClaimStatus | null>;
   pollClaim: () => Promise<ClaimPollResult["state"]>;
   cancelClaim: () => Promise<void>;
+  /** Browser sign-in in progress (the console page to approve in). */
+  connect: ConnectStart | null;
+  /** Open the console in the browser and wait until the user approves. */
+  signInWithBrowser: (consoleUrl: string, tags?: string) => Promise<boolean>;
+  cancelSignIn: () => Promise<void>;
   unregister: (force?: boolean) => Promise<boolean>;
   setEnabled: (enabled: boolean) => Promise<void>;
   syncNow: () => Promise<void>;
@@ -112,6 +123,7 @@ export const useFleetAgentStore = create<FleetAgentState>((set, get) => {
     status: UNREGISTERED,
     busy: false,
     error: "",
+    connect: null,
 
     refresh: async () => {
       set({ status: await tauriInvokeSafe<AgentStatus>("fleet_agent_status", undefined, UNREGISTERED) });
@@ -153,6 +165,24 @@ export const useFleetAgentStore = create<FleetAgentState>((set, get) => {
 
     cancelClaim: async () => {
       await act(() => tauriInvoke<AgentStatus>("fleet_agent_cancel_claim"));
+    },
+
+    signInWithBrowser: async (consoleUrl, tags) => {
+      set({ error: "" });
+      try {
+        set({ connect: await tauriInvoke<ConnectStart>("fleet_agent_connect_start", { consoleUrl: consoleUrl.trim() }) });
+      } catch (err) {
+        set({ error: describeAgentError(err) });
+        return false;
+      }
+      const ok = await act(() => tauriInvoke<AgentStatus>("fleet_agent_connect_finish", { tags: tags?.trim() ? tags.trim() : null }));
+      set({ connect: null });
+      return ok;
+    },
+
+    cancelSignIn: async () => {
+      await tauriInvokeSafe("fleet_agent_connect_cancel", undefined, null);
+      set({ connect: null });
     },
 
     unregister: (force = false) => act(() => tauriInvoke<AgentStatus>("fleet_agent_unregister", { force })),

@@ -34,6 +34,10 @@ import * as claimPoll from '@/app/api/agent/claim/poll/route';
 import * as heartbeat from '@/app/api/agent/heartbeat/route';
 import * as agentReport from '@/app/api/agent/report/route';
 import * as agentDiagnostics from '@/app/api/agent/diagnostics/route';
+import * as fleetConnect from '@/app/api/fleet/connect/route';
+import * as connectToken from '@/app/api/agent/connect/token/route';
+import { middleware } from '@/middleware';
+import { createHash } from 'node:crypto';
 import * as machineDiagnostics from '@/app/api/fleet/machines/[id]/diagnostics/route';
 import { KEEP_PER_MACHINE, MAX_DIAGNOSTICS_BYTES } from '@/lib/db/repos/diagnostics';
 import * as rotate from '@/app/api/agent/rotate/route';
@@ -512,5 +516,55 @@ describe('audit trail of fleet actions', () => {
     const other = createOrg({ name: 'Diag Other' });
     const outsider = makeUser('diag-out@y.org', 'org_admin', other.id);
     expect((await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics`, { as: outsider }), P(m.id))).status).toBe(404);
+  });
+
+  it('enrolls a desktop by browser sign-in with a loopback redirect and PKCE', async () => {
+    const admin = makeUser('connect-admin@x.org', 'org_admin');
+    const viewer = makeUser('connect-viewer@x.org', 'read_only_auditor');
+    const verifier = 'v'.repeat(64);
+    const challenge = createHash('sha256').update(verifier).digest('base64url');
+    const redirectUri = 'http://127.0.0.1:49152/callback';
+    const approve = async (as: UserRecord, body: Record<string, unknown>) => fleetConnect.POST(await req('POST', '/api/fleet/connect', { as, body }));
+    const exchange = async (body: Record<string, unknown>) => connectToken.POST(await req('POST', '/api/agent/connect/token', { body }));
+
+    expect((await approve(viewer, { redirectUri, state: 's1', codeChallenge: challenge })).status).toBe(403);
+    for (const bad of ['https://127.0.0.1:1/cb', 'http://evil.example:80/cb', 'http://127.0.0.1/cb', 'http://user:pw@127.0.0.1:5/cb']) {
+      expect((await approve(admin, { redirectUri: bad, state: 's1', codeChallenge: challenge })).status).toBe(400);
+    }
+    expect((await approve(admin, { redirectUri, state: 's1', codeChallenge: 'short' })).status).toBe(400);
+
+    const ok = await json<{ redirect: string }>(await approve(admin, { redirectUri, state: 's1', codeChallenge: challenge, name: 'Ana laptop', tags: ['Laptop'] }));
+    expect(ok.status).toBe(200);
+    const back = new URL(ok.body.redirect);
+    expect(back.origin + back.pathname).toBe(redirectUri);
+    expect(back.searchParams.get('state')).toBe('s1');
+    const code = back.searchParams.get('code')!;
+    expect(code).toMatch(/^ufop_connect_/);
+
+    // Wrong verifier burns the code; it cannot be retried with the right one.
+    expect((await exchange({ code, codeVerifier: 'x'.repeat(64), redirectUri, info: { hostname: 'ana' } })).status).toBe(401);
+    expect((await exchange({ code, codeVerifier: verifier, redirectUri, info: { hostname: 'ana' } })).status).toBe(401);
+
+    const again = new URL((await json<{ redirect: string }>(await approve(admin, { redirectUri, state: 's2', codeChallenge: challenge, name: 'Ana laptop', tags: ['Laptop'] }))).body.redirect).searchParams.get('code')!;
+    expect((await exchange({ code: again, codeVerifier: verifier, redirectUri: 'http://127.0.0.1:1/other', info: {} })).status).toBe(401);
+    const third = new URL((await json<{ redirect: string }>(await approve(admin, { redirectUri, state: 's3', codeChallenge: challenge, name: 'Ana laptop', tags: ['Laptop'] }))).body.redirect).searchParams.get('code')!;
+    const reg = await json<{ machineId: string; agentToken: string }>(await exchange({ code: third, codeVerifier: verifier, redirectUri, info: { hostname: 'ana', os: 'macos', clientVersion: '1.0.0' }, tags: ['dev'] }));
+    expect(reg.status).toBe(201);
+    expect(reg.body.agentToken).toMatch(/^ufop_agent_/);
+    const m = getMachine(reg.body.machineId)!;
+    expect(m).toMatchObject({ name: 'Ana laptop', hostname: 'ana', registeredVia: 'sso:connect-admin@x.org' });
+    expect(m.tags).toEqual(['dev', 'laptop']);
+    expect((await hb(reg.body.agentToken)).status).toBe(200);
+    expect((await exchange({ code: third, codeVerifier: verifier, redirectUri, info: {} })).status).toBe(401);
+    expect(listAudit({}).entries.map((e) => e.eventType)).toEqual(expect.arrayContaining(['fleet.desktop_connect']));
+  });
+
+  it('sends signed-out page requests to sign-in and back to the same page', async () => {
+    const r = await middleware(new NextRequest(new URL('http://localhost:3001/fleet/connect?redirect_uri=http%3A%2F%2F127.0.0.1%3A5%2Fcb&state=s')));
+    const loc = new URL(r.headers.get('location')!);
+    expect(loc.pathname).toBe('/login');
+    expect(loc.searchParams.get('redirect')).toBe('/fleet/connect?redirect_uri=http%3A%2F%2F127.0.0.1%3A5%2Fcb&state=s');
+    const api = await middleware(new NextRequest(new URL('http://localhost:3001/api/fleet/machines')));
+    expect(api.status).toBe(401);
   });
 });

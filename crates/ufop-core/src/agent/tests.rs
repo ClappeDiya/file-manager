@@ -143,6 +143,12 @@ fn console() -> (MockConsole, Arc<Mutex<Console>>) {
                 }
                 (201, json!({ "machineId": "mch_1", "agentToken": c.token, "organization": "Acme", "heartbeatSeconds": 20 }))
             }
+            "/api/agent/connect/token" => {
+                if r.body["code"] != "ufop_connect_ok" || r.body["codeVerifier"] != "verifier" || r.body["redirectUri"] != "http://127.0.0.1:5/callback" {
+                    return (401, json!({ "error": "The sign-in code is not valid or has expired; sign in again" }));
+                }
+                (201, json!({ "machineId": "mch_3", "agentToken": c.token, "organization": "Acme", "heartbeatSeconds": 45 }))
+            }
             "/api/agent/claim" => (201, json!({ "claimId": "clm_1", "code": "ABCD-EFGH", "secret": "ufop_claim_s", "expiresAt": "2099-01-01T00:00:00Z" })),
             "/api/agent/claim/poll" => {
                 c.claim_polls += 1;
@@ -302,6 +308,30 @@ async fn rotate_command_completes_with_new_token() {
     assert_eq!(host.st().token.as_deref(), Some("ufop_agent_rotated1"));
     a.cycle().await.unwrap();
     assert_eq!(m.hits("/api/agent/heartbeat").last().unwrap().bearer(), Some("ufop_agent_rotated1"));
+}
+
+#[tokio::test]
+async fn browser_sign_in_builds_the_url_and_redeems_the_code() {
+    let (m, _c) = console();
+    let host = FakeHost::default();
+    let a = agent(&host).await;
+    let url = reqwest::Url::parse(&a.connect_url(&m.url, "http://127.0.0.1:5/callback", "st", "ch").unwrap()).unwrap();
+    assert_eq!(url.path(), "/fleet/connect");
+    let q: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(q["redirect_uri"], "http://127.0.0.1:5/callback");
+    assert_eq!(q["state"], "st");
+    assert_eq!(q["code_challenge_method"], "S256");
+    assert_eq!(q["hostname"], "box1");
+
+    let err = a.register_with_code(&m.url, "ufop_connect_bad", "verifier", "http://127.0.0.1:5/callback", vec![]).await.unwrap_err();
+    assert!(err.user_message().contains("sign in again"), "{}", err.user_message());
+    let st = a.register_with_code(&m.url, "ufop_connect_ok", "verifier", "http://127.0.0.1:5/callback", vec!["dev".into()]).await.unwrap();
+    assert!(st.registered);
+    assert_eq!(st.machine_id, "mch_3");
+    assert_eq!(st.registered_via, "sso");
+    assert_eq!(host.st().token.as_deref(), Some("ufop_agent_first"));
+    // Already registered: no second sign-in.
+    assert!(a.connect_url(&m.url, "http://127.0.0.1:5/callback", "st", "ch").is_err());
 }
 
 #[tokio::test]
