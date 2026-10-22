@@ -39,6 +39,7 @@
     "enrollment": "Enrollment",
     "fleetPolicies": "Fleet policies",
     "appSettings": "App settings",
+    "policyAsCode": "Policy as code",
     "credentials": "Credentials",
     "alerts": "Alerts",
     "webhooks": "Webhooks",

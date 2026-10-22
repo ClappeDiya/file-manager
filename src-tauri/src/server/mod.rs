@@ -12,6 +12,7 @@ pub mod folders;
 pub mod gateway;
 pub mod oauth;
 pub mod openapi;
+pub mod sdk;
 pub mod shares;
 pub mod tls;
 /// Server settings live in `security::settings_store` (shared with the backup engine).
@@ -679,10 +680,22 @@ fn mime_for(p: &std::path::Path) -> &'static str {
 }
 
 /// Build the full router.
+/// `GET /api/v1/sdk/{language}`: the generated client library (public, like the OpenAPI document).
+async fn sdk_download(axum::extract::Path(language): axum::extract::Path<String>) -> Response {
+    let doc = openapi::document();
+    let (text, file) = match language.as_str() {
+        "typescript" | "ts" => (sdk::typescript(&doc), "ufop-client.ts"),
+        "python" | "py" => (sdk::python(&doc), "ufop_client.py"),
+        _ => return (StatusCode::NOT_FOUND, Json(json!({ "error_type": "not_found", "message": format!("No client for '{language}'"), "advice": "Use typescript or python." }))).into_response(),
+    };
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()), (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{file}\""))], text).into_response()
+}
+
 pub fn router(st: ServerState) -> Router {
     let public = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/openapi.json", get(|| async { Json(openapi::document()) }))
+        .route("/api/v1/sdk/{language}", get(sdk_download))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/refresh", post(refresh))
         .route("/api/v1/auth/logout", post(logout))

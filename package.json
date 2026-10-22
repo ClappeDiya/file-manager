@@ -50,7 +50,8 @@
     "hooks:uninstall": "bash scripts/install-git-hooks.sh --uninstall",
     "hooks:status": "bash scripts/install-git-hooks.sh --status",
     "admin:dev": "pnpm --filter admin dev",
-    "admin:build": "pnpm --filter admin build"
+    "admin:build": "pnpm --filter admin build",
+    "sdk:check": "tsc -p sdk/typescript && python3 -m py_compile sdk/python/ufop_client.py"
   },
   "packageManager": "pnpm@10.27.0",
   "dependencies": {

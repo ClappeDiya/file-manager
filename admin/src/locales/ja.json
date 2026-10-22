@@ -39,6 +39,7 @@
     "enrollment": "登録",
     "fleetPolicies": "フリートポリシー",
     "appSettings": "アプリ設定",
+    "policyAsCode": "コードとしてのポリシー",
     "credentials": "認証情報",
     "alerts": "アラート",
     "webhooks": "Webhook",

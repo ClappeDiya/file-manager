@@ -39,6 +39,7 @@
     "enrollment": "Inscription",
     "fleetPolicies": "Stratégies du parc",
     "appSettings": "Réglages de l’app",
+    "policyAsCode": "Politiques en code",
     "credentials": "Identifiants",
     "alerts": "Alertes",
     "webhooks": "Webhooks",

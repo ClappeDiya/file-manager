@@ -39,6 +39,7 @@
     "enrollment": "注册",
     "fleetPolicies": "设备群策略",
     "appSettings": "应用设置",
+    "policyAsCode": "策略即代码",
     "credentials": "凭据",
     "alerts": "警报",
     "webhooks": "Webhook",

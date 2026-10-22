@@ -720,3 +720,65 @@ async fn file_gateway_relays_through_an_ha_pool_without_storing() {
     b.await.unwrap().unwrap();
     assert_eq!(s.client.get(gw("/files?path=/")).bearer_auth(&read_tok).send().await.unwrap().status(), 404, "the empty gateway is gone");
 }
+
+/// The generated clients, run for real against a server: Python (standard
+/// library) and TypeScript (Node's type stripping), when installed.
+#[tokio::test]
+async fn generated_clients_work_against_a_live_server() {
+    let s = start(ServerConfig::default(), None).await;
+    let sdk = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sdk");
+    // The server hands out the same clients.
+    let served = s.client.get(format!("{}/api/v1/sdk/python", s.base)).send().await.unwrap();
+    assert_eq!(served.status(), 200);
+    assert_eq!(served.text().await.unwrap(), sdk::python(&openapi::document()));
+    assert_eq!(s.client.get(format!("{}/api/v1/sdk/cobol", s.base)).send().await.unwrap().status(), 404);
+
+    let run = |program: &str, args: Vec<String>| {
+        let out = std::process::Command::new(program).args(&args).output();
+        out.ok().map(|o| (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string(), String::from_utf8_lossy(&o.stderr).to_string()))
+    };
+    let py = format!(
+        r#"import json, sys
+sys.path.insert(0, {dir:?})
+from ufop_client import UfopClient, UfopError
+c = UfopClient({base:?})
+try:
+    c.get_jobs()
+    raise SystemExit("unauthenticated call succeeded")
+except UfopError as e:
+    assert e.status == 401, e.status
+c.login("server-password")
+print(json.dumps({{"status": c.get_health()["status"], "jobs": c.get_jobs(), "tokens": len(c.get_auth_api_tokens()["tokens"]), "paused": c.post_scheduler_pause({{"minutes": 5}})["paused"]}}))
+"#,
+        dir = sdk.join("python").to_string_lossy(),
+        base = s.base
+    );
+    if let Some((ok, out, err)) = tokio::task::spawn_blocking(move || run("python3", vec!["-c".into(), py])).await.unwrap() {
+        assert!(ok, "python client failed: {err}");
+        let v: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v, json!({ "status": "ok", "jobs": [], "tokens": 0, "paused": true }));
+    }
+    let script = s.dir.join("client.mts");
+    std::fs::write(
+        &script,
+        format!(
+            r#"import {{ UfopClient, UfopError }} from {index:?};
+const c = new UfopClient({base:?});
+try {{ await c.getJobs(); throw new Error("unauthenticated call succeeded"); }} catch (e) {{ if (!(e instanceof UfopError) || e.status !== 401) throw e; }}
+await c.login("server-password");
+const health = await c.getHealth();
+const resumed = await c.postSchedulerResume();
+console.log(JSON.stringify({{ status: health.status, jobs: await c.getJobs(), paused: resumed.paused }}));
+"#,
+            index = sdk.join("typescript/src/index.ts").to_string_lossy(),
+            base = s.base
+        ),
+    )
+    .unwrap();
+    let args = vec!["--experimental-strip-types".into(), "--no-warnings".into(), script.to_string_lossy().into_owned()];
+    if let Some((ok, out, err)) = tokio::task::spawn_blocking(move || run("node", args)).await.unwrap() {
+        assert!(ok, "typescript client failed: {err}");
+        let v: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v, json!({ "status": "ok", "jobs": [], "paused": false }));
+    }
+}

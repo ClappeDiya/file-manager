@@ -4,6 +4,7 @@ import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
+  FileCode2,
   LayoutDashboard,
   Users,
   Monitor,
@@ -53,6 +54,7 @@ const navItems: NavItem[] = [
   { id: 'enrollment', i18nKey: 'nav.enrollment', href: '/fleet/enroll', icon: Link2, requiredPermission: 'fleet.enroll' },
   { id: 'fleet-policies', i18nKey: 'nav.fleetPolicies', href: '/fleet/policies', icon: ClipboardList, requiredPermission: 'fleet.read' },
   { id: 'app-settings', i18nKey: 'nav.appSettings', href: '/fleet/app-settings', icon: SlidersHorizontal, requiredPermission: 'fleet.read' },
+  { id: 'policy-as-code', i18nKey: 'nav.policyAsCode', href: '/fleet/policy-as-code', icon: FileCode2, requiredPermission: 'fleet.read' },
   { id: 'credentials', i18nKey: 'nav.credentials', href: '/fleet/credentials', icon: KeyRound, requiredPermission: 'fleet.read' },
   { id: 'alerts', i18nKey: 'nav.alerts', href: '/alerts', icon: Bell, requiredPermission: 'alerts.read' },
   { id: 'webhooks', i18nKey: 'nav.webhooks', href: '/integrations/webhooks', icon: Webhook, requiredPermission: 'alerts.read' },

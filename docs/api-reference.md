@@ -723,3 +723,7 @@ The desktop application uses Tauri IPC for communication between the frontend (R
 | **Preview** | `preview_file`, `preview_get_exif` |
 | **Archive** | `archive_browse`, `archive_create`, `archive_extract`, `archive_info` |
 | **Integrity** | `integrity_checksum`, `integrity_verify`, `integrity_find_duplicates`, `integrity_resolve_duplicates`, `integrity_create_tag`, `integrity_list_tags`, `integrity_tag_file`, `integrity_create_smart_folder`, `integrity_run_smart_folder` |
+
+## Client libraries
+
+Generated TypeScript and Python clients live in [`sdk/`](../sdk/README.md) and are served by every server at `GET /api/v1/sdk/typescript` and `GET /api/v1/sdk/python` (public, like `/api/v1/openapi.json`). They cover the JSON API under `/api/v1`, are regenerated from the OpenAPI document (`UPDATE_SDK=1 cargo test --lib sdk`), and a test fails when the committed clients drift from the API.

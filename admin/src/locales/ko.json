@@ -39,6 +39,7 @@
     "enrollment": "등록",
     "fleetPolicies": "플릿 정책",
     "appSettings": "앱 설정",
+    "policyAsCode": "코드형 정책",
     "credentials": "자격 증명",
     "alerts": "알림",
     "webhooks": "웹후크",

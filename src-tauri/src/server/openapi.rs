@@ -66,6 +66,7 @@ macro_rules! op {
 pub(crate) const OPS: &[Op] = &[
     op!("get" "/api/v1/health", "general", "Liveness, version and scheduler summary", auth: false, params: &[], body: None, response: || json!({ "type": "object", "properties": { "status": { "const": "ok" }, "version": { "type": "string" }, "uptime_secs": { "type": "integer" }, "scheduler_running": { "type": "boolean" }, "scheduler_paused": { "type": "boolean" }, "active_tasks": { "type": "integer" }, "queued_tasks": { "type": "integer" } } })),
     op!("get" "/api/v1/openapi.json", "general", "This document", auth: false, params: &[], body: None, response: any),
+    Op { method: "get", path: "/api/v1/sdk/{language}", tag: "general", summary: "Generated client library for this API (typescript or python)", auth: false, params: &[("language", "path", "string", true, "typescript or python")], body: None, response: html, content_type: "text/plain" },
     op!("post" "/api/v1/auth/login", "auth", "Sign in with the server password; sets the refresh cookie", auth: false, params: &[], body: Some(|| json!({ "type": "object", "required": ["password"], "properties": { "password": { "type": "string", "format": "password" } } })), response: session),
     op!("post" "/api/v1/auth/refresh", "auth", "New access token from the refresh cookie (rotated)", auth: false, params: &[], body: None, response: session),
     op!("post" "/api/v1/auth/logout", "auth", "Revoke the refresh cookie's session", auth: false, params: &[], body: None, response: ok_flag),
