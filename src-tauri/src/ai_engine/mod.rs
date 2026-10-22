@@ -137,6 +137,9 @@ pub struct AiAssistant {
     /// Limits set by the organization's console (on top of the user's toggles).
     managed: Arc<RwLock<Option<ufop_core::agent::ManagedAi>>>,
     pending_confirmations: Arc<RwLock<Vec<String>>>,
+    /// The tamper-evident audit chain (`audit_events`): AI actions and chat
+    /// transcripts are appended there and read back from it.
+    audit_pool: Option<crate::storage::pool::DbPool>,
     // Ollama integration
     http_client: reqwest::Client,
     ollama_available: Arc<RwLock<Option<bool>>>,
@@ -157,9 +160,25 @@ impl AiAssistant {
             feature_toggles: Arc::new(RwLock::new(AiFeatureToggles::default())),
             managed: Arc::new(RwLock::new(None)),
             pending_confirmations: Arc::new(RwLock::new(Vec::new())),
+            audit_pool: None,
             http_client,
             ollama_available: Arc::new(RwLock::new(None)),
             ollama_model: Arc::new(RwLock::new("llama3.2".to_string())),
+        }
+    }
+
+    /// An assistant whose AI actions and chat transcripts go to the audit
+    /// chain in `pool` (persisted, hash-linked, covered by signed anchors).
+    pub fn with_audit(pool: crate::storage::pool::DbPool) -> Self {
+        Self { audit_pool: Some(pool), ..Self::new() }
+    }
+
+    /// Append to the audit chain (non-fatal: a failure is logged, the in-memory log keeps the entry).
+    async fn chain(&self, event_type: String, resource: String, details: serde_json::Value) {
+        let Some(pool) = &self.audit_pool else { return };
+        let event = crate::core::types::AuditEvent { id: Uuid::new_v4(), timestamp: Utc::now(), event_type, actor: "user".into(), resource, details: details.to_string() };
+        if let Err(e) = pool.execute(move |c| crate::security::audit_chain::append_event(c, &event).map(|_| ())).await {
+            tracing::warn!("Could not record an AI audit event: {e}");
         }
     }
 
@@ -911,6 +930,14 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
         };
 
         history.push(assistant_msg.clone());
+        drop(history);
+        // The transcript: what was asked and what the assistant answered.
+        self.chain(
+            "ai.chat".into(),
+            "chat".into(),
+            serde_json::json!({ "prompt": bounded(user_message), "response": bounded(&assistant_msg.content), "message_id": assistant_msg.id }),
+        )
+        .await;
 
         Ok(assistant_msg)
     }
@@ -959,8 +986,25 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
             || action_payload.contains("overwrite")
     }
 
-    /// Get all AI audit log entries.
+    /// AI audit log entries, oldest first: from the audit chain when the
+    /// assistant has one (so they survive restarts), else this session's.
     pub async fn get_audit_log(&self, limit: usize, offset: usize) -> Vec<AiAuditEntry> {
+        if let Some(pool) = &self.audit_pool {
+            let (limit, offset) = (limit as i64, offset as i64);
+            match pool
+                .execute(move |c| {
+                    let mut st = c.prepare("SELECT id, timestamp, event_type, details FROM audit_events WHERE event_type LIKE 'ai.%' ORDER BY sequence LIMIT ?1 OFFSET ?2")?;
+                    let rows = st
+                        .query_map(rusqlite::params![limit, offset], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                })
+                .await
+            {
+                Ok(rows) => return rows.into_iter().map(|(id, ts, ty, details)| entry_from_chain(&id, &ts, &ty, &details)).collect(),
+                Err(e) => tracing::warn!("Could not read the AI audit log: {e}"),
+            }
+        }
         let log = self.audit_log.read().await;
         let start = offset.min(log.len());
         let end = (start + limit).min(log.len());
@@ -1044,8 +1088,17 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
             destructive,
             metadata: None,
         };
-        let mut log = self.audit_log.write().await;
-        log.push(entry);
+        let details = serde_json::json!({
+            "entry_id": entry.id,
+            "input": bounded(&entry.input_summary),
+            "output": bounded(&entry.output_summary),
+            "user_confirmed": entry.user_confirmed,
+            "destructive": entry.destructive,
+        });
+        let event_type = format!("ai.{}", entry.action_type);
+        let resource = entry.action_type.clone();
+        self.audit_log.write().await.push(entry);
+        self.chain(event_type, resource, details).await;
     }
 
     /// Generate a chat response using local context analysis.
@@ -1392,6 +1445,37 @@ pub fn parsed_job_to_automation_rule(
     rule
 }
 
+/// Transcript text kept in the audit chain (bounded so one entry cannot bloat the log).
+const TRANSCRIPT_MAX: usize = 16 * 1024;
+
+fn bounded(s: &str) -> String {
+    if s.len() <= TRANSCRIPT_MAX {
+        return s.to_string();
+    }
+    let mut end = TRANSCRIPT_MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [truncated {} bytes]", &s[..end], s.len() - end)
+}
+
+/// An `ai.*` audit-chain row as an `AiAuditEntry`.
+fn entry_from_chain(id: &str, ts: &str, event_type: &str, details: &str) -> AiAuditEntry {
+    let d: serde_json::Value = serde_json::from_str(details).unwrap_or_default();
+    let text = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let chat = event_type == "ai.chat";
+    AiAuditEntry {
+        id: d.get("entry_id").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| id.to_string()),
+        timestamp: DateTime::parse_from_rfc3339(ts).map(|t| t.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+        action_type: event_type.trim_start_matches("ai.").to_string(),
+        input_summary: if chat { text("prompt") } else { text("input") },
+        output_summary: if chat { text("response") } else { text("output") },
+        user_confirmed: d.get("user_confirmed").and_then(|v| v.as_bool()).unwrap_or(false),
+        destructive: d.get("destructive").and_then(|v| v.as_bool()).unwrap_or(false),
+        metadata: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1541,6 +1625,34 @@ mod tests {
         let _ = ai.parse_natural_language("sync my documents").await;
         let log = ai.get_audit_log(10, 0).await;
         assert!(!log.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ai_actions_and_chat_transcripts_go_to_the_audit_chain() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let ai = AiAssistant::with_audit(repo.pool().clone());
+        ai.chat("how do I sync my photos?").await.unwrap();
+        let _ = ai.parse_natural_language("sync my documents to drive every night").await;
+        let long = "x".repeat(TRANSCRIPT_MAX + 10);
+        ai.chat(&long).await.unwrap();
+
+        // A fresh assistant on the same database (a restart) still sees them, in order.
+        let again = AiAssistant::with_audit(repo.pool().clone());
+        let log = again.get_audit_log(50, 0).await;
+        assert!(log.len() >= 3, "{log:?}");
+        assert_eq!(log[0].action_type, "chat");
+        assert_eq!(log[0].input_summary, "how do I sync my photos?");
+        assert!(!log[0].output_summary.is_empty());
+        assert!(log.iter().any(|e| e.action_type != "chat"), "the NL action is logged too");
+        let last = log.iter().rev().find(|e| e.action_type == "chat").unwrap();
+        assert!(last.input_summary.ends_with("[truncated 10 bytes]"));
+        assert_eq!(again.get_audit_log(1, 1).await[0].id, log[1].id);
+
+        // They are links of the tamper-evident chain.
+        let v = repo.pool().execute(|c| crate::security::audit_chain::verify(c, None)).await.unwrap();
+        assert!(v.ok, "{v:?}");
+        let n: i64 = repo.pool().execute(|c| Ok(c.query_row("SELECT COUNT(*) FROM audit_events WHERE event_type LIKE 'ai.%' AND hash IS NOT NULL", [], |r| r.get(0))?)).await.unwrap();
+        assert_eq!(n as usize, log.len());
     }
 
     #[tokio::test]

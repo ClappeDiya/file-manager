@@ -15,6 +15,7 @@ import { useAuthStore } from '@/lib/stores/auth-store';
 import { formatDateTime } from '@/lib/utils/format';
 import type { AiReport, AiSettings } from '@/lib/ai';
 import type { Channel } from '@/lib/db/repos/channels';
+import { TranscriptDialog } from '@/components/ai/transcript-dialog';
 
 export default function AiInsightsPage() {
   const check = useAuthStore((s) => s.checkPermission);
@@ -28,6 +29,8 @@ export default function AiInsightsPage() {
   const [question, setQuestion] = useState('');
   const [days, setDays] = useState('30');
   const [busy, setBusy] = useState(false);
+  const [transcriptOf, setTranscriptOf] = useState<string | null>(null);
+  const canAudit = check('audit.read');
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -67,6 +70,7 @@ export default function AiInsightsPage() {
     <div>
       <PageHeader title="AI insights" description="Ask Claude to analyze backup reports, explain failures and summarize fleet health." />
       <ErrorBanner message={err ?? settings.error ?? reports.error} />
+      <TranscriptDialog reportId={transcriptOf} onClose={() => setTranscriptOf(null)} />
       {!s || !draft ? (
         <Loading />
       ) : (
@@ -109,6 +113,11 @@ export default function AiInsightsPage() {
                     </p>
                     <p className="text-xs text-foreground-tertiary">
                       {formatDateTime(r.createdAt)} · {r.createdBy} · {r.model} · {r.inputTokens + r.outputTokens} tokens
+                      {canAudit && (
+                        <button className="ml-2 underline" onClick={() => setTranscriptOf(r.id)}>
+                          Transcript
+                        </button>
+                      )}
                     </p>
                   </div>
                   {r.error ? <p className="text-sm text-error">{r.error}</p> : <div className="whitespace-pre-wrap text-sm leading-relaxed text-foreground">{r.content}</div>}

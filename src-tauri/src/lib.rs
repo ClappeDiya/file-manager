@@ -152,7 +152,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     let server_transfer_mgr = ServerTransferManager::new();
 
     // Initialize AI assistant (T-043..T-045)
-    let ai_assistant = AiAssistant::new();
+    let ai_assistant = AiAssistant::with_audit(repo.pool().clone());
 
     // Initialize terminal manager (T-046)
     let terminal_mgr = TerminalManager::new();
@@ -415,6 +415,7 @@ pub fn run() {
                     "desktop",
                 ));
                 let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), None);
+                let ai_assistant = AiAssistant::with_audit(repo.pool().clone());
                 AppState {
                     metadata_store: metadata_engine::MetadataStore::new(repo.clone()),
                     search_manager: search_engine::SearchManager::new(
@@ -430,7 +431,7 @@ pub fn run() {
                     sync_mgr: SyncManager::new(),
                     peer_mgr: PeerManager::new(),
                     server_transfer_mgr: ServerTransferManager::new(),
-                    ai_assistant: AiAssistant::new(),
+                    ai_assistant,
                     terminal_mgr: TerminalManager::new(),
                     vault_mgr,
                     master_pw_mgr: MasterPasswordManager::new(),

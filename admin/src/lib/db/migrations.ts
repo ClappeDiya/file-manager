@@ -587,6 +587,19 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 25,
+    description: 'AI transcripts (their hashes are on the audit chain)',
+    up(d) {
+      d.exec(`
+        CREATE TABLE ai_transcripts (
+          report_id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          model TEXT NOT NULL, system_prompt TEXT NOT NULL, request TEXT NOT NULL, response TEXT NOT NULL,
+          sha256 TEXT NOT NULL, audit_id TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

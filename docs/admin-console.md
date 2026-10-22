@@ -74,7 +74,7 @@ cd admin && npx next build && npx next start -p 3001
   - Open alerts can be **acknowledged** (they stay open, no further notifications) or **snoozed** for up to 30 days; both are audited and visible on the alert.
   - Rules are scoped by tags, use a cooldown and can notify on resolve.
   - Channels: SMTP email (STARTTLS/TLS, custom CA), Slack, Microsoft Teams (paste the URL of a "Post to a channel when a webhook request is received" workflow; messages arrive as Adaptive Cards), and signed webhooks (`X-UFOP-Signature: sha256=<HMAC of body>`).
-- **AI insights:** organization-level Anthropic API key (sealed), on-demand analysis of a machine or the whole fleet, and daily or weekly summaries sent to channels. Only report metadata is sent; file names, paths and secrets are not.
+- **AI insights:** organization-level Anthropic API key (sealed), on-demand analysis of a machine or the whole fleet, and daily or weekly summaries sent to channels. Only report metadata is sent; file names, paths and secrets are not. Every run keeps its full transcript (system prompt, request with the snapshot, response or error); its SHA-256 is recorded on the audit chain (`ai.transcript`), and *Transcript* on a report (AI and audit read permission) shows it with a check that it is unchanged and the chain verifies. Viewing is audited. On the desktop, AI actions and assistant chat transcripts are appended to the app's tamper-evident audit chain (`ai.*` events, covered by its signed anchors and export) and the AI audit log reads from it, so it survives restarts.
 
 ## Agent protocol (summary)
 
