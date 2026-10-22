@@ -6,6 +6,7 @@
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
 import { channelSecret, getChannel, listChannels, markDelivery, type Channel, type EmailConfig, type WebhookConfig } from './db/repos/channels';
+import { addToOutbox, dueOutbox, getOutboxEntry, pruneOutbox, recordOutboxAttempt } from './db/repos/outbox';
 
 export interface Message {
   subject: string;
@@ -70,24 +71,67 @@ export async function deliver(ch: Channel, m: Message): Promise<Delivery> {
   }
 }
 
-export async function deliverTo(orgId: string, channelIds: string[], m: Message): Promise<Delivery[]> {
+/**
+ * Send through the outbox: the message is recorded, tried once now (the
+ * result is returned), and retried later if that attempt fails.
+ */
+async function sendQueued(ch: Channel, m: Message, context: string): Promise<Delivery & { outboxId?: string }> {
+  if (!ch.enabled) return { channelId: ch.id, ok: false, error: 'Channel is disabled' };
+  const entry = addToOutbox(ch.orgId, ch.id, ch.kind, m, context);
+  const d = await deliver(ch, m);
+  recordOutboxAttempt(entry.id, d.ok ? null : (d.error ?? 'failed'));
+  return { ...d, outboxId: entry.id };
+}
+
+export async function deliverTo(orgId: string, channelIds: string[], m: Message, context = ''): Promise<Delivery[]> {
   const out: Delivery[] = [];
   for (const id of channelIds) {
     const ch = getChannel(orgId, id);
-    if (ch) out.push(await deliver(ch, m));
+    if (ch) out.push(await sendQueued(ch, m, context || String(m.data?.event ?? '')));
     else out.push({ channelId: id, ok: false, error: 'Channel not found' });
   }
   return out;
+}
+
+/** Retry due outbox messages; returns how many were attempted. */
+export async function processOutbox(at = new Date()): Promise<number> {
+  let n = 0;
+  for (;;) {
+    const batch = dueOutbox(at);
+    if (!batch.length) break;
+    for (const e of batch) {
+      const ch = getChannel(e.orgId, e.channelId);
+      const d = ch ? await deliver(ch, e.message) : { ok: false, error: 'Channel removed' };
+      recordOutboxAttempt(e.id, d.ok ? null : (d.error ?? 'failed'), new Date(Math.max(Date.now(), at.getTime())));
+      n++;
+    }
+  }
+  pruneOutbox();
+  return n;
+}
+
+/** Retry one outbox message now (from the status page); returns its new status. */
+export async function sendOutboxNow(orgId: string, id: string): Promise<Delivery | null> {
+  const e = getOutboxEntry(orgId, id);
+  const ch = e && getChannel(orgId, e.channelId);
+  if (!e || !ch) return null;
+  const d = await deliver(ch, e.message);
+  recordOutboxAttempt(e.id, d.ok ? null : (d.error ?? 'failed'));
+  return d;
 }
 
 /** Email an invitation through the organization's email channel marked for invitations. */
 export async function sendInvitationEmail(orgId: string, to: string, link: string, inviter: string): Promise<{ sent: boolean; error?: string }> {
   const ch = listChannels(orgId).find((c) => c.kind === 'email' && c.enabled && (c.config as EmailConfig).useForInvitations);
   if (!ch) return { sent: false };
-  const d = await deliver(ch, {
-    to: [to],
-    subject: 'You are invited to the UFOP backup console',
-    text: `${inviter} invited you to the UFOP backup console.\n\nOpen this link within 7 days to accept:\n${link}\n\nIf you did not expect this, ignore this email.`,
-  });
+  const d = await sendQueued(
+    ch,
+    {
+      to: [to],
+      subject: 'You are invited to the UFOP backup console',
+      text: `${inviter} invited you to the UFOP backup console.\n\nOpen this link within 7 days to accept:\n${link}\n\nIf you did not expect this, ignore this email.`,
+    },
+    'invitation',
+  );
   return { sent: d.ok, error: d.error };
 }

@@ -406,6 +406,23 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 13,
+    description: 'Notification outbox (email, Slack, webhook channels) with retries',
+    up(d) {
+      d.exec(`
+        CREATE TABLE channel_outbox (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL,
+          channel_id TEXT NOT NULL REFERENCES notification_channels(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL, subject TEXT NOT NULL, message TEXT NOT NULL, context TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at TEXT, last_error TEXT, created_at TEXT NOT NULL, sent_at TEXT
+        );
+        CREATE INDEX idx_channel_outbox_due ON channel_outbox(status, next_attempt_at);
+        CREATE INDEX idx_channel_outbox_org ON channel_outbox(org_id, created_at);
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

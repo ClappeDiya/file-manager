@@ -1,6 +1,6 @@
 /**
  * Webhook delivery: sends queued deliveries (`db/repos/webhooks`) and
- * records each attempt.
+ * records each attempt. The same loop retries the notification outbox.
  *
  * Every request is a JSON POST with
  *   X-UFOP-Event, X-UFOP-Delivery, X-UFOP-Timestamp (unix seconds) and
@@ -19,6 +19,7 @@ import https from 'https';
 import net from 'net';
 import { dueDeliveries, pruneDeliveries, recordAttempt, setEnqueueListener, webhookSecret, type WebhookDelivery } from './db/repos/webhooks';
 import { logger } from './utils/logger';
+import { processOutbox } from './mailer';
 
 export const TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 4096;
@@ -156,6 +157,7 @@ export function startDelivery(intervalMs = 30_000): void {
   loop = setInterval(() => {
     tick();
     pruneDeliveries();
+    processOutbox().catch((e) => logger.error('outbox.failed', { error: e instanceof Error ? e.message : String(e) }));
   }, intervalMs);
   loop.unref?.();
 }

@@ -19,6 +19,7 @@ import { useAuthStore } from '@/lib/stores/auth-store';
 import { useToastStore } from '@/lib/stores/toast-store';
 import { formatRelativeTime } from '@/lib/utils/format';
 import type { Alert, AlertKind, AlertParams, AlertRule } from '@/lib/db/repos/alerts';
+import { OutboxView } from '@/components/alerts/outbox-view';
 import type { Channel, ChannelKind, EmailConfig, WebhookConfig } from '@/lib/db/repos/channels';
 
 const KIND_LABEL: Record<AlertKind, string> = {
@@ -168,6 +169,7 @@ export default function AlertsPage() {
           { id: 'alerts', label: 'Alerts', count: state === 'open' ? alerts.data?.alerts.length : undefined },
           { id: 'rules', label: 'Rules', count: rules.data?.rules.length },
           { id: 'channels', label: 'Channels', count: channels.data?.channels.length },
+          { id: 'deliveries', label: 'Deliveries' },
         ]}
       />
 
@@ -316,6 +318,9 @@ export default function AlertsPage() {
             ))}
           </div>
         )}
+      </TabContent>
+      <TabContent tabId="deliveries" activeTab={tab}>
+        <OutboxView canWrite={canWrite} />
       </TabContent>
 
       <Dialog open={!!rule} onClose={() => setRule(null)} className="max-w-2xl">
