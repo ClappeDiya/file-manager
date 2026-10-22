@@ -60,6 +60,12 @@ pub struct ServerConfig {
     pub tls: TlsMode,
     /// Client addresses allowed to connect (TCP peer; empty = any).
     pub allowed_clients: ufop_core::netacl::IpAllowlist,
+    /// Lowest TLS version accepted when HTTPS is on.
+    pub min_tls: tls::MinTls,
+    /// Strict-Transport-Security max-age in seconds when HTTPS is on (0 = no header).
+    pub hsts_max_age: u64,
+    /// Add `includeSubDomains` to the HSTS header.
+    pub hsts_include_subdomains: bool,
 }
 
 impl Default for ServerConfig {
@@ -75,6 +81,9 @@ impl Default for ServerConfig {
             preauth_tokens: Vec::new(),
             tls: TlsMode::None,
             allowed_clients: Default::default(),
+            min_tls: tls::MinTls::Tls12,
+            hsts_max_age: 31_536_000,
+            hsts_include_subdomains: false,
         }
     }
 }
@@ -155,6 +164,22 @@ async fn ip_check(State(st): State<ServerState>, req: Request, next: Next) -> Re
         }
     }
     next.run(req).await
+}
+
+/// Security headers on every response; HSTS only when served over HTTPS.
+async fn security_headers(State(st): State<ServerState>, req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    if !matches!(st.cfg.tls, TlsMode::None) && st.cfg.hsts_max_age > 0 {
+        let v = format!("max-age={}{}", st.cfg.hsts_max_age, if st.cfg.hsts_include_subdomains { "; includeSubDomains" } else { "" });
+        if let Ok(v) = HeaderValue::from_str(&v) {
+            h.insert(header::STRICT_TRANSPORT_SECURITY, v);
+        }
+    }
+    res
 }
 
 async fn host_check(State(st): State<ServerState>, req: Request, next: Next) -> Response {
@@ -691,7 +716,10 @@ pub fn router(st: ServerState) -> Router {
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static(PREAUTH_HEADER)]),
         );
     }
-    app.layer(middleware::from_fn_with_state(st.clone(), host_check)).layer(middleware::from_fn_with_state(st.clone(), ip_check)).with_state(st)
+    app.layer(middleware::from_fn_with_state(st.clone(), host_check))
+        .layer(middleware::from_fn_with_state(st.clone(), ip_check))
+        .layer(middleware::from_fn_with_state(st.clone(), security_headers))
+        .with_state(st)
 }
 
 /// Restrict the data directory to the current user (0700 on Unix).
@@ -715,6 +743,7 @@ pub async fn serve(st: ServerState) -> Result<(), AppError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let addr = st.cfg.bind_addr()?;
     let tls = st.cfg.tls.clone();
+    let min_tls = st.cfg.min_tls;
     let app = router(st).into_make_service_with_connect_info::<SocketAddr>();
     let io = |e: std::io::Error| AppError::Configuration { message: format!("Server failed: {e}"), advice: "Check the port and TLS settings.".into() };
     match tls {
@@ -723,15 +752,15 @@ pub async fn serve(st: ServerState) -> Result<(), AppError> {
             axum_server::bind(addr).serve(app).await.map_err(io)
         }
         TlsMode::Generated { dir, hostnames } => {
-            let pair = tls::GeneratedCerts::new(dir).load_or_create(&hostnames)?;
-            let cfg = axum_server::tls_rustls::RustlsConfig::from_pem(pair.cert_chain_pem.into_bytes(), pair.key_pem.into_bytes()).await.map_err(io)?;
-            tracing::info!("ufop-server listening on https://{addr}");
+            let (chain, key) = tls::pem_to_der(&tls::GeneratedCerts::new(dir).load_or_create(&hostnames)?)?;
+            let cfg = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls::server_config(chain, key, min_tls)?));
+            tracing::info!("ufop-server listening on https://{addr} (TLS {:?}+)", min_tls);
             axum_server::bind_rustls(addr, cfg).serve(app).await.map_err(io)
         }
         TlsMode::Pfx { path, password } => {
             let (chain, key) = tls::load_pfx(&path, &password)?;
-            let cfg = axum_server::tls_rustls::RustlsConfig::from_der(chain, key).await.map_err(io)?;
-            tracing::info!("ufop-server listening on https://{addr} (imported certificate)");
+            let cfg = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls::server_config(chain, key, min_tls)?));
+            tracing::info!("ufop-server listening on https://{addr} (imported certificate, TLS {:?}+)", min_tls);
             axum_server::bind_rustls(addr, cfg).serve(app).await.map_err(io)
         }
     }

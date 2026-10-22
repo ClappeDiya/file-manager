@@ -277,3 +277,23 @@ async fn scoped_expiring_api_tokens() {
     assert_eq!(s.post("/api/v1/auth/reset", &tok, json!({})).await.status(), 200);
     assert_eq!(s.get("/api/v1/jobs", &run_tok).await.status(), 401);
 }
+
+#[tokio::test]
+async fn security_headers_and_hsts_only_with_https() {
+    let plain = start(ServerConfig::default(), None).await;
+    let r = plain.client.get(format!("{}/api/v1/health", plain.base)).send().await.unwrap();
+    assert_eq!(r.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(r.headers()["x-frame-options"], "DENY");
+    assert!(r.headers().get("strict-transport-security").is_none(), "no HSTS over plain HTTP");
+    // The router decides from the configured mode (serve() terminates TLS in front of it).
+    let tls = TlsMode::Generated { dir: plain.dir.join("tls"), hostnames: vec!["localhost".into()] };
+    let https = start(ServerConfig { tls: tls.clone(), hsts_include_subdomains: true, ..Default::default() }, None).await;
+    let r = https.client.get(format!("{}/api/v1/health", https.base)).send().await.unwrap();
+    assert_eq!(r.headers()["strict-transport-security"], "max-age=31536000; includeSubDomains");
+    // Errors carry the headers too.
+    let r = https.client.get(format!("{}/api/v1/jobs", https.base)).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+    assert!(r.headers().get("strict-transport-security").is_some());
+    let off = start(ServerConfig { tls, hsts_max_age: 0, ..Default::default() }, None).await;
+    assert!(off.client.get(format!("{}/api/v1/health", off.base)).send().await.unwrap().headers().get("strict-transport-security").is_none());
+}

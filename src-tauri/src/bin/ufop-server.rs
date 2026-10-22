@@ -3,6 +3,7 @@
 //! ```text
 //! ufop-server --set-password            # first run (reads UFOP_SERVER_PASSWORD or prompts)
 //! ufop-server --interface any --allowed-hostnames backup.lan --https auto
+//! ufop-server --https pfx --pfx cert.p12 --min-tls 1.3 --hsts-max-age 63072000   # TLS floor + HSTS (on by default with HTTPS)
 //! ufop-server --interface any --allowed-cidrs 10.0.0.0/8,fd00::/8   # only these clients (by TCP peer)
 //! ufop server tokens create ci --scope run --days 30                 # scoped API token (see server::api_tokens)
 //! ```
@@ -59,6 +60,15 @@ struct Args {
     /// Hostnames for the generated certificate
     #[arg(long, value_delimiter = ',', default_value = "localhost,127.0.0.1")]
     cert_hostnames: Vec<String>,
+    /// Lowest TLS version accepted with HTTPS: 1.2 or 1.3
+    #[arg(long, env = "UFOP_SERVER_MIN_TLS", default_value = "1.2")]
+    min_tls: String,
+    /// HSTS max-age in seconds with HTTPS (0 = do not send Strict-Transport-Security)
+    #[arg(long, env = "UFOP_SERVER_HSTS_MAX_AGE", default_value_t = 31_536_000)]
+    hsts_max_age: u64,
+    /// Add includeSubDomains to the HSTS header
+    #[arg(long)]
+    hsts_include_subdomains: bool,
     #[arg(long, env = "UFOP_SERVER_PFX")]
     pfx: Option<PathBuf>,
     #[arg(long, env = "UFOP_SERVER_PFX_PASSWORD", default_value = "")]
@@ -340,6 +350,9 @@ async fn run(argv: Vec<String>) {
         cors_origins: a.cors_origins,
         preauth_tokens: a.preauth_tokens,
         tls,
+        min_tls: a.min_tls.parse().unwrap_or_else(|e: String| fail(format!("--min-tls: {e}"))),
+        hsts_max_age: a.hsts_max_age,
+        hsts_include_subdomains: a.hsts_include_subdomains,
         allowed_clients: ufop_core::netacl::IpAllowlist::parse(&a.allowed_cidrs).unwrap_or_else(|e| fail(format!("--allowed-cidrs: {e}"))),
     };
     let st = ServerState { mgr, conns: Some(conns), auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent };
