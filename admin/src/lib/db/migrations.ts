@@ -423,6 +423,17 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 14,
+    description: 'Alert acknowledgement and snooze',
+    up(d) {
+      d.exec(`
+        ALTER TABLE alerts ADD COLUMN acknowledged_at TEXT;
+        ALTER TABLE alerts ADD COLUMN acknowledged_by TEXT;
+        ALTER TABLE alerts ADD COLUMN snoozed_until TEXT;
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

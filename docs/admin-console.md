@@ -56,7 +56,8 @@ cd admin && npx next build && npx next start -p 3001
   - They are delivered only to authenticated agents that a policy targets, with `Cache-Control: no-store`.
   - Agents keep them in the OS keychain.
 - **Alerts:**
-  - Rules: backup failed (optionally on warnings), missed backup (schedule from the client, or an assumed interval, plus grace), unusual changed or deleted file counts, unusual duration (median and standard deviation of earlier runs).
+  - Rules: backup failed (optionally on warnings), missed backup (schedule from the client, or an assumed interval, plus grace), backup not arrived by a set time (local time in an IANA time zone, chosen weekdays, grace; a successful backup must arrive between the previous deadline and this one), unusual changed or deleted file counts, unusual duration (median and standard deviation of earlier runs).
+  - Open alerts can be **acknowledged** (they stay open, no further notifications) or **snoozed** for up to 30 days; both are audited and visible on the alert.
   - Rules are scoped by tags, use a cooldown and can notify on resolve.
   - Channels: SMTP email (STARTTLS/TLS, custom CA), Slack, Microsoft Teams (paste the URL of a "Post to a channel when a webhook request is received" workflow; messages arrive as Adaptive Cards), and signed webhooks (`X-UFOP-Signature: sha256=<HMAC of body>`).
 - **AI insights:** organization-level Anthropic API key (sealed), on-demand analysis of a machine or the whole fleet, and daily or weekly summaries sent to channels. Only report metadata is sent; file names, paths and secrets are not.
