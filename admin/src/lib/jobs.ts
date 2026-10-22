@@ -15,6 +15,7 @@ import { retireInactive } from './retirement';
 import { expireMemberships, purgeRemovedMembers } from './offboarding';
 import { applyRetention } from './retention';
 import { runDueSchedules } from './report-runner';
+import { processExports } from './exports';
 
 let started = false;
 
@@ -36,6 +37,7 @@ export async function runJobsOnce(at = new Date()): Promise<{ missed: number; pu
   }
   const summaries = await runScheduledSummaries(at);
   await runDueSchedules(at);
+  await processExports(at);
   return { missed, purged, retired, anchored, summaries };
 }
 

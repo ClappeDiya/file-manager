@@ -17,13 +17,14 @@ import { Tabs, TabContent } from '@/components/ui/tabs';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 import {
-  type AuditEntry, type AuditSeverity, type AuditExportFormat,
+  type AuditEntry, type AuditSeverity,
   AUDIT_EVENT_CATEGORIES,
 } from '@/lib/types/audit';
 import { formatDateTime, formatRelativeTime } from '@/lib/utils/format';
 import type { AuditVerification } from '@/lib/db/repos/audit';
 import { SiemDialog } from '@/components/audit/siem-dialog';
 import { ApiRequestsLog } from '@/components/audit/api-requests';
+import { ExportsPanel } from '@/components/exports/exports-panel';
 
 export default function AuditPage() {
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
@@ -74,16 +75,13 @@ export default function AuditPage() {
     }
   };
 
-  const handleExport = (format: AuditExportFormat) => {
-    // Use server-side export endpoint
-    const params = new URLSearchParams({ export: format });
-    if (searchQuery) params.set('search', searchQuery);
-    if (severityFilter) params.set('severity', severityFilter);
-    if (dateFrom) params.set('dateFrom', dateFrom);
-    if (dateTo) params.set('dateTo', dateTo);
-
-    window.open(`/api/audit?${params.toString()}`, '_blank');
-    setShowExportDialog(false);
+  const exportParams = () => {
+    const p: Record<string, string> = {};
+    if (searchQuery) p.search = searchQuery;
+    if (severityFilter) p.severity = severityFilter;
+    if (dateFrom) p.dateFrom = dateFrom;
+    if (dateTo) p.dateTo = dateTo;
+    return p;
   };
 
   // The server recomputes the full hash chain and checks the signed checkpoints.
@@ -381,21 +379,11 @@ export default function AuditPage() {
       <Dialog open={showExportDialog} onClose={() => setShowExportDialog(false)}>
         <DialogHeader>
           <DialogTitle>Export Audit Log</DialogTitle>
-          <DialogDescription>Export {filteredEntries.length} entries in your preferred format</DialogDescription>
+          <DialogDescription>Exports every entry matching the current filters (search, severity, dates), oldest first, with their hash-chain fields.</DialogDescription>
         </DialogHeader>
-        <div className="space-y-3">
-          <Button className="w-full justify-start" variant="outline" onClick={() => handleExport('csv')}>
-            <Download size={14} /> Export as CSV
-          </Button>
-          <Button className="w-full justify-start" variant="outline" onClick={() => handleExport('json')}>
-            <Download size={14} /> Export as JSON
-          </Button>
-          <Button className="w-full justify-start" variant="outline" onClick={() => handleExport('syslog')}>
-            <Download size={14} /> Export as Syslog (Enterprise)
-          </Button>
-        </div>
+        {showExportDialog && <ExportsPanel kind="audit" formats={['csv', 'json', 'syslog']} params={exportParams()} />}
         <DialogFooter>
-          <Button variant="outline" onClick={() => setShowExportDialog(false)}>Cancel</Button>
+          <Button variant="outline" onClick={() => setShowExportDialog(false)}>Close</Button>
         </DialogFooter>
       </Dialog>
 

@@ -151,6 +151,10 @@ export interface AuditQuery {
   search?: string;
   limit?: number;
   offset?: number;
+  /** Only entries up to this sequence (a stable snapshot for paging exports). */
+  untilSequence?: number;
+  /** Oldest first (default newest first). */
+  ascending?: boolean;
 }
 
 export function listAudit(q: AuditQuery = {}): { entries: AuditRecord[]; total: number } {
@@ -166,6 +170,7 @@ export function listAudit(q: AuditQuery = {}): { entries: AuditRecord[]; total: 
   if (q.userId) { where.push('user_id = ?'); args.push(q.userId); }
   if (q.from) { where.push('timestamp >= ?'); args.push(q.from); }
   if (q.to) { where.push('timestamp <= ?'); args.push(q.to); }
+  if (q.untilSequence !== undefined) { where.push('sequence <= ?'); args.push(q.untilSequence); }
   if (q.search) {
     where.push('(lower(description) LIKE ? OR lower(event_type) LIKE ? OR lower(user_email) LIKE ?)');
     const s = `%${q.search.toLowerCase()}%`;
@@ -174,7 +179,7 @@ export function listAudit(q: AuditQuery = {}): { entries: AuditRecord[]; total: 
   const w = where.join(' AND ');
   const total = (db().prepare(`SELECT COUNT(*) n FROM audit_entries WHERE ${w}`).get(...args) as { n: number }).n;
   const rows = db()
-    .prepare(`SELECT * FROM audit_entries WHERE ${w} ORDER BY sequence DESC LIMIT ? OFFSET ?`)
+    .prepare(`SELECT * FROM audit_entries WHERE ${w} ORDER BY sequence ${q.ascending ? 'ASC' : 'DESC'} LIMIT ? OFFSET ?`)
     .all(...args, Math.min(q.limit ?? 50, 10_000), q.offset ?? 0) as Row[];
   return { entries: rows.map(fromRow), total };
 }

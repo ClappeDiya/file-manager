@@ -664,6 +664,21 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 29,
+    description: 'Background export jobs',
+    up(d) {
+      d.exec(`
+        CREATE TABLE export_jobs (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL, format TEXT NOT NULL, params TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
+          total INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, file BLOB, size INTEGER NOT NULL DEFAULT 0,
+          sha256 TEXT, error TEXT, requested_by TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, expires_at TEXT
+        );
+        CREATE INDEX idx_export_jobs_queue ON export_jobs(status, created_at);
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

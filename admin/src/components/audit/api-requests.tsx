@@ -11,6 +11,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { useApi } from '@/lib/use-api';
 import { formatDateTime } from '@/lib/utils/format';
 import type { ApiRequest } from '@/lib/db/repos/api-log';
+import { ExportsPanel } from '@/components/exports/exports-panel';
 
 const PAGE = 50;
 
@@ -36,6 +37,12 @@ export function ApiRequestsLog() {
         />
         <span className="text-xs text-foreground-tertiary">Requests made with API tokens, and requests refused by the network rule. Kept {data?.keepDays ?? 30} days.</span>
       </div>
+      <details className="mb-3">
+        <summary className="cursor-pointer text-sm">Export all matching requests</summary>
+        <div className="mt-2">
+          <ExportsPanel kind="api_requests" formats={['csv', 'json']} params={result ? { result } : {}} />
+        </div>
+      </details>
       <ErrorBanner message={error} />
       {loading && !data ? (
         <Loading />
