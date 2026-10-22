@@ -13,6 +13,7 @@ import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useAiStore } from "@/stores/ai-store";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
+import { SecurityAuditSection } from "@/components/security-audit-section";
 
 // ── Types ──
 
@@ -1318,6 +1319,11 @@ export default function SettingsPanel({
         {/* Log Controls */}
         <Section title="Logging">
           <LogControlsSection />
+        </Section>
+
+        {/* Tamper-evident security audit log */}
+        <Section title="Security Audit Log">
+          <SecurityAuditSection />
         </Section>
 
         {/* Trusted SSH Host CAs */}

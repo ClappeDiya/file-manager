@@ -560,23 +560,12 @@ impl Repository {
 
     // ── Audit event operations ──
 
+    /// Append an event to the tamper-evident audit chain. Runs on the
+    /// pool's single connection inside `BEGIN IMMEDIATE`, so `sequence` and
+    /// `prev_hash` can never race (see `security::audit_chain`).
     pub async fn log_audit_event(&self, event: AuditEvent) -> Result<(), AppError> {
         self.pool
-            .execute(move |conn| {
-                conn.execute(
-                    "INSERT INTO audit_events (id, timestamp, event_type, actor, resource, details)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![
-                        event.id.to_string(),
-                        event.timestamp.to_rfc3339(),
-                        event.event_type,
-                        event.actor,
-                        event.resource,
-                        event.details,
-                    ],
-                )?;
-                Ok(())
-            })
+            .execute(move |conn| crate::security::audit_chain::append_event(conn, &event).map(|_| ()))
             .await
     }
 
@@ -589,7 +578,7 @@ impl Repository {
             .execute(move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT id, timestamp, event_type, actor, resource, details
-                     FROM audit_events ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2",
+                     FROM audit_events ORDER BY sequence DESC LIMIT ?1 OFFSET ?2",
                 )?;
                 let events = stmt
                     .query_map(rusqlite::params![limit, offset], |row| {
@@ -807,7 +796,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
     }
 
     #[tokio::test]

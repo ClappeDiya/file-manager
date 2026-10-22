@@ -1,4 +1,5 @@
 pub mod ai_commands;
+pub mod audit_commands;
 pub mod automation_commands;
 pub mod backup_commands;
 pub mod archive_commands;

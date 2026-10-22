@@ -25,7 +25,7 @@ use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -70,6 +70,7 @@ struct AppState {
     quickflow_suggester: LedgerSuggester,
     backup_mgr: BackupManager,
     background_mode: tray::BackgroundMode,
+    audit_trail: security::audit::AuditTrail,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -224,10 +225,21 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     );
     // Without an OS keychain, job passphrases persist in the (encrypted)
     // settings store instead of process memory.
-    match crate::security::settings_store::SettingsStore::open(repo.pool().clone(), &credential_store, Default::default()).await {
-        Ok(store) => backup_mgr.set_settings_store(store),
-        Err(e) => tracing::warn!("Settings store unavailable (non-fatal): {e}"),
-    }
+    let settings_store =
+        match crate::security::settings_store::SettingsStore::open(repo.pool().clone(), &credential_store, Default::default()).await {
+            Ok(store) => {
+                backup_mgr.set_settings_store(store.clone());
+                Some(store)
+            }
+            Err(e) => {
+                tracing::warn!("Settings store unavailable (non-fatal): {e}");
+                None
+            }
+        };
+    // Tamper-evident security audit log: anchors are signed with a key in
+    // the OS keychain (or the encrypted settings store as a fallback).
+    let audit_trail =
+        security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), settings_store);
     if let Err(e) = backup_mgr.load_from_db().await {
         tracing::warn!("Failed to load backup jobs (non-fatal): {e}");
     }
@@ -262,6 +274,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         quickflow_suggester,
         backup_mgr,
         background_mode,
+        audit_trail,
     })
 }
 
@@ -320,11 +333,14 @@ pub fn run() {
                 // scheduler is not started because nothing persists.
                 let backup_mgr = BackupManager::new(
                     repo.pool().clone(),
-                    credential_store,
+                    credential_store.clone(),
                     Some(connection_mgr.clone()),
                     Some(ledger.clone()),
                     backup_engine::default_data_dir(),
                 );
+                // In-memory DB: no settings store; the key comes from the
+                // env var or keychain, else is ephemeral like the DB itself.
+                let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store), None);
                 AppState {
                     repo,
                     transfer_mgr,
@@ -352,6 +368,7 @@ pub fn run() {
                     quickflow_suggester,
                     backup_mgr,
                     background_mode: tray::BackgroundMode::default(),
+                    audit_trail,
                 }
             }
         }
@@ -362,6 +379,7 @@ pub fn run() {
     let setup_backup_mgr = app_state.backup_mgr.clone();
     let close_mode = app_state.background_mode.clone();
     let shutdown_transfer = app_state.transfer_mgr.clone();
+    let setup_audit = app_state.audit_trail.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -383,6 +401,8 @@ pub fn run() {
                 }
             }));
             mgr.start_scheduler();
+            // Signed audit checkpoints: once at start-up, then hourly.
+            tauri::async_runtime::spawn(setup_audit.clone().run_anchor_loop(security::audit::ANCHOR_INTERVAL));
             if let Err(e) = tray::setup(app, mgr) {
                 tracing::warn!("System tray unavailable (non-fatal): {e}");
             }
@@ -420,7 +440,13 @@ pub fn run() {
         .manage(app_state.quickflow_suggester)
         .manage(app_state.backup_mgr)
         .manage(app_state.background_mode)
+        .manage(app_state.audit_trail)
         .invoke_handler(tauri::generate_handler![
+            // Security audit log (tamper-evident, append-only)
+            audit_commands::verify_audit_log,
+            audit_commands::export_audit_log,
+            audit_commands::create_audit_anchor,
+            audit_commands::get_audit_log_status,
             // System
             system_commands::greet,
             system_commands::get_app_version,

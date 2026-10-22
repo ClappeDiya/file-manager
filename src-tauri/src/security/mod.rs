@@ -10,6 +10,7 @@
 //! - `tls`: TLS enforcement helpers for in-transit encryption
 
 pub mod audit;
+pub mod audit_chain;
 pub mod confirmation;
 pub mod credential_store;
 pub mod encryption;
