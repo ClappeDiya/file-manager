@@ -20,9 +20,11 @@ export interface SecuritySettings {
   sessionIdleMinutes: number;
   /** Console access only from these IP addresses / CIDR ranges (empty = anywhere). */
   ipAllowlist: string[];
+  /** Remove members (and revoke API tokens) unused for this many days (0 = never; owners are exempt). */
+  retireInactiveDays: number;
 }
 
-export const DEFAULT_SECURITY: SecuritySettings = { passwordMaxAgeDays: 0, requireMfa: false, ssoExemptFromMfa: false, sessionIdleMinutes: 0, ipAllowlist: [] };
+export const DEFAULT_SECURITY: SecuritySettings = { passwordMaxAgeDays: 0, requireMfa: false, ssoExemptFromMfa: false, sessionIdleMinutes: 0, ipAllowlist: [], retireInactiveDays: 0 };
 
 export function getSecurity(orgId: string): SecuritySettings {
   const r = db().prepare('SELECT settings FROM org_security WHERE org_id = ?').get(orgId) as Row | undefined;
@@ -35,6 +37,7 @@ export function getSecurity(orgId: string): SecuritySettings {
  */
 export function setSecurity(orgId: string, patch: Partial<SecuritySettings>, by: string, savedFrom?: string): SecuritySettings {
   const next = { ...getSecurity(orgId), ...patch };
+  if (!Number.isInteger(next.retireInactiveDays) || (next.retireInactiveDays !== 0 && (next.retireInactiveDays < 30 || next.retireInactiveDays > 3650))) throw new OrgError('Inactive accounts are retired after 0 (never) or 30 to 3650 days');
   try {
     next.ipAllowlist = normalizeAllowlist(next.ipAllowlist);
   } catch (e) {

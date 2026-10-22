@@ -90,6 +90,22 @@ export default function SecuritySettingsPage() {
         </Card>
         <Card>
           <CardHeader className="flex-col items-start gap-1">
+            <CardTitle>Inactive access</CardTitle>
+            <CardDescription>
+              Members with no sign-in, session or API token use for this long are removed from the organization (their account is disabled if it belongs to no other); unused API tokens are revoked. Owners are never removed.
+            </CardDescription>
+          </CardHeader>
+          <Input
+            label="Retire after (days without activity, 0 = never, 30–3650)"
+            type="number"
+            min={0}
+            max={3650}
+            value={s.retireInactiveDays}
+            onChange={(e) => setDraft({ ...s, retireInactiveDays: Math.max(0, Math.floor(Number(e.target.value) || 0)) })}
+          />
+        </Card>
+        <Card>
+          <CardHeader className="flex-col items-start gap-1">
             <CardTitle>Allowed networks</CardTitle>
             <CardDescription>
               Console access only from these addresses or CIDR ranges, one per line (empty = anywhere). It must include the address you save from. Agents and SCIM are not affected.

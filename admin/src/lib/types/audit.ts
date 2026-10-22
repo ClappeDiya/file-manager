@@ -10,6 +10,8 @@ export type AuditEventType =
   | 'auth.login_failed'
   | 'auth.reauth'
   | 'auth.reauth_failed'
+  | 'user.retired_inactive'
+  | 'api_token.retired_inactive'
   | 'connection.create'
   | 'connection.update'
   | 'connection.delete'
