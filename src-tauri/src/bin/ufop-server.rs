@@ -310,6 +310,10 @@ async fn run(argv: Vec<String>) {
     let mgr = BackupManager::new(repo.pool().clone(), creds.clone(), Some(conns.clone()), Some(ledger), data_dir.join("backups"));
     mgr.set_settings_store(store.clone());
     mgr.set_module_policy(ModulePolicy::from_lists(a.allowed_backends.as_deref(), a.allowed_encryption.as_deref(), a.allowed_compression.as_deref(), a.disable_modules.as_deref()));
+    // Holiday calendars used by backup schedules.
+    if let Err(e) = unified_file_ops_lib::schedule_library::ScheduleLibrary::new(repo.pool().clone()).load().await {
+        tracing::warn!("Could not load holiday calendars: {e}");
+    }
     if let Err(e) = mgr.load_from_db().await {
         fail(e);
     }

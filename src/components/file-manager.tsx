@@ -56,6 +56,7 @@ import SettingsPanel from "./settings-panel";
 import { ConnectionPanel } from "./connection-panel";
 import { SyncPanel } from "./sync-panel";
 import { BackupPanel } from "./backup/backup-panel";
+import { ScheduleLibraryPanel } from "./schedule-library-panel";
 import { PreviewPane } from "./preview-pane";
 import { TransferHistoryPanel } from "./transfer-history-panel";
 import { ArchiveBrowser, CreateArchiveDialog } from "./archive-browser";
@@ -139,6 +140,7 @@ import {
   Layers,
   X,
   DatabaseBackup,
+  CalendarClock,
 } from "lucide-react";
 
 // Toolbar customization definition (#14)
@@ -154,6 +156,7 @@ const ALL_TOOLBAR_ITEMS = [
   { id: "smart-spaces", label: "Smart Spaces" },
   { id: "sync-browse", label: "Sync Browse" },
   { id: "backups", label: "Backups" },
+  { id: "schedules", label: "Schedules & holiday calendars" },
   { id: "operations", label: "Operations" },
 ];
 
@@ -717,6 +720,7 @@ export function FileManager() {
   const [syncOpen, setSyncOpen] = useState(false);
   // Versioned backups panel (jobs, restore, maintenance, history).
   const [backupOpen, setBackupOpen] = useState(false);
+  const [schedulesOpen, setSchedulesOpen] = useState(false);
   // The tray's "Backups…" item opens this panel.
   useEffect(() => {
     if (!isTauriAvailable()) return;
@@ -2115,6 +2119,7 @@ export function FileManager() {
         onOpenBackups: () => {
           setBackupOpen(true);
         },
+        onOpenSchedules: appMode === "advanced" ? () => setSchedulesOpen(true) : undefined,
         onOpenTransferHistory: () => {
           setTransferHistoryOpen(true);
         },
@@ -2253,7 +2258,7 @@ export function FileManager() {
         },
       }),
     ],
-    [quickflowCommands, toggleSidebar, handleUndo, handleRedo, handleSaveWorkspace, getFirstSelectedPath, getAllSelectedPaths, toggleAutomationPanel, automationPanelOpen, toggleActivityTimeline, favorites, handleJumpLastTouched],
+    [quickflowCommands, toggleSidebar, handleUndo, handleRedo, handleSaveWorkspace, getFirstSelectedPath, getAllSelectedPaths, toggleAutomationPanel, automationPanelOpen, toggleActivityTimeline, favorites, handleJumpLastTouched, appMode],
   );
 
   return (
@@ -2428,6 +2433,18 @@ export function FileManager() {
               data-testid="toggle-backups"
             >
               <DatabaseBackup className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
+          {appMode === "advanced" && toolbarItems.includes("schedules") && (
+            <Button
+              variant={schedulesOpen ? "secondary" : "ghost"}
+              size="icon"
+              onClick={() => setSchedulesOpen((open) => !open)}
+              aria-label="Schedules"
+              title="Schedules & holiday calendars"
+              data-testid="toggle-schedules"
+            >
+              <CalendarClock className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
           {toolbarItems.includes("smart-spaces") && (
@@ -2810,6 +2827,35 @@ export function FileManager() {
                 <X className="w-4 h-4" />
               </button>
               <BackupPanel />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Schedules & holiday calendars (Advanced): shared by sync pairs,
+          automation rules and backup jobs. */}
+      {schedulesOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Schedules"
+          data-testid="schedules-backdrop"
+          onClick={() => setSchedulesOpen(false)}
+        >
+          <div
+            className="w-[min(820px,95vw)] max-h-[min(760px,92vh)] overflow-auto rounded-lg shadow-2xl border border-[var(--color-border)] bg-[var(--color-surface)]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="relative pt-9">
+              <button
+                className="absolute top-3 right-4 z-10 h-7 w-7 flex items-center justify-center rounded text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover)]"
+                onClick={() => setSchedulesOpen(false)}
+                aria-label="Close Schedules"
+              >
+                <X className="w-4 h-4" />
+              </button>
+              <ScheduleLibraryPanel />
             </div>
           </div>
         </div>

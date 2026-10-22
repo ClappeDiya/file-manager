@@ -239,6 +239,8 @@ export interface BackupSchedule {
   interval_minutes: number;
   weekdays: number[];
   skip_on_battery: boolean;
+  /** Holiday calendars whose days off skip runs (`schedule_library`). */
+  calendar_ids: string[];
 }
 
 export interface ScriptConfig {
@@ -895,7 +897,7 @@ export function newBackupJob(): BackupJob {
       photos: { include_hidden: false, include_trashed: false, albums: [] },
     },
     retention: { type: "keep_all" },
-    schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false },
+    schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [] },
     scripts: { run_before: null, run_before_required: false, run_after: null, run_on_source_release: null, timeout_secs: 60, result_format: "json" },
     reports: {
       http_urls: [],

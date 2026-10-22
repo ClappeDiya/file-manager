@@ -9,6 +9,7 @@ pub mod backup;
 pub mod agent;
 #[cfg(feature = "doctext")]
 pub mod doctext;
+pub mod calendar;
 pub mod confine;
 pub mod error;
 pub mod fsutil;

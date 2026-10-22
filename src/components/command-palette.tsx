@@ -46,6 +46,7 @@ import {
   Filter,
   FolderSync,
   DatabaseBackup,
+  CalendarClock,
   Upload,
   History,
   ShieldCheck,
@@ -761,6 +762,8 @@ export function getDefaultCommands(actions: {
   /** Open the Backups panel — versioned, deduplicated, encrypted
    *  backup jobs with restore, maintenance and run history. */
   onOpenBackups?: () => void;
+  /** Advanced mode only (undefined hides the entry). */
+  onOpenSchedules?: () => void;
   /** Open the Transfer History (Journal) panel \u2014 searchable
    *  table of every historical transfer with status, checksum
    *  verification, retry count, duration, and speed; CSV/JSON
@@ -1178,6 +1181,19 @@ export function getDefaultCommands(actions: {
         "time machine",
       ],
     },
+    ...(actions.onOpenSchedules
+      ? [
+          {
+            id: "open-schedules",
+            label: "Schedules & holiday calendars\u2026",
+            description: "Named schedules for sync pairs and rules; holiday calendars that skip scheduled runs",
+            icon: <CalendarClock className="h-4 w-4" />,
+            category: "Navigation",
+            action: actions.onOpenSchedules,
+            keywords: ["schedule", "schedules", "cron", "holiday", "holidays", "calendar", "business days", "bank holiday"],
+          },
+        ]
+      : []),
     {
       id: "open-sync",
       label: "Sync Pairs\u2026",

@@ -171,6 +171,9 @@ pub(crate) fn start_folder_watcher(
 pub fn validate_cron(cron_expr: &str) -> Result<(), crate::core::error::AppError> {
     use cron::Schedule;
     use std::str::FromStr;
+    if crate::schedule_library::schedule_ref(cron_expr).is_some() {
+        return crate::schedule_library::resolve(cron_expr).map(|_| ());
+    }
 
     Schedule::from_str(cron_expr).map_err(|e| crate::core::error::AppError::State {
         message: format!("Invalid cron expression '{}': {e}", cron_expr),

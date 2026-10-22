@@ -95,7 +95,7 @@ async fn background_backup_status_and_scheduler() {
     let m = manager(t.path()).await;
     let mut jb = job(&src, &dst);
     jb.encrypted = false;
-    jb.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, weekdays: vec![], skip_on_battery: false };
+    jb.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, weekdays: vec![], skip_on_battery: false, calendar_ids: vec![] };
     let j = m.save_job(jb, None).await.unwrap();
 
     // Created "now": the next slot is in the future, so not due yet …
@@ -1004,4 +1004,29 @@ async fn legal_hold_suspends_retention_blocks_removal_and_feeds_ediscovery() {
     m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
     assert_eq!(m.list_versions(&j.id).await.unwrap().len(), 1);
     m.delete_job(&j.id, true, false).await.unwrap();
+}
+
+#[tokio::test]
+async fn holiday_calendar_skips_a_scheduled_backup_slot() {
+    use crate::schedule_library::registry;
+    use ufop_core::calendar::HolidayCalendar;
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    let m = manager(t.path()).await;
+    let cal = HolidayCalendar { id: format!("bk-{}", uuid::Uuid::new_v4().simple()), name: "Closed today".into(), dates: vec![chrono::Local::now().date_naive()], ..Default::default() };
+    let mut jb = job(&src, &dst);
+    jb.encrypted = false;
+    jb.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, calendar_ids: vec![cal.id.clone()], ..Default::default() };
+    assert!(m.save_job(jb.clone(), None).await.unwrap_err().to_string().contains("does not exist"), "unknown calendar");
+    registry().insert_for_tests(None, Some(cal));
+    let j = m.save_job(jb, None).await.unwrap();
+    // Make a slot overdue.
+    m.inner.jobs.write().await.get_mut(&j.id).unwrap().stats.last_scheduled_at = Some((Utc::now() - chrono::Duration::hours(3)).to_rfc3339());
+    assert_eq!(m.due_jobs(Utc::now()).await, vec![j.id.clone()]);
+    m.tick().await;
+    // The slot was used up without running anything.
+    assert!(!m.is_job_busy(&j.id));
+    assert!(m.run_history(Some(j.id.clone()), 10).await.unwrap().is_empty());
+    assert!(m.due_jobs(Utc::now()).await.is_empty());
 }

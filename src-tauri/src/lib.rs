@@ -23,6 +23,7 @@ pub mod safety;
 pub mod security;
 pub mod server;
 pub mod storage;
+pub mod schedule_library;
 pub mod sync_engine;
 pub mod spaces_engine;
 pub mod transfer_engine;
@@ -33,7 +34,7 @@ use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -77,6 +78,7 @@ struct AppState {
     narrator: OperationNarrator,
     quickflow_suggester: LedgerSuggester,
     backup_mgr: BackupManager,
+    schedule_library: schedule_library::ScheduleLibrary,
     fleet_agent: fleet_agent::FleetAgent,
     background_mode: tray::BackgroundMode,
     audit_trail: security::audit::AuditTrail,
@@ -134,6 +136,13 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     let s3_connector = std::sync::Arc::new(S3Connector::new());
     let gdrive_connector = std::sync::Arc::new(GoogleDriveConnector::new());
     let onedrive_connector = std::sync::Arc::new(OneDriveConnector::new());
+
+    // Named schedules and holiday calendars, loaded before anything that is
+    // scheduled by them (sync pairs, automation rules, backup jobs).
+    let schedule_library = schedule_library::ScheduleLibrary::new(repo.pool().clone());
+    if let Err(e) = schedule_library.load().await {
+        tracing::warn!("Failed to load the schedule library (non-fatal): {e}");
+    }
 
     // Initialize sync manager (T-039..T-042)
     let sync_mgr = SyncManager::new();
@@ -288,6 +297,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         spaces_mgr,
         confirmation_mgr,
         ledger,
+        schedule_library,
         safety_interlock,
         narrator,
         quickflow_suggester,
@@ -418,6 +428,7 @@ pub fn run() {
                 ));
                 let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), None);
                 let ai_assistant = AiAssistant::with_audit(repo.pool().clone());
+                let fallback_schedules = schedule_library::ScheduleLibrary::new(repo.pool().clone());
                 AppState {
                     metadata_store: metadata_engine::MetadataStore::new(repo.clone()),
                     search_manager: search_engine::SearchManager::new(
@@ -447,6 +458,7 @@ pub fn run() {
                     spaces_mgr: SpacesManager::new(),
                     confirmation_mgr: ConfirmationManager::new(),
                     ledger,
+                    schedule_library: fallback_schedules,
                     safety_interlock,
                     narrator,
                     quickflow_suggester,
@@ -531,6 +543,7 @@ pub fn run() {
         .manage(app_state.spaces_mgr)
         .manage(app_state.confirmation_mgr)
         .manage(app_state.ledger)
+        .manage(app_state.schedule_library)
         .manage(app_state.safety_interlock)
         .manage(app_state.narrator)
         .manage(app_state.quickflow_suggester)
@@ -671,6 +684,14 @@ pub fn run() {
             backup_commands::backup_run,
             backup_commands::backup_execute,
             backup_commands::backup_cancel,
+            schedule_commands::schedules_list,
+            schedule_commands::schedule_save,
+            schedule_commands::schedule_delete,
+            schedule_commands::calendars_list,
+            schedule_commands::calendar_save,
+            schedule_commands::calendar_delete,
+            schedule_commands::calendar_import_ics,
+            schedule_commands::schedule_preview,
             backup_commands::backup_place_legal_hold,
             backup_commands::backup_release_legal_hold,
             backup_commands::ediscovery_export,

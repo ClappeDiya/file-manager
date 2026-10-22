@@ -542,6 +542,14 @@ Files and folders display compatibility badges indicating their status across ta
 
 ---
 
+## Schedules & holiday calendars
+
+In Advanced mode, **Schedules & holiday calendars** (toolbar or command palette) defines schedules and calendars once and shares them:
+
+- A **named schedule** is a cron expression (`sec min hour day month weekday`, UTC) plus the holiday calendars whose days it skips. Choose it in a sync pair (Trigger: Scheduled) or an automation rule (Trigger: Schedule) instead of typing cron. Editing the schedule changes every pair and rule that uses it at once. A schedule that is still in use cannot be deleted.
+- A **holiday calendar** lists days off: dates, dates that recur every year (`MM-DD`), and optionally weekends. Import an iCalendar (`.ics`) file to add its all-day events; yearly events recur. Backup jobs pick calendars on their Schedule step.
+- A scheduled run that falls on a day off (by local date) is skipped, not postponed: the next regular run happens as usual. The schedule editor previews the next runs and marks the ones a calendar skips.
+
 ## Automation: downloading a URL
 
 In Advanced mode, an automation rule can **Download a URL** into a folder. The URL, folder, file name and expected SHA-256 accept the same templates as other actions (`{name}`, `{yyyy}`, webhook fields …).

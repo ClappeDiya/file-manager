@@ -79,9 +79,9 @@ describe("backup helpers", () => {
   });
 
   it("describes schedules and retention", () => {
-    expect(describeSchedule({ enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false })).toBe("Manual only");
-    expect(describeSchedule({ enabled: true, start_time: "02:00", interval_minutes: 1440, weekdays: [0, 4], skip_on_battery: false })).toBe("daily from 02:00 on Mon, Fri");
-    expect(describeSchedule({ enabled: true, start_time: "00:30", interval_minutes: 60, weekdays: [], skip_on_battery: false })).toBe("every 1 h from 00:30");
+    expect(describeSchedule({ enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [] })).toBe("Manual only");
+    expect(describeSchedule({ enabled: true, start_time: "02:00", interval_minutes: 1440, weekdays: [0, 4], skip_on_battery: false, calendar_ids: [] })).toBe("daily from 02:00 on Mon, Fri");
+    expect(describeSchedule({ enabled: true, start_time: "00:30", interval_minutes: 60, weekdays: [], skip_on_battery: false, calendar_ids: [] })).toBe("every 1 h from 00:30");
     expect(describeRetention({ type: "keep_count", count: 5 })).toBe("Keep 5 version(s)");
   });
 

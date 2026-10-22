@@ -18,11 +18,13 @@ pub struct BackupSchedule {
     pub weekdays: Vec<u8>,
     /// Skip scheduled runs while the computer runs on battery.
     pub skip_on_battery: bool,
+    /// Holiday calendars (`schedule_library`) whose days off skip runs.
+    pub calendar_ids: Vec<String>,
 }
 
 impl Default for BackupSchedule {
     fn default() -> Self {
-        Self { enabled: false, start_time: "02:00".into(), interval_minutes: 1440, weekdays: Vec::new(), skip_on_battery: false }
+        Self { enabled: false, start_time: "02:00".into(), interval_minutes: 1440, weekdays: Vec::new(), skip_on_battery: false, calendar_ids: Vec::new() }
     }
 }
 
@@ -36,6 +38,9 @@ impl BackupSchedule {
         }
         if self.weekdays.iter().any(|d| *d > 6) {
             return Err(crate::core::error::AppError::validation("Weekdays must be 0 (Mon) to 6 (Sun)"));
+        }
+        if let Some(id) = self.calendar_ids.iter().find(|id| crate::schedule_library::registry().calendar(id).is_none()) {
+            return Err(crate::core::error::AppError::validation(format!("Holiday calendar {id} does not exist")));
         }
         Ok(())
     }
@@ -90,7 +95,7 @@ mod tests {
 
     #[test]
     fn daily_next_and_catch_up() {
-        let s = BackupSchedule { enabled: true, start_time: "02:00".into(), interval_minutes: 1440, weekdays: vec![], skip_on_battery: false };
+        let s = BackupSchedule { enabled: true, start_time: "02:00".into(), interval_minutes: 1440, weekdays: vec![], skip_on_battery: false, calendar_ids: vec![] };
         assert_eq!(s.next_after(local(2026, 3, 10, 1, 0)), Some(local(2026, 3, 10, 2, 0)));
         assert_eq!(s.next_after(local(2026, 3, 10, 2, 0)), Some(local(2026, 3, 11, 2, 0)));
         // Missed while offline: due immediately.
@@ -101,7 +106,7 @@ mod tests {
     #[test]
     fn hourly_with_weekdays() {
         // 2026-03-14 is a Saturday.
-        let s = BackupSchedule { enabled: true, start_time: "00:30".into(), interval_minutes: 60, weekdays: vec![0, 1, 2, 3, 4], skip_on_battery: false };
+        let s = BackupSchedule { enabled: true, start_time: "00:30".into(), interval_minutes: 60, weekdays: vec![0, 1, 2, 3, 4], skip_on_battery: false, calendar_ids: vec![] };
         let n = s.next_after(local(2026, 3, 14, 10, 0)).unwrap();
         assert_eq!(n, local(2026, 3, 16, 0, 30));
         assert_eq!(s.next_after(local(2026, 3, 16, 10, 0)), Some(local(2026, 3, 16, 10, 30)));

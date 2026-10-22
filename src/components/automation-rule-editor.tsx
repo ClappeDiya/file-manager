@@ -7,6 +7,8 @@
  * Rust), overwrite/retry/priority/settle options, a dry run, command
  * approval and webhook URLs. Rules are saved disabled unless switched on.
  */
+import { NamedSchedulePicker } from "@/components/schedule-pickers";
+import { refId } from "@/stores/schedule-store";
 import { useCallback, useEffect, useState } from "react";
 import { ArrowDown, ArrowUp, FlaskConical, Link2, Plus, ShieldCheck, Trash2, X } from "lucide-react";
 import { Button } from "@ufop/ui-components";
@@ -586,7 +588,15 @@ export function AutomationRuleEditor() {
                 </label>
               </div>
             )}
-            {form.trigger.type === "schedule" && (
+            {form.trigger.type === "schedule" && advanced && (
+              <NamedSchedulePicker
+                className={field}
+                value={form.trigger.cron_expr}
+                customCron={refId(form.trigger.cron_expr) ? "0 0 9 * * *" : form.trigger.cron_expr}
+                onChange={(cron) => update({ trigger: { type: "schedule", cron_expr: cron, cron_human: null } })}
+              />
+            )}
+            {form.trigger.type === "schedule" && !refId(form.trigger.cron_expr) && (
               <div className="flex gap-2">
                 <select
                   aria-label="Schedule preset"

@@ -2364,8 +2364,13 @@ impl BackupManager {
                     j.clone()
                 })
             };
-            if let Some(j) = snapshot {
-                let _ = self.persist(&j).await;
+            if let Some(j) = &snapshot {
+                let _ = self.persist(j).await;
+                // A day off in one of the job's holiday calendars uses up the slot.
+                if let Some(cal) = crate::schedule_library::registry().run_blocked(None, &j.schedule.calendar_ids, now) {
+                    tracing::info!("Skipping scheduled backup '{}': today is a day off in '{cal}'", j.name);
+                    continue;
+                }
             }
             if let Err(e) = self.start_backup(id, false).await {
                 tracing::warn!("Scheduled backup {id} could not start: {e}");
