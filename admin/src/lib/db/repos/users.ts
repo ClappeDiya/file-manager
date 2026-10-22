@@ -32,12 +32,13 @@ function fromRow(r: Row): UserRecord {
     lastTotpStep: (r.last_totp_step as number) ?? null,
     passwordChangedAt: (r.password_changed_at as string) ?? null,
     timeZone: (r.time_zone as string) ?? null,
+    locale: (r.locale as string) ?? null,
   };
 }
 
 /** The public shape (no secrets). */
 export function publicUser(u: UserRecord): AdminUser & { mfaEnabled: boolean } {
-  return { id: u.id, email: u.email, name: u.name, role: u.role, permissions: u.permissions, organizationId: u.organizationId, lastLoginAt: u.lastLoginAt, createdAt: u.createdAt, isActive: u.isActive, ssoProvider: u.ssoProvider, mfaEnabled: u.mfaEnabled, timeZone: u.timeZone ?? null };
+  return { id: u.id, email: u.email, name: u.name, role: u.role, permissions: u.permissions, organizationId: u.organizationId, lastLoginAt: u.lastLoginAt, createdAt: u.createdAt, isActive: u.isActive, ssoProvider: u.ssoProvider, mfaEnabled: u.mfaEnabled, timeZone: u.timeZone ?? null, locale: u.locale ?? null };
 }
 
 export function getUser(id: string): UserRecord | null {
@@ -91,6 +92,7 @@ export interface UserUpdate {
   lastTotpStep?: number | null;
   passwordChangedAt?: string | null;
   timeZone?: string | null;
+  locale?: string | null;
 }
 
 const COLUMNS: Record<keyof UserUpdate, string> = {
@@ -108,6 +110,7 @@ const COLUMNS: Record<keyof UserUpdate, string> = {
   lastTotpStep: 'last_totp_step',
   passwordChangedAt: 'password_changed_at',
   timeZone: 'time_zone',
+  locale: 'locale',
 };
 
 export function updateUser(id: string, u: UserUpdate): boolean {

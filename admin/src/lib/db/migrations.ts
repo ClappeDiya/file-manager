@@ -679,6 +679,13 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 30,
+    description: 'User console language',
+    up(d) {
+      d.exec('ALTER TABLE users ADD COLUMN locale TEXT');
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

@@ -13,6 +13,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { ErrorBanner, Loading } from '@/components/fleet/badges';
 import { useApi } from '@/lib/use-api';
 import type { PageInfo } from '@/lib/pagination';
+import { useTranslate } from '@/lib/i18n';
 
 export interface Column<T> {
   key: string;
@@ -76,7 +77,8 @@ interface Props<T> {
   onOffset?: (offset: number) => void;
 }
 
-export function DataTable<T>({ id, columns, rows, rowKey, loading, error, empty = 'Nothing to show', pagination, limit, onLimit, onOffset }: Props<T>) {
+export function DataTable<T>({ id, columns, rows, rowKey, loading, error, empty, pagination, limit, onLimit, onOffset }: Props<T>) {
+  const t = useTranslate();
   const defaults = useMemo(() => columns.filter((c) => !c.defaultHidden).map((c) => c.key), [columns]);
   const [visible, setVisible] = useState<string[]>(() => load(`ufop.table.${id}.columns`, defaults));
   const [picker, setPicker] = useState(false);
@@ -104,7 +106,7 @@ export function DataTable<T>({ id, columns, rows, rowKey, loading, error, empty 
       <div className="mb-2 flex items-center justify-end gap-2">
         <div className="relative" ref={pickerRef}>
           <Button size="sm" variant="outline" aria-expanded={picker} aria-haspopup="true" onClick={() => setPicker(!picker)}>
-            <Columns3 size={14} aria-hidden="true" /> Columns
+            <Columns3 size={14} aria-hidden="true" /> {t('table.columns')}
           </Button>
           {picker && (
             <div role="menu" className="absolute right-0 z-20 mt-1 w-56 rounded-md border border-border bg-background p-2 shadow-lg">
@@ -123,7 +125,7 @@ export function DataTable<T>({ id, columns, rows, rowKey, loading, error, empty 
                   save(`ufop.table.${id}.columns`, defaults);
                 }}
               >
-                Reset
+                {t('table.reset')}
               </button>
             </div>
           )}
@@ -156,7 +158,7 @@ export function DataTable<T>({ id, columns, rows, rowKey, loading, error, empty 
               {!rows.length && (
                 <TableRow>
                   <TableCell colSpan={shown.length} className="py-8 text-center text-foreground-secondary">
-                    {empty}
+                    {empty ?? t('table.empty')}
                   </TableCell>
                 </TableRow>
               )}
@@ -167,18 +169,17 @@ export function DataTable<T>({ id, columns, rows, rowKey, loading, error, empty 
       {pagination && onOffset && (
         <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
           <Button size="sm" variant="outline" disabled={pagination.offset === 0} onClick={() => onOffset(Math.max(0, pagination.offset - (limit ?? rows.length)))}>
-            Previous
+            {t('common.previous')}
           </Button>
           <span>
-            {rows.length ? `${from}–${to}` : '0'}
-            {pagination.total !== null ? ` of ${pagination.total}` : ''}
+            {!rows.length ? '0' : pagination.total !== null ? t('table.rangeOf', { from, to, total: pagination.total }) : t('table.range', { from, to })}
           </span>
           <Button size="sm" variant="outline" disabled={!pagination.hasMore} onClick={() => onOffset(pagination.offset + rows.length)}>
-            Next
+            {t('common.next')}
           </Button>
           {onLimit && (
             <label className="ml-auto flex items-center gap-1 text-xs">
-              Rows
+              {t('table.rows')}
               <select className="rounded border border-border bg-background px-1 py-0.5" value={limit} onChange={(e) => onLimit(Number(e.target.value))}>
                 {PAGE_SIZES.map((n) => (
                   <option key={n} value={n}>

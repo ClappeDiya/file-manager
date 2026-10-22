@@ -13,7 +13,14 @@
     "loading": "Loading…",
     "error": "Error",
     "success": "Success",
-    "noResults": "No results"
+    "noResults": "No results",
+    "close": "Close",
+    "confirm": "Confirm",
+    "export": "Export",
+    "download": "Download",
+    "previous": "Previous",
+    "next": "Next",
+    "language": "Language"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -67,5 +74,47 @@
     "refreshAria": "Refresh dashboard",
     "refreshSuccess": "Dashboard refreshed",
     "refreshError": "Could not refresh: {message}"
+  },
+  "login": {
+    "title": "Sign in",
+    "description": "Enter your work email to see the sign-in methods for your organization.",
+    "email": "Email",
+    "password": "Password",
+    "submit": "Sign in",
+    "passkey": "Sign in with a passkey",
+    "forgot": "Forgot your password?",
+    "orContinue": "Or continue with",
+    "mfaTitle": "Two-factor verification",
+    "mfaDescription": "Enter the 6-digit code from your authenticator app, or a recovery code.",
+    "code": "Code",
+    "verify": "Verify",
+    "back": "Back to sign in"
+  },
+  "account": {
+    "title": "My account",
+    "profile": "Profile",
+    "profileDescription": "Times in the console are shown in your time zone (now: {now}).",
+    "name": "Name",
+    "timeZone": "Time zone",
+    "browserZone": "Browser ({zone})",
+    "browserLanguage": "Browser language",
+    "saved": "Profile saved"
+  },
+  "reauth": {
+    "title": "Confirm it is you",
+    "description": "This change needs a recent sign-in.",
+    "codeLabel": "Code from your authenticator app (or a recovery code)",
+    "passwordLabel": "Your password",
+    "usePasskey": "Use a passkey",
+    "ssoNotice": "This account signs in with single sign-on. Sign in again, then repeat the change.",
+    "signInAgain": "Sign in again"
+  },
+  "table": {
+    "columns": "Columns",
+    "reset": "Reset",
+    "rows": "Rows",
+    "range": "{from}–{to}",
+    "rangeOf": "{from}–{to} of {total}",
+    "empty": "Nothing to show"
   }
 }

@@ -9,8 +9,10 @@ import { ErrorBanner } from '@/components/fleet/badges';
 import { api, errorText } from '@/lib/api-client';
 import { getPasskey, passkeysSupported } from '@/lib/passkey-client';
 import { useReauthStore } from '@/lib/stores/reauth-store';
+import { useTranslate } from '@/lib/i18n';
 
 export function ReauthDialog() {
+  const t = useTranslate();
   const methods = useReauthStore((s) => s.methods);
   const finish = useReauthStore((s) => s.finish);
   const [value, setValue] = useState('');
@@ -54,8 +56,8 @@ export function ReauthDialog() {
 
   return (
     <Dialog open onClose={() => done(false)} className="max-w-md">
-      <h2 className="text-lg font-semibold">Confirm it is you</h2>
-      <p className="mt-1 text-sm text-muted-foreground">This change needs a recent sign-in.</p>
+      <h2 className="text-lg font-semibold">{t('reauth.title')}</h2>
+      <p className="mt-1 text-sm text-muted-foreground">{t('reauth.description')}</p>
       <ErrorBanner message={err} />
       <form
         className="mt-4 space-y-3"
@@ -71,7 +73,7 @@ export function ReauthDialog() {
       >
         {typed && (
           <Input
-            label={typed === 'totp' ? 'Code from your authenticator app (or a recovery code)' : 'Your password'}
+            label={typed === 'totp' ? t('reauth.codeLabel') : t('reauth.passwordLabel')}
             type={typed === 'totp' ? 'text' : 'password'}
             autoComplete={typed === 'totp' ? 'one-time-code' : 'current-password'}
             value={value}
@@ -79,24 +81,24 @@ export function ReauthDialog() {
             autoFocus
           />
         )}
-        {methods.includes('sso') && <p className="text-sm">This account signs in with single sign-on. Sign in again, then repeat the change.</p>}
+        {methods.includes('sso') && <p className="text-sm">{t('reauth.ssoNotice')}</p>}
         <div className="flex flex-wrap justify-end gap-2">
           <Button type="button" variant="secondary" onClick={() => done(false)}>
-            Cancel
+            {t('common.cancel')}
           </Button>
           {methods.includes('passkey') && passkeysSupported() && (
             <Button type="button" variant={typed ? 'secondary' : 'primary'} disabled={busy} onClick={() => void withPasskey()}>
-              Use a passkey
+              {t('reauth.usePasskey')}
             </Button>
           )}
           {methods.includes('sso') && (
             <Button type="button" onClick={() => window.location.assign(`/login?redirect=${encodeURIComponent(window.location.pathname)}`)}>
-              Sign in again
+              {t('reauth.signInAgain')}
             </Button>
           )}
           {typed && (
             <Button type="submit" disabled={busy || !value}>
-              Confirm
+              {t('common.confirm')}
             </Button>
           )}
         </div>

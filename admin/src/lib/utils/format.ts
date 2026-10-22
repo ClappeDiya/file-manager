@@ -12,6 +12,14 @@ export function formatBytes(bytes: number, decimals = 2): string {
 }
 
 let displayTimeZone: string | undefined;
+let displayLocale = 'en-US';
+
+const REGION: Record<string, string> = { en: 'en-US', de: 'de-DE', es: 'es-ES', fr: 'fr-FR', ja: 'ja-JP', ko: 'ko-KR', pt: 'pt-BR', zh: 'zh-CN' };
+
+/** Format dates and numbers for this console language (`en`, `de`, …). */
+export function setDisplayLocale(locale: string): void {
+  displayLocale = REGION[locale] ?? 'en-US';
+}
 
 /** Show dates in this IANA time zone (the signed-in user's preference); undefined = the browser's. */
 export function setDisplayTimeZone(tz: string | null | undefined): void {
@@ -25,7 +33,7 @@ export function getDisplayTimeZone(): string {
 /** Format a date for display */
 export function formatDate(date: string | Date): string {
   const d = typeof date === 'string' ? new Date(date) : date;
-  return d.toLocaleDateString('en-US', {
+  return d.toLocaleDateString(displayLocale, {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
@@ -36,7 +44,7 @@ export function formatDate(date: string | Date): string {
 /** Format a datetime for display (with the zone's abbreviation when a preference is set) */
 export function formatDateTime(date: string | Date): string {
   const d = typeof date === 'string' ? new Date(date) : date;
-  return d.toLocaleString('en-US', {
+  return d.toLocaleString(displayLocale, {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
@@ -57,6 +65,13 @@ export function formatRelativeTime(date: string | Date): string {
   const diffHour = Math.floor(diffMin / 60);
   const diffDay = Math.floor(diffHour / 24);
 
+  if (displayLocale !== 'en-US' && diffDay < 7) {
+    const rtf = new Intl.RelativeTimeFormat(displayLocale, { numeric: 'auto', style: 'short' });
+    if (diffSec < 60) return rtf.format(0, 'second');
+    if (diffMin < 60) return rtf.format(-diffMin, 'minute');
+    if (diffHour < 24) return rtf.format(-diffHour, 'hour');
+    return rtf.format(-diffDay, 'day');
+  }
   if (diffSec < 60) return 'just now';
   if (diffMin < 60) return `${diffMin}m ago`;
   if (diffHour < 24) return `${diffHour}h ago`;
@@ -66,7 +81,7 @@ export function formatRelativeTime(date: string | Date): string {
 
 /** Format a number with commas */
 export function formatNumber(n: number): string {
-  return n.toLocaleString('en-US');
+  return n.toLocaleString(displayLocale);
 }
 
 /** Format a duration in minutes */

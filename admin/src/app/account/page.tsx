@@ -20,6 +20,7 @@ import { PasskeysCard } from '@/components/auth/passkeys-card';
 import { SessionsCard } from '@/components/auth/sessions-card';
 import { ApiTokensCard } from '@/components/auth/api-tokens-card';
 import { ProfileCard } from '@/components/auth/profile-card';
+import { useTranslate } from '@/lib/i18n';
 
 interface Identities {
   hasPassword: boolean;
@@ -28,6 +29,7 @@ interface Identities {
 }
 
 function AccountView() {
+  const t = useTranslate();
   const params = useSearchParams();
   const user = useAuthStore((s) => s.user);
   const organization = useAuthStore((s) => s.organization);
@@ -91,7 +93,7 @@ function AccountView() {
 
   return (
     <div>
-      <PageHeader title="My account" description={user ? `${user.name} · ${user.email}${organization ? ` · ${ROLE_LABELS[user.role]} in ${organization.name}` : ''}` : ''} />
+      <PageHeader title={t('account.title')} description={user ? `${user.name} · ${user.email}${organization ? ` · ${ROLE_LABELS[user.role]} in ${organization.name}` : ''}` : ''} />
       {params.get('setup-mfa') && !mfa.data?.enabled && (
         <div role="alert" className="mb-4 rounded-md border border-warning bg-warning-bg px-3 py-2 text-sm">
           Your organization requires two-factor sign-in. Turn it on below to continue using the console.

@@ -6,6 +6,7 @@ import React, { Suspense, useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Fingerprint, KeyRound } from 'lucide-react';
 import { useAuthStore } from '@/lib/stores/auth-store';
+import { useTranslate } from '@/lib/i18n';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '@/components/ui/card';
@@ -23,6 +24,7 @@ function LoginForm() {
   const params = useSearchParams();
   const { isAuthenticated, isLoading, error, setError, login, verifyMfa, validateSession } = useAuthStore();
   const redirect = safeRedirect(params.get('redirect'));
+  const t = useTranslate();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [code, setCode] = useState('');
@@ -101,25 +103,25 @@ function LoginForm() {
           <div className="w-12 h-12 rounded-xl bg-primary flex items-center justify-center mb-3">
             <span className="text-primary-foreground font-bold text-xl">U</span>
           </div>
-          <h1 className="text-xl font-bold text-foreground">UFOP Admin Console</h1>
-          <p className="text-sm text-foreground-secondary mt-1">Unified File Operations Platform</p>
+          <h1 className="text-xl font-bold text-foreground">{t('app.name')}</h1>
+          <p className="text-sm text-foreground-secondary mt-1">{t('app.tagline')}</p>
         </div>
 
         {challengeId ? (
           <Card>
             <CardHeader className="flex-col items-start gap-1">
-              <CardTitle>Two-factor verification</CardTitle>
-              <CardDescription>Enter the 6-digit code from your authenticator app, or a recovery code.</CardDescription>
+              <CardTitle>{t('login.mfaTitle')}</CardTitle>
+              <CardDescription>{t('login.mfaDescription')}</CardDescription>
             </CardHeader>
             <CardContent>
               <form onSubmit={submitCode} className="space-y-4">
-                <Input label="Code" inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(e) => setCode(e.target.value)} autoFocus required />
+                <Input label={t('login.code')} inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(e) => setCode(e.target.value)} autoFocus required />
                 {errorBox}
                 <Button type="submit" className="w-full" loading={isLoading}>
-                  Verify
+                  {t('login.verify')}
                 </Button>
                 <Button type="button" variant="ghost" className="w-full" onClick={() => (setChallengeId(null), setCode(''), setError(null))}>
-                  Back to sign in
+                  {t('login.back')}
                 </Button>
               </form>
             </CardContent>
@@ -127,31 +129,31 @@ function LoginForm() {
         ) : (
           <Card>
             <CardHeader className="flex-col items-start gap-1">
-              <CardTitle>Sign in</CardTitle>
-              <CardDescription>Enter your work email to see the sign-in methods for your organization.</CardDescription>
+              <CardTitle>{t('login.title')}</CardTitle>
+              <CardDescription>{t('login.description')}</CardDescription>
             </CardHeader>
             <CardContent>
               <form onSubmit={submitPassword} className="space-y-4">
-                <Input label="Email" type="email" placeholder="you@company.com" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required />
-                <Input label="Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+                <Input label={t('login.email')} type="email" placeholder="you@company.com" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required />
+                <Input label={t('login.password')} type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
                 {errorBox}
                 <Button type="submit" className="w-full" loading={isLoading}>
-                  Sign in
+                  {t('login.submit')}
                 </Button>
                 {passkeysSupported() && (
                   <Button type="button" variant="outline" className="w-full" onClick={() => void signInWithPasskey()}>
                     <Fingerprint size={14} className="mr-2" aria-hidden="true" />
-                    Sign in with a passkey
+                    {t('login.passkey')}
                   </Button>
                 )}
                 <Link href="/reset-password" className="block text-center text-xs text-primary hover:underline">
-                  Forgot your password?
+                  {t('login.forgot')}
                 </Link>
               </form>
             </CardContent>
             {sso.length > 0 && (
               <CardFooter className="flex-col gap-2">
-                <p className="w-full text-xs text-foreground-tertiary">Or continue with</p>
+                <p className="w-full text-xs text-foreground-tertiary">{t('login.orContinue')}</p>
                 {sso.map((p) => (
                   <Button key={p.id} variant="outline" className="w-full" onClick={() => (window.location.href = `/api/auth/sso/${p.id}/start?redirect=${encodeURIComponent(redirect)}`)}>
                     <KeyRound size={14} className="mr-2" aria-hidden="true" />
