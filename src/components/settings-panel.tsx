@@ -17,6 +17,7 @@ import { SecurityAuditSection } from "@/components/security-audit-section";
 import { TrustedSshHostsSection } from "@/components/trusted-ssh-hosts-section";
 import { FilenamePoliciesSection } from "@/components/filename-policies-section";
 import { SearchIndexFolders } from "@/components/search-index-folders";
+import { GpgKeysSection } from "@/components/gpg-keys-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
 
 // ── Types ──
@@ -1345,6 +1346,11 @@ export default function SettingsPanel({
         {/* Which names may be written where (enforced by the engines) */}
         <Section title="Filename Policies">
           <FilenamePoliciesSection />
+        </Section>
+
+        {/* GnuPG keyring for file encryption and signatures */}
+        <Section title="OpenPGP Keys">
+          <GpgKeysSection />
         </Section>
 
         {/* Persisted host keys (trust on first use) */}

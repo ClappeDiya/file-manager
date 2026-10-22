@@ -75,6 +75,8 @@ import { AutomationPanel } from "./automation-panel";
 import { AutomationRuleEditor } from "./automation-rule-editor";
 import { CopyToManyDialog } from "./copy-to-many-dialog";
 import { IndexedSearchResults } from "./indexed-search-results";
+import { GpgDialog } from "./gpg-dialog";
+import { looksEncrypted, looksLikeSignature, useGpgDialog } from "@/stores/gpg-store";
 import type { SearchScope } from "@/stores/search-store";
 import { openCopyToMany } from "@/stores/copy-to-many-store";
 import { VaultPanel } from "./vault-panel";
@@ -2595,6 +2597,7 @@ export function FileManager() {
         {automationPanelOpen && <AutomationPanel />}
         <AutomationRuleEditor />
         <CopyToManyDialog />
+        <GpgDialog />
         {activityTimelineOpen && (
           <ActivityTimelinePanel onDispatchPath={handleDispatchLedgerPath} />
         )}
@@ -4405,6 +4408,9 @@ function FilePane({
         onPaste: handlePaste,
         onCopyToOtherPane: handleCopyToOtherPane,
         onCopyToMany: () => openCopyToMany(selectedPaths, currentPath, otherPanePath()),
+        onGpg: (mode) => useGpgDialog.getState().open(mode, selectedPaths),
+        gpgDecrypt: selectedPaths.length > 0 && selectedPaths.every((p) => looksEncrypted(p)),
+        gpgVerify: selectedPaths.length > 0 && selectedPaths.every((p) => looksLikeSignature(p)),
         onMoveToOtherPane: handleMoveToOtherPane,
         onDelete: handleDelete,
         onDeletePermanently: () => handleDeletePermanently(selectedPaths.length > 0 ? selectedPaths : [entry.path]),

@@ -278,6 +278,11 @@ export function getFileContextMenuItems(options: {
   onMoveToOtherPane?: () => void;
   /** Copy the selection into several folders at once. */
   onCopyToMany?: () => void;
+  /** OpenPGP actions on the selected files; `gpgDecrypt` / `gpgVerify`
+   *  say whether the selection looks encrypted / like signatures. */
+  onGpg?: (mode: "encrypt" | "decrypt" | "sign" | "verify") => void;
+  gpgDecrypt?: boolean;
+  gpgVerify?: boolean;
   onPaste: () => void;
   onDelete: () => void;
   onRename: () => void;
@@ -599,6 +604,15 @@ export function getFileContextMenuItems(options: {
         icon: <FileArchive className="h-3.5 w-3.5" />,
         action: options.onCompress,
       });
+    }
+
+    // OpenPGP: files only; decrypt/verify only where the names fit.
+    if (options.onGpg && !options.isDirectory) {
+      const gpg = options.onGpg;
+      items.push({ id: "gpg-encrypt", label: "Encrypt with GPG…", icon: <Lock className="h-3.5 w-3.5" />, advancedOnly: true, action: () => gpg("encrypt") });
+      if (options.gpgDecrypt) items.push({ id: "gpg-decrypt", label: "Decrypt with GPG…", icon: <Lock className="h-3.5 w-3.5" />, action: () => gpg("decrypt") });
+      items.push({ id: "gpg-sign", label: "Sign with GPG…", icon: <Lock className="h-3.5 w-3.5" />, advancedOnly: true, action: () => gpg("sign") });
+      if (options.gpgVerify) items.push({ id: "gpg-verify", label: "Verify Signature", icon: <Lock className="h-3.5 w-3.5" />, action: () => gpg("verify") });
     }
 
     items.push({ id: "sep2", label: "", separator: true });

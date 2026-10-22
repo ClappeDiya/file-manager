@@ -9,6 +9,7 @@ pub mod backup;
 pub mod agent;
 pub mod error;
 pub mod fsutil;
+pub mod gpg;
 pub mod naming;
 pub mod policy;
 pub mod preload;

@@ -12,8 +12,9 @@
 
 use super::modules::EncryptionModule;
 use crate::error::AppError;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use crate::gpg::Gpg;
+#[cfg(test)]
+use std::process::Command;
 
 #[derive(Clone, Debug, Default)]
 pub struct GpgModule {
@@ -26,51 +27,21 @@ pub struct GpgModule {
     pub recipients: Vec<String>,
 }
 
-fn gpg_err(msg: String) -> AppError {
-    AppError::encryption(msg, "Check that GnuPG is installed, the passphrase is right and (for key encryption) the secret key is in the keyring.")
-}
-
 impl GpgModule {
-    fn command(&self) -> Command {
-        let exe = if !self.executable.trim().is_empty() {
-            self.executable.trim().to_string()
-        } else {
-            std::env::var("UFOP_GPG").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "gpg".into())
-        };
-        let mut c = Command::new(exe);
-        c.args(["--batch", "--yes", "--no-tty", "--quiet"]);
-        if !self.homedir.trim().is_empty() {
-            c.arg("--homedir").arg(self.homedir.trim());
-        }
-        c.stdout(Stdio::piped()).stderr(Stdio::piped());
-        c
+    fn gpg(&self) -> Gpg {
+        Gpg { executable: self.executable.clone(), homedir: self.homedir.clone() }
     }
 
-    fn with_pass(&self, c: &mut Command) -> Option<Vec<u8>> {
-        let p = self.passphrase.as_deref().filter(|p| !p.is_empty())?;
-        // Without --no-symkey-cache, gpg-agent reuses a cached symmetric key
-        // and a wrong passphrase would still decrypt.
-        c.args(["--pinentry-mode", "loopback", "--no-symkey-cache", "--passphrase-fd", "0"]);
-        Some(format!("{p}\n").into_bytes())
+    fn command(&self) -> std::process::Command {
+        self.gpg().command()
     }
 
-    fn run(mut c: Command, stdin: Vec<u8>, what: &str) -> Result<Vec<u8>, AppError> {
-        c.stdin(Stdio::piped());
-        let mut child = c.spawn().map_err(|e| gpg_err(format!("Could not start gpg: {e}")))?;
-        let mut sin = child.stdin.take().ok_or_else(|| gpg_err("gpg stdin unavailable".into()))?;
-        // Feed stdin on a thread so large outputs cannot deadlock the pipes.
-        let writer = std::thread::spawn(move || {
-            let r = sin.write_all(&stdin);
-            drop(sin);
-            r
-        });
-        let out = child.wait_with_output().map_err(|e| gpg_err(format!("gpg failed: {e}")))?;
-        let _ = writer.join();
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            return Err(gpg_err(format!("gpg {what} failed: {}", err.trim().lines().last().unwrap_or("unknown error"))));
-        }
-        Ok(out.stdout)
+    fn with_pass(&self, c: &mut std::process::Command) -> Option<Vec<u8>> {
+        Gpg::with_pass(c, self.passphrase.as_deref())
+    }
+
+    fn run(c: std::process::Command, stdin: Vec<u8>, what: &str) -> Result<Vec<u8>, AppError> {
+        Gpg::run(c, stdin, what)
     }
 
     /// Private temporary file holding `data`; removed when dropped.
@@ -89,10 +60,7 @@ impl GpgModule {
 
     /// `gpg --version` first line (diagnostics).
     pub fn version(&self) -> Result<String, AppError> {
-        let mut c = self.command();
-        c.arg("--version");
-        let out = Self::run(c, Vec::new(), "--version")?;
-        Ok(String::from_utf8_lossy(&out).lines().next().unwrap_or_default().to_string())
+        self.gpg().version()
     }
 }
 
