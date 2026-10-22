@@ -132,4 +132,8 @@ impl ActionServices for TauriActionServices {
     fn rule<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Option<super::AutomationRule>> {
         Box::pin(async move { self.app.state::<super::AutomationManager>().get_rule(id).await })
     }
+
+    fn ai_task<'a>(&'a self, instruction: &'a str, file_name: &'a str, text: &'a str) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async move { self.app.state::<crate::ai_engine::AiAssistant>().run_task(instruction, file_name, text).await.map_err(|e| e.user_message()) })
+    }
 }

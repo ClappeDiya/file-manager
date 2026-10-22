@@ -314,6 +314,7 @@ pub fn action_kind(action: &RuleAction) -> &'static str {
         RuleAction::ConvertImage { .. } => "convert_image",
         RuleAction::ConvertDocument { .. } => "convert_document",
         RuleAction::ValidateBatch { .. } => "validate_batch",
+        RuleAction::AiTask { .. } => "ai_task",
     }
 }
 
@@ -804,6 +805,33 @@ pub async fn dispatch(action: &RuleAction, triggered_file: Option<&str>, env: &E
             };
             crate::convert_engine::convert_document(&src, &target, to, std::time::Duration::from_secs(300)).await?;
             Ok(vec![target.to_string_lossy().into_owned()])
+        }
+
+        RuleAction::AiTask { instruction, dest_path, suffix, max_chars } => {
+            let source = Path::new(triggered_file.ok_or("No source file for the AI task")?);
+            validate_automation_path(source, None)?;
+            let instruction = env.text(instruction, triggered_file)?;
+            if instruction.trim().is_empty() {
+                return Err("Write the instruction for the AI task".into());
+            }
+            let suffix = suffix.trim().trim_start_matches('.');
+            validate_rename_name(suffix)?;
+            let (path, max) = (source.to_path_buf(), (*max_chars).clamp(100, 200_000));
+            let text: String = tokio::task::spawn_blocking(move || crate::search_engine::read_text(&path, (max * 4) as u64))
+                .await
+                .map_err(|e| format!("Cannot read the file: {e}"))?
+                .ok_or_else(|| format!("{} has no text the AI can read", source.display()))?
+                .chars()
+                .take(max)
+                .collect();
+            let name = source.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or("Cannot determine filename")?;
+            let answer = require_services(services)?.ai_task(&instruction, &name, &text).await?;
+            let dir = if dest_path.trim().is_empty() { source.parent().ok_or("Cannot determine parent directory")?.to_path_buf() } else { PathBuf::from(env.path(dest_path, triggered_file)?) };
+            validate_automation_path(&dir, None)?;
+            std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create destination directory: {e}"))?;
+            let Some(out) = resolve_target(source, dir.join(format!("{name}.{suffix}")), env.overwrite)? else { return Ok(vec![]) };
+            std::fs::write(&out, format!("{answer}\n")).map_err(|e| format!("Cannot write {}: {e}", out.display()))?;
+            Ok(vec![source.to_string_lossy().into_owned(), out.to_string_lossy().into_owned()])
         }
 
         RuleAction::ValidateBatch { folder, rules, report_folder, fail_on_invalid } => {
@@ -1464,6 +1492,29 @@ mod tests {
         assert_eq!(execute_rule_action(&rule_steps(action(false), vec![], RuleOptions::default()), marker.to_str(), false).await.status, AutomationStatus::Success);
         write(&batch.join("invoice.pdf"), "%PDF");
         assert_eq!(execute_rule_action(&rule_steps(action(true), vec![], RuleOptions::default()), marker.to_str(), false).await.status, AutomationStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn ai_task_sends_the_text_and_saves_the_answer() {
+        let svc = RecordingServices::default();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("invoice.txt");
+        write(&f, &"ACME invoice ".repeat(50));
+        let task = |dest: &str, chars| RuleAction::AiTask { instruction: "Summarize {filename} in one line".into(), dest_path: dest.into(), suffix: "summary.md".into(), max_chars: chars };
+        let log = execute_rule_action_with(&rule_steps(task(&format!("{}/ai", dir.path().display()), 100), vec![], RuleOptions::default()), f.to_str(), false, Some(&svc)).await;
+        assert_eq!(log.status, AutomationStatus::Success, "{:?}", log.error_message);
+        assert_eq!(svc.calls(), vec!["ai:Summarize invoice.txt in one line:invoice.txt:100".to_string()], "the instruction is a template; the text is capped");
+        let out = dir.path().join("ai/invoice.txt.summary.md");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "100 chars about invoice.txt\n");
+        assert!(log.files_affected.contains(&out.to_string_lossy().to_string()));
+
+        // Binary files have no text; without services the task fails honestly.
+        let bin = dir.path().join("photo.bin");
+        std::fs::write(&bin, [0u8, 1, 2, 0]).unwrap();
+        let none = execute_rule_action_with(&rule_steps(task("", 1000), vec![], RuleOptions::default()), bin.to_str(), false, Some(&svc)).await;
+        assert!(none.error_message.unwrap().contains("has no text"));
+        let unattached = execute_rule_action(&rule_steps(task("", 1000), vec![], RuleOptions::default()), f.to_str(), false).await;
+        assert_eq!(unattached.status, AutomationStatus::Failed);
     }
 
     fn rule_steps(first: RuleAction, more: Vec<ActionStep>, options: RuleOptions) -> AutomationRule {

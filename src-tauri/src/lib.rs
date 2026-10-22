@@ -816,6 +816,8 @@ pub fn run() {
             // AI features (T-043..T-045)
             ai_commands::ai_explain_error,
             ai_commands::ai_chat,
+            ai_commands::ai_help,
+            ai_commands::ai_activity_report,
             ai_commands::ai_get_chat_history,
             ai_commands::ai_clear_chat,
             ai_commands::ai_generate_suggestions,

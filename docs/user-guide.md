@@ -463,9 +463,17 @@ Connect to remote servers via SSH directly from UFOP. Uses saved connection prof
 
 ## AI Assistant
 
-### Chat
+### Chat and Help
 
-Ask questions about files, get help with operations, or troubleshoot errors. The AI provides contextual assistance based on what you're doing in the app.
+Ask questions about files, get help with operations, or troubleshoot errors. Answers come from this documentation, which is built into the app: with a local model running (Ollama, `UFOP_OLLAMA_URL` for another address) the assistant writes an answer from the best sections; without one it shows those sections. The **Help** tab lists the sources of every answer and works offline, even with AI turned off.
+
+### Activity report
+
+The **Report** tab summarizes the last 24 hours, 7 or 30 days: rule runs and failures per rule (failing rules first, with their latest error), file operations by kind and size, and what needs attention. With a local model, a short summary is added — written from the report's numbers only. Copy it or save it as a Markdown file.
+
+### Unattended AI tasks
+
+The automation action **Ask the local AI** (Advanced) applies an instruction — "summarize", "classify as invoice/receipt/other", "extract the total" — to each file's text (PDFs and office documents included) and saves the answer as `<file name>.ai.md` (or another suffix) next to the file or in a chosen folder. It only runs when AI and *content analysis* are allowed in the AI settings, uses the local model, and every task is recorded in the AI audit log.
 
 ### Error Explanation
 

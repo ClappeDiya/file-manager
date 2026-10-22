@@ -85,7 +85,9 @@ export type RuleAction =
   /** Convert an office document with LibreOffice; the result is handed on. */
   | { type: "convert_document"; to: DocumentFormat; dest_path: string }
   /** Check a delivered batch against member and content rules (`automation_engine::validate`). */
-  | { type: "validate_batch"; folder: string; rules: BatchRules; report_folder: string | null; fail_on_invalid: boolean };
+  | { type: "validate_batch"; folder: string; rules: BatchRules; report_folder: string | null; fail_on_invalid: boolean }
+  /** The local AI model applies `instruction` to the file's text; the answer is saved as `<name>.<suffix>`. */
+  | { type: "ai_task"; instruction: string; dest_path: string; suffix: string; max_chars: number };
 
 /** `validate::MemberRule`: files matching `pattern` must number `min..=max`, each at least `min_bytes`. */
 export interface MemberRule {

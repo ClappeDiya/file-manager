@@ -141,7 +141,7 @@ fn like_escape(s: &str) -> String {
 /// Plain text worth indexing: no NUL bytes in the first 8 KiB.
 /// Text for the content index: office documents and PDFs through
 /// `doctext`, other files when they look like text.
-fn read_text(path: &Path, max: u64) -> Option<String> {
+pub(crate) fn read_text(path: &Path, max: u64) -> Option<String> {
     use std::io::Read;
     let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
     if ufop_core::doctext::has_text(&ext) {

@@ -5,6 +5,7 @@
  * - Chat interface for help and error explanations
  * - Natural language job creation input
  * - Suggestion cards with Accept/Dismiss
+ * - Help from the bundled documentation, and activity reports
  * - AI audit log viewer
  * - Enterprise feature toggles
  */
@@ -28,8 +29,11 @@ import {
   Settings,
   ToggleLeft,
   ToggleRight,
+  BookOpen,
+  FileText,
 } from "lucide-react";
 import { AiSuggestionCard } from "./ai-suggestion-card";
+import { HelpTab, ReportTab } from "./ai-help-report";
 import { FeaturePeek } from "@/components/feature-peek";
 
 // ──────────────────────────────────────────────
@@ -109,6 +113,18 @@ export function AiPanel({ className }: AiPanelProps) {
           label="Chat"
         />
         <TabButton
+          active={activeTab === "help"}
+          onClick={() => setActiveTab("help")}
+          icon={<BookOpen className="h-3.5 w-3.5" />}
+          label="Help"
+        />
+        <TabButton
+          active={activeTab === "report"}
+          onClick={() => setActiveTab("report")}
+          icon={<FileText className="h-3.5 w-3.5" />}
+          label="Report"
+        />
+        <TabButton
           active={activeTab === "suggestions"}
           onClick={() => setActiveTab("suggestions")}
           icon={<Lightbulb className="h-3.5 w-3.5" />}
@@ -125,6 +141,8 @@ export function AiPanel({ className }: AiPanelProps) {
       {/* Tab content */}
       <div className="flex-1 overflow-hidden">
         {activeTab === "chat" && <ChatTab />}
+        {activeTab === "help" && <HelpTab />}
+        {activeTab === "report" && <ReportTab />}
         {activeTab === "suggestions" && <SuggestionsTab />}
         {activeTab === "audit" && <AuditTab />}
       </div>

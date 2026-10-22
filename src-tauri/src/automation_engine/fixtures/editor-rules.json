@@ -298,6 +298,16 @@
           "fail_on_invalid": true
         },
         "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "ai_task",
+          "instruction": "Classify {filename}",
+          "dest_path": "/ai",
+          "suffix": "class.txt",
+          "max_chars": 5000
+        },
+        "continue_on_error": true
       }
     ],
     "options": {

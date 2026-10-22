@@ -75,6 +75,14 @@ pub fn rule_from_definition(definition: &serde_json::Value) -> Result<Automation
     serde_json::from_value(v)
 }
 
+fn default_ai_suffix() -> String {
+    "ai.md".into()
+}
+
+fn default_ai_chars() -> usize {
+    20_000
+}
+
 fn default_fail_on_invalid() -> bool {
     true
 }
@@ -395,6 +403,20 @@ pub enum RuleAction {
         report_folder: Option<String>,
         #[serde(default = "default_fail_on_invalid")]
         fail_on_invalid: bool,
+    },
+    /// Ask the local AI model to process the file (summarize, classify,
+    /// extract…): `instruction` (a template) is applied to the file's text
+    /// (at most `max_chars`) and the answer saved as `<file name>.<suffix>`
+    /// in `dest_path` (a folder template; empty = next to the file). Needs
+    /// AI and content analysis allowed in the AI settings.
+    AiTask {
+        instruction: String,
+        #[serde(default)]
+        dest_path: String,
+        #[serde(default = "default_ai_suffix")]
+        suffix: String,
+        #[serde(default = "default_ai_chars")]
+        max_chars: usize,
     },
     /// Download a URL into a folder (`automation_engine::download`). URL,
     /// folder and file name are templates.
@@ -1647,7 +1669,8 @@ mod tests {
         let last = &rules[rules.len() - 2];
         assert_eq!(last.trigger, RuleTrigger::Webhook);
         assert!(matches!(last.condition_tree, Some(ConditionNode::Any { ref nodes }) if nodes.len() == 2));
-        assert_eq!(last.steps.len(), 5);
+        assert_eq!(last.steps.len(), 6);
+        assert!(matches!(&last.steps[5].action, RuleAction::AiTask { instruction, suffix, max_chars: 5000, .. } if instruction == "Classify {filename}" && suffix == "class.txt"));
         assert!(matches!(&last.steps[2].action, RuleAction::ConvertImage { format: Some(f), max_width: Some(800), max_height: None, quality: None, dest_path } if f == "webp" && dest_path == "/in/small"));
         assert!(matches!(&last.steps[3].action, RuleAction::ConvertDocument { to, dest_path } if to == "pdf" && dest_path.is_empty()));
         let RuleAction::ValidateBatch { rules: batch, report_folder: Some(_), fail_on_invalid: true, .. } = &last.steps[4].action else { panic!("validate_batch") };

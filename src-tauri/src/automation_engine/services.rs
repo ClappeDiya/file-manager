@@ -51,6 +51,11 @@ pub trait ActionServices: Send + Sync {
         body: &str,
     ) -> BoxFuture<'_, Result<(), String>>;
 
+    /// Apply `instruction` to a file's text with the local AI model.
+    fn ai_task<'a>(&'a self, _instruction: &'a str, _file_name: &'a str, _text: &'a str) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async { Err(SERVICES_UNAVAILABLE.to_string()) })
+    }
+
     /// Another rule by id (workflow steps that run a nested rule).
     fn rule<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Option<super::AutomationRule>> {
         Box::pin(async { None })
@@ -146,6 +151,12 @@ pub mod mock {
         fn rule<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Option<crate::automation_engine::AutomationRule>> {
             let r = self.rules.lock().unwrap().iter().find(|r| r.id == id).cloned();
             Box::pin(async move { r })
+        }
+
+        fn ai_task<'a>(&'a self, instruction: &'a str, file_name: &'a str, text: &'a str) -> BoxFuture<'a, Result<String, String>> {
+            let r = self.record(format!("ai:{instruction}:{file_name}:{}", text.chars().count()));
+            let answer = format!("{} chars about {file_name}", text.chars().count());
+            Box::pin(async move { r.map(|_| answer) })
         }
     }
 }

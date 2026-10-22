@@ -455,6 +455,32 @@ function ActionFields({
         </div>
       );
     }
+    case "ai_task":
+      if (!advanced) return <p className="text-xs text-[var(--color-text-muted)]">Switch to Advanced mode to edit AI tasks.</p>;
+      return (
+        <div className="space-y-2">
+          <div>
+            <label className={label} htmlFor={id("instr")}>Instruction (templates allowed)</label>
+            <textarea id={id("instr")} rows={3} className={field} value={a.instruction} onChange={(e) => onChange({ ...a, instruction: e.target.value })} />
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className={label} htmlFor={id("suffix")}>Save the answer as name.</label>
+              <input id={id("suffix")} className={`${field} font-mono`} value={a.suffix} onChange={(e) => onChange({ ...a, suffix: e.target.value })} />
+            </div>
+            <div>
+              <label className={label} htmlFor={id("chars")}>Read up to (characters)</label>
+              <input id={id("chars")} type="number" min={100} max={200000} className={field} value={a.max_chars} onChange={(e) => onChange({ ...a, max_chars: Number(e.target.value) })} />
+            </div>
+          </div>
+          <div>
+            <label className={label} htmlFor={id("aidest")}>Save into folder (empty = next to the file)</label>
+            <FolderInput id={id("aidest")} value={a.dest_path} onChange={(v) => onChange({ ...a, dest_path: v })} placeholder="Same folder" />
+            {tokenHint}
+          </div>
+          <p className="text-[11px] text-amber-600">Sends the file&apos;s text (PDFs and office documents included) to your local AI model. Needs AI and “content analysis” allowed in the AI settings; every task is recorded in the AI audit log.</p>
+        </div>
+      );
     case "validate_batch":
       if (!advanced) return <p className="text-xs text-[var(--color-text-muted)]">Switch to Advanced mode to edit batch validation.</p>;
       return (

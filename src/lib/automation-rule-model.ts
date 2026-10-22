@@ -148,6 +148,7 @@ export const ACTION_TYPES: { type: RuleAction["type"]; label: string; advanced?:
   { type: "convert_image", label: "Resize / convert an image" },
   { type: "convert_document", label: "Convert a document (LibreOffice)" },
   { type: "validate_batch", label: "Validate a batch of files", advanced: true },
+  { type: "ai_task", label: "Ask the local AI (summarize, classify…)", advanced: true },
 ];
 
 export function defaultAction(type: RuleAction["type"]): RuleAction {
@@ -185,6 +186,8 @@ export function defaultAction(type: RuleAction["type"]): RuleAction {
       return { type, format: "jpeg", max_width: 1920, max_height: 1920, quality: 85, dest_path: "" };
     case "convert_document":
       return { type, to: "pdf", dest_path: "" };
+    case "ai_task":
+      return { type, instruction: "Summarize this file in three bullet points.", dest_path: "", suffix: "ai.md", max_chars: 20_000 };
     case "validate_batch":
       return { type, folder: "", rules: { members: [{ pattern: "*.csv", min: 1, max: null, min_bytes: null }], content: [], no_extra_files: false }, report_folder: null, fail_on_invalid: true };
   }
@@ -311,6 +314,11 @@ function actionErrors(a: RuleAction, n: string): string[] {
     for (const v of [a.max_width, a.max_height]) if (v !== null && !(v >= 1 && v <= 20_000)) errors.push(`${n}: sizes are 1–20000 pixels.`);
     if (a.quality !== null && !(a.quality >= 1 && a.quality <= 100)) errors.push(`${n}: quality is 1–100.`);
   }
+  if (a.type === "ai_task") {
+    if (!a.instruction.trim()) errors.push(`${n}: write the instruction for the AI.`);
+    if (!/^[\w.-]+$/.test(a.suffix.trim().replace(/^\./, ""))) errors.push(`${n}: the answer's file suffix may use letters, digits, '.', '-' and '_'.`);
+    if (!(a.max_chars >= 100 && a.max_chars <= 200_000)) errors.push(`${n}: read 100–200000 characters.`);
+  }
   if (a.type === "validate_batch") {
     const { members, content, no_extra_files } = a.rules;
     if (members.length === 0 && content.length === 0 && !no_extra_files) errors.push(`${n}: add a member or content rule.`);
@@ -337,7 +345,7 @@ export function validateForm(form: RuleForm): string[] {
   }
   if (form.trigger.type === "schedule" && !form.trigger.cron_expr.trim()) errors.push("Choose a schedule.");
   if (!form.workflow && form.steps.length === 0) errors.push("Add at least one action.");
-  const fileActions = new Set(["move_file", "copy_file", "rename_file", "delete_file", "compress_folder", "extract_archive", "transfer_to_connector", "convert_image", "convert_document"]);
+  const fileActions = new Set(["move_file", "copy_file", "rename_file", "delete_file", "compress_folder", "extract_archive", "transfer_to_connector", "convert_image", "convert_document", "ai_task"]);
   const formActions = form.workflow ? workflowActions(form.workflow) : form.steps.map((s) => s.action);
   if (!isFileTrigger(form.trigger) && !form.options.source?.path && formActions.some((a) => fileActions.has(a.type))) {
     errors.push("This trigger has no file: choose which folder's files the rule works on.");

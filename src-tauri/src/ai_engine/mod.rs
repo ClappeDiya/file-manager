@@ -3,6 +3,9 @@
 //!
 //! Provides `AiAssistant` for AI-powered features (T-043..T-045).
 
+pub mod docs_help;
+pub mod report;
+
 use crate::core::error::AppError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -144,6 +147,17 @@ pub struct AiAssistant {
     http_client: reqwest::Client,
     ollama_available: Arc<RwLock<Option<bool>>>,
     ollama_model: Arc<RwLock<String>>,
+    /// Ollama's address (`UFOP_OLLAMA_URL`, default `http://localhost:11434`).
+    ollama_base: String,
+}
+
+/// An answer from the documentation (`ai_help`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HelpAnswer {
+    pub answer: String,
+    pub sources: Vec<docs_help::DocHit>,
+    /// `model` (written by the local model from the sources) or `docs` (the sources themselves).
+    pub generated_by: String,
 }
 
 impl AiAssistant {
@@ -164,7 +178,14 @@ impl AiAssistant {
             http_client,
             ollama_available: Arc::new(RwLock::new(None)),
             ollama_model: Arc::new(RwLock::new("llama3.2".to_string())),
+            ollama_base: std::env::var("UFOP_OLLAMA_URL").ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "http://localhost:11434".into()).trim_end_matches('/').to_string(),
         }
+    }
+
+    /// The same assistant talking to Ollama at `url`.
+    pub fn with_ollama_url(mut self, url: &str) -> Self {
+        self.ollama_base = url.trim_end_matches('/').to_string();
+        self
     }
 
     /// An assistant whose AI actions and chat transcripts go to the audit
@@ -196,7 +217,7 @@ impl AiAssistant {
 
         let result = self
             .http_client
-            .get("http://localhost:11434/api/tags")
+            .get(format!("{}/api/tags", self.ollama_base))
             .timeout(Duration::from_millis(500))
             .send()
             .await;
@@ -248,7 +269,7 @@ impl AiAssistant {
         let mut cached = self.ollama_available.write().await;
         *cached = Some(available);
         if available {
-            tracing::info!("Ollama detected at localhost:11434");
+            tracing::info!("Ollama detected at {}", self.ollama_base);
         }
         available
     }
@@ -316,7 +337,7 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
 
         let resp = self
             .http_client
-            .post("http://localhost:11434/api/generate")
+            .post(format!("{}/api/generate", self.ollama_base))
             .timeout(Duration::from_secs(8))
             .json(&payload)
             .send()
@@ -349,6 +370,80 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
             })?;
 
         Ok(config)
+    }
+
+    /// Free text from the local model (no JSON mode). Fails when no model is running.
+    pub async fn generate_text(&self, prompt: &str, timeout: Duration) -> Result<String, AppError> {
+        if !self.probe_ollama().await {
+            return Err(AppError::Configuration {
+                message: "No local AI model is running".into(),
+                advice: "Install Ollama and pull a model (for example `ollama pull llama3.2`), then try again.".into(),
+            });
+        }
+        let model = self.ollama_model.read().await.clone();
+        let resp = self
+            .http_client
+            .post(format!("{}/api/generate", self.ollama_base))
+            .timeout(timeout)
+            .json(&serde_json::json!({ "model": model, "prompt": prompt, "stream": false }))
+            .send()
+            .await
+            .map_err(|e| AppError::Internal { message: format!("Ollama request failed: {e}") })?;
+        if !resp.status().is_success() {
+            return Err(AppError::Internal { message: format!("Ollama returned status {}", resp.status()) });
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| AppError::Internal { message: format!("Failed to parse Ollama response: {e}") })?;
+        body.get("response").and_then(|v| v.as_str()).map(|t| t.trim().to_string()).ok_or_else(|| AppError::Internal { message: "Ollama response missing 'response' field".into() })
+    }
+
+    /// Answer a question from the bundled documentation: written by the
+    /// local model from the best sections when AI is on and a model runs,
+    /// otherwise the sections themselves.
+    pub async fn help(&self, question: &str) -> HelpAnswer {
+        let hits = docs_help::DocIndex::bundled().search(question, 4);
+        if !hits.is_empty() && self.effective_toggles().await.ai_master_enabled {
+            if let Ok(answer) = self.generate_text(&docs_help::grounded_prompt(question, &hits), Duration::from_secs(60)).await {
+                if !answer.is_empty() {
+                    return HelpAnswer { answer, sources: hits, generated_by: "model".into() };
+                }
+            }
+        }
+        HelpAnswer { answer: docs_help::offline_answer(&hits), sources: hits, generated_by: "docs".into() }
+    }
+
+    /// The activity report for the last `days`, with a short summary from
+    /// the local model when AI is on and one runs (it sees only the report).
+    pub async fn activity_report(&self, days: u32, logs: &[crate::automation_engine::AutomationLog], events: &[crate::ledger::LedgerEvent]) -> report::ActivityReport {
+        let mut r = report::activity_report(days, Utc::now(), logs, events);
+        if self.effective_toggles().await.ai_master_enabled {
+            r.summary = self.generate_text(&report::summary_prompt(&r), Duration::from_secs(90)).await.ok().filter(|s| !s.is_empty());
+        }
+        r
+    }
+
+    /// An unattended AI task (automation): `instruction` applied to a
+    /// file's text by the local model. File contents only go to a model
+    /// when content analysis is allowed; every task is audited.
+    pub async fn run_task(&self, instruction: &str, file_name: &str, text: &str) -> Result<String, AppError> {
+        let toggles = self.effective_toggles().await;
+        if !toggles.ai_master_enabled {
+            return Err(AppError::Configuration { message: "AI features are disabled".into(), advice: "Enable AI in Settings > AI Controls.".into() });
+        }
+        if !toggles.content_analysis_opt_in {
+            return Err(AppError::Configuration {
+                message: "AI tasks read file contents, and content analysis is off".into(),
+                advice: "Allow content analysis in Settings > AI Controls to let automation send file text to your local model.".into(),
+            });
+        }
+        let prompt = format!("{instruction}\n\nFile: {file_name}\n---\n{text}\n---\nResult:");
+        let out = self.generate_text(&prompt, Duration::from_secs(300)).await?;
+        self.chain(
+            "ai.task".into(),
+            file_name.to_string(),
+            serde_json::json!({ "instruction": bounded(instruction), "input_chars": text.chars().count(), "response": bounded(&out) }),
+        )
+        .await;
+        Ok(out)
     }
 
     // ── T-043: Error Explanations ──
@@ -919,8 +1014,9 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
         let mut history = self.chat_history.write().await;
         history.push(user_msg);
 
-        // Generate response based on content analysis
-        let response_content = self.generate_chat_response(user_message).await;
+        // From the documentation first; canned guidance when it has nothing.
+        let help = self.help(user_message).await;
+        let response_content = if help.sources.is_empty() { self.generate_chat_response(user_message).await } else { help.answer };
 
         let assistant_msg = AiChatMessage {
             id: Uuid::new_v4().to_string(),
@@ -1482,6 +1578,93 @@ fn entry_from_chain(id: &str, ts: &str, event_type: &str, details: &str) -> AiAu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in Ollama: lists one model and answers every prompt with
+    /// `reply`; the prompts it received are returned.
+    async fn mock_ollama(reply: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = prompts.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let body = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some(i) = text.find("\r\n\r\n") {
+                            let len = text[..i].lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                            if buf.len() >= i + 4 + len {
+                                break (text[..i].to_string(), String::from_utf8_lossy(&buf[i + 4..i + 4 + len]).to_string());
+                            }
+                        }
+                    };
+                    let json = if body.0.starts_with("GET /api/tags") {
+                        serde_json::json!({ "models": [{ "name": "llama3.2:latest" }] })
+                    } else {
+                        let req: serde_json::Value = serde_json::from_str(&body.1).unwrap_or_default();
+                        seen.lock().unwrap().push(req["prompt"].as_str().unwrap_or_default().to_string());
+                        serde_json::json!({ "response": reply })
+                    };
+                    let out = json.to_string();
+                    let _ = sock.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{out}", out.len()).as_bytes()).await;
+                });
+            }
+        });
+        (url, prompts)
+    }
+
+    #[tokio::test]
+    async fn help_is_grounded_in_the_docs_with_or_without_a_model() {
+        // No model: the best sections themselves.
+        let offline = AiAssistant::new().with_ollama_url("http://127.0.0.1:9");
+        let a = offline.help("how do I re-encrypt a gpg file for another key").await;
+        assert_eq!(a.generated_by, "docs");
+        assert!(a.answer.starts_with("From the User Guide") && a.sources.iter().any(|s| s.section.contains("OpenPGP")), "{a:?}");
+        // With a model: its answer, from a prompt built on those sections.
+        let (url, prompts) = mock_ollama("Right-click the file and choose Re-encrypt with GPG.").await;
+        let ai = AiAssistant::new().with_ollama_url(&url);
+        let a = ai.help("how do I re-encrypt a gpg file for another key").await;
+        assert_eq!((a.generated_by.as_str(), a.answer.as_str()), ("model", "Right-click the file and choose Re-encrypt with GPG."));
+        let p = prompts.lock().unwrap()[0].clone();
+        assert!(p.contains("ONLY the documentation") && p.contains("OpenPGP") && p.contains("Question: how do I re-encrypt"), "{p}");
+        // Chat answers from the docs too.
+        assert_eq!(ai.chat("re-encrypt a gpg file").await.unwrap().content, "Right-click the file and choose Re-encrypt with GPG.");
+        // AI switched off: no model call, the docs still help.
+        let mut t = ai.get_feature_toggles().await;
+        t.ai_master_enabled = false;
+        ai.set_feature_toggles(t).await;
+        let before = prompts.lock().unwrap().len();
+        assert_eq!(ai.help("convert documents to pdf").await.generated_by, "docs");
+        assert_eq!(prompts.lock().unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn unattended_tasks_need_content_analysis_and_a_model() {
+        let (url, prompts) = mock_ollama("Invoice from ACME, total 42 EUR").await;
+        let ai = AiAssistant::new().with_ollama_url(&url);
+        let refused = ai.run_task("Summarize", "inv.txt", "ACME invoice 42").await.unwrap_err();
+        assert!(refused.user_message().contains("content analysis is off"), "{}", refused.user_message());
+        assert!(prompts.lock().unwrap().is_empty(), "nothing was sent");
+        let mut t = ai.get_feature_toggles().await;
+        t.content_analysis_opt_in = true;
+        ai.set_feature_toggles(t).await;
+        assert_eq!(ai.run_task("Summarize", "inv.txt", "ACME invoice 42").await.unwrap(), "Invoice from ACME, total 42 EUR");
+        assert!(prompts.lock().unwrap()[0].contains("Summarize\n\nFile: inv.txt\n---\nACME invoice 42"));
+        let none = AiAssistant::new().with_ollama_url("http://127.0.0.1:9");
+        let mut t = none.get_feature_toggles().await;
+        t.content_analysis_opt_in = true;
+        none.set_feature_toggles(t).await;
+        assert!(none.run_task("Summarize", "a", "b").await.unwrap_err().user_message().contains("No local AI model"));
+    }
 
     #[test]
     fn test_explain_file_error() {
