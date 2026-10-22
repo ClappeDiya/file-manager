@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { getUser } from '@/lib/db/repos/users';
 import { ROLE_HIERARCHY, type Role } from '@/lib/types/auth';
 import { audit, badRequest, can, isContext, readJson, requirePermission } from '@/lib/session';
 import { createGroup, groupGrants, groupMembers, isGroupOwner, listGroups } from '@/lib/db/repos/groups';
@@ -9,7 +10,10 @@ import { canManageRole } from '@/lib/utils/permissions';
 export async function GET(request: NextRequest) {
   const ctx = await requirePermission(request, 'groups.read');
   if (!isContext(ctx)) return ctx;
-  const groups = listGroups(ctx.orgId).map((g) => ({ ...g, members: groupMembers(g.id), grants: groupGrants(g.id), canManage: can(ctx, 'groups.write') || isGroupOwner(g.id, ctx.user.id) }));
+  const groups = listGroups(ctx.orgId).map((g) => ({ ...g, members: groupMembers(g.id).map((m) => {
+    const u = getUser(m.userId);
+    return { ...m, email: u?.email ?? '', name: u?.name ?? '' };
+  }), grants: groupGrants(g.id), canManage: can(ctx, 'groups.write') || isGroupOwner(g.id, ctx.user.id) }));
   return NextResponse.json({ groups });
 }
 

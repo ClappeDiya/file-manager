@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod archive;
 pub mod backup;
 pub mod checksum;

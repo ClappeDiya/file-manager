@@ -14,6 +14,7 @@ import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useAiStore } from "@/stores/ai-store";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
 import { SecurityAuditSection } from "@/components/security-audit-section";
+import { FleetAgentSection } from "@/components/fleet-agent-section";
 
 // ── Types ──
 
@@ -1319,6 +1320,11 @@ export default function SettingsPanel({
         {/* Log Controls */}
         <Section title="Logging">
           <LogControlsSection />
+        </Section>
+
+        {/* Management console agent */}
+        <Section title="Managed by Console">
+          <FleetAgentSection />
         </Section>
 
         {/* Tamper-evident security audit log */}

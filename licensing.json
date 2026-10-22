@@ -1,0 +1,19 @@
+{
+  "$comment": "Component license map, checked by scripts/check-licensing.mjs. Changing a component's license is the copyright holder's decision: edit `license` here and in that component's manifest together.",
+  "licenses": {
+    "PolyForm-Shield-1.0.0": { "file": "LICENSE", "spdx": null, "openSource": false }
+  },
+  "components": [
+    { "name": "desktop-app", "kind": "client", "license": "PolyForm-Shield-1.0.0", "paths": ["src", "src-tauri"], "manifests": ["package.json", "src-tauri/Cargo.toml"] },
+    { "name": "ufop-core", "kind": "client", "license": "PolyForm-Shield-1.0.0", "paths": ["crates/ufop-core"], "manifests": ["crates/ufop-core/Cargo.toml"] },
+    { "name": "cli", "kind": "client", "license": "PolyForm-Shield-1.0.0", "paths": ["cli"], "manifests": ["cli/Cargo.toml"] },
+    { "name": "design-tokens", "kind": "shared", "license": "PolyForm-Shield-1.0.0", "paths": ["packages/design-tokens"], "manifests": ["packages/design-tokens/package.json"] },
+    { "name": "ui-components", "kind": "shared", "license": "PolyForm-Shield-1.0.0", "paths": ["packages/ui-components"], "manifests": ["packages/ui-components/package.json"] },
+    { "name": "admin-console", "kind": "console", "license": "PolyForm-Shield-1.0.0", "paths": ["admin"], "manifests": ["admin/package.json"] }
+  ],
+  "rules": [
+    "client and shared components never import console code",
+    "shared components import only shared components",
+    "the console talks to clients only over the documented agent protocol (HTTP), never by linking client code"
+  ]
+}

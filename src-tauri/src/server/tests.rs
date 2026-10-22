@@ -17,7 +17,7 @@ async fn start(cfg: ServerConfig, oauth: Option<oauth::OAuthBroker>) -> TestServ
     let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
     let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
     auth.set_password("server-password").await.unwrap();
-    let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth };
+    let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent: None };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, router(st)).await.unwrap() });
@@ -160,7 +160,7 @@ async fn https_with_generated_certificate() {
     let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, d.path().join("dbs"), KdfParams::insecure_fast());
     let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
     let cfg = ServerConfig { port, tls: TlsMode::Generated { dir: d.path().join("tls"), hostnames: vec!["localhost".into()] }, ..Default::default() };
-    let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None };
+    let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None };
     tokio::spawn(async move { serve(st).await.unwrap() });
     let ca = std::fs::read(loop {
         let p = d.path().join("tls/ufop-ca.pem");

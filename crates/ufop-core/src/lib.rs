@@ -5,6 +5,8 @@
 
 #[cfg(feature = "backup")]
 pub mod backup;
+#[cfg(feature = "agent")]
+pub mod agent;
 pub mod error;
 pub mod preload;
 pub mod sync;

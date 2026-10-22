@@ -5,6 +5,7 @@ pub mod commands;
 pub mod compat_engine;
 pub mod connectors;
 pub mod core;
+pub mod fleet_agent;
 pub mod fs_engine;
 pub mod governance;
 pub mod ledger;
@@ -25,7 +26,7 @@ use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -69,6 +70,7 @@ struct AppState {
     narrator: OperationNarrator,
     quickflow_suggester: LedgerSuggester,
     backup_mgr: BackupManager,
+    fleet_agent: fleet_agent::FleetAgent,
     background_mode: tray::BackgroundMode,
     audit_trail: security::audit::AuditTrail,
 }
@@ -238,11 +240,15 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         };
     // Tamper-evident security audit log: anchors are signed with a key in
     // the OS keychain (or the encrypted settings store as a fallback).
+    let agent_store = settings_store.clone().unwrap_or_else(|| crate::security::settings_store::SettingsStore::plain(repo.pool().clone()));
     let audit_trail =
         security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), settings_store);
     if let Err(e) = backup_mgr.load_from_db().await {
         tracing::warn!("Failed to load backup jobs (non-fatal): {e}");
     }
+    // Management console agent (registration, heartbeats, policies, reports);
+    // its loop starts in `setup`, like the scheduler.
+    let fleet_agent = fleet_agent::init_or_default(backup_mgr.clone(), agent_store, credential_store.clone(), "desktop").await;
     // The scheduler starts in Tauri's `setup` hook: this function runs on a
     // throwaway runtime whose spawned tasks die when it is dropped.
     let background_mode = tray::load_background_mode(&repo).await;
@@ -273,6 +279,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         narrator,
         quickflow_suggester,
         backup_mgr,
+        fleet_agent,
         background_mode,
         audit_trail,
     })
@@ -340,6 +347,13 @@ pub fn run() {
                 );
                 // In-memory DB: no settings store; the key comes from the
                 // env var or keychain, else is ephemeral like the DB itself.
+                // The console agent still works; its settings live in the in-memory DB.
+                let fleet_agent = rt2.block_on(fleet_agent::init_or_default(
+                    backup_mgr.clone(),
+                    crate::security::settings_store::SettingsStore::plain(repo.pool().clone()),
+                    credential_store.clone(),
+                    "desktop",
+                ));
                 let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store), None);
                 AppState {
                     repo,
@@ -367,6 +381,7 @@ pub fn run() {
                     narrator,
                     quickflow_suggester,
                     backup_mgr,
+                    fleet_agent,
                     background_mode: tray::BackgroundMode::default(),
                     audit_trail,
                 }
@@ -380,6 +395,7 @@ pub fn run() {
     let close_mode = app_state.background_mode.clone();
     let shutdown_transfer = app_state.transfer_mgr.clone();
     let setup_audit = app_state.audit_trail.clone();
+    let setup_agent = app_state.fleet_agent.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -401,6 +417,7 @@ pub fn run() {
                 }
             }));
             mgr.start_scheduler();
+            fleet_agent::spawn(setup_agent.clone(), "unified-file-ops");
             // Signed audit checkpoints: once at start-up, then hourly.
             tauri::async_runtime::spawn(setup_audit.clone().run_anchor_loop(security::audit::ANCHOR_INTERVAL));
             if let Err(e) = tray::setup(app, mgr) {
@@ -439,6 +456,7 @@ pub fn run() {
         .manage(app_state.narrator)
         .manage(app_state.quickflow_suggester)
         .manage(app_state.backup_mgr)
+        .manage(app_state.fleet_agent)
         .manage(app_state.background_mode)
         .manage(app_state.audit_trail)
         .invoke_handler(tauri::generate_handler![
@@ -545,6 +563,15 @@ pub fn run() {
             drive_commands::transfer_preflight,
             drive_commands::eject_drive,
             // Sync engine (T-039..T-042)
+            // Management console agent
+            fleet_agent_commands::fleet_agent_status,
+            fleet_agent_commands::fleet_agent_register,
+            fleet_agent_commands::fleet_agent_start_claim,
+            fleet_agent_commands::fleet_agent_poll_claim,
+            fleet_agent_commands::fleet_agent_cancel_claim,
+            fleet_agent_commands::fleet_agent_unregister,
+            fleet_agent_commands::fleet_agent_set_enabled,
+            fleet_agent_commands::fleet_agent_sync_now,
             // Versioned backups
             backup_commands::backup_list_jobs,
             backup_commands::backup_get_job,

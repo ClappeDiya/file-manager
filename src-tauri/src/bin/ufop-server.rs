@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use unified_file_ops_lib::backup_engine::{self, policy::ModulePolicy, BackupManager};
 use unified_file_ops_lib::connectors::ConnectionManager;
+use unified_file_ops_lib::fleet_agent;
 use unified_file_ops_lib::ledger::OperationLedger;
 use unified_file_ops_lib::security::CredentialStore;
 use unified_file_ops_lib::server::{self, auth::AuthService, oauth, settings, ServerConfig, ServerState, TlsMode};
@@ -57,6 +58,9 @@ struct Args {
     pfx: Option<PathBuf>,
     #[arg(long, env = "UFOP_SERVER_PFX_PASSWORD", default_value = "")]
     pfx_password: String,
+    /// Do not run the management console agent (registration via UFOP_CONSOLE_* / preload, heartbeats, policies)
+    #[arg(long, env = "UFOP_NO_CONSOLE_AGENT")]
+    no_console_agent: bool,
     /// Set (or change) the UI password and exit. Reads UFOP_SERVER_PASSWORD or stdin.
     #[arg(long)]
     set_password: bool,
@@ -279,7 +283,7 @@ async fn run(argv: Vec<String>) {
     let conns = ConnectionManager::new(repo.clone(), creds.clone());
     let ledger = OperationLedger::new(repo.pool().clone());
     let mgr = BackupManager::new(repo.pool().clone(), creds.clone(), Some(conns.clone()), Some(ledger), data_dir.join("backups"));
-    mgr.set_settings_store(store);
+    mgr.set_settings_store(store.clone());
     mgr.set_module_policy(ModulePolicy::from_lists(a.allowed_backends.as_deref(), a.allowed_encryption.as_deref(), a.allowed_compression.as_deref(), a.disable_modules.as_deref()));
     if let Err(e) = mgr.load_from_db().await {
         fail(e);
@@ -287,6 +291,16 @@ async fn run(argv: Vec<String>) {
     if !a.no_scheduler {
         mgr.start_scheduler();
     }
+
+    // Management console agent: registers from UFOP_CONSOLE_URL /
+    // UFOP_CONSOLE_REGISTRATION_TOKEN (preload) and runs while registered.
+    let agent = if a.no_console_agent {
+        None
+    } else {
+        let agent = fleet_agent::init_or_default(mgr.clone(), store.clone(), creds.clone(), "server").await;
+        fleet_agent::spawn(agent.clone(), "ufop-server");
+        Some(agent)
+    };
 
     let oauth = a.oauth_config.as_ref().map(|p| {
         let cfg: oauth::BrokerConfig = serde_json::from_slice(&std::fs::read(p).unwrap_or_else(|e| fail(e))).unwrap_or_else(|e| fail(e));
@@ -312,7 +326,7 @@ async fn run(argv: Vec<String>) {
         preauth_tokens: a.preauth_tokens,
         tls,
     };
-    let st = ServerState { mgr, conns: Some(conns), auth, cfg: Arc::new(cfg), started: Instant::now(), oauth };
+    let st = ServerState { mgr, conns: Some(conns), auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent };
     if let Err(e) = server::serve(st).await {
         fail(e);
     }

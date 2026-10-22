@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { isContext, requirePermission } from '@/lib/session';
+import { canIn, isContext, requirePermission } from '@/lib/session';
 import { listMachines, type Connectivity } from '@/lib/db/repos/machines';
 import { listBackups, listReports, storageHistory } from '@/lib/db/repos/reports';
 import { listAlerts } from '@/lib/db/repos/alerts';
@@ -15,7 +15,8 @@ export async function GET(request: NextRequest) {
   if (!isContext(ctx)) return ctx;
   const sp = new URL(request.url).searchParams;
   const days = Math.min(365, Math.max(1, Number(sp.get('days') ?? 30)));
-  const orgIds = sp.get('includeChildren') === '1' && ctx.role !== 'user' ? managedSubtree(ctx.orgId) : [ctx.orgId];
+  // Sub-organizations only where the user's own role reaches (a non-delegated group role does not).
+  const orgIds = sp.get('includeChildren') === '1' && ctx.role !== 'user' ? managedSubtree(ctx.orgId).filter((id) => canIn(ctx, id, 'fleet.read')) : [ctx.orgId];
   const tags = sp.getAll('tag').filter(Boolean);
   const scoped = visibleMachineIds(ctx);
   const machines = listMachines({ orgIds, tags, ids: scoped });

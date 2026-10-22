@@ -562,11 +562,39 @@ struct Inner {
     policy: std::sync::RwLock<policy::ModulePolicy>,
     secrets: std::sync::OnceLock<SettingsStore>,
     notifier: std::sync::OnceLock<Notifier>,
+    run_listener: std::sync::OnceLock<RunListener>,
     secret_cache: secrets::SecretCache,
+    /// Console-delivered (`central:`) secrets when no secure store exists:
+    /// kept in memory only and re-delivered by the agent after a restart.
+    volatile_secrets: Mutex<HashMap<String, String>>,
 }
 
 /// Desktop notification sink: (title, body, status).
 pub type Notifier = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+
+/// A finished operation, as handed to the run listener (the fleet agent
+/// forwards these to the management console).
+#[derive(Debug, Clone, Serialize)]
+pub struct RunEvent {
+    pub job_id: String,
+    pub job_name: String,
+    pub operation: String,
+    /// `success`, `warning`, `error` or `cancelled`.
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub duration_ms: u64,
+    pub summary: String,
+    /// The engine report (redacted like HTTP reports, without log lines).
+    pub report: serde_json::Value,
+    /// Job statistics after the run.
+    pub stats: JobStats,
+    /// Repeat interval when the job is scheduled.
+    pub schedule_interval_minutes: Option<u32>,
+}
+
+/// Receives every finished operation; must not block.
+pub type RunListener = Arc<dyn Fn(RunEvent) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct BackupManager {
@@ -616,6 +644,8 @@ impl BackupManager {
                 policy: std::sync::RwLock::new(policy::ModulePolicy::from_env()),
                 secrets: std::sync::OnceLock::new(),
                 notifier: std::sync::OnceLock::new(),
+                run_listener: std::sync::OnceLock::new(),
+                volatile_secrets: Mutex::new(HashMap::new()),
                 secret_cache: secrets::SecretCache::default(),
             }),
         }
@@ -780,12 +810,20 @@ impl BackupManager {
             return Err(AppError::validation("Invalid credential id"));
         }
         let key = format!("{DEST_KEY_PREFIX}{credential_id}");
-        if secret.is_empty() {
+        if secret.is_empty() || credential_id.starts_with(ufop_core::agent::policy::CENTRAL_PREFIX) {
+            lock(&self.inner.volatile_secrets).remove(&key);
             if let Some(db) = self.secret_db() {
                 let _ = db.delete(&key).await;
             }
             let _ = self.inner.creds.delete(&key).await;
-            return Ok(());
+            if secret.is_empty() {
+                return Ok(());
+            }
+            // Never write a console credential to disk unencrypted.
+            if !self.has_secure_store() {
+                lock(&self.inner.volatile_secrets).insert(key, secret.to_string());
+                return Ok(());
+            }
         }
         match self.secret_db() {
             Some(db) => db.set_secret(&key, secret).await,
@@ -840,7 +878,15 @@ impl BackupManager {
         Ok(s)
     }
 
+    /// An OS keychain, or a settings store encrypted with a key.
+    fn has_secure_store(&self) -> bool {
+        self.inner.creds.is_keychain_available() || self.inner.secrets.get().is_some_and(|s| s.is_encrypted())
+    }
+
     async fn store_get(&self, key: &str) -> Result<Option<String>, AppError> {
+        if let Some(v) = lock(&self.inner.volatile_secrets).get(key) {
+            return Ok(Some(v.clone()));
+        }
         match self.secret_db() {
             Some(db) => db.get_secret(key).await,
             None => self.inner.creds.retrieve(key).await,
@@ -857,6 +903,17 @@ impl BackupManager {
     /// Resolve one secret through `providers` (in order). Returns the value,
     /// the provider name and whether it came from the cache.
     async fn resolve_secret(&self, settings: &secrets::SecretSettings, providers: &[&secrets::SecretProvider], name: &str) -> Result<(String, String, bool), AppError> {
+        // `$central:<id>`: a credential delivered by the management console,
+        // kept in the secure store under that id (never in a provider or file).
+        if let Some(id) = ufop_core::agent::policy::central_credential_id(name).filter(|_| name.starts_with(ufop_core::agent::policy::CENTRAL_PREFIX)) {
+            return match self.store_get(&format!("{DEST_KEY_PREFIX}{id}")).await? {
+                Some(v) if !v.is_empty() => Ok((v, "management console".into(), false)),
+                _ => Err(AppError::Configuration {
+                    message: format!("The central credential '{id}' has not been delivered to this machine"),
+                    advice: "Check that the machine is registered with the management console and the policy using it applies here.".into(),
+                }),
+            };
+        }
         let ttl = std::time::Duration::from_secs(settings.cache_ttl_secs.max(1));
         let mut errors = Vec::new();
         for p in providers {
@@ -989,6 +1046,11 @@ impl BackupManager {
     /// Route run results to OS notifications (set by the desktop app).
     pub fn set_notifier(&self, n: Notifier) {
         let _ = self.inner.notifier.set(n);
+    }
+
+    /// Receive every finished operation (set once, by the fleet agent).
+    pub fn set_run_listener(&self, l: RunListener) {
+        let _ = self.inner.run_listener.set(l);
     }
 
     /// Persist passphrases in the database when no OS keychain exists.
@@ -1749,6 +1811,26 @@ impl BackupManager {
             for v in vars.values_mut() {
                 *v = notify::redact_paths(v, &job.sources);
             }
+        }
+        if let Some(l) = self.inner.run_listener.get() {
+            let mut data = payload.clone();
+            if let Some(o) = data.as_object_mut() {
+                o.remove("log");
+            }
+            let stats = self.inner.jobs.read().await.get(&job.id).map(|j| j.stats.clone()).unwrap_or_default();
+            l(RunEvent {
+                job_id: job.id.clone(),
+                job_name: job.name.clone(),
+                operation: op.to_string(),
+                status: status.clone(),
+                started_at: started.to_rfc3339(),
+                finished_at: finished.to_rfc3339(),
+                duration_ms: (finished - started).num_milliseconds().max(0) as u64,
+                summary: summary.clone(),
+                report: data,
+                stats,
+                schedule_interval_minutes: job.schedule.enabled.then_some(job.schedule.interval_minutes),
+            });
         }
         for f in hooks::send_reports(&job.reports, &status, &vars, payload).await {
             tracing::warn!("{f}");

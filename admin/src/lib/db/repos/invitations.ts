@@ -4,7 +4,7 @@
  * account (password or SSO) or attaches an existing one.
  */
 import { db, hashToken, newId, newToken, now, tx, type Row } from '../index';
-import type { Role } from '../../types/auth';
+import { ROLE_HIERARCHY, type Role } from '../../types/auth';
 import { getOrg, OrgError, setMembership } from './orgs';
 import { createUser, findUserByEmail, type UserRecord } from './users';
 import { getGroup, setGroupMember, type GroupRole } from './groups';
@@ -112,7 +112,9 @@ export function acceptInvitation(token: string, account: { existing: UserRecord 
       if (findUserByEmail(inv.email)) throw new OrgError('An account already exists for this address. Sign in, then open the link again.', 409);
       user = createUser({ email: inv.email, name: account.name, role: inv.role, organizationId: inv.orgId, passwordHash: account.passwordHash, ssoProvider: account.ssoProvider ?? null });
     }
-    setMembership(user.id, inv.orgId, inv.role);
+    // Never lower an existing membership (e.g. a member invited into a group).
+    const cur = db().prepare('SELECT role FROM org_memberships WHERE user_id = ? AND org_id = ?').get(user.id, inv.orgId) as Row | undefined;
+    if (!cur || (ROLE_HIERARCHY[inv.role] ?? 0) > (ROLE_HIERARCHY[cur.role as Role] ?? 0)) setMembership(user.id, inv.orgId, inv.role);
     if (inv.groupId && getGroup(inv.groupId)) setGroupMember(inv.groupId, user.id, inv.groupRole);
     db().prepare('UPDATE invitations SET accepted_at = ?, accepted_user_id = ? WHERE id = ?').run(now(), user.id, inv.id);
     return { user, invitation: getInvitation(inv.id)! };

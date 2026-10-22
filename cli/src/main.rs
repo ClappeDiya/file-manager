@@ -132,6 +132,10 @@ pub enum Commands {
     #[command(subcommand)]
     Backup(commands::backup::BackupCommands),
 
+    /// Management console agent: register / claim, status, run the agent loop
+    #[command(subcommand)]
+    Agent(commands::agent::AgentCommands),
+
     /// Check compatibility of paths across platforms
     Compat {
         /// Paths to check
@@ -447,6 +451,9 @@ async fn main() -> ExitCode {
         }
         Commands::Backup(cmd) => {
             commands::backup::execute(cmd, &format, dry_run).await
+        }
+        Commands::Agent(cmd) => {
+            commands::agent::execute(cmd, &format).await
         }
         Commands::Compat { paths, targets } => {
             commands::compat::execute(paths, targets, &format).await

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { publicOrigin } from '@/lib/route-helpers';
 import { audit, badRequest, isContext, requirePermission } from '@/lib/session';
 import { getLink, linkToken } from '@/lib/db/repos/machines';
 
@@ -19,7 +20,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   const preload = {
     env: {
       '*': {
-        UFOP_CONSOLE_URL: new URL(request.url).origin,
+        UFOP_CONSOLE_URL: publicOrigin(request),
         UFOP_CONSOLE_REGISTRATION_TOKEN: token,
         ...(link.defaultTags.length ? { UFOP_CONSOLE_TAGS: link.defaultTags.join(',') } : {}),
       },

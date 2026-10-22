@@ -13,6 +13,7 @@ pub mod drive_commands;
 pub mod editor_commands;
 pub mod encryption_commands;
 pub mod file_ops_commands;
+pub mod fleet_agent_commands;
 pub mod fs_commands;
 pub mod integrity_commands;
 pub mod ledger_commands;

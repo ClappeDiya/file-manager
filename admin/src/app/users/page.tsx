@@ -19,6 +19,7 @@ import { StatCard } from '@/components/ui/stat-card';
 import { ROLE_LABELS, ROLE_PERMISSIONS, type Role, type AdminUser } from '@/lib/types/auth';
 import { formatDate, formatRelativeTime } from '@/lib/utils/format';
 import { useAuthStore } from '@/lib/stores/auth-store';
+import type { Invitation } from '@/lib/db/repos/invitations';
 import { useToastStore } from '@/lib/stores/toast-store';
 import { z } from 'zod';
 
@@ -38,6 +39,8 @@ export default function UsersPage() {
   const [inviteRole, setInviteRole] = useState<Role>('user');
   const [inviteErrors, setInviteErrors] = useState<{ email?: string; role?: string }>({});
   const [users, setUsers] = useState<AdminUser[]>([]);
+  const [invitations, setInvitations] = useState<Invitation[]>([]);
+  const [inviteLink, setInviteLink] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -50,7 +53,7 @@ export default function UsersPage() {
         if (!res.ok) throw new Error('Failed to fetch users');
         return res.json();
       })
-      .then((data) => { setUsers(data.users || []); setLoading(false); })
+      .then((data) => { setUsers(data.users || []); setInvitations(data.invitations || []); setLoading(false); })
       .catch((err) => { setError(err instanceof Error ? err.message : String(err)); setLoading(false); });
   }, []);
 
@@ -86,13 +89,14 @@ export default function UsersPage() {
           name: parsed.data.email.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
         }),
       });
-      if (!res.ok) throw new Error(`Failed to invite user (${res.status})`);
       const data = await res.json();
-      setUsers([...users, data.user]);
+      if (!res.ok) throw new Error(data.error || `Failed to invite user (${res.status})`);
+      setInvitations([data.invitation, ...invitations]);
       setShowInviteDialog(false);
       setInviteEmail('');
       setInviteRole('user');
-      notify('Invitation sent', 'success');
+      if (data.emailed) notify('Invitation emailed', 'success');
+      else setInviteLink(data.link);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
@@ -100,10 +104,32 @@ export default function UsersPage() {
     }
   };
 
-  const handleRoleChange = (userId: string, newRole: Role) => {
-    setUsers(users.map(u => u.id === userId ? { ...u, role: newRole } : u));
+  const handleRoleChange = async (userId: string, newRole: Role) => {
+    try {
+      const response = await fetch('/api/users', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'set_role', userIds: [userId], role: newRole }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+      setUsers(users.map(u => u.id === userId ? { ...u, role: newRole } : u));
+      notify('Role updated', 'success');
+    } catch (err) {
+      notify(`Could not change the role. ${err instanceof Error ? err.message : ''}`.trim(), 'error');
+    }
     setShowRoleDialog(false);
     setSelectedUser(null);
+  };
+
+  const handleRevokeInvitation = async (id: string) => {
+    try {
+      const response = await fetch(`/api/invitations/${id}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error(`Request failed (${response.status})`);
+      setInvitations(invitations.map((i) => (i.id === id ? { ...i, status: 'revoked' as const } : i)));
+    } catch (err) {
+      notify(`Could not revoke. ${err instanceof Error ? err.message : ''}`.trim(), 'error');
+    }
   };
 
   const handleDeactivate = async (userId: string) => {
@@ -346,6 +372,23 @@ export default function UsersPage() {
               </TableBody>
             </Table>
           </Card>
+          {invitations.some((i) => i.status === 'pending') && (
+            <Card className="mt-4">
+              <h3 className="mb-2 text-sm font-semibold">Pending invitations</h3>
+              <ul className="divide-y divide-border">
+                {invitations.filter((i) => i.status === 'pending').map((i) => (
+                  <li key={i.id} className="flex items-center justify-between py-2 text-sm">
+                    <span>
+                      {i.email} <span className="text-xs text-foreground-tertiary">as {ROLE_LABELS[i.role]} · invited by {i.invitedBy} · expires {formatRelativeTime(i.expiresAt)}</span>
+                    </span>
+                    <Button size="sm" variant="ghost" onClick={() => void handleRevokeInvitation(i.id)}>
+                      Revoke
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </Card>
+          )}
         </TabContent>
 
         <TabContent tabId="roles" activeTab={activeTab}>
@@ -493,12 +536,23 @@ export default function UsersPage() {
               label="New Role"
               options={roleOptions}
               value={selectedUser.role}
-              onChange={(e) => handleRoleChange(selectedUser.id, e.target.value as Role)}
+              onChange={(e) => void handleRoleChange(selectedUser.id, e.target.value as Role)}
             />
           </div>
         )}
         <DialogFooter>
           <Button variant="outline" onClick={() => { setShowRoleDialog(false); setSelectedUser(null); }}>Cancel</Button>
+        </DialogFooter>
+      </Dialog>
+      <Dialog open={!!inviteLink} onClose={() => setInviteLink(null)}>
+        <DialogHeader>
+          <DialogTitle>Invitation created</DialogTitle>
+          <DialogDescription>No email channel is set up for invitations. Send this one-time link yourself.</DialogDescription>
+        </DialogHeader>
+        <code className="block break-all rounded bg-background-secondary p-2 text-xs">{inviteLink}</code>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => inviteLink && void navigator.clipboard.writeText(inviteLink)}>Copy</Button>
+          <Button onClick={() => setInviteLink(null)}>Done</Button>
         </DialogFooter>
       </Dialog>
     </div>

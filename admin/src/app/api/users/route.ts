@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { publicOrigin } from '@/lib/route-helpers';
 import { ROLE_HIERARCHY, type Role } from '@/lib/types/auth';
-import { audit, badRequest, can, isContext, readJson, requirePermission } from '@/lib/session';
+import { audit, badRequest, can, canIn, isContext, readJson, requirePermission } from '@/lib/session';
 import { canManageRole } from '@/lib/utils/permissions';
-import { membersOf, OrgError, removeMembership, setMembership } from '@/lib/db/repos/orgs';
+import { effectiveRole, membersOf, membershipsOf, OrgError, removeMembership, setMembership } from '@/lib/db/repos/orgs';
 import { listUsers, publicUser, updateUser } from '@/lib/db/repos/users';
 import { groupsOfUser } from '@/lib/db/repos/groups';
 import { createInvitation, listInvitations } from '@/lib/db/repos/invitations';
@@ -42,7 +43,7 @@ export async function POST(request: NextRequest) {
   if (role !== 'user' && !canManageRole(ctx.role, role) && ctx.role !== 'org_owner') return badRequest('You cannot invite someone with a role at or above your own', 403);
   try {
     const { invitation, token } = createInvitation(ctx.orgId, { email: b.email, role, groupId: b.groupId ?? null, groupRole: b.groupRole ?? 'member' }, ctx.user.email);
-    const link = `${new URL(request.url).origin}/invite/${encodeURIComponent(token)}`;
+    const link = `${publicOrigin(request)}/invite/${encodeURIComponent(token)}`;
     const delivery = await sendInvitationEmail(ctx.orgId, invitation.email, link, ctx.user.name);
     audit(ctx, { eventType: 'admin.user_invite', description: `Invited ${invitation.email} as ${role}`, resourceType: 'invitation', resourceId: invitation.id, metadata: { emailed: delivery.sent } });
     return NextResponse.json({ invitation, link, emailed: delivery.sent, emailError: delivery.error }, { status: 201 });
@@ -64,7 +65,13 @@ export async function PATCH(request: NextRequest) {
   for (const id of b.userIds) {
     const m = members.get(id);
     if (!m) return badRequest(`User ${id} is not a member of this organization`, 404);
-    if (ctx.role !== 'org_owner' && !canManageRole(ctx.role, m.role)) return badRequest('You cannot change someone whose role is at or above your own', 403);
+    // Compare with the effective role here (a parent's role is delegated down), not just the direct membership.
+    const theirs = effectiveRole(id, ctx.orgId) ?? m.role;
+    if (ctx.role !== 'org_owner' && !canManageRole(ctx.role, theirs)) return badRequest('You cannot change someone whose role is at or above your own', 403);
+    // Deactivation locks the whole account: only when every organization it belongs to is yours to manage.
+    if ((b.action === 'deactivate' || b.action === 'activate') && membershipsOf(id).some((x) => x.orgId !== ctx.orgId && !canIn(ctx, x.orgId, 'users.deactivate'))) {
+      return badRequest('This account also belongs to other organizations; remove it from this organization instead', 403);
+    }
   }
   const owners = [...members.values()].filter((m) => m.role === 'org_owner' && !b.userIds!.includes(m.userId));
   switch (b.action) {

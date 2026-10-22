@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { publicOrigin } from '@/lib/route-helpers';
 import { audit, badRequest, isContext, readJson, requirePermission } from '@/lib/session';
 import { manageableGroup } from '@/lib/group-access';
 import { demoteCheck, removeGroupMember, setGroupMember, type GroupRole } from '@/lib/db/repos/groups';
@@ -31,7 +32,7 @@ export async function POST(request: NextRequest, { params }: P) {
     }
     if (!b?.email) return badRequest('Enter the person\'s email address', 400);
     const { invitation, token } = createInvitation(m.group.orgId, { email: b.email, role: 'user', groupId: id, groupRole: role }, ctx.user.email);
-    const link = `${new URL(request.url).origin}/invite/${encodeURIComponent(token)}`;
+    const link = `${publicOrigin(request)}/invite/${encodeURIComponent(token)}`;
     const sent = await sendInvitationEmail(m.group.orgId, invitation.email, link, ctx.user.name);
     audit(ctx, { eventType: 'group.invite', description: `Invited ${invitation.email} to "${m.group.name}" as ${role}`, resourceType: 'invitation', resourceId: invitation.id });
     return NextResponse.json({ invitation, link, emailed: sent.sent }, { status: 201 });

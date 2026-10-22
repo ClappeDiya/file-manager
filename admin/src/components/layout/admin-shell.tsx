@@ -15,12 +15,15 @@ interface AdminShellProps {
 
 export function AdminShell({ children }: AdminShellProps) {
   const { isAuthenticated, isValidating, validateSession } = useAuthStore();
+  // Block rendering only for the first check; later refreshes (after sign-in,
+  // switching organization) keep the page mounted.
+  const [checkedOnce, setCheckedOnce] = React.useState(false);
   const applyTheme = useAdminStore((s) => s.applyTheme);
   const theme = useAdminStore((s) => s.theme);
   const t = useTranslate();
 
   useEffect(() => {
-    validateSession();
+    void validateSession().finally(() => setCheckedOnce(true));
   }, [validateSession]);
 
   // Apply persisted theme as soon as the shell mounts so a reload no longer
@@ -35,7 +38,7 @@ export function AdminShell({ children }: AdminShellProps) {
     return () => media.removeEventListener('change', onChange);
   }, [applyTheme, theme]);
 
-  if (isValidating) {
+  if (isValidating && !checkedOnce) {
     return (
       <div className="flex h-screen items-center justify-center bg-background">
         <div className="text-muted-foreground">Validating session...</div>

@@ -100,6 +100,8 @@ pub struct ServerState {
     pub cfg: Arc<ServerConfig>,
     pub started: Instant,
     pub oauth: Option<oauth::OAuthBroker>,
+    /// Management console agent (`fleet_agent_*` RPC calls of the web UI).
+    pub agent: Option<crate::fleet_agent::FleetAgent>,
 }
 
 /// HTTP error wrapper: AppError → status + sanitized `{error_type, message, advice}`.
@@ -314,6 +316,12 @@ async fn rpc(State(st): State<ServerState>, AxPath(cmd): AxPath<String>, body: O
         return match &st.conns {
             Some(c) => ok(c.list_connections().await?),
             None => ok(Vec::<Value>::new()),
+        };
+    }
+    if cmd.starts_with("fleet_agent_") {
+        return match &st.agent {
+            Some(a) => Ok(Json(crate::fleet_agent::dispatch(a, &cmd, &args).await?)),
+            None => Err(AppError::state("The management console agent is not available on this server", "Start ufop-server without --no-console-agent.").into()),
         };
     }
     Ok(Json(api::dispatch(&st.mgr, &cmd, &args).await?))

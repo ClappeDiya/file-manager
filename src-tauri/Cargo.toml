@@ -3,6 +3,7 @@ name = "unified-file-ops"
 version = "0.1.0"
 description = "Unified File Operations Platform - Rust Core"
 authors = ["UFOP Team"]
+license-file = "../LICENSE"
 edition = "2021"
 rust-version = "1.80"
 
@@ -15,7 +16,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # Shared error type + sync/copy engine (also used by the `ufop` CLI).
-ufop-core = { path = "../crates/ufop-core", features = ["sqlite", "backup"] }
+ufop-core = { path = "../crates/ufop-core", features = ["sqlite", "backup", "agent"] }
 shlex = "1"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"

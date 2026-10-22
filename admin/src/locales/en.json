@@ -26,7 +26,18 @@
     "workspaces": "Workspaces",
     "aiGovernance": "AI Governance",
     "billing": "Billing",
-    "support": "Support"
+    "support": "Support",
+    "fleet": "Fleet overview",
+    "machines": "Machines",
+    "enrollment": "Enrollment",
+    "fleetPolicies": "Fleet policies",
+    "credentials": "Credentials",
+    "alerts": "Alerts",
+    "aiInsights": "AI insights",
+    "organizations": "Organizations",
+    "groups": "Groups",
+    "sso": "Single sign-on",
+    "account": "My account"
   },
   "shell": {
     "skipToContent": "Skip to main content",
@@ -34,7 +45,8 @@
     "notifications": "Notifications",
     "logout": "Logout",
     "themeLabel": "Theme: {theme}. Activate to switch.",
-    "locked": "Locked"
+    "locked": "Locked",
+    "organization": "Organization"
   },
   "footer": {
     "privacy": "Privacy",
