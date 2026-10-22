@@ -14,6 +14,7 @@ import { loadSmartDestinations, fileExtension, type SmartDestination } from "@/h
 import { assessBeforeExecute, measureSelection, FS_INTENT_KIND } from "@/lib/safety";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
 import { reportOperationFailure } from "@/lib/op-error-toast";
+import { OS_DROP_ATTR, useOsFileDrop } from "@/hooks/use-os-file-drop";
 import {
   computeListBytes,
   computeSelectionBytes,
@@ -286,6 +287,7 @@ let migrationRun: MigrationRunState | null = null;
 let migrationRunDest: string | null = null;
 
 export function FileManager() {
+  useOsFileDrop();
   const appMode = useUIStore((s) => s.appMode);
   const sidebarOpen = useUIStore((s) => s.sidebarOpen);
   const sidebarWidth = useUIStore((s) => s.sidebarWidth);
@@ -4603,7 +4605,8 @@ function FilePane({
 
   return (
     <div
-      className="flex flex-col h-full relative"
+      className="flex flex-col h-full relative data-[os-drop-hover]:ring-2 data-[os-drop-hover]:ring-inset data-[os-drop-hover]:ring-[var(--color-primary)]"
+      {...{ [OS_DROP_ATTR]: currentPath }}
       onDragOver={handleDragOver}
       onDrop={(e) => {
         const droppedPaths = handleDrop(e);
