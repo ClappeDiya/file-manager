@@ -163,13 +163,13 @@ pub enum TokenCommands {
     Revoke { id: String },
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
-struct Client {
+pub(crate) struct Client {
     http: reqwest::Client,
-    url: String,
+    pub(crate) url: String,
     cfg: CliConfig,
 }
 
@@ -178,7 +178,7 @@ fn refresh_from(headers: &reqwest::header::HeaderMap) -> Option<String> {
 }
 
 impl Client {
-    fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         let cfg = CliConfig::load();
         let url = cfg.server_url.clone().ok_or("Not signed in: run `ufop server login --url …` first")?;
         Ok(Self { http: reqwest::Client::new(), url, cfg })
@@ -196,7 +196,16 @@ impl Client {
         self.cfg.save().map_err(|e| e.to_string())
     }
 
-    async fn call(&mut self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, String> {
+    /// A request with the stored credentials (for streamed bodies).
+    pub(crate) fn raw(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        let req = self.http.request(method, format!("{}/api/v1{path}", self.url));
+        match &self.cfg.server_token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
+    }
+
+    pub(crate) async fn call(&mut self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, String> {
         for attempt in 0..2 {
             let mut req = self.http.request(method.clone(), format!("{}/api/v1{path}", self.url));
             if let Some(t) = &self.cfg.server_token {
@@ -231,7 +240,7 @@ impl Client {
     }
 }
 
-fn show(format: &OutputFormat, v: &Value) {
+pub(crate) fn show(format: &OutputFormat, v: &Value) {
     match format {
         OutputFormat::Human => println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()),
         _ => output::print_data(format, v),

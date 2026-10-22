@@ -110,6 +110,25 @@ export async function serverApi<T>(
   path: string,
   body?: unknown,
 ): Promise<T> {
+  const r = await serverRaw(
+    method,
+    path,
+    body !== undefined ? JSON.stringify(body) : undefined,
+    body !== undefined ? "application/json" : undefined,
+  );
+  return (await r.json()) as T;
+}
+
+/**
+ * A REST call with a raw body and response (file downloads and uploads);
+ * throws the server's `{message, advice}` on failure.
+ */
+export async function serverRaw(
+  method: string,
+  path: string,
+  body?: BodyInit,
+  contentType?: string,
+): Promise<Response> {
   for (let attempt = 0; attempt < 2; attempt++) {
     if (!accessToken && !(await refresh())) {
       throw {
@@ -120,18 +139,18 @@ export async function serverApi<T>(
     const r = await fetch(api(path), {
       method,
       headers: {
-        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+        ...(contentType ? { "Content-Type": contentType } : {}),
         Authorization: `Bearer ${accessToken}`,
       },
       credentials: "same-origin",
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      body,
     });
     if (r.status === 401 && attempt === 0) {
       accessToken = null;
       continue;
     }
     if (!r.ok) throw await errorFrom(r);
-    return (await r.json()) as T;
+    return r;
   }
   throw { message: "Not signed in", advice: "Sign in to the backup server." };
 }

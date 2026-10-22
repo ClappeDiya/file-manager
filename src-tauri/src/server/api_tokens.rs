@@ -48,6 +48,10 @@ pub fn required_scope(method: &Method, path: &str) -> Scope {
     if p.starts_with("/api/v1/auth/") || p.starts_with("/api/v1/rpc/") || p.starts_with("/api/v1/oauth/") || (p == "/api/v1/settings" && method != Method::GET) {
         return Scope::Admin;
     }
+    // Gateway agents relay data in both directions: write, whatever the method.
+    if p.starts_with("/api/v1/gateway/") {
+        return Scope::Write;
+    }
     if method == Method::GET || method == Method::HEAD {
         return Scope::Read;
     }
@@ -222,6 +226,9 @@ mod tests {
         assert_eq!(required_scope(&Method::DELETE, "/api/v1/jobs/j1"), Scope::Write);
         assert_eq!(required_scope(&get, "/api/v1/settings"), Scope::Read);
         assert_eq!(required_scope(&Method::PUT, "/api/v1/settings"), Scope::Admin);
+        assert_eq!(required_scope(&Method::GET, "/api/v1/gateway/jobs/j/body"), Scope::Write);
+        assert_eq!(required_scope(&Method::GET, "/api/v1/gateways/office/download"), Scope::Read);
+        assert_eq!(required_scope(&Method::PUT, "/api/v1/gateways/office/upload"), Scope::Write);
         assert_eq!(required_scope(&post, "/api/v1/rpc/anything"), Scope::Admin);
         assert_eq!(required_scope(&get, "/api/v1/auth/api-tokens"), Scope::Admin);
         assert!(Scope::Admin > Scope::Write && Scope::Write > Scope::Run && Scope::Run > Scope::Read);

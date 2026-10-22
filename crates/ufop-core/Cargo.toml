@@ -16,6 +16,8 @@ backup = ["sqlite", "dep:windows", "dep:aes-gcm", "dep:argon2", "dep:flate2", "d
 # Fleet agent: client side of the admin console's `/api/agent/*` protocol
 # (registration, claiming, heartbeats, commands, policies, reports).
 agent = ["dep:reqwest", "dep:tokio", "dep:base64"]
+# File gateway agent (`gateway` module): serves local folders through ufop-server.
+gateway = ["agent", "reqwest/stream", "tokio/fs", "tokio/io-util", "tokio/rt", "dep:tokio-util"]
 # Text from office documents (docx/xlsx/pptx, OpenDocument, RTF) for previews and search.
 doctext = ["dep:zip"]
 
@@ -42,6 +44,7 @@ base64 = { version = "0.22", optional = true }
 # TLS backends come from the consumer (the desktop app / CLI enable theirs).
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json"] }
 tokio = { version = "1", optional = true, features = ["time", "sync", "macros"] }
+tokio-util = { version = "0.7", optional = true, features = ["io"] }
 
 # Backup metadata (xattrs, POSIX ACLs via system.* xattrs), advisory locks,
 # I/O priority and free-space checks.

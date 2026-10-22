@@ -12,6 +12,7 @@ pub mod doctext;
 pub mod confine;
 pub mod error;
 pub mod fsutil;
+pub mod gateway;
 pub mod gpg;
 pub mod naming;
 pub mod netacl;

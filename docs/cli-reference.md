@@ -523,6 +523,24 @@ ufop server folders list
 
 ---
 
+### `ufop gateway`
+
+An on-premises **file gateway**: serve folders on this machine through a `ufop-server`, so the server's users can browse, download and (optionally) upload them. The agent connects out to the server over HTTPS, so no inbound port is opened. Data streams straight through and the server does not store it. Start agents with the same `--name` on several machines to share the work and fail over.
+
+```bash
+# On the machine with the files (token: ufop server tokens create gw --scope write)
+UFOP_GATEWAY_TOKEN=ufop_pat_… ufop gateway serve --server https://files.example.com \
+    --name office --root /srv/projects --root /srv/scans [--writable] [--max-upload-mb 500]
+
+# Anywhere, after `ufop server login`
+ufop gateway list                                  # gateways and their nodes
+ufop gateway ls office /projects                   # list a folder (/ = the roots)
+ufop gateway get office /projects/q3/report.pdf    # download (-o to choose the file)
+ufop gateway put office ./notes.txt /projects/notes.txt   # upload (writable gateways)
+```
+
+Paths are `/<root folder name>/…`. They stay inside the roots after symlinks are resolved, and dot-files are neither listed nor served. Uploads are written under a hidden temporary name and renamed into place. Ctrl+C stops an agent, which leaves the pool at once.
+
 ### `ufop mcp`
 
 Serve file tools to an AI client (Claude Desktop, Claude Code, any MCP client) over the Model Context Protocol on stdio. Every path is confined to the `--root` directories: paths are resolved and symlinks followed before the check, so `..`, absolute paths and links pointing outside are refused. Read-only unless `--allow-write`.

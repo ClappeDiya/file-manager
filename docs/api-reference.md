@@ -684,6 +684,19 @@ Start the server with `--dav-root <folder>` (repeatable, or `UFOP_SERVER_DAV_ROO
 - **Network:** `--allowed-cidrs` applies as everywhere; `--dav-allowed-cidrs` (or `UFOP_SERVER_DAV_ALLOWED_CIDRS`) restricts WebDAV further. Basic sends the password with every request, so use `--https` or a TLS reverse proxy when the server is reachable from other machines (the server warns otherwise).
 - **Confinement:** paths are resolved after following symlinks and must stay inside the folder; dot-files and links pointing outside are neither listed nor served.
 
+### File gateways
+
+On-premises agents (`ufop gateway serve`) serve folders through the server without an inbound port. An agent long-polls `POST /api/v1/gateway/poll` with an API token of the **write** scope, receives jobs (`list`, `download`, `upload`) and streams its answers to `POST /api/v1/gateway/jobs/{id}/reply`. For uploads it reads the client's data from `GET /api/v1/gateway/jobs/{id}/body`. Nothing is stored on the server.
+
+| Client call | Scope | |
+|---|---|---|
+| `GET /api/v1/gateways` | read | Gateways, nodes (host, address, roots, writable, last seen, jobs) |
+| `GET /api/v1/gateways/{name}/files?path=/root/dir` | read | One folder (`/` = the roots) |
+| `GET /api/v1/gateways/{name}/download?path=/root/file` | read | The file, streamed |
+| `PUT /api/v1/gateways/{name}/upload?path=/root/file` | write | The request body becomes the file (writable gateways only) |
+
+Nodes that share a gateway name form a pool: each job goes to the first node that polls, read-only nodes leave uploads to writable ones, and a stopping agent leaves the pool at once (others drop out after 60 s without polling). With no node online, a request fails with `503`; a job no node answers within 60 s fails with `504`. Agent errors map to `404`, `403` or `400`.
+
 ## Tauri IPC Commands
 
 The desktop application uses Tauri IPC for communication between the frontend (React/TypeScript) and backend (Rust). These are not REST endpoints but are documented here for extension developers.

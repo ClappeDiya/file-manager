@@ -146,6 +146,10 @@ pub enum Commands {
     #[command(subcommand)]
     Agent(commands::agent::AgentCommands),
 
+    /// File gateway: serve local folders through a ufop-server, or use one
+    #[command(subcommand)]
+    Gateway(commands::gateway::GatewayCommands),
+
     /// Check compatibility of paths across platforms
     Compat {
         /// Paths to check
@@ -484,6 +488,9 @@ async fn main() -> ExitCode {
         }
         Commands::Agent(cmd) => {
             commands::agent::execute(cmd, &format).await
+        }
+        Commands::Gateway(cmd) => {
+            commands::gateway::execute(cmd, &format).await
         }
         Commands::Compat { paths, targets } => {
             commands::compat::execute(paths, targets, &format).await

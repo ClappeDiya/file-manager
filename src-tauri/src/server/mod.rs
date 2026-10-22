@@ -9,6 +9,7 @@ pub mod api_tokens;
 pub mod auth;
 pub mod dav;
 pub mod folders;
+pub mod gateway;
 pub mod oauth;
 pub mod openapi;
 pub mod shares;
@@ -130,6 +131,8 @@ pub struct ServerState {
     pub oauth: Option<oauth::OAuthBroker>,
     /// Management console agent (`fleet_agent_*` RPC calls of the web UI).
     pub agent: Option<crate::fleet_agent::FleetAgent>,
+    /// File gateway relay (on-premises agents and their jobs).
+    pub gateways: gateway::Hub,
 }
 
 /// HTTP error wrapper: AppError → status + sanitized `{error_type, message, advice}`.
@@ -718,6 +721,7 @@ pub fn router(st: ServerState) -> Router {
         .merge(oauth::protected_routes())
         .merge(shares::protected_routes())
         .merge(folders::protected_routes())
+        .merge(gateway::protected_routes())
         .route_layer(middleware::from_fn_with_state(st.clone(), require_auth));
     let mut app = public.merge(protected).merge(dav::routes());
     if !st.cfg.api_only && st.cfg.webroot.is_some() {

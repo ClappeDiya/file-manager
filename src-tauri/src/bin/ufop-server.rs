@@ -376,7 +376,7 @@ async fn run(argv: Vec<String>) {
             tracing::warn!("WebDAV is reachable over plain HTTP: passwords and tokens are sent unencrypted. Use --https or a TLS reverse proxy.");
         }
     }
-    let st = ServerState { mgr, conns: Some(conns), auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent };
+    let st = ServerState { mgr, conns: Some(conns), auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent, gateways: Default::default() };
     if let Err(e) = server::serve(st).await {
         fail(e);
     }

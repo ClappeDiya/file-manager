@@ -6,6 +6,7 @@ pub mod compat;
 pub mod connection;
 pub mod copy;
 pub mod duplicates;
+pub mod gateway;
 pub mod login;
 pub mod mcp;
 pub mod profile;

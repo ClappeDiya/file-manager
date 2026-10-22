@@ -118,6 +118,14 @@ pub(crate) const OPS: &[Op] = &[
     Op { method: "post", path: "/s/{token}/unlock", tag: "shares", summary: "Enter a link's password (form field `password`); sets an unlock cookie", auth: false, params: &[("token", "path", "string", true, "Link token")], body: None, response: html, content_type: "text/html" },
     Op { method: "get", path: "/s/{token}/dl", tag: "shares", summary: "Download a file of a share (counts against its download limit)", auth: false, params: &[("token", "path", "string", true, "Link token"), ("p", "query", "string", false, "File inside the share")], body: None, response: || json!({ "type": "string", "format": "binary" }), content_type: "application/octet-stream" },
     Op { method: "post", path: "/s/{token}/upload", tag: "shares", summary: "Upload files (multipart field `file`, repeatable) into an upload link's folder", auth: false, params: &[("token", "path", "string", true, "Link token"), ("p", "query", "string", false, "Folder inside the share")], body: None, response: html, content_type: "text/html" },
+    op!("post" "/api/v1/gateway/poll", "gateways", "Gateway agent: register this node and wait (up to 25 s) for a job; 204 when none (write scope)", auth: true, params: &[], body: Some(|| json!({ "type": "object", "required": ["gateway", "node", "roots"], "properties": { "gateway": { "type": "string" }, "node": { "type": "string" }, "host": { "type": "string" }, "roots": { "type": "array", "items": { "type": "string" } }, "writable": { "type": "boolean" }, "version": { "type": "string" } } })), response: || json!({ "type": "object", "properties": { "id": { "type": "string" }, "op": { "type": "string", "enum": ["list", "download", "upload"] }, "path": { "type": "string" }, "size": { "type": ["integer", "null"] } } })),
+    op!("post" "/api/v1/gateway/leave", "gateways", "Gateway agent: leave the pool (sent when the agent stops)", auth: true, params: &[], body: Some(|| json!({ "type": "object", "required": ["gateway", "node"], "properties": { "gateway": { "type": "string" }, "node": { "type": "string" } }, "additionalProperties": true })), response: ok_flag),
+    op!("post" "/api/v1/gateway/jobs/{id}/reply", "gateways", "Gateway agent: answer a job (header x-ufop-gateway-status ok|error; the body is streamed to the client)", auth: true, params: &[("id", "path", "string", true, "Job id")], body: None, response: ok_flag),
+    Op { method: "get", path: "/api/v1/gateway/jobs/{id}/body", tag: "gateways", summary: "Gateway agent: the data of an upload job", auth: true, params: &[("id", "path", "string", true, "Job id")], body: None, response: || json!({ "type": "string", "format": "binary" }), content_type: "application/octet-stream" },
+    op!("get" "/api/v1/gateways", "gateways", "Gateways and their nodes (online, roots, writable, jobs)", auth: true, params: &[], body: None, response: || json!({ "type": "object", "properties": { "gateways": { "type": "array", "items": { "type": "object", "additionalProperties": true } } } })),
+    op!("get" "/api/v1/gateways/{name}/files", "gateways", "List a folder through a gateway (`/` = its roots)", auth: true, params: &[("name", "path", "string", true, "Gateway name"), ("path", "query", "string", false, "/<root>/<folder>")], body: None, response: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "entries": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "is_dir": { "type": "boolean" }, "size": { "type": "integer" }, "modified": { "type": ["string", "null"] } } } } } })),
+    Op { method: "get", path: "/api/v1/gateways/{name}/download", tag: "gateways", summary: "Download a file through a gateway (streamed, not stored)", auth: true, params: &[("name", "path", "string", true, "Gateway name"), ("path", "query", "string", true, "/<root>/<file>")], body: None, response: || json!({ "type": "string", "format": "binary" }), content_type: "application/octet-stream" },
+    op!("put" "/api/v1/gateways/{name}/upload", "gateways", "Upload the request body as a file through a writable gateway", auth: true, params: &[("name", "path", "string", true, "Gateway name"), ("path", "query", "string", true, "/<root>/<file>")], body: None, response: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "bytes": { "type": "integer" } } })),
     op!("get" "/oauth/token", "oauth", "Access token for an AuthID (the AuthID is the credential)", auth: false, params: &[("authid", "query", "string", true, "AuthID from the callback")], body: None, response: || json!({ "type": "object", "properties": { "access_token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" } } })),
 ];
 
@@ -183,7 +191,7 @@ pub fn document() -> Value {
         },
         "servers": [{ "url": "/" }],
         "tags": [
-            { "name": "general" }, { "name": "auth" }, { "name": "jobs" }, { "name": "browse" }, { "name": "tasks" }, { "name": "shares" }, { "name": "oauth" }
+            { "name": "general" }, { "name": "auth" }, { "name": "jobs" }, { "name": "browse" }, { "name": "tasks" }, { "name": "shares" }, { "name": "gateways" }, { "name": "oauth" }
         ],
         "paths": paths,
         "components": components(),
@@ -198,7 +206,7 @@ mod tests {
     /// `(method, path)` of every `.route(…)` in the router sources.
     fn routed() -> BTreeSet<(String, String)> {
         let mut out = BTreeSet::new();
-        for src in [include_str!("mod.rs"), include_str!("oauth.rs"), include_str!("shares.rs"), include_str!("folders.rs")] {
+        for src in [include_str!("mod.rs"), include_str!("oauth.rs"), include_str!("shares.rs"), include_str!("folders.rs"), include_str!("gateway.rs")] {
             for chunk in src.split(".route(\"").skip(1) {
                 let Some((path, rest)) = chunk.split_once('"') else { continue };
                 let handlers = &rest[..rest.find(".route(").unwrap_or(rest.len()).min(rest.find('\n').unwrap_or(rest.len()))];

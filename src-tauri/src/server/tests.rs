@@ -17,7 +17,7 @@ async fn start(cfg: ServerConfig, oauth: Option<oauth::OAuthBroker>) -> TestServ
     let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
     let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
     auth.set_password("server-password").await.unwrap();
-    let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent: None };
+    let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent: None, gateways: Default::default() };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
@@ -160,7 +160,7 @@ async fn https_with_generated_certificate() {
     let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, d.path().join("dbs"), KdfParams::insecure_fast());
     let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
     let cfg = ServerConfig { port, tls: TlsMode::Generated { dir: d.path().join("tls"), hostnames: vec!["localhost".into()] }, ..Default::default() };
-    let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None };
+    let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None, gateways: Default::default() };
     tokio::spawn(async move { serve(st).await.unwrap() });
     let ca = std::fs::read(loop {
         let p = d.path().join("tls/ufop-ca.pem");
@@ -620,4 +620,103 @@ async fn webdav_is_read_only_authenticated_and_confined() {
     .await;
     assert_eq!(narrowed.client.get(format!("{}/dav/docs/hello.txt", narrowed.base)).basic_auth("u", Some("server-password")).send().await.unwrap().status(), 403);
     assert_eq!(narrowed.client.get(format!("{}/api/v1/health", narrowed.base)).send().await.unwrap().status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_gateway_relays_through_an_ha_pool_without_storing() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use ufop_core::gateway::{run, AgentConfig};
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    let mint = |scope: &'static str| s.post("/api/v1/auth/api-tokens", &tok, json!({"name": format!("gw {scope}"), "scope": scope, "expires_in_days": 1}));
+    let write_tok = mint("write").await.json::<Value>().await.unwrap()["token"].as_str().unwrap().to_string();
+    let read_tok = mint("read").await.json::<Value>().await.unwrap()["token"].as_str().unwrap().to_string();
+
+    let files = tempfile::tempdir().unwrap();
+    let docs = files.path().join("docs");
+    std::fs::create_dir_all(docs.join("sub")).unwrap();
+    let big: Vec<u8> = (0..3_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+    std::fs::write(docs.join("big.bin"), &big).unwrap();
+    std::fs::write(docs.join(".secret"), b"x").unwrap();
+    std::fs::write(files.path().join("outside.txt"), b"outside").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(files.path().join("outside.txt"), docs.join("escape.txt")).unwrap();
+
+    let gw = |path: &str| format!("{}/api/v1/gateways/office{path}", s.base);
+    // Nothing connected yet.
+    assert_eq!(s.client.get(gw("/files?path=/")).bearer_auth(&read_tok).send().await.unwrap().status(), 404);
+
+    let agent = |token: String, writable: bool| {
+        let stop = Arc::new(AtomicBool::new(false));
+        let cfg = AgentConfig { server: s.base.clone(), token, gateway: "office".into(), roots: vec![docs.clone()], writable, max_upload: Some(10 << 20), concurrency: 4 };
+        let h = tokio::spawn(run(cfg, stop.clone()));
+        (stop, h)
+    };
+    // An agent needs the write scope.
+    let (_, h) = agent(read_tok.clone(), false);
+    assert!(h.await.unwrap().unwrap_err().contains("refused the token"));
+
+    let (stop_a, a) = agent(write_tok.clone(), true);
+    let (stop_b, b) = agent(write_tok.clone(), false);
+    let mut online = 0;
+    for _ in 0..100 {
+        let v = s.get("/api/v1/gateways", &read_tok).await.json::<Value>().await.unwrap();
+        online = v["gateways"][0]["online_nodes"].as_u64().unwrap_or(0);
+        if online == 2 {
+            assert_eq!(v["gateways"][0]["name"], "office");
+            assert_eq!(v["gateways"][0]["writable"], true);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(online, 2, "both nodes registered");
+
+    // Listing: roots, then a folder without dot-files or links out of the root.
+    let roots = s.client.get(gw("/files?path=/")).bearer_auth(&read_tok).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(roots["entries"][0]["name"], "docs");
+    let l = s.client.get(gw("/files?path=/docs")).bearer_auth(&read_tok).send().await.unwrap().json::<Value>().await.unwrap();
+    let names: Vec<&str> = l["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["sub", "big.bin"]);
+
+    // Downloads stream through, several at once, served by the pool.
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let (c, url, t) = (s.client.clone(), gw("/download?path=/docs/big.bin"), read_tok.clone());
+        handles.push(tokio::spawn(async move {
+            let r = c.get(url).bearer_auth(t).send().await.unwrap();
+            assert_eq!(r.status(), 200);
+            assert_eq!(r.headers()["content-length"], "3000000");
+            r.bytes().await.unwrap().to_vec()
+        }));
+    }
+    for h in handles {
+        assert!(h.await.unwrap() == big, "relayed bytes are identical");
+    }
+    for (p, code) in [("/docs/missing.bin", 404), ("/docs/.secret", 400), ("/docs/../outside.txt", 400), ("/docs/escape.txt", 404), ("/nope/x", 404)] {
+        assert_eq!(s.client.get(gw(&format!("/download?path={p}"))).bearer_auth(&read_tok).send().await.unwrap().status(), code, "{p}");
+    }
+
+    // Uploads need the write scope and a writable node; written via a temp name.
+    assert_eq!(s.client.put(gw("/upload?path=/docs/sub/new.txt")).bearer_auth(&read_tok).body("hello").send().await.unwrap().status(), 401);
+    let r = s.client.put(gw("/upload?path=/docs/sub/new.txt")).bearer_auth(&write_tok).body("hello gateway").send().await.unwrap();
+    assert_eq!(r.status(), 200, "{:?}", r.text().await);
+    assert_eq!(std::fs::read(docs.join("sub/new.txt")).unwrap(), b"hello gateway");
+    assert!(!docs.join("sub/.new.txt.ufop-part").exists());
+    assert_eq!(s.client.put(gw("/upload?path=/docs/.hidden")).bearer_auth(&write_tok).body("x").send().await.unwrap().status(), 400);
+    assert_eq!(s.client.put(gw("/upload?path=/docs/huge.bin")).bearer_auth(&write_tok).body(vec![0u8; 11 << 20]).send().await.unwrap().status(), 403);
+    assert!(!docs.join("huge.bin").exists() && !docs.join(".huge.bin.ufop-part").exists());
+
+    // Failover: with the writable node gone, reads continue on the other node
+    // and uploads are refused straight away.
+    stop_a.store(true, Ordering::SeqCst);
+    a.await.unwrap().unwrap();
+    let v = s.get("/api/v1/gateways", &read_tok).await.json::<Value>().await.unwrap();
+    assert_eq!(v["gateways"][0]["online_nodes"], 1);
+    let r = s.client.get(gw("/download?path=/docs/big.bin")).bearer_auth(&read_tok).send().await.unwrap();
+    assert_eq!(r.bytes().await.unwrap().len(), big.len());
+    assert_eq!(s.client.put(gw("/upload?path=/docs/x.txt")).bearer_auth(&write_tok).body("x").send().await.unwrap().status(), 403);
+
+    stop_b.store(true, Ordering::SeqCst);
+    b.await.unwrap().unwrap();
+    assert_eq!(s.client.get(gw("/files?path=/")).bearer_auth(&read_tok).send().await.unwrap().status(), 404, "the empty gateway is gone");
 }

@@ -7,6 +7,7 @@ import { BackupPanel } from "@/components/backup/backup-panel";
 import { errorText } from "@/lib/error-text";
 import { pickFolder, setFolderPickerImpl } from "@/lib/folder-picker";
 import { ShareLinksPanel } from "@/components/server/share-links-panel";
+import { GatewaysPanel } from "@/components/server/gateways-panel";
 import {
   isSignedIn,
   login,
@@ -161,7 +162,7 @@ export default function ServerApp() {
     title: string;
     resolve: (p: string | null) => void;
   } | null>(null);
-  const [tab, setTab] = useState<"backups" | "shares">("backups");
+  const [tab, setTab] = useState<"backups" | "shares" | "gateways">("backups");
 
   useEffect(() => {
     const off = onAuthChange(setSignedIn);
@@ -187,6 +188,7 @@ export default function ServerApp() {
             [
               ["backups", "Backups"],
               ["shares", "Share links"],
+              ["gateways", "Gateways"],
             ] as const
           ).map(([id, label]) => (
             <button
@@ -210,8 +212,10 @@ export default function ServerApp() {
       <div className="flex-1 min-h-0">
         {tab === "backups" ? (
           <BackupPanel />
-        ) : (
+        ) : tab === "shares" ? (
           <ShareLinksPanel pickFolder={pickFolder} />
+        ) : (
+          <GatewaysPanel />
         )}
       </div>
       {picker && (
