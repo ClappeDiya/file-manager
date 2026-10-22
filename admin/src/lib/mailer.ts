@@ -1,6 +1,7 @@
 /**
  * Message delivery for alerts, summaries and invitations: SMTP email (nodemailer),
- * Slack incoming webhooks and generic JSON webhooks (HMAC-SHA256 signed when
+ * Slack incoming webhooks, Microsoft Teams workflow webhooks (Adaptive Card)
+ * and generic JSON webhooks (HMAC-SHA256 signed when
  * the channel has a secret: `X-UFOP-Signature: sha256=<hex of body>`).
  */
 import crypto from 'crypto';
@@ -47,6 +48,36 @@ async function postJson(url: string, body: string, headers: Record<string, strin
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
 }
 
+/**
+ * The message as a Teams "Post to a channel when a webhook request is
+ * received" workflow expects it: one Adaptive Card attachment.
+ */
+export function teamsPayload(m: Message): Record<string, unknown> {
+  const facts = Object.entries(m.data ?? {})
+    .filter(([, v]) => ['string', 'number', 'boolean'].includes(typeof v))
+    .slice(0, 10)
+    .map(([title, value]) => ({ title, value: String(value) }));
+  return {
+    type: 'message',
+    attachments: [
+      {
+        contentType: 'application/vnd.microsoft.card.adaptive',
+        contentUrl: null,
+        content: {
+          $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+          type: 'AdaptiveCard',
+          version: '1.4',
+          body: [
+            { type: 'TextBlock', text: m.subject, weight: 'Bolder', size: 'Medium', wrap: true },
+            { type: 'TextBlock', text: m.text, wrap: true },
+            ...(facts.length ? [{ type: 'FactSet', facts }] : []),
+          ],
+        },
+      },
+    ],
+  };
+}
+
 export async function deliver(ch: Channel, m: Message): Promise<Delivery> {
   try {
     if (!ch.enabled) throw new Error('Channel is disabled');
@@ -55,6 +86,10 @@ export async function deliver(ch: Channel, m: Message): Promise<Delivery> {
       const url = channelSecret(ch.id);
       if (!url) throw new Error('The Slack webhook URL is missing');
       await postJson(url, JSON.stringify({ text: `*${m.subject}*\n${m.text}` }), {});
+    } else if (ch.kind === 'teams') {
+      const url = channelSecret(ch.id);
+      if (!url) throw new Error('The Teams webhook URL is missing');
+      await postJson(url, JSON.stringify(teamsPayload(m)), {});
     } else {
       const c = ch.config as WebhookConfig;
       const body = JSON.stringify({ subject: m.subject, text: m.text, ...m.data, sentAt: new Date().toISOString() });

@@ -140,7 +140,7 @@ export default function AlertsPage() {
     await channels.reload();
   };
 
-  const secretLabel = (k: ChannelKind) => (k === 'email' ? 'SMTP password' : k === 'slack' ? 'Slack incoming webhook URL' : 'Signing secret (HMAC-SHA256)');
+  const secretLabel = (k: ChannelKind) => (k === 'email' ? 'SMTP password' : k === 'slack' ? 'Slack incoming webhook URL' : k === 'teams' ? 'Teams workflow webhook URL' : 'Signing secret (HMAC-SHA256)');
 
   return (
     <div>
@@ -289,7 +289,7 @@ export default function AlertsPage() {
                       {c.name} <span className="text-xs text-foreground-tertiary">{c.kind}</span> {!c.enabled && <span className="text-xs text-warning">disabled</span>}
                     </p>
                     <p className="text-xs text-foreground-secondary">
-                      {c.kind === 'email' ? `${(c.config as EmailConfig).host} → ${(c.config as EmailConfig).to?.join(', ')}` : c.kind === 'webhook' ? (c.config as WebhookConfig).url : 'Slack incoming webhook'}
+                      {c.kind === 'email' ? `${(c.config as EmailConfig).host} → ${(c.config as EmailConfig).to?.join(', ')}` : c.kind === 'webhook' ? (c.config as WebhookConfig).url : c.kind === 'teams' ? 'Microsoft Teams workflow' : 'Slack incoming webhook'}
                     </p>
                     {c.lastError ? <p className="text-xs text-error">Last error: {c.lastError}</p> : c.lastSentAt ? <p className="text-xs text-foreground-tertiary">Last sent {formatRelativeTime(c.lastSentAt)}</p> : null}
                   </div>
@@ -400,7 +400,7 @@ export default function AlertsPage() {
             <ErrorBanner message={formErr} />
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Input label="Name" value={channel.name} onChange={(e) => setChannel({ ...channel, name: e.target.value })} />
-              <Select label="Type" value={channel.kind} disabled={!!channel.id} onChange={(e) => setChannel({ ...channel, kind: e.target.value as ChannelKind })} options={[{ value: 'email', label: 'Email (SMTP)' }, { value: 'slack', label: 'Slack' }, { value: 'webhook', label: 'Webhook' }]} />
+              <Select label="Type" value={channel.kind} disabled={!!channel.id} onChange={(e) => setChannel({ ...channel, kind: e.target.value as ChannelKind })} options={[{ value: 'email', label: 'Email (SMTP)' }, { value: 'slack', label: 'Slack' }, { value: 'teams', label: 'Microsoft Teams' }, { value: 'webhook', label: 'Webhook' }]} />
             </div>
             {channel.kind === 'email' && (
               <>

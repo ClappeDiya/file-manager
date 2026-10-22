@@ -1,13 +1,14 @@
 /**
- * Notification channels (email, Slack, generic webhook). Secrets — SMTP
- * password, Slack webhook URL, webhook signing secret — are sealed at rest
- * and never returned by the API.
+ * Notification channels (email, Slack, Microsoft Teams, generic webhook).
+ * Secrets — SMTP password, Slack/Teams webhook URL, webhook signing
+ * secret — are sealed at rest and never returned by the API.
  */
 import { db, newId, now, parseJson, type Row } from '../index';
 import { openOpt, sealOpt } from '../../crypto';
 import { OrgError } from './orgs';
 
-export type ChannelKind = 'email' | 'slack' | 'webhook';
+export type ChannelKind = 'email' | 'slack' | 'teams' | 'webhook';
+export const CHANNEL_KINDS: ChannelKind[] = ['email', 'slack', 'teams', 'webhook'];
 
 export interface EmailConfig {
   host: string;
@@ -87,9 +88,10 @@ function validate(kind: ChannelKind, config: Record<string, unknown>, secret: st
     } catch {
       throw new OrgError('Enter a valid http(s) webhook URL');
     }
-  } else if (kind === 'slack') {
-    if (!secret && !existing) throw new OrgError('Paste the Slack incoming-webhook URL');
-    if (secret && !/^https:\/\//.test(secret)) throw new OrgError('The Slack webhook URL must start with https://');
+  } else if (kind === 'slack' || kind === 'teams') {
+    const what = kind === 'slack' ? 'Slack incoming-webhook URL' : 'Teams workflow webhook URL';
+    if (!secret && !existing) throw new OrgError(`Paste the ${what}`);
+    if (secret && !/^https:\/\//.test(secret)) throw new OrgError(`The ${what} must start with https://`);
   } else {
     throw new OrgError('Unknown channel type');
   }

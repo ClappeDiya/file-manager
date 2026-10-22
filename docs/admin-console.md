@@ -51,14 +51,14 @@ cd admin && npx next build && npx next start -p 3001
 - **App settings** set update channel, update blackout window, proxy, AI limits and machine-wide transfer caps for every desktop (see `silent-install.md`).
 - **Diagnostics**: machines upload scrubbed log bundles on request (machine page → Diagnostics) or from the app.
 - **Webhooks** (Integrations → Webhooks): subscribe URLs to console events — backup results (`backup.success|warning|error|cancelled`), alerts (`alert.opened|resolved`) and every audit event type (`machine.register`, `credential.rotate`, …), by exact name, `prefix.*` or `*`. Each delivery is a JSON POST with `X-UFOP-Event`, `X-UFOP-Delivery`, `X-UFOP-Timestamp` and `X-UFOP-Signature: sha256=HMAC-SHA256(secret, "<timestamp>.<body>")`. Failed deliveries are retried after 1 min, 5 min, 30 min, 2 h and 6 h, then marked failed; after 15 failures in a row the webhook is paused until resumed. The delivery log shows status, attempts and responses, and any delivery can be sent again. Internal addresses (loopback, private, link-local) are refused unless `WEBHOOKS_ALLOW_PRIVATE=1`; redirects are not followed.
-- **Notification outbox** (Alerts → Deliveries): every alert, summary and invitation sent through a channel (email/SMTP, Slack, webhook) is recorded. The first attempt is immediate; failures are retried on the same schedule as webhooks and then marked failed. Messages can be retried now or discarded; sent and discarded ones are kept 30 days. Channel *Test* sends directly.
+- **Notification outbox** (Alerts → Deliveries): every alert, summary and invitation sent through a channel (email/SMTP, Slack, Teams, webhook) is recorded. The first attempt is immediate; failures are retried on the same schedule as webhooks and then marked failed. Messages can be retried now or discarded; sent and discarded ones are kept 30 days. Channel *Test* sends directly.
   - Policies reference them as `central:<id>`.
   - They are delivered only to authenticated agents that a policy targets, with `Cache-Control: no-store`.
   - Agents keep them in the OS keychain.
 - **Alerts:**
   - Rules: backup failed (optionally on warnings), missed backup (schedule from the client, or an assumed interval, plus grace), unusual changed or deleted file counts, unusual duration (median and standard deviation of earlier runs).
   - Rules are scoped by tags, use a cooldown and can notify on resolve.
-  - Channels: SMTP email (STARTTLS/TLS, custom CA), Slack, and signed webhooks (`X-UFOP-Signature: sha256=<HMAC of body>`).
+  - Channels: SMTP email (STARTTLS/TLS, custom CA), Slack, Microsoft Teams (paste the URL of a "Post to a channel when a webhook request is received" workflow; messages arrive as Adaptive Cards), and signed webhooks (`X-UFOP-Signature: sha256=<HMAC of body>`).
 - **AI insights:** organization-level Anthropic API key (sealed), on-demand analysis of a machine or the whole fleet, and daily or weekly summaries sent to channels. Only report metadata is sent; file names, paths and secrets are not.
 
 ## Agent protocol (summary)
