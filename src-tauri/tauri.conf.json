@@ -22,7 +22,15 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; img-src 'self' asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src 'self' https://releases.filemanager.clappe.com https://api.github.com"
+      "csp": "default-src 'self'; script-src 'self'; img-src 'self' data: asset: http://asset.localhost https://asset.localhost; media-src 'self' asset: http://asset.localhost https://asset.localhost; frame-src 'self' asset: http://asset.localhost https://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src 'self' https://releases.filemanager.clappe.com https://api.github.com",
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "allow": ["**"],
+          "deny": ["$HOME/.ssh/**", "$HOME/.gnupg/**", "$HOME/.aws/**"],
+          "requireLiteralLeadingDot": false
+        }
+      }
     }
   },
   "bundle": {

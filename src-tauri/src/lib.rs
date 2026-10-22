@@ -12,6 +12,7 @@ pub mod ledger;
 pub mod lineage;
 pub mod metadata_engine;
 pub mod search_engine;
+pub mod thumbnail_engine;
 pub mod mount_engine;
 pub mod narrator;
 pub mod safety;
@@ -77,6 +78,7 @@ struct AppState {
     audit_trail: security::audit::AuditTrail,
     metadata_store: metadata_engine::MetadataStore,
     search_manager: search_engine::SearchManager,
+    thumbnails: std::sync::Arc<thumbnail_engine::ThumbnailCache>,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -289,6 +291,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         audit_trail,
         metadata_store: metadata_engine::MetadataStore::new(repo_for_metadata),
         search_manager: search_engine::SearchManager::open_default(),
+        thumbnails: std::sync::Arc::new(thumbnail_engine::ThumbnailCache::open_default()),
     })
 }
 
@@ -411,6 +414,7 @@ pub fn run() {
                     search_manager: search_engine::SearchManager::new(
                         search_engine::SearchIndex::open_in_memory().expect("in-memory SQLite"),
                     ),
+                    thumbnails: std::sync::Arc::new(thumbnail_engine::ThumbnailCache::open_default()),
                     repo,
                     transfer_mgr,
                     connection_mgr,
@@ -517,6 +521,7 @@ pub fn run() {
         .manage(app_state.audit_trail)
         .manage(app_state.metadata_store)
         .manage(app_state.search_manager)
+        .manage(app_state.thumbnails)
         .invoke_handler(tauri::generate_handler![
             // Security audit log (tamper-evident, append-only)
             audit_commands::verify_audit_log,
@@ -832,6 +837,8 @@ pub fn run() {
             commands::search_commands::search_index_remove,
             commands::search_commands::search_index_cancel,
             commands::search_commands::search_files_query,
+            commands::thumbnail_commands::thumbnail_get,
+            commands::thumbnail_commands::thumbnail_cache_clear,
             file_ops_commands::move_files,
             file_ops_commands::rename_file,
             file_ops_commands::duplicate_files,

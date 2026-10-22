@@ -18,7 +18,7 @@ tauri-build = { version = "2", features = [] }
 # Shared error type + sync/copy engine (also used by the `ufop` CLI).
 ufop-core = { path = "../crates/ufop-core", features = ["sqlite", "backup", "agent"] }
 shlex = "1"
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
@@ -44,6 +44,7 @@ digest = "0.10"
 # Transfer integrity: xxHash3 for fast hashing, ring for SHA-256
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32fast = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 ring = "0.17"
 # Platform-specific low-level I/O
 libc = "0.2"
