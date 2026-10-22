@@ -6,6 +6,7 @@ const PUBLIC_PATHS = [
   '/invite/',
   '/api/auth/login',
   '/api/auth/password/',
+  '/api/auth/passkey/',
   '/reset-password',
   '/api/auth/logout',
   '/api/auth/mfa/verify',

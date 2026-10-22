@@ -12,7 +12,7 @@ import { SignJWT, jwtVerify } from 'jose';
 import { ROLE_PERMISSIONS, type Permission, type Role } from './types/auth';
 import { getUser, type UserRecord } from './db/repos/users';
 import { accessibleOrgs, effectiveRole, getOrg } from './db/repos/orgs';
-import { mfaRequired } from './db/repos/security';
+import { needsSecondFactorSetup } from './db/repos/security';
 import { appendAudit, type AuditInput } from './db/repos/audit';
 
 export const SESSION_COOKIE = 'ufop-admin-session';
@@ -69,7 +69,7 @@ export function defaultOrgFor(user: UserRecord): string | null {
 const deny = (status: number, error: string) => NextResponse.json({ error }, { status });
 
 /** What a session that still has to set up required MFA may call. */
-const MFA_SETUP_PATHS = ['/api/account/mfa', '/api/auth/session', '/api/auth/logout'];
+const MFA_SETUP_PATHS = ['/api/account/mfa', '/api/account/passkeys', '/api/auth/session', '/api/auth/logout'];
 
 export async function authenticate(req: NextRequest): Promise<AuthContext | NextResponse> {
   if (!process.env.NEXTAUTH_SECRET) return deny(500, 'Server configuration error');
@@ -90,7 +90,7 @@ export async function authenticate(req: NextRequest): Promise<AuthContext | Next
   const amr = Array.isArray(payload.amr) ? (payload.amr as string[]) : ['pwd'];
   // An organization requires two-factor sign-in and this account has none yet:
   // the session can only set it up (also for sessions from before the rule).
-  if (!user.mfaEnabled && mfaRequired(user, amr.includes('sso')) && !MFA_SETUP_PATHS.some((p) => req.nextUrl.pathname.startsWith(p))) {
+  if (needsSecondFactorSetup(user, amr.includes('sso')) && !MFA_SETUP_PATHS.some((p) => req.nextUrl.pathname.startsWith(p))) {
     return NextResponse.json({ error: 'Your organization requires two-factor sign-in. Set it up under My account first.', code: 'mfa_setup_required' }, { status: 403 });
   }
   return {

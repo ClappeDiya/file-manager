@@ -4,12 +4,12 @@ import { attachSession, defaultOrgFor } from './session';
 import { updateUser, type UserRecord } from './db/repos/users';
 import { createChallenge } from './db/repos/mfa';
 import { appendAudit } from './db/repos/audit';
-import { mfaRequired } from './db/repos/security';
+import { needsSecondFactorSetup } from './db/repos/security';
 
 export interface SignInMeta {
   ip: string;
   userAgent: string;
-  /** `pwd` or `sso:<provider id>` */
+  /** `pwd`, `passkey` or `sso:<provider id>` */
   method: string;
   /** The identity provider insists on a second factor. */
   requireMfa?: boolean;
@@ -34,10 +34,10 @@ export async function finishSignIn(user: UserRecord, meta: SignInMeta, mfaDone =
     return NextResponse.json({ mfaRequired: true, challengeId: ch.id, expiresAt: ch.expiresAt, redirect: meta.redirect ?? '/' });
   }
   updateUser(user.id, { lastLoginAt: new Date().toISOString() });
-  const amr = [meta.method.startsWith('sso') ? 'sso' : 'pwd', ...(mfaDone ? ['mfa'] : [])];
+  const amr = [meta.method.startsWith('sso') ? 'sso' : meta.method === 'passkey' ? 'passkey' : 'pwd', ...(mfaDone ? ['mfa'] : [])];
   appendAudit({ eventType: 'auth.login', orgId, userId: user.id, userEmail: user.email, userName: user.name, ipAddress: meta.ip, userAgent: meta.userAgent, description: `Signed in (${amr.join(' + ')})`, metadata: { method: meta.method } });
   // Required by an organization but not set up yet: the session is limited to enrollment.
-  const setup = !user.mfaEnabled && mfaRequired(user, meta.method.startsWith('sso'));
+  const setup = needsSecondFactorSetup(user, meta.method.startsWith('sso'));
   if (setup) appendAudit({ eventType: 'auth.mfa_setup_required', orgId, userId: user.id, userEmail: user.email, ipAddress: meta.ip, description: 'Signed in; two-factor sign-in must be set up before using the console' });
   const res = NextResponse.json({ user: { id: user.id, email: user.email, name: user.name }, orgId, redirect: setup ? '/account?setup-mfa=1' : (meta.redirect ?? '/'), ...(setup ? { mfaSetupRequired: true } : {}) });
   return attachSession(res, user, orgId, amr);

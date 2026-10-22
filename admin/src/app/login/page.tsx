@@ -1,9 +1,10 @@
 'use client';
 
 import Link from 'next/link';
+import { getPasskey, passkeysSupported } from '@/lib/passkey-client';
 import React, { Suspense, useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { KeyRound } from 'lucide-react';
+import { Fingerprint, KeyRound } from 'lucide-react';
 import { useAuthStore } from '@/lib/stores/auth-store';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -20,7 +21,7 @@ const safeRedirect = (v: string | null) => (v && v.startsWith('/') && !v.startsW
 function LoginForm() {
   const router = useRouter();
   const params = useSearchParams();
-  const { isAuthenticated, isLoading, error, setError, login, verifyMfa } = useAuthStore();
+  const { isAuthenticated, isLoading, error, setError, login, verifyMfa, validateSession } = useAuthStore();
   const redirect = safeRedirect(params.get('redirect'));
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -62,6 +63,22 @@ function LoginForm() {
     if (r.ok) router.replace(safeRedirect(r.redirect));
     else if ('mfaChallengeId' in r) setChallengeId(r.mfaChallengeId);
     else if ('passwordChangeToken' in r) router.replace(`/reset-password?token=${encodeURIComponent(r.passwordChangeToken)}&redirect=${encodeURIComponent(redirect)}`);
+  };
+
+  const signInWithPasskey = async () => {
+    setError(null);
+    try {
+      const o = await (await fetch('/api/auth/passkey/options', { method: 'POST' })).json();
+      const credential = await getPasskey(o.publicKey);
+      const r = await fetch('/api/auth/passkey/verify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ challengeId: o.challengeId, credential }) });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error ?? 'Passkey sign-in failed');
+      if (data.mfaRequired) return setChallengeId(data.challengeId);
+      await validateSession();
+      router.replace(safeRedirect(data.mfaSetupRequired ? data.redirect : redirect));
+    } catch (x) {
+      setError(x instanceof DOMException && x.name === 'NotAllowedError' ? 'The passkey request was cancelled' : x instanceof Error ? x.message : String(x));
+    }
   };
 
   const submitCode = async (e: React.FormEvent) => {
@@ -121,6 +138,12 @@ function LoginForm() {
                 <Button type="submit" className="w-full" loading={isLoading}>
                   Sign in
                 </Button>
+                {passkeysSupported() && (
+                  <Button type="button" variant="outline" className="w-full" onClick={() => void signInWithPasskey()}>
+                    <Fingerprint size={14} className="mr-2" aria-hidden="true" />
+                    Sign in with a passkey
+                  </Button>
+                )}
                 <Link href="/reset-password" className="block text-center text-xs text-primary hover:underline">
                   Forgot your password?
                 </Link>

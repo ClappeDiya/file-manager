@@ -473,6 +473,24 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 17,
+    description: 'WebAuthn passkeys',
+    up(d) {
+      d.exec(`
+        CREATE TABLE passkeys (
+          credential_id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, public_key TEXT NOT NULL, alg INTEGER NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0,
+          transports TEXT NOT NULL DEFAULT '[]', aaguid TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_used_at TEXT
+        );
+        CREATE INDEX idx_passkeys_user ON passkeys(user_id);
+        CREATE TABLE webauthn_challenges (
+          id TEXT PRIMARY KEY, user_id TEXT, purpose TEXT NOT NULL, challenge TEXT NOT NULL,
+          created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT
+        );
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

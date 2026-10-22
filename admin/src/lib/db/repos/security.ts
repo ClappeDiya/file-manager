@@ -6,6 +6,7 @@
 import { db, hashToken, newToken, now, parseJson, type Row } from '../index';
 import { membershipsOf, OrgError } from './orgs';
 import type { UserRecord } from './users';
+import { hasPasskeys } from './passkeys';
 
 export interface SecuritySettings {
   /** Days before a console password must be changed (0 = never). */
@@ -52,6 +53,11 @@ export function mfaRequired(user: UserRecord, viaSso: boolean): boolean {
     .filter((s) => s.requireMfa);
   if (!requiring.length) return false;
   return !(viaSso && requiring.every((s) => s.ssoExemptFromMfa));
+}
+
+/** Required two-factor sign-in that the account has not set up (no TOTP, no passkey). */
+export function needsSecondFactorSetup(user: UserRecord, viaSso: boolean): boolean {
+  return !user.mfaEnabled && !hasPasskeys(user.id) && mfaRequired(user, viaSso);
 }
 
 export function passwordExpired(user: UserRecord, at = Date.now()): boolean {
