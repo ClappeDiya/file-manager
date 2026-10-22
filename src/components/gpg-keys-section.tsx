@@ -1,11 +1,84 @@
 /**
  * OpenPGP keys (Settings): the GnuPG keyring with expiry warnings,
- * importing keys (file or pasted) and copying a public key to share.
+ * creating a key pair, importing keys (file or pasted) and copying a
+ * public key to share.
  */
 import { useCallback, useEffect, useState } from "react";
 import { errorText } from "@/lib/error-text";
 import { isTauriAvailable, tauriInvoke } from "@/hooks/use-tauri";
-import { EXPIRY_WARNING_DAYS, daysToExpiry, gpg, type GpgKey, type GpgStatus } from "@/stores/gpg-store";
+import { EXPIRY_WARNING_DAYS, daysToExpiry, gpg, type GpgKey, type GpgStatus, type NewKey } from "@/stores/gpg-store";
+
+const input = "w-full rounded border border-gray-200 dark:border-gray-700 bg-transparent px-1 py-0.5";
+
+/** Create a key pair (Ed25519 by default) protected by a passphrase. */
+function GenerateKey({ onCreated }: { onCreated: (fingerprint: string) => void }) {
+  const [key, setKey] = useState<NewKey>({ name: "", email: "", algorithm: "ed25519", expires: "2y" });
+  const [pass, setPass] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const set = (patch: Partial<NewKey>) => setKey((k) => ({ ...k, ...patch }));
+  const mismatch = pass !== confirm;
+  const create = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const fp = await gpg.generateKey(key, pass || null);
+      setPass("");
+      setConfirm("");
+      onCreated(fp);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <details className="rounded border border-gray-200 dark:border-gray-700 p-2">
+      <summary className="cursor-pointer font-medium">Create a key pair</summary>
+      <div className="mt-2 grid grid-cols-2 gap-2">
+        <label>
+          Name
+          <input className={input} value={key.name} onChange={(e) => set({ name: e.target.value })} />
+        </label>
+        <label>
+          E-mail
+          <input className={input} type="email" value={key.email} onChange={(e) => set({ email: e.target.value })} />
+        </label>
+        <label>
+          Type
+          <select className={input} value={key.algorithm} onChange={(e) => set({ algorithm: e.target.value as NewKey["algorithm"] })}>
+            <option value="ed25519">Ed25519 (recommended)</option>
+            <option value="rsa4096">RSA 4096 (older software)</option>
+          </select>
+        </label>
+        <label>
+          Expires
+          <select className={input} value={key.expires} onChange={(e) => set({ expires: e.target.value })}>
+            <option value="1y">in 1 year</option>
+            <option value="2y">in 2 years</option>
+            <option value="5y">in 5 years</option>
+            <option value="never">never</option>
+          </select>
+        </label>
+        <label>
+          Passphrase
+          <input className={input} type="password" autoComplete="new-password" value={pass} onChange={(e) => setPass(e.target.value)} />
+        </label>
+        <label>
+          Repeat passphrase
+          <input className={input} type="password" autoComplete="new-password" value={confirm} onChange={(e) => setConfirm(e.target.value)} />
+        </label>
+      </div>
+      {!pass && <p className="mt-1 text-amber-600">Without a passphrase, anyone who can read your keyring can use the key.</p>}
+      {mismatch && confirm && <p className="mt-1 text-red-500">The passphrases don&apos;t match.</p>}
+      {error && <p className="mt-1 text-red-500" role="alert">{error}</p>}
+      <button type="button" disabled={busy || mismatch || !key.name.trim() || !key.email.trim()} className="mt-2 px-2 py-1 rounded border border-gray-200 dark:border-gray-700 disabled:opacity-40" onClick={create}>
+        {busy ? "Creating…" : "Create key"}
+      </button>
+    </details>
+  );
+}
 
 function expiryText(k: GpgKey): { text: string; tone: string } {
   if (k.revoked) return { text: "revoked", tone: "text-red-500" };
@@ -93,6 +166,12 @@ export function GpgKeysSection() {
           })}
         </ul>
       )}
+      <GenerateKey
+        onCreated={async (fp) => {
+          setMsg(`Created key ${fp.slice(-16)}.`);
+          await load();
+        }}
+      />
       <div className="space-y-1">
         <label className="block text-gray-500" htmlFor="gpg-paste">Import a key (paste an armored block)</label>
         <textarea id="gpg-paste" rows={3} className="w-full font-mono rounded border border-gray-200 dark:border-gray-700 bg-transparent p-1" value={paste} onChange={(e) => setPaste(e.target.value)} placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----" />

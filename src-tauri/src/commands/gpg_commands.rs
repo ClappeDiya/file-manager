@@ -1,11 +1,13 @@
-//! OpenPGP file actions (encrypt, decrypt, sign, verify) and the keyring,
-//! through the user's GnuPG (`ufop_core::gpg`). Outputs are written next
-//! to their inputs under a free name; passphrases go to gpg on stdin.
+//! OpenPGP file actions (encrypt, decrypt, re-encrypt, sign, verify) and the
+//! keyring (import, export, generate), through the user's GnuPG
+//! (`ufop_core::gpg`). Outputs are written next to their inputs under a
+//! free name (re-encryption replaces the file); passphrases go to gpg on
+//! stdin.
 
 use crate::core::error::AppError;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use ufop_core::gpg::{opened_name, sealed_name, unique_path, EncryptOptions, Gpg, GpgKey, SignatureCheck};
+use ufop_core::gpg::{opened_name, sealed_name, unique_path, Decryption, EncryptOptions, Gpg, GpgKey, NewKey, SignatureCheck, NO_INTEGRITY};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GpgStatus {
@@ -21,6 +23,20 @@ pub struct GpgOutcome {
     pub output: Option<String>,
     pub signature: Option<SignatureCheck>,
     pub error: Option<String>,
+    /// Decrypted without integrity protection (a legacy file, allowed explicitly).
+    pub unprotected: bool,
+    /// Refused because it has no integrity protection; it can be decrypted anyway on request.
+    pub needs_unprotected: bool,
+}
+
+fn outcome(input: String, output: &Path, res: Result<Decryption, AppError>) -> GpgOutcome {
+    match res {
+        Ok(d) => GpgOutcome { input, output: Some(output.to_string_lossy().into()), signature: d.signature, error: None, unprotected: d.unprotected, needs_unprotected: false },
+        Err(e) => {
+            let error = e.user_message();
+            GpgOutcome { input, output: None, signature: None, needs_unprotected: error.contains(NO_INTEGRITY), error: Some(error), unprotected: false }
+        }
+    }
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce(Gpg) -> Result<T, AppError> + Send + 'static) -> Result<T, AppError> {
@@ -33,24 +49,25 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce(Gpg) -> Result<T, AppError> 
 fn each(
     inputs: Vec<String>,
     name: impl Fn(&Path) -> PathBuf,
-    op: impl Fn(&Path, &Path) -> Result<Option<SignatureCheck>, AppError>,
+    op: impl Fn(&Path, &Path) -> Result<Decryption, AppError>,
 ) -> Vec<GpgOutcome> {
     inputs
         .into_iter()
         .map(|input| {
             let src = PathBuf::from(&input);
-            let out = unique_path(&name(&src));
+            let out = name(&src);
             let res = if !src.is_file() {
                 Err(AppError::validation(format!("Not a file: {input}")))
             } else {
                 super::policy_commands::enforce_path(&out).and_then(|_| op(&src, &out))
             };
-            match res {
-                Ok(signature) => GpgOutcome { input, output: Some(out.to_string_lossy().into()), signature, error: None },
-                Err(e) => GpgOutcome { input, output: None, signature: None, error: Some(e.user_message()) },
-            }
+            outcome(input, &out, res)
         })
         .collect()
+}
+
+fn unsigned(r: Result<(), AppError>) -> Result<Decryption, AppError> {
+    r.map(|_| Decryption::default())
 }
 
 #[tauri::command]
@@ -92,15 +109,39 @@ pub async fn gpg_export_public(key: String) -> Result<String, AppError> {
 pub async fn gpg_encrypt_files(paths: Vec<String>, options: EncryptOptions, passphrase: Option<String>) -> Result<Vec<GpgOutcome>, AppError> {
     blocking(move |g| {
         let armor = options.armor;
-        Ok(each(paths, |p| sealed_name(p, armor, false), |src, out| g.encrypt_file(src, out, &options, passphrase.as_deref()).map(|_| None)))
+        Ok(each(paths, |p| unique_path(&sealed_name(p, armor, false)), |src, out| unsigned(g.encrypt_file(src, out, &options, passphrase.as_deref()))))
     })
     .await
 }
 
 #[tauri::command]
-pub async fn gpg_decrypt_files(paths: Vec<String>, passphrase: Option<String>) -> Result<Vec<GpgOutcome>, AppError> {
-    blocking(move |g| Ok(each(paths, opened_name, |src, out| g.decrypt_file(src, out, passphrase.as_deref()))))
+pub async fn gpg_decrypt_files(paths: Vec<String>, passphrase: Option<String>, allow_unprotected: Option<bool>) -> Result<Vec<GpgOutcome>, AppError> {
+    let allow = allow_unprotected.unwrap_or(false);
+    blocking(move |g| Ok(each(paths, |p| unique_path(&opened_name(p)), |src, out| g.decrypt_file_with(src, out, passphrase.as_deref(), allow))))
         .await
+}
+
+/// Re-encrypt files in place for new recipients or a new passphrase,
+/// without writing their plaintext anywhere.
+#[tauri::command]
+pub async fn gpg_recrypt_files(
+    paths: Vec<String>,
+    options: EncryptOptions,
+    old_passphrase: Option<String>,
+    new_passphrase: Option<String>,
+    allow_unprotected: Option<bool>,
+) -> Result<Vec<GpgOutcome>, AppError> {
+    let allow = allow_unprotected.unwrap_or(false);
+    blocking(move |g| {
+        Ok(each(paths, Path::to_path_buf, |src, out| g.recrypt_file(src, out, &options, old_passphrase.as_deref(), new_passphrase.as_deref(), allow)))
+    })
+    .await
+}
+
+/// Create a key pair; returns its fingerprint.
+#[tauri::command]
+pub async fn gpg_generate_key(key: NewKey, passphrase: Option<String>) -> Result<String, AppError> {
+    blocking(move |g| g.generate_key(&key, passphrase.as_deref())).await
 }
 
 #[tauri::command]
@@ -114,8 +155,8 @@ pub async fn gpg_sign_files(
     blocking(move |g| {
         Ok(each(
             paths,
-            |p| sealed_name(p, armor, detached),
-            |src, out| g.sign_file(src, out, key.as_deref(), detached, armor, passphrase.as_deref()).map(|_| None),
+            |p| unique_path(&sealed_name(p, armor, detached)),
+            |src, out| unsigned(g.sign_file(src, out, key.as_deref(), detached, armor, passphrase.as_deref())),
         ))
     })
     .await
@@ -166,14 +207,20 @@ mod tests {
         let s = |p: &Path| p.to_string_lossy().to_string();
         let out = each(
             vec![s(&f), s(&d.path().join("missing.txt"))],
-            |p| sealed_name(p, false, false),
+            |p| unique_path(&sealed_name(p, false, false)),
             |_, out| {
                 std::fs::write(out, "sealed").unwrap();
-                Ok(None)
+                Ok(Decryption::default())
             },
         );
         assert_eq!(out[0].output.as_deref(), Some(s(&d.path().join("a.txt (2).gpg")).as_str()), "existing output kept");
         assert_eq!(std::fs::read_to_string(d.path().join("a.txt.gpg")).unwrap(), "existing");
         assert!(out[1].error.as_deref().unwrap().contains("Not a file"));
+        assert!(!out[1].needs_unprotected);
+        // A legacy-file refusal is flagged so the dialog can offer to decrypt anyway.
+        let refused = outcome("x.gpg".into(), Path::new("x"), Err(AppError::encryption(format!("{NO_INTEGRITY} (old)"), "")));
+        assert!(refused.needs_unprotected && refused.output.is_none());
+        let legacy = outcome("x.gpg".into(), Path::new("x"), Ok(Decryption { signature: None, unprotected: true }));
+        assert!(legacy.unprotected && legacy.output.as_deref() == Some("x"));
     }
 }

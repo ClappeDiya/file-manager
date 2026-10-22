@@ -6,9 +6,8 @@
 //! - **recipients**: `gpg --encrypt -r <key>…`. Restores need the matching
 //!   secret key in the keyring; the passphrase, if given, unlocks it.
 //!
-//! Plaintext only touches disk while sealing a volume in symmetric mode
-//! (stdin carries the passphrase there), in a private temporary file that is
-//! removed straight away.
+//! Volumes never touch disk in plaintext: when a passphrase is needed it is
+//! the first line on gpg's stdin and the data follows.
 
 use super::modules::EncryptionModule;
 use crate::error::AppError;
@@ -44,34 +43,9 @@ impl GpgModule {
         Gpg::run(c, stdin, what)
     }
 
-    /// Private temporary file holding `data`; removed when dropped.
-    fn temp_file(data: &[u8]) -> Result<TempFile, AppError> {
-        let dir = std::env::temp_dir().join(format!("ufop-gpg-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-        let path = dir.join("data");
-        std::fs::write(&path, data)?;
-        Ok(TempFile { dir, path })
-    }
-
     /// `gpg --version` first line (diagnostics).
     pub fn version(&self) -> Result<String, AppError> {
         self.gpg().version()
-    }
-}
-
-struct TempFile {
-    dir: std::path::PathBuf,
-    path: std::path::PathBuf,
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -90,24 +64,18 @@ impl EncryptionModule for GpgModule {
             c.args(["--output", "-"]);
             return Self::run(c, plain.to_vec(), "encryption");
         }
-        let pass = self.with_pass(&mut c).ok_or_else(|| AppError::validation("GPG symmetric encryption needs a passphrase (or set recipients)"))?;
-        let tmp = Self::temp_file(plain)?;
-        c.args(["--symmetric", "--cipher-algo", "AES256", "--s2k-digest-algo", "SHA512", "--s2k-count", "65011712", "--output", "-"]).arg(&tmp.path);
-        Self::run(c, pass, "encryption")
+        let mut stdin = self.with_pass(&mut c).ok_or_else(|| AppError::validation("GPG symmetric encryption needs a passphrase (or set recipients)"))?;
+        stdin.extend_from_slice(plain);
+        c.args(["--symmetric", "--cipher-algo", "AES256", "--s2k-digest-algo", "SHA512", "--s2k-count", "65011712", "--output", "-"]);
+        Self::run(c, stdin, "encryption")
     }
 
     fn open(&self, sealed: &[u8]) -> Result<Vec<u8>, AppError> {
         let mut c = self.command();
-        let stdin = self.with_pass(&mut c);
+        let mut stdin = self.with_pass(&mut c).unwrap_or_default();
+        stdin.extend_from_slice(sealed);
         c.args(["--decrypt", "--output", "-"]);
-        match stdin {
-            Some(pass) => {
-                let tmp = Self::temp_file(sealed)?;
-                c.arg(&tmp.path);
-                Self::run(c, pass, "decryption")
-            }
-            None => Self::run(c, sealed.to_vec(), "decryption"),
-        }
+        Self::run(c, stdin, "decryption")
     }
 }
 

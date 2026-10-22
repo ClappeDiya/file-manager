@@ -36,6 +36,20 @@ export interface GpgOutcome {
   output: string | null;
   signature: SignatureCheck | null;
   error: string | null;
+  /** Decrypted without integrity protection (a legacy file, allowed explicitly). */
+  unprotected: boolean;
+  /** Refused for lacking integrity protection; can be decrypted anyway. */
+  needs_unprotected: boolean;
+}
+
+export type KeyAlgorithm = "ed25519" | "rsa4096";
+
+export interface NewKey {
+  name: string;
+  email: string;
+  algorithm: KeyAlgorithm;
+  /** `2y`, `90d`, `2030-12-31` or `never`. */
+  expires: string;
 }
 
 export interface GpgStatus {
@@ -50,7 +64,7 @@ export interface EncryptOptions {
   sign_with: string | null;
 }
 
-export type GpgMode = "encrypt" | "decrypt" | "sign" | "verify";
+export type GpgMode = "encrypt" | "decrypt" | "recrypt" | "sign" | "verify";
 
 export const gpg = {
   status: () => tauriInvoke<GpgStatus>("gpg_status"),
@@ -58,7 +72,10 @@ export const gpg = {
   importKeys: (src: { path?: string; text?: string }) => tauriInvoke<number>("gpg_import_keys", { path: src.path ?? null, text: src.text ?? null }),
   exportPublic: (key: string) => tauriInvoke<string>("gpg_export_public", { key }),
   encrypt: (paths: string[], options: EncryptOptions, passphrase: string | null) => tauriInvoke<GpgOutcome[]>("gpg_encrypt_files", { paths, options, passphrase }),
-  decrypt: (paths: string[], passphrase: string | null) => tauriInvoke<GpgOutcome[]>("gpg_decrypt_files", { paths, passphrase }),
+  decrypt: (paths: string[], passphrase: string | null, allowUnprotected = false) => tauriInvoke<GpgOutcome[]>("gpg_decrypt_files", { paths, passphrase, allowUnprotected }),
+  recrypt: (paths: string[], options: EncryptOptions, oldPassphrase: string | null, newPassphrase: string | null, allowUnprotected = false) =>
+    tauriInvoke<GpgOutcome[]>("gpg_recrypt_files", { paths, options, oldPassphrase, newPassphrase, allowUnprotected }),
+  generateKey: (key: NewKey, passphrase: string | null) => tauriInvoke<string>("gpg_generate_key", { key, passphrase }),
   sign: (paths: string[], key: string | null, detached: boolean, armor: boolean, passphrase: string | null) =>
     tauriInvoke<GpgOutcome[]>("gpg_sign_files", { paths, key, detached, armor, passphrase }),
   verify: (path: string) => tauriInvoke<SignatureCheck>("gpg_verify", { path }),

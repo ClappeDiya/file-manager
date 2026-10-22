@@ -518,6 +518,15 @@ Define organizational policies for encryption:
 
 ---
 
+## OpenPGP (GPG)
+
+With GnuPG installed, files can be encrypted (to keys or with a passphrase), decrypted, signed and verified from the context menu; outputs are written next to the originals under free names.
+
+- **Re-encrypt** (Advanced, on `.gpg`/`.pgp`/`.asc` files) changes who can open a file — other keys, or a new passphrase — in place. The file is decrypted in memory (up to 512 MB) and written again; no unencrypted copy is created, and a failure leaves the file unchanged.
+- **Legacy files** made without integrity protection (common before 2003) are refused, because changes to them can't be detected. *Decrypt anyway* opens them when you trust the source, and the result says it was unprotected. Re-encrypting such a file produces a protected one.
+- **Create a key pair** in Settings → OpenPGP Keys: Ed25519 (recommended) or RSA 4096, with an expiry and a passphrase; both can sign and encrypt.
+- Passphrases go to gpg on its input, never on the command line, and plaintext is never written to a temporary file.
+
 ## Cross-Platform Compatibility
 
 UFOP includes a compatibility engine that helps files work across macOS, Windows, Linux, and cloud services.

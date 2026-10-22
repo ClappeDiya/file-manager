@@ -280,7 +280,7 @@ export function getFileContextMenuItems(options: {
   onCopyToMany?: () => void;
   /** OpenPGP actions on the selected files; `gpgDecrypt` / `gpgVerify`
    *  say whether the selection looks encrypted / like signatures. */
-  onGpg?: (mode: "encrypt" | "decrypt" | "sign" | "verify") => void;
+  onGpg?: (mode: "encrypt" | "decrypt" | "recrypt" | "sign" | "verify") => void;
   gpgDecrypt?: boolean;
   gpgVerify?: boolean;
   onPaste: () => void;
@@ -611,6 +611,7 @@ export function getFileContextMenuItems(options: {
       const gpg = options.onGpg;
       items.push({ id: "gpg-encrypt", label: "Encrypt with GPG…", icon: <Lock className="h-3.5 w-3.5" />, advancedOnly: true, action: () => gpg("encrypt") });
       if (options.gpgDecrypt) items.push({ id: "gpg-decrypt", label: "Decrypt with GPG…", icon: <Lock className="h-3.5 w-3.5" />, action: () => gpg("decrypt") });
+      if (options.gpgDecrypt) items.push({ id: "gpg-recrypt", label: "Re-encrypt with GPG…", icon: <Lock className="h-3.5 w-3.5" />, advancedOnly: true, action: () => gpg("recrypt") });
       items.push({ id: "gpg-sign", label: "Sign with GPG…", icon: <Lock className="h-3.5 w-3.5" />, advancedOnly: true, action: () => gpg("sign") });
       if (options.gpgVerify) items.push({ id: "gpg-verify", label: "Verify Signature", icon: <Lock className="h-3.5 w-3.5" />, action: () => gpg("verify") });
     }

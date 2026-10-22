@@ -7,7 +7,7 @@ You choose the method when the backup is created (**Options → Encryption metho
 | Method | Key | Volume names | Notes |
 |---|---|---|---|
 | AES-256-GCM (default) | Argon2id from the passphrase | `….aes` | The Argon2id cost is stored in the header. |
-| GPG, symmetric | the passphrase (`gpg --symmetric --cipher-algo AES256`) | `….gpg` | Needs GnuPG. The passphrase goes to gpg on stdin, never on the command line. `--no-symkey-cache` stops gpg-agent from accepting a cached key. |
+| GPG, symmetric | the passphrase (`gpg --symmetric --cipher-algo AES256`) | `….gpg` | Needs GnuPG. The passphrase goes to gpg on stdin, never on the command line. `--no-symkey-cache` stops gpg-agent from accepting a cached key. Volumes never touch disk unencrypted: the passphrase is the first line on stdin and the volume follows. |
 | GPG, recipients | public keys (`--gpg-recipient`) | `….gpg` | Backups need no passphrase. Restores need the secret key in the keyring. |
 
 AES and symmetric GPG backups carry a key check, so a wrong passphrase is rejected before any work starts.

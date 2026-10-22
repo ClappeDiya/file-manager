@@ -898,6 +898,8 @@ pub fn run() {
             commands::gpg_commands::gpg_export_public,
             commands::gpg_commands::gpg_encrypt_files,
             commands::gpg_commands::gpg_decrypt_files,
+            commands::gpg_commands::gpg_recrypt_files,
+            commands::gpg_commands::gpg_generate_key,
             commands::gpg_commands::gpg_sign_files,
             commands::gpg_commands::gpg_verify,
             commands::share_commands::sharing_policy_get,

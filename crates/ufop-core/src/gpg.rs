@@ -1,6 +1,12 @@
 //! OpenPGP through the `gpg` executable: running it safely (batch mode,
 //! passphrases on stdin, never argv), the user's keys with their expiry,
-//! and file-level encrypt / decrypt / sign / verify.
+//! and file-level encrypt / decrypt / sign / verify, re-encryption in
+//! memory, legacy (no integrity protection) files on request, and key
+//! generation.
+//!
+//! Plaintext never goes to a temporary file: when gpg needs both a
+//! passphrase and data on stdin, the passphrase is the first line
+//! (`--passphrase-fd 0` reads exactly one line) and the data follows.
 //!
 //! Used by the file manager's GPG actions and by the backup engine's GPG
 //! volume cipher (`backup::gpg`).
@@ -61,6 +67,58 @@ pub struct SignatureCheck {
     /// The public key needed to check it isn't in the keyring.
     pub missing_key: bool,
     pub message: String,
+}
+
+/// Decrypting refused a file without integrity protection.
+pub const NO_INTEGRITY: &str = "This file was encrypted without integrity protection";
+
+/// Largest file [`Gpg::recrypt_file`] re-encrypts in memory.
+pub const MAX_RECRYPT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Outcome of a decryption.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Decryption {
+    /// The embedded signature, if the file was signed.
+    pub signature: Option<SignatureCheck>,
+    /// Decrypted although it had no integrity protection (allowed explicitly).
+    pub unprotected: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyAlgorithm {
+    /// Ed25519 signing key with a Curve25519 encryption subkey.
+    #[default]
+    Ed25519,
+    /// RSA 4096 signing key with an RSA 4096 encryption subkey (for older software).
+    Rsa4096,
+}
+
+/// A key pair to generate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NewKey {
+    pub name: String,
+    pub email: String,
+    #[serde(default)]
+    pub algorithm: KeyAlgorithm,
+    /// `2y`, `90d`, `2030-12-31`, `never`; empty = 2 years.
+    #[serde(default)]
+    pub expires: String,
+}
+
+impl NewKey {
+    /// `Name <email>`, checked.
+    fn user_id(&self) -> Result<String, AppError> {
+        let (name, email) = (self.name.trim(), self.email.trim());
+        if name.is_empty() || name.chars().count() > 100 || name.contains(['<', '>', '\n', '\r']) {
+            return Err(AppError::validation("Enter a name (up to 100 characters, without < or >)"));
+        }
+        let at = email.find('@').unwrap_or(0);
+        if at == 0 || at + 1 >= email.len() || email.contains(|c: char| c.is_whitespace() || c == '<' || c == '>') || email.len() > 254 {
+            return Err(AppError::validation("Enter an e-mail address like name@example.com"));
+        }
+        Ok(format!("{name} <{email}>"))
+    }
 }
 
 /// Options for encrypting a file.
@@ -142,7 +200,16 @@ impl Gpg {
     }
 
     /// Run gpg; returns (stdout, stderr) on success.
-    pub(crate) fn run_full(mut c: Command, stdin: Vec<u8>, what: &str) -> Result<(Vec<u8>, String), AppError> {
+    pub(crate) fn run_full(c: Command, stdin: Vec<u8>, what: &str) -> Result<(Vec<u8>, String), AppError> {
+        let (ok, out, stderr) = Self::exec(c, stdin)?;
+        if !ok {
+            return Err(gpg_err(format!("gpg {what} failed: {}", last_reason(&stderr))));
+        }
+        Ok((out, stderr))
+    }
+
+    /// Run gpg; returns (success, stdout, stderr).
+    fn exec(mut c: Command, stdin: Vec<u8>) -> Result<(bool, Vec<u8>, String), AppError> {
         c.stdin(Stdio::piped());
         let mut child = c.spawn().map_err(|e| gpg_err(format!("Could not start gpg: {e}")))?;
         let mut sin = child.stdin.take().ok_or_else(|| gpg_err("gpg stdin unavailable".into()))?;
@@ -154,11 +221,7 @@ impl Gpg {
         });
         let out = child.wait_with_output().map_err(|e| gpg_err(format!("gpg failed: {e}")))?;
         let _ = writer.join();
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        if !out.status.success() {
-            return Err(gpg_err(format!("gpg {what} failed: {}", last_reason(&stderr))));
-        }
-        Ok((out.stdout, stderr))
+        Ok((out.status.success(), out.stdout, String::from_utf8_lossy(&out.stderr).to_string()))
     }
 
     pub(crate) fn run(c: Command, stdin: Vec<u8>, what: &str) -> Result<Vec<u8>, AppError> {
@@ -213,6 +276,21 @@ impl Gpg {
     }
 
     pub fn encrypt_file(&self, input: &Path, output: &Path, opts: &EncryptOptions, passphrase: Option<&str>) -> Result<(), AppError> {
+        let (mut c, stdin) = self.encrypt_command(opts, passphrase)?;
+        c.arg("--output").arg(output).arg(input);
+        Self::run(c, stdin, "encryption").map(|_| ())
+    }
+
+    /// Encrypt `plain` in memory (it goes to gpg on stdin, after the passphrase line when there is one).
+    pub fn encrypt_bytes(&self, plain: &[u8], opts: &EncryptOptions, passphrase: Option<&str>) -> Result<Vec<u8>, AppError> {
+        let (mut c, mut stdin) = self.encrypt_command(opts, passphrase)?;
+        c.args(["--output", "-"]);
+        stdin.extend_from_slice(plain);
+        Self::run(c, stdin, "encryption")
+    }
+
+    /// The encryption command and the passphrase line it reads from stdin.
+    fn encrypt_command(&self, opts: &EncryptOptions, passphrase: Option<&str>) -> Result<(Command, Vec<u8>), AppError> {
         let mut c = self.command();
         let stdin = if opts.recipients.is_empty() {
             let pass = Self::with_pass(&mut c, passphrase).ok_or_else(|| AppError::validation("Choose recipients, or enter a passphrase to encrypt with"))?;
@@ -234,20 +312,125 @@ impl Gpg {
         if opts.armor {
             c.arg("--armor");
         }
-        c.arg("--output").arg(output).arg(input);
-        Self::run(c, stdin, "encryption").map(|_| ())
+        Ok((c, stdin))
     }
 
     /// Decrypt `input` to `output`; reports the embedded signature, if any.
+    /// Files without integrity protection are refused (see [`Gpg::decrypt_file_with`]).
     pub fn decrypt_file(&self, input: &Path, output: &Path, passphrase: Option<&str>) -> Result<Option<SignatureCheck>, AppError> {
+        self.decrypt_file_with(input, output, passphrase, false).map(|d| d.signature)
+    }
+
+    /// Decrypt `input` to `output`. A legacy file without integrity
+    /// protection (no MDC, typical before 2003) is refused with
+    /// [`NO_INTEGRITY`] unless `allow_unprotected`; then it decrypts and
+    /// the result says so.
+    pub fn decrypt_file_with(&self, input: &Path, output: &Path, passphrase: Option<&str>, allow_unprotected: bool) -> Result<Decryption, AppError> {
+        let (mut c, stdin) = self.decrypt_command(passphrase, allow_unprotected);
+        c.arg("--output").arg(output).arg(input);
+        Self::decryption(c, stdin).map(|(_, d)| d).inspect_err(|_| {
+            let _ = std::fs::remove_file(output);
+        })
+    }
+
+    /// Decrypt `sealed` in memory.
+    pub fn decrypt_bytes(&self, sealed: &[u8], passphrase: Option<&str>, allow_unprotected: bool) -> Result<(Vec<u8>, Decryption), AppError> {
+        let (mut c, mut stdin) = self.decrypt_command(passphrase, allow_unprotected);
+        c.args(["--output", "-"]);
+        stdin.extend_from_slice(sealed);
+        Self::decryption(c, stdin)
+    }
+
+    fn decrypt_command(&self, passphrase: Option<&str>, allow_unprotected: bool) -> (Command, Vec<u8>) {
         let mut c = self.command();
         let stdin = Self::with_pass(&mut c, passphrase).unwrap_or_default();
-        c.args(["--status-fd", "2", "--decrypt", "--output"]).arg(output).arg(input);
-        let (_, err) = Self::run_full(c, stdin, "decryption").inspect_err(|_| {
-            let _ = std::fs::remove_file(output);
-        })?;
+        if allow_unprotected {
+            c.arg("--ignore-mdc-error");
+        }
+        c.args(["--status-fd", "2", "--decrypt"]);
+        (c, stdin)
+    }
+
+    fn decryption(c: Command, stdin: Vec<u8>) -> Result<(Vec<u8>, Decryption), AppError> {
+        let (ok, out, err) = Self::exec(c, stdin)?;
+        if !ok {
+            if err.lines().any(|l| l.starts_with("[GNUPG:] ERROR nomdc_with_legacy_cipher")) {
+                return Err(AppError::encryption(
+                    format!("{NO_INTEGRITY} (an old OpenPGP format), so changes to it can't be detected"),
+                    "If you trust where the file came from (files made before 2003 often look like this), decrypt it anyway.",
+                ));
+            }
+            return Err(gpg_err(format!("gpg decryption failed: {}", last_reason(&err))));
+        }
         let check = parse_status(&err);
-        Ok((check.valid || check.key_id.is_some() || check.missing_key).then_some(check))
+        // `DECRYPTION_INFO <mdc> <cipher> [<aead>]`: neither MDC nor AEAD means no integrity protection.
+        let unprotected = err.lines().filter_map(|l| l.strip_prefix("[GNUPG:] DECRYPTION_INFO ")).any(|info| {
+            let f: Vec<&str> = info.split_whitespace().collect();
+            f.first() == Some(&"0") && f.get(2).map_or(true, |a| *a == "0")
+        });
+        let signature = (check.valid || check.key_id.is_some() || check.missing_key).then_some(check);
+        Ok((out, Decryption { signature, unprotected }))
+    }
+
+    /// Re-encrypt `input` for new recipients or a new passphrase, writing
+    /// `output` (which may be `input`) atomically. The plaintext stays in
+    /// memory (files up to [`MAX_RECRYPT_BYTES`]) and is wiped afterwards.
+    pub fn recrypt_file(&self, input: &Path, output: &Path, opts: &EncryptOptions, old_passphrase: Option<&str>, new_passphrase: Option<&str>, allow_unprotected: bool) -> Result<Decryption, AppError> {
+        let len = std::fs::metadata(input).map_err(|e| AppError::file_op(format!("Cannot read {}: {e}", input.display()), "Check the file"))?.len();
+        if len > MAX_RECRYPT_BYTES {
+            return Err(AppError::validation(format!("{} is larger than {} MB; decrypt and encrypt it in two steps instead", input.display(), MAX_RECRYPT_BYTES / 1024 / 1024)));
+        }
+        let sealed = std::fs::read(input).map_err(|e| AppError::file_op(format!("Cannot read {}: {e}", input.display()), "Check the file"))?;
+        let (mut plain, d) = self.decrypt_bytes(&sealed, old_passphrase, allow_unprotected)?;
+        let resealed = self.encrypt_bytes(&plain, opts, new_passphrase);
+        plain.fill(0);
+        let resealed = resealed?;
+        let name = output.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let tmp = output.with_file_name(format!(".{name}.{}.ufop-tmp", uuid::Uuid::new_v4().simple()));
+        let write = std::fs::write(&tmp, &resealed).and_then(|_| std::fs::rename(&tmp, output));
+        if let Err(e) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(AppError::file_op(format!("Cannot write {}: {e}", output.display()), "Check free space and permissions"));
+        }
+        Ok(d)
+    }
+
+    /// Create a key pair that can sign and encrypt; returns its fingerprint.
+    /// Without a passphrase the secret key is stored unprotected.
+    pub fn generate_key(&self, key: &NewKey, passphrase: Option<&str>) -> Result<String, AppError> {
+        let uid = key.user_id()?;
+        let expires = key.expires.trim().to_lowercase();
+        let expires = if expires.is_empty() { "2y".to_string() } else { expires };
+        if !regex::Regex::new(r"^(never|\d{1,4}[dwmy]?|\d{4}-\d{2}-\d{2})$").expect("static pattern").is_match(&expires) {
+            return Err(AppError::validation("Expiry is a number of days, weeks, months or years (e.g. 2y), a date (YYYY-MM-DD) or never"));
+        }
+        let (algo, usage) = match key.algorithm {
+            KeyAlgorithm::Ed25519 => ("future-default", "default"),
+            KeyAlgorithm::Rsa4096 => ("rsa4096", "cert,sign"),
+        };
+        let gen = |args: &[&str]| -> Result<String, AppError> {
+            let mut c = self.command();
+            let stdin = match Self::with_pass(&mut c, passphrase) {
+                Some(p) => p,
+                None => {
+                    c.args(["--pinentry-mode", "loopback", "--passphrase", ""]);
+                    Vec::new()
+                }
+            };
+            c.args(["--status-fd", "2"]).args(args);
+            Self::run_full(c, stdin, "key generation").map(|(_, err)| err)
+        };
+        let err = gen(&["--quick-generate-key", &uid, algo, usage, &expires])?;
+        let fingerprint = err
+            .lines()
+            .find_map(|l| l.strip_prefix("[GNUPG:] KEY_CREATED "))
+            .and_then(|r| r.split_whitespace().nth(1))
+            .map(str::to_string)
+            .ok_or_else(|| gpg_err("gpg did not report the new key".into()))?;
+        if key.algorithm == KeyAlgorithm::Rsa4096 {
+            gen(&["--quick-add-key", &fingerprint, "rsa4096", "encr", &expires])?;
+        }
+        Ok(fingerprint)
     }
 
     /// Sign `input`: detached signature (`.sig`/`.asc`) or a signed copy.
@@ -536,5 +719,75 @@ uid:e::::1500000000::H3::Expired Key \\x3a test::::::::::0:
         assert!(other.verify(&sigf, Some(&plain)).unwrap().valid);
         assert!(other.list_keys().unwrap().iter().all(|k| !k.secret));
         assert!(other.export_public("nobody@nowhere.invalid").is_err());
+    }
+
+    #[test]
+    fn legacy_files_recrypt_in_memory_and_generated_keys() {
+        if !gpg_available() {
+            return;
+        }
+        let (_home, g) = keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("old.txt");
+        std::fs::write(&plain, "from 1999").unwrap();
+
+        // A legacy message without integrity protection (no MDC).
+        let legacy = dir.path().join("old.txt.gpg");
+        let mut c = g.command();
+        let pass = Gpg::with_pass(&mut c, Some("pw")).unwrap();
+        c.args(["--rfc2440", "--symmetric", "--output"]).arg(&legacy).arg(&plain);
+        Gpg::run(c, pass, "legacy").unwrap();
+        let out = dir.path().join("out.txt");
+        let refused = g.decrypt_file(&legacy, &out, Some("pw")).unwrap_err();
+        assert!(refused.user_message().contains(NO_INTEGRITY), "{}", refused.user_message());
+        assert!(!out.exists(), "the refused plaintext is removed");
+        let d = g.decrypt_file_with(&legacy, &out, Some("pw"), true).unwrap();
+        assert!(d.unprotected);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "from 1999");
+        // Modern files are protected.
+        let modern = dir.path().join("new.gpg");
+        g.encrypt_file(&plain, &modern, &EncryptOptions::default(), Some("pw")).unwrap();
+        assert!(!g.decrypt_file_with(&modern, &dir.path().join("n.txt"), Some("pw"), true).unwrap().unprotected);
+
+        // In memory, with the passphrase line ahead of the data (binary data with newlines included).
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let sealed = g.encrypt_bytes(&data, &EncryptOptions::default(), Some("line one")).unwrap();
+        assert_eq!(g.decrypt_bytes(&sealed, Some("line one"), false).unwrap().0, data);
+        assert!(g.decrypt_bytes(&sealed, Some("line two"), false).is_err());
+
+        // Generated keys: Ed25519 with a passphrase, RSA without.
+        let bad = |k: NewKey| g.generate_key(&k, None).unwrap_err().user_message();
+        assert!(bad(NewKey { name: "".into(), email: "a@b.c".into(), ..Default::default() }).contains("name"));
+        assert!(bad(NewKey { name: "A <x>".into(), email: "a@b.c".into(), ..Default::default() }).contains("name"));
+        assert!(bad(NewKey { name: "A".into(), email: "nobody".into(), ..Default::default() }).contains("e-mail"));
+        assert!(bad(NewKey { name: "A".into(), email: "a@b.c".into(), expires: "soon".into(), ..Default::default() }).contains("Expiry"));
+        let ed = g.generate_key(&NewKey { name: "Ed Example".into(), email: "ed@ufop.invalid".into(), expires: "1y".into(), ..Default::default() }, Some("keypass")).unwrap();
+        let rsa = g.generate_key(&NewKey { name: "Rsa Example".into(), email: "rsa@ufop.invalid".into(), algorithm: KeyAlgorithm::Rsa4096, expires: "never".into() }, None).unwrap();
+        let keys = g.list_keys().unwrap();
+        let find = |fp: &str| keys.iter().find(|k| k.fingerprint == fp).unwrap().clone();
+        let (ed_key, rsa_key) = (find(&ed), find(&rsa));
+        assert!(ed_key.secret && ed_key.can_sign && ed_key.can_encrypt && ed_key.expires.is_some(), "{ed_key:?}");
+        assert!(rsa_key.secret && rsa_key.can_sign && rsa_key.can_encrypt && rsa_key.expires.is_none(), "{rsa_key:?}");
+        assert_eq!(ed_key.user_ids, vec!["Ed Example <ed@ufop.invalid>"]);
+
+        // Recrypt in place: passphrase → key, then key → new passphrase; old secrets stop working.
+        let doc = dir.path().join("doc.gpg");
+        g.encrypt_file(&plain, &doc, &EncryptOptions::default(), Some("old")).unwrap();
+        let to_ed = EncryptOptions { recipients: vec![ed.clone()], ..Default::default() };
+        g.recrypt_file(&doc, &doc, &to_ed, Some("old"), None, false).unwrap();
+        assert!(g.decrypt_bytes(&std::fs::read(&doc).unwrap(), Some("old"), false).is_err());
+        assert_eq!(g.decrypt_bytes(&std::fs::read(&doc).unwrap(), Some("keypass"), false).unwrap().0, b"from 1999");
+        g.recrypt_file(&doc, &doc, &EncryptOptions::default(), Some("keypass"), Some("new"), false).unwrap();
+        assert_eq!(g.decrypt_bytes(&std::fs::read(&doc).unwrap(), Some("new"), false).unwrap().0, b"from 1999");
+        // A failed recrypt (wrong passphrase) leaves the file as it was, and no temporary files.
+        let before = std::fs::read(&doc).unwrap();
+        assert!(g.recrypt_file(&doc, &doc, &to_ed, Some("wrong"), None, false).is_err());
+        assert_eq!(std::fs::read(&doc).unwrap(), before);
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains("ufop-tmp")));
+        // Legacy files recrypt only when allowed, into a protected file.
+        let fresh = dir.path().join("fresh.gpg");
+        assert!(g.recrypt_file(&legacy, &fresh, &to_ed, Some("pw"), None, false).is_err());
+        assert!(g.recrypt_file(&legacy, &fresh, &to_ed, Some("pw"), None, true).unwrap().unprotected);
+        assert!(!g.decrypt_bytes(&std::fs::read(&fresh).unwrap(), Some("keypass"), false).unwrap().1.unprotected);
     }
 }
