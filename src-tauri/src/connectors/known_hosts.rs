@@ -212,21 +212,11 @@ fn load_store(path: &Path) -> HashMap<String, KnownHostEntry> {
     }
 }
 
-/// Atomic write: temp file + rename, owner-only permissions on Unix.
+/// Atomic, owner-only write of the store.
 fn save_store(path: &Path, entries: &HashMap<String, KnownHostEntry>) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     let mut list: Vec<&KnownHostEntry> = entries.values().collect();
     list.sort_by(|a, b| (&a.hostname, a.port, &a.key_type).cmp(&(&b.hostname, b.port, &b.key_type)));
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&list).map_err(std::io::Error::other)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(tmp, path)
+    ufop_core::fsutil::write_private_atomic(path, &serde_json::to_vec_pretty(&list).map_err(std::io::Error::other)?)
 }
 
 /// A key from an OpenSSH known_hosts file that applies to the queried host.

@@ -47,6 +47,19 @@ import { dispatchRefresh } from "@/lib/refresh-affected";
 import { TextEditor } from "./text-editor";
 import { errorText } from "@/lib/error-text";
 import { confirmText } from "@/lib/prompt-dialog";
+import { useUIStore } from "@/stores/ui-store";
+
+/** Mirrors `EditorDraft` in editor_draft_commands.rs. */
+export interface EditorDraft {
+  path: string;
+  content: string;
+  base_modified: string | null;
+  saved_at: string;
+}
+
+/** How long after the last keystroke a draft is written / autosave runs. */
+export const DRAFT_DEBOUNCE_MS = 1500;
+export const AUTOSAVE_MS = 3000;
 
 /** Shape of the `get_file_metadata` IPC response that this wrapper
  *  actually uses. The real `FileEntry` type carries more fields, but
@@ -143,6 +156,42 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
   useEffect(() => {
     dirtyRef.current = dirty;
   }, [dirty]);
+  // A draft left by an earlier session that differs from the file on
+  // disk; offered back with Restore / Discard until the user picks one.
+  const [recovered, setRecovered] = useState<EditorDraft | null>(null);
+  // The editor was remounted with the draft's text (starts dirty).
+  const [restored, setRestored] = useState(false);
+  const autosave = useUIStore((s) => s.editorAutosave);
+  const setAutosave = useUIStore((s) => s.setEditorAutosave);
+  const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const baselineRef = useRef<string | null>(null);
+  useEffect(() => {
+    baselineRef.current = baselineMtime;
+  }, [baselineMtime]);
+
+  const discardDraft = useCallback(() => {
+    if (draftTimer.current) clearTimeout(draftTimer.current);
+    draftTimer.current = null;
+    if (isTauriAvailable()) void tauriInvoke("editor_draft_discard", { path: filePath }).catch(() => {});
+  }, [filePath]);
+
+  // Keep a draft of unsaved edits (debounced) so a crash loses nothing.
+  const handleContentChange = useCallback(
+    (text: string) => {
+      if (!isTauriAvailable()) return;
+      if (draftTimer.current) clearTimeout(draftTimer.current);
+      draftTimer.current = setTimeout(() => {
+        draftTimer.current = null;
+        void tauriInvoke("editor_draft_save", { path: filePath, content: text, baseModified: baselineRef.current }).catch((err) =>
+          console.warn("[text-editor-modal] draft not saved:", err),
+        );
+      }, DRAFT_DEBOUNCE_MS);
+    },
+    [filePath],
+  );
+  useEffect(() => () => {
+    if (draftTimer.current) clearTimeout(draftTimer.current);
+  }, []);
 
   // Load file content on mount. Re-runs when `filePath` changes so the
   // parent can re-use the same modal instance for a different file if
@@ -155,6 +204,8 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
     setBaselineMtime(null);
     setPendingContent(null);
     setSaveError(null);
+    setRecovered(null);
+    setRestored(false);
 
     if (!isTauriAvailable()) {
       // Browser-mode fallback: render a placeholder so component
@@ -180,11 +231,14 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
         console.warn("[text-editor-modal] mtime baseline unavailable:", err);
         return { modified: null } as FileMetaPartial;
       }),
+      tauriInvoke<EditorDraft | null>("editor_draft_load", { path: filePath }).catch(() => null),
     ])
-      .then(([text, meta]) => {
+      .then(([text, meta, draft]) => {
         if (!cancelled) {
           setContent(text);
           setBaselineMtime(meta.modified);
+          if (draft && draft.content !== text) setRecovered(draft);
+          else if (draft) void tauriInvoke("editor_draft_discard", { path: filePath }).catch(() => {});
           setLoading(false);
         }
       })
@@ -235,8 +289,9 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
       // matches child paths against the pane's viewed directory
       // via prefix logic — see iter-18/19 helper semantics.
       dispatchRefresh([filePath]);
+      discardDraft();
     },
-    [filePath],
+    [filePath, discardDraft],
   );
 
   const handleSave = useCallback(
@@ -317,12 +372,27 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
       ]);
       setContent(text);
       setBaselineMtime(meta.modified);
+      setRestored(false);
+      discardDraft();
       setReloadCounter((n) => n + 1);
     } catch (err) {
       const msg = errorText(err);
       setSaveError(msg);
     }
-  }, [filePath]);
+  }, [filePath, discardDraft]);
+
+  const handleRestoreDraft = useCallback(() => {
+    if (!recovered) return;
+    setContent(recovered.content);
+    setRecovered(null);
+    setRestored(true);
+    setReloadCounter((n) => n + 1);
+  }, [recovered]);
+
+  const handleDiscardRecovered = useCallback(() => {
+    setRecovered(null);
+    discardDraft();
+  }, [discardDraft]);
 
   const handleDismissConflict = useCallback(() => {
     setPendingContent(null);
@@ -342,12 +412,15 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
       // confirm dialog resolves asynchronously and closes on accept.
       void confirmText("You have unsaved changes. Close without saving?", "Close")
         .then((ok) => {
-          if (ok) onClose();
+          if (ok) {
+            discardDraft();
+            onClose();
+          }
         });
       return;
     }
     onClose();
-  }, [onClose]);
+  }, [onClose, discardDraft]);
 
   if (loading) {
     return (
@@ -416,6 +489,26 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
           </div>
         </div>
       )}
+      {recovered && (
+        <div
+          className="px-3 py-2 text-xs bg-blue-500/10 text-blue-600 dark:text-blue-400 border-b border-blue-500/30 flex items-center gap-2 flex-wrap"
+          role="status"
+          aria-label="Recovered draft"
+        >
+          <span className="font-medium">
+            Unsaved changes from {new Date(recovered.saved_at).toLocaleString()} were recovered.
+            {recovered.base_modified && baselineMtime && recovered.base_modified !== baselineMtime && " The file has changed on disk since then."}
+          </span>
+          <div className="flex items-center gap-1 ml-auto">
+            <button onClick={handleRestoreDraft} className="px-2 py-0.5 rounded bg-blue-500 text-white hover:bg-blue-600">
+              Restore
+            </button>
+            <button onClick={handleDiscardRecovered} className="px-2 py-0.5 rounded border border-blue-500/50 hover:bg-blue-500/10">
+              Discard
+            </button>
+          </div>
+        </div>
+      )}
       {saveError && (
         <div className="px-3 py-2 text-xs bg-red-500/10 text-red-500 border-b border-red-500/30">
           Save failed: {saveError}
@@ -431,6 +524,15 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
           onSave={handleSave}
           onClose={handleClose}
           onDirtyChange={setDirty}
+          initialDirty={restored}
+          onContentChange={handleContentChange}
+          autosaveMs={autosave ? AUTOSAVE_MS : null}
+          toolbarExtra={
+            <label className="flex items-center gap-1 text-text-tertiary" title="Save automatically a few seconds after you stop typing">
+              <input type="checkbox" checked={autosave} onChange={(e) => setAutosave(e.target.checked)} />
+              Autosave
+            </label>
+          }
         />
       </div>
     </div>

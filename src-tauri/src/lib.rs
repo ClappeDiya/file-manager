@@ -810,6 +810,10 @@ pub fn run() {
             // File operations
             file_ops_commands::copy_files,
             file_ops_commands::copy_files_to_many,
+            commands::editor_draft_commands::editor_draft_save,
+            commands::editor_draft_commands::editor_draft_load,
+            commands::editor_draft_commands::editor_draft_discard,
+            commands::editor_draft_commands::editor_draft_list,
             file_ops_commands::move_files,
             file_ops_commands::rename_file,
             file_ops_commands::duplicate_files,
