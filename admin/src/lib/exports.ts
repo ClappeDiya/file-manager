@@ -13,7 +13,7 @@ import { listMachines } from './db/repos/machines';
 import { managedSubtree, OrgError } from './db/repos/orgs';
 import { exportAuditEntries } from './utils/audit-integrity';
 import { renderReport } from './report-catalog';
-import type { AuditEntry } from './types/audit';
+import { AUDIT_EVENT_CATEGORIES, type AuditEntry } from './types/audit';
 import type { Permission } from './types/auth';
 import { logger } from './utils/logger';
 
@@ -46,6 +46,7 @@ const auditQuery = (orgId: string, p: Record<string, string>): AuditQuery => ({
   untilSequence: Number(p.__until),
   ascending: true,
   eventType: p.eventType || undefined,
+  eventTypes: p.category ? (AUDIT_EVENT_CATEGORIES[p.category] ?? []) : undefined,
   severity: p.severity || undefined,
   userId: p.userId || undefined,
   from: p.dateFrom || undefined,

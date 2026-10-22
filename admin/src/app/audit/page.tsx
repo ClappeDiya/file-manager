@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   Download, Shield,
   AlertTriangle, Info, AlertOctagon,
@@ -15,7 +15,6 @@ import { Select } from '@/components/ui/select';
 import { SearchInput } from '@/components/ui/search-input';
 import { Tabs, TabContent } from '@/components/ui/tabs';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
-import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 import {
   type AuditEntry, type AuditSeverity,
   AUDIT_EVENT_CATEGORIES,
@@ -25,11 +24,10 @@ import type { AuditVerification } from '@/lib/db/repos/audit';
 import { SiemDialog } from '@/components/audit/siem-dialog';
 import { ApiRequestsLog } from '@/components/audit/api-requests';
 import { ExportsPanel } from '@/components/exports/exports-panel';
+import { DataTable, useServerTable, type Column } from '@/components/ui/data-table';
+import { useApi } from '@/lib/use-api';
 
 export default function AuditPage() {
-  const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState('explorer');
   const [searchQuery, setSearchQuery] = useState('');
   const [severityFilter, setSeverityFilter] = useState('');
@@ -43,28 +41,9 @@ export default function AuditPage() {
   const [verificationResult, setVerificationResult] = useState<string | null>(null);
 
 
-  useEffect(() => {
-    fetch('/api/audit')
-      .then((res) => {
-        if (!res.ok) throw new Error('Failed to fetch audit entries');
-        return res.json();
-      })
-      .then((data) => { setAuditEntries(data.entries || []); setLoading(false); })
-      .catch((err) => { setError(err instanceof Error ? err.message : String(err)); setLoading(false); });
-  }, []);
-
-  const filteredEntries = auditEntries.filter((entry) => {
-    const matchesSearch = !searchQuery ||
-      entry.description.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      entry.userName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      entry.eventType.toLowerCase().includes(searchQuery.toLowerCase());
-    const matchesSeverity = !severityFilter || entry.severity === severityFilter;
-    const matchesCategory = !categoryFilter ||
-      (AUDIT_EVENT_CATEGORIES[categoryFilter]?.includes(entry.eventType) ?? false);
-    const matchesDateFrom = !dateFrom || new Date(entry.timestamp) >= new Date(dateFrom);
-    const matchesDateTo = !dateTo || new Date(entry.timestamp) <= new Date(dateTo + 'T23:59:59Z');
-    return matchesSearch && matchesSeverity && matchesCategory && matchesDateFrom && matchesDateTo;
-  });
+  // The server filters and pages; nothing is filtered in the browser.
+  const table = useServerTable<AuditEntry>('audit', '/api/audit', 'entries', { search: searchQuery, severity: severityFilter, category: categoryFilter, dateFrom, dateTo });
+  const counts = useApi<{ counts: Record<string, number> }>(activeTab === 'categories' ? '/api/audit?view=counts' : null);
 
   const severityIcon = (severity: AuditSeverity) => {
     switch (severity) {
@@ -79,6 +58,7 @@ export default function AuditPage() {
     const p: Record<string, string> = {};
     if (searchQuery) p.search = searchQuery;
     if (severityFilter) p.severity = severityFilter;
+    if (categoryFilter) p.category = categoryFilter;
     if (dateFrom) p.dateFrom = dateFrom;
     if (dateTo) p.dateTo = dateTo;
     return p;
@@ -112,27 +92,17 @@ export default function AuditPage() {
     }
   };
 
-  if (loading) {
-    return (
-      <div>
-        <PageHeader title="Audit Log" description="Searchable, filterable audit trail" />
-        <div className="flex items-center justify-center py-20">
-          <div className="animate-spin h-8 w-8 border-4 border-primary border-t-transparent rounded-full" />
-        </div>
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div>
-        <PageHeader title="Audit Log" description="Searchable, filterable audit trail" />
-        <div className="rounded-md bg-error-bg border border-error/20 px-4 py-3 mt-4">
-          <p className="text-sm text-error">Error: {error}</p>
-        </div>
-      </div>
-    );
-  }
+  const auditColumns: Column<AuditEntry>[] = [
+    { key: 'severity', label: 'Severity', required: true, className: 'w-8', render: (e) => severityIcon(e.severity) },
+    { key: 'event', label: 'Event', required: true, render: (e) => <Badge variant="outline" className="text-xs font-mono">{e.eventType}</Badge> },
+    { key: 'user', label: 'User', render: (e) => <div><p className="text-sm">{e.userName}</p><p className="text-xs text-foreground-tertiary">{e.userEmail}</p></div> },
+    { key: 'description', label: 'Description', render: (e) => <p className="text-sm text-foreground max-w-xs truncate">{e.description}</p> },
+    { key: 'ip', label: 'IP', render: (e) => <span className="text-sm text-foreground-secondary font-mono">{e.ipAddress}</span> },
+    { key: 'resource', label: 'Resource', defaultHidden: true, render: (e) => <span className="text-xs font-mono">{e.resourceType ? `${e.resourceType} ${e.resourceId ?? ''}` : ''}</span> },
+    { key: 'sequence', label: '#', defaultHidden: true, render: (e) => <span className="text-xs font-mono">{(e as AuditEntry & { sequence?: number }).sequence}</span> },
+    { key: 'time', label: 'Time', render: (e) => <span className="text-sm text-foreground-secondary whitespace-nowrap" title={formatDateTime(e.timestamp)}>{formatRelativeTime(e.timestamp)}</span> },
+    { key: 'actions', label: 'Actions', required: true, className: 'w-20', render: (e) => <Button variant="ghost" size="sm" onClick={() => { setSelectedEntry(e); setShowDetailDialog(true); }}>Details</Button> },
+  ];
 
   return (
     <div>
@@ -171,7 +141,7 @@ export default function AuditPage() {
 
       <Tabs
         tabs={[
-          { id: 'explorer', label: 'Audit Explorer', count: auditEntries.length },
+          { id: 'explorer', label: 'Audit Explorer', count: table.pagination?.total ?? undefined },
           { id: 'categories', label: 'Event Categories' },
           { id: 'api', label: 'API requests' },
         ]}
@@ -224,64 +194,19 @@ export default function AuditPage() {
           </div>
 
           {/* Audit Entries Table */}
-          <Card padding="none">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-8"></TableHead>
-                  <TableHead>Event</TableHead>
-                  <TableHead className="hidden md:table-cell">User</TableHead>
-                  <TableHead>Description</TableHead>
-                  <TableHead className="hidden lg:table-cell">IP</TableHead>
-                  <TableHead>Time</TableHead>
-                  <TableHead className="w-20">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {filteredEntries.map((entry) => (
-                  <TableRow key={entry.id}>
-                    <TableCell>{severityIcon(entry.severity)}</TableCell>
-                    <TableCell>
-                      <Badge variant="outline" className="text-xs font-mono">
-                        {entry.eventType}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="hidden md:table-cell">
-                      <div>
-                        <p className="text-sm">{entry.userName}</p>
-                        <p className="text-xs text-foreground-tertiary">{entry.userEmail}</p>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <p className="text-sm text-foreground max-w-xs truncate">{entry.description}</p>
-                    </TableCell>
-                    <TableCell className="hidden lg:table-cell text-sm text-foreground-secondary font-mono">
-                      {entry.ipAddress}
-                    </TableCell>
-                    <TableCell className="text-sm text-foreground-secondary whitespace-nowrap">
-                      {formatRelativeTime(entry.timestamp)}
-                    </TableCell>
-                    <TableCell>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => { setSelectedEntry(entry); setShowDetailDialog(true); }}
-                      >
-                        Details
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
-                {filteredEntries.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={7} className="text-center py-8 text-foreground-secondary">
-                      No audit entries found
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-          </Card>
+          <DataTable
+            id="audit"
+            columns={auditColumns}
+            rows={table.rows}
+            rowKey={(e) => e.id}
+            loading={table.loading}
+            error={table.error}
+            empty="No audit entries found"
+            pagination={table.pagination}
+            limit={table.limit}
+            onLimit={table.setLimit}
+            onOffset={table.setOffset}
+          />
         </TabContent>
 
         <TabContent tabId="api" activeTab={activeTab}>
@@ -295,7 +220,7 @@ export default function AuditPage() {
                 <h3 className="text-sm font-semibold text-foreground mb-3">{category}</h3>
                 <div className="flex flex-wrap gap-2">
                   {events.map((event) => {
-                    const count = auditEntries.filter(e => e.eventType === event).length;
+                    const count = counts.data?.counts[event] ?? 0;
                     return (
                       <Badge key={event} variant={count > 0 ? 'info' : 'default'}>
                         {event} {count > 0 && `(${count})`}

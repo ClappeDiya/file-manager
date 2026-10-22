@@ -71,3 +71,18 @@ describe('paged routes', () => {
     expect(next.body.users).toHaveLength(2);
   });
 });
+
+describe('audit explorer filters on the server', () => {
+  it('finds entries beyond the first page (regression: the page filtered only the 50 it had loaded)', async () => {
+    const org = createOrg({ name: 'Filter org' });
+    const admin = makeUser('filter-admin@x.org', 'org_admin', org.id);
+    appendAudit({ eventType: 'admin.role_change', orgId: org.id, description: 'needle in the haystack' });
+    for (let i = 0; i < 120; i++) appendAudit({ eventType: 'machine.heartbeat', orgId: org.id, description: `hay ${i}` });
+    const found = await json<{ entries: { description: string }[]; total: number }>(await audit.GET(await req('GET', '/api/audit?search=needle', { as: admin })));
+    expect(found.body.entries.map((e) => e.description)).toEqual(['needle in the haystack']);
+    const admins = await json<{ entries: { eventType: string }[]; total: number }>(await audit.GET(await req('GET', '/api/audit?category=Admin', { as: admin })));
+    expect(admins.body.entries.map((e) => e.eventType)).toEqual(['admin.role_change']);
+    const counts = await json<{ counts: Record<string, number> }>(await audit.GET(await req('GET', '/api/audit?view=counts', { as: admin })));
+    expect(counts.body.counts).toMatchObject({ 'admin.role_change': 1, 'machine.heartbeat': 120 });
+  });
+});

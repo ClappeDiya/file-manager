@@ -2,23 +2,50 @@
 
 /** Audit → API requests: what scripts did with API tokens, and refused requests. */
 import React, { useState } from 'react';
-import { Card } from '@/components/ui/card';
 import { Select } from '@/components/ui/select';
-import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { ErrorBanner, Loading } from '@/components/fleet/badges';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { useApi } from '@/lib/use-api';
+import { DataTable, useServerTable, type Column } from '@/components/ui/data-table';
+import { ExportsPanel } from '@/components/exports/exports-panel';
 import { formatDateTime } from '@/lib/utils/format';
 import type { ApiRequest } from '@/lib/db/repos/api-log';
-import { ExportsPanel } from '@/components/exports/exports-panel';
 
-const PAGE = 50;
+const COLUMNS: Column<ApiRequest>[] = [
+  { key: 'at', label: 'Time', required: true, render: (r) => <span className="whitespace-nowrap text-xs">{formatDateTime(r.at)}</span> },
+  {
+    key: 'request',
+    label: 'Request',
+    required: true,
+    render: (r) => (
+      <span className="font-mono text-xs">
+        {r.method} {r.path}
+      </span>
+    ),
+  },
+  {
+    key: 'result',
+    label: 'Result',
+    render: (r) => (
+      <>
+        <Badge variant={r.status < 400 ? 'success' : 'error'}>{r.status}</Badge> <span className="text-xs">{r.outcome}</span>
+      </>
+    ),
+  },
+  {
+    key: 'who',
+    label: 'Who',
+    render: (r) => (
+      <span className="text-xs">
+        {r.userEmail || '—'} <span className="text-foreground-tertiary">· {r.auth === 'token' ? `token ${r.tokenId ?? 'unknown'}` : 'session'}</span>
+      </span>
+    ),
+  },
+  { key: 'ip', label: 'Address', render: (r) => <span className="text-xs">{r.ip}</span> },
+  { key: 'agent', label: 'Client', defaultHidden: true, render: (r) => <span className="text-xs text-foreground-tertiary">{r.userAgent}</span> },
+];
 
 export function ApiRequestsLog() {
   const [result, setResult] = useState('');
-  const [offset, setOffset] = useState(0);
-  const { data, error, loading } = useApi<{ requests: ApiRequest[]; total: number; keepDays: number }>(`/api/api-requests?limit=${PAGE}&offset=${offset}${result ? `&result=${result}` : ''}`);
+  const t = useServerTable<ApiRequest>('api-requests', '/api/api-requests', 'requests', { result });
   return (
     <div>
       <div className="mb-3 flex items-center gap-3">
@@ -29,13 +56,10 @@ export function ApiRequestsLog() {
             { value: 'refused', label: 'Refused' },
           ]}
           value={result}
-          onChange={(e) => {
-            setResult(e.target.value);
-            setOffset(0);
-          }}
+          onChange={(e) => setResult(e.target.value)}
           className="w-48"
         />
-        <span className="text-xs text-foreground-tertiary">Requests made with API tokens, and requests refused by the network rule. Kept {data?.keepDays ?? 30} days.</span>
+        <span className="text-xs text-foreground-tertiary">Requests made with API tokens, and requests refused by the network rule. Kept {String(t.data?.keepDays ?? 30)} days.</span>
       </div>
       <details className="mb-3">
         <summary className="cursor-pointer text-sm">Export all matching requests</summary>
@@ -43,63 +67,19 @@ export function ApiRequestsLog() {
           <ExportsPanel kind="api_requests" formats={['csv', 'json']} params={result ? { result } : {}} />
         </div>
       </details>
-      <ErrorBanner message={error} />
-      {loading && !data ? (
-        <Loading />
-      ) : (
-        <Card padding="none">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Time</TableHead>
-                <TableHead>Request</TableHead>
-                <TableHead>Result</TableHead>
-                <TableHead className="hidden md:table-cell">Who</TableHead>
-                <TableHead className="hidden lg:table-cell">From</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {data?.requests.map((r) => (
-                <TableRow key={r.id}>
-                  <TableCell className="whitespace-nowrap text-xs">{formatDateTime(r.at)}</TableCell>
-                  <TableCell className="font-mono text-xs">
-                    {r.method} {r.path}
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant={r.status < 400 ? 'success' : 'error'}>{r.status}</Badge> <span className="text-xs">{r.outcome}</span>
-                  </TableCell>
-                  <TableCell className="hidden text-xs md:table-cell">
-                    {r.userEmail || '—'} {r.auth === 'token' ? <span className="text-foreground-tertiary">· token {r.tokenId ?? 'unknown'}</span> : <span className="text-foreground-tertiary">· session</span>}
-                  </TableCell>
-                  <TableCell className="hidden text-xs lg:table-cell">
-                    {r.ip} <span className="text-foreground-tertiary">{r.userAgent.slice(0, 40)}</span>
-                  </TableCell>
-                </TableRow>
-              ))}
-              {data && !data.requests.length && (
-                <TableRow>
-                  <TableCell colSpan={5} className="py-8 text-center text-foreground-secondary">
-                    No API requests yet
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
-        </Card>
-      )}
-      {data && data.total > PAGE && (
-        <div className="mt-3 flex items-center gap-2 text-sm">
-          <Button size="sm" variant="outline" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE))}>
-            Newer
-          </Button>
-          <span>
-            {offset + 1}–{Math.min(offset + PAGE, data.total)} of {data.total}
-          </span>
-          <Button size="sm" variant="outline" disabled={offset + PAGE >= data.total} onClick={() => setOffset(offset + PAGE)}>
-            Older
-          </Button>
-        </div>
-      )}
+      <DataTable
+        id="api-requests"
+        columns={COLUMNS}
+        rows={t.rows}
+        rowKey={(r) => r.id}
+        loading={t.loading}
+        error={t.error}
+        empty="No API requests yet"
+        pagination={t.pagination}
+        limit={t.limit}
+        onLimit={t.setLimit}
+        onOffset={t.setOffset}
+      />
     </div>
   );
 }

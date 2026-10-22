@@ -142,6 +142,8 @@ export function appendAudit(e: AuditInput): AuditRecord {
 export interface AuditQuery {
   orgIds?: string[];
   eventType?: string;
+  /** Any of these event types (e.g. a category). */
+  eventTypes?: string[];
   /** Match every event type starting with this prefix, e.g. `ai.`. */
   eventPrefix?: string;
   severity?: string;
@@ -165,6 +167,7 @@ export function listAudit(q: AuditQuery = {}): { entries: AuditRecord[]; total: 
     args.push(...q.orgIds);
   }
   if (q.eventType) { where.push('event_type = ?'); args.push(q.eventType); }
+  if (q.eventTypes) { where.push(`event_type IN (${q.eventTypes.map(() => '?').join(',') || "''"})`); args.push(...q.eventTypes); }
   if (q.eventPrefix) { where.push("event_type LIKE ? ESCAPE '\\'"); args.push(`${q.eventPrefix.replace(/[\\%_]/g, (c) => `\\${c}`)}%`); }
   if (q.severity) { where.push('severity = ?'); args.push(q.severity); }
   if (q.userId) { where.push('user_id = ?'); args.push(q.userId); }
@@ -182,6 +185,13 @@ export function listAudit(q: AuditQuery = {}): { entries: AuditRecord[]; total: 
     .prepare(`SELECT * FROM audit_entries WHERE ${w} ORDER BY sequence ${q.ascending ? 'ASC' : 'DESC'} LIMIT ? OFFSET ?`)
     .all(...args, Math.min(q.limit ?? 50, 10_000), q.offset ?? 0) as Row[];
   return { entries: rows.map(fromRow), total };
+}
+
+/** How many entries each event type has in these organizations. */
+export function auditCounts(orgIds: string[]): Record<string, number> {
+  if (!orgIds.length) return {};
+  const rows = db().prepare(`SELECT event_type, COUNT(*) AS n FROM audit_entries WHERE org_id IN (${orgIds.map(() => '?').join(',')}) GROUP BY event_type`).all(...orgIds) as Row[];
+  return Object.fromEntries(rows.map((r) => [r.event_type as string, Number(r.n)]));
 }
 
 /** Entries of these organizations after a sequence number, oldest first (forwarding). */

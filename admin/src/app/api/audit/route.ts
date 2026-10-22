@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import type { AuditEntry, AuditExportFormat } from '@/lib/types/audit';
+import { AUDIT_EVENT_CATEGORIES, type AuditEntry, type AuditExportFormat } from '@/lib/types/audit';
 import { exportAuditEntries } from '@/lib/utils/audit-integrity';
 import { isContext, requirePermission } from '@/lib/session';
-import { listAudit } from '@/lib/db/repos/audit';
+import { auditCounts, listAudit } from '@/lib/db/repos/audit';
 import { managedSubtree } from '@/lib/db/repos/orgs';
 import { pageInfo } from '@/lib/pagination';
 import { pagedJson, readPage } from '@/lib/route-helpers';
@@ -15,10 +15,13 @@ export async function GET(request: NextRequest) {
   const exportFormat = searchParams.get('export') as AuditExportFormat | null;
   const ctx = await requirePermission(request, 'audit.read', ...(exportFormat ? (['audit.export'] as const) : []));
   if (!isContext(ctx)) return ctx;
+  // Per-event-type totals for the categories view.
+  if (searchParams.get('view') === 'counts') return NextResponse.json({ counts: auditCounts(managedSubtree(ctx.orgId)) });
   const dateTo = searchParams.get('dateTo');
   const q = {
     orgIds: managedSubtree(ctx.orgId),
     eventType: searchParams.get('eventType') || undefined,
+    eventTypes: searchParams.get('category') ? (AUDIT_EVENT_CATEGORIES[searchParams.get('category')!] ?? []) : undefined,
     severity: searchParams.get('severity') || undefined,
     userId: searchParams.get('userId') || undefined,
     from: searchParams.get('dateFrom') || undefined,
