@@ -11,6 +11,7 @@
 pub mod download;
 pub mod evaluator;
 pub mod executor;
+pub mod malware;
 pub mod pinner;
 pub mod scheduler;
 pub mod services;
@@ -417,6 +418,15 @@ pub enum RuleAction {
         suffix: String,
         #[serde(default = "default_ai_chars")]
         max_chars: usize,
+    },
+    /// Scan the file with ClamAV (`automation_engine::malware`). A clean
+    /// file goes on to later steps; an infected one is moved to
+    /// `quarantine_path` (a folder template), a notification is shown when
+    /// `notify`, and the step fails so nothing else touches it.
+    ScanForMalware {
+        quarantine_path: String,
+        #[serde(default = "default_fail_on_invalid")]
+        notify: bool,
     },
     /// Download a URL into a folder (`automation_engine::download`). URL,
     /// folder and file name are templates.
@@ -1669,7 +1679,8 @@ mod tests {
         let last = &rules[rules.len() - 2];
         assert_eq!(last.trigger, RuleTrigger::Webhook);
         assert!(matches!(last.condition_tree, Some(ConditionNode::Any { ref nodes }) if nodes.len() == 2));
-        assert_eq!(last.steps.len(), 6);
+        assert_eq!(last.steps.len(), 7);
+        assert!(matches!(&last.steps[6].action, RuleAction::ScanForMalware { quarantine_path, notify: false } if quarantine_path == "/quarantine/{yyyy}"));
         assert!(matches!(&last.steps[5].action, RuleAction::AiTask { instruction, suffix, max_chars: 5000, .. } if instruction == "Classify {filename}" && suffix == "class.txt"));
         assert!(matches!(&last.steps[2].action, RuleAction::ConvertImage { format: Some(f), max_width: Some(800), max_height: None, quality: None, dest_path } if f == "webp" && dest_path == "/in/small"));
         assert!(matches!(&last.steps[3].action, RuleAction::ConvertDocument { to, dest_path } if to == "pdf" && dest_path.is_empty()));

@@ -87,7 +87,9 @@ export type RuleAction =
   /** Check a delivered batch against member and content rules (`automation_engine::validate`). */
   | { type: "validate_batch"; folder: string; rules: BatchRules; report_folder: string | null; fail_on_invalid: boolean }
   /** The local AI model applies `instruction` to the file's text; the answer is saved as `<name>.<suffix>`. */
-  | { type: "ai_task"; instruction: string; dest_path: string; suffix: string; max_chars: number };
+  | { type: "ai_task"; instruction: string; dest_path: string; suffix: string; max_chars: number }
+  /** Scan with ClamAV; an infected file is moved to `quarantine_path` and the step fails. */
+  | { type: "scan_for_malware"; quarantine_path: string; notify: boolean };
 
 /** `validate::MemberRule`: files matching `pattern` must number `min..=max`, each at least `min_bytes`. */
 export interface MemberRule {

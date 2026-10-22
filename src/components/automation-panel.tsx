@@ -146,6 +146,8 @@ function actionLabel(action: RuleAction): string {
       return [action.format ? `Convert to ${action.format.toUpperCase()}` : "Resize", action.max_width || action.max_height ? `≤ ${action.max_width ?? "∞"}×${action.max_height ?? "∞"}` : ""].filter(Boolean).join(" ");
     case "convert_document":
       return `Convert to ${action.to.toUpperCase()}`;
+    case "scan_for_malware":
+      return `Scan for malware → ${shortenPath(action.quarantine_path)}`;
     case "ai_task":
       return `AI: ${action.instruction.length > 40 ? `${action.instruction.slice(0, 40)}…` : action.instruction}`;
     case "validate_batch":

@@ -601,6 +601,10 @@ In Advanced mode, **Validate a batch of files** checks a delivery — the files 
 - **Content checks** on matching files: not empty; valid JSON; CSV with required columns (case-insensitive), a minimum number of data rows and a delimiter; or a SHA-256 manifest (`sha256sum` format) whose listed files must exist in the batch and match.
 - **Report:** with a report folder (templates allowed), each run writes `<folder>-<time>.validation.json` and `.txt` listing every check. An invalid batch fails the step — the run history shows which checks failed, and a workflow's failure branch can move the batch to quarantine or send a message. Turn that off to only report.
 
+## Automation: scanning for malware
+
+**Scan for malware (ClamAV)** checks each file with ClamAV — `clamdscan` when the clamd daemon runs (fast), else `clamscan`; set `UFOP_CLAMSCAN` for another location. A clean file goes on to the rule's next steps. An infected one is moved to the quarantine folder (owner-only, with a `.quarantine.json` note naming the signature and where it came from), you get a notification, and the run stops with an error naming the signature. If ClamAV is missing or the scan fails, the run fails too — nothing is passed on unscanned. The template **Scan arrivals for malware** sets this up for a folder; keep the quarantine folder outside the watched folder.
+
 ## Automation: downloading a URL
 
 In Advanced mode, an automation rule can **Download a URL** into a folder. The URL, folder, file name and expected SHA-256 accept the same templates as other actions (`{name}`, `{yyyy}`, webhook fields …).

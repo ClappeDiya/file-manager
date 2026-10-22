@@ -455,6 +455,20 @@ function ActionFields({
         </div>
       );
     }
+    case "scan_for_malware":
+      return (
+        <div className="space-y-2">
+          <div>
+            <label className={label} htmlFor={id("quar")}>Quarantine folder for infected files</label>
+            <FolderInput id={id("quar")} value={a.quarantine_path} onChange={(v) => onChange({ ...a, quarantine_path: v })} placeholder="~/Quarantine" />
+            {tokenHint}
+          </div>
+          <label className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={a.notify} onChange={(e) => onChange({ ...a, notify: e.target.checked })} /> Notify me when a file is quarantined
+          </label>
+          <p className="text-[11px] text-[var(--color-text-muted)]">Uses ClamAV (clamdscan or clamscan; set UFOP_CLAMSCAN for another location). Clean files go on to the next steps; an infected file is moved to the quarantine folder (with a note naming the signature) and the run stops with an error. Keep the quarantine folder outside watched folders.</p>
+        </div>
+      );
     case "ai_task":
       if (!advanced) return <p className="text-xs text-[var(--color-text-muted)]">Switch to Advanced mode to edit AI tasks.</p>;
       return (

@@ -149,6 +149,7 @@ export const ACTION_TYPES: { type: RuleAction["type"]; label: string; advanced?:
   { type: "convert_document", label: "Convert a document (LibreOffice)" },
   { type: "validate_batch", label: "Validate a batch of files", advanced: true },
   { type: "ai_task", label: "Ask the local AI (summarize, classify…)", advanced: true },
+  { type: "scan_for_malware", label: "Scan for malware (ClamAV)" },
 ];
 
 export function defaultAction(type: RuleAction["type"]): RuleAction {
@@ -186,6 +187,8 @@ export function defaultAction(type: RuleAction["type"]): RuleAction {
       return { type, format: "jpeg", max_width: 1920, max_height: 1920, quality: 85, dest_path: "" };
     case "convert_document":
       return { type, to: "pdf", dest_path: "" };
+    case "scan_for_malware":
+      return { type, quarantine_path: "~/Quarantine", notify: true };
     case "ai_task":
       return { type, instruction: "Summarize this file in three bullet points.", dest_path: "", suffix: "ai.md", max_chars: 20_000 };
     case "validate_batch":
@@ -314,6 +317,7 @@ function actionErrors(a: RuleAction, n: string): string[] {
     for (const v of [a.max_width, a.max_height]) if (v !== null && !(v >= 1 && v <= 20_000)) errors.push(`${n}: sizes are 1–20000 pixels.`);
     if (a.quality !== null && !(a.quality >= 1 && a.quality <= 100)) errors.push(`${n}: quality is 1–100.`);
   }
+  if (a.type === "scan_for_malware" && !a.quarantine_path.trim()) errors.push(`${n}: choose the quarantine folder.`);
   if (a.type === "ai_task") {
     if (!a.instruction.trim()) errors.push(`${n}: write the instruction for the AI.`);
     if (!/^[\w.-]+$/.test(a.suffix.trim().replace(/^\./, ""))) errors.push(`${n}: the answer's file suffix may use letters, digits, '.', '-' and '_'.`);
@@ -345,7 +349,7 @@ export function validateForm(form: RuleForm): string[] {
   }
   if (form.trigger.type === "schedule" && !form.trigger.cron_expr.trim()) errors.push("Choose a schedule.");
   if (!form.workflow && form.steps.length === 0) errors.push("Add at least one action.");
-  const fileActions = new Set(["move_file", "copy_file", "rename_file", "delete_file", "compress_folder", "extract_archive", "transfer_to_connector", "convert_image", "convert_document", "ai_task"]);
+  const fileActions = new Set(["move_file", "copy_file", "rename_file", "delete_file", "compress_folder", "extract_archive", "transfer_to_connector", "convert_image", "convert_document", "ai_task", "scan_for_malware"]);
   const formActions = form.workflow ? workflowActions(form.workflow) : form.steps.map((s) => s.action);
   if (!isFileTrigger(form.trigger) && !form.options.source?.path && formActions.some((a) => fileActions.has(a.type))) {
     errors.push("This trigger has no file: choose which folder's files the rule works on.");
@@ -469,6 +473,16 @@ export const PRESETS: RulePreset[] = [
       conditions: [{ key: rowKey(), negate: false, condition: { type: "older_than", seconds: 30 * 86_400 } }],
       steps: [{ action: { type: "delete_file", to_trash: true }, continue_on_error: false }],
       options: { ...defaultOptions(), source: { path: folder, recursive: false, newest: null, include_dirs: false } },
+    }),
+  },
+  {
+    id: "malware-scan",
+    label: "Scan arrivals for malware",
+    description: "Scan each new file with ClamAV; infected files go to a quarantine folder and you are notified.",
+    build: (folder) => ({
+      ...newRuleForm(folder),
+      name: "Scan new files for malware",
+      steps: [{ action: { type: "scan_for_malware", quarantine_path: folder ? `${folder.replace(/[\\/]+$/, "")}-quarantine` : "~/Quarantine", notify: true }, continue_on_error: false }],
     }),
   },
   {

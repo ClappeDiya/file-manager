@@ -120,6 +120,43 @@
   },
   {
     "id": "00000000-0000-4000-8000-000000000003",
+    "name": "Scan new files for malware",
+    "enabled": false,
+    "trigger": {
+      "type": "file_appears",
+      "watch_path": "/inbox",
+      "recursive": false
+    },
+    "conditions": [],
+    "condition_tree": null,
+    "action": {
+      "type": "scan_for_malware",
+      "quarantine_path": "/inbox-quarantine",
+      "notify": true
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": null
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000004",
     "name": "Extract arriving zips",
     "enabled": false,
     "trigger": {
@@ -164,7 +201,7 @@
     "last_error": null
   },
   {
-    "id": "00000000-0000-4000-8000-000000000004",
+    "id": "00000000-0000-4000-8000-000000000005",
     "name": "R",
     "enabled": false,
     "trigger": {
@@ -308,6 +345,14 @@
           "max_chars": 5000
         },
         "continue_on_error": true
+      },
+      {
+        "action": {
+          "type": "scan_for_malware",
+          "quarantine_path": "/quarantine/{yyyy}",
+          "notify": false
+        },
+        "continue_on_error": false
       }
     ],
     "options": {
@@ -336,7 +381,7 @@
     "last_error": null
   },
   {
-    "id": "00000000-0000-4000-8000-000000000005",
+    "id": "00000000-0000-4000-8000-000000000006",
     "name": "R",
     "enabled": false,
     "trigger": {

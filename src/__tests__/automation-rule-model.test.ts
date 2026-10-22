@@ -207,6 +207,7 @@ describe("presets", () => {
           continue_on_error: false,
         },
         { action: { type: "ai_task", instruction: "Classify {filename}", dest_path: "/ai", suffix: "class.txt", max_chars: 5000 }, continue_on_error: true },
+        { action: { type: "scan_for_malware", quarantine_path: "/quarantine/{yyyy}", notify: false }, continue_on_error: false },
       ],
       options: { ...newRuleForm().options, source: { path: "/inbox", recursive: true, newest: 5, include_dirs: false }, priority: -1 },
     })), rules.length));

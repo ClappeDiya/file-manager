@@ -315,6 +315,7 @@ pub fn action_kind(action: &RuleAction) -> &'static str {
         RuleAction::ConvertDocument { .. } => "convert_document",
         RuleAction::ValidateBatch { .. } => "validate_batch",
         RuleAction::AiTask { .. } => "ai_task",
+        RuleAction::ScanForMalware { .. } => "scan_for_malware",
     }
 }
 
@@ -805,6 +806,32 @@ pub async fn dispatch(action: &RuleAction, triggered_file: Option<&str>, env: &E
             };
             crate::convert_engine::convert_document(&src, &target, to, std::time::Duration::from_secs(300)).await?;
             Ok(vec![target.to_string_lossy().into_owned()])
+        }
+
+        RuleAction::ScanForMalware { quarantine_path, notify } => {
+            let source = Path::new(triggered_file.ok_or("No source file to scan")?);
+            validate_automation_path(source, None)?;
+            if !source.is_file() {
+                return Err(format!("{} does not exist or is not a file", source.display()));
+            }
+            if quarantine_path.trim().is_empty() {
+                return Err("Choose the quarantine folder".into());
+            }
+            match super::malware::scan(source).await? {
+                super::malware::Verdict::Clean => Ok(vec![source.to_string_lossy().into_owned()]),
+                super::malware::Verdict::Infected(signature) => {
+                    let dir = PathBuf::from(env.path(quarantine_path, triggered_file)?);
+                    validate_automation_path(&dir, None)?;
+                    let dest = super::malware::quarantine(source, &dir, &signature)?;
+                    if *notify {
+                        if let Some(s) = services {
+                            let name = source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            let _ = s.notify("Malware quarantined", &format!("{name}: {signature}")).await;
+                        }
+                    }
+                    Err(format!("Malware found ({signature}); the file was moved to quarantine: {}", dest.display()))
+                }
+            }
         }
 
         RuleAction::AiTask { instruction, dest_path, suffix, max_chars } => {
@@ -1515,6 +1542,44 @@ mod tests {
         assert!(none.error_message.unwrap().contains("has no text"));
         let unattached = execute_rule_action(&rule_steps(task("", 1000), vec![], RuleOptions::default()), f.to_str(), false).await;
         assert_eq!(unattached.status, AutomationStatus::Failed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scan_for_malware_passes_clean_files_and_quarantines_infected_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = crate::automation_engine::malware::tests::fake_clamscan(dir.path());
+        // The only test that sets the scanner.
+        std::env::set_var("UFOP_CLAMSCAN", &scanner);
+        let svc = RecordingServices::default();
+        let inbox = dir.path().join("inbox");
+        let (clean, bad) = (inbox.join("report.txt"), inbox.join("invoice.pdf.exe"));
+        write(&clean, "quarterly numbers");
+        write(&bad, crate::automation_engine::malware::tests::EICAR);
+        let quarantine = dir.path().join("quarantine");
+        let rule = rule_steps(
+            RuleAction::ScanForMalware { quarantine_path: format!("{}/{{yyyy}}", quarantine.display()), notify: true },
+            vec![ActionStep { action: RuleAction::CopyFile { dest_path: dir.path().join("safe").to_string_lossy().into() }, continue_on_error: false }],
+            RuleOptions::default(),
+        );
+        let ok = execute_rule_action_with(&rule, clean.to_str(), false, Some(&svc)).await;
+        assert_eq!(ok.status, AutomationStatus::Success, "{:?}", ok.error_message);
+        assert!(dir.path().join("safe/report.txt").exists(), "a clean file goes on to the next step");
+
+        let infected = execute_rule_action_with(&rule, bad.to_str(), false, Some(&svc)).await;
+        assert_eq!(infected.status, AutomationStatus::Failed);
+        let msg = infected.error_message.unwrap();
+        assert!(msg.contains("Malware found (Eicar-Test-Signature)"), "{msg}");
+        assert!(!bad.exists() && !dir.path().join("safe/invoice.pdf.exe").exists(), "moved away, never copied");
+        let year = quarantine.join(chrono::Utc::now().format("%Y").to_string());
+        assert!(std::fs::read_dir(&year).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().ends_with("-invoice.pdf.exe")));
+        assert!(svc.calls().iter().any(|c| c == "notify:Malware quarantined:invoice.pdf.exe: Eicar-Test-Signature"), "{:?}", svc.calls());
+        assert_eq!(infected.attempts, 1, "not retried");
+
+        std::env::set_var("UFOP_CLAMSCAN", dir.path().join("no-such-scanner"));
+        let missing = execute_rule_action_with(&rule, clean.to_str(), false, Some(&svc)).await;
+        assert!(missing.error_message.unwrap().contains("ClamAV was not found"));
+        std::env::remove_var("UFOP_CLAMSCAN");
     }
 
     fn rule_steps(first: RuleAction, more: Vec<ActionStep>, options: RuleOptions) -> AutomationRule {
