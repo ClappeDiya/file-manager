@@ -16,7 +16,7 @@ export const FEATURES = {
   /** Audit-log forwarding to a SIEM. */
   siemForwarding: true,
   /** Subscription and payment management. */
-  billing: false,
+  billing: true,
   /** Outbound webhook subscriptions with delivery. */
   webhooks: true,
   /** Org-level connector definitions (use Fleet → Credentials meanwhile). */

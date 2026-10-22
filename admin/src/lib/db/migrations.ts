@@ -686,6 +686,24 @@ export const MIGRATIONS: Migration[] = [
       d.exec('ALTER TABLE users ADD COLUMN locale TEXT');
     },
   },
+  {
+    version: 31,
+    description: 'Billing accounts and processed billing events',
+    up(d) {
+      d.exec(`
+        CREATE TABLE billing_accounts (
+          org_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+          provider TEXT NOT NULL, customer_id TEXT, subscription_id TEXT, plan TEXT, seats INTEGER,
+          status TEXT NOT NULL DEFAULT 'none', current_period_end TEXT, cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX idx_billing_customer ON billing_accounts(provider, customer_id);
+        CREATE TABLE billing_events (
+          id TEXT PRIMARY KEY, provider TEXT NOT NULL, org_id TEXT, type TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '', received_at TEXT NOT NULL
+        );
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

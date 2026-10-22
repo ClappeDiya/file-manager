@@ -1,129 +1,191 @@
 'use client';
 
-import React from 'react';
-import { CreditCard, Users, HardDrive, Check } from 'lucide-react';
+/** Billing: the organization's license, its subscription (checkout and portal at the provider) and invoices. */
+import React, { useState } from 'react';
+import { useSearchParams } from 'next/navigation';
+import { CreditCard, Users, CalendarClock, Check } from 'lucide-react';
 import { PageHeader } from '@/components/layout/page-header';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { StatCard } from '@/components/ui/stat-card';
-import { ComingSoon } from '@/components/ui/coming-soon';
+import { ErrorBanner, Loading } from '@/components/fleet/badges';
 import { useApi } from '@/lib/use-api';
-import { isEnabled } from '@/lib/features';
+import { api, errorText } from '@/lib/api-client';
+import { useAuthStore } from '@/lib/stores/auth-store';
+import { formatDate } from '@/lib/utils/format';
+import type { BillingAccount } from '@/lib/billing';
+import type { Invoice } from '@/lib/billing/provider';
+import type { License } from '@/lib/db/repos/orgs';
 
-interface OrgLicense {
-  plan: string | null;
-  seats: number | null;
-  used: number;
-  inherited: boolean;
+interface PlanView {
+  id: string;
+  name: string;
+  seats: number;
+  price: string;
+  period: string;
+  features: string[];
+  purchasable: boolean;
 }
 
-const plans = [
-  {
-    name: 'Starter',
-    price: '$0',
-    period: 'Free',
-    features: ['5 users', '10 GB storage', 'Basic connectors (Local, SFTP)', '7-day audit log', 'Community support'],
-  },
-  {
-    name: 'Business',
-    price: '$9.99',
-    period: '/user/month',
-    features: ['Unlimited users', '1 TB storage', 'All connectors', 'SAML SSO', '90-day audit log', 'Policy engine', 'Approval workflows', 'Email support'],
-  },
-  {
-    name: 'Enterprise',
-    price: 'Custom',
-    period: 'Contact us',
-    features: ['Everything in Business', 'Unlimited storage', 'SAML + SCIM', 'SIEM integration', 'Unlimited audit log', 'Custom policies', 'Dedicated support', 'SLA guarantee'],
-  },
-];
+interface Data {
+  configured: boolean;
+  provider: string;
+  ownsLicense: boolean;
+  license: License;
+  account: BillingAccount | null;
+  plans: PlanView[];
+  invoices: Invoice[];
+  invoicesError: string | null;
+}
+
+const money = (cents: number, currency: string) => new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(cents / 100);
 
 export default function BillingPage() {
-  // The license (plan + seats) is real and set by the parent organization;
-  // only payment management is not built yet.
-  const { data } = useApi<{ organizations: { id: string; license: OrgLicense }[]; currentOrgId?: string }>('/api/orgs');
-  const org = data?.organizations?.find((o) => o.id === data.currentOrgId) ?? data?.organizations?.[0];
-  const lic = org?.license;
-  const planName = lic?.plan ? lic.plan[0].toUpperCase() + lic.plan.slice(1) : null;
+  const params = useSearchParams();
+  const { data, error, loading } = useApi<Data>('/api/billing');
+  const canWrite = useAuthStore((s) => s.checkPermission)('billing.write');
+  const [seats, setSeats] = useState<Record<string, string>>({});
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  if (loading && !data) return <Loading />;
+  if (!data) return <ErrorBanner message={error ?? 'Could not load billing'} />;
+
+  const lic = data.license;
+  const acct = data.account;
+  const subscribed = !!acct && ['active', 'trialing', 'past_due'].includes(acct.status);
+  const go = async (path: string, body?: unknown) => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const r = await api<{ url: string }>(path, { body: body ?? {} });
+      window.location.assign(r.url);
+    } catch (e) {
+      setErr(errorText(e));
+      setBusy(false);
+    }
+  };
+  const planName = (id: string | null) => data.plans.find((p) => p.id === id)?.name ?? (id ? id[0].toUpperCase() + id.slice(1) : '—');
 
   return (
     <div>
-      <PageHeader
-        title="Billing"
-        description="Manage your subscription, usage, and billing information"
-      />
-
-      {!isEnabled('billing') && (
-        <ComingSoon
-          feature="billing"
-          className="mb-6"
-          description="Online upgrades, seat changes, invoices and payment methods. Your license below is active; contact sales to change it."
-        />
+      <PageHeader title="Billing" description="Your license, subscription and invoices" />
+      <ErrorBanner message={err} />
+      {params.get('checkout') === 'success' && (
+        <div className="mb-4 rounded-md border border-success bg-success-bg px-3 py-2 text-sm">Thank you — your subscription is being confirmed and the license updates in a moment.</div>
       )}
+      {acct?.status === 'past_due' && (
+        <div className="mb-4 rounded-md border border-warning bg-warning-bg px-3 py-2 text-sm">A payment is overdue. The license stays active for now; update the payment method in the billing portal.</div>
+      )}
+      {!data.configured && <p className="mb-4 text-sm text-foreground-secondary">Online billing is not set up on this console; licenses are assigned by a parent organization or the operator.</p>}
+      {data.configured && !data.ownsLicense && <p className="mb-4 text-sm text-foreground-secondary">This organization’s license comes from its parent organization.</p>}
 
-      {/* License from the organization tree */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+      <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
         <StatCard
-          title="Current Plan"
-          value={planName ?? '—'}
+          title="Current plan"
+          value={planName(lic.plan)}
           icon={CreditCard}
           variant="default"
-          subtitle={lic ? (lic.inherited ? 'Inherited from parent organization' : 'Set on this organization') : 'No license assigned'}
+          subtitle={lic.inherited ? 'Inherited from the parent organization' : acct ? `Subscription: ${acct.status}` : 'Set on this organization'}
         />
-        <StatCard title="Seats" value={lic?.seats != null ? `${lic.used} / ${lic.seats}` : lic ? `${lic.used} used` : '—'} icon={Users} variant="default" subtitle="Enrolled machines" />
-        <StatCard title="Storage Used" value="—" icon={HardDrive} variant="default" subtitle="Not metered" />
+        <StatCard title="Seats" value={lic.seats != null ? `${lic.used} / ${lic.seats}` : `${lic.used} used`} icon={Users} variant="default" subtitle="Enrolled machines" />
+        <StatCard
+          title="Renews"
+          value={acct?.currentPeriodEnd ? formatDate(acct.currentPeriodEnd) : '—'}
+          icon={CalendarClock}
+          variant="default"
+          subtitle={acct?.cancelAtPeriodEnd ? 'Ends at the end of the period' : subscribed ? 'Renews automatically' : 'No subscription'}
+        />
       </div>
 
-      {/* Plans */}
-      <h2 className="text-lg font-semibold text-foreground mb-4">Plans</h2>
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-        {plans.map((plan) => (
-          <Card
-            key={plan.name}
-            className={planName === plan.name ? 'border-primary ring-1 ring-primary' : ''}
-          >
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-bold text-foreground">{plan.name}</h3>
-              {planName === plan.name && <Badge variant="info">Current Plan</Badge>}
-            </div>
-            <div className="mb-4">
-              <span className="text-3xl font-bold text-foreground">{plan.price}</span>
-              <span className="text-sm text-foreground-secondary"> {plan.period}</span>
-            </div>
-            <ul className="space-y-2 mb-6">
-              {plan.features.map((feature) => (
-                <li key={feature} className="flex items-center gap-2 text-sm text-foreground-secondary">
-                  <Check size={14} className="text-success shrink-0" />
-                  {feature}
+      {subscribed && canWrite && (
+        <Button className="mb-6" disabled={busy} onClick={() => void go('/api/billing/portal')}>
+          Manage subscription (seats, payment, invoices)
+        </Button>
+      )}
+
+      <h2 className="mb-4 text-lg font-semibold text-foreground">Plans</h2>
+      <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-3">
+        {data.plans.map((plan) => {
+          const current = lic.plan === plan.id;
+          return (
+            <Card key={plan.id} className={current ? 'border-primary ring-1 ring-primary' : ''}>
+              <div className="mb-4 flex items-center justify-between">
+                <h3 className="text-lg font-bold text-foreground">{plan.name}</h3>
+                {current && <Badge variant="info">Current plan</Badge>}
+              </div>
+              <div className="mb-4">
+                <span className="text-3xl font-bold text-foreground">{plan.price}</span>
+                <span className="text-sm text-foreground-secondary"> {plan.period}</span>
+              </div>
+              <ul className="mb-6 space-y-2">
+                {plan.features.map((f) => (
+                  <li key={f} className="flex items-center gap-2 text-sm text-foreground-secondary">
+                    <Check size={14} className="shrink-0 text-success" />
+                    {f}
+                  </li>
+                ))}
+              </ul>
+              {plan.id === 'enterprise' ? (
+                <Button variant="primary" className="w-full" onClick={() => window.open('https://filemanager.clappe.com/pricing', '_blank', 'noopener')}>
+                  Contact sales
+                </Button>
+              ) : plan.purchasable && canWrite && data.ownsLicense && !subscribed ? (
+                <div className="flex items-end gap-2">
+                  <Input
+                    label="Seats"
+                    type="number"
+                    min={plan.seats}
+                    className="w-24"
+                    value={seats[plan.id] ?? String(Math.max(plan.seats, lic.used, 1))}
+                    onChange={(e) => setSeats({ ...seats, [plan.id]: e.target.value })}
+                  />
+                  <Button className="flex-1" disabled={busy} onClick={() => void go('/api/billing/checkout', { plan: plan.id, seats: Number(seats[plan.id] ?? Math.max(plan.seats, lic.used, 1)) })}>
+                    Subscribe
+                  </Button>
+                </div>
+              ) : (
+                <Button variant="outline" className="w-full" disabled>
+                  {current ? 'Current plan' : subscribed ? 'Change in the portal' : 'Not available online'}
+                </Button>
+              )}
+            </Card>
+          );
+        })}
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Invoices</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <ErrorBanner message={data.invoicesError} />
+          {!data.invoices.length ? (
+            <div className="py-8 text-center text-sm text-foreground-tertiary">No invoices yet.</div>
+          ) : (
+            <ul className="divide-y divide-border text-sm">
+              {data.invoices.map((i) => (
+                <li key={i.id} className="flex items-center justify-between py-2">
+                  <span>
+                    {i.number ?? i.id} · {formatDate(i.createdAt)} · {money(i.amountDue, i.currency)} <Badge variant={i.status === 'paid' ? 'success' : i.status === 'open' ? 'warning' : 'default'}>{i.status}</Badge>
+                  </span>
+                  <span className="flex gap-2">
+                    {i.url && (
+                      <a className="text-primary underline" href={i.url} target="_blank" rel="noopener noreferrer">
+                        View
+                      </a>
+                    )}
+                    {i.pdf && (
+                      <a className="text-primary underline" href={i.pdf} target="_blank" rel="noopener noreferrer">
+                        PDF
+                      </a>
+                    )}
+                  </span>
                 </li>
               ))}
             </ul>
-            {planName === plan.name ? (
-              <Button variant="outline" className="w-full" disabled>Current Plan</Button>
-            ) : (
-              <Button
-                variant={plan.name === 'Enterprise' ? 'primary' : 'outline'}
-                className="w-full"
-                disabled={!isEnabled('billing') && plan.name !== 'Enterprise'}
-                onClick={plan.name === 'Enterprise' ? () => window.open('https://filemanager.clappe.com/pricing', '_blank', 'noopener') : undefined}
-              >
-                {plan.name === 'Enterprise' ? 'Contact Sales' : 'Upgrade'}
-              </Button>
-            )}
-          </Card>
-        ))}
-      </div>
-
-      {/* Billing History */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Billing History</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="py-8 text-center text-sm text-foreground-tertiary">
-            No invoices yet. Past invoices will appear here once the first billing cycle closes.
-          </div>
+          )}
         </CardContent>
       </Card>
     </div>
