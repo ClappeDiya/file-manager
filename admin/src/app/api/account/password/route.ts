@@ -4,6 +4,7 @@ import { audit, authenticate, badRequest, isContext, readJson } from '@/lib/sess
 import { updateUser } from '@/lib/db/repos/users';
 import { checkPassword } from '@/lib/password-policy';
 import { loginLimiter } from '@/lib/rate-limit';
+import { revokeUserSessions } from '@/lib/db/repos/sessions';
 
 /** POST /api/account/password {current, password} — change your own password. */
 export async function POST(request: NextRequest) {
@@ -21,6 +22,8 @@ export async function POST(request: NextRequest) {
   if (!check.ok) return NextResponse.json({ error: check.problems[0], problems: check.problems }, { status: 400 });
   if (await compare(b.password!, ctx.user.passwordHash)) return badRequest('Choose a password different from the current one');
   updateUser(ctx.user.id, { passwordHash: await hash(b.password!, 12), passwordChangedAt: new Date().toISOString() });
-  audit(ctx, { eventType: 'auth.password_change', description: 'Changed the account password', resourceType: 'user', resourceId: ctx.user.id });
-  return NextResponse.json({ success: true });
+  // Other sessions may have been opened with the old password.
+  const signedOut = revokeUserSessions(ctx.user.id, 'password changed', ctx.sid);
+  audit(ctx, { eventType: 'auth.password_change', description: 'Changed the account password', resourceType: 'user', resourceId: ctx.user.id, metadata: { otherSessionsSignedOut: signedOut } });
+  return NextResponse.json({ success: true, otherSessionsSignedOut: signedOut });
 }

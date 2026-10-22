@@ -491,6 +491,21 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 18,
+    description: 'Server-side sessions (idle timeout, revocation)',
+    up(d) {
+      d.exec(`
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          method TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+          revoked_at TEXT, revoked_reason TEXT
+        );
+        CREATE INDEX idx_sessions_user ON sessions(user_id, revoked_at);
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

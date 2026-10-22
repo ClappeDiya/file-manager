@@ -11,5 +11,5 @@ export async function POST(request: NextRequest) {
   const role = org ? effectiveRole(ctx.user.id, org.id) : null;
   if (!org || !role) return badRequest('You do not have access to that organization', 403);
   audit({ ...ctx, orgId: org.id }, { eventType: 'org.switch', description: `Switched to "${org.name}"`, resourceType: 'organization', resourceId: org.id });
-  return attachSession(NextResponse.json({ orgId: org.id, role }), ctx.user, org.id, ctx.amr);
+  return attachSession(NextResponse.json({ orgId: org.id, role }), ctx.user, org.id, ctx.amr, ctx.sid);
 }

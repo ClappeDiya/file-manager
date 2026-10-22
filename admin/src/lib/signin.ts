@@ -40,5 +40,5 @@ export async function finishSignIn(user: UserRecord, meta: SignInMeta, mfaDone =
   const setup = needsSecondFactorSetup(user, meta.method.startsWith('sso'));
   if (setup) appendAudit({ eventType: 'auth.mfa_setup_required', orgId, userId: user.id, userEmail: user.email, ipAddress: meta.ip, description: 'Signed in; two-factor sign-in must be set up before using the console' });
   const res = NextResponse.json({ user: { id: user.id, email: user.email, name: user.name }, orgId, redirect: setup ? '/account?setup-mfa=1' : (meta.redirect ?? '/'), ...(setup ? { mfaSetupRequired: true } : {}) });
-  return attachSession(res, user, orgId, amr);
+  return attachSession(res, user, orgId, amr, undefined, { ip: meta.ip, userAgent: meta.userAgent });
 }

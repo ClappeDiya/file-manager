@@ -7,6 +7,7 @@ import { consumePasswordToken, peekPasswordToken } from '@/lib/db/repos/security
 import { appendAudit } from '@/lib/db/repos/audit';
 import { checkPassword } from '@/lib/password-policy';
 import { enrollLimiter } from '@/lib/rate-limit';
+import { revokeUserSessions } from '@/lib/db/repos/sessions';
 
 /** GET /api/auth/password/reset?token= — whether the link is valid, and for whom. */
 export async function GET(request: NextRequest) {
@@ -32,6 +33,7 @@ export async function POST(request: NextRequest) {
   // Use the token only once the new password is acceptable.
   if (!consumePasswordToken(b!.token!)) return NextResponse.json({ error: 'This link is not valid or has expired' }, { status: 404 });
   updateUser(user.id, { passwordHash: await hash(b!.password!, 12), passwordChangedAt: new Date().toISOString() });
+  revokeUserSessions(user.id, peek.purpose === 'expired' ? 'password changed' : 'password reset');
   appendAudit({ eventType: peek.purpose === 'expired' ? 'auth.password_change' : 'auth.password_reset', orgId: user.organizationId, userId: user.id, userEmail: user.email, ipAddress: ip, description: peek.purpose === 'expired' ? 'Changed an expired password' : 'Reset the password with an e-mailed link' });
   return finishSignIn(getUser(user.id)!, { ip, userAgent: request.headers.get('user-agent') ?? '', method: 'pwd' });
 }

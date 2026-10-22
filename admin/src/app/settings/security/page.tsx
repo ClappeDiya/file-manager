@@ -72,6 +72,20 @@ export default function SecuritySettingsPage() {
             </label>
           </div>
         </Card>
+        <Card>
+          <CardHeader className="flex-col items-start gap-1">
+            <CardTitle>Sessions</CardTitle>
+            <CardDescription>Sessions last at most 8 hours. Members can see and end their sessions under My account; administrators can sign a member out everywhere.</CardDescription>
+          </CardHeader>
+          <Input
+            label="Sign out after inactivity (minutes, 0 = off, 5–480)"
+            type="number"
+            min={0}
+            max={480}
+            value={s.sessionIdleMinutes}
+            onChange={(e) => setDraft({ ...s, sessionIdleMinutes: Math.max(0, Math.floor(Number(e.target.value) || 0)) })}
+          />
+        </Card>
       </fieldset>
       {canWrite && (
         <Button className="mt-4" disabled={!draft} onClick={() => void save()}>

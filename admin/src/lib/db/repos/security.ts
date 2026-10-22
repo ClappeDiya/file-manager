@@ -15,9 +15,11 @@ export interface SecuritySettings {
   requireMfa: boolean;
   /** With requireMfa: single sign-on sessions are exempt (the identity provider enforces MFA). */
   ssoExemptFromMfa: boolean;
+  /** Sign out sessions after this many minutes without activity (0 = only the 8-hour limit). */
+  sessionIdleMinutes: number;
 }
 
-export const DEFAULT_SECURITY: SecuritySettings = { passwordMaxAgeDays: 0, requireMfa: false, ssoExemptFromMfa: false };
+export const DEFAULT_SECURITY: SecuritySettings = { passwordMaxAgeDays: 0, requireMfa: false, ssoExemptFromMfa: false, sessionIdleMinutes: 0 };
 
 export function getSecurity(orgId: string): SecuritySettings {
   const r = db().prepare('SELECT settings FROM org_security WHERE org_id = ?').get(orgId) as Row | undefined;
@@ -28,10 +30,19 @@ export function setSecurity(orgId: string, patch: Partial<SecuritySettings>, by:
   const next = { ...getSecurity(orgId), ...patch };
   if (!Number.isInteger(next.passwordMaxAgeDays) || next.passwordMaxAgeDays < 0 || next.passwordMaxAgeDays > 3650) throw new OrgError('Password age is 0 (never) to 3650 days');
   if (typeof next.requireMfa !== 'boolean' || typeof next.ssoExemptFromMfa !== 'boolean') throw new OrgError('requireMfa and ssoExemptFromMfa are true or false');
+  if (!Number.isInteger(next.sessionIdleMinutes) || (next.sessionIdleMinutes !== 0 && (next.sessionIdleMinutes < 5 || next.sessionIdleMinutes > 480))) throw new OrgError('The idle timeout is 0 (off) or 5 to 480 minutes');
   db()
     .prepare('INSERT INTO org_security (org_id, settings, updated_by, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(org_id) DO UPDATE SET settings = excluded.settings, updated_by = excluded.updated_by, updated_at = excluded.updated_at')
     .run(orgId, JSON.stringify(next), by, now());
   return next;
+}
+
+/** The strictest idle timeout over the account's organizations, in minutes (0 = none). */
+export function sessionIdleMinutes(userId: string): number {
+  const v = membershipsOf(userId)
+    .map((m) => getSecurity(m.orgId).sessionIdleMinutes)
+    .filter((d) => d > 0);
+  return v.length ? Math.min(...v) : 0;
 }
 
 /** The strictest password age over the account's organizations (0 = no expiry). */

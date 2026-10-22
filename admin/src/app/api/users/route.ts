@@ -7,6 +7,7 @@ import { effectiveRole, membersOf, membershipsOf, OrgError, removeMembership, se
 import { listUsers, publicUser, updateUser } from '@/lib/db/repos/users';
 import { groupsOfUser } from '@/lib/db/repos/groups';
 import { createInvitation, listInvitations } from '@/lib/db/repos/invitations';
+import { revokeUserSessions } from '@/lib/db/repos/sessions';
 import { sendInvitationEmail } from '@/lib/mailer';
 
 /** GET /api/users — the organization's roster: members (with groups) and invitations. */
@@ -56,7 +57,7 @@ export async function POST(request: NextRequest) {
 /** PATCH /api/users — bulk actions on members of this organization. */
 export async function PATCH(request: NextRequest) {
   const b = await readJson<{ action?: string; userIds?: string[]; role?: Role }>(request);
-  const perm = b?.action === 'remove' ? 'users.remove' : b?.action === 'set_role' ? 'roles.write' : 'users.deactivate';
+  const perm = b?.action === 'remove' ? 'users.remove' : b?.action === 'set_role' ? 'roles.write' : 'users.deactivate'; // deactivate, activate, sign_out
   const ctx = await requirePermission(request, perm);
   if (!isContext(ctx)) return ctx;
   if (!b?.action || !Array.isArray(b.userIds) || b.userIds.length === 0) return badRequest('Action and userIds required');
@@ -69,7 +70,7 @@ export async function PATCH(request: NextRequest) {
     const theirs = effectiveRole(id, ctx.orgId) ?? m.role;
     if (ctx.role !== 'org_owner' && !canManageRole(ctx.role, theirs)) return badRequest('You cannot change someone whose role is at or above your own', 403);
     // Deactivation locks the whole account: only when every organization it belongs to is yours to manage.
-    if ((b.action === 'deactivate' || b.action === 'activate') && membershipsOf(id).some((x) => x.orgId !== ctx.orgId && !canIn(ctx, x.orgId, 'users.deactivate'))) {
+    if ((b.action === 'deactivate' || b.action === 'activate' || b.action === 'sign_out') && membershipsOf(id).some((x) => x.orgId !== ctx.orgId && !canIn(ctx, x.orgId, 'users.deactivate'))) {
       return badRequest('This account also belongs to other organizations; remove it from this organization instead', 403);
     }
   }
@@ -77,7 +78,13 @@ export async function PATCH(request: NextRequest) {
   switch (b.action) {
     case 'deactivate':
     case 'activate':
-      for (const id of b.userIds) updateUser(id, { isActive: b.action === 'activate' });
+      for (const id of b.userIds) {
+        updateUser(id, { isActive: b.action === 'activate' });
+        if (b.action === 'deactivate') revokeUserSessions(id, 'deactivated');
+      }
+      break;
+    case 'sign_out':
+      for (const id of b.userIds) revokeUserSessions(id, `signed out by ${ctx.user.email}`);
       break;
     case 'remove':
       if (owners.length === 0) return badRequest('Cannot remove the last organization owner', 403);
@@ -93,7 +100,7 @@ export async function PATCH(request: NextRequest) {
     default:
       return badRequest('Unknown action');
   }
-  const event = { deactivate: 'admin.user_deactivate', activate: 'admin.user_activate', remove: 'admin.user_remove', set_role: 'admin.role_change' }[b.action] ?? 'admin.settings_change';
+  const event = { deactivate: 'admin.user_deactivate', activate: 'admin.user_activate', remove: 'admin.user_remove', set_role: 'admin.role_change', sign_out: 'admin.user_sign_out' }[b.action] ?? 'admin.settings_change';
   audit(ctx, { eventType: event, description: `${b.action} ${b.userIds.length} user(s)${b.role ? ` → ${b.role}` : ''}`, metadata: { userIds: b.userIds } });
   return NextResponse.json({ success: true, affected: b.userIds.length });
 }
