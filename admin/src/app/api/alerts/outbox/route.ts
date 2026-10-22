@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { pageInfo } from '@/lib/pagination';
+import { pagedJson, readPage } from '@/lib/route-helpers';
 import { badRequest, isContext, requirePermission } from '@/lib/session';
 import { listOutbox, outboxCounts, OUTBOX_STATUSES, type OutboxStatus } from '@/lib/db/repos/outbox';
 import { listChannels } from '@/lib/db/repos/channels';
@@ -11,13 +13,16 @@ export async function GET(request: NextRequest) {
   const status = q.get('status') as OutboxStatus | null;
   if (status && !OUTBOX_STATUSES.includes(status)) return badRequest('Unknown status');
   const channels = Object.fromEntries(listChannels(ctx.orgId).map((c) => [c.id, { name: c.name, kind: c.kind }]));
-  return NextResponse.json({
+  const pr = readPage(request, { defaultLimit: 100 });
+  if (pr instanceof NextResponse) return pr;
+  const list = listOutbox(ctx.orgId, { status: status ?? undefined, channelId: q.get('channelId') ?? undefined, limit: pr.limit, offset: pr.offset });
+  return pagedJson(request, {
     counts: outboxCounts(ctx.orgId),
     channels,
-    messages: listOutbox(ctx.orgId, { status: status ?? undefined, channelId: q.get('channelId') ?? undefined, limit: Number(q.get('limit')) || 100 }).map((m) => ({
+    messages: list.map((m) => ({
       ...m,
       // Recipients and bodies stay on the server; the list shows what and where.
       message: { subject: m.message.subject, recipients: m.message.to?.length ?? null },
     })),
-  });
+  }, pageInfo(pr, list.length, null));
 }

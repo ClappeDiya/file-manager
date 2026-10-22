@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { paged } from '@/lib/pagination';
 import { revokeUserApiTokens } from '@/lib/db/repos/api-tokens';
-import { orgErrorResponse, publicOrigin } from '@/lib/route-helpers';
+import { orgErrorResponse, pagedJson, publicOrigin, readPage } from '@/lib/route-helpers';
 import { ROLE_HIERARCHY, type Role } from '@/lib/types/auth';
 import { audit, badRequest, can, canIn, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
 import { canManageRole } from '@/lib/utils/permissions';
@@ -34,7 +35,11 @@ export async function GET(request: NextRequest) {
   if (search) users = users.filter((u) => u.name.toLowerCase().includes(search) || u.email.toLowerCase().includes(search));
   const invitations = can(ctx, 'users.invite') ? listInvitations(ctx.orgId) : [];
   const removed = can(ctx, 'users.remove') ? listRemovedMembers(ctx.orgId) : [];
-  return NextResponse.json({ users, total: users.length, invitations, removed, restoreDays: RESTORE_DAYS });
+  // Every member unless a page is asked for (the Users screen shows all).
+  const pr = readPage(request, { defaultLimit: Infinity });
+  if (pr instanceof NextResponse) return pr;
+  const { items, page } = paged(users, pr);
+  return pagedJson(request, { users: items, total: users.length, invitations, removed, restoreDays: RESTORE_DAYS }, page);
 }
 
 /** POST /api/users — invite someone to this organization (optionally into a group). */

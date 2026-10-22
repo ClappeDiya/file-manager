@@ -4,6 +4,8 @@ import { exportAuditEntries } from '@/lib/utils/audit-integrity';
 import { isContext, requirePermission } from '@/lib/session';
 import { listAudit } from '@/lib/db/repos/audit';
 import { managedSubtree } from '@/lib/db/repos/orgs';
+import { pageInfo } from '@/lib/pagination';
+import { pagedJson, readPage } from '@/lib/route-helpers';
 
 const SYNC_EXPORT_LIMIT = 10_000;
 
@@ -13,8 +15,6 @@ export async function GET(request: NextRequest) {
   const exportFormat = searchParams.get('export') as AuditExportFormat | null;
   const ctx = await requirePermission(request, 'audit.read', ...(exportFormat ? (['audit.export'] as const) : []));
   if (!isContext(ctx)) return ctx;
-  const page = Math.max(1, parseInt(searchParams.get('page') || '1'));
-  const pageSize = Math.min(200, Math.max(1, parseInt(searchParams.get('pageSize') || '50')));
   const dateTo = searchParams.get('dateTo');
   const q = {
     orgIds: managedSubtree(ctx.orgId),
@@ -35,8 +35,11 @@ export async function GET(request: NextRequest) {
       headers: { 'Content-Type': types[exportFormat], 'Content-Disposition': `attachment; filename="audit-export.${exportFormat}"` },
     });
   }
-  const { entries, total } = listAudit({ ...q, limit: pageSize, offset: (page - 1) * pageSize });
-  return NextResponse.json({ entries, total, page, pageSize, totalPages: Math.ceil(total / pageSize) });
+  const pr = readPage(request, { maxLimit: 200 });
+  if (pr instanceof NextResponse) return pr;
+  const { entries, total } = listAudit({ ...q, limit: pr.limit, offset: pr.offset });
+  // `page`/`pageSize`/`totalPages` stay for existing callers.
+  return pagedJson(request, { entries, total, page: Math.floor(pr.offset / pr.limit) + 1, pageSize: pr.limit, totalPages: Math.ceil(total / pr.limit) }, pageInfo(pr, entries.length, total));
 }
 
 /** Audit entries are append-only and written by the console itself. */

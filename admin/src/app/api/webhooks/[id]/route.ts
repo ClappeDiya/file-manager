@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { pageInfo } from '@/lib/pagination';
+import { pagedJson, readPage } from '@/lib/route-helpers';
 import { audit, badRequest, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
 import {
   deleteWebhook,
@@ -29,7 +31,10 @@ export async function GET(request: NextRequest, { params }: P) {
   const q = new URL(request.url).searchParams;
   const status = q.get('status') as DeliveryStatus | null;
   if (status && !STATUSES.includes(status)) return badRequest('Unknown status');
-  return NextResponse.json({ webhook: w, stats: deliveryStats(ctx.orgId, id), deliveries: listDeliveries(ctx.orgId, id, { status: status ?? undefined, limit: Number(q.get('limit')) || 100 }) });
+  const pr = readPage(request, { defaultLimit: 100 });
+  if (pr instanceof NextResponse) return pr;
+  const deliveries = listDeliveries(ctx.orgId, id, { status: status ?? undefined, limit: pr.limit, offset: pr.offset });
+  return pagedJson(request, { webhook: w, stats: deliveryStats(ctx.orgId, id), deliveries }, pageInfo(pr, deliveries.length, null));
 }
 
 /** PATCH /api/webhooks/:id {name?, url?, events?, headers?, enabled?} */

@@ -288,8 +288,8 @@ export function recordSsoAttempt(p: Pick<SsoProvider, 'id' | 'orgId' | 'kind'>, 
     .run(p.id, p.id, KEEP_ATTEMPTS);
 }
 
-export function listSsoAttempts(orgId: string, providerId: string, limit = 50): SsoAttempt[] {
-  return (db().prepare('SELECT * FROM sso_attempts WHERE org_id = ? AND provider_id = ? ORDER BY at DESC, rowid DESC LIMIT ?').all(orgId, providerId, Math.min(limit, KEEP_ATTEMPTS)) as Row[]).map((r) => ({
+export function listSsoAttempts(orgId: string, providerId: string, limit = 50, offset = 0): SsoAttempt[] {
+  return (db().prepare('SELECT * FROM sso_attempts WHERE org_id = ? AND provider_id = ? ORDER BY at DESC, rowid DESC LIMIT ? OFFSET ?').all(orgId, providerId, Math.min(limit, KEEP_ATTEMPTS), offset) as Row[]).map((r) => ({
     id: r.id as string,
     providerId: r.provider_id as string,
     orgId: r.org_id as string,

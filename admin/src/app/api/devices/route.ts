@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { paged } from '@/lib/pagination';
+import { pagedJson, readPage } from '@/lib/route-helpers';
 import { isContext, requirePermission } from '@/lib/session';
 import { listMachines, type Machine } from '@/lib/db/repos/machines';
 import { listBackups } from '@/lib/db/repos/reports';
@@ -57,5 +59,9 @@ export async function GET(request: NextRequest) {
     error: devices.filter((d) => d.status === 'error').length,
     nonCompliant: devices.filter((d) => !d.policyCompliance.isCompliant).length,
   };
-  return NextResponse.json({ devices, stats });
+  // Stats cover every matching device; the list is paged when asked.
+  const pr = readPage(request, { defaultLimit: Infinity });
+  if (pr instanceof NextResponse) return pr;
+  const { items, page } = paged(devices, pr);
+  return pagedJson(request, { devices: items, stats }, page);
 }

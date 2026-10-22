@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { pageInfo } from '@/lib/pagination';
+import { pagedJson, readPage } from '@/lib/route-helpers';
 import { isContext, requirePermission } from '@/lib/session';
 import { listReports, reportRaw } from '@/lib/db/repos/reports';
 import { visibleMachineIds } from '@/lib/scope';
@@ -15,7 +17,8 @@ export async function GET(request: NextRequest) {
     return r ? NextResponse.json({ report: r, raw: reportRaw(id) }) : NextResponse.json({ error: 'Report not found' }, { status: 404 });
   }
   const days = Number(sp.get('days') ?? 0);
-  return NextResponse.json({
-    reports: listReports({ orgIds: [ctx.orgId], machineIds: ids, machineId: sp.get('machineId') || undefined, backupId: sp.get('backupId') || undefined, status: sp.get('status') || undefined, since: days ? new Date(Date.now() - days * 86_400_000).toISOString() : undefined, limit: Number(sp.get('limit') ?? 100) }),
-  });
+  const pr = readPage(request, { defaultLimit: 100 });
+  if (pr instanceof NextResponse) return pr;
+  const reports = listReports({ orgIds: [ctx.orgId], machineIds: ids, machineId: sp.get('machineId') || undefined, backupId: sp.get('backupId') || undefined, status: sp.get('status') || undefined, since: days ? new Date(Date.now() - days * 86_400_000).toISOString() : undefined, limit: pr.limit, offset: pr.offset });
+  return pagedJson(request, { reports }, pageInfo(pr, reports.length, null));
 }

@@ -187,7 +187,7 @@ export function listBackups(orgIds: string[], machineIds?: string[]): BackupRoll
   }));
 }
 
-export function listReports(o: { orgIds: string[]; machineId?: string; backupId?: string; status?: string; since?: string; limit?: number; machineIds?: string[] }): StoredReport[] {
+export function listReports(o: { orgIds: string[]; machineId?: string; backupId?: string; status?: string; since?: string; limit?: number; offset?: number; machineIds?: string[] }): StoredReport[] {
   if (!o.orgIds.length || (o.machineIds && !o.machineIds.length)) return [];
   const where = [`org_id IN (${o.orgIds.map(() => '?').join(',')})`];
   const args: unknown[] = [...o.orgIds];
@@ -196,7 +196,7 @@ export function listReports(o: { orgIds: string[]; machineId?: string; backupId?
   if (o.backupId) { where.push('backup_id = ?'); args.push(o.backupId); }
   if (o.status) { where.push('status = ?'); args.push(o.status); }
   if (o.since) { where.push('finished_at >= ?'); args.push(o.since); }
-  return (db().prepare(`SELECT * FROM backup_reports WHERE ${where.join(' AND ')} ORDER BY finished_at DESC LIMIT ?`).all(...args, Math.min(o.limit ?? 100, 5000)) as Row[]).map(fromRow);
+  return (db().prepare(`SELECT * FROM backup_reports WHERE ${where.join(' AND ')} ORDER BY finished_at DESC, rowid DESC LIMIT ? OFFSET ?`).all(...args, Math.min(o.limit ?? 100, 5000), o.offset ?? 0) as Row[]).map(fromRow);
 }
 
 export function reportRaw(id: string): unknown {

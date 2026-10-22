@@ -89,7 +89,7 @@ export function dueOutbox(at: Date, limit = 50): OutboxEntry[] {
   return (db().prepare("SELECT * FROM channel_outbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY next_attempt_at, created_at LIMIT ?").all(at.toISOString(), limit) as Row[]).map(fromRow);
 }
 
-export function listOutbox(orgId: string, o: { status?: OutboxStatus; channelId?: string; limit?: number } = {}): OutboxEntry[] {
+export function listOutbox(orgId: string, o: { status?: OutboxStatus; channelId?: string; limit?: number; offset?: number } = {}): OutboxEntry[] {
   const where = ['org_id = ?'];
   const args: unknown[] = [orgId];
   if (o.status) {
@@ -100,8 +100,8 @@ export function listOutbox(orgId: string, o: { status?: OutboxStatus; channelId?
     where.push('channel_id = ?');
     args.push(o.channelId);
   }
-  args.push(Math.min(o.limit ?? 100, 500));
-  return (db().prepare(`SELECT * FROM channel_outbox WHERE ${where.join(' AND ')} ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(...args) as Row[]).map(fromRow);
+  args.push(Math.min(o.limit ?? 100, 500), o.offset ?? 0);
+  return (db().prepare(`SELECT * FROM channel_outbox WHERE ${where.join(' AND ')} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`).all(...args) as Row[]).map(fromRow);
 }
 
 export function outboxCounts(orgId: string): Record<OutboxStatus, number> {

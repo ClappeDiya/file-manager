@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { pageInfo } from '@/lib/pagination';
+import { pagedJson, readPage } from '@/lib/route-helpers';
 import { audit, badRequest, isContext, readJson, requirePermission } from '@/lib/session';
 import { listAudit } from '@/lib/db/repos/audit';
 import { getAiGovernance, GovernanceError, saveAiGovernance, validateAiGovernance } from '@/lib/db/repos/ai-governance';
@@ -48,11 +50,10 @@ export async function GET(request: NextRequest) {
   const settings = getAiGovernance(ctx.orgId);
 
   if (view === 'audit') {
-    const params = new URL(request.url).searchParams;
-    const limit = Math.min(Math.max(parseInt(params.get('limit') || '50', 10) || 50, 1), 500);
-    const offset = Math.max(parseInt(params.get('offset') || '0', 10) || 0, 0);
-    const { entries, total } = listAudit({ orgIds: [ctx.orgId], eventPrefix: 'ai.', limit, offset });
-    return NextResponse.json({ entries, total });
+    const pr = readPage(request);
+    if (pr instanceof NextResponse) return pr;
+    const { entries, total } = listAudit({ orgIds: [ctx.orgId], eventPrefix: 'ai.', limit: pr.limit, offset: pr.offset });
+    return pagedJson(request, { entries, total }, pageInfo(pr, entries.length, total));
   }
 
   if (view === 'toggles') {

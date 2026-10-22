@@ -254,10 +254,10 @@ export function recordAttempt(d: WebhookDelivery, r: { ok: boolean; status: numb
   return dead ? 'dead' : 'pending';
 }
 
-export function listDeliveries(orgId: string, webhookId: string, o: { status?: DeliveryStatus; limit?: number } = {}): WebhookDelivery[] {
+export function listDeliveries(orgId: string, webhookId: string, o: { status?: DeliveryStatus; limit?: number; offset?: number } = {}): WebhookDelivery[] {
   const where = o.status ? 'AND status = ?' : '';
-  const args: unknown[] = [orgId, webhookId, ...(o.status ? [o.status] : []), Math.min(o.limit ?? 100, 500)];
-  return (db().prepare(`SELECT * FROM webhook_deliveries WHERE org_id = ? AND webhook_id = ? ${where} ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(...args) as Row[]).map(deliveryFromRow);
+  const args: unknown[] = [orgId, webhookId, ...(o.status ? [o.status] : []), Math.min(o.limit ?? 100, 500), o.offset ?? 0];
+  return (db().prepare(`SELECT * FROM webhook_deliveries WHERE org_id = ? AND webhook_id = ? ${where} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`).all(...args) as Row[]).map(deliveryFromRow);
 }
 
 /** Send a delivery again (any status): a fresh attempt now, attempts counted anew. */
