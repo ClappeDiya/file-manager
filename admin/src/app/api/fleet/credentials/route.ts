@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { managedSubtree } from '@/lib/db/repos/orgs';
 import { audit, badRequest, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
 import { createCredential, credentialPropagation, listCredentials } from '@/lib/db/repos/fleet-policies';
 import { listMachines } from '@/lib/db/repos/machines';
@@ -8,7 +9,7 @@ import { orgErrorResponse } from '@/lib/route-helpers';
 export async function GET(request: NextRequest) {
   const ctx = await requirePermission(request, 'fleet.read');
   if (!isContext(ctx)) return ctx;
-  const propagation = credentialPropagation(ctx.orgId, listMachines({ orgIds: [ctx.orgId], status: 'active' }));
+  const propagation = credentialPropagation(ctx.orgId, listMachines({ orgIds: managedSubtree(ctx.orgId), status: 'active' })) // inherited policies use them below too;
   return NextResponse.json({ credentials: listCredentials(ctx.orgId).map((c) => ({ ...c, propagation: propagation[c.id] ?? { targeted: 0, upToDate: 0, pending: [] } })) });
 }
 

@@ -9,7 +9,7 @@ export async function GET(request: NextRequest) {
   const m = await agentAuth(request);
   if (!isMachine(m)) return m;
   const policies = policiesFor(m);
-  const credentials = credentialsForPolicies(m.orgId, policies);
+  const credentials = credentialsForPolicies(policies);
   if (credentials.length) appendAudit({ eventType: 'credential.deliver', orgId: m.orgId, description: `Delivered ${credentials.length} credential(s) to "${m.name}"`, resourceType: 'machine', resourceId: m.id, metadata: { credentialIds: credentials.map((c) => c.id) } });
   return NextResponse.json({
     policySetVersion: policySetVersion(m),

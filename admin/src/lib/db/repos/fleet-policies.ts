@@ -5,6 +5,12 @@
  * Agents fetch the policies that apply to them and create/update a managed
  * job per policy (`policy-<id>`), tracking the version they applied.
  *
+ * Inheritance: a policy marked `inherit` also applies to machines of child
+ * organizations (not across a detached organization). A child organization
+ * can opt out of an inherited policy or replace it with its own policy of the
+ * same name — unless the parent `locked` it, in which case the inherited
+ * policy always applies and same-named child policies are refused.
+ *
  * Central credentials are sealed at rest and delivered only to machines a
  * policy that references them applies to. The agent stores each one in its
  * secure store under the credential id `central:<id>`, which templates use as
@@ -12,7 +18,7 @@
  */
 import { db, newId, now, parseJson, tx, type Row } from '../index';
 import { open, seal } from '../../crypto';
-import { OrgError } from './orgs';
+import { ancestors, getOrg, OrgError, type Organization } from './orgs';
 import { normalizeTags, type Machine } from './machines';
 import { managedSettingsForAgent } from './managed-settings';
 
@@ -32,6 +38,10 @@ export interface FleetPolicy {
   job: Record<string, unknown>;
   credentialIds: string[];
   enabled: boolean;
+  /** Also applies to machines of child organizations. */
+  inherit: boolean;
+  /** With inherit: child organizations cannot opt out or replace it. */
+  locked: boolean;
   version: number;
   createdBy: string;
   createdAt: string;
@@ -49,6 +59,8 @@ function fromRow(r: Row): FleetPolicy {
     job: parseJson(r.job, {}),
     credentialIds: parseJson<string[]>(r.credential_ids, []),
     enabled: Boolean(r.enabled),
+    inherit: Boolean(r.inherit),
+    locked: Boolean(r.inherit) && Boolean(r.locked),
     version: Number(r.version),
     createdBy: r.created_by as string,
     createdAt: r.created_at as string,
@@ -86,18 +98,27 @@ export interface PolicyInput {
   target: Partial<PolicyTarget>;
   job: Record<string, unknown>;
   enabled?: boolean;
+  inherit?: boolean;
+  locked?: boolean;
+}
+
+/** A locked inherited policy owns its name in this organization. */
+function assertNameFree(orgId: string, name: string) {
+  const lock = inheritedPolicies(orgId).find((i) => i.policy.locked && i.policy.name.toLowerCase() === name.trim().toLowerCase());
+  if (lock) throw new OrgError(`"${lock.policy.name}" is a locked policy inherited from ${lock.sourceOrgName}; it cannot be replaced here`, 409);
 }
 
 export function createFleetPolicy(orgId: string, p: PolicyInput, by: string): FleetPolicy {
   if (!p.name?.trim()) throw new OrgError('Give the policy a name');
+  assertNameFree(orgId, p.name);
   const creds: string[] = [];
   validateJob(p.job, orgId, creds);
   const id = newId('fpl');
   const ts = now();
   const target: PolicyTarget = { tags: normalizeTags(p.target?.tags ?? []), machineIds: (p.target?.machineIds ?? []).map(String), all: !!p.target?.all };
   db()
-    .prepare('INSERT INTO fleet_policies (id, org_id, name, description, target, job, credential_ids, enabled, version, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)')
-    .run(id, orgId, p.name.trim(), p.description ?? '', JSON.stringify(target), JSON.stringify(p.job), JSON.stringify(creds), p.enabled === false ? 0 : 1, by, ts, ts);
+    .prepare('INSERT INTO fleet_policies (id, org_id, name, description, target, job, credential_ids, enabled, inherit, locked, version, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)')
+    .run(id, orgId, p.name.trim(), p.description ?? '', JSON.stringify(target), JSON.stringify(p.job), JSON.stringify(creds), p.enabled === false ? 0 : 1, p.inherit ? 1 : 0, p.inherit && p.locked ? 1 : 0, by, ts, ts);
   return getFleetPolicy(orgId, id)!;
 }
 
@@ -108,9 +129,12 @@ export function updateFleetPolicy(orgId: string, id: string, p: Partial<PolicyIn
   const creds: string[] = [];
   validateJob(job, orgId, creds);
   const target: PolicyTarget = p.target ? { tags: normalizeTags(p.target.tags ?? []), machineIds: (p.target.machineIds ?? []).map(String), all: !!p.target.all } : cur.target;
+  if (p.name?.trim() && p.name.trim().toLowerCase() !== cur.name.toLowerCase()) assertNameFree(orgId, p.name);
+  const inherit = p.inherit ?? cur.inherit;
+  const locked = inherit && (p.locked ?? cur.locked);
   db()
-    .prepare('UPDATE fleet_policies SET name = ?, description = ?, target = ?, job = ?, credential_ids = ?, enabled = ?, version = version + 1, updated_at = ? WHERE org_id = ? AND id = ?')
-    .run(p.name?.trim() || cur.name, p.description ?? cur.description, JSON.stringify(target), JSON.stringify(job), JSON.stringify(creds), (p.enabled ?? cur.enabled) ? 1 : 0, now(), orgId, id);
+    .prepare('UPDATE fleet_policies SET name = ?, description = ?, target = ?, job = ?, credential_ids = ?, enabled = ?, inherit = ?, locked = ?, version = version + 1, updated_at = ? WHERE org_id = ? AND id = ?')
+    .run(p.name?.trim() || cur.name, p.description ?? cur.description, JSON.stringify(target), JSON.stringify(job), JSON.stringify(creds), (p.enabled ?? cur.enabled) ? 1 : 0, inherit ? 1 : 0, locked ? 1 : 0, now(), orgId, id);
   return getFleetPolicy(orgId, id);
 }
 
@@ -127,19 +151,95 @@ export function deleteFleetPolicy(orgId: string, id: string): boolean {
   return db().prepare('DELETE FROM fleet_policies WHERE org_id = ? AND id = ?').run(orgId, id).changes > 0;
 }
 
-export function policyApplies(p: FleetPolicy, m: Machine): boolean {
-  return p.enabled && p.orgId === m.orgId && (p.target.all || p.target.machineIds.includes(m.id) || (p.target.tags.length > 0 && p.target.tags.every((t) => m.tags.includes(t))));
+/** The policy's target matches the machine (organization rules aside). */
+function targets(p: FleetPolicy, m: Machine): boolean {
+  return p.enabled && (p.target.all || p.target.machineIds.includes(m.id) || (p.target.tags.length > 0 && p.target.tags.every((t) => m.tags.includes(t))));
 }
 
+/** The organization and the ancestors whose inherited policies reach it (stopping at a detached organization), closest first. */
+function inheritanceChain(orgId: string): Organization[] {
+  const org = getOrg(orgId);
+  if (!org) return [];
+  const chain = [org];
+  let below = org;
+  for (const a of ancestors(orgId)) {
+    if (below.detached) break;
+    chain.push(a);
+    below = a;
+  }
+  return chain;
+}
+
+export interface InheritedPolicy {
+  policy: FleetPolicy;
+  sourceOrgId: string;
+  sourceOrgName: string;
+  /** Opted out here or by an organization in between (ignored when locked). */
+  optedOut: boolean;
+  /** This organization's own opt-out (what the opt-out switch shows). */
+  optedOutHere: boolean;
+}
+
+/** Policies that reach `orgId` from its ancestors (closest ancestor first). */
+export function inheritedPolicies(orgId: string): InheritedPolicy[] {
+  const chain = inheritanceChain(orgId);
+  const out: InheritedPolicy[] = [];
+  for (let depth = 1; depth < chain.length; depth++) {
+    const src = chain[depth];
+    const between = chain.slice(0, depth).map((o) => o.id);
+    for (const p of listFleetPolicies(src.id).filter((x) => x.inherit)) {
+      const outs = new Set((db().prepare(`SELECT org_id FROM policy_opt_outs WHERE policy_id = ? AND org_id IN (${between.map(() => '?').join(',')})`).all(p.id, ...between) as Row[]).map((r) => r.org_id as string));
+      out.push({ policy: p, sourceOrgId: src.id, sourceOrgName: src.name, optedOut: outs.size > 0, optedOutHere: outs.has(orgId) });
+    }
+  }
+  return out;
+}
+
+/** Opt a child organization out of (or back into) an inherited policy. */
+export function setPolicyOptOut(orgId: string, policyId: string, optOut: boolean, by: string): InheritedPolicy {
+  const i = inheritedPolicies(orgId).find((x) => x.policy.id === policyId);
+  if (!i) throw new OrgError('Not a policy inherited by this organization', 404);
+  if (optOut && i.policy.locked) throw new OrgError(`"${i.policy.name}" is locked by ${i.sourceOrgName}`, 409);
+  if (optOut) db().prepare('INSERT OR IGNORE INTO policy_opt_outs (org_id, policy_id, opted_out_by, created_at) VALUES (?, ?, ?, ?)').run(orgId, policyId, by, now());
+  else db().prepare('DELETE FROM policy_opt_outs WHERE org_id = ? AND policy_id = ?').run(orgId, policyId);
+  return inheritedPolicies(orgId).find((x) => x.policy.id === policyId)!;
+}
+
+/**
+ * The policies a machine runs: its organization's own, plus inherited ones
+ * not opted out. Per name, a locked inherited policy wins (the top-most lock);
+ * otherwise the closest organization's policy replaces inherited ones.
+ */
 export function policiesFor(m: Machine): FleetPolicy[] {
-  return listFleetPolicies(m.orgId).filter((p) => policyApplies(p, m));
+  const own = listFleetPolicies(m.orgId).map((p) => ({ p, depth: 0, locked: false }));
+  const inherited = inheritedPolicies(m.orgId)
+    .filter((i) => i.policy.locked || !i.optedOut)
+    .map((i) => ({ p: i.policy, depth: inheritanceChain(m.orgId).findIndex((o) => o.id === i.sourceOrgId), locked: i.policy.locked }));
+  const byName = new Map<string, { p: FleetPolicy; depth: number; locked: boolean }[]>();
+  for (const c of [...own, ...inherited]) {
+    if (!targets(c.p, m)) continue;
+    const k = c.p.name.toLowerCase();
+    byName.set(k, [...(byName.get(k) ?? []), c]);
+  }
+  const out: FleetPolicy[] = [];
+  for (const group of byName.values()) {
+    const locks = group.filter((c) => c.locked);
+    const pick = locks.length ? locks.reduce((a, b) => (b.depth > a.depth ? b : a)) : group.reduce((a, b) => (b.depth < a.depth ? b : a));
+    // Same-named policies of one organization all run (names are not unique within an organization).
+    out.push(...group.filter((c) => c.depth === pick.depth && c.locked === pick.locked).map((c) => c.p));
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+}
+
+export function policyApplies(p: FleetPolicy, m: Machine): boolean {
+  return policiesFor(m).some((x) => x.id === p.id);
 }
 
 /** Policy set version the agent compares against (changes when any applicable policy changes). */
 export function policySetVersion(m: Machine): string {
   const policies = policiesFor(m);
   const parts = policies.map((p) => `${p.id}:${p.version}`);
-  for (const c of credentialVersionsFor(m.orgId, policies)) parts.push(`cred:${c.id}:${c.version}`);
+  for (const c of credentialVersionsFor(policies)) parts.push(`cred:${c.id}:${c.version}`);
   const settings = managedSettingsForAgent(m.orgId);
   if (settings) parts.push(`settings:${settings.version}`);
   return parts.sort().join(',');
@@ -221,18 +321,23 @@ export function deleteCredential(orgId: string, id: string): boolean {
   return db().prepare('DELETE FROM central_credentials WHERE org_id = ? AND id = ?').run(orgId, id).changes > 0;
 }
 
+/** Credential rows referenced by these policies, each from its policy's own organization (inherited policies use their parent's). */
+function credentialRows(policies: FleetPolicy[]): Row[] {
+  const pairs = new Map<string, string>();
+  for (const p of policies) for (const id of p.credentialIds) pairs.set(id, p.orgId);
+  if (!pairs.size) return [];
+  const ids = [...pairs.keys()];
+  return (db().prepare(`SELECT * FROM central_credentials WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids) as Row[]).filter((r) => pairs.get(r.id as string) === r.org_id);
+}
+
 /** Decrypted credentials referenced by these policies (agent delivery only). */
-export function credentialsForPolicies(orgId: string, policies: FleetPolicy[]): { id: string; credentialId: string; name: string; secret: string; updatedAt: string; version: number }[] {
-  const ids = [...new Set(policies.flatMap((p) => p.credentialIds))];
-  if (!ids.length) return [];
-  return (db().prepare(`SELECT * FROM central_credentials WHERE org_id = ? AND id IN (${ids.map(() => '?').join(',')})`).all(orgId, ...ids) as Row[]).map((r) => ({ id: r.id as string, credentialId: `central:${r.id}`, name: r.name as string, secret: open(r.ciphertext as string), updatedAt: r.updated_at as string, version: Number(r.version ?? 1) }));
+export function credentialsForPolicies(policies: FleetPolicy[]): { id: string; credentialId: string; name: string; secret: string; updatedAt: string; version: number }[] {
+  return credentialRows(policies).map((r) => ({ id: r.id as string, credentialId: `central:${r.id}`, name: r.name as string, secret: open(r.ciphertext as string), updatedAt: r.updated_at as string, version: Number(r.version ?? 1) }));
 }
 
 /** Versions of the credentials a machine's policies use (no secrets). */
-function credentialVersionsFor(orgId: string, policies: FleetPolicy[]): { id: string; version: number }[] {
-  const ids = [...new Set(policies.flatMap((p) => p.credentialIds))];
-  if (!ids.length) return [];
-  return (db().prepare(`SELECT id, version FROM central_credentials WHERE org_id = ? AND id IN (${ids.map(() => '?').join(',')})`).all(orgId, ...ids) as Row[]).map((r) => ({ id: r.id as string, version: Number(r.version ?? 1) }));
+function credentialVersionsFor(policies: FleetPolicy[]): { id: string; version: number }[] {
+  return credentialRows(policies).map((r) => ({ id: r.id as string, version: Number(r.version ?? 1) }));
 }
 
 /** Per credential: machines whose policies use it, and which hold the current version. */

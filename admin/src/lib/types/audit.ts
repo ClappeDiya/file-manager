@@ -15,6 +15,7 @@ export type AuditEventType =
   | 'admin.user_restore'
   | 'admin.user_purge'
   | 'admin.user_expiry'
+  | 'fleet.policy_opt_out'
   | 'api_token.retired_inactive'
   | 'connection.create'
   | 'connection.update'

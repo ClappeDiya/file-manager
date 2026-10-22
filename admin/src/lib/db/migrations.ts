@@ -554,6 +554,22 @@ export const MIGRATIONS: Migration[] = [
       d.exec('ALTER TABLE users ADD COLUMN time_zone TEXT');
     },
   },
+  {
+    version: 23,
+    description: 'Fleet policy inheritance, locks and child-organization opt-outs',
+    up(d) {
+      d.exec(`
+        ALTER TABLE fleet_policies ADD COLUMN inherit INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE fleet_policies ADD COLUMN locked INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE policy_opt_outs (
+          org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          policy_id TEXT NOT NULL REFERENCES fleet_policies(id) ON DELETE CASCADE,
+          opted_out_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+          PRIMARY KEY (org_id, policy_id)
+        );
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;
