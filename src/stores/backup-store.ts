@@ -480,9 +480,43 @@ export interface BackupJob {
   secret_providers: string[];
   prevent_sleep: boolean;
   notify_on: string[];
+  /** Legal hold: while set, retention is suspended and nothing can be removed. */
+  legal_hold: LegalHold | null;
   created_at: string;
   updated_at: string;
   stats: JobStats;
+}
+
+export interface LegalHold {
+  matter: string;
+  reason: string;
+  placed_by: string;
+  placed_at: string;
+}
+
+/** `governance::ediscovery::EDiscoveryRequest`. */
+export interface EDiscoveryRequest {
+  matter: string;
+  output: string;
+  paths: string[];
+  since: string | null;
+  until: string | null;
+  /** Empty = every job under legal hold. */
+  job_ids: string[];
+  include_files: boolean;
+  max_file_bytes: number | null;
+}
+
+export interface EDiscoveryReport {
+  output: string;
+  sha256: string;
+  bytes: number;
+  entries: number;
+  ledger_events: number;
+  jobs: string[];
+  restored_files: number;
+  files_truncated: boolean;
+  audit_ok: boolean;
 }
 
 export interface Fileset {
@@ -894,6 +928,7 @@ export function newBackupJob(): BackupJob {
     log_outputs: { file: null, file_filter: newLogFilter(), file_max_mb: 10, system_log: false, system_filter: { ...newLogFilter(), min_level: "warning" } },
     prevent_sleep: true,
     notify_on: ["warning", "error"],
+    legal_hold: null,
     created_at: now,
     updated_at: now,
     stats: {
@@ -963,6 +998,9 @@ interface BackupState {
   execute: (id: string, operation: BackupOperation) => Promise<OperationResult>;
   pause: (minutes: number | null) => Promise<void>;
   resume: () => Promise<void>;
+  placeLegalHold: (id: string, matter: string, reason: string) => Promise<BackupJob>;
+  releaseLegalHold: (id: string) => Promise<BackupJob>;
+  exportEDiscovery: (request: EDiscoveryRequest) => Promise<EDiscoveryReport>;
   clearError: () => void;
 }
 
@@ -1052,6 +1090,20 @@ export const useBackupStore = create<BackupState>((set, get) => ({
     const status = await tauriInvoke<SchedulerStatus>("backup_resume", {});
     set({ status });
   },
+
+  placeLegalHold: async (id, matter, reason) => {
+    const job = await tauriInvoke<BackupJob>("backup_place_legal_hold", { id, matter, reason });
+    await get().loadJobs();
+    return job;
+  },
+
+  releaseLegalHold: async (id) => {
+    const job = await tauriInvoke<BackupJob>("backup_release_legal_hold", { id });
+    await get().loadJobs();
+    return job;
+  },
+
+  exportEDiscovery: (request) => tauriInvoke<EDiscoveryReport>("ediscovery_export", { request }),
 
   clearError: () => set({ error: null }),
 }));

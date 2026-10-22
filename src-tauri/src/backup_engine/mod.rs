@@ -8,6 +8,7 @@
 //! missed-run catch-up and pause/resume, pre/post scripts, HTTP report
 //! callbacks, run history (`backup_runs`) and the operation ledger.
 
+pub mod legal_hold;
 pub mod api;
 pub mod bugreport;
 pub mod connector_backend;
@@ -233,6 +234,9 @@ pub struct BackupJob {
     pub created_at: String,
     pub updated_at: String,
     pub stats: JobStats,
+    /// While set, nothing in the backup set can be removed (see `legal_hold`).
+    #[serde(default)]
+    pub legal_hold: Option<legal_hold::LegalHold>,
 }
 
 impl Default for BackupJob {
@@ -268,6 +272,7 @@ impl Default for BackupJob {
             created_at: now.clone(),
             updated_at: now,
             stats: JobStats::default(),
+            legal_hold: None,
         }
     }
 }
@@ -750,6 +755,8 @@ impl BackupManager {
             Some(old) => {
                 job.created_at = old.created_at.clone();
                 job.stats = old.stats.clone();
+                // Only the hold commands place or release a hold.
+                job.legal_hold = old.legal_hold.clone();
                 if old.options.block_size != job.options.block_size && old.stats.version_count > 0 {
                     return Err(AppError::validation(
                         "Block size cannot change after the first backup; create a new job for a new block size",
@@ -761,6 +768,7 @@ impl BackupManager {
                     job.id = uuid::Uuid::new_v4().to_string();
                 }
                 job.created_at = now.clone();
+                job.legal_hold = None;
             }
         }
         job.updated_at = now;
@@ -1073,6 +1081,7 @@ impl BackupManager {
             return Err(AppError::state("This job has a running or queued operation", "Cancel it first."));
         }
         let job = self.get_job(id).await?;
+        legal_hold::guard_delete(&job)?;
         if delete_remote {
             let backend = self.build_backend(&job).await?;
             let prefix = job.options.prefix.clone();
@@ -2461,6 +2470,7 @@ fn run_core(
     kdf: KdfParams,
     ctx: &OpContext,
 ) -> Result<serde_json::Value, AppError> {
+    legal_hold::guard(job, &op)?;
     let db = BackupDb::open(db_path)?;
     let open = |create: bool| Repo::open(backend, &db, pass, &job.options, create, kdf);
     let v = match op {
@@ -2474,7 +2484,7 @@ fn run_core(
                 (true, true) => Some(portability::full_config(job)?),
             };
             let sources: Vec<PathBuf> = job.sources.iter().map(PathBuf::from).collect();
-            serde_json::to_value(ufop_core::backup::run_backup(backend, &db, &sources, &filter, &opts, &job.retention, pass, kdf, ctx)?)?
+            serde_json::to_value(ufop_core::backup::run_backup(backend, &db, &sources, &filter, &opts, &legal_hold::effective_retention(job), pass, kdf, ctx)?)?
         }
         BackupOperation::Restore { options, .. } => serde_json::to_value(ufop_core::backup::run_restore(&open(false)?, &options, ctx)?)?,
         BackupOperation::Verify { full } => {

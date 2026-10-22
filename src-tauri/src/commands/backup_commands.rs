@@ -9,6 +9,10 @@ use crate::backup_engine::defaults::{GlobalDefaults, SavedDestination};
 use crate::backup_engine::{DatabaseCleanupReport, DatabaseEntry};
 use ufop_core::backup::recovery;
 use crate::core::error::AppError;
+use crate::governance::ediscovery::{self, EDiscoveryReport, EDiscoveryRequest};
+use crate::ledger::OperationLedger;
+use crate::security::audit::{AuditTrail, SecurityAudit};
+use crate::storage::Repository;
 use tauri::State;
 use ufop_core::backup::crypto::{self, PassphraseStrength};
 use ufop_core::backup::maintenance::{FoundFile, VersionComparison};
@@ -388,4 +392,37 @@ pub async fn backup_set_desktop_settings(
     let res = if settings.start_at_login { al.enable() } else { al.disable() };
     res.map_err(|e| AppError::state(format!("Could not change start-at-login: {e}"), "Check that the app may register itself to start at login."))?;
     backup_get_desktop_settings(app, mode).await
+}
+
+// ── Legal hold and eDiscovery ───────────────────────────────────────────
+
+/// Place a legal hold on a job: retention is suspended and nothing in the
+/// backup set can be removed until it is released. Recorded in the audit log.
+#[tauri::command]
+pub async fn backup_place_legal_hold(id: String, matter: String, reason: String, mgr: State<'_, BackupManager>, repo: State<'_, Repository>) -> Result<BackupJob, AppError> {
+    let job = mgr.place_legal_hold(&id, &matter, &reason, "user").await?;
+    SecurityAudit::log(repo.inner(), "legal_hold.place", "user", &format!("backup:{}", job.id), &format!("\"{}\" held for matter {}: {}", job.name, matter.trim(), reason.trim())).await;
+    Ok(job)
+}
+
+#[tauri::command]
+pub async fn backup_release_legal_hold(id: String, mgr: State<'_, BackupManager>, repo: State<'_, Repository>) -> Result<BackupJob, AppError> {
+    let (job, hold) = mgr.release_legal_hold(&id).await?;
+    SecurityAudit::log(repo.inner(), "legal_hold.release", "user", &format!("backup:{}", job.id), &format!("\"{}\" released from matter {} (placed {} by {})", job.name, hold.matter, hold.placed_at, hold.placed_by)).await;
+    Ok(job)
+}
+
+/// Write an eDiscovery bundle (audit log, ledger, held backups, optionally
+/// restored files) with a SHA-256 manifest. Recorded in the audit log.
+#[tauri::command]
+pub async fn ediscovery_export(
+    request: EDiscoveryRequest,
+    mgr: State<'_, BackupManager>,
+    ledger: State<'_, OperationLedger>,
+    audit: State<'_, AuditTrail>,
+    repo: State<'_, Repository>,
+) -> Result<EDiscoveryReport, AppError> {
+    let report = ediscovery::export(&request, mgr.inner(), ledger.inner(), audit.inner(), "user").await?;
+    SecurityAudit::log(repo.inner(), "ediscovery.export", "user", &report.output, &format!("matter {}: {} entries, sha256 {}", request.matter.trim(), report.entries, report.sha256)).await;
+    Ok(report)
 }

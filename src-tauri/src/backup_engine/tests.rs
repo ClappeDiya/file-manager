@@ -899,3 +899,109 @@ async fn concurrency_cap_runs_jobs_in_parallel_but_never_one_job_twice() {
     d.caps.max_concurrent_runs = 9;
     assert!(m.set_global_defaults(d).await.is_err());
 }
+
+#[tokio::test]
+async fn legal_hold_suspends_retention_blocks_removal_and_feeds_ediscovery() {
+    use crate::governance::ediscovery::{export, EDiscoveryRequest, ManifestEntry};
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(src.join("legal")).unwrap();
+    std::fs::write(src.join("legal/contract.txt"), b"v1").unwrap();
+    std::fs::write(src.join("other.txt"), b"x").unwrap();
+    let repo = Repository::open_in_memory().await.unwrap();
+    let ledger = OperationLedger::new(repo.pool().clone());
+    let m = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, Some(ledger.clone()), t.path().join("dbs"), KdfParams::insecure_fast());
+    let audit = crate::security::audit::AuditTrail::new(repo.pool().clone(), None, None);
+    let mut j = job(&src, &dst);
+    j.retention = RetentionPolicy::KeepCount { count: 1 };
+    let j = m.save_job(j, Some("pw".into())).await.unwrap();
+
+    assert!(m.place_legal_hold(&j.id, "  ", "", "user").await.is_err());
+    let held = m.place_legal_hold(&j.id, "Case 2026-17", "Litigation", "user").await.unwrap();
+    assert_eq!(held.legal_hold.as_ref().unwrap().matter, "Case 2026-17");
+
+    // Retention (keep 1) is suspended: both versions stay.
+    for body in [b"v22".as_slice(), b"v333".as_slice()] {
+        std::fs::write(src.join("legal/contract.txt"), body).unwrap();
+        let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+        assert_eq!(r.status, "success", "{:?}", r.log);
+    }
+    assert_eq!(m.list_versions(&j.id).await.unwrap().len(), 2);
+
+    // Removal is refused; a dry run is not.
+    assert!(m.execute(&j.id, BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false }).await.is_err());
+    assert!(m.execute(&j.id, BackupOperation::Purge { paths: vec!["/x".into()], versions: None, dry_run: false }).await.is_err());
+    assert!(m.execute(&j.id, BackupOperation::Purge { paths: vec!["/x".into()], versions: None, dry_run: true }).await.is_ok());
+    assert!(m.delete_job(&j.id, true, false).await.is_err());
+
+    // The job editor keeps the hold (it cannot be cleared by saving).
+    let mut edited = m.get_job(&j.id).await.unwrap();
+    edited.legal_hold = None;
+    edited.name = "Docs renamed".into();
+    assert!(m.save_job(edited, None).await.unwrap().legal_hold.is_some());
+    // …and it survives a reload from the database.
+    m.inner.jobs.write().await.clear();
+    m.load_from_db().await.unwrap();
+    assert!(m.get_job(&j.id).await.unwrap().legal_hold.is_some());
+
+    // eDiscovery export of the held job, scoped to the legal folder, with files.
+    let out = t.path().join("matter.zip");
+    let legal = src.join("legal").to_string_lossy().into_owned();
+    let req = EDiscoveryRequest { matter: "Case 2026-17".into(), output: out.to_string_lossy().into(), paths: vec![legal.clone()], include_files: true, ..Default::default() };
+    assert!(export(&EDiscoveryRequest { output: t.path().join("x.tar").to_string_lossy().into(), ..req.clone() }, &m, &ledger, &audit, "user").await.is_err());
+    let rep = export(&req, &m, &ledger, &audit, "user").await.unwrap();
+    assert_eq!(rep.jobs, vec!["Docs renamed".to_string()]);
+    assert_eq!(rep.restored_files, 1);
+    assert!(rep.audit_ok && !rep.files_truncated);
+    assert!(!t.path().join("matter.zip.part").exists());
+    assert_eq!(rep.sha256, hex::encode(Sha256::digest(std::fs::read(&out).unwrap())));
+    // Exporting over an existing file is refused.
+    assert!(export(&req, &m, &ledger, &audit, "user").await.is_err());
+
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+    assert_eq!(zip.len(), rep.entries);
+    let mut manifest = String::new();
+    zip.by_name("manifest.json").unwrap().read_to_string(&mut manifest).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    assert_eq!(manifest["format"], "ufop-ediscovery/1");
+    assert_eq!(manifest["matter"], "Case 2026-17");
+    let entries: Vec<ManifestEntry> = serde_json::from_value(manifest["entries"].clone()).unwrap();
+    assert_eq!(entries.len() + 1, zip.len());
+    for e in &entries {
+        let mut data = Vec::new();
+        zip.by_name(&e.path).unwrap().read_to_end(&mut data).unwrap();
+        assert_eq!((data.len() as u64, hex::encode(Sha256::digest(&data))), (e.bytes, e.sha256.clone()), "{}", e.path);
+    }
+    let names: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    for want in ["audit/audit-log.jsonl", "audit/verification.json", "ledger/events.jsonl", "README.txt"] {
+        assert!(names.contains(&want), "{want} missing from {names:?}");
+    }
+    let restored: Vec<&&str> = names.iter().filter(|n| n.starts_with("files/")).collect();
+    assert_eq!(restored.len(), 1);
+    assert!(restored[0].ends_with("legal/contract.txt"), "{restored:?}");
+    let mut body = String::new();
+    zip.by_name(restored[0]).unwrap().read_to_string(&mut body).unwrap();
+    assert_eq!(body, "v333");
+    // Only files under the requested paths are listed.
+    let mut listed = String::new();
+    zip.by_name(names.iter().find(|n| n.ends_with("files-v0.jsonl")).unwrap()).unwrap().read_to_string(&mut listed).unwrap();
+    assert!(listed.contains("contract.txt") && !listed.contains("other.txt"));
+    let hold: serde_json::Value = {
+        let mut s = String::new();
+        zip.by_name(names.iter().find(|n| n.ends_with("legal-hold.json")).unwrap()).unwrap().read_to_string(&mut s).unwrap();
+        serde_json::from_str(&s).unwrap()
+    };
+    assert_eq!(hold["reason"], "Litigation");
+    drop(zip);
+
+    // Release: retention applies again and the job can be deleted.
+    let (released, hold) = m.release_legal_hold(&j.id).await.unwrap();
+    assert!(released.legal_hold.is_none() && hold.matter == "Case 2026-17");
+    assert!(m.release_legal_hold(&j.id).await.is_err());
+    std::fs::write(src.join("legal/contract.txt"), b"v4444").unwrap();
+    m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(m.list_versions(&j.id).await.unwrap().len(), 1);
+    m.delete_job(&j.id, true, false).await.unwrap();
+}

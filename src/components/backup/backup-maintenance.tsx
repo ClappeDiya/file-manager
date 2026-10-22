@@ -10,6 +10,7 @@ import { formatBytes } from "@/lib/format-bytes";
 import { downloadText, inputCls } from "@/lib/backup-helpers";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { BackupSupportTools } from "./backup-support-tools";
+import { BackupLegalHold } from "./backup-legal-hold";
 
 
 export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDeleted: () => void }) {
@@ -65,6 +66,8 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
           <pre className="text-[11px] max-h-40 overflow-auto whitespace-pre-wrap">{JSON.stringify(result.report, null, 2)}</pre>
         </Banner>
       )}
+
+      <BackupLegalHold job={job} />
 
       <Section title="Integrity">
         <div className="flex gap-1 flex-wrap">
