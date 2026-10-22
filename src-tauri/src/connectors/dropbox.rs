@@ -773,6 +773,28 @@ impl Connector for DropboxConnector {
     fn is_connected(&self) -> bool {
         false // Conservative default
     }
+
+    fn create_share_link(
+        &self,
+        remote_path: &str,
+        options: &super::ShareOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<super::ShareLink, AppError>> + Send + '_>> {
+        let (r, o) = (remote_path.to_string(), options.clone());
+        Box::pin(async move {
+            let token = self.get_token().await?;
+            let resp = self
+                .http
+                .post(format!("{DROPBOX_API_BASE}/sharing/create_shared_link_with_settings"))
+                .bearer_auth(&token)
+                .json(&dropbox_link_body(&r, &o, chrono::Utc::now()))
+                .send()
+                .await
+                .map_err(|e| AppError::connection(format!("Dropbox share failed: {e}"), "Check your network connection."))?;
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            parse_dropbox_link(status, &body, o.scope)
+        })
+    }
 }
 
 /// Convert a Dropbox API entry to our FileEntry.
@@ -817,8 +839,68 @@ fn dropbox_entry_to_file_entry(entry: DropboxEntry) -> FileEntry {
     }
 }
 
+/// `create_shared_link_with_settings` request body.
+pub(crate) fn dropbox_link_body(path: &str, o: &super::ShareOptions, now: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    let mut settings = serde_json::json!({
+        "audience": { ".tag": match o.scope { super::ShareScope::Anyone => "public", super::ShareScope::Organization => "team" } },
+        "access": { ".tag": if o.allow_edit { "editor" } else { "viewer" } },
+    });
+    if let Some(s) = o.expires_in_secs {
+        settings["expires"] = (now + chrono::Duration::seconds(s as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into();
+    }
+    if let Some(p) = o.password.as_deref().filter(|p| !p.is_empty()) {
+        settings["require_password"] = true.into();
+        settings["link_password"] = p.into();
+    }
+    serde_json::json!({ "path": path, "settings": settings })
+}
+
+/// Link from the reply; an already-existing link is reused (Dropbox keeps
+/// one link per file and won't change its settings here).
+pub(crate) fn parse_dropbox_link(status: u16, body: &str, scope: super::ShareScope) -> Result<super::ShareLink, AppError> {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let expires = |m: &serde_json::Value| m["expires"].as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.with_timezone(&chrono::Utc));
+    if status == 200 {
+        let url = v["url"].as_str().ok_or_else(|| AppError::connection("Dropbox returned no link", "Try again."))?;
+        return Ok(super::ShareLink { url: url.into(), expires_at: expires(&v), scope, provider: "dropbox".into(), note: None });
+    }
+    let existing = &v["error"]["shared_link_already_exists"]["metadata"];
+    if let Some(url) = existing["url"].as_str() {
+        return Ok(super::ShareLink {
+            url: url.into(),
+            expires_at: expires(existing),
+            scope,
+            provider: "dropbox".into(),
+            note: Some("This file already had a link; Dropbox reused it with its existing settings.".into()),
+        });
+    }
+    let summary = v["error_summary"].as_str().unwrap_or(body);
+    Err(AppError::Connection {
+        message: format!("Dropbox refused the share link: {summary}"),
+        advice: "Expiry dates, passwords and team-only links need a Dropbox plan that allows them.".into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn share_link_body_and_replies() {
+        use crate::connectors::{ShareOptions, ShareScope};
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-22T10:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let b = super::dropbox_link_body("/a.pdf", &ShareOptions { expires_in_secs: Some(60), password: Some("pw".into()), ..Default::default() }, now);
+        assert_eq!(b["settings"]["expires"], "2026-10-22T10:01:00Z");
+        assert_eq!(b["settings"]["audience"][".tag"], "public");
+        assert_eq!((b["settings"]["require_password"].as_bool(), b["settings"]["link_password"].as_str()), (Some(true), Some("pw")));
+        let ok = super::parse_dropbox_link(200, r#"{"url":"https://www.dropbox.com/s/x/a.pdf?dl=0","expires":"2026-10-22T10:01:00Z"}"#, ShareScope::Anyone).unwrap();
+        assert_eq!(ok.url, "https://www.dropbox.com/s/x/a.pdf?dl=0");
+        assert!(ok.expires_at.is_some() && ok.note.is_none());
+        let reused = super::parse_dropbox_link(409, r#"{"error_summary":"shared_link_already_exists/metadata/..","error":{".tag":"shared_link_already_exists","shared_link_already_exists":{".tag":"metadata","metadata":{"url":"https://db.tt/old"}}}}"#, ShareScope::Anyone).unwrap();
+        assert_eq!(reused.url, "https://db.tt/old");
+        assert!(reused.note.is_some());
+        let err = super::parse_dropbox_link(409, r#"{"error_summary":"settings_error/not_authorized/.."}"#, ShareScope::Anyone).unwrap_err();
+        assert!(err.to_string().contains("settings_error"));
+    }
+
     use super::*;
 
     #[test]

@@ -219,3 +219,31 @@ pub async fn connector_list_protocols(
 ) -> Result<Vec<String>, AppError> {
     Ok(registry.protocols())
 }
+
+/// The connector for `protocol`, connected with the saved connection's
+/// secret when it isn't already.
+pub async fn ensure_connected(
+    registry: &ConnectorRegistry,
+    connections: &crate::connectors::ConnectionManager,
+    protocol: &str,
+    connection_id: Option<&str>,
+) -> Result<std::sync::Arc<dyn crate::connectors::Connector>, AppError> {
+    let connector = registry
+        .get(protocol)
+        .ok_or_else(|| AppError::validation(format!("Unsupported protocol '{protocol}'")))?;
+    if !connector.is_connected() {
+        if let Some(cid) = connection_id.filter(|c| !c.is_empty()) {
+            let id = uuid::Uuid::parse_str(cid).map_err(|_| AppError::validation(format!("Invalid connection id '{cid}'")))?;
+            let profile = connections
+                .get_connection(id)
+                .await?
+                .ok_or_else(|| AppError::validation(format!("Saved connection {cid} not found")))?;
+            let secret = connections.get_password(id).await.unwrap_or(None);
+            connector
+                .connect_with_secret(&profile, secret)
+                .await
+                .map_err(|e| AppError::connection(format!("Cannot connect to {}: {e}", profile.name), "Check the connection's settings."))?;
+        }
+    }
+    Ok(connector)
+}

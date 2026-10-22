@@ -18,6 +18,7 @@ import { TrustedSshHostsSection } from "@/components/trusted-ssh-hosts-section";
 import { FilenamePoliciesSection } from "@/components/filename-policies-section";
 import { SearchIndexFolders } from "@/components/search-index-folders";
 import { GpgKeysSection } from "@/components/gpg-keys-section";
+import { SharingPolicySection } from "@/components/sharing-policy-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
 
 // ── Types ──
@@ -1346,6 +1347,11 @@ export default function SettingsPanel({
         {/* Which names may be written where (enforced by the engines) */}
         <Section title="Filename Policies">
           <FilenamePoliciesSection />
+        </Section>
+
+        {/* Which share links may be created from cloud connections */}
+        <Section title="Sharing">
+          <SharingPolicySection />
         </Section>
 
         {/* GnuPG keyring for file encryption and signatures */}

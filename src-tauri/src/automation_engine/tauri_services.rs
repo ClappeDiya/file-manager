@@ -54,25 +54,14 @@ impl ActionServices for TauriActionServices {
             remote_dir.to_string(),
         );
         Box::pin(async move {
-            let registry = self.app.state::<ConnectorRegistry>();
-            let connector = registry
-                .get(&protocol)
-                .ok_or_else(|| format!("Unsupported protocol '{protocol}'"))?;
-            if !connector.is_connected() {
-                let id = uuid::Uuid::parse_str(&connection_id)
-                    .map_err(|_| format!("Invalid connection id '{connection_id}'"))?;
-                let connections = self.app.state::<ConnectionManager>();
-                let profile = connections
-                    .get_connection(id)
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("Saved connection {connection_id} not found"))?;
-                let secret = connections.get_password(id).await.unwrap_or(None);
-                connector
-                    .connect_with_secret(&profile, secret)
-                    .await
-                    .map_err(|e| format!("Cannot connect to {}: {e}", profile.name))?;
-            }
+            let connector = crate::commands::connector_commands::ensure_connected(
+                &self.app.state::<ConnectorRegistry>(),
+                &self.app.state::<ConnectionManager>(),
+                &protocol,
+                Some(&connection_id),
+            )
+            .await
+            .map_err(|e| e.user_message())?;
             let name = Path::new(&local_path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())

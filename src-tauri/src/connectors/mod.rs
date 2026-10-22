@@ -71,6 +71,48 @@ pub use openstack_swift::SwiftConnector;
 pub use peer::PeerManager;
 pub use server_to_server::ServerTransferManager;
 
+/// Who a share link opens to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareScope {
+    /// Anyone with the link.
+    #[default]
+    Anyone,
+    /// Only people in the account's organization (OneDrive / Dropbox teams).
+    Organization,
+}
+
+/// What a share link should allow.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ShareOptions {
+    /// Link lifetime; `None` = the provider's default (or no expiry).
+    #[serde(default)]
+    pub expires_in_secs: Option<u64>,
+    /// Password the recipient must enter (where the provider supports it).
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub scope: ShareScope,
+    /// Recipients may edit, not only view.
+    #[serde(default)]
+    pub allow_edit: bool,
+}
+
+/// A created share link.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ShareLink {
+    pub url: String,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub scope: ShareScope,
+    pub provider: String,
+    /// Caveats worth showing (e.g. "an existing link was reused").
+    pub note: Option<String>,
+}
+
+pub(crate) fn share_unsupported(what: &str) -> AppError {
+    AppError::validation(format!("This provider can't {what} on share links"))
+}
+
 /// Trait for remote filesystem connectors.
 pub trait Connector: Send + Sync {
     fn connect(&self, profile: &ConnectionProfile) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>>;
@@ -125,6 +167,20 @@ pub trait Connector: Send + Sync {
         _is_dir: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         Box::pin(async { Err(unsupported_op("delete")) })
+    }
+
+    /// Create a link others can open `remote_path` with.
+    fn create_share_link(
+        &self,
+        _remote_path: &str,
+        _options: &ShareOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<ShareLink, AppError>> + Send + '_>> {
+        Box::pin(async {
+            Err(AppError::Connection {
+                message: "Share links are not available for this connection type.".to_string(),
+                advice: "Share links work with S3, Azure Blob, OneDrive, Dropbox and Google Drive.".to_string(),
+            })
+        })
     }
 }
 

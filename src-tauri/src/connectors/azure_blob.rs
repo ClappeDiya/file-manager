@@ -468,10 +468,65 @@ impl Connector for AzureBlobConnector {
             .map(|s| s.as_ref().map(|c| c.connected).unwrap_or(false))
             .unwrap_or(false)
     }
+
+    fn create_share_link(
+        &self,
+        remote_path: &str,
+        options: &super::ShareOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<super::ShareLink, AppError>> + Send + '_>> {
+        let (r, o) = (remote_path.to_string(), options.clone());
+        Box::pin(async move {
+            let hours = sas_hours(&o)?;
+            let (container, blob) = super::split_bucket_key(&r)?;
+            let fixed_token = matches!(
+                self.state.read().await.as_ref().map(|c| &c.config.auth_method),
+                Some(AzureAuthMethod::SasToken { .. })
+            );
+            let url = self.generate_sas_url(&container, &blob, hours).await?;
+            Ok(super::ShareLink {
+                url,
+                expires_at: (!fixed_token).then(|| chrono::Utc::now() + chrono::Duration::hours(hours as i64)),
+                scope: super::ShareScope::Anyone,
+                provider: "azure_blob".into(),
+                note: Some(if fixed_token {
+                    "Uses this connection's SAS token: it expires when that token does.".into()
+                } else {
+                    "Read-only SAS link: anyone holding it can download until it expires.".into()
+                }),
+            })
+        })
+    }
+}
+
+/// Whole hours for a read-only SAS link (default one day).
+pub(crate) fn sas_hours(o: &super::ShareOptions) -> Result<u32, AppError> {
+    if o.password.as_deref().is_some_and(|p| !p.is_empty()) {
+        return Err(super::share_unsupported("set a password"));
+    }
+    if o.allow_edit {
+        return Err(super::share_unsupported("allow editing"));
+    }
+    if o.scope != super::ShareScope::Anyone {
+        return Err(super::share_unsupported("limit links to your organization"));
+    }
+    match o.expires_in_secs {
+        None => Ok(24),
+        Some(0) => Err(AppError::validation("Choose an expiry time")),
+        Some(s) => u32::try_from(s.div_ceil(3600)).map_err(|_| AppError::validation("Expiry too far in the future")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sas_hours_round_up_and_reject_unsupported() {
+        use crate::connectors::{ShareOptions, ShareScope};
+        assert_eq!(super::sas_hours(&ShareOptions::default()).unwrap(), 24);
+        assert_eq!(super::sas_hours(&ShareOptions { expires_in_secs: Some(3601), ..Default::default() }).unwrap(), 2);
+        assert!(super::sas_hours(&ShareOptions { scope: ShareScope::Organization, ..Default::default() }).is_err());
+        assert!(super::sas_hours(&ShareOptions { allow_edit: true, ..Default::default() }).is_err());
+    }
+
     use super::*;
 
     #[test]

@@ -12,6 +12,8 @@
  * - Delete connection groups
  */
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { ShareLinkDialog } from "@/components/share-link-dialog";
+import { SHAREABLE_PROTOCOLS } from "@/stores/share-store";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { pickFiles, pickFolder } from "@/lib/folder-picker";
 import { promptText, confirmText } from "@/lib/prompt-dialog";
@@ -1483,6 +1485,8 @@ export function ConnectionPanel() {
     return conn?.name || connectedId;
   }, [connectedId, connections]);
 
+  const [sharingEntry, setSharing] = useState<RemoteFileEntry | null>(null);
+
   const joinRemote = (dir: string, name: string) => (dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`);
 
   const reloadRemote = useCallback(async () => {
@@ -2056,6 +2060,17 @@ export function ConnectionPanel() {
                   </div>
                 </button>
                 <div className="flex items-center gap-1 pr-2 flex-shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+                  {!entry.is_dir && connectedProtocol && SHAREABLE_PROTOCOLS.has(connectedProtocol) && (
+                    <button
+                      onClick={() => setSharing(entry)}
+                      className="text-xs px-1.5 py-0.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+                      type="button"
+                      aria-label={`Share ${entry.name}`}
+                      data-testid={`remote-share-${entry.name}`}
+                    >
+                      Share
+                    </button>
+                  )}
                   {!entry.is_dir && (
                     <button
                       onClick={() => handleDownload(entry)}
@@ -2081,6 +2096,9 @@ export function ConnectionPanel() {
               ))}
           </div>
         </div>
+      )}
+      {sharingEntry && connectedProtocol && (
+        <ShareLinkDialog protocol={connectedProtocol} connectionId={connectedId} path={sharingEntry.path} name={sharingEntry.name} onClose={() => setSharing(null)} />
       )}
     </div>
   );

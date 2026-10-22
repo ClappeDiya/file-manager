@@ -68,7 +68,8 @@ describe("GpgDialog", () => {
     fireEvent.change(screen.getByLabelText("Passphrase"), { target: { value: "s3cret" } });
     fireEvent.click(screen.getByRole("button", { name: "Encrypt" }));
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("gpg_encrypt_files", expect.objectContaining({ options: expect.objectContaining({ recipients: [] }), passphrase: "s3cret" })));
-    expect((screen.getByLabelText("Passphrase") as HTMLInputElement).value).toBe("", "passphrase cleared after use");
+    // The passphrase is cleared once used.
+    expect((screen.getByLabelText("Passphrase") as HTMLInputElement).value).toBe("");
   });
 
   it("decrypts and reports the signature", async () => {

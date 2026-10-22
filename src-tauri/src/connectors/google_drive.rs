@@ -919,6 +919,69 @@ impl Connector for GoogleDriveConnector {
     fn is_connected(&self) -> bool {
         false // Conservative; actual check needs async
     }
+
+    fn create_share_link(
+        &self,
+        remote_path: &str,
+        options: &super::ShareOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<super::ShareLink, AppError>> + Send + '_>> {
+        let (r, o) = (remote_path.to_string(), options.clone());
+        Box::pin(async move {
+            let permission = drive_permission_body(&o)?;
+            let file_id = r.trim_end_matches('/').rsplit('/').next().filter(|s| !s.is_empty()).ok_or_else(|| AppError::validation("Choose a file or folder to share"))?.to_string();
+            let token = self.get_token().await?;
+            let resp = self
+                .http
+                .post(format!("{DRIVE_API_BASE}/files/{file_id}/permissions?supportsAllDrives=true"))
+                .bearer_auth(&token)
+                .json(&permission)
+                .send()
+                .await
+                .map_err(|e| AppError::connection(format!("Google Drive share failed: {e}"), "Check your network connection."))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(AppError::Connection {
+                    message: format!("Google Drive refused the share (HTTP {status}): {}", body.chars().take(200).collect::<String>()),
+                    advice: "Your organization may block sharing outside it.".into(),
+                });
+            }
+            let meta: serde_json::Value = self
+                .http
+                .get(format!("{DRIVE_API_BASE}/files/{file_id}?fields=webViewLink&supportsAllDrives=true"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .map_err(|e| AppError::connection(format!("Google Drive link lookup failed: {e}"), "Try again."))?
+                .json()
+                .await
+                .map_err(|e| AppError::connection(format!("Unexpected Google Drive reply: {e}"), "Try again."))?;
+            let url = meta["webViewLink"].as_str().ok_or_else(|| AppError::connection("Google Drive returned no link", "Try again."))?;
+            Ok(super::ShareLink {
+                url: url.into(),
+                expires_at: None,
+                scope: super::ShareScope::Anyone,
+                provider: "google_drive".into(),
+                note: Some("Anyone with the link can open it until you stop sharing it in Google Drive.".into()),
+            })
+        })
+    }
+}
+
+/// Permission for an anyone-with-the-link share. Drive can't put an
+/// expiry or password on these, and domain links need the domain name, so
+/// those options are refused rather than silently ignored.
+pub(crate) fn drive_permission_body(o: &super::ShareOptions) -> Result<serde_json::Value, AppError> {
+    if o.expires_in_secs.is_some() {
+        return Err(AppError::validation("Google Drive links can't expire; leave the expiry empty or share another way"));
+    }
+    if o.password.as_deref().is_some_and(|p| !p.is_empty()) {
+        return Err(super::share_unsupported("set a password"));
+    }
+    if o.scope != super::ShareScope::Anyone {
+        return Err(super::share_unsupported("limit links to your organization"));
+    }
+    Ok(serde_json::json!({ "role": if o.allow_edit { "writer" } else { "reader" }, "type": "anyone" }))
 }
 
 /// Convert a Drive API file object to our FileEntry.
@@ -1010,6 +1073,14 @@ fn parse_drive_path(path: &str) -> (DriveScope, Option<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn drive_permissions() {
+        use crate::connectors::ShareOptions;
+        assert_eq!(super::drive_permission_body(&ShareOptions::default()).unwrap(), serde_json::json!({"role": "reader", "type": "anyone"}));
+        assert_eq!(super::drive_permission_body(&ShareOptions { allow_edit: true, ..Default::default() }).unwrap()["role"], "writer");
+        assert!(super::drive_permission_body(&ShareOptions { expires_in_secs: Some(60), ..Default::default() }).is_err());
+    }
+
     use super::*;
 
     #[test]

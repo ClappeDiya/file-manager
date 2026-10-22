@@ -2803,6 +2803,49 @@ impl Connector for S3Connector {
             self.delete_object(&bucket, &key).await
         })
     }
+
+    fn create_share_link(
+        &self,
+        remote_path: &str,
+        options: &super::ShareOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<super::ShareLink, AppError>> + Send + '_>> {
+        let (r, o) = (remote_path.to_string(), options.clone());
+        Box::pin(async move {
+            let secs = presign_expiry(&o)?;
+            let (bucket, key) = super::split_bucket_key(&r)?;
+            let state = self.state.read().await;
+            let st = state.as_ref().ok_or_else(|| AppError::connection("Not connected to S3", "Connect first."))?;
+            let url = self.generate_presigned_url(&st.credentials, &bucket, &key, secs)?;
+            Ok(super::ShareLink {
+                url,
+                expires_at: Some(Utc::now() + chrono::Duration::seconds(secs as i64)),
+                scope: super::ShareScope::Anyone,
+                provider: "s3".into(),
+                note: Some("Pre-signed download link: anyone holding it can download until it expires.".into()),
+            })
+        })
+    }
+}
+
+/// SigV4 pre-signed URLs live at most 7 days; default one day. They are
+/// bearer links for downloading only.
+pub(crate) const PRESIGN_MAX_SECS: u64 = 7 * 24 * 3600;
+
+pub(crate) fn presign_expiry(o: &super::ShareOptions) -> Result<u64, AppError> {
+    if o.password.as_deref().is_some_and(|p| !p.is_empty()) {
+        return Err(super::share_unsupported("set a password"));
+    }
+    if o.allow_edit {
+        return Err(super::share_unsupported("allow editing"));
+    }
+    if o.scope != super::ShareScope::Anyone {
+        return Err(super::share_unsupported("limit links to your organization"));
+    }
+    let secs = o.expires_in_secs.unwrap_or(24 * 3600);
+    if secs == 0 || secs > PRESIGN_MAX_SECS {
+        return Err(AppError::validation("S3 links must expire within 7 days"));
+    }
+    Ok(secs)
 }
 
 // ── AWS Signature V4 helpers ──
@@ -3403,6 +3446,27 @@ fn parse_object_versions_xml(xml: &str, key_filter: &str) -> Vec<S3ObjectVersion
     // Sort by last_modified descending (latest first)
     versions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
     versions
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::*;
+    use crate::connectors::{ShareOptions, ShareScope};
+
+    #[test]
+    fn presign_expiry_rules() {
+        assert_eq!(presign_expiry(&ShareOptions::default()).unwrap(), 86_400);
+        assert_eq!(presign_expiry(&ShareOptions { expires_in_secs: Some(600), ..Default::default() }).unwrap(), 600);
+        for bad in [
+            ShareOptions { expires_in_secs: Some(PRESIGN_MAX_SECS + 1), ..Default::default() },
+            ShareOptions { expires_in_secs: Some(0), ..Default::default() },
+            ShareOptions { password: Some("x".into()), ..Default::default() },
+            ShareOptions { allow_edit: true, ..Default::default() },
+            ShareOptions { scope: ShareScope::Organization, ..Default::default() },
+        ] {
+            assert!(presign_expiry(&bad).is_err(), "{bad:?}");
+        }
+    }
 }
 
 #[cfg(test)]
