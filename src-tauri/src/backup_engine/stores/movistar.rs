@@ -146,7 +146,10 @@ impl MovistarStore {
     }
 
     async fn current(&self) -> Result<Session, AppError> {
-        match self.session.lock().await.clone() {
+        // Bind first: a guard in the match scrutinee would live through
+        // `sign_in`, which takes the same lock (deadlock on first use).
+        let cached = self.session.lock().await.clone();
+        match cached {
             Some(s) => Ok(s),
             None => self.sign_in().await,
         }
