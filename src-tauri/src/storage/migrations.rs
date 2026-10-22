@@ -128,6 +128,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "ufop-server scoped, expiring API tokens",
             sql: V22_SCHEMA,
         },
+        Migration {
+            version: 23,
+            description: "Metadata schemas - typed, required fields per folder",
+            sql: V23_SCHEMA,
+        },
     ]
 }
 
@@ -145,6 +150,21 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
 /// symlink policy, connector extras) as JSON; previously never saved.
 /// Schema v22: named `ufop-server` API tokens (SHA-256 hashes) with scopes
 /// (JSON list) and a mandatory expiry.
+/// Schema v23: metadata schemas (`metadata_engine::schema`). One per folder;
+/// `recursive` schemas also govern subfolders (the nearest one wins).
+const V23_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS metadata_schemas (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    folder TEXT NOT NULL UNIQUE,
+    fields_json TEXT NOT NULL DEFAULT '[]',
+    strict INTEGER NOT NULL DEFAULT 0,
+    recursive INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
 const V22_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS server_api_tokens (
     id           TEXT PRIMARY KEY NOT NULL,
@@ -899,7 +919,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 22);
+        assert_eq!(applied, 23);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -934,7 +954,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 22);
+        assert_eq!(first, 23);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -947,7 +967,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 22);
+        assert_eq!(current_version(&conn).unwrap(), 23);
     }
 
     #[test]

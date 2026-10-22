@@ -932,6 +932,11 @@ pub fn run() {
             integrity_commands::integrity_remove_metadata,
             integrity_commands::integrity_search_metadata,
             integrity_commands::integrity_metadata_keys,
+            integrity_commands::metadata_list_schemas,
+            integrity_commands::metadata_save_schema,
+            integrity_commands::metadata_delete_schema,
+            integrity_commands::metadata_schema_for,
+            integrity_commands::metadata_check_compliance,
             // Mount Engine (Finder-mounted remote storage)
             mount_commands::check_mount_capability,
             mount_commands::mount_remote,

@@ -411,6 +411,18 @@ Organize files with custom tags and color labels:
 - Set color labels on files
 - View file info including all tags and labels
 
+### Metadata and Metadata Schemas
+
+Files carry key-value metadata (client, invoice number, status …), edited under Tags & Labels and searchable with *Find by metadata*. It follows files that are moved or renamed in the app.
+
+**Metadata Schemas** (Integrity Tools → Metadata Schemas) define the fields a folder's files carry:
+
+- Field types: text (optional pattern and length), number, whole number (with ranges), date, yes/no, choice (fixed options), email and URL; each field can be required.
+- A schema applies to its folder and, with *Include subfolders*, everything below it; a subfolder can override it with its own schema (the nearest one wins).
+- Values are checked and normalized when they are set (e.g. `yes` → `true`, choices take the option's spelling); required fields cannot be removed; a *strict* schema accepts only its own fields.
+- The metadata editor shows the schema's fields first with matching inputs and highlights missing required ones.
+- *Check files* lists files that miss required fields or hold values that no longer fit (set before the schema existed or changed).
+
 ### Smart Folders
 
 Create virtual folders based on rules (file type, size, date, tags). Smart folders update dynamically as files change.

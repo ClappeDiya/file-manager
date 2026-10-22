@@ -23,6 +23,7 @@ describe("metadata editor", () => {
     let current: Record<string, string> = { client: "Acme" };
     mockInvoke.mockImplementation(async (cmd: string, args: Record<string, string>) => {
       if (cmd === "integrity_metadata_keys") return ["client", "invoice"];
+      if (cmd === "metadata_schema_for") return null;
       if (cmd === "integrity_set_metadata") current = { ...current, [args.key]: args.value };
       if (cmd === "integrity_remove_metadata") {
         const { [args.key]: _gone, ...rest } = current;
@@ -56,6 +57,7 @@ describe("metadata editor", () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "integrity_set_metadata") throw new Error("Metadata keys must be 1–128 characters");
       if (cmd === "integrity_metadata_keys") return [];
+      if (cmd === "metadata_schema_for") return null;
       return info({});
     });
     render(<MetadataEditor path="/d/a.pdf" />);

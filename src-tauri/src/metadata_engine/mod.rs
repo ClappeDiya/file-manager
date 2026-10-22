@@ -4,6 +4,9 @@
 //! Replaces the process-local store the integrity commands used, which lost
 //! every tag and label on quit. Rows are keyed by absolute path; moving or
 //! renaming through the app carries metadata along (`rename_path`).
+//! Folder schemas (`schema`) type and require values under a folder.
+
+pub mod schema;
 
 use crate::core::error::AppError;
 use crate::storage::Repository;
@@ -274,7 +277,8 @@ impl MetadataStore {
         if value.len() > MAX_VALUE_LEN {
             return Err(AppError::validation(format!("Metadata values are limited to {MAX_VALUE_LEN} bytes")));
         }
-        let (p, v) = (path.to_string(), value.to_string());
+        let value = self.check_value(path, &key, value).await?;
+        let (p, v) = (path.to_string(), value);
         self.repo
             .pool()
             .execute(move |conn| {
@@ -290,6 +294,7 @@ impl MetadataStore {
     }
 
     pub async fn remove_metadata(&self, path: &str, key: &str) -> Result<FileLabel, AppError> {
+        self.check_removal(path, key).await?;
         let (p, k) = (path.to_string(), key.to_string());
         self.repo
             .pool()

@@ -15,6 +15,7 @@ import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import { errorText } from "@/lib/error-text";
 import { MetadataEditor, MetadataSearch, type FileLabel } from "@/components/metadata-editor";
+import { MetadataSchemaPanel } from "@/components/metadata-schema";
 
 /** Mirrors `HASH_ALGORITHMS` in integrity_commands.rs. */
 const HASH_ALGORITHMS = ["md5", "sha1", "sha256", "crc32", "xxh3"] as const;
@@ -89,7 +90,7 @@ interface SmartFolderQuery {
   include_subdirs: boolean;
 }
 
-type IntegrityTab = "checksum" | "duplicates" | "tags" | "smart-folders";
+type IntegrityTab = "checksum" | "duplicates" | "tags" | "smart-folders" | "schemas";
 
 interface IntegrityToolsProps {
   selectedFiles?: string[];
@@ -136,6 +137,7 @@ export function IntegrityTools({
           ["duplicates", "Duplicates"],
           ["tags", "Tags & Labels"],
           ["smart-folders", "Smart Folders"],
+          ["schemas", "Metadata Schemas"],
         ] as [IntegrityTab, string][]).map(([tab, label]) => (
           <button
             key={tab}
@@ -165,6 +167,7 @@ export function IntegrityTools({
         {activeTab === "smart-folders" && (
           <SmartFolderPanel currentDirectory={currentDirectory} />
         )}
+        {activeTab === "schemas" && <MetadataSchemaPanel folder={currentDirectory} />}
       </div>
     </div>
   );

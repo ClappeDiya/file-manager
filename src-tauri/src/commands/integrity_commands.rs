@@ -492,6 +492,43 @@ pub async fn integrity_metadata_keys(store: State<'_, MetadataStore>) -> Result<
     store.metadata_keys().await
 }
 
+// ── Metadata schema commands ──
+
+pub use crate::metadata_engine::schema::{ComplianceReport, MetadataSchema};
+
+/// Every metadata schema, by folder.
+#[tauri::command]
+pub async fn metadata_list_schemas(store: State<'_, MetadataStore>) -> Result<Vec<MetadataSchema>, AppError> {
+    store.list_schemas().await
+}
+
+/// Create (empty `id`) or replace a schema.
+#[tauri::command]
+pub async fn metadata_save_schema(schema: MetadataSchema, store: State<'_, MetadataStore>) -> Result<MetadataSchema, AppError> {
+    store.save_schema(schema).await
+}
+
+#[tauri::command]
+pub async fn metadata_delete_schema(id: String, store: State<'_, MetadataStore>) -> Result<(), AppError> {
+    store.delete_schema(&id).await
+}
+
+/// The schema governing a file (`path`) or, with `is_dir`, files in a folder.
+#[tauri::command]
+pub async fn metadata_schema_for(path: String, is_dir: Option<bool>, store: State<'_, MetadataStore>) -> Result<Option<MetadataSchema>, AppError> {
+    if is_dir.unwrap_or(false) {
+        store.schema_for_dir(&path).await
+    } else {
+        store.schema_for(&path).await
+    }
+}
+
+/// Files in `folder` missing required fields or holding invalid values.
+#[tauri::command]
+pub async fn metadata_check_compliance(folder: String, recursive: Option<bool>, store: State<'_, MetadataStore>) -> Result<ComplianceReport, AppError> {
+    store.compliance(&folder, recursive.unwrap_or(true)).await
+}
+
 // ── Smart Folder commands ──
 
 /// Create a smart folder with saved filter queries.
