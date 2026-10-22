@@ -64,7 +64,10 @@ export async function login(password: string): Promise<void> {
 }
 
 function hasSessionCookie(): boolean {
-  return typeof document !== "undefined" && document.cookie.split(";").some((c) => c.trim().startsWith("ufop_session="));
+  return (
+    typeof document !== "undefined" &&
+    document.cookie.split(";").some((c) => c.trim().startsWith("ufop_session="))
+  );
 }
 
 /** Exchange the refresh cookie for a new access token. */
@@ -74,7 +77,10 @@ export async function refresh(): Promise<boolean> {
     notify();
     return false;
   }
-  const r = await fetch(api("/auth/refresh"), { method: "POST", credentials: "same-origin" });
+  const r = await fetch(api("/auth/refresh"), {
+    method: "POST",
+    credentials: "same-origin",
+  });
   if (!r.ok) {
     accessToken = null;
     notify();
@@ -86,22 +92,39 @@ export async function refresh(): Promise<boolean> {
 }
 
 export async function logout(): Promise<void> {
-  await fetch(api("/auth/logout"), { method: "POST", credentials: "same-origin" }).catch(() => undefined);
+  await fetch(api("/auth/logout"), {
+    method: "POST",
+    credentials: "same-origin",
+  }).catch(() => undefined);
   accessToken = null;
   notify();
 }
 
 /** Call a backup command on the server; retries once after refreshing an expired token. */
-export async function serverRpc<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+/**
+ * Call the server's REST API (`/api/v1<path>`) with the session's access
+ * token, renewing it once from the refresh cookie when it has expired.
+ */
+export async function serverApi<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<T> {
   for (let attempt = 0; attempt < 2; attempt++) {
     if (!accessToken && !(await refresh())) {
-      throw { message: "Not signed in", advice: "Sign in to the backup server." };
+      throw {
+        message: "Not signed in",
+        advice: "Sign in to the backup server.",
+      };
     }
-    const r = await fetch(api(`/rpc/${encodeURIComponent(command)}`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+    const r = await fetch(api(path), {
+      method,
+      headers: {
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+        Authorization: `Bearer ${accessToken}`,
+      },
       credentials: "same-origin",
-      body: JSON.stringify(args ?? {}),
+      body: body !== undefined ? JSON.stringify(body) : undefined,
     });
     if (r.status === 401 && attempt === 0) {
       accessToken = null;
@@ -111,6 +134,18 @@ export async function serverRpc<T>(command: string, args?: Record<string, unknow
     return (await r.json()) as T;
   }
   throw { message: "Not signed in", advice: "Sign in to the backup server." };
+}
+
+/** An IPC command over `POST /api/v1/rpc/<command>`. */
+export function serverRpc<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  return serverApi<T>(
+    "POST",
+    `/rpc/${encodeURIComponent(command)}`,
+    args ?? {},
+  );
 }
 
 /** Test hook. */

@@ -133,6 +133,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "Metadata schemas - typed, required fields per folder",
             sql: V23_SCHEMA,
         },
+        Migration {
+            version: 24,
+            description: "ufop-server share portal - links and their access log",
+            sql: V24_SCHEMA,
+        },
     ]
 }
 
@@ -150,6 +155,36 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
 /// symlink policy, connector extras) as JSON; previously never saved.
 /// Schema v22: named `ufop-server` API tokens (SHA-256 hashes) with scopes
 /// (JSON list) and a mandatory expiry.
+/// Schema v24: ufop-server share links (`server::shares`). Only a hash of
+/// each link's token is stored.
+const V24_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_shares (
+    id TEXT PRIMARY KEY NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    token_prefix TEXT NOT NULL,
+    name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    password_hash TEXT,
+    expires_at TEXT,
+    max_downloads INTEGER,
+    downloads INTEGER NOT NULL DEFAULT 0,
+    max_upload_bytes INTEGER,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT,
+    last_access_at TEXT
+);
+CREATE TABLE IF NOT EXISTS server_share_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    share_id TEXT NOT NULL REFERENCES server_shares(id) ON DELETE CASCADE,
+    at TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_server_share_events_share ON server_share_events(share_id, id);
+"#;
+
 /// Schema v23: metadata schemas (`metadata_engine::schema`). One per folder;
 /// `recursive` schemas also govern subfolders (the nearest one wins).
 const V23_SCHEMA: &str = r#"
@@ -919,7 +954,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 23);
+        assert_eq!(applied, 24);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -954,7 +989,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 23);
+        assert_eq!(first, 24);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -967,7 +1002,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 23);
+        assert_eq!(current_version(&conn).unwrap(), 24);
     }
 
     #[test]

@@ -103,6 +103,14 @@ pub(crate) const OPS: &[Op] = &[
     op!("get" "/api/v1/oauth/providers", "oauth", "Configured OAuth providers for cloud destinations", auth: true, params: &[], body: None, response: list),
     Op { method: "get", path: "/oauth/{provider}/start", tag: "oauth", summary: "Begin authorization with a provider (redirect)", auth: false, params: &[("provider", "path", "string", true, "Provider id")], body: None, response: html, content_type: "text/html" },
     Op { method: "get", path: "/oauth/callback", tag: "oauth", summary: "Provider redirect target; shows the AuthID to paste into the destination", auth: false, params: &[("code", "query", "string", false, ""), ("state", "query", "string", false, ""), ("error", "query", "string", false, "")], body: None, response: html, content_type: "text/html" },
+    op!("get" "/api/v1/shares", "shares", "Share links (tokens are never returned) and the folders that may be shared", auth: true, params: &[], body: None, response: || json!({ "type": "object", "properties": { "shares": { "type": "array", "items": { "$ref": "#/components/schemas/Share" } }, "roots": { "type": "array", "items": { "type": "string" } } } })),
+    op!("post" "/api/v1/shares", "shares", "Create a share link to a file or folder under --share-root; the link is returned once", auth: true, params: &[], body: Some(|| json!({ "type": "object", "required": ["name", "path"], "properties": { "name": { "type": "string" }, "path": { "type": "string" }, "kind": { "type": "string", "enum": ["download", "upload", "both"], "default": "download" }, "password": { "type": ["string", "null"], "minLength": 8 }, "expires_in_days": { "type": ["integer", "null"], "minimum": 1, "maximum": 3650 }, "max_downloads": { "type": ["integer", "null"], "minimum": 1 }, "max_upload_mb": { "type": ["integer", "null"], "minimum": 1 } } })), response: || json!({ "type": "object", "properties": { "share": { "$ref": "#/components/schemas/Share" }, "token": { "type": "string" }, "url": { "type": "string", "description": "/s/<token>" } } })),
+    op!("delete" "/api/v1/shares/{id}", "shares", "Turn a share link off", auth: true, params: &[("id", "path", "string", true, "Share id")], body: None, response: ok_flag),
+    op!("get" "/api/v1/shares/{id}/events", "shares", "Access log of a link (views, downloads, uploads, refusals, wrong passwords)", auth: true, params: &[("id", "path", "string", true, "Share id"), ("limit", "query", "integer", false, "Newest N (default 200, max 1000)")], body: None, response: || json!({ "type": "object", "properties": { "events": { "type": "array", "items": { "type": "object", "properties": { "at": { "type": "string" }, "ip": { "type": "string" }, "action": { "type": "string" }, "detail": { "type": "string" } } } } } })),
+    Op { method: "get", path: "/s/{token}", tag: "shares", summary: "Public page of a share link (password form, folder listing, upload form)", auth: false, params: &[("token", "path", "string", true, "Link token"), ("p", "query", "string", false, "Folder inside the share")], body: None, response: html, content_type: "text/html" },
+    Op { method: "post", path: "/s/{token}/unlock", tag: "shares", summary: "Enter a link's password (form field `password`); sets an unlock cookie", auth: false, params: &[("token", "path", "string", true, "Link token")], body: None, response: html, content_type: "text/html" },
+    Op { method: "get", path: "/s/{token}/dl", tag: "shares", summary: "Download a file of a share (counts against its download limit)", auth: false, params: &[("token", "path", "string", true, "Link token"), ("p", "query", "string", false, "File inside the share")], body: None, response: || json!({ "type": "string", "format": "binary" }), content_type: "application/octet-stream" },
+    Op { method: "post", path: "/s/{token}/upload", tag: "shares", summary: "Upload files (multipart field `file`, repeatable) into an upload link's folder", auth: false, params: &[("token", "path", "string", true, "Link token"), ("p", "query", "string", false, "Folder inside the share")], body: None, response: html, content_type: "text/html" },
     op!("get" "/oauth/token", "oauth", "Access token for an AuthID (the AuthID is the credential)", auth: false, params: &[("authid", "query", "string", true, "AuthID from the callback")], body: None, response: || json!({ "type": "object", "properties": { "access_token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" } } })),
 ];
 
@@ -119,6 +127,7 @@ fn components() -> Value {
             "ApiToken": { "type": "object", "properties": { "id": { "type": "string" }, "name": { "type": "string" }, "scope": { "$ref": "#/components/schemas/Scope" }, "created_at": { "type": "string" }, "expires_at": { "type": "string" }, "last_used_at": { "type": ["string", "null"] } }, "additionalProperties": true },
             "BackupJob": { "type": "object", "description": "A backup job (sources, destination, schedule, retention, filters, encryption); see docs/api-reference.md", "additionalProperties": true },
             "TaskInfo": { "type": "object", "properties": { "task_id": { "type": "string" }, "job_id": { "type": "string" }, "job_name": { "type": "string" }, "operation": { "type": "string" }, "state": { "type": "string", "enum": ["queued", "running"] }, "queued_at": { "type": "string" }, "started_at": { "type": ["string", "null"] }, "elapsed_secs": { "type": "integer" } }, "additionalProperties": true },
+            "Share": { "type": "object", "properties": { "id": { "type": "string" }, "name": { "type": "string" }, "path": { "type": "string" }, "kind": { "type": "string", "enum": ["download", "upload", "both"] }, "token_prefix": { "type": "string" }, "has_password": { "type": "boolean" }, "expires_at": { "type": ["string", "null"] }, "max_downloads": { "type": ["integer", "null"] }, "downloads": { "type": "integer" }, "max_upload_bytes": { "type": ["integer", "null"] }, "created_at": { "type": "string" }, "revoked_at": { "type": ["string", "null"] }, "last_access_at": { "type": ["string", "null"] } } },
             "SchedulerStatus": { "type": "object", "properties": { "running": { "type": "boolean" }, "paused": { "type": "boolean" }, "tasks": { "type": "array", "items": { "$ref": "#/components/schemas/TaskInfo" } } }, "additionalProperties": true }
         }
     })
@@ -166,7 +175,7 @@ pub fn document() -> Value {
         },
         "servers": [{ "url": "/" }],
         "tags": [
-            { "name": "general" }, { "name": "auth" }, { "name": "jobs" }, { "name": "browse" }, { "name": "tasks" }, { "name": "oauth" }
+            { "name": "general" }, { "name": "auth" }, { "name": "jobs" }, { "name": "browse" }, { "name": "tasks" }, { "name": "shares" }, { "name": "oauth" }
         ],
         "paths": paths,
         "components": components(),
@@ -181,7 +190,7 @@ mod tests {
     /// `(method, path)` of every `.route(…)` in the router sources.
     fn routed() -> BTreeSet<(String, String)> {
         let mut out = BTreeSet::new();
-        for src in [include_str!("mod.rs"), include_str!("oauth.rs")] {
+        for src in [include_str!("mod.rs"), include_str!("oauth.rs"), include_str!("shares.rs")] {
             for chunk in src.split(".route(\"").skip(1) {
                 let Some((path, rest)) = chunk.split_once('"') else { continue };
                 let handlers = &rest[..rest.find(".route(").unwrap_or(rest.len()).min(rest.find('\n').unwrap_or(rest.len()))];

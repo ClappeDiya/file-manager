@@ -1,5 +1,6 @@
-//! Root confinement for `ufop mcp`: every path a client names must resolve —
-//! after following symlinks — inside one of the configured roots.
+//! Root confinement: every path a client names must resolve — after
+//! following symlinks — inside one of the configured roots. Used by
+//! `ufop mcp` and the ufop-server share portal.
 //!
 //! Paths are absolute (inside a root) or relative to the first root, or
 //! written `<root name>:relative/path`. Existing paths are canonicalized, so a

@@ -9,6 +9,7 @@ pub mod api_tokens;
 pub mod auth;
 pub mod oauth;
 pub mod openapi;
+pub mod shares;
 pub mod tls;
 /// Server settings live in `security::settings_store` (shared with the backup engine).
 pub use crate::security::settings_store as settings;
@@ -67,6 +68,8 @@ pub struct ServerConfig {
     pub hsts_max_age: u64,
     /// Add `includeSubDomains` to the HSTS header.
     pub hsts_include_subdomains: bool,
+    /// Folders whose contents may be shared by link (`/s/…`); empty = sharing off.
+    pub share_roots: Vec<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -85,6 +88,7 @@ impl Default for ServerConfig {
             min_tls: tls::MinTls::Tls12,
             hsts_max_age: 31_536_000,
             hsts_include_subdomains: false,
+            share_roots: Vec::new(),
         }
     }
 }
@@ -672,7 +676,8 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/auth/refresh", post(refresh))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/signin", post(redeem_signin))
-        .merge(oauth::public_routes());
+        .merge(oauth::public_routes())
+        .merge(shares::public_routes());
     let protected = Router::new()
         .route("/api/v1/auth/signin-token", post(signin_token))
         .route("/api/v1/auth/automation-token", post(automation_token))
@@ -703,6 +708,7 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/scheduler/pause", post(pause))
         .route("/api/v1/scheduler/resume", post(resume))
         .merge(oauth::protected_routes())
+        .merge(shares::protected_routes())
         .route_layer(middleware::from_fn_with_state(st.clone(), require_auth));
     let mut app = public.merge(protected);
     if !st.cfg.api_only && st.cfg.webroot.is_some() {

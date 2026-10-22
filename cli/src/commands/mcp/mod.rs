@@ -3,7 +3,6 @@
 //! directories. Read-only unless `--allow-write`. Every tool call is logged
 //! (`--log-file`); stdout carries only protocol messages.
 
-mod roots;
 mod tools;
 
 use clap::Args;
@@ -11,7 +10,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
-pub use roots::Roots;
+pub use ufop_core::confine::Roots;
 
 /// Protocol revisions this server speaks, newest first.
 const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];

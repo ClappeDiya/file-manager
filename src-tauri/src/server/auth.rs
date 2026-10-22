@@ -177,6 +177,11 @@ impl AuthService {
         self.reset_jwt().await
     }
 
+    /// Share links (see `shares`).
+    pub fn shares(&self) -> super::shares::ShareStore {
+        super::shares::ShareStore::new(self.settings.pool().clone())
+    }
+
     /// Named, scoped API tokens (see `api_tokens`).
     pub fn api_tokens(&self) -> super::api_tokens::ApiTokenStore {
         super::api_tokens::ApiTokenStore::new(self.settings.pool().clone())

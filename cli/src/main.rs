@@ -534,6 +534,15 @@ async fn main() -> ExitCode {
 mod logging_tests {
     use super::*;
 
+    /// Every subcommand's arguments are consistent with the global ones
+    /// (a subcommand `--limit` once collided with the global `--limit`).
+    #[test]
+    fn command_tree_is_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        Cli::try_parse_from(["ufop", "server", "shares", "log", "abc", "-n", "5"]).unwrap();
+    }
+
     #[test]
     fn redacts_secret_options_and_parses_levels() {
         let a = ["backup", "run", "--passphrase", "pw", "--token=abc", "--passphrase-env", "VAR", "--dest", "/d"].map(String::from);

@@ -496,6 +496,22 @@ ufop archive list backup.zip --json
 
 ---
 
+### `ufop server shares`
+
+Share links on a `ufop-server` started with `--share-root` (sign in first with `ufop server login`).
+
+```bash
+ufop server shares create /srv/share/q3 --name "Q3 reports" --expires-in-days 14 --max-downloads 20
+ufop server shares create /srv/share/inbox --kind upload --password "$PW" --max-upload-mb 500
+ufop server shares list --csv
+ufop server shares log <id> -n 100
+ufop server shares revoke <id>
+```
+
+`create` prints the full link once (only its hash is kept). Kinds: `download`, `upload` (drop box), `both`.
+
+---
+
 ### `ufop mcp`
 
 Serve file tools to an AI client (Claude Desktop, Claude Code, any MCP client) over the Model Context Protocol on stdio. Every path is confined to the `--root` directories: paths are resolved and symlinks followed before the check, so `..`, absolute paths and links pointing outside are refused. Read-only unless `--allow-write`.

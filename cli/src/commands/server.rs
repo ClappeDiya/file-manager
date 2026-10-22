@@ -61,6 +61,46 @@ pub enum ServerCommands {
     /// Named, scoped, expiring API tokens (read, run, write, admin)
     #[command(subcommand)]
     Tokens(TokenCommands),
+    /// Share links to files and folders under the server's --share-root
+    #[command(subcommand)]
+    Shares(ShareCommands),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ShareCommands {
+    /// List links (their tokens are never shown again)
+    List,
+    /// Create a link; the URL is shown once
+    Create {
+        /// File or folder on the server (under a --share-root)
+        path: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// download (browse and download), upload (drop box) or both
+        #[arg(long, default_value = "download", value_parser = ["download", "upload", "both"])]
+        kind: String,
+        /// Require this password (8+ characters)
+        #[arg(long, env = "UFOP_SHARE_PASSWORD")]
+        password: Option<String>,
+        /// Expire after this many days
+        #[arg(long)]
+        expires_in_days: Option<i64>,
+        /// Stop after this many downloads
+        #[arg(long)]
+        max_downloads: Option<i64>,
+        /// Largest upload per file, in MB (default 1024)
+        #[arg(long)]
+        max_upload_mb: Option<i64>,
+    },
+    /// Turn a link off
+    Revoke { id: String },
+    /// A link's access log
+    Log {
+        id: String,
+        /// Newest N events
+        #[arg(long = "last", short = 'n', default_value_t = 50)]
+        last: i64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -276,6 +316,35 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
             ServerCommands::IssueToken => {
                 let mut c = Client::new()?;
                 show(format, &c.call(reqwest::Method::POST, "/auth/automation-token", None).await?);
+                Ok(0)
+            }
+            ServerCommands::Shares(sc) => {
+                let mut c = Client::new()?;
+                let v = match sc {
+                    ShareCommands::List => {
+                        let v = c.call(reqwest::Method::GET, "/shares", None).await?;
+                        // Rows for people and spreadsheets; JSON/YAML keep the share roots too.
+                        if matches!(format, OutputFormat::Human | OutputFormat::Csv) {
+                            v["shares"].clone()
+                        } else {
+                            v
+                        }
+                    }
+                    ShareCommands::Create { path, name, kind, password, expires_in_days, max_downloads, max_upload_mb } => {
+                        let name = name.unwrap_or_else(|| path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("Shared").to_string());
+                        let mut v = c
+                            .call(reqwest::Method::POST, "/shares", Some(json!({"name": name, "path": path, "kind": kind, "password": password, "expires_in_days": expires_in_days, "max_downloads": max_downloads, "max_upload_mb": max_upload_mb})))
+                            .await?;
+                        // The full link, ready to send.
+                        if let Some(u) = v["url"].as_str() {
+                            v["url"] = json!(format!("{}{u}", c.url.trim_end_matches('/')));
+                        }
+                        v
+                    }
+                    ShareCommands::Revoke { id } => c.call(reqwest::Method::DELETE, &format!("/shares/{id}"), None).await?,
+                    ShareCommands::Log { id, last } => c.call(reqwest::Method::GET, &format!("/shares/{id}/events?limit={last}"), None).await?["events"].clone(),
+                };
+                show(format, &v);
                 Ok(0)
             }
             ServerCommands::Tokens(t) => {

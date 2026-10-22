@@ -652,6 +652,15 @@ The headless backup server (`ufop-server`, also `ufop server` in the CLI) has it
 - **Errors**: `{error_type, message, advice}`; 401 (not signed in, invalid token or too narrow a scope), 403 (client address outside `--allowed-cidrs`), 421 (host not in `--allowed-hostnames`), 404, 409, 429 (sign-in throttling).
 - Areas: `auth` (sign-in, tokens, password), `jobs` (CRUD, run, operations, import/export, destination test), `browse` (versions, files, search, compare), `tasks` (tasks, run history, scheduler), `oauth` (cloud authorization broker) and `general` (health, status, modules, settings, filesystem, `rpc/{command}` for any desktop IPC command).
 
+### Share portal
+
+Start the server with `--share-root <folder>` (repeatable, or `UFOP_SERVER_SHARE_ROOTS`) to share files and folders under it by link; without it sharing is off. Links are created in the web UI (*Share links*), with `ufop server shares create <path>` or `POST /api/v1/shares`, and open at `/s/<token>` without an account:
+
+- **download** — a file, or a folder to browse (subfolders included) and download from; **upload** — a drop box: visitors upload into the folder and see nothing in it; **both**.
+- Options: password (8+ characters; argon2; 10 wrong tries lock the link for 15 minutes), expiry in days, download limit, largest upload per file (default 1 GB).
+- Only a hash of the token is stored, so the link is shown once. Paths are confined to the shared folder after resolving symbolic links, dot-files are never listed or served, downloads are sent as attachments, uploads never overwrite (`name (2).ext`), and pages carry a strict Content-Security-Policy. The server's `--allowed-cidrs` and host checks apply to links too.
+- Every view, download, upload, refusal and wrong password is logged per link (`GET /api/v1/shares/{id}/events`, `ufop server shares log <id>`); links can be turned off at any time.
+
 A test fails the build when a route is added without an OpenAPI entry (or an entry outlives its route), and another checks every documented scope against the running server.
 
 ---

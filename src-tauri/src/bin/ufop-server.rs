@@ -6,6 +6,7 @@
 //! ufop-server --https pfx --pfx cert.p12 --min-tls 1.3 --hsts-max-age 63072000   # TLS floor + HSTS (on by default with HTTPS)
 //! ufop-server --interface any --allowed-cidrs 10.0.0.0/8,fd00::/8   # only these clients (by TCP peer)
 //! ufop server tokens create ci --scope run --days 30                 # scoped API token (see server::api_tokens)
+//! ufop-server --share-root /srv/exchange                              # share links under /srv/exchange (/s/<token>)
 //! ```
 //! Defaults come from the machine-wide preload file (see `ufop_core::preload`).
 
@@ -69,6 +70,9 @@ struct Args {
     /// Add includeSubDomains to the HSTS header
     #[arg(long)]
     hsts_include_subdomains: bool,
+    /// Folder whose files and subfolders may be shared by link (repeat or comma-separate; default: sharing off)
+    #[arg(long = "share-root", env = "UFOP_SERVER_SHARE_ROOTS", value_delimiter = ',')]
+    share_roots: Vec<PathBuf>,
     #[arg(long, env = "UFOP_SERVER_PFX")]
     pfx: Option<PathBuf>,
     #[arg(long, env = "UFOP_SERVER_PFX_PASSWORD", default_value = "")]
@@ -354,6 +358,7 @@ async fn run(argv: Vec<String>) {
         hsts_max_age: a.hsts_max_age,
         hsts_include_subdomains: a.hsts_include_subdomains,
         allowed_clients: ufop_core::netacl::IpAllowlist::parse(&a.allowed_cidrs).unwrap_or_else(|e| fail(format!("--allowed-cidrs: {e}"))),
+        share_roots: a.share_roots,
     };
     let st = ServerState { mgr, conns: Some(conns), auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent };
     if let Err(e) = server::serve(st).await {

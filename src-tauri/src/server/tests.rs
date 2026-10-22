@@ -327,3 +327,119 @@ async fn openapi_document_is_public_and_matches_enforced_scopes() {
         }
     }
 }
+
+#[tokio::test]
+async fn share_portal_links_downloads_uploads_and_passwords() {
+    let off = start(ServerConfig::default(), None).await;
+    let tok = off.login().await;
+    let r = off.post("/api/v1/shares", &tok, json!({"name": "x", "path": "/tmp"})).await;
+    assert_eq!(r.status(), 409, "sharing is off without --share-root");
+
+    let root = tempfile::tempdir().unwrap();
+    let r_path = root.path();
+    std::fs::create_dir_all(r_path.join("docs/sub")).unwrap();
+    std::fs::write(r_path.join("docs/report.pdf"), b"%PDF report").unwrap();
+    std::fs::write(r_path.join("docs/sub/a b.txt"), b"hello").unwrap();
+    std::fs::write(r_path.join("docs/.env"), b"SECRET=1").unwrap();
+    std::fs::create_dir_all(r_path.join("drop")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), b"nope").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path(), r_path.join("docs/escape")).unwrap();
+
+    let s = start(ServerConfig { share_roots: vec![r_path.to_path_buf()], ..Default::default() }, None).await;
+    let tok = s.login().await;
+    let anon = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).cookie_store(true).build().unwrap();
+    let page = |url: String| {
+        let anon = anon.clone();
+        async move {
+            let r = anon.get(url).send().await.unwrap();
+            (r.status().as_u16(), r.headers().get("content-security-policy").is_some(), r.text().await.unwrap())
+        }
+    };
+
+    // Outside the share roots, hidden paths and bad options are refused.
+    assert_eq!(s.post("/api/v1/shares", &tok, json!({"name": "x", "path": outside.path()})).await.status(), 400);
+    assert_eq!(s.post("/api/v1/shares", &tok, json!({"name": "x", "path": r_path.join("docs/.env")})).await.status(), 400);
+    assert_eq!(s.post("/api/v1/shares", &tok, json!({"name": "x", "path": r_path.join("docs/report.pdf"), "kind": "upload"})).await.status(), 400);
+
+    // A folder link: browse, download, nothing outside, no dot-files.
+    let made = s.post("/api/v1/shares", &tok, json!({"name": "Q3 docs", "path": r_path.join("docs"), "max_downloads": 2})).await.json::<Value>().await.unwrap();
+    let url = format!("{}{}", s.base, made["url"].as_str().unwrap());
+    let id = made["share"]["id"].as_str().unwrap().to_string();
+    assert!(made["share"].get("token").is_none());
+    let (code, csp, html) = page(url.clone()).await;
+    assert_eq!((code, csp), (200, true));
+    assert!(html.contains("Q3 docs") && html.contains("report.pdf") && html.contains("sub") && !html.contains(".env"), "{html}");
+    let (_, _, html) = page(format!("{url}?p=sub")).await;
+    assert!(html.contains("a b.txt") && html.contains("dl?p=sub/a%20b.txt"), "{html}");
+    let dl = anon.get(format!("{url}/dl?p=sub/a%20b.txt")).send().await.unwrap();
+    assert_eq!(dl.status(), 200);
+    assert!(dl.headers()["content-disposition"].to_str().unwrap().contains("filename*=UTF-8''a%20b.txt"));
+    assert_eq!(dl.bytes().await.unwrap().as_ref(), b"hello");
+    for bad in ["?p=..", "?p=../drop", "?p=.env", "/dl?p=.env", "/dl?p=../../etc/passwd", "/dl?p=escape/secret.txt", "?p=escape"] {
+        let (code, _, html) = page(format!("{url}{bad}")).await;
+        assert_eq!(code, 404, "{bad}");
+        assert!(!html.contains("nope") && !html.contains("SECRET"), "{bad}");
+    }
+    // Download limit: two in total.
+    assert_eq!(anon.get(format!("{url}/dl?p=report.pdf")).send().await.unwrap().status(), 200);
+    assert_eq!(anon.get(format!("{url}/dl?p=report.pdf")).send().await.unwrap().status(), 410);
+    // Download-only links refuse uploads.
+    let part = reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(b"x".to_vec()).file_name("x.txt"));
+    assert_eq!(anon.post(format!("{url}/upload")).multipart(part).send().await.unwrap().status(), 403);
+
+    // An upload link with a password and a size limit.
+    let drop = s.post("/api/v1/shares", &tok, json!({"name": "Drop box", "path": r_path.join("drop"), "kind": "upload", "password": "open sesame", "max_upload_mb": 1})).await.json::<Value>().await.unwrap();
+    let durl = format!("{}{}", s.base, drop["url"].as_str().unwrap());
+    let did = drop["share"]["id"].as_str().unwrap().to_string();
+    let (_, _, html) = page(durl.clone()).await;
+    assert!(html.contains("protected by a password") && !html.contains("Upload files"));
+    let up = |name: &'static str, body: Vec<u8>| reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(body).file_name(name));
+    assert_eq!(anon.post(format!("{durl}/upload")).multipart(up("early.txt", b"x".to_vec())).send().await.unwrap().status(), 401);
+    let wrong = anon.post(format!("{durl}/unlock")).form(&[("password", "nope")]).send().await.unwrap();
+    assert_eq!(wrong.status(), 401);
+    let right = anon.post(format!("{durl}/unlock")).form(&[("password", "open sesame")]).send().await.unwrap();
+    assert_eq!(right.status(), 303);
+    assert!(right.headers()["set-cookie"].to_str().unwrap().contains("HttpOnly"));
+    let (_, _, html) = page(durl.clone()).await;
+    assert!(html.contains("Upload files") && !html.contains("<table>"), "upload links list nothing: {html}");
+    let r = anon.post(format!("{durl}/upload")).multipart(up("../../evil.txt", b"one".to_vec()).part("file", reqwest::multipart::Part::bytes(b"two".to_vec()).file_name("evil.txt"))).send().await.unwrap();
+    assert_eq!(r.status(), 303);
+    assert!(r.headers()["location"].to_str().unwrap().contains("uploaded=2"));
+    assert_eq!(std::fs::read(r_path.join("drop/evil.txt")).unwrap(), b"one");
+    assert_eq!(std::fs::read(r_path.join("drop/evil (2).txt")).unwrap(), b"two", "no overwrite");
+    assert!(!r_path.join("evil.txt").exists());
+    let big = anon.post(format!("{durl}/upload")).multipart(up("big.bin", vec![0u8; 1024 * 1024 + 1])).send().await.unwrap();
+    assert_eq!(big.status(), 413);
+    assert!(std::fs::read_dir(r_path.join("drop")).unwrap().filter_map(Result::ok).all(|e| !e.file_name().to_string_lossy().starts_with(".ufop-upload")), "partial upload removed");
+    assert_eq!(anon.get(format!("{durl}/dl?p=evil.txt")).send().await.unwrap().status(), 403, "upload links do not serve files");
+
+    // Wrong passwords are throttled.
+    let other = reqwest::Client::new();
+    for _ in 0..10 {
+        other.post(format!("{durl}/unlock")).form(&[("password", "guess")]).send().await.unwrap();
+    }
+    assert_eq!(other.post(format!("{durl}/unlock")).form(&[("password", "open sesame")]).send().await.unwrap().status(), 429);
+
+    // Access log, listing and revocation.
+    let ev = s.get(&format!("/api/v1/shares/{id}/events"), &tok).await.json::<Value>().await.unwrap();
+    let actions: Vec<&str> = ev["events"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+    assert!(actions.contains(&"download") && actions.contains(&"view") && actions.contains(&"refused"), "{actions:?}");
+    let dev = s.get(&format!("/api/v1/shares/{did}/events"), &tok).await.json::<Value>().await.unwrap();
+    let dactions: Vec<&str> = dev["events"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+    assert!(dactions.contains(&"upload") && dactions.contains(&"wrong_password") && dactions.contains(&"throttled"), "{dactions:?}");
+    let list = s.get("/api/v1/shares", &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(list["shares"].as_array().unwrap().len(), 2);
+    assert_eq!(list["shares"][1]["downloads"], 2);
+    assert_eq!(s.client.delete(format!("{}/api/v1/shares/{id}", s.base)).bearer_auth(&tok).send().await.unwrap().status(), 200);
+    assert_eq!(page(url.clone()).await.0, 410);
+    assert_eq!(page(format!("{}/s/not-a-real-token", s.base)).await.0, 404);
+
+    // A one-file link.
+    let one = s.post("/api/v1/shares", &tok, json!({"name": "Report", "path": r_path.join("docs/report.pdf")})).await.json::<Value>().await.unwrap();
+    let ourl = format!("{}{}", s.base, one["url"].as_str().unwrap());
+    assert!(page(ourl.clone()).await.2.contains("report.pdf"));
+    assert_eq!(anon.get(format!("{ourl}/dl")).send().await.unwrap().bytes().await.unwrap().as_ref(), b"%PDF report");
+    assert_eq!(anon.get(format!("{ourl}/dl?p=../sub/a%20b.txt")).send().await.unwrap().status(), 404);
+}

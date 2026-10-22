@@ -218,8 +218,8 @@ async fn callback(State(st): State<ServerState>, Query(q): Query<CallbackQuery>)
     .into_response())
 }
 
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+pub(crate) fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
 
 #[derive(Deserialize)]
