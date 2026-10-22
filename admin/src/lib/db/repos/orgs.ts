@@ -177,31 +177,67 @@ export function membersOf(orgId: string): Membership[] {
 const rank = (r: Role | null | undefined) => (r ? (ROLE_HIERARCHY[r] ?? 0) : 0);
 const maxRole = (a: Role | null, b: Role | null): Role | null => (rank(b) > rank(a) ? b : a);
 
-/** Role grants in one organization: direct membership plus group-granted roles. */
-function grantsIn(userId: string, orgId: string, inheritedOnly: boolean): Role | null {
-  // Direct memberships always delegate downward; groups only when they opt in.
-  const m = db().prepare('SELECT role FROM org_memberships WHERE user_id = ? AND org_id = ?').get(userId, orgId) as Row | undefined;
-  let best: Role | null = (m?.role as Role) ?? null;
+/** One way a user gets a role in an organization (see `roleSources`). */
+export interface RoleSource {
+  /** Where the grant is defined (the organization itself or an ancestor). */
+  orgId: string;
+  orgName: string;
+  via: 'membership' | 'group';
+  groupId?: string;
+  groupName?: string;
+  role: Role;
+  /** Defined on an ancestor and delegated down. */
+  inherited: boolean;
+  /** Counts towards the effective role. */
+  applies: boolean;
+  /** Why a grant does not apply. */
+  note?: string;
+}
+
+function sourcesIn(userId: string, o: Organization, inherited: boolean, blockedBy: Organization | null): RoleSource[] {
+  const out: RoleSource[] = [];
+  const blocked = blockedBy ? `"${blockedBy.name}" is detached from its parent, so grants above it do not reach this organization` : undefined;
+  const m = db().prepare('SELECT role FROM org_memberships WHERE user_id = ? AND org_id = ?').get(userId, o.id) as Row | undefined;
+  // Direct memberships always delegate downward.
+  if (m) out.push({ orgId: o.id, orgName: o.name, via: 'membership', role: m.role as Role, inherited, applies: !blocked, note: blocked });
   const gs = db()
-    .prepare(`SELECT g.org_role FROM groups g JOIN group_members m ON m.group_id = g.id WHERE m.user_id = ? AND g.org_id = ? AND g.org_role IS NOT NULL ${inheritedOnly ? 'AND g.delegate_to_children = 1' : ''}`)
-    .all(userId, orgId) as Row[];
-  for (const g of gs) best = maxRole(best, g.org_role as Role);
-  return best;
+    .prepare('SELECT g.id, g.name, g.org_role, g.delegate_to_children FROM groups g JOIN group_members m ON m.group_id = g.id WHERE m.user_id = ? AND g.org_id = ? AND g.org_role IS NOT NULL ORDER BY g.name')
+    .all(userId, o.id) as Row[];
+  for (const g of gs) {
+    // Groups grant their role to child organizations only when they opt in.
+    const note = blocked ?? (inherited && !g.delegate_to_children ? 'The group does not delegate its role to child organizations' : undefined);
+    out.push({ orgId: o.id, orgName: o.name, via: 'group', groupId: g.id as string, groupName: g.name as string, role: g.org_role as Role, inherited, applies: !note, note });
+  }
+  return out;
+}
+
+/**
+ * Every role grant that could give the user access to `orgId` — in the
+ * organization itself and on its ancestors — marked with whether it applies.
+ * `effectiveRole` is the highest applying one; the Explain panel shows all.
+ */
+export function roleSources(userId: string, orgId: string): RoleSource[] {
+  const org = getOrg(orgId);
+  if (!org) return [];
+  const out = sourcesIn(userId, org, false, null);
+  // Walk up; once an organization on the way is detached, grants above it stop applying.
+  let below = org;
+  let blockedBy: Organization | null = null;
+  for (const a of ancestors(orgId)) {
+    if (!blockedBy && below.detached) blockedBy = below;
+    out.push(...sourcesIn(userId, a, true, blockedBy));
+    below = a;
+  }
+  return out;
+}
+
+export function highestRole(sources: RoleSource[]): Role | null {
+  return sources.filter((x) => x.applies).reduce<Role | null>((best, x) => maxRole(best, x.role), null);
 }
 
 /** The user's effective role in `orgId`, or null without access. */
 export function effectiveRole(userId: string, orgId: string): Role | null {
-  const org = getOrg(orgId);
-  if (!org) return null;
-  let best = grantsIn(userId, orgId, false);
-  // Walk up while the organization below is not detached.
-  let below = org;
-  for (const a of ancestors(orgId)) {
-    if (below.detached) break;
-    best = maxRole(best, grantsIn(userId, a.id, true));
-    below = a;
-  }
-  return best;
+  return highestRole(roleSources(userId, orgId));
 }
 
 /** Every organization the user can open, with their role there. */

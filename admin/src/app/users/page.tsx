@@ -3,7 +3,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
   UserPlus, Upload, Download, Shield,
-  Mail, UserX, Trash2, Key, CalendarClock,
+  Mail, UserX, Trash2, Key, CalendarClock, HelpCircle,
 } from 'lucide-react';
 import { PageHeader } from '@/components/layout/page-header';
 import { Button } from '@/components/ui/button';
@@ -29,6 +29,7 @@ import { CsvImportDialog } from '@/components/users/csv-import-dialog';
 import { isEnabled } from '@/lib/features';
 import { api } from '@/lib/api-client';
 import { MembershipExpiryDialog, RemoveMemberDialog, RemovedMembers } from '@/components/users/offboarding';
+import { ExplainAccessDialog } from '@/components/users/explain-access';
 import type { RemovedMember } from '@/lib/offboarding';
 
 type Member = AdminUser & { expiresAt?: string | null };
@@ -53,6 +54,7 @@ export default function UsersPage() {
   const [restoreDays, setRestoreDays] = useState(30);
   const [removing, setRemoving] = useState<AdminUser | null>(null);
   const [expiring, setExpiring] = useState<Member | null>(null);
+  const [explaining, setExplaining] = useState<AdminUser | null>(null);
   const [invitations, setInvitations] = useState<Invitation[]>([]);
   const [inviteLink, setInviteLink] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -342,6 +344,13 @@ export default function UsersPage() {
                           <UserX size={14} className="text-foreground-secondary" />
                         </button>
                         <button
+                          onClick={() => setExplaining(user)}
+                          className="p-1.5 rounded hover:bg-background-secondary"
+                          title="Explain access"
+                        >
+                          <HelpCircle size={14} className="text-foreground-secondary" />
+                        </button>
+                        <button
                           onClick={() => setExpiring(user)}
                           className="p-1.5 rounded hover:bg-background-secondary"
                           title={user.expiresAt ? `Membership ends ${formatDate(user.expiresAt)}` : 'Set membership end'}
@@ -394,6 +403,7 @@ export default function UsersPage() {
             onClose={() => setRemoving(null)}
             onDone={() => { setRemoving(null); void reloadUsers(); notify('User removed', 'success'); }}
           />
+          <ExplainAccessDialog user={explaining} onClose={() => setExplaining(null)} />
           <MembershipExpiryDialog user={expiring} onClose={() => setExpiring(null)} onDone={() => { setExpiring(null); void reloadUsers(); notify('Membership end saved', 'success'); }} />
         </TabContent>
 
