@@ -1090,6 +1090,9 @@ pub fn run() {
             ssh_key_commands::list_known_hosts,
             ssh_key_commands::forget_known_host,
             // Automation engine (Quickflows)
+            automation_commands::automation_rule_revisions,
+            automation_commands::automation_restore_revision,
+            automation_commands::automation_convert_to_workflow,
             automation_commands::create_automation_rule,
             automation_commands::update_automation_rule,
             automation_commands::delete_automation_rule,

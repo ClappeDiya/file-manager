@@ -4,6 +4,8 @@
  * Right-side panel for creating and managing automation rules.
  * Features: NL rule creation, rule list with toggles, rule editor, execution logs.
  */
+import { WorkflowBuilder } from "@/components/workflow-builder";
+import { runStatus } from "@/lib/workflow-model";
 import { useCallback, useEffect, useState } from "react";
 import {
   useAutomationStore,
@@ -248,7 +250,7 @@ function RuleCard({ rule }: RuleCardProps) {
             {triggerIcon(rule.trigger)}
             <span>{triggerLabel(rule.trigger)}</span>
             <span className="text-[var(--color-text-muted)]">→</span>
-            <span>{actionLabel(rule.action)}</span>
+            <span>{rule.workflow ? `Workflow (${rule.workflow.nodes.length} steps)` : actionLabel(rule.action)}</span>
           </div>
         </div>
 
@@ -294,7 +296,7 @@ function RuleCard({ rule }: RuleCardProps) {
               {conditionsSummary(rule)}
             </div>
           )}
-          {(rule.steps?.length ?? 0) > 0 && (
+          {!rule.workflow && (rule.steps?.length ?? 0) > 0 && (
             <div className="text-[10px] text-[var(--color-text-muted)] mb-2">
               <span className="font-medium">Then: </span>
               {rule.steps!.map((s) => actionLabel(s.action)).join(" → ")}
@@ -371,7 +373,30 @@ function RuleCard({ rule }: RuleCardProps) {
 
 // ── Log Entry ──
 
+/** A workflow run drawn on its graph: each step coloured by how it ended. */
+function RunGraph({ log, onClose }: { log: AutomationLog; onClose: () => void }) {
+  const rule = useAutomationStore((s) => s.rules.find((r) => r.id === log.rule_id));
+  if (!rule?.workflow) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" role="dialog" aria-modal="true" aria-label="Run graph" onClick={onClose}>
+      <div className="w-[min(900px,95vw)] rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] p-3 space-y-2" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-2 text-xs">
+          <b>{log.rule_name}</b>
+          <span>{new Date(log.triggered_at).toLocaleString()}</span>
+          <span>{log.status}</span>
+          <button className="ml-auto underline" onClick={onClose}>
+            Close
+          </button>
+        </div>
+        <WorkflowBuilder workflow={rule.workflow} status={runStatus(log)} actionLabel={actionLabel} />
+      </div>
+    </div>
+  );
+}
+
 function LogEntry({ log }: { log: AutomationLog }) {
+  const [graph, setGraph] = useState(false);
+  const hasGraph = (log.steps ?? []).some((s) => s.node);
   const statusIcon = {
     success: <CheckCircle2 className="h-3 w-3 text-green-500" />,
     failed: <XCircle className="h-3 w-3 text-red-500" />,
@@ -397,6 +422,12 @@ function LogEntry({ log }: { log: AutomationLog }) {
             {log.files_affected.length} file(s) affected
           </div>
         )}
+        {hasGraph && (
+          <button className="text-[10px] underline text-[var(--color-text-muted)]" onClick={() => setGraph(true)}>
+            Run graph
+          </button>
+        )}
+        {graph && <RunGraph log={log} onClose={() => setGraph(false)} />}
       </div>
     </div>
   );

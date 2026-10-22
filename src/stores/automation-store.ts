@@ -136,6 +136,40 @@ export interface AutomationRule {
   condition_tree?: ConditionNode | null;
   steps?: ActionStep[];
   options?: RuleOptions;
+  /** When set, the rule runs this graph instead of `action` + `steps`. */
+  workflow?: Workflow | null;
+}
+
+/** `automation_engine::workflow`: a rule's actions as a DAG. */
+export type EdgeOn = "success" | "failure" | "always" | "true" | "false";
+
+export type WorkflowNodeKind =
+  | { kind: "action"; action: RuleAction }
+  | { kind: "condition"; condition: ConditionNode }
+  | { kind: "delay"; seconds: number }
+  | { kind: "join"; all: boolean }
+  | { kind: "sub_rule"; rule_id: string };
+
+export type WorkflowNode = WorkflowNodeKind & { id: string; label: string; x: number; y: number };
+
+export interface WorkflowEdge {
+  from: string;
+  to: string;
+  on: EdgeOn;
+}
+
+export interface Workflow {
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+}
+
+export interface RuleRevision {
+  revision: number;
+  saved_at: string;
+  name: string;
+  workflow: boolean;
+  actions: number;
+  rule: AutomationRule;
 }
 
 export interface StepResult {
@@ -145,6 +179,8 @@ export interface StepResult {
   ok: boolean;
   attempts: number;
   message: string | null;
+  /** Workflow step id (workflow runs). */
+  node?: string | null;
 }
 
 export interface AutomationLog {

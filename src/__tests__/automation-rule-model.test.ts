@@ -176,6 +176,26 @@ describe("presets", () => {
       ],
       options: { ...newRuleForm().options, source: { path: "/inbox", recursive: true, newest: 5, include_dirs: false }, priority: -1 },
     })), rules.length));
+    // A workflow rule: every node kind and edge kind the builder emits.
+    rules.push(normalize(ruleFromForm(form({
+      trigger: { type: "manual" },
+      workflow: {
+        nodes: [
+          { id: "n1", kind: "condition", condition: { type: "condition", condition: { type: "extension_is", extensions: ["pdf"] } }, label: "PDF?", x: 0, y: 0 },
+          { id: "n2", kind: "action", action: { type: "move_file", dest_path: "/pdf" }, label: "", x: -120, y: 120 },
+          { id: "n3", kind: "delay", seconds: 5, label: "", x: 120, y: 120 },
+          { id: "n4", kind: "join", all: true, label: "", x: 0, y: 240 },
+          { id: "n5", kind: "sub_rule", rule_id: "00000000-0000-4000-8000-000000000000", label: "", x: 0, y: 360 },
+        ],
+        edges: [
+          { from: "n1", to: "n2", on: "true" },
+          { from: "n1", to: "n3", on: "false" },
+          { from: "n2", to: "n4", on: "success" },
+          { from: "n3", to: "n4", on: "always" },
+          { from: "n4", to: "n5", on: "failure" },
+        ],
+      },
+    })), rules.length));
     const json = JSON.stringify(rules, null, 2) + "\n";
     if (process.env.UPDATE_FIXTURES) writeFileSync(FIXTURE, json);
     expect(json).toBe(readFileSync(FIXTURE, "utf8"));

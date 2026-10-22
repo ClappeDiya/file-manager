@@ -550,6 +550,17 @@ In Advanced mode, **Schedules & holiday calendars** (toolbar or command palette)
 - A **holiday calendar** lists days off: dates, dates that recur every year (`MM-DD`), and optionally weekends. Import an iCalendar (`.ics`) file to add its all-day events; yearly events recur. Backup jobs pick calendars on their Schedule step.
 - A scheduled run that falls on a day off (by local date) is skipped, not postponed: the next regular run happens as usual. The schedule editor previews the next runs and marks the ones a calendar skips.
 
+## Automation: workflows
+
+In Advanced mode, a rule's actions can be edited as a **workflow**: a graph instead of a list (rule editor → *Edit as a workflow*; a plain chain turns back into a list with *Use a list of actions instead*).
+
+- **Steps:** an action (any automation action), a **condition** (matching files continue on its *true* branch, the rest on *false*), a **delay**, a **join**, or a **nested rule** that runs another rule's actions on the files.
+- **Connections** fire on success (default), on failure, always, or on a condition's true/false branch. Branches run in parallel. A step waits until all its inputs have finished, then runs when at least one of them fired; a join set to *every* needs all of them. Otherwise it is skipped, and so is everything after it.
+- **Files flow along connections.** A step receives the files its inputs carry (several branches are merged), and an action runs once per file. Moving, renaming or downloading hands the new file on; other actions pass their input through.
+- **Run graph:** a workflow run in the run history has a *Run graph* button that shows which steps succeeded, failed or were skipped.
+- **History:** every edit keeps the previous version of the rule (up to 50). Open the rule's *History* to restore one. Command approvals must be given again after a restore.
+- Workflows are checked when saved: no loops, known steps only, delays up to 24 hours, nested rules at most 4 deep and never running themselves. Programs (`Run a program`) inside a workflow need the same approval as in a list.
+
 ## Automation: downloading a URL
 
 In Advanced mode, an automation rule can **Download a URL** into a folder. The URL, folder, file name and expected SHA-256 accept the same templates as other actions (`{name}`, `{yyyy}`, webhook fields …).

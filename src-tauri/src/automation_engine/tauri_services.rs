@@ -128,4 +128,8 @@ impl ActionServices for TauriActionServices {
                 .map_err(|e| e.user_message())
         })
     }
+
+    fn rule<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Option<super::AutomationRule>> {
+        Box::pin(async move { self.app.state::<super::AutomationManager>().get_rule(id).await })
+    }
 }

@@ -50,6 +50,11 @@ pub trait ActionServices: Send + Sync {
         title: &str,
         body: &str,
     ) -> BoxFuture<'_, Result<(), String>>;
+
+    /// Another rule by id (workflow steps that run a nested rule).
+    fn rule<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Option<super::AutomationRule>> {
+        Box::pin(async { None })
+    }
 }
 
 /// Join a remote directory and a file name with exactly one `/`.
@@ -73,6 +78,8 @@ pub mod mock {
         pub calls: Mutex<Vec<String>>,
         /// When set, every call fails with this message.
         pub fail_with: Option<String>,
+        /// Rules nested workflow steps can run.
+        pub rules: Mutex<Vec<crate::automation_engine::AutomationRule>>,
     }
 
     impl RecordingServices {
@@ -133,6 +140,11 @@ pub mod mock {
         ) -> BoxFuture<'_, Result<(), String>> {
             let kind = serde_json::to_value(&notification.channel).ok().and_then(|v| v["type"].as_str().map(str::to_string)).unwrap_or_default();
             let r = self.record(format!("message:{kind}:{title}:{body}"));
+            Box::pin(async move { r })
+        }
+
+        fn rule<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Option<crate::automation_engine::AutomationRule>> {
+            let r = self.rules.lock().unwrap().iter().find(|r| r.id == id).cloned();
             Box::pin(async move { r })
         }
     }

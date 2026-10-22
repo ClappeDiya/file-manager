@@ -15,8 +15,10 @@ import type {
   RuleCondition,
   RuleOptions,
   RuleTrigger,
+  Workflow,
 } from "@/stores/automation-store";
 import { formatBytes } from "@/lib/format-bytes";
+import { validateWorkflow, workflowActions } from "@/lib/workflow-model";
 
 export interface ConditionRow {
   key: string;
@@ -35,6 +37,8 @@ export interface RuleForm {
   options: RuleOptions;
   /** A stored tree too complex for the row editor; kept untouched. */
   customTree: ConditionNode | null;
+  /** The rule's actions as a graph (replaces `steps` when set). */
+  workflow?: Workflow | null;
   /** Fields of the original rule the editor doesn't show. */
   base?: AutomationRule;
 }
@@ -196,6 +200,7 @@ export function newRuleForm(folder = ""): RuleForm {
     steps: [{ action: defaultAction("move_file"), continue_on_error: false }],
     options: defaultOptions(),
     customTree: null,
+    workflow: null,
   };
 }
 
@@ -236,6 +241,7 @@ export function formFromRule(rule: AutomationRule): RuleForm {
     // Stored rules keep their own options (absent = engine defaults).
     options: rule.options ?? { overwrite: "rename", retry: { ...NO_RETRY }, priority: 0, allow_overlap: false, settle_secs: 0, source: null },
     customTree,
+    workflow: rule.workflow ?? null,
     base: rule,
   };
 }
@@ -257,7 +263,9 @@ export function ruleFromForm(form: RuleForm): AutomationRule {
           ),
         }
       : null;
-  const [first, ...rest] = form.steps;
+  // With a workflow, `action` is its first action (the engine runs the graph).
+  const firstNodeAction = form.workflow ? workflowActions(form.workflow)[0] : undefined;
+  const [first, ...rest] = form.workflow ? [{ action: firstNodeAction ?? form.steps[0].action, continue_on_error: false }] : form.steps;
   const source = isFileTrigger(form.trigger) ? null : form.options.source ?? null;
   return {
     id: form.id ?? crypto.randomUUID(),
@@ -275,7 +283,27 @@ export function ruleFromForm(form: RuleForm): AutomationRule {
     trigger_count: base?.trigger_count ?? 0,
     error_count: base?.error_count ?? 0,
     last_error: base?.last_error ?? null,
+    ...(form.workflow ? { workflow: form.workflow } : {}),
   };
+}
+
+/** Problems with one action (`n` names it in the message). */
+function actionErrors(a: RuleAction, n: string): string[] {
+  const errors: string[] = [];
+  if ((a.type === "move_file" || a.type === "copy_file" || a.type === "compress_folder" || a.type === "extract_archive") && !a.dest_path.trim()) errors.push(`${n}: choose a destination.`);
+  if (a.type === "create_folder" && !a.path.trim()) errors.push(`${n}: choose the folder to create.`);
+  if (a.type === "rename_file" && !a.pattern.trim()) errors.push(`${n}: enter a name pattern.`);
+  if (a.type === "run_sync" && !a.sync_pair_id) errors.push(`${n}: choose a sync pair.`);
+  if (a.type === "transfer_to_connector" && !a.connection_id) errors.push(`${n}: choose a connection.`);
+  if (a.type === "run_command" && !a.program.trim()) errors.push(`${n}: enter the program to run.`);
+  if (a.type === "execute_custom_command" && !a.command_id) errors.push(`${n}: choose a custom command.`);
+  if (a.type === "download_url") {
+    if (!/^https?:\/\/[^/\s]+/i.test(a.url.trim())) errors.push(`${n}: enter an http(s) URL to download.`);
+    if (!a.dest_path.trim()) errors.push(`${n}: choose the folder to save into.`);
+    if (!(a.max_mb >= 1)) errors.push(`${n}: the size limit must be at least 1 MB.`);
+    if (a.sha256 && !/^([0-9a-f]{64}|.*\{.*\}.*)$/i.test(a.sha256.trim())) errors.push(`${n}: the SHA-256 must be 64 hex digits.`);
+  }
+  return errors;
 }
 
 /** Problems to fix before saving; empty when the form is valid. */
@@ -286,28 +314,20 @@ export function validateForm(form: RuleForm): string[] {
     errors.push("Choose the folder to watch.");
   }
   if (form.trigger.type === "schedule" && !form.trigger.cron_expr.trim()) errors.push("Choose a schedule.");
-  if (form.steps.length === 0) errors.push("Add at least one action.");
+  if (!form.workflow && form.steps.length === 0) errors.push("Add at least one action.");
   const fileActions = new Set(["move_file", "copy_file", "rename_file", "delete_file", "compress_folder", "extract_archive", "transfer_to_connector"]);
-  if (!isFileTrigger(form.trigger) && !form.options.source?.path && form.steps.some((s) => fileActions.has(s.action.type))) {
+  const formActions = form.workflow ? workflowActions(form.workflow) : form.steps.map((s) => s.action);
+  if (!isFileTrigger(form.trigger) && !form.options.source?.path && formActions.some((a) => fileActions.has(a.type))) {
     errors.push("This trigger has no file: choose which folder's files the rule works on.");
   }
-  form.steps.forEach((s, i) => {
-    const a = s.action;
-    const n = `Action ${i + 1}`;
-    if ((a.type === "move_file" || a.type === "copy_file" || a.type === "compress_folder" || a.type === "extract_archive") && !a.dest_path.trim()) errors.push(`${n}: choose a destination.`);
-    if (a.type === "create_folder" && !a.path.trim()) errors.push(`${n}: choose the folder to create.`);
-    if (a.type === "rename_file" && !a.pattern.trim()) errors.push(`${n}: enter a name pattern.`);
-    if (a.type === "run_sync" && !a.sync_pair_id) errors.push(`${n}: choose a sync pair.`);
-    if (a.type === "transfer_to_connector" && !a.connection_id) errors.push(`${n}: choose a connection.`);
-    if (a.type === "run_command" && !a.program.trim()) errors.push(`${n}: enter the program to run.`);
-    if (a.type === "execute_custom_command" && !a.command_id) errors.push(`${n}: choose a custom command.`);
-    if (a.type === "download_url") {
-      if (!/^https?:\/\/[^/\s]+/i.test(a.url.trim())) errors.push(`${n}: enter an http(s) URL to download.`);
-      if (!a.dest_path.trim()) errors.push(`${n}: choose the folder to save into.`);
-      if (!(a.max_mb >= 1)) errors.push(`${n}: the size limit must be at least 1 MB.`);
-      if (a.sha256 && !/^([0-9a-f]{64}|.*\{.*\}.*)$/i.test(a.sha256.trim())) errors.push(`${n}: the SHA-256 must be 64 hex digits.`);
-    }
-  });
+  if (form.workflow) {
+    errors.push(...validateWorkflow(form.workflow));
+    form.workflow.nodes.forEach((node) => {
+      if (node.kind === "action") errors.push(...actionErrors(node.action, `Step ${node.id}`));
+    });
+  } else {
+    form.steps.forEach((s, i) => errors.push(...actionErrors(s.action, `Action ${i + 1}`)));
+  }
   for (const r of form.conditions) {
     if (r.condition.type === "name_regex") {
       try {
@@ -321,13 +341,42 @@ export function validateForm(form: RuleForm): string[] {
 }
 
 /** Whether a rule runs programs that need the user's approval. */
+/**
+ * A workflow that is a plain chain of actions as a list of steps (a step
+ * whose outgoing connection fires "always" continues on error); null when
+ * it branches or cannot be written as a list.
+ */
+export function linearSteps(wf: Workflow): ActionStep[] | null {
+  if (wf.nodes.length === 0 || wf.nodes.some((n) => n.kind !== "action")) return null;
+  const starts = wf.nodes.filter((n) => !wf.edges.some((e) => e.to === n.id));
+  if (starts.length !== 1 || wf.edges.length !== wf.nodes.length - 1) return null;
+  const steps: ActionStep[] = [];
+  let cur: string | undefined = starts[0].id;
+  while (cur) {
+    const n = wf.nodes.find((x) => x.id === cur)!;
+    const out = wf.edges.filter((e) => e.from === cur);
+    if (out.length > 1 || out.some((e) => e.on === "failure") || n.kind !== "action") return null;
+    // "Always" out of a step = carry on when it fails (the first action can't).
+    const keepGoing = out[0]?.on === "always";
+    if (keepGoing && steps.length === 0) return null;
+    steps.push({ action: n.action, continue_on_error: keepGoing });
+    cur = out[0]?.to;
+  }
+  return steps.length === wf.nodes.length ? steps : null;
+}
+
+/** Every action a rule runs: its workflow's, or `action` + `steps`. */
+export function ruleActions(rule: AutomationRule): RuleAction[] {
+  return rule.workflow ? workflowActions(rule.workflow) : [rule.action, ...(rule.steps ?? []).map((s) => s.action)];
+}
+
 export function runsCommands(rule: AutomationRule): boolean {
-  return [rule.action, ...(rule.steps ?? []).map((s) => s.action)].some((a) => a.type === "run_command");
+  return ruleActions(rule).some((a) => a.type === "run_command");
 }
 
 /** The exact command lines a rule runs, for the approval prompt. */
 export function commandLines(rule: AutomationRule): string[] {
-  return [rule.action, ...(rule.steps ?? []).map((s) => s.action)]
+  return ruleActions(rule)
     .filter((a): a is Extract<RuleAction, { type: "run_command" }> => a.type === "run_command")
     .map((a) => [a.program, ...a.args.map((x) => (/\s/.test(x) ? JSON.stringify(x) : x))].join(" ") + (a.working_dir ? `  (in ${a.working_dir})` : ""));
 }

@@ -48,6 +48,13 @@ pub fn evaluate_rule(rule: &AutomationRule, file_path: &str) -> RuleMatch {
     RuleMatch { matched, captures: if matched { captures } else { Vec::new() } }
 }
 
+/// Whether `file_path` satisfies a condition tree (workflow condition steps).
+pub fn evaluate_tree(tree: &ConditionNode, file_path: &str) -> bool {
+    let path = Path::new(file_path);
+    let metadata = std::fs::metadata(file_path).ok();
+    eval_node(tree, path, &metadata, &mut Vec::new())
+}
+
 fn eval_node(node: &ConditionNode, path: &Path, md: &Option<std::fs::Metadata>, caps: &mut Vec<String>) -> bool {
     match node {
         ConditionNode::All { nodes } => nodes.iter().all(|n| eval_node(n, path, md, caps)),

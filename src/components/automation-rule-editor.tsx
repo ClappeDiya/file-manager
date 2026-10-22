@@ -8,6 +8,8 @@
  * approval and webhook URLs. Rules are saved disabled unless switched on.
  */
 import { NamedSchedulePicker } from "@/components/schedule-pickers";
+import { WorkflowBuilder } from "@/components/workflow-builder";
+import { autoLayout } from "@/lib/workflow-model";
 import { refId } from "@/stores/schedule-store";
 import { useCallback, useEffect, useState } from "react";
 import { ArrowDown, ArrowUp, FlaskConical, Link2, Plus, ShieldCheck, Trash2, X } from "lucide-react";
@@ -38,6 +40,7 @@ import {
   runsCommands,
   validateForm,
   type RuleForm,
+  linearSteps,
 } from "@/lib/automation-rule-model";
 import {
   useAutomationStore,
@@ -47,6 +50,8 @@ import {
   type RuleAction,
   type RuleCondition,
   type WebhookInfo,
+  type RuleRevision,
+  type Workflow,
 } from "@/stores/automation-store";
 
 const field = "w-full min-w-0 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-xs";
@@ -468,6 +473,8 @@ export function AutomationRuleEditor() {
   const [syncPairs, setSyncPairs] = useState<Named[]>([]);
   const [connections, setConnections] = useState<Named[]>([]);
   const [customCommands, setCustomCommands] = useState<Named[]>([]);
+  const [revisions, setRevisions] = useState<RuleRevision[]>([]);
+  const loadRules = useAutomationStore((s) => s.loadRules);
 
   useEffect(() => {
     if (!editorOpen) return;
@@ -482,6 +489,8 @@ export function AutomationRuleEditor() {
     void tauriInvokeSafe<Named[]>("list_sync_pairs", undefined, []).then(setSyncPairs);
     void tauriInvokeSafe<Named[]>("list_connections", undefined, []).then(setConnections);
     void tauriInvokeSafe<Named[]>("list_custom_commands", undefined, []).then(setCustomCommands);
+    setRevisions([]);
+    if (existing) void tauriInvokeSafe<RuleRevision[]>("automation_rule_revisions", { ruleId: existing.id }, []).then(setRevisions);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editorOpen, editorRule]);
 
@@ -712,7 +721,56 @@ export function AutomationRuleEditor() {
           {/* Actions */}
           <section aria-labelledby="act-h" className="space-y-2">
             <h3 id="act-h" className="text-xs font-semibold">Then</h3>
-            {form.steps.map((step, i) => (
+            {advanced && !form.workflow && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={async () => {
+                  try {
+                    const wf = await tauriInvoke<Workflow>("automation_convert_to_workflow", { rule: ruleFromForm(form) });
+                    update({ workflow: autoLayout(wf) });
+                  } catch (e) {
+                    setErrors([errorText(e)]);
+                  }
+                }}
+              >
+                Edit as a workflow (graph)
+              </Button>
+            )}
+            {form.workflow && (
+              <>
+                <WorkflowBuilder
+                  workflow={form.workflow}
+                  onChange={(wf) => update({ workflow: wf })}
+                  rules={rules.filter((r) => r.id !== form.id).map((r) => ({ id: r.id, name: r.name }))}
+                  actionLabel={(a) => ACTION_TYPES.find((t) => t.type === a.type)?.label ?? a.type}
+                  renderAction={(a, onChange, idx) => (
+                    <ActionFields a={a} onChange={onChange} idx={idx} sample={sample} regex={regex?.pattern} syncPairs={syncPairs} connections={connections} customCommands={customCommands} advanced={advanced} />
+                  )}
+                  renderCondition={(c, onChange) =>
+                    c.type === "condition" ? (
+                      <ConditionFields c={c.condition} onChange={(condition) => onChange({ type: "condition", condition })} id="wf-cond" />
+                    ) : (
+                      <p className="text-[11px] text-[var(--color-text-muted)]">A combined condition; replace it with a single one to edit it here.</p>
+                    )
+                  }
+                  newAction={() => defaultAction("notify")}
+                  newCondition={() => ({ type: "condition", condition: defaultCondition("extension_is") })}
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    const steps = linearSteps(form.workflow!);
+                    if (steps) update({ workflow: null, steps });
+                    else if (confirm("This workflow has branches; turning it back into a list keeps the previous list of actions and drops the graph. Continue?")) update({ workflow: null });
+                  }}
+                >
+                  Use a list of actions instead
+                </Button>
+              </>
+            )}
+            {!form.workflow && form.steps.map((step, i) => (
               <div key={i} className="rounded border border-[var(--color-border)] p-2 space-y-2" data-testid={`step-${i}`}>
                 <div className="flex gap-1 items-center">
                   <span className="text-[11px] text-[var(--color-text-muted)] w-5">{i + 1}.</span>
@@ -741,15 +799,49 @@ export function AutomationRuleEditor() {
                 )}
               </div>
             ))}
-            <div className="flex gap-2">
+            {!form.workflow && <div className="flex gap-2">
               <Button variant="outline" size="sm" onClick={() => update({ steps: [...form.steps, { action: defaultAction("copy_file"), continue_on_error: false }] })}>
                 <Plus className="h-3.5 w-3.5 mr-1" /> Add another destination
               </Button>
               <Button variant="outline" size="sm" onClick={() => update({ steps: [...form.steps, { action: defaultAction("notify"), continue_on_error: true }] })}>
                 <Plus className="h-3.5 w-3.5 mr-1" /> Add action
               </Button>
-            </div>
+            </div>}
           </section>
+
+          {revisions.length > 0 && form.id && (
+            <details className="rounded border border-[var(--color-border)] p-2" data-testid="rule-history">
+              <summary className="cursor-pointer text-xs font-semibold">History ({revisions.length} earlier version{revisions.length === 1 ? "" : "s"})</summary>
+              <ul className="mt-2 space-y-1 text-xs">
+                {revisions.map((r) => (
+                  <li key={r.revision} className="flex items-center gap-2">
+                    <span>#{r.revision}</span>
+                    <span>{new Date(r.saved_at).toLocaleString()}</span>
+                    <span className="truncate">{r.name}</span>
+                    <span className="text-[var(--color-text-muted)]">{r.workflow ? "workflow" : `${r.actions} action(s)`}</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="ml-auto"
+                      onClick={async () => {
+                        try {
+                          const restored = await tauriInvoke<AutomationRule>("automation_restore_revision", { ruleId: form.id, revision: r.revision });
+                          await loadRules();
+                          setForm(formFromRule(restored));
+                          setSaved(restored);
+                          setRevisions(await tauriInvokeSafe<RuleRevision[]>("automation_rule_revisions", { ruleId: restored.id }, []));
+                        } catch (e) {
+                          setErrors([errorText(e)]);
+                        }
+                      }}
+                    >
+                      Restore
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
 
           {/* Options */}
           <details className="rounded border border-[var(--color-border)] p-2">

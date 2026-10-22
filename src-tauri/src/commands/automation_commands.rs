@@ -31,6 +31,10 @@ pub async fn update_automation_rule(
     mgr: State<'_, AutomationManager>,
 ) -> Result<AutomationRule, AppError> {
     mgr.sanitize_incoming(&mut rule).await;
+    if let Some(wf) = &rule.workflow {
+        wf.validate().map_err(AppError::validation)?;
+    }
+    mgr.record_revision(&repo, &rule.id).await?;
     mgr.save_rule(&repo, &rule).await?;
     // Restart the trigger so a changed watch path or cron takes effect.
     mgr.rearm(&rule).await?;
@@ -347,4 +351,24 @@ pub async fn retry_failed_event(
         log.files_affected.len()
     );
     Ok(log)
+}
+
+/// Earlier versions of a rule (newest first).
+#[tauri::command]
+pub async fn automation_rule_revisions(rule_id: String, repo: State<'_, Repository>, mgr: State<'_, AutomationManager>) -> Result<Vec<crate::automation_engine::RuleRevision>, AppError> {
+    mgr.list_revisions(&repo, &rule_id).await
+}
+
+/// Put an earlier version of a rule back.
+#[tauri::command]
+pub async fn automation_restore_revision(rule_id: String, revision: i64, repo: State<'_, Repository>, mgr: State<'_, AutomationManager>) -> Result<AutomationRule, AppError> {
+    let rule = mgr.restore_revision(&repo, &rule_id, revision).await?;
+    mgr.rearm(&rule).await?;
+    Ok(rule)
+}
+
+/// The workflow equivalent of a rule's actions (v1 → v2 conversion).
+#[tauri::command]
+pub async fn automation_convert_to_workflow(rule: AutomationRule) -> Result<crate::automation_engine::workflow::Workflow, AppError> {
+    Ok(rule.workflow.clone().unwrap_or_else(|| crate::automation_engine::workflow::Workflow::from_rule(&rule)))
 }

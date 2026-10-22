@@ -17,6 +17,7 @@ pub mod services;
 pub mod suggester;
 pub mod tauri_services;
 pub mod webhook;
+pub mod workflow;
 
 use crate::core::error::AppError;
 use chrono::Utc;
@@ -52,6 +53,9 @@ pub struct AutomationRule {
     pub steps: Vec<ActionStep>,
     #[serde(default)]
     pub options: RuleOptions,
+    /// When set, the rule runs this graph instead of `action` + `steps`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<workflow::Workflow>,
 }
 
 /// The parts of a rule stored in `automation_rules.extra_json`.
@@ -63,6 +67,8 @@ struct RuleExtra {
     steps: Vec<ActionStep>,
     #[serde(default)]
     options: RuleOptions,
+    #[serde(default)]
+    workflow: Option<workflow::Workflow>,
 }
 
 /// One extra action of a multi-step rule.
@@ -173,6 +179,23 @@ impl AutomationRule {
             condition_tree: None,
             steps: Vec::new(),
             options: RuleOptions::default(),
+            workflow: None,
+        }
+    }
+
+    /// Every action the rule can run: its workflow's action nodes, or
+    /// `action` + `steps` (for approvals and checks that must see them all).
+    pub fn all_actions(&self) -> Vec<&RuleAction> {
+        match &self.workflow {
+            Some(wf) => wf
+                .nodes
+                .iter()
+                .filter_map(|n| match &n.kind {
+                    workflow::NodeKind::Action { action } => Some(action.as_ref()),
+                    _ => None,
+                })
+                .collect(),
+            None => self.all_steps().into_iter().map(|(a, _)| a).collect(),
         }
     }
 
@@ -355,6 +378,9 @@ pub struct StepResult {
     pub ok: bool,
     pub attempts: u32,
     pub message: Option<String>,
+    /// Workflow step id (workflow runs), for drawing the run on the graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 /// An execution log entry for a rule run.
@@ -428,9 +454,9 @@ pub(crate) async fn record_automation_log(
 /// fingerprints), or `None` if it runs no commands.
 pub fn command_approvals(rule: &AutomationRule) -> Option<String> {
     let fps: Vec<String> = rule
-        .all_steps()
+        .all_actions()
         .into_iter()
-        .filter_map(|(a, _)| match a {
+        .filter_map(|a| match a {
             RuleAction::RunCommand { program, args, working_dir, .. } => Some(executor::command_fingerprint(program, args, working_dir.as_deref())),
             _ => None,
         })
@@ -439,6 +465,20 @@ pub fn command_approvals(rule: &AutomationRule) -> Option<String> {
 }
 
 // ── Manager ──
+
+/// Revisions kept per rule.
+const MAX_REVISIONS: i64 = 50;
+
+/// An earlier version of a rule.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleRevision {
+    pub revision: i64,
+    pub saved_at: String,
+    pub name: String,
+    pub workflow: bool,
+    pub actions: usize,
+    pub rule: AutomationRule,
+}
 
 /// Maximum number of active filesystem watchers to prevent resource exhaustion.
 const MAX_WATCHERS: usize = 50;
@@ -636,6 +676,7 @@ async fn db_save_rule(repo: &crate::storage::Repository, rule: &AutomationRule) 
             condition_tree: rule_clone.condition_tree.clone(),
             steps: rule_clone.steps.clone(),
             options: rule_clone.options.clone(),
+            workflow: rule_clone.workflow.clone(),
         })
         .unwrap_or_else(|_| "{}".into());
 
@@ -843,6 +884,7 @@ impl AutomationManager {
                         condition_tree: extra.condition_tree,
                         steps: extra.steps,
                         options: extra.options,
+                        workflow: extra.workflow,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -859,6 +901,9 @@ impl AutomationManager {
 
     /// Save or update a rule in the database.
     pub async fn save_rule(&self, repo: &crate::storage::Repository, rule: &AutomationRule) -> Result<(), AppError> {
+        if let Some(wf) = &rule.workflow {
+            wf.validate().map_err(AppError::validation)?;
+        }
         db_save_rule(repo, rule).await?;
 
         // Update in-memory list
@@ -890,6 +935,7 @@ impl AutomationManager {
         let rid = rule_id.to_string();
         repo.pool().execute(move |conn| {
             conn.execute("DELETE FROM automation_rules WHERE id = ?1", rusqlite::params![rid])?;
+            conn.execute("DELETE FROM automation_rule_revisions WHERE rule_id = ?1", rusqlite::params![rid])?;
             Ok(())
         }).await?;
 
@@ -1162,9 +1208,60 @@ impl AutomationManager {
         copy.conditions = src.conditions.clone();
         copy.condition_tree = src.condition_tree.clone();
         copy.steps = src.steps.clone();
+        copy.workflow = src.workflow.clone();
         copy.options = RuleOptions { command_approval: None, webhook_secret_hash: None, ..src.options.clone() };
         self.save_rule(repo, &copy).await?;
         Ok(copy)
+    }
+
+    /// Keep the stored version of `rule_id` as a revision before an edit
+    /// replaces it (the newest `MAX_REVISIONS` are kept).
+    pub async fn record_revision(&self, repo: &crate::storage::Repository, rule_id: &str) -> Result<(), AppError> {
+        let Some(old) = self.get_rule(rule_id).await else { return Ok(()) };
+        let (id, data, at) = (old.id.clone(), serde_json::to_string(&old)?, old.updated_at.clone());
+        repo.pool()
+            .execute(move |c| {
+                let next: i64 = c.query_row("SELECT COALESCE(MAX(revision), 0) + 1 FROM automation_rule_revisions WHERE rule_id = ?1", rusqlite::params![id], |r| r.get(0))?;
+                c.execute("INSERT INTO automation_rule_revisions (rule_id, revision, data, saved_at) VALUES (?1, ?2, ?3, ?4)", rusqlite::params![id, next, data, at])?;
+                c.execute("DELETE FROM automation_rule_revisions WHERE rule_id = ?1 AND revision <= ?2", rusqlite::params![id, next - MAX_REVISIONS])?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Earlier versions of a rule, newest first.
+    pub async fn list_revisions(&self, repo: &crate::storage::Repository, rule_id: &str) -> Result<Vec<RuleRevision>, AppError> {
+        let id = rule_id.to_string();
+        repo.pool()
+            .execute(move |c| {
+                let mut st = c.prepare("SELECT revision, data, saved_at FROM automation_rule_revisions WHERE rule_id = ?1 ORDER BY revision DESC")?;
+                let rows = st
+                    .query_map(rusqlite::params![id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                    .filter_map(Result::ok)
+                    .filter_map(|(revision, data, saved_at)| {
+                        let rule: AutomationRule = serde_json::from_str(&data).ok()?;
+                        Some(RuleRevision { revision, saved_at, name: rule.name.clone(), workflow: rule.workflow.is_some(), actions: rule.all_actions().len(), rule })
+                    })
+                    .collect();
+                Ok(rows)
+            })
+            .await
+    }
+
+    /// Put an earlier version back (the current one becomes a revision).
+    /// Statistics stay current; command approvals must be given again.
+    pub async fn restore_revision(&self, repo: &crate::storage::Repository, rule_id: &str, revision: i64) -> Result<AutomationRule, AppError> {
+        let current = self.get_rule(rule_id).await.ok_or_else(|| AppError::not_found(format!("Automation rule '{rule_id}' not found")))?;
+        let old = self.list_revisions(repo, rule_id).await?.into_iter().find(|r| r.revision == revision).ok_or_else(|| AppError::not_found(format!("Revision {revision} not found")))?;
+        let mut rule = old.rule;
+        rule.id = current.id.clone();
+        rule.created_at = current.created_at.clone();
+        (rule.trigger_count, rule.error_count, rule.last_triggered, rule.last_error) = (current.trigger_count, current.error_count, current.last_triggered.clone(), current.last_error.clone());
+        rule.updated_at = Utc::now().to_rfc3339();
+        self.sanitize_incoming(&mut rule).await;
+        self.record_revision(repo, rule_id).await?;
+        self.save_rule(repo, &rule).await?;
+        Ok(rule)
     }
 
     /// Issue a new webhook secret for a rule; returns it once (only its hash
@@ -1315,12 +1412,48 @@ mod tests {
     /// Rules exactly as the desktop rule editor emits them (generated by
     /// `src/__tests__/automation-rule-model.test.ts`): every one must load,
     /// and the shapes the editor relies on must come through.
+    #[tokio::test]
+    async fn revisions_are_kept_listed_and_restored() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = AutomationManager::new();
+        let mut rule = AutomationRule::new("v1".into(), RuleTrigger::Manual, RuleAction::CreateFolder { path: "/a".into() });
+        mgr.save_rule(&repo, &rule).await.unwrap();
+        for name in ["v2", "v3"] {
+            mgr.record_revision(&repo, &rule.id).await.unwrap();
+            rule.name = name.into();
+            rule.workflow = (name == "v3").then(|| workflow::Workflow::from_rule(&rule));
+            mgr.save_rule(&repo, &rule).await.unwrap();
+        }
+        let revs = mgr.list_revisions(&repo, &rule.id).await.unwrap();
+        assert_eq!(revs.iter().map(|r| (r.revision, r.name.as_str(), r.workflow)).collect::<Vec<_>>(), vec![(2, "v2", false), (1, "v1", false)]);
+        let back = mgr.restore_revision(&repo, &rule.id, 1).await.unwrap();
+        assert_eq!((back.name.as_str(), back.workflow.is_none(), back.id == rule.id), ("v1", true, true));
+        assert_eq!(mgr.get_rule(&rule.id).await.unwrap().name, "v1");
+        assert_eq!(mgr.list_revisions(&repo, &rule.id).await.unwrap()[0].name, "v3", "the replaced version is kept");
+        assert!(mgr.restore_revision(&repo, &rule.id, 99).await.is_err());
+        // An invalid workflow is refused on save.
+        rule.workflow = Some(workflow::Workflow::default());
+        assert!(mgr.save_rule(&repo, &rule).await.is_err());
+        mgr.delete_rule(&repo, &rule.id).await.unwrap();
+        assert!(mgr.list_revisions(&repo, &rule.id).await.unwrap().is_empty());
+    }
+
     #[test]
     fn editor_rules_deserialize() {
         let rules: Vec<AutomationRule> =
             serde_json::from_str(include_str!("fixtures/editor-rules.json")).expect("editor JSON matches the engine");
         assert!(rules.len() >= 5);
-        let last = rules.last().unwrap();
+        // The workflow rule the builder emits.
+        let wf_rule = rules.last().unwrap();
+        let wf = wf_rule.workflow.as_ref().expect("workflow survives the round trip");
+        assert!(wf.validate().is_ok());
+        assert_eq!(wf.nodes.len(), 5);
+        assert!(matches!(wf.nodes[0].kind, workflow::NodeKind::Condition { .. }));
+        assert!(matches!(&wf.nodes[1].kind, workflow::NodeKind::Action { action } if matches!(**action, RuleAction::MoveFile { .. })));
+        assert!(matches!(wf.nodes[3].kind, workflow::NodeKind::Join { all: true }));
+        assert_eq!(wf.edges.iter().map(|e| e.on).collect::<Vec<_>>(), vec![workflow::EdgeOn::True, workflow::EdgeOn::False, workflow::EdgeOn::Success, workflow::EdgeOn::Always, workflow::EdgeOn::Failure]);
+        assert!(matches!(wf_rule.action, RuleAction::MoveFile { .. }), "action = the first action step");
+        let last = &rules[rules.len() - 2];
         assert_eq!(last.trigger, RuleTrigger::Webhook);
         assert!(matches!(last.condition_tree, Some(ConditionNode::Any { ref nodes }) if nodes.len() == 2));
         assert_eq!(last.steps.len(), 2);

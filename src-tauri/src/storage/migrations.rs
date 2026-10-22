@@ -153,6 +153,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "Named schedules and holiday calendars shared by sync, automation and backup",
             sql: V27_SCHEMA,
         },
+        Migration {
+            version: 28,
+            description: "Automation rule revisions (workflow history)",
+            sql: V28_SCHEMA,
+        },
     ]
 }
 
@@ -171,6 +176,17 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
 /// Schema v22: named `ufop-server` API tokens (SHA-256 hashes) with scopes
 /// (JSON list) and a mandatory expiry.
 /// Schema v26: folder policies of folders ufop-server shares (`server::folders`).
+/// Schema v28: earlier versions of automation rules, kept when a rule is edited.
+const V28_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS automation_rule_revisions (
+    rule_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    saved_at TEXT NOT NULL,
+    PRIMARY KEY (rule_id, revision)
+);
+"#;
+
 /// Schema v27: the schedule library (`schedule_library`): named cron
 /// schedules and holiday calendars (each as JSON).
 const V27_SCHEMA: &str = r#"
@@ -1001,7 +1017,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 27);
+        assert_eq!(applied, 28);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -1036,7 +1052,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 27);
+        assert_eq!(first, 28);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -1049,7 +1065,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 27);
+        assert_eq!(current_version(&conn).unwrap(), 28);
     }
 
     #[test]

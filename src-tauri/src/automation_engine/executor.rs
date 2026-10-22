@@ -30,6 +30,8 @@ pub struct ExecEnv<'a> {
     pub command_approval: Option<&'a str>,
     /// Extra template values (e.g. webhook payload fields).
     pub extra: std::collections::HashMap<String, String>,
+    /// Rules that called this one through nested workflow steps.
+    pub call_stack: Vec<String>,
 }
 
 impl<'a> ExecEnv<'a> {
@@ -41,6 +43,24 @@ impl<'a> ExecEnv<'a> {
             rule_name: "",
             command_approval: None,
             extra: Default::default(),
+            call_stack: Vec::new(),
+        }
+    }
+
+    /// The environment for a nested rule: its own options and approvals,
+    /// the caller's services, template values and call stack.
+    pub(crate) fn child<'b>(&self, rule: &'b AutomationRule) -> ExecEnv<'b>
+    where
+        'a: 'b,
+    {
+        ExecEnv {
+            services: self.services,
+            overwrite: rule.options.overwrite,
+            captures: self.captures.clone(),
+            rule_name: &rule.name,
+            command_approval: rule.options.command_approval.as_deref(),
+            extra: self.extra.clone(),
+            call_stack: self.call_stack.clone(),
         }
     }
 
@@ -52,6 +72,7 @@ impl<'a> ExecEnv<'a> {
             rule_name: &rule.name,
             command_approval: rule.options.command_approval.as_deref(),
             extra: Default::default(),
+            call_stack: Vec::new(),
         }
     }
 
@@ -194,8 +215,8 @@ pub async fn execute_rule(
         let files: Vec<String> = targets.iter().filter_map(|(f, _)| f.clone()).collect();
         let steps = targets
             .iter()
-            .flat_map(|(f, _)| rule.all_steps().into_iter().enumerate().map(move |(i, (a, _))| (i, a, f.clone())))
-            .map(|(i, a, f)| StepResult { step: i, action: action_kind(a).into(), file: f, ok: true, attempts: 0, message: Some("dry run".into()) })
+            .flat_map(|(f, _)| rule.all_actions().into_iter().enumerate().map(move |(i, a)| (i, a, f.clone())))
+            .map(|(i, a, f)| StepResult { step: i, action: action_kind(a).into(), file: f, ok: true, attempts: 0, message: Some("dry run".into()), node: None })
             .collect();
         return finish(AutomationStatus::Success, files, Some("Dry run — no action taken".to_string()), 0, steps);
     }
@@ -208,42 +229,68 @@ pub async fn execute_rule(
     let mut max_attempts = 1;
     for (file, captures) in &targets {
         env.captures = captures.clone();
-        // A step that moves or renames the file hands the new path on.
-        let mut current = file.clone();
-        for (i, (action, continue_on_error)) in rule.all_steps().into_iter().enumerate() {
-            let retried = ufop_core::retry::retry_async(
-                &rule.options.retry,
-                |_| dispatch(action, current.as_deref(), &env),
-                |e: &String| is_transient(action, e),
-                |attempt, e, d| tracing::warn!("Automation '{}' step {} failed (attempt {}), retrying in {d:?}: {e}", rule.name, i + 1, attempt + 1),
-            )
-            .await;
-            max_attempts = max_attempts.max(retried.attempts);
-            match retried.result {
-                Ok(paths) => {
-                    if moves_file(action) {
-                        if let Some(p) = paths.first() {
-                            current = Some(p.clone());
-                        }
-                    }
-                    results.push(StepResult { step: i, action: action_kind(action).into(), file: file.clone(), ok: true, attempts: retried.attempts, message: None });
-                    affected.extend(paths);
-                }
-                Err(e) => {
-                    results.push(StepResult { step: i, action: action_kind(action).into(), file: file.clone(), ok: false, attempts: retried.attempts, message: Some(e.clone()) });
-                    let label = file.as_deref().map(|f| format!("{f}: ")).unwrap_or_default();
-                    first_error.get_or_insert(format!("{label}{e}"));
-                    if !continue_on_error {
-                        break;
-                    }
-                }
-            }
+        let o = run_actions(rule, file.clone(), &env).await;
+        max_attempts = max_attempts.max(o.attempts);
+        if first_error.is_none() {
+            first_error = o.error;
         }
+        affected.extend(o.affected);
+        results.extend(o.results);
     }
     affected.dedup();
     let failed = results.iter().any(|r| !r.ok);
     let status = if failed { AutomationStatus::Failed } else { AutomationStatus::Success };
     finish(status, affected, first_error, max_attempts, results)
+}
+
+/// What one rule's actions did for one target file.
+pub(crate) struct ActionsOutcome {
+    pub affected: Vec<String>,
+    pub error: Option<String>,
+    pub results: Vec<StepResult>,
+    pub attempts: u32,
+}
+
+/// Run `rule`'s actions for one file: its workflow, or `action` + `steps`
+/// in order (a step that moves, renames or downloads hands the new path on).
+pub(crate) async fn run_actions(rule: &AutomationRule, file: Option<String>, env: &ExecEnv<'_>) -> ActionsOutcome {
+    if let Some(wf) = &rule.workflow {
+        let (results, affected, error) = super::workflow::run(wf, rule, file, env).await;
+        let attempts = results.iter().map(|r| r.attempts).max().unwrap_or(1).max(1);
+        return ActionsOutcome { affected, error, results, attempts };
+    }
+    let (mut affected, mut results, mut error, mut attempts) = (Vec::new(), Vec::new(), None, 1);
+    let mut current = file.clone();
+    for (i, (action, continue_on_error)) in rule.all_steps().into_iter().enumerate() {
+        let retried = ufop_core::retry::retry_async(
+            &rule.options.retry,
+            |_| dispatch(action, current.as_deref(), env),
+            |e: &String| is_transient(action, e),
+            |attempt, e, d| tracing::warn!("Automation '{}' step {} failed (attempt {}), retrying in {d:?}: {e}", rule.name, i + 1, attempt + 1),
+        )
+        .await;
+        attempts = attempts.max(retried.attempts);
+        match retried.result {
+            Ok(paths) => {
+                if hands_on_path(action) {
+                    if let Some(p) = paths.first() {
+                        current = Some(p.clone());
+                    }
+                }
+                results.push(StepResult { step: i, action: action_kind(action).into(), file: file.clone(), ok: true, attempts: retried.attempts, message: None, node: None });
+                affected.extend(paths);
+            }
+            Err(e) => {
+                results.push(StepResult { step: i, action: action_kind(action).into(), file: file.clone(), ok: false, attempts: retried.attempts, message: Some(e.clone()), node: None });
+                let label = file.as_deref().map(|f| format!("{f}: ")).unwrap_or_default();
+                error.get_or_insert(format!("{label}{e}"));
+                if !continue_on_error {
+                    break;
+                }
+            }
+        }
+    }
+    ActionsOutcome { affected, error, results, attempts }
 }
 
 /// Snake-case name of an action (for logs and step results).
@@ -267,9 +314,10 @@ pub fn action_kind(action: &RuleAction) -> &'static str {
     }
 }
 
-/// Actions after which the file lives at a new path.
-fn moves_file(action: &RuleAction) -> bool {
-    matches!(action, RuleAction::MoveFile { .. } | RuleAction::RenameFile { .. })
+/// Actions whose result is the file later steps work on: the file moved or
+/// renamed, or the file downloaded.
+pub(crate) fn hands_on_path(action: &RuleAction) -> bool {
+    matches!(action, RuleAction::MoveFile { .. } | RuleAction::RenameFile { .. } | RuleAction::DownloadUrl { .. })
 }
 
 /// Whether retrying `action` after `error` could help. Validation and
@@ -1003,6 +1051,7 @@ mod tests {
             condition_tree: None,
             steps: vec![],
             options: Default::default(),
+            workflow: None,
         };
 
         let log = execute_rule_action(&rule, Some(source.to_str().unwrap()), true).await;
