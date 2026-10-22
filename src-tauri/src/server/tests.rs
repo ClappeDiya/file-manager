@@ -297,3 +297,33 @@ async fn security_headers_and_hsts_only_with_https() {
     let off = start(ServerConfig { tls, hsts_max_age: 0, ..Default::default() }, None).await;
     assert!(off.client.get(format!("{}/api/v1/health", off.base)).send().await.unwrap().headers().get("strict-transport-security").is_none());
 }
+
+#[tokio::test]
+async fn openapi_document_is_public_and_matches_enforced_scopes() {
+    let s = start(ServerConfig::default(), None).await;
+    let r = s.client.get(format!("{}/api/v1/openapi.json", s.base)).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let doc = r.json::<Value>().await.unwrap();
+    assert_eq!(doc["openapi"], "3.1.0");
+    let tok = s.login().await;
+    let read_tok = s.post("/api/v1/auth/api-tokens", &tok, json!({"name": "reader", "scope": "read"})).await.json::<Value>().await.unwrap()["token"].as_str().unwrap().to_string();
+    // Every operation documented as needing more than `read` refuses a read token; `read` ones admit it.
+    for (path, item) in doc["paths"].as_object().unwrap() {
+        for (method, op) in item.as_object().unwrap() {
+            let Some(scope) = op["x-required-scope"].as_str() else { continue };
+            let url = format!("{}{}", s.base, path.replace("{id}", "nope").replace("{command}", "backup_list_jobs"));
+            let req = match method.as_str() {
+                "get" => s.client.get(&url),
+                "post" => s.client.post(&url).json(&json!({})),
+                "put" => s.client.put(&url).json(&json!({})),
+                _ => s.client.delete(&url),
+            };
+            let status = req.bearer_auth(&read_tok).send().await.unwrap().status();
+            if scope == "read" {
+                assert_ne!(status, 401, "{method} {path} should admit a read token");
+            } else {
+                assert_eq!(status, 401, "{method} {path} needs {scope}");
+            }
+        }
+    }
+}

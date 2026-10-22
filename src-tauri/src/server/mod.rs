@@ -8,6 +8,7 @@
 pub mod api_tokens;
 pub mod auth;
 pub mod oauth;
+pub mod openapi;
 pub mod tls;
 /// Server settings live in `security::settings_store` (shared with the backup engine).
 pub use crate::security::settings_store as settings;
@@ -666,6 +667,7 @@ fn mime_for(p: &std::path::Path) -> &'static str {
 pub fn router(st: ServerState) -> Router {
     let public = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/openapi.json", get(|| async { Json(openapi::document()) }))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/refresh", post(refresh))
         .route("/api/v1/auth/logout", post(logout))

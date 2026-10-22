@@ -643,6 +643,19 @@ POST /api/ai-governance
 
 ---
 
+## ufop-server REST API (`/api/v1`)
+
+The headless backup server (`ufop-server`, also `ufop server` in the CLI) has its own versioned API, described by a live **OpenAPI 3.1** document at `GET /api/v1/openapi.json` (public, like `/api/v1/health`). Load it into Swagger UI, Postman or a client generator.
+
+- **Authentication**: `Authorization: Bearer <token>` with an access token from `POST /api/v1/auth/login` (refreshed through the `ufop_refresh` cookie), an automation token, or an API token (`ufop_pat_…`); or reverse-proxy pre-authentication (`X-UFOP-Preauth`).
+- **API token scopes**: `read` < `run` < `write` < `admin`. Each operation's `x-required-scope` in the document comes from the same function that enforces it: GETs need `read`; starting backups, operations, cancelling tasks and the scheduler need `run`; other changes need `write`; `/auth/*`, `/rpc/*`, `/oauth/*` and changing settings need `admin`.
+- **Errors**: `{error_type, message, advice}`; 401 (not signed in, invalid token or too narrow a scope), 403 (client address outside `--allowed-cidrs`), 421 (host not in `--allowed-hostnames`), 404, 409, 429 (sign-in throttling).
+- Areas: `auth` (sign-in, tokens, password), `jobs` (CRUD, run, operations, import/export, destination test), `browse` (versions, files, search, compare), `tasks` (tasks, run history, scheduler), `oauth` (cloud authorization broker) and `general` (health, status, modules, settings, filesystem, `rpc/{command}` for any desktop IPC command).
+
+A test fails the build when a route is added without an OpenAPI entry (or an entry outlives its route), and another checks every documented scope against the running server.
+
+---
+
 ## Tauri IPC Commands
 
 The desktop application uses Tauri IPC for communication between the frontend (React/TypeScript) and backend (Rust). These are not REST endpoints but are documented here for extension developers.
