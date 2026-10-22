@@ -562,6 +562,8 @@ Client configuration (e.g. `claude_desktop_config.json`):
 | `--allow-write` | Also offer `write_file`, `create_directory`, `copy_file`, `move`, `delete` |
 | `--max-read-bytes <N>` | Largest read per call (default 4 MiB) |
 
+For remote clients, `ufop-server --mcp-root <DIR>` serves the same tools over HTTP at `/mcp` with OAuth sign-in (see *MCP over HTTP* in the API reference).
+
 Tools: `list_roots`, `list_directory` (optionally recursive; symlinks listed, not followed), `get_file_info`, `read_text_file` (byte ranges; `encoding: base64` for binary), `search_files` (glob on names), `checksum` (sha256/sha1/md5); with `--allow-write`: `write_file` (atomic; `overwrite` to replace), `create_directory`, `copy_file`, `move`, `delete` (`recursive` for non-empty directories; roots and symlinks cannot be deleted or written through). Paths are `<root>:relative/path`, absolute inside a root, or relative to the first root. Tool annotations mark read-only and destructive tools. Each call is logged (tool, arguments, outcome) to the log (`--log-file` / `UFOP_LOG_FILE`); stdout carries only protocol messages.
 
 ---

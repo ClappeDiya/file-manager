@@ -124,6 +124,38 @@ pub fn definitions(allow_write: bool) -> Vec<Value> {
         .collect()
 }
 
+/// Whether `name` creates, changes, moves or deletes files.
+pub fn is_write_tool(name: &str) -> bool {
+    tools().iter().any(|t| t.name == name && t.write)
+}
+
+/// Hex digest of a file (`sha256`, `sha1` or `md5`), read in 64 KiB blocks.
+pub fn hash_file(path: &Path, algorithm: &str) -> Result<String, String> {
+    use sha2::Digest;
+    fn stream<D: sha2::Digest>(mut f: std::fs::File, mut h: D) -> Result<String, String> {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = f.read(&mut buf).map_err(io)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        Ok(hex_encode(&h.finalize()))
+    }
+    let f = std::fs::File::open(path).map_err(io)?;
+    match algorithm {
+        "md5" => stream(f, md5::Md5::new()),
+        "sha1" => stream(f, sha1::Sha1::new()),
+        "sha256" => stream(f, sha2::Sha256::new()),
+        other => Err(format!("Unsupported algorithm: {other} (use md5, sha1 or sha256)")),
+    }
+}
+
+fn hex_encode(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 pub fn exists(name: &str, allow_write: bool) -> bool {
     tools().iter().any(|t| t.name == name && (allow_write || !t.write))
 }
@@ -293,7 +325,7 @@ pub fn call(srv: &Server, name: &str, a: &Value) -> Result<Value, String> {
         "checksum" => {
             let p = roots.resolve(s(a, "path")?, true)?;
             let algorithm = a.get("algorithm").and_then(Value::as_str).unwrap_or("sha256");
-            let hash = crate::commands::checksum::compute_hash(&p, algorithm).map_err(|e| e.to_string())?;
+            let hash = hash_file(&p, algorithm)?;
             Ok(json!({ "path": roots.display(&p), "algorithm": algorithm, "hash": hash }))
         }
         "write_file" => {

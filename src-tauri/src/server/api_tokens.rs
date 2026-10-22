@@ -48,6 +48,10 @@ pub fn required_scope(method: &Method, path: &str) -> Scope {
     if p.starts_with("/api/v1/auth/") || p.starts_with("/api/v1/rpc/") || p.starts_with("/api/v1/oauth/") || (p == "/api/v1/settings" && method != Method::GET) {
         return Scope::Admin;
     }
+    // MCP checks write access per tool call.
+    if p == "/mcp" {
+        return Scope::Read;
+    }
     // Gateway agents relay data in both directions: write, whatever the method.
     if p.starts_with("/api/v1/gateway/") {
         return Scope::Write;

@@ -115,6 +115,17 @@ pub(crate) const OPS: &[Op] = &[
     op!("put" "/api/v1/folder-policies", "shares", "Set a folder's own policy (an empty policy removes it; subfolders inherit)", auth: true, params: &[], body: Some(|| json!({ "type": "object", "required": ["path"], "properties": { "path": { "type": "string" }, "policy": { "$ref": "#/components/schemas/FolderPolicy" } } })), response: folder_policy_result),
     op!("get" "/api/v1/folder-policies/effective", "shares", "The policy in force for a folder (own settings merged with its parents')", auth: true, params: &[("path", "query", "string", true, "Folder (or a file in it) under --share-root")], body: None, response: folder_policy_result),
     op!("post" "/api/v1/folder-policies/copy", "shares", "Copy a folder's own policy to another folder", auth: true, params: &[], body: Some(|| json!({ "type": "object", "required": ["from", "to"], "properties": { "from": { "type": "string" }, "to": { "type": "string" } } })), response: folder_policy_result),
+    Op { method: "get", path: "/.well-known/oauth-protected-resource", tag: "mcp", summary: "OAuth protected-resource metadata of /mcp (RFC 9728)", auth: false, params: &[], body: None, response: any, content_type: "application/json" },
+    Op { method: "get", path: "/.well-known/oauth-protected-resource/mcp", tag: "mcp", summary: "Same, at the path-specific location", auth: false, params: &[], body: None, response: any, content_type: "application/json" },
+    Op { method: "get", path: "/.well-known/oauth-authorization-server", tag: "mcp", summary: "OAuth authorization-server metadata (RFC 8414)", auth: false, params: &[], body: None, response: any, content_type: "application/json" },
+    Op { method: "post", path: "/oauth2/register", tag: "mcp", summary: "Register a public OAuth client (RFC 7591): redirect_uris (https or loopback http), client_name", auth: false, params: &[], body: Some(any), response: any, content_type: "application/json" },
+    Op { method: "get", path: "/oauth2/authorize", tag: "mcp", summary: "Consent page (server password); PKCE S256 required; scopes mcp:read, mcp:write", auth: false, params: &[("client_id", "query", "string", true, ""), ("redirect_uri", "query", "string", true, ""), ("code_challenge", "query", "string", true, "")], body: None, response: html, content_type: "text/html" },
+    Op { method: "post", path: "/oauth2/authorize", tag: "mcp", summary: "Submit the consent form; redirects with a code", auth: false, params: &[], body: None, response: html, content_type: "text/html" },
+    Op { method: "post", path: "/oauth2/token", tag: "mcp", summary: "authorization_code (with code_verifier) or refresh_token grant (form-encoded); refresh tokens rotate", auth: false, params: &[], body: None, response: any, content_type: "application/json" },
+    Op { method: "post", path: "/oauth2/revoke", tag: "mcp", summary: "Revoke a refresh or access token (RFC 7009)", auth: false, params: &[], body: None, response: any, content_type: "application/json" },
+    Op { method: "post", path: "/mcp", tag: "mcp", summary: "MCP over Streamable HTTP (JSON-RPC 2.0; JSON responses); 401 points to the OAuth metadata", auth: false, params: &[], body: Some(any), response: any, content_type: "application/json" },
+    Op { method: "get", path: "/mcp", tag: "mcp", summary: "No server-initiated stream (405)", auth: false, params: &[], body: None, response: any, content_type: "application/json" },
+    Op { method: "delete", path: "/mcp", tag: "mcp", summary: "No sessions to end (405)", auth: false, params: &[], body: None, response: any, content_type: "application/json" },
     Op { method: "get", path: "/s/{token}", tag: "shares", summary: "Public page of a share link (password form, folder listing, upload form)", auth: false, params: &[("token", "path", "string", true, "Link token"), ("p", "query", "string", false, "Folder inside the share")], body: None, response: html, content_type: "text/html" },
     Op { method: "post", path: "/s/{token}/unlock", tag: "shares", summary: "Enter a link's password (form field `password`); sets an unlock cookie", auth: false, params: &[("token", "path", "string", true, "Link token")], body: None, response: html, content_type: "text/html" },
     Op { method: "get", path: "/s/{token}/dl", tag: "shares", summary: "Download a file of a share (counts against its download limit)", auth: false, params: &[("token", "path", "string", true, "Link token"), ("p", "query", "string", false, "File inside the share")], body: None, response: || json!({ "type": "string", "format": "binary" }), content_type: "application/octet-stream" },
@@ -192,7 +203,7 @@ pub fn document() -> Value {
         },
         "servers": [{ "url": "/" }],
         "tags": [
-            { "name": "general" }, { "name": "auth" }, { "name": "jobs" }, { "name": "browse" }, { "name": "tasks" }, { "name": "shares" }, { "name": "gateways" }, { "name": "oauth" }
+            { "name": "general" }, { "name": "auth" }, { "name": "jobs" }, { "name": "browse" }, { "name": "tasks" }, { "name": "shares" }, { "name": "gateways" }, { "name": "oauth" }, { "name": "mcp" }
         ],
         "paths": paths,
         "components": components(),
@@ -207,7 +218,7 @@ mod tests {
     /// `(method, path)` of every `.route(…)` in the router sources.
     fn routed() -> BTreeSet<(String, String)> {
         let mut out = BTreeSet::new();
-        for src in [include_str!("mod.rs"), include_str!("oauth.rs"), include_str!("shares.rs"), include_str!("folders.rs"), include_str!("gateway.rs")] {
+        for src in [include_str!("mod.rs"), include_str!("oauth.rs"), include_str!("shares.rs"), include_str!("folders.rs"), include_str!("gateway.rs"), include_str!("mcp.rs"), include_str!("mcp_oauth.rs")] {
             for chunk in src.split(".route(\"").skip(1) {
                 let Some((path, rest)) = chunk.split_once('"') else { continue };
                 let handlers = &rest[..rest.find(".route(").unwrap_or(rest.len()).min(rest.find('\n').unwrap_or(rest.len()))];

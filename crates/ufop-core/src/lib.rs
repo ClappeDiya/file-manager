@@ -15,6 +15,8 @@ pub mod error;
 pub mod fsutil;
 pub mod gateway;
 pub mod gpg;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod naming;
 pub mod netacl;
 pub mod policy;

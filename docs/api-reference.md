@@ -684,6 +684,14 @@ Start the server with `--dav-root <folder>` (repeatable, or `UFOP_SERVER_DAV_ROO
 - **Network:** `--allowed-cidrs` applies as everywhere; `--dav-allowed-cidrs` (or `UFOP_SERVER_DAV_ALLOWED_CIDRS`) restricts WebDAV further. Basic sends the password with every request, so use `--https` or a TLS reverse proxy when the server is reachable from other machines (the server warns otherwise).
 - **Confinement:** paths are resolved after following symlinks and must stay inside the folder; dot-files and links pointing outside are neither listed nor served.
 
+### MCP over HTTP (OAuth)
+
+Start the server with `--mcp-root <folder>` (repeatable, or `UFOP_SERVER_MCP_ROOTS`) to offer the same file tools as `ufop mcp` to remote AI clients at `POST /mcp` (Streamable HTTP; JSON responses; `GET`/`DELETE` → 405). Read-only unless `--mcp-allow-write`; behind a proxy set `--public-url https://files.example.com` so the OAuth metadata names the right origin.
+
+- **Authorization** follows the MCP authorization spec, so clients such as Claude connect by URL alone: an unauthenticated request gets `401` with `WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource"`; the client reads `/.well-known/oauth-authorization-server`, registers itself at `/oauth2/register` (public clients; redirect URIs must be `https` or `http` on `localhost`/`127.0.0.1`), and sends the user to `/oauth2/authorize`, a consent page where the server password approves it. PKCE (`S256`) is required; scopes are `mcp:read` and `mcp:write` (granted only with `--mcp-allow-write`); the authorization response carries `iss`.
+- **Tokens:** `/oauth2/token` exchanges the code (single use, two minutes) for a one-day access token and a 30-day refresh token. Refresh tokens rotate: each use revokes it and the access token it issued, and a second use fails. `/oauth2/revoke` revokes either kind. Access tokens are API tokens named `MCP: <client name>` with the `read` or `write` scope — they appear in the API token list and can be revoked there; API tokens and sessions work on `/mcp` too.
+- **Tools:** write tools exist only with `--mcp-allow-write` and a token that may write. Paths are confined to the roots exactly as with `ufop mcp`. Requests whose `Origin` is another site (DNS rebinding) are refused; use `--https` or a TLS proxy when reachable from other machines (the server warns).
+
 ### File gateways
 
 On-premises agents (`ufop gateway serve`) serve folders through the server without an inbound port. An agent long-polls `POST /api/v1/gateway/poll` with an API token of the **write** scope, receives jobs (`list`, `download`, `upload`) and streams its answers to `POST /api/v1/gateway/jobs/{id}/reply`. For uploads it reads the client's data from `GET /api/v1/gateway/jobs/{id}/body`. Nothing is stored on the server.

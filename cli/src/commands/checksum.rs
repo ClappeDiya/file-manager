@@ -3,7 +3,6 @@
 use crate::output;
 use crate::OutputFormat;
 use serde::Serialize;
-use std::io::Read;
 use std::path::Path;
 
 #[derive(Debug, Serialize)]
@@ -96,30 +95,7 @@ pub async fn execute(
 }
 
 pub(crate) fn compute_hash(path: &Path, algorithm: &str) -> Result<String, Box<dyn std::error::Error>> {
-    use md5::Digest;
-    let file = std::fs::File::open(path)?;
-    match algorithm {
-        "md5" => stream_hex(file, md5::Md5::new()),
-        "sha1" => stream_hex(file, sha1::Sha1::new()),
-        "sha256" => stream_hex(file, sha2::Sha256::new()),
-        _ => Err(format!("Unsupported algorithm: {algorithm} (use md5, sha1 or sha256)").into()),
-    }
-}
-
-/// Hash a file in 64 KiB blocks (constant memory, any file size).
-fn stream_hex<D: md5::Digest>(
-    mut file: std::fs::File,
-    mut hasher: D,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(ufop_core::mcp::hash_file(path, algorithm)?)
 }
 
 #[cfg(test)]

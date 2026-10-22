@@ -193,6 +193,11 @@ impl AuthService {
     }
 
     /// Named, scoped API tokens (see `api_tokens`).
+    /// The server database (OAuth clients and refresh tokens live there too).
+    pub fn settings_pool(&self) -> &crate::storage::pool::DbPool {
+        self.settings.pool()
+    }
+
     pub fn api_tokens(&self) -> super::api_tokens::ApiTokenStore {
         super::api_tokens::ApiTokenStore::new(self.settings.pool().clone())
     }

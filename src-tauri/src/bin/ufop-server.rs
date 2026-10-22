@@ -79,6 +79,15 @@ struct Args {
     /// Client address ranges allowed to use WebDAV, on top of --allowed-cidrs (default: any)
     #[arg(long, env = "UFOP_SERVER_DAV_ALLOWED_CIDRS", value_delimiter = ',')]
     dav_allowed_cidrs: Vec<String>,
+    /// Folder the MCP endpoint (/mcp, OAuth-protected) may use (repeat or comma-separate; default: MCP off)
+    #[arg(long = "mcp-root", env = "UFOP_SERVER_MCP_ROOTS", value_delimiter = ',')]
+    mcp_roots: Vec<PathBuf>,
+    /// Offer MCP tools that create, change, move and delete files (to clients granted mcp:write)
+    #[arg(long, env = "UFOP_SERVER_MCP_ALLOW_WRITE")]
+    mcp_allow_write: bool,
+    /// Public origin for OAuth metadata behind a proxy, e.g. https://files.example.com (default: from the request)
+    #[arg(long, env = "UFOP_SERVER_PUBLIC_URL")]
+    public_url: Option<String>,
     #[arg(long, env = "UFOP_SERVER_PFX")]
     pfx: Option<PathBuf>,
     #[arg(long, env = "UFOP_SERVER_PFX_PASSWORD", default_value = "")]
@@ -371,7 +380,18 @@ async fn run(argv: Vec<String>) {
         share_roots: a.share_roots,
         dav_roots: a.dav_roots,
         dav_allowed_clients: ufop_core::netacl::IpAllowlist::parse(&a.dav_allowed_cidrs).unwrap_or_else(|e| fail(format!("--dav-allowed-cidrs: {e}"))),
+        mcp_roots: a.mcp_roots,
+        mcp_allow_write: a.mcp_allow_write,
+        public_url: a.public_url,
     };
+    if !cfg.mcp_roots.is_empty() {
+        let roots = ufop_core::confine::Roots::new(&cfg.mcp_roots).unwrap_or_else(|e| fail(format!("--mcp-root: {e}")));
+        let names: Vec<&str> = roots.list().iter().map(|r| r.name.as_str()).collect();
+        tracing::info!("MCP at /mcp ({}): {}", if cfg.mcp_allow_write { "read-write" } else { "read-only" }, names.join(", "));
+        if matches!(cfg.tls, TlsMode::None) && !matches!(cfg.interface.as_str(), "loopback" | "") {
+            tracing::warn!("MCP and its OAuth sign-in are reachable over plain HTTP. Use --https or a TLS reverse proxy.");
+        }
+    }
     if !cfg.dav_roots.is_empty() {
         let roots = ufop_core::confine::Roots::new(&cfg.dav_roots).unwrap_or_else(|e| fail(format!("--dav-root: {e}")));
         let names: Vec<&str> = roots.list().iter().map(|r| r.name.as_str()).collect();

@@ -11,6 +11,8 @@ pub mod dav;
 pub mod folders;
 pub mod gateway;
 pub mod oauth;
+pub mod mcp;
+pub mod mcp_oauth;
 pub mod openapi;
 pub mod sdk;
 pub mod shares;
@@ -78,6 +80,12 @@ pub struct ServerConfig {
     pub dav_roots: Vec<PathBuf>,
     /// Client address ranges allowed to use WebDAV (on top of `allowed_clients`; empty = any).
     pub dav_allowed_clients: ufop_core::netacl::IpAllowlist,
+    /// Folders the `/mcp` endpoint's file tools may use; empty = MCP off.
+    pub mcp_roots: Vec<PathBuf>,
+    /// Offer MCP tools that change files (to tokens with the write scope).
+    pub mcp_allow_write: bool,
+    /// Public origin (`https://files.example.com`) for OAuth metadata; default: from the request.
+    pub public_url: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -98,6 +106,9 @@ impl Default for ServerConfig {
             hsts_include_subdomains: false,
             share_roots: Vec::new(),
             dav_roots: Vec::new(),
+            mcp_roots: Vec::new(),
+            mcp_allow_write: false,
+            public_url: None,
             dav_allowed_clients: Default::default(),
         }
     }
@@ -207,38 +218,41 @@ async fn host_check(State(st): State<ServerState>, req: Request, next: Next) -> 
     next.run(req).await
 }
 
-async fn require_auth(State(st): State<ServerState>, mut req: Request, next: Next) -> Response {
-    let h = req.headers();
+/// Who is calling: the pre-authentication header, an API token (with
+/// enough scope for `method path`), or a session/automation token.
+pub(crate) async fn authenticate(st: &ServerState, h: &HeaderMap, method: &Method, path: &str) -> Result<Principal, AppError> {
     if let Some(t) = h.get(PREAUTH_HEADER).and_then(|v| v.to_str().ok()) {
         if !t.is_empty() && st.cfg.preauth_tokens.iter().any(|p| constant_eq(p, t)) {
-            req.extensions_mut().insert(Principal::Session);
-            return next.run(req).await;
+            return Ok(Principal::Session);
         }
     }
     let bearer = h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::to_string);
-    let principal = match bearer {
-        Some(t) if t.starts_with(api_tokens::PREFIX) => match st.auth.api_tokens().validate(&t).await {
-            Ok(tok) => {
-                let need = api_tokens::required_scope(req.method(), req.uri().path());
-                if tok.scope < need {
-                    return ApiError(AppError::PermissionDenied {
-                        message: format!("The API token \"{}\" has the {} scope; this needs {}", tok.name, tok.scope.as_str(), need.as_str()),
-                        advice: "Use a token with a wider scope.".into(),
-                    })
-                    .into_response();
-                }
-                Principal::ApiToken { id: tok.id, scope: tok.scope }
+    match bearer {
+        Some(t) if t.starts_with(api_tokens::PREFIX) => {
+            let tok = st.auth.api_tokens().validate(&t).await?;
+            let need = api_tokens::required_scope(method, path);
+            if tok.scope < need {
+                return Err(AppError::PermissionDenied {
+                    message: format!("The API token \"{}\" has the {} scope; this needs {}", tok.name, tok.scope.as_str(), need.as_str()),
+                    advice: "Use a token with a wider scope.".into(),
+                });
             }
-            Err(e) => return ApiError(e).into_response(),
-        },
-        Some(t) => match st.auth.validate(&t).await {
-            Ok(_) => Principal::Session,
-            Err(e) => return ApiError(e).into_response(),
-        },
-        None => return ApiError(AppError::PermissionDenied { message: "Authentication required".into(), advice: "Sign in first.".into() }).into_response(),
-    };
-    req.extensions_mut().insert(principal);
-    next.run(req).await
+            Ok(Principal::ApiToken { id: tok.id, scope: tok.scope })
+        }
+        Some(t) => st.auth.validate(&t).await.map(|_| Principal::Session),
+        None => Err(AppError::PermissionDenied { message: "Authentication required".into(), advice: "Sign in first.".into() }),
+    }
+}
+
+async fn require_auth(State(st): State<ServerState>, mut req: Request, next: Next) -> Response {
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
+    match authenticate(&st, req.headers(), &method, &path).await {
+        Ok(principal) => {
+            req.extensions_mut().insert(principal);
+            next.run(req).await
+        }
+        Err(e) => ApiError(e).into_response(),
+    }
 }
 
 fn constant_eq(a: &str, b: &str) -> bool {
@@ -679,7 +693,6 @@ fn mime_for(p: &std::path::Path) -> &'static str {
     }
 }
 
-/// Build the full router.
 /// `GET /api/v1/sdk/{language}`: the generated client library (public, like the OpenAPI document).
 async fn sdk_download(axum::extract::Path(language): axum::extract::Path<String>) -> Response {
     let doc = openapi::document();
@@ -691,6 +704,7 @@ async fn sdk_download(axum::extract::Path(language): axum::extract::Path<String>
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()), (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{file}\""))], text).into_response()
 }
 
+/// Build the full router.
 pub fn router(st: ServerState) -> Router {
     let public = Router::new()
         .route("/api/v1/health", get(health))
@@ -701,7 +715,9 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/signin", post(redeem_signin))
         .merge(oauth::public_routes())
-        .merge(shares::public_routes());
+        .merge(shares::public_routes())
+        .merge(mcp_oauth::routes())
+        .merge(mcp::routes());
     let protected = Router::new()
         .route("/api/v1/auth/signin-token", post(signin_token))
         .route("/api/v1/auth/automation-token", post(automation_token))

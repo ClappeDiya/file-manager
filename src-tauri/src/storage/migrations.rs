@@ -158,6 +158,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "Automation rule revisions (workflow history)",
             sql: V28_SCHEMA,
         },
+        Migration {
+            version: 29,
+            description: "OAuth clients and refresh tokens for ufop-server's MCP endpoint",
+            sql: V29_SCHEMA,
+        },
     ]
 }
 
@@ -176,6 +181,26 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
 /// Schema v22: named `ufop-server` API tokens (SHA-256 hashes) with scopes
 /// (JSON list) and a mandatory expiry.
 /// Schema v26: folder policies of folders ufop-server shares (`server::folders`).
+/// Schema v29: OAuth 2.1 for `ufop-server`'s `/mcp` (`server::mcp_oauth`):
+/// dynamically registered public clients and rotating refresh tokens
+/// (SHA-256 hashes), each tied to the API token it last issued.
+const V29_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_oauth_clients (
+    client_id     TEXT PRIMARY KEY NOT NULL,
+    client_name   TEXT NOT NULL,
+    redirect_uris TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS server_oauth_refresh (
+    token_hash      TEXT PRIMARY KEY NOT NULL,
+    client_id       TEXT NOT NULL REFERENCES server_oauth_clients(client_id) ON DELETE CASCADE,
+    scope           TEXT NOT NULL,
+    access_token_id TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    revoked         INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
 /// Schema v28: earlier versions of automation rules, kept when a rule is edited.
 const V28_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS automation_rule_revisions (
@@ -1017,7 +1042,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 28);
+        assert_eq!(applied, 29);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -1052,7 +1077,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 28);
+        assert_eq!(first, 29);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -1065,7 +1090,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 28);
+        assert_eq!(current_version(&conn).unwrap(), 29);
     }
 
     #[test]
