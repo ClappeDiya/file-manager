@@ -86,6 +86,8 @@
     "passkey": "Se connecter avec une clé d’accès",
     "forgot": "Mot de passe oublié ?",
     "orContinue": "Ou continuer avec",
+    "directoryUser": "Nom d’utilisateur de l’annuaire",
+    "directorySignIn": "Se connecter avec {name}",
     "mfaTitle": "Vérification en deux étapes",
     "mfaDescription": "Saisissez le code à 6 chiffres de votre application d’authentification ou un code de secours.",
     "code": "Code",

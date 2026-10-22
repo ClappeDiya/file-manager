@@ -32,6 +32,7 @@ cd admin && npx next build && npx next start -p 3001
 - **Single sign-on:**
   - **OIDC:** authorization code + PKCE, with the ID token verified against the issuer's JWKS, and claims also taken from userinfo.
   - **SAML 2.0:** signed assertions required, InResponseTo checked, SP metadata at `/api/auth/sso/<id>/metadata`.
+  - **LDAP / Active Directory:** people type their directory user name and password on the console's sign-in page (`POST /api/auth/ldap`). A service account searches `baseDn` with the user filter (`{username}` is escaped per RFC 4515; exactly one entry must match), then the console binds as that entry with the password. Email, name, groups (`memberOf`; mappings may use the CN or the full DN) and a stable id (`objectGUID`/`entryUUID`) feed the same account rules as OIDC and SAML. `ldaps://` or StartTLS is required (plain `ldap://` only to a loopback address); a private CA certificate can be pasted. Attempts and their steps (service bind, search, user bind) are in the provider's diagnostics, failures are rate-limited and audited as `auth.login_failed`.
   - Providers claim email domains. The sign-in page shows them for matching addresses, and existing accounts in those domains are linked on first sign-in.
   - Accounts can be created on first sign-in with a default role (never owner), a default group, and groups mapped from the IdP's group claim.
   - People link and unlink providers on **My account**.

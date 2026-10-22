@@ -14,7 +14,7 @@ import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter }
 interface SsoOption {
   id: string;
   name: string;
-  kind: 'oidc' | 'saml';
+  kind: 'oidc' | 'saml' | 'ldap';
 }
 
 const safeRedirect = (v: string | null) => (v && v.startsWith('/') && !v.startsWith('//') ? v : '/dashboard');
@@ -30,6 +30,10 @@ function LoginForm() {
   const [code, setCode] = useState('');
   const [challengeId, setChallengeId] = useState<string | null>(params.get('mfa'));
   const [sso, setSso] = useState<SsoOption[]>([]);
+  /** An LDAP provider chosen: sign in with directory credentials instead. */
+  const [directory, setDirectory] = useState<SsoOption | null>(null);
+  const [username, setUsername] = useState('');
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     const e = params.get('error');
@@ -65,6 +69,26 @@ function LoginForm() {
     if (r.ok) router.replace(safeRedirect(r.redirect));
     else if ('mfaChallengeId' in r) setChallengeId(r.mfaChallengeId);
     else if ('passwordChangeToken' in r) router.replace(`/reset-password?token=${encodeURIComponent(r.passwordChangeToken)}&redirect=${encodeURIComponent(redirect)}`);
+  };
+
+  const submitDirectory = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!directory) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const r = await fetch('/api/auth/ldap', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ providerId: directory.id, username, password, redirect }) });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error ?? 'Sign-in failed');
+      setPassword('');
+      if (data.mfaRequired) return setChallengeId(data.challengeId);
+      await validateSession();
+      router.replace(safeRedirect(data.redirect ?? redirect));
+    } catch (x) {
+      setError(x instanceof Error ? x.message : String(x));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const signInWithPasskey = async () => {
@@ -126,6 +150,25 @@ function LoginForm() {
               </form>
             </CardContent>
           </Card>
+        ) : directory ? (
+          <Card>
+            <CardHeader className="flex-col items-start gap-1">
+              <CardTitle>{t('login.directorySignIn', { name: directory.name })}</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <form onSubmit={submitDirectory} className="space-y-4">
+                <Input label={t('login.directoryUser')} value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" autoFocus required />
+                <Input label={t('login.password')} type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required />
+                {errorBox}
+                <Button type="submit" className="w-full" loading={busy}>
+                  {t('login.submit')}
+                </Button>
+                <Button type="button" variant="ghost" className="w-full" onClick={() => (setDirectory(null), setPassword(''), setError(null))}>
+                  {t('login.back')}
+                </Button>
+              </form>
+            </CardContent>
+          </Card>
         ) : (
           <Card>
             <CardHeader className="flex-col items-start gap-1">
@@ -155,7 +198,18 @@ function LoginForm() {
               <CardFooter className="flex-col gap-2">
                 <p className="w-full text-xs text-foreground-tertiary">{t('login.orContinue')}</p>
                 {sso.map((p) => (
-                  <Button key={p.id} variant="outline" className="w-full" onClick={() => (window.location.href = `/api/auth/sso/${p.id}/start?redirect=${encodeURIComponent(redirect)}`)}>
+                  <Button
+                    key={p.id}
+                    variant="outline"
+                    className="w-full"
+                    onClick={() => {
+                      if (p.kind === 'ldap') {
+                        setDirectory(p);
+                        setUsername(email);
+                        setError(null);
+                      } else window.location.href = `/api/auth/sso/${p.id}/start?redirect=${encodeURIComponent(redirect)}`;
+                    }}
+                  >
                     <KeyRound size={14} className="mr-2" aria-hidden="true" />
                     {p.name} ({p.kind.toUpperCase()})
                   </Button>

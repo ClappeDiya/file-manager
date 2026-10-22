@@ -86,6 +86,8 @@
     "passkey": "Entrar com uma chave de acesso",
     "forgot": "Esqueceu a senha?",
     "orContinue": "Ou continue com",
+    "directoryUser": "Usuário do diretório",
+    "directorySignIn": "Entrar com {name}",
     "mfaTitle": "Verificação em duas etapas",
     "mfaDescription": "Digite o código de 6 dígitos do seu app autenticador ou um código de recuperação.",
     "code": "Código",

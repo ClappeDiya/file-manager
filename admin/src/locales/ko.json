@@ -86,6 +86,8 @@
     "passkey": "패스키로 로그인",
     "forgot": "비밀번호를 잊으셨나요?",
     "orContinue": "또는 다음으로 계속",
+    "directoryUser": "디렉터리 사용자 이름",
+    "directorySignIn": "{name}(으)로 로그인",
     "mfaTitle": "2단계 인증",
     "mfaDescription": "인증 앱의 6자리 코드나 복구 코드를 입력하세요.",
     "code": "코드",

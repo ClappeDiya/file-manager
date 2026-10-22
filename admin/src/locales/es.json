@@ -86,6 +86,8 @@
     "passkey": "Iniciar sesión con una llave de acceso",
     "forgot": "¿Has olvidado la contraseña?",
     "orContinue": "O continúa con",
+    "directoryUser": "Usuario del directorio",
+    "directorySignIn": "Iniciar sesión con {name}",
     "mfaTitle": "Verificación en dos pasos",
     "mfaDescription": "Introduce el código de 6 dígitos de tu app de autenticación o un código de recuperación.",
     "code": "Código",

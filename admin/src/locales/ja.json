@@ -86,6 +86,8 @@
     "passkey": "パスキーでサインイン",
     "forgot": "パスワードをお忘れですか?",
     "orContinue": "または次で続行",
+    "directoryUser": "ディレクトリのユーザー名",
+    "directorySignIn": "{name} でサインイン",
     "mfaTitle": "2 段階認証",
     "mfaDescription": "認証アプリの 6 桁のコード、またはリカバリーコードを入力してください。",
     "code": "コード",

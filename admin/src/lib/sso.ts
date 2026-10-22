@@ -1,5 +1,6 @@
 /**
- * Single sign-on flows.
+ * Single sign-on flows (LDAP directory sign-in is in `ldap.ts`; it shares
+ * `resolveUser`).
  *
  * OIDC: authorization code with PKCE (S256), `state` and `nonce`; the ID
  * token is verified against the issuer's JWKS (signature, issuer, audience,
@@ -100,6 +101,8 @@ export function samlMetadata(p: SsoProvider, origin: string): string {
 /** Where to send the browser to start signing in. */
 export async function startUrl(p: SsoProvider, origin: string, redirect: string, linkUserId: string | null): Promise<string> {
   if (!p.enabled) throw new OrgError('This sign-in method is disabled', 403);
+  // Directory sign-in takes a user name and password on the console's own page.
+  if (p.kind === 'ldap') throw new OrgError('Sign in with your directory user name and password on the sign-in page', 400);
   const state = b64url(crypto.randomBytes(24));
   if (p.kind === 'oidc') {
     const c = p.config as OidcConfig;

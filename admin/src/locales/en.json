@@ -86,6 +86,8 @@
     "passkey": "Sign in with a passkey",
     "forgot": "Forgot your password?",
     "orContinue": "Or continue with",
+    "directoryUser": "Directory user name",
+    "directorySignIn": "Sign in with {name}",
     "mfaTitle": "Two-factor verification",
     "mfaDescription": "Enter the 6-digit code from your authenticator app, or a recovery code.",
     "code": "Code",

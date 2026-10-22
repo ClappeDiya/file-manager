@@ -1,6 +1,6 @@
 /**
- * Identity providers (OIDC / SAML) per organization, linked identities and
- * short-lived authorization state.
+ * Identity providers (OIDC / SAML / LDAP) per organization, linked
+ * identities and short-lived authorization state.
  */
 import { db, newId, now, parseJson, type Row } from '../index';
 import { openOpt, sealOpt } from '../../crypto';
@@ -8,8 +8,11 @@ import type { Role } from '../../types/auth';
 import { ROLE_HIERARCHY } from '../../types/auth';
 import { OrgError } from './orgs';
 import { getGroup } from './groups';
+import { validateLdapConfig, type LdapConfig } from '../../ldap-config';
 
-export type SsoKind = 'oidc' | 'saml';
+export type { LdapConfig };
+
+export type SsoKind = 'oidc' | 'saml' | 'ldap';
 
 export interface OidcConfig {
   issuer: string;
@@ -37,7 +40,7 @@ export interface SsoProvider {
   orgId: string;
   name: string;
   kind: SsoKind;
-  config: OidcConfig | SamlConfig;
+  config: OidcConfig | SamlConfig | LdapConfig;
   hasSecret: boolean;
   defaultRole: Role;
   defaultGroupId: string | null;
@@ -58,7 +61,7 @@ function fromRow(r: Row): SsoProvider {
     orgId: r.org_id as string,
     name: r.name as string,
     kind: r.kind as SsoKind,
-    config: config as unknown as OidcConfig | SamlConfig,
+    config: config as unknown as OidcConfig | SamlConfig | LdapConfig,
     hasSecret: !!r.secret_ciphertext,
     defaultRole: r.default_role as Role,
     defaultGroupId: (r.default_group_id as string) ?? null,
@@ -123,7 +126,11 @@ function validate(orgId: string, p: ProviderInput, existingSecret: boolean) {
       throw new OrgError('Enter the IdP sign-on URL');
     }
     if (!/-----BEGIN CERTIFICATE-----/.test(c.idpCert ?? '')) throw new OrgError('Paste the IdP signing certificate (PEM)');
-  } else throw new OrgError('Provider type is oidc or saml');
+  } else if (p.kind === 'ldap') {
+    const problem = validateLdapConfig(p.config as Partial<LdapConfig>);
+    if (problem) throw new OrgError(problem);
+    if (!p.secret && !existingSecret) throw new OrgError('Enter the service account password');
+  } else throw new OrgError('Provider type is oidc, saml or ldap');
   if (p.defaultRole && !(p.defaultRole in ROLE_HIERARCHY)) throw new OrgError('Unknown default role');
   if (p.defaultRole === 'org_owner') throw new OrgError('Automatic sign-up cannot grant the owner role');
   const groups = [p.defaultGroupId, ...Object.values(p.groupMapping ?? {})].filter(Boolean) as string[];

@@ -86,6 +86,8 @@
     "passkey": "Mit einem Passkey anmelden",
     "forgot": "Passwort vergessen?",
     "orContinue": "Oder weiter mit",
+    "directoryUser": "Verzeichnis-Benutzername",
+    "directorySignIn": "Mit {name} anmelden",
     "mfaTitle": "Bestätigung in zwei Schritten",
     "mfaDescription": "Geben Sie den 6-stelligen Code aus Ihrer Authenticator-App oder einen Wiederherstellungscode ein.",
     "code": "Code",
