@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { audit, badRequest, isContext, readJson, requirePermission } from '@/lib/session';
+import { audit, badRequest, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
 import { createScimToken, listScimTokens, SCIM_ROLES } from '@/lib/db/repos/scim';
 import { orgErrorResponse, publicOrigin } from '@/lib/route-helpers';
 import type { Role } from '@/lib/types/auth';
@@ -13,7 +13,7 @@ export async function GET(request: NextRequest) {
 
 /** POST /api/scim-tokens {name, defaultRole?} — the secret is returned once. */
 export async function POST(request: NextRequest) {
-  const ctx = await requirePermission(request, 'users.write');
+  const ctx = await requireStepUp(request, 'users.write');
   if (!isContext(ctx)) return ctx;
   const b = await readJson<{ name?: string; defaultRole?: Role }>(request);
   if (!b) return badRequest('Invalid request');

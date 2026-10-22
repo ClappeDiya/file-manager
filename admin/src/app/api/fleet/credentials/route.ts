@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { audit, badRequest, isContext, readJson, requirePermission } from '@/lib/session';
+import { audit, badRequest, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
 import { createCredential, credentialPropagation, listCredentials } from '@/lib/db/repos/fleet-policies';
 import { listMachines } from '@/lib/db/repos/machines';
 import { orgErrorResponse } from '@/lib/route-helpers';
@@ -14,7 +14,7 @@ export async function GET(request: NextRequest) {
 
 /** POST /api/fleet/credentials {name, kind?, description?, secret} */
 export async function POST(request: NextRequest) {
-  const ctx = await requirePermission(request, 'credentials.write');
+  const ctx = await requireStepUp(request, 'credentials.write');
   if (!isContext(ctx)) return ctx;
   const b = await readJson<{ name?: string; kind?: string; description?: string; secret?: string }>(request);
   if (!b) return badRequest('Invalid request');

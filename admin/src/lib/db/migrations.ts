@@ -506,6 +506,13 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 19,
+    description: 'Step-up re-authentication time on sessions',
+    up(d) {
+      d.exec('ALTER TABLE sessions ADD COLUMN verified_at TEXT');
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { audit, badRequest, isContext, readJson, requirePermission } from '@/lib/session';
+import { audit, badRequest, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
 import { credentialHistory, deleteCredential, rotateCredential } from '@/lib/db/repos/fleet-policies';
 import { orgErrorResponse } from '@/lib/route-helpers';
 
@@ -17,7 +17,7 @@ export async function GET(request: NextRequest, { params }: P) {
 
 /** PUT {secret} — rotate: a new version that agents fetch on their next heartbeat. */
 export async function PUT(request: NextRequest, { params }: P) {
-  const ctx = await requirePermission(request, 'credentials.write');
+  const ctx = await requireStepUp(request, 'credentials.write');
   if (!isContext(ctx)) return ctx;
   const { id } = await params;
   const b = await readJson<{ secret?: string }>(request);
@@ -33,7 +33,7 @@ export async function PUT(request: NextRequest, { params }: P) {
 }
 
 export async function DELETE(request: NextRequest, { params }: P) {
-  const ctx = await requirePermission(request, 'credentials.write');
+  const ctx = await requireStepUp(request, 'credentials.write');
   if (!isContext(ctx)) return ctx;
   const { id } = await params;
   try {

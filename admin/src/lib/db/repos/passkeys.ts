@@ -76,7 +76,7 @@ export function deletePasskey(userId: string, credentialId: string): boolean {
   return db().prepare('DELETE FROM passkeys WHERE user_id = ? AND credential_id = ?').run(userId, credentialId).changes > 0;
 }
 
-export type CeremonyPurpose = 'register' | 'login';
+export type CeremonyPurpose = 'register' | 'login' | 'reauth';
 const CHALLENGE_MINUTES = 5;
 
 export function createCeremony(purpose: CeremonyPurpose, userId: string | null): { id: string; challenge: string } {

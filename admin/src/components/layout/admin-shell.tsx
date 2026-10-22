@@ -7,6 +7,7 @@ import { Sidebar } from './sidebar';
 import { Header } from './header';
 import { Footer } from './footer';
 import { Toaster } from '@/components/ui/toaster';
+import { ReauthDialog } from '@/components/auth/reauth-dialog';
 import { useTranslate } from '@/lib/i18n';
 
 interface AdminShellProps {
@@ -71,6 +72,7 @@ export function AdminShell({ children }: AdminShellProps) {
         </main>
         <Footer />
       </div>
+      <ReauthDialog />
       <Toaster />
     </div>
   );

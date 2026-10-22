@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { publicOrigin } from '@/lib/route-helpers';
 import { ROLE_HIERARCHY, type Role } from '@/lib/types/auth';
-import { audit, badRequest, can, canIn, isContext, readJson, requirePermission } from '@/lib/session';
+import { audit, badRequest, can, canIn, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
 import { canManageRole } from '@/lib/utils/permissions';
 import { effectiveRole, membersOf, membershipsOf, OrgError, removeMembership, setMembership } from '@/lib/db/repos/orgs';
 import { listUsers, publicUser, updateUser } from '@/lib/db/repos/users';
@@ -58,7 +58,8 @@ export async function POST(request: NextRequest) {
 export async function PATCH(request: NextRequest) {
   const b = await readJson<{ action?: string; userIds?: string[]; role?: Role }>(request);
   const perm = b?.action === 'remove' ? 'users.remove' : b?.action === 'set_role' ? 'roles.write' : 'users.deactivate'; // deactivate, activate, sign_out
-  const ctx = await requirePermission(request, perm);
+  // Removing members and changing roles are sensitive: they need a recent sign-in.
+  const ctx = b?.action === 'remove' || b?.action === 'set_role' ? await requireStepUp(request, perm) : await requirePermission(request, perm);
   if (!isContext(ctx)) return ctx;
   if (!b?.action || !Array.isArray(b.userIds) || b.userIds.length === 0) return badRequest('Action and userIds required');
   if (b.userIds.includes(ctx.user.id)) return badRequest('Cannot modify your own account via bulk operations', 403);

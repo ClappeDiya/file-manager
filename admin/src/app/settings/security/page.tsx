@@ -19,6 +19,7 @@ export default function SecuritySettingsPage() {
   const notify = useToastStore((s) => s.notify);
   const [draft, setDraft] = useState<SecuritySettings | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [ipText, setIpText] = useState<string | null>(null);
   if (loading && !data) return <Loading />;
   const s = draft ?? data?.settings;
   if (!s) return <ErrorBanner message={error ?? 'Could not load the settings'} />;
@@ -28,6 +29,7 @@ export default function SecuritySettingsPage() {
     try {
       await api('/api/security', { method: 'PUT', body: s });
       setDraft(null);
+      setIpText(null);
       notify('Security settings saved', 'success');
       await reload();
     } catch (e) {
@@ -85,6 +87,26 @@ export default function SecuritySettingsPage() {
             value={s.sessionIdleMinutes}
             onChange={(e) => setDraft({ ...s, sessionIdleMinutes: Math.max(0, Math.floor(Number(e.target.value) || 0)) })}
           />
+        </Card>
+        <Card>
+          <CardHeader className="flex-col items-start gap-1">
+            <CardTitle>Allowed networks</CardTitle>
+            <CardDescription>
+              Console access only from these addresses or CIDR ranges, one per line (empty = anywhere). It must include the address you save from. Agents and SCIM are not affected.
+            </CardDescription>
+          </CardHeader>
+          <label className="block text-sm">
+            <span className="mb-1 block font-medium">IP addresses and ranges</span>
+            <textarea
+              className="h-28 w-full rounded-md border border-border bg-background p-2 font-mono text-sm"
+              placeholder={'203.0.113.0/24\n2001:db8::/32'}
+              value={(draft ? ipText : null) ?? s.ipAllowlist.join('\n')}
+              onChange={(e) => {
+                setIpText(e.target.value);
+                setDraft({ ...s, ipAllowlist: e.target.value.split(/[\n,]/) });
+              }}
+            />
+          </label>
         </Card>
       </fieldset>
       {canWrite && (

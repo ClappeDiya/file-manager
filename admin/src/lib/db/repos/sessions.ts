@@ -13,6 +13,8 @@ export interface Session {
   userAgent: string;
   createdAt: string;
   lastSeenAt: string;
+  /** When the user last proved who they are (sign-in or re-authentication). */
+  verifiedAt: string;
   expiresAt: string;
   revokedAt: string | null;
   revokedReason: string | null;
@@ -27,6 +29,7 @@ function fromRow(r: Row): Session {
     userAgent: r.user_agent as string,
     createdAt: r.created_at as string,
     lastSeenAt: r.last_seen_at as string,
+    verifiedAt: ((r.verified_at as string) ?? r.created_at) as string,
     expiresAt: r.expires_at as string,
     revokedAt: (r.revoked_at as string) ?? null,
     revokedReason: (r.revoked_reason as string) ?? null,
@@ -55,6 +58,11 @@ export function getSession(id: string): Session | null {
 /** Record activity (throttled). */
 export function touchSession(s: Session, at = Date.now()): void {
   if (at - new Date(s.lastSeenAt).getTime() >= TOUCH_MS) db().prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ?').run(new Date(at).toISOString(), s.id);
+}
+
+/** The user re-authenticated in this session (step-up). */
+export function markVerified(id: string, at = new Date()): void {
+  db().prepare('UPDATE sessions SET verified_at = ? WHERE id = ?').run(at.toISOString(), id);
 }
 
 export function revokeSession(id: string, reason: string): boolean {

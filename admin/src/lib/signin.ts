@@ -4,7 +4,9 @@ import { attachSession, defaultOrgFor } from './session';
 import { updateUser, type UserRecord } from './db/repos/users';
 import { createChallenge } from './db/repos/mfa';
 import { appendAudit } from './db/repos/audit';
-import { needsSecondFactorSetup } from './db/repos/security';
+import { getSecurity, needsSecondFactorSetup } from './db/repos/security';
+import { accessibleOrgs } from './db/repos/orgs';
+import { ipAllowed } from './netacl';
 
 export interface SignInMeta {
   ip: string;
@@ -22,8 +24,15 @@ export interface SignInMeta {
  * is refused: enrollment must happen from an already strong session.
  */
 export async function finishSignIn(user: UserRecord, meta: SignInMeta, mfaDone = false): Promise<NextResponse> {
-  const orgId = defaultOrgFor(user);
-  if (!orgId) return NextResponse.json({ error: 'Your account has no access to any organization' }, { status: 403 });
+  const home = defaultOrgFor(user);
+  if (!home) return NextResponse.json({ error: 'Your account has no access to any organization' }, { status: 403 });
+  // Land in an organization that admits this address (the home one when it does).
+  const allows = (id: string) => ipAllowed(getSecurity(id).ipAllowlist, meta.ip);
+  const orgId = allows(home) ? home : accessibleOrgs(user.id).find((o) => allows(o.org.id))?.org.id;
+  if (!orgId) {
+    appendAudit({ eventType: 'auth.login_failed', severity: 'warning', orgId: home, userId: user.id, userEmail: user.email, ipAddress: meta.ip, description: `Sign-in refused: console access is not allowed from ${meta.ip}`, metadata: { method: meta.method } });
+    return NextResponse.json({ error: `Your organization does not allow console access from this network (${meta.ip})`, code: 'ip_not_allowed' }, { status: 403 });
+  }
   const needsMfa = !mfaDone && (user.mfaEnabled || meta.requireMfa);
   if (needsMfa) {
     if (!user.mfaEnabled) {

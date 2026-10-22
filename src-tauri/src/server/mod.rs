@@ -55,6 +55,8 @@ pub struct ServerConfig {
     /// Tokens a trusted reverse proxy sends in `X-UFOP-PreAuth`.
     pub preauth_tokens: Vec<String>,
     pub tls: TlsMode,
+    /// Client addresses allowed to connect (TCP peer; empty = any).
+    pub allowed_clients: ufop_core::netacl::IpAllowlist,
 }
 
 impl Default for ServerConfig {
@@ -69,6 +71,7 @@ impl Default for ServerConfig {
             cors_origins: Vec::new(),
             preauth_tokens: Vec::new(),
             tls: TlsMode::None,
+            allowed_clients: Default::default(),
         }
     }
 }
@@ -136,6 +139,20 @@ fn ok<T: serde::Serialize>(v: T) -> ApiResult {
 }
 
 // ── Middleware ──
+
+/// Refuse clients outside `--allowed-cidrs` (by TCP peer address, so a
+/// forwarded header cannot fake it; list the reverse proxy behind one).
+async fn ip_check(State(st): State<ServerState>, req: Request, next: Next) -> Response {
+    if !st.cfg.allowed_clients.is_empty() {
+        let peer = req.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+        if !peer.is_some_and(|ip| st.cfg.allowed_clients.allows(ip)) {
+            let who = peer.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into());
+            tracing::warn!("Refused a connection from {who} (not in --allowed-cidrs)");
+            return (StatusCode::FORBIDDEN, Json(json!({"error_type":"permission_denied","message":format!("Connections from {who} are not allowed"),"advice":"Add the address range with --allowed-cidrs."}))).into_response();
+        }
+    }
+    next.run(req).await
+}
 
 async fn host_check(State(st): State<ServerState>, req: Request, next: Next) -> Response {
     let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
@@ -618,7 +635,7 @@ pub fn router(st: ServerState) -> Router {
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static(PREAUTH_HEADER)]),
         );
     }
-    app.layer(middleware::from_fn_with_state(st.clone(), host_check)).with_state(st)
+    app.layer(middleware::from_fn_with_state(st.clone(), host_check)).layer(middleware::from_fn_with_state(st.clone(), ip_check)).with_state(st)
 }
 
 /// Restrict the data directory to the current user (0700 on Unix).

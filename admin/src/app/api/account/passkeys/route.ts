@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { audit, authenticate, badRequest, isContext, readJson } from '@/lib/session';
+import { audit, authenticate, badRequest, isContext, readJson, recentlyVerified, stepUpResponse } from '@/lib/session';
 import { addPasskey, consumeCeremony, createCeremony, deletePasskey, listPasskeys, publicPasskey, renamePasskey } from '@/lib/db/repos/passkeys';
 import { mfaRequired } from '@/lib/db/repos/security';
 import { OrgError } from '@/lib/db/repos/orgs';
@@ -23,6 +23,8 @@ export async function POST(request: NextRequest) {
   if (!isContext(ctx)) return ctx;
   const b = await readJson<{ action?: string; challengeId?: string; name?: string; credential?: { response?: { clientDataJSON?: string; attestationObject?: string }; transports?: string[] } }>(request);
   const rp = relyingParty(request);
+  // Adding a passkey would let a stolen session keep the account: a recent sign-in is needed.
+  if (b?.action === 'options' && !recentlyVerified(ctx)) return stepUpResponse(ctx);
   if (b?.action === 'options') {
     const c = createCeremony('register', ctx.user.id);
     return NextResponse.json({
@@ -71,6 +73,7 @@ export async function PATCH(request: NextRequest) {
 export async function DELETE(request: NextRequest) {
   const ctx = await authenticate(request);
   if (!isContext(ctx)) return ctx;
+  if (!recentlyVerified(ctx)) return stepUpResponse(ctx);
   const id = new URL(request.url).searchParams.get('id') ?? '';
   // The last second factor cannot go while an organization requires one.
   if (!ctx.user.mfaEnabled && listPasskeys(ctx.user.id).length === 1 && mfaRequired(ctx.user, false)) return badRequest('Your organization requires two-factor sign-in; set up an authenticator app or another passkey first', 403);

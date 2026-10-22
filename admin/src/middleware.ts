@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { jwtVerify } from 'jose';
+import { clientIp } from './lib/netacl';
 
 const PUBLIC_PATHS = [
   '/login',
@@ -56,7 +57,7 @@ export async function middleware(request: NextRequest) {
     const host = request.headers.get('host');
 
     if (!origin) {
-      const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+      const ip = clientIp(request);
       console.error(JSON.stringify({ level: 'warn', event: 'security.csrf_blocked', timestamp: new Date().toISOString(), ip, pathname, reason: 'missing_origin' }));
       return NextResponse.json({ error: 'CSRF validation failed: Origin header required' }, { status: 403 });
     }
@@ -65,7 +66,7 @@ export async function middleware(request: NextRequest) {
       try {
         const originHost = new URL(origin).host;
         if (originHost !== host) {
-          const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+          const ip = clientIp(request);
           console.error(JSON.stringify({ level: 'warn', event: 'security.csrf_blocked', timestamp: new Date().toISOString(), ip, pathname, origin, host, reason: 'origin_mismatch' }));
           return NextResponse.json({ error: 'CSRF validation failed' }, { status: 403 });
         }

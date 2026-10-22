@@ -6,6 +6,7 @@
 import { db, hashToken, newToken, now, parseJson, type Row } from '../index';
 import { membershipsOf, OrgError } from './orgs';
 import type { UserRecord } from './users';
+import { ipAllowed, normalizeAllowlist } from '../../netacl';
 import { hasPasskeys } from './passkeys';
 
 export interface SecuritySettings {
@@ -17,17 +18,29 @@ export interface SecuritySettings {
   ssoExemptFromMfa: boolean;
   /** Sign out sessions after this many minutes without activity (0 = only the 8-hour limit). */
   sessionIdleMinutes: number;
+  /** Console access only from these IP addresses / CIDR ranges (empty = anywhere). */
+  ipAllowlist: string[];
 }
 
-export const DEFAULT_SECURITY: SecuritySettings = { passwordMaxAgeDays: 0, requireMfa: false, ssoExemptFromMfa: false, sessionIdleMinutes: 0 };
+export const DEFAULT_SECURITY: SecuritySettings = { passwordMaxAgeDays: 0, requireMfa: false, ssoExemptFromMfa: false, sessionIdleMinutes: 0, ipAllowlist: [] };
 
 export function getSecurity(orgId: string): SecuritySettings {
   const r = db().prepare('SELECT settings FROM org_security WHERE org_id = ?').get(orgId) as Row | undefined;
   return { ...DEFAULT_SECURITY, ...parseJson<Partial<SecuritySettings>>(r?.settings, {}) };
 }
 
-export function setSecurity(orgId: string, patch: Partial<SecuritySettings>, by: string): SecuritySettings {
+/**
+ * Save settings. With `savedFrom` (the saving administrator's address), an
+ * allowlist that would shut that administrator out is refused.
+ */
+export function setSecurity(orgId: string, patch: Partial<SecuritySettings>, by: string, savedFrom?: string): SecuritySettings {
   const next = { ...getSecurity(orgId), ...patch };
+  try {
+    next.ipAllowlist = normalizeAllowlist(next.ipAllowlist);
+  } catch (e) {
+    throw new OrgError((e as Error).message);
+  }
+  if (savedFrom !== undefined && !ipAllowed(next.ipAllowlist, savedFrom)) throw new OrgError(`The allowlist must include your current address (${savedFrom}), or you would be locked out`);
   if (!Number.isInteger(next.passwordMaxAgeDays) || next.passwordMaxAgeDays < 0 || next.passwordMaxAgeDays > 3650) throw new OrgError('Password age is 0 (never) to 3650 days');
   if (typeof next.requireMfa !== 'boolean' || typeof next.ssoExemptFromMfa !== 'boolean') throw new OrgError('requireMfa and ssoExemptFromMfa are true or false');
   if (!Number.isInteger(next.sessionIdleMinutes) || (next.sessionIdleMinutes !== 0 && (next.sessionIdleMinutes < 5 || next.sessionIdleMinutes > 480))) throw new OrgError('The idle timeout is 0 (off) or 5 to 480 minutes');

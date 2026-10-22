@@ -11,6 +11,7 @@ pub mod error;
 pub mod fsutil;
 pub mod gpg;
 pub mod naming;
+pub mod netacl;
 pub mod policy;
 pub mod preload;
 pub mod retry;

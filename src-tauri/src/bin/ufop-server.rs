@@ -3,6 +3,7 @@
 //! ```text
 //! ufop-server --set-password            # first run (reads UFOP_SERVER_PASSWORD or prompts)
 //! ufop-server --interface any --allowed-hostnames backup.lan --https auto
+//! ufop-server --interface any --allowed-cidrs 10.0.0.0/8,fd00::/8   # only these clients (by TCP peer)
 //! ```
 //! Defaults come from the machine-wide preload file (see `ufop_core::preload`).
 
@@ -46,6 +47,9 @@ struct Args {
     #[arg(long, env = "UFOP_SERVER_CORS_ORIGINS", value_delimiter = ',')]
     cors_origins: Vec<String>,
     /// Reverse-proxy pre-authentication tokens (sent in X-UFOP-PreAuth)
+    /// Client address ranges allowed to connect, e.g. 10.0.0.0/8,192.168.1.0/24 (default: any).
+    #[arg(long, env = "UFOP_SERVER_ALLOWED_CIDRS", value_delimiter = ',')]
+    allowed_cidrs: Vec<String>,
     #[arg(long, env = "UFOP_SERVER_PREAUTH_TOKENS", value_delimiter = ',')]
     preauth_tokens: Vec<String>,
     /// `off`, `auto` (local CA + certificate) or `pfx`
@@ -335,6 +339,7 @@ async fn run(argv: Vec<String>) {
         cors_origins: a.cors_origins,
         preauth_tokens: a.preauth_tokens,
         tls,
+        allowed_clients: ufop_core::netacl::IpAllowlist::parse(&a.allowed_cidrs).unwrap_or_else(|e| fail(format!("--allowed-cidrs: {e}"))),
     };
     let st = ServerState { mgr, conns: Some(conns), auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent };
     if let Err(e) = server::serve(st).await {

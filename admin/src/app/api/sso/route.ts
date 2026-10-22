@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { audit, badRequest, isContext, readJson, requirePermission } from '@/lib/session';
+import { audit, badRequest, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
 import { createProvider, listProviders, type ProviderInput } from '@/lib/db/repos/sso';
 import { callbackUrl } from '@/lib/sso';
 import { orgErrorResponse, publicOrigin } from '@/lib/route-helpers';
@@ -15,7 +15,7 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const ctx = await requirePermission(request, 'sso.configure');
+  const ctx = await requireStepUp(request, 'sso.configure');
   if (!isContext(ctx)) return ctx;
   const b = await readJson<ProviderInput>(request);
   if (!b) return badRequest('Invalid request');

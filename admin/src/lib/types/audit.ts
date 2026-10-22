@@ -8,6 +8,8 @@ export type AuditEventType =
   | 'auth.login'
   | 'auth.logout'
   | 'auth.login_failed'
+  | 'auth.reauth'
+  | 'auth.reauth_failed'
   | 'connection.create'
   | 'connection.update'
   | 'connection.delete'
@@ -38,7 +40,7 @@ export type AuditEventType =
   | 'admin.settings_change';
 
 export const AUDIT_EVENT_CATEGORIES: Record<string, AuditEventType[]> = {
-  Authentication: ['auth.login', 'auth.logout', 'auth.login_failed'],
+  Authentication: ['auth.login', 'auth.logout', 'auth.login_failed', 'auth.reauth', 'auth.reauth_failed'],
   Connections: ['connection.create', 'connection.update', 'connection.delete', 'connection.test'],
   Transfers: ['transfer.start', 'transfer.complete', 'transfer.fail', 'transfer.cancel'],
   Sync: ['sync.start', 'sync.complete', 'sync.fail', 'sync.conflict'],

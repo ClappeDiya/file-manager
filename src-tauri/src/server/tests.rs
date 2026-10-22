@@ -20,7 +20,7 @@ async fn start(cfg: ServerConfig, oauth: Option<oauth::OAuthBroker>) -> TestServ
     let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent: None };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, router(st)).await.unwrap() });
+    tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
     TestServer {
         base: format!("http://127.0.0.1:{port}"),
         client: reqwest::Client::builder().cookie_store(true).build().unwrap(),
@@ -226,4 +226,16 @@ async fn oauth_broker_authid_flow() {
     assert_eq!(bad.status(), 401);
     // State is single-use.
     assert_ne!(s.client.get(format!("{}/oauth/callback?code=good&state={state}", s.base)).send().await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn client_address_allowlist_by_tcp_peer() {
+    let deny = start(ServerConfig { allowed_clients: ufop_core::netacl::IpAllowlist::parse(&["10.0.0.0/8"]).unwrap(), ..Default::default() }, None).await;
+    let r = deny.client.get(format!("{}/api/v1/health", deny.base)).header("x-forwarded-for", "10.1.2.3").send().await.unwrap();
+    assert_eq!(r.status(), 403, "a forwarded header does not change the peer");
+    assert!(r.json::<Value>().await.unwrap()["message"].as_str().unwrap().contains("127.0.0.1"));
+    let allow = start(ServerConfig { allowed_clients: ufop_core::netacl::IpAllowlist::parse(&["127.0.0.0/8", "::1"]).unwrap(), ..Default::default() }, None).await;
+    assert_eq!(allow.client.get(format!("{}/api/v1/health", allow.base)).send().await.unwrap().status(), 200);
+    let tok = allow.login().await;
+    assert_eq!(allow.get("/api/v1/jobs", &tok).await.status(), 200);
 }

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { audit, badRequest, isContext, readJson, requirePermission } from '@/lib/session';
+import { audit, badRequest, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
 import {
   deleteWebhook,
   deliveryStats,
@@ -34,7 +34,7 @@ export async function GET(request: NextRequest, { params }: P) {
 
 /** PATCH /api/webhooks/:id {name?, url?, events?, headers?, enabled?} */
 export async function PATCH(request: NextRequest, { params }: P) {
-  const ctx = await requirePermission(request, 'alerts.write');
+  const ctx = await requireStepUp(request, 'alerts.write');
   if (!isContext(ctx)) return ctx;
   const { id } = await params;
   const b = await readJson<WebhookInput>(request);
@@ -94,7 +94,7 @@ export async function POST(request: NextRequest, { params }: P) {
 }
 
 export async function DELETE(request: NextRequest, { params }: P) {
-  const ctx = await requirePermission(request, 'alerts.write');
+  const ctx = await requireStepUp(request, 'alerts.write');
   if (!isContext(ctx)) return ctx;
   const { id } = await params;
   const w = getWebhook(ctx.orgId, id);

@@ -14,8 +14,10 @@ import { SignJWT, jwtVerify } from 'jose';
 import { ROLE_PERMISSIONS, type Permission, type Role } from './types/auth';
 import { getUser, type UserRecord } from './db/repos/users';
 import { accessibleOrgs, effectiveRole, getOrg } from './db/repos/orgs';
-import { needsSecondFactorSetup, sessionIdleMinutes } from './db/repos/security';
+import { getSecurity, needsSecondFactorSetup, sessionIdleMinutes } from './db/repos/security';
+import { clientIp, ipAllowed } from './netacl';
 import { createSession, getSession, revokeSession, touchSession } from './db/repos/sessions';
+import { hasPasskeys } from './db/repos/passkeys';
 import { appendAudit, type AuditInput } from './db/repos/audit';
 
 export const SESSION_COOKIE = 'ufop-admin-session';
@@ -29,6 +31,8 @@ export interface AuthContext {
   amr: string[];
   /** The server-side session id. */
   sid: string;
+  /** When the user last signed in or re-authenticated in this session. */
+  verifiedAt: string;
   ip: string;
   userAgent: string;
 }
@@ -41,9 +45,7 @@ function secret(): Uint8Array {
   return new TextEncoder().encode(s);
 }
 
-export function clientIp(req: Request): string {
-  return req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || req.headers.get('x-real-ip') || 'unknown';
-}
+export { clientIp };
 
 /** Sign a session cookie; without `sid` a new server-side session is created. */
 export async function signSession(user: UserRecord, orgId: string, amr: string[], sid?: string, meta: { ip?: string; userAgent?: string } = {}): Promise<string> {
@@ -104,6 +106,11 @@ export async function authenticate(req: NextRequest): Promise<AuthContext | Next
   const org = getOrg(orgId);
   const role = org ? effectiveRole(user.id, orgId) : null;
   if (!org || !role) return deny(403, 'You no longer have access to this organization');
+  const ip = clientIp(req);
+  // The organization only admits console sessions from its networks (signing out still works).
+  if (!ipAllowed(getSecurity(orgId).ipAllowlist, ip) && !req.nextUrl.pathname.startsWith('/api/auth/logout')) {
+    return NextResponse.json({ error: `This organization does not allow console access from ${ip}`, code: 'ip_not_allowed' }, { status: 403 });
+  }
   const amr = Array.isArray(payload.amr) ? (payload.amr as string[]) : ['pwd'];
   // An organization requires two-factor sign-in and this account has none yet:
   // the session can only set it up (also for sessions from before the rule).
@@ -117,7 +124,8 @@ export async function authenticate(req: NextRequest): Promise<AuthContext | Next
     permissions: ROLE_PERMISSIONS[role] ?? [],
     amr,
     sid: session.id,
-    ip: clientIp(req),
+    verifiedAt: session.verifiedAt,
+    ip,
     userAgent: req.headers.get('user-agent') ?? '',
   };
 }
@@ -138,6 +146,39 @@ export async function requirePermission(req: NextRequest, ...perms: Permission[]
   const missing = perms.filter((p) => !can(ctx, p));
   if (missing.length) return deny(403, `Forbidden: requires ${missing.join(', ')}`);
   return ctx;
+}
+
+/** Sensitive changes need a sign-in or re-authentication this recent (STEP_UP_MINUTES, default 10). */
+export function stepUpMinutes(): number {
+  const n = Number(process.env.STEP_UP_MINUTES ?? 10);
+  return Number.isFinite(n) && n > 0 ? n : 10;
+}
+
+/** How this account can prove itself again: its strongest factors, else its password, else single sign-on. */
+export function reauthMethods(user: UserRecord): ReauthMethod[] {
+  const strong: ReauthMethod[] = [...(user.mfaEnabled ? (['totp'] as const) : []), ...(hasPasskeys(user.id) ? (['passkey'] as const) : [])];
+  if (strong.length) return strong;
+  return user.passwordHash ? ['password'] : ['sso'];
+}
+export type ReauthMethod = 'totp' | 'passkey' | 'password' | 'sso';
+
+/**
+ * Like `requirePermission`, for sensitive changes: the session must have
+ * signed in or re-authenticated recently, else 403 `reauth_required` (the
+ * console asks the user to confirm and retries).
+ */
+export async function requireStepUp(req: NextRequest, ...perms: Permission[]): Promise<AuthContext | NextResponse> {
+  const ctx = await requirePermission(req, ...perms);
+  if (!isContext(ctx)) return ctx;
+  return recentlyVerified(ctx) ? ctx : stepUpResponse(ctx);
+}
+
+export function recentlyVerified(ctx: AuthContext, at = Date.now()): boolean {
+  return at - new Date(ctx.verifiedAt).getTime() <= stepUpMinutes() * 60_000;
+}
+
+export function stepUpResponse(ctx: AuthContext): NextResponse {
+  return NextResponse.json({ error: 'Confirm it is you to make this change', code: 'reauth_required', methods: reauthMethods(ctx.user) }, { status: 403 });
 }
 
 /** Permission check against another organization the user can reach. */

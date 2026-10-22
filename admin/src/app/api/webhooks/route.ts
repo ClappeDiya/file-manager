@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { audit, badRequest, isContext, readJson, requirePermission } from '@/lib/session';
+import { audit, badRequest, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
 import { createWebhook, deliveryStats, EVENT_CATALOG, listWebhooks, type WebhookInput } from '@/lib/db/repos/webhooks';
 import { orgErrorResponse } from '@/lib/route-helpers';
 
@@ -19,7 +19,7 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const ctx = await requirePermission(request, 'alerts.write');
+  const ctx = await requireStepUp(request, 'alerts.write');
   if (!isContext(ctx)) return ctx;
   const b = await readJson<WebhookInput>(request);
   if (!b) return badRequest('Invalid request');
