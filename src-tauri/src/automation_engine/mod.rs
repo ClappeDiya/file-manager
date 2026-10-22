@@ -1157,8 +1157,18 @@ impl AutomationManager {
     }
 
     /// Start the webhook listener; returns the bound address.
+    /// Start the webhook listener on `addr`. When the default port is held by
+    /// another session on this machine (Remote Desktop, shared servers), a
+    /// stable per-user port is used instead.
     pub async fn start_webhook_listener(&self, addr: std::net::SocketAddr) -> std::io::Result<std::net::SocketAddr> {
-        let bound = webhook::serve(self.fire_context(), addr).await?;
+        let bound = match webhook::serve(self.fire_context(), addr).await {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && addr.port() == webhook::DEFAULT_PORT => {
+                let alt = std::net::SocketAddr::new(addr.ip(), ufop_core::session::per_user_port(webhook::DEFAULT_PORT, 500));
+                tracing::warn!("Webhook port {} is in use (another session?); using {} for this user", addr.port(), alt.port());
+                webhook::serve(self.fire_context(), alt).await?
+            }
+            r => r?,
+        };
         if let Ok(mut a) = self.webhook_addr.write() {
             *a = Some(bound);
         }
@@ -1634,6 +1644,12 @@ mod tests {
         let secret = mgr.rotate_webhook_secret(&repo, &rule.id).await.unwrap();
         let addr = mgr.start_webhook_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let url = format!("http://{addr}/hooks/{}", rule.id);
+        // Another session holding the default port: this user's own port is used.
+        if let Ok(_held) = std::net::TcpListener::bind(("127.0.0.1", webhook::DEFAULT_PORT)) {
+            let (other, _) = manager().await;
+            let alt = other.start_webhook_listener(std::net::SocketAddr::from(([127, 0, 0, 1], webhook::DEFAULT_PORT))).await.unwrap();
+            assert_eq!(alt.port(), ufop_core::session::per_user_port(webhook::DEFAULT_PORT, 500));
+        }
         let http = reqwest::Client::new();
 
         let denied = http.post(&url).bearer_auth("wrong").body("{}").send().await.unwrap();

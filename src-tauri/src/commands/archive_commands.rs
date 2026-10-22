@@ -5,7 +5,7 @@
 
 use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Sanitize an archive path to prevent flag injection.
 /// Rejects paths starting with '-' and prefixes relative paths with './' .
@@ -436,32 +436,11 @@ fn create_zip(
         .map(|s| sanitize_archive_path(s).map_err(|e| e.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
 
-    if let Some(pw) = password {
-        // Use 7z for password-protected archives to avoid exposing password
-        // in process arguments. 7z supports stdin password via -si flag.
-        // Fallback to zip -P only if 7z is unavailable.
-        if which_exists("7z") {
-            return create_7z_with_stdin_password(
-                &safe_output, &safe_sources, pw,
-            );
-        }
-        // zip does not support stdin passwords — -P is the only option.
-        // This is a known limitation; the password is briefly visible in `ps`.
-        tracing::warn!("Using zip -P (password visible in process list). Install 7z for safer password handling.");
-        let mut args = vec!["-r".to_string(), "-P".to_string(), pw.to_string()];
-        args.push(safe_output);
-        args.extend(safe_sources.iter().cloned());
-
-        let status = std::process::Command::new("zip")
-            .args(&args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-
-        if !status.success() {
-            return Err("zip creation failed".into());
-        }
-        return Ok(sources.len());
+    if let Some(pw) = password.filter(|p| !p.is_empty()) {
+        // Written in-process with AES-256: the password never reaches another
+        // process's command line (visible to every user of the machine) and
+        // the entries are not protected by the weak legacy ZipCrypto.
+        return create_zip_aes(Path::new(output), &sources.iter().map(PathBuf::from).collect::<Vec<_>>(), pw);
     }
 
     // No password — straightforward zip
@@ -489,6 +468,55 @@ fn which_exists(cmd: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// A zip of `sources` (files and folders, recursively) with every entry
+/// AES-256 encrypted. Entry names are relative to each source's parent folder.
+fn create_zip_aes(output: &Path, sources: &[PathBuf], password: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    if password.is_empty() {
+        return Err("The archive password is empty".into());
+    }
+    let tmp = output.with_extension("zip.part");
+    let file = std::fs::File::create(&tmp)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .with_aes_encryption(zip::AesMode::Aes256, password);
+    let mut count = 0usize;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        for src in sources {
+            let base = src.parent().unwrap_or_else(|| Path::new(""));
+            let mut stack = vec![src.clone()];
+            while let Some(p) = stack.pop() {
+                let md = std::fs::symlink_metadata(&p)?;
+                let name = p.strip_prefix(base).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                if md.is_dir() {
+                    zip.add_directory(format!("{}/", name.trim_end_matches('/')), zip::write::SimpleFileOptions::default())?;
+                    let mut children: Vec<PathBuf> = std::fs::read_dir(&p)?.filter_map(Result::ok).map(|e| e.path()).collect();
+                    children.sort();
+                    stack.extend(children.into_iter().rev());
+                } else if md.is_file() {
+                    zip.start_file(name, opts)?;
+                    let mut f = std::fs::File::open(&p)?;
+                    std::io::copy(&mut f, &mut zip)?;
+                    count += 1;
+                }
+            }
+        }
+        zip.finish()?.flush()?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            std::fs::rename(&tmp, output)?;
+            Ok(count.max(sources.len()))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// Create a 7z archive with password piped via stdin (not visible in `ps`).
@@ -738,3 +766,38 @@ fn count_items(path: &Path) -> Result<usize, std::io::Error> {
     }
     Ok(count)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Password zips are written in-process with AES-256 (no `zip -P`
+    /// command line for other users to read, no weak ZipCrypto).
+    #[test]
+    fn password_zips_are_aes_encrypted_in_process() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("reports");
+        std::fs::create_dir_all(src.join("q3")).unwrap();
+        std::fs::write(src.join("q3/a.txt"), "hello").unwrap();
+        std::fs::write(d.path().join("single.txt"), "one").unwrap();
+        let out = d.path().join("out.zip");
+        let n = create_zip(&out.to_string_lossy(), &[src.to_string_lossy().into(), d.path().join("single.txt").to_string_lossy().into()], Some("s3cret pass")).unwrap();
+        assert_eq!(n, 2);
+        assert!(!d.path().join("out.zip.part").exists());
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+        let names: Vec<String> = z.file_names().map(String::from).collect();
+        assert!(names.contains(&"reports/q3/a.txt".to_string()) && names.contains(&"single.txt".to_string()), "{names:?}");
+        assert!(z.by_name("reports/q3/a.txt").is_err(), "entries need the password");
+        assert!(z.by_name_decrypt("reports/q3/a.txt", b"wrong").is_err());
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut z.by_name_decrypt("reports/q3/a.txt", b"s3cret pass").unwrap(), &mut s).unwrap();
+        assert_eq!(s, "hello");
+        // Other tools open it with the password (7-Zip reads WinZip AES).
+        if which_exists("7z") {
+            let ok = |pw: &str| std::process::Command::new("7z").args(["t", &format!("-p{pw}")]).arg(&out).output().unwrap().status.success();
+            assert!(ok("s3cret pass") && !ok("nope"));
+        }
+        assert!(create_zip_aes(&d.path().join("x.zip"), &[src.clone()], "").is_err());
+    }
+}
+

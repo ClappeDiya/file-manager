@@ -230,7 +230,13 @@ pub async fn dispatch(agent: &FleetAgent, command: &str, a: &Value) -> Result<Va
 
 impl AgentHost for BackupHost {
     fn client_info(&self) -> ClientInfo {
-        ClientInfo::detect(self.agent_kind, env!("CARGO_PKG_VERSION"))
+        let mut info = ClientInfo::detect(self.agent_kind, env!("CARGO_PKG_VERSION"));
+        // On a shared host (Remote Desktop, Citrix, xrdp) each user's app is
+        // its own machine in the console: name it after the user too.
+        if info.name.is_none() && self.agent_kind == "desktop" {
+            info.name = ufop_core::session::SessionInfo::detect().machine_name(&info.hostname);
+        }
+        info
     }
 
     fn load(&self) -> BoxFuture<'_, Result<(AgentConfig, Option<String>), AppError>> {

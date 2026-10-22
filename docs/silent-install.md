@@ -121,6 +121,16 @@ Refused calls fail with a clear reason in the console's command history and
 policy status; nothing is changed on the machine. If the saved limits cannot
 be read, the agent refuses all changes until they are saved again.
 
+## Multi-session hosts (Remote Desktop, Citrix, xrdp)
+
+Several people can run the app on one terminal server at once; each runs their own copy with their own data, settings and credentials (per-user app data and keychain). What is machine-wide is made per user:
+
+- Temporary files (sync staging, backup volumes, previews, mount caches, imports, SSH askpass helpers) live in a private folder per user — `%TEMP%\ufop-<user>` on Windows (already per session there), `<tmp>/ufop-<uid>` with mode 0700 on Unix. A folder of that name owned by someone else is never used, and secrets for helpers are created exclusively, owner-only, and never follow a planted symlink.
+- Passwords never go on a helper's command line (which every user can read with `ps`): password-protected `.zip` archives are written in-process with AES-256, 7z reads the password from its input, and SSH key passphrases go through a private askpass helper.
+- The automation webhook listener uses port 47321 when it is free; when another session holds it, the user gets a stable port of their own (47322–47821, the same every time). The webhook URL in the rule shows the port in use.
+- Each user's app registers with the management console as its own machine, named `HOST (user)`, so seats, policies and reports stay per person.
+- OAuth sign-ins use fixed callback ports registered with the providers; they are protected with PKCE, so a code caught by another user's listener is useless. Two people signing in to the same provider at the same moment may need to retry.
+
 ## 5. Verify
 
 - The machine appears under **Machines** with the link's tags.

@@ -285,7 +285,7 @@ impl MountManager {
     pub fn new() -> Self {
         let cache_root = directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
             .map(|d| d.cache_dir().join("mounts"))
-            .unwrap_or_else(|| std::env::temp_dir().join("ufop-mount-cache"));
+            .unwrap_or_else(|| ufop_core::session::user_temp_subdir("mount-cache"));
         Self::with_cache_root(cache_root)
     }
 

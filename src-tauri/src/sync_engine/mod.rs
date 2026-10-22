@@ -151,7 +151,7 @@ fn default_state_dir() -> PathBuf {
     }
     directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
         .map(|d| d.data_dir().join("sync"))
-        .unwrap_or_else(|| std::env::temp_dir().join("ufop-sync"))
+        .unwrap_or_else(|| ufop_core::session::user_temp_subdir("sync"))
 }
 
 impl SyncManager {

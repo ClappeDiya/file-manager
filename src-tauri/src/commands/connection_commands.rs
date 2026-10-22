@@ -380,7 +380,7 @@ pub async fn import_from_third_party(
                 .and_then(|n| Path::new(n).file_name())
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "import.txt".to_string());
-            let dir = std::env::temp_dir().join(format!("ufop-import-{}", uuid::Uuid::new_v4()));
+            let dir = ufop_core::session::user_temp_subdir("imports").join(uuid::Uuid::new_v4().to_string());
             std::fs::create_dir_all(&dir)?;
             let p = dir.join(name);
             std::fs::write(&p, content)?;

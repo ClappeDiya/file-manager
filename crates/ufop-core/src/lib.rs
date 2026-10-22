@@ -18,6 +18,7 @@ pub mod netacl;
 pub mod policy;
 pub mod preload;
 pub mod retry;
+pub mod session;
 pub mod stability;
 pub mod sync;
 pub mod sync_types;

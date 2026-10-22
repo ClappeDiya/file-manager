@@ -618,7 +618,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub fn default_data_dir() -> PathBuf {
     directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
         .map(|d| d.data_dir().join("backups"))
-        .unwrap_or_else(|| std::env::temp_dir().join("ufop-backups"))
+        .unwrap_or_else(|| ufop_core::session::user_temp_subdir("backups"))
 }
 
 impl BackupManager {
@@ -1797,7 +1797,7 @@ impl BackupManager {
             if let Some(cmd) = job.scripts.run_after.as_deref().filter(|c| !c.trim().is_empty()) {
                 let mut env = Self::script_env(job, op, "AFTER");
                 env.insert("UFOP_PARSED_RESULT".into(), status.clone());
-                let rf = std::env::temp_dir().join(format!("ufop-result-{}.txt", uuid::Uuid::new_v4().simple()));
+                let rf = ufop_core::session::user_temp_subdir("results").join(format!("{}.txt", uuid::Uuid::new_v4().simple()));
                 let body = if job.scripts.result_format == "text" { summary.clone() } else { report.to_string() };
                 if std::fs::write(&rf, body).is_ok() {
                     env.insert("UFOP_RESULTFILE".into(), rf.to_string_lossy().into_owned());

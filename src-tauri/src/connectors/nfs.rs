@@ -181,7 +181,7 @@ impl NfsConnector {
 
     /// Get the mount point path for a given host and export.
     fn mount_point_path(host: &str, export_path: &str) -> PathBuf {
-        let base = std::env::temp_dir().join("ufop_nfs_mounts");
+        let base = ufop_core::session::user_temp_subdir("nfs-mounts");
         let sanitized_host = host.replace(['/', '\\', ':', ' '], "_");
         let sanitized_export = export_path
             .trim_start_matches('/')
@@ -785,7 +785,8 @@ mod tests {
     fn test_mount_point_path() {
         let mp = NfsConnector::mount_point_path("192.168.1.100", "/exports/data");
         let mp_str = mp.to_string_lossy();
-        assert!(mp_str.contains("ufop_nfs_mounts"));
+        // In this user's private temp folder, not a shared /tmp name.
+        assert!(mp.starts_with(ufop_core::session::user_temp_dir().unwrap().join("nfs-mounts")), "{mp_str}");
         assert!(mp_str.contains("192.168.1.100_exports_data"));
     }
 

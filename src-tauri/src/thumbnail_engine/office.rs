@@ -69,7 +69,7 @@ impl OfficeRenderer {
     pub fn open_default() -> Self {
         let dir = directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
             .map(|d| d.cache_dir().join("office-previews"))
-            .unwrap_or_else(|| std::env::temp_dir().join("ufop-office-previews"));
+            .unwrap_or_else(|| ufop_core::session::user_temp_subdir("office-previews"));
         Self::new(dir, find_soffice(), cfg!(target_os = "macos") && Path::new("/usr/bin/qlmanage").is_file())
     }
 
