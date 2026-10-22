@@ -1,4 +1,4 @@
-/** Connection form: S3 role assumption and preset are saved as `extras`. */
+/** Connection form: S3 role assumption, preset and Swift sign-in settings are saved as `extras`. */
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
@@ -42,6 +42,7 @@ describe("connection form extras", () => {
       rclone_remote: null,
       preset: null,
       assume_role: { role_arn: "arn:aws:iam::123456789012:role/Reader", external_id: "ext-42", session_name: null, duration_secs: 1800 },
+      swift: null,
     });
   });
 
@@ -118,5 +119,115 @@ describe("Azure connections", () => {
     await waitFor(() => expect(mockInvoke.mock.calls.some(([c]) => c === "save_connection")).toBe(true));
     const args = mockInvoke.mock.calls.find(([c]) => c === "save_connection")![1];
     expect([args.protocol, args.username, args.password, args.host]).toEqual([protocol, "acct", "sv=2021&sig=x", "acct.core.usgovcloudapi.net"]);
+  });
+});
+
+describe("OpenStack Swift connections", () => {
+  const swiftProfile = {
+    id: "c1",
+    name: "Lab Swift",
+    protocol: "swift",
+    host: "keystone.lab",
+    port: 5000,
+    username: "alice",
+    remote_path: "/",
+    group_id: null,
+    created_at: "2024-01-01T00:00:00Z",
+    last_used: null,
+    extras: {
+      assume_role: null,
+      rclone_remote: null,
+      preset: null,
+      swift: { auth_kind: "password", auth_url: "https://keystone.lab:5000/v3", project_name: "proj", domain_name: "Corp", region: "R2", application_credential_id: null },
+    },
+  };
+
+  beforeEach(() => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_connections") return [swiftProfile];
+      if (cmd === "list_connection_groups" || cmd === "list_aws_profiles" || cmd === "connection_presets") return [];
+      if (cmd === "connector_list_protocols") return ["sftp", "swift"];
+      return undefined;
+    });
+  });
+
+  async function saved() {
+    await waitFor(() => expect(mockInvoke.mock.calls.some(([c]) => c === "save_connection")).toBe(true));
+    return mockInvoke.mock.calls.find(([c]) => c === "save_connection")![1];
+  }
+
+  it("saves the Keystone settings, which were never stored before", async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_connections" || cmd === "list_connection_groups" || cmd === "list_aws_profiles" || cmd === "connection_presets") return [];
+      if (cmd === "connector_list_protocols") return ["sftp", "swift"];
+      return undefined;
+    });
+    const { container } = render(<ConnectionPanel />);
+    fireEvent.click(await screen.findByText("Add your first connection"));
+    const form = container.querySelector("form")!;
+    fireEvent.change(form.querySelectorAll("input")[0], { target: { value: "Swift" } });
+    const proto = form.querySelector("select")!;
+    await waitFor(() => expect([...proto.options].some((o) => o.value === "swift")).toBe(true));
+    fireEvent.change(proto, { target: { value: "swift" } });
+    expect(screen.getByTestId("swift-fields")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Auth URL"), { target: { value: " https://keystone.example.com/identity/v3 " } });
+    fireEvent.change(screen.getByLabelText("Project name"), { target: { value: "proj" } });
+    fireEvent.change(screen.getByLabelText("Domain"), { target: { value: "Corp" } });
+    fireEvent.change(screen.getByLabelText(/Region/), { target: { value: "RegionOne" } });
+    fireEvent.submit(form);
+    const args = await saved();
+    expect(args.extras.swift).toEqual({
+      auth_kind: "password",
+      auth_url: "https://keystone.example.com/identity/v3",
+      project_name: "proj",
+      domain_name: "Corp",
+      region: "RegionOne",
+      application_credential_id: null,
+    });
+  });
+
+  it("shows only the fields each sign-in kind uses", async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_connections" || cmd === "list_connection_groups" || cmd === "list_aws_profiles" || cmd === "connection_presets") return [];
+      if (cmd === "connector_list_protocols") return ["sftp", "swift"];
+      return undefined;
+    });
+    const { container } = render(<ConnectionPanel />);
+    fireEvent.click(await screen.findByText("Add your first connection"));
+    const form = container.querySelector("form")!;
+    fireEvent.change(form.querySelectorAll("input")[0], { target: { value: "Swift" } });
+    const proto = form.querySelector("select")!;
+    await waitFor(() => expect([...proto.options].some((o) => o.value === "swift")).toBe(true));
+    fireEvent.change(proto, { target: { value: "swift" } });
+    fireEvent.change(screen.getByLabelText("Sign in with"), { target: { value: "temp_auth" } });
+    expect(screen.queryByLabelText(/Region/)).toBeNull();
+    expect(screen.queryByLabelText("Project name")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Sign in with"), { target: { value: "application_credential" } });
+    expect(screen.queryByLabelText("Project name")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Application credential ID"), { target: { value: "ac-123" } });
+    // With an auth URL the host is optional.
+    fireEvent.change(screen.getByLabelText("Auth URL"), { target: { value: "https://keystone.example.com/v3" } });
+    fireEvent.submit(form);
+    expect((await saved()).extras.swift).toEqual({
+      auth_kind: "application_credential",
+      auth_url: "https://keystone.example.com/v3",
+      project_name: null,
+      domain_name: null,
+      region: null,
+      application_credential_id: "ac-123",
+    });
+  });
+
+  it("loads the saved settings when editing", async () => {
+    render(<ConnectionPanel />);
+    fireEvent.click(await screen.findByTitle("Edit"));
+    expect((screen.getByLabelText("Auth URL") as HTMLInputElement).value).toBe("https://keystone.lab:5000/v3");
+    expect((screen.getByLabelText("Project name") as HTMLInputElement).value).toBe("proj");
+    expect((screen.getByLabelText("Domain") as HTMLInputElement).value).toBe("Corp");
+    expect((screen.getByLabelText(/Region/) as HTMLInputElement).value).toBe("R2");
+    fireEvent.change(screen.getByLabelText(/Region/), { target: { value: "R3" } });
+    fireEvent.submit(document.querySelector("form")!);
+    const args = await saved();
+    expect([args.connectionId ?? args.id, args.extras.swift.region, args.extras.swift.project_name]).toEqual(["c1", "R3", "proj"]);
   });
 });

@@ -361,13 +361,19 @@ pub fn entry(parent: &str, name: &str, is_dir: bool, size: u64, modified: Option
 }
 
 /// Stream a response body into a local file; returns bytes written.
-pub async fn save_body(mut resp: reqwest::Response, local: &str) -> Result<u64, AppError> {
+pub async fn save_body(resp: reqwest::Response, local: &str) -> Result<u64, AppError> {
+    save_body_as(resp, local, "Azure download").await
+}
+
+/// [`save_body`] with `what` naming the download in errors. The file is
+/// written as `<local>.ufop-part` and renamed once complete.
+pub async fn save_body_as(mut resp: reqwest::Response, local: &str, what: &str) -> Result<u64, AppError> {
     use tokio::io::AsyncWriteExt;
     let part = format!("{local}.ufop-part");
     let mut f = tokio::fs::File::create(&part).await?;
     let mut n = 0u64;
     let r: Result<(), AppError> = async {
-        while let Some(chunk) = resp.chunk().await.map_err(|e| http::net("Azure download", e))? {
+        while let Some(chunk) = resp.chunk().await.map_err(|e| http::net(what, e))? {
             f.write_all(&chunk).await?;
             n += chunk.len() as u64;
         }

@@ -825,6 +825,37 @@ pub struct ConnectionExtras {
     pub rclone_remote: Option<String>,
     /// Provider preset the connection was created from (`r2`, `egnyte`…).
     pub preset: Option<String>,
+    /// OpenStack Swift sign-in settings.
+    pub swift: Option<SwiftSettings>,
+}
+
+/// How a Swift connection signs in.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SwiftAuthKind {
+    /// Keystone v3 user name and password, scoped to a project.
+    #[default]
+    Password,
+    /// Keystone v3 application credential (id + secret).
+    ApplicationCredential,
+    /// TempAuth / v1 (`X-Auth-User` / `X-Auth-Key`).
+    TempAuth,
+}
+
+/// OpenStack Swift settings. The secret is the password, the application
+/// credential secret or the TempAuth key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SwiftSettings {
+    pub auth_kind: SwiftAuthKind,
+    /// Keystone or TempAuth URL; when empty, `https://<host>:<port>/v3`.
+    pub auth_url: Option<String>,
+    pub project_name: Option<String>,
+    /// User and project domain (Keystone password sign-in); default `Default`.
+    pub domain_name: Option<String>,
+    /// Catalog region to use when the project has several.
+    pub region: Option<String>,
+    pub application_credential_id: Option<String>,
 }
 
 /// Global proxy configuration.

@@ -291,8 +291,17 @@ Reports can be exported as CSV or JSON.
 | **Azure Blob Storage** | Containers and blobs; uploads in 4 MiB blocks; folders as `dir/` marker blobs; read-only SAS share links. |
 | **Azure Data Lake Storage Gen2** | Accounts with a hierarchical namespace (`dfs` endpoint): real folders, and uploads that appear only when complete (written under a hidden name, then renamed). |
 | **Azure Files** | File shares over the REST API (no SMB port needed); uploads in 4 MiB ranges under a hidden name, then renamed; read-only SAS share links. |
+| **OpenStack Swift** | Containers and objects; Keystone v3 (password or application credential) or TempAuth; files over 32 MiB upload as Static Large Objects; folders as `dir/` objects; TempURL share links. |
 
 For the Azure services, enter the **storage account** and sign in with an **account key**, a **SAS token** or a **connection string**. Leave **Endpoint** blank for the public cloud; enter a host or URL for Azure Government, Azure China or the Azurite emulator. A container, file system or share is never deleted from the app (that removes everything in it); folders are removed only when empty.
+
+For **OpenStack Swift**, choose how to sign in:
+
+- **Keystone user name and password**: enter the user, password, **project name** and **domain** (default `Default`). The domain applies to both the user and the project.
+- **Keystone application credential**: enter the **application credential ID**, and its secret as the password. The credential's own project applies.
+- **TempAuth (v1)**: enter the user as `account:user` and the key as the password.
+
+**Auth URL** is the Keystone (or TempAuth) URL; leave it blank to use `https://<host>:<port>/v3` (or `/auth/v1.0` for TempAuth). A URL without a version gets `/v3`. When the project has storage in several regions, enter the **region** to use. Large objects keep their segments in `<container>_segments`; replacing or deleting the object removes its old segments. Containers and folders are removed only when empty. Share links are TempURLs and need a `Temp-URL-Key` on the account or the container (for example `swift post -m Temp-URL-Key:<secret>`); changing that key revokes every link.
 
 ### Connection Management
 

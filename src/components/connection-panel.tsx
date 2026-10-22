@@ -61,10 +61,23 @@ interface AssumeRoleConfig {
   duration_secs: number | null;
 }
 
+type SwiftAuthKind = "password" | "application_credential" | "temp_auth";
+
+/** Mirrors `SwiftSettings` (core/types.rs). */
+interface SwiftSettings {
+  auth_kind: SwiftAuthKind;
+  auth_url: string | null;
+  project_name: string | null;
+  domain_name: string | null;
+  region: string | null;
+  application_credential_id: string | null;
+}
+
 interface ConnectionExtras {
   assume_role: AssumeRoleConfig | null;
   rclone_remote: string | null;
   preset: string | null;
+  swift: SwiftSettings | null;
 }
 
 interface ConnectionGroup {
@@ -530,10 +543,13 @@ function ConnectionForm({
   const [azureAuthMethod, setAzureAuthMethod] = useState<"account_key" | "sas_token" | "connection_string">("account_key");
 
   // OpenStack Swift fields
-  const [swiftAuthUrl, setSwiftAuthUrl] = useState("");
-  const [swiftProjectName, setSwiftProjectName] = useState("");
-  const [swiftDomainName, setSwiftDomainName] = useState("Default");
-  const [swiftRegion, setSwiftRegion] = useState("");
+  const initialSwift = initialData?.extras?.swift;
+  const [swiftAuthKind, setSwiftAuthKind] = useState<SwiftAuthKind>(initialSwift?.auth_kind ?? "password");
+  const [swiftAuthUrl, setSwiftAuthUrl] = useState(initialSwift?.auth_url ?? "");
+  const [swiftProjectName, setSwiftProjectName] = useState(initialSwift?.project_name ?? "");
+  const [swiftDomainName, setSwiftDomainName] = useState(initialSwift?.domain_name ?? "Default");
+  const [swiftRegion, setSwiftRegion] = useState(initialSwift?.region ?? "");
+  const [swiftCredentialId, setSwiftCredentialId] = useState(initialSwift?.application_credential_id ?? "");
 
   // Auto-expand Advanced section when editing a connection that has advanced fields set
   useEffect(() => {
@@ -653,6 +669,16 @@ function ConnectionForm({
           isS3 && roleArn.trim()
             ? { role_arn: roleArn.trim(), external_id: externalId.trim() || null, session_name: null, duration_secs: roleDuration ? Number(roleDuration) : null }
             : null,
+        swift: isSwift
+          ? {
+              auth_kind: swiftAuthKind,
+              auth_url: swiftAuthUrl.trim() || null,
+              project_name: swiftAuthKind === "password" ? swiftProjectName.trim() || null : null,
+              domain_name: swiftAuthKind === "password" ? swiftDomainName.trim() || null : null,
+              region: swiftAuthKind === "temp_auth" ? null : swiftRegion.trim() || null,
+              application_credential_id: swiftAuthKind === "application_credential" ? swiftCredentialId.trim() || null : null,
+            }
+          : null,
       } satisfies ConnectionExtras,
     });
   };
@@ -718,7 +744,7 @@ function ConnectionForm({
             setSshConfigHint(null);
           }}
           onBlur={handleHostBlur}
-          required
+          required={!(isSwift && swiftAuthUrl.trim())}
           placeholder="example.com"
           className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
         />
@@ -931,50 +957,91 @@ function ConnectionForm({
       )}
       {/* OpenStack Swift fields */}
       {isSwift && (
-        <div className="space-y-2">
+        <div className="space-y-2" data-testid="swift-fields">
           <div>
-            <label className="block text-xs font-medium mb-1">Auth URL</label>
+            <label className="block text-xs font-medium mb-1" htmlFor="swift-auth-kind">Sign in with</label>
+            <select
+              id="swift-auth-kind"
+              value={swiftAuthKind}
+              onChange={(e) => setSwiftAuthKind(e.target.value as SwiftAuthKind)}
+              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+            >
+              <option value="password">Keystone user name and password</option>
+              <option value="application_credential">Keystone application credential</option>
+              <option value="temp_auth">TempAuth (v1)</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1" htmlFor="swift-auth-url">Auth URL</label>
             <input
+              id="swift-auth-url"
               type="text"
               value={swiftAuthUrl}
               onChange={(e) => setSwiftAuthUrl(e.target.value)}
-              placeholder="https://keystone.example.com:5000/v3"
+              placeholder={swiftAuthKind === "temp_auth" ? "https://swift.example.com/auth/v1.0" : "https://keystone.example.com:5000/v3"}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
             />
+            <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">
+              Leave blank to use the host and port above{swiftAuthKind === "temp_auth" ? " with /auth/v1.0" : " with /v3"}.
+            </p>
           </div>
-          <div>
-            <label className="block text-xs font-medium mb-1">Project Name</label>
-            <input
-              type="text"
-              value={swiftProjectName}
-              onChange={(e) => setSwiftProjectName(e.target.value)}
-              placeholder="my-project"
-              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium mb-1">Domain Name</label>
-            <input
-              type="text"
-              value={swiftDomainName}
-              onChange={(e) => setSwiftDomainName(e.target.value)}
-              placeholder="Default"
-              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium mb-1">
-              Region
-              <span className="text-gray-400 dark:text-gray-500 font-normal"> (optional)</span>
-            </label>
-            <input
-              type="text"
-              value={swiftRegion}
-              onChange={(e) => setSwiftRegion(e.target.value)}
-              placeholder="RegionOne"
-              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-            />
-          </div>
+          {swiftAuthKind === "application_credential" && (
+            <div>
+              <label className="block text-xs font-medium mb-1" htmlFor="swift-credential-id">Application credential ID</label>
+              <input
+                id="swift-credential-id"
+                type="text"
+                value={swiftCredentialId}
+                onChange={(e) => setSwiftCredentialId(e.target.value)}
+                className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+              />
+              <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">Enter the credential secret as the password; the credential's own project applies.</p>
+            </div>
+          )}
+          {swiftAuthKind === "password" && (
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-xs font-medium mb-1" htmlFor="swift-project">Project name</label>
+                <input
+                  id="swift-project"
+                  type="text"
+                  value={swiftProjectName}
+                  onChange={(e) => setSwiftProjectName(e.target.value)}
+                  placeholder="my-project"
+                  className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1" htmlFor="swift-domain">Domain</label>
+                <input
+                  id="swift-domain"
+                  type="text"
+                  value={swiftDomainName}
+                  onChange={(e) => setSwiftDomainName(e.target.value)}
+                  placeholder="Default"
+                  className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+                />
+              </div>
+            </div>
+          )}
+          {swiftAuthKind === "temp_auth" ? (
+            <p className="text-[10px] text-gray-400 dark:text-gray-500">Enter the user as account:user and the key as the password.</p>
+          ) : (
+            <div>
+              <label className="block text-xs font-medium mb-1" htmlFor="swift-region">
+                Region
+                <span className="text-gray-400 dark:text-gray-500 font-normal"> (optional)</span>
+              </label>
+              <input
+                id="swift-region"
+                type="text"
+                value={swiftRegion}
+                onChange={(e) => setSwiftRegion(e.target.value)}
+                placeholder="RegionOne"
+                className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+              />
+            </div>
+          )}
         </div>
       )}
       <div>
