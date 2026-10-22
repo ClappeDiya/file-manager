@@ -47,6 +47,34 @@ interface MountInfo {
   error_message: string | null;
 }
 
+/** Mirrors `mount_engine::MountCapability`. */
+type MountCapability =
+  | { native_mount: { command: string } }
+  | { requires_install: { tool: string; install_hint: string } }
+  | { not_supported: { reason: string } };
+
+function CapabilityBadge({ capability }: { capability: MountCapability }) {
+  if ("native_mount" in capability) {
+    return (
+      <p className="text-xs text-green-600" data-testid="mount-capability">
+        Can be mounted (uses {capability.native_mount.command})
+      </p>
+    );
+  }
+  if ("requires_install" in capability) {
+    return (
+      <p className="text-xs text-amber-600" data-testid="mount-capability">
+        Needs {capability.requires_install.tool}: <code>{capability.requires_install.install_hint}</code>
+      </p>
+    );
+  }
+  return (
+    <p className="text-xs text-gray-500" data-testid="mount-capability">
+      Can't be mounted: {capability.not_supported.reason}
+    </p>
+  );
+}
+
 interface MountResult {
   mount_id: string;
   mount_point: string;
@@ -107,6 +135,21 @@ function MountNewDriveForm({
   const [mounting, setMounting] = useState(false);
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
+  const [capability, setCapability] = useState<MountCapability | null>(null);
+
+  // What mounting this connection needs (rclone, FUSE, sshfs…), shown as a badge.
+  useEffect(() => {
+    setCapability(null);
+    const conn = connections.find((c) => c.id === selectedConnectionId);
+    if (!conn) return;
+    let live = true;
+    tauriInvoke<MountCapability>("check_mount_capability", { protocol: conn.protocol })
+      .then((c) => live && setCapability(c))
+      .catch(() => live && setCapability(null));
+    return () => {
+      live = false;
+    };
+  }, [selectedConnectionId, connections]);
 
   // Auto-generate mount point based on selected connection
   useEffect(() => {
@@ -187,6 +230,8 @@ function MountNewDriveForm({
         </select>
       </div>
 
+      {capability && <CapabilityBadge capability={capability} />}
+
       <div>
         <label className="block text-xs font-medium mb-1">Mount Point</label>
         <div className="flex gap-2">
@@ -234,7 +279,7 @@ function MountNewDriveForm({
       <div className="flex justify-end">
         <button
           type="submit"
-          disabled={mounting || !selectedConnectionId}
+          disabled={mounting || !selectedConnectionId || (capability !== null && !("native_mount" in capability))}
           className="inline-flex items-center gap-1.5 text-sm px-4 py-1.5 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <Plug size={14} />

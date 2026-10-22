@@ -9,6 +9,8 @@
 //!
 //! Mount metadata is persisted in SQLite for auto-mount on startup.
 
+pub mod rclone_mount;
+
 use crate::connectors::ConnectionManager;
 use crate::core::error::AppError;
 use crate::storage::Repository;
@@ -130,6 +132,18 @@ pub enum MountCapability {
     NotSupported { reason: String },
 }
 
+/// Expand a leading `~` to the home directory.
+pub fn expand_home(p: &str) -> String {
+    let home = || directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
+    match p.strip_prefix("~") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') => match home() {
+            Some(h) => format!("{}{}", h.display(), rest),
+            None => p.to_string(),
+        },
+        _ => p.to_string(),
+    }
+}
+
 /// Check what mount capability exists for a given protocol on the current OS.
 pub fn check_mount_capability(protocol: &str) -> MountCapability {
     match protocol {
@@ -198,6 +212,20 @@ pub fn check_mount_capability(protocol: &str) -> MountCapability {
                 MountCapability::NotSupported { reason: "WebDAV mount not supported on this OS".to_string() }
             }
         }
+        // Cloud storage mounts through rclone + FUSE.
+        "rclone" | "s3" => {
+            if !rclone_mount::rclone_available() {
+                MountCapability::RequiresInstall { tool: "rclone".to_string(), install_hint: "Install rclone from https://rclone.org/install/".to_string() }
+            } else {
+                match rclone_mount::fuse_available() {
+                    Ok(()) => MountCapability::NativeMount { command: "rclone mount".to_string() },
+                    Err((tool, install_hint)) => MountCapability::RequiresInstall { tool, install_hint },
+                }
+            }
+        }
+        "google_drive" | "dropbox" | "onedrive" | "azure_blob" | "b2" | "swift" => MountCapability::NotSupported {
+            reason: "Add this account as an rclone remote (`rclone config`), create an rclone connection for it, and mount that.".to_string(),
+        },
         _ => MountCapability::NotSupported {
             reason: format!("Protocol '{}' cannot be mounted as a filesystem. Use sync or transfer instead.", protocol),
         },
@@ -213,12 +241,15 @@ pub fn check_mount_capability(protocol: &str) -> MountCapability {
 pub struct MountManager {
     /// Active mounts keyed by mount ID.
     mounts: Arc<RwLock<HashMap<Uuid, VirtualMount>>>,
+    /// rclone processes serving cloud mounts.
+    rclone: rclone_mount::RcloneProcesses,
 }
 
 impl MountManager {
     pub fn new() -> Self {
         Self {
             mounts: Arc::new(RwLock::new(HashMap::new())),
+            rclone: rclone_mount::RcloneProcesses::default(),
         }
     }
 
@@ -281,6 +312,8 @@ impl MountManager {
             MountCapability::NativeMount { .. } => {}
         }
 
+        // "~/x" (what the mount dialog suggests) means the home folder.
+        let mount_point = expand_home(&mount_point);
         // Validate mount point: must be absolute, no path traversal, within user home
         let mp_path = std::path::Path::new(&mount_point);
         if !mp_path.is_absolute() {
@@ -328,14 +361,16 @@ impl MountManager {
             })?;
         }
 
-        // Execute native OS mount command
-        let mount_result = Self::execute_native_mount(
-            protocol_str,
-            &profile,
-            &mount_point,
-        ).await;
-
         let mount_id = Uuid::new_v4();
+        let mount_result = if matches!(protocol_str, "rclone" | "s3") {
+            let secret = connection_mgr.get_password(connection_id).await.ok().flatten();
+            match rclone_mount::spec_for(&profile, secret.as_deref()) {
+                Ok(spec) => self.rclone.mount(mount_id, &spec, &mount_point).await,
+                Err(e) => Err(e),
+            }
+        } else {
+            Self::execute_native_mount(protocol_str, &profile, &mount_point).await
+        };
         let now = Utc::now();
 
         let (status, error_message, msg) = match mount_result {
@@ -522,6 +557,11 @@ impl MountManager {
         let mid = mount_id.to_string();
 
         if let Some(info) = &mount_info {
+            if self.rclone.unmount(mount_id, &info.mount_point).await {
+                tracing::info!("Unmounted rclone mount '{}' (mount_id: {})", info.mount_point, mount_id);
+            }
+        }
+        if let Some(info) = mount_info.as_ref().filter(|i| !matches!(i.protocol.as_str(), "rclone" | "s3")) {
             // Execute real OS unmount
             let mp = &info.mount_point;
             let cmd_name = if cfg!(target_os = "macos") { "umount" } else { "fusermount" };
@@ -896,6 +936,17 @@ mod tests {
 
         assert_eq!(mounted, 0);
         assert_eq!(failed, 3, "every flagged config is attempted despite failures");
+    }
+
+    /// Regression: the dialog's default "~/UFOP-Mounts/x" was rejected as
+    /// not absolute.
+    #[test]
+    fn tilde_mount_points_expand_to_home() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert_eq!(expand_home("~/UFOP-Mounts/a"), format!("{}/UFOP-Mounts/a", home.display()));
+        assert!(std::path::Path::new(&expand_home("~/x")).is_absolute());
+        assert_eq!(expand_home("/abs/x"), "/abs/x");
+        assert_eq!(expand_home("~other/x"), "~other/x");
     }
 
     #[tokio::test]
