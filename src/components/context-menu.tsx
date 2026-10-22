@@ -276,6 +276,8 @@ export function getFileContextMenuItems(options: {
   /** Direct pane-to-pane transfers (dual-pane workflows). */
   onCopyToOtherPane?: () => void;
   onMoveToOtherPane?: () => void;
+  /** Copy the selection into several folders at once. */
+  onCopyToMany?: () => void;
   onPaste: () => void;
   onDelete: () => void;
   onRename: () => void;
@@ -523,6 +525,14 @@ export function getFileContextMenuItems(options: {
         icon: <Copy className="h-3.5 w-3.5" />,
         shortcut: "F5",
         action: options.onCopyToOtherPane,
+      });
+    }
+    if (options.onCopyToMany) {
+      items.push({
+        id: "copy-to-many",
+        label: "Copy to Several Folders…",
+        icon: <Copy className="h-3.5 w-3.5" />,
+        action: options.onCopyToMany,
       });
     }
     if (options.onMoveToOtherPane) {

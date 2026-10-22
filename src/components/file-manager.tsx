@@ -73,6 +73,8 @@ import { useLedgerTailPoll } from "@/hooks/use-ledger-tail-poll";
 import { AiPanel } from "./ai-panel";
 import { AutomationPanel } from "./automation-panel";
 import { AutomationRuleEditor } from "./automation-rule-editor";
+import { CopyToManyDialog } from "./copy-to-many-dialog";
+import { openCopyToMany } from "@/stores/copy-to-many-store";
 import { VaultPanel } from "./vault-panel";
 import { TransferPanel } from "./transfer-panel";
 import {
@@ -2590,6 +2592,7 @@ export function FileManager() {
             ships with just the file canvas + sidebar instead of four hidden panels. */}
         {automationPanelOpen && <AutomationPanel />}
         <AutomationRuleEditor />
+        <CopyToManyDialog />
         {activityTimelineOpen && (
           <ActivityTimelinePanel onDispatchPath={handleDispatchLedgerPath} />
         )}
@@ -4391,6 +4394,7 @@ function FilePane({
         onCut: handleCut,
         onPaste: handlePaste,
         onCopyToOtherPane: handleCopyToOtherPane,
+        onCopyToMany: () => openCopyToMany(selectedPaths, currentPath, otherPanePath()),
         onMoveToOtherPane: handleMoveToOtherPane,
         onDelete: handleDelete,
         onDeletePermanently: () => handleDeletePermanently(selectedPaths.length > 0 ? selectedPaths : [entry.path]),

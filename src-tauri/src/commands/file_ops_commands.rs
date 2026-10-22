@@ -214,6 +214,46 @@ pub async fn copy_files(
     with_fs_failure_record(&ledger, "copy", &source_paths, outcome).await
 }
 
+/// Outcome of copying a selection into one of several destinations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DestinationOutcome {
+    pub dest_dir: String,
+    pub result: Option<FileOpResult>,
+    pub error: Option<String>,
+}
+
+/// Copy the same selection into several folders. Each destination is its
+/// own ledger operation (own undo); one failing does not stop the others.
+#[tauri::command]
+pub async fn copy_files_to_many(
+    source_paths: Vec<String>,
+    dest_dirs: Vec<String>,
+    ledger: tauri::State<'_, OperationLedger>,
+) -> Result<Vec<DestinationOutcome>, AppError> {
+    copy_files_to_many_impl(source_paths, dest_dirs, &ledger).await
+}
+
+pub async fn copy_files_to_many_impl(
+    source_paths: Vec<String>,
+    dest_dirs: Vec<String>,
+    ledger: &OperationLedger,
+) -> Result<Vec<DestinationOutcome>, AppError> {
+    if dest_dirs.is_empty() {
+        return Err(AppError::validation("Choose at least one destination folder."));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for dest_dir in dest_dirs.into_iter().filter(|d| seen.insert(d.clone())) {
+        let outcome = copy_files_impl(source_paths.clone(), dest_dir.clone(), ledger).await;
+        let outcome = with_fs_failure_record(ledger, "copy", &source_paths, outcome).await;
+        out.push(match outcome {
+            Ok(r) => DestinationOutcome { dest_dir, result: Some(r), error: None },
+            Err(e) => DestinationOutcome { dest_dir, result: None, error: Some(e.user_message()) },
+        });
+    }
+    Ok(out)
+}
+
 /// What a selection would actually touch on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AffectedFiles {
@@ -1955,6 +1995,32 @@ mod tests {
         assert!(result.success);
         assert!(src.exists());
         assert!(dest_dir.join("source.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn copy_to_many_continues_past_a_bad_destination() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, "x").unwrap();
+        let (d1, d2) = (dir.path().join("d1"), dir.path().join("d2"));
+        fs::create_dir(&d1).unwrap();
+        fs::create_dir(&d2).unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+        let l = test_ledger();
+        let out = copy_files_to_many_impl(
+            vec![s(&src)],
+            vec![s(&d1), s(&dir.path().join("missing")), s(&d2), s(&d1)],
+            &l,
+        )
+        .await
+        .unwrap();
+        // Duplicates collapse; the missing folder fails alone.
+        assert_eq!(out.len(), 3);
+        assert!(out[0].result.is_some() && out[2].result.is_some());
+        assert!(out[1].error.as_deref().unwrap().contains("does not exist"));
+        assert!(d1.join("a.txt").exists() && d2.join("a.txt").exists());
+        assert_ne!(out[0].result.as_ref().unwrap().undo_id, out[2].result.as_ref().unwrap().undo_id);
+        assert!(copy_files_to_many_impl(vec![s(&src)], vec![], &l).await.is_err());
     }
 
     #[tokio::test]

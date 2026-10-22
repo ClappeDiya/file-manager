@@ -809,6 +809,7 @@ pub fn run() {
             master_password_commands::master_decrypt_credential,
             // File operations
             file_ops_commands::copy_files,
+            file_ops_commands::copy_files_to_many,
             file_ops_commands::move_files,
             file_ops_commands::rename_file,
             file_ops_commands::duplicate_files,
