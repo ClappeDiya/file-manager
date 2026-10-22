@@ -4,6 +4,7 @@ use crate::output;
 use crate::OutputFormat;
 use serde::Serialize;
 use std::path::Path;
+use ufop_core::naming::{plan_rename, RenameSpec};
 
 #[derive(Debug, Clone, Serialize)]
 struct RenamePreview {
@@ -57,136 +58,28 @@ pub async fn execute(
         return Ok(0);
     }
 
-    // Generate previews
-    let mut previews: Vec<RenamePreview> = Vec::new();
-    let mut counter = start;
-
-    for file in &files {
-        let filename = file
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let stem = file
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let ext = file
-            .extension()
-            .map(|e| e.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let parent_name = file
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let date_str = file
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .map(|t| {
-                let dt: chrono::DateTime<chrono::Utc> = t.into();
-                dt.format("%Y%m%d").to_string()
-            })
-            .unwrap_or_else(|| "unknown".into());
-
-        let mut new_name = filename.clone();
-        let mut warnings: Vec<String> = Vec::new();
-
-        // Apply pattern with token substitution
-        if let Some(ref pat) = pattern {
-            let counter_str = if pad > 0 {
-                format!("{:0>width$}", counter, width = pad)
-            } else {
-                counter.to_string()
-            };
-
-            new_name = pat
-                .replace("{name}", &stem)
-                .replace("{ext}", &ext)
-                .replace("{num}", &counter_str)
-                .replace("{date}", &date_str)
-                .replace("{parent}", &parent_name)
-                .replace("{counter}", &counter_str);
-
-            // Add extension if pattern doesn't include it and original had one
-            if !new_name.contains('.') && !ext.is_empty() {
-                new_name = format!("{new_name}.{ext}");
-            }
+    // Plan with the shared pipeline (same as the desktop batch rename).
+    let spec = RenameSpec {
+        pattern,
+        find,
+        replace,
+        use_regex,
+        case_transform: case,
+        counter_start: start as u64,
+        counter_step: step as u64,
+        counter_pad: pad,
+    };
+    let plan = match plan_rename(&files, &spec) {
+        Ok(p) => p,
+        Err(e) => {
+            output::print_error(format, &e.to_string());
+            return Ok(2);
         }
-
-        // Apply find/replace
-        if let (Some(ref find_str), Some(ref replace_str)) = (&find, &replace) {
-            if use_regex {
-                match regex::Regex::new(find_str) {
-                    Ok(re) => {
-                        new_name = re.replace_all(&new_name, replace_str.as_str()).to_string();
-                    }
-                    Err(e) => {
-                        output::print_error(format, &format!("Invalid regex: {e}"));
-                        return Ok(2);
-                    }
-                }
-            } else {
-                new_name = new_name.replace(find_str.as_str(), replace_str.as_str());
-            }
-        } else if let Some(ref find_str) = find {
-            // Find without replace = delete matches
-            if use_regex {
-                match regex::Regex::new(find_str) {
-                    Ok(re) => {
-                        new_name = re.replace_all(&new_name, "").to_string();
-                    }
-                    Err(e) => {
-                        output::print_error(format, &format!("Invalid regex: {e}"));
-                        return Ok(2);
-                    }
-                }
-            } else {
-                new_name = new_name.replace(find_str.as_str(), "");
-            }
-        }
-
-        // Apply case transformation
-        if let Some(ref case_type) = case {
-            new_name = match case_type.to_lowercase().as_str() {
-                "upper" => new_name.to_uppercase(),
-                "lower" => new_name.to_lowercase(),
-                "title" => title_case(&new_name),
-                "sentence" => sentence_case(&new_name),
-                _ => {
-                    output::print_error(
-                        format,
-                        &format!("Unknown case type '{case_type}'. Use: upper, lower, title, sentence"),
-                    );
-                    return Ok(2);
-                }
-            };
-        }
-
-        // Check for compatibility issues (basic checks)
-        let invalid_chars = ['<', '>', ':', '"', '|', '?', '*'];
-        for ch in &invalid_chars {
-            if new_name.contains(*ch) {
-                warnings.push(format!("Contains '{ch}' which is invalid on Windows"));
-            }
-        }
-
-        if new_name.is_empty() {
-            warnings.push("Resulting filename would be empty!".into());
-        }
-
-        previews.push(RenamePreview {
-            original: filename,
-            renamed: new_name,
-            warnings,
-        });
-
-        counter += step;
-    }
+    };
+    let previews: Vec<RenamePreview> = plan
+        .iter()
+        .map(|e| RenamePreview { original: e.original_name.clone(), renamed: e.new_name.clone(), warnings: e.warnings.clone() })
+        .collect();
 
     let report = RenameReport {
         total_files: files.len(),
@@ -222,38 +115,20 @@ pub async fn execute(
         _ => output::print_data(format, &report),
     }
 
-    // Apply renames unless dry-run
+    // Apply renames unless dry-run: refuses collisions with other entries or
+    // existing files, and renames in two phases so chains and swaps work.
     if !dry_run && report.renamed > 0 {
-        let mut success_count = 0;
-        let mut fail_count = 0;
-
-        for (i, preview) in report.previews.iter().enumerate() {
-            if preview.original == preview.renamed {
-                continue;
-            }
-
-            let old_path = &files[i];
-            let new_path = old_path.parent().unwrap_or(Path::new(".")).join(&preview.renamed);
-
-            match std::fs::rename(old_path, &new_path) {
-                Ok(()) => success_count += 1,
-                Err(e) => {
-                    fail_count += 1;
-                    output::print_error(format, &format!("Failed to rename '{}': {e}", preview.original));
+        match ufop_core::naming::rename::apply(&plan) {
+            Ok(outcome) => {
+                if let OutputFormat::Human = format {
+                    println!();
+                    output::print_success(format, &format!("{} file(s) renamed", outcome.renamed.len()));
                 }
             }
-        }
-
-        if let OutputFormat::Human = format {
-            println!();
-            output::print_success(
-                format,
-                &format!("{success_count} file(s) renamed, {fail_count} failed"),
-            );
-        }
-
-        if fail_count > 0 {
-            return Ok(1); // Partial failure
+            Err(reason) => {
+                output::print_error(format, &format!("Nothing was renamed: {reason}"));
+                return Ok(1);
+            }
         }
     } else if dry_run {
         if let OutputFormat::Human = format {
@@ -262,33 +137,4 @@ pub async fn execute(
     }
 
     Ok(0)
-}
-
-fn title_case(s: &str) -> String {
-    s.split_whitespace()
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => {
-                    let upper: String = first.to_uppercase().collect();
-                    let rest: String = chars.collect::<String>().to_lowercase();
-                    format!("{upper}{rest}")
-                }
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn sentence_case(s: &str) -> String {
-    let lower = s.to_lowercase();
-    let mut chars = lower.chars();
-    match chars.next() {
-        Some(first) => {
-            let upper: String = first.to_uppercase().collect();
-            format!("{upper}{}", chars.collect::<String>())
-        }
-        None => String::new(),
-    }
 }

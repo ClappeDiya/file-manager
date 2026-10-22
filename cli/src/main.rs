@@ -173,7 +173,7 @@ pub enum Commands {
     Rename {
         /// Files or directory to rename
         path: String,
-        /// Pattern with tokens: {name}, {ext}, {num}, {date}, {parent}, {counter}
+        /// Pattern with tokens: {name} {ext} {num:3} {date} {yyyy} {mm} {dd} {parent} {size} {modified:%Y-%m}; filters {name|lower} {name|slug}
         #[arg(long)]
         pattern: Option<String>,
         /// Find string (literal or regex)

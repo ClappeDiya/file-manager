@@ -8,6 +8,10 @@ pub mod backup;
 #[cfg(feature = "agent")]
 pub mod agent;
 pub mod error;
+pub mod naming;
+pub mod policy;
 pub mod preload;
+pub mod retry;
+pub mod stability;
 pub mod sync;
 pub mod sync_types;

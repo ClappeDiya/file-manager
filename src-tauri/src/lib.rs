@@ -823,6 +823,7 @@ pub fn run() {
             batch_rename_commands::batch_rename_preview,
             batch_rename_commands::batch_rename_apply,
             batch_rename_commands::batch_rename_undo,
+            batch_rename_commands::naming_preview,
             // Preview Engine (T-061)
             preview_commands::preview_file,
             preview_commands::preview_get_exif,

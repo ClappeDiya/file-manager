@@ -238,32 +238,8 @@ impl Backend for LocalBackend {
     }
 }
 
-/// Retry policy for backend operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RetryPolicy {
-    pub retries: u32,
-    pub delay_ms: u64,
-    pub exponential: bool,
-    pub max_delay_ms: u64,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self { retries: 5, delay_ms: 10_000, exponential: true, max_delay_ms: 300_000 }
-    }
-}
-
-impl RetryPolicy {
-    pub fn delay_for(&self, attempt: u32) -> Duration {
-        let ms = if self.exponential {
-            self.delay_ms.saturating_mul(1u64 << attempt.min(20))
-        } else {
-            self.delay_ms
-        };
-        Duration::from_millis(ms.min(self.max_delay_ms))
-    }
-}
+/// Retry policy for backend operations (the crate-wide policy).
+pub use crate::retry::RetryPolicy;
 
 /// Bandwidth limits in bytes/second (0 = unlimited).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,19 +262,10 @@ impl<B: Backend> RetryingBackend<B> {
     }
 
     fn retry<T>(&self, what: &str, mut f: impl FnMut() -> Result<T, AppError>) -> Result<T, AppError> {
-        let mut attempt = 0;
-        loop {
-            match f() {
-                Ok(v) => return Ok(v),
-                Err(e) if attempt < self.policy.retries && is_retryable(&e) => {
-                    let d = self.policy.delay_for(attempt);
-                    tracing::warn!("backup backend {what} failed (attempt {}), retrying in {:?}: {e}", attempt + 1, d);
-                    std::thread::sleep(d);
-                    attempt += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        crate::retry::retry_blocking(&self.policy, |_| f(), is_retryable, |attempt, e, d| {
+            tracing::warn!("backup backend {what} failed (attempt {}), retrying in {:?}: {e}", attempt + 1, d);
+        })
+        .result
     }
 
     fn pace(bps: u64, bytes: usize, started: Instant) {
