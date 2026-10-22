@@ -25,6 +25,7 @@ import { z } from 'zod';
 import Link from 'next/link';
 import { ComingSoon } from '@/components/ui/coming-soon';
 import { ScimProvisioning } from '@/components/users/scim-provisioning';
+import { CsvImportDialog } from '@/components/users/csv-import-dialog';
 import { isEnabled } from '@/lib/features';
 
 const inviteSchema = z.object({
@@ -48,6 +49,7 @@ export default function UsersPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [importCsv, setImportCsv] = useState<string | null>(null);
   const _currentUser = useAuthStore((s) => s.user);
   const notify = useToastStore((s) => s.notify);
 
@@ -171,32 +173,20 @@ export default function UsersPage() {
 
   const handleCSVImport = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const text = event.target?.result as string;
-      const lines = text.split('\n').slice(1); // skip header
-      const imported: AdminUser[] = lines
-        .filter(line => line.trim())
-        .map((line, i) => {
-          const [email, name, role] = line.split(',').map(s => s.trim());
-          return {
-            id: `usr_import_${Date.now()}_${i}`,
-            email: email || '',
-            name: name || email?.split('@')[0] || '',
-            role: (role as Role) || 'user',
-            permissions: [],
-            organizationId: 'org_001',
-            createdAt: new Date().toISOString(),
-            isActive: true,
-          };
-        });
-      setUsers([...users, ...imported]);
-    };
-    reader.readAsText(file);
     e.target.value = '';
+    if (!file) return;
+    // Parsed and checked on the server (preview first, then invitations).
+    void file.text().then(setImportCsv);
   };
+
+  const reloadUsers = () =>
+    fetch('/api/users')
+      .then((res) => res.json())
+      .then((data) => {
+        setUsers(data.users || []);
+        setInvitations(data.invitations || []);
+      })
+      .catch(() => undefined);
 
   const handleCSVExport = () => {
     const header = 'Email,Name,Role,Status,Created At,Last Login';
@@ -461,6 +451,8 @@ export default function UsersPage() {
           </div>
         </TabContent>
       </Tabs>
+
+      <CsvImportDialog csv={importCsv} onClose={() => setImportCsv(null)} onImported={() => void reloadUsers()} />
 
       {/* Invite Dialog */}
       <Dialog

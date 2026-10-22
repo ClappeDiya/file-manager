@@ -12,7 +12,7 @@ export const FEATURES = {
   /** SCIM 2.0 user and group provisioning (/api/scim/v2). */
   scim: true,
   /** Server-side CSV user import. */
-  csvUserImport: false,
+  csvUserImport: true,
   /** Audit-log forwarding to a SIEM. */
   siemForwarding: false,
   /** Subscription and payment management. */
