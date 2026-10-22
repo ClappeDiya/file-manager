@@ -14,6 +14,8 @@ struct HostState {
     jobs: BTreeMap<String, Value>,
     rpc_calls: Vec<(String, Value)>,
     runs: Vec<String>,
+    /// Size of the diagnostics bundle the host builds (`None`: unsupported).
+    diag_size: Option<usize>,
 }
 
 #[derive(Clone, Default)]
@@ -101,6 +103,14 @@ impl AgentHost for FakeHost {
     fn managed_policies(&self) -> BoxFuture<'_, Vec<String>> {
         Box::pin(async move { self.st().jobs.keys().filter_map(|k| policy_of_job(k).map(String::from)).collect() })
     }
+    fn diagnostics(&self) -> BoxFuture<'_, Result<DiagnosticsUpload, AppError>> {
+        Box::pin(async move {
+            match self.st().diag_size {
+                Some(n) => Ok(DiagnosticsUpload { file_name: "diag.zip".into(), summary: json!({ "os": "linux" }), bytes: vec![b'P'; n] }),
+                None => Err(AppError::state("Diagnostics are not available on this client", "")),
+            }
+        })
+    }
 }
 
 /// A small stateful console: one org, tokens, a command queue, policies.
@@ -116,6 +126,7 @@ struct Console {
     applied: Value,
     claim_polls: u32,
     rotations: u32,
+    diagnostics: Vec<Value>,
 }
 
 fn console() -> (MockConsole, Arc<Mutex<Console>>) {
@@ -158,6 +169,10 @@ fn console() -> (MockConsole, Arc<Mutex<Console>>) {
             "/api/agent/report" => {
                 c.reports.push(r.body.clone());
                 (201, json!({ "id": "rpt_1" }))
+            }
+            "/api/agent/diagnostics" => {
+                c.diagnostics.push(r.body.clone());
+                (201, json!({ "id": format!("dgn_{}", c.diagnostics.len()) }))
             }
             "/api/agent/rotate" => {
                 c.rotations += 1;
@@ -287,6 +302,38 @@ async fn rotate_command_completes_with_new_token() {
     assert_eq!(host.st().token.as_deref(), Some("ufop_agent_rotated1"));
     a.cycle().await.unwrap();
     assert_eq!(m.hits("/api/agent/heartbeat").last().unwrap().bearer(), Some("ufop_agent_rotated1"));
+}
+
+#[tokio::test]
+async fn diagnostics_upload_on_demand_and_by_command() {
+    let (m, c) = console();
+    let host = FakeHost::default();
+    let a = agent(&host).await;
+    assert!(a.send_diagnostics().await.unwrap_err().user_message().contains("not registered"));
+    a.register(&m.url, "ufop_reg_good", vec![]).await.unwrap();
+
+    // Hosts without a builder fail the command instead of crashing the cycle.
+    c.lock().unwrap().commands = vec![json!({ "id": "cmd_d0", "kind": "collect_diagnostics", "payload": {} })];
+    a.cycle().await.unwrap();
+    assert_eq!(c.lock().unwrap().completed[0]["body"]["ok"], false);
+
+    host.st().diag_size = Some(4);
+    assert_eq!(a.send_diagnostics().await.unwrap(), "dgn_1");
+    let sent = c.lock().unwrap().diagnostics[0].clone();
+    assert_eq!(sent["fileName"], "diag.zip");
+    assert_eq!(sent["bundleBase64"], "UFBQUA==");
+    assert_eq!(sent["summary"]["os"], "linux");
+
+    c.lock().unwrap().commands = vec![json!({ "id": "cmd_d1", "kind": "collect_diagnostics", "payload": {} })];
+    a.cycle().await.unwrap();
+    let done = c.lock().unwrap().completed.last().cloned().unwrap();
+    assert_eq!(done["body"]["ok"], true);
+    assert_eq!(done["body"]["result"]["diagnosticsId"], "dgn_2");
+
+    // Oversized bundles are refused locally, never uploaded.
+    host.st().diag_size = Some(MAX_DIAGNOSTICS_BYTES + 1);
+    assert!(a.send_diagnostics().await.is_err());
+    assert_eq!(c.lock().unwrap().diagnostics.len(), 2);
 }
 
 fn report(i: u64) -> RunReport {

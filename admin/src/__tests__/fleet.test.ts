@@ -33,6 +33,9 @@ import * as claim from '@/app/api/agent/claim/route';
 import * as claimPoll from '@/app/api/agent/claim/poll/route';
 import * as heartbeat from '@/app/api/agent/heartbeat/route';
 import * as agentReport from '@/app/api/agent/report/route';
+import * as agentDiagnostics from '@/app/api/agent/diagnostics/route';
+import * as machineDiagnostics from '@/app/api/fleet/machines/[id]/diagnostics/route';
+import { KEEP_PER_MACHINE, MAX_DIAGNOSTICS_BYTES } from '@/lib/db/repos/diagnostics';
 import * as rotate from '@/app/api/agent/rotate/route';
 import * as unregister from '@/app/api/agent/unregister/route';
 import * as agentCommand from '@/app/api/agent/commands/[id]/route';
@@ -458,5 +461,56 @@ describe('audit trail of fleet actions', () => {
     const types = listAudit({}).entries.map((e) => e.eventType);
     expect(types).toEqual(expect.arrayContaining(['fleet.link_create', 'fleet.preload_download', 'machine.register', 'machine.update', 'fleet.tag_color', 'machine.token_rotate', 'machine.claim', 'fleet.link_revoke']));
     expect(verifyAudit()).toMatchObject({ ok: true });
+  });
+
+  it('stores diagnostics bundles from agents, on demand and by command', async () => {
+    const admin = makeUser('diag-admin@x.org', 'org_admin');
+    const viewer = makeUser('diag-auditor@x.org', 'read_only_auditor');
+    const owner = makeUser('diag-user@x.org', 'user');
+    const m = await enroll(admin, 'diag-box');
+    const zip = Buffer.concat([Buffer.from('PK\x03\x04'), Buffer.alloc(32, 1)]);
+    const upload = async (token: string, body: unknown) => agentDiagnostics.POST(await req('POST', '/api/agent/diagnostics', { body, headers: bearer(token) }));
+
+    expect((await upload('ufop_agent_nope', { bundleBase64: zip.toString('base64') })).status).toBe(401);
+    expect((await upload(m.token, {})).status).toBe(400);
+    expect((await upload(m.token, { bundleBase64: Buffer.from('not a zip').toString('base64') })).status).toBe(422);
+    expect((await upload(m.token, { bundleBase64: Buffer.alloc(MAX_DIAGNOSTICS_BYTES + 10, 0x50).toString('base64') })).status).toBe(413);
+    const ok = await json<{ id: string }>(await upload(m.token, { fileName: '../../evil name.zip', summary: { appVersion: '1.2.3', os: 'linux' }, bundleBase64: zip.toString('base64') }));
+    expect(ok.status).toBe(201);
+
+    const list = await json<{ diagnostics: { id: string; fileName: string; size: number; summary: Record<string, unknown> }[] }>(
+      await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics`, { as: viewer }), P(m.id)),
+    );
+    expect(list.body.diagnostics).toHaveLength(1);
+    expect(list.body.diagnostics[0]).toMatchObject({ id: ok.body.id, fileName: '.._.._evil_name.zip', size: zip.length, summary: { appVersion: '1.2.3' } });
+
+    const dl = await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics?download=${ok.body.id}`, { as: viewer }), P(m.id));
+    expect(dl.status).toBe(200);
+    expect(dl.headers.get('content-type')).toBe('application/zip');
+    expect(Buffer.from(await dl.arrayBuffer()).equals(zip)).toBe(true);
+    expect(listAudit({}).entries.some((e) => e.eventType === 'fleet.diagnostics_download')).toBe(true);
+
+    // Admins request a bundle through the command queue.
+    expect((await commands.POST(await req('POST', `/api/fleet/machines/${m.id}/commands`, { as: admin, body: { kind: 'collect_diagnostics' } }), P(m.id))).status).toBe(201);
+    const cmds = (await json<{ commands: { kind: string }[] }>(await hb(m.token))).body.commands;
+    expect(cmds.map((c) => c.kind)).toEqual(['collect_diagnostics']);
+
+    // Only the newest bundles are kept.
+    for (let i = 0; i < KEEP_PER_MACHINE + 2; i++) await upload(m.token, { fileName: `d${i}.zip`, bundleBase64: zip.toString('base64') });
+    const after = (await json<{ diagnostics: { fileName: string }[] }>(await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics`, { as: admin }), P(m.id)))).body.diagnostics;
+    expect(after).toHaveLength(KEEP_PER_MACHINE);
+    expect(after[0].fileName).toBe(`d${KEEP_PER_MACHINE + 1}.zip`);
+
+    // Deleting needs fleet.write.
+    expect((await machineDiagnostics.DELETE(await req('DELETE', `/api/fleet/machines/${m.id}/diagnostics?id=x`, { as: viewer }), P(m.id))).status).toBe(403);
+    const first = (await json<{ diagnostics: { id: string }[] }>(await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics`, { as: admin }), P(m.id)))).body.diagnostics[0].id;
+    expect((await machineDiagnostics.DELETE(await req('DELETE', `/api/fleet/machines/${m.id}/diagnostics?id=${first}`, { as: admin }), P(m.id))).status).toBe(200);
+    expect((await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics?download=${first}`, { as: admin }), P(m.id))).status).toBe(404);
+
+    // Machine owners without a grant and other organizations see nothing.
+    expect((await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics`, { as: owner }), P(m.id))).status).toBe(404);
+    const other = createOrg({ name: 'Diag Other' });
+    const outsider = makeUser('diag-out@y.org', 'org_admin', other.id);
+    expect((await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics`, { as: outsider }), P(m.id))).status).toBe(404);
   });
 });

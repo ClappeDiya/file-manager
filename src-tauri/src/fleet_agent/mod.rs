@@ -23,7 +23,7 @@ use crate::security::CredentialStore;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use ufop_core::agent::policy::{self, managed_job_id, policy_of_job};
-use ufop_core::agent::{Agent, AgentConfig, AgentHost, BoxFuture, ClientInfo, FleetPolicy, JobSummary, ReportStats, RunReport};
+use ufop_core::agent::{Agent, AgentConfig, AgentHost, BoxFuture, ClientInfo, DiagnosticsUpload, FleetPolicy, JobSummary, ReportStats, RunReport};
 
 pub const CONFIG_KEY: &str = "fleet_agent.config";
 pub const TOKEN_KEY: &str = "fleet-agent-token";
@@ -283,6 +283,16 @@ impl AgentHost for BackupHost {
 
     fn managed_policies(&self) -> BoxFuture<'_, Vec<String>> {
         Box::pin(async move { self.mgr.list_jobs().await.iter().filter_map(|j| policy_of_job(&j.id).map(String::from)).collect() })
+    }
+
+    fn diagnostics(&self) -> BoxFuture<'_, Result<DiagnosticsUpload, AppError>> {
+        let kind = self.agent_kind;
+        Box::pin(async move {
+            let (b, summary) = tokio::task::spawn_blocking(move || crate::diagnostics::collect(kind))
+                .await
+                .map_err(|e| AppError::internal(format!("Diagnostics task failed: {e}")))??;
+            Ok(DiagnosticsUpload { file_name: b.file_name, summary, bytes: b.bytes })
+        })
     }
 }
 

@@ -15,7 +15,7 @@ sqlite = ["dep:rusqlite"]
 backup = ["sqlite", "dep:windows", "dep:aes-gcm", "dep:argon2", "dep:flate2", "dep:rand", "dep:hex", "dep:zip", "dep:base64"]
 # Fleet agent: client side of the admin console's `/api/agent/*` protocol
 # (registration, claiming, heartbeats, commands, policies, reports).
-agent = ["dep:reqwest", "dep:tokio"]
+agent = ["dep:reqwest", "dep:tokio", "dep:base64"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

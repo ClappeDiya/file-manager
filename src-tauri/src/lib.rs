@@ -11,6 +11,8 @@ pub mod governance;
 pub mod ledger;
 pub mod lineage;
 pub mod metadata_engine;
+pub mod logging;
+pub mod diagnostics;
 pub mod net;
 pub mod search_engine;
 pub mod thumbnail_engine;
@@ -356,12 +358,9 @@ async fn persist_on_shutdown(repo: &Repository, transfer_mgr: &TransferManager) 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let log_dir = logging::log_dir();
+    logging::init(&log_dir);
+    logging::Retention::load(&log_dir).apply(&log_dir);
 
     tracing::info!("Starting Unified File Operations Platform");
 
@@ -1015,6 +1014,10 @@ pub fn run() {
             editor_commands::list_watched_files,
             // Log Controls & Structured Export
             log_commands::get_log_level,
+            log_commands::get_log_retention,
+            log_commands::set_log_retention,
+            log_commands::diagnostics_create,
+            log_commands::diagnostics_send,
             log_commands::set_log_level,
             log_commands::get_log_directory,
             log_commands::export_logs_json,

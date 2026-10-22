@@ -153,6 +153,11 @@ pub trait AgentHost: Send + Sync + 'static {
     fn remove_policy(&self, policy_id: String) -> BoxFuture<'_, Result<(), AppError>>;
     /// Policy ids that have a managed job here.
     fn managed_policies(&self) -> BoxFuture<'_, Vec<String>>;
+    /// Build a diagnostics bundle (logs, versions, OS; no secrets). Hosts
+    /// without one keep the default.
+    fn diagnostics(&self) -> BoxFuture<'_, Result<DiagnosticsUpload, AppError>> {
+        Box::pin(async { Err(AppError::state("Diagnostics are not available on this client", "Collect logs on the machine instead.")) })
+    }
 }
 
 struct PendingClaim {
@@ -487,12 +492,28 @@ impl<H: AgentHost> Agent<H> {
                 _ => Err(AppError::validation("run_backup needs a jobId")),
             },
             "apply_policies" => self.sync_policies(client, token).await.and_then(|s| Ok(serde_json::to_value(s)?)),
+            "collect_diagnostics" => self.upload_diagnostics(client, token).await.map(|id| json!({ "diagnosticsId": id })),
             other => Err(AppError::validation(format!("Unknown command kind '{other}'"))),
         };
         match r {
             Ok(v) => (true, v),
             Err(e) => (false, err_json(&e)),
         }
+    }
+
+    async fn upload_diagnostics(&self, client: &AgentClient, token: &str) -> Result<String, AppError> {
+        let d = self.host.diagnostics().await?;
+        if d.bytes.len() > MAX_DIAGNOSTICS_BYTES {
+            return Err(AppError::validation(format!("The diagnostics bundle is {} bytes; the limit is {MAX_DIAGNOSTICS_BYTES}", d.bytes.len())));
+        }
+        Ok(client.diagnostics(token, &d).await?)
+    }
+
+    /// Build a diagnostics bundle and send it to the console ("Send diagnostics").
+    pub async fn send_diagnostics(&self) -> Result<String, AppError> {
+        let c = self.config();
+        let t = self.token().filter(|_| c.is_registered()).ok_or_else(|| AppError::state("This machine is not registered", "Register it with a console first."))?;
+        self.upload_diagnostics(&self.client(&c.console_url)?, &t).await
     }
 
     async fn sync_policies(&self, client: &AgentClient, token: &str) -> Result<PolicySync, AppError> {

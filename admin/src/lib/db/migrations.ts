@@ -321,6 +321,22 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 8,
+    description: 'Diagnostics bundles uploaded by machines',
+    up(d) {
+      d.exec(`
+        CREATE TABLE machine_diagnostics (
+          id TEXT PRIMARY KEY,
+          org_id TEXT NOT NULL,
+          machine_id TEXT NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+          file_name TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+          summary TEXT NOT NULL DEFAULT '{}', data BLOB NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE INDEX machine_diagnostics_machine ON machine_diagnostics(machine_id, created_at);
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

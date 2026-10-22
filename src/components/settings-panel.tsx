@@ -21,6 +21,7 @@ import { GpgKeysSection } from "@/components/gpg-keys-section";
 import { SharingPolicySection } from "@/components/sharing-policy-section";
 import { ProxySection } from "@/components/proxy-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
+import { DiagnosticsSection } from "@/components/diagnostics-section";
 
 // ── Types ──
 
@@ -1326,6 +1327,7 @@ export default function SettingsPanel({
         {/* Log Controls */}
         <Section title="Logging">
           <LogControlsSection />
+          <DiagnosticsSection />
         </Section>
 
         {/* Management console agent */}

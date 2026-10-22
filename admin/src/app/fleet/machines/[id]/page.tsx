@@ -11,6 +11,7 @@ import { Select } from '@/components/ui/select';
 import { Tabs, TabContent } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { ConnectivityBadge, ErrorBanner, Loading, StatusBadge, TagChip } from '@/components/fleet/badges';
+import { DiagnosticsCard } from '@/components/fleet/diagnostics-card';
 import { useApi } from '@/lib/use-api';
 import { api, errorText } from '@/lib/api-client';
 import { useAuthStore } from '@/lib/stores/auth-store';
@@ -219,6 +220,7 @@ export default function MachineDetailPage({ params }: { params: Promise<{ id: st
           { id: 'reports', label: 'Reports', count: data.reports.length },
           { id: 'alerts', label: 'Alerts', count: data.alerts.filter((a) => !a.resolvedAt).length },
           { id: 'policies', label: 'Policies', count: data.policies.length },
+          { id: 'diagnostics', label: 'Diagnostics' },
           ...(check('remote.execute') ? [{ id: 'remote', label: 'Remote session' }] : []),
         ]}
       />
@@ -366,6 +368,9 @@ export default function MachineDetailPage({ params }: { params: Promise<{ id: st
             </div>
           )}
         </Card>
+      </TabContent>
+      <TabContent tabId="diagnostics" activeTab={tab}>
+        <DiagnosticsCard machineId={m.id} canRequest={canRemote} canDelete={canWrite} heartbeatSeconds={m.heartbeatSeconds} />
       </TabContent>
       <TabContent tabId="remote" activeTab={tab}>
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
