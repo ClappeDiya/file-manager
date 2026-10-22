@@ -16,7 +16,7 @@ beforeEach(() => {
 
 describe("parsing", () => {
   it("handles quotes, escaped quotes, embedded newlines, CRLF and BOM", () => {
-    const text = '﻿name,note\r\n"Smith, J","said ""hi""\nthen left"\r\nb,\n';
+    const text = '\uFEFFname,note\r\n"Smith, J","said ""hi""\nthen left"\r\nb,\n';
     expect(parseDelimited(text, ",")).toEqual([["name", "note"], ["Smith, J", 'said "hi"\nthen left'], ["b", ""]]);
   });
 

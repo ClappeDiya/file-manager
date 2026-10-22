@@ -314,6 +314,8 @@ fn start_background_engines(app: tauri::AppHandle) {
     }));
 
     tauri::async_runtime::spawn(async move {
+        // Rules first, so no watcher or scheduled job runs unchecked.
+        commands::policy_commands::activate_stored(&app.state::<Repository>()).await;
         let automation = app.state::<AutomationManager>();
         if let Err(e) = automation.start_all_watchers().await {
             tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
@@ -814,6 +816,9 @@ pub fn run() {
             commands::editor_draft_commands::editor_draft_load,
             commands::editor_draft_commands::editor_draft_discard,
             commands::editor_draft_commands::editor_draft_list,
+            commands::policy_commands::filename_policies_list,
+            commands::policy_commands::filename_policies_save,
+            commands::policy_commands::filename_policy_check,
             file_ops_commands::move_files,
             file_ops_commands::rename_file,
             file_ops_commands::duplicate_files,

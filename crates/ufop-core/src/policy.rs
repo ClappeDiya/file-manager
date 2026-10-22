@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// One rule, applying to `scope` and (unless `recursive` is false) below it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -206,6 +207,78 @@ impl PolicySet {
     }
 }
 
+// ── The rules in force for this process ──
+
+fn active_cell() -> &'static RwLock<Arc<PolicySet>> {
+    static ACTIVE: OnceLock<RwLock<Arc<PolicySet>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| RwLock::new(Arc::new(PolicySet::default())))
+}
+
+/// Replace the rules every engine checks (file operations, sync, transfers,
+/// automation). Called at startup and whenever the user saves rules.
+pub fn set_active(set: PolicySet) {
+    *active_cell().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(set);
+}
+
+/// The rules in force (empty unless [`set_active`] was called).
+pub fn active() -> Arc<PolicySet> {
+    active_cell().read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Most files examined when checking a folder copy; beyond it the copy is
+/// checked by name of the top-level items only.
+pub const MAX_CHECKED_FILES: usize = 100_000;
+
+/// Where the files of `source` would land when copied/moved into
+/// `dest_dir` (a folder contributes every file below it).
+pub fn copy_targets(source: &Path, dest_dir: &Path) -> Vec<PathBuf> {
+    let Some(name) = source.file_name() else { return Vec::new() };
+    let top = dest_dir.join(name);
+    if !source.is_dir() {
+        return vec![top];
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![(source.to_path_buf(), top.clone())];
+    while let Some((dir, target)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            if out.len() >= MAX_CHECKED_FILES {
+                return vec![top];
+            }
+            let to = target.join(e.file_name());
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push((e.path(), to)),
+                Ok(_) => out.push(to),
+                Err(_) => {}
+            }
+        }
+    }
+    out
+}
+
+/// Violations of the active rules for copying/moving `sources` into `dest_dir`.
+pub fn check_copy<P: AsRef<Path>>(sources: &[P], dest_dir: &Path) -> Vec<PolicyViolation> {
+    check_copy_with(&active(), sources, dest_dir)
+}
+
+/// [`check_copy`] against an explicit rule set.
+pub fn check_copy_with<P: AsRef<Path>>(set: &PolicySet, sources: &[P], dest_dir: &Path) -> Vec<PolicyViolation> {
+    if set.is_empty() {
+        return Vec::new();
+    }
+    let targets: Vec<PathBuf> = sources.iter().flat_map(|s| copy_targets(s.as_ref(), dest_dir)).collect();
+    set.check_all(&targets)
+}
+
+/// One-line summary of violations for an error message.
+pub fn describe(violations: &[PolicyViolation]) -> String {
+    let mut s = violations.iter().take(3).map(|v| v.to_string()).collect::<Vec<_>>().join("; ");
+    if violations.len() > 3 {
+        s.push_str(&format!("; and {} more", violations.len() - 3));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +354,36 @@ mod tests {
     fn rules_round_trip_with_defaults() {
         let r: FilenameRule = serde_json::from_str(r#"{"id":"x","blocked_extensions":["exe"]}"#).unwrap();
         assert!(r.blocked_extensions == vec!["exe"] && r.enabled && r.recursive && r.inherit, "missing fields take the defaults");
+    }
+
+    #[test]
+    fn copy_targets_and_active_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pack");
+        std::fs::create_dir_all(src.join("bin")).unwrap();
+        std::fs::write(src.join("readme.txt"), "x").unwrap();
+        std::fs::write(src.join("bin/tool.exe"), "x").unwrap();
+        let dest = dir.path().join("out");
+        let mut t = copy_targets(&src, &dest);
+        t.sort();
+        assert_eq!(t, vec![dest.join("pack/bin/tool.exe"), dest.join("pack/readme.txt")]);
+        assert_eq!(copy_targets(&src.join("readme.txt"), &dest), vec![dest.join("readme.txt")]);
+
+        assert!(check_copy_with(&PolicySet::default(), &[&src], &dest).is_empty(), "no rules, nothing blocked");
+        let set = PolicySet::new(vec![FilenameRule { blocked_extensions: vec!["exe".into()], ..rule("no-exe", "") }]).unwrap();
+        let v = check_copy_with(&set, &[&src], &dest);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].path.ends_with("tool.exe"));
+        assert!(describe(&v).contains("NO-EXE"));
+    }
+
+    #[test]
+    fn active_set_is_swappable() {
+        // Other tests run in parallel against the active set: use an
+        // extension nothing else writes.
+        set_active(PolicySet::new(vec![FilenameRule { blocked_extensions: vec!["zz-active-test".into()], ..rule("t", "") }]).unwrap());
+        assert!(active().check(Path::new("/x/a.zz-active-test")).is_err());
+        set_active(PolicySet::default());
+        assert!(active().is_empty());
     }
 }

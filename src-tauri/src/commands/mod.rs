@@ -12,6 +12,7 @@ pub mod custom_commands;
 pub mod drive_commands;
 pub mod editor_commands;
 pub mod editor_draft_commands;
+pub mod policy_commands;
 pub mod encryption_commands;
 pub mod file_ops_commands;
 pub mod fleet_agent_commands;

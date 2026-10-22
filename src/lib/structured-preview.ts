@@ -32,7 +32,7 @@ export function parseDelimited(text: string, delimiter: string, maxRows = Infini
   let field = "";
   let quoted = false;
   let i = 0;
-  const src = text.replace(/^﻿/, "");
+  const src = text.replace(/^\uFEFF/, "");
   const endRow = () => {
     row.push(field);
     field = "";

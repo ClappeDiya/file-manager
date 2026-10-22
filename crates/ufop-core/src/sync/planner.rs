@@ -427,6 +427,7 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
         .map(|f| (f.relative_path.as_str(), f))
         .collect();
     let settle = pair.run_options.settle_secs;
+    let policy = crate::policy::active();
 
     let mut additions = Vec::new();
     let mut modifications = Vec::new();
@@ -461,6 +462,10 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
         }
         if still_changing(src, settle, now) {
             skipped.push(skip_entry(rel_path, src, "Still changing (modified moments ago); the next run copies it"));
+            continue;
+        }
+        if let Err(v) = policy.check(&dest_root.join(rel_path)) {
+            skipped.push(skip_entry(rel_path, src, &format!("Blocked by filename policy: {}", v.reason)));
             continue;
         }
 
@@ -614,6 +619,7 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
                     && matches_filter(rel_path, dest.size, &pair.filter)
                     && option_exclusion(dest, opts, now).is_none()
                     && !still_changing(dest, settle, now)
+                    && policy.check(&source_root.join(rel_path)).is_ok()
                 {
                     additions.push(SyncDiffEntry {
                         relative_path: rel_path.to_string(),

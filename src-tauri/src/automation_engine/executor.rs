@@ -339,6 +339,15 @@ fn validate_rename_name(name: &str) -> Result<(), String> {
 /// write to (the same path to replace it, a new one to keep both), `None`
 /// to skip.
 fn resolve_target(source: &Path, target: PathBuf, policy: ConflictPolicy) -> Result<Option<PathBuf>, String> {
+    // Filename policy first: a blocked name is refused whatever the overwrite choice.
+    let violations = if source.is_dir() {
+        ufop_core::policy::check_copy(&[source], target.parent().unwrap_or(Path::new("")))
+    } else {
+        ufop_core::policy::active().check(&target).err().into_iter().collect()
+    };
+    if !violations.is_empty() {
+        return Err(format!("Blocked by filename policy: {}", ufop_core::policy::describe(&violations)));
+    }
     if !target.exists() {
         return Ok(Some(target));
     }
@@ -826,6 +835,25 @@ fn apply_rename_pattern(filename: &str, pattern: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn filename_policy_refuses_blocked_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("payload.zz-auto-policy");
+        std::fs::write(&src, "x").unwrap();
+        // Unique extension: the active set is process-wide.
+        ufop_core::policy::set_active(
+            ufop_core::policy::PolicySet::new(vec![ufop_core::policy::FilenameRule {
+                blocked_extensions: vec!["zz-auto-policy".into()],
+                ..ufop_core::policy::FilenameRule::new("t", "")
+            }])
+            .unwrap(),
+        );
+        let out = super::place(&src, &dir.path().join("out"), crate::core::types::ConflictPolicy::Rename, false);
+        ufop_core::policy::set_active(ufop_core::policy::PolicySet::default());
+        assert!(out.unwrap_err().starts_with("Blocked by filename policy"));
+        assert!(!dir.path().join("out/payload.zz-auto-policy").exists());
+    }
+
     #[test]
     fn only_cross_device_errors_fall_back_to_copy() {
         use super::is_cross_device;

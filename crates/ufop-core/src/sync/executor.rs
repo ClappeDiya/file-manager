@@ -1366,6 +1366,29 @@ mod tests {
     }
 
     #[test]
+    fn filename_policy_blocks_files_in_sync() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("ok.txt"), "a").unwrap();
+        fs::write(src.path().join("bad.zz-sync-policy"), "b").unwrap();
+        // Unique extension: the active set is process-wide.
+        crate::policy::set_active(
+            crate::policy::PolicySet::new(vec![crate::policy::FilenameRule {
+                blocked_extensions: vec!["zz-sync-policy".into()],
+                ..crate::policy::FilenameRule::new("t", "")
+            }])
+            .unwrap(),
+        );
+        let pair = make_test_pair(src.path(), dst.path());
+        let preview = planner::compute_preview(&pair).unwrap();
+        let report = run_with(pair);
+        crate::policy::set_active(crate::policy::PolicySet::default());
+        assert!(preview.skipped.iter().any(|e| e.relative_path == "bad.zz-sync-policy" && e.reason.starts_with("Blocked by filename policy")));
+        assert_eq!(report.files_added, 1);
+        assert!(!dst.path().join("bad.zz-sync-policy").exists());
+    }
+
+    #[test]
     fn run_options_validation() {
         use crate::sync_types::SyncRunOptions;
         let ok = SyncRunOptions { settle_secs: 5, completion_marker: Some("_DONE".into()), version_template: Some("{name}.{now:%Y}.{ext}".into()) };

@@ -427,6 +427,7 @@ pub async fn copy_files_impl(
             "Check that the destination folder exists.",
         ));
     }
+    super::policy_commands::enforce_copy(&source_paths, &dest_dir)?;
 
     let mut dest_paths = Vec::new();
     let mut copied_sources = Vec::new();
@@ -550,6 +551,7 @@ pub async fn move_files_impl(
         ));
     }
 
+    super::policy_commands::enforce_copy(&source_paths, &dest_dir)?;
     // Measure first: once moved, the sources are gone from their old paths.
     let affected_files = measure_paths(&source_paths);
     let mut dest_paths = Vec::new();
@@ -627,6 +629,9 @@ pub async fn rename_file_impl(
             format!("A file named '{new_name}' already exists"),
             "Choose a different name.",
         ));
+    }
+    if !src.is_dir() {
+        super::policy_commands::enforce_path(&target)?;
     }
 
     std::fs::rename(src, &target).map_err(|e| {
@@ -928,6 +933,7 @@ pub async fn create_file_impl(
         ));
     }
 
+    super::policy_commands::enforce_path(p)?;
     // Ensure parent directory exists
     if let Some(parent) = p.parent() {
         if !parent.exists() {
@@ -1995,6 +2001,34 @@ mod tests {
         assert!(result.success);
         assert!(src.exists());
         assert!(dest_dir.join("source.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn filename_policy_blocks_copy_move_rename_and_create() {
+        use ufop_core::policy::{set_active, FilenameRule, PolicySet};
+        let dir = tempdir().unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+        let folder = dir.path().join("pkg");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("inner.zz-fileops"), "x").unwrap();
+        let ok = dir.path().join("ok.txt");
+        fs::write(&ok, "x").unwrap();
+        let dest = dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        // Unique extension: the active set is process-wide.
+        set_active(PolicySet::new(vec![FilenameRule { blocked_extensions: vec!["zz-fileops".into()], ..FilenameRule::new("t", "") }]).unwrap());
+        let l = test_ledger();
+        let copy = copy_files_impl(vec![s(&folder)], s(&dest), &l).await;
+        let mv = move_files_impl(vec![s(&folder)], s(&dest), &l).await;
+        let ren = rename_file_impl(s(&ok), "ok.zz-fileops".into(), &l).await;
+        let create = create_file_impl(s(&dest.join("new.zz-fileops")), &l).await;
+        let allowed = copy_files_impl(vec![s(&ok)], s(&dest), &l).await;
+        set_active(PolicySet::default());
+        for r in [copy.map(|_| ()), mv.map(|_| ()), ren.map(|_| ()), create.map(|_| ())] {
+            assert!(r.unwrap_err().to_string().contains("Blocked by filename policy"));
+        }
+        assert!(allowed.is_ok());
+        assert!(!dest.join("pkg").exists() && folder.exists() && ok.exists());
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ import { useAiStore } from "@/stores/ai-store";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
 import { SecurityAuditSection } from "@/components/security-audit-section";
 import { TrustedSshHostsSection } from "@/components/trusted-ssh-hosts-section";
+import { FilenamePoliciesSection } from "@/components/filename-policies-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
 
 // ── Types ──
@@ -1331,6 +1332,11 @@ export default function SettingsPanel({
         {/* Tamper-evident security audit log */}
         <Section title="Security Audit Log">
           <SecurityAuditSection />
+        </Section>
+
+        {/* Which names may be written where (enforced by the engines) */}
+        <Section title="Filename Policies">
+          <FilenamePoliciesSection />
         </Section>
 
         {/* Persisted host keys (trust on first use) */}
