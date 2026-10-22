@@ -7,6 +7,7 @@ pub mod connection;
 pub mod copy;
 pub mod duplicates;
 pub mod login;
+pub mod profile;
 pub mod rename;
 pub mod server;
 pub mod status;

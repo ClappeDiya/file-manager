@@ -22,12 +22,14 @@ cargo build --release
 
 | Flag | Description |
 |------|-------------|
-| `--format <FORMAT>` | Output format: `human` (default), `json`, `yaml` |
+| `--format <FORMAT>` | Output format: `human`, `json`, `yaml`, `csv` (default: the profile's `default_format`, else `human`) |
 | `--json` | Shorthand for `--format json` |
 | `--yaml` | Shorthand for `--format yaml` |
+| `--csv` | Shorthand for `--format csv` |
+| `--profile <NAME>` | Named profile to use for this run (or set `UFOP_PROFILE`); see `ufop profile` |
 | `--dry-run` | Show what would happen without executing |
 | `--limit <RATE>` | Bandwidth limit (e.g., `1M`, `500K`, `2G`) |
-| `--api-url <URL>` | API server URL (or set `UFOP_API_URL` env var) |
+| `--api-url <URL>` | API server URL for this run (or set `UFOP_API_URL`); not saved unless a command changes it |
 | `-v`, `-vv`, `-vvv` | Verbosity level (info, debug, trace) |
 
 ### Exit Codes
@@ -39,6 +41,27 @@ cargo build --release
 | 2 | Full failure |
 | 3 | Authentication error |
 | 4 | Policy violation |
+
+### CSV output
+
+`--csv` writes RFC 4180 records (CRLF line ends) to stdout; status messages go to stderr, so `ufop … --csv > out.csv` is pure data. Lists become one row per item (columns in first-seen order), a single result one row, and nested values compact JSON. Cells a spreadsheet would treat as a formula (starting `=`, `+`, `-`, `@`, other than numbers) are prefixed with `'`. In `--json` mode `ufop transfer` also streams progress events, one JSON object per line; YAML and CSV print only the result.
+
+### Configuration and profiles
+
+Settings live in `~/.config/ufop/config.toml` (owner-only; `UFOP_CONFIG` overrides the path). Named profiles keep separate API servers, tokens, `ufop server` sign-ins and default output formats; saved connections are shared.
+
+```bash
+ufop profile create staging --api https://staging.example.com --default-format json
+ufop --profile staging login --token <TOKEN>      # signs in to that profile only
+ufop --profile lab server login --url http://lab:8200 --password …
+ufop profile use staging                           # default for later runs
+ufop profile list                                  # `*` marks the active profile
+ufop profile show                                  # tokens are masked
+ufop --profile default status                      # the top-level settings
+ufop profile remove staging                        # not while it is in use
+```
+
+The active profile is `--profile` / `UFOP_PROFILE`, else the one chosen with `ufop profile use`, else `default`. A `--profile` that does not exist is an error, except for `login` and `server login`, which create it. `ufop profile create --from <name>` copies another profile, tokens included.
 
 ---
 

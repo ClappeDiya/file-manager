@@ -138,13 +138,15 @@ pub async fn execute(
             }
         }
         _ => {
-            // JSON/YAML mode: emit progress events
+            // Structured modes: JSON also streams progress events (one per line);
+            // YAML and CSV print only the result so stdout stays one document.
             if is_local_src && !is_remote_dest {
                 let transferred = local_transfer_with_events(
                     Path::new(&src),
                     Path::new(&dest),
                     overwrite,
                     total_bytes,
+                    matches!(format, OutputFormat::Json),
                 )?;
 
                 let elapsed = start_time.elapsed();
@@ -285,6 +287,7 @@ fn local_transfer_with_events(
     dest: &Path,
     overwrite: bool,
     total_bytes: u64,
+    events: bool,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let dest_path = if dest.is_dir() && src.is_file() {
         dest.join(src.file_name().unwrap_or_default())
@@ -335,7 +338,9 @@ fn local_transfer_with_events(
                 eta_seconds: remaining,
                 current_file: Some(src.display().to_string()),
             };
-            event.emit();
+            if events {
+                event.emit();
+            }
         }
 
         Ok(transferred)

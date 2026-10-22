@@ -19,9 +19,13 @@ use std::process::ExitCode;
 #[derive(Parser, Debug)]
 #[command(name = "ufop", version, about, long_about = None)]
 pub struct Cli {
-    /// Output format
-    #[arg(long, global = true, default_value = "human")]
-    format: OutputFormat,
+    /// Output format (default: the profile's `default_format`, else human)
+    #[arg(long, global = true)]
+    format: Option<OutputFormat>,
+
+    /// Named profile (API server, tokens, format) from the config file
+    #[arg(long, global = true, env = "UFOP_PROFILE")]
+    profile: Option<String>,
 
     /// Output as JSON (shorthand for --format json)
     #[arg(long, global = true, conflicts_with = "yaml")]
@@ -30,6 +34,10 @@ pub struct Cli {
     /// Output as YAML (shorthand for --format yaml)
     #[arg(long, global = true, conflicts_with = "json")]
     yaml: bool,
+
+    /// Output as CSV (shorthand for --format csv)
+    #[arg(long, global = true, conflicts_with_all = ["json", "yaml"])]
+    csv: bool,
 
     /// Dry run - show what would happen without executing
     #[arg(long, global = true)]
@@ -68,6 +76,8 @@ pub enum OutputFormat {
     Human,
     Json,
     Yaml,
+    /// Comma-separated values (RFC 4180) on stdout; messages go to stderr.
+    Csv,
 }
 
 #[derive(Subcommand, Debug)]
@@ -205,6 +215,10 @@ pub enum Commands {
 
     /// Show server/platform status
     Status,
+
+    /// Manage named profiles (servers, tokens, output format)
+    #[command(subcommand)]
+    Profile(commands::profile::ProfileCommands),
 }
 
 #[derive(Subcommand, Debug)]
@@ -314,8 +328,12 @@ impl Cli {
             OutputFormat::Json
         } else if self.yaml {
             OutputFormat::Yaml
+        } else if self.csv {
+            OutputFormat::Csv
+        } else if let Some(f) = &self.format {
+            f.clone()
         } else {
-            self.format.clone()
+            config::CliConfig::load().default_format.as_deref().and_then(|f| commands::profile::parse_format(f).ok()).unwrap_or(OutputFormat::Human)
         }
     }
 
@@ -421,7 +439,16 @@ async fn main() -> ExitCode {
     }
 
     tracing::info!(target: "ufop", "ufop {} started", redact_args(std::env::args().skip(1)).join(" "));
+    config::select(cli.profile.clone(), cli.api_url.clone());
     let format = cli.effective_format();
+    // A named profile must exist, except where the command creates it (sign-in) or manages profiles.
+    if let Some(p) = cli.profile.as_deref().filter(|p| !p.is_empty()) {
+        let creates = matches!(cli.command, Commands::Login { .. } | Commands::Profile(_) | Commands::Server(commands::server::ServerCommands::Login { .. }));
+        if !config::valid_profile_name(p) || (!creates && !config::CliConfig::load_raw(&config::CliConfig::path()).has_profile(p)) {
+            output::print_error(&format, &format!("no profile named '{p}' (see `ufop profile list`)"));
+            return ExitCode::from(2);
+        }
+    }
     let dry_run = cli.dry_run;
     let rate_limit = cli.rate_limit_bps();
 
@@ -478,6 +505,9 @@ async fn main() -> ExitCode {
         }
         Commands::Status => {
             commands::status::execute(&format).await
+        }
+        Commands::Profile(cmd) => {
+            commands::profile::execute(cmd, &format).await
         }
     };
 
