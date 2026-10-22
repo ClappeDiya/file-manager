@@ -14,7 +14,11 @@ export interface OrgSummary {
 }
 
 /** Outcome of the password step: signed in, or a second factor is needed. */
-export type LoginOutcome = { ok: true; redirect: string } | { ok: false; mfaChallengeId: string; redirect: string } | { ok: false; error: string };
+export type LoginOutcome =
+  | { ok: true; redirect: string }
+  | { ok: false; mfaChallengeId: string; redirect: string }
+  | { ok: false; passwordChangeToken: string }
+  | { ok: false; error: string };
 
 interface AuthState {
   user: AdminUser | null;
@@ -63,6 +67,10 @@ export const useAuthStore = create<AuthState>()(
             body: JSON.stringify({ email, password, redirect }),
           });
           const data = await response.json();
+          if (!response.ok && data.code === 'password_expired' && data.changeToken) {
+            set({ isLoading: false });
+            return { ok: false, passwordChangeToken: data.changeToken as string };
+          }
           if (!response.ok) throw new Error(data.error || 'Login failed');
           set({ isLoading: false });
           if (data.mfaRequired) return { ok: false, mfaChallengeId: data.challengeId, redirect: data.redirect ?? '/' };

@@ -6,6 +6,7 @@ import { acceptInvitation, findByToken } from '@/lib/db/repos/invitations';
 import { getOrg, OrgError } from '@/lib/db/repos/orgs';
 import { appendAudit } from '@/lib/db/repos/audit';
 import { enrollLimiter } from '@/lib/rate-limit';
+import { checkPassword } from '@/lib/password-policy';
 
 /** GET /api/invitations/accept?token= — what the invitation is for (public). */
 export async function GET(request: NextRequest) {
@@ -27,8 +28,10 @@ export async function POST(request: NextRequest) {
     if (session && isContext(session)) {
       result = acceptInvitation(b.token, { existing: session.user });
     } else {
-      if (!b.password || b.password.length < 12) return NextResponse.json({ error: 'Choose a password of at least 12 characters' }, { status: 400 });
-      result = acceptInvitation(b.token, { name: b.name?.trim() || '', passwordHash: await hash(b.password, 12) });
+      const inv = findByToken(b.token);
+      const check = checkPassword(b.password ?? '', { email: inv?.email, name: b.name });
+      if (!check.ok) return NextResponse.json({ error: check.problems[0], problems: check.problems }, { status: 400 });
+      result = acceptInvitation(b.token, { name: b.name?.trim() || '', passwordHash: await hash(b.password!, 12) });
     }
     appendAudit({ eventType: 'admin.invite_accept', orgId: result.invitation.orgId, userId: result.user.id, userEmail: result.user.email, ipAddress: ip, description: `${result.user.email} joined as ${result.invitation.role}`, metadata: { invitationId: result.invitation.id } });
     return finishSignIn(result.user, { ip, userAgent: request.headers.get('user-agent') ?? '', method: 'pwd' });

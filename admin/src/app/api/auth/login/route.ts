@@ -7,6 +7,7 @@ import { createUser, findUserByEmail, listUsers } from '@/lib/db/repos/users';
 import { setMembership } from '@/lib/db/repos/orgs';
 import { appendAudit } from '@/lib/db/repos/audit';
 import { loginLimiter } from '@/lib/rate-limit';
+import { createPasswordToken, passwordExpired } from '@/lib/db/repos/security';
 
 /** Seed ADMIN_EMAIL / ADMIN_PASSWORD as the owner of the default organization on an empty database. */
 async function ensureBootstrapAdmin() {
@@ -44,6 +45,11 @@ export async function POST(request: NextRequest) {
   if (!user || !user.passwordHash) return fail('unknown account or no password');
   if (!(await compare(password, user.passwordHash))) return fail('wrong password');
   if (!user.isActive) return fail('account deactivated', 403, 'Account is deactivated');
+  if (passwordExpired(user)) {
+    // The password was right but is too old: a short-lived token to choose a new one.
+    appendAudit({ eventType: 'auth.password_expired', orgId: user.organizationId, userId: user.id, userEmail: user.email, ipAddress: ip, description: 'Sign-in needs a new password (expired)' });
+    return NextResponse.json({ error: 'Your password has expired. Choose a new one.', code: 'password_expired', changeToken: createPasswordToken(user.id, 'expired') }, { status: 403 });
+  }
 
   const redirect = typeof body?.redirect === 'string' && body.redirect.startsWith('/') && !body.redirect.startsWith('//') ? body.redirect : '/';
   return finishSignIn(user, { ip, userAgent: request.headers.get('user-agent') ?? '', method: 'pwd', redirect });

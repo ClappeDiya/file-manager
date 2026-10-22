@@ -39,6 +39,7 @@
     "organizations": "Organizations",
     "groups": "Groups",
     "sso": "Single sign-on",
+    "security": "Security",
     "account": "My account"
   },
   "shell": {

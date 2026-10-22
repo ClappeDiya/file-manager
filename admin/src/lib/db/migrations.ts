@@ -455,6 +455,24 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 16,
+    description: 'Organization security settings, password age and reset tokens',
+    up(d) {
+      d.exec(`
+        CREATE TABLE org_security (
+          org_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+          settings TEXT NOT NULL DEFAULT '{}', updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+        );
+        ALTER TABLE users ADD COLUMN password_changed_at TEXT;
+        UPDATE users SET password_changed_at = created_at WHERE password_hash IS NOT NULL;
+        CREATE TABLE password_resets (
+          token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          purpose TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT
+        );
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

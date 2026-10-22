@@ -15,6 +15,7 @@ import { useAuthStore } from '@/lib/stores/auth-store';
 import { useToastStore } from '@/lib/stores/toast-store';
 import { ROLE_LABELS } from '@/lib/types/auth';
 import { formatRelativeTime } from '@/lib/utils/format';
+import { ChangePassword } from '@/components/auth/change-password';
 
 interface Identities {
   hasPassword: boolean;
@@ -89,6 +90,7 @@ function AccountView() {
       <PageHeader title="My account" description={user ? `${user.name} · ${user.email}${organization ? ` · ${ROLE_LABELS[user.role]} in ${organization.name}` : ''}` : ''} />
       <ErrorBanner message={err ?? mfa.error ?? ids.error} />
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+        {ids.data?.hasPassword && user && <ChangePassword email={user.email} name={user.name} />}
         <Card>
           <CardHeader className="flex-col items-start gap-1">
             <CardTitle>

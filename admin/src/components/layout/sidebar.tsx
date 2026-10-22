@@ -26,7 +26,7 @@ import {
   Sparkles,
   Building2,
   UsersRound,
-  Fingerprint, SlidersHorizontal, Webhook } from 'lucide-react';
+  Fingerprint, SlidersHorizontal, Webhook, ShieldCheck } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 import { useAdminStore } from '@/lib/stores/admin-store';
 import { useAuthStore } from '@/lib/stores/auth-store';
@@ -68,6 +68,7 @@ const navItems: NavItem[] = [
   { id: 'ai-governance', i18nKey: 'nav.aiGovernance', href: '/ai-governance', icon: Brain, requiredPermission: 'ai_governance.read' },
   { id: 'billing', i18nKey: 'nav.billing', href: '/billing', icon: CreditCard, requiredPermission: 'billing.read' },
   { id: 'sso', i18nKey: 'nav.sso', href: '/settings/sso', icon: Fingerprint, requiredPermission: 'sso.configure' },
+  { id: 'security', i18nKey: 'nav.security', href: '/settings/security', icon: ShieldCheck, requiredPermission: 'users.read' },
 ];
 
 export function Sidebar() {

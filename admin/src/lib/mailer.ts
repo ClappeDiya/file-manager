@@ -155,9 +155,34 @@ export async function sendOutboxNow(orgId: string, id: string): Promise<Delivery
   return d;
 }
 
+/** The e-mail channel used for account mail (invitations, password resets) in any of `orgIds`. */
+function accountMailChannel(orgIds: string[]): Channel | undefined {
+  for (const orgId of orgIds) {
+    const ch = listChannels(orgId).find((c) => c.kind === 'email' && c.enabled && (c.config as EmailConfig).useForInvitations);
+    if (ch) return ch;
+  }
+  return undefined;
+}
+
+/** Send a password-reset link through an account-mail channel of one of the user's organizations. */
+export async function sendPasswordResetEmail(orgIds: string[], to: string, link: string): Promise<{ sent: boolean; error?: string }> {
+  const ch = accountMailChannel(orgIds);
+  if (!ch) return { sent: false };
+  const d = await sendQueued(
+    ch,
+    {
+      to: [to],
+      subject: 'Reset your UFOP console password',
+      text: `Someone asked to reset the password of ${to} for the UFOP backup console.\n\nOpen this link within an hour to choose a new password:\n${link}\n\nIf this was not you, ignore this email; your password stays the same.`,
+    },
+    'password_reset',
+  );
+  return { sent: d.ok, error: d.error };
+}
+
 /** Email an invitation through the organization's email channel marked for invitations. */
 export async function sendInvitationEmail(orgId: string, to: string, link: string, inviter: string): Promise<{ sent: boolean; error?: string }> {
-  const ch = listChannels(orgId).find((c) => c.kind === 'email' && c.enabled && (c.config as EmailConfig).useForInvitations);
+  const ch = accountMailChannel([orgId]);
   if (!ch) return { sent: false };
   const d = await sendQueued(
     ch,

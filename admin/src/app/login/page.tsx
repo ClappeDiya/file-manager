@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import React, { Suspense, useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { KeyRound } from 'lucide-react';
@@ -60,6 +61,7 @@ function LoginForm() {
     const r = await login(email, password, redirect);
     if (r.ok) router.replace(safeRedirect(r.redirect));
     else if ('mfaChallengeId' in r) setChallengeId(r.mfaChallengeId);
+    else if ('passwordChangeToken' in r) router.replace(`/reset-password?token=${encodeURIComponent(r.passwordChangeToken)}&redirect=${encodeURIComponent(redirect)}`);
   };
 
   const submitCode = async (e: React.FormEvent) => {
@@ -119,6 +121,9 @@ function LoginForm() {
                 <Button type="submit" className="w-full" loading={isLoading}>
                   Sign in
                 </Button>
+                <Link href="/reset-password" className="block text-center text-xs text-primary hover:underline">
+                  Forgot your password?
+                </Link>
               </form>
             </CardContent>
             {sso.length > 0 && (

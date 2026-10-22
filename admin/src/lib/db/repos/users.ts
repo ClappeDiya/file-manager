@@ -9,6 +9,7 @@ export interface UserRecord extends AdminUser {
   totpPendingCiphertext: string | null;
   recoveryCodes: string[];
   lastTotpStep: number | null;
+  passwordChangedAt: string | null;
 }
 
 function fromRow(r: Row): UserRecord {
@@ -29,6 +30,7 @@ function fromRow(r: Row): UserRecord {
     totpPendingCiphertext: (r.totp_pending_ciphertext as string) ?? null,
     recoveryCodes: parseJson<string[]>(r.recovery_codes, []),
     lastTotpStep: (r.last_totp_step as number) ?? null,
+    passwordChangedAt: (r.password_changed_at as string) ?? null,
   };
 }
 
@@ -68,8 +70,8 @@ export function createUser(u: NewUser): UserRecord {
   const id = newId('usr');
   const email = u.email.trim().toLowerCase();
   db()
-    .prepare(`INSERT INTO users (id, email, name, role, password_hash, permissions, organization_id, created_at, is_active, sso_provider) VALUES (?, ?, ?, ?, ?, '[]', ?, ?, 1, ?)`)
-    .run(id, email, u.name?.trim() || email.split('@')[0], u.role, u.passwordHash ?? null, u.organizationId, now(), u.ssoProvider ?? null);
+    .prepare(`INSERT INTO users (id, email, name, role, password_hash, permissions, organization_id, created_at, is_active, sso_provider, password_changed_at) VALUES (?, ?, ?, ?, ?, '[]', ?, ?, 1, ?, ?)`)
+    .run(id, email, u.name?.trim() || email.split('@')[0], u.role, u.passwordHash ?? null, u.organizationId, now(), u.ssoProvider ?? null, u.passwordHash ? now() : null);
   return getUser(id)!;
 }
 
@@ -86,6 +88,7 @@ export interface UserUpdate {
   totpPendingCiphertext?: string | null;
   recoveryCodes?: string[];
   lastTotpStep?: number | null;
+  passwordChangedAt?: string | null;
 }
 
 const COLUMNS: Record<keyof UserUpdate, string> = {
@@ -101,6 +104,7 @@ const COLUMNS: Record<keyof UserUpdate, string> = {
   totpPendingCiphertext: 'totp_pending_ciphertext',
   recoveryCodes: 'recovery_codes',
   lastTotpStep: 'last_totp_step',
+  passwordChangedAt: 'password_changed_at',
 };
 
 export function updateUser(id: string, u: UserUpdate): boolean {
