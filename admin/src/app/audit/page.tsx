@@ -23,6 +23,7 @@ import {
 import { formatDateTime, formatRelativeTime } from '@/lib/utils/format';
 import type { AuditVerification } from '@/lib/db/repos/audit';
 import { SiemDialog } from '@/components/audit/siem-dialog';
+import { ApiRequestsLog } from '@/components/audit/api-requests';
 
 export default function AuditPage() {
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
@@ -174,6 +175,7 @@ export default function AuditPage() {
         tabs={[
           { id: 'explorer', label: 'Audit Explorer', count: auditEntries.length },
           { id: 'categories', label: 'Event Categories' },
+          { id: 'api', label: 'API requests' },
         ]}
         activeTab={activeTab}
         onTabChange={setActiveTab}
@@ -282,6 +284,10 @@ export default function AuditPage() {
               </TableBody>
             </Table>
           </Card>
+        </TabContent>
+
+        <TabContent tabId="api" activeTab={activeTab}>
+          {activeTab === 'api' && <ApiRequestsLog />}
         </TabContent>
 
         <TabContent tabId="categories" activeTab={activeTab}>

@@ -15,6 +15,7 @@ import { api, errorText } from '@/lib/api-client';
 import { ROLE_LABELS, type Role } from '@/lib/types/auth';
 import type { OidcConfig, SamlConfig, SsoKind, SsoProvider } from '@/lib/db/repos/sso';
 import type { Group } from '@/lib/db/repos/groups';
+import { SsoDiagnostics } from '@/components/users/sso-diagnostics';
 
 type Row = SsoProvider & { callbackUrl: string; metadataUrl: string | null };
 
@@ -56,6 +57,7 @@ export default function SsoSettingsPage() {
   const groups = useApi<{ groups: Group[] }>('/api/groups');
   const [draft, setDraft] = useState<Draft | null>(null);
   const [formErr, setFormErr] = useState<string | null>(null);
+  const [diagnose, setDiagnose] = useState<SsoProvider | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const gs = groups.data?.groups ?? [];
 
@@ -150,6 +152,9 @@ export default function SsoSettingsPage() {
                   )}
                 </div>
                 <div className="flex shrink-0 gap-2">
+                  <Button size="sm" variant="outline" onClick={() => setDiagnose(p)}>
+                    Diagnostics
+                  </Button>
                   <Button size="sm" variant="outline" onClick={() => edit(p)}>
                     Edit
                   </Button>
@@ -238,6 +243,7 @@ export default function SsoSettingsPage() {
           <Button onClick={() => void save()}>Save</Button>
         </DialogFooter>
       </Dialog>
+      <SsoDiagnostics provider={diagnose} onClose={() => setDiagnose(null)} />
     </div>
   );
 }

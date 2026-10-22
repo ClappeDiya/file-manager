@@ -250,3 +250,57 @@ export const samlRequestCache = {
     return (r?.value as string) ?? null;
   },
 };
+
+// ── Sign-in diagnostics ──
+
+/** One step of an SSO sign-in, with what the provider sent (no tokens or signatures). */
+export interface SsoStep {
+  step: string;
+  ok: boolean;
+  detail?: Record<string, unknown>;
+}
+
+export interface SsoAttempt {
+  id: string;
+  providerId: string;
+  orgId: string;
+  kind: SsoKind;
+  at: string;
+  ok: boolean;
+  /** The step that failed, or `done`. */
+  stage: string;
+  error: string | null;
+  steps: SsoStep[];
+  email: string;
+  userId: string | null;
+  ip: string;
+}
+
+/** Attempts kept per provider. */
+export const KEEP_ATTEMPTS = 200;
+
+export function recordSsoAttempt(p: Pick<SsoProvider, 'id' | 'orgId' | 'kind'>, a: { ok: boolean; stage: string; error: string | null; steps: SsoStep[]; email: string; userId: string | null; ip: string }): void {
+  db()
+    .prepare('INSERT INTO sso_attempts (id, provider_id, org_id, kind, at, ok, stage, error, steps, email, user_id, ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(newId('ssa'), p.id, p.orgId, p.kind, now(), a.ok ? 1 : 0, a.stage, a.error, JSON.stringify(a.steps), a.email, a.userId, a.ip);
+  db()
+    .prepare('DELETE FROM sso_attempts WHERE provider_id = ? AND id NOT IN (SELECT id FROM sso_attempts WHERE provider_id = ? ORDER BY at DESC, rowid DESC LIMIT ?)')
+    .run(p.id, p.id, KEEP_ATTEMPTS);
+}
+
+export function listSsoAttempts(orgId: string, providerId: string, limit = 50): SsoAttempt[] {
+  return (db().prepare('SELECT * FROM sso_attempts WHERE org_id = ? AND provider_id = ? ORDER BY at DESC, rowid DESC LIMIT ?').all(orgId, providerId, Math.min(limit, KEEP_ATTEMPTS)) as Row[]).map((r) => ({
+    id: r.id as string,
+    providerId: r.provider_id as string,
+    orgId: r.org_id as string,
+    kind: r.kind as SsoKind,
+    at: r.at as string,
+    ok: !!r.ok,
+    stage: r.stage as string,
+    error: (r.error as string) ?? null,
+    steps: parseJson<SsoStep[]>(r.steps, []),
+    email: r.email as string,
+    userId: (r.user_id as string) ?? null,
+    ip: r.ip as string,
+  }));
+}

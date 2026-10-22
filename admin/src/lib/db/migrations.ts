@@ -600,6 +600,27 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 26,
+    description: 'API request log and SSO sign-in diagnostics',
+    up(d) {
+      d.exec(`
+        CREATE TABLE api_requests (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL DEFAULT '', at TEXT NOT NULL,
+          method TEXT NOT NULL, path TEXT NOT NULL, status INTEGER NOT NULL, outcome TEXT NOT NULL DEFAULT '',
+          auth TEXT NOT NULL, token_id TEXT, user_id TEXT, user_email TEXT NOT NULL DEFAULT '',
+          ip TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX idx_api_requests_org ON api_requests(org_id, at);
+        CREATE TABLE sso_attempts (
+          id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, org_id TEXT NOT NULL, kind TEXT NOT NULL,
+          at TEXT NOT NULL, ok INTEGER NOT NULL, stage TEXT NOT NULL, error TEXT,
+          steps TEXT NOT NULL DEFAULT '[]', email TEXT NOT NULL DEFAULT '', user_id TEXT, ip TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX idx_sso_attempts_provider ON sso_attempts(provider_id, at);
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

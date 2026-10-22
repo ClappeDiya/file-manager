@@ -13,6 +13,7 @@ import { startDelivery } from './delivery';
 import { startSiemForwarding } from './siem';
 import { retireInactive } from './retirement';
 import { expireMemberships, purgeRemovedMembers } from './offboarding';
+import { pruneApiRequests } from './db/repos/api-log';
 
 let started = false;
 
@@ -22,6 +23,7 @@ export async function runJobsOnce(at = new Date()): Promise<{ missed: number; pu
   for (const id of purged) appendAudit({ eventType: 'org.purge', severity: 'critical', description: `Deleted offboarded organization ${id} and its data`, resourceType: 'organization', resourceId: id });
   expireMemberships(at);
   purgeRemovedMembers(at);
+  pruneApiRequests(at);
   const r = retireInactive(at);
   const retired = r.members.length + r.tokens.length;
   const last = listAnchors()[0];

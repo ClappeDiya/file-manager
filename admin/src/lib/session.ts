@@ -18,7 +18,8 @@ import { getSecurity, needsSecondFactorSetup, sessionIdleMinutes } from './db/re
 import { clientIp, ipAllowed } from './netacl';
 import { createSession, getSession, revokeSession, touchSession } from './db/repos/sessions';
 import { hasPasskeys } from './db/repos/passkeys';
-import { isBearerToken, useApiToken } from './db/repos/api-tokens';
+import { isBearerToken, peekApiToken, useApiToken } from './db/repos/api-tokens';
+import { logApiRequest } from './db/repos/api-log';
 import { appendAudit, type AuditInput } from './db/repos/audit';
 
 export const SESSION_COOKIE = 'ufop-admin-session';
@@ -86,7 +87,7 @@ const deny = (status: number, error: string) => NextResponse.json({ error }, { s
 const MFA_SETUP_PATHS = ['/api/account/mfa', '/api/account/passkeys', '/api/auth/session', '/api/auth/logout'];
 
 /** Paths an API token may not use: account and sign-in changes, minting tokens, switching organization. */
-const TOKEN_DENIED_PATHS = ['/api/account/', '/api/auth/', '/api/api-tokens', '/api/orgs/switch'];
+const TOKEN_DENIED_PATHS = ['/api/account/', '/api/auth/', '/api/api-tokens', '/api/orgs/switch', '/api/invitations/'];
 
 export async function authenticate(req: NextRequest): Promise<AuthContext | NextResponse> {
   const token = req.cookies.get(SESSION_COOKIE)?.value;
@@ -113,7 +114,11 @@ export async function authenticate(req: NextRequest): Promise<AuthContext | Next
   const amr = Array.isArray(payload.amr) ? (payload.amr as string[]) : ['pwd'];
   const orgId = typeof payload.org === 'string' ? payload.org : user.organizationId;
   const admitted = admit(req, user, orgId, amr.includes('sso'));
-  if (admitted instanceof NextResponse) return admitted;
+  if ('denied' in admitted) {
+    // Refusals by the organization's network rule are logged (two-factor setup is a normal flow).
+    if (admitted.reason === 'network') logRequest(req, 403, 'network not allowed', { orgId, tokenId: null, user, auth: 'session' });
+    return admitted.denied;
+  }
   return { user, orgId, role: admitted.role, permissions: ROLE_PERMISSIONS[admitted.role] ?? [], amr, sid: session.id, verifiedAt: session.verifiedAt, tokenId: null, ip: admitted.ip, userAgent: req.headers.get('user-agent') ?? '' };
 }
 
@@ -121,32 +126,44 @@ export async function authenticate(req: NextRequest): Promise<AuthContext | Next
  * The checks every request passes, whichever way it authenticated: access
  * to the organization, its allowed networks and its two-factor rule.
  */
-function admit(req: NextRequest, user: UserRecord, orgId: string, viaSso: boolean): { role: Role; ip: string } | NextResponse {
+type Admission = { role: Role; ip: string } | { denied: NextResponse; reason: 'access' | 'network' | 'two_factor' };
+
+function admit(req: NextRequest, user: UserRecord, orgId: string, viaSso: boolean): Admission {
   const org = getOrg(orgId);
   const role = org ? effectiveRole(user.id, orgId) : null;
-  if (!org || !role) return deny(403, 'You no longer have access to this organization');
+  if (!org || !role) return { denied: deny(403, 'You no longer have access to this organization'), reason: 'access' };
   const ip = clientIp(req);
   // The organization only admits console access from its networks (signing out still works).
   if (!ipAllowed(getSecurity(orgId).ipAllowlist, ip) && !req.nextUrl.pathname.startsWith('/api/auth/logout')) {
-    return NextResponse.json({ error: `This organization does not allow console access from ${ip}`, code: 'ip_not_allowed' }, { status: 403 });
+    return { denied: NextResponse.json({ error: `This organization does not allow console access from ${ip}`, code: 'ip_not_allowed' }, { status: 403 }), reason: 'network' };
   }
   // An organization requires two-factor sign-in and this account has none yet:
   // the session can only set it up (also for sessions from before the rule).
   if (needsSecondFactorSetup(user, viaSso) && !MFA_SETUP_PATHS.some((p) => req.nextUrl.pathname.startsWith(p))) {
-    return NextResponse.json({ error: 'Your organization requires two-factor sign-in. Set it up under My account first.', code: 'mfa_setup_required' }, { status: 403 });
+    return { denied: NextResponse.json({ error: 'Your organization requires two-factor sign-in. Set it up under My account first.', code: 'mfa_setup_required' }, { status: 403 }), reason: 'two_factor' };
   }
   return { role, ip };
 }
 
+/** Record an API-token request, or a refused one (see `db/repos/api-log`). */
+function logRequest(req: NextRequest, status: number, outcome: string, who: { orgId: string; tokenId: string | null; user: UserRecord | null; auth: 'token' | 'session' }): void {
+  logApiRequest({ orgId: who.orgId, method: req.method, path: req.nextUrl.pathname, status, outcome, auth: who.auth, tokenId: who.tokenId, userId: who.user?.id ?? null, userEmail: who.user?.email ?? '', ip: clientIp(req), userAgent: req.headers.get('user-agent') ?? '' });
+}
+
 /** `Authorization: Bearer ufop_cat_…`: the token's permissions, narrowed to what its owner's role allows now. */
 function authenticateToken(req: NextRequest): AuthContext | NextResponse {
-  const t = useApiToken((req.headers.get('authorization') ?? '').slice('Bearer '.length).trim(), clientIp(req));
-  if (!t) return deny(401, 'Unknown, expired or revoked API token');
-  if (TOKEN_DENIED_PATHS.some((p) => req.nextUrl.pathname.startsWith(p))) return deny(403, 'API tokens cannot be used for this; sign in to the console');
+  const secret = (req.headers.get('authorization') ?? '').slice('Bearer '.length).trim();
+  const t = useApiToken(secret, clientIp(req));
+  const refuse = (res: NextResponse, outcome: string, tok = t ?? peekApiToken(secret)) => {
+    logRequest(req, res.status, outcome, { orgId: tok?.orgId ?? '', tokenId: tok?.id ?? null, user: tok ? getUser(tok.userId) : null, auth: 'token' });
+    return res;
+  };
+  if (!t) return refuse(deny(401, 'Unknown, expired or revoked API token'), 'unknown, expired or revoked token');
+  if (TOKEN_DENIED_PATHS.some((p) => req.nextUrl.pathname.startsWith(p))) return refuse(deny(403, 'API tokens cannot be used for this; sign in to the console'), 'not allowed with a token');
   const user = getUser(t.userId);
-  if (!user || !user.isActive) return deny(401, 'The token owner’s account is no longer active');
+  if (!user || !user.isActive) return refuse(deny(401, 'The token owner’s account is no longer active'), 'owner inactive');
   const admitted = admit(req, user, t.orgId, false);
-  if (admitted instanceof NextResponse) return admitted;
+  if ('denied' in admitted) return refuse(admitted.denied, { access: 'no access to the organization', network: 'network not allowed', two_factor: 'owner must set up two-factor sign-in' }[admitted.reason]);
   const now = ROLE_PERMISSIONS[admitted.role] ?? [];
   return {
     user,
@@ -174,8 +191,10 @@ export function can(ctx: AuthContext, p: Permission): boolean {
 export async function requirePermission(req: NextRequest, ...perms: Permission[]): Promise<AuthContext | NextResponse> {
   const ctx = await authenticate(req);
   if (!isContext(ctx)) return ctx;
-  if (!can(ctx, 'admin.access')) return deny(403, 'Your role cannot use the admin console');
-  const missing = perms.filter((p) => !can(ctx, p));
+  const missing = can(ctx, 'admin.access') ? perms.filter((p) => !can(ctx, p)) : ['admin.access' as Permission];
+  // API-token traffic is logged with its outcome.
+  if (ctx.tokenId) logRequest(req, missing.length ? 403 : 200, missing.length ? `missing ${missing.join(', ')}` : 'authorized', { orgId: ctx.orgId, tokenId: ctx.tokenId, user: ctx.user, auth: 'token' });
+  if (missing.includes('admin.access')) return deny(403, 'Your role cannot use the admin console');
   if (missing.length) return deny(403, `Forbidden: requires ${missing.join(', ')}`);
   return ctx;
 }

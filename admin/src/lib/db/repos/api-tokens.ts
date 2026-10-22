@@ -90,6 +90,12 @@ export function revokeUserApiTokens(userId: string): number {
   return db().prepare('UPDATE api_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL').run(now(), userId).changes;
 }
 
+/** The token behind a secret whatever its state (for logging refused requests). */
+export function peekApiToken(secret: string): ApiToken | null {
+  const r = db().prepare('SELECT * FROM api_tokens WHERE token_hash = ?').get(hashToken(secret)) as Row | undefined;
+  return r ? fromRow(r) : null;
+}
+
 /** The valid token behind a secret (not revoked, not expired); records its use. */
 export function useApiToken(secret: string, ip: string): ApiToken | null {
   const r = db().prepare('SELECT * FROM api_tokens WHERE token_hash = ?').get(hashToken(secret)) as Row | undefined;
