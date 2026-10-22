@@ -10,6 +10,8 @@
  * - Reports and rollback
  */
 import { useState, useCallback, useEffect } from "react";
+import { SyncRunOptionsSection } from "@/components/sync-run-options";
+import { DEFAULT_RUN_OPTIONS, type SyncRunOptions } from "@/stores/sync-store";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import { SyncProgressCard } from "@/components/sync-progress-card";
@@ -256,6 +258,7 @@ export function SyncPanel() {
     minSize: 0,
     timeOffsetSecs: null as number | null,
     copyOptions: DEFAULT_COPY_OPTIONS as CopyOptions,
+    runOptions: DEFAULT_RUN_OPTIONS as SyncRunOptions,
     presetId: null as string | null,
   });
 
@@ -299,6 +302,7 @@ export function SyncPanel() {
         checksumAlgorithm: createForm.checksumAlgorithm,
         timeOffsetSecs: createForm.timeOffsetSecs,
         optionsJson: JSON.stringify(createForm.copyOptions),
+        runOptionsJson: JSON.stringify(createForm.runOptions),
       });
 
       setView("list");
@@ -323,6 +327,7 @@ export function SyncPanel() {
         minSize: 0,
         timeOffsetSecs: null,
         copyOptions: DEFAULT_COPY_OPTIONS,
+        runOptions: DEFAULT_RUN_OPTIONS,
         presetId: null,
       });
       _setDetectedOffset(null);
@@ -836,6 +841,13 @@ function CreatePairView({
           <option value="versioned_backup">Versioned Backup</option>
         </select>
       </label>
+
+      <SyncRunOptionsSection
+        mode={form.mode}
+        runOptions={form.runOptions}
+        copyOptions={form.copyOptions}
+        onChange={(runOptions, copyOptions) => setForm({ ...form, runOptions, copyOptions })}
+      />
 
       <CopyPresetPicker
         activeId={form.presetId}

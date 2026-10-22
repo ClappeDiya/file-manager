@@ -6,4 +6,4 @@ pub mod rename;
 pub mod tokens;
 
 pub use rename::{compat_warnings, plan as plan_rename, RenameError, RenamePlanEntry, RenameSpec};
-pub use tokens::{render, render_path, TemplateError, TokenContext, UnknownTokens};
+pub use tokens::{render, render_path, sanitize_segment, TemplateError, TokenContext, UnknownTokens};

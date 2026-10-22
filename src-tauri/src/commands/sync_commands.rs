@@ -68,6 +68,7 @@ pub async fn create_sync_pair(
     options_json: Option<String>,
     dest_state: Option<String>,
     checksum_algorithm: Option<String>,
+    run_options_json: Option<String>,
     manager: State<'_, SyncManager>,
     ledger: State<'_, OperationLedger>,
     repo: State<'_, Repository>,
@@ -95,6 +96,14 @@ pub async fn create_sync_pair(
         None => CopyOptions::default(),
     };
     crate::sync_engine::copier::validate_options(&copy_options)?;
+    let run_options: ufop_core::sync_types::SyncRunOptions = match run_options_json {
+        Some(j) => serde_json::from_str(&j).map_err(|e| AppError::Sync {
+            message: format!("Invalid run options: {}", e),
+            advice: "Check the pair's run options.".to_string(),
+        })?,
+        None => Default::default(),
+    };
+    ufop_core::sync::executor::validate_run_options(&run_options)?;
 
     let policy = conflict_policy
         .map(|s| SyncConflictPolicy::from_str_lossy(&s))
@@ -122,6 +131,7 @@ pub async fn create_sync_pair(
         copy_options,
         dest_state: dest_state.and_then(|v| serde_json::from_value(serde_json::Value::String(v)).ok()).unwrap_or_default(),
         checksum_algorithm: checksum_algorithm.and_then(|v| serde_json::from_value(serde_json::Value::String(v)).ok()).unwrap_or_default(),
+        run_options,
     };
 
     use crate::core::traits::SyncOperations;
@@ -238,6 +248,7 @@ pub async fn update_sync_pair(
         advice: "Check the sync pair configuration.".to_string(),
     })?;
     crate::sync_engine::copier::validate_options(&pair.copy_options)?;
+    ufop_core::sync::executor::validate_run_options(&pair.run_options)?;
     let updated = manager.update_pair(pair).await?;
     manager.save_pair_to_db(&repo, &updated).await?;
     Ok(updated)

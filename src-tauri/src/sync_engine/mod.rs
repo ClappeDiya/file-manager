@@ -788,8 +788,8 @@ impl SyncManager {
                     "INSERT INTO sync_pairs (id, name, source_path, dest_path, mode, enabled, \
                      last_run, trigger_mode, cron_expr, filter_json, conflict_policy, \
                      verify_mode, checksum_enabled, created_at, time_offset_secs, options_json, \
-                     dest_state, checksum_algorithm) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) \
+                     dest_state, checksum_algorithm, run_options_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) \
                      ON CONFLICT(id) DO UPDATE SET \
                      name = excluded.name, source_path = excluded.source_path, \
                      dest_path = excluded.dest_path, mode = excluded.mode, \
@@ -802,7 +802,8 @@ impl SyncManager {
                      time_offset_secs = excluded.time_offset_secs, \
                      options_json = excluded.options_json, \
                      dest_state = excluded.dest_state, \
-                     checksum_algorithm = excluded.checksum_algorithm",
+                     checksum_algorithm = excluded.checksum_algorithm, \
+                     run_options_json = excluded.run_options_json",
                     rusqlite::params![
                         p.id.to_string(),
                         p.name,
@@ -822,6 +823,7 @@ impl SyncManager {
                         options_json,
                         serde_json::to_value(p.dest_state).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "scan".into()),
                         serde_json::to_value(p.checksum_algorithm).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "xxh3".into()),
+                        serde_json::to_string(&p.run_options).unwrap_or_else(|_| "{}".into()),
                     ],
                 )?;
                 Ok(())
@@ -859,7 +861,7 @@ impl SyncManager {
                     "SELECT id, name, source_path, dest_path, mode, enabled, last_run, \
                      trigger_mode, cron_expr, filter_json, conflict_policy, verify_mode, \
                      checksum_enabled, created_at, time_offset_secs, options_json, \
-                     dest_state, checksum_algorithm \
+                     dest_state, checksum_algorithm, run_options_json \
                      FROM sync_pairs ORDER BY created_at ASC",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -875,6 +877,7 @@ impl SyncManager {
                     let options_json: String = row.get(15)?;
                     let dest_state: String = row.get(16)?;
                     let checksum_algorithm: String = row.get(17)?;
+                    let run_options_json: String = row.get(18)?;
 
                     Ok(SyncPair {
                         // A row we cannot parse is a row we cannot honour, but
@@ -906,6 +909,7 @@ impl SyncManager {
                         copy_options: serde_json::from_str(&options_json).unwrap_or_default(),
                         dest_state: serde_json::from_value(serde_json::Value::String(dest_state)).unwrap_or_default(),
                         checksum_algorithm: serde_json::from_value(serde_json::Value::String(checksum_algorithm)).unwrap_or_default(),
+                        run_options: serde_json::from_str(&run_options_json).unwrap_or_default(),
                     })
                 })?;
                 let mut out = Vec::new();
@@ -1138,6 +1142,24 @@ mod tests {
             SyncTrigger::Scheduled { cron_expr } => assert_eq!(cron_expr, "0 0 */6 * * * *"),
             other => panic!("trigger did not round-trip: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_options_survive_a_restart() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = SyncManager::new();
+        let pair = SyncPair {
+            run_options: ufop_core::sync_types::SyncRunOptions {
+                settle_secs: 30,
+                completion_marker: Some("_DONE".into()),
+                version_template: Some("{name}~{num}.{ext}".into()),
+            },
+            ..SyncPair::default()
+        };
+        mgr.save_pair_to_db(&repo, &pair).await.unwrap();
+        let restarted = SyncManager::new();
+        restarted.load_pairs_from_db(&repo).await.unwrap();
+        assert_eq!(restarted.pairs.read().await.get(&pair.id).unwrap().run_options, pair.run_options);
     }
 
     #[tokio::test]

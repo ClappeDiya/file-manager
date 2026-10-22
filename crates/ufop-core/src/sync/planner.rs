@@ -64,6 +64,11 @@ fn is_hidden(name: &str, _metadata: &std::fs::Metadata) -> bool {
 /// a `.ufop-partial` would throw away the progress /Z exists to keep.
 pub const INTERNAL_DIRS: [&str; 2] = [".sync-rollback", ".sync-quarantine"];
 
+/// Modified within the pair's settle window: probably still being written.
+fn still_changing(file: &FileMeta, settle_secs: u64, now: DateTime<Utc>) -> bool {
+    settle_secs > 0 && file.modified.is_some_and(|m| now - m < chrono::Duration::seconds(settle_secs as i64))
+}
+
 pub fn is_internal_entry(name: &str) -> bool {
     INTERNAL_DIRS.contains(&name) || name == INVENTORY_FILE || name.ends_with(super::copier::PARTIAL_SUFFIX)
 }
@@ -407,18 +412,21 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
         DestStateMode::Scan => walk_directory_with(dest_root, opts)?,
     };
 
-    // Build lookup maps by relative path
+    // Build lookup maps by relative path. The completion marker is the
+    // engine's own output: never copied, never purged.
+    let marker = pair.run_options.completion_marker.as_deref().map(str::trim).filter(|m| !m.is_empty());
     let source_map: HashMap<&str, &FileMeta> = source_files
         .iter()
-        .filter(|f| !f.is_dir)
+        .filter(|f| !f.is_dir && Some(f.relative_path.as_str()) != marker)
         .map(|f| (f.relative_path.as_str(), f))
         .collect();
 
     let dest_map: HashMap<&str, &FileMeta> = dest_files
         .iter()
-        .filter(|f| !f.is_dir)
+        .filter(|f| !f.is_dir && Some(f.relative_path.as_str()) != marker)
         .map(|f| (f.relative_path.as_str(), f))
         .collect();
+    let settle = pair.run_options.settle_secs;
 
     let mut additions = Vec::new();
     let mut modifications = Vec::new();
@@ -449,6 +457,10 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
         }
         if let Some(reason) = option_exclusion(src, opts, now) {
             skipped.push(skip_entry(rel_path, src, reason));
+            continue;
+        }
+        if still_changing(src, settle, now) {
+            skipped.push(skip_entry(rel_path, src, "Still changing (modified moments ago); the next run copies it"));
             continue;
         }
 
@@ -601,6 +613,7 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
                 if !source_map.contains_key(rel_path)
                     && matches_filter(rel_path, dest.size, &pair.filter)
                     && option_exclusion(dest, opts, now).is_none()
+                    && !still_changing(dest, settle, now)
                 {
                     additions.push(SyncDiffEntry {
                         relative_path: rel_path.to_string(),

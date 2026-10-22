@@ -176,6 +176,11 @@ pub async fn naming_preview(
 ) -> Result<String, AppError> {
     use ufop_core::naming::{render, render_path, TokenContext, UnknownTokens};
     let mut ctx = TokenContext::for_path(Path::new(&sample_path)).with_counter(1, 0);
+    // A sample that doesn't exist (an example name): dates use "now", as
+    // the engines do for files not written yet.
+    if ctx.modified.is_none() {
+        ctx.modified = Some(chrono::Utc::now());
+    }
     if let Some(re) = match_regex.as_deref().filter(|r| !r.is_empty()) {
         let re = regex::Regex::new(re).map_err(|e| AppError::validation(format!("Invalid regular expression: {e}")))?;
         if !ctx.capture_from(&re) {
@@ -205,6 +210,9 @@ mod tests {
             "/archive/2026/inv-2026-0042.pdf"
         );
         assert!(naming_preview("{nmae}".into(), p.clone(), None, None).await.is_err());
+        // An example name that doesn't exist still renders date tokens.
+        let year = chrono::Local::now().format("%Y").to_string();
+        assert_eq!(naming_preview("{name}-{yyyy}.{ext}".into(), "/no/such/report.pdf".into(), None, None).await.unwrap(), format!("report-{year}.pdf"));
         assert!(naming_preview("{1}".into(), p, Some("^nope".into()), None).await.unwrap_err().to_string().contains("does not match"));
     }
 }

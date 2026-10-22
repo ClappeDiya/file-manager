@@ -381,6 +381,25 @@ impl SyncVerifyMode {
     }
 }
 
+/// Run behaviour beyond the Robocopy options.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SyncRunOptions {
+    /// Leave out source files modified within this many seconds: they are
+    /// probably still being written, and the next run picks them up.
+    #[serde(default)]
+    pub settle_secs: u64,
+    /// File written at the destination root after a run that finished
+    /// without errors (e.g. `_SYNC_COMPLETE`), for downstream jobs to
+    /// wait on. Holds a small JSON summary of the run.
+    #[serde(default)]
+    pub completion_marker: Option<String>,
+    /// Name of kept versions in versioned-backup mode, using the naming
+    /// tokens (`{name}`, `{ext}`, `{num}`, `{now:%Y%m%d}`…). Default
+    /// `{name}.v{num}.{ext}`.
+    #[serde(default)]
+    pub version_template: Option<String>,
+}
+
 /// Sync pair configuration (enhanced for T-039..T-042).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncPair {
@@ -417,6 +436,8 @@ pub struct SyncPair {
     /// Checksum algorithm for full verification.
     #[serde(default)]
     pub checksum_algorithm: SyncHashAlgorithm,
+    #[serde(default)]
+    pub run_options: SyncRunOptions,
 }
 
 impl Default for SyncPair {
@@ -439,6 +460,7 @@ impl Default for SyncPair {
             copy_options: CopyOptions::default(),
             dest_state: DestStateMode::Scan,
             checksum_algorithm: SyncHashAlgorithm::Xxh3,
+            run_options: SyncRunOptions::default(),
         }
     }
 }
