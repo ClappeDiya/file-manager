@@ -11,7 +11,7 @@
 A unified replacement for ForkLift, Transmit, Cyberduck, Rclone-GUI, and the file manager built into your OS — one app that does:
 
 - **Dual-pane browsing** — local + remote side-by-side
-- **17 protocols** — SFTP, S3, Google Drive, Dropbox, OneDrive, WebDAV, SMB/CIFS, NFS, FTP/FTPS, Backblaze B2, Azure Blob, OpenStack Swift, mDNS peer-to-peer, server-to-server relay, and more
+- **17 protocols** — SFTP, S3, Google Drive, Dropbox, OneDrive, WebDAV, SMB/CIFS, NFS, FTP/FTPS, Backblaze B2, Azure Blob, Azure Data Lake Gen2, Azure Files, OpenStack Swift, mDNS peer-to-peer, server-to-server relay, and more
 - **Crash-safe transfers** — resume from anywhere, integrity-verified with xxHash3 + SHA-256, atomic rename, journal-backed
 - **Real-time bidirectional sync** — conflict resolution, redaction rules, scheduled or continuous
 - **Local AI assistant** — runs against your own Ollama; no API keys, no cloud calls, no data leaving your box

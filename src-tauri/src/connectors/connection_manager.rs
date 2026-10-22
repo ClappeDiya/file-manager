@@ -138,7 +138,7 @@ impl ConnectionManager {
             ConnectionProtocol::GoogleDrive => 443,
             ConnectionProtocol::Dropbox => 443,
             ConnectionProtocol::OneDrive => 443,
-            ConnectionProtocol::AzureBlob => 443,
+            ConnectionProtocol::AzureBlob | ConnectionProtocol::AdlsGen2 | ConnectionProtocol::AzureFiles => 443,
             ConnectionProtocol::Swift => 5000,
             ConnectionProtocol::Local => 0,
             ConnectionProtocol::Rclone => 0,

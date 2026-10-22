@@ -110,6 +110,14 @@ interface AwsProfile {
 
 type ThirdPartySource = "filezilla" | "cyberduck" | "winscp" | "transmit";
 
+/** Azure storage services: account + key/SAS/connection string + optional endpoint. */
+const AZURE_PROTOCOLS = new Set(["azure_blob", "adls_gen2", "azure_files"]);
+const AZURE_ENDPOINT_HINT: Record<string, string> = {
+  azure_blob: "myaccount.blob.core.usgovcloudapi.net or http://127.0.0.1:10000/devstoreaccount1",
+  adls_gen2: "myaccount.dfs.core.chinacloudapi.cn",
+  azure_files: "myaccount.file.core.usgovcloudapi.net",
+};
+
 const FALLBACK_PROTOCOLS: ProtocolOption[] = [
   { value: "sftp", label: "SFTP", port: 22 },
   { value: "ftp", label: "FTP", port: 21 },
@@ -119,6 +127,8 @@ const FALLBACK_PROTOCOLS: ProtocolOption[] = [
   { value: "nfs", label: "NFS", port: 2049 },
   { value: "s3", label: "S3", port: 443 },
   { value: "azure_blob", label: "Azure Blob Storage", port: 443 },
+  { value: "adls_gen2", label: "Azure Data Lake Storage Gen2", port: 443 },
+  { value: "azure_files", label: "Azure Files", port: 443 },
   { value: "swift", label: "OpenStack Swift", port: 5000 },
   { value: "google_drive", label: "Google Drive", port: 443 },
   { value: "dropbox", label: "Dropbox", port: 443 },
@@ -136,6 +146,8 @@ const DEFAULT_PORTS: Record<string, number> = {
   nfs: 2049,
   s3: 443,
   azure_blob: 443,
+  adls_gen2: 443,
+  azure_files: 443,
   swift: 5000,
   google_drive: 443,
   dropbox: 443,
@@ -513,13 +525,9 @@ function ConnectionForm({
   const [externalId, setExternalId] = useState(initialData?.extras?.assume_role?.external_id ?? "");
   const [roleDuration, setRoleDuration] = useState(String(initialData?.extras?.assume_role?.duration_secs ?? ""));
 
-  // Azure Blob Storage fields
-  const [azureAccountName, setAzureAccountName] = useState("");
-  const [azureAuthMethod, setAzureAuthMethod] = useState<
-    "account_key" | "sas_token" | "connection_string" | "azure_ad"
-  >("account_key");
-  const [azureSecret, setAzureSecret] = useState("");
-  const [azureCustomEndpoint, setAzureCustomEndpoint] = useState("");
+  // Azure (Blob, Data Lake, Files): the account is the user name, the
+  // endpoint the host and the key / SAS / connection string the password.
+  const [azureAuthMethod, setAzureAuthMethod] = useState<"account_key" | "sas_token" | "connection_string">("account_key");
 
   // OpenStack Swift fields
   const [swiftAuthUrl, setSwiftAuthUrl] = useState("");
@@ -605,7 +613,7 @@ function ConnectionForm({
   );
   const isFtpProtocol = protocol === "ftp" || protocol === "ftps";
   const isSshProtocol = protocol === "sftp";
-  const isAzureBlob = protocol === "azure_blob";
+  const isAzure = AZURE_PROTOCOLS.has(protocol);
   const isRclone = protocol === "rclone";
   const isSwift = protocol === "swift";
   const isS3 = protocol === "s3";
@@ -691,6 +699,8 @@ function ConnectionForm({
           />
         </div>
       </div>
+      {!isAzure && (
+      <>
       <div>
         <div className="flex items-center gap-1 mb-1">
           <label className="block text-xs font-medium">Host</label>
@@ -734,6 +744,8 @@ function ConnectionForm({
           />
         </div>
       </div>
+      </>
+      )}
       {/* SSH Key Generation (SFTP only) */}
       {isSshProtocol && (
         <SshKeyGenSection
@@ -858,68 +870,61 @@ function ConnectionForm({
           </div>
         </details>
       )}
-      {/* Azure Blob Storage fields */}
-      {isAzureBlob && (
-        <div className="space-y-2">
+      {/* Azure Blob / Data Lake / Files fields */}
+      {isAzure && (
+        <div className="space-y-2" data-testid="azure-fields">
           <div>
-            <label className="block text-xs font-medium mb-1">Account Name</label>
+            <label className="block text-xs font-medium mb-1" htmlFor="azure-account">Storage account</label>
             <input
+              id="azure-account"
               type="text"
-              value={azureAccountName}
-              onChange={(e) => setAzureAccountName(e.target.value)}
-              placeholder="mystorageaccount"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder={azureAuthMethod === "connection_string" ? "(from the connection string)" : "mystorageaccount"}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
             />
           </div>
           <div>
-            <label className="block text-xs font-medium mb-1">Auth Method</label>
+            <label className="block text-xs font-medium mb-1" htmlFor="azure-auth">Sign in with</label>
             <select
+              id="azure-auth"
               value={azureAuthMethod}
               onChange={(e) => setAzureAuthMethod(e.target.value as typeof azureAuthMethod)}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
             >
-              <option value="account_key">Account Key</option>
-              <option value="sas_token">SAS Token</option>
-              <option value="connection_string">Connection String</option>
-              <option value="azure_ad">Azure AD</option>
+              <option value="account_key">Account key</option>
+              <option value="sas_token">SAS token</option>
+              <option value="connection_string">Connection string</option>
             </select>
           </div>
-          {azureAuthMethod !== "azure_ad" && (
-            <div>
-              <label className="block text-xs font-medium mb-1">
-                {azureAuthMethod === "account_key"
-                  ? "Account Key"
-                  : azureAuthMethod === "sas_token"
-                    ? "SAS Token"
-                    : "Connection String"}
-              </label>
-              <input
-                type="password"
-                value={azureSecret}
-                onChange={(e) => setAzureSecret(e.target.value)}
-                placeholder={
-                  azureAuthMethod === "connection_string"
-                    ? "DefaultEndpointsProtocol=https;AccountName=..."
-                    : ""
-                }
-                className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-              />
-            </div>
-          )}
           <div>
-            <label className="block text-xs font-medium mb-1">
-              Custom Endpoint URL
+            <label className="block text-xs font-medium mb-1" htmlFor="azure-secret">
+              {azureAuthMethod === "account_key" ? "Account key" : azureAuthMethod === "sas_token" ? "SAS token" : "Connection string"}
+            </label>
+            <input
+              id="azure-secret"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder={initialData ? "(unchanged)" : azureAuthMethod === "connection_string" ? "DefaultEndpointsProtocol=https;AccountName=…" : azureAuthMethod === "sas_token" ? "sv=…&sig=…" : ""}
+              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1" htmlFor="azure-endpoint">
+              Endpoint
               <span className="text-gray-400 dark:text-gray-500 font-normal"> (optional)</span>
             </label>
             <input
+              id="azure-endpoint"
               type="text"
-              value={azureCustomEndpoint}
-              onChange={(e) => setAzureCustomEndpoint(e.target.value)}
-              placeholder="For Azure Gov, China, or Azurite"
+              value={host}
+              onChange={(e) => setHost(e.target.value)}
+              placeholder={AZURE_ENDPOINT_HINT[protocol]}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
             />
             <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">
-              Leave blank for standard Azure public cloud
+              Leave blank for the public Azure cloud. For Azure Government, Azure China or the Azurite emulator, enter the host or URL.
             </p>
           </div>
         </div>

@@ -671,6 +671,10 @@ pub enum ConnectionProtocol {
     OneDrive,
     Local,
     AzureBlob,
+    /// Azure Data Lake Storage Gen2 (`dfs` endpoint).
+    AdlsGen2,
+    /// Azure Files (REST).
+    AzureFiles,
     Swift,
     /// Any rclone remote (GCS, Box, pCloud, Mega…).
     Rclone,
@@ -691,6 +695,8 @@ impl ConnectionProtocol {
             Self::OneDrive => "onedrive",
             Self::Local => "local",
             Self::AzureBlob => "azure_blob",
+            Self::AdlsGen2 => "adls_gen2",
+            Self::AzureFiles => "azure_files",
             Self::Swift => "swift",
             Self::Rclone => "rclone",
         }
@@ -710,6 +716,8 @@ impl ConnectionProtocol {
             "onedrive" => Self::OneDrive,
             "local" => Self::Local,
             "azure_blob" => Self::AzureBlob,
+            "adls_gen2" => Self::AdlsGen2,
+            "azure_files" => Self::AzureFiles,
             "swift" => Self::Swift,
             "rclone" => Self::Rclone,
             _ => Self::Local,
@@ -1045,6 +1053,8 @@ mod tests {
             ConnectionProtocol::OneDrive,
             ConnectionProtocol::Local,
             ConnectionProtocol::AzureBlob,
+            ConnectionProtocol::AdlsGen2,
+            ConnectionProtocol::AzureFiles,
             ConnectionProtocol::Swift,
         ];
         for p in &protocols {

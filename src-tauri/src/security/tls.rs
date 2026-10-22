@@ -220,6 +220,8 @@ pub fn check_transport_security(
         | ConnectionProtocol::Dropbox
         | ConnectionProtocol::OneDrive
         | ConnectionProtocol::AzureBlob
+        | ConnectionProtocol::AdlsGen2
+        | ConnectionProtocol::AzureFiles
         | ConnectionProtocol::Swift => {
             // Cloud APIs always use HTTPS
             check.secure = true;
@@ -280,6 +282,8 @@ pub fn recommended_security(protocol: ConnectionProtocol) -> TransportSecurity {
         | ConnectionProtocol::Dropbox
         | ConnectionProtocol::OneDrive
         | ConnectionProtocol::AzureBlob
+        | ConnectionProtocol::AdlsGen2
+        | ConnectionProtocol::AzureFiles
         | ConnectionProtocol::Swift => TransportSecurity::strict(),
         ConnectionProtocol::Rclone => TransportSecurity::default(),
         ConnectionProtocol::Local => TransportSecurity {

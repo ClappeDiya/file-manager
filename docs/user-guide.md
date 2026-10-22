@@ -288,6 +288,11 @@ Reports can be exported as CSV or JSON.
 | **Dropbox** | OAuth 2.0 login. Team/shared folders and session uploads. |
 | **OneDrive** | Personal and Business accounts. SharePoint support. Handles naming restrictions. |
 | **Backblaze B2** | Native API with large file uploads. S3 compatibility mode available. |
+| **Azure Blob Storage** | Containers and blobs; uploads in 4 MiB blocks; folders as `dir/` marker blobs; read-only SAS share links. |
+| **Azure Data Lake Storage Gen2** | Accounts with a hierarchical namespace (`dfs` endpoint): real folders, and uploads that appear only when complete (written under a hidden name, then renamed). |
+| **Azure Files** | File shares over the REST API (no SMB port needed); uploads in 4 MiB ranges under a hidden name, then renamed; read-only SAS share links. |
+
+For the Azure services, enter the **storage account** and sign in with an **account key**, a **SAS token** or a **connection string**. Leave **Endpoint** blank for the public cloud; enter a host or URL for Azure Government, Azure China or the Azurite emulator. A container, file system or share is never deleted from the app (that removes everything in it); folders are removed only when empty.
 
 ### Connection Management
 

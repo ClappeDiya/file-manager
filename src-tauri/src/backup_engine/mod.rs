@@ -2166,7 +2166,7 @@ impl BackupManager {
                         P::Sftp => (22, false),
                         P::Ftp => (21, false),
                         P::Ftps => (990, false),
-                        P::WebDav | P::S3 | P::GoogleDrive | P::Dropbox | P::OneDrive | P::AzureBlob | P::Swift => (443, true),
+                        P::WebDav | P::S3 | P::GoogleDrive | P::Dropbox | P::OneDrive | P::AzureBlob | P::AdlsGen2 | P::AzureFiles | P::Swift => (443, true),
                         P::Smb => (445, false),
                         P::Nfs => (2049, false),
                         P::Local | P::Rclone => return None,

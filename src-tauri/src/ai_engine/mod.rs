@@ -291,7 +291,7 @@ Return ONLY valid JSON with these fields:
 - intent: one of "sync" | "transfer" | "backup" | "automation" | "filter" | "navigate" | "vault" | "rename" | "exclusion"
 - source_path: string or null (use ~ for home directory)
 - dest_path: string or null
-- dest_connector: one of "s3" | "google_drive" | "dropbox" | "onedrive" | "sftp" | "ftp" | "webdav" | "smb" | "local" | "azure_blob" | "backblaze_b2" or null
+- dest_connector: one of "s3" | "google_drive" | "dropbox" | "onedrive" | "sftp" | "ftp" | "webdav" | "smb" | "local" | "azure_blob" | "adls_gen2" | "azure_files" | "backblaze_b2" or null
 - schedule: cron expression string or null (use "watch" for real-time)
 - schedule_human: human-readable schedule description or null
 - direction: "one_way" | "bidirectional" or null
@@ -1215,6 +1215,9 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
             ("onedrive", "onedrive"),
             ("s3", "aws_s3"),
             ("aws", "aws_s3"),
+            ("data lake", "adls_gen2"),
+            ("adls", "adls_gen2"),
+            ("azure files", "azure_files"),
             ("azure", "azure_blob"),
             ("backblaze", "backblaze_b2"),
             ("b2", "backblaze_b2"),

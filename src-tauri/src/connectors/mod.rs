@@ -17,7 +17,8 @@
 //! - Backblaze B2 (T-030): Native API, large file uploads, S3 compatibility
 //! - Peer (T-031): mDNS/Bonjour peer discovery, TLS encrypted peer-to-peer transfer
 //! - Server-to-Server (T-033): Direct transfer between remote endpoints
-//! - Azure Blob Storage: SAS/AD auth, container/blob ops, access tiers, SAS URLs
+//! - Azure Blob Storage, Data Lake Storage Gen2 and Files: Shared Key, SAS or
+//!   connection string (`azure_rest`), file ops, read-only SAS links
 //! - OpenStack Swift: Keystone v3/TempAuth, container/object ops, SLO/DLO, TempURL
 
 pub mod presets;
@@ -45,6 +46,11 @@ pub mod aws_credentials;
 // Azure Blob Storage and OpenStack Swift connectors
 pub mod azure_blob;
 pub mod openstack_swift;
+pub mod azure_rest;
+pub mod azure_adls;
+pub mod azure_files;
+#[cfg(test)]
+mod azure_tests;
 
 use crate::core::error::AppError;
 use crate::core::types::{ConnectionProfile, ConnectionProtocol, FileEntry};
@@ -68,6 +74,8 @@ pub use onedrive::OneDriveConnector;
 pub use s3::S3Connector;
 // Azure Blob Storage and OpenStack Swift
 pub use azure_blob::AzureBlobConnector;
+pub use azure_adls::AdlsGen2Connector;
+pub use azure_files::AzureFilesConnector;
 pub use openstack_swift::SwiftConnector;
 // T-031, T-033: Peer and server-to-server
 pub use peer::PeerManager;
@@ -282,6 +290,8 @@ impl ConnectorRegistry {
         registry.register("b2", Arc::new(B2Connector::new()));
         // Azure Blob Storage and OpenStack Swift
         registry.register("azure_blob", Arc::new(AzureBlobConnector::new()));
+        registry.register("adls_gen2", Arc::new(AdlsGen2Connector::new()));
+        registry.register("azure_files", Arc::new(AzureFilesConnector::new()));
         registry.register("swift", Arc::new(SwiftConnector::new()));
         registry.register("rclone", Arc::new(rclone::RcloneConnector::new()));
 
@@ -444,7 +454,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod live_tests {
+pub(crate) mod live_tests {
     //! Live round-trip tests against real servers. They are skipped unless
     //! `UFOP_LIVE=1`, so `cargo test` stays hermetic. Servers (see docs): SFTP on
     //! :2222, FTP on :2121, WebDAV on :8080, S3 (adobe/s3mock) on :9090.
@@ -455,7 +465,7 @@ mod live_tests {
         std::env::var("UFOP_LIVE").map(|v| v == "1").unwrap_or(false)
     }
 
-    fn profile(protocol: ConnectionProtocol, host: &str, port: Option<u16>, user: &str, remote_path: &str) -> ConnectionProfile {
+    pub(crate) fn profile(protocol: ConnectionProtocol, host: &str, port: Option<u16>, user: &str, remote_path: &str) -> ConnectionProfile {
         ConnectionProfile {
             id: uuid::Uuid::new_v4(),
             name: "live".into(),
@@ -492,7 +502,7 @@ mod live_tests {
     }
 
     /// connect → mkdir → upload (multi-MB, patterned) → list → download → byte-compare → delete.
-    async fn round_trip(protocol: &str, p: ConnectionProfile, secret: Option<&str>, dir: &str) {
+    pub(crate) async fn round_trip(protocol: &str, p: ConnectionProfile, secret: Option<&str>, dir: &str) {
         let registry = ConnectorRegistry::new();
         let c = registry.get(protocol).unwrap();
         c.connect_with_secret(&p, secret.map(String::from)).await.unwrap_or_else(|e| panic!("{protocol} connect: {e}"));

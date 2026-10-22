@@ -28,12 +28,14 @@ export interface SharingPolicy {
 }
 
 /** Protocols whose connectors implement `create_share_link`. */
-export const SHAREABLE_PROTOCOLS = new Set(["s3", "azure_blob", "onedrive", "dropbox", "google_drive", "rclone"]);
+export const SHAREABLE_PROTOCOLS = new Set(["s3", "azure_blob", "adls_gen2", "azure_files", "onedrive", "dropbox", "google_drive", "rclone"]);
 
 /** What each provider can put on a link (the dialog hides the rest). */
 export const PROVIDER_CAPS: Record<string, { expiry: "required" | "optional" | "none"; password: boolean; organization: boolean; edit: boolean; maxDays?: number }> = {
   s3: { expiry: "required", password: false, organization: false, edit: false, maxDays: 7 },
   azure_blob: { expiry: "required", password: false, organization: false, edit: false },
+  adls_gen2: { expiry: "required", password: false, organization: false, edit: false },
+  azure_files: { expiry: "required", password: false, organization: false, edit: false },
   onedrive: { expiry: "optional", password: true, organization: true, edit: true },
   dropbox: { expiry: "optional", password: true, organization: true, edit: true },
   google_drive: { expiry: "none", password: false, organization: false, edit: true },

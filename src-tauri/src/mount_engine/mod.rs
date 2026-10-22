@@ -255,7 +255,7 @@ pub fn check_mount_capability(protocol: &str) -> MountCapability {
                 }
             }
         }
-        "google_drive" | "dropbox" | "onedrive" | "azure_blob" | "b2" | "swift" => MountCapability::NotSupported {
+        "google_drive" | "dropbox" | "onedrive" | "azure_blob" | "adls_gen2" | "azure_files" | "b2" | "swift" => MountCapability::NotSupported {
             reason: "Add this account as an rclone remote (`rclone config`), create an rclone connection for it, and mount that.".to_string(),
         },
         _ => MountCapability::NotSupported {

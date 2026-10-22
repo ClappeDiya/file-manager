@@ -6,16 +6,12 @@
 
 use super::http::{self, TlsOptions};
 use super::{direct_child, join_key, BoxFut, ObjectStore};
+use crate::connectors::azure_rest::{AzureClient, Service};
 use crate::core::error::AppError;
 use base64::Engine;
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use std::collections::BTreeMap;
 use ufop_core::backup::backend::LockMode;
 use ufop_core::backup::RemoteFile;
-
-const VERSION: &str = "2021-08-06";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -50,18 +46,9 @@ impl Default for AzureConfig {
     }
 }
 
-enum Auth {
-    SharedKey(Vec<u8>),
-    Sas(String),
-}
-
 pub struct AzureStore {
     cfg: AzureConfig,
-    auth: Auth,
-    http: reqwest::Client,
-    /// Endpoint without trailing slash, and its URL path (for signing).
-    base: String,
-    base_path: String,
+    client: AzureClient,
 }
 
 impl AzureStore {
@@ -70,41 +57,8 @@ impl AzureStore {
         if cfg.account.trim().is_empty() || cfg.container.trim().is_empty() {
             return Err(AppError::validation("Enter the storage account and container"));
         }
-        let base = if cfg.endpoint.trim().is_empty() { format!("https://{}.blob.core.windows.net", cfg.account) } else { cfg.endpoint.trim().trim_end_matches('/').to_string() };
-        let u = url::Url::parse(&base).map_err(|e| AppError::validation(format!("Invalid Azure endpoint: {e}")))?;
-        let s = secret.trim();
-        let auth = if s.starts_with("sv=") || s.starts_with("?sv=") || s.contains("&sig=") {
-            Auth::Sas(s.trim_start_matches('?').to_string())
-        } else {
-            Auth::SharedKey(base64::engine::general_purpose::STANDARD.decode(s).map_err(|_| AppError::validation("The Azure account key is not valid base64"))?)
-        };
-        Ok(Self { base_path: u.path().trim_end_matches('/').to_string(), http: http::client(&cfg.tls)?, base, cfg, auth })
-    }
-
-    fn sign(&self, method: &str, path: &str, query: &[(&str, String)], headers: &BTreeMap<String, String>, content_length: usize) -> Option<String> {
-        let Auth::SharedKey(key) = &self.auth else { return None };
-        let h = |n: &str| headers.get(n).cloned().unwrap_or_default();
-        let len = if content_length == 0 { String::new() } else { content_length.to_string() };
-        let canon_headers: String = headers.iter().filter(|(k, _)| k.starts_with("x-ms-")).map(|(k, v)| format!("{k}:{}\n", v.trim())).collect();
-        let mut q: Vec<(String, String)> = query.iter().map(|(k, v)| (k.to_lowercase(), v.clone())).collect();
-        q.sort();
-        let canon_query: String = q.iter().map(|(k, v)| format!("\n{k}:{v}")).collect();
-        let resource = format!("/{}{}{}", self.cfg.account, self.base_path, path);
-        let sts = format!(
-            "{method}\n{}\n{}\n{len}\n{}\n{}\n\n{}\n{}\n{}\n{}\n{}\n{canon_headers}{resource}{canon_query}",
-            h("content-encoding"),
-            h("content-language"),
-            h("content-md5"),
-            h("content-type"),
-            h("if-modified-since"),
-            h("if-match"),
-            h("if-none-match"),
-            h("if-unmodified-since"),
-            h("range"),
-        );
-        let mut m = Hmac::<Sha256>::new_from_slice(key).expect("any key length");
-        m.update(sts.as_bytes());
-        Some(format!("SharedKey {}:{}", self.cfg.account, base64::engine::general_purpose::STANDARD.encode(m.finalize().into_bytes())))
+        let client = AzureClient::new(&cfg.account, &cfg.endpoint, Service::Blob, &secret, &cfg.tls)?;
+        Ok(Self { cfg, client })
     }
 
     async fn send(&self, method: reqwest::Method, blob: Option<&str>, query: &[(&str, String)], extra: &[(&str, String)], body: Vec<u8>) -> Result<reqwest::Response, AppError> {
@@ -112,25 +66,7 @@ impl AzureStore {
             Some(b) => format!("/{}/{}", self.cfg.container, super::s3::uri_encode(b, true)),
             None => format!("/{}", self.cfg.container),
         };
-        let mut headers: BTreeMap<String, String> = BTreeMap::new();
-        headers.insert("x-ms-date".into(), chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string());
-        headers.insert("x-ms-version".into(), VERSION.into());
-        for (k, v) in extra {
-            headers.insert(k.to_lowercase(), v.clone());
-        }
-        let mut qs: Vec<String> = query.iter().map(|(k, v)| format!("{k}={}", urlencoding::encode(v))).collect();
-        if let Auth::Sas(sas) = &self.auth {
-            qs.push(sas.clone());
-        }
-        let url = format!("{}{path}{}", self.base, if qs.is_empty() { String::new() } else { format!("?{}", qs.join("&")) });
-        let mut req = self.http.request(method.clone(), &url);
-        if let Some(a) = self.sign(method.as_str(), &path, query, &headers, body.len()) {
-            req = req.header("authorization", a);
-        }
-        for (k, v) in &headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        req.body(body).send().await.map_err(|e| http::net("Azure request", e))
+        self.client.send(method, &path, query, extra, body).await
     }
 
     fn md5(data: &[u8]) -> String {

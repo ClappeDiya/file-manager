@@ -87,3 +87,36 @@ describe("connection form extras", () => {
     expect([...form.querySelectorAll("input")].some((i) => i.value === "https://abc123.r2.cloudflarestorage.com")).toBe(true);
   });
 });
+
+describe("Azure connections", () => {
+  it.each([
+    ["azure_blob", "Azure Blob Storage"],
+    ["adls_gen2", "Azure Data Lake Storage Gen2"],
+    ["azure_files", "Azure Files"],
+  ])("saves %s with the account as user, the secret as password and the endpoint as host", async (protocol, label) => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_connections" || cmd === "list_connection_groups" || cmd === "list_aws_profiles" || cmd === "connection_presets") return [];
+      if (cmd === "connector_list_protocols") return ["sftp", "azure_blob", "adls_gen2", "azure_files"];
+      return undefined;
+    });
+    const { container } = render(<ConnectionPanel />);
+    fireEvent.click(await screen.findByText("Add your first connection"));
+    const form = container.querySelector("form")!;
+    fireEvent.change(form.querySelectorAll("input")[0], { target: { value: "Lake" } });
+    const proto = form.querySelector("select")!;
+    await waitFor(() => expect([...proto.options].some((o) => o.textContent === label)).toBe(true));
+    fireEvent.change(proto, { target: { value: protocol } });
+    // Generic host / user / password fields give way to the Azure ones.
+    expect(screen.queryByText("Host")).toBeNull();
+    expect(screen.getByTestId("azure-fields")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Storage account"), { target: { value: "acct" } });
+    fireEvent.change(screen.getByLabelText("Sign in with"), { target: { value: "sas_token" } });
+    fireEvent.change(screen.getByLabelText("SAS token"), { target: { value: "sv=2021&sig=x" } });
+    fireEvent.change(screen.getByLabelText(/Endpoint/), { target: { value: "acct.core.usgovcloudapi.net" } });
+    expect(screen.queryByText("Azure AD")).toBeNull();
+    fireEvent.submit(form);
+    await waitFor(() => expect(mockInvoke.mock.calls.some(([c]) => c === "save_connection")).toBe(true));
+    const args = mockInvoke.mock.calls.find(([c]) => c === "save_connection")![1];
+    expect([args.protocol, args.username, args.password, args.host]).toEqual([protocol, "acct", "sv=2021&sig=x", "acct.core.usgovcloudapi.net"]);
+  });
+});

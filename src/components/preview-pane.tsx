@@ -535,11 +535,11 @@ function InspectorContent({ preview, protocol, advancedMode: _advancedMode }: {
         </div>
       )}
 
-      {protocol === "azure_blob" && (
+      {(protocol === "azure_blob" || protocol === "adls_gen2" || protocol === "azure_files") && (
         <div>
-          <h4 className="text-xs font-semibold text-text-secondary mb-2 uppercase tracking-wider">Azure Blob Properties</h4>
+          <h4 className="text-xs font-semibold text-text-secondary mb-2 uppercase tracking-wider">Azure Properties</h4>
           <div className="text-xs space-y-1.5">
-            <MetadataRow label="Protocol" value="Azure Blob Storage" />
+            <MetadataRow label="Protocol" value={protocol === "adls_gen2" ? "Azure Data Lake Storage Gen2" : protocol === "azure_files" ? "Azure Files" : "Azure Blob Storage"} />
           </div>
         </div>
       )}
