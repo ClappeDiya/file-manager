@@ -302,6 +302,36 @@ mod tests {
         ConnectionManager::new(repo, cred_store)
     }
 
+    /// Regression: upload modes, FTP tuning and symlink policy had no
+    /// columns and were silently dropped on save; extras persist too.
+    #[tokio::test]
+    async fn advanced_settings_and_extras_survive_a_reload() {
+        let repo = Repository::open_in_memory().await.unwrap();
+        let mut p = make_test_profile();
+        p.default_file_mode = Some("640".into());
+        p.default_dir_mode = Some("750".into());
+        p.ftp_use_mlsd = Some(true);
+        p.ftp_force_passive_ip = Some(false);
+        p.ftp_post_login_commands = Some(vec!["OPTS UTF8 ON".into()]);
+        p.symlink_policy = Some("skip".into());
+        p.extras.assume_role = Some(crate::core::types::AssumeRoleConfig {
+            role_arn: "arn:aws:iam::123456789012:role/Reader".into(),
+            external_id: Some("ext-42".into()),
+            session_name: None,
+            duration_secs: Some(1800),
+        });
+        p.extras.preset = Some("r2".into());
+        repo.save_connection(&p).await.unwrap();
+        let back = repo.get_connection(p.id).await.unwrap().unwrap();
+        assert_eq!(back.default_file_mode.as_deref(), Some("640"));
+        assert_eq!(back.default_dir_mode.as_deref(), Some("750"));
+        assert_eq!((back.ftp_use_mlsd, back.ftp_force_passive_ip), (Some(true), Some(false)));
+        assert_eq!(back.ftp_post_login_commands, p.ftp_post_login_commands);
+        assert_eq!(back.symlink_policy.as_deref(), Some("skip"));
+        assert_eq!(back.extras, p.extras);
+        assert_eq!(repo.list_connections().await.unwrap()[0].extras, p.extras);
+    }
+
     fn make_test_profile() -> ConnectionProfile {
         ConnectionProfile {
             id: Uuid::new_v4(),
@@ -334,6 +364,7 @@ mod tests {
             ftp_force_passive_ip: None,
             ftp_post_login_commands: None,
             symlink_policy: None,
+            extras: Default::default(),
         }
     }
 

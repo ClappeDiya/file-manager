@@ -49,6 +49,7 @@ fn make_connection(name: &str, protocol: ConnectionProtocol, host: &str) -> Conn
         ftp_force_passive_ip: None,
         ftp_post_login_commands: None,
         symlink_policy: None,
+        extras: Default::default(),
     }
 }
 

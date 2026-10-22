@@ -64,6 +64,7 @@ pub async fn connector_connect(
         ftp_force_passive_ip: None,
         ftp_post_login_commands: None,
         symlink_policy: None,
+        extras: Default::default(),
     };
 
     connector.connect_with_secret(&profile, secret).await

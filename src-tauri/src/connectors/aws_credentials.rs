@@ -9,6 +9,7 @@
 use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use sha2::Digest;
 use std::path::PathBuf;
 
 // ── Data Types ──────────────────────────────────────────────────────────────
@@ -708,6 +709,101 @@ pub async fn assume_role_with_web_identity(
         secret_access_key,
         session_token,
         expiration,
+    })
+}
+
+/// Base keys an `AssumeRole` call is signed with.
+#[derive(Debug, Clone)]
+pub struct BaseKeys {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
+/// Signed `AssumeRole` request: (url, headers, form body). `endpoint`
+/// overrides `https://sts.<region>.amazonaws.com` (tests, GovCloud, VPC).
+pub fn assume_role_request(
+    base: &BaseKeys,
+    role: &crate::core::types::AssumeRoleConfig,
+    region: &str,
+    endpoint: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(String, std::collections::BTreeMap<String, String>, String), AppError> {
+    if !role.role_arn.starts_with("arn:") {
+        return Err(AppError::validation("The role ARN should look like arn:aws:iam::123456789012:role/Name"));
+    }
+    let duration = role.duration_secs.unwrap_or(3600).clamp(900, 43_200).to_string();
+    let session = role.session_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "ufop".into());
+    let mut form = vec![
+        ("Action", "AssumeRole".to_string()),
+        ("Version", "2011-06-15".to_string()),
+        ("RoleArn", role.role_arn.clone()),
+        ("RoleSessionName", session),
+        ("DurationSeconds", duration),
+    ];
+    if let Some(x) = role.external_id.as_deref().filter(|x| !x.is_empty()) {
+        form.push(("ExternalId", x.to_string()));
+    }
+    let body = form
+        .iter()
+        .map(|(k, v)| format!("{k}={}", crate::backup_engine::stores::s3::uri_encode(v, false)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = endpoint
+        .map(|e| e.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| format!("https://sts.{region}.amazonaws.com"));
+    let parsed = reqwest::Url::parse(&url).map_err(|e| AppError::validation(format!("Invalid STS endpoint: {e}")))?;
+    let host = match parsed.port() {
+        Some(p) => format!("{}:{p}", parsed.host_str().unwrap_or_default()),
+        None => parsed.host_str().unwrap_or_default().to_string(),
+    };
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert("content-type".to_string(), "application/x-www-form-urlencoded; charset=utf-8".to_string());
+    headers.insert("host".to_string(), host);
+    headers.insert("x-amz-date".to_string(), now.format("%Y%m%dT%H%M%SZ").to_string());
+    if let Some(t) = &base.session_token {
+        headers.insert("x-amz-security-token".to_string(), t.clone());
+    }
+    let payload_hash = hex::encode(sha2::Sha256::digest(body.as_bytes()));
+    let auth = crate::backup_engine::stores::s3::sign_v4("POST", "/", &[], &headers, &payload_hash, &base.access_key_id, &base.secret_access_key, region, "sts");
+    headers.insert("authorization".to_string(), auth);
+    Ok((format!("{url}/"), headers, body))
+}
+
+/// Temporary credentials for `role`, assumed with `base` (STS AssumeRole,
+/// with the external ID when set).
+pub async fn assume_role(base: &BaseKeys, role: &crate::core::types::AssumeRoleConfig, region: &str, endpoint: Option<&str>) -> Result<AwsCredentials, AppError> {
+    let (url, headers, body) = assume_role_request(base, role, region, endpoint, chrono::Utc::now())?;
+    let mut req = crate::net::client().post(&url).body(body);
+    for (k, v) in &headers {
+        if k != "host" {
+            req = req.header(k, v);
+        }
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AppError::connection(format!("STS AssumeRole failed: {e}"), "Check your network connection."))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = extract_xml_tag(&text, "Message").unwrap_or(text.chars().take(300).collect());
+        return Err(AppError::connection(
+            format!("STS AssumeRole failed ({status}): {msg}"),
+            "Check the role ARN, the external ID and that the role trusts these keys.",
+        ));
+    }
+    parse_sts_credentials(&text)
+}
+
+/// `Credentials` of an STS `Assume*` response.
+pub fn parse_sts_credentials(xml: &str) -> Result<AwsCredentials, AppError> {
+    let need = |tag: &str| extract_xml_tag(xml, tag).ok_or_else(|| AppError::connection(format!("Missing {tag} in STS response"), "Unexpected STS response format."));
+    Ok(AwsCredentials {
+        access_key_id: need("AccessKeyId")?,
+        secret_access_key: need("SecretAccessKey")?,
+        session_token: need("SessionToken")?,
+        expiration: extract_xml_tag(xml, "Expiration"),
     })
 }
 

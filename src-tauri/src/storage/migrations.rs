@@ -118,6 +118,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "Sync run options - settle window, completion marker, version naming",
             sql: V20_SCHEMA,
         },
+        Migration {
+            version: 21,
+            description: "Connection settings_json - persists advanced options and extras",
+            sql: V21_SCHEMA,
+        },
     ]
 }
 
@@ -130,6 +135,12 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
         _ => None,
     }
 }
+
+/// Schema v21: profile fields with no column (upload modes, FTP tuning,
+/// symlink policy, connector extras) as JSON; previously never saved.
+const V21_SCHEMA: &str = r#"
+ALTER TABLE connections ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}';
+"#;
 
 /// Schema v20: per-pair run options (`SyncRunOptions`); `{}` = defaults.
 const V20_SCHEMA: &str = r#"
@@ -868,7 +879,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 20);
+        assert_eq!(applied, 21);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -903,7 +914,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 20);
+        assert_eq!(first, 21);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -916,7 +927,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 20);
+        assert_eq!(current_version(&conn).unwrap(), 21);
     }
 
     #[test]

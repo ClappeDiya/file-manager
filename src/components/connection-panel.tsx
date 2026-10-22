@@ -49,6 +49,21 @@ interface ConnectionProfile {
   // Upload-time permission defaults
   default_file_mode: string | null;
   default_dir_mode: string | null;
+  /** Mirrors `ConnectionExtras` (core/types.rs). */
+  extras?: ConnectionExtras;
+}
+
+interface AssumeRoleConfig {
+  role_arn: string;
+  external_id: string | null;
+  session_name: string | null;
+  duration_secs: number | null;
+}
+
+interface ConnectionExtras {
+  assume_role: AssumeRoleConfig | null;
+  rclone_remote: string | null;
+  preset: string | null;
 }
 
 interface ConnectionGroup {
@@ -484,7 +499,12 @@ function ConnectionForm({
   const [awsProfilesLoaded, setAwsProfilesLoaded] = useState(false);
 
   // S3-compatible preset selector
-  const [selectedS3Preset, setSelectedS3Preset] = useState("");
+  const [selectedS3Preset, setSelectedS3Preset] = useState(initialData?.extras?.preset ?? "");
+
+  // STS AssumeRole (S3): temporary credentials from the keys above
+  const [roleArn, setRoleArn] = useState(initialData?.extras?.assume_role?.role_arn ?? "");
+  const [externalId, setExternalId] = useState(initialData?.extras?.assume_role?.external_id ?? "");
+  const [roleDuration, setRoleDuration] = useState(String(initialData?.extras?.assume_role?.duration_secs ?? ""));
 
   // Azure Blob Storage fields
   const [azureAccountName, setAzureAccountName] = useState("");
@@ -610,6 +630,14 @@ function ConnectionForm({
       // Upload-time permission defaults (SFTP/FTP only)
       defaultFileMode: isSshProtocol || isFtpProtocol ? defaultFileMode || null : null,
       defaultDirMode: isSshProtocol || isFtpProtocol ? defaultDirMode || null : null,
+      extras: {
+        rclone_remote: initialData?.extras?.rclone_remote ?? null,
+        preset: isS3 ? selectedS3Preset || null : initialData?.extras?.preset ?? null,
+        assume_role:
+          isS3 && roleArn.trim()
+            ? { role_arn: roleArn.trim(), external_id: externalId.trim() || null, session_name: null, duration_secs: roleDuration ? Number(roleDuration) : null }
+            : null,
+      } satisfies ConnectionExtras,
     });
   };
 
@@ -754,6 +782,31 @@ function ConnectionForm({
             ) : null;
           })()}
         </div>
+      )}
+      {/* STS AssumeRole (S3 only) */}
+      {isS3 && (
+        <details className="rounded border border-gray-200 dark:border-gray-700 p-2" open={!!roleArn}>
+          <summary className="text-xs font-medium cursor-pointer">Assume an IAM role</summary>
+          <div className="space-y-2 mt-2">
+            <div>
+              <label className="block text-xs font-medium mb-1" htmlFor="role-arn">Role ARN</label>
+              <input id="role-arn" value={roleArn} onChange={(e) => setRoleArn(e.target.value)} placeholder="arn:aws:iam::123456789012:role/Reader" className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 font-mono" />
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-xs font-medium mb-1" htmlFor="role-external-id">External ID</label>
+                <input id="role-external-id" value={externalId} onChange={(e) => setExternalId(e.target.value)} placeholder="optional" className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1" htmlFor="role-duration">Session length (s)</label>
+                <input id="role-duration" type="number" min={900} max={43200} value={roleDuration} onChange={(e) => setRoleDuration(e.target.value)} placeholder="3600" className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900" />
+              </div>
+            </div>
+            <p className="text-[10px] text-gray-400 dark:text-gray-500">
+              The access key and secret above sign the AssumeRole call; the app uses the temporary credentials and renews them before they expire.
+            </p>
+          </div>
+        </details>
       )}
       {/* Azure Blob Storage fields */}
       {isAzureBlob && (

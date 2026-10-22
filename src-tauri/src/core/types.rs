@@ -785,6 +785,34 @@ pub struct ConnectionProfile {
     /// "follow" = resolve and transfer target, "skip" = ignore symlinks,
     /// "preserve" = recreate symlinks at destination (default).
     pub symlink_policy: Option<String>,
+
+    /// Connector-specific settings (role assumption, rclone remote, preset).
+    #[serde(default)]
+    pub extras: ConnectionExtras,
+}
+
+/// STS AssumeRole on top of a connection's keys.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssumeRoleConfig {
+    pub role_arn: String,
+    /// Required by many cross-account trust policies.
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub session_name: Option<String>,
+    /// 900..=43200 seconds; default 3600.
+    #[serde(default)]
+    pub duration_secs: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ConnectionExtras {
+    pub assume_role: Option<AssumeRoleConfig>,
+    /// rclone remote name (`gdrive:`) for rclone connections.
+    pub rclone_remote: Option<String>,
+    /// Provider preset the connection was created from (`r2`, `egnyte`…).
+    pub preset: Option<String>,
 }
 
 /// Global proxy configuration.

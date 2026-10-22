@@ -269,7 +269,17 @@ pub struct CompletedPart {
 struct S3State {
     credentials: S3Credentials,
     http: reqwest::Client,
+    /// Changes on every connect, so a role refresher of an earlier
+    /// connection stops instead of overwriting the new credentials.
+    epoch: u64,
 }
+
+static S3_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Refresh assumed-role credentials this long before they expire.
+const ROLE_REFRESH_EARLY_SECS: i64 = 300;
+/// Never retry faster than this (tests: immediately).
+const ROLE_MIN_WAIT_SECS: i64 = if cfg!(test) { 0 } else { 30 };
 
 /// Amazon S3 connector implementing the Connector trait.
 pub struct S3Connector {
@@ -297,10 +307,61 @@ impl S3Connector {
         let state = S3State {
             credentials: creds,
             http,
+            epoch: S3_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
 
         let mut lock = self.state.write().await;
         *lock = Some(state);
+        Ok(())
+    }
+
+    /// Connect with a role assumed from `base` and keep it fresh: a
+    /// background task re-assumes the role shortly before the temporary
+    /// credentials expire, until the connection is replaced or closed.
+    pub async fn connect_with_role(
+        &self,
+        base: super::aws_credentials::BaseKeys,
+        role: crate::core::types::AssumeRoleConfig,
+        mut creds: S3Credentials,
+        sts_endpoint: Option<String>,
+    ) -> Result<(), AppError> {
+        let temp = super::aws_credentials::assume_role(&base, &role, &creds.region, sts_endpoint.as_deref()).await?;
+        let mut expires = expiry_of(&temp);
+        creds.access_key_id = temp.access_key_id;
+        creds.secret_access_key = temp.secret_access_key;
+        creds.session_token = Some(temp.session_token);
+        let region = creds.region.clone();
+        self.connect_with_credentials(creds).await?;
+        let epoch = self.state.read().await.as_ref().map(|s| s.epoch).unwrap_or(0);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            loop {
+                let wait = (expires - chrono::Utc::now()).num_seconds() - ROLE_REFRESH_EARLY_SECS;
+                tokio::time::sleep(std::time::Duration::from_secs(wait.max(ROLE_MIN_WAIT_SECS) as u64)).await;
+                if state.read().await.as_ref().map(|s| s.epoch) != Some(epoch) {
+                    return; // reconnected or disconnected
+                }
+                match super::aws_credentials::assume_role(&base, &role, &region, sts_endpoint.as_deref()).await {
+                    Ok(t) => {
+                        expires = expiry_of(&t);
+                        let mut st = state.write().await;
+                        match st.as_mut() {
+                            Some(s) if s.epoch == epoch => {
+                                s.credentials.access_key_id = t.access_key_id;
+                                s.credentials.secret_access_key = t.secret_access_key;
+                                s.credentials.session_token = Some(t.session_token);
+                                tracing::debug!("Refreshed assumed-role S3 credentials");
+                            }
+                            _ => return,
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Assumed-role refresh failed, retrying: {e}");
+                        expires = chrono::Utc::now() + chrono::Duration::seconds(ROLE_REFRESH_EARLY_SECS + 60);
+                    }
+                }
+            }
+        });
         Ok(())
     }
 
@@ -2734,7 +2795,17 @@ impl Connector for S3Connector {
                 path_style,
                 session_token: None,
             };
-            self.connect_with_credentials(creds).await?;
+            match profile.extras.assume_role.clone().filter(|r| !r.role_arn.trim().is_empty()) {
+                Some(role) => {
+                    let base = super::aws_credentials::BaseKeys {
+                        access_key_id: creds.access_key_id.clone(),
+                        secret_access_key: creds.secret_access_key.clone(),
+                        session_token: None,
+                    };
+                    self.connect_with_role(base, role, creds, None).await?;
+                }
+                None => self.connect_with_credentials(creds).await?,
+            }
             // Fail now (bad keys, unreachable endpoint) rather than on first browse.
             if let Err(e) = self.list_buckets().await {
                 *self.state.write().await = None;
@@ -2825,6 +2896,15 @@ impl Connector for S3Connector {
             })
         })
     }
+}
+
+/// When temporary credentials expire (an hour if STS didn't say).
+fn expiry_of(c: &super::aws_credentials::AwsCredentials) -> chrono::DateTime<Utc> {
+    c.expiration
+        .as_deref()
+        .and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok())
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(1))
 }
 
 /// SigV4 pre-signed URLs live at most 7 days; default one day. They are
@@ -3452,6 +3532,72 @@ fn parse_object_versions_xml(xml: &str, key_filter: &str) -> Vec<S3ObjectVersion
 mod share_tests {
     use super::*;
     use crate::connectors::{ShareOptions, ShareScope};
+
+    #[tokio::test]
+    async fn assumes_role_with_external_id_and_refreshes() {
+        use axum::{routing::post, Router};
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let c2 = calls.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |headers: axum::http::HeaderMap, body: String| {
+                let calls = c2.clone();
+                async move {
+                    let n = {
+                        let mut v = calls.lock().unwrap();
+                        v.push((headers.get("authorization").map(|h| h.to_str().unwrap().to_string()).unwrap_or_default(), body));
+                        v.len()
+                    };
+                    // Expires inside the refresh window, so a refresh follows at once.
+                    let exp = (chrono::Utc::now() + chrono::Duration::seconds(10)).to_rfc3339();
+                    format!("<AssumeRoleResponse><AssumeRoleResult><Credentials><AccessKeyId>ASIA{n}</AccessKeyId><SecretAccessKey>sk{n}</SecretAccessKey><SessionToken>tok{n}</SessionToken><Expiration>{exp}</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let c = S3Connector::new();
+        let base = crate::connectors::aws_credentials::BaseKeys { access_key_id: "AKIDBASE".into(), secret_access_key: "basesecret".into(), session_token: None };
+        let role = crate::core::types::AssumeRoleConfig { role_arn: "arn:aws:iam::123456789012:role/Reader".into(), external_id: Some("ext-42".into()), session_name: None, duration_secs: Some(900) };
+        let creds = S3Credentials { access_key_id: String::new(), secret_access_key: String::new(), region: "eu-west-1".into(), endpoint: None, path_style: false, session_token: None };
+        c.connect_with_role(base, role, creds, Some(format!("http://{addr}"))).await.unwrap();
+        {
+            let st = c.state.read().await;
+            let cr = &st.as_ref().unwrap().credentials;
+            assert_eq!((cr.access_key_id.as_str(), cr.session_token.as_deref()), ("ASIA1", Some("tok1")));
+        }
+        let (auth, body) = calls.lock().unwrap()[0].clone();
+        assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDBASE/") && auth.contains("/eu-west-1/sts/aws4_request"), "{auth}");
+        assert!(body.contains("Action=AssumeRole") && body.contains("ExternalId=ext-42") && body.contains("DurationSeconds=900"), "{body}");
+        assert!(body.contains("RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2FReader"));
+        // The refresher swaps in new credentials before expiry.
+        for _ in 0..100 {
+            if c.state.read().await.as_ref().unwrap().credentials.access_key_id != "ASIA1" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_ne!(c.state.read().await.as_ref().unwrap().credentials.access_key_id, "ASIA1");
+        // Reconnecting stops the old refresher from touching the new state.
+        c.connect_with_credentials(S3Credentials { access_key_id: "PLAIN".into(), secret_access_key: "x".into(), region: "eu-west-1".into(), endpoint: None, path_style: false, session_token: None }).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(c.state.read().await.as_ref().unwrap().credentials.access_key_id, "PLAIN");
+    }
+
+    #[test]
+    fn assume_role_validates_arn() {
+        let base = crate::connectors::aws_credentials::BaseKeys { access_key_id: "a".into(), secret_access_key: "b".into(), session_token: Some("t".into()) };
+        let bad = crate::core::types::AssumeRoleConfig { role_arn: "Reader".into(), ..Default::default() };
+        assert!(crate::connectors::aws_credentials::assume_role_request(&base, &bad, "us-east-1", None, chrono::Utc::now()).is_err());
+        let ok = crate::core::types::AssumeRoleConfig { role_arn: "arn:aws:iam::1:role/R".into(), duration_secs: Some(60), ..Default::default() };
+        let (url, headers, body) = crate::connectors::aws_credentials::assume_role_request(&base, &ok, "us-east-1", None, chrono::Utc::now()).unwrap();
+        assert_eq!(url, "https://sts.us-east-1.amazonaws.com/");
+        assert!(body.contains("DurationSeconds=900"), "clamped to the STS minimum");
+        assert!(!body.contains("ExternalId"));
+        assert_eq!(headers.get("x-amz-security-token").map(String::as_str), Some("t"));
+    }
 
     #[test]
     fn presign_expiry_rules() {
