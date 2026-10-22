@@ -227,6 +227,25 @@
           "allow_private": false
         },
         "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "convert_image",
+          "format": "webp",
+          "max_width": 800,
+          "max_height": null,
+          "quality": null,
+          "dest_path": "/in/small"
+        },
+        "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "convert_document",
+          "to": "pdf",
+          "dest_path": ""
+        },
+        "continue_on_error": false
       }
     ],
     "options": {

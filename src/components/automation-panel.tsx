@@ -142,6 +142,10 @@ function actionLabel(action: RuleAction): string {
       return `Create folder ${shortenPath(action.path)}`;
     case "download_url":
       return `Download to ${shortenPath(action.dest_path)}`;
+    case "convert_image":
+      return [action.format ? `Convert to ${action.format.toUpperCase()}` : "Resize", action.max_width || action.max_height ? `≤ ${action.max_width ?? "∞"}×${action.max_height ?? "∞"}` : ""].filter(Boolean).join(" ");
+    case "convert_document":
+      return `Convert to ${action.to.toUpperCase()}`;
     case "replay_op": {
       // Operation Pin: a captured copy/move replayed verbatim. The
       // source list and destination both travel with the rule, so the

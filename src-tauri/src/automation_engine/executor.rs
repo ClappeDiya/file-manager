@@ -311,13 +311,15 @@ pub fn action_kind(action: &RuleAction) -> &'static str {
         RuleAction::SendMessage { .. } => "send_message",
         RuleAction::ReplayOp { .. } => "replay_op",
         RuleAction::DownloadUrl { .. } => "download_url",
+        RuleAction::ConvertImage { .. } => "convert_image",
+        RuleAction::ConvertDocument { .. } => "convert_document",
     }
 }
 
-/// Actions whose result is the file later steps work on: the file moved or
-/// renamed, or the file downloaded.
+/// Actions whose result is the file later steps work on: the file moved,
+/// renamed, downloaded or converted.
 pub(crate) fn hands_on_path(action: &RuleAction) -> bool {
-    matches!(action, RuleAction::MoveFile { .. } | RuleAction::RenameFile { .. } | RuleAction::DownloadUrl { .. })
+    matches!(action, RuleAction::MoveFile { .. } | RuleAction::RenameFile { .. } | RuleAction::DownloadUrl { .. } | RuleAction::ConvertImage { .. } | RuleAction::ConvertDocument { .. })
 }
 
 /// Whether retrying `action` after `error` could help. Validation and
@@ -411,6 +413,30 @@ fn resolve_target(source: &Path, target: PathBuf, policy: ConflictPolicy) -> Res
         }
         ConflictPolicy::OverwriteIfLarger => (meta(source)?.len() > meta(&target)?.len()).then_some(target),
     })
+}
+
+/// Source and output path of a conversion: the output goes to `dest_path`
+/// (a folder template; empty = the source's folder) under `name(source)`,
+/// subject to the rule's overwrite policy (`None` = skipped).
+fn convert_target(
+    triggered_file: Option<&str>,
+    dest_path: &str,
+    name: impl Fn(&Path) -> Result<String, String>,
+    env: &ExecEnv<'_>,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let source = Path::new(triggered_file.ok_or("No source file for convert action")?);
+    validate_automation_path(source, None)?;
+    if !source.is_file() {
+        return Err(format!("{} does not exist or is not a file", source.display()));
+    }
+    let dir = if dest_path.trim().is_empty() {
+        source.parent().ok_or("Cannot determine parent directory")?.to_path_buf()
+    } else {
+        PathBuf::from(env.path(dest_path, triggered_file)?)
+    };
+    validate_automation_path(&dir, None)?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create destination directory: {e}"))?;
+    Ok(resolve_target(source, dir.join(name(source)?), env.overwrite)?.map(|t| (source.to_path_buf(), t)))
 }
 
 /// Remove an existing target that is about to be replaced.
@@ -756,6 +782,27 @@ pub async fn dispatch(action: &RuleAction, triggered_file: Option<&str>, env: &E
             };
             let saved = super::download::run(&spec).await?;
             Ok(vec![saved.to_string_lossy().into_owned()])
+        }
+
+        RuleAction::ConvertImage { format, max_width, max_height, quality, dest_path } => {
+            let spec = crate::convert_engine::ImageSpec { format: format.clone().filter(|f| !f.trim().is_empty()), max_width: *max_width, max_height: *max_height, quality: *quality };
+            spec.validate()?;
+            let (src, target) = match convert_target(triggered_file, dest_path, |src| spec.output_name(src), env)? {
+                Some(t) => t,
+                None => return Ok(vec![]),
+            };
+            let out = target.clone();
+            tokio::task::spawn_blocking(move || crate::convert_engine::convert_image(&src, &out, &spec)).await.map_err(|e| format!("Conversion failed: {e}"))??;
+            Ok(vec![target.to_string_lossy().into_owned()])
+        }
+
+        RuleAction::ConvertDocument { to, dest_path } => {
+            let (src, target) = match convert_target(triggered_file, dest_path, |src| crate::convert_engine::document_output_name(src, to), env)? {
+                Some(t) => t,
+                None => return Ok(vec![]),
+            };
+            crate::convert_engine::convert_document(&src, &target, to, std::time::Duration::from_secs(300)).await?;
+            Ok(vec![target.to_string_lossy().into_owned()])
         }
 
         RuleAction::Notify { title, body } => {
@@ -1332,6 +1379,36 @@ mod tests {
 
     use crate::automation_engine::{ActionStep, ConditionNode, RuleCondition, RuleOptions, SourceSelection};
     use crate::core::types::ConflictPolicy;
+
+    #[tokio::test]
+    async fn convert_image_hands_the_new_file_on_and_follows_the_overwrite_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("photo.png");
+        image::RgbaImage::from_pixel(300, 150, image::Rgba([10, 20, 30, 255])).save(&src).unwrap();
+        let out = dir.path().join("shared");
+        let convert = |dest: &str| RuleAction::ConvertImage { format: Some("jpeg".into()), max_width: Some(120), max_height: None, quality: Some(80), dest_path: dest.into() };
+        // Convert into a templated folder, then copy what was produced.
+        let rule = rule_steps(convert(&format!("{}/small/{{ext}}", dir.path().display())), vec![ActionStep { action: RuleAction::CopyFile { dest_path: out.to_string_lossy().into() }, continue_on_error: false }], RuleOptions::default());
+        let log = execute_rule_action(&rule, src.to_str(), false).await;
+        assert_eq!(log.status, AutomationStatus::Success, "{:?}", log.error_message);
+        let small = dir.path().join("small/png/photo.jpg");
+        assert_eq!(image::image_dimensions(&small).unwrap(), (120, 60));
+        assert_eq!(image::image_dimensions(out.join("photo.jpg")).unwrap(), (120, 60), "the copy step got the converted file");
+        assert!(src.exists(), "the original stays");
+
+        // Next to the source; an existing output follows the policy.
+        let beside = |policy| rule_steps(convert(""), vec![], RuleOptions { overwrite: policy, ..Default::default() });
+        execute_rule_action(&beside(ConflictPolicy::Rename), src.to_str(), false).await;
+        execute_rule_action(&beside(ConflictPolicy::Rename), src.to_str(), false).await;
+        assert!(dir.path().join("photo.jpg").exists() && dir.path().join("photo (2).jpg").exists());
+        let skipped = execute_rule_action(&beside(ConflictPolicy::SkipAlways), src.to_str(), false).await;
+        assert!(skipped.files_affected.is_empty());
+
+        // Bad input: a clear, permanent error.
+        let bad = execute_rule_action(&rule_steps(RuleAction::ConvertImage { format: None, max_width: None, max_height: None, quality: None, dest_path: String::new() }, vec![], RuleOptions::default()), src.to_str(), false).await;
+        assert_eq!(bad.status, AutomationStatus::Failed);
+        assert!(bad.error_message.unwrap().contains("format or a largest size"));
+    }
 
     fn rule_steps(first: RuleAction, more: Vec<ActionStep>, options: RuleOptions) -> AutomationRule {
         let mut r = AutomationRule::new("v15".into(), crate::automation_engine::RuleTrigger::Manual, first);

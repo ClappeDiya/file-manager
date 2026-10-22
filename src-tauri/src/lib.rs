@@ -3,6 +3,7 @@ pub mod automation_engine;
 pub mod backup_engine;
 pub mod commands;
 pub mod compat_engine;
+pub mod convert_engine;
 pub mod connectors;
 pub mod core;
 pub mod fleet_agent;
@@ -892,6 +893,9 @@ pub fn run() {
             commands::search_commands::search_files_query,
             commands::thumbnail_commands::thumbnail_get,
             commands::thumbnail_commands::thumbnail_cache_clear,
+            commands::convert_commands::convert_capabilities,
+            commands::convert_commands::convert_images,
+            commands::convert_commands::convert_documents,
             commands::gpg_commands::gpg_status,
             commands::gpg_commands::gpg_list_keys,
             commands::gpg_commands::gpg_import_keys,

@@ -354,6 +354,29 @@ pub enum RuleAction {
         /// Destination directory captured from the original ledger event.
         dest_path: String,
     },
+    /// Resize an image and/or change its format (`convert_engine`). The
+    /// result is written to `dest_path` (a folder template; empty = next to
+    /// the file) and is the file later steps work on.
+    ConvertImage {
+        /// `jpeg`, `png`, `webp`, `gif`, `bmp`, `tiff`; empty = keep.
+        #[serde(default)]
+        format: Option<String>,
+        #[serde(default)]
+        max_width: Option<u32>,
+        #[serde(default)]
+        max_height: Option<u32>,
+        #[serde(default)]
+        quality: Option<u8>,
+        #[serde(default)]
+        dest_path: String,
+    },
+    /// Convert an office document with LibreOffice (e.g. to PDF); like
+    /// `ConvertImage`, the result is handed on.
+    ConvertDocument {
+        to: String,
+        #[serde(default)]
+        dest_path: String,
+    },
     /// Download a URL into a folder (`automation_engine::download`). URL,
     /// folder and file name are templates.
     DownloadUrl {
@@ -1605,7 +1628,9 @@ mod tests {
         let last = &rules[rules.len() - 2];
         assert_eq!(last.trigger, RuleTrigger::Webhook);
         assert!(matches!(last.condition_tree, Some(ConditionNode::Any { ref nodes }) if nodes.len() == 2));
-        assert_eq!(last.steps.len(), 2);
+        assert_eq!(last.steps.len(), 4);
+        assert!(matches!(&last.steps[2].action, RuleAction::ConvertImage { format: Some(f), max_width: Some(800), max_height: None, quality: None, dest_path } if f == "webp" && dest_path == "/in/small"));
+        assert!(matches!(&last.steps[3].action, RuleAction::ConvertDocument { to, dest_path } if to == "pdf" && dest_path.is_empty()));
         assert!(matches!(last.action, RuleAction::SendMessage { .. }));
         assert!(matches!(last.steps[0].action, RuleAction::RunCommand { .. }));
         assert!(matches!(&last.steps[1].action, RuleAction::DownloadUrl { url, overwrite: true, max_mb: 50, allow_private: false, .. } if url.contains("{customer}")));

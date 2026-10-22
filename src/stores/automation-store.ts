@@ -79,7 +79,18 @@ export type RuleAction =
       max_mb: number;
       sha256: string | null;
       allow_private: boolean;
-    };
+    }
+  /** Resize and/or change an image's format; the result (in `dest_path`, empty = same folder) is handed on. */
+  | { type: "convert_image"; format: ImageFormat | null; max_width: number | null; max_height: number | null; quality: number | null; dest_path: string }
+  /** Convert an office document with LibreOffice; the result is handed on. */
+  | { type: "convert_document"; to: DocumentFormat; dest_path: string };
+
+/** `convert_engine::IMAGE_FORMATS` */
+export const IMAGE_FORMATS = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] as const;
+export type ImageFormat = (typeof IMAGE_FORMATS)[number];
+/** `convert_engine::DOCUMENT_FORMATS` */
+export const DOCUMENT_FORMATS = ["pdf", "docx", "odt", "rtf", "txt", "html", "xlsx", "ods", "csv", "pptx", "odp"] as const;
+export type DocumentFormat = (typeof DOCUMENT_FORMATS)[number];
 
 export type OverwritePolicy =
   | "rename"

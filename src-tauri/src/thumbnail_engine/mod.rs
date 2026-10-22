@@ -123,13 +123,7 @@ impl ThumbnailCache {
 
 /// Decode with size limits; `None` if the file isn't a readable image.
 fn decode(path: &Path) -> Option<image::DynamicImage> {
-    let mut reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(20_000);
-    limits.max_image_height = Some(20_000);
-    limits.max_alloc = Some(512 * 1024 * 1024);
-    reader.limits(limits);
-    reader.decode().ok()
+    crate::convert_engine::decode(path).ok()
 }
 
 /// Mark a cached file as just used (its mtime is the LRU stamp).

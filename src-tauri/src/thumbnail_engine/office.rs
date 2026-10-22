@@ -35,22 +35,8 @@ impl OfficeRender {
     }
 }
 
-/// LibreOffice's `soffice`: `UFOP_SOFFICE`, then PATH, then the usual install locations.
-pub fn find_soffice() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("UFOP_SOFFICE").map(PathBuf::from) {
-        return p.is_file().then_some(p);
-    }
-    let exe = if cfg!(windows) { "soffice.exe" } else { "soffice" };
-    let on_path = std::env::var_os("PATH").into_iter().flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).flat_map(|d| [d.join(exe), d.join("libreoffice")]);
-    let known: Vec<PathBuf> = if cfg!(target_os = "macos") {
-        vec!["/Applications/LibreOffice.app/Contents/MacOS/soffice".into()]
-    } else if cfg!(windows) {
-        ["ProgramFiles", "ProgramFiles(x86)"].iter().filter_map(|v| std::env::var_os(v)).map(|p| PathBuf::from(p).join("LibreOffice").join("program").join("soffice.exe")).collect()
-    } else {
-        vec!["/usr/bin/soffice".into(), "/usr/lib/libreoffice/program/soffice".into(), "/opt/libreoffice/program/soffice".into(), "/snap/bin/libreoffice".into()]
-    };
-    on_path.chain(known).find(|p| p.is_file())
-}
+/// LibreOffice's `soffice` (shared with document conversion).
+pub use crate::convert_engine::find_office as find_soffice;
 
 pub struct OfficeRenderer {
     dir: PathBuf,

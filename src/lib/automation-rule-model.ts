@@ -145,6 +145,8 @@ export const ACTION_TYPES: { type: RuleAction["type"]; label: string; advanced?:
   { type: "execute_custom_command", label: "Run a saved custom command", advanced: true },
   { type: "run_command", label: "Run a program", advanced: true },
   { type: "download_url", label: "Download a URL", advanced: true },
+  { type: "convert_image", label: "Resize / convert an image" },
+  { type: "convert_document", label: "Convert a document (LibreOffice)" },
 ];
 
 export function defaultAction(type: RuleAction["type"]): RuleAction {
@@ -178,6 +180,10 @@ export function defaultAction(type: RuleAction["type"]): RuleAction {
       return { type, kind: "copy", source_paths: [], dest_path: "" };
     case "download_url":
       return { type, url: "https://", dest_path: "", file_name: null, overwrite: false, max_mb: 1024, sha256: null, allow_private: false };
+    case "convert_image":
+      return { type, format: "jpeg", max_width: 1920, max_height: 1920, quality: 85, dest_path: "" };
+    case "convert_document":
+      return { type, to: "pdf", dest_path: "" };
   }
 }
 
@@ -297,6 +303,11 @@ function actionErrors(a: RuleAction, n: string): string[] {
   if (a.type === "transfer_to_connector" && !a.connection_id) errors.push(`${n}: choose a connection.`);
   if (a.type === "run_command" && !a.program.trim()) errors.push(`${n}: enter the program to run.`);
   if (a.type === "execute_custom_command" && !a.command_id) errors.push(`${n}: choose a custom command.`);
+  if (a.type === "convert_image") {
+    if (!a.format && !a.max_width && !a.max_height) errors.push(`${n}: choose a format or a largest size.`);
+    for (const v of [a.max_width, a.max_height]) if (v !== null && !(v >= 1 && v <= 20_000)) errors.push(`${n}: sizes are 1–20000 pixels.`);
+    if (a.quality !== null && !(a.quality >= 1 && a.quality <= 100)) errors.push(`${n}: quality is 1–100.`);
+  }
   if (a.type === "download_url") {
     if (!/^https?:\/\/[^/\s]+/i.test(a.url.trim())) errors.push(`${n}: enter an http(s) URL to download.`);
     if (!a.dest_path.trim()) errors.push(`${n}: choose the folder to save into.`);
@@ -315,7 +326,7 @@ export function validateForm(form: RuleForm): string[] {
   }
   if (form.trigger.type === "schedule" && !form.trigger.cron_expr.trim()) errors.push("Choose a schedule.");
   if (!form.workflow && form.steps.length === 0) errors.push("Add at least one action.");
-  const fileActions = new Set(["move_file", "copy_file", "rename_file", "delete_file", "compress_folder", "extract_archive", "transfer_to_connector"]);
+  const fileActions = new Set(["move_file", "copy_file", "rename_file", "delete_file", "compress_folder", "extract_archive", "transfer_to_connector", "convert_image", "convert_document"]);
   const formActions = form.workflow ? workflowActions(form.workflow) : form.steps.map((s) => s.action);
   if (!isFileTrigger(form.trigger) && !form.options.source?.path && formActions.some((a) => fileActions.has(a.type))) {
     errors.push("This trigger has no file: choose which folder's files the rule works on.");

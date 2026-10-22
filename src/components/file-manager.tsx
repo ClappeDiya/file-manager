@@ -77,9 +77,11 @@ import { AutomationRuleEditor } from "./automation-rule-editor";
 import { CopyToManyDialog } from "./copy-to-many-dialog";
 import { IndexedSearchResults } from "./indexed-search-results";
 import { GpgDialog } from "./gpg-dialog";
+import { ConvertDialog } from "./convert-dialog";
 import { OperationsDrawer, OperationsIndicator } from "./operations-drawer";
 import { useOperationsStore } from "@/stores/operations-store";
 import { looksEncrypted, looksLikeSignature, useGpgDialog } from "@/stores/gpg-store";
+import { convertKind, useConvertDialog } from "@/stores/convert-store";
 import type { SearchScope } from "@/stores/search-store";
 import { openCopyToMany } from "@/stores/copy-to-many-store";
 import { VaultPanel } from "./vault-panel";
@@ -2643,6 +2645,7 @@ export function FileManager() {
         <AutomationRuleEditor />
         <CopyToManyDialog />
         <GpgDialog />
+        <ConvertDialog />
         <OperationsDrawer />
         {activityTimelineOpen && (
           <ActivityTimelinePanel onDispatchPath={handleDispatchLedgerPath} />
@@ -4484,6 +4487,7 @@ function FilePane({
         onCopyToOtherPane: handleCopyToOtherPane,
         onCopyToMany: () => openCopyToMany(selectedPaths, currentPath, otherPanePath()),
         onGpg: (mode) => useGpgDialog.getState().open(mode, selectedPaths),
+        onConvert: convertKind(selectedPaths) ? () => useConvertDialog.getState().open(selectedPaths) : undefined,
         gpgDecrypt: selectedPaths.length > 0 && selectedPaths.every((p) => looksEncrypted(p)),
         gpgVerify: selectedPaths.length > 0 && selectedPaths.every((p) => looksLikeSignature(p)),
         onMoveToOtherPane: handleMoveToOtherPane,

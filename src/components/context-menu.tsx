@@ -283,6 +283,8 @@ export function getFileContextMenuItems(options: {
   onGpg?: (mode: "encrypt" | "decrypt" | "recrypt" | "sign" | "verify") => void;
   gpgDecrypt?: boolean;
   gpgVerify?: boolean;
+  /** Convert the selected images or documents (only when the selection is convertible). */
+  onConvert?: () => void;
   onPaste: () => void;
   onDelete: () => void;
   onRename: () => void;
@@ -604,6 +606,10 @@ export function getFileContextMenuItems(options: {
         icon: <FileArchive className="h-3.5 w-3.5" />,
         action: options.onCompress,
       });
+    }
+
+    if (options.onConvert && !options.isDirectory) {
+      items.push({ id: "convert", label: options.selectionCount > 1 ? `Convert ${options.selectionCount} Files…` : "Convert…", icon: <RefreshCw className="h-3.5 w-3.5" />, action: options.onConvert });
     }
 
     // OpenPGP: files only; decrypt/verify only where the names fit.

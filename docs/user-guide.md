@@ -575,6 +575,16 @@ In Advanced mode, a rule's actions can be edited as a **workflow**: a graph inst
 - Workflows are checked when saved: no loops, known steps only, delays up to 24 hours, nested rules at most 4 deep and never running themselves. Programs (`Run a program`) inside a workflow need the same approval as in a list.
 - **Organization workflows:** rules your organization pushes from the admin console show an *Org* badge. They run like your own but can only be viewed, not edited, switched off or deleted; *Clone* makes an editable copy. *Copy as JSON* (rule editor) copies any rule's definition — without its run statistics, command approval or webhook secret — to paste into the console.
 
+## Converting images and documents
+
+Right-click images (PNG, JPEG, WebP, GIF, BMP, TIFF) or documents (Word, Excel, PowerPoint, OpenDocument, RTF, text, HTML, CSV) → **Convert…**:
+
+- **Images:** choose a format (JPEG with a quality, PNG, WebP, GIF, BMP, TIFF, or keep the format) and a largest width/height. Images shrink to fit, keeping their proportions, and are never enlarged. JPEG output drops transparency.
+- **Documents:** convert to PDF, Word, OpenDocument, RTF, text, HTML, Excel, CSV or PowerPoint with LibreOffice, which must be installed (or set `UFOP_SOFFICE` to its `soffice` program). A private LibreOffice profile is used, so an open LibreOffice window isn't disturbed.
+- Converted files are new files next to the originals (or in the folder you choose) under free names; the originals are never changed.
+
+In automation rules, **Resize / convert an image** and **Convert a document** do the same for each file, into a folder template (empty = next to the file), following the rule's overwrite choice. Later steps work on the converted file, so *convert to PDF → upload* is two steps.
+
 ## Automation: downloading a URL
 
 In Advanced mode, an automation rule can **Download a URL** into a folder. The URL, folder, file name and expected SHA-256 accept the same templates as other actions (`{name}`, `{yyyy}`, webhook fields …).

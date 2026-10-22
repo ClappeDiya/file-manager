@@ -185,6 +185,8 @@ describe("presets", () => {
         { action: { type: "send_message", notification: { type: "teams", credential_id: "cred-1" }, title: "{rule}", body: "{customer}" }, continue_on_error: true },
         { action: { type: "run_command", program: "/bin/echo", args: ["{payload}"], working_dir: null, timeout_secs: 30 }, continue_on_error: false },
         { action: { type: "download_url", url: "https://example.com/{customer}.csv", dest_path: "/in/{yyyy}", file_name: null, overwrite: true, max_mb: 50, sha256: null, allow_private: false }, continue_on_error: false },
+        { action: { type: "convert_image", format: "webp", max_width: 800, max_height: null, quality: null, dest_path: "/in/small" }, continue_on_error: false },
+        { action: { type: "convert_document", to: "pdf", dest_path: "" }, continue_on_error: false },
       ],
       options: { ...newRuleForm().options, source: { path: "/inbox", recursive: true, newest: 5, include_dirs: false }, priority: -1 },
     })), rules.length));

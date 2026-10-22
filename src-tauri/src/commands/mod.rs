@@ -12,6 +12,7 @@ pub mod custom_commands;
 pub mod drive_commands;
 pub mod editor_commands;
 pub mod editor_draft_commands;
+pub mod convert_commands;
 pub mod gpg_commands;
 pub mod operations_commands;
 pub mod policy_commands;

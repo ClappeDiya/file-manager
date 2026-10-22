@@ -44,6 +44,8 @@ import {
   linearSteps,
 } from "@/lib/automation-rule-model";
 import {
+  DOCUMENT_FORMATS,
+  IMAGE_FORMATS,
   useAutomationStore,
   type AutomationLog,
   type AutomationRule,
@@ -412,6 +414,63 @@ function ActionFields({
             Allow intranet addresses (localhost, private and link-local networks)
           </label>
           <p className="text-[11px] text-[var(--color-text-muted)]">Downloads to a hidden temporary file and moves it into place when complete. Redirects are followed (up to 5); private addresses stay blocked unless allowed above.</p>
+        </div>
+      );
+    case "convert_image": {
+      const size = (v: string) => (v.trim() === "" ? null : Number(v));
+      return (
+        <div className="space-y-2">
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className={label} htmlFor={id("ifmt")}>Format</label>
+              <select id={id("ifmt")} className={field} value={a.format ?? ""} onChange={(e) => onChange({ ...a, format: (e.target.value || null) as typeof a.format })}>
+                <option value="">Keep the format</option>
+                {IMAGE_FORMATS.map((f) => (
+                  <option key={f} value={f}>{f.toUpperCase()}</option>
+                ))}
+              </select>
+            </div>
+            {a.format === "jpeg" && (
+              <div>
+                <label className={label} htmlFor={id("q")}>Quality (1–100)</label>
+                <input id={id("q")} type="number" min={1} max={100} className={field} value={a.quality ?? ""} onChange={(e) => onChange({ ...a, quality: size(e.target.value) })} />
+              </div>
+            )}
+            <div>
+              <label className={label} htmlFor={id("mw")}>Largest width (px)</label>
+              <input id={id("mw")} type="number" min={1} className={field} value={a.max_width ?? ""} placeholder="Any" onChange={(e) => onChange({ ...a, max_width: size(e.target.value) })} />
+            </div>
+            <div>
+              <label className={label} htmlFor={id("mh")}>Largest height (px)</label>
+              <input id={id("mh")} type="number" min={1} className={field} value={a.max_height ?? ""} placeholder="Any" onChange={(e) => onChange({ ...a, max_height: size(e.target.value) })} />
+            </div>
+          </div>
+          <div>
+            <label className={label} htmlFor={id("idest")}>Save into folder (empty = next to the image)</label>
+            <FolderInput id={id("idest")} value={a.dest_path} onChange={(v) => onChange({ ...a, dest_path: v })} placeholder="Same folder" />
+            {tokenHint}
+          </div>
+          <p className="text-[11px] text-[var(--color-text-muted)]">Images are shrunk to fit, keeping their proportions, and never enlarged. Later steps work on the converted file; the original stays.</p>
+        </div>
+      );
+    }
+    case "convert_document":
+      return (
+        <div className="space-y-2">
+          <div>
+            <label className={label} htmlFor={id("dfmt")}>Convert to</label>
+            <select id={id("dfmt")} className={field} value={a.to} onChange={(e) => onChange({ ...a, to: e.target.value as typeof a.to })}>
+              {DOCUMENT_FORMATS.map((f) => (
+                <option key={f} value={f}>{f.toUpperCase()}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className={label} htmlFor={id("ddest")}>Save into folder (empty = next to the document)</label>
+            <FolderInput id={id("ddest")} value={a.dest_path} onChange={(v) => onChange({ ...a, dest_path: v })} placeholder="Same folder" />
+            {tokenHint}
+          </div>
+          <p className="text-[11px] text-[var(--color-text-muted)]">Needs LibreOffice installed. Later steps work on the converted file; the original stays.</p>
         </div>
       );
   }
