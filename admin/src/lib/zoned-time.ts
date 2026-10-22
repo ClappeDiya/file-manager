@@ -57,3 +57,27 @@ export function recentDeadlines(at: Date, w: WeeklyDeadline, count = 2): Date[] 
   }
   return out.sort((a, b) => b.getTime() - a.getTime()).slice(0, count);
 }
+
+export interface Recurrence {
+  frequency: 'daily' | 'weekly' | 'monthly';
+  /** Local hour, 0–23. */
+  hour: number;
+  /** weekly: 0 = Sunday … 6 = Saturday. */
+  weekday?: number;
+  /** monthly: 1–28. */
+  dayOfMonth?: number;
+  timeZone: string;
+}
+
+/** The first occurrence strictly after `after` (DST-aware). */
+export function nextOccurrence(after: Date, r: Recurrence): Date {
+  for (let i = 0; i < 63; i++) {
+    const p = localParts(new Date(after.getTime() + i * 86_400_000), r.timeZone);
+    const weekday = new Date(Date.UTC(p.y, p.m - 1, p.d)).getUTCDay();
+    if (r.frequency === 'weekly' && weekday !== (r.weekday ?? 1)) continue;
+    if (r.frequency === 'monthly' && p.d !== (r.dayOfMonth ?? 1)) continue;
+    const t = zonedToUtc(p.y, p.m, p.d, r.hour, 0, r.timeZone);
+    if (t.getTime() > after.getTime()) return t;
+  }
+  throw new Error('No occurrence within 63 days');
+}

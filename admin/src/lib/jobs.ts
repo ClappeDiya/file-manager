@@ -14,6 +14,7 @@ import { startSiemForwarding } from './siem';
 import { retireInactive } from './retirement';
 import { expireMemberships, purgeRemovedMembers } from './offboarding';
 import { pruneApiRequests } from './db/repos/api-log';
+import { runDueSchedules } from './report-runner';
 
 let started = false;
 
@@ -29,6 +30,7 @@ export async function runJobsOnce(at = new Date()): Promise<{ missed: number; pu
   const last = listAnchors()[0];
   const anchored = !last || at.getTime() - new Date(last.createdAt).getTime() > 86_400_000 ? anchorAudit() !== null : false;
   const summaries = await runScheduledSummaries(at);
+  await runDueSchedules(at);
   return { missed, purged, retired, anchored, summaries };
 }
 

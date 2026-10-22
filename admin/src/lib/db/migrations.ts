@@ -621,6 +621,30 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 27,
+    description: 'Report schedules and report runs',
+    up(d) {
+      d.exec(`
+        CREATE TABLE report_schedules (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, report_id TEXT NOT NULL, days INTEGER NOT NULL, format TEXT NOT NULL DEFAULT 'csv',
+          frequency TEXT NOT NULL, hour INTEGER NOT NULL, weekday INTEGER, day_of_month INTEGER, time_zone TEXT NOT NULL,
+          channel_ids TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1, next_run_at TEXT,
+          created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_report_schedules_due ON report_schedules(enabled, next_run_at);
+        CREATE TABLE report_runs (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          report_id TEXT NOT NULL, schedule_id TEXT, days INTEGER NOT NULL, status TEXT NOT NULL,
+          row_count INTEGER NOT NULL DEFAULT 0, summary TEXT NOT NULL DEFAULT '', result TEXT, error TEXT,
+          delivery TEXT NOT NULL DEFAULT '[]', requested_by TEXT NOT NULL DEFAULT '',
+          started_at TEXT NOT NULL, finished_at TEXT
+        );
+        CREATE INDEX idx_report_runs_org ON report_runs(org_id, started_at);
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

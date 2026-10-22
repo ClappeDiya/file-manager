@@ -16,6 +16,8 @@ export interface Message {
   data?: Record<string, unknown>;
   /** Override recipients (invitations). */
   to?: string[];
+  /** Email attachments (other channels get the text and data only). */
+  attachments?: { filename: string; content: string; contentType: string }[];
 }
 
 export interface Delivery {
@@ -40,7 +42,7 @@ async function sendEmail(ch: Channel, m: Message): Promise<void> {
   });
   const to = m.to ?? c.to;
   if (!to.length) throw new Error('No recipients');
-  await transport.sendMail({ from: c.from, to, subject: m.subject, text: m.text });
+  await transport.sendMail({ from: c.from, to, subject: m.subject, text: m.text, attachments: m.attachments?.map((a) => ({ filename: a.filename, content: a.content, contentType: a.contentType })) });
 }
 
 async function postJson(url: string, body: string, headers: Record<string, string>): Promise<void> {

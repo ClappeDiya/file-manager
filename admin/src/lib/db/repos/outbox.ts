@@ -18,6 +18,8 @@ export interface OutboxMessage {
   text: string;
   data?: Record<string, unknown>;
   to?: string[];
+  /** Kept so retries send the same attachments (report runs cap them at 1 MB). */
+  attachments?: { filename: string; content: string; contentType: string }[];
 }
 
 export interface OutboxEntry {

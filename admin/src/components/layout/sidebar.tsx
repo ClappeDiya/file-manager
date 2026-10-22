@@ -26,7 +26,7 @@ import {
   Sparkles,
   Building2,
   UsersRound,
-  Fingerprint, SlidersHorizontal, Webhook, ShieldCheck } from 'lucide-react';
+  Fingerprint, SlidersHorizontal, Webhook, ShieldCheck, FileBarChart } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 import { useAdminStore } from '@/lib/stores/admin-store';
 import { useAuthStore } from '@/lib/stores/auth-store';
@@ -62,6 +62,7 @@ const navItems: NavItem[] = [
   { id: 'devices', i18nKey: 'nav.devices', href: '/devices', icon: Monitor, requiredPermission: 'devices.read' },
   { id: 'policies', i18nKey: 'nav.policies', href: '/policies', icon: Shield, requiredPermission: 'policies.read' },
   { id: 'approvals', i18nKey: 'nav.approvals', href: '/approvals', icon: CheckSquare, requiredPermission: 'approvals.read' },
+  { id: 'reports', i18nKey: 'nav.reports', href: '/reports', icon: FileBarChart, requiredPermission: 'fleet.read' },
   { id: 'audit', i18nKey: 'nav.audit', href: '/audit', icon: ScrollText, requiredPermission: 'audit.read' },
   { id: 'connectors', i18nKey: 'nav.connectors', href: '/connectors', icon: Plug, requiredPermission: 'connectors.read' },
   { id: 'workspaces', i18nKey: 'nav.workspaces', href: '/workspaces', icon: FolderSync, requiredPermission: 'workspaces.read' },
