@@ -4,6 +4,7 @@ import { beginEnrollment, confirmEnrollment, disableMfa } from '@/lib/db/repos/m
 import { getUser, updateUser } from '@/lib/db/repos/users';
 import { open } from '@/lib/crypto';
 import { otpauthUrl, verifyTotp } from '@/lib/totp';
+import { mfaRequired } from '@/lib/db/repos/security';
 
 /** GET /api/account/mfa — whether two-factor sign-in is on. */
 export async function GET(request: NextRequest) {
@@ -35,6 +36,7 @@ export async function POST(request: NextRequest) {
     }
     case 'disable': {
       if (!user.mfaEnabled || !user.totpSecretCiphertext) return badRequest('Two-factor sign-in is not on', 409);
+      if (mfaRequired(user, false)) return badRequest('Your organization requires two-factor sign-in', 403);
       const step = verifyTotp(open(user.totpSecretCiphertext), String(b.code ?? ''), user.lastTotpStep);
       if (step === null) return badRequest('The code is not valid', 401);
       updateUser(user.id, { lastTotpStep: step });

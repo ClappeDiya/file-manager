@@ -56,6 +56,22 @@ export default function SecuritySettingsPage() {
             onChange={(e) => setDraft({ ...s, passwordMaxAgeDays: Math.max(0, Math.floor(Number(e.target.value) || 0)) })}
           />
         </Card>
+        <Card>
+          <CardHeader className="flex-col items-start gap-1">
+            <CardTitle>Two-factor sign-in</CardTitle>
+            <CardDescription>Members without an authenticator app can only set one up until they do. Members of several organizations follow the strictest rule.</CardDescription>
+          </CardHeader>
+          <div className="space-y-2 text-sm">
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={s.requireMfa} onChange={(e) => setDraft({ ...s, requireMfa: e.target.checked })} />
+              Require two-factor sign-in for every member
+            </label>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" disabled={!s.requireMfa} checked={s.ssoExemptFromMfa} onChange={(e) => setDraft({ ...s, ssoExemptFromMfa: e.target.checked })} />
+              Except single sign-on (your identity provider enforces MFA)
+            </label>
+          </div>
+        </Card>
       </fieldset>
       {canWrite && (
         <Button className="mt-4" disabled={!draft} onClick={() => void save()}>

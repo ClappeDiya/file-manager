@@ -12,7 +12,11 @@ export async function api<T = Record<string, unknown>>(path: string, init: { met
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
     credentials: 'same-origin',
   });
-  const data = (await res.json().catch(() => ({}))) as T & { error?: string };
+  const data = (await res.json().catch(() => ({}))) as T & { error?: string; code?: string };
+  // An organization requires two-factor sign-in: go and set it up.
+  if (res.status === 403 && data.code === 'mfa_setup_required' && typeof window !== 'undefined' && !window.location.pathname.startsWith('/account')) {
+    window.location.assign('/account?setup-mfa=1');
+  }
   if (!res.ok) throw new ApiError(data.error || `Request failed (HTTP ${res.status})`, res.status);
   return data;
 }

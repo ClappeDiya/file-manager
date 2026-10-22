@@ -10,9 +10,13 @@ import type { UserRecord } from './users';
 export interface SecuritySettings {
   /** Days before a console password must be changed (0 = never). */
   passwordMaxAgeDays: number;
+  /** Every member must use two-factor sign-in (TOTP). */
+  requireMfa: boolean;
+  /** With requireMfa: single sign-on sessions are exempt (the identity provider enforces MFA). */
+  ssoExemptFromMfa: boolean;
 }
 
-export const DEFAULT_SECURITY: SecuritySettings = { passwordMaxAgeDays: 0 };
+export const DEFAULT_SECURITY: SecuritySettings = { passwordMaxAgeDays: 0, requireMfa: false, ssoExemptFromMfa: false };
 
 export function getSecurity(orgId: string): SecuritySettings {
   const r = db().prepare('SELECT settings FROM org_security WHERE org_id = ?').get(orgId) as Row | undefined;
@@ -22,6 +26,7 @@ export function getSecurity(orgId: string): SecuritySettings {
 export function setSecurity(orgId: string, patch: Partial<SecuritySettings>, by: string): SecuritySettings {
   const next = { ...getSecurity(orgId), ...patch };
   if (!Number.isInteger(next.passwordMaxAgeDays) || next.passwordMaxAgeDays < 0 || next.passwordMaxAgeDays > 3650) throw new OrgError('Password age is 0 (never) to 3650 days');
+  if (typeof next.requireMfa !== 'boolean' || typeof next.ssoExemptFromMfa !== 'boolean') throw new OrgError('requireMfa and ssoExemptFromMfa are true or false');
   db()
     .prepare('INSERT INTO org_security (org_id, settings, updated_by, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(org_id) DO UPDATE SET settings = excluded.settings, updated_by = excluded.updated_by, updated_at = excluded.updated_at')
     .run(orgId, JSON.stringify(next), by, now());
@@ -34,6 +39,19 @@ export function passwordMaxAgeDays(user: UserRecord): number {
     .map((m) => getSecurity(m.orgId).passwordMaxAgeDays)
     .filter((d) => d > 0);
   return ages.length ? Math.min(...ages) : 0;
+}
+
+/**
+ * Whether the account must use two-factor sign-in: any of its organizations
+ * requires it, and (for an SSO session) not every requiring organization
+ * exempts single sign-on.
+ */
+export function mfaRequired(user: UserRecord, viaSso: boolean): boolean {
+  const requiring = membershipsOf(user.id)
+    .map((m) => getSecurity(m.orgId))
+    .filter((s) => s.requireMfa);
+  if (!requiring.length) return false;
+  return !(viaSso && requiring.every((s) => s.ssoExemptFromMfa));
 }
 
 export function passwordExpired(user: UserRecord, at = Date.now()): boolean {
