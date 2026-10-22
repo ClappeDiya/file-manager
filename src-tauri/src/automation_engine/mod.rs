@@ -15,6 +15,7 @@ pub mod scheduler;
 pub mod services;
 pub mod suggester;
 pub mod tauri_services;
+pub mod webhook;
 
 use crate::core::error::AppError;
 use chrono::Utc;
@@ -41,6 +42,115 @@ pub struct AutomationRule {
     pub trigger_count: u64,
     pub error_count: u64,
     pub last_error: Option<String>,
+    /// AND/OR/NOT condition tree; when set it replaces `conditions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_tree: Option<ConditionNode>,
+    /// Further actions run after `action`, in order (also how one rule
+    /// delivers to several destinations).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<ActionStep>,
+    #[serde(default)]
+    pub options: RuleOptions,
+}
+
+/// The parts of a rule stored in `automation_rules.extra_json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RuleExtra {
+    #[serde(default)]
+    condition_tree: Option<ConditionNode>,
+    #[serde(default)]
+    steps: Vec<ActionStep>,
+    #[serde(default)]
+    options: RuleOptions,
+}
+
+/// One extra action of a multi-step rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActionStep {
+    pub action: RuleAction,
+    /// Keep going with later steps if this one fails.
+    #[serde(default)]
+    pub continue_on_error: bool,
+}
+
+/// A boolean tree of conditions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConditionNode {
+    All { nodes: Vec<ConditionNode> },
+    Any { nodes: Vec<ConditionNode> },
+    Not { node: Box<ConditionNode> },
+    Condition { condition: RuleCondition },
+}
+
+/// Which files a rule without a triggering file (schedule, manual, webhook)
+/// works on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceSelection {
+    pub path: String,
+    #[serde(default)]
+    pub recursive: bool,
+    /// Only the N most recently modified matching files.
+    #[serde(default)]
+    pub newest: Option<usize>,
+    /// Include folders as well as files (e.g. to compress them).
+    #[serde(default)]
+    pub include_dirs: bool,
+}
+
+fn default_overwrite() -> crate::core::types::ConflictPolicy {
+    crate::core::types::ConflictPolicy::Rename
+}
+
+/// How a rule runs. Every field defaults to the behaviour rules had before
+/// it existed, so stored rules are unaffected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuleOptions {
+    /// What a copy/move/extract does when the target exists.
+    #[serde(default = "default_overwrite")]
+    pub overwrite: crate::core::types::ConflictPolicy,
+    /// Retries for transient failures (network, locked files).
+    #[serde(default = "no_retry")]
+    pub retry: ufop_core::retry::RetryPolicy,
+    /// Lower runs first when several rules fire for the same event or tick.
+    #[serde(default)]
+    pub priority: i32,
+    /// Let a new run start while the previous one is still going.
+    #[serde(default)]
+    pub allow_overlap: bool,
+    /// For file triggers: wait until the file has not changed for this many
+    /// seconds before acting (a file still being written is not touched).
+    #[serde(default)]
+    pub settle_secs: u64,
+    /// Files to act on when nothing triggered with a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceSelection>,
+    /// Approval of the exact command a `RunCommand` step runs (hash of its
+    /// program and arguments), set only through `approve_automation_command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_approval: Option<String>,
+    /// SHA-256 of the secret in this rule's webhook URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_hash: Option<String>,
+}
+
+fn no_retry() -> ufop_core::retry::RetryPolicy {
+    ufop_core::retry::RetryPolicy::NONE
+}
+
+impl Default for RuleOptions {
+    fn default() -> Self {
+        Self {
+            overwrite: default_overwrite(),
+            retry: no_retry(),
+            priority: 0,
+            allow_overlap: false,
+            settle_secs: 0,
+            source: None,
+            command_approval: None,
+            webhook_secret_hash: None,
+        }
+    }
 }
 
 impl AutomationRule {
@@ -59,12 +169,22 @@ impl AutomationRule {
             trigger_count: 0,
             error_count: 0,
             last_error: None,
+            condition_tree: None,
+            steps: Vec::new(),
+            options: RuleOptions::default(),
         }
+    }
+
+    /// Every action of the rule in order, with its continue-on-error flag.
+    pub fn all_steps(&self) -> Vec<(&RuleAction, bool)> {
+        std::iter::once((&self.action, false))
+            .chain(self.steps.iter().map(|s| (&s.action, s.continue_on_error)))
+            .collect()
     }
 }
 
 /// What triggers the rule.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuleTrigger {
     /// A new file appears in the watched directory.
@@ -90,10 +210,12 @@ pub enum RuleTrigger {
     },
     /// Manual trigger only (run from UI or command palette).
     Manual,
+    /// An HTTP request to the rule's webhook URL (see `webhook`).
+    Webhook,
 }
 
 /// Optional conditions that must ALL match (AND logic).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuleCondition {
     /// File extension matches one of the given extensions (e.g., ["pdf", "doc"]).
@@ -108,10 +230,16 @@ pub enum RuleCondition {
     CreatedWithin { seconds: u64 },
     /// File path contains this substring.
     PathContains { substring: String },
+    /// File was last modified more than N seconds ago (expiry rules).
+    OlderThan { seconds: u64 },
+    /// File was modified within the last N seconds.
+    ModifiedWithin { seconds: u64 },
+    /// File name matches a regular expression; captures feed `{1}`… tokens.
+    NameRegex { pattern: String },
 }
 
 /// What action to perform when triggered and conditions match.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuleAction {
     /// Move file(s) to a destination directory.
@@ -141,6 +269,34 @@ pub enum RuleAction {
     Notify { title: String, body: String },
     /// Create a folder (and any missing parents).
     CreateFolder { path: String },
+    /// Extract an archive (zip, tar, tar.gz, 7z) into a folder.
+    ExtractArchive {
+        dest_path: String,
+        /// Refuse archives with more members than this (zip bombs).
+        #[serde(default = "default_max_entries")]
+        max_entries: usize,
+        /// Delete the archive after a successful extraction.
+        #[serde(default)]
+        delete_archive: bool,
+    },
+    /// Run a program directly (no shell) with templated arguments.
+    RunCommand {
+        program: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        working_dir: Option<String>,
+        #[serde(default = "default_command_timeout")]
+        timeout_secs: u64,
+    },
+    /// Send a message to email, Slack, Microsoft Teams, Telegram or XMPP
+    /// (title and body are templates). The channel is configured like a
+    /// backup notification; its secret stays in the credential store.
+    SendMessage {
+        notification: crate::backup_engine::notify::Notification,
+        title: String,
+        body: String,
+    },
     /// Replay a captured set of file operations exactly as the user once
     /// performed them. Carries its own source list and destination, so the
     /// trigger doesn't need to provide a file. Created by the **Operation
@@ -157,6 +313,25 @@ pub enum RuleAction {
     },
 }
 
+fn default_max_entries() -> usize {
+    10_000
+}
+
+fn default_command_timeout() -> u64 {
+    300
+}
+
+/// Outcome of one step of one run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StepResult {
+    pub step: usize,
+    pub action: String,
+    pub file: Option<String>,
+    pub ok: bool,
+    pub attempts: u32,
+    pub message: Option<String>,
+}
+
 /// An execution log entry for a rule run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutomationLog {
@@ -169,6 +344,16 @@ pub struct AutomationLog {
     pub status: AutomationStatus,
     pub files_affected: Vec<String>,
     pub error_message: Option<String>,
+    /// Attempts the run took (more than 1 when retried).
+    #[serde(default = "one")]
+    pub attempts: u32,
+    /// Per-step, per-file results.
+    #[serde(default)]
+    pub steps: Vec<StepResult>,
+}
+
+fn one() -> u32 {
+    1
 }
 
 /// Status of an automation execution.
@@ -214,6 +399,20 @@ pub(crate) async fn record_automation_log(
     ledger.record(ev).await;
 }
 
+/// Approval string covering every `RunCommand` step of `rule` (comma-joined
+/// fingerprints), or `None` if it runs no commands.
+pub fn command_approvals(rule: &AutomationRule) -> Option<String> {
+    let fps: Vec<String> = rule
+        .all_steps()
+        .into_iter()
+        .filter_map(|(a, _)| match a {
+            RuleAction::RunCommand { program, args, working_dir, .. } => Some(executor::command_fingerprint(program, args, working_dir.as_deref())),
+            _ => None,
+        })
+        .collect();
+    (!fps.is_empty()).then(|| fps.join(","))
+}
+
 // ── Manager ──
 
 /// Maximum number of active filesystem watchers to prevent resource exhaustion.
@@ -244,6 +443,9 @@ pub(crate) struct FireContext {
     ledger: Option<crate::ledger::OperationLedger>,
     services: SharedServices,
     repo: SharedRepo,
+    /// Per-rule run locks: runs of one rule are serialized in trigger
+    /// order unless it allows overlap (tokio's Mutex is FIFO-fair).
+    locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl FireContext {
@@ -273,9 +475,41 @@ impl FireContext {
         }
     }
 
-    /// Execute a rule and record the outcome everywhere: rule stats (with
-    /// auto-disable after repeated failures), SQLite history, the in-memory
-    /// log and the operation ledger. `repo` overrides the attached repository.
+    fn lock_for(&self, rule_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks.entry(rule_id.to_string()).or_default().clone()
+    }
+
+    /// Record a run that was decided without executing (e.g. a file that
+    /// never stopped changing), so the user sees why nothing happened.
+    pub(crate) async fn record_skip(&self, rule_id: &str, file: Option<&str>, event: &str, reason: &str) {
+        let Some(rule) = self.rule(rule_id).await else { return };
+        let now = Utc::now().to_rfc3339();
+        let log = AutomationLog {
+            id: Uuid::new_v4().to_string(),
+            rule_id: rule.id.clone(),
+            rule_name: rule.name.clone(),
+            triggered_at: now.clone(),
+            completed_at: Some(now),
+            trigger_event: match file {
+                Some(f) => format!("{event}: {f}"),
+                None => event.to_string(),
+            },
+            status: AutomationStatus::Skipped,
+            files_affected: file.map(|f| vec![f.to_string()]).unwrap_or_default(),
+            error_message: Some(reason.to_string()),
+            attempts: 0,
+            steps: vec![],
+        };
+        if let Some(repo) = self.repo() {
+            if let Err(e) = db_save_log(&repo, &log).await {
+                tracing::warn!("Failed to persist automation run history: {e}");
+            }
+        }
+        self.logs.write().await.push(log);
+    }
+
+    /// [`fire`](Self::fire) with extra template values (webhook payload).
     pub(crate) async fn fire(
         &self,
         rule_id: &str,
@@ -283,14 +517,32 @@ impl FireContext {
         event: &str,
         repo: Option<&crate::storage::Repository>,
     ) -> Result<AutomationLog, AppError> {
+        self.fire_with(rule_id, triggered_file, event, repo, HashMap::new()).await
+    }
+
+    /// Execute a rule and record the outcome everywhere: rule stats (with
+    /// auto-disable after repeated failures), SQLite history, the in-memory
+    /// log and the operation ledger. `repo` overrides the attached repository.
+    pub(crate) async fn fire_with(
+        &self,
+        rule_id: &str,
+        triggered_file: Option<&str>,
+        event: &str,
+        repo: Option<&crate::storage::Repository>,
+        extra: HashMap<String, String>,
+    ) -> Result<AutomationLog, AppError> {
         let rule = self.rule(rule_id).await.ok_or_else(|| AppError::State {
             message: format!("Automation rule '{}' not found", rule_id),
             advice: "Check the rule ID.".to_string(),
         })?;
 
+        let lock = self.lock_for(rule_id);
+        let _serial = if rule.options.allow_overlap { None } else { Some(lock.lock().await) };
+        // The rule may have changed while this run waited its turn.
+        let rule = self.rule(rule_id).await.unwrap_or(rule);
+
         let services = self.services();
-        let mut log =
-            executor::execute_rule_action_with(&rule, triggered_file, false, services.as_deref()).await;
+        let mut log = executor::execute_rule(&rule, triggered_file, false, services.as_deref(), extra).await;
         log.trigger_event = match triggered_file {
             Some(f) if event != EVENT_MANUAL => format!("{event}: {f}"),
             _ => event.to_string(),
@@ -355,17 +607,24 @@ async fn db_save_rule(repo: &crate::storage::Repository, rule: &AutomationRule) 
         let trigger_json = serde_json::to_string(&rule_clone.trigger).unwrap_or_default();
         let conditions_json = serde_json::to_string(&rule_clone.conditions).unwrap_or_default();
         let action_json = serde_json::to_string(&rule_clone.action).unwrap_or_default();
+        let extra_json = serde_json::to_string(&RuleExtra {
+            condition_tree: rule_clone.condition_tree.clone(),
+            steps: rule_clone.steps.clone(),
+            options: rule_clone.options.clone(),
+        })
+        .unwrap_or_else(|_| "{}".into());
 
         conn.execute(
             "INSERT INTO automation_rules (id, name, enabled, trigger_json, conditions_json, action_json, \
-             created_at, updated_at, last_triggered, trigger_count, error_count, last_error) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+             created_at, updated_at, last_triggered, trigger_count, error_count, last_error, extra_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
              ON CONFLICT(id) DO UPDATE SET \
              name = excluded.name, enabled = excluded.enabled, \
              trigger_json = excluded.trigger_json, conditions_json = excluded.conditions_json, \
              action_json = excluded.action_json, updated_at = excluded.updated_at, \
              last_triggered = excluded.last_triggered, trigger_count = excluded.trigger_count, \
-             error_count = excluded.error_count, last_error = excluded.last_error",
+             error_count = excluded.error_count, last_error = excluded.last_error, \
+             extra_json = excluded.extra_json",
             rusqlite::params![
                 rule_clone.id,
                 rule_clone.name,
@@ -379,6 +638,7 @@ async fn db_save_rule(repo: &crate::storage::Repository, rule: &AutomationRule) 
                 rule_clone.trigger_count as i64,
                 rule_clone.error_count as i64,
                 rule_clone.last_error,
+                extra_json,
             ],
         )?;
         Ok(())
@@ -395,10 +655,11 @@ async fn db_save_log(repo: &crate::storage::Repository, log: &AutomationLog) -> 
             .trim_matches('"')
             .to_string();
 
+        let steps_json = serde_json::to_string(&log_clone.steps).unwrap_or_else(|_| "[]".into());
         conn.execute(
             "INSERT INTO automation_logs (id, rule_id, rule_name, triggered_at, completed_at, \
-             trigger_event, status, files_affected, error_message) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             trigger_event, status, files_affected, error_message, attempts, steps_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 log_clone.id,
                 log_clone.rule_id,
@@ -409,18 +670,32 @@ async fn db_save_log(repo: &crate::storage::Repository, log: &AutomationLog) -> 
                 status_str,
                 files_json,
                 log_clone.error_message,
+                log_clone.attempts as i64,
+                steps_json,
             ],
         )?;
         Ok(())
     }).await
 }
 
+/// A watched folder and the rules listening on it.
+struct FolderWatch {
+    _handle: scheduler::WatchHandle,
+    members: Arc<RwLock<Vec<String>>>,
+    recursive: bool,
+}
+
+/// Key identifying a watched folder (canonical path when resolvable).
+fn folder_key(path: &str) -> String {
+    std::fs::canonicalize(path).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| path.trim_end_matches(['/', '\\']).to_string())
+}
+
 /// Manages automation rules, watchers, schedulers, and execution.
 pub struct AutomationManager {
     rules: Arc<RwLock<Vec<AutomationRule>>>,
     logs: Arc<RwLock<Vec<AutomationLog>>>,
-    /// Track which rules have active watchers (rule_id -> watch handle).
-    active_watchers: Arc<RwLock<HashMap<String, scheduler::WatchHandle>>>,
+    /// One OS watcher per watched folder, shared by every rule on it.
+    active_watchers: Arc<RwLock<HashMap<String, FolderWatch>>>,
     /// Concurrency limiter for action execution.
     exec_semaphore: Arc<tokio::sync::Semaphore>,
     /// Cooldown tracker to prevent circular triggers (file_path -> last_trigger_time).
@@ -440,6 +715,8 @@ pub struct AutomationManager {
     cron: Arc<crate::sync_engine::scheduler::SyncScheduler>,
     /// Cron key → rule id.
     cron_ids: Arc<std::sync::Mutex<HashMap<Uuid, String>>>,
+    run_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    webhook_addr: Arc<std::sync::RwLock<Option<std::net::SocketAddr>>>,
 }
 
 impl AutomationManager {
@@ -455,6 +732,8 @@ impl AutomationManager {
             repo: Arc::new(std::sync::RwLock::new(None)),
             cron: Arc::new(crate::sync_engine::scheduler::SyncScheduler::new()),
             cron_ids: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            run_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            webhook_addr: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -487,6 +766,7 @@ impl AutomationManager {
             ledger: self.ledger.clone(),
             services: self.services.clone(),
             repo: self.repo.clone(),
+            locks: self.run_locks.clone(),
         }
     }
 
@@ -495,7 +775,7 @@ impl AutomationManager {
         let rules = repo.pool().execute(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, name, enabled, trigger_json, conditions_json, action_json, \
-                 created_at, updated_at, last_triggered, trigger_count, error_count, last_error \
+                 created_at, updated_at, last_triggered, trigger_count, error_count, last_error, extra_json \
                  FROM automation_rules ORDER BY created_at DESC"
             )?;
 
@@ -510,11 +790,15 @@ impl AutomationManager {
                     // different action that would run on the next trigger.
                     let parsed_action = serde_json::from_str::<RuleAction>(&action_json);
                     let parsed_trigger = serde_json::from_str::<RuleTrigger>(&trigger_json);
-                    let unreadable = match (&parsed_action, &parsed_trigger) {
-                        (Err(e), _) => Some(format!("Unreadable action configuration: {e}")),
-                        (_, Err(e)) => Some(format!("Unreadable trigger configuration: {e}")),
+                    let extra_json: String = row.get(12)?;
+                    let parsed_extra = serde_json::from_str::<RuleExtra>(&extra_json);
+                    let unreadable = match (&parsed_action, &parsed_trigger, &parsed_extra) {
+                        (Err(e), _, _) => Some(format!("Unreadable action configuration: {e}")),
+                        (_, Err(e), _) => Some(format!("Unreadable trigger configuration: {e}")),
+                        (_, _, Err(e)) => Some(format!("Unreadable rule options: {e}")),
                         _ => None,
                     };
+                    let extra = parsed_extra.unwrap_or_default();
                     Ok(AutomationRule {
                         id: row.get(0)?,
                         name: row.get(1)?,
@@ -531,6 +815,9 @@ impl AutomationManager {
                         trigger_count: row.get::<_, i64>(9)? as u64,
                         error_count: row.get::<_, i64>(10)? as u64,
                         last_error: unreadable.or(row.get(11)?),
+                        condition_tree: extra.condition_tree,
+                        steps: extra.steps,
+                        options: extra.options,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -652,6 +939,11 @@ impl AutomationManager {
     /// Start the cron loop for `Schedule` rules. Call once from inside the
     /// long-lived tokio runtime; due rules run on that runtime.
     pub fn start_scheduler(&self) {
+        self.start_scheduler_every(std::time::Duration::from_secs(30));
+    }
+
+    /// [`start_scheduler`](Self::start_scheduler) with a custom poll interval.
+    pub fn start_scheduler_every(&self, interval: std::time::Duration) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             tracing::warn!("Automation scheduler not started: no tokio runtime");
             return;
@@ -659,19 +951,33 @@ impl AutomationManager {
         let ctx = self.fire_context();
         let ids = self.cron_ids.clone();
         let semaphore = self.exec_semaphore.clone();
-        self.cron.start(Arc::new(move |key: Uuid| {
-            let Some(rule_id) = ids.lock().ok().and_then(|m| m.get(&key).cloned()) else {
-                return;
-            };
-            let ctx = ctx.clone();
-            let semaphore = semaphore.clone();
-            handle.spawn(async move {
-                let Ok(_permit) = semaphore.acquire_owned().await else { return };
-                if let Some(log) = ctx.fire_if_enabled(&rule_id, None, EVENT_SCHEDULE).await {
-                    tracing::info!("Scheduled automation '{}' ran: {:?}", log.rule_name, log.status);
-                }
-            });
-        }));
+        self.cron.start_batch_with_interval(
+            Arc::new(move |keys: Vec<Uuid>| {
+                let rule_ids: Vec<String> = {
+                    let map = ids.lock().unwrap_or_else(|e| e.into_inner());
+                    keys.iter().filter_map(|k| map.get(k).cloned()).collect()
+                };
+                let (ctx, semaphore) = (ctx.clone(), semaphore.clone());
+                // Rules due on the same tick run one after another, lowest
+                // priority number first.
+                handle.spawn(async move {
+                    let mut due = Vec::new();
+                    for id in rule_ids {
+                        if let Some(r) = ctx.rule(&id).await {
+                            due.push(r);
+                        }
+                    }
+                    due.sort_by(|a, b| a.options.priority.cmp(&b.options.priority).then_with(|| a.created_at.cmp(&b.created_at)));
+                    let Ok(_permit) = semaphore.acquire_owned().await else { return };
+                    for rule in due {
+                        if let Some(log) = ctx.fire_if_enabled(&rule.id, None, EVENT_SCHEDULE).await {
+                            tracing::info!("Scheduled automation '{}' ran: {:?}", log.rule_name, log.status);
+                        }
+                    }
+                });
+            }),
+            interval,
+        );
     }
 
     /// Whether the cron loop is running.
@@ -712,61 +1018,157 @@ impl AutomationManager {
         }
 
         let watch_path = match &rule.trigger {
-            RuleTrigger::FileAppears { watch_path, .. } => Some(watch_path.clone()),
-            RuleTrigger::FileModified { watch_path, .. } => Some(watch_path.clone()),
-            RuleTrigger::FileDeleted { watch_path, .. } => Some(watch_path.clone()),
-            RuleTrigger::Schedule { .. } | RuleTrigger::Manual => None,
+            RuleTrigger::FileAppears { watch_path, .. }
+            | RuleTrigger::FileModified { watch_path, .. }
+            | RuleTrigger::FileDeleted { watch_path, .. } => watch_path.clone(),
+            RuleTrigger::Schedule { .. } | RuleTrigger::Manual | RuleTrigger::Webhook => return Ok(()),
         };
+        let recursive = matches!(
+            rule.trigger,
+            RuleTrigger::FileAppears { recursive: true, .. }
+                | RuleTrigger::FileModified { recursive: true, .. }
+                | RuleTrigger::FileDeleted { recursive: true, .. }
+        );
+        let key = folder_key(&watch_path);
 
-        let Some(path) = watch_path else {
-            return Ok(());
-        };
-
-        // Check watcher limit
-        let watchers = self.active_watchers.read().await;
-        if watchers.len() >= MAX_WATCHERS {
+        let mut watchers = self.active_watchers.write().await;
+        if let Some(existing) = watchers.get(&key) {
+            let mut members = existing.members.write().await;
+            if !members.contains(&rule.id) {
+                members.push(rule.id.clone());
+            }
+            if existing.recursive || !recursive {
+                return Ok(());
+            }
+        } else if watchers.len() >= MAX_WATCHERS {
             return Err(AppError::State {
-                message: format!("Maximum watcher limit ({MAX_WATCHERS}) reached"),
+                message: format!("Maximum watcher limit ({MAX_WATCHERS} folders) reached"),
                 advice: "Disable some automation rules to free up watchers.".to_string(),
             });
         }
-        if watchers.contains_key(&rule.id) {
-            return Ok(()); // already watching
-        }
-        drop(watchers);
 
-        let recursive = match &rule.trigger {
-            RuleTrigger::FileAppears { recursive, .. }
-            | RuleTrigger::FileModified { recursive, .. }
-            | RuleTrigger::FileDeleted { recursive, .. } => *recursive,
-            _ => false,
+        // New folder, or an existing one that now needs a recursive watch:
+        // (re)start the OS watcher with the folder's member list.
+        let members = match watchers.get(&key) {
+            Some(w) => w.members.clone(),
+            None => Arc::new(RwLock::new(vec![rule.id.clone()])),
         };
-
-        let handle = scheduler::start_file_watcher(
-            rule.id.clone(),
-            path,
+        let recursive = recursive || watchers.get(&key).is_some_and(|w| w.recursive);
+        let handle = scheduler::start_folder_watcher(
+            watch_path,
             recursive,
-            rule.trigger.clone(),
+            members.clone(),
             self.exec_semaphore.clone(),
             self.cooldowns.clone(),
             self.fire_context(),
         )?;
-
-        self.active_watchers.write().await.insert(rule.id.clone(), handle);
-        tracing::info!("Started watcher for automation rule '{}'", rule.name);
+        watchers.insert(key, FolderWatch { _handle: handle, members, recursive });
+        tracing::info!("Watching for automation rule '{}'", rule.name);
         Ok(())
     }
 
-    /// Stop a rule's watcher and cron schedule.
+    /// Stop a rule's watcher membership and cron schedule.
     async fn stop_watcher(&self, rule_id: &str) {
         let key = Self::cron_key(rule_id);
         let _ = self.cron.remove_schedule(key);
         if let Ok(mut ids) = self.cron_ids.lock() {
             ids.remove(&key);
         }
-        if self.active_watchers.write().await.remove(rule_id).is_some() {
-            tracing::info!("Stopped watcher for automation rule '{}'", rule_id);
+        let mut watchers = self.active_watchers.write().await;
+        let mut emptied = Vec::new();
+        for (folder, w) in watchers.iter() {
+            let mut members = w.members.write().await;
+            if let Some(i) = members.iter().position(|m| m == rule_id) {
+                members.remove(i);
+                tracing::info!("Stopped watching for automation rule '{}'", rule_id);
+            }
+            if members.is_empty() {
+                emptied.push(folder.clone());
+            }
         }
+        for folder in emptied {
+            watchers.remove(&folder);
+        }
+    }
+
+    /// Folders currently watched, with how many rules use each.
+    pub async fn watched_folders(&self) -> Vec<(String, usize)> {
+        let watchers = self.active_watchers.read().await;
+        let mut out = Vec::new();
+        for (k, w) in watchers.iter() {
+            out.push((k.clone(), w.members.read().await.len()));
+        }
+        out.sort();
+        out
+    }
+
+    /// Security fields can't arrive through create/update: command
+    /// approval and the webhook secret hash are only ever set by
+    /// [`approve_commands`](Self::approve_commands) and
+    /// [`rotate_webhook_secret`](Self::rotate_webhook_secret). An edit keeps
+    /// the stored approval only while the command lines are unchanged.
+    pub async fn sanitize_incoming(&self, rule: &mut AutomationRule) {
+        let stored = self.get_rule(&rule.id).await;
+        let still_approved = stored.as_ref().and_then(|s| s.options.command_approval.clone()).filter(|a| {
+            command_approvals(rule).is_some_and(|wanted| wanted.split(',').all(|fp| a.split(',').any(|x| x == fp)))
+        });
+        rule.options.command_approval = still_approved;
+        rule.options.webhook_secret_hash = stored.and_then(|s| s.options.webhook_secret_hash);
+    }
+
+    /// Approve the exact command lines a rule runs (after the user confirmed
+    /// them in the UI).
+    pub async fn approve_commands(&self, repo: &crate::storage::Repository, rule_id: &str) -> Result<AutomationRule, AppError> {
+        let mut rule = self.get_rule(rule_id).await.ok_or_else(|| AppError::not_found(format!("Automation rule '{rule_id}' not found")))?;
+        rule.options.command_approval = command_approvals(&rule);
+        if rule.options.command_approval.is_none() {
+            return Err(AppError::validation("This rule doesn't run any commands"));
+        }
+        rule.updated_at = Utc::now().to_rfc3339();
+        self.save_rule(repo, &rule).await?;
+        Ok(rule)
+    }
+
+    /// Copy a rule: new id, "(copy)" name, disabled, fresh statistics, and
+    /// without the original's command approval or webhook secret.
+    pub async fn clone_rule(&self, repo: &crate::storage::Repository, rule_id: &str) -> Result<AutomationRule, AppError> {
+        let src = self.get_rule(rule_id).await.ok_or_else(|| AppError::not_found(format!("Automation rule '{rule_id}' not found")))?;
+        let mut copy = AutomationRule::new(format!("{} (copy)", src.name), src.trigger.clone(), src.action.clone());
+        copy.conditions = src.conditions.clone();
+        copy.condition_tree = src.condition_tree.clone();
+        copy.steps = src.steps.clone();
+        copy.options = RuleOptions { command_approval: None, webhook_secret_hash: None, ..src.options.clone() };
+        self.save_rule(repo, &copy).await?;
+        Ok(copy)
+    }
+
+    /// Issue a new webhook secret for a rule; returns it once (only its hash
+    /// is stored, so it can't be shown again).
+    pub async fn rotate_webhook_secret(&self, repo: &crate::storage::Repository, rule_id: &str) -> Result<String, AppError> {
+        let mut rule = self.get_rule(rule_id).await.ok_or_else(|| AppError::not_found(format!("Automation rule '{rule_id}' not found")))?;
+        if rule.trigger != RuleTrigger::Webhook {
+            return Err(AppError::validation("Only webhook-triggered rules have a webhook URL"));
+        }
+        let secret = webhook::new_secret();
+        rule.options.webhook_secret_hash = Some(webhook::hash_secret(&secret));
+        rule.updated_at = Utc::now().to_rfc3339();
+        self.save_rule(repo, &rule).await?;
+        Ok(secret)
+    }
+
+    /// Start the webhook listener; returns the bound address.
+    pub async fn start_webhook_listener(&self, addr: std::net::SocketAddr) -> std::io::Result<std::net::SocketAddr> {
+        let bound = webhook::serve(self.fire_context(), addr).await?;
+        if let Ok(mut a) = self.webhook_addr.write() {
+            *a = Some(bound);
+        }
+        tracing::info!("Automation webhooks listening on http://{bound}/hooks/<rule-id>");
+        Ok(bound)
+    }
+
+    /// Where the webhook listener is bound, if running.
+    pub fn webhook_addr(&self) -> Option<std::net::SocketAddr> {
+        self.webhook_addr.read().ok().and_then(|a| *a)
     }
 
     /// Stop all watchers and schedules.
@@ -787,21 +1189,12 @@ impl AutomationManager {
         self.fire_context().fire(rule_id, None, EVENT_MANUAL, Some(repo)).await
     }
 
-    /// Dry-run a rule without executing the action.
+    /// Dry-run a rule: which files it would act on and which steps would
+    /// run, without touching anything.
     pub async fn test_rule(&self, rule: &AutomationRule) -> Result<AutomationLog, AppError> {
-        executor::execute_rule_action(rule, None, true).await;
-
-        Ok(AutomationLog {
-            id: Uuid::new_v4().to_string(),
-            rule_id: rule.id.clone(),
-            rule_name: rule.name.clone(),
-            triggered_at: Utc::now().to_rfc3339(),
-            completed_at: Some(Utc::now().to_rfc3339()),
-            trigger_event: "dry_run".to_string(),
-            status: AutomationStatus::Success,
-            files_affected: vec![],
-            error_message: None,
-        })
+        let mut log = executor::execute_rule_action(rule, None, true).await;
+        log.trigger_event = "dry_run".to_string();
+        Ok(log)
     }
 
     /// List automation logs, optionally filtered by rule ID.
@@ -817,7 +1210,7 @@ impl AutomationManager {
         repo.pool().execute(move |conn| {
             if let Some(ref rid) = rid {
                 let mut stmt = conn.prepare(
-                    "SELECT id, rule_id, rule_name, triggered_at, completed_at, trigger_event, status, files_affected, error_message \
+                    "SELECT id, rule_id, rule_name, triggered_at, completed_at, trigger_event, status, files_affected, error_message, attempts, steps_json \
                      FROM automation_logs WHERE rule_id = ?1 ORDER BY triggered_at DESC LIMIT ?2"
                 )?;
                 let logs: Vec<AutomationLog> = stmt.query_map(rusqlite::params![rid, limit], parse_log_row)?
@@ -826,7 +1219,7 @@ impl AutomationManager {
                 Ok(logs)
             } else {
                 let mut stmt = conn.prepare(
-                    "SELECT id, rule_id, rule_name, triggered_at, completed_at, trigger_event, status, files_affected, error_message \
+                    "SELECT id, rule_id, rule_name, triggered_at, completed_at, trigger_event, status, files_affected, error_message, attempts, steps_json \
                      FROM automation_logs ORDER BY triggered_at DESC LIMIT ?1"
                 )?;
                 let logs: Vec<AutomationLog> = stmt.query_map(rusqlite::params![limit], parse_log_row)?
@@ -871,6 +1264,8 @@ fn parse_log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationLog> {
         },
         files_affected: serde_json::from_str(&files_json).unwrap_or_default(),
         error_message: row.get(8)?,
+        attempts: row.get::<_, i64>(9)? as u32,
+        steps: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
     })
 }
 
@@ -882,6 +1277,31 @@ impl Default for AutomationManager {
 
 #[cfg(test)]
 mod tests {
+    /// Rules exactly as the desktop rule editor emits them (generated by
+    /// `src/__tests__/automation-rule-model.test.ts`): every one must load,
+    /// and the shapes the editor relies on must come through.
+    #[test]
+    fn editor_rules_deserialize() {
+        let rules: Vec<AutomationRule> =
+            serde_json::from_str(include_str!("fixtures/editor-rules.json")).expect("editor JSON matches the engine");
+        assert!(rules.len() >= 5);
+        let last = rules.last().unwrap();
+        assert_eq!(last.trigger, RuleTrigger::Webhook);
+        assert!(matches!(last.condition_tree, Some(ConditionNode::Any { ref nodes }) if nodes.len() == 2));
+        assert_eq!(last.steps.len(), 1);
+        assert!(matches!(last.action, RuleAction::SendMessage { .. }));
+        assert!(matches!(last.steps[0].action, RuleAction::RunCommand { .. }));
+        assert_eq!(last.options.priority, -1);
+        assert_eq!(last.options.source.as_ref().map(|s| s.newest), Some(Some(5)));
+        assert!(command_approvals(last).is_some());
+        // Round trip: what the engine sends back the editor reads the same.
+        for r in &rules {
+            let json = serde_json::to_value(r).unwrap();
+            let again: AutomationRule = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&again).unwrap(), json);
+        }
+    }
+
     use super::*;
     use crate::automation_engine::services::mock::RecordingServices;
     use crate::storage::Repository;
@@ -1069,5 +1489,200 @@ mod tests {
         let r = mgr.get_rule("r1").await.unwrap();
         assert!(!r.enabled);
         assert!(r.last_error.unwrap().contains("Unreadable action"));
+    }
+
+    // ── Automation v1.5: manager level ──
+
+    /// Rules on one folder run in priority order (lower first) for each file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_folder_watch_runs_rules_in_priority_order() {
+        let (mgr, repo) = manager().await;
+        let watched = tempfile::tempdir().unwrap();
+        let journal = watched.path().parent().unwrap().join(format!("journal-{}", Uuid::new_v4()));
+        let mk = |name: &str, priority: i32| {
+            let mut r = AutomationRule::new(
+                name.into(),
+                RuleTrigger::FileAppears { watch_path: watched.path().to_string_lossy().to_string(), recursive: false },
+                RuleAction::RunCommand { program: "sh".into(), args: vec!["-c".into(), format!("echo {name} >> {}", journal.display())], working_dir: None, timeout_secs: 10 },
+            );
+            r.options.priority = priority;
+            r.options.command_approval = command_approvals(&r);
+            r
+        };
+        for r in [mk("third", 9), mk("first", -1), mk("second", 0)] {
+            mgr.save_rule(&repo, &r).await.unwrap();
+            mgr.set_enabled(&repo, &r.id, true).await.unwrap();
+        }
+        assert_eq!(mgr.watched_folders().await.len(), 1, "one OS watcher for the folder");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(watched.path().join("a.csv"), b"x").unwrap();
+        let done = wait_for(|| async { std::fs::read_to_string(&journal).map(|s| s.lines().count() == 3).unwrap_or(false) }).await;
+        mgr.stop_all().await;
+        assert!(done, "all three rules ran");
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), "first\nsecond\nthird\n");
+        std::fs::remove_file(journal).ok();
+    }
+
+    /// Regression: the watcher dropped every event within 2 s of the
+    /// previous one, so the second of two files arriving together was missed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn files_arriving_together_are_all_handled() {
+        let (mgr, repo) = manager().await;
+        let watched = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let rule = AutomationRule::new(
+            "copy all".into(),
+            RuleTrigger::FileAppears { watch_path: watched.path().to_string_lossy().to_string(), recursive: false },
+            RuleAction::CopyFile { dest_path: out.path().to_string_lossy().to_string() },
+        );
+        mgr.save_rule(&repo, &rule).await.unwrap();
+        mgr.set_enabled(&repo, &rule.id, true).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for i in 0..5 {
+            std::fs::write(watched.path().join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let all = wait_for(|| async { (0..5).all(|i| out.path().join(format!("f{i}.txt")).exists()) }).await;
+        mgr.stop_all().await;
+        assert!(all, "every file was copied");
+    }
+
+    #[tokio::test]
+    async fn runs_of_one_rule_never_overlap_unless_allowed() {
+        let (mgr, repo) = manager().await;
+        let mut rule = AutomationRule::new(
+            "slow".into(),
+            RuleTrigger::Manual,
+            RuleAction::RunCommand { program: "sleep".into(), args: vec!["0.3".into()], working_dir: None, timeout_secs: 5 },
+        );
+        rule.options.command_approval = command_approvals(&rule);
+        mgr.save_rule(&repo, &rule).await.unwrap();
+        let ctx = mgr.fire_context();
+        let (a, b) = tokio::join!(ctx.fire(&rule.id, None, EVENT_MANUAL, None), ctx.fire(&rule.id, None, EVENT_MANUAL, None));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let (first, second) = if a.triggered_at <= b.triggered_at { (a, b) } else { (b, a) };
+        assert!(first.completed_at.as_deref().unwrap() <= second.triggered_at.as_str(), "second run started after the first finished");
+
+        rule.options.allow_overlap = true;
+        mgr.save_rule(&repo, &rule).await.unwrap();
+        let started = std::time::Instant::now();
+        let _ = tokio::join!(ctx.fire(&rule.id, None, EVENT_MANUAL, None), ctx.fire(&rule.id, None, EVENT_MANUAL, None));
+        assert!(started.elapsed() < Duration::from_millis(550), "overlapping runs went in parallel");
+    }
+
+    #[tokio::test]
+    async fn incoming_rules_cannot_forge_approval_or_webhook_secret() {
+        let (mgr, repo) = manager().await;
+        let mut rule = AutomationRule::new(
+            "cmd".into(),
+            RuleTrigger::Manual,
+            RuleAction::RunCommand { program: "touch".into(), args: vec!["/tmp/x".into()], working_dir: None, timeout_secs: 5 },
+        );
+        rule.options.command_approval = command_approvals(&rule); // forged by the caller
+        rule.options.webhook_secret_hash = Some("forged".into());
+        mgr.sanitize_incoming(&mut rule).await;
+        assert!(rule.options.command_approval.is_none() && rule.options.webhook_secret_hash.is_none());
+        mgr.save_rule(&repo, &rule).await.unwrap();
+
+        let approved = mgr.approve_commands(&repo, &rule.id).await.unwrap();
+        assert!(approved.options.command_approval.is_some());
+        // Unchanged edit keeps the approval; changing the command drops it.
+        let mut same = approved.clone();
+        same.name = "renamed".into();
+        mgr.sanitize_incoming(&mut same).await;
+        assert_eq!(same.options.command_approval, approved.options.command_approval);
+        let mut changed = approved.clone();
+        changed.action = RuleAction::RunCommand { program: "rm".into(), args: vec!["-rf".into(), "/".into()], working_dir: None, timeout_secs: 5 };
+        mgr.sanitize_incoming(&mut changed).await;
+        assert!(changed.options.command_approval.is_none());
+    }
+
+    #[tokio::test]
+    async fn clone_copies_everything_but_identity_and_secrets() {
+        let (mgr, repo) = manager().await;
+        let mut rule = AutomationRule::new("orig".into(), RuleTrigger::Webhook, RuleAction::CreateFolder { path: "/tmp/{customer}".into() });
+        rule.enabled = true;
+        rule.trigger_count = 9;
+        rule.steps = vec![ActionStep { action: RuleAction::CreateFolder { path: "/tmp/b".into() }, continue_on_error: true }];
+        rule.options.priority = 3;
+        mgr.save_rule(&repo, &rule).await.unwrap();
+        mgr.rotate_webhook_secret(&repo, &rule.id).await.unwrap();
+        let copy = mgr.clone_rule(&repo, &rule.id).await.unwrap();
+        assert_ne!(copy.id, rule.id);
+        assert_eq!(copy.name, "orig (copy)");
+        assert!(!copy.enabled && copy.trigger_count == 0);
+        assert_eq!((copy.steps.len(), copy.options.priority), (1, 3));
+        assert!(copy.options.webhook_secret_hash.is_none());
+        // Extras persist across a reload.
+        let reloaded = AutomationManager::new();
+        reloaded.load_rules_from_db(&repo).await.unwrap();
+        let back = reloaded.get_rule(&copy.id).await.unwrap();
+        assert_eq!(back.steps, copy.steps);
+        assert_eq!(back.options, copy.options);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn webhook_runs_the_rule_with_payload_values() {
+        let (mgr, repo) = manager().await;
+        let base = tempfile::tempdir().unwrap();
+        let mut rule = AutomationRule::new(
+            "hook".into(),
+            RuleTrigger::Webhook,
+            RuleAction::CreateFolder { path: format!("{}/{{customer}}/{{order}}", base.path().display()) },
+        );
+        rule.enabled = true;
+        mgr.save_rule(&repo, &rule).await.unwrap();
+        let secret = mgr.rotate_webhook_secret(&repo, &rule.id).await.unwrap();
+        let addr = mgr.start_webhook_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let url = format!("http://{addr}/hooks/{}", rule.id);
+        let http = reqwest::Client::new();
+
+        let denied = http.post(&url).bearer_auth("wrong").body("{}").send().await.unwrap();
+        assert_eq!(denied.status(), 401);
+        let unknown = http.post(format!("http://{addr}/hooks/nope")).bearer_auth(&secret).send().await.unwrap();
+        assert_eq!(unknown.status(), 404);
+
+        let ok = http.post(&url).bearer_auth(&secret).body(r#"{"customer":"acme","order":42}"#).send().await.unwrap();
+        assert_eq!(ok.status(), 202);
+        let target = base.path().join("acme/42");
+        assert!(wait_for(|| async { target.is_dir() }).await, "rule ran with payload values");
+        let via_query = http.get(format!("{url}?token={secret}")).send().await.unwrap();
+        assert_eq!(via_query.status(), 202);
+
+        // A rotated secret invalidates the old one.
+        mgr.rotate_webhook_secret(&repo, &rule.id).await.unwrap();
+        assert_eq!(http.post(&url).bearer_auth(&secret).send().await.unwrap().status(), 401);
+    }
+
+    /// A file still being written is copied only once it stops changing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settle_waits_for_writes_to_finish() {
+        use std::io::Write;
+        let (mgr, repo) = manager().await;
+        let watched = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut rule = AutomationRule::new(
+            "settled copy".into(),
+            RuleTrigger::FileAppears { watch_path: watched.path().to_string_lossy().to_string(), recursive: false },
+            RuleAction::CopyFile { dest_path: out.path().to_string_lossy().to_string() },
+        );
+        rule.options.settle_secs = 1;
+        mgr.save_rule(&repo, &rule).await.unwrap();
+        mgr.set_enabled(&repo, &rule.id, true).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let path = watched.path().join("big.bin");
+        let writer = std::thread::spawn(move || {
+            let mut f = std::fs::File::create(&path).unwrap();
+            for _ in 0..6 {
+                f.write_all(&[7u8; 4096]).unwrap();
+                f.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
+        let copied = out.path().join("big.bin");
+        assert!(wait_for(|| async { copied.exists() }).await);
+        writer.join().unwrap();
+        mgr.stop_all().await;
+        assert_eq!(std::fs::metadata(&copied).unwrap().len(), 6 * 4096, "copied only after the last write");
     }
 }

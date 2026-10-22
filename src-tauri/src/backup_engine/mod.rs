@@ -2040,6 +2040,29 @@ impl BackupManager {
         .await
     }
 
+    /// Send one message through a notification channel, resolving its
+    /// secret (password, bot token or webhook URL) from the credential
+    /// store. Used by automation's SendMessage action.
+    pub async fn send_message(&self, mut n: notify::Notification, title: &str, body: &str) -> Result<(), AppError> {
+        let secret = self.destination_secret(&n.credential_id).await?;
+        n.send_on = vec!["message".into()];
+        n.template.clear();
+        if let notify::Channel::Email { subject, .. } = &mut n.channel {
+            *subject = title.to_string();
+        }
+        let vars: std::collections::BTreeMap<String, String> =
+            [("name", title), ("operation", "automation"), ("result", "message")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let body = match &n.channel {
+            // Slack/Teams show the title separately; email has it as subject.
+            notify::Channel::Telegram { .. } | notify::Channel::Xmpp { .. } => format!("{title}\n\n{body}"),
+            _ => body.to_string(),
+        };
+        match notify::deliver(&[(n, secret)], "message", &vars, &body).await.into_iter().next() {
+            Some(e) => Err(AppError::connection(e, "Check the channel settings with Send test in Backup → Notifications.")),
+            None => Ok(()),
+        }
+    }
+
     /// Send a test message through one notification channel.
     pub async fn test_notification(&self, mut n: notify::Notification) -> Result<(), AppError> {
         let secret = self.destination_secret(&n.credential_id).await?;

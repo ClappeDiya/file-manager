@@ -10,11 +10,10 @@ import {
   type AutomationRule,
   type RuleTrigger,
   type RuleAction,
-  type RuleCondition,
   type AutomationLog,
   type QuickflowSuggestion,
 } from "@/stores/automation-store";
-import { formatBytes } from "@/lib/format-bytes";
+import { conditionsSummary } from "@/lib/automation-rule-model";
 import { cn } from "@ufop/ui-components";
 import { Button, Badge, ScrollArea } from "@ufop/ui-components";
 import { FeaturePeek } from "@/components/feature-peek";
@@ -38,6 +37,8 @@ import {
   ToggleLeft,
   ToggleRight,
   Sparkles,
+  Copy,
+  Webhook,
 } from "lucide-react";
 
 // ── NL Input Bar ──
@@ -103,6 +104,8 @@ function triggerLabel(trigger: RuleTrigger): string {
       return trigger.cron_human || `Schedule: ${trigger.cron_expr}`;
     case "manual":
       return "Manual trigger";
+    case "webhook":
+      return "Webhook call";
   }
 }
 
@@ -126,6 +129,12 @@ function actionLabel(action: RuleAction): string {
       return "Run custom command";
     case "notify":
       return `Notify: ${action.title}`;
+    case "extract_archive":
+      return `Extract to ${shortenPath(action.dest_path)}`;
+    case "run_command":
+      return `Run ${action.program}`;
+    case "send_message":
+      return `Message: ${action.title}`;
     case "create_folder":
       return `Create folder ${shortenPath(action.path)}`;
     case "replay_op": {
@@ -150,6 +159,8 @@ function triggerIcon(trigger: RuleTrigger) {
       return <Clock className="h-3.5 w-3.5" aria-hidden="true" />;
     case "manual":
       return <Hand className="h-3.5 w-3.5" aria-hidden="true" />;
+    case "webhook":
+      return <Webhook className="h-3.5 w-3.5" aria-hidden="true" />;
   }
 }
 
@@ -171,6 +182,7 @@ function RuleCard({ rule }: RuleCardProps) {
   const runRule = useAutomationStore((s) => s.runRule);
   const deleteRule = useAutomationStore((s) => s.deleteRule);
   const openEditor = useAutomationStore((s) => s.openEditor);
+  const cloneRule = useAutomationStore((s) => s.cloneRule);
   const selectRule = useAutomationStore((s) => s.selectRule);
   const selectedRuleId = useAutomationStore((s) => s.selectedRuleId);
   const [expanded, setExpanded] = useState(false);
@@ -274,15 +286,16 @@ function RuleCard({ rule }: RuleCardProps) {
           </div>
 
           {/* Conditions */}
-          {rule.conditions.length > 0 && (
+          {(rule.conditions.length > 0 || rule.condition_tree) && (
             <div className="text-[10px] text-[var(--color-text-muted)] mb-2">
               <span className="font-medium">Conditions: </span>
-              {rule.conditions.map((c, i) => (
-                <span key={i}>
-                  {i > 0 && " AND "}
-                  {conditionLabel(c)}
-                </span>
-              ))}
+              {conditionsSummary(rule)}
+            </div>
+          )}
+          {(rule.steps?.length ?? 0) > 0 && (
+            <div className="text-[10px] text-[var(--color-text-muted)] mb-2">
+              <span className="font-medium">Then: </span>
+              {rule.steps!.map((s) => actionLabel(s.action)).join(" → ")}
             </div>
           )}
 
@@ -326,6 +339,18 @@ function RuleCard({ rule }: RuleCardProps) {
               size="sm"
               onClick={(e) => {
                 e.stopPropagation();
+                void cloneRule(rule.id);
+              }}
+              className="h-6 text-[10px]"
+            >
+              <Copy className="h-3 w-3 mr-1" />
+              Clone
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={(e) => {
+                e.stopPropagation();
                 if (confirm(`Delete rule "${rule.name}"?`)) {
                   deleteRule(rule.id);
                 }
@@ -340,23 +365,6 @@ function RuleCard({ rule }: RuleCardProps) {
       )}
     </div>
   );
-}
-
-function conditionLabel(condition: RuleCondition): string {
-  switch (condition.type) {
-    case "extension_is":
-      return `ext = ${condition.extensions.join(", ")}`;
-    case "name_matches":
-      return `name ~ ${condition.pattern}`;
-    case "size_greater_than":
-      return `size > ${formatBytes(condition.bytes)}`;
-    case "size_less_than":
-      return `size < ${formatBytes(condition.bytes)}`;
-    case "created_within":
-      return `age < ${condition.seconds}s`;
-    case "path_contains":
-      return `path contains "${condition.substring}"`;
-  }
 }
 
 // ── Log Entry ──

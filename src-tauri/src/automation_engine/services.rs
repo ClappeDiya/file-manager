@@ -41,6 +41,15 @@ pub trait ActionServices: Send + Sync {
 
     /// Show an OS notification.
     fn notify(&self, title: &str, body: &str) -> BoxFuture<'_, Result<(), String>>;
+
+    /// Deliver a message through a configured channel (email, Slack,
+    /// Teams, Telegram, XMPP).
+    fn send_message(
+        &self,
+        notification: &crate::backup_engine::notify::Notification,
+        title: &str,
+        body: &str,
+    ) -> BoxFuture<'_, Result<(), String>>;
 }
 
 /// Join a remote directory and a file name with exactly one `/`.
@@ -113,6 +122,17 @@ pub mod mock {
 
         fn notify(&self, title: &str, body: &str) -> BoxFuture<'_, Result<(), String>> {
             let r = self.record(format!("notify:{title}:{body}"));
+            Box::pin(async move { r })
+        }
+
+        fn send_message(
+            &self,
+            notification: &crate::backup_engine::notify::Notification,
+            title: &str,
+            body: &str,
+        ) -> BoxFuture<'_, Result<(), String>> {
+            let kind = serde_json::to_value(&notification.channel).ok().and_then(|v| v["type"].as_str().map(str::to_string)).unwrap_or_default();
+            let r = self.record(format!("message:{kind}:{title}:{body}"));
             Box::pin(async move { r })
         }
     }

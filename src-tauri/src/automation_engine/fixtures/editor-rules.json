@@ -1,0 +1,244 @@
+[
+  {
+    "id": "00000000-0000-4000-8000-000000000000",
+    "name": "Notify on new files",
+    "enabled": false,
+    "trigger": {
+      "type": "file_appears",
+      "watch_path": "/inbox",
+      "recursive": false
+    },
+    "conditions": [],
+    "condition_tree": null,
+    "action": {
+      "type": "notify",
+      "title": "New file in {parent}",
+      "body": "{filename} ({size} bytes)"
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": null
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "name": "File by date",
+    "enabled": false,
+    "trigger": {
+      "type": "file_appears",
+      "watch_path": "/inbox",
+      "recursive": false
+    },
+    "conditions": [],
+    "condition_tree": null,
+    "action": {
+      "type": "move_file",
+      "dest_path": "/inbox/Filed/{yyyy}/{mm}"
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": null
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000002",
+    "name": "Expire files older than 30 days",
+    "enabled": false,
+    "trigger": {
+      "type": "schedule",
+      "cron_expr": "0 0 2 * * * *",
+      "cron_human": "Every day at 02:00"
+    },
+    "conditions": [
+      {
+        "type": "older_than",
+        "seconds": 2592000
+      }
+    ],
+    "condition_tree": null,
+    "action": {
+      "type": "delete_file",
+      "to_trash": true
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": {
+        "path": "/inbox",
+        "recursive": false,
+        "newest": null,
+        "include_dirs": false
+      }
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000003",
+    "name": "Extract arriving zips",
+    "enabled": false,
+    "trigger": {
+      "type": "file_appears",
+      "watch_path": "/inbox",
+      "recursive": false
+    },
+    "conditions": [
+      {
+        "type": "extension_is",
+        "extensions": [
+          "zip"
+        ]
+      }
+    ],
+    "condition_tree": null,
+    "action": {
+      "type": "extract_archive",
+      "dest_path": "/inbox/{name}",
+      "max_entries": 10000,
+      "delete_archive": false
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": null
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000004",
+    "name": "R",
+    "enabled": false,
+    "trigger": {
+      "type": "webhook"
+    },
+    "conditions": [],
+    "condition_tree": {
+      "type": "any",
+      "nodes": [
+        {
+          "type": "not",
+          "node": {
+            "type": "condition",
+            "condition": {
+              "type": "modified_within",
+              "seconds": 30
+            }
+          }
+        },
+        {
+          "type": "condition",
+          "condition": {
+            "type": "name_regex",
+            "pattern": "^(?P<y>\\d{4})"
+          }
+        }
+      ]
+    },
+    "action": {
+      "type": "send_message",
+      "notification": {
+        "type": "teams",
+        "credential_id": "cred-1"
+      },
+      "title": "{rule}",
+      "body": "{customer}"
+    },
+    "steps": [
+      {
+        "action": {
+          "type": "run_command",
+          "program": "/bin/echo",
+          "args": [
+            "{payload}"
+          ],
+          "working_dir": null,
+          "timeout_secs": 30
+        },
+        "continue_on_error": false
+      }
+    ],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": -1,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": {
+        "path": "/inbox",
+        "recursive": true,
+        "newest": 5,
+        "include_dirs": false
+      }
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  }
+]

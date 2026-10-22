@@ -123,4 +123,20 @@ impl ActionServices for TauriActionServices {
                 .map_err(|e| format!("Notification failed: {e}"))
         })
     }
+
+    fn send_message(
+        &self,
+        notification: &crate::backup_engine::notify::Notification,
+        title: &str,
+        body: &str,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        let (n, title, body) = (notification.clone(), title.to_string(), body.to_string());
+        Box::pin(async move {
+            self.app
+                .state::<crate::backup_engine::BackupManager>()
+                .send_message(n, &title, &body)
+                .await
+                .map_err(|e| e.user_message())
+        })
+    }
 }

@@ -319,6 +319,14 @@ fn start_background_engines(app: tauri::AppHandle) {
             tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
         }
         automation.start_scheduler();
+        // The webhook listener only runs when some rule uses it.
+        let uses_webhooks = automation.list_rules().await.iter().any(|r| r.trigger == automation_engine::RuleTrigger::Webhook);
+        if uses_webhooks {
+            let addr = commands::automation_commands::webhook_bind_addr(&app.state::<Repository>()).await;
+            if let Err(e) = automation.start_webhook_listener(addr).await {
+                tracing::warn!("Automation webhook listener unavailable on {addr}: {e}");
+            }
+        }
     });
 }
 
@@ -976,6 +984,9 @@ pub fn run() {
             automation_commands::enable_automation_rule,
             automation_commands::run_automation_rule,
             automation_commands::test_automation_rule,
+            automation_commands::approve_automation_command,
+            automation_commands::clone_automation_rule,
+            automation_commands::rotate_automation_webhook,
             automation_commands::list_automation_logs,
             automation_commands::clear_automation_logs,
             automation_commands::parse_automation_nl,

@@ -23,6 +23,9 @@ pub struct ScheduledPair {
 /// Callback type for scheduled sync execution.
 pub type ScheduleCallback = Arc<dyn Fn(Uuid) + Send + Sync>;
 
+/// Callback receiving every id due in one check.
+pub type BatchCallback = Arc<dyn Fn(Vec<Uuid>) + Send + Sync>;
+
 /// Manages scheduled sync pairs.
 pub struct SyncScheduler {
     schedules: Arc<Mutex<HashMap<Uuid, ScheduledPair>>>,
@@ -145,6 +148,13 @@ impl SyncScheduler {
 
     /// [`start`](Self::start) with a custom poll interval (tests use a short one).
     pub fn start_with_interval(&self, callback: ScheduleCallback, interval: std::time::Duration) {
+        self.start_batch_with_interval(Arc::new(move |ids: Vec<Uuid>| ids.into_iter().for_each(|id| callback(id))), interval);
+    }
+
+    /// Like [`start_with_interval`](Self::start_with_interval), but hands
+    /// every id due in the same check to `callback` at once, so the caller
+    /// can order them.
+    pub fn start_batch_with_interval(&self, callback: BatchCallback, interval: std::time::Duration) {
         {
             let mut r = match self.running.lock() {
                 Ok(r) => r,
@@ -160,9 +170,10 @@ impl SyncScheduler {
         std::thread::spawn(move || {
             tracing::info!("Cron scheduler started");
             while scheduler.is_running() {
-                for id in scheduler.check_due() {
-                    tracing::info!("Scheduler triggering {}", id);
-                    callback(id);
+                let due = scheduler.check_due();
+                if !due.is_empty() {
+                    tracing::info!("Scheduler triggering {} item(s)", due.len());
+                    callback(due);
                 }
                 std::thread::sleep(interval);
             }

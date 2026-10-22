@@ -108,6 +108,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "File metadata - color tags, labels, key-value metadata, smart folders",
             sql: V18_SCHEMA,
         },
+        Migration {
+            version: 19,
+            description: "Automation v1.5 - condition trees, steps, options; per-step run results",
+            sql: V19_SCHEMA,
+        },
     ]
 }
 
@@ -120,6 +125,15 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
         _ => None,
     }
 }
+
+/// Schema v19: automation rule extras (condition tree, steps, options) and
+/// per-step results/attempt counts on runs. Old rows read as `{}`/`[]`,
+/// which deserialize to the previous behaviour.
+const V19_SCHEMA: &str = r#"
+ALTER TABLE automation_rules ADD COLUMN extra_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE automation_logs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE automation_logs ADD COLUMN steps_json TEXT NOT NULL DEFAULT '[]';
+"#;
 
 /// Schema v18: file metadata (previously held in memory and lost on quit).
 /// Rows are keyed by absolute path; see `metadata_engine`.
@@ -844,7 +858,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 18);
+        assert_eq!(applied, 19);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -879,7 +893,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 18);
+        assert_eq!(first, 19);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -892,7 +906,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 18);
+        assert_eq!(current_version(&conn).unwrap(), 19);
     }
 
     #[test]

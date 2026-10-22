@@ -71,6 +71,7 @@ import {
 import { useLedgerTailPoll } from "@/hooks/use-ledger-tail-poll";
 import { AiPanel } from "./ai-panel";
 import { AutomationPanel } from "./automation-panel";
+import { AutomationRuleEditor } from "./automation-rule-editor";
 import { VaultPanel } from "./vault-panel";
 import { TransferPanel } from "./transfer-panel";
 import {
@@ -2586,6 +2587,7 @@ export function FileManager() {
         {/* Lazy-mount: only render side panels when their toggle is on, so a fresh window
             ships with just the file canvas + sidebar instead of four hidden panels. */}
         {automationPanelOpen && <AutomationPanel />}
+        <AutomationRuleEditor />
         {activityTimelineOpen && (
           <ActivityTimelinePanel onDispatchPath={handleDispatchLedgerPath} />
         )}
