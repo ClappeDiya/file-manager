@@ -365,6 +365,22 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 11,
+    description: 'Central credential versions and rotation history',
+    up(d) {
+      d.exec(`
+        ALTER TABLE central_credentials ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+        CREATE TABLE credential_versions (
+          credential_id TEXT NOT NULL REFERENCES central_credentials(id) ON DELETE CASCADE,
+          version INTEGER NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY (credential_id, version)
+        );
+        INSERT INTO credential_versions (credential_id, version, created_by, created_at)
+          SELECT id, 1, created_by, created_at FROM central_credentials;
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

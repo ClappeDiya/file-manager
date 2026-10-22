@@ -560,14 +560,26 @@ impl<H: AgentHost> Agent<H> {
         let bundle = client.policies(token).await?;
         let mut delivered = Vec::new();
         let mut errors = BTreeMap::new();
+        // Versions of the credentials now in the secure store, reported to the
+        // console as `credential:<id>` so it can follow a rotation.
+        let mut credential_versions = BTreeMap::new();
         for c in bundle.credentials {
             let Some(id) = policy::central_credential_id(&c.credential_id) else {
                 tracing::warn!("Ignoring a central credential with a malformed id");
                 continue;
             };
+            let key = format!("credential:{}", id.trim_start_matches(policy::CENTRAL_PREFIX));
             match self.host.store_credential(id.clone(), Some(c.secret)).await {
-                Ok(()) => delivered.push(id),
-                Err(e) => tracing::warn!("Could not store central credential {id}: {}", e.user_message()),
+                Ok(()) => {
+                    if c.version > 0 {
+                        credential_versions.insert(key, c.version);
+                    }
+                    delivered.push(id)
+                }
+                Err(e) => {
+                    tracing::warn!("Could not store central credential {id}: {}", e.user_message());
+                    errors.insert(key, e.user_message());
+                }
             }
         }
         let previous = self.config();
@@ -621,6 +633,7 @@ impl<H: AgentHost> Agent<H> {
         }
         // The console sees the settings version next to the policies.
         let mut reported = applied.clone();
+        reported.extend(credential_versions);
         if settings_version > 0 {
             reported.insert(MANAGED_SETTINGS_KEY.into(), settings_version);
         }

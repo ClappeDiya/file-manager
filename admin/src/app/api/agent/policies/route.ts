@@ -14,7 +14,7 @@ export async function GET(request: NextRequest) {
   return NextResponse.json({
     policySetVersion: policySetVersion(m),
     policies: policies.map((p) => ({ id: p.id, name: p.name, version: p.version, job: p.job })),
-    credentials: credentials.map((c) => ({ credentialId: c.credentialId, name: c.name, secret: c.secret, updatedAt: c.updatedAt })),
+    credentials: credentials.map((c) => ({ credentialId: c.credentialId, name: c.name, secret: c.secret, updatedAt: c.updatedAt, version: c.version })),
     managedSettings: managedSettingsForAgent(m.orgId),
   }, { headers: { 'cache-control': 'no-store' } });
 }

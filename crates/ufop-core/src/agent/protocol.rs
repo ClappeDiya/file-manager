@@ -154,6 +154,8 @@ pub struct CentralCredential {
     pub credential_id: String,
     pub name: String,
     pub secret: String,
+    /// Increases with every rotation (0 from consoles without versions).
+    pub version: u64,
     pub updated_at: String,
 }
 

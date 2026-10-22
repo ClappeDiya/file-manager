@@ -10,7 +10,7 @@
  * secure store under the credential id `central:<id>`, which templates use as
  * a destination `credential_id` or as `passphraseCredentialId`.
  */
-import { db, newId, now, parseJson, type Row } from '../index';
+import { db, newId, now, parseJson, tx, type Row } from '../index';
 import { open, seal } from '../../crypto';
 import { OrgError } from './orgs';
 import { normalizeTags, type Machine } from './machines';
@@ -137,7 +137,9 @@ export function policiesFor(m: Machine): FleetPolicy[] {
 
 /** Policy set version the agent compares against (changes when any applicable policy changes). */
 export function policySetVersion(m: Machine): string {
-  const parts = policiesFor(m).map((p) => `${p.id}:${p.version}`);
+  const policies = policiesFor(m);
+  const parts = policies.map((p) => `${p.id}:${p.version}`);
+  for (const c of credentialVersionsFor(m.orgId, policies)) parts.push(`cred:${c.id}:${c.version}`);
   const settings = managedSettingsForAgent(m.orgId);
   if (settings) parts.push(`settings:${settings.version}`);
   return parts.sort().join(',');
@@ -154,10 +156,30 @@ export interface CentralCredential {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+  /** Increases with every rotation; agents report the version they hold. */
+  version: number;
 }
 
+/** One rotation (no secret material is kept for old versions). */
+export interface CredentialVersion {
+  version: number;
+  createdBy: string;
+  createdAt: string;
+}
+
+/** Key under which agents report a credential's version among applied policies. */
+export const credentialKey = (id: string) => `credential:${id}`;
+
 function credFromRow(r: Row): CentralCredential {
-  return { id: r.id as string, orgId: r.org_id as string, name: r.name as string, kind: r.kind as string, description: r.description as string, createdBy: r.created_by as string, createdAt: r.created_at as string, updatedAt: r.updated_at as string };
+  return { id: r.id as string, orgId: r.org_id as string, name: r.name as string, kind: r.kind as string, description: r.description as string, createdBy: r.created_by as string, createdAt: r.created_at as string, updatedAt: r.updated_at as string, version: Number(r.version ?? 1) };
+}
+
+export function credentialHistory(orgId: string, id: string): CredentialVersion[] {
+  return (
+    db()
+      .prepare('SELECT v.version, v.created_by, v.created_at FROM credential_versions v JOIN central_credentials c ON c.id = v.credential_id WHERE c.org_id = ? AND c.id = ? ORDER BY v.version DESC')
+      .all(orgId, id) as Row[]
+  ).map((r) => ({ version: Number(r.version), createdBy: r.created_by as string, createdAt: r.created_at as string }));
 }
 
 export function listCredentials(orgId: string): CentralCredential[] {
@@ -170,16 +192,27 @@ export function createCredential(orgId: string, c: { name: string; kind?: string
   if (db().prepare('SELECT 1 FROM central_credentials WHERE org_id = ? AND lower(name) = lower(?)').get(orgId, c.name.trim())) throw new OrgError('A credential with this name exists', 409);
   const id = newId('crd');
   const ts = now();
-  db().prepare('INSERT INTO central_credentials (id, org_id, name, kind, description, ciphertext, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, orgId, c.name.trim(), c.kind ?? 'secret', c.description ?? '', seal(c.secret), by, ts, ts);
+  db().prepare('INSERT INTO central_credentials (id, org_id, name, kind, description, ciphertext, created_by, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)').run(id, orgId, c.name.trim(), c.kind ?? 'secret', c.description ?? '', seal(c.secret), by, ts, ts);
+  db().prepare('INSERT INTO credential_versions (credential_id, version, created_by, created_at) VALUES (?, 1, ?, ?)').run(id, by, ts);
   return credFromRow(db().prepare('SELECT * FROM central_credentials WHERE id = ?').get(id) as Row);
 }
 
-/** Replace the secret (rotation): every policy using it gets a new version so agents re-fetch. */
-export function rotateCredential(orgId: string, id: string, secret: string): boolean {
+/**
+ * Replace the secret (rotation). The credential's version goes up; it is
+ * part of the policy set version of every machine that uses it, so their
+ * agents fetch the new secret on the next heartbeat (policies themselves
+ * are not re-versioned, so jobs are not rewritten).
+ */
+export function rotateCredential(orgId: string, id: string, secret: string, by = ''): CentralCredential | null {
   if (!secret) throw new OrgError('Enter the new secret value');
-  const changed = db().prepare('UPDATE central_credentials SET ciphertext = ?, updated_at = ? WHERE org_id = ? AND id = ?').run(seal(secret), now(), orgId, id).changes > 0;
-  if (changed) for (const p of listFleetPolicies(orgId).filter((x) => x.credentialIds.includes(id))) db().prepare('UPDATE fleet_policies SET version = version + 1, updated_at = ? WHERE id = ?').run(now(), p.id);
-  return changed;
+  return tx(() => {
+    const ts = now();
+    const changed = db().prepare('UPDATE central_credentials SET ciphertext = ?, updated_at = ?, version = version + 1 WHERE org_id = ? AND id = ?').run(seal(secret), ts, orgId, id).changes > 0;
+    if (!changed) return null;
+    const c = credFromRow(db().prepare('SELECT * FROM central_credentials WHERE id = ?').get(id) as Row);
+    db().prepare('INSERT INTO credential_versions (credential_id, version, created_by, created_at) VALUES (?, ?, ?, ?)').run(id, c.version, by, ts);
+    return c;
+  });
 }
 
 export function deleteCredential(orgId: string, id: string): boolean {
@@ -189,8 +222,33 @@ export function deleteCredential(orgId: string, id: string): boolean {
 }
 
 /** Decrypted credentials referenced by these policies (agent delivery only). */
-export function credentialsForPolicies(orgId: string, policies: FleetPolicy[]): { id: string; credentialId: string; name: string; secret: string; updatedAt: string }[] {
+export function credentialsForPolicies(orgId: string, policies: FleetPolicy[]): { id: string; credentialId: string; name: string; secret: string; updatedAt: string; version: number }[] {
   const ids = [...new Set(policies.flatMap((p) => p.credentialIds))];
   if (!ids.length) return [];
-  return (db().prepare(`SELECT * FROM central_credentials WHERE org_id = ? AND id IN (${ids.map(() => '?').join(',')})`).all(orgId, ...ids) as Row[]).map((r) => ({ id: r.id as string, credentialId: `central:${r.id}`, name: r.name as string, secret: open(r.ciphertext as string), updatedAt: r.updated_at as string }));
+  return (db().prepare(`SELECT * FROM central_credentials WHERE org_id = ? AND id IN (${ids.map(() => '?').join(',')})`).all(orgId, ...ids) as Row[]).map((r) => ({ id: r.id as string, credentialId: `central:${r.id}`, name: r.name as string, secret: open(r.ciphertext as string), updatedAt: r.updated_at as string, version: Number(r.version ?? 1) }));
+}
+
+/** Versions of the credentials a machine's policies use (no secrets). */
+function credentialVersionsFor(orgId: string, policies: FleetPolicy[]): { id: string; version: number }[] {
+  const ids = [...new Set(policies.flatMap((p) => p.credentialIds))];
+  if (!ids.length) return [];
+  return (db().prepare(`SELECT id, version FROM central_credentials WHERE org_id = ? AND id IN (${ids.map(() => '?').join(',')})`).all(orgId, ...ids) as Row[]).map((r) => ({ id: r.id as string, version: Number(r.version ?? 1) }));
+}
+
+/** Per credential: machines whose policies use it, and which hold the current version. */
+export function credentialPropagation(orgId: string, machines: Machine[]): Record<string, { targeted: number; upToDate: number; pending: { id: string; name: string; version: number | null }[] }> {
+  const out: Record<string, { targeted: number; upToDate: number; pending: { id: string; name: string; version: number | null }[] }> = {};
+  const creds = new Map(listCredentials(orgId).map((c) => [c.id, c.version]));
+  for (const m of machines) {
+    for (const id of new Set(policiesFor(m).flatMap((p) => p.credentialIds))) {
+      const want = creds.get(id);
+      if (want === undefined) continue;
+      const o = (out[id] ??= { targeted: 0, upToDate: 0, pending: [] });
+      o.targeted += 1;
+      const have = m.appliedPolicies[credentialKey(id)] ?? null;
+      if (have === want) o.upToDate += 1;
+      else o.pending.push({ id: m.id, name: m.name, version: have });
+    }
+  }
+  return out;
 }

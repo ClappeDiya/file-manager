@@ -1,13 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { audit, badRequest, isContext, readJson, requirePermission } from '@/lib/session';
-import { createCredential, listCredentials } from '@/lib/db/repos/fleet-policies';
+import { createCredential, credentialPropagation, listCredentials } from '@/lib/db/repos/fleet-policies';
+import { listMachines } from '@/lib/db/repos/machines';
 import { orgErrorResponse } from '@/lib/route-helpers';
 
 /** GET /api/fleet/credentials — names and metadata only; secrets never leave except to agents. */
 export async function GET(request: NextRequest) {
   const ctx = await requirePermission(request, 'fleet.read');
   if (!isContext(ctx)) return ctx;
-  return NextResponse.json({ credentials: listCredentials(ctx.orgId) });
+  const propagation = credentialPropagation(ctx.orgId, listMachines({ orgIds: [ctx.orgId], status: 'active' }));
+  return NextResponse.json({ credentials: listCredentials(ctx.orgId).map((c) => ({ ...c, propagation: propagation[c.id] ?? { targeted: 0, upToDate: 0, pending: [] } })) });
 }
 
 /** POST /api/fleet/credentials {name, kind?, description?, secret} */

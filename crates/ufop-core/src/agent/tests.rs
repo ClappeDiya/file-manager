@@ -140,6 +140,8 @@ struct Console {
     rotations: u32,
     diagnostics: Vec<Value>,
     managed_settings: Value,
+    secret: Option<String>,
+    cred_version: u64,
 }
 
 fn console() -> (MockConsole, Arc<Mutex<Console>>) {
@@ -179,7 +181,7 @@ fn console() -> (MockConsole, Arc<Mutex<Console>>) {
             }
             "/api/agent/policies" => (
                 200,
-                json!({ "policySetVersion": c.version, "policies": c.policies, "credentials": [{ "credentialId": "central:crd_1", "name": "pw", "secret": "s3cret", "updatedAt": "" }], "managedSettings": c.managed_settings }),
+                json!({ "policySetVersion": c.version, "policies": c.policies, "credentials": [{ "credentialId": "central:crd_1", "name": "pw", "secret": c.secret.clone().unwrap_or_else(|| "s3cret".into()), "updatedAt": "", "version": c.cred_version }], "managedSettings": c.managed_settings }),
             ),
             "/api/agent/policies/applied" => {
                 c.applied = r.body.clone();
@@ -402,6 +404,32 @@ async fn managed_settings_apply_on_change_report_errors_and_release() {
     assert_eq!(host.st().settings.len(), before + 1);
     a.unregister(false).await.unwrap();
     assert_eq!(host.st().settings.last().unwrap(), &None, "unregistering releases them");
+}
+
+#[tokio::test]
+async fn rotated_credentials_are_stored_and_their_version_reported() {
+    let (m, c) = console();
+    let host = FakeHost::default();
+    let a = agent(&host).await;
+    a.register(&m.url, "ufop_reg_good", vec![]).await.unwrap();
+    {
+        let mut g = c.lock().unwrap();
+        g.version = "cred:crd_1:1".into();
+        g.cred_version = 1;
+    }
+    a.cycle().await.unwrap();
+    assert_eq!(host.st().creds["central:crd_1"], "s3cret");
+    assert_eq!(c.lock().unwrap().applied["applied"]["credential:crd_1"], 1);
+    {
+        let mut g = c.lock().unwrap();
+        g.version = "cred:crd_1:2".into();
+        g.cred_version = 2;
+        g.secret = Some("rotated".into());
+    }
+    a.cycle().await.unwrap();
+    assert_eq!(host.st().creds["central:crd_1"], "rotated");
+    assert_eq!(c.lock().unwrap().applied["applied"]["credential:crd_1"], 2);
+    assert!(a.status().managed_policies.is_empty(), "credential versions are not listed as policies");
 }
 
 #[tokio::test]

@@ -47,7 +47,9 @@ cd admin && npx next build && npx next start -p 3001
 - **Machines** carry tags (with organization-wide colors), notes, connectivity (online / stale / offline from heartbeats), backups, reports, alerts and policy compliance. Machines can be suspended, revoked, deleted, or have their token rotated (the agent rotates itself on its next check-in).
 - **Remote session:** queue allow-listed client calls (`backup_*`), runs, policy applies and token rotation. Agents pick commands up on their next heartbeat and post the result back. Calls that read secrets back or touch arbitrary files are not allowed.
 - **Fleet policies** push a backup job template to every machine with the targeted tags. Machines create, update and remove the managed job (`policy-<id>`) and acknowledge the version they applied.
-- **Credentials** (passphrases, cloud keys) are stored sealed and can be replaced but never read back.
+- **Credentials** (passphrases, cloud keys) are stored sealed and can be replaced but never read back. Each replacement is a new **version** (history: who and when, never the secret). Machines whose policies use a credential fetch the new version on their next heartbeat without their jobs being rewritten, and report the version they hold; the Credentials page shows how many machines have the current version and which are still waiting.
+- **App settings** set update channel, update blackout window, proxy, AI limits and machine-wide transfer caps for every desktop (see `silent-install.md`).
+- **Diagnostics**: machines upload scrubbed log bundles on request (machine page → Diagnostics) or from the app.
   - Policies reference them as `central:<id>`.
   - They are delivered only to authenticated agents that a policy targets, with `Cache-Control: no-store`.
   - Agents keep them in the OS keychain.

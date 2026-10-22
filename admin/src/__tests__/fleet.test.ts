@@ -402,13 +402,14 @@ describe('fleet policies and central credentials', () => {
 
     // The heartbeat announces the policy set; only the targeted agent receives the secret.
     const beat = await json<{ policySetVersion: string; policiesChanged: boolean }>(await hb(inScope.token));
-    expect(beat.body).toMatchObject({ policySetVersion: `${pol.id}:1`, policiesChanged: true });
-    expect((await json<{ policiesChanged: boolean }>(await hb(inScope.token, { policySetVersion: `${pol.id}:1` }))).body.policiesChanged).toBe(false);
+    const set1 = `cred:${credId}:1,${pol.id}:1`;
+    expect(beat.body).toMatchObject({ policySetVersion: set1, policiesChanged: true });
+    expect((await json<{ policiesChanged: boolean }>(await hb(inScope.token, { policySetVersion: set1 }))).body.policiesChanged).toBe(false);
     const got = await agentPolicies.GET(await req('GET', '/api/agent/policies', { headers: bearer(inScope.token) }));
     expect(got.headers.get('cache-control')).toBe('no-store');
     const body = (await got.json()) as { policies: { id: string; version: number; job: Record<string, unknown> }[]; credentials: { credentialId: string; secret: string }[] };
     expect(body.policies).toMatchObject([{ id: pol.id, version: 1, job: { name: 'Managed docs' } }]);
-    expect(body.credentials).toMatchObject([{ credentialId: `central:${credId}`, name: 'S3 key', secret: 'sup3r-s3cret-value' }]);
+    expect(body.credentials).toMatchObject([{ credentialId: `central:${credId}`, name: 'S3 key', secret: 'sup3r-s3cret-value', version: 1 }]);
     for (const t of [outOfScope.token, foreign.token]) {
       const r = await (await agentPolicies.GET(await req('GET', '/api/agent/policies', { headers: bearer(t) }))).text();
       expect(r).not.toContain('sup3r-s3cret-value');
@@ -418,18 +419,32 @@ describe('fleet policies and central credentials', () => {
     expect(listAudit({ eventType: 'credential.deliver' }).total).toBe(1);
 
     // The agent reports what it applied; compliance follows.
-    await applied.POST(await req('POST', '/api/agent/policies/applied', { headers: bearer(inScope.token), body: { applied: { [pol.id]: 1, bogus: 'x' }, errors: {} } }));
+    await applied.POST(await req('POST', '/api/agent/policies/applied', { headers: bearer(inScope.token), body: { applied: { [pol.id]: 1, [`credential:${credId}`]: 1, bogus: 'x' }, errors: {} } }));
     const comp = await json<{ policies: { id: string; targeted: number; upToDate: number }[] }>(await fleetPolicies.GET(await req('GET', '/api/fleet/policies', { as: admin })));
     expect(comp.body.policies.find((p) => p.id === pol.id)).toMatchObject({ targeted: 1, upToDate: 1 });
-    expect(getMachine(inScope.id)!.appliedPolicies).toEqual({ [pol.id]: 1 });
+    expect(getMachine(inScope.id)!.appliedPolicies).toEqual({ [pol.id]: 1, [`credential:${credId}`]: 1 });
+    type CredView = { id: string; version: number; propagation: { targeted: number; upToDate: number; pending: { id: string; version: number | null }[] } };
+    const credView = async () => (await json<{ credentials: CredView[] }>(await credentials.GET(await req('GET', '/api/fleet/credentials', { as: admin })))).body.credentials.find((c) => c.id === credId)!;
+    expect(await credView()).toMatchObject({ version: 1, propagation: { targeted: 1, upToDate: 1, pending: [] } });
 
-    // Rotation re-versions the policy so agents fetch the new secret.
-    expect((await credentialById.PUT(await req('PUT', `/api/fleet/credentials/${credId}`, { as: sec, body: { secret: 'rotated-value' } }), P(credId))).status).toBe(200);
-    expect((await json<{ policiesChanged: boolean; policySetVersion: string }>(await hb(inScope.token, { policySetVersion: `${pol.id}:1` }))).body).toMatchObject({ policiesChanged: true, policySetVersion: `${pol.id}:2` });
-    const after = (await (await agentPolicies.GET(await req('GET', '/api/agent/policies', { headers: bearer(inScope.token) }))).json()) as { credentials: { secret: string }[] };
-    expect(after.credentials[0].secret).toBe('rotated-value');
-    const comp2 = await json<{ policies: { id: string; upToDate: number; pending: { id: string; applied: number }[] }[] }>(await fleetPolicies.GET(await req('GET', '/api/fleet/policies', { as: admin })));
-    expect(comp2.body.policies.find((p) => p.id === pol.id)).toMatchObject({ upToDate: 0, pending: [{ id: inScope.id, applied: 1 }] });
+    // Rotation: a new credential version; the policy itself is unchanged, the
+    // policy set version moves so the agent fetches the new secret.
+    const rot = await json<{ credential: { version: number } }>(await credentialById.PUT(await req('PUT', `/api/fleet/credentials/${credId}`, { as: sec, body: { secret: 'rotated-value' } }), P(credId)));
+    expect(rot.status).toBe(200);
+    expect(rot.body.credential.version).toBe(2);
+    expect((await json<{ policiesChanged: boolean; policySetVersion: string }>(await hb(inScope.token, { policySetVersion: set1 }))).body).toMatchObject({ policiesChanged: true, policySetVersion: `cred:${credId}:2,${pol.id}:1` });
+    const after = (await (await agentPolicies.GET(await req('GET', '/api/agent/policies', { headers: bearer(inScope.token) }))).json()) as { policies: { version: number }[]; credentials: { secret: string; version: number }[] };
+    expect(after.credentials[0]).toMatchObject({ secret: 'rotated-value', version: 2 });
+    expect(after.policies[0].version).toBe(1);
+    const comp2 = await json<{ policies: { id: string; upToDate: number }[] }>(await fleetPolicies.GET(await req('GET', '/api/fleet/policies', { as: admin })));
+    expect(comp2.body.policies.find((p) => p.id === pol.id)).toMatchObject({ upToDate: 1 });
+    expect(await credView()).toMatchObject({ version: 2, propagation: { targeted: 1, upToDate: 0, pending: [{ id: inScope.id, version: 1 }] } });
+    await applied.POST(await req('POST', '/api/agent/policies/applied', { headers: bearer(inScope.token), body: { applied: { [pol.id]: 1, [`credential:${credId}`]: 2 } } }));
+    expect((await credView()).propagation).toMatchObject({ upToDate: 1, pending: [] });
+    const hist = await json<{ history: { version: number; createdBy: string }[] }>(await credentialById.GET(await req('GET', `/api/fleet/credentials/${credId}`, { as: admin }), P(credId)));
+    expect(hist.body.history.map((h) => [h.version, h.createdBy])).toEqual([[2, sec.email], [1, sec.email]]);
+    expect(JSON.stringify(hist.body)).not.toContain('rotated-value');
+    expect(listAudit({ eventType: 'credential.rotate' }).entries[0].description).toContain('version 2');
 
     // Failures to apply are audited.
     await applied.POST(await req('POST', '/api/agent/policies/applied', { headers: bearer(inScope.token), body: { applied: {}, errors: { [pol.id]: 'destination unreachable' } } }));
