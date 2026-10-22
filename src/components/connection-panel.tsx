@@ -18,6 +18,7 @@ import { tauriInvoke } from "@/hooks/use-tauri";
 import { pickFiles, pickFolder } from "@/lib/folder-picker";
 import { promptText, confirmText } from "@/lib/prompt-dialog";
 import { errorText } from "@/lib/error-text";
+import { PRESET_FIELD_LABELS, fillPreset, type ProviderPreset } from "@/lib/provider-presets";
 
 // ── Types (mirrors Rust types) ──
 
@@ -143,19 +144,6 @@ const DEFAULT_PORTS: Record<string, number> = {
   http: 80,
 };
 
-// S3-compatible provider presets
-const S3_PRESETS = [
-  { id: "aws", label: "Amazon S3", endpoint: "", region: "us-east-1", helpText: "" },
-  { id: "wasabi", label: "Wasabi", endpoint: "s3.wasabisys.com", region: "us-east-1", helpText: "" },
-  { id: "minio", label: "MinIO", endpoint: "localhost:9000", region: "us-east-1", helpText: "Self-hosted MinIO instance" },
-  {
-    id: "gcs",
-    label: "Google Cloud Storage (S3 Compatible)",
-    endpoint: "storage.googleapis.com",
-    region: "auto",
-    helpText: "Create HMAC keys in GCP Console > Cloud Storage > Settings > Interoperability",
-  },
-] as const;
 
 // ── Helpers ──
 
@@ -500,7 +488,12 @@ function ConnectionForm({
   const [awsProfilesLoaded, setAwsProfilesLoaded] = useState(false);
 
   // S3-compatible preset selector
-  const [selectedS3Preset, setSelectedS3Preset] = useState(initialData?.extras?.preset ?? "");
+  const [selectedPreset, setSelectedPreset] = useState(initialData?.extras?.preset ?? "");
+  const [presets, setPresets] = useState<ProviderPreset[]>([]);
+  const [presetValues, setPresetValues] = useState<Record<string, string>>({});
+  useEffect(() => {
+    tauriInvoke<ProviderPreset[]>("connection_presets", undefined, []).then((p) => setPresets(p ?? []), () => setPresets([]));
+  }, []);
 
   // rclone remotes from the user's rclone config
   const [rcloneRemotes, setRcloneRemotes] = useState<{ name: string; backend: string }[] | null>(null);
@@ -599,17 +592,17 @@ function ConnectionForm({
   );
 
   // Handle S3 preset selection
-  const handleS3PresetSelect = useCallback(
-    (presetId: string) => {
-      setSelectedS3Preset(presetId);
-      const preset = S3_PRESETS.find((p) => p.id === presetId);
-      if (preset && preset.endpoint) {
-        setHost(preset.endpoint);
-      }
+  // Apply a provider preset: host (and port) from its template.
+  const applyPreset = useCallback(
+    (presetId: string, values: Record<string, string>) => {
+      const preset = presets.find((p) => p.id === presetId);
+      if (!preset) return;
+      const vals = { region: preset.default_region ?? "", ...values };
+      setHost(fillPreset(preset.host, vals));
+      if (preset.port) setPort(String(preset.port));
     },
-    []
+    [presets],
   );
-
   const isFtpProtocol = protocol === "ftp" || protocol === "ftps";
   const isSshProtocol = protocol === "sftp";
   const isAzureBlob = protocol === "azure_blob";
@@ -647,7 +640,7 @@ function ConnectionForm({
       defaultDirMode: isSshProtocol || isFtpProtocol ? defaultDirMode || null : null,
       extras: {
         rclone_remote: protocol === "rclone" ? host.trim() || null : initialData?.extras?.rclone_remote ?? null,
-        preset: isS3 ? selectedS3Preset || null : initialData?.extras?.preset ?? null,
+        preset: selectedPreset || null,
         assume_role:
           isS3 && roleArn.trim()
             ? { role_arn: roleArn.trim(), external_id: externalId.trim() || null, session_name: null, duration_secs: roleDuration ? Number(roleDuration) : null }
@@ -772,32 +765,51 @@ function ConnectionForm({
           </p>
         </div>
       )}
-      {/* S3-compatible provider presets (S3 only) */}
-      {isS3 && (
-        <div>
-          <label className="block text-xs font-medium mb-1">S3 Provider Preset</label>
-          <select
-            value={selectedS3Preset}
-            onChange={(e) => handleS3PresetSelect(e.target.value)}
-            className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-          >
-            <option value="">Custom / Amazon S3</option>
-            {S3_PRESETS.filter((p) => p.id !== "aws").map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.label}
-              </option>
+      {/* Provider presets (S3-compatible stores, hosted SFTP) */}
+      {presets.some((p) => p.protocol === protocol) && (() => {
+        const preset = presets.find((p) => p.id === selectedPreset && p.protocol === protocol);
+        return (
+          <div className="space-y-1">
+            <label className="block text-xs font-medium mb-1" htmlFor="provider-preset">Provider</label>
+            <select
+              id="provider-preset"
+              value={preset ? selectedPreset : ""}
+              onChange={(e) => {
+                setSelectedPreset(e.target.value);
+                setPresetValues({});
+                applyPreset(e.target.value, {});
+              }}
+              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+            >
+              <option value="">{isS3 ? "Custom / Amazon S3" : "Custom server"}</option>
+              {presets.filter((p) => p.protocol === protocol).map((p) => (
+                <option key={p.id} value={p.id}>{p.label}</option>
+              ))}
+            </select>
+            {preset?.fields.map((f) => (
+              <div key={f}>
+                <label className="block text-xs font-medium mb-1" htmlFor={`preset-${f}`}>{PRESET_FIELD_LABELS[f] ?? f}</label>
+                <input
+                  id={`preset-${f}`}
+                  value={presetValues[f] ?? (f === "region" ? preset.default_region ?? "" : "")}
+                  onChange={(e) => {
+                    const next = { ...presetValues, [f]: e.target.value };
+                    setPresetValues(next);
+                    applyPreset(preset.id, next);
+                  }}
+                  className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+                />
+              </div>
             ))}
-          </select>
-          {selectedS3Preset && (() => {
-            const preset = S3_PRESETS.find((p) => p.id === selectedS3Preset);
-            return preset?.helpText ? (
-              <p className="text-[10px] text-blue-500 dark:text-blue-400 mt-0.5">
-                {preset.helpText}
+            {preset?.username && (
+              <p className="text-[10px] text-blue-500 dark:text-blue-400" data-testid="preset-username">
+                Username format: {fillPreset(preset.username, { ...presetValues, user: "your-username" })}
               </p>
-            ) : null;
-          })()}
-        </div>
-      )}
+            )}
+            {preset?.help && <p className="text-[10px] text-blue-500 dark:text-blue-400">{preset.help}</p>}
+          </div>
+        );
+      })()}
       {/* rclone remote picker */}
       {isRclone && (
         <div>

@@ -14,6 +14,11 @@ beforeEach(() => {
   mockInvoke.mockReset().mockImplementation(async (cmd: string) => {
     if (cmd === "list_connections" || cmd === "list_connection_groups" || cmd === "list_aws_profiles") return [];
     if (cmd === "connector_list_protocols") return ["sftp", "s3", "rclone"];
+    if (cmd === "connection_presets")
+      return [
+        { id: "r2", label: "Cloudflare R2", protocol: "s3", host: "https://{account}.r2.cloudflarestorage.com", port: null, default_region: "auto", path_style: false, fields: ["account"], username: null, help: "Account ID" },
+        { id: "egnyte", label: "Egnyte", protocol: "sftp", host: "ftp-{domain}.egnyte.com", port: 22, default_region: null, path_style: false, fields: ["domain"], username: "{user}${domain}", help: "" },
+      ];
     if (cmd === "rclone_list_remotes") return [{ name: "gcs:", backend: "google cloud storage" }, { name: "box:", backend: "box" }];
     return undefined;
   });
@@ -52,5 +57,33 @@ describe("connection form extras", () => {
     await waitFor(() => expect(mockInvoke.mock.calls.some(([c]) => c === "save_connection")).toBe(true));
     const args = mockInvoke.mock.calls.find(([c]) => c === "save_connection")![1];
     expect([args.protocol, args.host, args.name, args.extras.rclone_remote]).toEqual(["rclone", "box:", "box", "box:"]);
+  });
+
+  it("fills host and port from a provider preset and saves the preset id", async () => {
+    const { container } = render(<ConnectionPanel />);
+    fireEvent.click(await screen.findByText("Add your first connection"));
+    const form = container.querySelector("form")!;
+    const inputs = form.querySelectorAll("input");
+    fireEvent.change(inputs[0], { target: { value: "Egnyte" } });
+    fireEvent.change(form.querySelector("select")!, { target: { value: "sftp" } });
+    const provider = (await screen.findByLabelText("Provider")) as HTMLSelectElement;
+    expect([...provider.options].map((o) => o.textContent)).toEqual(["Custom server", "Egnyte"]);
+    fireEvent.change(provider, { target: { value: "egnyte" } });
+    fireEvent.change(screen.getByLabelText("Domain"), { target: { value: "acme" } });
+    expect(screen.getByTestId("preset-username").textContent).toBe("Username format: your-username$acme");
+    fireEvent.submit(form);
+    await waitFor(() => expect(mockInvoke.mock.calls.some(([c]) => c === "save_connection")).toBe(true));
+    const args = mockInvoke.mock.calls.find(([c]) => c === "save_connection")![1];
+    expect([args.host, args.port, args.extras.preset]).toEqual(["ftp-acme.egnyte.com", 22, "egnyte"]);
+  });
+
+  it("offers S3 presets like R2 with their account field", async () => {
+    const { container } = render(<ConnectionPanel />);
+    fireEvent.click(await screen.findByText("Add your first connection"));
+    const form = container.querySelector("form")!;
+    fireEvent.change(form.querySelector("select")!, { target: { value: "s3" } });
+    fireEvent.change(await screen.findByLabelText("Provider"), { target: { value: "r2" } });
+    fireEvent.change(screen.getByLabelText("Account ID"), { target: { value: "abc123" } });
+    expect([...form.querySelectorAll("input")].some((i) => i.value === "https://abc123.r2.cloudflarestorage.com")).toBe(true);
   });
 });

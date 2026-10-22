@@ -20,6 +20,7 @@
 //! - Azure Blob Storage: SAS/AD auth, container/blob ops, access tiers, SAS URLs
 //! - OpenStack Swift: Keystone v3/TempAuth, container/object ops, SLO/DLO, TempURL
 
+pub mod presets;
 pub mod rclone;
 pub mod connection_manager;
 pub mod known_hosts;

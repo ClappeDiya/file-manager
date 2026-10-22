@@ -254,3 +254,10 @@ pub async fn ensure_connected(
 pub async fn rclone_list_remotes() -> Result<Vec<crate::connectors::rclone::RcloneRemote>, AppError> {
     crate::connectors::rclone::list_remotes().await
 }
+
+/// Provider presets for the connection form (S3-compatible stores,
+/// hosted SFTP services).
+#[tauri::command]
+pub async fn connection_presets() -> Result<Vec<crate::connectors::presets::ProviderPreset>, AppError> {
+    Ok(crate::connectors::presets::PRESETS.to_vec())
+}
