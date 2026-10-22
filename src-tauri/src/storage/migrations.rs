@@ -123,6 +123,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "Connection settings_json - persists advanced options and extras",
             sql: V21_SCHEMA,
         },
+        Migration {
+            version: 22,
+            description: "ufop-server scoped, expiring API tokens",
+            sql: V22_SCHEMA,
+        },
     ]
 }
 
@@ -138,6 +143,21 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
 
 /// Schema v21: profile fields with no column (upload modes, FTP tuning,
 /// symlink policy, connector extras) as JSON; previously never saved.
+/// Schema v22: named `ufop-server` API tokens (SHA-256 hashes) with scopes
+/// (JSON list) and a mandatory expiry.
+const V22_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_api_tokens (
+    id           TEXT PRIMARY KEY NOT NULL,
+    name         TEXT NOT NULL,
+    token_hash   TEXT NOT NULL UNIQUE,
+    scopes       TEXT NOT NULL DEFAULT '[]',
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked      INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
 const V21_SCHEMA: &str = r#"
 ALTER TABLE connections ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}';
 "#;
@@ -879,7 +899,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 21);
+        assert_eq!(applied, 22);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -914,7 +934,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 21);
+        assert_eq!(first, 22);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -927,7 +947,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 21);
+        assert_eq!(current_version(&conn).unwrap(), 22);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! ufop-server --set-password            # first run (reads UFOP_SERVER_PASSWORD or prompts)
 //! ufop-server --interface any --allowed-hostnames backup.lan --https auto
 //! ufop-server --interface any --allowed-cidrs 10.0.0.0/8,fd00::/8   # only these clients (by TCP peer)
+//! ufop server tokens create ci --scope run --days 30                 # scoped API token (see server::api_tokens)
 //! ```
 //! Defaults come from the machine-wide preload file (see `ufop_core::preload`).
 

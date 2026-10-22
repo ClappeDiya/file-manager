@@ -239,3 +239,41 @@ async fn client_address_allowlist_by_tcp_peer() {
     let tok = allow.login().await;
     assert_eq!(allow.get("/api/v1/jobs", &tok).await.status(), 200);
 }
+
+#[tokio::test]
+async fn scoped_expiring_api_tokens() {
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    let mint = |scope: &'static str| s.post("/api/v1/auth/api-tokens", &tok, json!({"name": format!("{scope} token"), "scope": scope, "expires_in_days": 30}));
+    let read = mint("read").await.json::<Value>().await.unwrap();
+    let read_tok = read["token"].as_str().unwrap().to_string();
+    assert!(read_tok.starts_with("ufop_pat_"));
+    assert_eq!(read["info"]["scope"], "read");
+    let run_tok = mint("run").await.json::<Value>().await.unwrap()["token"].as_str().unwrap().to_string();
+    let admin_tok = mint("admin").await.json::<Value>().await.unwrap()["token"].as_str().unwrap().to_string();
+    assert_eq!(s.post("/api/v1/auth/api-tokens", &tok, json!({"name": "x", "scope": "read", "expires_in_days": 400})).await.status(), 400);
+
+    // read: GETs only.
+    assert_eq!(s.get("/api/v1/jobs", &read_tok).await.status(), 200);
+    let r = s.post("/api/v1/jobs/nope/run", &read_tok, json!({})).await;
+    assert_eq!(r.status(), 401);
+    assert!(r.json::<Value>().await.unwrap()["message"].as_str().unwrap().contains("needs run"));
+    // run: may start backups (the job does not exist, so not found rather than refused) but not change jobs.
+    assert_ne!(s.post("/api/v1/jobs/nope/run", &run_tok, json!({})).await.status(), 401);
+    assert_eq!(s.post("/api/v1/scheduler/pause", &run_tok, json!({})).await.status(), 200);
+    assert_eq!(s.client.delete(format!("{}/api/v1/jobs/nope", s.base)).bearer_auth(&run_tok).send().await.unwrap().status(), 401);
+    assert_eq!(s.get("/api/v1/auth/api-tokens", &run_tok).await.status(), 401);
+    // admin: lists tokens, but cannot mint new ones.
+    let list = s.get("/api/v1/auth/api-tokens", &admin_tok).await.json::<Value>().await.unwrap();
+    assert_eq!(list["tokens"].as_array().unwrap().len(), 3);
+    assert!(!list.to_string().contains("ufop_pat_"), "raw tokens are never listed");
+    assert_eq!(s.post("/api/v1/auth/api-tokens", &admin_tok, json!({"name": "more", "scope": "admin"})).await.status(), 401);
+
+    // Revocation, then a JWT reset revokes the rest.
+    let id = read["info"]["id"].as_str().unwrap();
+    assert_eq!(s.client.delete(format!("{}/api/v1/auth/api-tokens/{id}", s.base)).bearer_auth(&tok).send().await.unwrap().status(), 200);
+    assert_eq!(s.get("/api/v1/jobs", &read_tok).await.status(), 401);
+    assert_eq!(s.client.delete(format!("{}/api/v1/auth/api-tokens/{id}", s.base)).bearer_auth(&tok).send().await.unwrap().status(), 404);
+    assert_eq!(s.post("/api/v1/auth/reset", &tok, json!({})).await.status(), 200);
+    assert_eq!(s.get("/api/v1/jobs", &run_tok).await.status(), 401);
+}

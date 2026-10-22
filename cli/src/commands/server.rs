@@ -1,6 +1,6 @@
 //! `ufop server …` — control a running `ufop-server` (ServerUtil
 //! equivalent): sign in and store credentials, list/run jobs, pause and
-//! resume the scheduler, read logs, issue automation tokens and check
+//! resume the scheduler, read logs, manage automation and scoped API tokens and check
 //! health with script-friendly exit codes (0 healthy, 1 degraded, 2 down).
 
 use crate::config::CliConfig;
@@ -17,7 +17,7 @@ pub enum ServerCommands {
         url: String,
         #[arg(long, env = "UFOP_SERVER_PASSWORD")]
         password: Option<String>,
-        /// Use a long-lived automation token instead of a password
+        /// Use an automation or API token (ufop_pat_…) instead of a password
         #[arg(long, env = "UFOP_SERVER_TOKEN")]
         token: Option<String>,
     },
@@ -58,6 +58,27 @@ pub enum ServerCommands {
     },
     /// Issue a long-lived automation token (must be enabled on the server)
     IssueToken,
+    /// Named, scoped, expiring API tokens (read, run, write, admin)
+    #[command(subcommand)]
+    Tokens(TokenCommands),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TokenCommands {
+    /// List API tokens (never their values)
+    List,
+    /// Create a token; its value is shown once
+    Create {
+        name: String,
+        /// read (GETs), run (+ start/cancel backups, pause/resume), write (+ change jobs), admin (everything)
+        #[arg(long, default_value = "read", value_parser = ["read", "run", "write", "admin"])]
+        scope: String,
+        /// Expires after this many days (1–365)
+        #[arg(long, default_value_t = 90)]
+        days: i64,
+    },
+    /// Revoke a token by id
+    Revoke { id: String },
 }
 
 struct Client {
@@ -255,6 +276,16 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
             ServerCommands::IssueToken => {
                 let mut c = Client::new()?;
                 show(format, &c.call(reqwest::Method::POST, "/auth/automation-token", None).await?);
+                Ok(0)
+            }
+            ServerCommands::Tokens(t) => {
+                let mut c = Client::new()?;
+                let v = match t {
+                    TokenCommands::List => c.call(reqwest::Method::GET, "/auth/api-tokens", None).await?,
+                    TokenCommands::Create { name, scope, days } => c.call(reqwest::Method::POST, "/auth/api-tokens", Some(json!({"name": name, "scope": scope, "expires_in_days": days}))).await?,
+                    TokenCommands::Revoke { id } => c.call(reqwest::Method::DELETE, &format!("/auth/api-tokens/{id}"), None).await?,
+                };
+                show(format, &v);
                 Ok(0)
             }
         }

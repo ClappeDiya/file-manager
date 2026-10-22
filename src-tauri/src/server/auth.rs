@@ -177,6 +177,11 @@ impl AuthService {
         self.reset_jwt().await
     }
 
+    /// Named, scoped API tokens (see `api_tokens`).
+    pub fn api_tokens(&self) -> super::api_tokens::ApiTokenStore {
+        super::api_tokens::ApiTokenStore::new(self.settings.pool().clone())
+    }
+
     async fn jwt_key(&self) -> Result<Vec<u8>, AppError> {
         if let Some(k) = self.settings.get_secret(KEY_JWT).await? {
             return hex::decode(k).map_err(|_| AppError::internal("corrupt jwt key"));
@@ -187,7 +192,7 @@ impl AuthService {
         Ok(k)
     }
 
-    /// Rotate the signing key and revoke all refresh tokens.
+    /// Rotate the signing key and revoke all refresh and API tokens.
     pub async fn reset_jwt(&self) -> Result<(), AppError> {
         let mut k = vec![0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut k);
@@ -196,6 +201,7 @@ impl AuthService {
             .pool()
             .execute(|c| {
                 c.execute("UPDATE server_tokens SET revoked = 1", [])?;
+                c.execute("UPDATE server_api_tokens SET revoked = 1", [])?;
                 Ok(())
             })
             .await

@@ -513,6 +513,23 @@ export const MIGRATIONS: Migration[] = [
       d.exec('ALTER TABLE sessions ADD COLUMN verified_at TEXT');
     },
   },
+  {
+    version: 20,
+    description: 'Personal API tokens (scoped, expiring)',
+    up(d) {
+      d.exec(`
+        CREATE TABLE api_tokens (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL,
+          permissions TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+          last_used_at TEXT, last_used_ip TEXT, revoked_at TEXT
+        );
+        CREATE INDEX idx_api_tokens_user ON api_tokens(user_id);
+        CREATE INDEX idx_api_tokens_org ON api_tokens(org_id);
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

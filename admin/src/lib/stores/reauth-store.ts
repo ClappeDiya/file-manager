@@ -1,13 +1,13 @@
-"use client";
+'use client';
 
 /**
  * Step-up re-authentication: a sensitive request came back `reauth_required`;
  * `request()` opens the dialog and resolves true once the user confirmed
  * (the API client then retries), false when they cancelled.
  */
-import { create } from "zustand";
+import { create } from 'zustand';
 
-export type ReauthMethod = "totp" | "passkey" | "password" | "sso";
+export type ReauthMethod = 'totp' | 'passkey' | 'password' | 'sso';
 
 interface ReauthState {
   methods: ReauthMethod[] | null;

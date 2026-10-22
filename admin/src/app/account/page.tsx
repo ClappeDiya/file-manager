@@ -18,6 +18,7 @@ import { formatRelativeTime } from '@/lib/utils/format';
 import { ChangePassword } from '@/components/auth/change-password';
 import { PasskeysCard } from '@/components/auth/passkeys-card';
 import { SessionsCard } from '@/components/auth/sessions-card';
+import { ApiTokensCard } from '@/components/auth/api-tokens-card';
 
 interface Identities {
   hasPassword: boolean;
@@ -100,6 +101,7 @@ function AccountView() {
         {ids.data?.hasPassword && user && <ChangePassword email={user.email} name={user.name} />}
         <PasskeysCard />
         <SessionsCard />
+        <ApiTokensCard />
         <Card>
           <CardHeader className="flex-col items-start gap-1">
             <CardTitle>

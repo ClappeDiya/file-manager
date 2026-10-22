@@ -39,6 +39,12 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
+  // Scripts with a console API token (and no session cookie): the route
+  // authenticates the token; no cookie means no cross-site request risk.
+  if (pathname.startsWith('/api/') && !request.cookies.get('ufop-admin-session') && request.headers.get('authorization')?.startsWith('Bearer ufop_cat_')) {
+    return NextResponse.next();
+  }
+
   // Public pages and auth endpoints still get the CSRF Origin check below for POSTs.
   const isPublic = PUBLIC_PATHS.some((p) => pathname.startsWith(p));
   if (isPublic && request.method === 'GET') {

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { revokeUserApiTokens } from '@/lib/db/repos/api-tokens';
 import { publicOrigin } from '@/lib/route-helpers';
 import { ROLE_HIERARCHY, type Role } from '@/lib/types/auth';
 import { audit, badRequest, can, canIn, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
@@ -81,7 +82,10 @@ export async function PATCH(request: NextRequest) {
     case 'activate':
       for (const id of b.userIds) {
         updateUser(id, { isActive: b.action === 'activate' });
-        if (b.action === 'deactivate') revokeUserSessions(id, 'deactivated');
+        if (b.action === 'deactivate') {
+          revokeUserSessions(id, 'deactivated');
+          revokeUserApiTokens(id);
+        }
       }
       break;
     case 'sign_out':

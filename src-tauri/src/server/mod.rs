@@ -5,6 +5,7 @@
 //! The same `BackupManager` the desktop app uses runs here, so jobs,
 //! scheduling, history and maintenance behave identically.
 
+pub mod api_tokens;
 pub mod auth;
 pub mod oauth;
 pub mod tls;
@@ -16,6 +17,8 @@ use crate::connectors::ConnectionManager;
 use crate::core::error::AppError;
 use auth::AuthService;
 use axum::extract::{Path as AxPath, Query, Request, State};
+use axum::Extension;
+use api_tokens::Principal;
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -162,21 +165,38 @@ async fn host_check(State(st): State<ServerState>, req: Request, next: Next) -> 
     next.run(req).await
 }
 
-async fn require_auth(State(st): State<ServerState>, req: Request, next: Next) -> Response {
+async fn require_auth(State(st): State<ServerState>, mut req: Request, next: Next) -> Response {
     let h = req.headers();
     if let Some(t) = h.get(PREAUTH_HEADER).and_then(|v| v.to_str().ok()) {
         if !t.is_empty() && st.cfg.preauth_tokens.iter().any(|p| constant_eq(p, t)) {
+            req.extensions_mut().insert(Principal::Session);
             return next.run(req).await;
         }
     }
-    let bearer = h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    match bearer {
-        Some(t) => match st.auth.validate(t).await {
-            Ok(_) => next.run(req).await,
-            Err(e) => ApiError(e).into_response(),
+    let bearer = h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::to_string);
+    let principal = match bearer {
+        Some(t) if t.starts_with(api_tokens::PREFIX) => match st.auth.api_tokens().validate(&t).await {
+            Ok(tok) => {
+                let need = api_tokens::required_scope(req.method(), req.uri().path());
+                if tok.scope < need {
+                    return ApiError(AppError::PermissionDenied {
+                        message: format!("The API token \"{}\" has the {} scope; this needs {}", tok.name, tok.scope.as_str(), need.as_str()),
+                        advice: "Use a token with a wider scope.".into(),
+                    })
+                    .into_response();
+                }
+                Principal::ApiToken { id: tok.id, scope: tok.scope }
+            }
+            Err(e) => return ApiError(e).into_response(),
         },
-        None => ApiError(AppError::PermissionDenied { message: "Authentication required".into(), advice: "Sign in first.".into() }).into_response(),
-    }
+        Some(t) => match st.auth.validate(&t).await {
+            Ok(_) => Principal::Session,
+            Err(e) => return ApiError(e).into_response(),
+        },
+        None => return ApiError(AppError::PermissionDenied { message: "Authentication required".into(), advice: "Sign in first.".into() }).into_response(),
+    };
+    req.extensions_mut().insert(principal);
+    next.run(req).await
 }
 
 fn constant_eq(a: &str, b: &str) -> bool {
@@ -263,6 +283,40 @@ async fn signin_token(State(st): State<ServerState>) -> ApiResult {
 
 async fn automation_token(State(st): State<ServerState>) -> ApiResult {
     ok(st.auth.issue_automation().await?)
+}
+
+#[derive(Deserialize)]
+struct ApiTokenBody {
+    name: String,
+    scope: api_tokens::Scope,
+    #[serde(default = "default_token_days")]
+    expires_in_days: i64,
+}
+
+fn default_token_days() -> i64 {
+    90
+}
+
+async fn list_api_tokens(State(st): State<ServerState>) -> ApiResult {
+    ok(json!({"tokens": st.auth.api_tokens().list().await?}))
+}
+
+/// Minting needs an interactive sign-in: an API token cannot create more tokens.
+async fn create_api_token(State(st): State<ServerState>, Extension(who): Extension<Principal>, Json(b): Json<ApiTokenBody>) -> ApiResult {
+    if who != Principal::Session {
+        return Err(AppError::PermissionDenied { message: "API tokens cannot create API tokens".into(), advice: "Sign in with the server password.".into() }.into());
+    }
+    let (t, raw) = st.auth.api_tokens().create(&b.name, b.scope, b.expires_in_days).await?;
+    tracing::info!("Created API token {} ({}, {} scope)", t.id, t.name, t.scope.as_str());
+    ok(json!({"token": raw, "info": t}))
+}
+
+async fn revoke_api_token(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    if !st.auth.api_tokens().revoke(&id).await? {
+        return Err(AppError::FileOperation { message: format!("API token {id} not found"), advice: "List the tokens to see their ids.".into() }.into());
+    }
+    tracing::info!("Revoked API token {id}");
+    ok(json!({"ok": true}))
 }
 
 async fn reset_jwt(State(st): State<ServerState>) -> ApiResult {
@@ -595,6 +649,8 @@ pub fn router(st: ServerState) -> Router {
     let protected = Router::new()
         .route("/api/v1/auth/signin-token", post(signin_token))
         .route("/api/v1/auth/automation-token", post(automation_token))
+        .route("/api/v1/auth/api-tokens", get(list_api_tokens).post(create_api_token))
+        .route("/api/v1/auth/api-tokens/{id}", axum::routing::delete(revoke_api_token))
         .route("/api/v1/auth/reset", post(reset_jwt))
         .route("/api/v1/auth/password", axum::routing::put(change_password))
         .route("/api/v1/status", get(status))

@@ -18,6 +18,7 @@ import { getSecurity, needsSecondFactorSetup, sessionIdleMinutes } from './db/re
 import { clientIp, ipAllowed } from './netacl';
 import { createSession, getSession, revokeSession, touchSession } from './db/repos/sessions';
 import { hasPasskeys } from './db/repos/passkeys';
+import { isBearerToken, useApiToken } from './db/repos/api-tokens';
 import { appendAudit, type AuditInput } from './db/repos/audit';
 
 export const SESSION_COOKIE = 'ufop-admin-session';
@@ -33,6 +34,8 @@ export interface AuthContext {
   sid: string;
   /** When the user last signed in or re-authenticated in this session. */
   verifiedAt: string;
+  /** Set when the request used an API token instead of a session. */
+  tokenId: string | null;
   ip: string;
   userAgent: string;
 }
@@ -82,9 +85,14 @@ const deny = (status: number, error: string) => NextResponse.json({ error }, { s
 /** What a session that still has to set up required MFA may call. */
 const MFA_SETUP_PATHS = ['/api/account/mfa', '/api/account/passkeys', '/api/auth/session', '/api/auth/logout'];
 
+/** Paths an API token may not use: account and sign-in changes, minting tokens, switching organization. */
+const TOKEN_DENIED_PATHS = ['/api/account/', '/api/auth/', '/api/api-tokens', '/api/orgs/switch'];
+
 export async function authenticate(req: NextRequest): Promise<AuthContext | NextResponse> {
-  if (!process.env.NEXTAUTH_SECRET) return deny(500, 'Server configuration error');
   const token = req.cookies.get(SESSION_COOKIE)?.value;
+  // A bearer token is only used without a session cookie (scripts, not browsers).
+  if (!token && isBearerToken(req.headers.get('authorization'))) return authenticateToken(req);
+  if (!process.env.NEXTAUTH_SECRET) return deny(500, 'Server configuration error');
   if (!token) return deny(401, 'Unauthorized');
   let payload: Record<string, unknown>;
   try {
@@ -102,30 +110,54 @@ export async function authenticate(req: NextRequest): Promise<AuthContext | Next
     return deny(401, 'Signed out after inactivity; sign in again');
   }
   touchSession(session);
+  const amr = Array.isArray(payload.amr) ? (payload.amr as string[]) : ['pwd'];
   const orgId = typeof payload.org === 'string' ? payload.org : user.organizationId;
+  const admitted = admit(req, user, orgId, amr.includes('sso'));
+  if (admitted instanceof NextResponse) return admitted;
+  return { user, orgId, role: admitted.role, permissions: ROLE_PERMISSIONS[admitted.role] ?? [], amr, sid: session.id, verifiedAt: session.verifiedAt, tokenId: null, ip: admitted.ip, userAgent: req.headers.get('user-agent') ?? '' };
+}
+
+/**
+ * The checks every request passes, whichever way it authenticated: access
+ * to the organization, its allowed networks and its two-factor rule.
+ */
+function admit(req: NextRequest, user: UserRecord, orgId: string, viaSso: boolean): { role: Role; ip: string } | NextResponse {
   const org = getOrg(orgId);
   const role = org ? effectiveRole(user.id, orgId) : null;
   if (!org || !role) return deny(403, 'You no longer have access to this organization');
   const ip = clientIp(req);
-  // The organization only admits console sessions from its networks (signing out still works).
+  // The organization only admits console access from its networks (signing out still works).
   if (!ipAllowed(getSecurity(orgId).ipAllowlist, ip) && !req.nextUrl.pathname.startsWith('/api/auth/logout')) {
     return NextResponse.json({ error: `This organization does not allow console access from ${ip}`, code: 'ip_not_allowed' }, { status: 403 });
   }
-  const amr = Array.isArray(payload.amr) ? (payload.amr as string[]) : ['pwd'];
   // An organization requires two-factor sign-in and this account has none yet:
   // the session can only set it up (also for sessions from before the rule).
-  if (needsSecondFactorSetup(user, amr.includes('sso')) && !MFA_SETUP_PATHS.some((p) => req.nextUrl.pathname.startsWith(p))) {
+  if (needsSecondFactorSetup(user, viaSso) && !MFA_SETUP_PATHS.some((p) => req.nextUrl.pathname.startsWith(p))) {
     return NextResponse.json({ error: 'Your organization requires two-factor sign-in. Set it up under My account first.', code: 'mfa_setup_required' }, { status: 403 });
   }
+  return { role, ip };
+}
+
+/** `Authorization: Bearer ufop_cat_…`: the token's permissions, narrowed to what its owner's role allows now. */
+function authenticateToken(req: NextRequest): AuthContext | NextResponse {
+  const t = useApiToken((req.headers.get('authorization') ?? '').slice('Bearer '.length).trim(), clientIp(req));
+  if (!t) return deny(401, 'Unknown, expired or revoked API token');
+  if (TOKEN_DENIED_PATHS.some((p) => req.nextUrl.pathname.startsWith(p))) return deny(403, 'API tokens cannot be used for this; sign in to the console');
+  const user = getUser(t.userId);
+  if (!user || !user.isActive) return deny(401, 'The token owner’s account is no longer active');
+  const admitted = admit(req, user, t.orgId, false);
+  if (admitted instanceof NextResponse) return admitted;
+  const now = ROLE_PERMISSIONS[admitted.role] ?? [];
   return {
     user,
-    orgId,
-    role,
-    permissions: ROLE_PERMISSIONS[role] ?? [],
-    amr,
-    sid: session.id,
-    verifiedAt: session.verifiedAt,
-    ip,
+    orgId: t.orgId,
+    role: admitted.role,
+    permissions: t.permissions.filter((p) => now.includes(p)),
+    amr: ['token'],
+    sid: `token:${t.id}`,
+    verifiedAt: new Date(0).toISOString(),
+    tokenId: t.id,
+    ip: admitted.ip,
     userAgent: req.headers.get('user-agent') ?? '',
   };
 }
@@ -178,6 +210,7 @@ export function recentlyVerified(ctx: AuthContext, at = Date.now()): boolean {
 }
 
 export function stepUpResponse(ctx: AuthContext): NextResponse {
+  if (ctx.tokenId) return NextResponse.json({ error: 'API tokens cannot make this change; use the console', code: 'interactive_required' }, { status: 403 });
   return NextResponse.json({ error: 'Confirm it is you to make this change', code: 'reauth_required', methods: reauthMethods(ctx.user) }, { status: 403 });
 }
 
@@ -197,6 +230,8 @@ export function audit(ctx: AuthContext | null, e: AuditInput): void {
     ipAddress: ctx?.ip,
     userAgent: ctx?.userAgent,
     ...e,
+    // Changes made with an API token name it.
+    ...(ctx?.tokenId ? { metadata: { ...e.metadata, apiToken: ctx.tokenId } } : {}),
   });
 }
 
