@@ -19,6 +19,7 @@ import { ChangePassword } from '@/components/auth/change-password';
 import { PasskeysCard } from '@/components/auth/passkeys-card';
 import { SessionsCard } from '@/components/auth/sessions-card';
 import { ApiTokensCard } from '@/components/auth/api-tokens-card';
+import { ProfileCard } from '@/components/auth/profile-card';
 
 interface Identities {
   hasPassword: boolean;
@@ -98,6 +99,7 @@ function AccountView() {
       )}
       <ErrorBanner message={err ?? mfa.error ?? ids.error} />
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+        <ProfileCard />
         {ids.data?.hasPassword && user && <ChangePassword email={user.email} name={user.name} />}
         <PasskeysCard />
         <SessionsCard />

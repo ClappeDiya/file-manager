@@ -344,7 +344,7 @@ export default function UsersPage() {
                         <button
                           onClick={() => setExpiring(user)}
                           className="p-1.5 rounded hover:bg-background-secondary"
-                          title={user.expiresAt ? `Membership ends ${new Date(user.expiresAt).toLocaleDateString()}` : 'Set membership end'}
+                          title={user.expiresAt ? `Membership ends ${formatDate(user.expiresAt)}` : 'Set membership end'}
                         >
                           <CalendarClock size={14} className={user.expiresAt ? 'text-warning' : 'text-foreground-secondary'} />
                         </button>

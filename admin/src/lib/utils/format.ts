@@ -11,6 +11,17 @@ export function formatBytes(bytes: number, decimals = 2): string {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(decimals))} ${sizes[i]}`;
 }
 
+let displayTimeZone: string | undefined;
+
+/** Show dates in this IANA time zone (the signed-in user's preference); undefined = the browser's. */
+export function setDisplayTimeZone(tz: string | null | undefined): void {
+  displayTimeZone = tz || undefined;
+}
+
+export function getDisplayTimeZone(): string {
+  return displayTimeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
 /** Format a date for display */
 export function formatDate(date: string | Date): string {
   const d = typeof date === 'string' ? new Date(date) : date;
@@ -18,10 +29,11 @@ export function formatDate(date: string | Date): string {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
+    timeZone: displayTimeZone,
   });
 }
 
-/** Format a datetime for display */
+/** Format a datetime for display (with the zone's abbreviation when a preference is set) */
 export function formatDateTime(date: string | Date): string {
   const d = typeof date === 'string' ? new Date(date) : date;
   return d.toLocaleString('en-US', {
@@ -30,6 +42,8 @@ export function formatDateTime(date: string | Date): string {
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
+    timeZone: displayTimeZone,
+    ...(displayTimeZone ? { timeZoneName: 'short' as const } : {}),
   });
 }
 

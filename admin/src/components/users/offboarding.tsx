@@ -12,9 +12,16 @@ import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
 import { ErrorBanner } from '@/components/fleet/badges';
 import { api, errorText } from '@/lib/api-client';
-import { formatRelativeTime } from '@/lib/utils/format';
+import { formatDateTime, formatRelativeTime, getDisplayTimeZone } from '@/lib/utils/format';
+import { zonedToUtc } from '@/lib/zoned-time';
 import { ROLE_LABELS, type AdminUser } from '@/lib/types/auth';
 import type { RemovedMember } from '@/lib/offboarding';
+
+/** A datetime-local value, read in the time zone the console shows times in. */
+const fromLocalInput = (v: string) => {
+  const [y, m, d, hh, mm] = v.split(/[-T:]/).map(Number);
+  return zonedToUtc(y, m, d, hh, mm, getDisplayTimeZone()).toISOString();
+};
 
 const patch = (body: Record<string, unknown>) => api('/api/users', { method: 'PATCH', body });
 
@@ -79,11 +86,11 @@ export function MembershipExpiryDialog({ user, onClose, onDone }: { user: (Admin
       <DialogHeader>
         <DialogTitle>Membership end for {user.name}</DialogTitle>
         <DialogDescription>
-          {user.expiresAt ? `Currently ends ${new Date(user.expiresAt).toLocaleString()}.` : 'No end date.'} On that date the member is removed (and can be restored for a while), as if removed by hand.
+          {user.expiresAt ? `Currently ends ${formatDateTime(user.expiresAt)}.` : 'No end date.'} On that date the member is removed (and can be restored for a while), as if removed by hand.
         </DialogDescription>
       </DialogHeader>
       <ErrorBanner message={err} />
-      <Input label="Ends on" type="datetime-local" value={date} onChange={(e) => setDate(e.target.value)} />
+      <Input label={`Ends on (${getDisplayTimeZone()})`} type="datetime-local" value={date} onChange={(e) => setDate(e.target.value)} />
       <DialogFooter>
         {user.expiresAt && (
           <Button variant="ghost" onClick={() => void save(null)}>
@@ -93,7 +100,7 @@ export function MembershipExpiryDialog({ user, onClose, onDone }: { user: (Admin
         <Button variant="secondary" onClick={onClose}>
           Cancel
         </Button>
-        <Button disabled={!date} onClick={() => void save(new Date(date).toISOString())}>
+        <Button disabled={!date} onClick={() => void save(fromLocalInput(date))}>
           Save
         </Button>
       </DialogFooter>

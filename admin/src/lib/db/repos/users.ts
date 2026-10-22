@@ -31,12 +31,13 @@ function fromRow(r: Row): UserRecord {
     recoveryCodes: parseJson<string[]>(r.recovery_codes, []),
     lastTotpStep: (r.last_totp_step as number) ?? null,
     passwordChangedAt: (r.password_changed_at as string) ?? null,
+    timeZone: (r.time_zone as string) ?? null,
   };
 }
 
 /** The public shape (no secrets). */
 export function publicUser(u: UserRecord): AdminUser & { mfaEnabled: boolean } {
-  return { id: u.id, email: u.email, name: u.name, role: u.role, permissions: u.permissions, organizationId: u.organizationId, lastLoginAt: u.lastLoginAt, createdAt: u.createdAt, isActive: u.isActive, ssoProvider: u.ssoProvider, mfaEnabled: u.mfaEnabled };
+  return { id: u.id, email: u.email, name: u.name, role: u.role, permissions: u.permissions, organizationId: u.organizationId, lastLoginAt: u.lastLoginAt, createdAt: u.createdAt, isActive: u.isActive, ssoProvider: u.ssoProvider, mfaEnabled: u.mfaEnabled, timeZone: u.timeZone ?? null };
 }
 
 export function getUser(id: string): UserRecord | null {
@@ -89,6 +90,7 @@ export interface UserUpdate {
   recoveryCodes?: string[];
   lastTotpStep?: number | null;
   passwordChangedAt?: string | null;
+  timeZone?: string | null;
 }
 
 const COLUMNS: Record<keyof UserUpdate, string> = {
@@ -105,6 +107,7 @@ const COLUMNS: Record<keyof UserUpdate, string> = {
   recoveryCodes: 'recovery_codes',
   lastTotpStep: 'last_totp_step',
   passwordChangedAt: 'password_changed_at',
+  timeZone: 'time_zone',
 };
 
 export function updateUser(id: string, u: UserUpdate): boolean {

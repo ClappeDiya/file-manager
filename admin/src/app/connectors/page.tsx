@@ -13,6 +13,7 @@ import { EmptyState } from '@/components/ui/empty-state';
 import { ComingSoon } from '@/components/ui/coming-soon';
 import { isEnabled } from '@/lib/features';
 import Link from 'next/link';
+import { formatDateTime } from '@/lib/utils/format';
 
 interface Connector {
   id: string;
@@ -124,7 +125,7 @@ export default function ConnectorsPage() {
                   </div>
                   <p className="text-xs text-foreground-tertiary mt-0.5">
                     {CONNECTOR_TYPES.find(t => t.value === connector.type)?.label || connector.type}
-                    {connector.lastTestedAt && ` - Last tested: ${new Date(connector.lastTestedAt).toLocaleString()}`}
+                    {connector.lastTestedAt && ` - Last tested: ${formatDateTime(connector.lastTestedAt)}`}
                   </p>
                 </div>
                 <div className="flex items-center gap-1">

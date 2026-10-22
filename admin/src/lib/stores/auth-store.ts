@@ -4,6 +4,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { AdminUser, Permission, Role } from '../types/auth';
 import { hasPermission } from '../utils/permissions';
+import { setDisplayTimeZone } from '../utils/format';
 
 export interface OrgSummary {
   id: string;
@@ -55,6 +56,7 @@ export const useAuthStore = create<AuthState>()(
       error: null,
 
       setUser: (user) => {
+        setDisplayTimeZone(user?.timeZone);
         set({ user, isAuthenticated: !!user, error: null });
       },
 
@@ -135,6 +137,7 @@ export const useAuthStore = create<AuthState>()(
             return;
           }
           const { user, permissions, organization, organizations } = await response.json();
+          setDisplayTimeZone(user?.timeZone);
           set({ user, permissions: permissions ?? null, organization: organization ?? null, organizations: organizations ?? [], isAuthenticated: true, isValidating: false });
         } catch {
           set({ user: null, isAuthenticated: false, isValidating: false });

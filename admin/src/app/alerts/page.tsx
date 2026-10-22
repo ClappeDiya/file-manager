@@ -17,7 +17,7 @@ import { useApi } from '@/lib/use-api';
 import { api, errorText } from '@/lib/api-client';
 import { useAuthStore } from '@/lib/stores/auth-store';
 import { useToastStore } from '@/lib/stores/toast-store';
-import { formatRelativeTime } from '@/lib/utils/format';
+import { formatDateTime, formatRelativeTime } from '@/lib/utils/format';
 import type { Alert, AlertKind, AlertParams, AlertRule } from '@/lib/db/repos/alerts';
 import { OutboxView } from '@/components/alerts/outbox-view';
 import type { Channel, ChannelKind, EmailConfig, WebhookConfig } from '@/lib/db/repos/channels';
@@ -215,7 +215,7 @@ export default function AlertsPage() {
                         )}
                         {a.resolvedAt ? ` · resolved ${formatRelativeTime(a.resolvedAt)}` : ''}
                         {!a.resolvedAt && a.acknowledgedAt && ` · acknowledged by ${a.acknowledgedBy}`}
-                        {!a.resolvedAt && a.snoozedUntil && new Date(a.snoozedUntil) > new Date() && ` · snoozed until ${new Date(a.snoozedUntil).toLocaleString()}`}
+                        {!a.resolvedAt && a.snoozedUntil && new Date(a.snoozedUntil) > new Date() && ` · snoozed until ${formatDateTime(a.snoozedUntil)}`}
                       </p>
                     </TableCell>
                     <TableCell>

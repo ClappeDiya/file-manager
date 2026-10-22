@@ -547,6 +547,13 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 22,
+    description: 'User time zone preference',
+    up(d) {
+      d.exec('ALTER TABLE users ADD COLUMN time_zone TEXT');
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;
