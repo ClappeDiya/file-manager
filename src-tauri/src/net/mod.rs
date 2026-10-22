@@ -275,4 +275,4 @@ pub fn client() -> reqwest::Client {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

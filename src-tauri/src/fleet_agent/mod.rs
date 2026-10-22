@@ -23,7 +23,7 @@ use crate::security::CredentialStore;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use ufop_core::agent::policy::{self, managed_job_id, policy_of_job};
-use ufop_core::agent::{Agent, AgentConfig, AgentHost, BoxFuture, ClientInfo, DiagnosticsUpload, FleetPolicy, JobSummary, ReportStats, RunReport};
+use ufop_core::agent::{Agent, AgentConfig, AgentHost, BoxFuture, ClientInfo, DiagnosticsUpload, ManagedSettings, FleetPolicy, JobSummary, ReportStats, RunReport};
 
 pub const CONFIG_KEY: &str = "fleet_agent.config";
 pub const TOKEN_KEY: &str = "fleet-agent-token";
@@ -38,11 +38,20 @@ pub struct BackupHost {
     settings: SettingsStore,
     creds: Arc<CredentialStore>,
     agent_kind: &'static str,
+    managed_handler: std::sync::Mutex<Option<ManagedSettingsHandler>>,
 }
+
+/// Applies the console's app settings on this kind of client (the desktop
+/// app sets one; the server and CLI have no proxy or AI settings to manage).
+pub type ManagedSettingsHandler = Arc<dyn Fn(Option<ManagedSettings>) -> BoxFuture<'static, Result<(), AppError>> + Send + Sync>;
 
 impl BackupHost {
     pub fn new(mgr: BackupManager, settings: SettingsStore, creds: Arc<CredentialStore>, agent_kind: &'static str) -> Self {
-        Self { mgr, settings, creds, agent_kind }
+        Self { mgr, settings, creds, agent_kind, managed_handler: std::sync::Mutex::new(None) }
+    }
+
+    pub fn set_managed_settings_handler(&self, h: ManagedSettingsHandler) {
+        *self.managed_handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
     }
 
     fn keychain(&self) -> bool {
@@ -283,6 +292,16 @@ impl AgentHost for BackupHost {
 
     fn managed_policies(&self) -> BoxFuture<'_, Vec<String>> {
         Box::pin(async move { self.mgr.list_jobs().await.iter().filter_map(|j| policy_of_job(&j.id).map(String::from)).collect() })
+    }
+
+    fn apply_managed_settings(&self, settings: Option<ManagedSettings>) -> BoxFuture<'_, Result<(), AppError>> {
+        let h = self.managed_handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        Box::pin(async move {
+            match h {
+                Some(h) => h(settings).await,
+                None => Ok(()),
+            }
+        })
     }
 
     fn diagnostics(&self) -> BoxFuture<'_, Result<DiagnosticsUpload, AppError>> {

@@ -169,6 +169,8 @@ pub struct PolicyBundle {
     pub policy_set_version: String,
     pub policies: Vec<FleetPolicy>,
     pub credentials: Vec<CentralCredential>,
+    /// The organization's managed app settings (`None`: nothing managed).
+    pub managed_settings: Option<super::ManagedSettings>,
 }
 
 /// Size figures the console keeps per backup.

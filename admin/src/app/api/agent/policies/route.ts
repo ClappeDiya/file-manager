@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { agentAuth, isMachine } from '@/lib/agent-auth';
 import { credentialsForPolicies, policiesFor, policySetVersion } from '@/lib/db/repos/fleet-policies';
 import { appendAudit } from '@/lib/db/repos/audit';
+import { managedSettingsForAgent } from '@/lib/db/repos/managed-settings';
 
 /** GET /api/agent/policies — the job templates for this machine and the central credentials they need. */
 export async function GET(request: NextRequest) {
@@ -14,5 +15,6 @@ export async function GET(request: NextRequest) {
     policySetVersion: policySetVersion(m),
     policies: policies.map((p) => ({ id: p.id, name: p.name, version: p.version, job: p.job })),
     credentials: credentials.map((c) => ({ credentialId: c.credentialId, name: c.name, secret: c.secret, updatedAt: c.updatedAt })),
+    managedSettings: managedSettingsForAgent(m.orgId),
   }, { headers: { 'cache-control': 'no-store' } });
 }

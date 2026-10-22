@@ -127,7 +127,8 @@ async fn clients_route_through_the_manual_proxy() {
 }
 
 /// Serialises the tests that change the process-wide proxy.
-static MODE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Serialises tests that change the process-wide proxy settings.
+pub(crate) static MODE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[test]
 fn loopback_and_metadata_never_proxied() {

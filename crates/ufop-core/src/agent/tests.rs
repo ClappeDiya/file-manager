@@ -16,6 +16,9 @@ struct HostState {
     runs: Vec<String>,
     /// Size of the diagnostics bundle the host builds (`None`: unsupported).
     diag_size: Option<usize>,
+    /// Managed settings applied by the agent, in order (`None` = released).
+    settings: Vec<Option<ManagedSettings>>,
+    fail_settings: bool,
 }
 
 #[derive(Clone, Default)]
@@ -103,6 +106,15 @@ impl AgentHost for FakeHost {
     fn managed_policies(&self) -> BoxFuture<'_, Vec<String>> {
         Box::pin(async move { self.st().jobs.keys().filter_map(|k| policy_of_job(k).map(String::from)).collect() })
     }
+    fn apply_managed_settings(&self, settings: Option<ManagedSettings>) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async move {
+            if self.st().fail_settings {
+                return Err(AppError::validation("proxy unreachable"));
+            }
+            self.st().settings.push(settings);
+            Ok(())
+        })
+    }
     fn diagnostics(&self) -> BoxFuture<'_, Result<DiagnosticsUpload, AppError>> {
         Box::pin(async move {
             match self.st().diag_size {
@@ -127,6 +139,7 @@ struct Console {
     claim_polls: u32,
     rotations: u32,
     diagnostics: Vec<Value>,
+    managed_settings: Value,
 }
 
 fn console() -> (MockConsole, Arc<Mutex<Console>>) {
@@ -166,7 +179,7 @@ fn console() -> (MockConsole, Arc<Mutex<Console>>) {
             }
             "/api/agent/policies" => (
                 200,
-                json!({ "policySetVersion": c.version, "policies": c.policies, "credentials": [{ "credentialId": "central:crd_1", "name": "pw", "secret": "s3cret", "updatedAt": "" }] }),
+                json!({ "policySetVersion": c.version, "policies": c.policies, "credentials": [{ "credentialId": "central:crd_1", "name": "pw", "secret": "s3cret", "updatedAt": "" }], "managedSettings": c.managed_settings }),
             ),
             "/api/agent/policies/applied" => {
                 c.applied = r.body.clone();
@@ -332,6 +345,56 @@ async fn browser_sign_in_builds_the_url_and_redeems_the_code() {
     assert_eq!(host.st().token.as_deref(), Some("ufop_agent_first"));
     // Already registered: no second sign-in.
     assert!(a.connect_url(&m.url, "http://127.0.0.1:5/callback", "st", "ch").is_err());
+}
+
+#[tokio::test]
+async fn managed_settings_apply_on_change_report_errors_and_release() {
+    let (m, c) = console();
+    let host = FakeHost::default();
+    let a = agent(&host).await;
+    a.register(&m.url, "ufop_reg_good", vec![]).await.unwrap();
+    let set = |v: Value, version: &str| {
+        let mut g = c.lock().unwrap();
+        g.managed_settings = v;
+        g.version = version.into();
+    };
+    set(json!({ "version": 2, "updates": { "channel": "beta" }, "ai": { "enabled": false } }), "s2");
+    a.cycle().await.unwrap();
+    let applied = host.st().settings.clone();
+    assert_eq!(applied.len(), 1);
+    let s = applied[0].clone().unwrap();
+    assert_eq!(s.updates.unwrap().channel.as_deref(), Some("beta"));
+    assert_eq!(c.lock().unwrap().applied["applied"][MANAGED_SETTINGS_KEY], 2);
+    assert!(a.status().managed_policies.is_empty(), "settings are not listed as a policy");
+
+    // Same version again: not re-applied.
+    set(json!({ "version": 2, "updates": { "channel": "beta" } }), "s2b");
+    a.cycle().await.unwrap();
+    assert_eq!(host.st().settings.len(), 1);
+
+    // Invalid or failing settings are reported, the old version stays.
+    set(json!({ "version": 3, "proxy": { "mode": "manual" } }), "s3");
+    a.cycle().await.unwrap();
+    assert!(c.lock().unwrap().applied["errors"][MANAGED_SETTINGS_KEY].as_str().unwrap().contains("URL"));
+    assert_eq!(a.config().managed_settings_version, 2);
+    host.st().fail_settings = true;
+    set(json!({ "version": 4, "proxy": { "mode": "none" } }), "s4");
+    a.cycle().await.unwrap();
+    assert!(c.lock().unwrap().applied["errors"][MANAGED_SETTINGS_KEY].as_str().unwrap().contains("unreachable"));
+    host.st().fail_settings = false;
+    a.cycle().await.unwrap();
+    assert_eq!(a.config().managed_settings_version, 2, "no policy-set change, no retry until the next change");
+
+    // The console stops managing: settings are released.
+    set(Value::Null, "s5");
+    a.cycle().await.unwrap();
+    assert_eq!(host.st().settings.last().unwrap(), &None);
+    assert_eq!(a.config().managed_settings_version, 0);
+
+    set(json!({ "version": 6, "ai": { "allowCloud": false } }), "s6");
+    a.cycle().await.unwrap();
+    a.unregister(false).await.unwrap();
+    assert_eq!(host.st().settings.last().unwrap(), &None, "unregistering releases them");
 }
 
 #[tokio::test]

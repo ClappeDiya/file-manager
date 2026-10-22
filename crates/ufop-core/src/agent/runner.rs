@@ -5,6 +5,7 @@
 //! small job store.
 
 use super::policy;
+use super::managed::ManagedSettings;
 use super::protocol::*;
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,8 @@ pub const RPC_ALLOW: &[&str] = &[
 
 /// Reports kept while the console is unreachable (oldest dropped first).
 pub const MAX_PENDING_REPORTS: usize = 100;
+/// Key of the managed app settings in applied/error reports.
+pub const MANAGED_SETTINGS_KEY: &str = "managed_settings";
 const MIN_HEARTBEAT: u64 = 15;
 const MAX_HEARTBEAT: u64 = 3600;
 const MAX_BACKOFF: u64 = 300;
@@ -70,6 +73,8 @@ pub struct AgentConfig {
     pub dropped_reports: u64,
     /// Set by an explicit unregister: preload/env auto-registration stays off.
     pub auto_register_declined: bool,
+    /// Version of the managed app settings in force (0 = none).
+    pub managed_settings_version: u64,
 }
 
 impl AgentConfig {
@@ -155,6 +160,10 @@ pub trait AgentHost: Send + Sync + 'static {
     fn managed_policies(&self) -> BoxFuture<'_, Vec<String>>;
     /// Build a diagnostics bundle (logs, versions, OS; no secrets). Hosts
     /// without one keep the default.
+    /// Apply the organization's app settings (`None`: release them to the user).
+    fn apply_managed_settings(&self, _settings: Option<ManagedSettings>) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async { Ok(()) })
+    }
     fn diagnostics(&self) -> BoxFuture<'_, Result<DiagnosticsUpload, AppError>> {
         Box::pin(async { Err(AppError::state("Diagnostics are not available on this client", "Collect logs on the machine instead.")) })
     }
@@ -414,6 +423,11 @@ impl<H: AgentHost> Agent<H> {
         for cred in &c.central_credentials {
             let _ = self.host.store_credential(cred.clone(), None).await;
         }
+        if c.managed_settings_version > 0 {
+            if let Err(e) = self.host.apply_managed_settings(None).await {
+                tracing::warn!("Could not release the managed app settings: {}", e.user_message());
+            }
+        }
         self.host.save_token(None).await?;
         *lock(&self.token) = None;
         self.update(|c| *c = AgentConfig { auto_register_declined: true, ..Default::default() });
@@ -584,7 +598,31 @@ impl<H: AgentHost> Agent<H> {
                 Err(e) => tracing::warn!("Could not remove the managed job of policy {id}: {}", e.user_message()),
             }
         }
-        if let Err(e) = client.policies_applied(token, &applied, &errors).await {
+        let mut settings_version = previous.managed_settings_version;
+        let wanted = bundle.managed_settings.as_ref().map(|s| s.version).unwrap_or(0);
+        if wanted != settings_version {
+            let r = match &bundle.managed_settings {
+                Some(s) => s.validate().map_err(AppError::validation),
+                None => Ok(()),
+            };
+            match r {
+                Ok(()) => match self.host.apply_managed_settings(bundle.managed_settings.clone()).await {
+                    Ok(()) => settings_version = wanted,
+                    Err(e) => {
+                        errors.insert(MANAGED_SETTINGS_KEY.into(), e.user_message());
+                    }
+                },
+                Err(e) => {
+                    errors.insert(MANAGED_SETTINGS_KEY.into(), e.user_message());
+                }
+            }
+        }
+        // The console sees the settings version next to the policies.
+        let mut reported = applied.clone();
+        if settings_version > 0 {
+            reported.insert(MANAGED_SETTINGS_KEY.into(), settings_version);
+        }
+        if let Err(e) = client.policies_applied(token, &reported, &errors).await {
             tracing::warn!("Could not report applied policies: {e}");
         }
         self.update(|c| {
@@ -592,6 +630,7 @@ impl<H: AgentHost> Agent<H> {
             c.applied_policies = applied.clone();
             c.policy_errors = errors.clone();
             c.central_credentials = delivered;
+            c.managed_settings_version = settings_version;
         });
         self.policies_fetched.store(true, Ordering::SeqCst);
         self.persist().await;

@@ -26,8 +26,7 @@ import {
   Sparkles,
   Building2,
   UsersRound,
-  Fingerprint,
-} from 'lucide-react';
+  Fingerprint, SlidersHorizontal } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 import { useAdminStore } from '@/lib/stores/admin-store';
 import { useAuthStore } from '@/lib/stores/auth-store';
@@ -52,6 +51,7 @@ const navItems: NavItem[] = [
   { id: 'machines', i18nKey: 'nav.machines', href: '/fleet/machines', icon: HardDrive, requiredPermission: 'fleet.read' },
   { id: 'enrollment', i18nKey: 'nav.enrollment', href: '/fleet/enroll', icon: Link2, requiredPermission: 'fleet.enroll' },
   { id: 'fleet-policies', i18nKey: 'nav.fleetPolicies', href: '/fleet/policies', icon: ClipboardList, requiredPermission: 'fleet.read' },
+  { id: 'app-settings', i18nKey: 'nav.appSettings', href: '/fleet/app-settings', icon: SlidersHorizontal, requiredPermission: 'fleet.read' },
   { id: 'credentials', i18nKey: 'nav.credentials', href: '/fleet/credentials', icon: KeyRound, requiredPermission: 'fleet.read' },
   { id: 'alerts', i18nKey: 'nav.alerts', href: '/alerts', icon: Bell, requiredPermission: 'alerts.read' },
   { id: 'ai-insights', i18nKey: 'nav.aiInsights', href: '/ai-insights', icon: Sparkles, requiredPermission: 'ai.read' },

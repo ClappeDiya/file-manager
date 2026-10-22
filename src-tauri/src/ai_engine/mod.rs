@@ -134,6 +134,8 @@ pub struct AiAssistant {
     suggestions: Arc<RwLock<Vec<AiSuggestion>>>,
     audit_log: Arc<RwLock<Vec<AiAuditEntry>>>,
     feature_toggles: Arc<RwLock<AiFeatureToggles>>,
+    /// Limits set by the organization's console (on top of the user's toggles).
+    managed: Arc<RwLock<Option<ufop_core::agent::ManagedAi>>>,
     pending_confirmations: Arc<RwLock<Vec<String>>>,
     // Ollama integration
     http_client: reqwest::Client,
@@ -153,6 +155,7 @@ impl AiAssistant {
             suggestions: Arc::new(RwLock::new(Vec::new())),
             audit_log: Arc::new(RwLock::new(Vec::new())),
             feature_toggles: Arc::new(RwLock::new(AiFeatureToggles::default())),
+            managed: Arc::new(RwLock::new(None)),
             pending_confirmations: Arc::new(RwLock::new(Vec::new())),
             http_client,
             ollama_available: Arc::new(RwLock::new(None)),
@@ -520,7 +523,7 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
         &self,
         context: &SuggestionContext,
     ) -> Vec<AiSuggestion> {
-        let toggles = self.feature_toggles.read().await;
+        let toggles = self.effective_toggles().await;
         if !toggles.ai_master_enabled || !toggles.suggestions {
             return vec![];
         }
@@ -706,7 +709,7 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
         input: &str,
         context_path: Option<&str>,
     ) -> Result<ParsedJobConfig, AppError> {
-        let toggles = self.feature_toggles.read().await;
+        let toggles = self.effective_toggles().await;
         if !toggles.ai_master_enabled || !toggles.nl_job_creation {
             return Err(AppError::Configuration {
                 message: "AI natural language processing is disabled".to_string(),
@@ -877,7 +880,7 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
 
     /// Send a chat message and get a response.
     pub async fn chat(&self, user_message: &str) -> Result<AiChatMessage, AppError> {
-        let toggles = self.feature_toggles.read().await;
+        let toggles = self.effective_toggles().await;
         if !toggles.ai_master_enabled {
             return Err(AppError::Configuration {
                 message: "AI features are disabled".to_string(),
@@ -964,15 +967,46 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
         log[start..end].to_vec()
     }
 
-    /// Get feature toggles.
+    /// Get feature toggles (as in force: the user's, limited by the console).
     pub async fn get_feature_toggles(&self) -> AiFeatureToggles {
-        let toggles = self.feature_toggles.read().await;
-        toggles.clone()
+        self.effective_toggles().await
     }
 
-    /// Update feature toggles.
-    pub async fn set_feature_toggles(&self, toggles: AiFeatureToggles) {
+    /// The user's toggles with the organization's limits applied.
+    pub async fn effective_toggles(&self) -> AiFeatureToggles {
+        let mut t = self.feature_toggles.read().await.clone();
+        if let Some(m) = self.managed.read().await.as_ref() {
+            if m.enabled == Some(false) {
+                t.ai_master_enabled = false;
+            }
+            if m.allow_cloud == Some(false) {
+                t.model_routing = "local".into();
+            }
+        }
+        t
+    }
+
+    /// Set (or clear) the console's AI limits.
+    pub async fn set_managed(&self, managed: Option<ufop_core::agent::ManagedAi>) {
+        *self.managed.write().await = managed;
+    }
+
+    pub async fn managed(&self) -> Option<ufop_core::agent::ManagedAi> {
+        self.managed.read().await.clone()
+    }
+
+    /// Update feature toggles. Fields the console overrides keep the user's
+    /// own value, so saving the effective toggles never bakes the limit in.
+    pub async fn set_feature_toggles(&self, mut toggles: AiFeatureToggles) {
         let mut current = self.feature_toggles.write().await;
+        if let Some(m) = self.managed.read().await.as_ref() {
+            if m.enabled == Some(false) {
+                toggles.ai_master_enabled = current.ai_master_enabled;
+            }
+            if m.allow_cloud == Some(false) {
+                toggles.model_routing = current.model_routing.clone();
+            }
+        }
         *current = toggles;
     }
 
@@ -1464,6 +1498,28 @@ mod tests {
         ai.dismiss_suggestion(&id).await.unwrap();
         let active = ai.get_suggestions().await;
         assert!(active.iter().all(|s| s.id != id));
+    }
+
+    #[tokio::test]
+    async fn managed_limits_override_the_users_toggles() {
+        let ai = AiAssistant::new();
+        let mut t = ai.get_feature_toggles().await;
+        t.model_routing = "cloud".into();
+        ai.set_feature_toggles(t).await;
+        ai.set_managed(Some(ufop_core::agent::ManagedAi { enabled: None, allow_cloud: Some(false) })).await;
+        assert_eq!(ai.get_feature_toggles().await.model_routing, "local");
+        assert!(ai.get_feature_toggles().await.ai_master_enabled);
+        ai.set_managed(Some(ufop_core::agent::ManagedAi { enabled: Some(false), allow_cloud: None })).await;
+        assert!(ai.chat("hi").await.is_err());
+        assert!(ai.parse_natural_language("copy a to b").await.is_err());
+        // Turning AI on in Settings does not lift the organization's limit.
+        let mut t = ai.get_feature_toggles().await;
+        t.ai_master_enabled = true;
+        ai.set_feature_toggles(t).await;
+        assert!(!ai.get_feature_toggles().await.ai_master_enabled);
+        ai.set_managed(None).await;
+        assert!(ai.get_feature_toggles().await.ai_master_enabled);
+        assert_eq!(ai.get_feature_toggles().await.model_routing, "cloud");
     }
 
     #[tokio::test]

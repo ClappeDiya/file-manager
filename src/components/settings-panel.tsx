@@ -22,6 +22,7 @@ import { SharingPolicySection } from "@/components/sharing-policy-section";
 import { ProxySection } from "@/components/proxy-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
 import { DiagnosticsSection } from "@/components/diagnostics-section";
+import { ManagedSettingsNotice } from "@/components/managed-settings-notice";
 
 // ── Types ──
 
@@ -1333,6 +1334,7 @@ export default function SettingsPanel({
         {/* Management console agent */}
         <Section title="Managed by Console">
           <FleetAgentSection />
+          <ManagedSettingsNotice />
         </Section>
 
         {/* Tamper-evident security audit log */}

@@ -1,0 +1,98 @@
+//! App settings managed by the organization's console (see
+//! `ufop_core::agent::ManagedSettings`): stored locally so they hold while
+//! offline, applied to the proxy and AI here, and read by the UI for the
+//! update channel, automatic checks and the blackout window.
+
+use crate::ai_engine::AiAssistant;
+use crate::commands::proxy_commands;
+use crate::core::error::AppError;
+use crate::net::{self, ProxyMode, ProxySettings};
+use crate::security::CredentialStore;
+use crate::storage::repository::Repository;
+use ufop_core::agent::{ManagedProxy, ManagedSettings};
+
+const CONFIG_KEY: &str = "managed_settings";
+
+pub async fn load(repo: &Repository) -> Option<ManagedSettings> {
+    repo.get_config(CONFIG_KEY).await.ok().flatten().and_then(|j| serde_json::from_str(&j).ok())
+}
+
+fn proxy_settings(p: &ManagedProxy) -> Result<ProxySettings, AppError> {
+    let mode = match p.mode.as_str() {
+        "system" => ProxyMode::System,
+        "none" => ProxyMode::None,
+        "manual" => ProxyMode::Manual,
+        "pac" => ProxyMode::Pac,
+        other => return Err(AppError::validation(format!("Unknown proxy mode '{other}'"))),
+    };
+    Ok(ProxySettings { mode, url: p.url.clone(), pac_url: p.pac_url.clone(), no_proxy: p.no_proxy.clone(), username: String::new(), managed: true })
+}
+
+/// Apply `settings` (or release them with `None`) and store them.
+pub async fn apply(repo: &Repository, creds: &CredentialStore, ai: &AiAssistant, settings: Option<ManagedSettings>) -> Result<(), AppError> {
+    if let Some(s) = &settings {
+        s.validate().map_err(AppError::validation)?;
+    }
+    match settings.as_ref().and_then(|s| s.proxy.as_ref()) {
+        Some(p) => {
+            // A managed proxy has no user credentials: clear any saved password.
+            proxy_commands::save(repo, creds, proxy_settings(p)?, Some(None)).await?;
+        }
+        None if net::current().managed => {
+            proxy_commands::save(repo, creds, ProxySettings::default(), None).await?;
+        }
+        None => {}
+    }
+    ai.set_managed(settings.as_ref().and_then(|s| s.ai.clone())).await;
+    let json = match &settings {
+        Some(s) => serde_json::to_string(s)?,
+        None => String::new(),
+    };
+    repo.set_config(CONFIG_KEY, &json).await
+}
+
+/// Startup: put the stored limits back in force (the proxy restores itself).
+pub async fn activate_stored(repo: &Repository, ai: &AiAssistant) {
+    ai.set_managed(load(repo).await.and_then(|s| s.ai)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ufop_core::agent::{ManagedAi, ManagedUpdates};
+
+    #[tokio::test]
+    async fn applies_stores_and_releases() {
+        let _lock = crate::net::tests::MODE_LOCK.lock().await;
+        let repo = Repository::open_in_memory().await.unwrap();
+        let creds = CredentialStore::new();
+        let ai = AiAssistant::new();
+        let s = ManagedSettings {
+            version: 3,
+            updates: Some(ManagedUpdates { channel: Some("beta".into()), ..Default::default() }),
+            proxy: Some(ManagedProxy { mode: "manual".into(), url: "http://proxy.corp:3128".into(), no_proxy: vec!["intranet".into()], ..Default::default() }),
+            ai: Some(ManagedAi { enabled: Some(false), allow_cloud: None }),
+        };
+        apply(&repo, &creds, &ai, Some(s.clone())).await.unwrap();
+        assert_eq!(load(&repo).await, Some(s));
+        let p = net::current();
+        assert!(p.managed && p.mode == ProxyMode::Manual && p.url == "http://proxy.corp:3128");
+        assert!(!ai.get_feature_toggles().await.ai_master_enabled);
+
+        // Restart: the AI limit comes back from storage.
+        let ai2 = AiAssistant::new();
+        activate_stored(&repo, &ai2).await;
+        assert!(!ai2.get_feature_toggles().await.ai_master_enabled);
+
+        // Invalid settings change nothing.
+        let bad = ManagedSettings { version: 4, proxy: Some(ManagedProxy { mode: "pac".into(), ..Default::default() }), ..Default::default() };
+        assert!(apply(&repo, &creds, &ai, Some(bad)).await.is_err());
+        assert_eq!(load(&repo).await.unwrap().version, 3);
+
+        apply(&repo, &creds, &ai, None).await.unwrap();
+        assert_eq!(load(&repo).await, None);
+        assert!(!net::current().managed, "the managed proxy is released");
+        assert!(ai.get_feature_toggles().await.ai_master_enabled);
+        let _ = net::apply(ProxySettings::default(), None);
+    }
+}

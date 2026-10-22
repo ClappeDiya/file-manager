@@ -13,6 +13,7 @@ pub mod lineage;
 pub mod metadata_engine;
 pub mod logging;
 pub mod diagnostics;
+pub mod managed_settings;
 pub mod net;
 pub mod search_engine;
 pub mod thumbnail_engine;
@@ -329,6 +330,7 @@ fn start_background_engines(app: tauri::AppHandle) {
         // or connects around the proxy.
         commands::policy_commands::activate_stored(&app.state::<Repository>()).await;
         commands::proxy_commands::activate_stored(&app.state::<Repository>(), &app.state::<std::sync::Arc<CredentialStore>>()).await;
+        managed_settings::activate_stored(&app.state::<Repository>(), &app.state::<AiAssistant>()).await;
         let automation = app.state::<AutomationManager>();
         if let Err(e) = automation.start_all_watchers().await {
             tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
@@ -482,6 +484,14 @@ pub fn run() {
             }));
             mgr.start_scheduler();
             start_background_engines(app.handle().clone());
+            // Console-managed proxy and AI limits.
+            let apply_handle = app.handle().clone();
+            setup_agent.host().set_managed_settings_handler(std::sync::Arc::new(move |settings| {
+                let h = apply_handle.clone();
+                Box::pin(async move {
+                    managed_settings::apply(&h.state::<Repository>(), &h.state::<std::sync::Arc<CredentialStore>>(), &h.state::<AiAssistant>(), settings).await
+                })
+            }));
             fleet_agent::spawn(setup_agent.clone(), "unified-file-ops");
             // Signed audit checkpoints: once at start-up, then hourly.
             tauri::async_runtime::spawn(setup_audit.clone().run_anchor_loop(security::audit::ANCHOR_INTERVAL));
@@ -1018,6 +1028,7 @@ pub fn run() {
             // Log Controls & Structured Export
             log_commands::get_log_level,
             log_commands::get_log_retention,
+            commands::proxy_commands::managed_settings_get,
             log_commands::set_log_retention,
             log_commands::diagnostics_create,
             log_commands::diagnostics_send,

@@ -352,6 +352,19 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 10,
+    description: 'Managed app settings per organization (updates, proxy, AI)',
+    up(d) {
+      d.exec(`
+        CREATE TABLE managed_settings (
+          org_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+          settings TEXT NOT NULL, version INTEGER NOT NULL,
+          updated_by TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

@@ -35,6 +35,7 @@ import * as heartbeat from '@/app/api/agent/heartbeat/route';
 import * as agentReport from '@/app/api/agent/report/route';
 import * as agentDiagnostics from '@/app/api/agent/diagnostics/route';
 import * as fleetConnect from '@/app/api/fleet/connect/route';
+import * as managedSettings from '@/app/api/fleet/managed-settings/route';
 import * as connectToken from '@/app/api/agent/connect/token/route';
 import { middleware } from '@/middleware';
 import { createHash } from 'node:crypto';
@@ -566,5 +567,54 @@ describe('audit trail of fleet actions', () => {
     expect(loc.searchParams.get('redirect')).toBe('/fleet/connect?redirect_uri=http%3A%2F%2F127.0.0.1%3A5%2Fcb&state=s');
     const api = await middleware(new NextRequest(new URL('http://localhost:3001/api/fleet/machines')));
     expect(api.status).toBe(401);
+  });
+
+  it('manages app settings for desktops and delivers them with the policies', async () => {
+    const admin = makeUser('ms-admin@x.org', 'org_admin');
+    const auditor = makeUser('ms-auditor@x.org', 'read_only_auditor');
+    const m = await enroll(admin, 'ms-desk');
+    const put = async (as: UserRecord, body: unknown) => managedSettings.PUT(await req('PUT', '/api/fleet/managed-settings', { as, body }));
+    const bundle = async () => (await json<{ policySetVersion: string; managedSettings: Record<string, unknown> | null }>(await agentPolicies.GET(await req('GET', '/api/agent/policies', { headers: bearer(m.token) })))).body;
+
+    expect((await bundle()).managedSettings).toBeNull();
+    const v0 = (await bundle()).policySetVersion;
+    expect((await put(auditor, { ai: { enabled: false } })).status).toBe(403);
+    for (const bad of [
+      { updates: { channel: 'nightly' } },
+      { updates: { blackout: { start: '8:00', end: '18:00', days: [] } } },
+      { updates: { blackout: { start: '08:00', end: '08:00', days: [] } } },
+      { updates: { blackout: { start: '08:00', end: '18:00', days: [7] } } },
+      { proxy: { mode: 'manual', url: 'proxy:3128' } },
+      { proxy: { mode: 'pac' } },
+      { proxy: { mode: 'magic' } },
+      { ai: { enabled: 'no' } },
+    ]) expect((await put(admin, bad)).status).toBe(400);
+
+    const ok = await json<{ settings: { version: number } }>(
+      await put(admin, { updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [5, 1, 1] } }, proxy: { mode: 'pac', pacUrl: 'https://wpad/p.pac', noProxy: [' intranet ', ''] }, ai: { allowCloud: false } }),
+    );
+    expect(ok.status).toBe(200);
+    expect(ok.body.settings.version).toBe(1);
+    const b = await bundle();
+    expect(b.managedSettings).toEqual({
+      version: 1,
+      updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [1, 5] } },
+      proxy: { mode: 'pac', url: '', pacUrl: 'https://wpad/p.pac', noProxy: ['intranet'] },
+      ai: { enabled: null, allowCloud: false },
+    });
+    expect(b.policySetVersion).not.toBe(v0);
+    const hbv = await json<{ policiesChanged: boolean }>(await hb(m.token, { policySetVersion: v0 }));
+    expect(hbv.body.policiesChanged).toBe(true);
+
+    // Compliance follows what agents report as applied.
+    await applied.POST(await req('POST', '/api/agent/policies/applied', { headers: bearer(m.token), body: { applied: { managed_settings: 1 } } }));
+    const view = await json<{ upToDate: number; desktops: number }>(await managedSettings.GET(await req('GET', '/api/fleet/managed-settings', { as: auditor })));
+    expect(view.body).toMatchObject({ upToDate: 1, desktops: 1 });
+
+    // Stopping: agents get null, and the next change is a newer version.
+    expect((await json<{ settings: null }>(await put(admin, { updates: null, proxy: null, ai: { enabled: null, allowCloud: null } }))).body.settings).toBeNull();
+    expect((await bundle()).managedSettings).toBeNull();
+    expect((await json<{ settings: { version: number } }>(await put(admin, { ai: { enabled: false } }))).body.settings.version).toBe(3);
+    expect(listAudit({}).entries.filter((e) => e.eventType === 'fleet.managed_settings')).toHaveLength(3);
   });
 });

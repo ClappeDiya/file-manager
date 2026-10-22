@@ -14,6 +14,7 @@ import { db, newId, now, parseJson, type Row } from '../index';
 import { open, seal } from '../../crypto';
 import { OrgError } from './orgs';
 import { normalizeTags, type Machine } from './machines';
+import { managedSettingsForAgent } from './managed-settings';
 
 export interface PolicyTarget {
   tags: string[];
@@ -136,10 +137,10 @@ export function policiesFor(m: Machine): FleetPolicy[] {
 
 /** Policy set version the agent compares against (changes when any applicable policy changes). */
 export function policySetVersion(m: Machine): string {
-  return policiesFor(m)
-    .map((p) => `${p.id}:${p.version}`)
-    .sort()
-    .join(',');
+  const parts = policiesFor(m).map((p) => `${p.id}:${p.version}`);
+  const settings = managedSettingsForAgent(m.orgId);
+  if (settings) parts.push(`settings:${settings.version}`);
+  return parts.sort().join(',');
 }
 
 // ── Central credentials ──

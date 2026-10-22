@@ -98,6 +98,12 @@ pub async fn proxy_get(repo: State<'_, Repository>, creds: State<'_, Arc<Credent
     })
 }
 
+/// The app settings the organization's console manages (`null`: none).
+#[tauri::command]
+pub async fn managed_settings_get(repo: State<'_, Repository>) -> Result<Option<ufop_core::agent::ManagedSettings>, AppError> {
+    Ok(crate::managed_settings::load(&repo).await)
+}
+
 /// `password`: omitted = keep, `null`/"" = remove, string = set.
 #[tauri::command]
 pub async fn proxy_set(
@@ -136,6 +142,7 @@ mod tests {
 
     #[tokio::test]
     async fn saves_applies_and_keeps_password_in_the_credential_store() {
+        let _guard = crate::net::tests::MODE_LOCK.lock().await;
         let repo = Repository::open_in_memory().await.unwrap();
         let creds = CredentialStore::new();
         let s = ProxySettings { mode: ProxyMode::None, no_proxy: vec!["a.example".into()], username: "me".into(), ..Default::default() };
