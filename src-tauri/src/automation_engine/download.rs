@@ -81,7 +81,7 @@ fn disposition_name(v: &str) -> Option<String> {
 }
 
 fn url_name(u: &url::Url) -> Option<String> {
-    let seg = u.path_segments()?.filter(|s| !s.is_empty()).next_back()?;
+    let seg = u.path_segments()?.rfind(|s| !s.is_empty())?;
     percent_encoding::percent_decode_str(seg).decode_utf8().ok().map(|s| s.into_owned())
 }
 
