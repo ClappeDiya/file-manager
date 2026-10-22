@@ -8,6 +8,7 @@
 //! - Action dispatch to existing engines (fs, transfer, sync, archive)
 //! - Execution logging and safety guards
 
+pub mod download;
 pub mod evaluator;
 pub mod executor;
 pub mod pinner;
@@ -311,6 +312,30 @@ pub enum RuleAction {
         /// Destination directory captured from the original ledger event.
         dest_path: String,
     },
+    /// Download a URL into a folder (`automation_engine::download`). URL,
+    /// folder and file name are templates.
+    DownloadUrl {
+        url: String,
+        dest_path: String,
+        /// File name (default: from the server or the URL).
+        #[serde(default)]
+        file_name: Option<String>,
+        /// Replace an existing file instead of adding a number.
+        #[serde(default)]
+        overwrite: bool,
+        #[serde(default = "default_download_max_mb")]
+        max_mb: u64,
+        /// Expected SHA-256 (hex; templates allowed).
+        #[serde(default)]
+        sha256: Option<String>,
+        /// Allow loopback, private and link-local addresses (intranet servers).
+        #[serde(default)]
+        allow_private: bool,
+    },
+}
+
+fn default_download_max_mb() -> u64 {
+    1024
 }
 
 fn default_max_entries() -> usize {
@@ -1298,9 +1323,10 @@ mod tests {
         let last = rules.last().unwrap();
         assert_eq!(last.trigger, RuleTrigger::Webhook);
         assert!(matches!(last.condition_tree, Some(ConditionNode::Any { ref nodes }) if nodes.len() == 2));
-        assert_eq!(last.steps.len(), 1);
+        assert_eq!(last.steps.len(), 2);
         assert!(matches!(last.action, RuleAction::SendMessage { .. }));
         assert!(matches!(last.steps[0].action, RuleAction::RunCommand { .. }));
+        assert!(matches!(&last.steps[1].action, RuleAction::DownloadUrl { url, overwrite: true, max_mb: 50, allow_private: false, .. } if url.contains("{customer}")));
         assert_eq!(last.options.priority, -1);
         assert_eq!(last.options.source.as_ref().map(|s| s.newest), Some(Some(5)));
         assert!(command_approvals(last).is_some());

@@ -141,6 +141,19 @@ describe("commands and summaries", () => {
   });
 });
 
+describe("download_url", () => {
+  it("validates URL, folder, limit and checksum", () => {
+    const step = (a: Partial<Extract<ReturnType<typeof defaultAction>, { type: "download_url" }>>) =>
+      validateForm(form({ trigger: { type: "manual" }, steps: [{ action: { ...(defaultAction("download_url") as Extract<ReturnType<typeof defaultAction>, { type: "download_url" }>), ...a }, continue_on_error: false }] }));
+    expect(step({ url: "https://h/x.csv", dest_path: "/out" })).toEqual([]);
+    expect(step({ url: "https://h/{name}.csv", dest_path: "/out", sha256: "{sha}" })).toEqual([]);
+    expect(step({ url: "ftp://h/x", dest_path: "/out" })).toEqual(["Action 1: enter an http(s) URL to download."]);
+    expect(step({ url: "https://h/x", dest_path: " " })).toEqual(["Action 1: choose the folder to save into."]);
+    expect(step({ url: "https://h/x", dest_path: "/o", max_mb: 0 })).toEqual(["Action 1: the size limit must be at least 1 MB."]);
+    expect(step({ url: "https://h/x", dest_path: "/o", sha256: "abc" })).toEqual(["Action 1: the SHA-256 must be 64 hex digits."]);
+  });
+});
+
 describe("presets", () => {
   it("each preset builds a valid rule for a folder", () => {
     for (const p of PRESETS) expect([p.id, validateForm(p.build("/inbox"))]).toEqual([p.id, []]);
@@ -159,6 +172,7 @@ describe("presets", () => {
       steps: [
         { action: { type: "send_message", notification: { type: "teams", credential_id: "cred-1" }, title: "{rule}", body: "{customer}" }, continue_on_error: true },
         { action: { type: "run_command", program: "/bin/echo", args: ["{payload}"], working_dir: null, timeout_secs: 30 }, continue_on_error: false },
+        { action: { type: "download_url", url: "https://example.com/{customer}.csv", dest_path: "/in/{yyyy}", file_name: null, overwrite: true, max_mb: 50, sha256: null, allow_private: false }, continue_on_error: false },
       ],
       options: { ...newRuleForm().options, source: { path: "/inbox", recursive: true, newest: 5, include_dirs: false }, priority: -1 },
     })), rules.length));

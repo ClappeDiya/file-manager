@@ -116,6 +116,22 @@ describe("AutomationRuleEditor", () => {
     await waitFor(() => expect(screen.queryByRole("region", { name: "Command approval" })).toBeNull());
   });
 
+  it("saves a URL download step in the engine's shape (advanced mode)", async () => {
+    useUIStore.setState({ appMode: "advanced" });
+    render(<AutomationRuleEditor />);
+    open();
+    fireEvent.change(screen.getByLabelText("Folder to watch", { selector: "input" }), { target: { value: "/in" } });
+    fireEvent.change(screen.getByLabelText("Action 1"), { target: { value: "download_url" } });
+    fireEvent.change(screen.getByLabelText("URL"), { target: { value: "https://example.com/{name}.csv" } });
+    fireEvent.change(screen.getByLabelText("Save into folder", { selector: "input" }), { target: { value: "/downloads" } });
+    fireEvent.change(screen.getByLabelText("File name (optional)"), { target: { value: "{name}-latest.csv" } });
+    fireEvent.change(screen.getByLabelText("Size limit (MB)"), { target: { value: "25" } });
+    fireEvent.click(screen.getByLabelText(/Allow intranet addresses/));
+    fireEvent.click(screen.getByText("Create rule"));
+    await waitFor(() => expect(calls("create_automation_rule")).toHaveLength(1));
+    expect(lastSaved!.action).toEqual({ type: "download_url", url: "https://example.com/{name}.csv", dest_path: "/downloads", file_name: "{name}-latest.csv", overwrite: false, max_mb: 25, sha256: null, allow_private: true });
+  });
+
   it("hides the webhook trigger in simple mode", async () => {
     render(<AutomationRuleEditor />);
     open();

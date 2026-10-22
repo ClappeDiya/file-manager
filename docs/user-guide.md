@@ -542,6 +542,15 @@ Files and folders display compatibility badges indicating their status across ta
 
 ---
 
+## Automation: downloading a URL
+
+In Advanced mode, an automation rule can **Download a URL** into a folder. The URL, folder, file name and expected SHA-256 accept the same templates as other actions (`{name}`, `{yyyy}`, webhook fields …).
+
+- The file name comes from the rule, else the server's `Content-Disposition`, else the URL. An existing file is kept and the new one gets a number, unless **Replace** is ticked.
+- The download goes to a hidden temporary file and is moved into place when complete. It stops at the size limit (default 1024 MB), and a wrong checksum discards it.
+- Up to 5 redirects are followed. Loopback, private, link-local (including cloud metadata) and other non-public addresses are blocked unless **Allow intranet addresses** is ticked. The check uses the address actually connected to, so it applies to every redirect too.
+- Network failures are retried with the rule's retry settings; blocked addresses, missing pages and checksum mismatches are not.
+
 ## Keyboard Shortcuts
 
 | Shortcut | Action |

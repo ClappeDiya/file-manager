@@ -137,6 +137,8 @@ function actionLabel(action: RuleAction): string {
       return `Message: ${action.title}`;
     case "create_folder":
       return `Create folder ${shortenPath(action.path)}`;
+    case "download_url":
+      return `Download to ${shortenPath(action.dest_path)}`;
     case "replay_op": {
       // Operation Pin: a captured copy/move replayed verbatim. The
       // source list and destination both travel with the rule, so the

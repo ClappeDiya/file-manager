@@ -140,6 +140,7 @@ export const ACTION_TYPES: { type: RuleAction["type"]; label: string; advanced?:
   { type: "send_message", label: "Send email / Slack / Teams" },
   { type: "execute_custom_command", label: "Run a saved custom command", advanced: true },
   { type: "run_command", label: "Run a program", advanced: true },
+  { type: "download_url", label: "Download a URL", advanced: true },
 ];
 
 export function defaultAction(type: RuleAction["type"]): RuleAction {
@@ -171,6 +172,8 @@ export function defaultAction(type: RuleAction["type"]): RuleAction {
       return { type, program: "", args: ["{path}"], working_dir: null, timeout_secs: 300 };
     case "replay_op":
       return { type, kind: "copy", source_paths: [], dest_path: "" };
+    case "download_url":
+      return { type, url: "https://", dest_path: "", file_name: null, overwrite: false, max_mb: 1024, sha256: null, allow_private: false };
   }
 }
 
@@ -298,6 +301,12 @@ export function validateForm(form: RuleForm): string[] {
     if (a.type === "transfer_to_connector" && !a.connection_id) errors.push(`${n}: choose a connection.`);
     if (a.type === "run_command" && !a.program.trim()) errors.push(`${n}: enter the program to run.`);
     if (a.type === "execute_custom_command" && !a.command_id) errors.push(`${n}: choose a custom command.`);
+    if (a.type === "download_url") {
+      if (!/^https?:\/\/[^/\s]+/i.test(a.url.trim())) errors.push(`${n}: enter an http(s) URL to download.`);
+      if (!a.dest_path.trim()) errors.push(`${n}: choose the folder to save into.`);
+      if (!(a.max_mb >= 1)) errors.push(`${n}: the size limit must be at least 1 MB.`);
+      if (a.sha256 && !/^([0-9a-f]{64}|.*\{.*\}.*)$/i.test(a.sha256.trim())) errors.push(`${n}: the SHA-256 must be 64 hex digits.`);
+    }
   });
   for (const r of form.conditions) {
     if (r.condition.type === "name_regex") {

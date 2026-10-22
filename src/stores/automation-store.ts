@@ -68,7 +68,18 @@ export type RuleAction =
    *  ledger event — carries its own source list so the trigger doesn't
    *  need to provide a file. Mirrors `RuleAction::ReplayOp` in the Rust
    *  automation engine. */
-  | { type: "replay_op"; kind: string; source_paths: string[]; dest_path: string };
+  | { type: "replay_op"; kind: string; source_paths: string[]; dest_path: string }
+  /** Download a URL into a folder (templates allowed in url, dest_path, file_name, sha256). */
+  | {
+      type: "download_url";
+      url: string;
+      dest_path: string;
+      file_name: string | null;
+      overwrite: boolean;
+      max_mb: number;
+      sha256: string | null;
+      allow_private: boolean;
+    };
 
 export type OverwritePolicy =
   | "rename"

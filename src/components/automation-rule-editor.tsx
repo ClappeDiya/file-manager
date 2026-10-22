@@ -366,6 +366,46 @@ function ActionFields({
       );
     case "replay_op":
       return <p className="text-xs text-[var(--color-text-muted)]">Replays {a.source_paths.length} pinned file(s) to {a.dest_path}.</p>;
+    case "download_url":
+      if (!advanced) return <p className="text-xs text-[var(--color-text-muted)]">Switch to Advanced mode to edit downloads.</p>;
+      return (
+        <div className="space-y-2">
+          <div>
+            <label className={label} htmlFor={id("url")}>URL</label>
+            <input id={id("url")} className={`${field} font-mono`} value={a.url} placeholder="https://example.com/exports/{yyyy}-{mm}-{dd}.csv" onChange={(e) => onChange({ ...a, url: e.target.value })} />
+            <TemplatePreview template={a.url} sample={sample} regex={regex} />
+          </div>
+          <div>
+            <label className={label} htmlFor={id("dest")}>Save into folder</label>
+            <FolderInput id={id("dest")} value={a.dest_path} onChange={(v) => onChange({ ...a, dest_path: v })} placeholder="/Downloads/{yyyy}" />
+            <TemplatePreview template={a.dest_path} sample={sample} asPath regex={regex} />
+            {tokenHint}
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className={label} htmlFor={id("fname")}>File name (optional)</label>
+              <input id={id("fname")} className={field} value={a.file_name ?? ""} placeholder="From the server or the URL" onChange={(e) => onChange({ ...a, file_name: e.target.value || null })} />
+            </div>
+            <div>
+              <label className={label} htmlFor={id("maxmb")}>Size limit (MB)</label>
+              <input id={id("maxmb")} type="number" min={1} className={field} value={a.max_mb} onChange={(e) => onChange({ ...a, max_mb: Number(e.target.value) })} />
+            </div>
+          </div>
+          <div>
+            <label className={label} htmlFor={id("sha")}>Expected SHA-256 (optional)</label>
+            <input id={id("sha")} className={`${field} font-mono`} value={a.sha256 ?? ""} onChange={(e) => onChange({ ...a, sha256: e.target.value || null })} />
+          </div>
+          <label className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={a.overwrite} onChange={(e) => onChange({ ...a, overwrite: e.target.checked })} />
+            Replace a file with the same name (otherwise a number is added)
+          </label>
+          <label className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={a.allow_private} onChange={(e) => onChange({ ...a, allow_private: e.target.checked })} />
+            Allow intranet addresses (localhost, private and link-local networks)
+          </label>
+          <p className="text-[11px] text-[var(--color-text-muted)]">Downloads to a hidden temporary file and moves it into place when complete. Redirects are followed (up to 5); private addresses stay blocked unless allowed above.</p>
+        </div>
+      );
   }
 }
 

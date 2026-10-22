@@ -263,6 +263,7 @@ pub fn action_kind(action: &RuleAction) -> &'static str {
         RuleAction::RunCommand { .. } => "run_command",
         RuleAction::SendMessage { .. } => "send_message",
         RuleAction::ReplayOp { .. } => "replay_op",
+        RuleAction::DownloadUrl { .. } => "download_url",
     }
 }
 
@@ -285,7 +286,7 @@ pub fn is_transient(action: &RuleAction, error: &str) -> bool {
     }
     match action {
         // Remote and engine actions: most failures are network/server side.
-        RuleAction::RunSync { .. } | RuleAction::TransferToConnector { .. } | RuleAction::SendMessage { .. } | RuleAction::Notify { .. } => true,
+        RuleAction::RunSync { .. } | RuleAction::TransferToConnector { .. } | RuleAction::SendMessage { .. } | RuleAction::Notify { .. } | RuleAction::DownloadUrl { .. } => true,
         // Local file actions: only "busy" style OS errors.
         _ => ["busy", "in use", "being used", "temporarily", "timed out", "would block", "interrupted", "sharing violation", "resource deadlock"]
             .iter()
@@ -681,6 +682,32 @@ pub async fn dispatch(action: &RuleAction, triggered_file: Option<&str>, env: &E
                 return Err("This command is not approved. Open the rule and approve its command line.".into());
             }
             run_command(program, args, working_dir.as_deref(), *timeout_secs, triggered_file, env).await
+        }
+
+        RuleAction::DownloadUrl { url, dest_path, file_name, overwrite, max_mb, sha256, allow_private } => {
+            let dest = env.path(dest_path, triggered_file)?;
+            validate_automation_path(Path::new(&dest), None)?;
+            std::fs::create_dir_all(&dest).map_err(|e| format!("Cannot create folder: {e}"))?;
+            let file_name = match file_name.as_deref().filter(|n| !n.trim().is_empty()) {
+                Some(n) => {
+                    let n = env.text(n, triggered_file)?;
+                    validate_rename_name(&n)?;
+                    Some(n)
+                }
+                None => None,
+            };
+            let spec = super::download::Download {
+                url: env.text(url, triggered_file)?,
+                dest_dir: PathBuf::from(&dest),
+                file_name,
+                overwrite: *overwrite,
+                max_bytes: max_mb.saturating_mul(1 << 20),
+                sha256: sha256.as_deref().map(|s| env.text(s, triggered_file)).transpose()?,
+                allow_private: *allow_private,
+                timeout: std::time::Duration::from_secs(3600),
+            };
+            let saved = super::download::run(&spec).await?;
+            Ok(vec![saved.to_string_lossy().into_owned()])
         }
 
         RuleAction::Notify { title, body } => {
@@ -1214,6 +1241,41 @@ mod tests {
         assert!(target.is_dir());
         // Idempotent.
         dispatch_action(&action, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_url_renders_templates_and_saves_the_file() {
+        let app = axum::Router::new().route("/files/{name}", axum::routing::get(|axum::extract::Path(n): axum::extract::Path<String>| async move { format!("contents of {n}") }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let trigger = dir.path().join("orders/invoice-17.txt");
+        std::fs::create_dir_all(trigger.parent().unwrap()).unwrap();
+        std::fs::write(&trigger, "x").unwrap();
+        let make = |file_name: &str, allow_private: bool| RuleAction::DownloadUrl {
+            url: format!("http://127.0.0.1:{port}/files/{{name}}.pdf"),
+            dest_path: format!("{}/downloads/{{name}}", dir.path().display()),
+            file_name: Some(file_name.into()),
+            overwrite: false,
+            max_mb: 1,
+            sha256: None,
+            allow_private,
+        };
+        let action = make("{name}-copy.pdf", true);
+        let out = dispatch_action(&action, trigger.to_str()).await.unwrap();
+        let saved = dir.path().join("downloads/invoice-17/invoice-17-copy.pdf");
+        assert_eq!(out, vec![saved.to_string_lossy().to_string()]);
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "contents of invoice-17.pdf");
+        // Loopback is refused unless the rule allows private addresses; that is not worth retrying.
+        let blocked = make("{name}-copy.pdf", false);
+        let e = dispatch_action(&blocked, trigger.to_str()).await.unwrap_err();
+        assert!(e.contains("blocked"), "{e}");
+        assert!(!is_transient(&blocked, &e));
+        assert!(is_transient(&blocked, "Download of http://x failed: connection reset"));
+        // A file name cannot leave the folder.
+        let escape = make("../x.pdf", true);
+        assert!(dispatch_action(&escape, trigger.to_str()).await.is_err());
     }
 
     // ── Automation v1.5 ──
