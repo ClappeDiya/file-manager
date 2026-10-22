@@ -108,18 +108,6 @@ export interface AuditFilter {
 /** Export formats */
 export type AuditExportFormat = 'csv' | 'json' | 'syslog';
 
-/** SIEM integration config (Enterprise) */
-export interface SIEMConfig {
-  type: 'webhook' | 'syslog';
-  endpoint: string;
-  format: 'json' | 'cef' | 'leef';
-  enabled: boolean;
-  authToken?: string;
-  tlsEnabled: boolean;
-  batchSize: number;
-  flushIntervalSeconds: number;
-}
-
 /** Device health types */
 export interface DeviceHealth {
   id: string;

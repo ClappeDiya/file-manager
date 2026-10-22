@@ -179,6 +179,25 @@ export function listAudit(q: AuditQuery = {}): { entries: AuditRecord[]; total: 
   return { entries: rows.map(fromRow), total };
 }
 
+/** Entries of these organizations after a sequence number, oldest first (forwarding). */
+export function auditAfter(orgIds: string[], afterSequence: number, limit: number): AuditRecord[] {
+  if (!orgIds.length) return [];
+  const rows = db()
+    .prepare(`SELECT * FROM audit_entries WHERE sequence > ? AND org_id IN (${orgIds.map(() => '?').join(',')}) ORDER BY sequence LIMIT ?`)
+    .all(afterSequence, ...orgIds, limit) as Row[];
+  return rows.map(fromRow);
+}
+
+export function countAuditAfter(orgIds: string[], afterSequence: number): number {
+  if (!orgIds.length) return 0;
+  return (db().prepare(`SELECT COUNT(*) AS n FROM audit_entries WHERE sequence > ? AND org_id IN (${orgIds.map(() => '?').join(',')})`).get(afterSequence, ...orgIds) as { n: number }).n;
+}
+
+/** The newest sequence number (0 when empty). */
+export function auditHead(): number {
+  return Number((db().prepare('SELECT MAX(sequence) AS s FROM audit_entries').get() as Row).s ?? 0);
+}
+
 export interface AuditVerification {
   ok: boolean;
   entriesChecked: number;

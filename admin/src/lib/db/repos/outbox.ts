@@ -6,7 +6,7 @@
  * retry or discard messages.
  */
 import { db, newId, now, parseJson, type Row } from '../index';
-import { BACKOFF_SECONDS, MAX_ATTEMPTS } from './webhooks';
+import { BACKOFF_SECONDS, MAX_ATTEMPTS } from '../../retry';
 
 export type OutboxStatus = 'pending' | 'sent' | 'dead' | 'discarded';
 export const OUTBOX_STATUSES: OutboxStatus[] = ['pending', 'sent', 'dead', 'discarded'];

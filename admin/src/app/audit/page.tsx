@@ -18,13 +18,11 @@ import { Dialog, DialogHeader, DialogTitle, DialogDescription, DialogFooter } fr
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 import {
   type AuditEntry, type AuditSeverity, type AuditExportFormat,
-  type SIEMConfig,
   AUDIT_EVENT_CATEGORIES,
 } from '@/lib/types/audit';
 import { formatDateTime, formatRelativeTime } from '@/lib/utils/format';
 import type { AuditVerification } from '@/lib/db/repos/audit';
-import { ComingSoon } from '@/components/ui/coming-soon';
-import { isEnabled } from '@/lib/features';
+import { SiemDialog } from '@/components/audit/siem-dialog';
 
 export default function AuditPage() {
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
@@ -42,16 +40,6 @@ export default function AuditPage() {
   const [showSIEMDialog, setShowSIEMDialog] = useState(false);
   const [verificationResult, setVerificationResult] = useState<string | null>(null);
 
-  // SIEM config state
-  const [siemConfig, setSiemConfig] = useState<SIEMConfig>({
-    type: 'webhook',
-    endpoint: '',
-    format: 'json',
-    enabled: false,
-    tlsEnabled: true,
-    batchSize: 100,
-    flushIntervalSeconds: 60,
-  });
 
   useEffect(() => {
     fetch('/api/audit')
@@ -405,80 +393,7 @@ export default function AuditPage() {
         </DialogFooter>
       </Dialog>
 
-      {/* SIEM Config Dialog */}
-      <Dialog open={showSIEMDialog} onClose={() => setShowSIEMDialog(false)} className="max-w-xl">
-        <DialogHeader>
-          <DialogTitle>SIEM Integration (Enterprise)</DialogTitle>
-          <DialogDescription>Configure real-time audit log streaming to your SIEM</DialogDescription>
-        </DialogHeader>
-        {!isEnabled('siemForwarding') ? (
-          <ComingSoon
-            feature="siemForwarding"
-            description="The audit log will stream to Splunk, syslog or any HTTPS collector with retries. Until then, export the log as JSON, CSV or syslog from Export."
-          />
-        ) : (
-        <div className="space-y-4">
-          <Select
-            label="Integration Type"
-            options={[
-              { value: 'webhook', label: 'Webhook' },
-              { value: 'syslog', label: 'Syslog' },
-            ]}
-            value={siemConfig.type}
-            onChange={(e) => setSiemConfig({ ...siemConfig, type: e.target.value as 'webhook' | 'syslog' })}
-          />
-          <Input
-            label="Endpoint URL"
-            placeholder={siemConfig.type === 'webhook' ? 'https://siem.example.com/api/events' : 'syslog://siem.example.com:514'}
-            value={siemConfig.endpoint}
-            onChange={(e) => setSiemConfig({ ...siemConfig, endpoint: e.target.value })}
-          />
-          <Select
-            label="Format"
-            options={[
-              { value: 'json', label: 'JSON' },
-              { value: 'cef', label: 'CEF (Common Event Format)' },
-              { value: 'leef', label: 'LEEF (Log Event Extended Format)' },
-            ]}
-            value={siemConfig.format}
-            onChange={(e) => setSiemConfig({ ...siemConfig, format: e.target.value as 'json' | 'cef' | 'leef' })}
-          />
-          {siemConfig.type === 'webhook' && (
-            <Input
-              label="Auth Token"
-              type="password"
-              placeholder="Bearer token for webhook authentication"
-              value={siemConfig.authToken || ''}
-              onChange={(e) => setSiemConfig({ ...siemConfig, authToken: e.target.value })}
-            />
-          )}
-          <div className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              id="tls-enabled"
-              checked={siemConfig.tlsEnabled}
-              onChange={(e) => setSiemConfig({ ...siemConfig, tlsEnabled: e.target.checked })}
-              className="rounded"
-            />
-            <label htmlFor="tls-enabled" className="text-sm text-foreground">Enable TLS</label>
-          </div>
-          <div className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              id="siem-enabled"
-              checked={siemConfig.enabled}
-              onChange={(e) => setSiemConfig({ ...siemConfig, enabled: e.target.checked })}
-              className="rounded"
-            />
-            <label htmlFor="siem-enabled" className="text-sm text-foreground">Enable SIEM Streaming</label>
-          </div>
-        </div>
-        )}
-        <DialogFooter>
-          <Button variant="outline" onClick={() => setShowSIEMDialog(false)}>{isEnabled('siemForwarding') ? 'Cancel' : 'Close'}</Button>
-          {isEnabled('siemForwarding') && <Button>Save Configuration</Button>}
-        </DialogFooter>
-      </Dialog>
+      <SiemDialog open={showSIEMDialog} onClose={() => setShowSIEMDialog(false)} />
     </div>
   );
 }

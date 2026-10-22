@@ -570,6 +570,23 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 24,
+    description: 'SIEM forwarding destinations with a per-destination audit cursor',
+    up(d) {
+      d.exec(`
+        CREATE TABLE siem_destinations (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, kind TEXT NOT NULL, config TEXT NOT NULL DEFAULT '{}', secret_ciphertext TEXT,
+          include_children INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+          cursor INTEGER NOT NULL DEFAULT 0, forwarded_total INTEGER NOT NULL DEFAULT 0,
+          failures INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, last_error TEXT, last_attempt_at TEXT, last_success_at TEXT,
+          created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_siem_org ON siem_destinations(org_id);
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

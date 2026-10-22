@@ -14,7 +14,7 @@ export const FEATURES = {
   /** Server-side CSV user import. */
   csvUserImport: true,
   /** Audit-log forwarding to a SIEM. */
-  siemForwarding: false,
+  siemForwarding: true,
   /** Subscription and payment management. */
   billing: false,
   /** Outbound webhook subscriptions with delivery. */

@@ -46,9 +46,9 @@ export interface WebhookDelivery {
   deliveredAt: string | null;
 }
 
-/** Seconds before attempt n+1 (after n failed attempts); then the delivery is dead. */
-export const BACKOFF_SECONDS = [60, 300, 1800, 7200, 21600];
-export const MAX_ATTEMPTS = BACKOFF_SECONDS.length + 1;
+import { BACKOFF_SECONDS, MAX_ATTEMPTS } from '../../retry';
+/** The shared schedule (see `lib/retry`); after MAX_ATTEMPTS the delivery is dead. */
+export { BACKOFF_SECONDS, MAX_ATTEMPTS };
 /** Consecutive failed attempts after which a webhook is paused. */
 export const PAUSE_AFTER_FAILURES = 15;
 /** Delivery log kept per webhook. */

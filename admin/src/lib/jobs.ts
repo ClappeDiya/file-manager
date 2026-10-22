@@ -10,6 +10,7 @@ import { anchorAudit, appendAudit, listAnchors } from './db/repos/audit';
 import { runScheduledSummaries } from './ai';
 import { logger } from './utils/logger';
 import { startDelivery } from './delivery';
+import { startSiemForwarding } from './siem';
 import { retireInactive } from './retirement';
 import { expireMemberships, purgeRemovedMembers } from './offboarding';
 
@@ -33,6 +34,7 @@ export function startJobs(intervalMs = 5 * 60_000): void {
   if (started || process.env.ADMIN_DISABLE_JOBS === '1') return;
   started = true;
   startDelivery();
+  startSiemForwarding();
   const tick = () =>
     runJobsOnce().catch((e) => logger.error('jobs.failed', { error: e instanceof Error ? e.message : String(e) }));
   setTimeout(tick, 30_000).unref?.();

@@ -39,20 +39,29 @@ export function isPrivateAddress(ip: string): boolean {
 
 const allowPrivate = () => process.env.WEBHOOKS_ALLOW_PRIVATE === '1';
 
-/** `dns.lookup` that refuses internal addresses (used by the HTTP agent). */
-function guardedLookup(hostname: string, options: dns.LookupOptions, cb: (err: NodeJS.ErrnoException | null, address: string | dns.LookupAddress[], family?: number) => void): void {
-  dns.lookup(hostname, { ...options, all: true }, (err, addresses) => {
-    if (err) return cb(err, '', 0);
-    const list = addresses as dns.LookupAddress[];
-    const blocked = !allowPrivate() && list.some((a) => isPrivateAddress(a.address));
-    if (blocked) {
-      const e: NodeJS.ErrnoException = new Error(`${hostname} resolves to an internal address; set WEBHOOKS_ALLOW_PRIVATE=1 to allow it`);
-      e.code = 'EPRIVATE';
-      return cb(e, '', 0);
-    }
-    if (options.all) return cb(null, list);
-    cb(null, list[0].address, list[0].family);
-  });
+const privateError = (host: string, env: string) => `${host} resolves to an internal address; set ${env}=1 to allow it`;
+
+/** `dns.lookup` that refuses internal addresses unless `allow` (used by the HTTP agent and raw sockets). */
+export function guardedLookup(allow: boolean, env: string) {
+  return (hostname: string, options: dns.LookupOptions, cb: (err: NodeJS.ErrnoException | null, address: string | dns.LookupAddress[], family?: number) => void): void => {
+    dns.lookup(hostname, { ...options, all: true }, (err, addresses) => {
+      if (err) return cb(err, '', 0);
+      const list = addresses as dns.LookupAddress[];
+      if (!allow && list.some((a) => isPrivateAddress(a.address))) {
+        const e: NodeJS.ErrnoException = new Error(privateError(hostname, env));
+        e.code = 'EPRIVATE';
+        return cb(e, '', 0);
+      }
+      if (options.all) return cb(null, list);
+      cb(null, list[0].address, list[0].family);
+    });
+  };
+}
+
+/** A literal internal IP (which skips DNS) that is not allowed. */
+export function literalPrivate(host: string, allow: boolean): boolean {
+  const h = host.replace(/^\[|\]$/g, '');
+  return !allow && net.isIP(h) !== 0 && isPrivateAddress(h);
 }
 
 export function sign(secret: string, timestamp: number, body: string): string {
@@ -66,11 +75,12 @@ export interface AttemptResult {
   durationMs: number;
 }
 
-/** POST one delivery. 2xx = delivered; anything else (incl. redirects) is a failure. */
-export function send(url: string, headers: Record<string, string>, secret: string, d: Pick<WebhookDelivery, 'id' | 'event' | 'payload'>): Promise<AttemptResult> {
+/**
+ * POST a body with internal addresses refused (unless `allowPrivate`, named
+ * by `env` in the error). 2xx = delivered; anything else (redirects too) fails.
+ */
+export function postGuarded(url: string, o: { headers: Record<string, string>; body: string; allowPrivate: boolean; env: string; userAgent: string }): Promise<AttemptResult> {
   const started = Date.now();
-  const body = JSON.stringify(d.payload);
-  const ts = Math.floor(started / 1000);
   return new Promise((resolve) => {
     const done = (r: Omit<AttemptResult, 'durationMs'>) => resolve({ ...r, durationMs: Date.now() - started });
     let u: URL;
@@ -79,28 +89,15 @@ export function send(url: string, headers: Record<string, string>, secret: strin
     } catch {
       return done({ ok: false, status: null, error: 'Invalid URL' });
     }
-    // A literal IP skips DNS: check it here.
-    const host = u.hostname.replace(/^\[|\]$/g, '');
-    if (net.isIP(host) && isPrivateAddress(host) && !allowPrivate()) {
-      return done({ ok: false, status: null, error: `${host} is an internal address; set WEBHOOKS_ALLOW_PRIVATE=1 to allow it` });
-    }
+    if (literalPrivate(u.hostname, o.allowPrivate)) return done({ ok: false, status: null, error: `${u.hostname.replace(/^\[|\]$/g, '')} is an internal address; set ${o.env}=1 to allow it` });
     const mod = u.protocol === 'https:' ? https : http;
     const req = mod.request(
       u,
       {
         method: 'POST',
-        lookup: guardedLookup as unknown as net.LookupFunction,
+        lookup: guardedLookup(o.allowPrivate, o.env) as unknown as net.LookupFunction,
         timeout: TIMEOUT_MS,
-        headers: {
-          ...headers,
-          'content-type': 'application/json',
-          'content-length': Buffer.byteLength(body),
-          'user-agent': 'UFOP-Webhooks/1.0',
-          'x-ufop-event': d.event,
-          'x-ufop-delivery': d.id,
-          'x-ufop-timestamp': String(ts),
-          'x-ufop-signature': sign(secret, ts, body),
-        },
+        headers: { ...o.headers, 'content-length': Buffer.byteLength(o.body), 'user-agent': o.userAgent },
       },
       (res) => {
         let text = '';
@@ -117,7 +114,20 @@ export function send(url: string, headers: Record<string, string>, secret: strin
     );
     req.on('timeout', () => req.destroy(new Error(`No response within ${TIMEOUT_MS / 1000} s`)));
     req.on('error', (e) => done({ ok: false, status: null, error: e.message }));
-    req.end(body);
+    req.end(o.body);
+  });
+}
+
+/** POST one webhook delivery, signed. */
+export function send(url: string, headers: Record<string, string>, secret: string, d: Pick<WebhookDelivery, 'id' | 'event' | 'payload'>): Promise<AttemptResult> {
+  const body = JSON.stringify(d.payload);
+  const ts = Math.floor(Date.now() / 1000);
+  return postGuarded(url, {
+    body,
+    allowPrivate: allowPrivate(),
+    env: 'WEBHOOKS_ALLOW_PRIVATE',
+    userAgent: 'UFOP-Webhooks/1.0',
+    headers: { ...headers, 'content-type': 'application/json', 'x-ufop-event': d.event, 'x-ufop-delivery': d.id, 'x-ufop-timestamp': String(ts), 'x-ufop-signature': sign(secret, ts, body) },
   });
 }
 
