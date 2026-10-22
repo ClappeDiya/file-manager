@@ -66,6 +66,8 @@ pub async fn create_sync_pair(
     checksum_enabled: Option<bool>,
     time_offset_secs: Option<i64>,
     options_json: Option<String>,
+    dest_state: Option<String>,
+    checksum_algorithm: Option<String>,
     manager: State<'_, SyncManager>,
     ledger: State<'_, OperationLedger>,
     repo: State<'_, Repository>,
@@ -118,6 +120,8 @@ pub async fn create_sync_pair(
         created_at: chrono::Utc::now(),
         time_offset_secs,
         copy_options,
+        dest_state: dest_state.and_then(|v| serde_json::from_value(serde_json::Value::String(v)).ok()).unwrap_or_default(),
+        checksum_algorithm: checksum_algorithm.and_then(|v| serde_json::from_value(serde_json::Value::String(v)).ok()).unwrap_or_default(),
     };
 
     use crate::core::traits::SyncOperations;
@@ -239,6 +243,24 @@ pub async fn update_sync_pair(
     Ok(updated)
 }
 
+/// Stored sync runs, newest first (all pairs when `pair_id` is omitted).
+#[tauri::command]
+pub async fn get_sync_run_history(
+    pair_id: Option<String>,
+    limit: Option<u32>,
+    manager: State<'_, SyncManager>,
+    repo: State<'_, Repository>,
+) -> Result<Vec<SyncReport>, AppError> {
+    let id = pair_id.as_deref().map(parse_uuid).transpose()?;
+    manager.run_history(&repo, id, limit.unwrap_or(100)).await
+}
+
+/// Delete stored sync runs older than `days`.
+#[tauri::command]
+pub async fn prune_sync_run_history(days: u32, manager: State<'_, SyncManager>, repo: State<'_, Repository>) -> Result<usize, AppError> {
+    manager.prune_run_history(&repo, days).await
+}
+
 /// Run a sync for a pair.
 #[tauri::command]
 pub async fn run_sync(
@@ -262,6 +284,12 @@ pub async fn run_sync(
                     tracing::warn!("Failed to persist last_run for sync pair {id}: {e}");
                 }
             }
+        }
+    }
+
+    if let Ok(report) = &result {
+        if let Err(e) = manager.save_report_to_db(&repo, report, 500).await {
+            tracing::warn!("Failed to store sync run history for {id}: {e}");
         }
     }
 
@@ -416,10 +444,18 @@ pub async fn export_sync_report_csv(
     pair_id: String,
     report_id: String,
     manager: State<'_, SyncManager>,
+    repo: State<'_, Repository>,
 ) -> Result<String, AppError> {
     let pid = parse_uuid(&pair_id)?;
     let rid = parse_uuid(&report_id)?;
-    manager.export_report_csv(pid, rid).await
+    match manager.export_report_csv(pid, rid).await {
+        Ok(s) => Ok(s),
+        // Older runs live only in the stored history.
+        Err(e) => match manager.stored_report(&repo, rid).await? {
+            Some(r) => crate::sync_engine::report::export_report_csv(&r),
+            None => Err(e),
+        },
+    }
 }
 
 /// Export a sync report as JSON.
@@ -428,10 +464,18 @@ pub async fn export_sync_report_json(
     pair_id: String,
     report_id: String,
     manager: State<'_, SyncManager>,
+    repo: State<'_, Repository>,
 ) -> Result<String, AppError> {
     let pid = parse_uuid(&pair_id)?;
     let rid = parse_uuid(&report_id)?;
-    manager.export_report_json(pid, rid).await
+    match manager.export_report_json(pid, rid).await {
+        Ok(s) => Ok(s),
+        // Older runs live only in the stored history.
+        Err(e) => match manager.stored_report(&repo, rid).await? {
+            Some(r) => crate::sync_engine::report::export_report_json(&r),
+            None => Err(e),
+        },
+    }
 }
 
 /// Start filesystem watcher for a sync pair.

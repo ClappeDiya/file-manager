@@ -85,7 +85,10 @@ const queryClient = new QueryClient({
 // Dynamically import the app to catch module-evaluation errors
 async function bootstrap() {
   try {
-    const mod = await import(/* @vite-ignore */ "./App");
+    // Served by ufop-server: the headless web UI (sign-in + Backups).
+    const mod = window.__UFOP_SERVER__
+      ? await import("./components/server/server-app")
+      : await import(/* @vite-ignore */ "./App");
     const App = mod.default;
 
     ReactDOM.createRoot(document.getElementById("root")!).render(

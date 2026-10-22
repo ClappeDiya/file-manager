@@ -22,7 +22,7 @@ import {
   AUDIT_EVENT_CATEGORIES,
 } from '@/lib/types/audit';
 import { formatDateTime, formatRelativeTime } from '@/lib/utils/format';
-import { verifyAuditChain } from '@/lib/utils/audit-integrity';
+import type { AuditVerification } from '@/lib/db/repos/audit';
 
 export default function AuditPage() {
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
@@ -95,9 +95,32 @@ export default function AuditPage() {
     setShowExportDialog(false);
   };
 
+  // The server recomputes the full hash chain and checks the signed checkpoints.
+  const describe = (v: AuditVerification, anchors?: number) =>
+    v.ok
+      ? `Intact: ${v.entriesChecked} entries chained, ${v.anchorsChecked} signed checkpoint(s) valid${anchors !== undefined ? ` (${anchors} listed)` : ''}. Head #${v.headSequence} ${v.headHash.slice(0, 16)}…`
+      : `TAMPERING DETECTED at entry #${v.firstBadSequence ?? '?'}: ${v.reason ?? 'chain mismatch'}`;
+
   const handleVerifyIntegrity = async () => {
-    const result = await verifyAuditChain(auditEntries);
-    setVerificationResult(result.details);
+    try {
+      const res = await fetch('/api/audit/verify');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Verification failed');
+      setVerificationResult(describe(data.verification, data.anchors?.length));
+    } catch (e) {
+      setVerificationResult(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleAnchor = async () => {
+    try {
+      const res = await fetch('/api/audit/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not sign a checkpoint');
+      setVerificationResult(data.anchor ? `Signed checkpoint at entry #${data.anchor.lastSequence}. ${describe(data.verification)}` : describe(data.verification));
+    } catch (e) {
+      setVerificationResult(e instanceof Error ? e.message : String(e));
+    }
   };
 
   if (loading) {
@@ -131,6 +154,9 @@ export default function AuditPage() {
           <div className="flex gap-2">
             <Button variant="outline" size="sm" onClick={handleVerifyIntegrity}>
               <Shield size={14} /> Verify Integrity
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleAnchor}>
+              Sign checkpoint
             </Button>
             <Button variant="outline" size="sm" onClick={() => setShowExportDialog(true)}>
               <Download size={14} /> Export

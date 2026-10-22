@@ -1,9 +1,11 @@
 pub mod ai_engine;
 pub mod automation_engine;
+pub mod backup_engine;
 pub mod commands;
 pub mod compat_engine;
 pub mod connectors;
 pub mod core;
+pub mod fleet_agent;
 pub mod fs_engine;
 pub mod governance;
 pub mod ledger;
@@ -12,16 +14,19 @@ pub mod mount_engine;
 pub mod narrator;
 pub mod safety;
 pub mod security;
+pub mod server;
 pub mod storage;
 pub mod sync_engine;
 pub mod spaces_engine;
 pub mod transfer_engine;
+pub mod tray;
 
 use ai_engine::AiAssistant;
 use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
+use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, automation_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -64,6 +69,10 @@ struct AppState {
     safety_interlock: SafetyInterlock,
     narrator: OperationNarrator,
     quickflow_suggester: LedgerSuggester,
+    backup_mgr: BackupManager,
+    fleet_agent: fleet_agent::FleetAgent,
+    background_mode: tray::BackgroundMode,
+    audit_trail: security::audit::AuditTrail,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -100,7 +109,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
 
     // Initialize credential store and connection manager
     let credential_store = std::sync::Arc::new(CredentialStore::new());
-    let connection_mgr = ConnectionManager::new(repo.clone(), credential_store);
+    let connection_mgr = ConnectionManager::new(repo.clone(), credential_store.clone());
 
     // Initialize transfer history and let the manager record terminal jobs
     let transfer_history = TransferHistory::new(repo.pool().clone());
@@ -122,6 +131,9 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // created fresh each boot, so there is never anything to load.
     if let Err(e) = sync_mgr.load_pairs_from_db(&repo).await {
         tracing::warn!("Failed to load sync pairs (non-fatal): {e}");
+    }
+    if let Err(e) = sync_mgr.load_reports_from_db(&repo, 50).await {
+        tracing::warn!("Failed to load sync run history (non-fatal): {e}");
     }
 
     // Initialize peer manager (T-031) and server transfer manager (T-033)
@@ -204,6 +216,43 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // automation panel. Pure derivation over existing ledger data.
     let quickflow_suggester = LedgerSuggester::new(ledger.clone());
 
+    // Versioned backup jobs: restore saved jobs, then arm the scheduler
+    // (which also catches up on runs missed while the app was closed).
+    let backup_mgr = BackupManager::new(
+        repo.pool().clone(),
+        credential_store.clone(),
+        Some(connection_mgr.clone()),
+        Some(ledger.clone()),
+        backup_engine::default_data_dir(),
+    );
+    // Without an OS keychain, job passphrases persist in the (encrypted)
+    // settings store instead of process memory.
+    let settings_store =
+        match crate::security::settings_store::SettingsStore::open(repo.pool().clone(), &credential_store, Default::default()).await {
+            Ok(store) => {
+                backup_mgr.set_settings_store(store.clone());
+                Some(store)
+            }
+            Err(e) => {
+                tracing::warn!("Settings store unavailable (non-fatal): {e}");
+                None
+            }
+        };
+    // Tamper-evident security audit log: anchors are signed with a key in
+    // the OS keychain (or the encrypted settings store as a fallback).
+    let agent_store = settings_store.clone().unwrap_or_else(|| crate::security::settings_store::SettingsStore::plain(repo.pool().clone()));
+    let audit_trail =
+        security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), settings_store);
+    if let Err(e) = backup_mgr.load_from_db().await {
+        tracing::warn!("Failed to load backup jobs (non-fatal): {e}");
+    }
+    // Management console agent (registration, heartbeats, policies, reports);
+    // its loop starts in `setup`, like the scheduler.
+    let fleet_agent = fleet_agent::init_or_default(backup_mgr.clone(), agent_store, credential_store.clone(), "desktop").await;
+    // The scheduler starts in Tauri's `setup` hook: this function runs on a
+    // throwaway runtime whose spawned tasks die when it is dropped.
+    let background_mode = tray::load_background_mode(&repo).await;
+
     Ok(AppState {
         repo,
         transfer_mgr,
@@ -229,6 +278,10 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         safety_interlock,
         narrator,
         quickflow_suggester,
+        backup_mgr,
+        fleet_agent,
+        background_mode,
+        audit_trail,
     })
 }
 
@@ -268,7 +321,7 @@ pub fn run() {
                     .block_on(Repository::open_in_memory())
                     .expect("Failed to create in-memory database");
                 let credential_store = std::sync::Arc::new(CredentialStore::new());
-                let connection_mgr = ConnectionManager::new(repo.clone(), credential_store);
+                let connection_mgr = ConnectionManager::new(repo.clone(), credential_store.clone());
                 let transfer_history = TransferHistory::new(repo.pool().clone());
                 let transfer_mgr = TransferManager::new();
                 let vault_mgr = VaultManager::new();
@@ -283,6 +336,25 @@ pub fn run() {
                 let quickflow_suggester = LedgerSuggester::new(ledger.clone());
                 let mut automation_mgr = AutomationManager::new();
                 automation_mgr.set_ledger(ledger.clone());
+                // Backup jobs can still be created and run this session; the
+                // scheduler is not started because nothing persists.
+                let backup_mgr = BackupManager::new(
+                    repo.pool().clone(),
+                    credential_store.clone(),
+                    Some(connection_mgr.clone()),
+                    Some(ledger.clone()),
+                    backup_engine::default_data_dir(),
+                );
+                // In-memory DB: no settings store; the key comes from the
+                // env var or keychain, else is ephemeral like the DB itself.
+                // The console agent still works; its settings live in the in-memory DB.
+                let fleet_agent = rt2.block_on(fleet_agent::init_or_default(
+                    backup_mgr.clone(),
+                    crate::security::settings_store::SettingsStore::plain(repo.pool().clone()),
+                    credential_store.clone(),
+                    "desktop",
+                ));
+                let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store), None);
                 AppState {
                     repo,
                     transfer_mgr,
@@ -308,6 +380,10 @@ pub fn run() {
                     safety_interlock,
                     narrator,
                     quickflow_suggester,
+                    backup_mgr,
+                    fleet_agent,
+                    background_mode: tray::BackgroundMode::default(),
+                    audit_trail,
                 }
             }
         }
@@ -315,7 +391,11 @@ pub fn run() {
 
     // Clone for shutdown hook
     let shutdown_repo = app_state.repo.clone();
+    let setup_backup_mgr = app_state.backup_mgr.clone();
+    let close_mode = app_state.background_mode.clone();
     let shutdown_transfer = app_state.transfer_mgr.clone();
+    let setup_audit = app_state.audit_trail.clone();
+    let setup_agent = app_state.fleet_agent.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -324,6 +404,33 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--background"])))
+        .setup(move |app| {
+            use tauri::Manager;
+            use tauri_plugin_notification::NotificationExt;
+            let mgr = setup_backup_mgr.clone();
+            // Backup results → OS notifications (warnings and errors by default).
+            let handle = app.handle().clone();
+            mgr.set_notifier(std::sync::Arc::new(move |title: &str, body: &str, _status: &str| {
+                if let Err(e) = handle.notification().builder().title(title).body(body).show() {
+                    tracing::warn!("Backup notification failed: {e}");
+                }
+            }));
+            mgr.start_scheduler();
+            fleet_agent::spawn(setup_agent.clone(), "unified-file-ops");
+            // Signed audit checkpoints: once at start-up, then hourly.
+            tauri::async_runtime::spawn(setup_audit.clone().run_anchor_loop(security::audit::ANCHOR_INTERVAL));
+            if let Err(e) = tray::setup(app, mgr) {
+                tracing::warn!("System tray unavailable (non-fatal): {e}");
+            }
+            // Launched at login: start hidden in the tray.
+            if std::env::args().any(|a| a == "--background") {
+                for w in app.webview_windows().values() {
+                    let _ = w.hide();
+                }
+            }
+            Ok(())
+        })
         .manage(app_state.repo)
         .manage(app_state.transfer_mgr)
         .manage(app_state.connection_mgr)
@@ -348,7 +455,16 @@ pub fn run() {
         .manage(app_state.safety_interlock)
         .manage(app_state.narrator)
         .manage(app_state.quickflow_suggester)
+        .manage(app_state.backup_mgr)
+        .manage(app_state.fleet_agent)
+        .manage(app_state.background_mode)
+        .manage(app_state.audit_trail)
         .invoke_handler(tauri::generate_handler![
+            // Security audit log (tamper-evident, append-only)
+            audit_commands::verify_audit_log,
+            audit_commands::export_audit_log,
+            audit_commands::create_audit_anchor,
+            audit_commands::get_audit_log_status,
             // System
             system_commands::greet,
             system_commands::get_app_version,
@@ -447,11 +563,87 @@ pub fn run() {
             drive_commands::transfer_preflight,
             drive_commands::eject_drive,
             // Sync engine (T-039..T-042)
+            // Management console agent
+            fleet_agent_commands::fleet_agent_status,
+            fleet_agent_commands::fleet_agent_register,
+            fleet_agent_commands::fleet_agent_start_claim,
+            fleet_agent_commands::fleet_agent_poll_claim,
+            fleet_agent_commands::fleet_agent_cancel_claim,
+            fleet_agent_commands::fleet_agent_unregister,
+            fleet_agent_commands::fleet_agent_set_enabled,
+            fleet_agent_commands::fleet_agent_sync_now,
+            // Versioned backups
+            backup_commands::backup_list_jobs,
+            backup_commands::backup_get_job,
+            backup_commands::backup_save_job,
+            backup_commands::backup_delete_job,
+            backup_commands::backup_test_destination,
+            backup_commands::backup_test_destination_compat,
+            backup_commands::backup_run,
+            backup_commands::backup_execute,
+            backup_commands::backup_cancel,
+            backup_commands::backup_status,
+            backup_commands::backup_pause,
+            backup_commands::backup_resume,
+            backup_commands::backup_list_versions,
+            backup_commands::backup_list_files,
+            backup_commands::backup_search,
+            backup_commands::backup_compare,
+            backup_commands::backup_run_history,
+            backup_commands::backup_prune_history,
+            backup_commands::backup_export_config,
+            backup_commands::backup_import_config,
+            backup_commands::backup_export_is_encrypted,
+            backup_commands::backup_export_cli,
+            backup_commands::backup_browse_remote,
+            backup_commands::backup_direct_restore,
+            backup_commands::backup_discover_remote_config,
+            backup_commands::backup_passphrase_strength,
+            backup_commands::backup_generate_passphrase,
+            backup_commands::backup_capabilities,
+            backup_commands::backup_preview_sources,
+            backup_commands::backup_photos_libraries,
+            backup_commands::backup_photos_library_info,
+            backup_commands::backup_get_global_defaults,
+            backup_commands::backup_set_global_defaults,
+            backup_commands::backup_effective_job,
+            backup_commands::backup_list_destinations,
+            backup_commands::backup_save_destination,
+            backup_commands::backup_delete_destination,
+            backup_commands::backup_adopt_repository,
+            backup_commands::backup_database_inventory,
+            backup_commands::backup_cleanup_databases,
+            backup_commands::backup_bug_report,
+            backup_commands::backup_test_notification,
+            backup_commands::backup_get_secret_settings,
+            backup_commands::backup_crypt_file,
+            backup_commands::backup_decrypt_volume,
+            backup_commands::backup_set_secret_settings,
+            backup_commands::backup_test_secret_providers,
+            backup_commands::backup_job_placeholders,
+            backup_commands::backup_diagnose,
+            backup_commands::backup_recovery_download,
+            backup_commands::backup_recovery_index,
+            backup_commands::backup_recovery_list,
+            backup_commands::backup_recovery_restore,
+            backup_commands::backup_recovery_convert,
+            backup_commands::backup_remote_list,
+            backup_commands::backup_remote_get,
+            backup_commands::backup_remote_put,
+            backup_commands::backup_remote_delete,
+            backup_commands::backup_start_operation,
+            backup_commands::backup_set_destination_secret,
+            backup_commands::backup_has_destination_secret,
+            backup_commands::backup_cloud_providers,
+            backup_commands::backup_get_desktop_settings,
+            backup_commands::backup_set_desktop_settings,
             sync_commands::create_sync_pair,
             sync_commands::delete_sync_pair,
             sync_commands::list_sync_pairs,
             sync_commands::update_sync_pair,
             sync_commands::run_sync,
+            sync_commands::get_sync_run_history,
+            sync_commands::prune_sync_run_history,
             sync_commands::get_sync_health,
             sync_commands::sync_dry_run,
             sync_commands::export_sync_preview_csv,
@@ -549,6 +741,7 @@ pub fn run() {
             encryption_commands::change_vault_password,
             encryption_commands::check_transport_security,
             encryption_commands::check_transport_security_custom,
+            encryption_commands::tls_fetch_fingerprint,
             encryption_commands::get_recommended_security,
             encryption_commands::enforce_https_url,
             encryption_commands::add_encryption_policy,
@@ -785,7 +978,16 @@ pub fn run() {
             // Operation Narrator (plain-language cross-engine story per correlation trace)
             narrator_commands::narrator_narrate_operation,
         ])
-        .on_window_event(move |_window, event| {
+        .on_window_event(move |window, event| {
+            // "Keep running in the tray": closing hides the window so
+            // scheduled backups continue.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if close_mode.enabled() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    return;
+                }
+            }
             if let tauri::WindowEvent::Destroyed = event {
                 tracing::info!("Window closing, persisting state...");
                 let repo = shutdown_repo.clone();

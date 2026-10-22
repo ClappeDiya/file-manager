@@ -3,6 +3,7 @@ name = "ufop"
 version = "0.1.0"
 description = "Unified File Operations Platform - CLI"
 authors = ["UFOP Team"]
+license-file = "../LICENSE"
 edition = "2021"
 rust-version = "1.77"
 
@@ -12,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Same sync/copy engine as the desktop app (Robocopy-compatible `ufop copy`).
-ufop-core = { path = "../crates/ufop-core" }
+ufop-core = { path = "../crates/ufop-core", features = ["backup", "agent"] }
 clap = { version = "4", features = ["derive", "env", "color"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -33,3 +34,5 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+# Synthetic Photos libraries in tests (same version ufop-core already links).
+rusqlite = { version = "0.35", features = ["bundled"] }

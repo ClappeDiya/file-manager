@@ -542,6 +542,21 @@ pub fn execute_sync_with(
         ),
     };
 
+    // Record the destination state for trusted-inventory runs.
+    if pair.dest_state == DestStateMode::TrustedInventory && report.errors == 0 && !hooks.cancelled() {
+        let state = if pair.mode == SyncMode::TwoWay {
+            planner::walk_directory_with(dest_root, opts)
+        } else {
+            // One-way / mirror: the destination now holds the selected source files.
+            planner::walk_directory_with(Path::new(&pair.source_path), opts).map(|v| {
+                v.into_iter().filter(|f| !f.is_dir && planner::matches_filter(&f.relative_path, f.size, &pair.filter)).collect()
+            })
+        };
+        if let Err(e) = state.map_err(|e| std::io::Error::other(e.to_string())).and_then(|s| planner::save_inventory(dest_root, &s)) {
+            tracing::warn!("Could not record the destination inventory of {}: {e}", pair.name);
+        }
+    }
+
     if let Err(e) = copier::write_log(pair, &report, &log_lines) {
         tracing::warn!("Could not write sync log for {}: {}", pair.name, e);
     }
@@ -893,9 +908,8 @@ pub fn verify_sync(pair: &SyncPair, _report: &SyncReport) -> Result<Vec<String>,
                         dest_meta.len()
                     ));
                 } else if pair.checksum_enabled {
-                    // Checksum comparison using xxhash3 (fast)
-                    let src_hash = compute_file_hash(&file.absolute_path)?;
-                    let dst_hash = compute_file_hash(&dest_file)?;
+                    let src_hash = compute_file_hash(&file.absolute_path, pair.checksum_algorithm)?;
+                    let dst_hash = compute_file_hash(&dest_file, pair.checksum_algorithm)?;
                     if src_hash != dst_hash {
                         mismatches.push(format!("Checksum mismatch: {}", file.relative_path));
                     }
@@ -908,8 +922,9 @@ pub fn verify_sync(pair: &SyncPair, _report: &SyncReport) -> Result<Vec<String>,
     Ok(mismatches)
 }
 
-/// Compute xxHash3 of a file for verification.
-fn compute_file_hash(path: &Path) -> Result<u64, AppError> {
+/// Hash a file for verification (xxHash3 or SHA-256, hex).
+pub fn compute_file_hash(path: &Path, alg: SyncHashAlgorithm) -> Result<String, AppError> {
+    use sha2::Digest;
     use std::io::Read;
 
     let mut file = fs::File::open(path).map_err(|e| AppError::Sync {
@@ -917,7 +932,8 @@ fn compute_file_hash(path: &Path) -> Result<u64, AppError> {
         advice: "Check file permissions.".to_string(),
     })?;
 
-    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let mut xx = xxhash_rust::xxh3::Xxh3::new();
+    let mut sha = sha2::Sha256::new();
     let mut buffer = vec![0u8; 256 * 1024]; // 256KB buffer
 
     loop {
@@ -928,10 +944,16 @@ fn compute_file_hash(path: &Path) -> Result<u64, AppError> {
         if bytes_read == 0 {
             break;
         }
-        hasher.update(&buffer[..bytes_read]);
+        match alg {
+            SyncHashAlgorithm::Xxh3 => xx.update(&buffer[..bytes_read]),
+            SyncHashAlgorithm::Sha256 => sha.update(&buffer[..bytes_read]),
+        }
     }
 
-    Ok(hasher.digest())
+    Ok(match alg {
+        SyncHashAlgorithm::Xxh3 => format!("{:016x}", xx.digest()),
+        SyncHashAlgorithm::Sha256 => format!("{:x}", sha.finalize()),
+    })
 }
 
 #[cfg(test)]
@@ -956,6 +978,7 @@ mod tests {
             created_at: Utc::now(),
             time_offset_secs: None,
             copy_options: CopyOptions::default(),
+            ..Default::default()
         }
     }
 
@@ -1471,5 +1494,66 @@ mod tests {
         let report = run_with(pair);
         assert_eq!(report.files_added, 1);
         assert_eq!(report.files_skipped, 1);
+    }
+
+    fn cfg(pair: SyncPair) -> ExecutorConfig {
+        ExecutorConfig { pair, run_id: Uuid::new_v4(), continue_on_error: true, resume_from: None, quarantine_dir: None, rollback_dir: None }
+    }
+
+    #[test]
+    fn trusted_inventory_skips_destination_scan() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "one").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.dest_state = DestStateMode::TrustedInventory;
+        let r = execute_sync(&cfg(pair.clone())).unwrap();
+        assert_eq!(r.files_added, 1);
+        assert!(dst.path().join(planner::INVENTORY_FILE).exists());
+        // Change the destination behind the engine's back: the inventory is
+        // trusted, so nothing is copied again.
+        fs::write(dst.path().join("a.txt"), "tampered!").unwrap();
+        let p = planner::compute_preview(&pair).unwrap();
+        assert_eq!(p.total_additions + p.total_modifications, 0, "trusted state");
+        // A scan notices the difference.
+        pair.dest_state = DestStateMode::Scan;
+        let p = planner::compute_preview(&pair).unwrap();
+        assert_eq!(p.total_modifications, 1);
+        // The inventory file itself is never synced or purged.
+        assert!(p.deletions.iter().all(|d| d.relative_path != planner::INVENTORY_FILE));
+    }
+
+    #[test]
+    fn blind_upload_copies_everything() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "same").unwrap();
+        fs::write(dst.path().join("a.txt"), "same").unwrap();
+        fs::write(dst.path().join("extra.txt"), "x").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.dest_state = DestStateMode::BlindUpload;
+        let p = planner::compute_preview(&pair).unwrap();
+        assert_eq!(p.total_additions, 1);
+        assert!(p.deletions.is_empty(), "blind mode never deletes unseen files");
+    }
+
+    #[test]
+    fn sha256_verification() {
+        let d = TempDir::new().unwrap();
+        let f = d.path().join("x");
+        fs::write(&f, "abc").unwrap();
+        assert_eq!(compute_file_hash(&f, SyncHashAlgorithm::Sha256).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(compute_file_hash(&f, SyncHashAlgorithm::Xxh3).unwrap().len(), 16);
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a"), "data").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.verify_mode = SyncVerifyMode::Full;
+        pair.checksum_enabled = true;
+        pair.checksum_algorithm = SyncHashAlgorithm::Sha256;
+        let r = execute_sync(&cfg(pair.clone())).unwrap();
+        assert!(verify_sync(&pair, &r).unwrap().is_empty());
+        fs::write(dst.path().join("a"), "dat4").unwrap();
+        assert_eq!(verify_sync(&pair, &r).unwrap().len(), 1);
     }
 }

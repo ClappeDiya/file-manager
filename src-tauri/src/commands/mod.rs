@@ -1,5 +1,7 @@
 pub mod ai_commands;
+pub mod audit_commands;
 pub mod automation_commands;
+pub mod backup_commands;
 pub mod archive_commands;
 pub mod confirmation_commands;
 pub mod aws_commands;
@@ -11,6 +13,7 @@ pub mod drive_commands;
 pub mod editor_commands;
 pub mod encryption_commands;
 pub mod file_ops_commands;
+pub mod fleet_agent_commands;
 pub mod fs_commands;
 pub mod integrity_commands;
 pub mod ledger_commands;

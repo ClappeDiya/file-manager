@@ -11,10 +11,16 @@
  */
 import { useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { isServerMode, serverRpc } from "@/lib/server-client";
 
 /** Check if the Tauri IPC bridge is available (i.e., running inside Tauri). */
 export function isTauriAvailable(): boolean {
   return typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || "__TAURI__" in window);
+}
+
+/** True inside Tauri or when served by `ufop-server` (commands go over HTTPS). */
+export function isBackendAvailable(): boolean {
+  return isTauriAvailable() || isServerMode();
 }
 
 /** React hook that returns whether Tauri IPC is available. Stable across renders. */
@@ -34,7 +40,8 @@ export async function tauriInvoke<T>(
   args?: Record<string, unknown>,
   fallback?: T,
 ): Promise<T> {
-  if (!isTauriAvailable()) {
+  const viaServer = !isTauriAvailable() && isServerMode();
+  if (!isTauriAvailable() && !viaServer) {
     if (fallback !== undefined) {
       return fallback;
     }
@@ -42,7 +49,7 @@ export async function tauriInvoke<T>(
   }
 
   try {
-    return await invoke<T>(command, args);
+    return viaServer ? await serverRpc<T>(command, args) : await invoke<T>(command, args);
   } catch (err) {
     console.error(`Tauri invoke "${command}" failed:`, err);
     if (fallback !== undefined) {
@@ -61,11 +68,12 @@ export async function tauriInvokeSafe<T>(
   args: Record<string, unknown> | undefined,
   fallback: T,
 ): Promise<T> {
-  if (!isTauriAvailable()) {
+  const viaServer = !isTauriAvailable() && isServerMode();
+  if (!isTauriAvailable() && !viaServer) {
     return fallback;
   }
   try {
-    return await invoke<T>(command, args);
+    return viaServer ? await serverRpc<T>(command, args) : await invoke<T>(command, args);
   } catch (err) {
     console.error(`Tauri invoke "${command}" failed (using fallback):`, err);
     return fallback;

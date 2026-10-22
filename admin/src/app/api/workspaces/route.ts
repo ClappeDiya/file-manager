@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { dataStore } from '@/lib/data-store';
+import { listSharedConnections, listSyncTemplates, listWorkspaces } from '@/lib/db/repos/workspaces';
 import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
 /** GET /api/workspaces - List workspaces and shared resources */
@@ -12,14 +12,14 @@ export async function GET(request: NextRequest) {
 
   switch (type) {
     case 'connections':
-      return NextResponse.json({ connections: dataStore.sharedConnections });
+      return NextResponse.json({ connections: listSharedConnections() });
     case 'sync_templates':
-      return NextResponse.json({ templates: dataStore.syncTemplates });
+      return NextResponse.json({ templates: listSyncTemplates() });
     default:
       return NextResponse.json({
-        workspaces: dataStore.workspaces,
-        connections: dataStore.sharedConnections,
-        syncTemplates: dataStore.syncTemplates,
+        workspaces: listWorkspaces(),
+        connections: listSharedConnections(),
+        syncTemplates: listSyncTemplates(),
       });
   }
 }

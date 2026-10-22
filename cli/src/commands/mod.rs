@@ -1,4 +1,6 @@
+pub mod agent;
 pub mod archive;
+pub mod backup;
 pub mod checksum;
 pub mod compat;
 pub mod connection;
@@ -6,6 +8,7 @@ pub mod copy;
 pub mod duplicates;
 pub mod login;
 pub mod rename;
+pub mod server;
 pub mod status;
 pub mod sync;
 pub mod transfer;

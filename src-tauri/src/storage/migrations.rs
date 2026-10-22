@@ -77,8 +77,104 @@ fn all_migrations() -> Vec<Migration> {
             description: "Sync pairs - Robocopy-equivalent copy options",
             sql: V12_SCHEMA,
         },
+        Migration {
+            version: 13,
+            description: "Backup engine - versioned backup jobs and run history",
+            sql: V13_SCHEMA,
+        },
+        Migration {
+            version: 14,
+            description: "Server auth tokens - refresh tokens and used sign-in tokens",
+            sql: V14_SCHEMA,
+        },
+        Migration {
+            version: 15,
+            description: "Sync pairs - destination-state mode and checksum algorithm",
+            sql: V15_SCHEMA,
+        },
+        Migration {
+            version: 16,
+            description: "Sync run history",
+            sql: V16_SCHEMA,
+        },
+        Migration {
+            version: 17,
+            description: "Security audit log - hash chain, signed anchors, append-only triggers",
+            // The work needs SHA-256, so it runs in Rust: see `rust_step`.
+            sql: "",
+        },
     ]
 }
+
+/// Migration steps that cannot be expressed as static SQL. They run in the
+/// same transaction as the migration's `sql`, after it.
+fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
+    match version {
+        // Hash existing audit rows into a chain, then lock the table down.
+        17 => Some(crate::security::audit_chain::migrate_v17),
+        _ => None,
+    }
+}
+
+/// Schema v16: every finished sync run, kept across restarts.
+const V16_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id TEXT PRIMARY KEY,
+    pair_id TEXT NOT NULL,
+    pair_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    report_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sync_runs_pair ON sync_runs(pair_id, started_at DESC);
+"#;
+
+/// Schema v15: how a sync pair learns the destination state (scan, trusted
+/// inventory, blind upload) and which hash full verification uses.
+const V15_SCHEMA: &str = r#"
+ALTER TABLE sync_pairs ADD COLUMN dest_state TEXT NOT NULL DEFAULT 'scan';
+ALTER TABLE sync_pairs ADD COLUMN checksum_algorithm TEXT NOT NULL DEFAULT 'xxh3';
+"#;
+
+/// Schema v14: `ufop-server` refresh tokens (stored as SHA-256 hashes) and
+/// redeemed one-time sign-in token ids.
+const V14_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_tokens (
+    id          TEXT PRIMARY KEY NOT NULL,
+    kind        TEXT NOT NULL,
+    token_hash  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    revoked     INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_server_tokens_hash ON server_tokens(token_hash);
+"#;
+
+/// Schema v13: versioned (deduplicated, encrypted) backup jobs. The job
+/// definition is JSON so options can grow without migrations; each job's
+/// block/version index lives in its own SQLite file next to the app DB.
+const V13_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS backup_jobs (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS backup_runs (
+    id          TEXT PRIMARY KEY NOT NULL,
+    job_id      TEXT NOT NULL,
+    operation   TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    summary     TEXT NOT NULL DEFAULT '',
+    report_json TEXT NOT NULL DEFAULT '{}',
+    log_json    TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_backup_runs_job ON backup_runs(job_id, started_at DESC);
+"#;
 
 /// Schema v12: per-pair Robocopy-equivalent copy options, stored as JSON so
 /// new options never need another column. `{}` deserializes to the defaults.
@@ -595,13 +691,19 @@ fn current_version(conn: &Connection) -> Result<u32, AppError> {
 
 /// Run all pending migrations. Returns the number of migrations applied.
 pub fn run_migrations(conn: &Connection) -> Result<u32, AppError> {
+    run_migrations_up_to(conn, u32::MAX)
+}
+
+/// Run pending migrations with `version <= target` (tests use this to
+/// build a database at an older schema version).
+pub(crate) fn run_migrations_up_to(conn: &Connection, target: u32) -> Result<u32, AppError> {
     ensure_migrations_table(conn)?;
     let current = current_version(conn)?;
     let migrations = all_migrations();
     let mut applied = 0u32;
 
     for migration in &migrations {
-        if migration.version <= current {
+        if migration.version <= current || migration.version > target {
             continue;
         }
 
@@ -614,6 +716,9 @@ pub fn run_migrations(conn: &Connection) -> Result<u32, AppError> {
         // Run migration in a transaction
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(migration.sql)?;
+        if let Some(step) = rust_step(migration.version) {
+            step(&tx)?;
+        }
         tx.execute(
             "INSERT INTO _migrations (version, description) VALUES (?1, ?2)",
             rusqlite::params![migration.version, migration.description],
@@ -631,9 +736,16 @@ pub fn run_migrations(conn: &Connection) -> Result<u32, AppError> {
     Ok(applied)
 }
 
+/// Tables a reset never drops: the security audit log is append-only and
+/// must outlive "reset all data" (#357). The reset itself is audited.
+const RESET_PRESERVED_TABLES: [&str; 2] = ["audit_events", "audit_anchors"];
+
 /// Reset the database by dropping all tables. Used for testing and recovery.
+///
+/// The security audit log (and its fallback signing key in `config`) is
+/// kept, so a reset cannot be used to erase audit history.
 pub fn reset_database(conn: &Connection) -> Result<(), AppError> {
-    tracing::warn!("Resetting database - all data will be lost");
+    tracing::warn!("Resetting database - all data except the security audit log will be lost");
 
     // Get all table names
     let mut stmt = conn.prepare(
@@ -644,13 +756,31 @@ pub fn reset_database(conn: &Connection) -> Result<(), AppError> {
         .filter_map(|r| r.ok())
         .collect();
 
+    let audit_key: Option<String> = if tables.iter().any(|t| t == "config") {
+        conn.query_row(
+            "SELECT value FROM config WHERE key = ?1",
+            [crate::security::audit::SETTINGS_KEY],
+            |r| r.get(0),
+        )
+        .ok()
+    } else {
+        None
+    };
+
     // Drop all tables
-    for table in &tables {
+    for table in tables.iter().filter(|t| !RESET_PRESERVED_TABLES.contains(&t.as_str())) {
         conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\"", table.replace('"', "\"\"")))?;
     }
 
-    // Re-run migrations
+    // Re-run migrations (v1 and v17 are no-ops on the preserved audit tables)
     run_migrations(conn)?;
+
+    if let Some(k) = audit_key {
+        conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+            rusqlite::params![crate::security::audit::SETTINGS_KEY, k],
+        )?;
+    }
 
     Ok(())
 }
@@ -669,7 +799,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 12);
+        assert_eq!(applied, 17);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -692,6 +822,8 @@ mod tests {
         assert!(tables.contains(&"audit_events".to_string()));
         assert!(tables.contains(&"workspace_state".to_string()));
         assert!(tables.contains(&"mount_configs".to_string()));
+        assert!(tables.contains(&"backup_jobs".to_string()));
+        assert!(tables.contains(&"backup_runs".to_string()));
         assert!(tables.contains(&"_migrations".to_string()));
     }
 
@@ -699,7 +831,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 12);
+        assert_eq!(first, 17);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -712,7 +844,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 12);
+        assert_eq!(current_version(&conn).unwrap(), 17);
     }
 
     #[test]

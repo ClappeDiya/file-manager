@@ -17,6 +17,16 @@ import {
   ChevronLeft,
   ChevronRight,
   Settings,
+  Server,
+  HardDrive,
+  Link2,
+  ClipboardList,
+  KeyRound,
+  Bell,
+  Sparkles,
+  Building2,
+  UsersRound,
+  Fingerprint,
 } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 import { useAdminStore } from '@/lib/stores/admin-store';
@@ -32,10 +42,21 @@ interface NavItem {
   icon: React.ElementType;
   requiredPermission?: Permission;
   badge?: number;
+  /** Highlight only on this exact path (a parent of other entries). */
+  exact?: boolean;
 }
 
 const navItems: NavItem[] = [
   { id: 'dashboard', i18nKey: 'nav.dashboard', href: '/dashboard', icon: LayoutDashboard },
+  { id: 'fleet', i18nKey: 'nav.fleet', href: '/fleet', icon: Server, requiredPermission: 'fleet.read', exact: true },
+  { id: 'machines', i18nKey: 'nav.machines', href: '/fleet/machines', icon: HardDrive, requiredPermission: 'fleet.read' },
+  { id: 'enrollment', i18nKey: 'nav.enrollment', href: '/fleet/enroll', icon: Link2, requiredPermission: 'fleet.enroll' },
+  { id: 'fleet-policies', i18nKey: 'nav.fleetPolicies', href: '/fleet/policies', icon: ClipboardList, requiredPermission: 'fleet.read' },
+  { id: 'credentials', i18nKey: 'nav.credentials', href: '/fleet/credentials', icon: KeyRound, requiredPermission: 'fleet.read' },
+  { id: 'alerts', i18nKey: 'nav.alerts', href: '/alerts', icon: Bell, requiredPermission: 'alerts.read' },
+  { id: 'ai-insights', i18nKey: 'nav.aiInsights', href: '/ai-insights', icon: Sparkles, requiredPermission: 'ai.read' },
+  { id: 'organizations', i18nKey: 'nav.organizations', href: '/organizations', icon: Building2, requiredPermission: 'orgs.read' },
+  { id: 'groups', i18nKey: 'nav.groups', href: '/groups', icon: UsersRound, requiredPermission: 'groups.read' },
   { id: 'users', i18nKey: 'nav.users', href: '/users', icon: Users, requiredPermission: 'users.read' },
   { id: 'devices', i18nKey: 'nav.devices', href: '/devices', icon: Monitor, requiredPermission: 'devices.read' },
   { id: 'policies', i18nKey: 'nav.policies', href: '/policies', icon: Shield, requiredPermission: 'policies.read' },
@@ -45,6 +66,7 @@ const navItems: NavItem[] = [
   { id: 'workspaces', i18nKey: 'nav.workspaces', href: '/workspaces', icon: FolderSync, requiredPermission: 'workspaces.read' },
   { id: 'ai-governance', i18nKey: 'nav.aiGovernance', href: '/ai-governance', icon: Brain, requiredPermission: 'ai_governance.read' },
   { id: 'billing', i18nKey: 'nav.billing', href: '/billing', icon: CreditCard, requiredPermission: 'billing.read' },
+  { id: 'sso', i18nKey: 'nav.sso', href: '/settings/sso', icon: Fingerprint, requiredPermission: 'sso.configure' },
 ];
 
 export function Sidebar() {
@@ -103,7 +125,7 @@ export function Sidebar() {
         <nav className="flex-1 overflow-y-auto py-3 px-2">
           <ul className="space-y-0.5">
             {itemsWithPermission.map(({ item, allowed }) => {
-              const isActive = allowed && (pathname === item.href || pathname?.startsWith(item.href + '/'));
+              const isActive = allowed && (pathname === item.href || (!item.exact && pathname?.startsWith(item.href + '/')));
               const Icon = item.icon;
               const label = t(item.i18nKey);
               const lockedTitle = `${label} — requires ${item.requiredPermission} permission`;

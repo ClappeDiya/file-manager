@@ -239,6 +239,12 @@ pub async fn check_transport_security(
     ))
 }
 
+/// SHA-256 fingerprint of the certificate a TLS server presents (for pinning).
+#[tauri::command]
+pub async fn tls_fetch_fingerprint(host: String, port: u16) -> Result<String, AppError> {
+    tls::fetch_fingerprint(host.trim(), port, std::time::Duration::from_secs(15)).await
+}
+
 /// Check transport security with custom security settings.
 #[tauri::command]
 pub async fn check_transport_security_custom(

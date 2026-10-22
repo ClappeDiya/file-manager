@@ -47,6 +47,8 @@ interface SyncPair {
   created_at: string;
   time_offset_secs: number | null;
   copy_options?: CopyOptions;
+  dest_state?: "scan" | "trusted_inventory" | "blind_upload";
+  checksum_algorithm?: "xxh3" | "sha256";
 }
 
 interface SyncFilter {
@@ -244,6 +246,8 @@ export function SyncPanel() {
     conflictPolicy: "create_conflict_copy",
     verifyMode: "fast",
     checksumEnabled: false,
+    destState: "scan",
+    checksumAlgorithm: "xxh3",
     advancedMode: false,
     excludePatterns: "",
     includePatterns: "",
@@ -291,6 +295,8 @@ export function SyncPanel() {
         conflictPolicy: createForm.conflictPolicy,
         verifyMode: createForm.verifyMode,
         checksumEnabled: createForm.checksumEnabled,
+        destState: createForm.destState,
+        checksumAlgorithm: createForm.checksumAlgorithm,
         timeOffsetSecs: createForm.timeOffsetSecs,
         optionsJson: JSON.stringify(createForm.copyOptions),
       });
@@ -307,6 +313,8 @@ export function SyncPanel() {
         conflictPolicy: "create_conflict_copy",
         verifyMode: "fast",
         checksumEnabled: false,
+        destState: "scan",
+        checksumAlgorithm: "xxh3",
         advancedMode: false,
         excludePatterns: "",
         includePatterns: "",
@@ -389,9 +397,12 @@ export function SyncPanel() {
 
   // ── Load Reports ──
 
-  const handleViewReports = async (pairId: string) => {
+  // Stored history (survives restarts); falls back to this session's runs.
+  const handleViewReports = async (pairId: string | null) => {
     try {
-      const result = await tauriInvoke<SyncReport[]>("get_sync_reports", { pairId });
+      const result = await tauriInvoke<SyncReport[]>("get_sync_run_history", { pairId, limit: 200 }).catch(() =>
+        pairId ? tauriInvoke<SyncReport[]>("get_sync_reports", { pairId }) : Promise.resolve([] as SyncReport[]),
+      );
       setReports(result);
       setView("reports");
     } catch (e: any) {
@@ -459,6 +470,17 @@ export function SyncPanel() {
             aria-label="Pair list view"
           >
             List
+          </button>
+          <button
+            onClick={() => void handleViewReports(null)}
+            className={`px-2 py-1 text-xs rounded ${
+              view === "reports"
+                ? "bg-blue-500 text-white"
+                : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+            }`}
+            aria-label="Run history"
+          >
+            History
           </button>
           <button
             onClick={() => setView("create")}
@@ -925,6 +947,33 @@ function CreatePairView({
               onChange={(e) => update("checksumEnabled", e.target.checked)}
             />
             Enable Checksum Verification
+          </label>
+
+          <label className="block text-xs text-zinc-600 dark:text-zinc-400">
+            Checksum algorithm
+            <select
+              data-testid="sync-checksum-algorithm"
+              value={form.checksumAlgorithm}
+              onChange={(e) => update("checksumAlgorithm", e.target.value)}
+              className="mt-1 block w-full px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
+            >
+              <option value="xxh3">xxHash3 (fast)</option>
+              <option value="sha256">SHA-256 (cryptographic)</option>
+            </select>
+          </label>
+
+          <label className="block text-xs text-zinc-600 dark:text-zinc-400">
+            Destination state
+            <select
+              data-testid="sync-dest-state"
+              value={form.destState}
+              onChange={(e) => update("destState", e.target.value)}
+              className="mt-1 block w-full px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
+            >
+              <option value="scan">Scan the destination every run</option>
+              <option value="trusted_inventory">Trust the inventory from the last run (fast)</option>
+              <option value="blind_upload">Blind upload (copy everything, never delete)</option>
+            </select>
           </label>
 
           <label className="block text-xs text-zinc-600 dark:text-zinc-400">

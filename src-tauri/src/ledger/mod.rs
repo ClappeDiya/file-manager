@@ -45,6 +45,7 @@ pub enum LedgerEngine {
     Compat,
     Connector,
     System,
+    Backup,
 }
 
 impl LedgerEngine {
@@ -61,6 +62,7 @@ impl LedgerEngine {
             Self::Compat => "compat",
             Self::Connector => "connector",
             Self::System => "system",
+            Self::Backup => "backup",
         }
     }
 }

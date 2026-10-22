@@ -323,6 +323,32 @@ impl SyncConflictPolicy {
 }
 
 /// Sync verification mode.
+/// How the destination's current state is determined before syncing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DestStateMode {
+    /// List the destination every run.
+    #[default]
+    Scan,
+    /// Trust the inventory recorded by the previous run (no destination
+    /// listing; fast for slow or remote destinations). Falls back to a scan
+    /// when no inventory exists.
+    TrustedInventory,
+    /// Copy every selected file without looking at the destination.
+    BlindUpload,
+}
+
+/// Hash used for checksum verification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncHashAlgorithm {
+    /// xxHash3 (fast, non-cryptographic).
+    #[default]
+    Xxh3,
+    /// SHA-256 (cryptographic).
+    Sha256,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -385,6 +411,12 @@ pub struct SyncPair {
     /// Robocopy-equivalent copy options.
     #[serde(default)]
     pub copy_options: CopyOptions,
+    /// How the destination state is obtained.
+    #[serde(default)]
+    pub dest_state: DestStateMode,
+    /// Checksum algorithm for full verification.
+    #[serde(default)]
+    pub checksum_algorithm: SyncHashAlgorithm,
 }
 
 impl Default for SyncPair {
@@ -405,6 +437,8 @@ impl Default for SyncPair {
             created_at: Utc::now(),
             time_offset_secs: None,
             copy_options: CopyOptions::default(),
+            dest_state: DestStateMode::Scan,
+            checksum_algorithm: SyncHashAlgorithm::Xxh3,
         }
     }
 }

@@ -45,6 +45,7 @@ import {
   Shield,
   Filter,
   FolderSync,
+  DatabaseBackup,
   Upload,
   History,
   ShieldCheck,
@@ -756,6 +757,9 @@ export function getDefaultCommands(actions: {
    *  reports, and rollback. Iter 28 surfaces the long-orphaned
    *  1454-LOC component. */
   onOpenSync?: () => void;
+  /** Open the Backups panel — versioned, deduplicated, encrypted
+   *  backup jobs with restore, maintenance and run history. */
+  onOpenBackups?: () => void;
   /** Open the Transfer History (Journal) panel \u2014 searchable
    *  table of every historical transfer with status, checksum
    *  verification, retry count, duration, and speed; CSV/JSON
@@ -1149,6 +1153,30 @@ export function getDefaultCommands(actions: {
     // and rollback. All 14 sync IPC commands were already
     // registered in the Rust backend; the component just had
     // zero importers until iter 28.
+    {
+      id: "open-backups",
+      label: "Backups\u2026",
+      description:
+        "Versioned, deduplicated, encrypted backups \u2014 create jobs, run, restore old versions, verify, repair, schedule",
+      icon: <DatabaseBackup className="h-4 w-4" />,
+      shortcut: `${cmd}\u2325B`,
+      category: "Navigation",
+      action: actions.onOpenBackups || (() => {}),
+      keywords: [
+        "backup",
+        "backups",
+        "restore",
+        "version",
+        "versions",
+        "snapshot",
+        "retention",
+        "deduplication",
+        "encrypted backup",
+        "verify backup",
+        "duplicati",
+        "time machine",
+      ],
+    },
     {
       id: "open-sync",
       label: "Sync Pairs\u2026",

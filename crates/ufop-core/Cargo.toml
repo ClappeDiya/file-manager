@@ -3,6 +3,7 @@ name = "ufop-core"
 version = "0.1.0"
 description = "Unified File Operations Platform - shared error type and sync/copy engine"
 authors = ["UFOP Team"]
+license-file = "../../LICENSE"
 edition = "2021"
 rust-version = "1.77"
 
@@ -10,6 +11,11 @@ rust-version = "1.77"
 default = []
 # `impl From<rusqlite::Error> for AppError`, for the desktop app's database.
 sqlite = ["dep:rusqlite"]
+# Deduplicated, compressed, encrypted versioned backup engine (`backup` module).
+backup = ["sqlite", "dep:windows", "dep:aes-gcm", "dep:argon2", "dep:flate2", "dep:rand", "dep:hex", "dep:zip", "dep:base64"]
+# Fleet agent: client side of the admin console's `/api/agent/*` protocol
+# (registration, claiming, heartbeats, commands, policies, reports).
+agent = ["dep:reqwest", "dep:tokio"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -22,7 +28,24 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 csv = "1.3"
 glob = "0.3"
 regex = "1"
-rusqlite = { version = "0.35", optional = true }
+rusqlite = { version = "0.35", features = ["bundled"], optional = true }
+aes-gcm = { version = "0.10", optional = true }
+argon2 = { version = "0.5", optional = true }
+sha2 = "0.10"
+flate2 = { version = "1", optional = true }
+rand = { version = "0.8", optional = true }
+hex = { version = "0.4", optional = true }
+zip = { version = "2", optional = true, default-features = false, features = ["deflate", "bzip2", "zstd"] }
+base64 = { version = "0.22", optional = true }
+# TLS backends come from the consumer (the desktop app / CLI enable theirs).
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json"] }
+tokio = { version = "1", optional = true, features = ["time", "sync", "macros"] }
+
+# Backup metadata (xattrs, POSIX ACLs via system.* xattrs), advisory locks,
+# I/O priority and free-space checks.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+xattr = "1"
 
 # Robocopy /A /M /IA /XA /A+ /A- and /COPY:SOU (NTFS attributes, ACLs, owner,
 # auditing) — Windows-only APIs.
@@ -34,7 +57,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
 ] }
+# VSS snapshots (COM IVssBackupComponents).
+windows = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Storage_Vss", "Win32_System_Com"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
