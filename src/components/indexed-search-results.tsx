@@ -113,7 +113,7 @@ export function IndexedSearchResults({
     return (
       <div className={`${box} px-3 py-2 flex items-center gap-2 flex-wrap`} role="status">
         <span>{res.root ? "This folder's index has names only." : "This folder isn't indexed yet."}</span>
-        <label className="flex items-center gap-1">
+        <label className="flex items-center gap-1" title="Text files, PDFs, and Word, Excel, PowerPoint, OpenDocument and RTF documents">
           <input type="checkbox" checked={indexContent} onChange={(e) => setIndexContent(e.target.checked)} /> include file contents
         </label>
         <button type="button" onClick={startIndex} className="px-2 py-0.5 rounded bg-[var(--color-primary)] text-white">

@@ -1,6 +1,6 @@
 //! Plain text from office documents, for previews and the search index:
 //! Office Open XML (`docx`, `xlsx`, `pptx` and their macro/template
-//! variants), OpenDocument (`odt`, `ods`, `odp`) and RTF. Legacy binary
+//! variants), OpenDocument (`odt`, `ods`, `odp`), RTF and PDF. Legacy binary
 //! formats (`doc`, `xls`, `ppt`) and iWork are recognized but have no text
 //! here (`Ok(None)`); callers render them through the OS instead.
 //!
@@ -9,6 +9,8 @@
 
 use std::io::Read;
 use std::path::Path;
+
+mod pdf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OfficeKind {
@@ -41,11 +43,23 @@ pub fn office_kind(ext: &str) -> Option<OfficeKind> {
 /// Largest decompressed size read from one archive entry.
 const MAX_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Text of `path`, at most `max_chars` characters; `Ok(None)` for formats without extraction.
+/// Whether [`extract_text`] reads text from files with this extension:
+/// office documents (not the opaque legacy formats) and PDF.
+pub fn has_text(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("pdf") || office_kind(ext).is_some_and(|k| k != OfficeKind::Opaque)
+}
+
+/// Text of `path`, at most `max_chars` characters; `Ok(None)` for formats
+/// without extraction (and encrypted PDFs).
 pub fn extract_text(path: &Path, max_chars: usize) -> Result<Option<String>, String> {
     let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
-    let Some(kind) = office_kind(&ext) else { return Ok(None) };
     let mut out = Out::new(max_chars);
+    if ext.eq_ignore_ascii_case("pdf") {
+        let mut raw = Vec::new();
+        std::fs::File::open(path).map_err(|e| e.to_string())?.take(pdf::MAX_FILE_BYTES).read_to_end(&mut raw).map_err(|e| e.to_string())?;
+        return Ok(pdf::pdf_text(&raw, &mut out)?.then(|| out.finish()));
+    }
+    let Some(kind) = office_kind(&ext) else { return Ok(None) };
     match kind {
         OfficeKind::Opaque => return Ok(None),
         OfficeKind::Rtf => {

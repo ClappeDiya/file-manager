@@ -18,8 +18,8 @@ backup = ["sqlite", "dep:windows", "dep:aes-gcm", "dep:argon2", "dep:flate2", "d
 agent = ["dep:reqwest", "dep:tokio", "dep:base64"]
 # File gateway agent (`gateway` module): serves local folders through ufop-server.
 gateway = ["agent", "reqwest/stream", "tokio/fs", "tokio/io-util", "tokio/rt", "dep:tokio-util"]
-# Text from office documents (docx/xlsx/pptx, OpenDocument, RTF) for previews and search.
-doctext = ["dep:zip"]
+# Text from office documents (docx/xlsx/pptx, OpenDocument, RTF) and PDF for previews and search.
+doctext = ["dep:zip", "dep:flate2"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

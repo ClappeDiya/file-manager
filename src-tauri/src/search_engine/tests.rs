@@ -150,3 +150,56 @@ fn remote_listings_are_searchable_and_replaced_per_folder() {
     i.remove_root("remote:sftp").unwrap();
     assert_eq!(i.file_count().unwrap(), 0);
 }
+
+/// A one-page PDF with `text` in Helvetica (uncompressed).
+fn tiny_pdf(text: &str) -> Vec<u8> {
+    let content = format!("BT /F1 12 Tf 72 700 Td ({text}) Tj ET");
+    format!(
+        "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
+3 0 obj << /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj\n\
+4 0 obj << /Length {} >>\nstream\n{content}\nendstream\nendobj\n5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n\
+trailer << /Root 1 0 R >>\n%%EOF\n",
+        content.len()
+    )
+    .into_bytes()
+}
+
+#[test]
+fn document_text_is_indexed_and_old_indexes_reread_documents() {
+    use std::io::Write;
+    let d = tempfile::tempdir().unwrap();
+    fs::write(d.path().join("minutes.pdf"), tiny_pdf("Pelican habitat survey")).unwrap();
+    let mut z = zip::ZipWriter::new(fs::File::create(d.path().join("notes.docx")).unwrap());
+    z.start_file("word/document.xml", zip::write::SimpleFileOptions::default()).unwrap();
+    z.write_all(br#"<w:document><w:body><w:p><w:r><w:t>Albatross budget</w:t></w:r></w:p></w:body></w:document>"#).unwrap();
+    z.finish().unwrap();
+    let names = |i: &SearchIndex, text: &str| i.search(&q(text, None, true)).unwrap().into_iter().map(|h| h.name).collect::<Vec<_>>();
+
+    let store = tempfile::tempdir().unwrap();
+    let db = store.path().join("index.db");
+    let root = d.path().to_str().unwrap();
+    let i = SearchIndex::open(&db).unwrap();
+    i.add_root(root, true).unwrap();
+    i.index_root(root, &AtomicBool::new(false), &AtomicU64::new(0)).unwrap();
+    assert_eq!(names(&i, "pelican habitat"), vec!["minutes.pdf"]);
+    assert_eq!(names(&i, "albatross"), vec!["notes.docx"]);
+    let hit = &i.search(&q("survey", None, true)).unwrap()[0];
+    assert!(hit.snippet.as_deref().unwrap().contains("[survey]"), "{:?}", hit.snippet);
+
+    // An index written before documents were read: no text for them, format 0.
+    i.with(|c| {
+        c.execute("UPDATE fts SET content = NULL", [])?;
+        c.pragma_update(None, "user_version", 0)
+    })
+    .unwrap();
+    drop(i);
+    let i = SearchIndex::open(&db).unwrap();
+    assert!(names(&i, "pelican").is_empty());
+    let stats = i.index_root(root, &AtomicBool::new(false), &AtomicU64::new(0)).unwrap();
+    assert_eq!(stats.updated, 2, "both documents are read again");
+    assert_eq!(names(&i, "pelican"), vec!["minutes.pdf"]);
+    // Once upgraded, unchanged files are skipped again.
+    drop(i);
+    let i = SearchIndex::open(&db).unwrap();
+    assert_eq!(i.index_root(root, &AtomicBool::new(false), &AtomicU64::new(0)).unwrap().updated, 0);
+}

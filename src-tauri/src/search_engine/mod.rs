@@ -139,8 +139,14 @@ fn like_escape(s: &str) -> String {
 }
 
 /// Plain text worth indexing: no NUL bytes in the first 8 KiB.
+/// Text for the content index: office documents and PDFs through
+/// `doctext`, other files when they look like text.
 fn read_text(path: &Path, max: u64) -> Option<String> {
     use std::io::Read;
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    if ufop_core::doctext::has_text(&ext) {
+        return ufop_core::doctext::extract_text(path, max as usize).ok().flatten().filter(|t| !t.is_empty());
+    }
     let mut f = std::fs::File::open(path).ok()?;
     let mut buf = Vec::new();
     f.by_ref().take(max).read_to_end(&mut buf).ok()?;
@@ -191,7 +197,31 @@ impl SearchIndex {
         conn.pragma_update(None, "journal_mode", "WAL").map_err(db_err)?;
         conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(db_err)?;
         conn.execute_batch(SCHEMA).map_err(db_err)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        let index = Self { conn: Mutex::new(conn) };
+        index.upgrade()?;
+        Ok(index)
+    }
+
+    /// Index format 1 reads document text (PDF, office files): documents
+    /// indexed before it are marked changed so the next run reads them.
+    fn upgrade(&self) -> Result<(), AppError> {
+        self.with(|c| {
+            let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            if version >= 1 {
+                return Ok(());
+            }
+            let tx = c.transaction()?;
+            let docs: Vec<i64> = {
+                let mut st = tx.prepare("SELECT id, name FROM files WHERE is_dir = 0")?;
+                let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+                rows.filter_map(Result::ok).filter(|(_, n)| Path::new(n).extension().is_some_and(|e| ufop_core::doctext::has_text(&e.to_string_lossy()))).map(|(id, _)| id).collect()
+            };
+            for id in docs {
+                tx.execute("UPDATE files SET mtime = -1 WHERE id = ?1", [id])?;
+            }
+            tx.pragma_update(None, "user_version", 1)?;
+            tx.commit()
+        })
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut Connection) -> rusqlite::Result<T>) -> Result<T, AppError> {

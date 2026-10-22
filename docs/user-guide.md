@@ -550,6 +550,10 @@ In Advanced mode, **Schedules & holiday calendars** (toolbar or command palette)
 - A **holiday calendar** lists days off: dates, dates that recur every year (`MM-DD`), and optionally weekends. Import an iCalendar (`.ics`) file to add its all-day events; yearly events recur. Backup jobs pick calendars on their Schedule step.
 - A scheduled run that falls on a day off (by local date) is skipped, not postponed: the next regular run happens as usual. The schedule editor previews the next runs and marks the ones a calendar skips.
 
+## Search: file contents
+
+Folders added to the search index with *include file contents* are searchable by the text inside their files: plain-text files, PDFs, and Word, Excel, PowerPoint, OpenDocument and RTF documents (up to 1 MB of text per file). PDF text comes from the document's fonts, so scanned pages (images) and password-protected PDFs have no text; legacy `.doc`/`.xls`/`.ppt` files are found by name only. Folders indexed before document text was supported read their documents again on the next index run.
+
 ## Automation: workflows
 
 In Advanced mode, a rule's actions can be edited as a **workflow**: a graph instead of a list (rule editor → *Edit as a workflow*; a plain chain turns back into a list with *Use a list of actions instead*).

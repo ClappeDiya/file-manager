@@ -95,7 +95,7 @@ export function SearchIndexFolders() {
         >
           <FolderPlus className="h-3.5 w-3.5" /> Add folder…
         </button>
-        <label className="flex items-center gap-1">
+        <label className="flex items-center gap-1" title="Text files, PDFs, and Word, Excel, PowerPoint, OpenDocument and RTF documents">
           <input type="checkbox" checked={content} onChange={(e) => setContent(e.target.checked)} /> include file contents
         </label>
       </div>
