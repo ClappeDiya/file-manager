@@ -5,7 +5,8 @@
  * "Copy to another backup…" (Advanced).
  *
  * Version numbers are positions in the unfiltered list (0 = newest of the
- * selected source), as the backend expects.
+ * selected source), as the backend expects. Columns sort by a header click
+ * and the table pages (K122); the view is remembered as "backup-versions".
  */
 import { useMemo, useState } from "react";
 import { formatBytes } from "@/lib/format-bytes";
@@ -24,6 +25,11 @@ import {
 import { AdvancedOnly } from "./advanced-only";
 import { useIsAdvanced } from "./use-is-advanced";
 import { Banner, Btn, Field, PathInput } from "./backup-ui";
+import { DataGrid } from "../data-grid";
+import type { ColumnDef } from "@tanstack/react-table";
+
+/** A version and its position in the unfiltered list (the backend's version number). */
+type Row = { v: Fileset; i: number };
 
 function NoteCell({ value, onSave, disabled }: { value: string | null; onSave: (note: string) => Promise<void>; disabled: boolean }) {
   const [editing, setEditing] = useState(false);
@@ -228,9 +234,10 @@ export function BackupVersionTable({
     return [...m.keys()].sort();
   }, [versions]);
   const hosts = useMemo(() => [...new Set(versions.map((v) => v.identity?.hostname).filter((h): h is string => !!h))].sort(), [versions]);
-  const rows = versions
-    .map((v, i) => ({ v, i }))
-    .filter(({ v }) => matchesTags(v.tags ?? {}, tagFilter) && (!host || v.identity?.hostname === host));
+  const rows: Row[] = useMemo(
+    () => versions.map((v, i) => ({ v, i })).filter(({ v }) => matchesTags(v.tags ?? {}, tagFilter) && (!host || v.identity?.hostname === host)),
+    [versions, tagFilter, host],
+  );
 
   const update = async (i: number, patch: Parameters<typeof setVersionMetadata>[2]) => {
     setBusy(true);
@@ -244,6 +251,81 @@ export function BackupVersionTable({
       setBusy(false);
     }
   };
+
+  // Rebuilt each render so the cells always use the current job, source and busy state.
+  const columns: ColumnDef<Row>[] = [
+    {
+      id: "time",
+      header: "Time",
+      accessorFn: ({ v }) => v.timestamp,
+      cell: ({ row: { original: { v, i } } }) => (
+        <button type="button" className="hover:underline whitespace-nowrap" onClick={() => onSelect(i)}>
+          {i === 0 ? "Latest — " : ""}
+          {formatDate(v.timestamp)}
+          {v.partial ? " (partial)" : ""}
+        </button>
+      ),
+    },
+    { id: "items", header: "Items", accessorFn: ({ v }) => v.file_count, meta: { className: "text-right" } },
+    {
+      id: "size",
+      header: "Size",
+      accessorFn: ({ v }) => v.total_size,
+      cell: ({ row: { original: { v } } }) => formatBytes(v.total_size),
+      meta: { className: "text-right whitespace-nowrap" },
+    },
+    {
+      id: "added",
+      header: "Added",
+      accessorFn: ({ v }) => v.stats?.bytes_added ?? -1,
+      cell: ({ row: { original: { v } } }) => (v.stats ? formatBytes(v.stats.bytes_added) : "—"),
+      meta: { className: "text-right whitespace-nowrap", title: "Storage this version added (after compression and encryption)" },
+    },
+    {
+      id: "keep",
+      header: "Keep",
+      accessorFn: ({ v }) => (v.pinned ? 1 : 0),
+      sortDescFirst: true,
+      meta: { title: "Keep forever" },
+      cell: ({ row: { original: { v, i } } }) => (
+        <button
+          type="button"
+          aria-pressed={v.pinned}
+          aria-label={v.pinned ? "Kept forever (click to unpin)" : "Keep forever"}
+          title={v.pinned ? `Kept forever${v.pin_reason ? `: ${v.pin_reason}` : ""} — retention never removes it` : "Keep forever"}
+          disabled={busy || readOnly}
+          className={v.pinned ? "" : "opacity-30 hover:opacity-80"}
+          onClick={() => void update(i, { pinned: !v.pinned })}
+          data-testid={`version-pin-${i}`}
+        >
+          📌
+        </button>
+      ),
+    },
+    {
+      id: "note",
+      header: "Note",
+      accessorFn: ({ v }) => v.note ?? "",
+      cell: ({ row: { original: { v, i } } }) => <NoteCell value={v.note} disabled={busy || readOnly} onSave={(note) => update(i, { note })} />,
+    },
+    {
+      id: "tags",
+      header: "Tags",
+      enableSorting: false,
+      cell: ({ row: { original: { v, i } } }) => <TagsCell tags={v.tags ?? {}} disabled={busy || readOnly} onSave={(tags) => update(i, { tags })} />,
+    },
+    ...(advanced
+      ? [
+          {
+            id: "computer",
+            header: "Computer",
+            accessorFn: ({ v }: Row) => (v.identity ? `${v.identity.username}@${v.identity.hostname}` : ""),
+            cell: ({ row: { original: { v } } }: { row: { original: Row } }) => (v.identity ? `${v.identity.username}@${v.identity.hostname}` : "—"),
+            meta: { className: "whitespace-nowrap text-zinc-500" },
+          } as ColumnDef<Row>,
+        ]
+      : []),
+  ];
 
   const toggleTag = (t: string) =>
     setTagFilter((f) => {
@@ -289,60 +371,19 @@ export function BackupVersionTable({
           </div>
         )}
       </AdvancedOnly>
-      <div className="overflow-x-auto">
-        <table className="w-full text-[11px]">
-          <thead className="text-zinc-500 text-left">
-            <tr>
-              <th className="font-normal px-1">Time</th>
-              <th className="font-normal px-1 text-right">Items</th>
-              <th className="font-normal px-1 text-right">Size</th>
-              <th className="font-normal px-1 text-right" title="Storage this version added (after compression and encryption)">Added</th>
-              <th className="font-normal px-1" title="Keep forever">Keep</th>
-              <th className="font-normal px-1">Note</th>
-              <th className="font-normal px-1">Tags</th>
-              {advanced && <th className="font-normal px-1">Computer</th>}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map(({ v, i }) => (
-              <tr key={v.id} className={i === selected ? "bg-blue-50 dark:bg-blue-950" : "hover:bg-zinc-50 dark:hover:bg-zinc-800"} data-testid={`version-row-${i}`}>
-                <td className="px-1 whitespace-nowrap">
-                  <button type="button" className="hover:underline" onClick={() => onSelect(i)}>
-                    {i === 0 ? "Latest — " : ""}
-                    {formatDate(v.timestamp)}
-                    {v.partial ? " (partial)" : ""}
-                  </button>
-                </td>
-                <td className="px-1 text-right">{v.file_count}</td>
-                <td className="px-1 text-right whitespace-nowrap">{formatBytes(v.total_size)}</td>
-                <td className="px-1 text-right whitespace-nowrap">{v.stats ? formatBytes(v.stats.bytes_added) : "—"}</td>
-                <td className="px-1">
-                  <button
-                    type="button"
-                    aria-pressed={v.pinned}
-                    aria-label={v.pinned ? "Kept forever (click to unpin)" : "Keep forever"}
-                    title={v.pinned ? `Kept forever${v.pin_reason ? `: ${v.pin_reason}` : ""} — retention never removes it` : "Keep forever"}
-                    disabled={busy || readOnly}
-                    className={v.pinned ? "" : "opacity-30 hover:opacity-80"}
-                    onClick={() => void update(i, { pinned: !v.pinned })}
-                    data-testid={`version-pin-${i}`}
-                  >
-                    📌
-                  </button>
-                </td>
-                <td className="px-1">
-                  <NoteCell value={v.note} disabled={busy || readOnly} onSave={(note) => update(i, { note })} />
-                </td>
-                <td className="px-1">
-                  <TagsCell tags={v.tags ?? {}} disabled={busy || readOnly} onSave={(tags) => update(i, { tags })} />
-                </td>
-                {advanced && <td className="px-1 whitespace-nowrap text-zinc-500">{v.identity ? `${v.identity.username}@${v.identity.hostname}` : "—"}</td>}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {rows.length === 0 && <p className="text-xs text-zinc-500 p-1">No version matches the filter.</p>}
-      </div>
+      <DataGrid<Row>
+        data={rows}
+        columns={columns}
+        label="Versions"
+        dense
+        pagination
+        prefsKey="backup-versions"
+        getRowId={(r) => String(r.v.id)}
+        rowProps={({ i }) => ({ className: i === selected ? "bg-blue-50 dark:bg-blue-950" : undefined, "data-testid": `version-row-${i}` })}
+        onRowActivate={({ i }) => onSelect(i)}
+        emptyText="No version matches the filter."
+        resetKey={`${host}|${JSON.stringify(tagFilter)}`}
+      />
       <AdvancedOnly>
         <div className="flex gap-1 flex-wrap">
           <Btn disabled={busy} onClick={() => setCopying([selected])} testId="copy-versions-open">

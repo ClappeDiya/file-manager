@@ -109,7 +109,7 @@ Ground rules
 - [x] K124 ufop-server web UI branding
 
 ## WP11 — Interface polish
-- [ ] K122 Sort and paginate backup version/file tables
+- [x] K122 Sort and paginate backup version/file tables
 - [x] K121 Text size setting
 - [ ] K123 Units (binary/decimal) and schedule timezone
 

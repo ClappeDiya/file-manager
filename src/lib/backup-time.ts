@@ -27,3 +27,13 @@ export function pickVersionAsOf(versions: Fileset[], iso: string, allowPartial =
   const i = versions.findIndex((v) => (allowPartial || !v.partial) && Date.parse(v.timestamp) <= t);
   return i < 0 ? null : i;
 }
+
+/** Time between two RFC 3339 instants, as "1 h 2 min" / "3 min" / "12 s". */
+export function runDuration(start: string, end: string | null): string {
+  if (!end) return "—";
+  const s = Math.max(0, Math.round((Date.parse(end) - Date.parse(start)) / 1000));
+  if (!Number.isFinite(s)) return "—";
+  if (s >= 3600) return `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} min`;
+  if (s >= 60) return `${Math.floor(s / 60)} min`;
+  return `${s} s`;
+}

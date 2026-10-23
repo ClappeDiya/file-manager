@@ -188,8 +188,8 @@ describe("BackupPanel", () => {
     const list = await screen.findByTestId("backup-file-list");
     await waitFor(() => expect(list.textContent).toContain("a.txt"));
     fireEvent.change(screen.getByTestId("backup-version-select"), { target: { value: "1" } });
-    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_list_files", { id: "job-1", version: 1, prefix: null }));
-    const box = (await screen.findAllByRole("checkbox")).find((c) => c.closest("li")?.textContent?.includes("a.txt"))!;
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_list_files", expect.objectContaining({ id: "job-1", version: 1, prefix: null })));
+    const box = await screen.findByRole("checkbox", { name: "Select /home/me/Docs/a.txt" });
     fireEvent.click(box);
     fireEvent.click(screen.getByTestId("backup-restore-run"));
     await waitFor(() =>

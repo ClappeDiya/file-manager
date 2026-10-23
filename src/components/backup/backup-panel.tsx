@@ -21,6 +21,7 @@ import {
 } from "@/stores/backup-store";
 import { BackupJobEditor } from "./backup-job-editor";
 import { BackupMaintenance } from "./backup-maintenance";
+import { BackupRunHistory } from "./backup-run-history";
 import { BackupRestoreView, DirectRestore } from "./backup-restore-view";
 import { BackupRecoveryView } from "./backup-recovery-view";
 import { BackupSettingsView } from "./backup-settings-view";
@@ -142,55 +143,6 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
         <Btn onClick={() => onView({ kind: "maintenance", job })}>Maintenance</Btn>
       </div>
       {est.panel}
-    </div>
-  );
-}
-
-function History() {
-  const { history, loadHistory, jobs } = useBackupStore();
-  const [jobId, setJobId] = useState<string>("");
-  const [open, setOpen] = useState<string | null>(null);
-  useEffect(() => {
-    void loadHistory(jobId || null, 100);
-  }, [jobId, loadHistory]);
-  return (
-    <div className="p-3 space-y-2" data-testid="backup-history">
-      <div className="flex gap-1">
-        <select className={inputCls} value={jobId} onChange={(e) => setJobId(e.target.value)}>
-          <option value="">All jobs</option>
-          {jobs.map((j) => (
-            <option key={j.id} value={j.id}>{j.name}</option>
-          ))}
-        </select>
-        <Btn onClick={() => void tauriInvoke<number>("backup_prune_history", { days: 90 }).then(() => loadHistory(jobId || null, 100))} title="Delete run history older than 90 days">
-          Prune &gt; 90 days
-        </Btn>
-      </div>
-      {history.length === 0 && <div className="text-sm text-zinc-500 text-center py-6">No runs yet.</div>}
-      {history.map((r) => (
-        <div key={r.id} className="border border-zinc-200 dark:border-zinc-700 rounded p-2 text-xs">
-          <button className="w-full text-left flex justify-between gap-2" onClick={() => setOpen(open === r.id ? null : r.id)}>
-            <span className="truncate">
-              <span className={statusColor(r.status)}>●</span> {jobs.find((j) => j.id === r.job_id)?.name ?? "deleted job"} · {r.operation} · {r.summary}
-            </span>
-            <span className="text-zinc-500 shrink-0">{formatDate(r.started_at)}</span>
-          </button>
-          {open === r.id && (
-            <div className="mt-1 space-y-1">
-              {r.log.length > 0 && (
-                <ul className="font-mono text-[11px] max-h-40 overflow-y-auto">
-                  {r.log.map((l, i) => (
-                    <li key={i} className={l.level === "error" ? "text-red-600" : l.level === "warning" ? "text-amber-600" : ""}>
-                      [{l.level}] {l.message}
-                    </li>
-                  ))}
-                </ul>
-              )}
-              <pre className="text-[11px] max-h-40 overflow-auto bg-zinc-50 dark:bg-zinc-800 p-1 rounded">{JSON.stringify(r.report, null, 2)}</pre>
-            </div>
-          )}
-        </div>
-      ))}
     </div>
   );
 }
@@ -386,7 +338,7 @@ export function BackupPanel() {
             ))}
           </div>
         )}
-        {view.kind === "history" && <History />}
+        {view.kind === "history" && <BackupRunHistory />}
         {view.kind === "direct" && <DirectRestore />}
         {view.kind === "settings" && <BackupSettingsView />}
         {view.kind === "recovery" && <BackupRecoveryView />}

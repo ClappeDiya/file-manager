@@ -21,6 +21,16 @@ export const FONT_SCALES: readonly { value: FontScale; label: string }[] = [
   { value: 1.25, label: "Larger" },
 ];
 
+/** Rows per page of a sortable table; "all" scrolls one virtualized list. */
+export type TablePageSize = 25 | 50 | 100 | 250 | "all";
+export const TABLE_PAGE_SIZES: readonly TablePageSize[] = [25, 50, 100, 250, "all"];
+
+/** Remembered view of one table (K122): page size and sort column. */
+export interface TableView {
+  pageSize: TablePageSize;
+  sort: { id: string; desc: boolean } | null;
+}
+
 /**
  * Application mode:
  * - "simple": Default mode with simplified UI
@@ -117,6 +127,10 @@ export interface UIState {
   setFontScale: (scale: FontScale) => void;
   /** One step larger (1), smaller (-1) or back to the default (0). */
   stepFontScale: (step: -1 | 0 | 1) => void;
+
+  // Table views (K122), by table id
+  tableViews: Record<string, TableView>;
+  setTableView: (id: string, patch: Partial<TableView>) => void;
 
   // Sidebar
   sidebarOpen: boolean;
@@ -246,6 +260,13 @@ export function nextFontScale(current: FontScale, step: -1 | 0 | 1): FontScale {
 
 const isFontScale = (v: unknown): v is FontScale => FONT_SCALES.some((f) => f.value === v);
 
+const isTableView = (v: unknown): v is TableView => {
+  if (!v || typeof v !== "object") return false;
+  const t = v as TableView;
+  const sortOk = t.sort === null || (typeof t.sort === "object" && typeof t.sort.id === "string" && typeof t.sort.desc === "boolean");
+  return TABLE_PAGE_SIZES.includes(t.pageSize) && sortOk;
+};
+
 /**
  * Get the OS preferred color scheme.
  */
@@ -296,6 +317,10 @@ export function migrateUIState(persisted: unknown, version: number): Partial<UIS
 function sanitizeAppearance(state: Partial<UIState>): Partial<UIState> {
   const out = { ...state };
   if ("fontScale" in out && !isFontScale(out.fontScale)) delete out.fontScale;
+  if ("tableViews" in out) {
+    const views = out.tableViews && typeof out.tableViews === "object" ? out.tableViews : {};
+    out.tableViews = Object.fromEntries(Object.entries(views).filter(([, v]) => isTableView(v)));
+  }
   return out;
 }
 
@@ -323,6 +348,14 @@ export const useUIStore = create<UIState>()(
         set({ fontScale: next });
       },
       stepFontScale: (step) => get().setFontScale(nextFontScale(get().fontScale, step)),
+
+      // Table views
+      tableViews: {},
+      setTableView: (id, patch) =>
+        set((state) => {
+          const prev = state.tableViews[id] ?? { pageSize: 50, sort: null };
+          return { tableViews: { ...state.tableViews, [id]: { ...prev, ...patch } } };
+        }),
 
       // Sidebar
       sidebarOpen: true,
@@ -465,6 +498,7 @@ export const useUIStore = create<UIState>()(
       partialize: (state) => ({
         theme: state.theme,
         fontScale: state.fontScale,
+        tableViews: state.tableViews,
         sidebarOpen: state.sidebarOpen,
         sidebarWidth: state.sidebarWidth,
         appMode: state.appMode,

@@ -16,6 +16,8 @@ import { BackupRepositoryFormat } from "./backup-repository-format";
 import { BackupRepositorySafety } from "./backup-repository-safety";
 import { BackupSharing } from "./backup-sharing";
 import { CustomVerify } from "./backup-policies";
+import { DataGrid } from "../data-grid";
+import type { ColumnDef } from "@tanstack/react-table";
 
 
 export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDeleted: () => void }) {
@@ -42,6 +44,31 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
     }
   };
   const [ctlTarget, setCtlTarget] = useState("");
+  const remoteColumns: ColumnDef<RemoteFile>[] = [
+    { id: "name", header: "Name", accessorFn: (f) => f.name, cell: ({ row: { original: f } }) => <span className="font-mono break-all">{f.name}</span> },
+    { id: "size", header: "Size", accessorFn: (f) => f.size, cell: ({ row: { original: f } }) => formatBytes(f.size), meta: { className: "text-right whitespace-nowrap" } },
+    {
+      id: "actions",
+      header: () => <span className="sr-only">Actions</span>,
+      enableSorting: false,
+      cell: ({ row: { original: f } }) =>
+        !f.name.startsWith(`${job.options.prefix}-`) && (
+          <button
+            className="text-red-600"
+            onClick={async () => {
+              try {
+                await tauriInvoke("backup_remote_delete", { destination: job.destination, name: f.name, force: false });
+                await listFiles();
+              } catch (e) {
+                setError(errorText(e));
+              }
+            }}
+          >
+            delete
+          </button>
+        ),
+    },
+  ];
 
   const op = async (label: string, operation: BackupOperation) => {
     setBusy(label);
@@ -154,31 +181,19 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
           {files && <input className={inputCls} placeholder="filter" value={filter} onChange={(e) => setFilter(e.target.value)} />}
         </div>
         {files && (
-          <ul className="text-xs max-h-48 overflow-auto font-mono" data-testid="remote-files">
-            {files
-              .filter((f) => !filter || f.name.includes(filter))
-              .map((f) => (
-                <li key={f.name} className="flex gap-2">
-                  <span className="truncate flex-1">{f.name}</span>
-                  <span className="text-zinc-500">{formatBytes(f.size)}</span>
-                  {!f.name.startsWith(`${job.options.prefix}-`) && (
-                    <button
-                      className="text-red-600"
-                      onClick={async () => {
-                        try {
-                          await tauriInvoke("backup_remote_delete", { destination: job.destination, name: f.name, force: false });
-                          await listFiles();
-                        } catch (e) {
-                          setError(errorText(e));
-                        }
-                      }}
-                    >
-                      delete
-                    </button>
-                  )}
-                </li>
-              ))}
-          </ul>
+          <div data-testid="remote-files">
+            <DataGrid<RemoteFile>
+              data={files.filter((f) => !filter || f.name.toLowerCase().includes(filter.toLowerCase()))}
+              columns={remoteColumns}
+              label="Destination files"
+              dense
+              pagination
+              prefsKey="backup-remote-files"
+              getRowId={(f) => f.name}
+              emptyText={filter ? "No file matches the filter." : "The destination is empty."}
+              resetKey={filter}
+            />
+          </div>
         )}
       </Section>
 

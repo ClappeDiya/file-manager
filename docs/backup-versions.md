@@ -18,6 +18,12 @@ Each backup run creates a version. This page explains how to label versions, kee
 
 In Advanced mode, chips above the table filter by tag (several chips combine), and a menu filters by computer when versions come from more than one.
 
+### Sorting and pages
+
+Click a column header (or focus it and press Enter or Space) to sort by it; click again to reverse. The header's `aria-sort` tells screen readers the order. Below the table, **Rows per page** offers 25, 50, 100, 250 or All (All scrolls one list that only draws the visible rows), with First / Previous / Next / Last buttons. Each backup table remembers its page size and sort on this computer (with the other window preferences): the version list, the files of a version and the search results in Restore, the run history, and the destination files in Maintenance.
+
+The files of a version and the run history are fetched one page at a time, sorted and filtered by the backend, so versions with hundreds of thousands of files open quickly; selected files stay selected while you page. For scripts, the same paging is available on the IPC calls `backup_list_files`, `backup_run_history` and `backup_remote_list` (optional `page: {offset, limit, sort, descending, filter}`, answered with `{items, total, offset, limit}`; without `page` they return the plain list as before) and on REST `GET /api/v1/jobs/{id}/files` and `GET /api/v1/runs` (`offset`, `limit`, `sort`, `desc`, `filter`; see [api-reference.md](api-reference.md)). Sort columns: files `path`, `size`, `kind`, `modified`; runs `started_at` (default, newest first), `finished_at`, `status`, `operation`, `job_id`; destination files `name`, `size`.
+
 The CLI shows the same columns:
 
 ```bash

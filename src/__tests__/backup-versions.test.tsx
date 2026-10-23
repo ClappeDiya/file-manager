@@ -182,7 +182,7 @@ describe("shared repositories", () => {
     const picker = await screen.findByLabelText("Source");
     fireEvent.change(picker, { target: { value: "s2" } });
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_list_versions", { id: "j1", source: "s2" }));
-    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_list_files", { id: "j1", version: 0, prefix: null, source: "s2" }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_list_files", expect.objectContaining({ id: "j1", version: 0, prefix: null, source: "s2" })));
     expect(screen.getByTestId("version-row-1")).toBeTruthy();
   });
 

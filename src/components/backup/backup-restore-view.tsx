@@ -14,7 +14,6 @@ import {
   errorText,
   useBackupStore,
   type BackupDestination,
-  type BackupFileEntry,
   type BackupJob,
   type Fileset,
   type FoundFile,
@@ -27,6 +26,7 @@ import { formatDate, inputCls } from "@/lib/backup-helpers";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { AdvancedOnly } from "./advanced-only";
 import { BackupVersionTable } from "./backup-version-list";
+import { BackupFileBrowser, BackupSearchHits } from "./backup-file-browser";
 import type { SourceInfo, VersionSelector } from "@/stores/backup-store";
 import { MirrorConfirm, RestoreAsOfPicker, RestoreSafetyOptions } from "./backup-restore-extras";
 import { ArchiveExportButton, BackupFilePreview, OpenAsDriveButton, OpenDrivesList } from "./backup-access-actions";
@@ -171,8 +171,6 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
   const [source, setSource] = useState<string | null>(null);
   const [versions, setVersions] = useState<Fileset[]>([]);
   const [version, setVersion] = useState(0);
-  const [files, setFiles] = useState<BackupFileEntry[]>([]);
-  const [filter, setFilter] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [opts, setOpts] = useState<RestoreOptions>(DEFAULT_RESTORE_OPTIONS);
   const [overrides, setOverrides] = useState<RestoreOverrides>({ download_bps: null, retries: null, network_timeout_secs: null });
@@ -187,8 +185,10 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
   const [asOfKey, setAsOfKey] = useState(0);
   const [preview, setPreview] = useState<string | null>(null);
   const mirror = useMirrorRestore(job.id, setReport);
+  // A newly picked version (or source) starts with nothing selected.
   const pickVersion = (i: number) => {
     setVersion(i);
+    setSelected(new Set());
     setAsOf(null);
     setAsOfKey((k) => k + 1);
   };
@@ -208,18 +208,6 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
     void loadVersions();
   }, [loadVersions]);
 
-  useEffect(() => {
-    if (versions.length === 0) return;
-    setSelected(new Set());
-    tauriInvoke<BackupFileEntry[]>("backup_list_files", { id: job.id, version, prefix: null, ...src }, [])
-      .then(setFiles)
-      .catch((e) => setError(errorText(e)));
-  }, [job.id, version, versions.length, src]);
-
-  const shown = useMemo(() => {
-    const f = filter.toLowerCase();
-    return (f ? files.filter((x) => x.path.toLowerCase().includes(f)) : files).slice(0, 2000);
-  }, [files, filter]);
 
   const run = async (fn: () => Promise<void>) => {
     setBusy(true);
@@ -249,6 +237,7 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
         onChange={(s) => {
           setSource(s);
           setVersion(0);
+          setSelected(new Set());
           setCmp(null);
         }}
       />
@@ -290,7 +279,10 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
           key={asOfKey}
           versions={versions}
           onPick={(i, iso) => {
-            if (i !== null) setVersion(i);
+            if (i !== null && i !== version) {
+              setVersion(i);
+              setSelected(new Set());
+            }
             setAsOf(i !== null ? iso : null);
           }}
         />
@@ -345,40 +337,17 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
           </Btn>
         </div>
         {hits && (
-          <ul className="max-h-32 overflow-y-auto text-[11px] font-mono">
-            {hits.length === 0 && <li className="text-zinc-500">No matches.</li>}
-            {hits.map((h) => (
-              <li key={`${h.version}:${h.path}`} className="flex justify-between gap-2">
-                <button className="truncate text-left hover:underline" onClick={() => { pickVersion(h.version); setSelected(new Set([h.path])); }} title="Select this version of the file">
-                  {h.path}
-                </button>
-                <span className="shrink-0 text-zinc-500">{formatDate(h.timestamp)} · {formatBytes(h.size)}</span>
-              </li>
-            ))}
-          </ul>
+          <BackupSearchHits
+            hits={hits}
+            onPick={(h) => {
+              pickVersion(h.version);
+              setSelected(new Set([h.path]));
+            }}
+          />
         )}
       </Section>
 
-      <Section title={`Files (${files.length}${selected.size ? `, ${selected.size} selected` : ""})`} hint="Select nothing to restore the whole version. Selecting a folder restores everything inside it.">
-        <input className={inputCls} value={filter} placeholder="Filter…" onChange={(e) => setFilter(e.target.value)} />
-        <ul className="max-h-56 overflow-y-auto text-[11px] font-mono border border-zinc-200 dark:border-zinc-700 rounded" data-testid="backup-file-list">
-          {shown.map((f) => (
-            <li key={f.path} className="flex items-center gap-2 px-1 hover:bg-zinc-50 dark:hover:bg-zinc-800">
-              <input type="checkbox" checked={selected.has(f.path)} onChange={() => toggle(f.path)} />
-              <span className="truncate flex-1" title={f.path}>
-                {f.kind === "dir" ? "📁 " : f.kind === "symlink" ? "↪ " : ""}
-                {f.path}
-              </span>
-              {f.kind === "file" && <span className="text-zinc-500 shrink-0">{formatBytes(f.size)}</span>}
-              {f.kind === "file" && (
-                <button className="shrink-0 text-blue-600 dark:text-blue-400 hover:underline" onClick={() => setPreview(f.path)} title="Show this file without restoring it" data-testid="backup-file-preview-open">
-                  Preview
-                </button>
-              )}
-            </li>
-          ))}
-        </ul>
-      </Section>
+      <BackupFileBrowser jobId={job.id} version={version} source={source} selected={selected} onToggle={toggle} onPreview={setPreview} />
 
       <Section title="Restore">
         <RestoreOptionsForm value={opts} onChange={setOpts} versionCount={versions.length} />
