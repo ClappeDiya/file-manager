@@ -141,7 +141,7 @@ pub struct CredentialProvider {
 
 impl CredentialProvider {
     pub fn new(source: CredentialSource, static_keys: Option<BaseKeys>, assume: Option<AssumeRoleOptions>, region: &str, env: ChainEnv) -> Result<Self, AppError> {
-        if source.is_static() && static_keys.as_ref().is_none_or(|k| k.access_key_id.trim().is_empty() || k.secret_access_key.trim().is_empty()) {
+        if source.is_static() && static_keys.as_ref().map_or(true, |k| k.access_key_id.trim().is_empty() || k.secret_access_key.trim().is_empty()) {
             return Err(AppError::validation("Enter the access key id and the secret access key"));
         }
         if let Some(a) = &assume {
@@ -162,7 +162,7 @@ impl CredentialProvider {
     pub async fn keys(&self) -> Result<BaseKeys, AppError> {
         let mut cache = self.cache.lock().await;
         if let Some(c) = cache.as_ref() {
-            let fresh = c.expires.is_none_or(|e| e - chrono::Duration::from_std(REFRESH_EARLY).unwrap_or_default() > Utc::now());
+            let fresh = c.expires.map_or(true, |e| e - chrono::Duration::from_std(REFRESH_EARLY).unwrap_or_default() > Utc::now());
             if fresh {
                 return Ok(c.keys.clone());
             }
@@ -191,15 +191,15 @@ impl CredentialProvider {
     async fn base(&self) -> Result<Credentials, AppError> {
         match &self.source {
             CredentialSource::Static => Ok(Credentials { keys: self.static_keys.clone().ok_or_else(|| missing("Static keys are missing", "Enter the secret access key."))?, expires: None }),
-            CredentialSource::Environment => self.from_env().ok_or_else(|| missing("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are not set", "Set them for the app (or service), or pick another credential source.")),
-            CredentialSource::Profile { name, file } => self.from_profile(name, file.as_deref()).await,
+            CredentialSource::Environment => self.env_keys().ok_or_else(|| missing("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are not set", "Set them for the app (or service), or pick another credential source.")),
+            CredentialSource::Profile { name, file } => self.profile_keys(name, file.as_deref()).await,
             CredentialSource::WebIdentity { role_arn, token_file } => self.web_identity(role_arn, token_file).await,
             CredentialSource::InstanceMetadata => self.imds().await,
             CredentialSource::Auto => self.auto().await,
         }
     }
 
-    fn from_env(&self) -> Option<Credentials> {
+    fn env_keys(&self) -> Option<Credentials> {
         let id = self.env.var("AWS_ACCESS_KEY_ID")?;
         let secret = self.env.var("AWS_SECRET_ACCESS_KEY")?;
         Some(Credentials { keys: BaseKeys { access_key_id: id, secret_access_key: secret, session_token: self.env.var("AWS_SESSION_TOKEN") }, expires: expiry(self.env.var("AWS_CREDENTIAL_EXPIRATION").as_deref()) })
@@ -236,7 +236,7 @@ impl CredentialProvider {
 
     /// Profile keys: static keys, `role_arn` with `source_profile`,
     /// `credential_source` or `web_identity_token_file`.
-    fn from_profile<'a>(&'a self, name: &'a str, file: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Credentials, AppError>> + Send + 'a>> {
+    fn profile_keys<'a>(&'a self, name: &'a str, file: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Credentials, AppError>> + Send + 'a>> {
         Box::pin(async move {
             let name = if name.trim().is_empty() { self.env.var("AWS_PROFILE").unwrap_or_else(|| "default".into()) } else { name.trim().to_string() };
             self.profile_chain(&name, file, 0).await
@@ -262,7 +262,7 @@ impl CredentialProvider {
                     }
                 } else {
                     match p.credential_source.as_deref() {
-                        Some("Environment") => self.from_env().ok_or_else(|| missing("credential_source = Environment, but AWS_ACCESS_KEY_ID is not set", "Set the variables or change the profile."))?,
+                        Some("Environment") => self.env_keys().ok_or_else(|| missing("credential_source = Environment, but AWS_ACCESS_KEY_ID is not set", "Set the variables or change the profile."))?,
                         Some("Ec2InstanceMetadata") => self.imds().await?,
                         Some("EcsContainer") => self.container().await?.ok_or_else(|| missing("credential_source = EcsContainer, but no container credentials are available", "Run inside ECS/EKS or change the profile."))?,
                         other => return Err(missing(format!("AWS profile '{name}' assumes a role without source_profile or a supported credential_source ({other:?})"), "Set source_profile, or credential_source = Environment | Ec2InstanceMetadata | EcsContainer.")),
@@ -331,7 +331,7 @@ impl CredentialProvider {
     }
 
     async fn auto(&self) -> Result<Credentials, AppError> {
-        if let Some(c) = self.from_env() {
+        if let Some(c) = self.env_keys() {
             return Ok(c);
         }
         if let (Some(role), Some(file)) = (self.env.var("AWS_ROLE_ARN"), self.env.var("AWS_WEB_IDENTITY_TOKEN_FILE")) {

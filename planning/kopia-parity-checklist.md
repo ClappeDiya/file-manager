@@ -73,15 +73,15 @@ Ground rules
 - [x] K34 Async (fire-and-forget) hook mode
 
 ## WP7 — Storage backends
-- [ ] K60 S3 credential chain (env, profile, web identity, IMDS) for backup S3 store
-- [ ] K61 STS assume-role in native S3 store
-- [ ] K62 Azure service principal / federated auth for Azure store
-- [ ] K63 GCS read-only scope for read-only connections
-- [ ] K64 rclone process control (startup timeout, kill on drop)
-- [ ] K66 Storage class per volume type
-- [ ] K67 Point-in-time read of a versioned S3 bucket
-- [ ] K55 Request-rate limits and listing parallelism
-- [ ] K58 Live-provider contract test harness (env-gated) + CI workflow
+- [x] K60 S3 credential chain (env, profile, web identity, IMDS) for backup S3 store
+- [x] K61 STS assume-role in native S3 store
+- [x] K62 Azure service principal / federated auth for Azure store
+- [x] K63 GCS read-only scope for read-only connections
+- [x] K64 rclone process control (startup timeout, kill on drop)
+- [x] K66 Storage class per volume type
+- [x] K67 Point-in-time read of a versioned S3 bucket
+- [x] K55 Request-rate limits and listing parallelism
+- [x] K58 Live-provider contract test harness (env-gated) + CI workflow
 
 ## WP8 — Server, security, observability
 - [ ] K97 Graceful server shutdown (drain, checkpoint)
