@@ -151,3 +151,5 @@ The output of a backup command is not included in the estimate; a warning says s
 | IPC | `backup_run_all { filter?: { job_ids, scheduled_only, dry_run } }`, which returns `{ started: [{job_id, job_name, task_id}], skipped: [{job_id, job_name, reason}] }` |
 | REST | `POST /api/v1/jobs/run-all` with the same filter (scope `run`) |
 | CLI | `ufop server run-all [--job NAME …] [--scheduled-only] [--dry-run] [--wait]`, or the same as `ufop backup run-all`. The CLI has no jobs of its own, so this talks to the `ufop-server` you signed in to with `ufop server login`. With `--wait`, it waits for every started backup and exits with the worst result (0 success, 1 warning, 2 error). |
+
+Restore options (as of a time, archives, mirror, owners, error policy, sparse files), reading single files, the volume cache and version drives are described in [backup-restore.md](backup-restore.md).

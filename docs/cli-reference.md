@@ -584,6 +584,37 @@ ufop backup run-all [--job Docs …] [--scheduled-only] [--wait]               #
 
 `ufop backup stdin` takes the repository, retention, `--note`/`--tag` and engine flags of `ufop backup run`. Exit codes follow `run`: 0 success, 1 warnings, 2 errors or a partial version (fail-fast, error budget, upload limit).
 
+### `ufop backup` restore and reading
+
+Restore as of a time, to an archive, mirror restores, owners, the restore error policy, sparse files, reading one file, the volume cache and serving a version as a drive. See [backup-restore.md](backup-restore.md).
+
+```bash
+ufop backup restore --dest /mnt/backup --target ~/out --time "2026-10-01 09:00"   # local time; also 2026-10-01 or RFC 3339
+ufop backup restore --dest /mnt/backup --target ~/out --version oldest            # latest | oldest | N | <timestamp>
+ufop backup restore --dest /mnt/backup --archive ~/docs.zip [/home/me/Docs]       # .zip | .tar | .tar.gz | .tgz
+ufop backup restore --dest /mnt/backup --target ~/Docs --mirror [--yes]           # also delete what the version lacks
+ufop backup restore … --restore-owner always --on-missing-data continue --fail-fast --max-errors 20 --sparse off
+ufop backup cat --dest /mnt/backup /home/me/Docs/a.txt [--time …] [--offset 0 --length 4096] > a.txt
+ufop backup mount --dest /mnt/backup [--version latest | --time … | --all] [--port 0]   # read-only WebDAV until Ctrl-C
+ufop backup cache stats|clear [--cache-dir DIR]
+```
+
+| Flag | Default | |
+|---|---|---|
+| `--version` | `0` | A number (0 = newest), `latest`, `oldest`, or a version's timestamp / file-list name |
+| `--time` | none | The newest complete version made at or before this time (wins over `--version`) |
+| `--allow-partial` | off | `latest`, `oldest` and `--time` may pick interrupted versions |
+| `--archive PATH`, `--archive-format` | none | Write an archive instead of files; format `zip`, `zip-stored`, `tar` or `tgz` (default: from the name) |
+| `--mirror`, `--yes` | off | Delete extra files in the restored folders of `--target`; lists them and asks unless `--yes` (refused without a terminal) |
+| `--restore-owner` | `auto` | `auto` (when root/administrator), `always` (fail otherwise), `never` |
+| `--on-file-error`, `--on-dir-error`, `--on-missing-data` | `fail` | `fail` (error) or `continue` (warning) |
+| `--on-metadata-error` | `warn` | `ignore`, `warn`, `fail` |
+| `--fail-fast`, `--max-errors N` | off, none | Stop at the first error / after more than N problems |
+| `--sparse` | `auto` | `auto` leaves holes for zero runs; `off` writes every byte |
+| `--use-cache`, `--cache-dir`, `--cache-size` | off, user cache folder, `2G` | Read volumes through the local volume cache (`cat` and `mount` always use it; `--cache-size 0` turns it off) |
+
+`ufop backup mount` prints the drive's address (`http://127.0.0.1:PORT/<token>/`) and password. `--bind` can serve another address; anyone who can reach it and has the token can read the files.
+
 ### `ufop server shares`
 
 Share links on a `ufop-server` started with `--share-root` (sign in first with `ufop server login`).

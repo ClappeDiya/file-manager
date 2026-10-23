@@ -83,16 +83,19 @@ macro; if you add a new one here, register it there too.
 - `resolve_aws_profile`
 - `start_sso_auth`
 
-## `backup_commands` (77 commands)
+## `backup_commands` (88 commands)
 
 - `backup_adopt_repository`
 - `backup_break_lock`
 - `backup_browse_remote`
 - `backup_bug_report`
+- `backup_cache_stats`
 - `backup_cancel`
 - `backup_capabilities`
 - `backup_change_passphrase`
 - `backup_cleanup_databases`
+- `backup_clear_cache`
+- `backup_close_drive`
 - `backup_cloud_providers`
 - `backup_compare`
 - `backup_crypt_file`
@@ -109,8 +112,10 @@ macro; if you add a new one here, register it there too.
 - `backup_execute`
 - `backup_export_cli`
 - `backup_export_config`
+- `backup_export_file`
 - `backup_export_is_encrypted`
 - `backup_generate_passphrase`
+- `backup_get_cache_settings`
 - `backup_get_desktop_settings`
 - `backup_get_global_defaults`
 - `backup_get_job`
@@ -119,19 +124,23 @@ macro; if you add a new one here, register it there too.
 - `backup_import_config`
 - `backup_job_placeholders`
 - `backup_list_destinations`
+- `backup_list_drives`
 - `backup_list_files`
 - `backup_list_jobs`
 - `backup_list_sources`
 - `backup_list_versions`
 - `backup_lock_status`
+- `backup_open_drive`
 - `backup_passphrase_strength`
 - `backup_pause`
 - `backup_photos_libraries`
 - `backup_photos_library_info`
 - `backup_place_legal_hold`
+- `backup_preview_file`
 - `backup_preview_retention`
 - `backup_preview_sources`
 - `backup_prune_history`
+- `backup_read_file`
 - `backup_recovery_convert`
 - `backup_recovery_download`
 - `backup_recovery_index`
@@ -142,6 +151,7 @@ macro; if you add a new one here, register it there too.
 - `backup_remote_get`
 - `backup_remote_list`
 - `backup_remote_put`
+- `backup_resolve_version`
 - `backup_resume`
 - `backup_run`
 - `backup_run_all`
@@ -149,6 +159,7 @@ macro; if you add a new one here, register it there too.
 - `backup_save_destination`
 - `backup_save_job`
 - `backup_search`
+- `backup_set_cache_settings`
 - `backup_set_database_encryption`
 - `backup_set_desktop_settings`
 - `backup_set_destination_secret`
@@ -321,11 +332,12 @@ macro; if you add a new one here, register it there too.
 - `fleet_agent_sync_now`
 - `fleet_agent_unregister`
 
-## `fs_commands` (5 commands)
+## `fs_commands` (6 commands)
 
 - `list_directory`
 - `pick_files`
 - `pick_folder`
+- `pick_save_file`
 - `read_text_file_full`
 - `write_text_file_full`
 
@@ -716,4 +728,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 548 commands across 51 modules.
+**Surface:** 560 commands across 51 modules.
