@@ -1,0 +1,121 @@
+# Kopia parity — implementation checklist
+
+Source: the Kopia gap analysis (79 rows decided ADD, ENHANCE or DEFER). IDs are `K<row>` from that report.
+Branch: `feat/kopia-parity`. One commit per item (or tight group), message prefixed with the ID.
+
+Ground rules
+- Additive only: existing behaviour, IPC names, CLI flags and v1 repositories keep working.
+- New serde fields use `#[serde(default)]`; TypeScript mirrors use `T | null`.
+- Format-changing features (CDC, zstd, envelope key, dlist compression, sharding) apply to format v2 repositories only.
+- Advanced-only UI goes behind `appMode === "advanced"` (K132). Standard view stays as it is.
+- Every item ships with tests; a box is ticked only when code, wiring (engine → IPC/CLI/API → UI where applicable) and tests are done and passing.
+
+## WP0 — Foundations
+- [ ] K132 Backup screens honour Simple/Advanced mode (`AdvancedOnly` gate + store selector)
+- [ ] K130 SECURITY.md (disclosure policy, supported versions, response SLA)
+
+## WP1 — Repository format v2 (ufop-core)
+- [ ] K72 Format v2, dual-version reader, in-place upgrade with v1 header backup and rollback
+- [ ] K83 Envelope key: random master key wrapped by Argon2id KEK; password change rewraps header only
+- [ ] K49 Zstd block codec in the native pack format (default for new v2 repos)
+- [ ] K52 Compress dlist/dindex metadata before sealing (v2)
+- [ ] K3 Content-defined chunking (FastCDC) behind a `Chunker` trait; chunker recorded in repo header
+- [ ] K82 ChaCha20-Poly1305 as a registered encryption module (v2 header records cipher)
+- [ ] K59 Optional sharded remote layout for v2 repos (+ reshard tool)
+
+## WP2 — Repository safety
+- [ ] K115 Remote repository lock lease (`{prefix}-lock`), renew, stale takeover, guarded force-unlock
+- [ ] K118 Clock-skew check against backend mtime; warn/abort thresholds
+- [ ] K9 Periodic checkpoints (sealed partial dlist every N minutes / bytes)
+- [ ] K70 Read-only connections (Backend wrapper refusing writes; job + adopt flag)
+- [ ] K81 Encrypted local database for encrypted repositories (key in OS keychain)
+
+## WP3 — Versions, retention, shared repositories
+- [ ] K7 Version notes and tags (+ tag filter)
+- [ ] K22 Pin versions ("Keep forever"), honoured by retention and delete
+- [ ] K113 Storage added per version (bytes_added, new_blocks)
+- [ ] K23 Retention preview (dry-run of deletions)
+- [ ] K20 Count-based GFS retention (`RetentionPolicy::Counts`)
+- [ ] K76 Copy selected versions to another repository
+- [ ] K4 Shared multi-client repositories (cross-job/machine dedup, DB sync from remote dindex)
+- [ ] K69 Client identity (host/user) recorded per version, override option
+
+## WP4 — Sources and backup runs
+- [ ] K26 `.ufopignore` and optional `.gitignore` support
+- [ ] K28 Stay on one filesystem
+- [ ] K12 Fail-fast error policy
+- [ ] K29 Per-type read-error policy (file / directory / unknown entry)
+- [ ] K11 Percentage rehash
+- [ ] K6 Backup from stdin
+- [ ] K10 Per-run upload cap
+- [ ] K54 Large-file parallel hashing threshold
+- [ ] K31 ZFS and btrfs snapshot providers
+- [ ] K14 Pre-backup estimate (new bytes + duration)
+- [ ] K5 Run all jobs (CLI, IPC, tray)
+
+## WP5 — Restore and access
+- [ ] K41 Restore as of a date/time
+- [ ] K42 Restore to ZIP / TAR / TGZ
+- [ ] K45 Mirror restore (delete extras, safety-interlocked)
+- [ ] K46 Restore ownership (chown when privileged)
+- [ ] K47 Restore error policy (shared with K12/K29)
+- [ ] K48 Sparse-file restore
+- [ ] K38 Read/preview a backed-up file without restoring
+- [ ] K77 Bounded local volume cache (size limit, stats, clear)
+- [ ] K44 Mount a version as a read-only WebDAV drive
+
+## WP6 — Policy, schedules, maintenance
+- [ ] K17 Named policy templates inherited by jobs
+- [ ] K18 Effective-settings view (inherited vs overridden)
+- [ ] K33 Cron schedules for backup jobs
+- [ ] K116 Separate maintenance schedule (compact / verify)
+- [ ] K119 Verification scope (version/path), percent sampling, parallelism, max errors
+- [ ] K34 Async (fire-and-forget) hook mode
+
+## WP7 — Storage backends
+- [ ] K60 S3 credential chain (env, profile, web identity, IMDS) for backup S3 store
+- [ ] K61 STS assume-role in native S3 store
+- [ ] K62 Azure service principal / federated auth for Azure store
+- [ ] K63 GCS read-only scope for read-only connections
+- [ ] K64 rclone process control (startup timeout, kill on drop)
+- [ ] K66 Storage class per volume type
+- [ ] K67 Point-in-time read of a versioned S3 bucket
+- [ ] K55 Request-rate limits and listing parallelism
+- [ ] K58 Live-provider contract test harness (env-gated) + CI workflow
+
+## WP8 — Server, security, observability
+- [ ] K97 Graceful server shutdown (drain, checkpoint)
+- [ ] K89 CSRF double-submit token on cookie routes
+- [ ] K93 API tokens scoped to job IDs
+- [ ] K107 Request tracing with X-Request-Id
+- [ ] K108 Prometheus `/metrics`
+- [ ] K109 OpenTelemetry trace export + Prometheus pushgateway
+- [ ] K92 Multi-user server accounts and per-job ACL
+- [ ] K87 Ransomware hardening guide + destination checklist in job editor
+
+## WP9 — Notifications
+- [ ] K101 Reusable notification profiles
+- [ ] K104 Webhook custom headers + presets (Pushover, ntfy, Discord, PagerDuty)
+- [ ] K105 HTML email (multipart)
+
+## WP10 — CLI, tooling, packaging
+- [ ] K56 `ufop backup bench` (compression, crypto, chunker)
+- [ ] K111 `ufop backup debug` (blocks, volumes, index, filesets)
+- [ ] K129 Shell completions
+- [ ] K125 Windows release targets
+- [ ] K126 Multi-arch Docker image
+- [ ] K127 Signed SHA256SUMS on releases
+- [ ] K131 Portable mode for the desktop app
+- [ ] K124 ufop-server web UI branding
+
+## WP11 — Interface polish
+- [ ] K122 Sort and paginate backup version/file tables
+- [ ] K121 Text size setting
+- [ ] K123 Units (binary/decimal) and schedule timezone
+
+## Final verification
+- [ ] ufop-core tests (all features) pass
+- [ ] src-tauri `cargo test --lib` passes
+- [ ] CLI tests pass
+- [ ] Web vitest, tsc, eslint (0 errors) pass
+- [ ] Docs updated (backup docs, cli-reference, api-reference, CHANGELOG)
