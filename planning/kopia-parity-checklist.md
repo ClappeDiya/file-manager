@@ -41,17 +41,17 @@ Ground rules
 - [x] K69 Client identity (host/user) recorded per version, override option
 
 ## WP4 — Sources and backup runs
-- [ ] K26 `.ufopignore` and optional `.gitignore` support
-- [ ] K28 Stay on one filesystem
-- [ ] K12 Fail-fast error policy
-- [ ] K29 Per-type read-error policy (file / directory / unknown entry)
-- [ ] K11 Percentage rehash
-- [ ] K6 Backup from stdin
-- [ ] K10 Per-run upload cap
-- [ ] K54 Large-file parallel hashing threshold
-- [ ] K31 ZFS and btrfs snapshot providers
-- [ ] K14 Pre-backup estimate (new bytes + duration)
-- [ ] K5 Run all jobs (CLI, IPC, tray)
+- [x] K26 `.ufopignore` and optional `.gitignore` support
+- [x] K28 Stay on one filesystem
+- [x] K12 Fail-fast error policy
+- [x] K29 Per-type read-error policy (file / directory / unknown entry)
+- [x] K11 Percentage rehash
+- [x] K6 Backup from stdin
+- [x] K10 Per-run upload cap
+- [x] K54 Large-file parallel hashing threshold
+- [x] K31 ZFS and btrfs snapshot providers
+- [x] K14 Pre-backup estimate (new bytes + duration)
+- [x] K5 Run all jobs (CLI, IPC, tray)
 
 ## WP5 — Restore and access
 - [ ] K41 Restore as of a date/time
