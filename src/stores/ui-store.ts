@@ -111,6 +111,10 @@ export interface UIState {
   // Application mode
   appMode: AppMode;
   setAppMode: (mode: AppMode) => void;
+  /** Per-area override for the Backup screens: true/false forces advanced/simple
+   *  backup UI, null follows `appMode`. Read it through `selectBackupAdvanced`. */
+  backupAdvanced: boolean | null;
+  setBackupAdvanced: (value: boolean | null) => void;
   /** Text editor saves on its own a moment after the last edit. */
   editorAutosave: boolean;
   setEditorAutosave: (on: boolean) => void;
@@ -227,6 +231,29 @@ function resolveTheme(theme: Theme): "light" | "dark" | "high-contrast" {
   return theme;
 }
 
+/** Whether the Backup screens show their advanced (expert) sections: the
+ *  per-area override wins, otherwise the global app mode decides. */
+export function selectBackupAdvanced(state: Pick<UIState, "appMode" | "backupAdvanced">): boolean {
+  return state.backupAdvanced ?? state.appMode === "advanced";
+}
+
+/** Persisted-state schema version. v0 (no version) predates `backupAdvanced`. */
+export const UI_STATE_VERSION = 1;
+
+/**
+ * Upgrades persisted UI state from an older version. Installs persisted before
+ * v1 always saw every backup option, so they get `backupAdvanced: true` to keep
+ * that experience; brand-new installs have no persisted state and keep the
+ * default `null` (follow `appMode`).
+ */
+export function migrateUIState(persisted: unknown, version: number): Partial<UIState> {
+  const state = (persisted && typeof persisted === "object" ? persisted : {}) as Partial<UIState>;
+  if (version < 1 && !("backupAdvanced" in state)) {
+    return { ...state, backupAdvanced: true };
+  }
+  return state;
+}
+
 let _activityIdCounter = 0;
 let _errorIdCounter = 0;
 
@@ -255,6 +282,8 @@ export const useUIStore = create<UIState>()(
       // Application mode - Simple is default per architecture rules
       appMode: "simple",
       setAppMode: (mode: AppMode) => set({ appMode: mode }),
+      backupAdvanced: null,
+      setBackupAdvanced: (value: boolean | null) => set({ backupAdvanced: value }),
       editorAutosave: false,
       setEditorAutosave: (on: boolean) => set({ editorAutosave: on }),
 
@@ -376,12 +405,15 @@ export const useUIStore = create<UIState>()(
     }),
     {
       name: "ufop-ui-state",
+      version: UI_STATE_VERSION,
+      migrate: migrateUIState,
       // Only persist these specific fields to localStorage
       partialize: (state) => ({
         theme: state.theme,
         sidebarOpen: state.sidebarOpen,
         sidebarWidth: state.sidebarWidth,
         appMode: state.appMode,
+        backupAdvanced: state.backupAdvanced,
         viewMode: state.viewMode,
         statusBarVisible: state.statusBarVisible,
         previewPanelOpen: state.previewPanelOpen,

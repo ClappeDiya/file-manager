@@ -11,6 +11,7 @@ import { downloadText, inputCls } from "@/lib/backup-helpers";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { BackupSupportTools } from "./backup-support-tools";
 import { BackupLegalHold } from "./backup-legal-hold";
+import { AdvancedOnly } from "./advanced-only";
 
 
 export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDeleted: () => void }) {
@@ -67,7 +68,9 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
         </Banner>
       )}
 
-      <BackupLegalHold job={job} />
+      <AdvancedOnly>
+        <BackupLegalHold job={job} />
+      </AdvancedOnly>
 
       <Section title="Integrity">
         <div className="flex gap-1 flex-wrap">
@@ -78,6 +81,7 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
         </div>
       </Section>
 
+      <AdvancedOnly hint>
       <Section title="Repair">
         <div className="flex gap-1 flex-wrap">
           {tool("Repair", { type: "repair" }, "Re-upload missing index/file-list volumes from the local database")}
@@ -193,6 +197,7 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
           })()}
         </div>
       </Section>
+      </AdvancedOnly>
 
       <Section title="Export configuration">
         <Check label="Include the backup passphrase" checked={includePass} onChange={setIncludePass} hint="Only with an export passphrase, unless you store the file securely." />

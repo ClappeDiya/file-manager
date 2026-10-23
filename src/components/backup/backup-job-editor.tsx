@@ -26,6 +26,7 @@ import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination
 import { LogOutputsEditor, NotificationsEditor, ReportExtras } from "./backup-notifications";
 import { JobSecretProviders } from "./backup-secret-providers";
 import { PhotosSourceSection } from "./backup-photos-source";
+import { AdvancedOnly } from "./advanced-only";
 
 interface ConnectionProfile {
   id: string;
@@ -387,11 +388,15 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 Compatibility test
               </Btn>
             </div>
-            <Field label="File-name prefix" hint="Lets several backups share one folder.">
-              <input className={inputCls} value={job.options.prefix} onChange={(e) => patchOpts({ prefix: e.target.value.replace(/[^A-Za-z0-9_.]/g, "") })} />
-            </Field>
+            <AdvancedOnly>
+              <Field label="File-name prefix" hint="Lets several backups share one folder.">
+                <input className={inputCls} value={job.options.prefix} onChange={(e) => patchOpts({ prefix: e.target.value.replace(/[^A-Za-z0-9_.]/g, "") })} />
+              </Field>
+            </AdvancedOnly>
           </Section>
-            <BackupReplicas replicas={job.replicas} onChange={(r) => patch({ replicas: r })} connections={connections} library={library} />
+            <AdvancedOnly hint>
+              <BackupReplicas replicas={job.replicas} onChange={(r) => patch({ replicas: r })} connections={connections} library={library} />
+            </AdvancedOnly>
           </>
         )}
 
@@ -505,6 +510,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 <input className={inputCls} value={job.options.no_compress_extensions.join(", ")} onChange={(e) => patchOpts({ no_compress_extensions: e.target.value.split(",").map((s) => s.trim().replace(/^\./, "").toLowerCase()).filter(Boolean) })} />
               </Field>
             </Section>
+            <AdvancedOnly hint>
             <BackupAdvancedOptions options={job.options} locked={!isNew && job.stats.version_count > 0} onChange={patchOpts} />
             <Section title="Source handling">
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
@@ -559,6 +565,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 <input className={inputCls} value={job.soft_delete_prefix ?? ""} placeholder="e.g. deleted-" onChange={(e) => patch({ soft_delete_prefix: e.target.value || null })} />
               </Field>
             </Section>
+            </AdvancedOnly>
             <Section title="Network">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <Field label="Upload limit (KB/s, 0 = unlimited)">
@@ -584,6 +591,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
 
         {step === "Hooks" && (
           <>
+            <AdvancedOnly>
             <Section title="Scripts" hint="Receive UFOP_* environment variables. Lines printed as LOG:INFO / LOG:WARN / LOG:ERROR appear in the run log.">
               <Field label="Before backup">
                 <input className={`${inputCls} font-mono`} value={job.scripts.run_before ?? ""} onChange={(e) => patch({ scripts: { ...job.scripts, run_before: e.target.value || null } })} />
@@ -607,6 +615,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 </Field>
               </div>
             </Section>
+            </AdvancedOnly>
             <Section title="Desktop notifications">
               <div className="flex gap-3 text-xs">
                 {["success", "warning", "error"].map((r) => (
@@ -619,6 +628,8 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 ))}
               </div>
             </Section>
+            <NotificationsEditor value={job.notifications} onChange={(notifications) => patch({ notifications })} />
+            <AdvancedOnly hint>
             <Section title="HTTP reports" hint="Sent to every URL when a run ends with a selected result.">
               <Field label="URLs (one per line)">
                 <textarea className={`${inputCls} font-mono`} rows={2} value={job.reports.http_urls.join("\n")} onChange={(e) => patch({ reports: { ...job.reports, http_urls: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) } })} />
@@ -665,9 +676,9 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
               <Check label="Accept invalid TLS certificates on report URLs" checked={job.reports.accept_invalid_certs} onChange={(v) => patch({ reports: { ...job.reports, accept_invalid_certs: v } })} />
               <ReportExtras reports={job.reports} onChange={(reports) => patch({ reports })} />
             </Section>
-            <NotificationsEditor value={job.notifications} onChange={(notifications) => patch({ notifications })} />
             <LogOutputsEditor value={job.log_outputs} onChange={(log_outputs) => patch({ log_outputs })} />
             <JobSecretProviders jobId={job.id} value={job.secret_providers} onChange={(secret_providers) => patch({ secret_providers })} />
+            </AdvancedOnly>
           </>
         )}
       </div>

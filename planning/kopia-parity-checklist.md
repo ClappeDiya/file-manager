@@ -11,7 +11,7 @@ Ground rules
 - Every item ships with tests; a box is ticked only when code, wiring (engine → IPC/CLI/API → UI where applicable) and tests are done and passing.
 
 ## WP0 — Foundations
-- [ ] K132 Backup screens honour Simple/Advanced mode (`AdvancedOnly` gate + store selector)
+- [x] K132 Backup screens honour Simple/Advanced mode (`AdvancedOnly` gate + store selector)
 - [ ] K130 SECURITY.md (disclosure policy, supported versions, response SLA)
 
 ## WP1 — Repository format v2 (ufop-core)

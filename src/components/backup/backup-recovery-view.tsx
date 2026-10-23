@@ -18,6 +18,7 @@ import {
 } from "@/stores/backup-store";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { BackupFileCrypt } from "./backup-file-crypt";
+import { AdvancedOnly } from "./advanced-only";
 
 export function BackupRecoveryView() {
   const [source, setSource] = useState("");
@@ -206,7 +207,9 @@ export function BackupRecoveryView() {
           {busy === "convert" ? "Converting…" : "Convert"}
         </Btn>
       </Section>
-      <BackupFileCrypt />
+      <AdvancedOnly hint>
+        <BackupFileCrypt />
+      </AdvancedOnly>
     </div>
   );
 }
