@@ -2,6 +2,7 @@
 //! the needed blocks, rebuild files to the original or an alternate
 //! location, verify their hashes and carry on past individual failures.
 
+use super::backend::Backend;
 use super::engine::Repo;
 use super::volume;
 use super::{hash_bytes, hash_file, meta, HashAlgorithm, EntryKind, FileEntry, OpContext, Phase, Progress};
@@ -517,8 +518,7 @@ fn check_space(path: Option<&Path>, need: u64, what: &str) -> Result<(), AppErro
 /// Hash files already present at the original paths (and overwrite
 /// targets) and stage any block the restore needs. Returns blocks found.
 fn harvest_local_blocks(repo: &Repo, jobs: &[Job], needed: &HashSet<&str>, spill: &Path, have: &mut HashSet<String>, ctx: &OpContext) -> Result<u64, AppError> {
-    use std::io::Read;
-    let bs = repo.header.block_size.max(1);
+    let chunker = repo.chunker();
     let mut candidates: Vec<&Path> = Vec::new();
     for j in jobs.iter().filter(|j| j.entry.kind == EntryKind::File) {
         candidates.push(Path::new(&j.entry.path));
@@ -527,34 +527,30 @@ fn harvest_local_blocks(repo: &Repo, jobs: &[Job], needed: &HashSet<&str>, spill
     candidates.sort();
     candidates.dedup();
     let mut found = 0u64;
-    let mut buf = vec![0u8; bs];
     for p in candidates {
         ctx.check()?;
         if have.len() >= needed.len() {
             break;
         }
-        let Ok(mut f) = std::fs::File::open(p) else { continue };
-        loop {
-            let mut n = 0;
-            while n < bs {
-                match f.read(&mut buf[n..]) {
-                    Ok(0) => break,
-                    Ok(k) => n += k,
-                    Err(_) => break,
-                }
-            }
-            if n == 0 {
-                break;
-            }
-            let h = hash_bytes(repo.header.block_hash, &buf[..n]);
+        let Ok(f) = std::fs::File::open(p) else { continue };
+        let mut f = std::io::BufReader::new(f);
+        // Cut with the repository's chunker (fixed or content-defined) so
+        // blocks line up with the backed-up ones.
+        let mut write_err = None;
+        let _ = super::chunker::for_each_chunk(&mut f, chunker.as_ref(), |chunk| {
+            let h = hash_bytes(repo.header.block_hash, chunk);
             if needed.contains(h.as_str()) && !have.contains(&h) {
-                std::fs::write(spill.join(&h), &buf[..n])?;
+                if let Err(e) = std::fs::write(spill.join(&h), chunk) {
+                    write_err = Some(e);
+                    return Ok(false);
+                }
                 have.insert(h);
                 found += 1;
             }
-            if n < bs {
-                break;
-            }
+            Ok(true)
+        });
+        if let Some(e) = write_err {
+            return Err(e.into());
         }
     }
     Ok(found)
@@ -813,7 +809,8 @@ mod tests {
         let r = run_restore(&repo, &o, &OpContext::new()).unwrap();
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         assert_eq!(r.volumes_downloaded, 0);
-        assert!(r.blocks_from_local >= 6);
+        // Every block came from the local file (count depends on the chunker).
+        assert!(r.blocks_from_local >= 1);
         assert_eq!(std::fs::read(out.path().join(src.path().file_name().unwrap()).join("big.bin")).unwrap(), big);
         // The staging folder is cleaned up.
         assert_eq!(std::fs::read_dir(out.path().join("tmp")).unwrap().count(), 0);

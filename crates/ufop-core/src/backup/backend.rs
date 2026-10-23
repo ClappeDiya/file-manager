@@ -64,6 +64,15 @@ pub trait Backend: Send + Sync {
         let _ = (name, until, mode);
         Err(AppError::validation(format!("{} does not support object locks", self.describe())))
     }
+    /// Whether names may contain one `/` (a subfolder, for sharded layouts).
+    fn supports_subfolders(&self) -> bool {
+        false
+    }
+    /// Every file, including those one subfolder down as `dir/name`.
+    /// Default: [`list`](Self::list) (backends without subfolders).
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
+        self.list()
+    }
     /// Connectivity test: lists the folder. `create` makes it first.
     fn test(&self, create: bool) -> Result<usize, AppError> {
         if create {
@@ -84,6 +93,8 @@ impl<T: Backend + ?Sized> Backend for Box<T> {
     fn quota(&self) -> Option<Quota> { (**self).quota() }
     fn supports_lock(&self) -> bool { (**self).supports_lock() }
     fn lock(&self, n: &str, u: chrono::DateTime<chrono::Utc>, m: LockMode) -> Result<(), AppError> { (**self).lock(n, u, m) }
+    fn supports_subfolders(&self) -> bool { (**self).supports_subfolders() }
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> { (**self).list_recursive() }
 }
 
 fn check_name(name: &str) -> Result<(), AppError> {
@@ -91,6 +102,14 @@ fn check_name(name: &str) -> Result<(), AppError> {
         return Err(AppError::validation(format!("Invalid remote volume name '{name}'")));
     }
     Ok(())
+}
+
+/// A name, or `dir/name` with one subfolder level (sharded layouts).
+fn check_path(name: &str) -> Result<(), AppError> {
+    match name.split_once('/') {
+        Some((dir, file)) => check_name(dir).and_then(|_| check_name(file)),
+        None => check_name(name),
+    }
 }
 
 /// Local disk, removable media or mounted share (including UNC paths).
@@ -185,8 +204,11 @@ impl Backend for LocalBackend {
     }
 
     fn put(&self, name: &str, data: &[u8]) -> Result<(), AppError> {
-        check_name(name)?;
+        check_path(name)?;
         let dest = self.root.join(name);
+        if let Some((dir, _)) = name.split_once('/') {
+            std::fs::create_dir_all(self.root.join(dir))?;
+        }
         let write = |p: &Path| -> std::io::Result<()> {
             let mut f = std::fs::File::create(p)?;
             std::io::Write::write_all(&mut f, data)?;
@@ -196,7 +218,10 @@ impl Backend for LocalBackend {
             Ok(())
         };
         if self.use_move {
-            let tmp = self.root.join(format!(".{name}.partial"));
+            let tmp = match name.split_once('/') {
+                Some((dir, file)) => self.root.join(dir).join(format!(".{file}.partial")),
+                None => self.root.join(format!(".{name}.partial")),
+            };
             write(&tmp)?;
             std::fs::rename(&tmp, &dest)?;
         } else {
@@ -215,16 +240,48 @@ impl Backend for LocalBackend {
     }
 
     fn get(&self, name: &str) -> Result<Vec<u8>, AppError> {
-        check_name(name)?;
+        check_path(name)?;
         Ok(std::fs::read(self.root.join(name))?)
     }
 
     fn delete(&self, name: &str) -> Result<(), AppError> {
-        check_name(name)?;
-        match std::fs::remove_file(self.root.join(name)) {
+        check_path(name)?;
+        let r = match std::fs::remove_file(self.root.join(name)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             r => Ok(r?),
+        };
+        if let Some((dir, _)) = name.split_once('/') {
+            // Drop the shard folder once empty (fails harmlessly otherwise).
+            let _ = std::fs::remove_dir(self.root.join(dir));
         }
+        r
+    }
+
+    fn supports_subfolders(&self) -> bool {
+        true
+    }
+
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
+        let mut out = self.list()?;
+        for e in std::fs::read_dir(&self.root)? {
+            let e = e?;
+            if !e.file_type()?.is_dir() {
+                continue;
+            }
+            let dir = e.file_name().to_string_lossy().into_owned();
+            if check_name(&dir).is_err() || dir.starts_with('.') {
+                continue;
+            }
+            for f in std::fs::read_dir(e.path())? {
+                let f = f?;
+                let md = f.metadata()?;
+                if md.is_file() {
+                    out.push(RemoteFile { name: format!("{dir}/{}", f.file_name().to_string_lossy()), size: md.len() });
+                }
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
     }
 
     fn create_folder(&self) -> Result<(), AppError> {
@@ -232,8 +289,11 @@ impl Backend for LocalBackend {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), AppError> {
-        check_name(from)?;
-        check_name(to)?;
+        check_path(from)?;
+        check_path(to)?;
+        if let Some((dir, _)) = to.split_once('/') {
+            std::fs::create_dir_all(self.root.join(dir))?;
+        }
         Ok(std::fs::rename(self.root.join(from), self.root.join(to))?)
     }
 }
@@ -384,6 +444,12 @@ impl<B: Backend> Backend for RetryingBackend<B> {
     fn rename(&self, a: &str, b: &str) -> Result<(), AppError> {
         self.retry("rename", || self.inner.rename(a, b))
     }
+    fn supports_subfolders(&self) -> bool {
+        self.inner.supports_subfolders()
+    }
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
+        self.retry("list", || self.inner.list_recursive())
+    }
 }
 
 /// Renames volumes to `{prefix}{name}` instead of deleting them.
@@ -414,6 +480,12 @@ impl<B: Backend> Backend for SoftDeleteBackend<B> {
     fn list(&self) -> Result<Vec<RemoteFile>, AppError> {
         Ok(self.inner.list()?.into_iter().filter(|f| !f.name.starts_with(&self.prefix)).collect())
     }
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
+        Ok(self.inner.list_recursive()?.into_iter().filter(|f| !super::layout::logical(&f.name).starts_with(&self.prefix)).collect())
+    }
+    fn supports_subfolders(&self) -> bool {
+        self.inner.supports_subfolders()
+    }
     fn put(&self, n: &str, d: &[u8]) -> Result<(), AppError> {
         self.inner.put(n, d)
     }
@@ -421,7 +493,11 @@ impl<B: Backend> Backend for SoftDeleteBackend<B> {
         self.inner.get(n)
     }
     fn delete(&self, n: &str) -> Result<(), AppError> {
-        self.inner.rename(n, &format!("{}{}", self.prefix, n))
+        let target = match n.rsplit_once('/') {
+            Some((dir, file)) => format!("{dir}/{}{file}", self.prefix),
+            None => format!("{}{}", self.prefix, n),
+        };
+        self.inner.rename(n, &target)
     }
     fn create_folder(&self) -> Result<(), AppError> {
         self.inner.create_folder()

@@ -12,7 +12,7 @@ default = []
 # `impl From<rusqlite::Error> for AppError`, for the desktop app's database.
 sqlite = ["dep:rusqlite"]
 # Deduplicated, compressed, encrypted versioned backup engine (`backup` module).
-backup = ["sqlite", "dep:windows", "dep:aes-gcm", "dep:argon2", "dep:flate2", "dep:rand", "dep:hex", "dep:zip", "dep:base64"]
+backup = ["sqlite", "dep:windows", "dep:aes-gcm", "dep:argon2", "dep:flate2", "dep:rand", "dep:hex", "dep:zip", "dep:base64", "dep:zstd", "dep:chacha20poly1305"]
 # Fleet agent: client side of the admin console's `/api/agent/*` protocol
 # (registration, claiming, heartbeats, commands, policies, reports).
 agent = ["dep:reqwest", "dep:tokio", "dep:base64"]
@@ -43,6 +43,8 @@ rand = { version = "0.8", optional = true }
 hex = { version = "0.4", optional = true }
 zip = { version = "2", optional = true, default-features = false, features = ["deflate", "bzip2", "zstd"] }
 base64 = { version = "0.22", optional = true }
+zstd = { version = "0.13", optional = true }
+chacha20poly1305 = { version = "0.10", optional = true }
 md-5 = { version = "0.10", optional = true }
 sha1 = { version = "0.10", optional = true }
 # TLS backends come from the consumer (the desktop app / CLI enable theirs).

@@ -5,7 +5,10 @@
 //!
 //! - [`EncryptionModule`]: seal/open whole volumes (built-ins: `aes`,
 //!   `none`; `gpg` in the desktop app). Plugged in through
-//!   [`super::crypto::VolumeCipher::external`].
+//!   [`super::crypto::VolumeCipher::external`]. The built-in passphrase
+//!   ciphers (`aes256_gcm`, and `chacha20_poly1305` for format 2) are
+//!   listed as encryption modules too; [`ModuleRegistry::cipher`] resolves
+//!   them for the repository header.
 //! - [`CompressionModule`]: per-block compression (built-ins: `deflate`,
 //!   `stored`, `bzip2`, `zstd`).
 //! - [`super::Backend`]: destinations (built-in: `file`; the desktop app
@@ -147,6 +150,10 @@ impl ModuleRegistry {
     pub fn encryption(&self, name: &str) -> Option<Arc<dyn EncryptionModule>> {
         self.encryption.get(name).cloned()
     }
+    /// A built-in passphrase cipher by name (`aes256_gcm`, `chacha20_poly1305`).
+    pub fn cipher(&self, name: &str) -> Option<super::crypto::CipherKind> {
+        super::crypto::CipherKind::parse(name)
+    }
     pub fn compression(&self, name: &str) -> Option<Arc<dyn CompressionModule>> {
         self.compression.get(name).cloned()
     }
@@ -160,6 +167,9 @@ impl ModuleRegistry {
     /// `(kind, name)` of every registered module.
     pub fn list(&self) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = Vec::new();
+        for c in [super::crypto::CipherKind::Aes256Gcm, super::crypto::CipherKind::ChaCha20Poly1305] {
+            v.push(("encryption".to_string(), c.as_str().to_string()));
+        }
         v.extend(self.encryption.keys().map(|k| ("encryption".to_string(), k.clone())));
         v.extend(self.compression.keys().map(|k| ("compression".to_string(), k.clone())));
         v.extend(self.backends.keys().map(|k| ("backend".to_string(), k.clone())));
@@ -211,6 +221,8 @@ mod tests {
         let mut r = ModuleRegistry::builtin();
         r.register_encryption(Arc::new(Rot13));
         assert!(r.list().contains(&("encryption".into(), "xor".into())));
+        assert!(r.list().contains(&("encryption".into(), "chacha20_poly1305".into())));
+        assert_eq!(r.cipher("chacha20_poly1305"), Some(crate::backup::crypto::CipherKind::ChaCha20Poly1305));
         let d = tempfile::tempdir().unwrap();
         let b = r.backend(&d.path().to_string_lossy()).unwrap();
         assert_eq!(b.test(false).unwrap(), 0);

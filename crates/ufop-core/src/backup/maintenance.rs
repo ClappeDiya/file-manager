@@ -163,10 +163,10 @@ pub fn verify(repo: &Repo, samples: Option<usize>, full: bool) -> Result<VerifyR
                     }
                 }
                 VolumeKind::Index => {
-                    serde_json::from_slice::<IndexVolume>(&payload)?;
+                    serde_json::from_slice::<IndexVolume>(&volume::decode_meta(payload)?)?;
                 }
                 VolumeKind::FileList => {
-                    serde_json::from_slice::<FileListVolume>(&payload)?;
+                    serde_json::from_slice::<FileListVolume>(&volume::decode_meta(payload)?)?;
                 }
             }
             Ok(())
@@ -217,7 +217,7 @@ pub fn recreate_database(
 ) -> Result<RecreateReport, AppError> {
     let opts = BackupOptions { prefix: prefix.to_string(), ..Default::default() };
     let repo = Repo::open(backend, db, passphrase, &opts, false, KdfParams::default())?;
-    let listing = backend.list()?;
+    let listing = repo.backend.list()?;
     let sizes: HashMap<&str, u64> = listing.iter().map(|f| (f.name.as_str(), f.size)).collect();
     db.clear()?;
     let mut r = RecreateReport::default();
@@ -225,7 +225,7 @@ pub fn recreate_database(
     db.begin()?;
     for f in listing.iter().filter(|f| volume::classify(prefix, &f.name) == Some(VolumeKind::Index)) {
         ctx.check()?;
-        let data = backend.get(&f.name)?;
+        let data = repo.backend.get(&f.name)?;
         let idx: IndexVolume = match volume::open_json(&repo.cipher, &data) {
             Ok(i) => i,
             Err(e) => {
@@ -250,7 +250,7 @@ pub fn recreate_database(
     // Block volumes with no index: read the volume itself.
     for f in listing.iter().filter(|f| volume::classify(prefix, &f.name) == Some(VolumeKind::Block) && !indexed.contains(&f.name)) {
         ctx.check()?;
-        let data = backend.get(&f.name)?;
+        let data = repo.backend.get(&f.name)?;
         match repo.cipher.open(&data).and_then(|p| volume::read_block_volume(&p)) {
             Ok(m) => {
                 let vid = db.add_volume(&f.name, VolumeKind::Block, f.size, &hash_bytes(HashAlgorithm::Sha256, &data), "uploaded")?;
@@ -266,7 +266,7 @@ pub fn recreate_database(
     }
     for f in listing.iter().filter(|f| volume::classify(prefix, &f.name) == Some(VolumeKind::FileList)) {
         ctx.check()?;
-        let data = backend.get(&f.name)?;
+        let data = repo.backend.get(&f.name)?;
         match volume::open_json::<FileListVolume>(&repo.cipher, &data) {
             Ok(fl) => {
                 db.add_volume(&f.name, VolumeKind::FileList, f.size, &hash_bytes(HashAlgorithm::Sha256, &data), "uploaded")?;
@@ -297,7 +297,7 @@ pub fn read_remote_task_config(
         .collect();
     lists.sort();
     for name in lists.iter().rev() {
-        let fl: FileListVolume = volume::open_json(&repo.cipher, &backend.get(name)?)?;
+        let fl: FileListVolume = volume::open_json(&repo.cipher, &repo.backend.get(name)?)?;
         if fl.task_config.is_some() {
             return Ok(fl.task_config);
         }
@@ -342,6 +342,7 @@ pub fn repair(repo: &Repo) -> Result<RepairReport, AppError> {
                         blocks: by_volume.get(&b.name).cloned().unwrap_or_default().into_iter().map(|(hash, size)| IndexedBlock { hash, size }).collect(),
                     };
                     let data = volume::seal_json(&repo.cipher, &idx)?;
+                    repo.note_write()?;
                     repo.backend.put(name, &data)?;
                     repo.db.add_volume(name, VolumeKind::Index, data.len() as u64, &hash_bytes(HashAlgorithm::Sha256, &data), "uploaded")?;
                     r.reuploaded.push(name.clone());
@@ -401,6 +402,27 @@ pub fn rebuild_missing_block_volumes(repo: &Repo, opts: &BackupOptions, ctx: &Op
                 continue;
             }
             let Ok(mut file) = std::fs::File::open(&f.path) else { continue };
+            if repo.header.chunker_spec().is_content_defined() {
+                // Variable-size blocks: re-cut the whole file and keep matches.
+                let chunker = repo.chunker();
+                let mut res: Result<(), AppError> = Ok(());
+                let _ = super::chunker::for_each_chunk(&mut std::io::BufReader::new(&mut file), chunker.as_ref(), |chunk| {
+                    let h = hash_bytes(repo.header.block_hash, chunk);
+                    if wanted.contains_key(&h) && !found.contains(&h) {
+                        res = pending.add_block(h.clone(), chunk, opts.compression_level);
+                        if res.is_ok() && pending.byte_size() >= opts.volume_size {
+                            res = flush(repo, &mut pending, opts, &mut scratch);
+                        }
+                        found.insert(h);
+                    }
+                    Ok(res.is_ok())
+                });
+                res?;
+                if found.len() == wanted.len() {
+                    break 'outer;
+                }
+                continue;
+            }
             for (i, b) in f.blocks.iter().enumerate() {
                 if !wanted.contains_key(b) || found.contains(b) {
                     continue;

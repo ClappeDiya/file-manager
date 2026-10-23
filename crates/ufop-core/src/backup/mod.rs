@@ -1,7 +1,8 @@
 //! Versioned backup engine: block-level deduplication, per-block compression,
 //! client-side AES-256-GCM encryption and remote volumes on any [`Backend`].
 //!
-//! Remote layout (all files live flat in the destination folder):
+//! Remote layout (all files live flat in the destination folder, unless a
+//! format v2 repository uses the sharded layout, see [`layout`]):
 //!
 //! - `{prefix}-repo.json` — unencrypted repository header: format version,
 //!   KDF salt/params and a key-check value. Never contains secrets.
@@ -11,16 +12,23 @@
 //! - `{prefix}-{UTC timestamp}.dlist[.aes]` — one backup version (file list).
 //! - `{prefix}-verification.json` — optional unencrypted SHA-256 inventory.
 //!
+//! Format v1 and v2 repositories are both read and written; see [`format`]
+//! for what v2 adds (envelope key, zstd, content-defined chunking,
+//! ChaCha20-Poly1305, sharding) and for upgrade / rollback / password change.
+//!
 //! The local database (`db`) is a cache of that remote state; `maintenance`
 //! can recreate it from the remote files when it is lost.
 
 pub mod backend;
+pub mod chunker;
 pub mod crypto;
 pub mod db;
 pub mod engine;
 pub mod filecrypt;
 pub mod filters;
+pub mod format;
 pub mod gpg;
+pub mod layout;
 pub mod maintenance;
 pub mod meta;
 pub mod mirror;
@@ -44,8 +52,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Repository format version written to `{prefix}-repo.json`.
-pub const REPO_FORMAT_VERSION: u32 = 1;
+/// Newest repository format version (written to new repositories by
+/// default). Format 1 stays fully readable and writable.
+pub const REPO_FORMAT_VERSION: u32 = 2;
+/// Oldest supported repository format version.
+pub const MIN_REPO_FORMAT_VERSION: u32 = 1;
 
 /// How symbolic links in the source are handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -102,6 +113,40 @@ pub enum VolumeFormat {
     Ufop,
     /// Standard ZIP archive (one entry per block, ZIP64 when needed).
     Zip,
+}
+
+/// Block compression codec in UFOP pack volumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockCodec {
+    /// Format v1 and v2.
+    #[default]
+    Deflate,
+    /// Format v2 only (the v2 default).
+    Zstd,
+}
+
+/// Compression of sealed metadata (dlist/dindex JSON).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataCompression {
+    /// Format v1.
+    #[default]
+    None,
+    /// Format v2.
+    Zstd,
+}
+
+/// How files are split into blocks (new repositories only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkerKind {
+    /// Fixed-size blocks of `block_size` (v1 and v2).
+    Fixed,
+    /// FastCDC content-defined chunking around `block_size` (v2 default).
+    #[default]
+    #[serde(rename = "fastcdc")]
+    FastCdc,
 }
 
 /// Compression method for ZIP volumes.
@@ -264,6 +309,20 @@ pub struct BackupOptions {
     pub kdf: Option<crypto::KdfParams>,
     /// What `photos://` (macOS Photos library) sources export.
     pub photos: photos::PhotosOptions,
+
+    // ── Repository format (new repositories only; existing ones keep theirs) ──
+    /// Format version for a new repository (`None` = [`REPO_FORMAT_VERSION`]).
+    pub format_version: Option<u32>,
+    /// Chunker for a new v2 repository (`None` = FastCDC). v1 is always fixed.
+    pub chunker: Option<ChunkerKind>,
+    /// Block codec for a new v2 repository (`None` = zstd). v1 is always deflate.
+    pub block_codec: Option<BlockCodec>,
+    /// Metadata compression for a new v2 repository (`None` = zstd). v1 never compresses.
+    pub metadata_compression: Option<MetadataCompression>,
+    /// AEAD for a new encrypted v2 repository (v1 is always AES-256-GCM).
+    pub cipher: crypto::CipherKind,
+    /// Destination layout for a new v2 repository.
+    pub layout: layout::RepoLayout,
 }
 
 /// How volumes are encrypted.
@@ -344,6 +403,12 @@ impl Default for BackupOptions {
             gpg: GpgOptions::default(),
             kdf: None,
             photos: photos::PhotosOptions::default(),
+            format_version: None,
+            chunker: None,
+            block_codec: None,
+            metadata_compression: None,
+            cipher: crypto::CipherKind::Aes256Gcm,
+            layout: layout::RepoLayout::Flat,
         }
     }
 }

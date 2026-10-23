@@ -7,6 +7,7 @@
 //! a half-finished replica invisible to restores.
 
 use super::backend::Backend;
+use super::layout::LayoutBackend;
 use super::volume;
 use super::{hash_bytes, HashAlgorithm, OpContext, Phase, Progress};
 use crate::error::AppError;
@@ -52,6 +53,17 @@ fn ours(prefix: &str, name: &str) -> bool {
 /// Make `dst` hold the same repository files as `src`.
 pub fn mirror(src: &dyn Backend, dst: &dyn Backend, prefix: &str, opts: &MirrorOptions, ctx: &OpContext) -> Result<MirrorReport, AppError> {
     let header = volume::repo_header_name(prefix);
+    // Both sides use the source repository's layout (sharded volumes are
+    // copied into the same shard folders).
+    let layout = src.get(&header).ok().and_then(|h| serde_json::from_slice::<super::volume::RepoHeader>(&h).ok()).map(|h| h.layout).unwrap_or_default();
+    if layout.is_sharded() && !dst.supports_subfolders() {
+        return Err(AppError::state(
+            format!("{} does not support subfolders, which this sharded backup needs", dst.describe()),
+            "Reshard the backup to the flat layout first, or mirror to a destination with folders.",
+        ));
+    }
+    let (src_l, dst_l) = (LayoutBackend::new(src, layout, prefix), LayoutBackend::new(dst, layout, prefix));
+    let (src, dst): (&dyn Backend, &dyn Backend) = (&src_l, &dst_l);
     let source: Vec<_> = src.list()?.into_iter().filter(|f| ours(prefix, &f.name)).collect();
     if !source.iter().any(|f| f.name == header) {
         return Err(AppError::file_op(format!("No backup with prefix '{prefix}' at {}", src.describe()), "Check the source destination and prefix."));

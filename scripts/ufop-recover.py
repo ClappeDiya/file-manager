@@ -2,9 +2,10 @@
 """Independent UFOP backup recovery: list and restore a backup folder
 without UFOP itself.
 
-Needs only Python 3.9+ and the `cryptography` package (for AES-256-GCM
-and Argon2id; `pip install cryptography`). ZIP volumes using Zstandard
-also need Python 3.14+ or the `zstandard` package.
+Needs only Python 3.9+ and the `cryptography` package (for AES-256-GCM,
+ChaCha20-Poly1305 and Argon2id; `pip install cryptography`). Zstandard
+data (format 2 blocks and metadata, ZIP volumes using zstd) also needs
+Python 3.14+ or the `zstandard` package.
 
     UFOP_PASSPHRASE=… ufop-recover.py list    /mnt/backup
     UFOP_PASSPHRASE=… ufop-recover.py restore /mnt/backup /tmp/out [--version 0] [--path PATTERN]…
@@ -13,18 +14,30 @@ The folder is the backup destination (local disk, removable drive or a
 mounted share). Files are verified against their recorded hashes; files
 with missing data are written with zero-filled gaps and reported.
 
-Format (see crates/ufop-core/src/backup/{crypto,volume}.rs):
-  <prefix>-repo.json        JSON header: encrypted, salt (hex), kdf
-                            {memory_kib, iterations, parallelism}, key_check,
-                            block_size, block_hash, file_hash, volume_format
-  volumes                   "UFOPV1" + flag (0 plain, 1 AES, 2 external module)
-                            flag 1: nonce(12) | AES-GCM(master, file key)(48)
-                                    | nonce(12) | AES-GCM(file key, payload)
+Format (see crates/ufop-core/src/backup/{crypto,volume,format,layout}.rs):
+  <prefix>-repo.json        JSON header: format_version, encrypted, salt (hex),
+                            kdf {memory_kib, iterations, parallelism}, key_check,
+                            block_size, block_hash, file_hash, volume_format;
+                            format 2 adds cipher (aes256_gcm | chacha20_poly1305),
+                            wrapped_master_key (hex nonce | AEAD(KEK, master key)),
+                            chunker, block_codec, metadata_compression, layout
+  key                       KEK = Argon2id(passphrase, salt); key_check is sealed
+                            with the KEK. Format 1: volumes use the KEK. Format 2:
+                            volumes use the master key unwrapped with the KEK.
+  volumes                   "UFOPV1" + flag (0 plain, 1 AES-256-GCM, 2 external
+                            module, 3 ChaCha20-Poly1305)
+                            flag 1/3: nonce(12) | AEAD(master, file key)(48)
+                                      | nonce(12) | AEAD(file key, payload)
   dlist payload             JSON {timestamp, partial, files: [FileEntry]}
   dindex payload            JSON {block_volume, blocks: [{hash, size}]}
+                            (format 2: zstd-compressed JSON, zstd frame magic)
   dblock payload (ufop)     u32 count, then per block: u8 len | hash | u8 flag
-                            (0 raw, 1 raw deflate) | u32 len | data
+                            (0 raw, 1 raw deflate, 2 zstd) | u32 len | data
   dblock payload (zip)      ZIP archive, one entry per block named by its hash
+  layout                    flat, or (format 2 "sharded") dblock/dindex volumes
+                            in one level of subfolders
+  blocks                    fixed block_size, or content-defined (variable size;
+                            file offsets are the running sum of block sizes)
 """
 import argparse
 import fnmatch
@@ -55,6 +68,18 @@ def _aes():
     return AESGCM
 
 
+def _chacha():
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    except ImportError:
+        raise Fail("This backup is encrypted: install the 'cryptography' package (pip install cryptography)")
+    return ChaCha20Poly1305
+
+
+def _aead(header):
+    return _chacha() if header.get("cipher") == "chacha20_poly1305" else _aes()
+
+
 def derive_key(passphrase, header):
     try:
         from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
@@ -69,13 +94,22 @@ def derive_key(passphrase, header):
         memory_cost=kdf["memory_kib"],
     ).derive(passphrase.encode())
     raw = bytes.fromhex(header.get("key_check") or "")
+    aead = _aead(header)
     try:
-        if _aes()(key).decrypt(raw[:12], raw[12:], None) != KEY_CHECK:
+        if aead(key).decrypt(raw[:12], raw[12:], None) != KEY_CHECK:
             raise Fail("Key check mismatch")
     except Fail:
         raise
     except Exception:
         raise Fail("The passphrase is incorrect")
+    wrapped = header.get("wrapped_master_key")
+    if wrapped:
+        # Format 2 envelope: the derived key only unwraps the master key.
+        w = bytes.fromhex(wrapped)
+        try:
+            key = aead(key).decrypt(w[:12], w[12:], None)
+        except Exception:
+            raise Fail("The wrapped repository key is damaged")
     return key
 
 
@@ -85,16 +119,16 @@ def open_volume(data, key):
     flag = data[6]
     if flag == 0:
         return data[7:]
-    if flag == 1:
+    if flag in (1, 3):
         if key is None:
             raise Fail("volume is encrypted but no passphrase was given")
         body = data[7:]
         if len(body) < 12 + 48 + 12 + 16:
             raise Fail("encrypted volume is truncated")
-        aes = _aes()
+        aead = _chacha() if flag == 3 else _aes()
         try:
-            file_key = aes(key).decrypt(body[:12], body[12:60], None)
-            return aes(file_key).decrypt(body[60:72], body[72:], None)
+            file_key = aead(key).decrypt(body[:12], body[12:60], None)
+            return aead(file_key).decrypt(body[60:72], body[72:], None)
         except Exception:
             raise Fail("decryption failed (damaged volume)")
     if flag == 2:
@@ -111,8 +145,18 @@ def _zstd(raw):
     try:
         import zstandard
     except ImportError:
-        raise Fail("ZIP volume uses Zstandard: use Python 3.14+ or pip install zstandard")
+        raise Fail("this backup uses Zstandard: use Python 3.14+ or pip install zstandard")
     return zstandard.ZstdDecompressor().decompressobj().decompress(raw)
+
+
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def meta_json(payload):
+    """Parse dlist/dindex JSON (zstd-compressed in format 2)."""
+    if payload[:4] == ZSTD_MAGIC:
+        payload = _zstd(payload)
+    return json.loads(payload)
 
 
 def _zip_entry(buf, zf, info):
@@ -157,6 +201,8 @@ def read_blocks(payload):
             out[h] = d
         elif flag == 1:
             out[h] = zlib.decompress(d, -15)
+        elif flag == 2:
+            out[h] = _zstd(d)
         else:
             raise Fail("unknown block flag %d" % flag)
     return out
@@ -180,17 +226,29 @@ class Backup:
             if not passphrase:
                 raise Fail("this backup is encrypted: set UFOP_PASSPHRASE or use --passphrase")
             self.key = derive_key(passphrase, self.header)
-        names = sorted(os.listdir(folder))
-        self.names = [n for n in names if n.startswith(prefix + "-") and not n.endswith(".par2")]
+        # Physical location of each volume (sharded layouts use one level of
+        # subfolders), keyed by the volume name.
+        self.paths = {}
+        for n in os.listdir(folder):
+            full = os.path.join(folder, n)
+            if os.path.isdir(full) and not n.startswith("."):
+                for m in os.listdir(full):
+                    self.paths.setdefault(m, os.path.join(full, m))
+            else:
+                self.paths[n] = full
+        self.names = sorted(n for n in self.paths if n.startswith(prefix + "-") and not n.endswith(".par2"))
+        chunker = self.header.get("chunker") or {"type": "fixed"}
+        self.variable_blocks = chunker.get("type") != "fixed"
 
     def kind(self, name):
         rest = name[len(self.prefix) + 1:]
-        if rest.endswith(".aes"):
-            rest = rest[:-4]
+        for ext in (".aes", ".gpg"):
+            if rest.endswith(ext):
+                rest = rest[:-len(ext)]
         return rest.rsplit(".", 1)[-1] if "." in rest else None
 
     def payload(self, name):
-        with open(os.path.join(self.folder, name), "rb") as f:
+        with open(self.paths[name], "rb") as f:
             return open_volume(f.read(), self.key)
 
     def versions(self):
@@ -200,33 +258,37 @@ class Backup:
             if self.kind(n) != "dlist":
                 continue
             try:
-                out.append((n, json.loads(self.payload(n))))
+                out.append((n, meta_json(self.payload(n))))
             except (Fail, ValueError) as e:
                 print("warning: %s unreadable: %s" % (n, e), file=sys.stderr)
         out.sort(key=lambda v: v[1]["timestamp"], reverse=True)
         return out
 
     def block_index(self, needed):
-        """hash -> volume name, from index volumes, then by scanning block volumes."""
+        """(hash -> volume name, hash -> size), from index volumes, then by
+        scanning block volumes."""
         where = {}
+        sizes = {}
         for n in self.names:
             if self.kind(n) == "dindex":
                 try:
-                    idx = json.loads(self.payload(n))
+                    idx = meta_json(self.payload(n))
                     for b in idx["blocks"]:
                         where[b["hash"]] = idx["block_volume"]
+                        sizes[b["hash"]] = b["size"]
                 except (Fail, ValueError, KeyError):
                     pass
         present = set(self.names)
-        if any(h not in where or where[h] not in present for h in needed):
+        if any(h not in where or where[h] not in present or h not in sizes for h in needed):
             for n in self.names:
                 if self.kind(n) == "dblock":
                     try:
-                        for h in read_blocks(self.payload(n)):
+                        for h, d in read_blocks(self.payload(n)).items():
                             where.setdefault(h, n)
+                            sizes.setdefault(h, len(d))
                     except Fail as e:
                         print("warning: %s: %s" % (n, e), file=sys.stderr)
-        return {h: v for h, v in where.items() if v in present}
+        return {h: v for h, v in where.items() if v in present}, sizes
 
 
 def selected(path, patterns):
@@ -274,7 +336,7 @@ def cmd_restore(b, args):
     base = relative_target([e["path"] for e in entries])
     bs = b.header["block_size"]
     needed = {h for e in entries if e["kind"] == "file" for h in e["blocks"]}
-    where = b.block_index(needed)
+    where, sizes = b.block_index(needed)
 
     def dest(path):
         p = path.replace("\\", "/")
@@ -300,8 +362,17 @@ def cmd_restore(b, args):
             os.makedirs(os.path.dirname(d), exist_ok=True)
             with open(d, "wb") as f:
                 f.truncate(e["size"])
+            off = 0
             for bi, h in enumerate(e["blocks"]):
-                jobs.setdefault(where.get(h), []).append((i, bi * bs, h))
+                if not b.variable_blocks:
+                    off = bi * bs
+                elif off is None:
+                    # Unknown size of an earlier block: position unknown.
+                    jobs.setdefault(None, []).append((i, 0, h))
+                    continue
+                jobs.setdefault(where.get(h), []).append((i, off, h))
+                if b.variable_blocks:
+                    off = off + sizes[h] if h in sizes else None
     missing = {}
     for vol, items in jobs.items():
         blocks = {}

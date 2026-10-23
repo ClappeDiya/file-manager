@@ -8,7 +8,9 @@
 //! thread.
 
 use super::backend::Backend;
+use super::chunker::{for_each_chunk, Chunker};
 use super::crypto::{KdfParams, VolumeCipher};
+use super::layout::LayoutBackend;
 use super::db::BackupDb;
 use super::filters::SourceFilter;
 use super::par2::{self, Par2};
@@ -16,14 +18,13 @@ use super::retention::RetentionPolicy;
 use super::volume::{self, BlockVolumeWriter, ControlFile, FileListVolume, IndexVolume, IndexedBlock, RepoHeader, VolumeKind};
 use super::{
     hash_bytes, meta, BackupOptions, EntryKind, FileEntry, FileHasher, HashAlgorithm, MissingSourcePolicy, OpContext, Phase, Progress, SymlinkPolicy,
-    UsnPolicy, REPO_FORMAT_VERSION,
+    UsnPolicy,
 };
 use super::snapshot::SnapshotPolicy;
 use crate::error::AppError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -31,13 +32,17 @@ use std::time::Instant;
 
 /// An opened repository: backend + local database + key material.
 pub struct Repo<'a> {
-    pub backend: &'a dyn Backend,
+    /// The destination seen through the repository layout (logical names).
+    pub backend: LayoutBackend<'a>,
     pub db: &'a BackupDb,
     pub cipher: VolumeCipher,
     pub header: RepoHeader,
     pub prefix: String,
     pub par2: Option<Par2>,
     pub case_insensitive: bool,
+    /// An upgraded repository still offers rollback to format 1 until the
+    /// first format-2 write (see [`Repo::note_write`]).
+    rollback_pending: AtomicBool,
 }
 
 impl<'a> Repo<'a> {
@@ -89,9 +94,7 @@ impl<'a> Repo<'a> {
         let found = listing.iter().find(|f| f.name == header_name || (options.remote_case_insensitive && f.name.eq_ignore_ascii_case(&header_name)));
         let (header, cipher) = if let Some(hf) = found {
             let header: RepoHeader = serde_json::from_slice(&backend.get(&hf.name)?)?;
-            if header.format_version > REPO_FORMAT_VERSION {
-                return Err(AppError::validation(format!("This backup was written by a newer version (format {}); update the app", header.format_version)));
-            }
+            super::format::check_readable(&header)?;
             let external = match external {
                 None if header.encrypted && header.encryption_module == "gpg" => Some(VolumeCipher::external(std::sync::Arc::new(super::gpg::GpgModule { recipients: header.gpg_recipients.clone(), ..(*gpg_from_options()).clone() }))),
                 other => other,
@@ -113,28 +116,7 @@ impl<'a> Repo<'a> {
                 }
                 other => other,
             };
-            let (cipher, salt) = match (external, passphrase.filter(|p| !p.is_empty())) {
-                (Some(ext), _) => (ext, None),
-                (None, Some(p)) => {
-                    let salt = VolumeCipher::random_salt();
-                    (VolumeCipher::derive(p, &salt, kdf)?, Some(hex::encode(&salt)))
-                }
-                (None, None) => (VolumeCipher::plain(), None),
-            };
-            let aes = salt.is_some();
-            let header = RepoHeader {
-                format_version: REPO_FORMAT_VERSION,
-                encrypted: cipher.is_encrypted(),
-                salt,
-                kdf: aes.then_some(kdf),
-                key_check: if cipher.is_encrypted() { cipher.key_check()? } else { None },
-                block_size: options.block_size.max(1024),
-                block_hash: options.block_hash,
-                file_hash: options.file_hash,
-                volume_format: options.volume_format,
-                encryption_module: if aes { "aes".into() } else if cipher.is_encrypted() { cipher.module_name() } else { String::new() },
-                gpg_recipients: if cipher.module_name() == "gpg" { options.gpg.recipients.clone() } else { Vec::new() },
-            };
+            let (header, cipher) = super::format::create_header(options, passphrase, external, kdf, backend)?;
             if !options.dry_run {
                 backend.create_folder()?;
                 backend.put(&header_name, &serde_json::to_vec_pretty(&header)?)?;
@@ -142,7 +124,31 @@ impl<'a> Repo<'a> {
             (header, cipher)
         };
         let par2 = options.par2.enabled.then(|| Par2::new(options.par2.clone(), options.temp_root()));
-        Ok(Self { backend, db, cipher, header, prefix: options.prefix.clone(), par2, case_insensitive: options.remote_case_insensitive })
+        let rollback_pending = AtomicBool::new(header.has_feature(super::format::FEATURE_V1_ROLLBACK));
+        Ok(Self {
+            backend: LayoutBackend::new(backend, header.layout, &options.prefix),
+            db,
+            cipher,
+            header,
+            prefix: options.prefix.clone(),
+            par2,
+            case_insensitive: options.remote_case_insensitive,
+            rollback_pending,
+        })
+    }
+
+    /// Record that format-2 data is about to be written: an upgraded
+    /// repository loses its rollback option (once, before the first write).
+    pub(crate) fn note_write(&self) -> Result<(), AppError> {
+        if self.rollback_pending.swap(false, Ordering::SeqCst) {
+            super::format::clear_rollback(self.backend.inner(), &self.prefix)?;
+        }
+        Ok(())
+    }
+
+    /// The chunker new blocks are cut with.
+    pub fn chunker(&self) -> Box<dyn Chunker> {
+        self.header.chunker_spec().build()
     }
 
     fn par2_key(name: &str) -> String {
@@ -165,6 +171,7 @@ impl<'a> Repo<'a> {
         if dry_run {
             return Ok(-1);
         }
+        self.note_write()?;
         self.db.add_volume(name, kind, data.len() as u64, &h, "uploading")?;
         self.backend.put(name, data)?;
         if kind != VolumeKind::Index {
@@ -219,7 +226,7 @@ impl<'a> Repo<'a> {
 
     /// Database-free volume downloader that worker threads can share.
     pub(crate) fn fetcher(&self) -> VolumeFetcher<'_> {
-        VolumeFetcher { backend: self.backend, par2: self.par2.as_ref(), case_insensitive: self.case_insensitive }
+        VolumeFetcher { backend: &self.backend, par2: self.par2.as_ref(), case_insensitive: self.case_insensitive }
     }
 
     /// Write a sealed file list for `files` and record the version.
@@ -250,6 +257,7 @@ impl<'a> Repo<'a> {
         let extra: DlistExtra = self.db.get_kv(&format!("dlist_extra:{timestamp}"))?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let fl = FileListVolume { timestamp: timestamp.to_string(), partial, files: files.to_vec(), task_config: extra.task_config, control_files: extra.control_files };
         let data = volume::seal_json(&self.cipher, &fl)?;
+        self.note_write()?;
         self.backend.put(volume_name, &data)?;
         self.put_recovery(volume_name, &data)?;
         self.db.add_volume(volume_name, VolumeKind::FileList, data.len() as u64, &hash_bytes(HashAlgorithm::Sha256, &data), "uploaded")?;
@@ -283,9 +291,7 @@ impl<'a> Repo<'a> {
 
 /// The volume cipher for an existing repository header.
 pub fn header_cipher(header: &RepoHeader, passphrase: Option<&str>, external: Option<VolumeCipher>) -> Result<VolumeCipher, AppError> {
-    if header.format_version > REPO_FORMAT_VERSION {
-        return Err(AppError::validation(format!("This backup was written by a newer version (format {}); update the app", header.format_version)));
-    }
+    super::format::check_readable(header)?;
     let external = match external {
         None if header.encrypted && header.encryption_module == "gpg" => Some(VolumeCipher::external(std::sync::Arc::new(super::gpg::GpgModule {
             passphrase: passphrase.filter(|p| !p.is_empty()).map(String::from),
@@ -294,7 +300,7 @@ pub fn header_cipher(header: &RepoHeader, passphrase: Option<&str>, external: Op
         }))),
         other => other,
     };
-    Ok(match (header.encrypted, external) {
+    let cipher = match (header.encrypted, external) {
         (true, Some(ext)) => {
             // Key-encrypted GPG backups are written by machines that may not
             // hold the secret key, so only symmetric checks are verified.
@@ -307,12 +313,18 @@ pub fn header_cipher(header: &RepoHeader, passphrase: Option<&str>, external: Op
         (true, None) => {
             let pass = passphrase.filter(|p| !p.is_empty()).ok_or_else(|| AppError::validation("This backup is encrypted; enter its passphrase"))?;
             let salt = hex::decode(header.salt.as_deref().unwrap_or_default()).map_err(|_| AppError::validation("Repository header salt is malformed"))?;
-            let c = VolumeCipher::derive(pass, &salt, header.kdf.unwrap_or_default())?;
-            c.verify_key_check(header.key_check.as_deref().unwrap_or_default())?;
-            c
+            // v1: the derived key encrypts volumes. v2: it is the KEK that
+            // unwraps the master key.
+            let kek = VolumeCipher::derive(pass, &salt, header.kdf.unwrap_or_default())?.with_aead(header.cipher);
+            kek.verify_key_check(header.key_check.as_deref().unwrap_or_default())?;
+            match header.wrapped_master_key.as_deref() {
+                Some(w) => kek.unwrap_key(w, header.cipher)?,
+                None => kek,
+            }
         }
         (false, _) => VolumeCipher::plain(),
-    })
+    };
+    Ok(super::format::configure_cipher(header, cipher))
 }
 
 /// Downloads a volume, checks it against its recorded SHA-256 and, when
@@ -429,11 +441,11 @@ pub(crate) struct Pending {
 
 impl Pending {
     pub(crate) fn for_repo(repo: &Repo, opts: &BackupOptions) -> Self {
-        Self { writer: BlockVolumeWriter::with_format(repo.header.volume_format, opts.zip_method), sizes: Vec::new(), hashes: HashSet::new() }
+        Self { writer: BlockVolumeWriter::with_format(repo.header.volume_format, opts.zip_method).with_codec(repo.header.block_codec), sizes: Vec::new(), hashes: HashSet::new() }
     }
 
     pub(crate) fn add_block(&mut self, hash: String, data: &[u8], level: u32) -> Result<(), AppError> {
-        let (flag, enc) = volume::encode_block(self.writer.format(), data, level)?;
+        let (flag, enc) = volume::encode_block(self.writer.format(), self.writer.codec(), data, level)?;
         self.add_encoded(hash, flag, enc, data.len() as u64);
         Ok(())
     }
@@ -452,8 +464,8 @@ impl Pending {
         if self.writer.is_empty() {
             return None;
         }
-        let fmt = self.writer.format();
-        let w = std::mem::replace(&mut self.writer, BlockVolumeWriter::with_format(fmt, Default::default()));
+        let (fmt, codec) = (self.writer.format(), self.writer.codec());
+        let w = std::mem::replace(&mut self.writer, BlockVolumeWriter::with_format(fmt, Default::default()).with_codec(codec));
         self.hashes.clear();
         Some((w, std::mem::take(&mut self.sizes)))
     }
@@ -501,10 +513,11 @@ pub(crate) fn flush(repo: &Repo, p: &mut Pending, opts: &BackupOptions, report: 
     if opts.dry_run {
         return Ok(());
     }
+    repo.note_write()?;
     repo.db.add_volume(&v.block_name, VolumeKind::Block, v.block_data.len() as u64, &hash_bytes(HashAlgorithm::Sha256, &v.block_data), "uploading")?;
     repo.backend.put(&v.block_name, &v.block_data)?;
     let par2_names = match &repo.par2 {
-        Some(p) => upload_recovery(repo.backend, p, &v.block_name, &v.block_data)?,
+        Some(p) => upload_recovery(&repo.backend, p, &v.block_name, &v.block_data)?,
         None => Vec::new(),
     };
     repo.backend.put(&v.index_name, &v.index_data)?;
@@ -1000,7 +1013,8 @@ enum Msg {
 }
 
 struct WorkerCfg {
-    block_size: usize,
+    chunker: Box<dyn Chunker>,
+    codec: super::BlockCodec,
     read_buf: usize,
     block_hash: HashAlgorithm,
     file_hash: HashAlgorithm,
@@ -1016,37 +1030,23 @@ fn read_file(cfg: &WorkerCfg, idx: usize, path: &Path, level: u32, tx: &mpsc::Sy
     if cfg.respect_locks && meta::is_advisory_locked(&f) {
         return Err("locked by another program (advisory lock)".into());
     }
-    let mut f = std::io::BufReader::with_capacity(cfg.read_buf.max(cfg.block_size), f);
-    let mut buf = vec![0u8; cfg.block_size];
+    let mut f = std::io::BufReader::with_capacity(cfg.read_buf.max(cfg.chunker.max_size()), f);
     let mut fh = FileHasher::new(cfg.file_hash);
-    let mut size = 0u64;
-    loop {
+    let size = for_each_chunk(&mut f, cfg.chunker.as_ref(), |chunk| {
         if stop() {
             return Err("cancelled".into());
         }
-        let mut filled = 0;
-        while filled < cfg.block_size {
-            let n = f.read(&mut buf[filled..]).map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
-            }
-            filled += n;
-        }
-        if filled == 0 {
-            break;
-        }
-        let chunk = &buf[..filled];
         fh.update(chunk);
-        size += filled as u64;
         let hash = hash_bytes(cfg.block_hash, chunk);
-        let (flag, data) = volume::encode_block(cfg.format, chunk, level).map_err(|e| e.user_message())?;
-        tx.send(Msg::Block { idx, hash, flag, data, raw_len: filled as u64 }).map_err(|_| "pipeline closed".to_string())?;
+        let (flag, data) = volume::encode_block(cfg.format, cfg.codec, chunk, level).map_err(|e| e.user_message())?;
+        tx.send(Msg::Block { idx, hash, flag, data, raw_len: chunk.len() as u64 }).map_err(|_| "pipeline closed".to_string())?;
         if !cfg.pause.is_zero() {
             std::thread::sleep(cfg.pause);
         }
-        if filled < cfg.block_size {
-            break;
-        }
+        Ok(true)
+    })?;
+    if stop() {
+        return Err("cancelled".into());
     }
     tx.send(Msg::Done { idx, size, hash: fh.finish() }).map_err(|_| "pipeline closed".to_string())
 }
@@ -1237,7 +1237,8 @@ pub fn run_backup_with_cipher(
         move || abort.load(Ordering::SeqCst) || ctx.is_cancelled()
     };
     let cfg = WorkerCfg {
-        block_size: repo.header.block_size,
+        chunker: repo.chunker(),
+        codec: repo.header.block_codec,
         read_buf: opts.read_buffer_size,
         block_hash: repo.header.block_hash,
         file_hash: repo.header.file_hash,
@@ -1285,7 +1286,7 @@ pub fn run_backup_with_cipher(
         let (res_tx, res_rx) = mpsc::channel::<UploadResult>();
         if !opts.dry_run {
             for _ in 0..uploaders {
-                let (job_rx, res_tx, par2) = (job_rx.clone(), res_tx.clone(), repo.par2.as_ref());
+                let (job_rx, res_tx, par2, backend) = (job_rx.clone(), res_tx.clone(), repo.par2.as_ref(), &repo.backend);
                 scope.spawn(move || loop {
                     let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                     let Ok(v) = job else { break };
@@ -1321,6 +1322,7 @@ pub fn run_backup_with_cipher(
             if opts.dry_run {
                 return Ok(());
             }
+            repo.note_write()?;
             repo.db.add_volume(&v.block_name, VolumeKind::Block, v.block_data.len() as u64, &hash_bytes(HashAlgorithm::Sha256, &v.block_data), "uploading")?;
             in_flight.extend(v.blocks.iter().map(|(h, _)| h.clone()));
             job_tx.send(v).map_err(|_| AppError::internal("upload pool stopped"))
@@ -1629,7 +1631,7 @@ mod tests {
         let o = BackupOptions { kdf: Some(custom), ..opts() };
         run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
         let header: RepoHeader = serde_json::from_slice(&std::fs::read(dst.path().join("ufop-repo.json")).unwrap()).unwrap();
-        assert_eq!((header.kdf, header.encryption_module.as_str(), header.format_version), (Some(custom), "aes", REPO_FORMAT_VERSION));
+        assert_eq!((header.kdf, header.encryption_module.as_str(), header.format_version), (Some(custom), "aes", crate::backup::REPO_FORMAT_VERSION));
         assert_eq!(KdfParams::preset("interactive").unwrap().memory_kib, 19 * 1024);
         assert!(KdfParams::preset("sensitive").unwrap().validate().is_ok() && KdfParams::preset("x").is_none());
     }
@@ -1826,7 +1828,8 @@ mod tests {
         write(src.path(), "f", &vec![7u8; 3000]);
         let be = LocalBackend::new(dst.path());
         let db = BackupDb::open_in_memory().unwrap();
-        let o = BackupOptions { quota_size: Some(1000), quota_warning_percent: 10, ..opts() };
+        // Sizes below assume format 1 (deflate, uncompressed metadata).
+        let o = BackupOptions { quota_size: Some(1000), quota_warning_percent: 10, format_version: Some(1), ..opts() };
         let r = run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll,
             None, KdfParams::insecure_fast(), &OpContext::new()).unwrap();
         assert!(r.warnings.iter().any(|w| w.contains("nearly full")), "{:?}", r.warnings);
