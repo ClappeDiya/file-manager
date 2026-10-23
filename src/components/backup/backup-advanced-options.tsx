@@ -4,9 +4,10 @@
  * cadence. Each field maps 1:1 onto `BackupOptions` in ufop-core.
  */
 import { inputCls } from "@/lib/backup-helpers";
-import { KDF_PRESETS, parseTags, tagText, type BackupOptions, type LockMode, type SnapshotPolicy, type UsnPolicy, type VolumeFormat, type ZipMethod } from "@/stores/backup-store";
+import { KDF_PRESETS, parseTags, tagText, type BackupOptions, type LockMode, type SnapshotPolicy, type SnapshotProvider, type UsnPolicy, type VolumeFormat, type ZipMethod } from "@/stores/backup-store";
 import { Check, Field, Section } from "./backup-ui";
 import { RepositoryFormatOptions } from "./backup-repository-format";
+import { SourcesAndRunsOptions } from "./backup-run-options";
 
 const lines = (v: string) => v.split("\n").map((s) => s.trim()).filter(Boolean);
 const num = (v: string, min = 0, max = Number.MAX_SAFE_INTEGER) => Math.min(max, Math.max(min, Math.floor(Number(v) || 0)));
@@ -131,7 +132,7 @@ export function BackupAdvancedOptions({
         </div>
       </Section>
 
-      <Section title="Snapshots" hint="Read a frozen point-in-time copy so open or changing files are consistent: VSS on Windows, LVM on Linux, APFS on macOS (administrator/root rights needed). Test it from Maintenance.">
+      <Section title="Snapshots" hint="Read a frozen point-in-time copy so open or changing files are consistent: VSS on Windows, ZFS, btrfs or LVM on Linux, APFS on macOS (administrator/root rights needed). Test it from Maintenance.">
         <Field label="Use a snapshot">
           <select data-testid="opt-snapshot" className={inputCls} value={o.snapshot_policy} onChange={(e) => onChange({ snapshot_policy: e.target.value as SnapshotPolicy })}>
             <option value="off">Off (read live files)</option>
@@ -142,6 +143,14 @@ export function BackupAdvancedOptions({
         </Field>
         {o.snapshot_policy !== "off" && (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <Field label="Linux snapshot method" hint="Automatic picks ZFS, btrfs or LVM from each source's filesystem.">
+              <select data-testid="opt-snapshot-provider" className={inputCls} value={o.snapshot.provider ?? "auto"} onChange={(e) => onChange({ snapshot: { ...o.snapshot, provider: e.target.value as SnapshotProvider } })}>
+                <option value="auto">Automatic</option>
+                <option value="zfs">ZFS dataset snapshot</option>
+                <option value="btrfs">btrfs subvolume snapshot</option>
+                <option value="lvm">LVM volume snapshot</option>
+              </select>
+            </Field>
             <Field label="LVM snapshot size" hint="Extents like 10%ORIGIN or a size like 2G.">
               <input className={`${inputCls} font-mono`} value={o.snapshot.lvm_size} onChange={(e) => onChange({ snapshot: { ...o.snapshot, lvm_size: e.target.value.trim() || "10%ORIGIN" } })} />
             </Field>
@@ -157,6 +166,8 @@ export function BackupAdvancedOptions({
           </div>
         )}
       </Section>
+
+      <SourcesAndRunsOptions options={o} onChange={onChange} />
 
       <Section title="Metadata">
         <Check label="Extended attributes" checked={o.backup_xattrs} onChange={(v) => onChange({ backup_xattrs: v })} />

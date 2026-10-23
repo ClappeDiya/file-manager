@@ -2,7 +2,8 @@
  * Non-component helpers for the Backup panel: filter-rule text format,
  * downloads and display formatting. (Folder picking: `@/lib/folder-picker`.)
  */
-import type { BackupOptions, FilterRule } from "@/stores/backup-store";
+import type { BackupEstimate, BackupOptions, FilterRule, RunAllReport } from "@/stores/backup-store";
+import { formatBytes } from "@/lib/format-bytes";
 
 export const inputCls =
   "w-full px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-blue-500";
@@ -76,3 +77,27 @@ export function diffOptions(builtin: BackupOptions, edited: BackupOptions): Part
   }
   return out as Partial<BackupOptions>;
 }
+
+// ── Estimate and run-all summaries ──
+
+export function formatEta(secs: number): string {
+  if (secs < 60) return `${secs} s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)} min ${secs % 60} s`;
+  const h = Math.floor(secs / 3600);
+  return `${h} h ${Math.floor((secs % 3600) / 60)} min`;
+}
+
+/** One-line summary of an estimate, e.g. "3 new, 1 changed: at most 1.2 GB, about 4 min". */
+export function describeEstimate(e: BackupEstimate): string {
+  const data = e.upper_bound ? `at most ${formatBytes(e.new_bytes_at_most)}` : formatBytes(e.new_bytes_at_most);
+  const time = e.estimated_duration_secs != null ? `, about ${formatEta(e.estimated_duration_secs)}` : "";
+  if (e.new_files === 0 && e.changed_files === 0) return `No new or changed files (${e.files} checked)${e.deleted_files ? `; ${e.deleted_files} deleted` : ""}`;
+  return `${e.new_files} new, ${e.changed_files} changed of ${e.files} files: ${data} to back up${time}`;
+}
+
+export function describeRunAll(r: RunAllReport): string {
+  const parts = [`${r.started.length} backup(s) queued`];
+  if (r.skipped.length) parts.push(`skipped ${r.skipped.map((s) => `${s.job_name || s.job_id} (${s.reason})`).join(", ")}`);
+  return parts.join("; ");
+}
+

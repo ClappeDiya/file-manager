@@ -26,6 +26,7 @@ import { BackupRecoveryView } from "./backup-recovery-view";
 import { BackupSettingsView } from "./backup-settings-view";
 import { formatDate, inputCls, statusColor } from "@/lib/backup-helpers";
 import { Banner, Btn, Section } from "./backup-ui";
+import { RunAllButton, useEstimate } from "./backup-estimate";
 
 type View =
   | { kind: "jobs" }
@@ -83,6 +84,7 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
   const [err, setErr] = useState<string | null>(null);
   const busy = status.tasks.some((t) => t.job_id === job.id);
   const next = status.next_runs.find((n) => n.job_id === job.id);
+  const est = useEstimate(job.id);
   const start = async (dryRun: boolean) => {
     setErr(null);
     try {
@@ -133,10 +135,12 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
       <div className="flex gap-1 mt-2 flex-wrap">
         <Btn tone="primary" disabled={busy || job.read_only} title={job.read_only ? "Read-only jobs never back up" : undefined} onClick={() => void start(false)} testId="backup-run-now">Run now</Btn>
         <Btn disabled={busy} onClick={() => void start(true)} title="Show what would be uploaded without changing anything">Dry run</Btn>
+        {!job.read_only && est.button}
         <Btn onClick={() => onView({ kind: "restore", job })} testId="backup-open-restore">Restore…</Btn>
         <Btn onClick={() => onView({ kind: "edit", job })}>Edit</Btn>
         <Btn onClick={() => onView({ kind: "maintenance", job })}>Maintenance</Btn>
       </div>
+      {est.panel}
     </div>
   );
 }
@@ -375,6 +379,7 @@ export function BackupPanel() {
                 <Btn tone="success" onClick={() => setView({ kind: "edit", job: newBackupJob() })}>Create your first backup</Btn>
               </div>
             )}
+            {jobs.length > 1 && <RunAllButton />}
             {jobs.map((j) => (
               <JobCard key={j.id} job={j} onView={setView} />
             ))}

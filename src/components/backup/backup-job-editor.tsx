@@ -21,6 +21,7 @@ import { pickFolder } from "@/lib/folder-picker";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { RetentionEditor } from "./backup-retention-editor";
 import { BackupAdvancedOptions } from "./backup-advanced-options";
+import { StdinCommandEditor } from "./backup-run-options";
 import { BackupReplicas } from "./backup-replicas";
 import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
 import { LogOutputsEditor, NotificationsEditor, ReportExtras } from "./backup-notifications";
@@ -217,6 +218,10 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
               onChange={(sources, photos) => setJob((j) => ({ ...j, sources, options: { ...j.options, photos } }))}
             />
 
+            <AdvancedOnly>
+              <StdinCommandEditor value={job.stdin_command ?? null} onChange={(stdin_command) => patch({ stdin_command })} />
+            </AdvancedOnly>
+
             <Section title="Filters" hint="Evaluated top to bottom; the first match wins. Excluding a folder skips everything inside it.">
               <div className="flex gap-1">
                 <Btn onClick={() => setFilterText(filterText === null ? rulesToText(job.filter.rules) : null)}>
@@ -280,7 +285,23 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 <Check label="Exclude temporary files (Windows)" checked={job.filter.exclude_temporary} onChange={(v) => patchFilter({ exclude_temporary: v })} />
                 <Check label="Skip cloud placeholders (OneDrive/iCloud)" checked={job.filter.exclude_cloud_placeholders} onChange={(v) => patchFilter({ exclude_cloud_placeholders: v })} />
                 <Check label="Skip empty folders" checked={job.filter.exclude_empty_folders} onChange={(v) => patchFilter({ exclude_empty_folders: v })} />
+                <Check
+                  label="Skip files listed in .gitignore"
+                  checked={!!job.filter.respect_gitignore}
+                  onChange={(v) => patchFilter({ respect_gitignore: v })}
+                  hint="Also honours .git/info/exclude. .ufopignore files are always read."
+                />
               </div>
+              <AdvancedOnly>
+                <Field label="Ignore-file names (comma separated, gitignore syntax)" hint="Read in every folder; rules apply to that folder and below. Explicit rules above win over them. Empty = none.">
+                  <input
+                    data-testid="filter-ignore-files"
+                    className={`${inputCls} font-mono`}
+                    value={(job.filter.ignore_files ?? []).join(", ")}
+                    onChange={(e) => patchFilter({ ignore_files: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })}
+                  />
+                </Field>
+              </AdvancedOnly>
               <Field label="Skip files larger than (MB, empty = no limit)">
                 <input
                   className={inputCls}

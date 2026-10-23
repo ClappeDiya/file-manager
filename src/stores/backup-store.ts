@@ -32,6 +32,10 @@ export interface SourceFilter {
   exclusion_markers: string[];
   exclude_empty_folders: boolean;
   exclude_cloud_placeholders: boolean;
+  /** Ignore-file names read in every folder, gitignore syntax (default `.ufopignore`). */
+  ignore_files: string[];
+  /** Also honour `.gitignore` and `.git/info/exclude`. */
+  respect_gitignore: boolean;
 }
 
 export type BackupDestination =
@@ -171,6 +175,76 @@ export interface BackupOptions {
   shared_repository: boolean;
   /** Shared repositories: compaction leaves volumes younger than this alone. */
   shared_gc_delay_hours: number;
+  // ── Sources and runs ──
+  /** Do not descend into folders on another filesystem (mount points stay empty). */
+  one_file_system: boolean;
+  /** What unreadable files, folders and unsupported entries do to the run. */
+  error_policy: ErrorPolicy;
+  /** Re-read and re-hash about this % (0–100) of unchanged-looking files per run. */
+  rehash_percent: number;
+  /** Stop the run with a partial version after uploading this much; null = no limit. */
+  max_upload_bytes_per_run: number | null;
+  /** Files above this size are hashed by several threads (0 = off). */
+  parallel_file_threshold: number;
+}
+
+/** Rust `ufop_core::backup::errors::ErrorPolicy`. */
+export type ErrorAction = "continue" | "fail";
+export type UnknownEntryAction = "ignore" | "warn" | "fail";
+export interface ErrorPolicy {
+  on_file_error: ErrorAction;
+  on_dir_error: ErrorAction;
+  on_unknown_entry: UnknownEntryAction;
+  /** Stop at the first error (keeping a partial version). */
+  fail_fast: boolean;
+  /** Stop after more than this many read problems; null = never. */
+  max_errors: number | null;
+}
+
+export const DEFAULT_PARALLEL_FILE_THRESHOLD = 256 * 1024 * 1024;
+
+/** Rust `hooks::StdinCommand`: a command whose output each backup stores as a file. */
+export interface StdinCommand {
+  command: string;
+  /** `name` → /stdin/name, or an absolute path such as /dumps/db.sql. */
+  path: string;
+  /** 0 = no limit. */
+  timeout_secs: number;
+}
+
+/** Rust `ufop_core::backup::estimate::BackupEstimate`. */
+export interface BackupEstimate {
+  files: number;
+  folders: number;
+  bytes_examined: number;
+  new_files: number;
+  changed_files: number;
+  unchanged_files: number;
+  deleted_files: number;
+  /** New and changed files' bytes: the most the run uploads. */
+  new_bytes_at_most: number;
+  /** New files plus the growth of changed files. */
+  new_bytes_at_least: number;
+  /** True when changed files make the figure an upper bound. */
+  upper_bound: boolean;
+  has_previous_version: boolean;
+  bytes_per_sec: number | null;
+  speed_source: "history" | "assumed" | "none";
+  estimated_duration_secs: number | null;
+  largest: { path: string; size: number; status: "new" | "changed" }[];
+  warnings: string[];
+}
+
+/** Which jobs "Back up all now" starts (`runs::RunAllFilter`). */
+export interface RunAllFilter {
+  job_ids: string[];
+  scheduled_only: boolean;
+  dry_run: boolean;
+}
+
+export interface RunAllReport {
+  started: { job_id: string; job_name: string; task_id: string }[];
+  skipped: { job_id: string; job_name: string; reason: string }[];
 }
 
 /** Rust `ufop_core::backup::versions::ClientIdentity`. */
@@ -189,6 +263,8 @@ export interface VersionStats {
   files_added: number;
   files_changed: number;
   files_deleted: number;
+  /** The run stopped at its upload limit (the version is partial). Absent when false. */
+  upload_cap_reached?: boolean;
 }
 
 /** Rust `MetadataPatch`: null leaves a field unchanged; "" removes a note / reason. */
@@ -436,11 +512,15 @@ export interface RemoteFile {
 
 export type SnapshotPolicy = "off" | "auto" | "on" | "required";
 
+/** Linux snapshot method; `auto` picks ZFS, btrfs or LVM by filesystem. */
+export type SnapshotProvider = "auto" | "lvm" | "zfs" | "btrfs";
+
 export interface SnapshotOptions {
   lvm_size: string;
   vss_provider: string | null;
   vss_exclude_writers: string[];
   mount_root: string | null;
+  provider: SnapshotProvider;
 }
 
 export interface SnapshotDiagnostics {
@@ -449,6 +529,8 @@ export interface SnapshotDiagnostics {
   mappings: [string, string][];
   steps: string[];
   error: string | null;
+  /** Snapshot methods of this platform and whether their tools are installed. */
+  providers: { name: string; available: boolean; detail: string }[];
 }
 
 export type UsnPolicy = "off" | "auto" | "on" | "required";
@@ -727,6 +809,8 @@ export interface BackupJob {
   read_only: boolean;
   /** Encrypt the local database (key in the keychain). null: decided when saved (on for encrypted jobs); older jobs stay plain. */
   encrypt_local_database: boolean | null;
+  /** A command whose output each backup stores as a virtual file (e.g. `pg_dump mydb`). */
+  stdin_command: StdinCommand | null;
   created_at: string;
   updated_at: string;
   stats: JobStats;
@@ -1103,6 +1187,8 @@ export function newBackupJob(): BackupJob {
       exclusion_markers: [],
       exclude_empty_folders: false,
       exclude_cloud_placeholders: false,
+      ignore_files: [".ufopignore"],
+      respect_gitignore: false,
     },
     destination: { type: "local", path: "", alternate_paths: [], marker_file: null },
     encrypted: true,
@@ -1154,7 +1240,7 @@ export function newBackupJob(): BackupJob {
       auto_vacuum_interval_days: null,
       remote_case_insensitive: false,
       snapshot_policy: "off",
-      snapshot: { lvm_size: "10%ORIGIN", vss_provider: null, vss_exclude_writers: [], mount_root: null },
+      snapshot: { lvm_size: "10%ORIGIN", vss_provider: null, vss_exclude_writers: [], mount_root: null, provider: "auto" },
       encryption_module: "aes",
       gpg: { recipients: [], executable: "", homedir: "" },
       kdf: null,
@@ -1176,6 +1262,11 @@ export function newBackupJob(): BackupJob {
       identity: { hostname: "", username: "", job_id: "", source_label: "" },
       shared_repository: false,
       shared_gc_delay_hours: 4,
+      one_file_system: false,
+      error_policy: { on_file_error: "continue", on_dir_error: "continue", on_unknown_entry: "ignore", fail_fast: false, max_errors: null },
+      rehash_percent: 0,
+      max_upload_bytes_per_run: null,
+      parallel_file_threshold: DEFAULT_PARALLEL_FILE_THRESHOLD,
     },
     retention: { type: "keep_all" },
     schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [] },
@@ -1214,6 +1305,7 @@ export function newBackupJob(): BackupJob {
     legal_hold: null,
     read_only: false,
     encrypt_local_database: null,
+    stdin_command: null,
     created_at: now,
     updated_at: now,
     stats: {
@@ -1280,6 +1372,10 @@ interface BackupState {
   saveJob: (job: BackupJob, passphrase?: string | null) => Promise<BackupJob>;
   deleteJob: (id: string, deleteLocalDb: boolean, deleteRemote: boolean) => Promise<void>;
   runJob: (id: string, dryRun?: boolean) => Promise<string>;
+  /** Queue a backup of every job (read-only and busy ones are skipped). */
+  runAll: (filter?: Partial<RunAllFilter>) => Promise<RunAllReport>;
+  /** Files, new data and time the next backup of a job likely needs. */
+  estimate: (id: string, assumedBytesPerSec?: number | null) => Promise<BackupEstimate>;
   cancel: (id: string) => Promise<void>;
   execute: (id: string, operation: BackupOperation) => Promise<OperationResult>;
   /** Change an encrypted job's passphrase in place (format 2); `current` null = the stored one. */
@@ -1371,6 +1467,15 @@ export const useBackupStore = create<BackupState>((set, get) => ({
     await get().loadStatus();
     return taskId;
   },
+
+  runAll: async (filter = {}) => {
+    const full: RunAllFilter = { job_ids: [], scheduled_only: false, dry_run: false, ...filter };
+    const report = await tauriInvoke<RunAllReport>("backup_run_all", { filter: full });
+    await get().loadStatus();
+    return report;
+  },
+
+  estimate: (id, assumedBytesPerSec = null) => tauriInvoke<BackupEstimate>("backup_estimate", { jobId: id, assumedBytesPerSec }),
 
   cancel: async (id) => {
     await tauriInvoke<boolean>("backup_cancel", { id });
