@@ -1,14 +1,13 @@
 /**
- * Alert evaluation and delivery against real transports: a local SMTP server
- * (STARTTLS with a self-signed certificate, AUTH LOGIN; started outside the
- * test, see SMTP_DIR), an HTTPS Slack-style endpoint and a signed JSON webhook.
+ * Alert evaluation and delivery against real transports: an in-process SMTP
+ * server (STARTTLS with a self-signed certificate, AUTH; `smtp-mock.ts`), an
+ * HTTPS Slack-style endpoint and a signed JSON webhook.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import crypto from 'crypto';
 import fs from 'fs';
 import http from 'http';
 import https from 'https';
-import net from 'net';
 import path from 'path';
 import tls from 'tls';
 import type { AddressInfo } from 'net';
@@ -19,6 +18,7 @@ import { evaluateMissed } from '@/lib/alerts';
 import { listAudit, verifyAudit } from '@/lib/db/repos/audit';
 import type { UserRecord } from '@/lib/db/repos/users';
 import { json, makeUser, req } from './helpers';
+import { startSmtpMock, type SmtpMock } from './smtp-mock';
 import * as channels from '@/app/api/alerts/channels/route';
 import * as channelById from '@/app/api/alerts/channels/[id]/route';
 import * as channelTest from '@/app/api/alerts/channels/[id]/test/route';
@@ -31,13 +31,11 @@ import * as heartbeat from '@/app/api/agent/heartbeat/route';
 import * as users from '@/app/api/users/route';
 
 const P = (id: string) => ({ params: Promise.resolve({ id }) });
-const SMTP_DIR = process.env.UFOP_TEST_SMTP_DIR ?? '/tmp/claude-0/emu/mail-admin';
-const SMTP_CERT = process.env.UFOP_TEST_SMTP_CERT ?? '/tmp/claude-0/emu/smtp.crt';
-const SMTP_KEY = path.join(path.dirname(SMTP_CERT), 'smtp.key');
-const SMTP_PORT = 2525;
-
-let smtpUp = false;
-const caPem = fs.existsSync(SMTP_CERT) ? fs.readFileSync(SMTP_CERT, 'utf8') : '';
+// Self-signed localhost certificate (CA:TRUE) for the SMTP and HTTPS test servers.
+const FIXTURES = path.join(__dirname, 'fixtures');
+const caPem = fs.readFileSync(path.join(FIXTURES, 'localhost-cert.pem'), 'utf8');
+const keyPem = fs.readFileSync(path.join(FIXTURES, 'localhost-key.pem'), 'utf8');
+let smtp: SmtpMock;
 
 // ── Local HTTP receivers ──
 
@@ -61,15 +59,12 @@ function collect(rq: http.IncomingMessage, rs: http.ServerResponse) {
 }
 
 beforeAll(async () => {
-  smtpUp = await new Promise<boolean>((r) => {
-    const s = net.connect(SMTP_PORT, '127.0.0.1', () => (s.end(), r(true)));
-    s.on('error', () => r(false));
-  });
+  smtp = await startSmtpMock({ cert: caPem, key: keyPem, user: 'mailer', pass: 'm41l' });
   webhookServer = http.createServer(collect);
   await new Promise<void>((r) => webhookServer.listen(0, '127.0.0.1', r));
   webhookUrl = `http://127.0.0.1:${(webhookServer.address() as AddressInfo).port}/hook`;
   // Slack webhooks must be https: serve one with the same self-signed certificate and trust it for this process.
-  slackServer = https.createServer({ cert: caPem, key: fs.readFileSync(SMTP_KEY, 'utf8') }, collect);
+  slackServer = https.createServer({ cert: caPem, key: keyPem }, collect);
   await new Promise<void>((r) => slackServer.listen(0, '127.0.0.1', r));
   slackUrl = `https://localhost:${(slackServer.address() as AddressInfo).port}/services/T0/B0/x`;
   tls.setDefaultCACertificates([...defaultCAs, caPem]);
@@ -79,6 +74,7 @@ afterAll(async () => {
   tls.setDefaultCACertificates(defaultCAs);
   await new Promise<void>((r) => webhookServer.close(() => r()));
   await new Promise<void>((r) => slackServer.close(() => r()));
+  await smtp.close();
 });
 
 afterEach(() => {
@@ -86,9 +82,10 @@ afterEach(() => {
   webhookStatus = 200;
 });
 
-const mails = () => (fs.existsSync(SMTP_DIR) ? fs.readdirSync(SMTP_DIR).filter((f) => f.endsWith('.eml')) : []);
+/** Messages accepted so far (a snapshot to compare with). */
+const mails = () => [...smtp.messages];
 function newMails(before: string[]): string[] {
-  return mails().filter((f) => !before.includes(f)).map((f) => fs.readFileSync(path.join(SMTP_DIR, f), 'utf8'));
+  return smtp.messages.slice(before.length);
 }
 /** Decoded subject + body of a raw message (nodemailer may quote-printable/encode-word them). */
 function plain(eml: string): string {
@@ -98,7 +95,7 @@ function plain(eml: string): string {
     .replace(/=([0-9A-F]{2})/g, (_x, h: string) => String.fromCharCode(parseInt(h, 16)));
 }
 
-const emailConfig = (extra: Record<string, unknown> = {}) => ({ host: 'localhost', port: SMTP_PORT, security: 'starttls', username: 'mailer', from: 'ufop@console.example', to: ['ops@corp.example'], caPem, ...extra });
+const emailConfig = (extra: Record<string, unknown> = {}) => ({ host: 'localhost', port: smtp.port, security: 'starttls', username: 'mailer', from: 'ufop@console.example', to: ['ops@corp.example'], caPem, ...extra });
 
 async function setup(as: UserRecord, withEmail = true) {
   const mk = async (body: unknown) => {
@@ -203,7 +200,6 @@ describe('channels', () => {
   });
 
   it('delivers email over STARTTLS with AUTH, trusting only the configured CA', async () => {
-    if (!smtpUp) throw new Error(`Start the local SMTP server on 127.0.0.1:${SMTP_PORT} (see the file header)`);
     const admin = makeUser('admin@x.org', 'org_admin');
     const before = mails();
     // Without the CA in the default trust store, only the channel's caPem makes the server trusted.
@@ -234,7 +230,6 @@ describe('channels', () => {
   });
 
   it('emails invitations through the channel marked for invitations', async () => {
-    if (!smtpUp) throw new Error('SMTP server not running');
     const admin = makeUser('admin@x.org', 'org_admin');
     await channels.POST(await req('POST', '/api/alerts/channels', { as: admin, body: { name: 'Mail', kind: 'email', config: emailConfig({ useForInvitations: true }), secret: 'm41l' } }));
     const before = mails();
@@ -248,7 +243,6 @@ describe('channels', () => {
 
 describe('alert rules', () => {
   it('raises backup_failed, notifies every channel once per cooldown and resolves on success', async () => {
-    if (!smtpUp) throw new Error('SMTP server not running');
     const admin = makeUser('admin@x.org', 'org_admin');
     const ids = await setup(admin);
     const m = machine();

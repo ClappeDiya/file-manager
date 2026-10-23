@@ -123,7 +123,7 @@ Ground rules
 
 - [ ] Portable mode on macOS: WKWebView keeps its (small) browser storage in the user profile; move it with `data_store_identifier`/a custom data store when Tauri exposes it (WP10 documented the limitation)
 - [ ] Build and smoke-test the multi-arch ufop-server image on a machine with a Docker daemon (`scripts/docker-build.sh --platforms linux/amd64,linux/arm64`); WP10 could only test the dry-run plan and review the Dockerfile
-- [ ] Pre-existing: admin `alerts.test.ts` needs a local SMTP server on 127.0.0.1:2525 (3 tests fail without it)
+- [x] Pre-existing: admin `alerts.test.ts` needed a local SMTP server on 127.0.0.1:2525 (3 tests failed without it): now starts an in-process SMTP server (`smtp-mock.ts`: STARTTLS with the localhost fixture certificate, AUTH PLAIN/LOGIN, MAIL/RCPT/DATA) on an ephemeral port; admin vitest 37 files / 186 tests pass
 
 ## Final verification
 - [ ] ufop-core tests (all features) pass
