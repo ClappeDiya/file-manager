@@ -63,7 +63,33 @@ impl<'a> Repo<'a> {
 
     /// Like [`Repo::open`], with an optional external encryption module
     /// (e.g. GPG) instead of the passphrase-derived AES key.
+    ///
+    /// A shared repository (see [`super::shared`]) scopes `db` to the
+    /// source of `options.identity` and brings it up to date from the
+    /// destination first.
     pub fn open_with_cipher(
+        backend: &'a dyn Backend,
+        db: &'a BackupDb,
+        passphrase: Option<&str>,
+        external: Option<VolumeCipher>,
+        options: &BackupOptions,
+        create: bool,
+        kdf: KdfParams,
+    ) -> Result<Self, AppError> {
+        let repo = Self::open_unsynced(backend, db, passphrase, external, options, create, kdf)?;
+        if super::shared::is_shared(&repo.header) {
+            db.set_scope(Some(options.identity.resolve().source_id()));
+            let r = super::shared::sync_from_remote(&repo, &OpContext::new())?;
+            for w in r.warnings {
+                tracing::warn!("{w}");
+            }
+        }
+        Ok(repo)
+    }
+
+    /// [`Repo::open_with_cipher`] without the shared-repository scope and
+    /// sync (database rebuilds, header-level tools).
+    pub(crate) fn open_unsynced(
         backend: &'a dyn Backend,
         db: &'a BackupDb,
         passphrase: Option<&str>,

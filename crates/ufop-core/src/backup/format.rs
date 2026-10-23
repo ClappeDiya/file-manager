@@ -37,12 +37,14 @@ pub const FEATURE_ZSTD_METADATA: &str = "zstd_metadata";
 pub const FEATURE_CDC: &str = "content_defined_chunking";
 pub const FEATURE_CHACHA: &str = "chacha20_poly1305";
 pub const FEATURE_SHARDED: &str = "sharded_layout";
+/// Several jobs / computers write to the repository (see [`super::shared`]).
+pub const FEATURE_SHARED: &str = "shared_repository";
 /// Set by [`upgrade_repository`]; cleared by the first write in format 2.
 pub const FEATURE_V1_ROLLBACK: &str = "v1_rollback_available";
 
 /// Every feature flag this version understands.
 pub const KNOWN_FEATURES: &[&str] =
-    &[FEATURE_ENVELOPE_KEY, FEATURE_ZSTD_BLOCKS, FEATURE_ZSTD_METADATA, FEATURE_CDC, FEATURE_CHACHA, FEATURE_SHARDED, FEATURE_V1_ROLLBACK];
+    &[FEATURE_ENVELOPE_KEY, FEATURE_ZSTD_BLOCKS, FEATURE_ZSTD_METADATA, FEATURE_CDC, FEATURE_CHACHA, FEATURE_SHARDED, FEATURE_V1_ROLLBACK, FEATURE_SHARED];
 
 pub fn v1_backup_name(prefix: &str) -> String {
     format!("{prefix}-repo.v1.bak.json")
@@ -99,6 +101,7 @@ pub fn sync_features(h: &mut RepoHeader) {
     add(h.encrypted && h.wrapped_master_key.is_some() && h.cipher == CipherKind::ChaCha20Poly1305, FEATURE_CHACHA);
     add(h.layout.is_sharded(), FEATURE_SHARDED);
     add(h.has_feature(FEATURE_V1_ROLLBACK), FEATURE_V1_ROLLBACK);
+    add(h.format_version >= 2 && h.has_feature(FEATURE_SHARED), FEATURE_SHARED);
     h.features = f;
 }
 
@@ -151,6 +154,9 @@ pub fn create_header(options: &BackupOptions, passphrase: Option<&str>, external
         if options.layout.is_sharded() {
             return Err(needs_v2("The sharded layout"));
         }
+        if options.shared_repository {
+            return Err(needs_v2("A shared repository"));
+        }
     }
     options.layout.validate()?;
     if options.layout.is_sharded() && !backend.supports_subfolders() {
@@ -189,7 +195,7 @@ pub fn create_header(options: &BackupOptions, passphrase: Option<&str>, external
         cipher: if v2 && aes { options.cipher } else { CipherKind::Aes256Gcm },
         wrapped_master_key: wrapped,
         layout: if v2 { options.layout } else { RepoLayout::Flat },
-        features: Vec::new(),
+        features: if v2 && options.shared_repository { vec![FEATURE_SHARED.to_string()] } else { Vec::new() },
     };
     sync_features(&mut header);
     let cipher = configure_cipher(&header, cipher);

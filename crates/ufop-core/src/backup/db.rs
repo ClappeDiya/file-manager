@@ -656,6 +656,9 @@ impl BackupDb {
     pub fn commit(&self) -> Result<(), AppError> {
         Ok(self.conn.execute_batch("COMMIT")?)
     }
+    pub fn rollback(&self) -> Result<(), AppError> {
+        Ok(self.conn.execute_batch("ROLLBACK")?)
+    }
 
     pub fn get_kv(&self, key: &str) -> Result<Option<String>, AppError> {
         let v: Option<String> = self.conn.query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0)).optional()?;
@@ -668,6 +671,18 @@ impl BackupDb {
         }
         self.conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES (?1, ?2)", params![key, self.enc(&format!("kv:{key}"), value)])?;
         Ok(())
+    }
+
+    pub fn delete_kv(&self, key: &str) -> Result<(), AppError> {
+        self.conn.execute("DELETE FROM kv WHERE key = ?1 AND key <> ?2", params![key, MARKER_KEY])?;
+        Ok(())
+    }
+
+    /// When this database first recorded a volume (upload, or discovery
+    /// on the destination).
+    pub fn volume_created_at(&self, name: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        let v: Option<String> = self.conn.query_row("SELECT created_at FROM remote_volumes WHERE name = ?1", [name], |r| r.get(0)).optional()?;
+        Ok(v.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok()).map(|t| t.with_timezone(&chrono::Utc)))
     }
 
     pub fn add_volume(&self, name: &str, kind: VolumeKind, size: u64, hash: &str, state: &str) -> Result<i64, AppError> {

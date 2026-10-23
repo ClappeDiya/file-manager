@@ -66,6 +66,10 @@ pub struct RestoreOptions {
     pub temp_dir: Option<PathBuf>,
     /// Do not refuse to start when the target or temp folder looks too small.
     pub skip_free_space_check: bool,
+    /// Shared repositories: restore from this source (id, or `*` for every
+    /// source's versions numbered together) instead of the job's own.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 impl Default for RestoreOptions {
@@ -89,6 +93,7 @@ impl Default for RestoreOptions {
             legacy: false,
             temp_dir: None,
             skip_free_space_check: false,
+            source: None,
         }
     }
 }
@@ -229,6 +234,7 @@ fn is_stream_entry(path: &str) -> bool {
 /// Restore from an opened repository.
 pub fn run_restore(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext) -> Result<RestoreReport, AppError> {
     let mut report = RestoreReport::default();
+    let _scope = super::shared::selector_scope(opts.source.as_deref()).map(|s| repo.db.scoped(s));
     // Versions to restore and where each one goes.
     let multi = !opts.versions.is_empty();
     if multi && opts.target.is_none() {

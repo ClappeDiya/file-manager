@@ -118,6 +118,9 @@ pub struct CompactReport {
     pub volumes_removed: usize,
     pub volumes_rewritten: usize,
     pub bytes_reclaimed: u64,
+    /// Shared repositories: volumes left for later (younger than the safety delay).
+    #[serde(default)]
+    pub volumes_too_young: usize,
 }
 
 fn delete_block_volume(repo: &Repo, name: &str) -> Result<(), AppError> {
@@ -131,6 +134,10 @@ fn delete_block_volume(repo: &Repo, name: &str) -> Result<(), AppError> {
 
 /// Remove fully unused block volumes and repack mostly-unused ones.
 pub fn compact(repo: &Repo, opts: &BackupOptions, ctx: &OpContext) -> Result<CompactReport, AppError> {
+    // Shared repositories: the database knows every source's versions
+    // (synced when the repository was opened), so blocks of other clients'
+    // versions count as used; young volumes wait for the safety delay.
+    let now = Utc::now();
     let referenced = repo.db.referenced_blocks()?;
     let by_volume = repo.db.blocks_by_volume()?;
     let volumes: HashMap<String, u64> =
@@ -142,6 +149,10 @@ pub fn compact(repo: &Repo, opts: &BackupOptions, ctx: &OpContext) -> Result<Com
     for (name, size) in &volumes {
         ctx.check()?;
         if repo.locked_until(name)?.is_some() {
+            continue;
+        }
+        if !super::shared::old_enough(repo, name, opts.shared_gc_delay_hours, now)? {
+            r.volumes_too_young += 1;
             continue;
         }
         let blocks = by_volume.get(name).cloned().unwrap_or_default();
@@ -268,7 +279,7 @@ pub fn recreate_database(
     ctx: &OpContext,
 ) -> Result<RecreateReport, AppError> {
     let opts = BackupOptions { prefix: prefix.to_string(), ..Default::default() };
-    let repo = Repo::open(backend, db, passphrase, &opts, false, KdfParams::default())?;
+    let repo = Repo::open_unsynced(backend, db, passphrase, None, &opts, false, KdfParams::default())?;
     let listing = repo.backend.list()?;
     let sizes: HashMap<&str, u64> = listing.iter().map(|f| (f.name.as_str(), f.size)).collect();
     db.clear()?;
@@ -329,6 +340,9 @@ pub fn recreate_database(
             Err(e) => r.warnings.push(format!("{}: {}", f.name, e.user_message())),
         }
     }
+    if super::shared::is_shared(&repo.header) {
+        db.set_kv(super::shared::SHARED_KEY, "1")?;
+    }
     db.commit()?;
     Ok(r)
 }
@@ -341,7 +355,7 @@ pub fn read_remote_task_config(
 ) -> Result<Option<serde_json::Value>, AppError> {
     let db = BackupDb::open_in_memory()?;
     let opts = BackupOptions { prefix: prefix.to_string(), ..Default::default() };
-    let repo = Repo::open(backend, &db, passphrase, &opts, false, KdfParams::default())?;
+    let repo = Repo::open_unsynced(backend, &db, passphrase, None, &opts, false, KdfParams::default())?;
     let mut lists: Vec<String> = backend
         .list()?
         .into_iter()
