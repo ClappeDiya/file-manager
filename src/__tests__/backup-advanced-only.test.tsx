@@ -9,7 +9,8 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { AdvancedOnly, useIsAdvanced } from "@/components/backup/advanced-only";
+import { AdvancedOnly } from "@/components/backup/advanced-only";
+import { useIsAdvanced } from "@/components/backup/use-is-advanced";
 import { BackupSettingsView } from "@/components/backup/backup-settings-view";
 import { migrateUIState, selectBackupAdvanced, UI_STATE_VERSION, useUIStore } from "@/stores/ui-store";
 

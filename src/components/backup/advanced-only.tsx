@@ -1,7 +1,7 @@
 /**
  * Simple/Advanced gate for the Backup screens (K132).
  *
- * `useIsAdvanced()` is true when the per-area override `backupAdvanced` in the
+ * `useIsAdvanced()` (use-is-advanced.ts) is true when the per-area override `backupAdvanced` in the
  * UI store is true, or when it is null and the global app mode is "advanced".
  * `<AdvancedOnly>` renders its children only then; in Simple mode it renders
  * nothing, or a one-line hint with a button that switches to Advanced mode.
@@ -29,12 +29,8 @@
  * - Recovery: file-crypt / GPG module tools.
  */
 import type { ReactNode } from "react";
-import { selectBackupAdvanced, useUIStore } from "@/stores/ui-store";
-
-/** True when the Backup screens should show their advanced sections. */
-export function useIsAdvanced(): boolean {
-  return useUIStore(selectBackupAdvanced);
-}
+import { useUIStore } from "@/stores/ui-store";
+import { useIsAdvanced } from "./use-is-advanced";
 
 export function AdvancedOnly({ children, hint = false }: { children: ReactNode; hint?: boolean }) {
   const advanced = useIsAdvanced();

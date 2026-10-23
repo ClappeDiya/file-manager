@@ -19,7 +19,8 @@ import {
 import { BackupAdvancedOptions } from "./backup-advanced-options";
 import { Banner, Btn, Field, PathInput, Section } from "./backup-ui";
 import { SecretProvidersEditor } from "./backup-secret-providers";
-import { AdvancedOnly, useIsAdvanced } from "./advanced-only";
+import { AdvancedOnly } from "./advanced-only";
+import { useIsAdvanced } from "./use-is-advanced";
 import { selectBackupAdvanced, useUIStore } from "@/stores/ui-store";
 
 const NO_CAPS: TransferCaps = { upload_bps: 0, download_bps: 0, max_concurrent_runs: 1 };
