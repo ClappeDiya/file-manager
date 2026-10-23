@@ -50,6 +50,8 @@ interface Form {
   mountRoot: string;
   workflows: WorkflowForm[];
   backupTemplates: BackupTemplateForm[];
+  /** `notificationProfiles` as a JSON list ("" = not managed). */
+  notificationProfilesJson: string;
   /** `serverAccess` as JSON ("" = not managed). */
   serverAccessJson: string;
 }
@@ -103,6 +105,7 @@ function toForm(s: ManagedSettings | null): Form {
     mountRoot: s?.mounts?.mountRoot ?? '',
     workflows: (s?.workflows ?? []).map((w) => ({ id: w.id, name: w.name, enabled: w.enabled, ruleJson: JSON.stringify(w.rule, null, 2) })),
     backupTemplates: (s?.backupTemplates ?? []).map((t) => ({ id: t.id, name: t.name, description: t.description, enforced: t.enforced, settingsJson: JSON.stringify(t.settings, null, 2) })),
+    notificationProfilesJson: s?.notificationProfiles ? JSON.stringify(s.notificationProfiles, null, 2) : '',
     serverAccessJson: s?.serverAccess ? JSON.stringify(s.serverAccess, null, 2) : '',
   };
 }
@@ -125,6 +128,7 @@ function toBody(f: Form): ManagedSettingsBody {
     backupTemplates: f.backupTemplates.length
       ? f.backupTemplates.map((t) => ({ id: t.id.trim(), name: t.name.trim(), description: t.description.trim(), enforced: t.enforced, settings: parseRule(t.settingsJson || '{}') }))
       : null,
+    notificationProfiles: f.notificationProfilesJson.trim() ? (parseRule(f.notificationProfilesJson) as unknown as ManagedSettingsBody['notificationProfiles']) : null,
     serverAccess: f.serverAccessJson.trim() ? (parseRule(f.serverAccessJson) as unknown as ManagedSettingsBody['serverAccess']) : null,
   };
 }
@@ -358,6 +362,25 @@ export default function AppSettingsPage() {
         </Card>
         <Card className="lg:col-span-2">
           <CardHeader>
+            <CardTitle>Notification profiles</CardTitle>
+            <CardDescription>
+              Notification channels every desktop can choose in its backup jobs and templates (as org:&lt;id&gt;), read-only there. Paste a profile&apos;s “notification” from the desktop app (Settings → Notification profiles). Secrets never travel here: set credential_id (and secret headers&apos; credential_id) to a console credential such as central:pagerduty-key. Leave empty to stop managing.
+            </CardDescription>
+          </CardHeader>
+          <label className="flex flex-col gap-1 text-sm">
+            Notification profiles (JSON list)
+            <textarea
+              aria-label="Notification profiles (JSON)"
+              className="min-h-32 rounded border border-border bg-background p-2 font-mono text-xs"
+              spellCheck={false}
+              placeholder={'[{ "id": "on-call", "name": "On-call pager", "minSeverity": "error", "notification": { "type": "webhook", "preset": "pagerduty", "url": "https://events.pagerduty.com/v2/enqueue", "credential_id": "central:pagerduty-key" } }]'}
+              value={form.notificationProfilesJson}
+              onChange={(e) => set({ notificationProfilesJson: e.target.value })}
+            />
+          </label>
+        </Card>
+        <Card className="lg:col-span-2">
+          <CardHeader>
             <CardTitle>Server accounts and access (ufop-server)</CardTitle>
             <CardDescription>
               Accounts and per-job access rules provisioned on every ufop-server node, read-only there. Passwords travel only as Argon2 hashes: run <code>ufop-server hash-password</code>. Roles: admin, operator, viewer. Rules give a principal (an account, role:operator, role:viewer or *) a permission (none, read, run, write, full) on jobs matching a pattern (id, or a glob such as prod-*). An account never replaces a local one of the same name. Leave empty to stop managing.
@@ -380,7 +403,7 @@ export default function AppSettingsPage() {
         <div className="mt-4 flex gap-2">
           <Button onClick={() => void save(toBody(form))}>Save</Button>
           {s && (
-            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null, serverAccess: null })}>
+            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null, notificationProfiles: null, serverAccess: null })}>
               Stop managing
             </Button>
           )}

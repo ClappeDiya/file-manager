@@ -33,6 +33,8 @@ export interface ManagedSettingsBody {
   workflows: ManagedWorkflow[] | null;
   /** Backup policy templates offered (or, `enforced`, imposed) on every desktop. */
   backupTemplates: ManagedBackupTemplate[] | null;
+  /** Notification profiles offered read-only on every desktop (secrets as `central:<id>` credentials). */
+  notificationProfiles: ManagedNotificationProfile[] | null;
   /** Accounts and per-job access rules for ufop-server nodes (read-only there). */
   serverAccess: ManagedServerAccess | null;
 }
@@ -94,6 +96,61 @@ export interface ManagedBackupTemplate {
 /** Mirrors `ufop_core::agent::{MAX_BACKUP_TEMPLATES, MAX_BACKUP_TEMPLATE_BYTES}`. */
 export const MAX_BACKUP_TEMPLATES = 50;
 export const MAX_BACKUP_TEMPLATE_BYTES = 64 * 1024;
+
+/** A notification profile: `notification` as the desktop app stores a profile's channel. */
+export interface ManagedNotificationProfile {
+  id: string;
+  name: string;
+  description: string;
+  notification: Record<string, unknown>;
+  minSeverity: 'success' | 'warning' | 'error' | null;
+}
+
+/** Mirrors `ufop_core::agent::{MAX_NOTIFICATION_PROFILES, MAX_NOTIFICATION_PROFILE_BYTES}`. */
+export const MAX_NOTIFICATION_PROFILES = 50;
+export const MAX_NOTIFICATION_PROFILE_BYTES = 64 * 1024;
+const CENTRAL = /^central:[A-Za-z0-9_-]{1,64}$/;
+
+/** Validate organization notification profiles: secrets must name console credentials, never travel in plain text. */
+export function normalizeNotificationProfiles(raw: unknown): ManagedNotificationProfile[] | null {
+  if (raw === null || raw === undefined) return null;
+  if (!Array.isArray(raw)) throw new OrgError('Notification profiles must be a list');
+  if (raw.length > MAX_NOTIFICATION_PROFILES) throw new OrgError(`At most ${MAX_NOTIFICATION_PROFILES} organization notification profiles`);
+  const ids = new Set<string>();
+  const out = raw.map((t, i) => {
+    const o = (t && typeof t === 'object' ? t : {}) as Record<string, unknown>;
+    const name = str(o.name, 200);
+    if (!name) throw new OrgError(`Notification profile ${i + 1} needs a name`);
+    const id = str(o.id, 64) || name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
+    if (!WORKFLOW_ID.test(id)) throw new OrgError(`Notification profile id '${id}' must be 1–64 letters, digits, '-' or '_'`);
+    if (ids.has(id)) throw new OrgError(`Two notification profiles share the id '${id}'`);
+    ids.add(id);
+    let n = o.notification ?? null;
+    if (typeof n === 'string') {
+      try {
+        n = JSON.parse(n);
+      } catch {
+        throw new OrgError(`Notification profile '${name}' channel is not valid JSON`);
+      }
+    }
+    if (!n || typeof n !== 'object' || Array.isArray(n)) throw new OrgError(`Notification profile '${name}' needs a notification object`);
+    const ch = n as Record<string, unknown>;
+    if (typeof ch.type !== 'string') throw new OrgError(`Notification profile '${name}' needs a channel type`);
+    if (JSON.stringify(ch).length > MAX_NOTIFICATION_PROFILE_BYTES) throw new OrgError(`Notification profile '${name}' is larger than ${MAX_NOTIFICATION_PROFILE_BYTES / 1024} KB`);
+    const cred = ch.credential_id;
+    if (cred !== undefined && cred !== null && cred !== '' && !(typeof cred === 'string' && CENTRAL.test(cred))) throw new OrgError(`Notification profile '${name}': credential_id must name a console credential (central:<id>)`);
+    for (const h of Array.isArray(ch.headers) ? (ch.headers as Record<string, unknown>[]) : []) {
+      if (h && h.secret === true) {
+        if (typeof h.value === 'string' && h.value !== '') throw new OrgError(`Notification profile '${name}': secret header values cannot be sent in plain text; use a console credential`);
+        if (typeof h.credential_id !== 'string' || !CENTRAL.test(h.credential_id)) throw new OrgError(`Notification profile '${name}': secret headers must name a console credential (central:<id>)`);
+      }
+    }
+    const sev = o.minSeverity ?? null;
+    if (sev !== null && sev !== '' && !['success', 'warning', 'error'].includes(sev as string)) throw new OrgError(`Notification profile '${name}': unknown minimum severity '${String(sev)}'`);
+    return { id, name, description: str(o.description, 1000), notification: ch, minSeverity: sev === '' ? null : (sev as ManagedNotificationProfile['minSeverity']) };
+  });
+  return out.length ? out : null;
+}
 
 /** Validate organization backup templates (the desktop checks the settings in full). */
 export function normalizeBackupTemplates(raw: unknown): ManagedBackupTemplate[] | null {
@@ -209,7 +266,7 @@ const str = (v: unknown, n = 500) => (typeof v === 'string' ? v.trim().slice(0, 
 /** Validate and normalize a settings body (throws `OrgError` with a readable message). */
 export function normalizeManagedSettings(raw: unknown): ManagedSettingsBody {
   const b = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: normalizeWorkflows(b.workflows), backupTemplates: normalizeBackupTemplates(b.backupTemplates), serverAccess: normalizeServerAccess(b.serverAccess) };
+  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: normalizeWorkflows(b.workflows), backupTemplates: normalizeBackupTemplates(b.backupTemplates), notificationProfiles: normalizeNotificationProfiles(b.notificationProfiles), serverAccess: normalizeServerAccess(b.serverAccess) };
   if (b.updates) {
     const u = b.updates as Record<string, unknown>;
     const channel = u.channel === null || u.channel === undefined || u.channel === '' ? null : u.channel;
@@ -291,8 +348,8 @@ function row(orgId: string): Row | undefined {
 export function getManagedSettings(orgId: string): ManagedSettings | null {
   const r = row(orgId);
   if (!r || r.settings === 'null') return null;
-  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null, serverAccess: null });
-  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, mounts: b.mounts ?? null, workflows: b.workflows ?? null, backupTemplates: b.backupTemplates ?? null, serverAccess: b.serverAccess ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
+  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null, notificationProfiles: null, serverAccess: null });
+  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, mounts: b.mounts ?? null, workflows: b.workflows ?? null, backupTemplates: b.backupTemplates ?? null, notificationProfiles: b.notificationProfiles ?? null, serverAccess: b.serverAccess ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
 }
 
 /**
@@ -301,7 +358,7 @@ export function getManagedSettings(orgId: string): ManagedSettings | null {
  */
 export function setManagedSettings(orgId: string, raw: unknown, by: string): ManagedSettings | null {
   const body = normalizeManagedSettings(raw);
-  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers && !body.mounts && !body.workflows && !body.backupTemplates && !body.serverAccess;
+  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers && !body.mounts && !body.workflows && !body.backupTemplates && !body.notificationProfiles && !body.serverAccess;
   const version = Number(row(orgId)?.version ?? 0) + 1;
   db()
     .prepare('INSERT INTO managed_settings (org_id, settings, version, updated_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(org_id) DO UPDATE SET settings = excluded.settings, version = excluded.version, updated_by = excluded.updated_by, updated_at = excluded.updated_at')
@@ -312,5 +369,5 @@ export function setManagedSettings(orgId: string, raw: unknown, by: string): Man
 /** What the agent receives: `null` when nothing is managed. */
 export function managedSettingsForAgent(orgId: string): (ManagedSettingsBody & { version: number }) | null {
   const s = getManagedSettings(orgId);
-  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers, mounts: s.mounts, workflows: s.workflows, backupTemplates: s.backupTemplates, serverAccess: s.serverAccess };
+  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers, mounts: s.mounts, workflows: s.workflows, backupTemplates: s.backupTemplates, notificationProfiles: s.notificationProfiles, serverAccess: s.serverAccess };
 }
