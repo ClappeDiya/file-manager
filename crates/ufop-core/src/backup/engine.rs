@@ -21,6 +21,7 @@ use super::{
     UsnPolicy,
 };
 use super::snapshot::SnapshotPolicy;
+use super::versions::{VersionMeta, VersionStats};
 use crate::error::AppError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -238,24 +239,27 @@ impl<'a> Repo<'a> {
         files: &[FileEntry],
         task_config: Option<serde_json::Value>,
         control_files: Vec<ControlFile>,
+        meta: VersionMeta,
         dry_run: bool,
     ) -> Result<String, AppError> {
         let name = volume::filelist_volume_name(&self.prefix, ts, &self.cipher);
-        let fl = FileListVolume { timestamp: ts.to_rfc3339(), partial, files: files.to_vec(), task_config, control_files };
+        let fl = FileListVolume { timestamp: ts.to_rfc3339(), partial, files: files.to_vec(), task_config, control_files, meta };
         let data = volume::seal_json(&self.cipher, &fl)?;
         self.put_volume(VolumeKind::FileList, &name, &data, dry_run)?;
         if !dry_run {
-            self.db.add_fileset(&fl.timestamp, &name, partial, files)?;
+            self.db.add_fileset_with_meta(&fl.timestamp, &name, partial, files, &fl.meta)?;
             // Kept so rewrites (purge, repair) preserve them.
             self.db.set_kv(&format!("dlist_extra:{}", fl.timestamp), &serde_json::to_string(&DlistExtra { task_config: fl.task_config, control_files: fl.control_files })?)?;
         }
         Ok(fl.timestamp)
     }
 
-    /// Re-upload a version's file list (same name), preserving extras.
-    pub(crate) fn rewrite_filelist(&self, timestamp: &str, partial: bool, volume_name: &str, files: &[FileEntry]) -> Result<Vec<u8>, AppError> {
+    /// Re-upload a version's file list (same name), preserving extras and
+    /// the version's metadata.
+    pub(crate) fn rewrite_filelist(&self, fs: &super::Fileset, files: &[FileEntry]) -> Result<Vec<u8>, AppError> {
+        let (timestamp, partial, volume_name) = (fs.timestamp.as_str(), fs.partial, fs.volume_name.as_str());
         let extra: DlistExtra = self.db.get_kv(&format!("dlist_extra:{timestamp}"))?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let fl = FileListVolume { timestamp: timestamp.to_string(), partial, files: files.to_vec(), task_config: extra.task_config, control_files: extra.control_files };
+        let fl = FileListVolume { timestamp: timestamp.to_string(), partial, files: files.to_vec(), task_config: extra.task_config, control_files: extra.control_files, meta: fs.meta() };
         let data = volume::seal_json(&self.cipher, &fl)?;
         self.note_write()?;
         self.backend.put(volume_name, &data)?;
@@ -379,10 +383,19 @@ impl VolumeFetcher<'_> {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct DlistExtra {
-    task_config: Option<serde_json::Value>,
+pub(crate) struct DlistExtra {
+    pub(crate) task_config: Option<serde_json::Value>,
     #[serde(default)]
-    control_files: Vec<ControlFile>,
+    pub(crate) control_files: Vec<ControlFile>,
+}
+
+/// Remember a file list's embedded configuration and control files so
+/// later rewrites (purge, repair) keep them.
+pub(crate) fn store_dlist_extra(db: &BackupDb, fl: &FileListVolume) -> Result<(), AppError> {
+    if fl.task_config.is_none() && fl.control_files.is_empty() {
+        return Ok(());
+    }
+    db.set_kv(&format!("dlist_extra:{}", fl.timestamp), &serde_json::to_string(&DlistExtra { task_config: fl.task_config.clone(), control_files: fl.control_files.clone() })?)
 }
 
 /// Result of [`Repo::consistency_check`].
@@ -996,12 +1009,13 @@ fn progress(ctx: &OpContext, phase: Phase, done: u64, total: u64, bytes: u64, cu
     ctx.report(&Progress { phase, files_processed: done, files_total: total, bytes_processed: bytes, current_path: cur.map(String::from) });
 }
 
-/// Next version timestamp, strictly after the newest existing one.
-fn next_timestamp(db: &BackupDb) -> Result<DateTime<Utc>, AppError> {
+/// Next version timestamp, strictly after the newest existing one of any
+/// source (version file names are made from it).
+pub(crate) fn next_timestamp(db: &BackupDb) -> Result<DateTime<Utc>, AppError> {
     use chrono::Timelike;
     let now = Utc::now();
     let now = now.with_nanosecond(0).unwrap_or(now);
-    let latest = db.filesets()?.first().and_then(|f| DateTime::parse_from_rfc3339(&f.timestamp).ok()).map(|t| t.with_timezone(&Utc));
+    let latest = db.all_filesets()?.first().and_then(|f| DateTime::parse_from_rfc3339(&f.timestamp).ok()).map(|t| t.with_timezone(&Utc));
     Ok(match latest {
         Some(l) if l >= now => l + chrono::Duration::seconds(1),
         _ => now,
@@ -1117,7 +1131,7 @@ impl Checkpoints {
             return Ok(());
         }
         let ts = next_timestamp(repo.db)?;
-        let written = repo.write_filelist(ts, true, &files, opts.task_config.clone(), Vec::new(), false)?;
+        let written = repo.write_filelist(ts, true, &files, opts.task_config.clone(), Vec::new(), version_meta(opts, report), false)?;
         tracing::info!("Checkpoint {written}: {} entries", files.len());
         self.remove(repo)?;
         self.current = Some(written);
@@ -1172,6 +1186,8 @@ pub fn run_backup_with_cipher(
     let started = Instant::now();
     let mut report = BackupReport { dry_run: opts.dry_run, ..Default::default() };
     retention.validate()?;
+    super::versions::validate_note(opts.default_note.as_deref())?;
+    super::versions::validate_tags(&opts.default_tags)?;
     if sources.is_empty() {
         return Err(AppError::validation("The backup job has no source folders"));
     }
@@ -1470,7 +1486,7 @@ pub fn run_backup_with_cipher(
         // Synthetic partial version: everything finished so far stays restorable.
         if !done.is_empty() {
             let ts = next_timestamp(db)?;
-            report.version = Some(repo.write_filelist(ts, true, &done, opts.task_config.clone(), control_files, opts.dry_run)?);
+            report.version = Some(repo.write_filelist(ts, true, &done, opts.task_config.clone(), control_files, version_meta(opts, &report), opts.dry_run)?);
             report.partial = true;
             checkpoints.remove(&repo)?;
         }
@@ -1487,7 +1503,7 @@ pub fn run_backup_with_cipher(
         report.skipped_unchanged = true;
     } else {
         let ts = next_timestamp(db)?;
-        report.version = Some(repo.write_filelist(ts, false, &done, opts.task_config.clone(), control_files, opts.dry_run)?);
+        report.version = Some(repo.write_filelist(ts, false, &done, opts.task_config.clone(), control_files, version_meta(opts, &report), opts.dry_run)?);
     }
     // The complete version (or the unchanged previous one) supersedes the checkpoint.
     checkpoints.remove(&repo)?;
@@ -1534,6 +1550,24 @@ pub fn run_backup_with_cipher(
     progress(ctx, Phase::Completed, total, total, report.bytes_examined, None);
     report.duration_ms = started.elapsed().as_millis() as u64;
     Ok(report)
+}
+
+/// Metadata recorded with a new version: the job's default note and tags,
+/// who wrote it and what this run added so far.
+fn version_meta(opts: &BackupOptions, report: &BackupReport) -> VersionMeta {
+    VersionMeta {
+        note: opts.default_note.clone().filter(|n| !n.trim().is_empty()),
+        tags: opts.default_tags.clone(),
+        identity: Some(opts.identity.resolve()),
+        stats: Some(VersionStats {
+            bytes_added: report.bytes_uploaded,
+            new_blocks: report.new_blocks,
+            files_added: report.files_added,
+            files_changed: report.files_changed,
+            files_deleted: report.files_deleted,
+        }),
+        ..Default::default()
+    }
 }
 
 fn read_control_files(paths: &[String], report: &mut BackupReport) -> Result<Vec<ControlFile>, AppError> {
@@ -1897,7 +1931,7 @@ mod tests {
         assert_eq!(fl.control_files.len(), 1);
         assert_eq!(fl.control_files[0].name, "manifest.txt");
         // A rewrite (purge/repair) keeps them.
-        repo.rewrite_filelist(&fs.timestamp, fs.partial, &fs.volume_name, &db.files(fs.id).unwrap()).unwrap();
+        repo.rewrite_filelist(fs, &db.files(fs.id).unwrap()).unwrap();
         let fl: FileListVolume = volume::open_json(&repo.cipher, &be.get(&fs.volume_name).unwrap()).unwrap();
         assert_eq!(fl.control_files.len(), 1);
     }

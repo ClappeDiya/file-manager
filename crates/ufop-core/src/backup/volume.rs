@@ -391,6 +391,10 @@ pub struct FileListVolume {
     /// Extra files attached to this version (`control_files` option).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub control_files: Vec<ControlFile>,
+    /// Note, tags, pin, client identity and storage statistics (all
+    /// optional; older readers ignore them).
+    #[serde(flatten)]
+    pub meta: super::versions::VersionMeta,
 }
 
 /// An auxiliary file stored inside a file-list volume.

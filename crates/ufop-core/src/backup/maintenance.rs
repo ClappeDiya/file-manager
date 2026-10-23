@@ -7,7 +7,7 @@ use super::crypto::KdfParams;
 use super::db::BackupDb;
 use super::engine::{flush, Pending, Repo};
 use super::restore::path_selected;
-use super::retention::RetentionPolicy;
+use super::retention::{RetentionCandidate, RetentionPolicy, RetentionVerdict};
 use super::volume::{self, FileListVolume, IndexVolume, IndexedBlock, VolumeKind};
 use super::{hash_bytes, BackupOptions, EntryKind, FileEntry, HashAlgorithm, OpContext};
 use crate::error::AppError;
@@ -21,14 +21,28 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
 }
 
 /// Delete versions by index (0 = newest). Refuses to remove every version
-/// unless `allow_full_removal` is set.
+/// unless `allow_full_removal` is set, and refuses pinned versions.
 pub fn delete_versions(repo: &Repo, versions: &[usize], allow_full_removal: bool) -> Result<usize, AppError> {
-    let all = repo.db.filesets()?;
-    let ids: Vec<i64> = versions.iter().filter_map(|v| all.get(*v).map(|f| f.id)).collect();
-    delete_fileset_ids(repo, &ids, allow_full_removal)
+    delete_versions_ex(repo, versions, allow_full_removal, false)
 }
 
-fn delete_fileset_ids(repo: &Repo, ids: &[i64], allow_full_removal: bool) -> Result<usize, AppError> {
+/// [`delete_versions`]; with `force` pinned versions are deleted too.
+pub fn delete_versions_ex(repo: &Repo, versions: &[usize], allow_full_removal: bool, force: bool) -> Result<usize, AppError> {
+    let all = repo.db.filesets()?;
+    let picked: Vec<&super::Fileset> = versions.iter().filter_map(|v| all.get(*v)).collect();
+    if !force {
+        if let Some(p) = picked.iter().find(|f| f.pinned) {
+            return Err(AppError::state(
+                format!("Version {} is pinned (Keep forever)", p.timestamp),
+                "Unpin it first, or delete with force.",
+            ));
+        }
+    }
+    let ids: Vec<i64> = picked.iter().map(|f| f.id).collect();
+    delete_fileset_ids(repo, &ids, allow_full_removal, force)
+}
+
+fn delete_fileset_ids(repo: &Repo, ids: &[i64], allow_full_removal: bool, force: bool) -> Result<usize, AppError> {
     let all = repo.db.filesets()?;
     let doomed: Vec<_> = all.iter().filter(|f| ids.contains(&f.id)).collect();
     if !allow_full_removal && !all.is_empty() && doomed.len() >= all.len() {
@@ -38,6 +52,10 @@ fn delete_fileset_ids(repo: &Repo, ids: &[i64], allow_full_removal: bool) -> Res
     }
     let mut n = 0;
     for f in &doomed {
+        if f.pinned && !force {
+            tracing::info!("Keeping version {} (pinned)", f.timestamp);
+            continue;
+        }
         // Locked versions stay until their lock expires.
         if let Some(until) = repo.locked_until(&f.volume_name)? {
             tracing::info!("Keeping version {} (locked until {until})", f.timestamp);
@@ -50,15 +68,49 @@ fn delete_fileset_ids(repo: &Repo, ids: &[i64], allow_full_removal: bool) -> Res
     Ok(n)
 }
 
-/// Apply a retention policy; returns how many versions were removed.
+/// The current source's versions as retention sees them (pins, locks).
+pub fn retention_candidates(db: &BackupDb) -> Result<Vec<RetentionCandidate>, AppError> {
+    let now = Utc::now();
+    let locks: HashMap<String, String> = db
+        .volumes(Some(VolumeKind::FileList))?
+        .into_iter()
+        .filter_map(|v| v.lock_until.filter(|u| parse_ts(u).is_some_and(|t| t > now)).map(|u| (v.name, u)))
+        .collect();
+    Ok(db
+        .filesets()?
+        .into_iter()
+        .filter_map(|f| {
+            parse_ts(&f.timestamp).map(|t| RetentionCandidate { id: f.id, time: t, pinned: f.pinned, locked_until: locks.get(&f.volume_name).cloned() })
+        })
+        .collect())
+}
+
+/// What a retention policy would keep and delete, version by version.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetentionPreview {
+    pub policy: RetentionPolicy,
+    pub legal_hold: bool,
+    pub keep: usize,
+    pub delete: usize,
+    /// Newest first.
+    pub versions: Vec<RetentionVerdict>,
+}
+
+/// Dry run of retention on the current source (nothing is changed).
+pub fn preview_retention(db: &BackupDb, policy: &RetentionPolicy, legal_hold: bool) -> Result<RetentionPreview, AppError> {
+    let versions = policy.plan(&retention_candidates(db)?, Utc::now(), legal_hold)?;
+    let keep = versions.iter().filter(|v| v.keep).count();
+    Ok(RetentionPreview { policy: policy.clone(), legal_hold, keep, delete: versions.len() - keep, versions })
+}
+
+/// Apply a retention policy to the current source; returns how many
+/// versions were removed. Pinned and locked versions are kept.
 pub fn apply_retention(repo: &Repo, policy: &RetentionPolicy, allow_full_removal: bool) -> Result<usize, AppError> {
-    let versions: Vec<(i64, DateTime<Utc>)> =
-        repo.db.filesets()?.iter().filter_map(|f| parse_ts(&f.timestamp).map(|t| (f.id, t))).collect();
-    let del = policy.select_deletions(&versions, Utc::now())?;
+    let del: Vec<i64> = policy.plan(&retention_candidates(repo.db)?, Utc::now(), false)?.into_iter().filter(|v| !v.keep).map(|v| v.id).collect();
     if del.is_empty() {
         return Ok(0);
     }
-    delete_fileset_ids(repo, &del, allow_full_removal)
+    delete_fileset_ids(repo, &del, allow_full_removal, false)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -270,7 +322,8 @@ pub fn recreate_database(
         match volume::open_json::<FileListVolume>(&repo.cipher, &data) {
             Ok(fl) => {
                 db.add_volume(&f.name, VolumeKind::FileList, f.size, &hash_bytes(HashAlgorithm::Sha256, &data), "uploaded")?;
-                db.add_fileset(&fl.timestamp, &f.name, fl.partial, &fl.files)?;
+                db.add_fileset_with_meta(&fl.timestamp, &f.name, fl.partial, &fl.files, &fl.meta)?;
+                super::engine::store_dlist_extra(db, &fl)?;
                 r.versions += 1;
             }
             Err(e) => r.warnings.push(format!("{}: {}", f.name, e.user_message())),
@@ -328,7 +381,7 @@ pub fn repair(repo: &Repo) -> Result<RepairReport, AppError> {
         match volume::classify(&repo.prefix, name) {
             Some(VolumeKind::FileList) => {
                 if let Some(fs) = filesets.iter().find(|f| &f.volume_name == name) {
-                    repo.rewrite_filelist(&fs.timestamp, fs.partial, name, &repo.db.files(fs.id)?)?;
+                    repo.rewrite_filelist(fs, &repo.db.files(fs.id)?)?;
                     r.reuploaded.push(name.clone());
                 }
             }
@@ -577,7 +630,7 @@ fn affected_by(repo: &Repo, is_bad: impl Fn(Option<&str>) -> bool) -> Result<Vec
 }
 
 fn rewrite_fileset(repo: &Repo, fs: &super::Fileset, files: &[FileEntry]) -> Result<(), AppError> {
-    repo.rewrite_filelist(&fs.timestamp, fs.partial, &fs.volume_name, files)?;
+    repo.rewrite_filelist(fs, files)?;
     repo.db.replace_fileset_files(fs.id, &fs.volume_name, files)
 }
 
@@ -586,6 +639,9 @@ pub struct PurgeReport {
     pub versions_rewritten: usize,
     pub entries_removed: usize,
     pub dry_run: bool,
+    /// Pinned versions left unchanged (a purge never rewrites them).
+    #[serde(default)]
+    pub pinned_skipped: usize,
 }
 
 /// Remove matching paths from the selected versions (all when `None`).
@@ -601,6 +657,10 @@ pub fn purge(repo: &Repo, selectors: &[String], versions: Option<&[usize]>, dry_
         let files = repo.db.files(fs.id)?;
         let kept: Vec<FileEntry> = files.iter().filter(|f| !path_selected(&f.path, selectors)).cloned().collect();
         let removed = files.len() - kept.len();
+        if removed > 0 && fs.pinned {
+            r.pinned_skipped += 1;
+            continue;
+        }
         if removed > 0 {
             r.entries_removed += removed;
             r.versions_rewritten += 1;

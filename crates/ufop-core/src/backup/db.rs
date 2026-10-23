@@ -15,6 +15,7 @@
 //! created with owner-only permissions (Unix) either way.
 
 use super::volume::VolumeKind;
+use super::versions::VersionMeta;
 use super::{EntryKind, FileEntry, Fileset};
 use crate::error::AppError;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -105,7 +106,7 @@ pub fn obfuscate_path(path: &str, salt: &[u8]) -> String {
 }
 
 /// Current job-database schema version (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Summary of a job database file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +149,21 @@ pub struct BackupDb {
     conn: Connection,
     /// Seals sensitive columns; `None` for a plain database.
     cols: Option<ColumnCipher>,
+    /// Shared repositories: [`BackupDb::filesets`] lists only this source
+    /// (`None` = every version).
+    scope: std::cell::RefCell<Option<String>>,
+}
+
+/// Restores the previous source scope when dropped (see [`BackupDb::scoped`]).
+pub struct ScopeGuard<'a> {
+    db: &'a BackupDb,
+    previous: Option<String>,
+}
+
+impl Drop for ScopeGuard<'_> {
+    fn drop(&mut self) {
+        *self.db.scope.borrow_mut() = self.previous.take();
+    }
 }
 
 /// 256-bit key for an encrypted job database (kept by the caller, e.g. in
@@ -349,7 +365,7 @@ impl BackupDb {
                 Some(c)
             }
         };
-        Ok(Self { conn, cols })
+        Ok(Self { conn, cols, scope: Default::default() })
     }
 
     fn marker(conn: &Connection) -> Result<Option<Marker>, AppError> {
@@ -417,6 +433,11 @@ impl BackupDb {
                     e.meta.filter(|m| !m.is_empty()).map(|m| serde_json::to_string(&m)).transpose()?.map(|m| seal("meta", m))
                 ])?;
                 rep.files += 1;
+            }
+            let metas: Vec<(i64, String)> = self.conn.prepare("SELECT id, meta FROM filesets WHERE meta IS NOT NULL")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            for (id, m) in metas {
+                let plain = self.dec("fileset_meta", m)?;
+                self.conn.execute("UPDATE filesets SET meta = ?2 WHERE id = ?1", params![id, seal("fileset_meta", plain)])?;
             }
             let mut kvu = self.conn.prepare("UPDATE kv SET value = ?2 WHERE key = ?1")?;
             for (k, v) in kv {
@@ -534,7 +555,8 @@ impl BackupDb {
             return Ok(0);
         }
         let has_meta: bool = conn.prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'meta'")?.exists([])?;
-        Ok(if has_meta { 2 } else { 1 })
+        let has_version_meta: bool = conn.prepare("SELECT 1 FROM pragma_table_info('filesets') WHERE name = 'meta'")?.exists([])?;
+        Ok(if has_version_meta { 3 } else if has_meta { 2 } else { 1 })
     }
 
     /// Apply every migration after the stored version, in one transaction.
@@ -558,6 +580,18 @@ impl BackupDb {
                 let has_meta: bool = conn.prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'meta'")?.exists([])?;
                 if !has_meta {
                     conn.execute_batch("ALTER TABLE files ADD COLUMN meta TEXT")?;
+                }
+            }
+            if from < 3 {
+                // v3: per-version metadata (note, tags, pin, identity, stats)
+                // and the source a version belongs to (shared repositories).
+                let has: bool = conn.prepare("SELECT 1 FROM pragma_table_info('filesets') WHERE name = 'meta'")?.exists([])?;
+                if !has {
+                    conn.execute_batch(
+                        "ALTER TABLE filesets ADD COLUMN source TEXT NOT NULL DEFAULT '';
+                         ALTER TABLE filesets ADD COLUMN meta TEXT;
+                         CREATE INDEX IF NOT EXISTS idx_filesets_source ON filesets(source);",
+                    )?;
                 }
             }
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -717,33 +751,103 @@ impl BackupDb {
     }
 
     pub fn add_fileset(&self, timestamp: &str, volume_name: &str, partial: bool, files: &[FileEntry]) -> Result<i64, AppError> {
+        self.add_fileset_with_meta(timestamp, volume_name, partial, files, &VersionMeta::default())
+    }
+
+    /// Record a version with its metadata (note, tags, pin, identity, stats).
+    pub fn add_fileset_with_meta(&self, timestamp: &str, volume_name: &str, partial: bool, files: &[FileEntry], meta: &VersionMeta) -> Result<i64, AppError> {
         let total: u64 = files.iter().map(|f| f.size).sum();
         self.conn.execute(
-            "INSERT INTO filesets(timestamp, volume_name, partial, file_count, total_size) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![timestamp, volume_name, partial as i64, files.len() as i64, total as i64],
+            "INSERT INTO filesets(timestamp, volume_name, partial, file_count, total_size, source, meta) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![timestamp, volume_name, partial as i64, files.len() as i64, total as i64, meta.source_id(), self.meta_value(meta)?],
         )?;
         let id = self.conn.last_insert_rowid();
         self.insert_files(id, files)?;
         Ok(id)
     }
 
-    pub fn filesets(&self) -> Result<Vec<Fileset>, AppError> {
-        let mut st = self.conn.prepare(
-            "SELECT id, timestamp, volume_name, partial, file_count, total_size FROM filesets ORDER BY timestamp DESC",
-        )?;
-        let v = st
-            .query_map([], |r| {
-                Ok(Fileset {
-                    id: r.get(0)?,
-                    timestamp: r.get(1)?,
-                    volume_name: r.get(2)?,
-                    partial: r.get::<_, i64>(3)? != 0,
-                    file_count: r.get::<_, i64>(4)? as u64,
-                    total_size: r.get::<_, i64>(5)? as u64,
-                })
+    fn meta_value(&self, meta: &VersionMeta) -> Result<Option<String>, AppError> {
+        Ok(if meta.is_empty() { None } else { Some(self.enc("fileset_meta", &serde_json::to_string(meta)?)) })
+    }
+
+    /// Replace a version's metadata (and the source it belongs to).
+    pub fn set_fileset_meta(&self, id: i64, meta: &VersionMeta) -> Result<(), AppError> {
+        self.conn.execute("UPDATE filesets SET source = ?2, meta = ?3 WHERE id = ?1", params![id, meta.source_id(), self.meta_value(meta)?])?;
+        Ok(())
+    }
+
+    fn query_filesets(&self, filter: &str, p: &[&dyn rusqlite::ToSql]) -> Result<Vec<Fileset>, AppError> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT id, timestamp, volume_name, partial, file_count, total_size, source, meta FROM filesets {filter} ORDER BY timestamp DESC"
+        ))?;
+        let rows: Vec<(Fileset, Option<String>)> = st
+            .query_map(p, |r| {
+                Ok((
+                    Fileset {
+                        id: r.get(0)?,
+                        timestamp: r.get(1)?,
+                        volume_name: r.get(2)?,
+                        partial: r.get::<_, i64>(3)? != 0,
+                        file_count: r.get::<_, i64>(4)? as u64,
+                        total_size: r.get::<_, i64>(5)? as u64,
+                        source: r.get(6)?,
+                        ..Default::default()
+                    },
+                    r.get(7)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(v)
+        rows.into_iter()
+            .map(|(mut f, m)| {
+                if let Some(m) = m {
+                    let meta: VersionMeta = serde_json::from_str(&self.dec("fileset_meta", m)?).unwrap_or_default();
+                    let source = std::mem::take(&mut f.source);
+                    f.set_meta(meta);
+                    // The column is authoritative (identities may be absent).
+                    f.source = source;
+                }
+                Ok(f)
+            })
+            .collect()
+    }
+
+    /// Versions of the current source (every version when no scope is
+    /// set), newest first.
+    pub fn filesets(&self) -> Result<Vec<Fileset>, AppError> {
+        match self.scope() {
+            Some(s) => self.query_filesets("WHERE source = ?1", &[&s]),
+            None => self.all_filesets(),
+        }
+    }
+
+    /// Every version of every source, newest first.
+    pub fn all_filesets(&self) -> Result<Vec<Fileset>, AppError> {
+        self.query_filesets("", &[])
+    }
+
+    /// Versions of one source, newest first.
+    pub fn filesets_of(&self, source: &str) -> Result<Vec<Fileset>, AppError> {
+        self.query_filesets("WHERE source = ?1", &[&source])
+    }
+
+    pub fn fileset_by_id(&self, id: i64) -> Result<Fileset, AppError> {
+        self.query_filesets("WHERE id = ?1", &[&id])?.into_iter().next().ok_or_else(|| AppError::validation(format!("Backup version #{id} does not exist")))
+    }
+
+    /// Limit [`filesets`](Self::filesets) (and so version numbers, restore,
+    /// retention, pins and comparisons) to one source; `None` = all.
+    pub fn set_scope(&self, source: Option<String>) {
+        *self.scope.borrow_mut() = source;
+    }
+
+    pub fn scope(&self) -> Option<String> {
+        self.scope.borrow().clone()
+    }
+
+    /// Change the scope until the guard is dropped.
+    pub fn scoped(&self, source: Option<String>) -> ScopeGuard<'_> {
+        let previous = self.scope.replace(source);
+        ScopeGuard { db: self, previous }
     }
 
     /// Resolve a version: index 0 = newest.
@@ -836,6 +940,14 @@ impl BackupDb {
                 rep.paths_obfuscated += 1;
             }
             rep.settings_removed = tx.execute("DELETE FROM kv WHERE key LIKE 'dlist_extra:%' OR key = 'usn_state'", [])? as u64;
+            // Version metadata: notes, tags and identities can name people
+            // or projects; only the pin and the statistics stay.
+            let metas: Vec<(i64, String)> = tx.prepare("SELECT id, meta FROM filesets WHERE meta IS NOT NULL")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            for (id, m) in metas {
+                let full: VersionMeta = serde_json::from_str(&self.dec("fileset_meta", m)?).unwrap_or_default();
+                let kept = VersionMeta { pinned: full.pinned, stats: full.stats, ..Default::default() };
+                tx.execute("UPDATE filesets SET meta = ?2 WHERE id = ?1", params![id, (!kept.is_empty()).then(|| serde_json::to_string(&kept)).transpose()?])?;
+            }
             if self.cols.is_some() {
                 let kv: Vec<(String, String)> = tx.prepare("SELECT key, value FROM kv WHERE key <> ?1")?.query_map([MARKER_KEY], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
                 for (k, v) in kv {

@@ -23,6 +23,7 @@
 
 pub mod backend;
 pub mod chunker;
+
 pub mod crypto;
 pub mod db;
 pub mod engine;
@@ -41,8 +42,10 @@ pub mod photos;
 pub mod recovery;
 pub mod restore;
 pub mod retention;
+pub mod shared;
 pub mod snapshot;
 pub mod usn;
+pub mod versions;
 pub mod volume;
 
 pub use backend::{Backend, LocalBackend, ReadOnlyBackend, RemoteFile, RetryingBackend, SoftDeleteBackend};
@@ -340,6 +343,22 @@ pub struct BackupOptions {
     pub checkpoint_interval_secs: u64,
     /// Also checkpoint after this many uploaded bytes (0 = off).
     pub checkpoint_interval_bytes: u64,
+
+    // ── Versions and shared repositories ──
+    /// Note stored with each new version.
+    pub default_note: Option<String>,
+    /// Tags stored with each new version.
+    pub default_tags: std::collections::BTreeMap<String, String>,
+    /// Who writes the versions. Empty host / user name = this computer's;
+    /// set them to continue another computer's history (migration).
+    pub identity: versions::ClientIdentity,
+    /// Create a new (format 2) repository as shared: several jobs or
+    /// computers write to it and deduplicate against each other.
+    pub shared_repository: bool,
+    /// Shared repositories: compaction leaves volumes younger than this
+    /// alone, so a writer that uploaded blocks but not yet its version is
+    /// safe (0 = no delay).
+    pub shared_gc_delay_hours: u32,
 }
 
 /// How volumes are encrypted.
@@ -431,6 +450,11 @@ impl Default for BackupOptions {
             clock_skew_abort_secs: lock::DEFAULT_SKEW_ABORT_SECS,
             checkpoint_interval_secs: 900,
             checkpoint_interval_bytes: 0,
+            default_note: None,
+            default_tags: std::collections::BTreeMap::new(),
+            identity: versions::ClientIdentity::default(),
+            shared_repository: false,
+            shared_gc_delay_hours: shared::DEFAULT_GC_DELAY_HOURS,
         }
     }
 }
@@ -580,7 +604,7 @@ pub struct FileEntry {
 }
 
 /// One backup version.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Fileset {
     pub id: i64,
     /// UTC timestamp (RFC 3339).
@@ -590,6 +614,48 @@ pub struct Fileset {
     pub partial: bool,
     pub file_count: u64,
     pub total_size: u64,
+    /// Source the version belongs to (see [`versions::ClientIdentity::source_id`]);
+    /// empty for versions written before identities were recorded.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub tags: std::collections::BTreeMap<String, String>,
+    /// Kept forever (retention skips it; deleting needs `force`).
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub pin_reason: Option<String>,
+    #[serde(default)]
+    pub identity: Option<versions::ClientIdentity>,
+    /// What the version added; `None` for versions from before this was recorded.
+    #[serde(default)]
+    pub stats: Option<versions::VersionStats>,
+}
+
+impl Fileset {
+    /// The metadata stored with this version.
+    pub fn meta(&self) -> versions::VersionMeta {
+        versions::VersionMeta {
+            note: self.note.clone(),
+            tags: self.tags.clone(),
+            pinned: self.pinned,
+            pin_reason: self.pin_reason.clone(),
+            identity: self.identity.clone(),
+            stats: self.stats,
+        }
+    }
+
+    pub(crate) fn set_meta(&mut self, m: versions::VersionMeta) {
+        self.source = m.source_id();
+        self.note = m.note;
+        self.tags = m.tags;
+        self.pinned = m.pinned;
+        self.pin_reason = m.pin_reason;
+        self.identity = m.identity;
+        self.stats = m.stats;
+    }
 }
 
 pub(crate) fn hash_bytes(alg: HashAlgorithm, data: &[u8]) -> String {
