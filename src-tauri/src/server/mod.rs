@@ -13,6 +13,7 @@ pub mod folders;
 pub mod gateway;
 pub mod lifecycle;
 pub mod oauth;
+pub mod observe;
 pub mod mcp;
 pub mod mcp_oauth;
 pub mod openapi;
@@ -90,6 +91,8 @@ pub struct ServerConfig {
     pub public_url: Option<String>,
     /// How long running backups get to stop at a safe point on shutdown.
     pub shutdown_grace_secs: u64,
+    /// One log line per request (method, route template, status, latency, request id).
+    pub request_log: bool,
 }
 
 impl Default for ServerConfig {
@@ -115,6 +118,7 @@ impl Default for ServerConfig {
             public_url: None,
             dav_allowed_clients: Default::default(),
             shutdown_grace_secs: crate::backup_engine::shutdown::DEFAULT_GRACE.as_secs(),
+            request_log: true,
         }
     }
 }
@@ -1070,7 +1074,7 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/server/shutdown", post(lifecycle::shutdown_route))
         .merge(gateway::protected_routes())
         .route_layer(middleware::from_fn_with_state(st.clone(), require_auth));
-    let mut app = public.merge(protected).merge(dav::routes());
+    let mut app = public.merge(protected).merge(dav::routes()).route_layer(middleware::from_fn(observe::record_route));
     if !st.cfg.api_only && st.cfg.webroot.is_some() {
         app = app.fallback(static_files);
     }
@@ -1081,7 +1085,8 @@ pub fn router(st: ServerState) -> Router {
                 .allow_origin(origins)
                 .allow_credentials(true)
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
-                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static(PREAUTH_HEADER), header::HeaderName::from_static(csrf::CSRF_HEADER)]),
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static(PREAUTH_HEADER), header::HeaderName::from_static(csrf::CSRF_HEADER), observe::REQUEST_ID])
+                .expose_headers([observe::REQUEST_ID]),
         );
     }
     app.layer(middleware::from_fn_with_state(st.clone(), csrf::csrf_guard))
@@ -1089,6 +1094,14 @@ pub fn router(st: ServerState) -> Router {
         .layer(middleware::from_fn_with_state(st.clone(), host_check))
         .layer(middleware::from_fn_with_state(st.clone(), ip_check))
         .layer(middleware::from_fn_with_state(st.clone(), security_headers))
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http()
+                .make_span_with(observe::make_span)
+                .on_request(observe::on_request)
+                .on_response(observe::LogResponse { enabled: st.cfg.request_log })
+                .on_failure(()),
+        )
+        .layer(middleware::from_fn_with_state(st.clone(), observe::request_context))
         .with_state(st)
 }
 

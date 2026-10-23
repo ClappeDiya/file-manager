@@ -87,7 +87,7 @@ Ground rules
 - [x] K97 Graceful server shutdown (drain, checkpoint)
 - [x] K89 CSRF double-submit token on cookie routes
 - [ ] K93 API tokens scoped to job IDs
-- [ ] K107 Request tracing with X-Request-Id
+- [x] K107 Request tracing with X-Request-Id
 - [ ] K108 Prometheus `/metrics`
 - [ ] K109 OpenTelemetry trace export + Prometheus pushgateway
 - [ ] K92 Multi-user server accounts and per-job ACL

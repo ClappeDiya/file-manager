@@ -1165,3 +1165,25 @@ async fn csrf_double_submit_on_cookie_routes() {
     assert_eq!(s.client.post(format!("{}/api/v1/auth/logout", s.base)).header("X-CSRF-Token", &csrf).send().await.unwrap().status(), 200);
     assert!(s.csrf().is_empty(), "logout clears the cookie");
 }
+
+#[tokio::test]
+async fn request_ids_are_echoed_generated_and_put_in_errors() {
+    let s = start(ServerConfig::default(), None).await;
+    let ok = s.client.get(format!("{}/api/v1/health", s.base)).header("X-Request-Id", "client-req.42").send().await.unwrap();
+    assert_eq!(ok.headers()["x-request-id"], "client-req.42");
+    // Unsafe or missing ids are replaced with a UUIDv4.
+    let gen = s.client.get(format!("{}/api/v1/health", s.base)).header("X-Request-Id", "bad id <x>").send().await.unwrap();
+    let id = gen.headers()["x-request-id"].to_str().unwrap().to_string();
+    assert!(uuid::Uuid::parse_str(&id).is_ok_and(|u| u.get_version_num() == 4), "{id}");
+    let none = s.client.get(format!("{}/api/v1/health", s.base)).send().await.unwrap();
+    assert_ne!(none.headers()["x-request-id"].to_str().unwrap(), id);
+    // JSON error bodies carry the id.
+    let err = s.client.get(format!("{}/api/v1/jobs", s.base)).header("X-Request-Id", "trace-me").send().await.unwrap();
+    assert_eq!(err.status(), 401);
+    assert_eq!(err.headers()["x-request-id"], "trace-me");
+    let body: Value = err.json().await.unwrap();
+    assert_eq!((body["request_id"].as_str(), body["error_type"].as_str()), (Some("trace-me"), Some("permission_denied")));
+    let missing = s.get("/api/v1/jobs/nope", &s.login().await).await;
+    let body: Value = missing.json().await.unwrap();
+    assert!(body["request_id"].is_string() && body["message"].is_string(), "{body}");
+}

@@ -65,3 +65,26 @@ header for you; a script that keeps the refresh cookie must send it too
 (`curl -b jar -c jar -H "X-CSRF-Token: $(awk '/ufop_csrf/{print $7}' jar)" -X POST …/api/v1/auth/refresh`).
 After upgrading, run `ufop server login` again once so the CLI stores the token. Share-link pages (`/s/…`)
 carry their capability in the URL and use `SameSite=Lax` unlock cookies; they are not covered by this check.
+
+## Request tracing and logs
+
+Every request gets a **request id**. A client may send its own in `X-Request-Id` (1–128 characters of
+letters, digits and `. _ : / + = -`); anything else is replaced by a new UUIDv4. The id is
+
+- echoed in the `X-Request-Id` response header (also exposed to CORS clients),
+- added as `request_id` to every JSON error body (`{error_type, message, advice, request_id}`),
+- a field of the request's tracing span `http.request` (tower-http `TraceLayer`), next to `http.method`,
+  `http.route` (the **route template**, e.g. `/api/v1/jobs/{id}/run`), and `http.status_code`.
+
+With `--request-log on` (the default; `UFOP_SERVER_REQUEST_LOG`) the server writes one line per request:
+
+```text
+INFO http.request{otel.kind="server" http.method=POST http.route=/api/v1/jobs/{id}/run http.status_code=200 request_id=3f1c…}: ufop_server::http: request status=200 latency_ms=4.2
+```
+
+`--request-log off` drops these lines; spans (and trace export) stay. Raw paths are never logged, because
+share links and gateway paths carry tokens in them. At `RUST_LOG=debug` a "request received" line adds the
+query string with sensitive parameters (`token`, `access_token`, `authid`, `code`, `password`, `secret`,
+`key`, `signature`, `X-Amz-*`, SAS `sig`/`se`/`sp`, anything ending in `token`, `secret` or `password`)
+replaced by `REDACTED`, and the headers with `Authorization`, `Cookie`, `Set-Cookie`, `X-UFOP-PreAuth` and
+`X-CSRF-Token` replaced. Quote the request id when reporting a problem; search the log for it.
