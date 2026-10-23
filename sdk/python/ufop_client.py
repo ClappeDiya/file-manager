@@ -12,7 +12,9 @@ API_VERSION = "0.1.0"
 ApiToken = Dict[str, Any]
 BackupJob = Dict[str, Any]
 ApiError = Dict[str, Any]
+Fileset = Dict[str, Any]
 FolderPolicy = Dict[str, Any]
+RetentionPolicy = Dict[str, Any]
 SchedulerStatus = Dict[str, Any]
 Scope = Dict[str, Any]
 Session = Dict[str, Any]
@@ -199,9 +201,9 @@ class UfopClient:
         """The equivalent `ufop backup` command line (API tokens: `read` scope). `GET /api/v1/jobs/{id}/cli`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/cli", None, None)
 
-    def get_jobs_id_compare(self, id_: str, base: int, compare: int) -> Dict[str, Any]:
+    def get_jobs_id_compare(self, id_: str, base: int, compare: int, source: Optional[str] = None) -> Dict[str, Any]:
         """Differences between two versions (API tokens: `read` scope). `GET /api/v1/jobs/{id}/compare`"""
-        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/compare", {"base": base, "compare": compare}, None)
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/compare", {"base": base, "compare": compare, "source": source}, None)
 
     def put_jobs_id_database_encryption(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
         """Encrypt or decrypt the job's local database now (key kept in the credential store) (API tokens: `write` scope). `PUT /api/v1/jobs/{id}/database-encryption`"""
@@ -211,9 +213,9 @@ class UfopClient:
         """Export the job configuration (API tokens: `read` scope). `GET /api/v1/jobs/{id}/export`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/export", {"include_passphrase": include_passphrase, "export_passphrase": export_passphrase}, None)
 
-    def get_jobs_id_files(self, id_: str, version: Optional[int] = None, prefix: Optional[str] = None) -> Dict[str, Any]:
+    def get_jobs_id_files(self, id_: str, version: Optional[int] = None, prefix: Optional[str] = None, source: Optional[str] = None) -> Dict[str, Any]:
         """Files in a version (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files`"""
-        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/files", {"version": version, "prefix": prefix}, None)
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/files", {"version": version, "prefix": prefix, "source": source}, None)
 
     def get_jobs_id_lock(self, id_: str) -> Dict[str, Any]:
         """Repository lock status: who holds the destination (host, operation, since, expires) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/lock`"""
@@ -231,17 +233,29 @@ class UfopClient:
         """Change an encrypted job's passphrase (format 2 repositories rewrite only the header) (API tokens: `write` scope). `PUT /api/v1/jobs/{id}/passphrase`"""
         return self._call("PUT", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/passphrase", None, body)
 
+    def post_jobs_id_retention_preview(self, id_: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """What retention would keep and delete (the job's policy or an unsaved one); changes nothing (API tokens: `write` scope). `POST /api/v1/jobs/{id}/retention/preview`"""
+        return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/retention/preview", None, body if body is not None else {})
+
     def post_jobs_id_run(self, id_: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Start a backup (queued); returns the task id (API tokens: `run` scope). `POST /api/v1/jobs/{id}/run`"""
         return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/run", None, body if body is not None else {})
 
-    def get_jobs_id_search(self, id_: str, q: str, version: Optional[int] = None) -> Dict[str, Any]:
+    def get_jobs_id_search(self, id_: str, q: str, version: Optional[int] = None, source: Optional[str] = None) -> Dict[str, Any]:
         """Search file names across versions (API tokens: `read` scope). `GET /api/v1/jobs/{id}/search`"""
-        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/search", {"q": q, "version": version}, None)
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/search", {"q": q, "version": version, "source": source}, None)
 
-    def get_jobs_id_versions(self, id_: str) -> List[Dict[str, Any]]:
-        """Backup versions of a job (API tokens: `read` scope). `GET /api/v1/jobs/{id}/versions`"""
-        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/versions", None, None)
+    def get_jobs_id_sources(self, id_: str) -> List[Dict[str, Any]]:
+        """Sources (jobs and computers) with versions in the job's repository (API tokens: `read` scope). `GET /api/v1/jobs/{id}/sources`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/sources", None, None)
+
+    def get_jobs_id_versions(self, id_: str, source: Optional[str] = None, tags: Optional[str] = None) -> List["Fileset"]:
+        """Backup versions of a job (with note, tags, pin, identity and storage added) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/versions`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/versions", {"source": source, "tags": tags}, None)
+
+    def patch_jobs_id_versions_version(self, id_: str, version: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Change a version's note, tags or pin (rewrites its file list) (API tokens: `write` scope). `PATCH /api/v1/jobs/{id}/versions/{version}`"""
+        return self._call("PATCH", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/versions/{urllib.parse.quote(version, safe='')}", None, body if body is not None else {})
 
     def get_modules(self) -> Dict[str, Any]:
         """Enabled and disabled modules (API tokens: `read` scope). `GET /api/v1/modules`"""

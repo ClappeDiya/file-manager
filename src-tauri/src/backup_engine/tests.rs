@@ -931,7 +931,7 @@ async fn legal_hold_suspends_retention_blocks_removal_and_feeds_ediscovery() {
     assert_eq!(m.list_versions(&j.id).await.unwrap().len(), 2);
 
     // Removal is refused; a dry run is not.
-    assert!(m.execute(&j.id, BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false }).await.is_err());
+    assert!(m.execute(&j.id, BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false, force: false }).await.is_err());
     assert!(m.execute(&j.id, BackupOperation::Purge { paths: vec!["/x".into()], versions: None, dry_run: false }).await.is_err());
     assert!(m.execute(&j.id, BackupOperation::Purge { paths: vec!["/x".into()], versions: None, dry_run: true }).await.is_ok());
     assert!(m.delete_job(&j.id, true, false).await.is_err());
@@ -1145,7 +1145,7 @@ async fn read_only_jobs_restore_and_browse_but_never_write() {
         BackupOperation::Backup { dry_run: false },
         BackupOperation::Compact,
         BackupOperation::Repair,
-        BackupOperation::DeleteVersions { versions: vec![0], allow_full_removal: true },
+        BackupOperation::DeleteVersions { versions: vec![0], allow_full_removal: true, force: false },
         BackupOperation::Purge { paths: vec!["*".into()], versions: None, dry_run: false },
         BackupOperation::UpgradeFormat { rollback: false },
         BackupOperation::Reshard { layout: ufop_core::backup::layout::RepoLayout::Sharded { prefix_len: 1 }, dry_run: false },
@@ -1214,4 +1214,130 @@ async fn local_database_encryption_default_migration_and_lost_key() {
     m.inner.jobs.write().await.insert(legacy.id.clone(), legacy.clone());
     assert_eq!(m.execute(&old.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
     assert!(!BackupDb::inspect(&m.job_db_path(&old.id)).unwrap().encrypted);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn version_notes_pins_retention_preview_and_delete() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    let m = manager(t.path()).await;
+    let mut jb = job(&src, &dst);
+    jb.options.default_note = Some("scheduled".into());
+    jb.options.default_tags.insert("env".into(), "prod".into());
+    let j = m.save_job(jb, Some("pw".into())).await.unwrap();
+    for i in 0..3u8 {
+        std::fs::write(src.join("f.txt"), [i; 20]).unwrap();
+        assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+    let v = m.list_versions(&j.id).await.unwrap();
+    assert_eq!(v.len(), 3);
+    assert_eq!(v[0].note.as_deref(), Some("scheduled"));
+    assert_eq!(v[0].identity.as_ref().map(|i| i.job_id.clone()), Some(j.id.clone()), "the job id is the identity");
+    assert!(v[0].stats.unwrap().bytes_added > 0);
+    assert_eq!(m.list_versions_in(&j.id, None, vec!["env=prod".into()]).await.unwrap().len(), 3);
+    assert!(m.list_versions_in(&j.id, None, vec!["env=dev".into()]).await.unwrap().is_empty());
+
+    // Pin the oldest with a note; retention keeps it.
+    let patch = ufop_core::backup::versions::MetadataPatch { pinned: Some(true), note: Some("year end".into()), ..Default::default() };
+    let r = m.execute(&j.id, BackupOperation::SetVersionMetadata { version: 2, source: None, patch }).await.unwrap();
+    assert_eq!(r.report["pinned"], true, "{:?}", r.log);
+    let p = m.preview_retention(&j.id, Some(RetentionPolicy::KeepCount { count: 1 }), None).await.unwrap();
+    assert_eq!((p.keep, p.delete), (2, 1));
+    assert_eq!(p.versions[2].summary, "kept: pinned");
+    assert_eq!(m.list_versions(&j.id).await.unwrap().len(), 3, "a preview changes nothing");
+    let r = m.execute(&j.id, BackupOperation::ApplyRetention { policy: Some(RetentionPolicy::KeepCount { count: 1 }), source: None }).await.unwrap();
+    assert_eq!(r.report["versions_deleted"], 1);
+    let v = m.list_versions(&j.id).await.unwrap();
+    assert!(v[1].pinned && v[1].note.as_deref() == Some("year end"));
+    // Deleting the pinned version needs force.
+    assert!(m.execute(&j.id, BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false, force: false }).await.is_err());
+    let r = m.execute(&j.id, BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false, force: true }).await.unwrap();
+    assert_eq!(r.report["versions_deleted"], 1);
+    // A legal hold keeps everything in the preview and refuses retention.
+    m.place_legal_hold(&j.id, "Case 1", "", "test").await.unwrap();
+    assert!(m.preview_retention(&j.id, None, None).await.unwrap().legal_hold);
+    assert!(m.execute(&j.id, BackupOperation::ApplyRetention { policy: None, source: None }).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_versions_to_another_job_and_a_new_destination() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, d1, d2, d3, out) = (t.path().join("src"), t.path().join("d1"), t.path().join("d2"), t.path().join("d3"), t.path().join("out"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.bin"), (0..50_000u32).map(|i| (i % 249) as u8).collect::<Vec<_>>()).unwrap();
+    let m = manager(t.path()).await;
+    let a = m.save_job(job(&src, &d1), Some("pw".into())).await.unwrap();
+    let mut jb = job(&src, &d2);
+    jb.name = "Archive".into();
+    jb.options.format_version = Some(1);
+    let b = m.save_job(jb, Some("pw2".into())).await.unwrap();
+    assert_eq!(m.execute(&a.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let patch = ufop_core::backup::versions::MetadataPatch { pinned: Some(true), ..Default::default() };
+    m.execute(&a.id, BackupOperation::SetVersionMetadata { version: 0, source: None, patch }).await.unwrap();
+
+    let op = |target: versions::CopyTarget, dry_run| BackupOperation::CopyVersions { versions: vec![0], source: None, target, dry_run };
+    let dry = m.execute(&a.id, op(versions::CopyTarget::Job { job_id: b.id.clone() }, true)).await.unwrap();
+    assert_eq!(dry.report["versions_copied"], 1, "{:?}", dry.log);
+    assert!(m.list_versions(&b.id).await.unwrap().is_empty());
+    let r = m.execute(&a.id, op(versions::CopyTarget::Job { job_id: b.id.clone() }, false)).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(r.report["rechunked"], true, "format 2 CDC into format 1 fixed blocks");
+    let copied = m.list_versions(&b.id).await.unwrap();
+    assert_eq!(copied.len(), 1);
+    assert!(copied[0].pinned, "pin copied");
+    assert_eq!(m.get_job(&b.id).await.unwrap().stats.version_count, 1);
+    let restore = RestoreOptions { target: Some(out.clone()), ..Default::default() };
+    let r = m.execute(&b.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.report["files_restored"], 1, "{:?}", r.log);
+    assert!(m.execute(&a.id, op(versions::CopyTarget::Job { job_id: a.id.clone() }, false)).await.is_err(), "not onto itself");
+
+    // A destination without a job, unencrypted.
+    let dest = BackupDestination::Local { path: d3.to_string_lossy().into(), alternate_paths: vec![], marker_file: None };
+    let r = m.execute(&a.id, op(versions::CopyTarget::Destination { destination: dest.clone(), passphrase: None, prefix: None, options: None }, false)).await.unwrap();
+    assert_eq!(r.report["versions_copied"], 1, "{:?}", r.log);
+    let again = m.execute(&a.id, op(versions::CopyTarget::Destination { destination: dest, passphrase: None, prefix: None, options: None }, false)).await.unwrap();
+    assert_eq!((again.report["versions_copied"].as_u64(), again.report["versions_skipped"].as_u64()), (Some(0), Some(1)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_repository_between_jobs_and_adoption_as_a_new_source() {
+    let t = tempfile::tempdir().unwrap();
+    let (sa, sb, dst) = (t.path().join("a"), t.path().join("b"), t.path().join("dst"));
+    std::fs::create_dir_all(&sa).unwrap();
+    std::fs::create_dir_all(&sb).unwrap();
+    let data: Vec<u8> = (0..60_000u32).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+    std::fs::write(sa.join("same.bin"), &data).unwrap();
+    std::fs::write(sb.join("same.bin"), &data).unwrap();
+    let m = manager(t.path()).await;
+    let a = m.save_job(job(&sa, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&a.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let r = m.execute(&a.id, BackupOperation::EnableSharing { claim_all: true }).await.unwrap();
+    assert_eq!(r.report["versions_assigned"], 0, "the job's versions already carry its identity");
+    let mut jb = job(&sb, &dst);
+    jb.name = "Other".into();
+    let b = m.save_job(jb, Some("pw".into())).await.unwrap();
+    let r = m.execute(&b.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(r.report["new_blocks"], 0, "deduplicated against job A");
+    assert_eq!(m.list_versions(&b.id).await.unwrap().len(), 1);
+    assert_eq!(m.list_versions_in(&b.id, Some("*".into()), vec![]).await.unwrap().len(), 2);
+    let r = m.execute(&a.id, BackupOperation::SyncSources).await.unwrap();
+    assert_eq!(r.report["shared"], true);
+    assert_eq!(r.report["sources"].as_array().unwrap().len(), 2);
+    let srcs = m.list_sources(&a.id).await.unwrap();
+    assert!(srcs[0].own && srcs[0].label.ends_with("(Docs)"));
+    // Retention on A never touches B's version.
+    let r = m.execute(&a.id, BackupOperation::ApplyRetention { policy: Some(RetentionPolicy::KeepCount { count: 1 }), source: None }).await.unwrap();
+    assert_eq!(r.report["versions_deleted"], 0);
+    assert_eq!(m.list_versions(&b.id).await.unwrap().len(), 1);
+
+    // Another computer adopting the shared repository becomes a new source.
+    let t2 = tempfile::tempdir().unwrap();
+    let m2 = manager(t2.path()).await;
+    let dest = BackupDestination::Local { path: dst.to_string_lossy().into(), alternate_paths: vec![], marker_file: None };
+    let adopted = m2.adopt_repository(dest, Some("pw".into()), "ufop".into(), Some("Laptop".into()), vec![sa.to_string_lossy().into()], vec![], false).await.unwrap();
+    assert_eq!(adopted.stats.version_count, 0, "no other job's history taken over");
+    assert_eq!(m2.list_sources(&adopted.id).await.unwrap().len(), 2);
 }

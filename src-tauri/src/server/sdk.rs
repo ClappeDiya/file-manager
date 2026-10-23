@@ -33,7 +33,7 @@ fn operations(doc: &Value) -> Vec<Operation<'_>> {
         if !path.starts_with("/api/v1/") {
             continue;
         }
-        for method in ["get", "post", "put", "delete"] {
+        for method in ["get", "post", "put", "patch", "delete"] {
             let Some(op) = item.get(method) else { continue };
             let content = &op["responses"]["200"]["content"];
             let Some(response) = content.get("application/json").map(|c| &c["schema"]) else { continue };
@@ -443,11 +443,11 @@ mod tests {
         assert!(names.contains("get_jobs_id") && names.contains("post_jobs_id_run") && names.contains("delete_shares_id"), "{names:?}");
         let ts = typescript(&doc);
         assert!(ts.contains("getJobsId(id: string): Promise<BackupJob>"));
-        assert!(ts.contains("getJobsIdSearch(id: string, query: { q: string; version?: number }): Promise<Record<string, unknown>>"), "required query → required object");
+        assert!(ts.contains("getJobsIdSearch(id: string, query: { q: string; version?: number; source?: string }): Promise<Record<string, unknown>>"), "required query → required object");
         assert!(ts.contains("export type Scope = \"read\" | \"run\" | \"write\" | \"admin\";"));
         assert!(ts.contains("`/api/v1/jobs/${encodeURIComponent(id)}/run`"));
         let py = python(&doc);
-        assert!(py.contains("def get_jobs_id_search(self, id_: str, q: str, version: Optional[int] = None)"));
+        assert!(py.contains("def get_jobs_id_search(self, id_: str, q: str, version: Optional[int] = None, source: Optional[str] = None)"));
         assert!(py.contains("(API tokens: `run` scope)"));
         assert_eq!(camel("post_auth_api_tokens"), "postAuthApiTokens");
     }

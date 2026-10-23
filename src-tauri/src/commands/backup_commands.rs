@@ -108,23 +108,53 @@ pub async fn backup_resume(mgr: State<'_, BackupManager>) -> Result<SchedulerSta
 }
 
 #[tauri::command]
-pub async fn backup_list_versions(id: String, mgr: State<'_, BackupManager>) -> Result<Vec<Fileset>, AppError> {
-    mgr.list_versions(&id).await
+pub async fn backup_list_versions(id: String, source: Option<String>, tags: Option<Vec<String>>, mgr: State<'_, BackupManager>) -> Result<Vec<Fileset>, AppError> {
+    mgr.list_versions_in(&id, source, tags.unwrap_or_default()).await
 }
 
 #[tauri::command]
-pub async fn backup_list_files(id: String, version: usize, prefix: Option<String>, mgr: State<'_, BackupManager>) -> Result<Vec<FileEntry>, AppError> {
-    mgr.list_files(&id, version, prefix).await
+pub async fn backup_list_files(id: String, version: usize, prefix: Option<String>, source: Option<String>, mgr: State<'_, BackupManager>) -> Result<Vec<FileEntry>, AppError> {
+    mgr.list_files_in(&id, version, prefix, source).await
 }
 
 #[tauri::command]
-pub async fn backup_search(id: String, pattern: String, version: Option<usize>, mgr: State<'_, BackupManager>) -> Result<Vec<FoundFile>, AppError> {
-    mgr.search(&id, pattern, version).await
+pub async fn backup_search(id: String, pattern: String, version: Option<usize>, source: Option<String>, mgr: State<'_, BackupManager>) -> Result<Vec<FoundFile>, AppError> {
+    mgr.search_in(&id, pattern, version, source).await
 }
 
 #[tauri::command]
-pub async fn backup_compare(id: String, base: usize, compare: usize, mgr: State<'_, BackupManager>) -> Result<VersionComparison, AppError> {
-    mgr.compare(&id, base, compare).await
+pub async fn backup_compare(id: String, base: usize, compare: usize, source: Option<String>, mgr: State<'_, BackupManager>) -> Result<VersionComparison, AppError> {
+    mgr.compare_in(&id, base, compare, source).await
+}
+
+/// Sources (jobs / computers) with versions in the job's repository.
+#[tauri::command]
+pub async fn backup_list_sources(id: String, mgr: State<'_, BackupManager>) -> Result<Vec<ufop_core::backup::shared::SourceInfo>, AppError> {
+    mgr.list_sources(&id).await
+}
+
+/// Keep/delete decision per version for the job's (or an unsaved) policy.
+#[tauri::command]
+pub async fn backup_preview_retention(
+    id: String,
+    policy: Option<ufop_core::backup::RetentionPolicy>,
+    source: Option<String>,
+    mgr: State<'_, BackupManager>,
+) -> Result<ufop_core::backup::maintenance::RetentionPreview, AppError> {
+    mgr.preview_retention(&id, policy, source).await
+}
+
+/// Change a version's note, tags or pin; returns the operation result
+/// (its `report` is the updated version).
+#[tauri::command]
+pub async fn backup_set_version_metadata(
+    id: String,
+    version: usize,
+    source: Option<String>,
+    patch: ufop_core::backup::versions::MetadataPatch,
+    mgr: State<'_, BackupManager>,
+) -> Result<OperationResult, AppError> {
+    mgr.execute(&id, BackupOperation::SetVersionMetadata { version, source, patch }).await
 }
 
 #[tauri::command]

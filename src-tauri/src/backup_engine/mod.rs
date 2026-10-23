@@ -23,6 +23,7 @@ pub mod power;
 pub mod schedule;
 pub mod secrets;
 pub mod stores;
+pub mod versions;
 
 use crate::connectors::ConnectionManager;
 use crate::core::error::AppError;
@@ -462,7 +463,13 @@ pub enum BackupOperation {
     ListBroken,
     PurgeBroken { dry_run: bool },
     Purge { paths: Vec<String>, versions: Option<Vec<usize>>, dry_run: bool },
-    DeleteVersions { versions: Vec<usize>, allow_full_removal: bool },
+    DeleteVersions {
+        versions: Vec<usize>,
+        allow_full_removal: bool,
+        /// Also delete pinned ("Keep forever") versions.
+        #[serde(default)]
+        force: bool,
+    },
     Consistency,
     /// Rebuild missing block volumes from the source files.
     RebuildMissing,
@@ -495,6 +502,47 @@ pub enum BackupOperation {
     },
     /// The repository's format settings (version, chunker, codec, cipher, layout).
     FormatInfo,
+    /// Change a version's note, tags or pin (rewrites its file list).
+    SetVersionMetadata {
+        version: usize,
+        /// Shared repositories: a version of another source (`None` = own).
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        patch: ufop_core::backup::versions::MetadataPatch,
+    },
+    /// Apply retention now (the job's policy, or `policy`), to the job's
+    /// own source or explicitly to `source`.
+    ApplyRetention {
+        #[serde(default)]
+        policy: Option<RetentionPolicy>,
+        #[serde(default)]
+        source: Option<String>,
+    },
+    /// Copy versions to another job's repository or a destination.
+    CopyVersions {
+        versions: Vec<usize>,
+        #[serde(default)]
+        source: Option<String>,
+        target: versions::CopyTarget,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// Make the repository shared (format 2): other jobs and computers can
+    /// write to it and deduplicate against it.
+    EnableSharing {
+        /// Assign every existing version to this job (not only versions
+        /// without an identity).
+        #[serde(default = "default_true")]
+        claim_all: bool,
+    },
+    /// Bring the local database up to date with the destination (other
+    /// sources' versions in a shared repository) and list the sources.
+    SyncSources,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl BackupOperation {
@@ -506,9 +554,26 @@ impl BackupOperation {
             Self::Backup { dry_run } | Self::PurgeBroken { dry_run } | Self::Purge { dry_run, .. } | Self::Reshard { dry_run, .. } => {
                 if *dry_run { Shared } else { Exclusive }
             }
-            Self::Compact | Self::Repair | Self::DeleteVersions { .. } | Self::RebuildMissing | Self::ApplyLocks { .. } | Self::UpgradeFormat { .. } => Exclusive,
-            Self::Restore { .. } | Self::Verify { .. } | Self::RecreateDatabase | Self::ListBroken | Self::Consistency | Self::ExtractControlFiles { .. } | Self::AutoTune { .. } | Self::ListLocks => Shared,
-            Self::SnapshotTest | Self::FormatInfo | Self::Replicate { .. } => return None,
+            Self::Compact
+            | Self::Repair
+            | Self::DeleteVersions { .. }
+            | Self::RebuildMissing
+            | Self::ApplyLocks { .. }
+            | Self::UpgradeFormat { .. }
+            | Self::SetVersionMetadata { .. }
+            | Self::ApplyRetention { .. }
+            | Self::EnableSharing { .. } => Exclusive,
+            Self::Restore { .. }
+            | Self::Verify { .. }
+            | Self::RecreateDatabase
+            | Self::ListBroken
+            | Self::Consistency
+            | Self::ExtractControlFiles { .. }
+            | Self::AutoTune { .. }
+            | Self::ListLocks
+            | Self::SyncSources => Shared,
+            // Copying locks both repositories itself (shared source, exclusive target).
+            Self::SnapshotTest | Self::FormatInfo | Self::Replicate { .. } | Self::CopyVersions { .. } => return None,
         })
     }
 
@@ -542,6 +607,11 @@ impl BackupOperation {
             Self::UpgradeFormat { rollback: true } => "rollback_format",
             Self::Reshard { .. } => "reshard",
             Self::FormatInfo => "format_info",
+            Self::SetVersionMetadata { .. } => "set_version_metadata",
+            Self::ApplyRetention { .. } => "apply_retention",
+            Self::CopyVersions { .. } => "copy_versions",
+            Self::EnableSharing { .. } => "enable_sharing",
+            Self::SyncSources => "sync_sources",
         }
     }
 }
@@ -1722,6 +1792,14 @@ impl BackupManager {
         if job.sources.is_empty() {
             return Err(AppError::validation("No stored configuration found: give the source folders to back up"));
         }
+        // A shared repository: this computer becomes a new source instead
+        // of taking over the history of the job whose configuration was stored.
+        let probe = self.backend_for(&job.destination, Throttle::default(), RetryPolicy { retries: 1, ..Default::default() }, None).await?;
+        let pfx = job.options.prefix.clone();
+        if blocking(move || ufop_core::backup::shared::repository_is_shared(probe.as_ref(), &pfx)).await.unwrap_or(false) {
+            job.options.identity = Default::default();
+            job.options.shared_repository = true;
+        }
         let job = self.save_job(job, passphrase.clone()).await?;
         let result = async {
             let backend = self.build_backend(&job).await?;
@@ -1762,12 +1840,24 @@ impl BackupManager {
     // ── Read-only queries on the local database ──
 
     async fn with_db<T: Send + 'static>(&self, job_id: &str, f: impl FnOnce(&BackupDb) -> Result<T, AppError> + Send + 'static) -> Result<T, AppError> {
+        self.with_db_in(job_id, None, f).await
+    }
+
+    /// Run `f` on the job's database, scoped to the job's own source in a
+    /// shared repository, or to `source` (`*` = every source).
+    async fn with_db_in<T: Send + 'static>(&self, job_id: &str, source: Option<String>, f: impl FnOnce(&BackupDb) -> Result<T, AppError> + Send + 'static) -> Result<T, AppError> {
         let job = self.get_job(job_id).await?;
         let (path, key, want) = self.open_job_db(&job).await?;
         let prefix = job.options.prefix.clone();
+        let identity = versions::with_identity(&job).options.identity;
         blocking(move || {
             let o = maintenance::JobDbOptions { key: key.as_ref(), encrypt: want };
-            f(&maintenance::open_job_db(&path, &o, None, None, &prefix, &OpContext::new())?.0)
+            let db = maintenance::open_job_db(&path, &o, None, None, &prefix, &OpContext::new())?.0;
+            ufop_core::backup::shared::scope_db(&db, &identity)?;
+            if let Some(s) = ufop_core::backup::shared::selector_scope(source.as_deref()) {
+                db.set_scope(s);
+            }
+            f(&db)
         })
         .await
     }
@@ -1976,6 +2066,10 @@ impl BackupManager {
             }
             if let BackupOperation::Replicate { replica_id } = &op {
                 return self.replicate(&job2, replica_id.as_deref(), &ctx).await;
+            }
+            if let BackupOperation::CopyVersions { versions, source, target, dry_run } = &op {
+                let o = ufop_core::backup::copy::CopyOptions { versions: versions.clone(), source: source.clone(), dry_run: *dry_run };
+                return self.copy_versions(&job2, o, target.clone(), &ctx).await;
             }
             let after: Vec<String> = if is_backup {
                 job2.replicas.iter().filter(|r| r.enabled && r.schedule == ReplicaSchedule::AfterBackup).map(|r| r.id.clone()).collect()
@@ -2242,8 +2336,13 @@ impl BackupManager {
     async fn refresh_stats(&self, job_id: &str, run: Option<(&BackupRun, Option<String>, u64)>) {
         let path = self.job_db_path(job_id);
         let key = self.stored_db_key(job_id).await.ok().flatten();
+        let identity = self.inner.jobs.read().await.get(job_id).map(versions::job_identity);
         let counts = blocking(move || {
             let db = BackupDb::open_with_key(&path, key.as_ref())?;
+            // Shared repositories: this job's own versions.
+            if let Some(i) = &identity {
+                ufop_core::backup::shared::scope_db(&db, i)?;
+            }
             let fs = db.filesets()?;
             let backend: u64 = db.volumes(None)?.iter().map(|v| v.size).sum();
             Ok((fs.len() as u64, fs.first().map(|f| f.total_size).unwrap_or(0), backend))
@@ -2747,6 +2846,19 @@ fn summarize(op: &str, v: &serde_json::Value) -> String {
             n("already_in_place")
         ),
         "format_info" => format!("Repository format {}", n("format_version")),
+        "delete_versions" | "apply_retention" => format!("{} version(s) deleted", n("versions_deleted")),
+        "set_version_metadata" => format!("Version {} updated", v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("")),
+        "copy_versions" => format!(
+            "{} version(s) {}copied ({} new block(s), {}), {} already there",
+            n("versions_copied"),
+            if v.get("dry_run").and_then(|b| b.as_bool()) == Some(true) { "would be " } else { "" },
+            n("blocks_copied"),
+            human_bytes(n("bytes_uploaded")),
+            n("versions_skipped")
+        ),
+        "enable_sharing" if v.get("already_shared").and_then(|b| b.as_bool()) == Some(true) => "The repository is already shared".to_string(),
+        "enable_sharing" => format!("Repository shared; {} existing version(s) assigned to this job", n("versions_assigned")),
+        "sync_sources" => format!("{} source(s)", v.get("sources").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0)),
         _ => format!("{op} completed"),
     }
 }
@@ -2777,6 +2889,7 @@ fn run_core(
     ctx: &OpContext,
 ) -> Result<serde_json::Value, AppError> {
     legal_hold::guard(job, &op)?;
+    let job = &versions::with_identity(job);
     let prefix = job.options.prefix.as_str();
     let kind = op.lock_kind();
     let name = op.name();
@@ -2832,10 +2945,34 @@ fn dispatch(
         BackupOperation::Purge { paths, versions, dry_run } => {
             serde_json::to_value(maintenance::purge(&open(false)?, &paths, versions.as_deref(), dry_run)?)?
         }
-        BackupOperation::DeleteVersions { versions, allow_full_removal } => {
-            let n = maintenance::delete_versions(&open(false)?, &versions, allow_full_removal || job.options.allow_full_removal)?;
+        BackupOperation::DeleteVersions { versions, allow_full_removal, force } => {
+            let n = maintenance::delete_versions_ex(&open(false)?, &versions, allow_full_removal || job.options.allow_full_removal, force)?;
             serde_json::json!({ "versions_deleted": n })
         }
+        BackupOperation::SetVersionMetadata { version, source, patch } => {
+            let repo = open(false)?;
+            let _scope = ufop_core::backup::shared::selector_scope(source.as_deref()).map(|s| db.scoped(s));
+            serde_json::to_value(ufop_core::backup::versions::set_version_metadata(&repo, version, &patch)?)?
+        }
+        BackupOperation::ApplyRetention { policy, source } => {
+            let repo = open(false)?;
+            let _scope = ufop_core::backup::shared::selector_scope(source.as_deref()).map(|s| db.scoped(s));
+            let policy = policy.unwrap_or_else(|| job.retention.clone());
+            let n = maintenance::apply_retention(&repo, &policy, job.options.allow_full_removal)?;
+            serde_json::json!({ "versions_deleted": n })
+        }
+        BackupOperation::EnableSharing { claim_all } => {
+            serde_json::to_value(ufop_core::backup::shared::enable_sharing(&open(false)?, &job.options.identity, claim_all)?)?
+        }
+        BackupOperation::SyncSources => {
+            let repo = open(false)?;
+            let own = job.options.identity.resolve().source_id();
+            serde_json::json!({
+                "shared": ufop_core::backup::shared::is_shared(&repo.header),
+                "sources": ufop_core::backup::shared::list_sources(db, Some(&own))?,
+            })
+        }
+        BackupOperation::CopyVersions { .. } => return Err(AppError::internal("copying runs in the manager")),
         BackupOperation::Consistency => serde_json::to_value(open(false)?.consistency_check()?)?,
         BackupOperation::RebuildMissing => serde_json::to_value(maintenance::rebuild_missing_block_volumes(&open(false)?, &job.options, ctx)?)?,
         BackupOperation::ExtractControlFiles { version, target } => {

@@ -163,10 +163,15 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
             mgr.resume();
             ok(mgr.status().await)
         }
-        "backup_list_versions" => ok(mgr.list_versions(&arg::<String>(a, "id")?).await?),
-        "backup_list_files" => ok(mgr.list_files(&arg::<String>(a, "id")?, arg(a, "version")?, opt(a, "prefix")?).await?),
-        "backup_search" => ok(mgr.search(&arg::<String>(a, "id")?, arg(a, "pattern")?, opt(a, "version")?).await?),
-        "backup_compare" => ok(mgr.compare(&arg::<String>(a, "id")?, arg(a, "base")?, arg(a, "compare")?).await?),
+        "backup_list_versions" => ok(mgr.list_versions_in(&arg::<String>(a, "id")?, opt(a, "source")?, opt(a, "tags")?.unwrap_or_default()).await?),
+        "backup_list_files" => ok(mgr.list_files_in(&arg::<String>(a, "id")?, arg(a, "version")?, opt(a, "prefix")?, opt(a, "source")?).await?),
+        "backup_search" => ok(mgr.search_in(&arg::<String>(a, "id")?, arg(a, "pattern")?, opt(a, "version")?, opt(a, "source")?).await?),
+        "backup_compare" => ok(mgr.compare_in(&arg::<String>(a, "id")?, arg(a, "base")?, arg(a, "compare")?, opt(a, "source")?).await?),
+        "backup_list_sources" => ok(mgr.list_sources(&arg::<String>(a, "id")?).await?),
+        "backup_preview_retention" => ok(mgr.preview_retention(&arg::<String>(a, "id")?, opt(a, "policy")?, opt(a, "source")?).await?),
+        "backup_set_version_metadata" => ok(mgr
+            .execute(&arg::<String>(a, "id")?, BackupOperation::SetVersionMetadata { version: arg(a, "version")?, source: opt(a, "source")?, patch: arg(a, "patch")? })
+            .await?),
         "backup_run_history" => ok(mgr.run_history(opt(a, "jobId")?, opt(a, "limit")?.unwrap_or(50)).await?),
         "backup_prune_history" => ok(mgr.prune_history(arg::<u32>(a, "days")?.max(1)).await?),
         "backup_export_config" => ok(export_config(
@@ -255,4 +260,5 @@ pub const COMMANDS: &[&str] = &[
     "backup_set_global_defaults", "backup_effective_job", "backup_list_destinations", "backup_save_destination",
     "backup_delete_destination", "backup_adopt_repository", "backup_database_inventory", "backup_cleanup_databases", "backup_bug_report", "backup_diagnose", "backup_test_notification", "backup_get_secret_settings", "backup_set_secret_settings", "backup_crypt_file", "backup_decrypt_volume", "backup_test_secret_providers", "backup_job_placeholders", "backup_recovery_download", "backup_recovery_index", "backup_recovery_list", "backup_recovery_restore", "backup_recovery_convert", "backup_remote_list", "backup_remote_get", "backup_remote_put", "backup_remote_delete", "backup_start_operation", "backup_set_destination_secret", "backup_has_destination_secret", "backup_cloud_providers",
     "backup_photos_libraries", "backup_photos_library_info", "backup_lock_status", "backup_break_lock", "backup_set_database_encryption",
+    "backup_list_sources", "backup_preview_retention", "backup_set_version_metadata",
 ];

@@ -39,7 +39,7 @@ pub fn guard(job: &BackupJob, op: &BackupOperation) -> Result<(), AppError> {
         return Ok(());
     }
     match op {
-        BackupOperation::DeleteVersions { .. } => Err(held(job)),
+        BackupOperation::DeleteVersions { .. } | BackupOperation::ApplyRetention { .. } => Err(held(job)),
         BackupOperation::Purge { dry_run: false, .. } | BackupOperation::PurgeBroken { dry_run: false } => Err(held(job)),
         _ => Ok(()),
     }
@@ -100,10 +100,12 @@ mod tests {
     #[test]
     fn guards_removal_but_not_other_work() {
         let mut job = BackupJob { name: "Finance".into(), retention: RetentionPolicy::KeepCount { count: 3 }, ..Default::default() };
-        assert!(guard(&job, &BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false }).is_ok());
+        assert!(guard(&job, &BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false, force: false }).is_ok());
         assert_eq!(effective_retention(&job), RetentionPolicy::KeepCount { count: 3 });
         job.legal_hold = Some(LegalHold { matter: "Case 2026-17".into(), ..Default::default() });
-        let e = guard(&job, &BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false }).unwrap_err();
+        let e = guard(&job, &BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false, force: true }).unwrap_err();
+        assert!(guard(&job, &BackupOperation::ApplyRetention { policy: None, source: None }).is_err());
+        assert!(guard(&job, &BackupOperation::SetVersionMetadata { version: 0, source: None, patch: Default::default() }).is_ok(), "pins and notes stay possible");
         assert!(e.to_string().contains("Case 2026-17"));
         assert!(guard(&job, &BackupOperation::Purge { paths: vec!["/x".into()], versions: None, dry_run: false }).is_err());
         assert!(guard(&job, &BackupOperation::Purge { paths: vec!["/x".into()], versions: None, dry_run: true }).is_ok());

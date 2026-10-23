@@ -555,8 +555,48 @@ async fn set_job_database_encryption(State(st): State<ServerState>, AxPath(id): 
     ok(st.mgr.set_database_encryption(&id, b.enabled).await?)
 }
 
-async fn versions(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
-    ok(st.mgr.list_versions(&id).await?)
+#[derive(Deserialize)]
+struct VersionsQuery {
+    /// Another source id, or `*` for every source.
+    source: Option<String>,
+    /// Comma-separated `key=value` (or `key`) tags a version must carry.
+    tags: Option<String>,
+}
+
+async fn versions(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<VersionsQuery>) -> ApiResult {
+    let tags: Vec<String> = q.tags.unwrap_or_default().split(',').map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect();
+    ok(st.mgr.list_versions_in(&id, q.source, tags).await?)
+}
+
+#[derive(Deserialize)]
+struct VersionPatchBody {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(flatten)]
+    patch: ufop_core::backup::versions::MetadataPatch,
+}
+
+/// Change a version's note, tags or pin.
+async fn patch_version(State(st): State<ServerState>, AxPath((id, version)): AxPath<(String, usize)>, Json(b): Json<VersionPatchBody>) -> ApiResult {
+    ok(st.mgr.execute(&id, BackupOperation::SetVersionMetadata { version, source: b.source, patch: b.patch }).await?)
+}
+
+async fn sources(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.list_sources(&id).await?)
+}
+
+#[derive(Deserialize, Default)]
+struct RetentionPreviewBody {
+    #[serde(default)]
+    policy: Option<ufop_core::backup::RetentionPolicy>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// Keep/delete per version for the job's policy or an unsaved one.
+async fn retention_preview(State(st): State<ServerState>, AxPath(id): AxPath<String>, body: Option<Json<RetentionPreviewBody>>) -> ApiResult {
+    let b = body.map(|b| b.0).unwrap_or_default();
+    ok(st.mgr.preview_retention(&id, b.policy, b.source).await?)
 }
 
 #[derive(Deserialize)]
@@ -564,30 +604,33 @@ struct FilesQuery {
     #[serde(default)]
     version: usize,
     prefix: Option<String>,
+    source: Option<String>,
 }
 
 async fn files(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<FilesQuery>) -> ApiResult {
-    ok(st.mgr.list_files(&id, q.version, q.prefix).await?)
+    ok(st.mgr.list_files_in(&id, q.version, q.prefix, q.source).await?)
 }
 
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
     version: Option<usize>,
+    source: Option<String>,
 }
 
 async fn search(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<SearchQuery>) -> ApiResult {
-    ok(st.mgr.search(&id, q.q, q.version).await?)
+    ok(st.mgr.search_in(&id, q.q, q.version, q.source).await?)
 }
 
 #[derive(Deserialize)]
 struct CompareQuery {
     base: usize,
     compare: usize,
+    source: Option<String>,
 }
 
 async fn compare(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<CompareQuery>) -> ApiResult {
-    ok(st.mgr.compare(&id, q.base, q.compare).await?)
+    ok(st.mgr.compare_in(&id, q.base, q.compare, q.source).await?)
 }
 
 #[derive(Deserialize)]
@@ -783,6 +826,9 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/jobs/{id}/lock", get(job_lock_status).delete(break_job_lock))
         .route("/api/v1/jobs/{id}/database-encryption", axum::routing::put(set_job_database_encryption))
         .route("/api/v1/jobs/{id}/versions", get(versions))
+        .route("/api/v1/jobs/{id}/versions/{version}", axum::routing::patch(patch_version))
+        .route("/api/v1/jobs/{id}/sources", get(sources))
+        .route("/api/v1/jobs/{id}/retention/preview", post(retention_preview))
         .route("/api/v1/jobs/{id}/files", get(files))
         .route("/api/v1/jobs/{id}/search", get(search))
         .route("/api/v1/jobs/{id}/compare", get(compare))
@@ -810,7 +856,7 @@ pub fn router(st: ServerState) -> Router {
             tower_http::cors::CorsLayer::new()
                 .allow_origin(origins)
                 .allow_credentials(true)
-                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static(PREAUTH_HEADER)]),
         );
     }

@@ -139,10 +139,23 @@ async fn backup_and_restore_over_rest_and_rpc() {
     let enc = s.client.put(format!("{}/api/v1/jobs/{id}/database-encryption", s.base)).bearer_auth(&tok).json(&json!({"enabled": true})).send().await.unwrap().json::<Value>().await.unwrap();
     assert_eq!(enc["encrypted"], true);
     assert_eq!(s.get(&format!("/api/v1/jobs/{id}/versions"), &tok).await.json::<Value>().await.unwrap().as_array().unwrap().len(), 1);
+    // Version metadata, tag filter, sources and the retention preview.
+    let patched = s.client.patch(format!("{}/api/v1/jobs/{id}/versions/0", s.base)).bearer_auth(&tok).json(&json!({"note": "first", "pinned": true, "tags": {"env": "prod"}})).send().await.unwrap();
+    assert_eq!(patched.status(), 200, "{}", patched.text().await.unwrap());
+    let v = s.get(&format!("/api/v1/jobs/{id}/versions?tags=env=prod"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!((v[0]["note"].as_str(), v[0]["pinned"].as_bool()), (Some("first"), Some(true)));
+    assert!(v[0]["stats"]["bytes_added"].as_u64().unwrap() > 0);
+    assert!(s.get(&format!("/api/v1/jobs/{id}/versions?tags=env=dev"), &tok).await.json::<Value>().await.unwrap().as_array().unwrap().is_empty());
+    let srcs = s.get(&format!("/api/v1/jobs/{id}/sources"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(srcs[0]["own"], true);
+    let p = s.post(&format!("/api/v1/jobs/{id}/retention/preview"), &tok, json!({"policy": {"type": "counts", "keep_daily": 7}})).await.json::<Value>().await.unwrap();
+    assert_eq!((p["keep"].as_u64(), p["versions"][0]["summary"].as_str()), (Some(1), Some("kept: newest version, daily 7, pinned")));
+    let rpc = s.post("/api/v1/rpc/backup_preview_retention", &tok, json!({"id": id})).await.json::<Value>().await.unwrap();
+    assert_eq!(rpc["delete"], 0);
     let unknown = s.post("/api/v1/rpc/rm_rf", &tok, json!({})).await;
     assert_eq!(unknown.status(), 400);
     let runs = s.get(&format!("/api/v1/runs?job_id={id}"), &tok).await.json::<Value>().await.unwrap();
-    assert_eq!(runs.as_array().unwrap().len(), 2);
+    assert_eq!(runs.as_array().unwrap().len(), 3);
     let fs = s.get(&format!("/api/v1/filesystem?path={}", s.dir.display()), &tok).await.json::<Value>().await.unwrap();
     assert!(fs["entries"].as_array().unwrap().iter().any(|e| e["name"] == "src"));
 }

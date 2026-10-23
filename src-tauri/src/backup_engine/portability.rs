@@ -170,6 +170,30 @@ pub fn cli_command(job: &BackupJob) -> String {
         RetentionPolicy::KeepCount { count } => parts.push(format!("--keep-versions={count}")),
         RetentionPolicy::Smart => parts.push("--retention-policy=smart".into()),
         RetentionPolicy::Custom { rules } => parts.push(format!("--retention-policy={}", quote(rules))),
+        RetentionPolicy::Counts { keep_latest, keep_hourly, keep_daily, keep_weekly, keep_monthly, keep_yearly } => {
+            for (flag, n) in [("latest", keep_latest), ("hourly", keep_hourly), ("daily", keep_daily), ("weekly", keep_weekly), ("monthly", keep_monthly), ("yearly", keep_yearly)] {
+                if *n > 0 {
+                    parts.push(format!("--keep-{flag}={n}"));
+                }
+            }
+        }
+    }
+    // Versions are recorded as this job's source (shared repositories).
+    parts.push(format!("--job-id={}", quote(&job.id)));
+    if !o.identity.hostname.is_empty() {
+        parts.push(format!("--hostname={}", quote(&o.identity.hostname)));
+    }
+    if !o.identity.username.is_empty() {
+        parts.push(format!("--username={}", quote(&o.identity.username)));
+    }
+    if o.shared_repository {
+        parts.push("--shared".into());
+    }
+    if let Some(n) = o.default_note.as_deref().filter(|n| !n.is_empty()) {
+        parts.push(format!("--note={}", quote(n)));
+    }
+    for (k, v) in &o.default_tags {
+        parts.push(format!("--tag={}", quote(&if v.is_empty() { k.clone() } else { format!("{k}={v}") })));
     }
     for r in &job.filter.rules {
         let flag = match r.action {
@@ -227,8 +251,11 @@ mod tests {
         j.options.chunker = Some(ufop_core::backup::ChunkerKind::Fixed);
         j.options.layout = ufop_core::backup::layout::RepoLayout::Sharded { prefix_len: 2 };
         j.options.format_version = Some(2);
+        j.retention = RetentionPolicy::Counts { keep_latest: 2, keep_hourly: 0, keep_daily: 7, keep_weekly: 4, keep_monthly: 0, keep_yearly: 0 };
+        j.options.shared_repository = true;
+        j.options.default_tags.insert("env".into(), "prod".into());
         let c = cli_command(&j);
-        for f in ["--cipher=chacha20-poly1305", "--chunker=fixed", "--layout=sharded --shard-prefix-len=2", "--format-version=2"] {
+        for f in ["--cipher=chacha20-poly1305", "--chunker=fixed", "--layout=sharded --shard-prefix-len=2", "--format-version=2", "--keep-latest=2", "--keep-daily=7", "--keep-weekly=4", "--shared", "--job-id=abc", "--tag='env=prod'"] {
             assert!(c.contains(f), "{f} in {c}");
         }
     }

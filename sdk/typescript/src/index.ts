@@ -11,8 +11,12 @@ export type BackupJob = Record<string, unknown>;
 
 export type ApiError = { advice?: string; error_type?: string; message: string };
 
+export type Fileset = { file_count?: number; id?: number; identity?: { hostname?: string; job_id?: string; source_label?: string; username?: string } | null; note?: string | null; partial?: boolean; pin_reason?: string | null; pinned?: boolean; source?: string; stats?: { bytes_added?: number; files_added?: number; files_changed?: number; files_deleted?: number; new_blocks?: number } | null; tags?: Record<string, unknown>; timestamp?: string; total_size?: number; volume_name?: string };
+
 /** null fields inherit from the parent folder */
 export type FolderPolicy = { allowed_extensions?: string[] | null; blocked_extensions?: string[] | null; intake_naming?: "keep" | "timestamp" | "sequence" | null; locked?: boolean | null; max_link_days?: number | null; max_upload_mb?: number | null; require_link_password?: boolean | null };
+
+export type RetentionPolicy = { count?: number; days?: number; keep_daily?: number; keep_hourly?: number; keep_latest?: number; keep_monthly?: number; keep_weekly?: number; keep_yearly?: number; rules?: string; type: "keep_all" | "keep_days" | "keep_count" | "smart" | "custom" | "counts" };
 
 export type SchedulerStatus = { paused?: boolean; running?: boolean; tasks?: TaskInfo[]; [key: string]: unknown };
 
@@ -242,7 +246,7 @@ export class UfopClient {
   }
 
   /** Differences between two versions (API tokens: `read` scope). `GET /api/v1/jobs/{id}/compare` */
-  getJobsIdCompare(id: string, query: { base: number; compare: number }): Promise<Record<string, unknown>> {
+  getJobsIdCompare(id: string, query: { base: number; compare: number; source?: string }): Promise<Record<string, unknown>> {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/compare`, query, undefined);
   }
 
@@ -257,7 +261,7 @@ export class UfopClient {
   }
 
   /** Files in a version (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files` */
-  getJobsIdFiles(id: string, query: { version?: number; prefix?: string } = {}): Promise<Record<string, unknown>> {
+  getJobsIdFiles(id: string, query: { version?: number; prefix?: string; source?: string } = {}): Promise<Record<string, unknown>> {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/files`, query, undefined);
   }
 
@@ -281,19 +285,34 @@ export class UfopClient {
     return this.call("PUT", `/api/v1/jobs/${encodeURIComponent(id)}/passphrase`, undefined, body);
   }
 
+  /** What retention would keep and delete (the job's policy or an unsaved one); changes nothing (API tokens: `write` scope). `POST /api/v1/jobs/{id}/retention/preview` */
+  postJobsIdRetentionPreview(id: string, body: { policy?: RetentionPolicy; source?: string | null } = {}): Promise<{ delete?: number; keep?: number; legal_hold?: boolean; policy?: RetentionPolicy; versions?: Array<{ id?: number; keep?: boolean; reasons?: string[]; summary?: string; timestamp?: string }> }> {
+    return this.call("POST", `/api/v1/jobs/${encodeURIComponent(id)}/retention/preview`, undefined, body);
+  }
+
   /** Start a backup (queued); returns the task id (API tokens: `run` scope). `POST /api/v1/jobs/{id}/run` */
   postJobsIdRun(id: string, body: { dry_run?: boolean } = {}): Promise<{ task_id?: string }> {
     return this.call("POST", `/api/v1/jobs/${encodeURIComponent(id)}/run`, undefined, body);
   }
 
   /** Search file names across versions (API tokens: `read` scope). `GET /api/v1/jobs/{id}/search` */
-  getJobsIdSearch(id: string, query: { q: string; version?: number }): Promise<Record<string, unknown>> {
+  getJobsIdSearch(id: string, query: { q: string; version?: number; source?: string }): Promise<Record<string, unknown>> {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/search`, query, undefined);
   }
 
-  /** Backup versions of a job (API tokens: `read` scope). `GET /api/v1/jobs/{id}/versions` */
-  getJobsIdVersions(id: string): Promise<Array<Record<string, unknown>>> {
-    return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/versions`, undefined, undefined);
+  /** Sources (jobs and computers) with versions in the job's repository (API tokens: `read` scope). `GET /api/v1/jobs/{id}/sources` */
+  getJobsIdSources(id: string): Promise<Array<{ id?: string; identity?: Record<string, unknown> | null; label?: string; newest?: string | null; newest_size?: number; oldest?: string | null; own?: boolean; versions?: number }>> {
+    return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/sources`, undefined, undefined);
+  }
+
+  /** Backup versions of a job (with note, tags, pin, identity and storage added) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/versions` */
+  getJobsIdVersions(id: string, query: { source?: string; tags?: string } = {}): Promise<Fileset[]> {
+    return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/versions`, query, undefined);
+  }
+
+  /** Change a version's note, tags or pin (rewrites its file list) (API tokens: `write` scope). `PATCH /api/v1/jobs/{id}/versions/{version}` */
+  patchJobsIdVersionsVersion(id: string, version: string, body: { note?: string | null; pin_reason?: string | null; pinned?: boolean | null; source?: string | null; tags?: Record<string, unknown> | null } = {}): Promise<Record<string, unknown>> {
+    return this.call("PATCH", `/api/v1/jobs/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}`, undefined, body);
   }
 
   /** Enabled and disabled modules (API tokens: `read` scope). `GET /api/v1/modules` */
