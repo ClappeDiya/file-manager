@@ -7014,6 +7014,7 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "base64 0.22.1",
+ "chacha20poly1305",
  "chrono",
  "csv",
  "flate2",
@@ -7039,6 +7040,7 @@ dependencies = [
  "xattr",
  "xxhash-rust",
  "zip 2.6.1",
+ "zstd",
 ]
 
 [[package]]

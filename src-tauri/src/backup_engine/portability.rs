@@ -148,6 +148,22 @@ pub fn cli_command(job: &BackupJob) -> String {
     parts.push(format!("--block-size={}", o.block_size));
     parts.push(format!("--volume-size={}", o.volume_size));
     parts.push(format!("--compression-level={}", o.compression_level));
+    // Repository format choices (only those differing from the defaults).
+    if let Some(v) = o.format_version {
+        parts.push(format!("--format-version={v}"));
+    }
+    if let Some(c) = o.chunker {
+        parts.push(format!("--chunker={}", if c == ufop_core::backup::ChunkerKind::Fixed { "fixed" } else { "fastcdc" }));
+    }
+    if let Some(c) = o.block_codec {
+        parts.push(format!("--block-codec={}", if c == ufop_core::backup::BlockCodec::Zstd { "zstd" } else { "deflate" }));
+    }
+    if o.cipher != ufop_core::backup::crypto::CipherKind::Aes256Gcm {
+        parts.push("--cipher=chacha20-poly1305".into());
+    }
+    if let ufop_core::backup::layout::RepoLayout::Sharded { prefix_len } = o.layout {
+        parts.push(format!("--layout=sharded --shard-prefix-len={prefix_len}"));
+    }
     match &job.retention {
         RetentionPolicy::KeepAll => {}
         RetentionPolicy::KeepDays { days } => parts.push(format!("--keep-days={days}")),
@@ -200,6 +216,20 @@ mod tests {
             destination: BackupDestination::Local { path: "/mnt/backup".into(), alternate_paths: vec![], marker_file: None },
             stats: JobStats { version_count: 4, ..Default::default() },
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cli_command_carries_format_options() {
+        let mut j = job();
+        assert!(!cli_command(&j).contains("--cipher"));
+        j.options.cipher = ufop_core::backup::crypto::CipherKind::ChaCha20Poly1305;
+        j.options.chunker = Some(ufop_core::backup::ChunkerKind::Fixed);
+        j.options.layout = ufop_core::backup::layout::RepoLayout::Sharded { prefix_len: 2 };
+        j.options.format_version = Some(2);
+        let c = cli_command(&j);
+        for f in ["--cipher=chacha20-poly1305", "--chunker=fixed", "--layout=sharded --shard-prefix-len=2", "--format-version=2"] {
+            assert!(c.contains(f), "{f} in {c}");
         }
     }
 

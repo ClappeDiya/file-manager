@@ -687,6 +687,7 @@ pub fn run() {
             backup_commands::backup_run,
             backup_commands::backup_execute,
             backup_commands::backup_cancel,
+            backup_commands::backup_change_passphrase,
             schedule_commands::schedules_list,
             schedule_commands::schedule_save,
             schedule_commands::schedule_delete,

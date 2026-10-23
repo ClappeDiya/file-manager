@@ -1030,3 +1030,57 @@ async fn holiday_calendar_skips_a_scheduled_backup_slot() {
     assert!(m.run_history(Some(j.id.clone()), 10).await.unwrap().is_empty());
     assert!(m.due_jobs(Utc::now()).await.is_empty());
 }
+
+#[tokio::test]
+async fn format_upgrade_rollback_reshard_and_passphrase_change() {
+    use ufop_core::backup::layout::RepoLayout;
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst, out) = (t.path().join("src"), t.path().join("dst"), t.path().join("out"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    let m = manager(t.path()).await;
+    // A format 1 job (as created by older versions).
+    let mut j = job(&src, &dst);
+    j.options.format_version = Some(1);
+    let j = m.save_job(j, Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let info = m.execute(&j.id, BackupOperation::FormatInfo).await.unwrap();
+    assert_eq!(info.report["format_version"], 1);
+    // v1 cannot change the passphrase in place.
+    assert!(m.change_passphrase(&j.id, None, "new-pw".into(), None).await.unwrap_err().user_message().contains("format 2"));
+
+    let up = m.execute(&j.id, BackupOperation::UpgradeFormat { rollback: false }).await.unwrap();
+    assert_eq!(up.status, "success", "{:?}", up.log);
+    assert_eq!(up.report["to_version"], 2);
+    assert_eq!(m.execute(&j.id, BackupOperation::FormatInfo).await.unwrap().report["rollback_available"], true);
+    let rb = m.execute(&j.id, BackupOperation::UpgradeFormat { rollback: true }).await.unwrap();
+    assert_eq!(rb.status, "success", "{:?}", rb.log);
+    assert_eq!(m.execute(&j.id, BackupOperation::FormatInfo).await.unwrap().report["format_version"], 1);
+    m.execute(&j.id, BackupOperation::UpgradeFormat { rollback: false }).await.unwrap();
+
+    // Reshard, then a new backup and restore through the sharded layout.
+    let rs = m.execute(&j.id, BackupOperation::Reshard { layout: RepoLayout::Sharded { prefix_len: 1 }, dry_run: false }).await.unwrap();
+    assert_eq!(rs.status, "success", "{:?}", rs.log);
+    assert!(rs.summary.contains("moved"), "{}", rs.summary);
+    std::fs::write(src.join("b.txt"), b"beta").unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let e = m.execute(&j.id, BackupOperation::UpgradeFormat { rollback: true }).await.unwrap_err();
+    assert!(e.user_message().contains("Cannot roll back"), "rollback refused after a format 2 write");
+
+    // Password change: header only, stored passphrase updated, old one refused.
+    assert!(m.change_passphrase(&j.id, Some("wrong".into()), "new-pw".into(), None).await.is_err());
+    let r = m.change_passphrase(&j.id, None, "new-pw".into(), None).await.unwrap();
+    assert_eq!(r.to_version, 2);
+    assert_eq!(m.passphrase(&j.id).await.unwrap().as_deref(), Some("new-pw"));
+    let restore = RestoreOptions { target: Some(out.clone()), ..Default::default() };
+    let r = m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(std::fs::read(out.join("src/b.txt")).unwrap(), b"beta");
+    assert!(m.browse_remote(j.destination.clone(), Some("pw".into()), "ufop".into()).await.is_err());
+    assert_eq!(m.browse_remote(j.destination.clone(), Some("new-pw".into()), "ufop".into()).await.unwrap().len(), 2);
+    // Operation JSON shape used by the frontend.
+    let op: BackupOperation = serde_json::from_value(serde_json::json!({"type": "reshard", "layout": {"type": "flat"}, "dry_run": true})).unwrap();
+    assert_eq!(op.name(), "reshard");
+    let op: BackupOperation = serde_json::from_value(serde_json::json!({"type": "upgrade_format", "rollback": true})).unwrap();
+    assert_eq!(op.name(), "rollback_format");
+}

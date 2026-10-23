@@ -510,6 +510,24 @@ async fn job_operation(State(st): State<ServerState>, AxPath(id): AxPath<String>
     ok(st.mgr.execute(&id, op).await?)
 }
 
+#[derive(Deserialize)]
+struct PassphraseBody {
+    #[serde(default)]
+    current: Option<String>,
+    new_passphrase: String,
+    #[serde(default)]
+    kdf_preset: Option<String>,
+}
+
+/// Change an encrypted job's passphrase (format 2 repositories: header only).
+async fn change_job_passphrase(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(b): Json<PassphraseBody>) -> ApiResult {
+    let kdf = match b.kdf_preset.as_deref().filter(|p| !p.is_empty()) {
+        Some(p) => Some(ufop_core::backup::crypto::KdfParams::preset(p).ok_or_else(|| AppError::validation(format!("Unknown key-derivation preset '{p}'")))?),
+        None => None,
+    };
+    ok(st.mgr.change_passphrase(&id, b.current, b.new_passphrase, kdf).await?)
+}
+
 async fn versions(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
     ok(st.mgr.list_versions(&id).await?)
 }
@@ -734,6 +752,7 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/jobs/{id}", get(get_job).put(update_job).delete(delete_job))
         .route("/api/v1/jobs/{id}/run", post(run_job))
         .route("/api/v1/jobs/{id}/operations", post(job_operation))
+        .route("/api/v1/jobs/{id}/passphrase", axum::routing::put(change_job_passphrase))
         .route("/api/v1/jobs/{id}/versions", get(versions))
         .route("/api/v1/jobs/{id}/files", get(files))
         .route("/api/v1/jobs/{id}/search", get(search))

@@ -55,14 +55,15 @@ pub fn mirror(src: &dyn Backend, dst: &dyn Backend, prefix: &str, opts: &MirrorO
     let header = volume::repo_header_name(prefix);
     // Both sides use the source repository's layout (sharded volumes are
     // copied into the same shard folders).
-    let layout = src.get(&header).ok().and_then(|h| serde_json::from_slice::<super::volume::RepoHeader>(&h).ok()).map(|h| h.layout).unwrap_or_default();
+    let src_l = super::layout::for_repository(src, prefix);
+    let layout = src_l.layout();
     if layout.is_sharded() && !dst.supports_subfolders() {
         return Err(AppError::state(
             format!("{} does not support subfolders, which this sharded backup needs", dst.describe()),
             "Reshard the backup to the flat layout first, or mirror to a destination with folders.",
         ));
     }
-    let (src_l, dst_l) = (LayoutBackend::new(src, layout, prefix), LayoutBackend::new(dst, layout, prefix));
+    let dst_l = LayoutBackend::new(dst, layout, prefix);
     let (src, dst): (&dyn Backend, &dyn Backend) = (&src_l, &dst_l);
     let source: Vec<_> = src.list()?.into_iter().filter(|f| ours(prefix, &f.name)).collect();
     if !source.iter().any(|f| f.name == header) {

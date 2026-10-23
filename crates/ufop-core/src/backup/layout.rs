@@ -141,6 +141,23 @@ impl Backend for LayoutBackend<'_> {
     }
 }
 
+/// `backend` seen through the layout recorded in the header of `prefix`
+/// (flat when there is no readable header).
+pub fn for_repository<'a>(backend: &'a dyn Backend, prefix: &str) -> LayoutBackend<'a> {
+    let layout = backend
+        .get(&volume::repo_header_name(prefix))
+        .ok()
+        .and_then(|h| serde_json::from_slice::<RepoHeader>(&h).ok())
+        .map(|h| h.layout)
+        .unwrap_or_default();
+    LayoutBackend::new(backend, layout, prefix)
+}
+
+/// Names of header copies kept by format operations (not volumes).
+pub fn header_copies(prefix: &str) -> [String; 3] {
+    [format!("{prefix}-repo.bak.json"), format!("{prefix}-repo.new.json"), super::format::v1_backup_name(prefix)]
+}
+
 /// Result of [`reshard`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReshardReport {

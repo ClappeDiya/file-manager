@@ -191,6 +191,36 @@ pub struct EngineArgs {
     /// Photos sources: only assets in this album (repeatable; title, case-insensitive)
     #[arg(long = "photos-album")]
     pub photos_albums: Vec<String>,
+    /// Repository format for a new backup: 1 | 2 (default: 2)
+    #[arg(long)]
+    pub format_version: Option<u32>,
+    /// Chunker for a new format 2 backup: fixed | fastcdc (default: fastcdc)
+    #[arg(long)]
+    pub chunker: Option<String>,
+    /// Block codec for a new format 2 backup: deflate | zstd (default: zstd)
+    #[arg(long)]
+    pub block_codec: Option<String>,
+    /// Cipher for a new encrypted format 2 backup: aes256-gcm | chacha20-poly1305
+    #[arg(long, default_value = "aes256-gcm")]
+    pub cipher: String,
+    /// Destination layout for a new format 2 backup: flat | sharded
+    #[arg(long, default_value = "flat")]
+    pub layout: String,
+    /// Hex digits per shard folder name with --layout sharded (1–4)
+    #[arg(long, default_value_t = 2)]
+    pub shard_prefix_len: u8,
+}
+
+/// Parse `--layout` / `--shard-prefix-len`.
+pub fn parse_layout(layout: &str, prefix_len: u8) -> Result<ufop_core::backup::layout::RepoLayout, ufop_core::error::AppError> {
+    use ufop_core::backup::layout::RepoLayout;
+    let l = match layout.to_ascii_lowercase().as_str() {
+        "flat" => RepoLayout::Flat,
+        "sharded" => RepoLayout::Sharded { prefix_len },
+        other => return Err(ufop_core::error::AppError::validation(format!("Invalid value '{other}' for --layout (flat, sharded)"))),
+    };
+    l.validate()?;
+    Ok(l)
 }
 
 fn parse_enum<T: serde::de::DeserializeOwned>(flag: &str, v: &str) -> Result<T, ufop_core::error::AppError> {
@@ -253,6 +283,12 @@ impl EngineArgs {
             encryption_module: parse_enum("encryption-module", &self.encryption_module)?,
             gpg: ufop_core::backup::GpgOptions { recipients: self.gpg_recipients.clone(), executable: self.gpg_executable.clone(), homedir: self.gpg_homedir.clone() },
             kdf: self.kdf()?,
+            format_version: self.format_version,
+            chunker: self.chunker.as_deref().map(|c| parse_enum("chunker", c)).transpose()?,
+            block_codec: self.block_codec.as_deref().map(|c| parse_enum("block-codec", c)).transpose()?,
+            cipher: ufop_core::backup::crypto::CipherKind::parse(&self.cipher)
+                .ok_or_else(|| ufop_core::error::AppError::validation(format!("Invalid value '{}' for --cipher (aes256-gcm, chacha20-poly1305)", self.cipher)))?,
+            layout: parse_layout(&self.layout, self.shard_prefix_len)?,
             photos: ufop_core::backup::photos::PhotosOptions {
                 include_hidden: self.photos_include_hidden,
                 include_trashed: self.photos_include_trashed,
@@ -617,6 +653,44 @@ pub enum BackupCommands {
         #[arg(long)]
         allow_full_removal: bool,
     },
+    /// Upgrade the repository to format 2 (rewrites only the header), or
+    /// with --rollback restore the saved format 1 header (only until the
+    /// first format 2 write)
+    Upgrade {
+        #[command(flatten)]
+        repo: RepoArgs,
+        #[arg(long)]
+        rollback: bool,
+    },
+    /// Change the passphrase of a format 2 repository (rewrites only the header)
+    ChangePassword {
+        #[command(flatten)]
+        repo: RepoArgs,
+        /// Environment variable holding the new passphrase
+        #[arg(long, default_value = "UFOP_NEW_PASSPHRASE")]
+        new_passphrase_env: String,
+        /// File whose first line is the new passphrase
+        #[arg(long)]
+        new_passphrase_file: Option<PathBuf>,
+        /// Argon2id cost for the new key: interactive | default | sensitive (default: keep)
+        #[arg(long)]
+        kdf_preset: Option<String>,
+    },
+    /// Move volumes between the flat and sharded layouts (format 2; --dry-run previews)
+    Reshard {
+        #[command(flatten)]
+        repo: RepoArgs,
+        /// flat | sharded
+        #[arg(long)]
+        layout: String,
+        #[arg(long, default_value_t = 2)]
+        shard_prefix_len: u8,
+    },
+    /// Show the repository format (version, chunker, codec, cipher, layout)
+    FormatInfo {
+        #[command(flatten)]
+        repo: RepoArgs,
+    },
     /// Randomized upload/download/hash test of a destination folder
     TestDestination {
         #[arg(long)]
@@ -953,6 +1027,43 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             ok(emit(format, "Restore AutoTune", &ufop_core::backup::restore::autotune(r, samples.clamp(1, 50), &OpContext::new())?))?;
             Ok(0)
         }),
+        BackupCommands::Upgrade { repo, rollback } => {
+            use ufop_core::backup::format;
+            let be = LocalBackend::new(&repo.dest);
+            let r = if rollback {
+                format::rollback_upgrade(&be, &repo.prefix)?
+            } else {
+                format::upgrade_repository(&be, &repo.prefix, repo.passphrase().as_deref(), ufop_core::backup::REPO_FORMAT_VERSION)?
+            };
+            ok(emit(format, if rollback { "Rollback" } else { "Upgrade" }, &r))?;
+            Ok(0)
+        }
+        BackupCommands::ChangePassword { repo, new_passphrase_env, new_passphrase_file, kdf_preset } => {
+            let current = repo.passphrase().ok_or_else(|| ufop_core::error::AppError::validation(format!("Set the current passphrase ({})", repo.passphrase_env)))?;
+            let new = match &new_passphrase_file {
+                Some(f) => std::fs::read_to_string(f)?.lines().next().map(|l| l.trim_end_matches('\r').to_string()),
+                None => std::env::var(&new_passphrase_env).ok(),
+            }
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| ufop_core::error::AppError::validation(format!("Set the new passphrase ({new_passphrase_env} or --new-passphrase-file)")))?;
+            let kdf = match kdf_preset.as_deref() {
+                Some(p) => Some(KdfParams::preset(p).ok_or_else(|| ufop_core::error::AppError::validation(format!("Unknown --kdf-preset '{p}' (interactive, default, sensitive)")))?),
+                None => None,
+            };
+            let r = ufop_core::backup::format::change_password(&LocalBackend::new(&repo.dest), &repo.prefix, &current, &new, kdf)?;
+            ok(emit(format, "Passphrase changed", &r))?;
+            Ok(0)
+        }
+        BackupCommands::Reshard { repo, layout, shard_prefix_len } => {
+            let l = parse_layout(&layout, shard_prefix_len)?;
+            let r = ufop_core::backup::layout::reshard(&LocalBackend::new(&repo.dest), &repo.prefix, l, dry_run, &progress_ctx(format))?;
+            ok(emit(format, "Reshard", &r))?;
+            Ok(if r.errors.is_empty() { 0 } else { 2 })
+        }
+        BackupCommands::FormatInfo { repo } => {
+            ok(emit(format, "Repository format", &ufop_core::backup::format::format_info(&LocalBackend::new(&repo.dest), &repo.prefix)?))?;
+            Ok(0)
+        }
         BackupCommands::TestDestination { dest, files } => {
             let log = backend::test_backend_compatibility(&LocalBackend::new(&dest), files, 1024, 4 << 20)?;
             ok(emit(format, "Destination test", &log))?;
@@ -1005,6 +1116,58 @@ mod tests {
         let code = run(restore_cmd, &OutputFormat::Json, false).unwrap();
         assert_eq!(code, 0);
         assert_eq!(std::fs::read(out.join("src/f.txt")).unwrap(), b"cli");
+    }
+
+    #[test]
+    fn format_flags_upgrade_reshard_and_change_password() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f.txt"), b"cli").unwrap();
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(subcommand)]
+            c: BackupCommands,
+        }
+        let parse = |args: &[&str]| <T as clap::Parser>::try_parse_from(std::iter::once("t").chain(args.iter().copied())).unwrap().c;
+        let dest = t.path().join("dest").to_string_lossy().into_owned();
+        let db = t.path().join("db.sqlite").to_string_lossy().into_owned();
+        let src_s = src.to_string_lossy().into_owned();
+        let base = ["--dest", dest.as_str(), "--dbpath", db.as_str(), "--passphrase", "pw"];
+        let with = |cmd: &str, extra: &[&str]| -> Vec<String> { std::iter::once(cmd).chain(base.iter().copied()).chain(extra.iter().copied()).map(String::from).collect() };
+        let p = |v: Vec<String>| parse(&v.iter().map(String::as_str).collect::<Vec<_>>());
+        match p(with("run", &["--source", &src_s, "--cipher", "chacha20-poly1305", "--chunker", "fixed", "--block-codec", "deflate", "--layout", "sharded", "--shard-prefix-len", "1"])) {
+            BackupCommands::Run { engine, .. } => {
+                let o = engine.apply(BackupOptions::default()).unwrap();
+                assert_eq!(o.cipher, ufop_core::backup::crypto::CipherKind::ChaCha20Poly1305);
+                assert_eq!(o.chunker, Some(ufop_core::backup::ChunkerKind::Fixed));
+                assert_eq!(o.layout, ufop_core::backup::layout::RepoLayout::Sharded { prefix_len: 1 });
+            }
+            _ => panic!("expected run"),
+        }
+        // A format 1 backup, upgraded, resharded, password changed, restored.
+        assert_eq!(run(p(with("run", &["--source", &src_s, "--format-version", "1", "--no-quota-warning"])), &OutputFormat::Json, false).unwrap(), 0);
+        let info = |d: &str| ufop_core::backup::format::format_info(&LocalBackend::new(d), "ufop").unwrap();
+        assert_eq!(info(&dest).format_version, 1);
+        assert_eq!(run(p(with("upgrade", &[])), &OutputFormat::Json, false).unwrap(), 0);
+        assert!(info(&dest).rollback_available);
+        assert_eq!(run(p(with("upgrade", &["--rollback"])), &OutputFormat::Json, false).unwrap(), 0);
+        assert_eq!(info(&dest).format_version, 1);
+        assert_eq!(run(p(with("upgrade", &[])), &OutputFormat::Json, false).unwrap(), 0);
+        assert_eq!(run(p(with("reshard", &["--layout", "sharded"])), &OutputFormat::Json, true).unwrap(), 0);
+        assert_eq!(info(&dest).layout, ufop_core::backup::layout::RepoLayout::Flat, "dry run");
+        assert_eq!(run(p(with("reshard", &["--layout", "sharded"])), &OutputFormat::Json, false).unwrap(), 0);
+        assert!(info(&dest).layout.is_sharded());
+        let newpw = t.path().join("new.txt");
+        std::fs::write(&newpw, "pw2\n").unwrap();
+        let newpw_s = newpw.to_string_lossy().into_owned();
+        assert_eq!(run(p(with("change-password", &["--new-passphrase-file", &newpw_s])), &OutputFormat::Json, false).unwrap(), 0);
+        assert!(run(p(with("format-info", &[])), &OutputFormat::Json, false).is_ok());
+        let out = t.path().join("out").to_string_lossy().into_owned();
+        let missing = t.path().join("missing.sqlite").to_string_lossy().into_owned();
+        let code = run(parse(&["restore", "--dest", &dest, "--dbpath", &missing, "--passphrase", "pw2", "--target", &out]), &OutputFormat::Json, false).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(std::fs::read(t.path().join("out/src/f.txt")).unwrap(), b"cli");
     }
 
     #[test]

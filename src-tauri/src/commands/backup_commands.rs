@@ -66,6 +66,24 @@ pub async fn backup_execute(id: String, operation: BackupOperation, mgr: State<'
     mgr.execute(&id, operation).await
 }
 
+/// Change an encrypted job's passphrase in place (repository format 2) and
+/// store the new one. `current` defaults to the stored passphrase;
+/// `kdf_preset` (interactive | default | sensitive) sets a new Argon2id cost.
+#[tauri::command]
+pub async fn backup_change_passphrase(
+    id: String,
+    current: Option<String>,
+    new_passphrase: String,
+    kdf_preset: Option<String>,
+    mgr: State<'_, BackupManager>,
+) -> Result<ufop_core::backup::format::FormatReport, AppError> {
+    let kdf = match kdf_preset.as_deref().filter(|p| !p.is_empty()) {
+        Some(p) => Some(ufop_core::backup::crypto::KdfParams::preset(p).ok_or_else(|| AppError::validation(format!("Unknown key-derivation preset '{p}'")))?),
+        None => None,
+    };
+    mgr.change_passphrase(&id, current, new_passphrase, kdf).await
+}
+
 #[tauri::command]
 pub async fn backup_cancel(id: String, mgr: State<'_, BackupManager>) -> Result<bool, AppError> {
     Ok(mgr.cancel(&id))

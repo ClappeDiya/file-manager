@@ -445,6 +445,20 @@ pub enum BackupOperation {
         #[serde(default)]
         replica_id: Option<String>,
     },
+    /// Upgrade the repository to format 2 (header only), or with
+    /// `rollback` restore the saved format 1 header.
+    UpgradeFormat {
+        #[serde(default)]
+        rollback: bool,
+    },
+    /// Move volumes between the flat and sharded layouts (format 2).
+    Reshard {
+        layout: ufop_core::backup::layout::RepoLayout,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// The repository's format settings (version, chunker, codec, cipher, layout).
+    FormatInfo,
 }
 
 impl BackupOperation {
@@ -468,6 +482,10 @@ impl BackupOperation {
             Self::Replicate { .. } => "replicate",
             Self::ApplyLocks { .. } => "apply_locks",
             Self::ListLocks => "list_locks",
+            Self::UpgradeFormat { rollback: false } => "upgrade_format",
+            Self::UpgradeFormat { rollback: true } => "rollback_format",
+            Self::Reshard { .. } => "reshard",
+            Self::FormatInfo => "format_info",
         }
     }
 }
@@ -821,6 +839,35 @@ impl BackupManager {
         self.resolve_stored(v).await
     }
 
+    /// Change an encrypted job's passphrase in place (format 2: only the
+    /// repository header is rewritten), then store the new passphrase for
+    /// the job. `current` defaults to the stored passphrase.
+    pub async fn change_passphrase(&self, job_id: &str, current: Option<String>, new: String, kdf: Option<KdfParams>) -> Result<ufop_core::backup::format::FormatReport, AppError> {
+        let job = self.get_job(job_id).await?;
+        if !job.encrypted || job.options.encryption_module == ufop_core::backup::EncryptionModuleKind::Gpg {
+            return Err(AppError::state("This job does not use passphrase encryption", "Only jobs encrypted with the built-in cipher have a passphrase to change."));
+        }
+        if new.trim().is_empty() {
+            return Err(AppError::validation("Enter the new passphrase"));
+        }
+        let current = match current.filter(|c| !c.is_empty()) {
+            Some(c) => c,
+            None => self.passphrase(job_id).await?.ok_or_else(|| AppError::validation("Enter the current passphrase"))?,
+        };
+        // No backup or maintenance may write while the header changes.
+        let job_lock = {
+            let mut locks = self.inner.job_locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks.entry(job.id.clone()).or_default().clone()
+        };
+        let _guard = job_lock.lock().await;
+        let backend = self.build_backend(&job).await?;
+        let (prefix, new2) = (job.options.prefix.clone(), new.clone());
+        let kdf = kdf.or(job.options.kdf);
+        let report = blocking(move || ufop_core::backup::format::change_password(backend.as_ref(), &prefix, &current, &new2, kdf)).await?;
+        self.store_secret(job_id, &new).await?;
+        Ok(report)
+    }
+
     /// Store (or, with an empty value, remove) a cloud destination's secret.
     pub async fn set_destination_secret(&self, credential_id: &str, secret: &str) -> Result<(), AppError> {
         if credential_id.trim().is_empty() || credential_id.len() > 128 {
@@ -1086,8 +1133,9 @@ impl BackupManager {
             let backend = self.build_backend(&job).await?;
             let prefix = job.options.prefix.clone();
             tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-                for f in backend.list()? {
-                    if f.name.starts_with(&format!("{prefix}-")) {
+                // Includes volumes in shard folders of sharded repositories.
+                for f in backend.list_recursive()? {
+                    if ufop_core::backup::layout::logical(&f.name).starts_with(&format!("{prefix}-")) {
                         backend.delete(&f.name)?;
                     }
                 }
@@ -2450,6 +2498,15 @@ fn summarize(op: &str, v: &serde_json::Value) -> String {
         "snapshot_test" => "Snapshot test failed".to_string(),
         "autotune" => format!("Best restore download concurrency: {} thread(s)", n("download_threads")),
         "recreate_database" => format!("{} version(s), {} block volume(s) indexed", n("versions"), n("block_volumes")),
+        "upgrade_format" | "rollback_format" => v.get("message").and_then(|m| m.as_str()).unwrap_or("Format updated").to_string(),
+        "reshard" => format!(
+            "{} volume(s) {}moved ({}), {} already in place",
+            n("moved"),
+            if v.get("dry_run").and_then(|b| b.as_bool()) == Some(true) { "would be " } else { "" },
+            human_bytes(n("bytes_moved")),
+            n("already_in_place")
+        ),
+        "format_info" => format!("Repository format {}", n("format_version")),
         _ => format!("{op} completed"),
     }
 }
@@ -2530,6 +2587,12 @@ fn run_core(
             v
         }
         BackupOperation::AutoTune { sample_volumes } => serde_json::to_value(ufop_core::backup::restore::autotune(&open(false)?, sample_volumes.clamp(1, 50), ctx)?)?,
+        BackupOperation::UpgradeFormat { rollback: false } => {
+            serde_json::to_value(ufop_core::backup::format::upgrade_repository(backend, &job.options.prefix, pass, ufop_core::backup::REPO_FORMAT_VERSION)?)?
+        }
+        BackupOperation::UpgradeFormat { rollback: true } => serde_json::to_value(ufop_core::backup::format::rollback_upgrade(backend, &job.options.prefix)?)?,
+        BackupOperation::Reshard { layout, dry_run } => serde_json::to_value(ufop_core::backup::layout::reshard(backend, &job.options.prefix, layout, dry_run, ctx)?)?,
+        BackupOperation::FormatInfo => serde_json::to_value(ufop_core::backup::format::format_info(backend, &job.options.prefix)?)?,
     };
     Ok(v)
 }
