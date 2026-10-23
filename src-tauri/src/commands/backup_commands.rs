@@ -485,6 +485,12 @@ pub async fn backup_preview_file(id: String, path: String, version: Option<usize
     mgr.preview_file(&id, selector_of(version, selector), path, source).await
 }
 
+/// Benchmark codecs, ciphers, Argon2id, chunkers and hashes on this computer.
+#[tauri::command]
+pub async fn backup_bench(options: Option<ufop_core::backup::bench::BenchOptions>) -> Result<ufop_core::backup::bench::BenchReport, AppError> {
+    crate::backup_engine::diagnostics::bench(options.unwrap_or_default()).await
+}
+
 #[tauri::command]
 pub async fn backup_cache_stats(mgr: State<'_, BackupManager>) -> Result<CacheStats, AppError> {
     mgr.cache_stats().await

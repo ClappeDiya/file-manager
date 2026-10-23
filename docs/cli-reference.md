@@ -696,6 +696,52 @@ ufop backup open-at Office --point-in-time 2026-10-01T08:00:00Z [--name "Office 
 
 `open-at` works with jobs of the signed-in `ufop-server` whose destination is a versioned S3 bucket. It creates a read-only job that reads the bucket as it was at the given RFC 3339 time and prints its name, id and version count. Restore from it on the server or in the app.
 
+### `ufop backup bench`
+
+Measures this computer with the engine's own code: block compression (stored, deflate 1/6/9, zstd 1/3/6/12/19, bzip2 for ZIP volumes), AES-256-GCM and ChaCha20-Poly1305 seal/open, Argon2id presets, the Fixed and FastCDC chunkers (speed, block count, size distribution and how much of an edited copy of the sample is found again) and SHA-256/SHA-512. Timings are the best of `--repeat` runs. Nothing is read from or written to a backup.
+
+```bash
+ufop backup bench                                         # 16 MiB of generated mixed data (seed 1)
+ufop backup bench --sample ~/Documents --size 64M         # your own data (a file or folder, first 64 MiB)
+ufop backup bench --only compression,chunkers --threads 4 --repeat 5
+ufop backup bench --kdf-target-ms 2000 --kdf-memory-kib 262144   # Argon2id parameters taking about 2 s
+ufop backup bench --print-options                          # just the recommended `ufop backup run` flags
+ufop --json backup bench                                   # the full report as JSON
+```
+
+| Flag | Default | |
+|---|---|---|
+| `--sample PATH` | generated | File or folder to read the sample from (files in name order, links not followed) |
+| `--size` | `16M` | Bytes to generate, or the most to read from `--sample` |
+| `--seed` | 1 | Generated data and the edited copy used for the deduplication figure |
+| `--repeat` | 3 | Runs per measurement; the fastest counts |
+| `--threads` | 1 | Workers for compression, encryption and hashing |
+| `--block-size` | `100K` | Unit for compression/encryption and the base size of the chunker variants |
+| `--only` | all | `compression`, `crypto`, `kdf`, `chunkers`, `hashes` (comma-separated) |
+| `--kdf-target-ms` | 1000 | Target for the suggested Argon2id parameters (0 = no suggestion) |
+| `--kdf-memory-kib` | 65536 | Memory for the suggestion (halved, down to 19 MiB, while one pass is already too slow) |
+| `--print-options` | | Print `--block-codec … --compression-level … --chunker fastcdc --block-size … --cipher … --kdf-*` |
+
+Compression is ranked by space saved weighed against speed (bzip2 is listed but only usable as a ZIP volume method, `--volume-format zip --zip-method bzip2`). When the sample barely compresses the suggestion is `--compression-level 0`. The desktop app runs the same benchmark under Settings → Benchmark (Advanced), capped at 256 MiB.
+
+### `ufop backup debug`
+
+Read-only expert views of a repository. They take the shared repository lock (like a restore) except `header` and `sessions`, which read one file each, and never change the destination or the local database.
+
+```bash
+ufop backup debug header   --dest /mnt/backup                 # repo.json decoded, format, known/unknown features
+ufop backup debug volumes  --dest /mnt/backup --kind dblock --min-size 10M [--name-prefix b3] [--max-size 60M]
+ufop backup debug stats    --dest /mnt/backup                 # count/bytes per kind, blocks, dedup, per-version use
+ufop backup debug blocks   --dest /mnt/backup --version 0 [--volume NAME] [--hash-prefix ab12] [--details] [--max-blocks 100]
+ufop backup debug block    --dest /mnt/backup <hash> [--raw|--decompressed] [--out block.bin]
+ufop backup debug index    --dest /mnt/backup ufop-i….dindex.aes
+ufop backup debug fileset  --dest /mnt/backup 0               # the decoded dlist of the newest version, with metadata
+ufop backup debug sessions --dest /mnt/backup                 # writer and readers holding the lock
+ufop backup debug db ~/.local/share/ufop/cli-backups/x.sqlite # same as `ufop backup db info`
+```
+
+`volumes` lists every file of the prefix with its kind (`dblock`, `dindex`, `dlist`, `header`, `lock`, `other`), size, shard folder (sharded layout) and the state the local database records. `stats` reports the raw block bytes, the stored dblock bytes (compression ratio), the deduplication ratio (all versions' logical size / raw block bytes) and, per version, the distinct blocks it references and the bytes only it references. `blocks` reads the local database; `--details` (implied by `--volume`) downloads the volumes involved for each block's stored size and codec. `block` checks the decoded data against the block hash (exit code 2 on a mismatch); `--raw` returns the stored, still compressed bytes of a UFOP pack entry. Add `--json` for machine-readable output. In the desktop app, Maintenance → Inspect (Advanced) shows the header and statistics.
+
 ### `ufop server shares`
 
 Share links on a `ufop-server` started with `--share-root` (sign in first with `ufop server login`).

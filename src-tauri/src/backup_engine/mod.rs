@@ -580,6 +580,11 @@ pub enum BackupOperation {
     },
     /// The repository's format settings (version, chunker, codec, cipher, layout).
     FormatInfo,
+    /// The decoded repository header with its feature flags (read-only).
+    InspectHeader,
+    /// Counts and bytes per volume kind, blocks, deduplication and
+    /// per-version use (read-only, `ufop backup debug stats`).
+    InspectStats,
     /// Change a version's note, tags or pin (rewrites its file list).
     SetVersionMetadata {
         version: usize,
@@ -649,9 +654,10 @@ impl BackupOperation {
             | Self::ExtractControlFiles { .. }
             | Self::AutoTune { .. }
             | Self::ListLocks
+            | Self::InspectStats
             | Self::SyncSources => Shared,
             // Copying locks both repositories itself (shared source, exclusive target).
-            Self::SnapshotTest | Self::FormatInfo | Self::Replicate { .. } | Self::CopyVersions { .. } => return None,
+            Self::SnapshotTest | Self::FormatInfo | Self::InspectHeader | Self::Replicate { .. } | Self::CopyVersions { .. } => return None,
         })
     }
 
@@ -685,6 +691,8 @@ impl BackupOperation {
             Self::UpgradeFormat { rollback: true } => "rollback_format",
             Self::Reshard { .. } => "reshard",
             Self::FormatInfo => "format_info",
+            Self::InspectHeader => "inspect_header",
+            Self::InspectStats => "inspect_stats",
             Self::SetVersionMetadata { .. } => "set_version_metadata",
             Self::ApplyRetention { .. } => "apply_retention",
             Self::CopyVersions { .. } => "copy_versions",
@@ -3176,6 +3184,8 @@ fn summarize(op: &str, v: &serde_json::Value) -> String {
             n("already_in_place")
         ),
         "format_info" => format!("Repository format {}", n("format_version")),
+        "inspect_header" => format!("Repository header (format {})", v.pointer("/format/format_version").and_then(|x| x.as_u64()).unwrap_or(0)),
+        "inspect_stats" => format!("{} block(s) in {} version(s), {} stored", n("blocks"), v.get("versions").and_then(|x| x.as_array()).map(|a| a.len()).unwrap_or(0), human_bytes(n("total_bytes"))),
         "delete_versions" | "apply_retention" => format!("{} version(s) deleted", n("versions_deleted")),
         "set_version_metadata" => format!("Version {} updated", v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("")),
         "copy_versions" => format!(
@@ -3344,6 +3354,8 @@ fn dispatch(
         BackupOperation::UpgradeFormat { rollback: true } => serde_json::to_value(ufop_core::backup::format::rollback_upgrade(backend, &job.options.prefix)?)?,
         BackupOperation::Reshard { layout, dry_run } => serde_json::to_value(ufop_core::backup::layout::reshard(backend, &job.options.prefix, layout, dry_run, ctx)?)?,
         BackupOperation::FormatInfo => serde_json::to_value(ufop_core::backup::format::format_info(backend, &job.options.prefix)?)?,
+        BackupOperation::InspectHeader => serde_json::to_value(ufop_core::backup::inspect::header(backend, &job.options.prefix)?)?,
+        BackupOperation::InspectStats => serde_json::to_value(ufop_core::backup::inspect::stats(&open(false)?)?)?,
     };
     Ok(v)
 }

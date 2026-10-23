@@ -204,3 +204,15 @@ pub struct Diagnostics {
     #[serde(default)]
     pub snapshot_providers: Vec<ufop_core::backup::snapshot::ProviderStatus>,
 }
+
+/// Largest sample the desktop benchmark accepts (the CLI has no cap).
+pub const BENCH_MAX_SAMPLE: usize = 256 << 20;
+
+/// Run `ufop_core::backup::bench` off the async runtime (Settings →
+/// Benchmark, `backup_bench`). The sample is capped at [`BENCH_MAX_SAMPLE`].
+pub async fn bench(mut opts: ufop_core::backup::bench::BenchOptions) -> Result<ufop_core::backup::bench::BenchReport, AppError> {
+    opts.size = opts.size.min(BENCH_MAX_SAMPLE);
+    tokio::task::spawn_blocking(move || ufop_core::backup::bench::run(&opts, &ufop_core::backup::OpContext::new()))
+        .await
+        .map_err(|e| AppError::internal(format!("benchmark task failed: {e}")))?
+}

@@ -295,6 +295,7 @@ async fn dispatch_inner(mgr: &BackupManager, command: &str, a: &Value) -> Result
             .export_file(&arg::<String>(a, "id")?, super::access::selector_of(opt(a, "version")?, opt(a, "selector")?), arg(a, "path")?, arg(a, "dest")?, opt(a, "source")?)
             .await?),
         "backup_cache_stats" => ok(mgr.cache_stats().await?),
+        "backup_bench" => ok(super::diagnostics::bench(opt(a, "options")?.unwrap_or_default()).await?),
         "backup_clear_cache" => ok(mgr.clear_cache().await?),
         "backup_get_cache_settings" => ok(mgr.cache_settings().await?),
         "backup_set_cache_settings" => ok(mgr.set_cache_settings(arg(a, "settings")?).await?),
@@ -336,4 +337,5 @@ pub const COMMANDS: &[&str] = &[
     "backup_effective_settings", "backup_open_point_in_time", "backup_hardening_report",
     "backup_list_notification_profiles", "backup_get_notification_profile", "backup_save_notification_profile",
     "backup_delete_notification_profile", "backup_test_notification_profile", "backup_preview_notification", "backup_webhook_preset",
+    "backup_bench",
 ];

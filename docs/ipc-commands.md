@@ -83,10 +83,11 @@ macro; if you add a new one here, register it there too.
 - `resolve_aws_profile`
 - `start_sso_auth`
 
-## `backup_commands` (106 commands)
+## `backup_commands` (107 commands)
 
 - `backup_adopt_repository`
 - `backup_apply_template`
+- `backup_bench`
 - `backup_break_lock`
 - `backup_browse_remote`
 - `backup_bug_report`
@@ -746,4 +747,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 578 commands across 51 modules.
+**Surface:** 579 commands across 51 modules.

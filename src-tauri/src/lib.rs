@@ -767,6 +767,7 @@ pub fn run() {
             backup_commands::backup_export_file,
             backup_commands::backup_preview_file,
             backup_commands::backup_cache_stats,
+            backup_commands::backup_bench,
             backup_commands::backup_clear_cache,
             backup_commands::backup_get_cache_settings,
             backup_commands::backup_set_cache_settings,

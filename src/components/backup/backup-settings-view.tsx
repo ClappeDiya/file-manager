@@ -21,6 +21,7 @@ import { Banner, Btn, Field, PathInput, Section } from "./backup-ui";
 import { SecretProvidersEditor } from "./backup-secret-providers";
 import { AdvancedOnly } from "./advanced-only";
 import { BackupCacheSettings } from "./backup-cache-settings";
+import { BackupBenchmark } from "./backup-benchmark";
 import { useIsAdvanced } from "./use-is-advanced";
 import { TemplatesManager } from "./backup-policies";
 import { NotificationProfilesManager } from "./backup-notification-profiles";
@@ -292,6 +293,9 @@ export function BackupSettingsView() {
       <NotificationProfilesManager />
       <AdvancedOnly>
         <TemplatesManager />
+      </AdvancedOnly>
+      <AdvancedOnly>
+        <BackupBenchmark />
       </AdvancedOnly>
     </div>
   );

@@ -94,6 +94,15 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
         <BackupRepositoryFormat job={job} />
       </AdvancedOnly>
       <AdvancedOnly>
+        <Section title="Inspect (read-only)">
+          <div className="flex gap-1 flex-wrap">
+            {tool("Repository header", { type: "inspect_header" }, "The decoded repository header: format, features, chunker, codec, cipher (ufop backup debug header)")}
+            {tool("Storage statistics", { type: "inspect_stats" }, "Files and bytes per kind, blocks, deduplication and per-version use (ufop backup debug stats)")}
+          </div>
+          <p className="text-[11px] text-zinc-500">Blocks, single volumes, index and file-list contents: use <code>ufop backup debug</code>.</p>
+        </Section>
+      </AdvancedOnly>
+      <AdvancedOnly>
         <BackupSharing job={job} />
       </AdvancedOnly>
 

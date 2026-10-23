@@ -333,7 +333,7 @@ mod tests {
 pub fn operation_need(op: &crate::backup_engine::BackupOperation) -> Permission {
     use crate::backup_engine::BackupOperation as O;
     match op {
-        O::Backup { .. } | O::Verify { .. } | O::ListBroken | O::Consistency | O::ListLocks | O::FormatInfo | O::SnapshotTest | O::AutoTune { .. } | O::Replicate { .. } | O::SyncSources | O::RecreateDatabase => Permission::Run,
+        O::Backup { .. } | O::Verify { .. } | O::ListBroken | O::Consistency | O::ListLocks | O::FormatInfo | O::InspectHeader | O::InspectStats | O::SnapshotTest | O::AutoTune { .. } | O::Replicate { .. } | O::SyncSources | O::RecreateDatabase => Permission::Run,
         O::Restore { .. } | O::ExtractControlFiles { .. } | O::SetVersionMetadata { .. } | O::CopyVersions { .. } => Permission::Write,
         O::Compact | O::Repair | O::DeleteVersions { .. } | O::Purge { .. } | O::PurgeBroken { .. } | O::RebuildMissing | O::ApplyLocks { .. } | O::UpgradeFormat { .. } | O::Reshard { .. } | O::ApplyRetention { .. } | O::EnableSharing { .. } => Permission::Full,
     }
@@ -373,7 +373,7 @@ pub fn rpc_need(cmd: &str, args: &serde_json::Value) -> RpcNeed {
         "backup_delete_job" | "backup_break_lock" | "backup_export_config" => job(P::Full),
         "backup_passphrase_strength" | "backup_generate_passphrase" | "backup_capabilities" | "backup_cloud_providers" | "backup_export_is_encrypted" | "backup_schedule_preview" | "backup_webhook_preset" | "backup_preview_notification" => RpcNeed::Global(Global::Any),
         "backup_list_templates" | "backup_get_template" | "backup_list_notification_profiles" | "backup_get_notification_profile" | "backup_cache_stats" | "backup_get_cache_settings" | "backup_get_global_defaults" | "backup_effective_settings" => RpcNeed::Global(Global::User),
-        "server_list_directory" | "list_connections" | "backup_test_destination" | "backup_test_destination_compat" | "backup_preview_sources" | "backup_photos_libraries" | "backup_list_destinations" => RpcNeed::Global(Global::Operator),
+        "server_list_directory" | "list_connections" | "backup_test_destination" | "backup_test_destination_compat" | "backup_preview_sources" | "backup_photos_libraries" | "backup_list_destinations" | "backup_bench" => RpcNeed::Global(Global::Operator),
         _ => RpcNeed::Global(Global::Admin),
     }
 }

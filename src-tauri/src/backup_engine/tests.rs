@@ -1613,3 +1613,30 @@ async fn s3_point_in_time_recovery_through_manager() {
     assert!(m.open_point_in_time(&local.id, good, None).await.unwrap_err().user_message().contains("S3"));
 }
 
+
+#[tokio::test]
+async fn inspect_operations_and_bench() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha beta gamma ".repeat(100)).unwrap();
+    let m = manager(t.path()).await;
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let h = m.execute(&j.id, BackupOperation::InspectHeader).await.unwrap();
+    assert_eq!(h.status, "success", "{:?}", h.log);
+    assert_eq!(h.report["header"]["encrypted"], true);
+    assert!(h.summary.starts_with("Repository header"), "{}", h.summary);
+    let s = m.execute(&j.id, BackupOperation::InspectStats).await.unwrap();
+    assert_eq!(s.status, "success", "{:?}", s.log);
+    assert_eq!(s.report["versions"].as_array().unwrap().len(), 1);
+    assert!(s.report["blocks"].as_u64().unwrap() > 0);
+    assert_eq!(BackupOperation::InspectStats.lock_kind(), Some(ufop_core::backup::lock::LockKind::Shared));
+    assert!(!BackupOperation::InspectHeader.writes_destination());
+
+    use ufop_core::backup::bench::{BenchOptions, BenchSection};
+    let o = BenchOptions { size: 64 * 1024, repeat: 1, block_size: 8 * 1024, sections: vec![BenchSection::Hashes, BenchSection::Crypto], ..Default::default() };
+    let r = super::diagnostics::bench(o).await.unwrap();
+    assert_eq!((r.hashes.len(), r.ciphers.len(), r.compression.len()), (2, 2, 0));
+    assert_eq!(r.sample.bytes, 64 * 1024);
+}

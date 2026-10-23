@@ -1301,6 +1301,8 @@ export type BackupOperation =
   | { type: "upgrade_format"; rollback: boolean }
   | { type: "reshard"; layout: RepoLayout; dry_run: boolean }
   | { type: "format_info" }
+  | { type: "inspect_header" }
+  | { type: "inspect_stats" }
   | { type: "set_version_metadata"; version: number; source: string | null; patch: MetadataPatch }
   | { type: "apply_retention"; policy: RetentionPolicy | null; source: string | null }
   | { type: "copy_versions"; versions: number[]; source: string | null; target: CopyTarget; dry_run: boolean }

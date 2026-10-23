@@ -99,8 +99,8 @@ Ground rules
 - [x] K105 HTML email (multipart)
 
 ## WP10 — CLI, tooling, packaging
-- [ ] K56 `ufop backup bench` (compression, crypto, chunker)
-- [ ] K111 `ufop backup debug` (blocks, volumes, index, filesets)
+- [x] K56 `ufop backup bench` (compression, crypto, chunker)
+- [x] K111 `ufop backup debug` (blocks, volumes, index, filesets)
 - [ ] K129 Shell completions
 - [ ] K125 Windows release targets
 - [ ] K126 Multi-arch Docker image
