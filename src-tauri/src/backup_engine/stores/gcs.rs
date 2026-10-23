@@ -6,7 +6,7 @@
 //! returned hashes. Object retention locks are supported.
 
 use super::http::{self, TlsOptions};
-use super::{direct_child, join_key, BoxFut, ObjectStore};
+use super::{child_within_one, direct_child, join_key, BoxFut, ClassByKind, ObjectStore};
 use crate::core::error::AppError;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -28,11 +28,29 @@ pub struct GcsConfig {
     /// Send CRC32C/MD5 with uploads and verify downloads.
     pub checksums: bool,
     pub tls: TlsOptions,
+    /// OAuth scope requested for a service-account key; empty = read-only
+    /// scope for read-only connections, else full control.
+    pub scope: String,
+    /// Storage class per volume kind, overriding `storage_class`.
+    pub storage_class_by_kind: ClassByKind,
 }
+
+pub const SCOPE_FULL_CONTROL: &str = "https://www.googleapis.com/auth/devstorage.full_control";
+pub const SCOPE_READ_ONLY: &str = "https://www.googleapis.com/auth/devstorage.read_only";
 
 impl Default for GcsConfig {
     fn default() -> Self {
-        Self { bucket: String::new(), prefix: String::new(), project: String::new(), storage_class: String::new(), endpoint: String::new(), checksums: true, tls: TlsOptions::default() }
+        Self {
+            bucket: String::new(),
+            prefix: String::new(),
+            project: String::new(),
+            storage_class: String::new(),
+            endpoint: String::new(),
+            checksums: true,
+            tls: TlsOptions::default(),
+            scope: String::new(),
+            storage_class_by_kind: ClassByKind::default(),
+        }
     }
 }
 
@@ -56,6 +74,8 @@ enum Cred {
 pub struct GcsStore {
     cfg: GcsConfig,
     cred: Cred,
+    /// OAuth scope asked for (service-account keys).
+    scope: String,
     token: Mutex<Option<(String, std::time::Instant)>>,
     http: reqwest::Client,
     base: String,
@@ -93,6 +113,12 @@ fn b64url(d: &[u8]) -> String {
 impl GcsStore {
     /// `secret` = service-account key JSON, or an OAuth access token.
     pub fn new(cfg: GcsConfig, secret: String) -> Result<Self, AppError> {
+        Self::with_access(cfg, secret, false)
+    }
+
+    /// [`new`](Self::new) for a connection that only reads (`read_only`):
+    /// a service-account key then asks for the read-only scope.
+    pub fn with_access(cfg: GcsConfig, secret: String, read_only: bool) -> Result<Self, AppError> {
         if cfg.bucket.trim().is_empty() {
             return Err(AppError::validation("Enter the bucket name"));
         }
@@ -103,11 +129,54 @@ impl GcsStore {
             Cred::Token(s.to_string())
         };
         let base = if cfg.endpoint.trim().is_empty() { "https://storage.googleapis.com".to_string() } else { cfg.endpoint.trim().trim_end_matches('/').to_string() };
-        Ok(Self { http: http::client(&cfg.tls)?, cfg, cred, token: Mutex::new(None), base })
+        let scope = match cfg.scope.trim() {
+            "" if read_only => SCOPE_READ_ONLY.to_string(),
+            "" => SCOPE_FULL_CONTROL.to_string(),
+            s => s.to_string(),
+        };
+        Ok(Self { http: http::client(&cfg.tls)?, cfg, cred, scope, token: Mutex::new(None), base })
     }
 
-    fn jwt(sa: &ServiceAccount) -> Result<String, AppError> {
-        service_account_jwt(sa, "https://www.googleapis.com/auth/devstorage.full_control")
+    /// The OAuth scope this store requests.
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    fn jwt(&self, sa: &ServiceAccount) -> Result<String, AppError> {
+        service_account_jwt(sa, &self.scope)
+    }
+
+    fn folder_prefix(&self) -> String {
+        let prefix = self.cfg.prefix.trim_matches('/');
+        if prefix.is_empty() { String::new() } else { format!("{prefix}/") }
+    }
+
+    /// Objects under `pfx` (all pages) and, with the delimiter, the sub-prefixes.
+    async fn list_prefix(&self, pfx: &str, delimiter: bool) -> Result<(Vec<(String, u64)>, Vec<String>), AppError> {
+        let (mut items, mut folders) = (Vec::new(), Vec::new());
+        let mut page: Option<String> = None;
+        loop {
+            let mut q = vec![("prefix", pfx.to_string()), ("fields", "items(name,size),prefixes,nextPageToken".to_string())];
+            if delimiter {
+                q.push(("delimiter", "/".to_string()));
+            }
+            if let Some(p) = &page {
+                q.push(("pageToken", p.clone()));
+            }
+            let r = self.http.get(format!("{}/storage/v1/b/{}/o", self.base, self.cfg.bucket)).query(&q).bearer_auth(self.bearer().await?).send().await.map_err(|e| http::net("GCS listing", e))?;
+            let v: serde_json::Value = http::check(r, "GCS listing").await?.json().await.map_err(|e| http::net("GCS listing", e))?;
+            for it in v["items"].as_array().into_iter().flatten() {
+                let name = it["name"].as_str().unwrap_or_default().to_string();
+                let size = it["size"].as_str().and_then(|s| s.parse().ok()).or_else(|| it["size"].as_u64()).unwrap_or(0);
+                items.push((name, size));
+            }
+            folders.extend(v["prefixes"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(String::from)));
+            page = v["nextPageToken"].as_str().map(String::from);
+            if page.is_none() {
+                break;
+            }
+        }
+        Ok((items, folders))
     }
 }
 
@@ -147,7 +216,7 @@ impl GcsStore {
                         return Ok(t.clone());
                     }
                 }
-                let jwt = Self::jwt(sa)?;
+                let jwt = self.jwt(sa)?;
                 let r = self
                     .http
                     .post(&sa.token_uri)
@@ -177,28 +246,36 @@ impl ObjectStore for GcsStore {
     fn list(&self) -> BoxFut<'_, Vec<RemoteFile>> {
         Box::pin(async move {
             let prefix = self.cfg.prefix.trim_matches('/');
-            let pfx = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
-            let mut out = Vec::new();
-            let mut page: Option<String> = None;
-            loop {
-                let mut q = vec![("prefix", pfx.clone()), ("delimiter", "/".to_string()), ("fields", "items(name,size),nextPageToken".to_string())];
-                if let Some(p) = &page {
-                    q.push(("pageToken", p.clone()));
-                }
-                let r = self.http.get(format!("{}/storage/v1/b/{}/o", self.base, self.cfg.bucket)).query(&q).bearer_auth(self.bearer().await?).send().await.map_err(|e| http::net("GCS listing", e))?;
-                let v: serde_json::Value = http::check(r, "GCS listing").await?.json().await.map_err(|e| http::net("GCS listing", e))?;
-                for it in v["items"].as_array().into_iter().flatten() {
-                    let name = it["name"].as_str().unwrap_or_default();
-                    let size = it["size"].as_str().and_then(|s| s.parse().ok()).or_else(|| it["size"].as_u64()).unwrap_or(0);
-                    if let Some(n) = direct_child(prefix, name) {
-                        out.push(RemoteFile { name: n.to_string(), size });
-                    }
-                }
-                page = v["nextPageToken"].as_str().map(String::from);
-                if page.is_none() {
-                    break;
-                }
+            let (items, _) = self.list_prefix(&self.folder_prefix(), true).await?;
+            Ok(items.into_iter().filter_map(|(n, size)| direct_child(prefix, &n).map(|n| RemoteFile { name: n.to_string(), size })).collect())
+        })
+    }
+
+    fn supports_subfolders(&self) -> bool {
+        true
+    }
+
+    fn list_recursive(&self, parallelism: usize) -> BoxFut<'_, Vec<RemoteFile>> {
+        Box::pin(async move {
+            let prefix = self.cfg.prefix.trim_matches('/').to_string();
+            let pfx = self.folder_prefix();
+            if parallelism <= 1 {
+                let (items, _) = self.list_prefix(&pfx, false).await?;
+                return Ok(items.into_iter().filter_map(|(n, size)| child_within_one(&prefix, &n).map(|name| RemoteFile { name, size })).collect());
             }
+            let (top, folders) = self.list_prefix(&pfx, true).await?;
+            let mut out: Vec<RemoteFile> = top.into_iter().filter_map(|(n, size)| direct_child(&prefix, &n).map(|n| RemoteFile { name: n.to_string(), size })).collect();
+            let p2 = prefix.clone();
+            out.extend(
+                super::list_folders(folders, parallelism, |f| {
+                    let prefix = p2.clone();
+                    async move {
+                        let (items, _) = self.list_prefix(&f, true).await?;
+                        Ok(items.into_iter().filter_map(|(n, size)| child_within_one(&prefix, &n).map(|name| RemoteFile { name, size })).collect())
+                    }
+                })
+                .await?,
+            );
             Ok(out)
         })
     }
@@ -207,8 +284,9 @@ impl ObjectStore for GcsStore {
         Box::pin(async move {
             let key = join_key(&self.cfg.prefix, name);
             let mut meta = serde_json::json!({ "name": key, "contentType": "application/octet-stream" });
-            if !self.cfg.storage_class.is_empty() {
-                meta["storageClass"] = self.cfg.storage_class.clone().into();
+            let class = self.cfg.storage_class_by_kind.pick(name, &self.cfg.storage_class);
+            if !class.is_empty() {
+                meta["storageClass"] = class.into();
             }
             if self.cfg.checksums {
                 use md5::Digest;

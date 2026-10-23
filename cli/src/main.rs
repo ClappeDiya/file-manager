@@ -545,9 +545,18 @@ mod logging_tests {
     /// (a subcommand `--limit` once collided with the global `--limit`).
     #[test]
     fn command_tree_is_valid() {
-        use clap::CommandFactory;
-        Cli::command().debug_assert();
-        Cli::try_parse_from(["ufop", "server", "shares", "log", "abc", "-n", "5"]).unwrap();
+        // Building the whole (unoptimised) command tree needs more than the
+        // 2 MiB of a test thread; the binary's main thread has 8 MiB.
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                use clap::CommandFactory;
+                Cli::command().debug_assert();
+                Cli::try_parse_from(["ufop", "server", "shares", "log", "abc", "-n", "5"]).unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

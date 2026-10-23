@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{RwLock, Semaphore};
-use ufop_core::backup::backend::{RetryPolicy, Throttle};
+use ufop_core::backup::backend::{RateLimitedBackend, RequestLimits, RetryPolicy, Throttle};
 use ufop_core::backup::crypto::KdfParams;
 use ufop_core::backup::db::{BackupDb, DbKey, KeyCheck};
 use ufop_core::backup::lock::{self as repo_lock, LockKind, LockOptions};
@@ -125,6 +125,14 @@ impl BackupDestination {
             Self::Connection { connection_id, remote_path } => format!("connection {connection_id}:{remote_path}"),
             Self::Library { destination_id, remote_path } => format!("library {destination_id}:{remote_path}"),
             Self::Cloud { config, .. } => config.describe(),
+        }
+    }
+
+    /// The time an S3 destination is read at (a read-only view), if set.
+    pub fn point_in_time(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::Cloud { config: stores::CloudConfig::S3(c), .. } => c.point_in_time,
+            _ => None,
         }
     }
 }
@@ -243,6 +251,9 @@ pub struct BackupJob {
     /// Write behaviour for local / mounted-share destinations.
     #[serde(default)]
     pub local_transfer: LocalTransfer,
+    /// Request-rate limits and listing parallelism for the destination.
+    #[serde(default)]
+    pub request_limits: RequestLimits,
     /// Extra destinations kept in sync with the primary.
     #[serde(default)]
     pub replicas: Vec<Replica>,
@@ -318,6 +329,7 @@ impl Default for BackupJob {
             remote_config_include_secrets: false,
             network_timeout_secs: 0,
             local_transfer: LocalTransfer::default(),
+            request_limits: RequestLimits::default(),
             replicas: Vec::new(),
             notifications: Vec::new(),
             log_outputs: logs::LogOutputs::default(),
@@ -353,6 +365,10 @@ impl BackupJob {
         }
         if self.options.rehash_percent > 100 {
             return Err(AppError::validation("The rehash percentage must be between 0 and 100"));
+        }
+        self.request_limits.validate()?;
+        if self.destination.point_in_time().is_some() && !self.read_only {
+            return Err(AppError::validation("A destination opened at a point in time is read-only: turn on 'Read-only' for this job"));
         }
         if let Some(k) = &self.options.kdf {
             k.validate()?;
@@ -431,6 +447,22 @@ impl BackupJob {
             return Err(AppError::validation("Block size must be ≥ 1 KiB and remote volume size ≥ block size"));
         }
         Ok(())
+    }
+}
+
+/// How a destination connection is opened.
+#[derive(Debug, Clone, Copy, Default)]
+struct BackendOpts {
+    timeout_secs: u64,
+    local: LocalTransfer,
+    /// The job only reads (narrower scopes where the provider has them).
+    read_only: bool,
+    limits: RequestLimits,
+}
+
+impl BackendOpts {
+    fn of(job: &BackupJob) -> Self {
+        Self { timeout_secs: job.network_timeout_secs, local: job.local_transfer, read_only: job.read_only, limits: job.request_limits }
     }
 }
 
@@ -1489,7 +1521,7 @@ impl BackupManager {
     // ── Destinations ──
 
     pub async fn backend_for(&self, dest: &BackupDestination, throttle: Throttle, retry: RetryPolicy, soft_delete: Option<String>) -> Result<Box<dyn Backend>, AppError> {
-        self.backend_with_timeout(dest, throttle, retry, soft_delete, 0, LocalTransfer::default()).await
+        Box::pin(self.backend_with_timeout(dest, throttle, retry, soft_delete, BackendOpts::default())).await
     }
 
     /// Resolve a library entry to its concrete destination (with sub-folder).
@@ -1511,17 +1543,10 @@ impl BackupManager {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn backend_with_timeout(
-        &self,
-        dest: &BackupDestination,
-        throttle: Throttle,
-        retry: RetryPolicy,
-        soft_delete: Option<String>,
-        timeout_secs: u64,
-        local: LocalTransfer,
-    ) -> Result<Box<dyn Backend>, AppError> {
+    async fn backend_with_timeout(&self, dest: &BackupDestination, throttle: Throttle, retry: RetryPolicy, soft_delete: Option<String>, opts: BackendOpts) -> Result<Box<dyn Backend>, AppError> {
+        let BackendOpts { timeout_secs, local, read_only, limits } = opts;
         let dest = &self.resolve_destination(dest).await?;
+        let parallel = limits.list_parallelism.max(1) as usize;
         let raw: Box<dyn Backend> = match dest {
             BackupDestination::Local { path, alternate_paths, marker_file } => {
                 let mut b = if alternate_paths.is_empty() && marker_file.is_none() {
@@ -1534,6 +1559,7 @@ impl BackupManager {
                 b.use_move = local.use_move;
                 b.verify_upload_size = local.verify_size;
                 b.sync_writes = local.sync_writes;
+                b.list_parallelism = parallel;
                 Box::new(b)
             }
             BackupDestination::Connection { connection_id, remote_path } => {
@@ -1543,25 +1569,33 @@ impl BackupManager {
                 let secret = conns.get_password(id).await.unwrap_or(None);
                 let mut b = connector_backend::ConnectorBackend::connect(&profile, secret, remote_path).await?;
                 b.set_timeout((timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs)));
+                b.set_list_parallelism(parallel);
                 Box::new(b)
             }
             BackupDestination::Library { .. } => return Err(AppError::validation("A library destination cannot point at another library entry")),
             BackupDestination::Cloud { config, credential_id } => {
                 let secret = self.destination_secret(credential_id).await?;
-                let store = stores::open(config, secret).await?;
-                Box::new(stores::StoreBackend::new(store, (timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs))))
+                let store = Box::pin(stores::open_with(config, secret, stores::OpenOptions { read_only: read_only || dest.point_in_time().is_some() })).await?;
+                Box::new(stores::StoreBackend::new(store, (timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs))).with_list_parallelism(parallel))
             }
         };
+        // A point-in-time view never writes, whatever the job says.
+        let view_only = raw.is_read_only();
+        // Each attempt of a retried request counts against the rate limits.
+        let raw: Box<dyn Backend> = if limits.is_limited() { Box::new(RateLimitedBackend::new(raw, limits)) } else { raw };
         let b: Box<dyn Backend> = Box::new(RetryingBackend::new(raw, retry, throttle));
-        Ok(match soft_delete.filter(|p| !p.is_empty()) {
+        let b: Box<dyn Backend> = match soft_delete.filter(|p| !p.is_empty()) {
             Some(p) => Box::new(SoftDeleteBackend::new(b, p)),
             None => b,
-        })
+        };
+        Ok(if view_only { Box::new(ReadOnlyBackend::new(b)) } else { b })
     }
 
     async fn build_backend(&self, job: &BackupJob) -> Result<Box<dyn Backend>, AppError> {
-        let b = self.backend_with_timeout(&job.destination, job.throttle, job.retry, job.soft_delete_prefix.clone(), job.network_timeout_secs, job.local_transfer).await?;
-        Ok(if job.read_only { Box::new(ReadOnlyBackend::new(b)) } else { b })
+        // Boxed: connecting has large futures (every provider), and callers'
+        // state machines stay small (debug builds run them on 2 MiB stacks).
+        let b = Box::pin(self.backend_with_timeout(&job.destination, job.throttle, job.retry, job.soft_delete_prefix.clone(), BackendOpts::of(job))).await?;
+        Ok(if job.read_only && !b.is_read_only() { Box::new(ReadOnlyBackend::new(b)) } else { b })
     }
 
     // ── Direct destination file operations ──
@@ -1625,7 +1659,7 @@ impl BackupManager {
         let mut targets = Vec::new();
         let mut errors = Vec::new();
         for r in picked {
-            match self.backend_with_timeout(&r.destination, r.throttle, job.retry, None, job.network_timeout_secs, job.local_transfer).await {
+            match Box::pin(self.backend_with_timeout(&r.destination, r.throttle, job.retry, None, BackendOpts { read_only: false, ..BackendOpts::of(job) })).await {
                 Ok(b) => targets.push((r, b)),
                 Err(e) => errors.push(format!("{}: {}", r.name, e.user_message())),
             }
@@ -1898,6 +1932,29 @@ impl BackupManager {
         self.get_job(&job.id).await
     }
 
+    /// "Open backup as it was at …": a new read-only job for this job's
+    /// versioned S3 bucket read as of `at` (destination-level recovery,
+    /// e.g. after ransomware rewrote or deleted volumes). Its index is
+    /// rebuilt from the old object versions; restore and browse as usual.
+    pub async fn open_point_in_time(&self, job_id: &str, at: chrono::DateTime<chrono::Utc>, name: Option<String>) -> Result<BackupJob, AppError> {
+        let job = self.get_job(job_id).await?;
+        if at > chrono::Utc::now() {
+            return Err(AppError::validation("Pick a time in the past"));
+        }
+        let dest = match self.resolve_destination(&job.destination).await? {
+            BackupDestination::Cloud { config: stores::CloudConfig::S3(mut c), credential_id } => {
+                c.point_in_time = Some(at);
+                BackupDestination::Cloud { config: stores::CloudConfig::S3(c), credential_id }
+            }
+            _ => {
+                return Err(AppError::validation("Point-in-time views need a native S3 destination whose bucket has versioning enabled"));
+            }
+        };
+        let passphrase = if job.encrypted { self.passphrase(job_id).await? } else { None };
+        let name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| format!("{} (as of {})", job.name, at.format("%Y-%m-%d %H:%M UTC")));
+        self.adopt_repository(dest, passphrase, job.options.prefix.clone(), Some(name), job.sources.clone(), Vec::new(), true).await
+    }
+
     /// Test a destination; optionally create the folder. Returns the number of files present.
     pub async fn test_destination(&self, dest: &BackupDestination, create: bool) -> Result<usize, AppError> {
         let b = self.backend_for(dest, Throttle::default(), RetryPolicy { retries: 0, ..Default::default() }, None).await?;
@@ -2032,7 +2089,8 @@ impl BackupManager {
     pub async fn execute(&self, job_id: &str, op: BackupOperation) -> Result<OperationResult, AppError> {
         let job = self.get_job(job_id).await?;
         let (task_id, cancel, progress) = self.register_task(&job, op.name());
-        self.run_registered(job, op, task_id, cancel, progress).await
+        // Boxed so callers that await many operations keep small frames.
+        Box::pin(self.run_registered(job, op, task_id, cancel, progress)).await
     }
 
     async fn run_registered(

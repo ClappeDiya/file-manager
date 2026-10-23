@@ -230,6 +230,31 @@ pub async fn effective(job: &str, format: &OutputFormat) -> Result<u8, String> {
     Ok(0)
 }
 
+/// Body of `POST /jobs/{id}/point-in-time`; the time must be RFC 3339.
+pub fn open_at_body(point_in_time: &str, name: Option<String>) -> Result<Value, String> {
+    let at = chrono::DateTime::parse_from_rfc3339(point_in_time.trim()).map_err(|e| format!("--point-in-time must be an RFC 3339 time such as 2026-10-01T08:00:00Z: {e}"))?;
+    Ok(json!({ "at": at.with_timezone(&chrono::Utc).to_rfc3339(), "name": name }))
+}
+
+/// `ufop backup open-at`: a read-only job reading the job's S3 bucket as of a time.
+pub async fn open_at(job: &str, point_in_time: &str, name: Option<String>, format: &OutputFormat) -> Result<u8, String> {
+    let body = open_at_body(point_in_time, name)?;
+    let mut c = Client::new()?;
+    let id = c.job_id(job).await?;
+    let v = c.call(Method::POST, &format!("/jobs/{}/point-in-time", urlencode(&id)), Some(body)).await?;
+    match format {
+        OutputFormat::Human => println!(
+            "Created read-only job \"{}\" ({}) with {} version(s) as of {}. Restore from it with the server or the app.",
+            v["name"].as_str().unwrap_or(""),
+            v["id"].as_str().unwrap_or(""),
+            v["stats"]["version_count"].as_u64().unwrap_or(0),
+            point_in_time.trim()
+        ),
+        _ => output::print_data(format, &v),
+    }
+    Ok(0)
+}
+
 /// Body of a schedule preview: cron expressions, or an interval schedule.
 pub fn preview_body(cron: &[String], start_time: Option<&str>, interval_minutes: Option<u32>, count: usize) -> Value {
     let mut s = json!({ "enabled": true, "cron": cron });
@@ -276,6 +301,14 @@ mod tests {
         assert!(template_body(json!({}), None, None, None, Some("not json".into())).is_err());
         let b = template_body(json!({"id": "a", "name": "Old", "settings": {}}), None, None, Some("New text".into()), None).unwrap();
         assert_eq!((b["id"].as_str(), b["description"].as_str()), (Some("a"), Some("New text")));
+    }
+
+    #[test]
+    fn open_at_body_needs_rfc3339() {
+        let b = open_at_body("2026-10-01T10:00:00+02:00", Some("Before attack".into())).unwrap();
+        assert_eq!(b["at"], "2026-10-01T08:00:00+00:00");
+        assert_eq!(b["name"], "Before attack");
+        assert!(open_at_body("yesterday", None).unwrap_err().contains("RFC 3339"));
     }
 
     #[test]

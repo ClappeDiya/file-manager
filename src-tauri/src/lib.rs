@@ -736,6 +736,7 @@ pub fn run() {
             backup_commands::backup_save_destination,
             backup_commands::backup_delete_destination,
             backup_commands::backup_adopt_repository,
+            backup_commands::backup_open_point_in_time,
             backup_commands::backup_lock_status,
             backup_commands::backup_break_lock,
             backup_commands::backup_set_database_encryption,

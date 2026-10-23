@@ -305,6 +305,14 @@ pub async fn backup_adopt_repository(
         .await
 }
 
+/// "Open backup as it was at …": a read-only job for the job's versioned
+/// S3 bucket as of `at` (RFC 3339).
+#[tauri::command]
+pub async fn backup_open_point_in_time(job_id: String, at: String, name: Option<String>, mgr: State<'_, BackupManager>) -> Result<BackupJob, AppError> {
+    let at = chrono::DateTime::parse_from_rfc3339(&at).map_err(|e| AppError::validation(format!("Invalid time '{at}': {e}")))?.with_timezone(&chrono::Utc);
+    mgr.open_point_in_time(&job_id, at, name).await
+}
+
 /// Who holds the job's repository lock(s) right now.
 #[tauri::command]
 pub async fn backup_lock_status(job_id: String, mgr: State<'_, BackupManager>) -> Result<ufop_core::backup::lock::LockStatus, AppError> {

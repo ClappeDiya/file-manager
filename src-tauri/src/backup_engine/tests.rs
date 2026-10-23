@@ -1555,3 +1555,61 @@ async fn backup_version_drive_serves_and_closes() {
     m.delete_job(&j.id, true, false).await.unwrap();
     assert!(m.list_drives().is_empty());
 }
+
+/// Destination-level recovery: after "ransomware" rewrote and deleted every
+/// object of a versioned S3 bucket, a point-in-time job (read-only) rebuilt
+/// from the old versions restores the data; request limits apply to the job.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_point_in_time_recovery_through_manager() {
+    let (base, st) = stores::mock_s3::serve().await;
+    st.lock().unwrap().buckets.push("bkt".into());
+    let t = tempfile::tempdir().unwrap();
+    let (src, out) = (t.path().join("src"), t.path().join("out"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("report.txt"), b"quarterly numbers").unwrap();
+    let m = manager(t.path()).await;
+    let cfg = stores::s3::S3Config { preset: "custom".into(), endpoint: base.clone(), bucket: "bkt".into(), prefix: "pc".into(), access_key_id: "AKIDBASE".into(), path_style: true, part_size_mb: 0, ..Default::default() };
+    m.set_destination_secret("cred-s3", "basesecret").await.unwrap();
+    let mut jb = job(&src, &t.path().join("unused"));
+    jb.destination = BackupDestination::Cloud { config: stores::CloudConfig::S3(cfg.clone()), credential_id: "cred-s3".into() };
+    jb.request_limits = RequestLimits { put_per_sec: 1000.0, max_concurrent_requests: 4, list_parallelism: 2, ..Default::default() };
+    let j = m.save_job(jb, Some("pw".into())).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let good = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    // The attack: every object overwritten with garbage, the file lists deleted.
+    let live = stores::s3::S3Store::new(cfg.clone(), "basesecret".into()).unwrap();
+    for f in stores::ObjectStore::list_recursive(&live, 1).await.unwrap() {
+        if f.name.contains(".dlist") {
+            stores::ObjectStore::delete(&live, &f.name).await.unwrap();
+        } else {
+            stores::ObjectStore::put(&live, &f.name, b"encrypted by ransomware".to_vec()).await.unwrap();
+        }
+    }
+    // A point-in-time destination must be read-only.
+    let mut bad = m.get_job(&j.id).await.unwrap();
+    bad.id = String::new();
+    if let BackupDestination::Cloud { config: stores::CloudConfig::S3(c), .. } = &mut bad.destination {
+        c.point_in_time = Some(good);
+    }
+    assert!(m.save_job(bad, Some("pw".into())).await.unwrap_err().user_message().contains("read-only"));
+    assert!(m.open_point_in_time(&j.id, chrono::Utc::now() + chrono::Duration::hours(1), None).await.is_err());
+    // Open the bucket as it was before the attack and restore from it.
+    let pit = m.open_point_in_time(&j.id, good, None).await.unwrap();
+    assert!(pit.read_only && pit.name.contains("as of"));
+    assert_eq!(pit.destination.point_in_time(), Some(good));
+    assert_eq!(pit.stats.version_count, 1);
+    let writes = st.lock().unwrap().log.iter().filter(|(m, _, _)| m == "PUT" || m == "DELETE").count();
+    let r = m.execute(&pit.id, BackupOperation::Restore { options: RestoreOptions { target: Some(out.clone()), ..Default::default() }, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(std::fs::read(out.join("src/report.txt")).unwrap(), b"quarterly numbers");
+    assert_eq!(st.lock().unwrap().log.iter().filter(|(m, _, _)| m == "PUT" || m == "DELETE").count(), writes, "the view never wrote");
+    // Backups into the view are refused.
+    assert!(m.execute(&pit.id, BackupOperation::Backup { dry_run: false }).await.is_err());
+    // Other destinations cannot be opened at a time.
+    let local = m.save_job(job(&src, &t.path().join("dst")), Some("pw".into())).await.unwrap();
+    assert!(m.open_point_in_time(&local.id, good, None).await.unwrap_err().user_message().contains("S3"));
+}
+

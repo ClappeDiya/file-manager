@@ -365,6 +365,11 @@ export class UfopClient {
     return this.call("PUT", `/api/v1/jobs/${encodeURIComponent(id)}/passphrase`, undefined, body);
   }
 
+  /** Open the job's versioned S3 destination as it was at a time: creates a read-only job whose index is rebuilt from the object versions of then (API tokens: `write` scope). `POST /api/v1/jobs/{id}/point-in-time` */
+  postJobsIdPointInTime(id: string, body: { at: string; name?: string | null }): Promise<BackupJob> {
+    return this.call("POST", `/api/v1/jobs/${encodeURIComponent(id)}/point-in-time`, undefined, body);
+  }
+
   /** What retention would keep and delete (the job's policy or an unsaved one); changes nothing (API tokens: `write` scope). `POST /api/v1/jobs/{id}/retention/preview` */
   postJobsIdRetentionPreview(id: string, body: { policy?: RetentionPolicy; source?: string | null } = {}): Promise<{ delete?: number; keep?: number; legal_hold?: boolean; policy?: RetentionPolicy; versions?: Array<{ id?: number; keep?: boolean; reasons?: string[]; summary?: string; timestamp?: string }> }> {
     return this.call("POST", `/api/v1/jobs/${encodeURIComponent(id)}/retention/preview`, undefined, body);

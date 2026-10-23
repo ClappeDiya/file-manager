@@ -87,6 +87,44 @@ pub struct RepoArgs {
     /// `ufop backup sources`, or * for all) instead of this job's
     #[arg(long)]
     pub source_id: Option<String>,
+    #[command(flatten)]
+    pub limits: LimitArgs,
+}
+
+/// Request-rate limits and listing parallelism for the destination.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct LimitArgs {
+    /// Most listing requests per second (0 = unlimited)
+    #[arg(long, default_value_t = 0.0)]
+    pub list_rate: f64,
+    /// Most download requests per second (0 = unlimited)
+    #[arg(long, default_value_t = 0.0)]
+    pub get_rate: f64,
+    /// Most upload requests per second (0 = unlimited)
+    #[arg(long, default_value_t = 0.0)]
+    pub put_rate: f64,
+    /// Most delete requests per second (0 = unlimited)
+    #[arg(long, default_value_t = 0.0)]
+    pub delete_rate: f64,
+    /// Most requests in flight at once (0 = unlimited)
+    #[arg(long, default_value_t = 0)]
+    pub max_concurrent_requests: u32,
+    /// Shard folders of a sharded layout listed at once
+    #[arg(long, default_value_t = 1)]
+    pub list_parallelism: u32,
+}
+
+impl LimitArgs {
+    pub fn limits(&self) -> ufop_core::backup::backend::RequestLimits {
+        ufop_core::backup::backend::RequestLimits {
+            list_per_sec: self.list_rate,
+            get_per_sec: self.get_rate,
+            put_per_sec: self.put_rate,
+            delete_per_sec: self.delete_rate,
+            max_concurrent_requests: self.max_concurrent_requests,
+            list_parallelism: self.list_parallelism,
+        }
+    }
 }
 
 /// Report a configuration problem and exit (exit code 2, like other usage errors).
@@ -146,13 +184,20 @@ impl RepoArgs {
         }
     }
 
-    /// The destination, read-only when `--read-only` is given.
+    /// The destination, read-only when `--read-only` is given, with the
+    /// request limits and listing parallelism of the flags.
     pub(super) fn backend(&self) -> Box<dyn Backend> {
-        let b = LocalBackend::new(&self.dest);
+        let limits = self.limits.limits();
+        if let Err(e) = limits.validate() {
+            fail(&e.user_message());
+        }
+        let mut local = LocalBackend::new(&self.dest);
+        local.list_parallelism = limits.list_parallelism.max(1) as usize;
+        let b: Box<dyn Backend> = if limits.is_limited() { Box::new(ufop_core::backup::backend::RateLimitedBackend::new(local, limits)) } else { Box::new(local) };
         if self.read_only {
             Box::new(ReadOnlyBackend::new(b))
         } else {
-            Box::new(b)
+            b
         }
     }
 
@@ -653,6 +698,7 @@ impl PassArgs {
             hostname: None,
             username: None,
             source_id: None,
+            limits: LimitArgs::default(),
         }
         .passphrase()
     }
@@ -1216,6 +1262,18 @@ pub enum BackupCommands {
         /// Job id or name
         job: String,
     },
+    /// Open a server job's versioned S3 destination as it was at a time, as a
+    /// new read-only job (recovery after ransomware or accidental deletes)
+    OpenAt {
+        /// Job id or name (signed-in ufop-server)
+        job: String,
+        /// RFC 3339 time, e.g. 2026-10-01T08:00:00Z
+        #[arg(long = "point-in-time")]
+        point_in_time: String,
+        /// Name of the new read-only job
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Validate a schedule and list its next runs (signed-in ufop-server)
     SchedulePreview {
         /// Cron expression, `min hour day month weekday` (repeatable)
@@ -1539,13 +1597,14 @@ pub async fn execute(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) 
         return super::server::execute(super::server::ServerCommands::RunAll { jobs, scheduled_only, dry_run, wait }, format).await;
     }
     let server_backed = match &cmd {
-        BackupCommands::Template { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } => true,
+        BackupCommands::Template { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } | BackupCommands::OpenAt { .. } => true,
         _ => false,
     };
     if server_backed {
         let r = match cmd {
             BackupCommands::Template { cmd } => super::backup_policy::template(cmd, format).await,
             BackupCommands::Effective { job } => super::backup_policy::effective(&job, format).await,
+            BackupCommands::OpenAt { job, point_in_time, name } => super::backup_policy::open_at(&job, &point_in_time, name, format).await,
             BackupCommands::SchedulePreview { cron, start_time, interval_minutes, count } => {
                 super::backup_policy::schedule_preview(&cron, start_time.as_deref(), interval_minutes, count, format).await
             }
@@ -1676,7 +1735,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             }
             Ok(0)
         }
-        BackupCommands::RunAll { .. } | BackupCommands::Template { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } => Err(ufop_core::error::AppError::internal("server-backed commands are handled before the blocking runner")),
+        BackupCommands::RunAll { .. } | BackupCommands::Template { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } | BackupCommands::OpenAt { .. } => Err(ufop_core::error::AppError::internal("server-backed commands are handled before the blocking runner")),
         BackupCommands::List { repo, tags } => with_repo(&repo, LockKind::Shared, "list", |_, db| {
             let filter = ufop_core::backup::versions::parse_tags(&tags)?;
             let v = ufop_core::backup::versions::filter_by_tags(db.filesets()?, &filter);
@@ -1741,6 +1800,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
                 hostname: None,
                 username: None,
                 source_id: None,
+                limits: repo.limits.clone(),
             };
             let dst_opts = BackupOptions {
                 format_version: to_format_version,

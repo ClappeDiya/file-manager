@@ -297,6 +297,10 @@ class UfopClient:
         """Change an encrypted job's passphrase (format 2 repositories rewrite only the header) (API tokens: `write` scope). `PUT /api/v1/jobs/{id}/passphrase`"""
         return self._call("PUT", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/passphrase", None, body)
 
+    def post_jobs_id_point_in_time(self, id_: str, body: Dict[str, Any]) -> "BackupJob":
+        """Open the job's versioned S3 destination as it was at a time: creates a read-only job whose index is rebuilt from the object versions of then (API tokens: `write` scope). `POST /api/v1/jobs/{id}/point-in-time`"""
+        return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/point-in-time", None, body)
+
     def post_jobs_id_retention_preview(self, id_: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """What retention would keep and delete (the job's policy or an unsaved one); changes nothing (API tokens: `write` scope). `POST /api/v1/jobs/{id}/retention/preview`"""
         return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/retention/preview", None, body if body is not None else {})

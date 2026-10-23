@@ -272,6 +272,11 @@ async fn dispatch_inner(mgr: &BackupManager, command: &str, a: &Value) -> Result
                 opt(a, "readOnly")?.unwrap_or(false),
             )
             .await?),
+        "backup_open_point_in_time" => {
+            let at: String = arg(a, "at")?;
+            let at = chrono::DateTime::parse_from_rfc3339(&at).map_err(|e| AppError::validation(format!("Invalid time '{at}': {e}")))?.with_timezone(&chrono::Utc);
+            ok(mgr.open_point_in_time(&arg::<String>(a, "jobId")?, at, opt(a, "name")?).await?)
+        }
         "backup_resolve_version" => ok(mgr.resolve_version(&arg::<String>(a, "id")?, arg(a, "selector")?, opt(a, "source")?).await?),
         "backup_read_file" => ok(mgr
             .read_file(&arg::<String>(a, "id")?, super::access::selector_of(opt(a, "version")?, opt(a, "selector")?), arg(a, "path")?, opt(a, "offset")?.unwrap_or(0), opt(a, "length")?, opt(a, "source")?)
@@ -311,5 +316,5 @@ pub const COMMANDS: &[&str] = &[
     "backup_resolve_version", "backup_read_file", "backup_export_file", "backup_cache_stats", "backup_clear_cache",
     "backup_get_cache_settings", "backup_set_cache_settings", "backup_schedule_preview", "backup_list_templates", "backup_get_template",
     "backup_save_template", "backup_delete_template", "backup_apply_template", "backup_export_templates", "backup_import_templates",
-    "backup_effective_settings",
+    "backup_effective_settings", "backup_open_point_in_time",
 ];

@@ -37,6 +37,8 @@ mod cloud_tests;
 #[cfg(test)]
 pub(crate) mod mock_azure;
 #[cfg(test)]
+pub(crate) mod mock_gcs;
+#[cfg(test)]
 pub(crate) mod mock_s3;
 #[cfg(test)]
 mod mocks;
@@ -391,7 +393,6 @@ pub async fn open(config: &CloudConfig, secret: Option<String>) -> Result<Box<dy
 /// [`open`] with options.
 pub async fn open_with(config: &CloudConfig, secret: Option<String>, opts: OpenOptions) -> Result<Box<dyn ObjectStore>, AppError> {
     let need = |s: Option<String>| s.filter(|s| !s.is_empty()).ok_or_else(|| AppError::validation("This destination's credentials are missing; edit the destination to enter them"));
-    let _ = opts;
     Ok(match config {
         CloudConfig::S3(c) => {
             // Only static keys need the stored secret; the chain finds the rest.
@@ -402,7 +403,7 @@ pub async fn open_with(config: &CloudConfig, secret: Option<String>, opts: OpenO
             let secret = if c.auth.needs_secret() { Some(need(secret)?) } else { secret };
             Box::new(azure::AzureStore::with_env(c.clone(), secret, crate::connectors::aws_chain::ChainEnv::process())?)
         }
-        CloudConfig::Gcs(c) => Box::new(gcs::GcsStore::new(c.clone(), need(secret)?)?),
+        CloudConfig::Gcs(c) => Box::new(gcs::GcsStore::with_access(c.clone(), need(secret)?, opts.read_only)?),
         CloudConfig::B2(c) => Box::new(b2::B2Store::connect(c.clone(), need(secret)?).await?),
         CloudConfig::Swift(c) => Box::new(swift::SwiftStore::connect(c.clone(), need(secret)?).await?),
         CloudConfig::Dropbox(c) => Box::new(oauth_drive::DriveStore::new(oauth_drive::Kind::Dropbox, c.clone(), need(secret)?)?),

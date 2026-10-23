@@ -305,3 +305,39 @@ async fn azure_sharded_backup_tiers_by_kind_and_parallel_listing() {
     let e = AzureStore::with_env(AzureConfig { access_tier_by_kind: ClassByKind { dblock: "archive".into(), ..Default::default() }, ..cfg.clone() }, Some("x".into()), ChainEnv::fixed(HashMap::new())).err().unwrap();
     assert!(e.user_message().contains("dblock"));
 }
+
+// ── Google Cloud Storage ──
+
+use super::mock_gcs;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gcs_scope_follows_read_only_and_sharded_backup() {
+    let (base, st) = mock_gcs::serve().await;
+    let sa = mock_gcs::service_account(&base);
+    let cfg = gcs::GcsConfig { bucket: "bkt".into(), prefix: "pc".into(), endpoint: base.clone(), storage_class_by_kind: ClassByKind { dblock: "NEARLINE".into(), ..Default::default() }, ..Default::default() };
+    // Read-write connections ask for full control and can write.
+    let rw = gcs::GcsStore::with_access(cfg.clone(), sa.clone(), false).unwrap();
+    assert_eq!(rw.scope(), gcs::SCOPE_FULL_CONTROL);
+    exercise(&rw, 200_000).await;
+    rw.put("ab/ufop-b1.dblock", b"blk".to_vec()).await.unwrap();
+    assert_eq!(st.lock().unwrap().objects["bkt/pc/ab/ufop-b1.dblock"].1.as_deref(), Some("NEARLINE"));
+    // Read-only connections request the read-only scope; reads work, writes are refused by GCS too.
+    let ro = gcs::GcsStore::with_access(cfg.clone(), sa.clone(), true).unwrap();
+    assert_eq!(ro.scope(), gcs::SCOPE_READ_ONLY);
+    assert_eq!(ro.get("ab/ufop-b1.dblock").await.unwrap(), b"blk");
+    assert!(ro.put("x", vec![1]).await.unwrap_err().user_message().contains("Insufficient Permission"));
+    assert_eq!(st.lock().unwrap().scopes, vec![gcs::SCOPE_FULL_CONTROL.to_string(), gcs::SCOPE_READ_ONLY.to_string()], "the token request carried the scope");
+    // An explicit scope wins.
+    let custom = gcs::GcsStore::with_access(gcs::GcsConfig { scope: "https://www.googleapis.com/auth/devstorage.read_write".into(), ..cfg.clone() }, sa.clone(), true).unwrap();
+    custom.list().await.unwrap();
+    assert!(st.lock().unwrap().scopes.last().unwrap().ends_with("read_write"));
+    // `open_with` derives the scope from the read-only flag.
+    let store = open_with(&CloudConfig::Gcs(cfg.clone()), Some(sa.clone()), OpenOptions { read_only: true }).await.unwrap();
+    store.list().await.unwrap();
+    assert!(st.lock().unwrap().scopes.last().unwrap().ends_with("read_only"));
+    rw.delete("ab/ufop-b1.dblock").await.unwrap();
+    // Sharded backup through prefix folders, listed in parallel.
+    let b = Arc::new(StoreBackend::new(Box::new(gcs::GcsStore::with_access(cfg, sa, false).unwrap()), None).with_list_parallelism(4));
+    let b2 = b.clone();
+    tokio::task::spawn_blocking(move || backup_roundtrip_with(b2.as_ref(), RepoLayout::Sharded { prefix_len: 1 })).await.unwrap();
+}
