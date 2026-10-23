@@ -160,6 +160,101 @@ export interface BackupOptions {
   checkpoint_interval_secs: number;
   /** Also checkpoint after this many uploaded bytes (0 = off). */
   checkpoint_interval_bytes: number;
+  // ── Versions and shared repositories ──
+  /** Note stored with each new version. */
+  default_note: string | null;
+  /** Tags stored with each new version. */
+  default_tags: Record<string, string>;
+  /** Who writes the versions; empty host / user = this computer's (override to continue another computer's history). */
+  identity: ClientIdentity;
+  /** Create a new (format 2) repository as shared by several jobs / computers. */
+  shared_repository: boolean;
+  /** Shared repositories: compaction leaves volumes younger than this alone. */
+  shared_gc_delay_hours: number;
+}
+
+/** Rust `ufop_core::backup::versions::ClientIdentity`. */
+export interface ClientIdentity {
+  hostname: string;
+  username: string;
+  job_id: string;
+  source_label: string;
+}
+
+/** Rust `ufop_core::backup::versions::VersionStats`: what a version added. */
+export interface VersionStats {
+  /** Sealed block volumes and indexes uploaded (after compression and encryption). */
+  bytes_added: number;
+  new_blocks: number;
+  files_added: number;
+  files_changed: number;
+  files_deleted: number;
+}
+
+/** Rust `MetadataPatch`: null leaves a field unchanged; "" removes a note / reason. */
+export interface MetadataPatch {
+  note: string | null;
+  tags: Record<string, string> | null;
+  pinned: boolean | null;
+  pin_reason: string | null;
+}
+
+/** Rust `retention::RetentionVerdict`. */
+export interface RetentionVerdict {
+  id: number;
+  timestamp: string;
+  keep: boolean;
+  reasons: string[];
+  /** "kept: daily 7, weekly 4" / "deleted: …" */
+  summary: string;
+}
+
+/** Rust `maintenance::RetentionPreview`. */
+export interface RetentionPreview {
+  policy: RetentionPolicy;
+  legal_hold: boolean;
+  keep: number;
+  delete: number;
+  versions: RetentionVerdict[];
+}
+
+/** Rust `shared::SourceInfo`: one job / computer writing to a repository. */
+export interface SourceInfo {
+  id: string;
+  identity: ClientIdentity | null;
+  label: string;
+  versions: number;
+  newest: string | null;
+  oldest: string | null;
+  newest_size: number;
+  own: boolean;
+}
+
+/** Rust `backup_engine::versions::CopyTarget`. */
+export type CopyTarget =
+  | { type: "job"; job_id: string }
+  | { type: "destination"; destination: BackupDestination; passphrase: string | null; prefix: string | null; options: BackupOptions | null };
+
+/** Rust `copy::CopyReport`. */
+export interface CopyReport {
+  dry_run: boolean;
+  versions_copied: number;
+  versions_skipped: number;
+  files: number;
+  blocks_copied: number;
+  blocks_reused: number;
+  bytes_copied: number;
+  bytes_uploaded: number;
+  rechunked: boolean;
+  copied: string[];
+  warnings: string[];
+}
+
+/** Rust `shared::SharingReport`. */
+export interface SharingReport {
+  already_shared: boolean;
+  versions_assigned: number;
+  source: string;
 }
 
 /** Rust `ufop_core::backup::lock::LockKind`. */
@@ -371,7 +466,11 @@ export type RetentionPolicy =
   | { type: "keep_days"; days: number }
   | { type: "keep_count"; count: number }
   | { type: "smart" }
-  | { type: "custom"; rules: string };
+  | { type: "custom"; rules: string }
+  | { type: "counts"; keep_latest: number; keep_hourly: number; keep_daily: number; keep_weekly: number; keep_monthly: number; keep_yearly: number };
+
+/** The everyday GFS preset: 7 daily, 4 weekly, 12 monthly, 3 yearly. */
+export const GFS_PRESET: RetentionPolicy = { type: "counts", keep_latest: 0, keep_hourly: 0, keep_daily: 7, keep_weekly: 4, keep_monthly: 12, keep_yearly: 3 };
 
 export interface BackupSchedule {
   enabled: boolean;
@@ -672,6 +771,16 @@ export interface Fileset {
   partial: boolean;
   file_count: number;
   total_size: number;
+  /** Source id (shared repositories); "" for versions from before identities. */
+  source: string;
+  note: string | null;
+  tags: Record<string, string>;
+  /** "Keep forever": retention skips it and deleting needs force. */
+  pinned: boolean;
+  pin_reason: string | null;
+  identity: ClientIdentity | null;
+  /** null for versions from before this was recorded ("—"). */
+  stats: VersionStats | null;
 }
 
 export type EntryKind = "file" | "dir" | "symlink";
@@ -726,6 +835,8 @@ export interface RestoreOptions {
   legacy: boolean;
   temp_dir: string | null;
   skip_free_space_check: boolean;
+  /** Shared repositories: restore from this source (id, or "*") instead of the job's own. */
+  source: string | null;
 }
 
 export interface AutoTuneResult {
@@ -914,7 +1025,7 @@ export type BackupOperation =
   | { type: "list_broken" }
   | { type: "purge_broken"; dry_run: boolean }
   | { type: "purge"; paths: string[]; versions: number[] | null; dry_run: boolean }
-  | { type: "delete_versions"; versions: number[]; allow_full_removal: boolean }
+  | { type: "delete_versions"; versions: number[]; allow_full_removal: boolean; force?: boolean }
   | { type: "consistency" }
   | { type: "rebuild_missing" }
   | { type: "extract_control_files"; version: number; target: string }
@@ -925,7 +1036,12 @@ export type BackupOperation =
   | { type: "list_locks" }
   | { type: "upgrade_format"; rollback: boolean }
   | { type: "reshard"; layout: RepoLayout; dry_run: boolean }
-  | { type: "format_info" };
+  | { type: "format_info" }
+  | { type: "set_version_metadata"; version: number; source: string | null; patch: MetadataPatch }
+  | { type: "apply_retention"; policy: RetentionPolicy | null; source: string | null }
+  | { type: "copy_versions"; versions: number[]; source: string | null; target: CopyTarget; dry_run: boolean }
+  | { type: "enable_sharing"; claim_all: boolean }
+  | { type: "sync_sources" };
 
 export interface PassphraseStrength {
   score: number;
@@ -1055,6 +1171,11 @@ export function newBackupJob(): BackupJob {
       clock_skew_abort_secs: 3600,
       checkpoint_interval_secs: 900,
       checkpoint_interval_bytes: 0,
+      default_note: null,
+      default_tags: {},
+      identity: { hostname: "", username: "", job_id: "", source_label: "" },
+      shared_repository: false,
+      shared_gc_delay_hours: 4,
     },
     retention: { type: "keep_all" },
     schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [] },
@@ -1127,6 +1248,7 @@ export const DEFAULT_RESTORE_OPTIONS: RestoreOptions = {
   legacy: false,
   temp_dir: null,
   skip_free_space_check: false,
+  source: null,
 };
 
 
@@ -1168,6 +1290,14 @@ interface BackupState {
   breakLock: (id: string, ownerId: string | null) => Promise<BreakLockReport>;
   /** Encrypt (or decrypt) the job's local database now. */
   setDatabaseEncryption: (id: string, enabled: boolean) => Promise<RekeyReport>;
+  /** Versions of the job's source (`source`: another id or "*"), only those with every tag (`key=value` / `key`). */
+  listVersions: (id: string, source?: string | null, tags?: string[]) => Promise<Fileset[]>;
+  /** Sources (jobs / computers) known in the job's repository, own first. */
+  listSources: (id: string) => Promise<SourceInfo[]>;
+  /** Keep/delete per version for the job's policy or an unsaved one (changes nothing). */
+  previewRetention: (id: string, policy: RetentionPolicy | null, source?: string | null) => Promise<RetentionPreview>;
+  /** Change a version's note, tags or pin; returns the updated version. */
+  setVersionMetadata: (id: string, version: number, patch: Partial<MetadataPatch>, source?: string | null) => Promise<Fileset>;
   pause: (minutes: number | null) => Promise<void>;
   resume: () => Promise<void>;
   placeLegalHold: (id: string, matter: string, reason: string) => Promise<BackupJob>;
@@ -1269,6 +1399,24 @@ export const useBackupStore = create<BackupState>((set, get) => ({
     return report;
   },
 
+  listVersions: (id, source = null, tags = []) => {
+    const args: Record<string, unknown> = { id };
+    if (source) args.source = source;
+    if (tags.length) args.tags = tags;
+    return ipc<Fileset[]>("backup_list_versions", args, []);
+  },
+
+  listSources: (id) => ipc<SourceInfo[]>("backup_list_sources", { id }, []),
+
+  previewRetention: (id, policy, source = null) =>
+    ipc<RetentionPreview>("backup_preview_retention", { id, policy, source }, { policy: policy ?? { type: "keep_all" }, legal_hold: false, keep: 0, delete: 0, versions: [] }),
+
+  setVersionMetadata: async (id, version, patch, source = null) => {
+    const full: MetadataPatch = { note: null, tags: null, pinned: null, pin_reason: null, ...patch };
+    const r = await tauriInvoke<OperationResult>("backup_set_version_metadata", { id, version, source, patch: full });
+    return r.report as unknown as Fileset;
+  },
+
   pause: async (minutes) => {
     const status = await tauriInvoke<SchedulerStatus>("backup_pause", { minutes });
     set({ status });
@@ -1324,5 +1472,48 @@ export function describeRetention(r: RetentionPolicy): string {
       return "Smart (1W:1D, 4W:1W, 12M:1M)";
     case "custom":
       return `Custom: ${r.rules}`;
+    case "counts":
+      return describeCounts(r);
   }
+}
+
+/** "Keep 7 daily, 4 weekly, 12 monthly" (all zero: keep everything). */
+export function describeCounts(r: Extract<RetentionPolicy, { type: "counts" }>): string {
+  const parts = (
+    [
+      ["latest", r.keep_latest],
+      ["hourly", r.keep_hourly],
+      ["daily", r.keep_daily],
+      ["weekly", r.keep_weekly],
+      ["monthly", r.keep_monthly],
+      ["yearly", r.keep_yearly],
+    ] as const
+  )
+    .filter(([, n]) => n > 0)
+    .map(([k, n]) => `${n} ${k}`);
+  return parts.length ? `Keep ${parts.join(", ")}` : "Keep all versions (no limits set)";
+}
+
+/** `key=value` / `key` text for a tag. */
+export function tagText(k: string, v: string): string {
+  return v ? `${k}=${v}` : k;
+}
+
+/** Parse `key=value` (or bare `key`) lines / comma lists into tags; invalid names are dropped. */
+export function parseTags(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const raw of text.split(/[,\n]/)) {
+    const item = raw.trim();
+    if (!item) continue;
+    const i = item.indexOf("=");
+    const k = (i < 0 ? item : item.slice(0, i)).trim();
+    const v = i < 0 ? "" : item.slice(i + 1).trim();
+    if (/^[A-Za-z0-9_.:-]{1,64}$/.test(k)) out[k] = v;
+  }
+  return out;
+}
+
+/** Does a version carry every tag of `filter` (bare key = any value)? Mirrors the Rust filter. */
+export function matchesTags(tags: Record<string, string>, filter: Record<string, string>): boolean {
+  return Object.entries(filter).every(([k, v]) => k in tags && (v === "" || tags[k] === v));
 }

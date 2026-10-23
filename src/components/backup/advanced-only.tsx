@@ -11,7 +11,10 @@
  * - Job editor: General (name, passphrase), Sources, Filters, Destination,
  *   Schedule, Retention, Options › Storage + Network limits, Hooks › desktop
  *   and channel notifications.
- * - Restore: versions, search, file picker, restore, restore from location.
+ * - Restore: versions (with storage added, "Keep forever" pin and note),
+ *   search, file picker, restore, restore from location.
+ * - Job editor › Retention: the policy, the daily/weekly/monthly preset and
+ *   the live preview of kept and deleted versions.
  * - Maintenance: Integrity checks, export configuration, delete job.
  * - Settings: destination library, basic defaults, machine-wide limits, and
  *   the "Show advanced backup options" toggle itself.
@@ -21,7 +24,11 @@
  * - Job editor: file-name prefix, extra destinations (replicas), advanced
  *   options, source handling, integrity and maintenance options, scripts,
  *   HTTP reports, log outputs, secret providers.
- * - Maintenance: legal hold, repair/recreate/compact/purge-broken, replica
+ * - Restore: tag chips and editing, filter by computer, source picker of a
+ *   shared repository, "Copy to another backup…".
+ * - Job editor: retention counts editor; Options › Versions and sharing
+ *   (default note/tags, identity override, shared repository).
+ * - Maintenance: sharing, legal hold, repair/recreate/compact/purge-broken, replica
  *   updates, object locks, destination file browser (raw remote listing),
  *   snapshot diagnostics, support tools, restore tuning, control files,
  *   remove files from history.

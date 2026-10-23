@@ -25,6 +25,9 @@ import {
 } from "@/stores/backup-store";
 import { formatDate, inputCls } from "@/lib/backup-helpers";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
+import { AdvancedOnly } from "./advanced-only";
+import { BackupVersionTable } from "./backup-version-list";
+import type { SourceInfo } from "@/stores/backup-store";
 
 function RestoreOptionsForm({ value, onChange, versionCount = 0 }: { value: RestoreOptions; onChange: (v: RestoreOptions) => void; versionCount?: number }) {
   const n = (v: string, max: number) => Math.min(max, Math.max(0, Math.floor(Number(v) || 0)));
@@ -109,8 +112,51 @@ function ReportView({ report }: { report: RestoreReport }) {
   );
 }
 
+/** Shared repositories (K4): pick whose versions to browse (Advanced). */
+function SourcePicker({ job, source, onChange }: { job: BackupJob; source: string | null; onChange: (s: string | null) => void }) {
+  const { listSources, execute } = useBackupStore();
+  const [sources, setSources] = useState<SourceInfo[]>([]);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    listSources(job.id).then(setSources).catch(() => setSources([]));
+  }, [job.id, listSources]);
+  if (sources.length < 2) return null;
+  return (
+    <div className="flex gap-1 items-center text-xs" data-testid="backup-source-picker">
+      <span className="text-zinc-500">Versions of</span>
+      <select className={`${inputCls} w-auto`} value={source ?? ""} onChange={(e) => onChange(e.target.value || null)} aria-label="Source">
+        <option value="">This job</option>
+        {sources
+          .filter((s) => !s.own)
+          .map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.label} · {s.versions} version(s)
+            </option>
+          ))}
+        <option value="*">All sources</option>
+      </select>
+      <Btn
+        disabled={busy}
+        title="Read other computers' latest versions from the destination"
+        onClick={async () => {
+          setBusy(true);
+          try {
+            await execute(job.id, { type: "sync_sources" });
+            setSources(await listSources(job.id));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        {busy ? "Refreshing…" : "Refresh"}
+      </Btn>
+    </div>
+  );
+}
+
 export function BackupRestoreView({ job }: { job: BackupJob }) {
-  const { execute } = useBackupStore();
+  const { execute, listVersions } = useBackupStore();
+  const [source, setSource] = useState<string | null>(null);
   const [versions, setVersions] = useState<Fileset[]>([]);
   const [version, setVersion] = useState(0);
   const [files, setFiles] = useState<BackupFileEntry[]>([]);
@@ -125,13 +171,16 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  // Another source's versions (shared repositories); omitted for the job's own.
+  const src = useMemo(() => (source ? { source } : {}), [source]);
+
   const loadVersions = useCallback(async () => {
     try {
-      setVersions(await tauriInvoke<Fileset[]>("backup_list_versions", { id: job.id }, []));
+      setVersions(await listVersions(job.id, source));
     } catch (e) {
       setError(errorText(e));
     }
-  }, [job.id]);
+  }, [job.id, source, listVersions]);
 
   useEffect(() => {
     void loadVersions();
@@ -140,10 +189,10 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
   useEffect(() => {
     if (versions.length === 0) return;
     setSelected(new Set());
-    tauriInvoke<BackupFileEntry[]>("backup_list_files", { id: job.id, version, prefix: null }, [])
+    tauriInvoke<BackupFileEntry[]>("backup_list_files", { id: job.id, version, prefix: null, ...src }, [])
       .then(setFiles)
       .catch((e) => setError(errorText(e)));
-  }, [job.id, version, versions.length]);
+  }, [job.id, version, versions.length, src]);
 
   const shown = useMemo(() => {
     const f = filter.toLowerCase();
@@ -170,18 +219,35 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
       return n;
     });
 
+  const picker = (
+    <AdvancedOnly>
+      <SourcePicker
+        job={job}
+        source={source}
+        onChange={(s) => {
+          setSource(s);
+          setVersion(0);
+          setCmp(null);
+        }}
+      />
+    </AdvancedOnly>
+  );
+
   if (versions.length === 0) {
     return (
-      <div className="p-4 text-sm text-zinc-500" data-testid="backup-no-versions">
+      <div className="p-4 text-sm text-zinc-500 space-y-2" data-testid="backup-no-versions">
+        {picker}
         {error ? <Banner tone="error">{error}</Banner> : "This job has no versions yet. Run a backup first."}
       </div>
     );
   }
+  const current = versions[Math.min(version, versions.length - 1)];
 
   return (
     <div className="p-3 space-y-3" data-testid="backup-restore-view">
       {error && <Banner tone="error" onClose={() => setError(null)}>{error}</Banner>}
       <Section title="Versions">
+        {picker}
         <select className={inputCls} value={version} onChange={(e) => setVersion(Number(e.target.value))} data-testid="backup-version-select">
           {versions.map((v, i) => (
             <option key={v.id} value={i}>
@@ -191,21 +257,26 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
             </option>
           ))}
         </select>
+        <BackupVersionTable job={job} versions={versions} selected={version} onSelect={setVersion} source={source} onChanged={loadVersions} />
         <div className="flex gap-1 flex-wrap">
           <Btn
             disabled={versions.length < 2 || busy}
-            onClick={() => run(async () => setCmp(await tauriInvoke<VersionComparison>("backup_compare", { id: job.id, base: Math.min(version + 1, versions.length - 1), compare: version })))}
+            onClick={() => run(async () => setCmp(await tauriInvoke<VersionComparison>("backup_compare", { id: job.id, base: Math.min(version + 1, versions.length - 1), compare: version, ...src })))}
           >
             Compare with previous
           </Btn>
           <Btn
             tone="danger"
-            disabled={busy || versions.length < 2}
-            title="Delete this version (the last remaining version is protected)"
+            disabled={busy || versions.length < 2 || source !== null}
+            title={source !== null ? "Versions of other sources are not deleted from here" : "Delete this version (the last remaining version is protected)"}
             onClick={() =>
-              confirm(`Delete the version from ${formatDate(versions[version].timestamp)}?`) &&
+              confirm(
+                current.pinned
+                  ? `The version from ${formatDate(current.timestamp)} is set to Keep forever. Delete it anyway?`
+                  : `Delete the version from ${formatDate(current.timestamp)}?`,
+              ) &&
               run(async () => {
-                await execute(job.id, { type: "delete_versions", versions: [version], allow_full_removal: false });
+                await execute(job.id, { type: "delete_versions", versions: [version], allow_full_removal: false, force: current.pinned });
                 setVersion(0);
                 await loadVersions();
               })
@@ -232,7 +303,7 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
       <Section title="Search all versions">
         <div className="flex gap-1">
           <input className={inputCls} value={search} placeholder="name or wildcard, e.g. *.docx" onChange={(e) => setSearch(e.target.value)} />
-          <Btn disabled={!search || busy} onClick={() => run(async () => setHits(await tauriInvoke<FoundFile[]>("backup_search", { id: job.id, pattern: search, version: null })))}>
+          <Btn disabled={!search || busy} onClick={() => run(async () => setHits(await tauriInvoke<FoundFile[]>("backup_search", { id: job.id, pattern: search, version: null, ...src })))}>
             Search
           </Btn>
         </div>
@@ -289,7 +360,7 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
           testId="backup-restore-run"
           onClick={() =>
             run(async () => {
-              const r = await execute(job.id, { type: "restore", options: { ...opts, version, paths: [...selected] }, overrides });
+              const r = await execute(job.id, { type: "restore", options: { ...opts, version, paths: [...selected], source }, overrides });
               setReport(r.report as unknown as RestoreReport);
             })
           }

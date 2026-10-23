@@ -13,13 +13,13 @@ import {
   type BackupJob,
   type FilterRule,
   type PassphraseStrength,
-  type RetentionPolicy,
   type SavedDestination,
   type SourcePreview,
 } from "@/stores/backup-store";
 import { inputCls, rulesToText, textToRules } from "@/lib/backup-helpers";
 import { pickFolder } from "@/lib/folder-picker";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
+import { RetentionEditor } from "./backup-retention-editor";
 import { BackupAdvancedOptions } from "./backup-advanced-options";
 import { BackupReplicas } from "./backup-replicas";
 import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
@@ -463,42 +463,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
           </Section>
         )}
 
-        {step === "Retention" && (
-          <Section title="Version retention" hint="Applied after each successful backup. The newest version is never deleted.">
-            <select
-              className={inputCls}
-              value={job.retention.type}
-              onChange={(e) => {
-                const t = e.target.value as RetentionPolicy["type"];
-                const r: RetentionPolicy =
-                  t === "keep_days" ? { type: t, days: 30 } : t === "keep_count" ? { type: t, count: 10 } : t === "custom" ? { type: t, rules: "1W:1D,4W:1W,12M:1M" } : { type: t };
-                patch({ retention: r });
-              }}
-              data-testid="backup-retention"
-            >
-              <option value="keep_all">Keep all versions</option>
-              <option value="keep_days">Delete versions older than…</option>
-              <option value="keep_count">Keep a number of versions</option>
-              <option value="smart">Smart (one per day for a week, per week for a month, per month for a year)</option>
-              <option value="custom">Custom thinning rules</option>
-            </select>
-            {job.retention.type === "keep_days" && (
-              <Field label="Days">
-                <input className={inputCls} type="number" min={1} value={job.retention.days} onChange={(e) => patch({ retention: { type: "keep_days", days: Math.max(1, Number(e.target.value)) } })} />
-              </Field>
-            )}
-            {job.retention.type === "keep_count" && (
-              <Field label="Versions">
-                <input className={inputCls} type="number" min={1} value={job.retention.count} onChange={(e) => patch({ retention: { type: "keep_count", count: Math.max(1, Number(e.target.value)) } })} />
-              </Field>
-            )}
-            {job.retention.type === "custom" && (
-              <Field label="Rules (timeframe:interval, …)" hint="Units s, m, h, D, W, M, Y; interval U keeps all. Example: 7D:U,4W:1D,12M:1W">
-                <input className={`${inputCls} font-mono`} value={job.retention.rules} onChange={(e) => patch({ retention: { type: "custom", rules: e.target.value } })} />
-              </Field>
-            )}
-          </Section>
-        )}
+        {step === "Retention" && <RetentionEditor job={job} isNew={isNew} onChange={(retention) => patch({ retention })} />}
 
         {step === "Options" && (
           <>

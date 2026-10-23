@@ -14,6 +14,7 @@ import { BackupLegalHold } from "./backup-legal-hold";
 import { AdvancedOnly } from "./advanced-only";
 import { BackupRepositoryFormat } from "./backup-repository-format";
 import { BackupRepositorySafety } from "./backup-repository-safety";
+import { BackupSharing } from "./backup-sharing";
 
 
 export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDeleted: () => void }) {
@@ -87,6 +88,9 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
 
       <AdvancedOnly>
         <BackupRepositoryFormat job={job} />
+      </AdvancedOnly>
+      <AdvancedOnly>
+        <BackupSharing job={job} />
       </AdvancedOnly>
 
       <AdvancedOnly hint>

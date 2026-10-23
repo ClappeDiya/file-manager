@@ -4,7 +4,7 @@
  * cadence. Each field maps 1:1 onto `BackupOptions` in ufop-core.
  */
 import { inputCls } from "@/lib/backup-helpers";
-import { KDF_PRESETS, type BackupOptions, type LockMode, type SnapshotPolicy, type UsnPolicy, type VolumeFormat, type ZipMethod } from "@/stores/backup-store";
+import { KDF_PRESETS, parseTags, tagText, type BackupOptions, type LockMode, type SnapshotPolicy, type UsnPolicy, type VolumeFormat, type ZipMethod } from "@/stores/backup-store";
 import { Check, Field, Section } from "./backup-ui";
 import { RepositoryFormatOptions } from "./backup-repository-format";
 
@@ -225,6 +225,39 @@ export function BackupAdvancedOptions({
           </Field>
         </div>
         <Check label="Disable capacity warnings" checked={o.quota_disable} onChange={(v) => onChange({ quota_disable: v })} />
+      </Section>
+
+      <Section title="Versions and sharing" hint="Stored with every new version; the identity decides which computer a version belongs to in a shared repository.">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <Field label="Note for new versions">
+            <input data-testid="opt-default-note" className={inputCls} maxLength={2000} value={o.default_note ?? ""} onChange={(e) => onChange({ default_note: e.target.value || null })} />
+          </Field>
+          <Field label="Tags for new versions" hint="key=value or key, separated by commas">
+            <input
+              data-testid="opt-default-tags"
+              className={`${inputCls} font-mono`}
+              defaultValue={Object.entries(o.default_tags ?? {}).map(([k, v]) => tagText(k, v)).join(", ")}
+              onBlur={(e) => onChange({ default_tags: parseTags(e.target.value) })}
+            />
+          </Field>
+          <Field label="Computer name to record (empty = this computer)" hint="Set it to the old computer's name to continue its history after moving to a new one.">
+            <input data-testid="opt-identity-host" className={inputCls} value={o.identity?.hostname ?? ""} onChange={(e) => onChange({ identity: { ...o.identity, hostname: e.target.value.trim() } })} />
+          </Field>
+          <Field label="User name to record (empty = current user)">
+            <input data-testid="opt-identity-user" className={inputCls} value={o.identity?.username ?? ""} onChange={(e) => onChange({ identity: { ...o.identity, username: e.target.value.trim() } })} />
+          </Field>
+        </div>
+        <Check
+          label="Share a new repository with other computers and jobs"
+          checked={o.shared_repository}
+          onChange={(v) => onChange({ shared_repository: v })}
+          hint={locked ? "For an existing backup use Maintenance → Sharing." : "Format 2 only. Each job keeps its own versions; identical data is stored once."}
+        />
+        {o.shared_repository && (
+          <Field label="Keep new volumes at least (hours) before compaction may remove them" hint="Protects a computer that is still uploading when another one compacts.">
+            <input data-testid="opt-gc-delay" className={inputCls} type="number" min={0} value={o.shared_gc_delay_hours} onChange={(e) => onChange({ shared_gc_delay_hours: num(e.target.value, 0, 24 * 30) })} />
+          </Field>
+        )}
       </Section>
 
       <Section title="Repository safety" hint="Locks keep two programs from changing one backup at once; checkpoints keep long backups restorable if they stop half way.">
