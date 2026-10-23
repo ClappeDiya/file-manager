@@ -65,12 +65,12 @@ Ground rules
 - [x] K44 Mount a version as a read-only WebDAV drive
 
 ## WP6 — Policy, schedules, maintenance
-- [ ] K17 Named policy templates inherited by jobs
-- [ ] K18 Effective-settings view (inherited vs overridden)
-- [ ] K33 Cron schedules for backup jobs
-- [ ] K116 Separate maintenance schedule (compact / verify)
-- [ ] K119 Verification scope (version/path), percent sampling, parallelism, max errors
-- [ ] K34 Async (fire-and-forget) hook mode
+- [x] K17 Named policy templates inherited by jobs
+- [x] K18 Effective-settings view (inherited vs overridden)
+- [x] K33 Cron schedules for backup jobs
+- [x] K116 Separate maintenance schedule (compact / verify)
+- [x] K119 Verification scope (version/path), percent sampling, parallelism, max errors
+- [x] K34 Async (fire-and-forget) hook mode
 
 ## WP7 — Storage backends
 - [ ] K60 S3 credential chain (env, profile, web identity, IMDS) for backup S3 store
