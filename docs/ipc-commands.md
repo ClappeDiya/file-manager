@@ -50,7 +50,7 @@ macro; if you add a new one here, register it there too.
 - `get_audit_log_status`
 - `verify_audit_log`
 
-## `automation_commands` (21 commands)
+## `automation_commands` (22 commands)
 
 - `approve_automation_command`
 - `automation_convert_to_workflow`
@@ -72,6 +72,7 @@ macro; if you add a new one here, register it there too.
 - `retry_failed_event`
 - `rotate_automation_webhook`
 - `run_automation_rule`
+- `test_automation_rule`
 - `update_automation_rule`
 
 ## `aws_commands` (6 commands)
@@ -748,4 +749,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 580 commands across 51 modules.
+**Surface:** 581 commands across 51 modules.

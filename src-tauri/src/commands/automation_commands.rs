@@ -103,8 +103,8 @@ pub async fn run_automation_rule(
     Ok(log)
 }
 
-#[tauri::command]
 /// Dry run: the files a rule would act on and the steps it would take.
+#[tauri::command]
 pub async fn test_automation_rule(
     rule: AutomationRule,
     mgr: State<'_, AutomationManager>,

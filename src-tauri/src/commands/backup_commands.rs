@@ -156,9 +156,9 @@ pub async fn backup_list_versions(id: String, source: Option<String>, tags: Opti
     mgr.list_versions_in(&id, source, tags.unwrap_or_default()).await
 }
 
-#[tauri::command]
 /// Files of a version; with `page` (offset, limit, sort, descending,
 /// filter) one page of all of them plus the total.
+#[tauri::command]
 pub async fn backup_list_files(
     id: String,
     version: usize,
@@ -210,8 +210,8 @@ pub async fn backup_set_version_metadata(
     mgr.execute(&id, BackupOperation::SetVersionMetadata { version, source, patch }).await
 }
 
-#[tauri::command]
 /// Most recent runs; with `page`, one page of the whole history plus the total.
+#[tauri::command]
 pub async fn backup_run_history(job_id: Option<String>, limit: Option<u32>, page: Option<PageRequest>, mgr: State<'_, BackupManager>) -> Result<Listing<BackupRun>, AppError> {
     mgr.run_history_listing(job_id, limit.unwrap_or(50), page).await
 }
@@ -430,8 +430,8 @@ pub async fn backup_recovery_convert(folder: String, destination: BackupDestinat
     mgr.recovery_convert(folder, destination, options).await
 }
 
-#[tauri::command]
 /// Files at a destination; with `page`, one sorted/filtered page plus the total.
+#[tauri::command]
 pub async fn backup_remote_list(destination: BackupDestination, page: Option<PageRequest>, mgr: State<'_, BackupManager>) -> Result<Listing<ufop_core::backup::RemoteFile>, AppError> {
     crate::backup_engine::paging::listing(mgr.remote_list(destination).await?, page.as_ref())
 }

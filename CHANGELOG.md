@@ -80,6 +80,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Automation rule editor: *Dry run* of an unsaved rule that watches a folder showed no files; it now tries the newest files already in that folder (`test_automation_rule`). `scripts/dump-ipc-commands.sh` no longer misses commands whose doc comment follows `#[tauri::command]`.
 - Mirror runs deleted the rollback snapshots they had just taken (stored inside the destination); snapshots and quarantine now live in the app data folder, and `.sync-rollback`, `.sync-quarantine` and `.ufop-partial` are never synced or purged.
 - "Rollback", the quarantine list and "Ask" conflicts never had data: the executor's snapshots, quarantined files and pending conflicts are now recorded, and resolving a conflict applies the choice to the file.
 - Copies didn't keep file dates, so every sync re-copied everything; conflict resolution now copies with dates too.

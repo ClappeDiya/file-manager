@@ -63,8 +63,8 @@ extract_commands() {
     fi
     if [[ $want_fn -eq 1 ]]; then
       trimmed="${line#"${line%%[![:space:]]*}"}"
-      # Blank line or another attribute (e.g. #[allow(...)]) → keep waiting.
-      if [[ -z "$trimmed" || "$trimmed" == "#["* ]]; then
+      # Blank line, another attribute (e.g. #[allow(...)]) or a doc comment → keep waiting.
+      if [[ -z "$trimmed" || "$trimmed" == "#["* || "$trimmed" == "//"* ]]; then
         continue
       fi
       if [[ "$trimmed" == "pub async fn "* || "$trimmed" == "pub fn "* ]]; then
@@ -94,7 +94,7 @@ extract_commands_with_line() {
     fi
     if [[ $want_fn -eq 1 ]]; then
       trimmed="${line#"${line%%[![:space:]]*}"}"
-      if [[ -z "$trimmed" || "$trimmed" == "#["* ]]; then
+      if [[ -z "$trimmed" || "$trimmed" == "#["* || "$trimmed" == "//"* ]]; then
         continue
       fi
       if [[ "$trimmed" == "pub async fn "* || "$trimmed" == "pub fn "* ]]; then
