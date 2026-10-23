@@ -23,7 +23,7 @@
 
 pub mod backend;
 pub mod chunker;
-
+pub mod copy;
 pub mod crypto;
 pub mod db;
 pub mod engine;
