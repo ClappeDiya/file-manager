@@ -652,6 +652,23 @@ The headless backup server (`ufop-server`, also `ufop server` in the CLI) has it
 - **Errors**: `{error_type, message, advice}`; 401 (not signed in, invalid token or too narrow a scope), 403 (client address outside `--allowed-cidrs`), 421 (host not in `--allowed-hostnames`), 404, 409, 429 (sign-in throttling).
 - Areas: `auth` (sign-in, tokens, password), `jobs` (CRUD, run, operations including `upgrade_format`, `reshard`, `format_info`, `set_version_metadata`, `apply_retention`, `copy_versions` (target `{"type":"job","job_id":…}` or `{"type":"destination",…}`), `enable_sharing`, `sync_sources` and `delete_versions` with `force` for pinned versions, `PUT /jobs/{id}/passphrase` to change an encrypted job's passphrase, `GET`/`DELETE /jobs/{id}/lock` for the repository lock (break needs `confirm=true`, optionally `owner_id`), `PUT /jobs/{id}/database-encryption` to encrypt the local database, import/export, destination test, `POST /jobs/run-all` with `{job_ids, scheduled_only, dry_run}` to back up every job (scope `run`; read-only and busy jobs are skipped and listed), `GET /jobs/{id}/estimate?assumed_bytes_per_sec=` for the pre-backup estimate; see [backup-sources-and-runs.md](backup-sources-and-runs.md)), `browse` (versions with note, tags, pin, identity and storage added, `?source=` for another source of a shared repository and `?tags=k=v,k2` to filter; `PATCH /jobs/{id}/versions/{version}` with `note`, `tags`, `pinned`, `pin_reason` to change one; `GET /jobs/{id}/sources`; `POST /jobs/{id}/retention/preview` with an optional unsaved `policy`; files, search and compare also take `source`; files also take `version=latest|oldest|N|<id>`, `time` (as of) and `allow_partial`; `GET /jobs/{id}/versions/resolve` says which version a time picks; `GET /jobs/{id}/file?path=` streams one file with single `Range` support (`206`/`416`); restore operations take `selector`, `archive`, `delete_extraneous` (with `overrides.confirm_delete: true`), `restore_owner`, `error_policy`, `sparse` and `use_cache`; see [backup-restore.md](backup-restore.md)), `tasks` (tasks, run history, scheduler), `oauth` (cloud authorization broker) and `general` (health, status, modules, settings, filesystem, the volume cache: `GET`/`DELETE /backup-cache` and `GET`/`PUT /backup-cache/settings`, `rpc/{command}` for any desktop IPC command).
 
+### Policy templates, effective settings and schedules
+
+See [backup-policies-and-schedules.md](backup-policies-and-schedules.md).
+
+| Method and path | Scope | |
+|---|---|---|
+| `GET /api/v1/backup-templates` | read | Local templates, then the organization's (`managed`, `enforced`, ids `org:…`) |
+| `POST /api/v1/backup-templates` | write | Create `{name, description, settings}`; `settings` is a partial job: `options`, `filter`, `retention`, `schedule`, `maintenance`, `scripts`, `notifications`, `notify_on`, `throttle`, `retry`, `prevent_sleep` |
+| `GET` / `PUT` / `DELETE /api/v1/backup-templates/{id}` | read / write / write | One template; organization templates cannot be changed (`403`); deleting one in use is `409` |
+| `POST /api/v1/backup-templates/{id}/apply` | write | `{job_id}`: append the template to the job's `template_ids` |
+| `GET /api/v1/backup-templates/export?ids=a,b` | read | Template file (`format: ufop-backup-templates`) |
+| `POST /api/v1/backup-templates/import` | write | Body: a template file, list or single template; same id or name updates |
+| `GET /api/v1/jobs/{id}/effective-settings` | read | `{job_id, template_ids, overrides, settings: [{field_path, value, source, inherited}], warnings}` |
+| `POST /api/v1/backup-schedule/preview` | read | `{schedule, count}`: validate an interval or cron schedule and list the next runs (`[{at, skipped_by}]`) |
+
+Jobs have three new optional fields: `template_ids` (ordered), `overrides` (field paths the job sets itself; `null` for older jobs) and `maintenance` (`{compact, verify: {schedule, options}, retention}`). `schedule.cron` takes cron expressions. `scripts.before_mode` and `scripts.after_mode` take `required`, `optional` or `async`. The `verify` operation takes `options`: `{scope: {versions, paths}, mode: {type: structure | sample_volumes, count | sample_percent, percent | full}, files_percent, parallelism, max_errors, use_cache}`. `GET /api/v1/status` lists upcoming maintenance in `next_maintenance`.
+
 ### Share portal
 
 Start the server with `--share-root <folder>` (repeatable, or `UFOP_SERVER_SHARE_ROOTS`) to share files and folders under it by link; without it sharing is off. Links are created in the web UI (*Share links*), with `ufop server shares create <path>` or `POST /api/v1/shares`, and open at `/s/<token>` without an account:

@@ -409,7 +409,7 @@ impl super::BackupManager {
     /// Create (empty id) or update a local template.
     pub async fn save_template(&self, mut t: PolicyTemplate) -> Result<PolicyTemplate, AppError> {
         if t.managed || t.id.starts_with(MANAGED_PREFIX) {
-            return Err(AppError::PermissionDenied { message: "Organization templates are managed by the console".into(), advice: "Copy it into a new template to change it.".into() });
+            return Err(AppError::PermissionDenied { message: "Changing organization templates is not allowed here; the console manages them".into(), advice: "Copy it into a new template to change it.".into() });
         }
         t.name = t.name.trim().to_string();
         t.enforced = false;
@@ -433,7 +433,7 @@ impl super::BackupManager {
     /// Delete a local template no job uses.
     pub async fn delete_template(&self, id: &str) -> Result<(), AppError> {
         if id.starts_with(MANAGED_PREFIX) {
-            return Err(AppError::PermissionDenied { message: "Organization templates are managed by the console".into(), advice: "Ask your administrator to remove it.".into() });
+            return Err(AppError::PermissionDenied { message: "Deleting organization templates is not allowed here; the console manages them".into(), advice: "Ask your administrator to remove it.".into() });
         }
         let users: Vec<String> = self.list_jobs().await.into_iter().filter(|j| j.template_ids.iter().any(|t| t == id)).map(|j| j.name).collect();
         if !users.is_empty() {

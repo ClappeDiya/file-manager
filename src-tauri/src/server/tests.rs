@@ -6,6 +6,7 @@ use ufop_core::backup::crypto::KdfParams;
 
 struct TestServer {
     base: String,
+    mgr: BackupManager,
     client: reqwest::Client,
     _dir: tempfile::TempDir,
     dir: PathBuf,
@@ -17,12 +18,13 @@ async fn start(cfg: ServerConfig, oauth: Option<oauth::OAuthBroker>) -> TestServ
     let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
     let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
     auth.set_password("server-password").await.unwrap();
-    let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent: None, gateways: Default::default() };
+    let st = ServerState { mgr: mgr.clone(), conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent: None, gateways: Default::default() };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
     TestServer {
         base: format!("http://127.0.0.1:{port}"),
+        mgr,
         client: reqwest::Client::builder().cookie_store(true).build().unwrap(),
         dir: dir.path().to_path_buf(),
         _dir: dir,
@@ -1017,6 +1019,10 @@ async fn policy_templates_effective_settings_and_schedule_preview_over_rest() {
     assert!(exported.contains("ufop-backup-templates"));
     let imported = s.client.post(format!("{}/api/v1/backup-templates/import", s.base)).bearer_auth(&tok).body(exported).send().await.unwrap().json::<Value>().await.unwrap();
     assert_eq!(imported[0]["id"], tid.as_str());
+    // Organization templates are read-only here.
+    let org = ufop_core::agent::ManagedBackupTemplate { id: "std".into(), name: "Org".into(), settings: json!({}), ..Default::default() };
+    assert!(s.mgr.set_managed_templates(Some(&[org])).is_empty());
+    assert_eq!(s.client.delete(format!("{}/api/v1/backup-templates/org:std", s.base)).bearer_auth(&tok).send().await.unwrap().status(), 403);
     // Cron schedules: preview and a friendly error.
     let p = s.post("/api/v1/backup-schedule/preview", &tok, json!({"schedule": {"enabled": true, "cron": ["30 2 * * *"]}, "count": 3})).await.json::<Value>().await.unwrap();
     assert_eq!(p.as_array().unwrap().len(), 3);

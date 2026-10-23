@@ -615,6 +615,38 @@ ufop backup cache stats|clear [--cache-dir DIR]
 
 `ufop backup mount` prints the drive's address (`http://127.0.0.1:PORT/<token>/`) and password. `--bind` can serve another address; anyone who can reach it and has the token can read the files.
 
+### `ufop backup` verification, templates and schedules
+
+Scoped and sampled verification works on a repository directly. Templates, effective settings and schedule previews use the signed-in `ufop-server` (`ufop server login`). See [backup-policies-and-schedules.md](backup-policies-and-schedules.md).
+
+```bash
+ufop backup verify --dest /mnt/backup --version latest --path '*/Documents/*' --percent 10 --files-percent 5 --parallel 8 --max-errors 20 --json
+ufop backup verify --dest /mnt/backup --structure          # index and listing only, no downloads
+ufop backup template list
+ufop backup template create --name Laptops --settings '{"retention":{"type":"keep_days","days":30},"options":{"compression_level":3}}'
+ufop backup template create --file laptops.json            # a template, or an export holding one
+ufop backup template update Laptops --settings '{"schedule":{"enabled":true,"cron":["30 1 * * *"]}}'
+ufop backup template apply Laptops --job Docs             # the job is based on it too (it wins over earlier ones)
+ufop backup template export [--template Laptops] [--out templates.json]
+ufop backup template import templates.json
+ufop backup template delete Laptops                       # refused while a job uses it
+ufop backup effective Docs                                # every setting and where it comes from
+ufop backup schedule-preview --cron "30 2 * * Mon-Fri" --cron "0 9 * * Sat" --count 5
+```
+
+| Flag (`verify`) | Default | |
+|---|---|---|
+| `--version` (repeatable) | all | A number (0 = newest), `latest`, `oldest` or a version's timestamp |
+| `--path` (repeatable) | all | A folder (everything below it) or a wildcard |
+| `--structure` | off | Check the index and listing only; nothing is downloaded |
+| `--samples N` / `--percent N` / `--full` | `--samples 3` | Download N volumes / N % of the volumes in scope / every volume, checking every block |
+| `--files-percent N` | 0 | Rebuild N % of the scoped files and compare their hashes |
+| `--parallel N` | 0 (= 4) | Downloads and file checks at once |
+| `--max-errors N` | 0 (no limit) | Stop after N problems |
+| `--use-cache` (+ `--cache-dir`, `--cache-size`) | off | Read volumes from the local volume cache |
+
+`verify` exits with 0 when it finds no problems and 2 when it finds some. With `--json` the full report is printed, including `problems` with the affected versions and paths.
+
 ### `ufop server shares`
 
 Share links on a `ufop-server` started with `--share-root` (sign in first with `ufop server login`).

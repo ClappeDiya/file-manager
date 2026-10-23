@@ -83,9 +83,10 @@ macro; if you add a new one here, register it there too.
 - `resolve_aws_profile`
 - `start_sso_auth`
 
-## `backup_commands` (88 commands)
+## `backup_commands` (97 commands)
 
 - `backup_adopt_repository`
+- `backup_apply_template`
 - `backup_break_lock`
 - `backup_browse_remote`
 - `backup_bug_report`
@@ -103,31 +104,37 @@ macro; if you add a new one here, register it there too.
 - `backup_decrypt_volume`
 - `backup_delete_destination`
 - `backup_delete_job`
+- `backup_delete_template`
 - `backup_diagnose`
 - `backup_direct_restore`
 - `backup_discover_remote_config`
 - `backup_effective_caps`
 - `backup_effective_job`
+- `backup_effective_settings`
 - `backup_estimate`
 - `backup_execute`
 - `backup_export_cli`
 - `backup_export_config`
 - `backup_export_file`
 - `backup_export_is_encrypted`
+- `backup_export_templates`
 - `backup_generate_passphrase`
 - `backup_get_cache_settings`
 - `backup_get_desktop_settings`
 - `backup_get_global_defaults`
 - `backup_get_job`
 - `backup_get_secret_settings`
+- `backup_get_template`
 - `backup_has_destination_secret`
 - `backup_import_config`
+- `backup_import_templates`
 - `backup_job_placeholders`
 - `backup_list_destinations`
 - `backup_list_drives`
 - `backup_list_files`
 - `backup_list_jobs`
 - `backup_list_sources`
+- `backup_list_templates`
 - `backup_list_versions`
 - `backup_lock_status`
 - `backup_open_drive`
@@ -158,6 +165,8 @@ macro; if you add a new one here, register it there too.
 - `backup_run_history`
 - `backup_save_destination`
 - `backup_save_job`
+- `backup_save_template`
+- `backup_schedule_preview`
 - `backup_search`
 - `backup_set_cache_settings`
 - `backup_set_database_encryption`
@@ -728,4 +737,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 560 commands across 51 modules.
+**Surface:** 569 commands across 51 modules.

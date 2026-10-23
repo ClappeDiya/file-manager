@@ -86,4 +86,4 @@ A shared repository takes backups from several computers or jobs, and identical 
 - **Restore → Versions of …** (Advanced) switches between *This job*, another computer's versions and *All sources*. *Refresh* reads their latest versions from the destination.
 - **Options → Advanced → Versions and sharing** records another computer or user name. Use it to continue a computer's history after moving to a new one.
 
-Restoring as of a time, archives, mirror restores, previews, the volume cache and opening a version as a drive are described in [backup-restore.md](backup-restore.md).
+Restoring as of a time, archives, mirror restores, previews, the volume cache and opening a version as a drive are described in [backup-restore.md](backup-restore.md). Templates, cron and maintenance schedules, and scoped verification are in [backup-policies-and-schedules.md](backup-policies-and-schedules.md).
