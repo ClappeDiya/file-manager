@@ -83,3 +83,5 @@ A key check stored in the database tells whether a key is the right one. Volume 
 - CLI: `--db-key-source keyring` (OS keychain, key created on first use), `--db-key-source env:VAR` (64 hex digits) or `--db-key-source none` (default, plain). `ufop backup db encrypt <db> [--decrypt]` converts a database in place, and `ufop backup db sanitize` takes `--db-key-source` too.
 
 **Losing the key** does not lose the backup. When the database is encrypted and its key is missing or different, the app sets the file aside as `<name>.undecryptable-<time>`, starts a new database and rebuilds it from the destination (Recreate database). The run log says so, and the next backup continues normally.
+
+Ignore files, the read-error policy, snapshots (including ZFS and btrfs), the estimate and backing up every job are described in [backup-sources-and-runs.md](backup-sources-and-runs.md).

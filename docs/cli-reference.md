@@ -550,6 +550,40 @@ ufop backup restore --dest /mnt/backup --source-id <id> --target ~/out   # anoth
 
 Every repository command also takes `--job-id` (the source a CLI job writes as; default derived from `--dest` and `--prefix`, so give each CLI job that shares a repository its own), `--hostname` and `--username` (record another computer or user, to continue its history) and `--source-id ID|*` (work on another source of a shared repository). `ufop backup run` also takes `--shared-gc-delay-hours` (default 4): in a shared repository, compaction leaves younger volumes alone. Any non-zero `--keep-latest|hourly|daily|weekly|monthly|yearly` selects count-based retention over `--keep-versions`, `--keep-days` and `--retention-policy`.
 
+### `ufop backup` sources and runs
+
+Ignore files, one filesystem, the read-error policy, rehash, standard input, the upload limit, parallel hashing, snapshot methods, the estimate and backing up every job. See [backup-sources-and-runs.md](backup-sources-and-runs.md).
+
+```bash
+ufop backup run … --ignore-file .ufopignore --ignore-file .backupignore --respect-gitignore
+ufop backup run … --one-file-system                           # mount points inside a source stay empty
+ufop backup run … --on-file-error fail --on-dir-error continue --on-unknown-entry warn [--fail-fast] [--max-errors 50]
+ufop backup run … --rehash-percent 5                          # re-check ~5% of unchanged files per run
+ufop backup run … --max-upload 20G                            # partial version at 20 GiB; the next run continues
+ufop backup run … --parallel-file-threshold 512M              # 0 = off; blocks are identical either way
+ufop backup run … --snapshot-policy required --snapshot-provider zfs   # auto | lvm | zfs | btrfs
+pg_dump mydb | ufop backup stdin --dest /mnt/backup --name mydb.sql    # standard input as /stdin/mydb.sql
+ufop backup estimate --dest /mnt/backup --source ~/Documents [--assumed-speed 20M] [--largest 10]
+ufop server run-all [--job Docs …] [--scheduled-only] [--dry-run] [--wait]   # every job of the signed-in ufop-server
+ufop backup run-all [--job Docs …] [--scheduled-only] [--wait]               # the same
+```
+
+| Flag | Default | |
+|---|---|---|
+| `--ignore-file NAME` | `.ufopignore` | Ignore-file name read in every folder (gitignore syntax; repeatable; replaces the default; `""` reads none) |
+| `--respect-gitignore` | off | Also `.gitignore` and `.git/info/exclude` |
+| `--one-file-system` | off | Do not enter folders on another filesystem |
+| `--on-file-error` / `--on-dir-error` | `continue` | `continue` (warning) or `fail` (error) |
+| `--on-unknown-entry` | `ignore` | Sockets, FIFOs, devices: `ignore`, `warn`, `fail` |
+| `--fail-fast` | off | Stop at the first error with a partial version |
+| `--max-errors N` | none | Stop after more than N read problems |
+| `--rehash-percent N` | 0 | 0–100 |
+| `--max-upload SIZE` | none | `500M`, `20G`, … (binary units) |
+| `--parallel-file-threshold SIZE` | `256M` | 0 = off |
+| `--snapshot-provider` | `auto` | Linux: `auto`, `lvm`, `zfs`, `btrfs` |
+
+`ufop backup stdin` takes the repository, retention, `--note`/`--tag` and engine flags of `ufop backup run`. Exit codes follow `run`: 0 success, 1 warnings, 2 errors or a partial version (fail-fast, error budget, upload limit).
+
 ### `ufop server shares`
 
 Share links on a `ufop-server` started with `--share-root` (sign in first with `ufop server login`).
