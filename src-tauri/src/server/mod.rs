@@ -9,6 +9,7 @@ pub mod access;
 pub mod accounts;
 pub mod api_tokens;
 pub mod auth;
+pub mod branding;
 pub mod csrf;
 pub mod dav;
 pub mod folders;
@@ -174,13 +175,15 @@ pub struct ServerState {
     pub metrics: metrics::Metrics,
     /// OTLP trace exporter (flushed on shutdown).
     pub otlp: Option<otlp::OtlpHandle>,
+    /// Web UI branding (command line, saved, console layers).
+    pub branding: branding::BrandingState,
 }
 
 impl ServerState {
     /// State with no OAuth broker, console agent or gateways (set the fields after).
     pub fn new(mgr: BackupManager, conns: Option<ConnectionManager>, auth: AuthService, cfg: ServerConfig) -> Self {
         let life = lifecycle::Lifecycle::new(std::time::Duration::from_secs(cfg.shutdown_grace_secs));
-        Self { mgr, conns, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None, gateways: Default::default(), life, metrics: Default::default(), otlp: None }
+        Self { mgr, conns, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None, gateways: Default::default(), life, metrics: Default::default(), otlp: None, branding: Default::default() }
     }
 }
 
@@ -1199,7 +1202,8 @@ async fn static_files(State(st): State<ServerState>, req: Request) -> Response {
     let path = format!("/{rel}");
     if st.cfg.spa_paths.iter().any(|p| path.starts_with(p.as_str())) {
         if let Ok(idx) = tokio::fs::read_to_string(root.join("index.html")).await {
-            return ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], inject_server_flag(&idx)).into_response();
+            let html = branding::brand_index(&inject_server_flag(&idx), &st.branding.effective().await);
+            return ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response();
         }
     }
     StatusCode::NOT_FOUND.into_response()
@@ -1241,6 +1245,9 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/auth/refresh", post(refresh))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/signin", post(redeem_signin))
+        .route("/api/v1/branding", get(branding::public_branding))
+        .route("/branding/logo", get(branding::logo))
+        .route("/branding/custom.css", get(branding::custom_css))
         .merge(oauth::public_routes())
         .merge(shares::public_routes())
         .merge(mcp_oauth::routes())
@@ -1305,6 +1312,7 @@ pub fn router(st: ServerState) -> Router {
         .merge(shares::protected_routes())
         .merge(folders::protected_routes())
         .route("/api/v1/server/shutdown", post(lifecycle::shutdown_route))
+        .route("/api/v1/server/branding", get(branding::get_admin).put(branding::put_admin))
         .route("/api/v1/metrics", get(metrics::metrics_route))
         .merge(gateway::protected_routes())
         .merge(accounts::protected_routes())

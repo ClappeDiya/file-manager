@@ -197,6 +197,10 @@ class UfopClient:
         """Base a job on this template too (appended: it wins over earlier ones) (API tokens: `write` scope). `POST /api/v1/backup-templates/{id}/apply`"""
         return self._call("POST", f"/api/v1/backup-templates/{urllib.parse.quote(id_, safe='')}/apply", None, body)
 
+    def get_branding(self) -> Dict[str, Any]:
+        """Web UI branding: title prefix, product name, accent color, logo and stylesheet URLs (public). `GET /api/v1/branding`"""
+        return self._call("GET", f"/api/v1/branding", None, None)
+
     def post_destinations_test(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """Test a destination (optionally create its folder); returns the files found (API tokens: `write` scope). `POST /api/v1/destinations/test`"""
         return self._call("POST", f"/api/v1/destinations/test", None, body)
@@ -420,6 +424,14 @@ class UfopClient:
     def post_scheduler_resume(self) -> "SchedulerStatus":
         """Resume the scheduler (API tokens: `run` scope). `POST /api/v1/scheduler/resume`"""
         return self._call("POST", f"/api/v1/scheduler/resume", None, None)
+
+    def get_server_branding(self) -> Dict[str, Any]:
+        """Branding layers: effective, saved, command line and console-managed (administrators) (API tokens: `admin` scope). `GET /api/v1/server/branding`"""
+        return self._call("GET", f"/api/v1/server/branding", None, None)
+
+    def put_server_branding(self, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Save the web UI branding (administrators; refused while the console manages it). The logo must be a data: URI; custom CSS may not import or load external resources (API tokens: `admin` scope). `PUT /api/v1/server/branding`"""
+        return self._call("PUT", f"/api/v1/server/branding", None, body if body is not None else {})
 
     def post_server_shutdown(self, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Stop the server gracefully: new mutating requests get 503, running backups stop at a safe point (partial version) within grace_secs (default --shutdown-grace), then the process exits 0; a second call stops at once. Answers 202 (API tokens: `admin` scope). `POST /api/v1/server/shutdown`"""

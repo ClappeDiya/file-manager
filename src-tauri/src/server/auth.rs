@@ -171,6 +171,11 @@ pub struct AuthService {
 pub const REMEMBER_LOGIN: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl AuthService {
+    /// The server's settings database (branding, flags).
+    pub fn settings(&self) -> &SettingsStore {
+        &self.settings
+    }
+
     pub fn new(settings: SettingsStore) -> Self {
         Self { settings, throttle: Arc::new(LoginThrottle::new(10, 250)), remembered: Default::default(), accounts_ready: Default::default() }
     }

@@ -29,6 +29,108 @@ pub struct ManagedSettings {
     pub notification_profiles: Option<Vec<ManagedNotificationProfile>>,
     /// Accounts and per-job access rules for `ufop-server` nodes (read-only there).
     pub server_access: Option<ManagedServerAccess>,
+    /// Web UI branding of `ufop-server` nodes (title prefix, logo, accent, CSS).
+    pub server_branding: Option<ManagedServerBranding>,
+}
+
+/// Longest title prefix / product name.
+pub const MAX_BRAND_TEXT: usize = 64;
+/// Largest logo (decoded bytes).
+pub const MAX_BRAND_LOGO: usize = 512 * 1024;
+/// Largest custom stylesheet.
+pub const MAX_BRAND_CSS: usize = 32 * 1024;
+/// Logo image types accepted.
+pub const BRAND_LOGO_TYPES: [&str; 5] = ["image/png", "image/jpeg", "image/svg+xml", "image/webp", "image/gif"];
+
+/// Web UI branding for `ufop-server` (empty fields keep the defaults). The
+/// logo is a `data:` URI here; the server also takes a file path from its
+/// own command line or config file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ManagedServerBranding {
+    pub title_prefix: String,
+    pub product_name: String,
+    /// `data:image/png;base64,…` (PNG, JPEG, SVG, WebP, GIF; ≤ 512 KiB).
+    pub logo: String,
+    /// `#rgb` or `#rrggbb`.
+    pub accent_color: String,
+    /// Extra CSS (≤ 32 KiB, no `@import`, external `url()`, `expression()`, scripts or markup).
+    pub custom_css: String,
+}
+
+impl ManagedServerBranding {
+    pub fn validate(&self) -> Result<(), String> {
+        check_brand_text("Title prefix", &self.title_prefix)?;
+        check_brand_text("Product name", &self.product_name)?;
+        if !self.logo.trim().is_empty() {
+            decode_logo_data_uri(&self.logo)?;
+        }
+        if !self.accent_color.trim().is_empty() {
+            check_accent_color(&self.accent_color)?;
+        }
+        check_custom_css(&self.custom_css)
+    }
+}
+
+/// Short single-line text (title prefix, product name).
+pub fn check_brand_text(what: &str, s: &str) -> Result<(), String> {
+    if s.chars().count() > MAX_BRAND_TEXT {
+        return Err(format!("{what} is longer than {MAX_BRAND_TEXT} characters"));
+    }
+    if s.chars().any(|c| c.is_control()) {
+        return Err(format!("{what} contains control characters"));
+    }
+    Ok(())
+}
+
+/// `#rgb` or `#rrggbb`.
+pub fn check_accent_color(s: &str) -> Result<(), String> {
+    let h = s.trim().strip_prefix('#').ok_or_else(|| format!("Accent color '{s}' must look like #1e66f5"))?;
+    if (h.len() == 3 || h.len() == 6) && h.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(format!("Accent color '{s}' must look like #1e66f5"))
+    }
+}
+
+/// Custom CSS is served on the same origin as the web UI, so anything that
+/// loads other resources, runs code or escapes the stylesheet is refused.
+pub fn check_custom_css(css: &str) -> Result<(), String> {
+    if css.len() > MAX_BRAND_CSS {
+        return Err(format!("Custom CSS is larger than {} KiB", MAX_BRAND_CSS / 1024));
+    }
+    let lower: String = css.to_ascii_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    for bad in ["<", "@import", "expression(", "javascript:", "vbscript:", "behavior:", "-moz-binding", "@charset", "\\"] {
+        if lower.contains(bad) {
+            return Err(format!("Custom CSS may not contain '{bad}'"));
+        }
+    }
+    // url() only for inline images.
+    let mut rest = lower.as_str();
+    while let Some(i) = rest.find("url(") {
+        let arg = rest[i + 4..].trim_start_matches(['"', '\'']);
+        if !arg.starts_with("data:image/") {
+            return Err("Custom CSS may only use url(data:image/…)".into());
+        }
+        rest = &rest[i + 4..];
+    }
+    Ok(())
+}
+
+/// `(mime, bytes)` of a `data:image/…;base64,…` logo.
+pub fn decode_logo_data_uri(uri: &str) -> Result<(String, Vec<u8>), String> {
+    use base64::Engine;
+    let rest = uri.trim().strip_prefix("data:").ok_or("The logo must be a data: URI (data:image/png;base64,…)")?;
+    let (meta, data) = rest.split_once(',').ok_or("The logo data URI is malformed")?;
+    let mime = meta.strip_suffix(";base64").ok_or("The logo data URI must be base64-encoded")?.to_ascii_lowercase();
+    if !BRAND_LOGO_TYPES.contains(&mime.as_str()) {
+        return Err(format!("Logo type '{mime}' is not supported (PNG, JPEG, SVG, WebP, GIF)"));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| "The logo data URI is not valid base64".to_string())?;
+    if bytes.is_empty() || bytes.len() > MAX_BRAND_LOGO {
+        return Err(format!("The logo must be between 1 byte and {} KiB", MAX_BRAND_LOGO / 1024));
+    }
+    Ok((mime, bytes))
 }
 
 /// Most organization accounts and access rules per server.
@@ -442,6 +544,9 @@ impl ManagedSettings {
         if let Some(a) = &self.server_access {
             a.validate()?;
         }
+        if let Some(b) = &self.server_branding {
+            b.validate()?;
+        }
         if let Some(p) = &self.proxy {
             if !PROXY_MODES.contains(&p.mode.as_str()) {
                 return Err(format!("Unknown proxy mode '{}'", p.mode));
@@ -458,13 +563,34 @@ impl ManagedSettings {
 
     /// No section managed.
     pub fn is_empty(&self) -> bool {
-        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none() && self.mounts.is_none() && self.workflows.is_none() && self.backup_templates.is_none() && self.notification_profiles.is_none() && self.server_access.is_none()
+        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none() && self.mounts.is_none() && self.workflows.is_none() && self.backup_templates.is_none() && self.notification_profiles.is_none() && self.server_access.is_none() && self.server_branding.is_none()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_branding_validates() {
+        let png = "data:image/png;base64,iVBORw0KGgo=";
+        let ok = ManagedServerBranding { title_prefix: "[ACME] ".into(), product_name: "ACME Backup".into(), logo: png.into(), accent_color: "#1E66f5".into(), custom_css: ".x{background:url(\"data:image/png;base64,AA==\")}".into() };
+        assert_eq!(ok.validate(), Ok(()));
+        assert_eq!(decode_logo_data_uri(png).unwrap().0, "image/png");
+        let bad = |b: ManagedServerBranding| b.validate().is_err();
+        assert!(bad(ManagedServerBranding { accent_color: "blue".into(), ..ok.clone() }));
+        assert!(bad(ManagedServerBranding { accent_color: "#12345".into(), ..ok.clone() }));
+        assert!(bad(ManagedServerBranding { title_prefix: "x".repeat(65), ..ok.clone() }));
+        assert!(bad(ManagedServerBranding { product_name: "a\nb".into(), ..ok.clone() }));
+        assert!(bad(ManagedServerBranding { logo: "https://evil/x.png".into(), ..ok.clone() }));
+        assert!(bad(ManagedServerBranding { logo: "data:text/html;base64,PGI+".into(), ..ok.clone() }));
+        for css in ["</style><script>", "@import url(x.css);", "a{background:url(https://t/x)}", "a{width:expression(alert(1))}", "a{b:url( 'javascript:x')}", "a{content:'\\3c'}"] {
+            assert!(check_custom_css(css).is_err(), "{css}");
+        }
+        assert!(check_custom_css(&"a".repeat(MAX_BRAND_CSS + 1)).is_err());
+        let s = ManagedSettings { server_branding: Some(ManagedServerBranding { accent_color: "nope".into(), ..Default::default() }), ..Default::default() };
+        assert!(s.validate().is_err() && !s.is_empty());
+    }
 
     #[test]
     fn server_access_validates() {

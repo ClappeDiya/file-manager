@@ -135,6 +135,7 @@ mod tests {
                 ..Default::default()
             }]),
             server_access: None,
+            server_branding: None,
         };
         let automation = AutomationManager::new();
         let mounts = MountManager::with_cache_root(t.path().join("mount-cache"));

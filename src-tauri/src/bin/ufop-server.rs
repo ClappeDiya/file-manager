@@ -41,6 +41,25 @@ struct Args {
     /// Folder with the built web UI (`pnpm build` → dist/)
     #[arg(long, env = "UFOP_SERVER_WEBROOT")]
     webroot: Option<PathBuf>,
+    /// Web UI branding from a JSON file: title_prefix, product_name, logo (data: URI or
+    /// an image file path), accent_color (#rrggbb), custom_css. The --brand-* flags win.
+    #[arg(long, env = "UFOP_SERVER_BRANDING_FILE")]
+    branding_file: Option<PathBuf>,
+    /// Text before every page title (e.g. "[ACME] ")
+    #[arg(long, env = "UFOP_SERVER_BRAND_TITLE_PREFIX")]
+    brand_title_prefix: Option<String>,
+    /// Product name in titles and the header (default: FileManager)
+    #[arg(long, env = "UFOP_SERVER_BRAND_PRODUCT_NAME")]
+    brand_product_name: Option<String>,
+    /// Logo: an image file (.png, .jpg, .svg, .webp, .gif; ≤ 512 KiB) or a data: URI
+    #[arg(long, env = "UFOP_SERVER_BRAND_LOGO")]
+    brand_logo: Option<String>,
+    /// Accent color, #rgb or #rrggbb
+    #[arg(long, env = "UFOP_SERVER_BRAND_ACCENT_COLOR")]
+    brand_accent_color: Option<String>,
+    /// Extra stylesheet (≤ 32 KiB; no @import, external url() or scripts)
+    #[arg(long, env = "UFOP_SERVER_BRAND_CSS_FILE")]
+    brand_css_file: Option<PathBuf>,
     /// Serve only the API, no web UI
     #[arg(long)]
     api_only: bool,
@@ -527,6 +546,23 @@ async fn run(argv: Vec<String>) {
         }
     }
     let auth = AuthService::new(store.clone());
+    // Branding: command line / config file layer, then what an administrator saved.
+    let brand = {
+        let css = a.brand_css_file.as_ref().map(|f| std::fs::read_to_string(f).unwrap_or_else(|e| fail(format!("--brand-css-file {}: {e}", f.display())))).unwrap_or_default();
+        let flags = server::branding::Branding {
+            title_prefix: a.brand_title_prefix.clone().unwrap_or_default(),
+            product_name: a.brand_product_name.clone().unwrap_or_default(),
+            logo: a.brand_logo.clone().unwrap_or_default(),
+            accent_color: a.brand_accent_color.clone().unwrap_or_default(),
+            custom_css: css,
+        };
+        let cli = server::branding::from_cli(a.branding_file.as_deref(), flags).unwrap_or_else(|e| fail(e.user_message()));
+        let b = server::branding::BrandingState::new(cli);
+        if let Err(e) = b.load_saved(&store).await {
+            tracing::warn!("Saved branding not loaded: {}", e.user_message());
+        }
+        b
+    };
     if let Some(Command::User(cmd)) = a.command {
         match user_command(&auth, cmd).await {
             Ok(msg) => {
@@ -580,15 +616,20 @@ async fn run(argv: Vec<String>) {
         // backup templates and server accounts with their access rules.
         let caps_mgr = mgr.clone();
         let users = auth.users();
+        let managed_brand = brand.clone();
         agent.host().set_managed_settings_handler(Arc::new(move |settings| {
             let m = caps_mgr.clone();
             let users = users.clone();
+            let managed_brand = managed_brand.clone();
             Box::pin(async move {
                 let mut problems = m.set_managed_templates(settings.as_ref().and_then(|s| s.backup_templates.as_deref()));
                 problems.extend(m.set_managed_notification_profiles(settings.as_ref().and_then(|s| s.notification_profiles.as_deref())));
                 match users.apply_managed(settings.as_ref().and_then(|s| s.server_access.as_ref())).await {
                     Ok(p) => problems.extend(p),
                     Err(e) => problems.push(format!("server accounts: {}", e.user_message())),
+                }
+                if let Err(e) = managed_brand.set_managed(settings.as_ref().and_then(|s| s.server_branding.as_ref())).await {
+                    problems.push(format!("server branding: {e}"));
                 }
                 m.set_managed_caps(settings.and_then(|s| s.transfers)).await;
                 if problems.is_empty() {
@@ -664,7 +705,7 @@ async fn run(argv: Vec<String>) {
             tracing::warn!("WebDAV is reachable over plain HTTP: passwords and tokens are sent unencrypted. Use --https or a TLS reverse proxy.");
         }
     }
-    let st = ServerState { oauth, agent, otlp: OTLP.get().cloned().flatten(), ..ServerState::new(mgr, Some(conns), auth, cfg) };
+    let st = ServerState { oauth, agent, otlp: OTLP.get().cloned().flatten(), branding: brand, ..ServerState::new(mgr, Some(conns), auth, cfg) };
     let _ = STOP.set(st.life.clone());
     if let Err(e) = server::serve(st).await {
         fail(e);

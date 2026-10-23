@@ -245,6 +245,11 @@ export class UfopClient {
     return this.call("POST", `/api/v1/backup-templates/${encodeURIComponent(id)}/apply`, undefined, body);
   }
 
+  /** Web UI branding: title prefix, product name, accent color, logo and stylesheet URLs (public). `GET /api/v1/branding` */
+  getBranding(): Promise<{ accent_color?: string | null; css_url?: string | null; logo_url?: string | null; product_name?: string; revision?: string; title_prefix?: string }> {
+    return this.call("GET", `/api/v1/branding`, undefined, undefined);
+  }
+
   /** Test a destination (optionally create its folder); returns the files found (API tokens: `write` scope). `POST /api/v1/destinations/test` */
   postDestinationsTest(body: { create?: boolean; destination: Record<string, unknown> }): Promise<{ files?: string[] }> {
     return this.call("POST", `/api/v1/destinations/test`, undefined, body);
@@ -523,6 +528,16 @@ export class UfopClient {
   /** Resume the scheduler (API tokens: `run` scope). `POST /api/v1/scheduler/resume` */
   postSchedulerResume(): Promise<SchedulerStatus> {
     return this.call("POST", `/api/v1/scheduler/resume`, undefined, undefined);
+  }
+
+  /** Branding layers: effective, saved, command line and console-managed (administrators) (API tokens: `admin` scope). `GET /api/v1/server/branding` */
+  getServerBranding(): Promise<Record<string, unknown>> {
+    return this.call("GET", `/api/v1/server/branding`, undefined, undefined);
+  }
+
+  /** Save the web UI branding (administrators; refused while the console manages it). The logo must be a data: URI; custom CSS may not import or load external resources (API tokens: `admin` scope). `PUT /api/v1/server/branding` */
+  putServerBranding(body: { accent_color?: string; custom_css?: string; logo?: string; product_name?: string; title_prefix?: string } = {}): Promise<Record<string, unknown>> {
+    return this.call("PUT", `/api/v1/server/branding`, undefined, body);
   }
 
   /** Stop the server gracefully: new mutating requests get 503, running backups stop at a safe point (partial version) within grace_secs (default --shutdown-grace), then the process exits 0; a second call stops at once. Answers 202 (API tokens: `admin` scope). `POST /api/v1/server/shutdown` */

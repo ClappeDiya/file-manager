@@ -1737,3 +1737,64 @@ async fn notification_profiles_presets_and_previews_over_rest() {
     assert!(s.mgr.set_managed_notification_profiles(Some(&[org])).is_empty());
     assert_eq!(s.client.delete(format!("{}/api/v1/notification-profiles/org:ops", s.base)).bearer_auth(&tok).send().await.unwrap().status(), 403);
 }
+
+#[tokio::test]
+async fn branding_rest_public_view_and_html() {
+    let web = tempfile::tempdir().unwrap();
+    std::fs::write(web.path().join("index.html"), "<html><head><title>FileManager</title></head><body>app</body></html>").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::open_in_memory().await.unwrap();
+    let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
+    let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
+    auth.set_password("server-password").await.unwrap();
+    let cli = branding::Branding { title_prefix: "[cli] ".into(), ..Default::default() };
+    let brand = branding::BrandingState::new(cli);
+    let st = ServerState { branding: brand.clone(), ..ServerState::new(mgr, None, auth, ServerConfig { webroot: Some(web.path().into()), ..Default::default() }) };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
+    let c = reqwest::Client::new();
+
+    // Public view without signing in; command line layer applies to the HTML.
+    let p: Value = c.get(format!("{base}/api/v1/branding")).send().await.unwrap().json().await.unwrap();
+    assert_eq!((p["title_prefix"].as_str(), p["logo_url"].is_null()), (Some("[cli] "), true));
+    let html = c.get(format!("{base}/")).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("<title>[cli] FileManager</title>"), "{html}");
+    assert_eq!(c.get(format!("{base}/branding/logo")).send().await.unwrap().status(), 404);
+
+    // Administrators save branding; invalid values are refused.
+    let tok = c.post(format!("{base}/api/v1/auth/login")).json(&json!({"password":"server-password"})).send().await.unwrap().json::<Value>().await.unwrap()["access_token"].as_str().unwrap().to_string();
+    assert_eq!(c.put(format!("{base}/api/v1/server/branding")).json(&json!({"product_name":"x"})).send().await.unwrap().status(), 401);
+    let bad = c.put(format!("{base}/api/v1/server/branding")).bearer_auth(&tok).json(&json!({"custom_css":"@import url(https://evil/x.css);"})).send().await.unwrap();
+    assert_eq!(bad.status(), 400);
+    let bad = c.put(format!("{base}/api/v1/server/branding")).bearer_auth(&tok).json(&json!({"logo":"/etc/passwd"})).send().await.unwrap();
+    assert_eq!(bad.status(), 400, "file paths only from the command line");
+    let body = json!({"title_prefix":"[ACME] ","product_name":"ACME Backup","accent_color":"#1e66f5","logo":"data:image/png;base64,iVBORw0KGgo=","custom_css":"header{border-color:var(--ufop-accent)}"});
+    let saved: Value = c.put(format!("{base}/api/v1/server/branding")).bearer_auth(&tok).json(&body).send().await.unwrap().json().await.unwrap();
+    assert_eq!(saved["effective"]["product_name"], "ACME Backup");
+    assert_eq!(saved["command_line"]["title_prefix"], "[cli] ");
+    let p: Value = c.get(format!("{base}/api/v1/branding")).send().await.unwrap().json().await.unwrap();
+    assert_eq!((p["title_prefix"].as_str(), p["accent_color"].as_str()), (Some("[ACME] "), Some("#1e66f5")));
+    assert!(p.get("custom_css").is_none() && p.get("logo").is_none(), "only URLs are public");
+    let logo = c.get(format!("{base}{}", p["logo_url"].as_str().unwrap())).send().await.unwrap();
+    assert_eq!(logo.headers()["content-type"], "image/png");
+    assert!(logo.headers()["content-security-policy"].to_str().unwrap().contains("default-src 'none'"));
+    assert_eq!(logo.bytes().await.unwrap().as_ref(), &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    let css = c.get(format!("{base}/branding/custom.css")).send().await.unwrap();
+    assert_eq!(css.headers()["content-type"], "text/css; charset=utf-8");
+    let html = c.get(format!("{base}/backups")).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("<title>[ACME] ACME Backup</title>") && html.contains("--ufop-accent:#1e66f5") && html.contains("/branding/custom.css?v="), "{html}");
+
+    // The console's settings win and lock the admin route.
+    brand.set_managed(Some(&ufop_core::agent::managed::ManagedServerBranding { title_prefix: "[Org] ".into(), ..Default::default() })).await.unwrap();
+    let p: Value = c.get(format!("{base}/api/v1/branding")).send().await.unwrap().json().await.unwrap();
+    assert_eq!((p["title_prefix"].as_str(), p["product_name"].as_str()), (Some("[Org] "), Some("ACME Backup")));
+    assert_eq!(c.put(format!("{base}/api/v1/server/branding")).bearer_auth(&tok).json(&body).send().await.unwrap().status(), 400);
+    let v: Value = c.get(format!("{base}/api/v1/server/branding")).bearer_auth(&tok).send().await.unwrap().json().await.unwrap();
+    assert_eq!(v["managed"]["title_prefix"], "[Org] ");
+
+    // Saved branding survives a restart (settings database).
+    let again = branding::BrandingState::default();
+    again.load_saved(&settings::SettingsStore::plain(repo.pool().clone())).await.unwrap();
+    assert_eq!(again.effective().await.product_name, "ACME Backup");
+}
