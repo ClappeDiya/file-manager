@@ -60,6 +60,7 @@ pub fn required_scope(method: &Method, path: &str) -> Scope {
         return Scope::Read;
     }
     let run = (p.starts_with("/api/v1/jobs/") && (p.ends_with("/run") || p.ends_with("/operations")))
+        || p == "/api/v1/jobs/run-all"
         || (p.starts_with("/api/v1/tasks/") && p.ends_with("/cancel"))
         || p.starts_with("/api/v1/scheduler/");
     if run {
@@ -224,6 +225,8 @@ mod tests {
         assert_eq!(required_scope(&get, "/api/v1/jobs"), Scope::Read);
         assert_eq!(required_scope(&get, "/api/v1/jobs/j1/files"), Scope::Read);
         assert_eq!(required_scope(&post, "/api/v1/jobs/j1/run"), Scope::Run);
+        assert_eq!(required_scope(&post, "/api/v1/jobs/run-all"), Scope::Run);
+        assert_eq!(required_scope(&Method::GET, "/api/v1/jobs/j1/estimate"), Scope::Read);
         assert_eq!(required_scope(&post, "/api/v1/tasks/t1/cancel"), Scope::Run);
         assert_eq!(required_scope(&post, "/api/v1/scheduler/pause"), Scope::Run);
         assert_eq!(required_scope(&post, "/api/v1/jobs"), Scope::Write);

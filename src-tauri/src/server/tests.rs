@@ -158,6 +158,20 @@ async fn backup_and_restore_over_rest_and_rpc() {
     assert_eq!(runs.as_array().unwrap().len(), 3);
     let fs = s.get(&format!("/api/v1/filesystem?path={}", s.dir.display()), &tok).await.json::<Value>().await.unwrap();
     assert!(fs["entries"].as_array().unwrap().iter().any(|e| e["name"] == "src"));
+    // Estimate and run-all.
+    std::fs::write(src.join("b.txt"), b"new since the backup").unwrap();
+    let est = s.get(&format!("/api/v1/jobs/{id}/estimate?assumed_bytes_per_sec=1000"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!((est["new_files"].as_u64(), est["unchanged_files"].as_u64()), (Some(1), Some(1)), "{est}");
+    let rpc_est = s.post("/api/v1/rpc/backup_estimate", &tok, json!({"jobId": id})).await.json::<Value>().await.unwrap();
+    assert_eq!(rpc_est["new_files"], 1);
+    let all = s.post("/api/v1/jobs/run-all", &tok, json!({"dry_run": true})).await.json::<Value>().await.unwrap();
+    assert_eq!(all["started"].as_array().map(|a| a.len()), Some(1), "{all}");
+    for _ in 0..100 {
+        if s.get("/api/v1/tasks", &tok).await.json::<Value>().await.unwrap().as_array().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]

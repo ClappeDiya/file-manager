@@ -225,6 +225,11 @@ export class UfopClient {
     return this.call("POST", `/api/v1/jobs/import`, undefined, body);
   }
 
+  /** Back up every job now (queued; read-only and busy jobs are skipped) (API tokens: `run` scope). `POST /api/v1/jobs/run-all` */
+  postJobsRunAll(body: { dry_run?: boolean; job_ids?: string[]; scheduled_only?: boolean } = {}): Promise<{ skipped?: Array<{ job_id?: string; job_name?: string; reason?: string }>; started?: Array<{ job_id?: string; job_name?: string; task_id?: string }> }> {
+    return this.call("POST", `/api/v1/jobs/run-all`, undefined, body);
+  }
+
   /** Get a job (API tokens: `read` scope). `GET /api/v1/jobs/{id}` */
   getJobsId(id: string): Promise<BackupJob> {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}`, undefined, undefined);
@@ -253,6 +258,11 @@ export class UfopClient {
   /** Encrypt or decrypt the job's local database now (key kept in the credential store) (API tokens: `write` scope). `PUT /api/v1/jobs/{id}/database-encryption` */
   putJobsIdDatabaseEncryption(id: string, body: { enabled: boolean }): Promise<{ encrypted?: boolean; files?: number; settings?: number }> {
     return this.call("PUT", `/api/v1/jobs/${encodeURIComponent(id)}/database-encryption`, undefined, body);
+  }
+
+  /** Estimate the next backup: files, new data (at most / at least) and duration; reads nothing (API tokens: `read` scope). `GET /api/v1/jobs/{id}/estimate` */
+  getJobsIdEstimate(id: string, query: { assumed_bytes_per_sec?: number } = {}): Promise<{ bytes_examined?: number; bytes_per_sec?: number | null; changed_files?: number; deleted_files?: number; estimated_duration_secs?: number | null; files?: number; folders?: number; has_previous_version?: boolean; largest?: Array<{ path?: string; size?: number; status?: "new" | "changed" }>; new_bytes_at_least?: number; new_bytes_at_most?: number; new_files?: number; speed_source?: "history" | "assumed" | "none"; unchanged_files?: number; upper_bound?: boolean; warnings?: string[] }> {
+    return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/estimate`, query, undefined);
   }
 
   /** Export the job configuration (API tokens: `read` scope). `GET /api/v1/jobs/{id}/export` */

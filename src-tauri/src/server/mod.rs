@@ -503,6 +503,19 @@ async fn run_job(State(st): State<ServerState>, AxPath(id): AxPath<String>, body
     ok(json!({"task_id": st.mgr.start_backup(&id, dry).await?}))
 }
 
+async fn run_all_jobs(State(st): State<ServerState>, body: Option<Json<crate::backup_engine::runs::RunAllFilter>>) -> ApiResult {
+    ok(st.mgr.run_all(body.map(|b| b.0).unwrap_or_default()).await?)
+}
+
+#[derive(Deserialize)]
+struct EstimateQuery {
+    assumed_bytes_per_sec: Option<u64>,
+}
+
+async fn estimate_job(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<EstimateQuery>) -> ApiResult {
+    ok(st.mgr.estimate(&id, q.assumed_bytes_per_sec).await?)
+}
+
 async fn job_operation(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(op): Json<BackupOperation>) -> ApiResult {
     if matches!(op, BackupOperation::Backup { .. }) {
         return Err(AppError::validation("Use POST /jobs/{id}/run to start a backup").into());
@@ -820,7 +833,9 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/jobs", get(list_jobs).post(create_job))
         .route("/api/v1/jobs/import", post(import_job))
         .route("/api/v1/jobs/{id}", get(get_job).put(update_job).delete(delete_job))
+        .route("/api/v1/jobs/run-all", post(run_all_jobs))
         .route("/api/v1/jobs/{id}/run", post(run_job))
+        .route("/api/v1/jobs/{id}/estimate", get(estimate_job))
         .route("/api/v1/jobs/{id}/operations", post(job_operation))
         .route("/api/v1/jobs/{id}/passphrase", axum::routing::put(change_job_passphrase))
         .route("/api/v1/jobs/{id}/lock", get(job_lock_status).delete(break_job_lock))

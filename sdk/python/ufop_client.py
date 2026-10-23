@@ -185,6 +185,10 @@ class UfopClient:
         """Import an exported job configuration (API tokens: `write` scope). `POST /api/v1/jobs/import`"""
         return self._call("POST", f"/api/v1/jobs/import", None, body)
 
+    def post_jobs_run_all(self, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Back up every job now (queued; read-only and busy jobs are skipped) (API tokens: `run` scope). `POST /api/v1/jobs/run-all`"""
+        return self._call("POST", f"/api/v1/jobs/run-all", None, body if body is not None else {})
+
     def get_jobs_id(self, id_: str) -> "BackupJob":
         """Get a job (API tokens: `read` scope). `GET /api/v1/jobs/{id}`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}", None, None)
@@ -208,6 +212,10 @@ class UfopClient:
     def put_jobs_id_database_encryption(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
         """Encrypt or decrypt the job's local database now (key kept in the credential store) (API tokens: `write` scope). `PUT /api/v1/jobs/{id}/database-encryption`"""
         return self._call("PUT", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/database-encryption", None, body)
+
+    def get_jobs_id_estimate(self, id_: str, assumed_bytes_per_sec: Optional[int] = None) -> Dict[str, Any]:
+        """Estimate the next backup: files, new data (at most / at least) and duration; reads nothing (API tokens: `read` scope). `GET /api/v1/jobs/{id}/estimate`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/estimate", {"assumed_bytes_per_sec": assumed_bytes_per_sec}, None)
 
     def get_jobs_id_export(self, id_: str, include_passphrase: Optional[bool] = None, export_passphrase: Optional[str] = None) -> Dict[str, Any]:
         """Export the job configuration (API tokens: `read` scope). `GET /api/v1/jobs/{id}/export`"""

@@ -172,6 +172,8 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
         "backup_set_version_metadata" => ok(mgr
             .execute(&arg::<String>(a, "id")?, BackupOperation::SetVersionMetadata { version: arg(a, "version")?, source: opt(a, "source")?, patch: arg(a, "patch")? })
             .await?),
+        "backup_run_all" => ok(mgr.run_all(opt(a, "filter")?.unwrap_or_default()).await?),
+        "backup_estimate" => ok(mgr.estimate(&arg::<String>(a, "jobId")?, opt(a, "assumedBytesPerSec")?).await?),
         "backup_run_history" => ok(mgr.run_history(opt(a, "jobId")?, opt(a, "limit")?.unwrap_or(50)).await?),
         "backup_prune_history" => ok(mgr.prune_history(arg::<u32>(a, "days")?.max(1)).await?),
         "backup_export_config" => ok(export_config(
@@ -260,5 +262,5 @@ pub const COMMANDS: &[&str] = &[
     "backup_set_global_defaults", "backup_effective_job", "backup_list_destinations", "backup_save_destination",
     "backup_delete_destination", "backup_adopt_repository", "backup_database_inventory", "backup_cleanup_databases", "backup_bug_report", "backup_diagnose", "backup_test_notification", "backup_get_secret_settings", "backup_set_secret_settings", "backup_crypt_file", "backup_decrypt_volume", "backup_test_secret_providers", "backup_job_placeholders", "backup_recovery_download", "backup_recovery_index", "backup_recovery_list", "backup_recovery_restore", "backup_recovery_convert", "backup_remote_list", "backup_remote_get", "backup_remote_put", "backup_remote_delete", "backup_start_operation", "backup_set_destination_secret", "backup_has_destination_secret", "backup_cloud_providers",
     "backup_photos_libraries", "backup_photos_library_info", "backup_lock_status", "backup_break_lock", "backup_set_database_encryption",
-    "backup_list_sources", "backup_preview_retention", "backup_set_version_metadata",
+    "backup_list_sources", "backup_preview_retention", "backup_set_version_metadata", "backup_run_all", "backup_estimate",
 ];
