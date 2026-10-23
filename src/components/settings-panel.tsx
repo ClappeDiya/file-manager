@@ -24,6 +24,7 @@ import { FleetAgentSection } from "@/components/fleet-agent-section";
 import { DiagnosticsSection } from "@/components/diagnostics-section";
 import { ManagedSettingsNotice } from "@/components/managed-settings-notice";
 import { FleetAgentLimits } from "@/components/fleet-agent-limits";
+import { PortableModeBadge, PortableModeDetails, usePortableStatus } from "@/components/portable-mode-status";
 
 // ── Types ──
 
@@ -1268,6 +1269,7 @@ export default function SettingsPanel({
   onOpenNetworkWizard?: () => void;
 }) {
   const [summary, setSummary] = useState<SettingsSummary | null>(null);
+  const portable = usePortableStatus();
 
   const loadSummary = useCallback(async () => {
     const s = await tauriInvokeSafe<SettingsSummary | null>(
@@ -1287,6 +1289,7 @@ export default function SettingsPanel({
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
         <h2 className="text-sm font-semibold">Settings</h2>
+        <PortableModeBadge status={portable} />
       </div>
 
       {/* Content */}
@@ -1324,6 +1327,11 @@ export default function SettingsPanel({
         {/* Privacy */}
         <Section title="Privacy">
           <PrivacySection />
+        </Section>
+
+        {/* Where this installation keeps its data (portable mode) */}
+        <Section title="Storage &amp; Portable Mode">
+          <PortableModeDetails status={portable} />
         </Section>
 
         {/* Log Controls */}

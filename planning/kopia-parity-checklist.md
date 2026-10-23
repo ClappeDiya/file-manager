@@ -105,7 +105,7 @@ Ground rules
 - [x] K125 Windows release targets
 - [x] K126 Multi-arch Docker image
 - [x] K127 Signed SHA256SUMS on releases
-- [ ] K131 Portable mode for the desktop app
+- [x] K131 Portable mode for the desktop app
 - [ ] K124 ufop-server web UI branding
 
 ## WP11 — Interface polish

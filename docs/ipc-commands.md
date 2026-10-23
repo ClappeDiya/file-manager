@@ -661,10 +661,11 @@ macro; if you add a new one here, register it there too.
 - `update_sync_pair`
 - `validate_sync_cron`
 
-## `system_commands` (3 commands)
+## `system_commands` (4 commands)
 
 - `get_app_version`
 - `get_platform_info`
+- `get_portable_status`
 - `greet`
 
 ## `terminal_commands` (11 commands)
@@ -747,4 +748,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 579 commands across 51 modules.
+**Surface:** 580 commands across 51 modules.

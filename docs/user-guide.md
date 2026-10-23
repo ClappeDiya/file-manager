@@ -38,6 +38,24 @@ UFOP is available as a native desktop application for macOS, Windows, and Linux.
 - **Windows**: Download the NSIS or WiX installer (`.exe` or `.msi`). The installer supports multiple languages (English, Spanish, French, German, Portuguese, Japanese, Chinese, Korean).
 - **Linux**: Available as `.deb`, `.rpm`, or `.AppImage`
 
+### Portable Mode (run from a USB drive)
+
+Portable mode keeps **everything** the app stores in one folder you can carry around: the settings database, backup job databases, the search index, logs, the backup volume cache, thumbnails and previews, sync state, editor drafts, temporary files and saved credentials. Nothing is written to the computer's user profile.
+
+Turn it on in one of three ways (the first that applies wins):
+
+1. Set the environment variable `UFOP_PORTABLE_DIR` to a folder (a relative path is relative to the app's folder).
+2. Put `ufop-portable.json` next to the app: `{ "data_dir": "UFOP Data" }` (relative to the app's folder; default `ufop-data`).
+3. Put an empty file named `portable` next to the app. The data goes into `ufop-data` next to it.
+
+"Next to the app" is the folder that holds the executable (`FileManager.exe` on Windows, the AppImage or binary on Linux); on macOS it can also be the folder that holds the `.app` bundle. Restart the app after adding the file. **Settings** then shows *Portable mode: on (path)* in the header, and **Settings → Storage & Portable Mode** lists the folders and where credentials are kept.
+
+Inside the portable folder: `data/` (databases, backup job databases, `data/logs`), `config/` (credential vault), `cache/` (volume cache, thumbnails, mounts) and `tmp/`. On Windows the WebView2 profile goes to `webview/`, on Linux the WebKit data to `xdg/`; on macOS the system web view keeps a small amount of browser storage (window and panel preferences) in the user profile.
+
+**Credentials.** The system keychain cannot travel with the drive, so in portable mode passwords and keys are saved in an encrypted vault file, `config/credentials.vault` (AES-256-GCM). By default its key is a random key file next to it (`config/credentials.key`): that keeps secrets out of plain text, but anyone with the drive can open the vault, so use an encrypted drive. For real protection set `UFOP_PORTABLE_PASSPHRASE` before the first start; the vault key is then derived from the passphrase (Argon2id) and the app needs the same passphrase on every start. Credentials saved in the keychain before switching to portable mode are not copied; enter them again.
+
+`ufop-server` honours `UFOP_PORTABLE_DIR` and the marker files the same way when `--data-dir` is not given.
+
 ### First Launch - Onboarding Wizard
 
 On first launch, a 6-step onboarding wizard guides you through setup:
