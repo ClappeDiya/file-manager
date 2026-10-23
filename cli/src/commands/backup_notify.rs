@@ -101,7 +101,12 @@ pub fn profile_body(base: Value, f: &ProfileFields, env: impl Fn(&str) -> Option
         p["description"] = json!(d);
     }
     if let Some(n) = &f.notification {
-        p["notification"] = serde_json::from_str(n).map_err(|e| format!("--notification is not JSON: {e}"))?;
+        let mut n: Value = serde_json::from_str(n).map_err(|e| format!("--notification is not JSON: {e}"))?;
+        // New email channels send HTML unless told otherwise (like the desktop app).
+        if n["type"] == "email" && n.get("html").is_none() {
+            n["html"] = json!(true);
+        }
+        p["notification"] = n;
     }
     if let Some(s) = &f.min_severity {
         p["min_severity"] = match s.as_str() {
@@ -236,6 +241,10 @@ mod tests {
         assert!(profile_body(json!({}), &ProfileFields { min_severity: Some("info".into()), ..Default::default() }, |_| None).is_err());
         assert!(profile_body(json!({}), &ProfileFields { secret_env: Some("MISSING".into()), ..Default::default() }, |_| None).is_err());
         assert!(profile_body(json!({}), &ProfileFields { notification: Some("{bad".into()), ..Default::default() }, |_| None).is_err());
+        let mail = profile_body(json!({}), &ProfileFields { notification: Some(r#"{"type":"email","host":"h"}"#.into()), ..Default::default() }, |_| None).unwrap();
+        assert_eq!(mail["notification"]["html"], true);
+        let plain = profile_body(json!({}), &ProfileFields { notification: Some(r#"{"type":"email","html":false}"#.into()), ..Default::default() }, |_| None).unwrap();
+        assert_eq!(plain["notification"]["html"], false);
     }
 
     #[test]
