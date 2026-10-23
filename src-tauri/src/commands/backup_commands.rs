@@ -19,6 +19,12 @@ use tauri::State;
 use ufop_core::backup::crypto::{self, PassphraseStrength};
 use ufop_core::backup::maintenance::{FoundFile, VersionComparison};
 use ufop_core::backup::{FileEntry, RestoreOptions, RestoreReport};
+use crate::backup_engine::access::{selector_of, ExportedFile, FileChunk, ResolvedVersion};
+use crate::backup_engine::drives::{DriveInfo, DriveRequest};
+use crate::commands::confirmation_commands::validate_confirmation;
+use crate::security::confirmation::ConfirmationManager;
+use ufop_core::backup::cache::{CacheSettings, CacheStats};
+use ufop_core::backup::select::VersionSelector;
 
 #[tauri::command]
 pub async fn backup_list_jobs(mgr: State<'_, BackupManager>) -> Result<Vec<BackupJob>, AppError> {
@@ -74,11 +80,33 @@ pub async fn backup_estimate(job_id: String, assumed_bytes_per_sec: Option<u64>,
 
 /// Run a maintenance/restore operation and wait for its result.
 #[tauri::command]
-pub async fn backup_execute(id: String, operation: BackupOperation, mgr: State<'_, BackupManager>) -> Result<OperationResult, AppError> {
+pub async fn backup_execute(
+    id: String,
+    operation: BackupOperation,
+    confirmation_token: Option<String>,
+    mgr: State<'_, BackupManager>,
+    confirmation_mgr: State<'_, ConfirmationManager>,
+) -> Result<OperationResult, AppError> {
     if matches!(operation, BackupOperation::Backup { .. }) {
         return Err(AppError::validation("Use backup_run to start a backup"));
     }
+    let operation = confirm_mirror(operation, confirmation_token, &confirmation_mgr).await?;
     mgr.execute(&id, operation).await
+}
+
+/// Operation name of the confirmation token a mirror restore needs.
+pub const MIRROR_RESTORE_CONFIRMATION: &str = "backup_mirror_restore";
+
+/// A mirror restore that deletes files (`confirm_delete`) needs a valid,
+/// single-use confirmation token from `request_destructive_confirmation`.
+async fn confirm_mirror(op: BackupOperation, token: Option<String>, confirmations: &ConfirmationManager) -> Result<BackupOperation, AppError> {
+    if let BackupOperation::Restore { options, overrides } = &op {
+        if overrides.confirm_delete && options.delete_extraneous && !options.dry_run {
+            let t = token.ok_or_else(|| AppError::state("A mirror restore needs confirmation", "Confirm the list of files to delete, then start the restore again."))?;
+            validate_confirmation(&t, MIRROR_RESTORE_CONFIRMATION, confirmations).await?;
+        }
+    }
+    Ok(op)
 }
 
 /// Change an encrypted job's passphrase in place (repository format 2) and
@@ -397,8 +425,85 @@ pub async fn backup_remote_delete(destination: BackupDestination, name: String, 
 }
 
 #[tauri::command]
-pub async fn backup_start_operation(id: String, operation: BackupOperation, mgr: State<'_, BackupManager>) -> Result<String, AppError> {
+pub async fn backup_start_operation(
+    id: String,
+    operation: BackupOperation,
+    confirmation_token: Option<String>,
+    mgr: State<'_, BackupManager>,
+    confirmation_mgr: State<'_, ConfirmationManager>,
+) -> Result<String, AppError> {
+    let operation = confirm_mirror(operation, confirmation_token, &confirmation_mgr).await?;
     mgr.start_operation(&id, operation).await
+}
+
+/// The version a selector picks ("as it was at …", newest, oldest, number, id).
+#[tauri::command]
+pub async fn backup_resolve_version(id: String, selector: VersionSelector, source: Option<String>, mgr: State<'_, BackupManager>) -> Result<ResolvedVersion, AppError> {
+    mgr.resolve_version(&id, selector, source).await
+}
+
+/// Bytes of one backed-up file (base64, at most 10 MiB per call).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn backup_read_file(
+    id: String,
+    path: String,
+    version: Option<usize>,
+    selector: Option<VersionSelector>,
+    offset: Option<u64>,
+    length: Option<u64>,
+    source: Option<String>,
+    mgr: State<'_, BackupManager>,
+) -> Result<FileChunk, AppError> {
+    mgr.read_file(&id, selector_of(version, selector), path, offset.unwrap_or(0), length, source).await
+}
+
+/// Copy one backed-up file to `dest`.
+#[tauri::command]
+pub async fn backup_export_file(id: String, path: String, dest: String, version: Option<usize>, selector: Option<VersionSelector>, source: Option<String>, mgr: State<'_, BackupManager>) -> Result<ExportedFile, AppError> {
+    mgr.export_file(&id, selector_of(version, selector), path, dest, source).await
+}
+
+/// Copy one backed-up file to a temporary file for the preview pane.
+#[tauri::command]
+pub async fn backup_preview_file(id: String, path: String, version: Option<usize>, selector: Option<VersionSelector>, source: Option<String>, mgr: State<'_, BackupManager>) -> Result<ExportedFile, AppError> {
+    mgr.preview_file(&id, selector_of(version, selector), path, source).await
+}
+
+#[tauri::command]
+pub async fn backup_cache_stats(mgr: State<'_, BackupManager>) -> Result<CacheStats, AppError> {
+    mgr.cache_stats().await
+}
+
+#[tauri::command]
+pub async fn backup_clear_cache(mgr: State<'_, BackupManager>) -> Result<u64, AppError> {
+    mgr.clear_cache().await
+}
+
+#[tauri::command]
+pub async fn backup_get_cache_settings(mgr: State<'_, BackupManager>) -> Result<CacheSettings, AppError> {
+    mgr.cache_settings().await
+}
+
+#[tauri::command]
+pub async fn backup_set_cache_settings(settings: CacheSettings, mgr: State<'_, BackupManager>) -> Result<CacheStats, AppError> {
+    mgr.set_cache_settings(settings).await
+}
+
+/// Serve a version (or all versions) as a read-only drive and mount it.
+#[tauri::command]
+pub async fn backup_open_drive(id: String, request: Option<DriveRequest>, mgr: State<'_, BackupManager>) -> Result<DriveInfo, AppError> {
+    mgr.open_drive(&id, request.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub async fn backup_close_drive(drive_id: String, mgr: State<'_, BackupManager>) -> Result<bool, AppError> {
+    mgr.close_drive(&drive_id).await
+}
+
+#[tauri::command]
+pub async fn backup_list_drives(mgr: State<'_, BackupManager>) -> Result<Vec<DriveInfo>, AppError> {
+    Ok(mgr.list_drives())
 }
 
 #[tauri::command]
@@ -509,4 +614,32 @@ pub async fn ediscovery_export(
     let report = ediscovery::export(&request, mgr.inner(), ledger.inner(), audit.inner(), "user").await?;
     SecurityAudit::log(repo.inner(), "ediscovery.export", "user", &report.output, &format!("matter {}: {} entries, sha256 {}", request.matter.trim(), report.entries, report.sha256)).await;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backup_engine::RestoreOverrides;
+
+    fn mirror(confirm: bool, dry_run: bool) -> BackupOperation {
+        BackupOperation::Restore {
+            options: RestoreOptions { delete_extraneous: true, dry_run, target: Some("/tmp/x".into()), ..Default::default() },
+            overrides: RestoreOverrides { confirm_delete: confirm, ..Default::default() },
+        }
+    }
+
+    #[tokio::test]
+    async fn mirror_restore_needs_a_matching_confirmation_token() {
+        let c = ConfirmationManager::new();
+        assert!(confirm_mirror(mirror(true, false), None, &c).await.is_err(), "no token");
+        let other = c.request_confirmation("reset_database".into(), String::new()).await;
+        assert!(confirm_mirror(mirror(true, false), Some(other), &c).await.is_err(), "token for another operation");
+        let t = c.request_confirmation(MIRROR_RESTORE_CONFIRMATION.into(), "12 files".into()).await;
+        assert!(confirm_mirror(mirror(true, false), Some(t.clone()), &c).await.is_ok());
+        assert!(confirm_mirror(mirror(true, false), Some(t), &c).await.is_err(), "single use");
+        // Dry runs and restores that do not ask to delete need no token
+        // (the manager itself refuses deletions without confirm_delete).
+        assert!(confirm_mirror(mirror(true, true), None, &c).await.is_ok());
+        assert!(confirm_mirror(mirror(false, false), None, &c).await.is_ok());
+    }
 }

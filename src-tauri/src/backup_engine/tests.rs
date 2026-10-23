@@ -296,7 +296,7 @@ async fn database_tools_recovery_and_restore_overrides() {
 
     // Restore with one-off overrides (job settings untouched).
     let out = t.path().join("out");
-    let ov = RestoreOverrides { download_bps: Some(10_000_000), retries: Some(0), network_timeout_secs: Some(30) };
+    let ov = RestoreOverrides { download_bps: Some(10_000_000), retries: Some(0), network_timeout_secs: Some(30), ..Default::default() };
     let r = m.execute(&j.id, BackupOperation::Restore { options: RestoreOptions { target: Some(out.clone()), ..Default::default() }, overrides: ov }).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.log);
     assert_eq!(m.get_job(&j.id).await.unwrap().throttle.download_bps, 0);
@@ -1445,4 +1445,113 @@ async fn stdin_command_output_is_backed_up_and_a_failing_command_fails_the_run()
     assert!(m.save_job(jb.clone(), None).await.is_err());
     jb.stdin_command = None;
     assert!(m.save_job(jb, None).await.is_err());
+}
+
+#[tokio::test]
+async fn restore_access_by_time_files_cache_and_mirror() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst, out) = (t.path().join("src"), t.path().join("dst"), t.path().join("out"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"one").unwrap();
+    let m = manager(t.path()).await;
+    m.set_cache_settings(ufop_core::backup::cache::CacheSettings { dir: Some(t.path().join("cache").to_string_lossy().into()), max_bytes: 1 << 30, use_for_restore: false }).await.unwrap();
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let between = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    std::fs::write(src.join("a.txt"), b"two!").unwrap();
+    std::fs::write(src.join("b.txt"), b"bee").unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+
+    // K41: which version a time picks.
+    use ufop_core::backup::select::VersionSelector;
+    let asof = VersionSelector::AsOf { time: between, allow_partial: false };
+    let r = m.resolve_version(&j.id, asof.clone(), None).await.unwrap();
+    assert_eq!(r.index, 1);
+    let restore = RestoreOptions { selector: Some(asof.clone()), target: Some(out.clone()), ..Default::default() };
+    let r = m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(r.report["version_index"], 1);
+    assert_eq!(std::fs::read(out.join("src/a.txt")).unwrap(), b"one");
+
+    // K38: read, export and preview one file; K77: the reads fill the cache.
+    let path = src.join("a.txt").to_string_lossy().into_owned();
+    let c = m.read_file(&j.id, VersionSelector::Latest { allow_partial: false }, path.clone(), 1, Some(2), None).await.unwrap();
+    use base64::Engine;
+    assert_eq!(base64::engine::general_purpose::STANDARD.decode(&c.data).unwrap(), b"wo");
+    assert_eq!((c.size, c.truncated, c.version), (4, true, 0));
+    let e = m.export_file(&j.id, asof.clone(), path.clone(), t.path().join("x/a-old.txt").to_string_lossy().into(), None).await.unwrap();
+    assert_eq!(std::fs::read(&e.local_path).unwrap(), b"one");
+    let p = m.preview_file(&j.id, VersionSelector::Index { index: 0 }, path.clone(), None).await.unwrap();
+    assert_eq!(std::fs::read(&p.local_path).unwrap(), b"two!");
+    assert!(p.local_path.ends_with("a.txt"));
+    m.cleanup_all_previews();
+    assert!(!Path::new(&p.local_path).exists());
+    assert!(m.read_file(&j.id, VersionSelector::Index { index: 0 }, "/nope".into(), 0, None, None).await.is_err());
+    let s = m.cache_stats().await.unwrap();
+    assert!(s.entries >= 1 && s.hits >= 1, "{s:?}");
+    assert!(m.clear_cache().await.unwrap() > 0);
+    assert_eq!(m.cache_stats().await.unwrap().entries, 0);
+
+    // Streaming with a range (REST GET /file).
+    let mut fs = m.stream_file(&j.id, VersionSelector::Index { index: 0 }, path.clone(), Some("bytes=1-".into()), None).await.unwrap();
+    assert_eq!(fs.range, Some((1, 3)));
+    let mut got = Vec::new();
+    while let Some(chunk) = fs.data.recv().await {
+        got.extend(chunk.unwrap());
+    }
+    assert_eq!(got, b"wo!");
+    assert!(m.stream_file(&j.id, VersionSelector::Index { index: 0 }, path.clone(), Some("bytes=9-".into()), None).await.is_err());
+
+    // K45: a mirror restore is refused without confirmation, dry run lists the deletions.
+    std::fs::write(out.join("src/junk.tmp"), b"j").unwrap();
+    let mirror = RestoreOptions { version: 1, target: Some(out.clone()), delete_extraneous: true, ..Default::default() };
+    let e = m.execute(&j.id, BackupOperation::Restore { options: mirror.clone(), overrides: RestoreOverrides::default() }).await.unwrap_err();
+    assert!(e.user_message().contains("needs confirmation"));
+    assert!(out.join("src/junk.tmp").exists());
+    let dry = RestoreOptions { dry_run: true, ..mirror.clone() };
+    let r = m.execute(&j.id, BackupOperation::Restore { options: dry, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.report["planned_deletions"].as_array().unwrap().len(), 1);
+    let r = m.execute(&j.id, BackupOperation::Restore { options: mirror, overrides: RestoreOverrides { confirm_delete: true, ..Default::default() } }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(r.report["files_deleted"], 1);
+    assert!(!out.join("src/junk.tmp").exists());
+}
+
+#[tokio::test]
+async fn backup_version_drive_serves_and_closes() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("hello.txt"), b"from the drive").unwrap();
+    let m = manager(t.path()).await;
+    m.set_cache_settings(ufop_core::backup::cache::CacheSettings { dir: Some(t.path().join("cache").to_string_lossy().into()), max_bytes: 0, use_for_restore: false }).await.unwrap();
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let d = m.open_drive(&j.id, drives::DriveRequest { mount: Some(false), ..Default::default() }).await.unwrap();
+    assert_eq!(d.version, Some(0));
+    assert!(d.url.starts_with("http://127.0.0.1:") && d.mount_point.is_none());
+    let url = d.url.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let rest = url.strip_prefix("http://").unwrap();
+        let (host, path) = rest.split_once('/').unwrap();
+        let mut s = std::net::TcpStream::connect(host).unwrap();
+        write!(s, "GET /{path}src/hello.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).unwrap();
+        raw
+    })
+    .await
+    .unwrap();
+    assert!(body.starts_with("HTTP/1.1 200") && body.ends_with("from the drive"), "{body}");
+    assert_eq!(m.list_drives().len(), 1);
+    // All versions as folders, then deleting the job closes its drives.
+    let all = m.open_drive(&j.id, drives::DriveRequest { all_versions: true, mount: Some(false), ..Default::default() }).await.unwrap();
+    assert!(all.all_versions && all.version.is_none());
+    assert!(m.close_drive(&d.id).await.unwrap());
+    assert!(!m.close_drive(&d.id).await.unwrap());
+    m.delete_job(&j.id, true, false).await.unwrap();
+    assert!(m.list_drives().is_empty());
 }

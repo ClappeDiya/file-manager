@@ -477,6 +477,7 @@ pub fn run() {
     let setup_backup_mgr = app_state.backup_mgr.clone();
     let close_mode = app_state.background_mode.clone();
     let shutdown_transfer = app_state.transfer_mgr.clone();
+    let shutdown_backup = app_state.backup_mgr.clone();
     let setup_audit = app_state.audit_trail.clone();
     let setup_agent = app_state.fleet_agent.clone();
 
@@ -758,6 +759,17 @@ pub fn run() {
             backup_commands::backup_remote_put,
             backup_commands::backup_remote_delete,
             backup_commands::backup_start_operation,
+            backup_commands::backup_resolve_version,
+            backup_commands::backup_read_file,
+            backup_commands::backup_export_file,
+            backup_commands::backup_preview_file,
+            backup_commands::backup_cache_stats,
+            backup_commands::backup_clear_cache,
+            backup_commands::backup_get_cache_settings,
+            backup_commands::backup_set_cache_settings,
+            backup_commands::backup_open_drive,
+            backup_commands::backup_close_drive,
+            backup_commands::backup_list_drives,
             backup_commands::backup_set_destination_secret,
             backup_commands::backup_has_destination_secret,
             backup_commands::backup_cloud_providers,
@@ -1189,6 +1201,9 @@ pub fn run() {
             }
             if let tauri::WindowEvent::Destroyed = event {
                 tracing::info!("Window closing, persisting state...");
+                // Backup drives and preview copies do not outlive the app.
+                shutdown_backup.close_all_drives_blocking();
+                shutdown_backup.cleanup_all_previews();
                 let repo = shutdown_repo.clone();
                 let mgr = shutdown_transfer.clone();
                 // Use spawn_blocking since we're in the event handler

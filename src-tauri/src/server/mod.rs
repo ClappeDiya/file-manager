@@ -614,14 +614,103 @@ async fn retention_preview(State(st): State<ServerState>, AxPath(id): AxPath<Str
 
 #[derive(Deserialize)]
 struct FilesQuery {
+    /// Version number (0 = newest), `latest`, `oldest` or a version id.
+    version: Option<String>,
+    /// "As of" this time (RFC 3339, or `2026-10-01 09:00` in the server's time zone).
+    time: Option<String>,
     #[serde(default)]
-    version: usize,
+    allow_partial: bool,
     prefix: Option<String>,
     source: Option<String>,
 }
 
 async fn files(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<FilesQuery>) -> ApiResult {
-    ok(st.mgr.list_files_in(&id, q.version, q.prefix, q.source).await?)
+    let sel = crate::backup_engine::access::query_selector(q.version.as_deref(), q.time.as_deref(), q.allow_partial)?;
+    let version = st.mgr.resolve_version(&id, sel, q.source.clone()).await?.index;
+    ok(st.mgr.list_files_in(&id, version, q.prefix, q.source).await?)
+}
+
+#[derive(Deserialize)]
+struct ResolveQuery {
+    version: Option<String>,
+    time: Option<String>,
+    #[serde(default)]
+    allow_partial: bool,
+    source: Option<String>,
+}
+
+/// Which version a time (or latest / oldest / number / id) picks.
+async fn resolve_version(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<ResolveQuery>) -> ApiResult {
+    let sel = crate::backup_engine::access::query_selector(q.version.as_deref(), q.time.as_deref(), q.allow_partial)?;
+    ok(st.mgr.resolve_version(&id, sel, q.source).await?)
+}
+
+#[derive(Deserialize)]
+struct FileQuery {
+    path: String,
+    version: Option<String>,
+    time: Option<String>,
+    #[serde(default)]
+    allow_partial: bool,
+    source: Option<String>,
+}
+
+/// One backed-up file's bytes, streamed, with single `Range` support.
+async fn file_content(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<FileQuery>, headers: HeaderMap) -> Result<Response, ApiError> {
+    let sel = crate::backup_engine::access::query_selector(q.version.as_deref(), q.time.as_deref(), q.allow_partial)?;
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).map(String::from);
+    let fs = match st.mgr.stream_file(&id, sel, q.path, range, q.source).await {
+        Ok(f) => f,
+        Err(e) if e.user_message().contains("Range not satisfiable") => {
+            let mut r = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            r.headers_mut().insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            return Ok(r);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let (status, count) = match fs.range {
+        Some((a, b)) => (StatusCode::PARTIAL_CONTENT, b - a + 1),
+        None => (StatusCode::OK, fs.size),
+    };
+    let stream = futures_util::stream::unfold(fs.data, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
+    let mut r = Response::new(axum::body::Body::from_stream(stream));
+    *r.status_mut() = status;
+    let h = r.headers_mut();
+    let name = std::path::Path::new(&fs.path.replace('\\', "/")).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(ufop_core::webdav::content_type(&name)));
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(count));
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(v) = HeaderValue::from_str(&fs.etag) {
+        h.insert(header::ETAG, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{}", ufop_core::webdav::encode_segment(&name))) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    if let Some(v) = fs.mtime.and_then(|m| chrono::DateTime::from_timestamp(m, 0)).and_then(|t| HeaderValue::from_str(&ufop_core::webdav::http_date(t.into())).ok()) {
+        h.insert(header::LAST_MODIFIED, v);
+    }
+    if let Some((a, b)) = fs.range {
+        if let Ok(v) = HeaderValue::from_str(&format!("bytes {a}-{b}/{}", fs.size)) {
+            h.insert(header::CONTENT_RANGE, v);
+        }
+    }
+    Ok(r)
+}
+
+async fn cache_stats(State(st): State<ServerState>) -> ApiResult {
+    ok(st.mgr.cache_stats().await?)
+}
+
+async fn clear_cache(State(st): State<ServerState>) -> ApiResult {
+    ok(json!({ "bytes_freed": st.mgr.clear_cache().await? }))
+}
+
+async fn get_cache_settings(State(st): State<ServerState>) -> ApiResult {
+    ok(st.mgr.cache_settings().await?)
+}
+
+async fn put_cache_settings(State(st): State<ServerState>, Json(s): Json<ufop_core::backup::cache::CacheSettings>) -> ApiResult {
+    ok(st.mgr.set_cache_settings(s).await?)
 }
 
 #[derive(Deserialize)]
@@ -845,6 +934,10 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/jobs/{id}/sources", get(sources))
         .route("/api/v1/jobs/{id}/retention/preview", post(retention_preview))
         .route("/api/v1/jobs/{id}/files", get(files))
+        .route("/api/v1/jobs/{id}/file", get(file_content))
+        .route("/api/v1/jobs/{id}/versions/resolve", get(resolve_version))
+        .route("/api/v1/backup-cache", get(cache_stats).delete(clear_cache))
+        .route("/api/v1/backup-cache/settings", get(get_cache_settings).put(put_cache_settings))
         .route("/api/v1/jobs/{id}/search", get(search))
         .route("/api/v1/jobs/{id}/compare", get(compare))
         .route("/api/v1/jobs/{id}/export", get(export_job))

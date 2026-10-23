@@ -9,11 +9,13 @@
 //! callbacks, run history (`backup_runs`) and the operation ledger.
 
 pub mod legal_hold;
+pub mod access;
 pub mod api;
 pub mod bugreport;
 pub mod connector_backend;
 pub mod defaults;
 pub mod diagnostics;
+pub mod drives;
 pub mod hooks;
 pub mod logs;
 pub mod notify;
@@ -421,6 +423,10 @@ pub struct RestoreOverrides {
     pub download_bps: Option<u64>,
     pub retries: Option<u32>,
     pub network_timeout_secs: Option<u64>,
+    /// Mirror restores (`delete_extraneous`) delete files and run only with
+    /// this set. The app sets it after the user confirmed the dry-run list
+    /// (with a confirmation token); API callers set it explicitly.
+    pub confirm_delete: bool,
 }
 
 impl RestoreOverrides {
@@ -734,6 +740,10 @@ struct Inner {
     /// Console-delivered (`central:`) secrets when no secure store exists:
     /// kept in memory only and re-delivered by the agent after a restart.
     volatile_secrets: Mutex<HashMap<String, String>>,
+    /// Local cache of downloaded volumes (built from its settings on first use).
+    volume_cache: Mutex<Option<Arc<ufop_core::backup::cache::VolumeCache>>>,
+    /// Open "backup as drive" servers.
+    drives: Mutex<Vec<drives::Drive>>,
 }
 
 /// Desktop notification sink: (title, body, status).
@@ -817,6 +827,8 @@ impl BackupManager {
                 run_listener: std::sync::OnceLock::new(),
                 volatile_secrets: Mutex::new(HashMap::new()),
                 secret_cache: secrets::SecretCache::default(),
+                volume_cache: Mutex::new(None),
+                drives: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -1381,6 +1393,7 @@ impl BackupManager {
         }
         let job = self.get_job(id).await?;
         legal_hold::guard_delete(&job)?;
+        self.close_drives_of(id).await;
         if delete_remote {
             if job.read_only {
                 return Err(Self::read_only_refusal(&job, "delete the backup files at the destination"));
@@ -2015,7 +2028,7 @@ impl BackupManager {
     async fn run_operation(
         &self,
         job: BackupJob,
-        op: BackupOperation,
+        mut op: BackupOperation,
         cancel: Arc<AtomicBool>,
         progress: Arc<Mutex<Option<Progress>>>,
     ) -> Result<OperationResult, AppError> {
@@ -2026,8 +2039,18 @@ impl BackupManager {
         if let Err(e) = self.global_defaults().await.and_then(|d| d.apply(&mut job)) {
             log.push(LogLine::warn(format!("Global defaults not applied: {}", e.user_message())));
         }
-        if let BackupOperation::Restore { overrides, .. } = &op {
+        if let BackupOperation::Restore { overrides, options } = &mut op {
             overrides.apply(&mut job);
+            if options.delete_extraneous && !options.dry_run && !overrides.confirm_delete {
+                let err = AppError::state(
+                    "A mirror restore deletes files and needs confirmation",
+                    "Run it as a dry run first to see what would be deleted, then confirm (confirm_delete: true in the API).",
+                );
+                return self.record(&job, op_name, started, Err(err), log).await;
+            }
+            if !options.use_cache && self.cache_settings().await.is_ok_and(|c| c.use_for_restore) {
+                options.use_cache = true;
+            }
         }
         match self.resolve_job_secrets(&job).await {
             Ok(j) => job = j,
@@ -2089,9 +2112,13 @@ impl BackupManager {
                 Vec::new()
             };
             let ctx2 = ctx.clone();
+            let cache = self.volume_cache().await.unwrap_or_else(|e| {
+                tracing::warn!("Volume cache unavailable: {}", e.user_message());
+                None
+            });
             let mut v = blocking(move || {
                 let dbo = maintenance::JobDbOptions { key: db_key.as_ref(), encrypt: db_encrypt };
-                run_core(&job2, op, backend.as_ref(), &db_path, &dbo, pass.as_deref(), kdf, &ctx)
+                run_core(&job2, op, backend.as_ref(), &db_path, &dbo, pass.as_deref(), kdf, cache, &ctx)
             })
             .await?;
             let clean = v.get("errors").and_then(|e| e.as_array()).is_none_or(|a| a.is_empty()) && v.get("dry_run") != Some(&serde_json::Value::Bool(true));
@@ -2756,6 +2783,7 @@ impl BackupManager {
 
     /// One scheduler pass: start every due job.
     pub async fn tick(&self) -> usize {
+        self.close_idle_drives().await;
         let now = Utc::now();
         let due = self.due_jobs(now).await;
         for id in &due {
@@ -2901,6 +2929,7 @@ fn run_core(
     dbo: &maintenance::JobDbOptions,
     pass: Option<&str>,
     kdf: KdfParams,
+    cache: Option<Arc<ufop_core::backup::cache::VolumeCache>>,
     ctx: &OpContext,
 ) -> Result<serde_json::Value, AppError> {
     legal_hold::guard(job, &op)?;
@@ -2910,7 +2939,7 @@ fn run_core(
     let name = op.name();
     let work = || -> Result<serde_json::Value, AppError> {
         let (db, notices) = maintenance::open_job_db(db_path, dbo, Some(backend), pass, prefix, ctx)?;
-        let mut v = dispatch(job, op, backend, &db, pass, kdf, ctx)?;
+        let mut v = dispatch(job, op, backend, &db, pass, kdf, cache.clone(), ctx)?;
         add_warnings(&mut v, notices);
         Ok(v)
     };
@@ -2924,6 +2953,7 @@ fn run_core(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     job: &BackupJob,
     op: BackupOperation,
@@ -2931,9 +2961,10 @@ fn dispatch(
     db: &BackupDb,
     pass: Option<&str>,
     kdf: KdfParams,
+    cache: Option<Arc<ufop_core::backup::cache::VolumeCache>>,
     ctx: &OpContext,
 ) -> Result<serde_json::Value, AppError> {
-    let open = |create: bool| Repo::open(backend, db, pass, &job.options, create, kdf);
+    let open = |create: bool| Repo::open(backend, db, pass, &job.options, create, kdf).map(|r| r.with_cache(cache.clone()));
     let v = match op {
         BackupOperation::Backup { dry_run } => {
             let filter = job.filter.clone().compile()?;

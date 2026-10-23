@@ -158,6 +158,36 @@ async fn backup_and_restore_over_rest_and_rpc() {
     assert_eq!(runs.as_array().unwrap().len(), 3);
     let fs = s.get(&format!("/api/v1/filesystem?path={}", s.dir.display()), &tok).await.json::<Value>().await.unwrap();
     assert!(fs["entries"].as_array().unwrap().iter().any(|e| e["name"] == "src"));
+    // Restore by time, one file's bytes (with ranges) and the volume cache.
+    let cache = s.client.put(format!("{}/api/v1/backup-cache/settings", s.base)).bearer_auth(&tok).json(&json!({"dir": s.dir.join("cache"), "max_bytes": 1u64 << 30})).send().await.unwrap();
+    assert_eq!(cache.status(), 200, "{}", cache.text().await.unwrap());
+    let r = s.get(&format!("/api/v1/jobs/{id}/versions/resolve?time=2099-01-01T00:00:00Z"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(r["index"], 0, "{r}");
+    assert_eq!(s.get(&format!("/api/v1/jobs/{id}/versions/resolve?time=2001-01-01T00:00:00Z"), &tok).await.status(), 400, "before every version");
+    let files = s.get(&format!("/api/v1/jobs/{id}/files?version=latest"), &tok).await.json::<Value>().await.unwrap();
+    assert!(files.as_array().unwrap().len() >= 2);
+    let fpath = src.join("a.txt").to_string_lossy().replace('/', "%2F");
+    let full = s.get(&format!("/api/v1/jobs/{id}/file?path={fpath}&version=latest"), &tok).await;
+    assert_eq!(full.status(), 200);
+    assert_eq!(full.headers()["accept-ranges"], "bytes");
+    assert_eq!(full.bytes().await.unwrap().as_ref(), b"server backup");
+    let part = s.client.get(format!("{}/api/v1/jobs/{id}/file?path={fpath}&time=2099-01-01%2000:00", s.base)).bearer_auth(&tok).header("Range", "bytes=7-").send().await.unwrap();
+    assert_eq!(part.status(), 206);
+    assert_eq!(part.headers()["content-range"], "bytes 7-12/13");
+    assert_eq!(part.bytes().await.unwrap().as_ref(), b"backup");
+    let bad = s.client.get(format!("{}/api/v1/jobs/{id}/file?path={fpath}", s.base)).bearer_auth(&tok).header("Range", "bytes=99-").send().await.unwrap();
+    assert_eq!(bad.status(), 416);
+    let stats = s.get("/api/v1/backup-cache", &tok).await.json::<Value>().await.unwrap();
+    assert!(stats["entries"].as_u64().unwrap() >= 1, "{stats}");
+    let cleared = s.client.delete(format!("{}/api/v1/backup-cache", s.base)).bearer_auth(&tok).send().await.unwrap().json::<Value>().await.unwrap();
+    assert!(cleared["bytes_freed"].as_u64().unwrap() > 0);
+    let rpc = s.post("/api/v1/rpc/backup_read_file", &tok, json!({"id": id, "path": src.join("a.txt"), "offset": 0, "length": 6})).await.json::<Value>().await.unwrap();
+    assert_eq!(rpc["data"], "c2VydmVy", "{rpc}");
+    // A mirror restore over the API needs confirm_delete.
+    let mirror = s.post(&format!("/api/v1/jobs/{id}/operations"), &tok, json!({"type":"restore","options":{"target": out, "delete_extraneous": true}})).await;
+    assert_eq!(mirror.status(), 409);
+    let mirror = s.post(&format!("/api/v1/jobs/{id}/operations"), &tok, json!({"type":"restore","options":{"target": out, "delete_extraneous": true},"overrides":{"confirm_delete": true}})).await.json::<Value>().await.unwrap();
+    assert_eq!(mirror["status"], "success", "{mirror}");
     // Estimate and run-all.
     std::fs::write(src.join("b.txt"), b"new since the backup").unwrap();
     let est = s.get(&format!("/api/v1/jobs/{id}/estimate?assumed_bytes_per_sec=1000"), &tok).await.json::<Value>().await.unwrap();

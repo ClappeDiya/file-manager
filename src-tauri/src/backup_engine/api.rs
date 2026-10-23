@@ -247,6 +247,17 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
                 opt(a, "readOnly")?.unwrap_or(false),
             )
             .await?),
+        "backup_resolve_version" => ok(mgr.resolve_version(&arg::<String>(a, "id")?, arg(a, "selector")?, opt(a, "source")?).await?),
+        "backup_read_file" => ok(mgr
+            .read_file(&arg::<String>(a, "id")?, super::access::selector_of(opt(a, "version")?, opt(a, "selector")?), arg(a, "path")?, opt(a, "offset")?.unwrap_or(0), opt(a, "length")?, opt(a, "source")?)
+            .await?),
+        "backup_export_file" => ok(mgr
+            .export_file(&arg::<String>(a, "id")?, super::access::selector_of(opt(a, "version")?, opt(a, "selector")?), arg(a, "path")?, arg(a, "dest")?, opt(a, "source")?)
+            .await?),
+        "backup_cache_stats" => ok(mgr.cache_stats().await?),
+        "backup_clear_cache" => ok(mgr.clear_cache().await?),
+        "backup_get_cache_settings" => ok(mgr.cache_settings().await?),
+        "backup_set_cache_settings" => ok(mgr.set_cache_settings(arg(a, "settings")?).await?),
         other => Err(AppError::validation(format!("Unknown command '{other}'"))),
     }
 }
@@ -263,4 +274,6 @@ pub const COMMANDS: &[&str] = &[
     "backup_delete_destination", "backup_adopt_repository", "backup_database_inventory", "backup_cleanup_databases", "backup_bug_report", "backup_diagnose", "backup_test_notification", "backup_get_secret_settings", "backup_set_secret_settings", "backup_crypt_file", "backup_decrypt_volume", "backup_test_secret_providers", "backup_job_placeholders", "backup_recovery_download", "backup_recovery_index", "backup_recovery_list", "backup_recovery_restore", "backup_recovery_convert", "backup_remote_list", "backup_remote_get", "backup_remote_put", "backup_remote_delete", "backup_start_operation", "backup_set_destination_secret", "backup_has_destination_secret", "backup_cloud_providers",
     "backup_photos_libraries", "backup_photos_library_info", "backup_lock_status", "backup_break_lock", "backup_set_database_encryption",
     "backup_list_sources", "backup_preview_retention", "backup_set_version_metadata", "backup_run_all", "backup_estimate",
+    "backup_resolve_version", "backup_read_file", "backup_export_file", "backup_cache_stats", "backup_clear_cache",
+    "backup_get_cache_settings", "backup_set_cache_settings",
 ];

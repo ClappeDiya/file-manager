@@ -145,6 +145,26 @@ export class UfopClient {
     return this.call("POST", `/api/v1/auth/signin-token`, undefined, undefined);
   }
 
+  /** Local volume cache: folder, size limit, entries, bytes, hits, misses, hit rate (API tokens: `read` scope). `GET /api/v1/backup-cache` */
+  getBackupCache(): Promise<{ bytes?: number; corrupt?: number; dir?: string; entries?: number; evictions?: number; hit_rate?: number; hits?: number; max_bytes?: number; misses?: number }> {
+    return this.call("GET", `/api/v1/backup-cache`, undefined, undefined);
+  }
+
+  /** Delete every cached volume (API tokens: `write` scope). `DELETE /api/v1/backup-cache` */
+  deleteBackupCache(): Promise<{ bytes_freed?: number }> {
+    return this.call("DELETE", `/api/v1/backup-cache`, undefined, undefined);
+  }
+
+  /** Volume cache settings (API tokens: `read` scope). `GET /api/v1/backup-cache/settings` */
+  getBackupCacheSettings(): Promise<{ dir?: string | null; max_bytes?: number; use_for_restore?: boolean }> {
+    return this.call("GET", `/api/v1/backup-cache/settings`, undefined, undefined);
+  }
+
+  /** Change the volume cache folder, size limit (0 = off) and use for full restores (API tokens: `write` scope). `PUT /api/v1/backup-cache/settings` */
+  putBackupCacheSettings(body: { dir?: string | null; max_bytes?: number; use_for_restore?: boolean } = {}): Promise<{ bytes?: number; corrupt?: number; dir?: string; entries?: number; evictions?: number; hit_rate?: number; hits?: number; max_bytes?: number; misses?: number }> {
+    return this.call("PUT", `/api/v1/backup-cache/settings`, undefined, body);
+  }
+
   /** Test a destination (optionally create its folder); returns the files found (API tokens: `write` scope). `POST /api/v1/destinations/test` */
   postDestinationsTest(body: { create?: boolean; destination: Record<string, unknown> }): Promise<{ files?: string[] }> {
     return this.call("POST", `/api/v1/destinations/test`, undefined, body);
@@ -271,7 +291,7 @@ export class UfopClient {
   }
 
   /** Files in a version (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files` */
-  getJobsIdFiles(id: string, query: { version?: number; prefix?: string; source?: string } = {}): Promise<Record<string, unknown>> {
+  getJobsIdFiles(id: string, query: { version?: string; time?: string; allow_partial?: boolean; prefix?: string; source?: string } = {}): Promise<Record<string, unknown>> {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/files`, query, undefined);
   }
 
@@ -318,6 +338,11 @@ export class UfopClient {
   /** Backup versions of a job (with note, tags, pin, identity and storage added) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/versions` */
   getJobsIdVersions(id: string, query: { source?: string; tags?: string } = {}): Promise<Fileset[]> {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/versions`, query, undefined);
+  }
+
+  /** Which version a time (or latest / oldest / number / id) picks (API tokens: `read` scope). `GET /api/v1/jobs/{id}/versions/resolve` */
+  getJobsIdVersionsResolve(id: string, query: { version?: string; time?: string; allow_partial?: boolean; source?: string } = {}): Promise<{ fileset?: Fileset; index?: number }> {
+    return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/versions/resolve`, query, undefined);
   }
 
   /** Change a version's note, tags or pin (rewrites its file list) (API tokens: `write` scope). `PATCH /api/v1/jobs/{id}/versions/{version}` */

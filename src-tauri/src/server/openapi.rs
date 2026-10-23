@@ -28,8 +28,17 @@ pub(crate) struct Op {
 
 const ID: Param = ("id", "path", "string", true, "Job id");
 const VERSION_Q: Param = ("version", "query", "integer", false, "Version index (0 = newest)");
+const VERSION_SEL_Q: Param = ("version", "query", "string", false, "Version: number (0 = newest), latest, oldest or a version id (timestamp or file-list name)");
+const TIME_Q: Param = ("time", "query", "string", false, "As of this time: the newest complete version made at or before it (RFC 3339, or 2026-10-01 09:00 in the server's time zone); wins over version");
+const PARTIAL_Q: Param = ("allow_partial", "query", "boolean", false, "latest / oldest / time may pick partial versions");
 const SOURCE_Q: Param = ("source", "query", "string", false, "Shared repositories: another source id, or * for every source (default: the job's own)");
 
+fn cache_stats() -> Value {
+    json!({ "type": "object", "properties": { "dir": { "type": "string" }, "max_bytes": { "type": "integer" }, "entries": { "type": "integer" }, "bytes": { "type": "integer" }, "hits": { "type": "integer" }, "misses": { "type": "integer" }, "corrupt": { "type": "integer" }, "evictions": { "type": "integer" }, "hit_rate": { "type": "number" } } })
+}
+fn cache_settings() -> Value {
+    json!({ "type": "object", "properties": { "dir": { "type": ["string", "null"], "description": "Cache folder (default: the app's cache folder)" }, "max_bytes": { "type": "integer", "default": 2147483648_u64, "description": "0 = cache off" }, "use_for_restore": { "type": "boolean", "default": false } } })
+}
 fn any() -> Value {
     json!({ "type": "object", "additionalProperties": true })
 }
@@ -102,7 +111,13 @@ pub(crate) const OPS: &[Op] = &[
     op!("patch" "/api/v1/jobs/{id}/versions/{version}", "browse", "Change a version's note, tags or pin (rewrites its file list)", auth: true, params: &[ID, ("version", "path", "integer", true, "Version index (0 = newest)")], body: Some(|| json!({ "type": "object", "properties": { "source": { "type": ["string", "null"] }, "note": { "type": ["string", "null"], "description": "Empty string removes the note" }, "tags": { "type": ["object", "null"], "additionalProperties": { "type": "string" }, "description": "Replaces all tags" }, "pinned": { "type": ["boolean", "null"] }, "pin_reason": { "type": ["string", "null"] } } })), response: any),
     op!("get" "/api/v1/jobs/{id}/sources", "browse", "Sources (jobs and computers) with versions in the job's repository", auth: true, params: &[ID], body: None, response: || json!({ "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "label": { "type": "string" }, "identity": { "type": ["object", "null"] }, "versions": { "type": "integer" }, "newest": { "type": ["string", "null"] }, "oldest": { "type": ["string", "null"] }, "newest_size": { "type": "integer" }, "own": { "type": "boolean" } } } })),
     op!("post" "/api/v1/jobs/{id}/retention/preview", "browse", "What retention would keep and delete (the job's policy or an unsaved one); changes nothing", auth: true, params: &[ID], body: Some(|| json!({ "type": "object", "properties": { "policy": { "$ref": "#/components/schemas/RetentionPolicy" }, "source": { "type": ["string", "null"] } } })), response: || json!({ "type": "object", "properties": { "policy": { "$ref": "#/components/schemas/RetentionPolicy" }, "legal_hold": { "type": "boolean" }, "keep": { "type": "integer" }, "delete": { "type": "integer" }, "versions": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "integer" }, "timestamp": { "type": "string" }, "keep": { "type": "boolean" }, "reasons": { "type": "array", "items": { "type": "string" } }, "summary": { "type": "string" } } } } } })),
-    op!("get" "/api/v1/jobs/{id}/files", "browse", "Files in a version", auth: true, params: &[ID, VERSION_Q, ("prefix", "query", "string", false, "Folder to list"), SOURCE_Q], body: None, response: any),
+    op!("get" "/api/v1/jobs/{id}/files", "browse", "Files in a version", auth: true, params: &[ID, VERSION_SEL_Q, TIME_Q, PARTIAL_Q, ("prefix", "query", "string", false, "Folder to list"), SOURCE_Q], body: None, response: any),
+    op!("get" "/api/v1/jobs/{id}/versions/resolve", "browse", "Which version a time (or latest / oldest / number / id) picks", auth: true, params: &[ID, VERSION_SEL_Q, TIME_Q, PARTIAL_Q, SOURCE_Q], body: None, response: || json!({ "type": "object", "properties": { "index": { "type": "integer" }, "fileset": { "$ref": "#/components/schemas/Fileset" } } })),
+    Op { method: "get", path: "/api/v1/jobs/{id}/file", tag: "browse", summary: "One backed-up file's content, streamed (single Range requests answer 206)", auth: true, params: &[ID, ("path", "query", "string", true, "Backed-up path of the file"), VERSION_SEL_Q, TIME_Q, PARTIAL_Q, SOURCE_Q], body: None, response: || json!({ "type": "string", "format": "binary" }), content_type: "application/octet-stream" },
+    op!("get" "/api/v1/backup-cache", "general", "Local volume cache: folder, size limit, entries, bytes, hits, misses, hit rate", auth: true, params: &[], body: None, response: cache_stats),
+    op!("delete" "/api/v1/backup-cache", "general", "Delete every cached volume", auth: true, params: &[], body: None, response: || json!({ "type": "object", "properties": { "bytes_freed": { "type": "integer" } } })),
+    op!("get" "/api/v1/backup-cache/settings", "general", "Volume cache settings", auth: true, params: &[], body: None, response: cache_settings),
+    op!("put" "/api/v1/backup-cache/settings", "general", "Change the volume cache folder, size limit (0 = off) and use for full restores", auth: true, params: &[], body: Some(cache_settings), response: cache_stats),
     op!("get" "/api/v1/jobs/{id}/search", "browse", "Search file names across versions", auth: true, params: &[ID, ("q", "query", "string", true, "Search text"), VERSION_Q, SOURCE_Q], body: None, response: any),
     op!("get" "/api/v1/jobs/{id}/compare", "browse", "Differences between two versions", auth: true, params: &[ID, ("base", "query", "integer", true, "Older version index"), ("compare", "query", "integer", true, "Newer version index"), SOURCE_Q], body: None, response: any),
     op!("get" "/api/v1/jobs/{id}/export", "jobs", "Export the job configuration", auth: true, params: &[ID, ("include_passphrase", "query", "boolean", false, "Include the job's passphrase"), ("export_passphrase", "query", "string", false, "Encrypt the export with this passphrase")], body: None, response: any),

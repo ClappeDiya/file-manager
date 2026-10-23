@@ -15,6 +15,7 @@
 
 pub mod policy;
 pub mod rclone_mount;
+pub mod webdav_mount;
 
 pub use policy::{CacheMode, MountOptions};
 

@@ -15,7 +15,7 @@
 //! - Paths are confined to the roots after resolving symlinks
 //!   (`ufop_core::confine`); dot-files are neither listed nor served.
 
-use super::{api_tokens, oauth::html_escape, ServerState};
+use super::{api_tokens, ServerState};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
@@ -32,7 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use ufop_core::confine::Roots;
 
 pub const PREFIX: &str = "/dav";
-const ALLOW: &str = "OPTIONS, GET, HEAD, PROPFIND";
+use ufop_core::webdav::{self as davkit, ALLOW};
 const MAX_LISTING: usize = 10_000;
 /// Characters escaped in hrefs (path segments).
 const SEGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'%').add(b'<').add(b'>').add(b'?').add(b'`').add(b'{').add(b'}').add(b'/').add(b'\\').add(b'&').add(b'\'');
@@ -116,7 +116,7 @@ fn href(root: &str, segs: &[String], dir: bool) -> String {
 }
 
 fn http_date(t: SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(t).format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+    davkit::http_date(t)
 }
 
 fn etag(m: &std::fs::Metadata) -> String {
@@ -124,47 +124,15 @@ fn etag(m: &std::fs::Metadata) -> String {
     format!("\"{:x}-{:x}\"", m.len(), mtime)
 }
 
-fn content_type(name: &str) -> &'static str {
-    match name.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref() {
-        Some("txt" | "log" | "md" | "csv") => "text/plain; charset=utf-8",
-        Some("pdf") => "application/pdf",
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("json") => "application/json",
-        Some("zip") => "application/zip",
-        Some("xml") => "application/xml",
-        // Never let a browser render served HTML, SVG or scripts.
-        _ => "application/octet-stream",
-    }
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-}
+use davkit::content_type;
 
 fn prop_response(href: &str, name: &str, m: &std::fs::Metadata) -> String {
-    let modified = m.modified().map(http_date).unwrap_or_default();
-    let created = m.created().ok().map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-    let mut p = format!("<D:displayname>{}</D:displayname><D:getlastmodified>{modified}</D:getlastmodified>", xml_escape(name));
-    if let Some(c) = created {
-        p.push_str(&format!("<D:creationdate>{c}</D:creationdate>"));
-    }
-    if m.is_dir() {
-        p.push_str("<D:resourcetype><D:collection/></D:resourcetype>");
-    } else {
-        p.push_str(&format!(
-            "<D:resourcetype/><D:getcontentlength>{}</D:getcontentlength><D:getcontenttype>{}</D:getcontenttype><D:getetag>{}</D:getetag>",
-            m.len(),
-            content_type(name),
-            xml_escape(&etag(m))
-        ));
-    }
-    format!("<D:response><D:href>{}</D:href><D:propstat><D:prop>{p}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>", xml_escape(href))
+    let tag = etag(m);
+    davkit::prop_response(&davkit::DavProps { href, name, is_dir: m.is_dir(), len: m.len(), modified: m.modified().ok(), created: m.created().ok(), etag: Some(&tag) })
 }
 
 fn multistatus(body: String) -> Response {
-    let xml = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">{body}</D:multistatus>");
+    let xml = davkit::multistatus_xml(&body);
     (StatusCode::MULTI_STATUS, [(header::CONTENT_TYPE, "application/xml; charset=utf-8")], xml).into_response()
 }
 
@@ -194,17 +162,7 @@ fn children(roots: &Roots, dir: &Path) -> Vec<(String, std::fs::Metadata)> {
 
 /// Parse a single `bytes=a-b` range against `len`; `Err` = unsatisfiable.
 fn byte_range(h: &HeaderMap, len: u64) -> Option<Result<(u64, u64), ()>> {
-    let v = h.get(header::RANGE)?.to_str().ok()?.strip_prefix("bytes=")?;
-    if v.contains(',') {
-        return None; // multiple ranges: send the whole file
-    }
-    let (a, b) = v.split_once('-')?;
-    let r = match (a.trim(), b.trim()) {
-        ("", n) => n.parse::<u64>().ok().filter(|n| *n > 0).map(|n| (len.saturating_sub(n), len.saturating_sub(1))),
-        (s, "") => s.parse::<u64>().ok().map(|s| (s, len.saturating_sub(1))),
-        (s, e) => s.parse::<u64>().ok().zip(e.parse::<u64>().ok()).map(|(s, e)| (s, e.min(len.saturating_sub(1)))),
-    }?;
-    Some(if len == 0 || r.0 > r.1 || r.0 >= len { Err(()) } else { Ok(r) })
+    davkit::parse_range(h.get(header::RANGE).and_then(|v| v.to_str().ok()), len)
 }
 
 async fn send_file(path: &Path, m: &std::fs::Metadata, name: &str, headers: &HeaderMap, head: bool) -> Response {
@@ -260,11 +218,7 @@ async fn send_file(path: &Path, m: &std::fs::Metadata, name: &str, headers: &Hea
 }
 
 fn index_page(title: &str, entries: &[(String, String, bool)]) -> Response {
-    let mut rows = String::new();
-    for (name, href, dir) in entries {
-        rows.push_str(&format!("<li><a href=\"{}\">{}{}</a></li>", html_escape(href), html_escape(name), if *dir { "/" } else { "" }));
-    }
-    let html = format!("<!doctype html><meta charset=utf-8><title>{t}</title><h1>{t}</h1><ul>{rows}</ul>", t = html_escape(title));
+    let html = davkit::index_html(title, entries);
     let mut r = (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response();
     r.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"));
     r
@@ -306,8 +260,7 @@ async fn handle(State(st): State<ServerState>, ConnectInfo(peer): ConnectInfo<So
     };
     let depth = headers.get("Depth").and_then(|v| v.to_str().ok()).unwrap_or("infinity").trim().to_ascii_lowercase();
     if propfind && depth != "0" && depth != "1" {
-        let body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:error xmlns:D=\"DAV:\"><D:propfind-finite-depth/></D:error>";
-        return (StatusCode::FORBIDDEN, [(header::CONTENT_TYPE, "application/xml; charset=utf-8")], body).into_response();
+        return (StatusCode::FORBIDDEN, [(header::CONTENT_TYPE, "application/xml; charset=utf-8")], davkit::FINITE_DEPTH_XML).into_response();
     }
 
     // `/dav/`: the roots.

@@ -121,6 +121,22 @@ class UfopClient:
         """Issue a one-time sign-in token (link for another browser) (API tokens: `admin` scope). `POST /api/v1/auth/signin-token`"""
         return self._call("POST", f"/api/v1/auth/signin-token", None, None)
 
+    def get_backup_cache(self) -> Dict[str, Any]:
+        """Local volume cache: folder, size limit, entries, bytes, hits, misses, hit rate (API tokens: `read` scope). `GET /api/v1/backup-cache`"""
+        return self._call("GET", f"/api/v1/backup-cache", None, None)
+
+    def delete_backup_cache(self) -> Dict[str, Any]:
+        """Delete every cached volume (API tokens: `write` scope). `DELETE /api/v1/backup-cache`"""
+        return self._call("DELETE", f"/api/v1/backup-cache", None, None)
+
+    def get_backup_cache_settings(self) -> Dict[str, Any]:
+        """Volume cache settings (API tokens: `read` scope). `GET /api/v1/backup-cache/settings`"""
+        return self._call("GET", f"/api/v1/backup-cache/settings", None, None)
+
+    def put_backup_cache_settings(self, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Change the volume cache folder, size limit (0 = off) and use for full restores (API tokens: `write` scope). `PUT /api/v1/backup-cache/settings`"""
+        return self._call("PUT", f"/api/v1/backup-cache/settings", None, body if body is not None else {})
+
     def post_destinations_test(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """Test a destination (optionally create its folder); returns the files found (API tokens: `write` scope). `POST /api/v1/destinations/test`"""
         return self._call("POST", f"/api/v1/destinations/test", None, body)
@@ -221,9 +237,9 @@ class UfopClient:
         """Export the job configuration (API tokens: `read` scope). `GET /api/v1/jobs/{id}/export`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/export", {"include_passphrase": include_passphrase, "export_passphrase": export_passphrase}, None)
 
-    def get_jobs_id_files(self, id_: str, version: Optional[int] = None, prefix: Optional[str] = None, source: Optional[str] = None) -> Dict[str, Any]:
+    def get_jobs_id_files(self, id_: str, version: Optional[str] = None, time: Optional[str] = None, allow_partial: Optional[bool] = None, prefix: Optional[str] = None, source: Optional[str] = None) -> Dict[str, Any]:
         """Files in a version (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files`"""
-        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/files", {"version": version, "prefix": prefix, "source": source}, None)
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/files", {"version": version, "time": time, "allow_partial": allow_partial, "prefix": prefix, "source": source}, None)
 
     def get_jobs_id_lock(self, id_: str) -> Dict[str, Any]:
         """Repository lock status: who holds the destination (host, operation, since, expires) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/lock`"""
@@ -260,6 +276,10 @@ class UfopClient:
     def get_jobs_id_versions(self, id_: str, source: Optional[str] = None, tags: Optional[str] = None) -> List["Fileset"]:
         """Backup versions of a job (with note, tags, pin, identity and storage added) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/versions`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/versions", {"source": source, "tags": tags}, None)
+
+    def get_jobs_id_versions_resolve(self, id_: str, version: Optional[str] = None, time: Optional[str] = None, allow_partial: Optional[bool] = None, source: Optional[str] = None) -> Dict[str, Any]:
+        """Which version a time (or latest / oldest / number / id) picks (API tokens: `read` scope). `GET /api/v1/jobs/{id}/versions/resolve`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/versions/resolve", {"version": version, "time": time, "allow_partial": allow_partial, "source": source}, None)
 
     def patch_jobs_id_versions_version(self, id_: str, version: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Change a version's note, tags or pin (rewrites its file list) (API tokens: `write` scope). `PATCH /api/v1/jobs/{id}/versions/{version}`"""
