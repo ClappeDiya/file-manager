@@ -3,6 +3,9 @@
  * automatic checks and a blackout window, the proxy, AI, transfer caps and
  * the mount profile (what drives may be mounted, and how). Delivered with
  * the policy bundle (`managedSettings`); `null` sections stay with the user.
+ * Organization backup policy templates travel the same way (`backupTemplates`),
+ * and so do accounts and per-job access rules for ufop-server nodes
+ * (`serverAccess`; passwords only as Argon2 hashes).
  * The shape mirrors `ufop_core::agent::ManagedSettings` and is validated the
  * same way, so a desktop never receives settings it would reject.
  */
@@ -28,6 +31,219 @@ export interface ManagedSettingsBody {
   mounts: ManagedMounts | null;
   /** Automation rules the organization owns on its desktops (read-only there). */
   workflows: ManagedWorkflow[] | null;
+  /** Backup policy templates offered (or, `enforced`, imposed) on every desktop. */
+  backupTemplates: ManagedBackupTemplate[] | null;
+  /** Notification profiles offered read-only on every desktop (secrets as `central:<id>` credentials). */
+  notificationProfiles: ManagedNotificationProfile[] | null;
+  /** Accounts and per-job access rules for ufop-server nodes (read-only there). */
+  serverAccess: ManagedServerAccess | null;
+  /** Web UI branding of ufop-server nodes (title prefix, product name, logo, accent, CSS). */
+  serverBranding: ManagedServerBranding | null;
+}
+
+/** Same limits and checks as Rust `ufop_core::agent::managed::ManagedServerBranding`. */
+export interface ManagedServerBranding {
+  titlePrefix: string;
+  productName: string;
+  /** `data:image/png;base64,…` (PNG, JPEG, SVG, WebP, GIF; ≤ 512 KiB). */
+  logo: string;
+  /** `#rgb` or `#rrggbb`. */
+  accentColor: string;
+  customCss: string;
+}
+
+export const MAX_BRAND_TEXT = 64;
+export const MAX_BRAND_LOGO = 512 * 1024;
+export const MAX_BRAND_CSS = 32 * 1024;
+const BRAND_LOGO_TYPES = ['image/png', 'image/jpeg', 'image/svg+xml', 'image/webp', 'image/gif'];
+
+/** Problem with custom CSS served on the server's origin, or null. */
+export function customCssProblem(css: string): string | null {
+  if (css.length > MAX_BRAND_CSS) return `Custom CSS is larger than ${MAX_BRAND_CSS / 1024} KiB`;
+  const lower = css.toLowerCase().replace(/\s+/g, '');
+  for (const bad of ['<', '@import', 'expression(', 'javascript:', 'vbscript:', 'behavior:', '-moz-binding', '@charset', '\\']) {
+    if (lower.includes(bad)) return `Custom CSS may not contain '${bad}'`;
+  }
+  let i = lower.indexOf('url(');
+  while (i >= 0) {
+    if (!lower.slice(i + 4).replace(/^["']+/, '').startsWith('data:image/')) return 'Custom CSS may only use url(data:image/…)';
+    i = lower.indexOf('url(', i + 4);
+  }
+  return null;
+}
+
+export function normalizeServerBranding(raw: unknown): ManagedServerBranding | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new OrgError('Server branding must be an object');
+  const o = raw as Record<string, unknown>;
+  const text = (v: unknown, what: string) => {
+    const t = typeof v === 'string' ? v : '';
+    if ([...t].length > MAX_BRAND_TEXT) throw new OrgError(`${what} is longer than ${MAX_BRAND_TEXT} characters`);
+    // eslint-disable-next-line no-control-regex
+    if (/[\u0000-\u001f\u007f]/.test(t)) throw new OrgError(`${what} contains control characters`);
+    return t;
+  };
+  const titlePrefix = text(o.titlePrefix, 'Title prefix');
+  const productName = text(o.productName, 'Product name');
+  const accentColor = typeof o.accentColor === 'string' ? o.accentColor.trim() : '';
+  if (accentColor && !/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(accentColor)) throw new OrgError(`Accent color '${accentColor}' must look like #1e66f5`);
+  const logo = typeof o.logo === 'string' ? o.logo.trim() : '';
+  if (logo) {
+    const m = /^data:([^;,]+);base64,([A-Za-z0-9+/=\s]+)$/.exec(logo);
+    if (!m) throw new OrgError('The logo must be a base64 data: URI (data:image/png;base64,…)');
+    if (!BRAND_LOGO_TYPES.includes(m[1].toLowerCase())) throw new OrgError(`Logo type '${m[1]}' is not supported (PNG, JPEG, SVG, WebP, GIF)`);
+    const bytes = Math.floor((m[2].replace(/\s/g, '').length * 3) / 4);
+    if (bytes === 0 || bytes > MAX_BRAND_LOGO) throw new OrgError(`The logo must be between 1 byte and ${MAX_BRAND_LOGO / 1024} KiB`);
+  }
+  const customCss = typeof o.customCss === 'string' ? o.customCss : '';
+  const problem = customCssProblem(customCss);
+  if (problem) throw new OrgError(problem);
+  const out = { titlePrefix, productName, logo, accentColor, customCss };
+  return Object.values(out).some((v) => v.trim() !== '') ? out : null;
+}
+
+export interface ManagedServerAccess {
+  users: { username: string; passwordHash: string; role: 'admin' | 'operator' | 'viewer'; disabled: boolean }[];
+  rules: { principal: string; jobPattern: string; permission: 'none' | 'read' | 'run' | 'write' | 'full' }[];
+}
+
+/** Mirrors `ufop_core::agent::{MAX_SERVER_USERS, MAX_SERVER_RULES}`. */
+export const MAX_SERVER_USERS = 500;
+export const MAX_SERVER_RULES = 2000;
+const SERVER_ROLES = ['admin', 'operator', 'viewer'] as const;
+const SERVER_PERMISSIONS = ['none', 'read', 'run', 'write', 'full'] as const;
+const SERVER_USERNAME = /^[A-Za-z0-9._@-]{1,64}$/;
+
+/** Validate server accounts and access rules (same checks as the server). */
+export function normalizeServerAccess(raw: unknown): ManagedServerAccess | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new OrgError('Server access must be an object with users and rules');
+  const o = raw as Record<string, unknown>;
+  const users = Array.isArray(o.users) ? o.users : [];
+  const rules = Array.isArray(o.rules) ? o.rules : [];
+  if (users.length > MAX_SERVER_USERS || rules.length > MAX_SERVER_RULES) throw new OrgError(`At most ${MAX_SERVER_USERS} server accounts and ${MAX_SERVER_RULES} access rules`);
+  const names = new Set<string>();
+  const outUsers = users.map((u) => {
+    const x = (u && typeof u === 'object' ? u : {}) as Record<string, unknown>;
+    const username = str(x.username, 64);
+    if (!SERVER_USERNAME.test(username)) throw new OrgError(`Server account name '${username}' must be 1–64 letters, digits, '.', '_', '@' or '-'`);
+    if (names.has(username.toLowerCase())) throw new OrgError(`Two server accounts are named '${username}'`);
+    names.add(username.toLowerCase());
+    const passwordHash = str(x.passwordHash, 1000);
+    if (!passwordHash.startsWith('$argon2')) throw new OrgError(`Server account '${username}' needs an Argon2 password hash ($argon2id$…, from ufop-server hash-password), not a password`);
+    const role = String(x.role ?? 'viewer') as (typeof SERVER_ROLES)[number];
+    if (!SERVER_ROLES.includes(role)) throw new OrgError(`Server account '${username}' has an unknown role '${role}' (admin, operator or viewer)`);
+    return { username, passwordHash, role, disabled: x.disabled === true };
+  });
+  const outRules = rules.map((r) => {
+    const x = (r && typeof r === 'object' ? r : {}) as Record<string, unknown>;
+    const principal = str(x.principal, 80);
+    const jobPattern = str(x.jobPattern, 200);
+    if (!principal || !jobPattern) throw new OrgError('Every access rule needs a principal and a job pattern');
+    const permission = String(x.permission ?? '') as (typeof SERVER_PERMISSIONS)[number];
+    if (!SERVER_PERMISSIONS.includes(permission)) throw new OrgError(`Unknown access permission '${permission}' (none, read, run, write or full)`);
+    return { principal, jobPattern, permission };
+  });
+  return outUsers.length || outRules.length ? { users: outUsers, rules: outRules } : null;
+}
+
+/** A backup policy template: `settings` as the desktop app exports a template's settings. */
+export interface ManagedBackupTemplate {
+  id: string;
+  name: string;
+  description: string;
+  enforced: boolean;
+  settings: Record<string, unknown>;
+}
+
+/** Mirrors `ufop_core::agent::{MAX_BACKUP_TEMPLATES, MAX_BACKUP_TEMPLATE_BYTES}`. */
+export const MAX_BACKUP_TEMPLATES = 50;
+export const MAX_BACKUP_TEMPLATE_BYTES = 64 * 1024;
+
+/** A notification profile: `notification` as the desktop app stores a profile's channel. */
+export interface ManagedNotificationProfile {
+  id: string;
+  name: string;
+  description: string;
+  notification: Record<string, unknown>;
+  minSeverity: 'success' | 'warning' | 'error' | null;
+}
+
+/** Mirrors `ufop_core::agent::{MAX_NOTIFICATION_PROFILES, MAX_NOTIFICATION_PROFILE_BYTES}`. */
+export const MAX_NOTIFICATION_PROFILES = 50;
+export const MAX_NOTIFICATION_PROFILE_BYTES = 64 * 1024;
+const CENTRAL = /^central:[A-Za-z0-9_-]{1,64}$/;
+
+/** Validate organization notification profiles: secrets must name console credentials, never travel in plain text. */
+export function normalizeNotificationProfiles(raw: unknown): ManagedNotificationProfile[] | null {
+  if (raw === null || raw === undefined) return null;
+  if (!Array.isArray(raw)) throw new OrgError('Notification profiles must be a list');
+  if (raw.length > MAX_NOTIFICATION_PROFILES) throw new OrgError(`At most ${MAX_NOTIFICATION_PROFILES} organization notification profiles`);
+  const ids = new Set<string>();
+  const out = raw.map((t, i) => {
+    const o = (t && typeof t === 'object' ? t : {}) as Record<string, unknown>;
+    const name = str(o.name, 200);
+    if (!name) throw new OrgError(`Notification profile ${i + 1} needs a name`);
+    const id = str(o.id, 64) || name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
+    if (!WORKFLOW_ID.test(id)) throw new OrgError(`Notification profile id '${id}' must be 1–64 letters, digits, '-' or '_'`);
+    if (ids.has(id)) throw new OrgError(`Two notification profiles share the id '${id}'`);
+    ids.add(id);
+    let n = o.notification ?? null;
+    if (typeof n === 'string') {
+      try {
+        n = JSON.parse(n);
+      } catch {
+        throw new OrgError(`Notification profile '${name}' channel is not valid JSON`);
+      }
+    }
+    if (!n || typeof n !== 'object' || Array.isArray(n)) throw new OrgError(`Notification profile '${name}' needs a notification object`);
+    const ch = n as Record<string, unknown>;
+    if (typeof ch.type !== 'string') throw new OrgError(`Notification profile '${name}' needs a channel type`);
+    if (JSON.stringify(ch).length > MAX_NOTIFICATION_PROFILE_BYTES) throw new OrgError(`Notification profile '${name}' is larger than ${MAX_NOTIFICATION_PROFILE_BYTES / 1024} KB`);
+    const cred = ch.credential_id;
+    if (cred !== undefined && cred !== null && cred !== '' && !(typeof cred === 'string' && CENTRAL.test(cred))) throw new OrgError(`Notification profile '${name}': credential_id must name a console credential (central:<id>)`);
+    for (const h of Array.isArray(ch.headers) ? (ch.headers as Record<string, unknown>[]) : []) {
+      if (h && h.secret === true) {
+        if (typeof h.value === 'string' && h.value !== '') throw new OrgError(`Notification profile '${name}': secret header values cannot be sent in plain text; use a console credential`);
+        if (typeof h.credential_id !== 'string' || !CENTRAL.test(h.credential_id)) throw new OrgError(`Notification profile '${name}': secret headers must name a console credential (central:<id>)`);
+      }
+    }
+    const sev = o.minSeverity ?? null;
+    if (sev !== null && sev !== '' && !['success', 'warning', 'error'].includes(sev as string)) throw new OrgError(`Notification profile '${name}': unknown minimum severity '${String(sev)}'`);
+    return { id, name, description: str(o.description, 1000), notification: ch, minSeverity: sev === '' ? null : (sev as ManagedNotificationProfile['minSeverity']) };
+  });
+  return out.length ? out : null;
+}
+
+/** Validate organization backup templates (the desktop checks the settings in full). */
+export function normalizeBackupTemplates(raw: unknown): ManagedBackupTemplate[] | null {
+  if (raw === null || raw === undefined) return null;
+  if (!Array.isArray(raw)) throw new OrgError('Backup templates must be a list');
+  if (raw.length > MAX_BACKUP_TEMPLATES) throw new OrgError(`At most ${MAX_BACKUP_TEMPLATES} organization backup templates`);
+  const ids = new Set<string>();
+  const out = raw.map((t, i) => {
+    const o = (t && typeof t === 'object' ? t : {}) as Record<string, unknown>;
+    const name = str(o.name, 200);
+    if (!name) throw new OrgError(`Backup template ${i + 1} needs a name`);
+    const id = str(o.id, 64) || name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
+    if (!WORKFLOW_ID.test(id)) throw new OrgError(`Backup template id '${id}' must be 1–64 letters, digits, '-' or '_'`);
+    if (ids.has(id)) throw new OrgError(`Two backup templates share the id '${id}'`);
+    ids.add(id);
+    let settings = o.settings ?? {};
+    if (typeof settings === 'string') {
+      try {
+        settings = JSON.parse(settings);
+      } catch {
+        throw new OrgError(`Backup template '${name}' settings are not valid JSON`);
+      }
+    }
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new OrgError(`Backup template '${name}' settings must be an object (export a template from the desktop app)`);
+    if (JSON.stringify(settings).length > MAX_BACKUP_TEMPLATE_BYTES) throw new OrgError(`Backup template '${name}' is larger than ${MAX_BACKUP_TEMPLATE_BYTES / 1024} KB`);
+    const sc = (settings as Record<string, unknown>).scripts;
+    if (sc !== undefined && sc !== null) throw new OrgError(`Backup template '${name}' sets scripts; organization templates cannot`);
+    return { id, name, description: str(o.description, 1000), enforced: o.enforced === true, settings: settings as Record<string, unknown> };
+  });
+  return out.length ? out : null;
 }
 
 /** An organization workflow: an automation rule as the desktop app exports it. */
@@ -113,7 +329,7 @@ const str = (v: unknown, n = 500) => (typeof v === 'string' ? v.trim().slice(0, 
 /** Validate and normalize a settings body (throws `OrgError` with a readable message). */
 export function normalizeManagedSettings(raw: unknown): ManagedSettingsBody {
   const b = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: normalizeWorkflows(b.workflows) };
+  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: normalizeWorkflows(b.workflows), backupTemplates: normalizeBackupTemplates(b.backupTemplates), notificationProfiles: normalizeNotificationProfiles(b.notificationProfiles), serverAccess: normalizeServerAccess(b.serverAccess), serverBranding: normalizeServerBranding(b.serverBranding) };
   if (b.updates) {
     const u = b.updates as Record<string, unknown>;
     const channel = u.channel === null || u.channel === undefined || u.channel === '' ? null : u.channel;
@@ -195,8 +411,8 @@ function row(orgId: string): Row | undefined {
 export function getManagedSettings(orgId: string): ManagedSettings | null {
   const r = row(orgId);
   if (!r || r.settings === 'null') return null;
-  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null });
-  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, mounts: b.mounts ?? null, workflows: b.workflows ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
+  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null, notificationProfiles: null, serverAccess: null, serverBranding: null });
+  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, mounts: b.mounts ?? null, workflows: b.workflows ?? null, backupTemplates: b.backupTemplates ?? null, notificationProfiles: b.notificationProfiles ?? null, serverAccess: b.serverAccess ?? null, serverBranding: b.serverBranding ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
 }
 
 /**
@@ -205,7 +421,7 @@ export function getManagedSettings(orgId: string): ManagedSettings | null {
  */
 export function setManagedSettings(orgId: string, raw: unknown, by: string): ManagedSettings | null {
   const body = normalizeManagedSettings(raw);
-  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers && !body.mounts && !body.workflows;
+  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers && !body.mounts && !body.workflows && !body.backupTemplates && !body.notificationProfiles && !body.serverAccess && !body.serverBranding;
   const version = Number(row(orgId)?.version ?? 0) + 1;
   db()
     .prepare('INSERT INTO managed_settings (org_id, settings, version, updated_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(org_id) DO UPDATE SET settings = excluded.settings, version = excluded.version, updated_by = excluded.updated_by, updated_at = excluded.updated_at')
@@ -216,5 +432,5 @@ export function setManagedSettings(orgId: string, raw: unknown, by: string): Man
 /** What the agent receives: `null` when nothing is managed. */
 export function managedSettingsForAgent(orgId: string): (ManagedSettingsBody & { version: number }) | null {
   const s = getManagedSettings(orgId);
-  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers, mounts: s.mounts, workflows: s.workflows };
+  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers, mounts: s.mounts, workflows: s.workflows, backupTemplates: s.backupTemplates, notificationProfiles: s.notificationProfiles, serverAccess: s.serverAccess, serverBranding: s.serverBranding };
 }

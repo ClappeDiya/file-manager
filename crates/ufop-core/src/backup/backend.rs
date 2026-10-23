@@ -64,6 +64,25 @@ pub trait Backend: Send + Sync {
         let _ = (name, until, mode);
         Err(AppError::validation(format!("{} does not support object locks", self.describe())))
     }
+    /// Whether names may contain one `/` (a subfolder, for sharded layouts).
+    fn supports_subfolders(&self) -> bool {
+        false
+    }
+    /// Every file, including those one subfolder down as `dir/name`.
+    /// Default: [`list`](Self::list) (backends without subfolders).
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
+        self.list()
+    }
+    /// Last-modified time of a file as the destination records it (its own
+    /// clock), when the backend can tell. Used for the clock-skew check.
+    fn modified(&self, name: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        let _ = name;
+        Ok(None)
+    }
+    /// True when this connection refuses every write (see [`ReadOnlyBackend`]).
+    fn is_read_only(&self) -> bool {
+        false
+    }
     /// Connectivity test: lists the folder. `create` makes it first.
     fn test(&self, create: bool) -> Result<usize, AppError> {
         if create {
@@ -84,6 +103,11 @@ impl<T: Backend + ?Sized> Backend for Box<T> {
     fn quota(&self) -> Option<Quota> { (**self).quota() }
     fn supports_lock(&self) -> bool { (**self).supports_lock() }
     fn lock(&self, n: &str, u: chrono::DateTime<chrono::Utc>, m: LockMode) -> Result<(), AppError> { (**self).lock(n, u, m) }
+    fn supports_subfolders(&self) -> bool { (**self).supports_subfolders() }
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> { (**self).list_recursive() }
+    fn modified(&self, n: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> { (**self).modified(n) }
+    fn is_read_only(&self) -> bool { (**self).is_read_only() }
+    fn test(&self, create: bool) -> Result<usize, AppError> { (**self).test(create) }
 }
 
 fn check_name(name: &str) -> Result<(), AppError> {
@@ -91,6 +115,14 @@ fn check_name(name: &str) -> Result<(), AppError> {
         return Err(AppError::validation(format!("Invalid remote volume name '{name}'")));
     }
     Ok(())
+}
+
+/// A name, or `dir/name` with one subfolder level (sharded layouts).
+fn check_path(name: &str) -> Result<(), AppError> {
+    match name.split_once('/') {
+        Some((dir, file)) => check_name(dir).and_then(|_| check_name(file)),
+        None => check_name(name),
+    }
 }
 
 /// Local disk, removable media or mounted share (including UNC paths).
@@ -104,11 +136,13 @@ pub struct LocalBackend {
     pub use_move: bool,
     /// Flush each file to disk before reporting success.
     pub sync_writes: bool,
+    /// Shard folders listed at once by [`Backend::list_recursive`] (≤ 1 = one at a time).
+    pub list_parallelism: usize,
 }
 
 impl LocalBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), verify_upload_size: true, use_move: true, sync_writes: false }
+        Self { root: root.into(), verify_upload_size: true, use_move: true, sync_writes: false, list_parallelism: 1 }
     }
 
     pub fn root(&self) -> &Path {
@@ -185,8 +219,11 @@ impl Backend for LocalBackend {
     }
 
     fn put(&self, name: &str, data: &[u8]) -> Result<(), AppError> {
-        check_name(name)?;
+        check_path(name)?;
         let dest = self.root.join(name);
+        if let Some((dir, _)) = name.split_once('/') {
+            std::fs::create_dir_all(self.root.join(dir))?;
+        }
         let write = |p: &Path| -> std::io::Result<()> {
             let mut f = std::fs::File::create(p)?;
             std::io::Write::write_all(&mut f, data)?;
@@ -196,7 +233,13 @@ impl Backend for LocalBackend {
             Ok(())
         };
         if self.use_move {
-            let tmp = self.root.join(format!(".{name}.partial"));
+            // Unique per write: two writers of one name (lock files) must
+            // not share a temporary file.
+            let tag = uuid::Uuid::new_v4().simple().to_string();
+            let tmp = match name.split_once('/') {
+                Some((dir, file)) => self.root.join(dir).join(format!(".{file}.{}.partial", &tag[..12])),
+                None => self.root.join(format!(".{name}.{}.partial", &tag[..12])),
+            };
             write(&tmp)?;
             std::fs::rename(&tmp, &dest)?;
         } else {
@@ -215,28 +258,102 @@ impl Backend for LocalBackend {
     }
 
     fn get(&self, name: &str) -> Result<Vec<u8>, AppError> {
-        check_name(name)?;
+        check_path(name)?;
         Ok(std::fs::read(self.root.join(name))?)
     }
 
     fn delete(&self, name: &str) -> Result<(), AppError> {
-        check_name(name)?;
-        match std::fs::remove_file(self.root.join(name)) {
+        check_path(name)?;
+        let r = match std::fs::remove_file(self.root.join(name)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             r => Ok(r?),
+        };
+        if let Some((dir, _)) = name.split_once('/') {
+            // Drop the shard folder once empty (fails harmlessly otherwise).
+            let _ = std::fs::remove_dir(self.root.join(dir));
         }
+        r
+    }
+
+    fn supports_subfolders(&self) -> bool {
+        true
+    }
+
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
+        let mut out = self.list()?;
+        let mut dirs = Vec::new();
+        for e in std::fs::read_dir(&self.root)? {
+            let e = e?;
+            if !e.file_type()?.is_dir() {
+                continue;
+            }
+            let dir = e.file_name().to_string_lossy().into_owned();
+            if check_name(&dir).is_err() || dir.starts_with('.') {
+                continue;
+            }
+            dirs.push((dir, e.path()));
+        }
+        let list_dir = |(dir, path): &(String, PathBuf)| -> Result<Vec<RemoteFile>, AppError> {
+            let mut v = Vec::new();
+            for f in std::fs::read_dir(path)? {
+                let f = f?;
+                let md = f.metadata()?;
+                if md.is_file() {
+                    v.push(RemoteFile { name: format!("{dir}/{}", f.file_name().to_string_lossy()), size: md.len() });
+                }
+            }
+            Ok(v)
+        };
+        for part in list_partitioned(&dirs, self.list_parallelism, list_dir)? {
+            out.extend(part);
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
     }
 
     fn create_folder(&self) -> Result<(), AppError> {
         Ok(std::fs::create_dir_all(&self.root)?)
     }
 
+    fn modified(&self, name: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        check_path(name)?;
+        // On a mounted share the file server sets this time.
+        Ok(std::fs::metadata(self.root.join(name))?.modified().ok().map(chrono::DateTime::<chrono::Utc>::from))
+    }
+
     fn rename(&self, from: &str, to: &str) -> Result<(), AppError> {
-        check_name(from)?;
-        check_name(to)?;
+        check_path(from)?;
+        check_path(to)?;
+        if let Some((dir, _)) = to.split_once('/') {
+            std::fs::create_dir_all(self.root.join(dir))?;
+        }
         Ok(std::fs::rename(self.root.join(from), self.root.join(to))?)
     }
 }
+
+/// Run `f` over `items` on up to `parallelism` threads (in order of the
+/// items; the first error wins). For listing shard folders concurrently.
+pub fn list_partitioned<T: Sync, R: Send>(items: &[T], parallelism: usize, f: impl Fn(&T) -> Result<R, AppError> + Sync) -> Result<Vec<R>, AppError> {
+    let n = parallelism.clamp(1, 64).min(items.len().max(1));
+    if n <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<Result<R, AppError>>>> = items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..n {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(item) = items.get(i) else { break };
+                let r = f(item);
+                *results[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            });
+        }
+    });
+    results.into_iter().map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).unwrap_or_else(|| Err(AppError::internal("listing worker stopped")))).collect()
+}
+
+pub use super::rate_limit::{RateLimitedBackend, RequestLimits};
 
 /// Retry policy for backend operations (the crate-wide policy).
 pub use crate::retry::RetryPolicy;
@@ -384,6 +501,18 @@ impl<B: Backend> Backend for RetryingBackend<B> {
     fn rename(&self, a: &str, b: &str) -> Result<(), AppError> {
         self.retry("rename", || self.inner.rename(a, b))
     }
+    fn supports_subfolders(&self) -> bool {
+        self.inner.supports_subfolders()
+    }
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
+        self.retry("list", || self.inner.list_recursive())
+    }
+    fn modified(&self, n: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        self.retry("stat", || self.inner.modified(n))
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
 }
 
 /// Renames volumes to `{prefix}{name}` instead of deleting them.
@@ -414,6 +543,12 @@ impl<B: Backend> Backend for SoftDeleteBackend<B> {
     fn list(&self) -> Result<Vec<RemoteFile>, AppError> {
         Ok(self.inner.list()?.into_iter().filter(|f| !f.name.starts_with(&self.prefix)).collect())
     }
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
+        Ok(self.inner.list_recursive()?.into_iter().filter(|f| !super::layout::logical(&f.name).starts_with(&self.prefix)).collect())
+    }
+    fn supports_subfolders(&self) -> bool {
+        self.inner.supports_subfolders()
+    }
     fn put(&self, n: &str, d: &[u8]) -> Result<(), AppError> {
         self.inner.put(n, d)
     }
@@ -421,13 +556,100 @@ impl<B: Backend> Backend for SoftDeleteBackend<B> {
         self.inner.get(n)
     }
     fn delete(&self, n: &str) -> Result<(), AppError> {
-        self.inner.rename(n, &format!("{}{}", self.prefix, n))
+        // Released repository locks are removed, not kept as deleted files.
+        if super::lock::looks_like_lock_file(n) {
+            return self.inner.delete(n);
+        }
+        let target = match n.rsplit_once('/') {
+            Some((dir, file)) => format!("{dir}/{}{file}", self.prefix),
+            None => format!("{}{}", self.prefix, n),
+        };
+        self.inner.rename(n, &target)
     }
     fn create_folder(&self) -> Result<(), AppError> {
         self.inner.create_folder()
     }
     fn rename(&self, a: &str, b: &str) -> Result<(), AppError> {
         self.inner.rename(a, b)
+    }
+    fn modified(&self, n: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        self.inner.modified(n)
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+}
+
+/// A connection that only reads: every write (upload, delete, rename,
+/// folder creation, object lock) fails with a clear error before anything
+/// reaches the destination. Restores, browsing and verification work.
+pub struct ReadOnlyBackend<B: Backend> {
+    inner: B,
+}
+
+impl<B: Backend> ReadOnlyBackend<B> {
+    pub fn new(inner: B) -> Self {
+        Self { inner }
+    }
+
+    pub fn into_inner(self) -> B {
+        self.inner
+    }
+
+    fn refuse(&self, what: &str, name: &str) -> AppError {
+        AppError::PermissionDenied {
+            message: format!("{} is connected read-only: cannot {what} {name}", self.inner.describe()),
+            advice: "This job only restores and browses. Turn off 'Read-only' in the job's destination settings to back up or run maintenance.".into(),
+        }
+    }
+}
+
+impl<B: Backend> Backend for ReadOnlyBackend<B> {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn list(&self) -> Result<Vec<RemoteFile>, AppError> {
+        self.inner.list()
+    }
+    fn put(&self, name: &str, _data: &[u8]) -> Result<(), AppError> {
+        Err(self.refuse("upload", name))
+    }
+    fn get(&self, name: &str) -> Result<Vec<u8>, AppError> {
+        self.inner.get(name)
+    }
+    fn delete(&self, name: &str) -> Result<(), AppError> {
+        Err(self.refuse("delete", name))
+    }
+    fn create_folder(&self) -> Result<(), AppError> {
+        // Nothing to create when the folder exists; never create one.
+        self.inner.list().map(|_| ())
+    }
+    fn rename(&self, from: &str, _to: &str) -> Result<(), AppError> {
+        Err(self.refuse("rename", from))
+    }
+    fn quota(&self) -> Option<Quota> {
+        self.inner.quota()
+    }
+    fn supports_lock(&self) -> bool {
+        false
+    }
+    fn lock(&self, name: &str, _until: chrono::DateTime<chrono::Utc>, _mode: LockMode) -> Result<(), AppError> {
+        Err(self.refuse("lock", name))
+    }
+    fn supports_subfolders(&self) -> bool {
+        self.inner.supports_subfolders()
+    }
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
+        self.inner.list_recursive()
+    }
+    fn modified(&self, n: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        self.inner.modified(n)
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn test(&self, _create: bool) -> Result<usize, AppError> {
+        Ok(self.inner.list()?.len())
     }
 }
 
@@ -537,6 +759,9 @@ mod tests {
         b.delete("v1").unwrap();
         assert!(b.list().unwrap().is_empty());
         assert!(d.path().join("deleted-v1").exists());
+        b.put("ufop-lock.json", b"{}").unwrap();
+        b.delete("ufop-lock.json").unwrap();
+        assert!(!d.path().join("deleted-ufop-lock.json").exists() && !d.path().join("ufop-lock.json").exists());
     }
 
     #[test]
@@ -563,6 +788,46 @@ mod tests {
         assert_eq!(p.delay_for(0), Duration::from_millis(100));
         assert_eq!(p.delay_for(1), Duration::from_millis(200));
         assert_eq!(p.delay_for(2), Duration::from_millis(350));
+    }
+
+    #[test]
+    fn read_only_refuses_every_write() {
+        let d = tempfile::tempdir().unwrap();
+        let local = LocalBackend::new(d.path());
+        local.put("a", b"1").unwrap();
+        let ro = ReadOnlyBackend::new(LocalBackend::new(d.path()));
+        assert!(ro.is_read_only() && !local.is_read_only());
+        assert_eq!(ro.get("a").unwrap(), b"1");
+        assert_eq!(ro.list().unwrap().len(), 1);
+        assert!(ro.modified("a").unwrap().is_some());
+        for e in [ro.put("b", b"2").unwrap_err(), ro.delete("a").unwrap_err(), ro.rename("a", "c").unwrap_err(), ro.lock("a", chrono::Utc::now(), LockMode::Governance).unwrap_err()] {
+            assert!(matches!(e, AppError::PermissionDenied { .. }), "{e:?}");
+            assert!(e.user_message().contains("read-only"));
+        }
+        assert!(!ro.supports_lock());
+        assert_eq!(local.list().unwrap().len(), 1, "nothing was written");
+        // Wrapped again (retry, box) it is still read-only.
+        let boxed: Box<dyn Backend> = Box::new(RetryingBackend::new(ro, RetryPolicy::default(), Throttle::default()));
+        assert!(boxed.is_read_only() && boxed.put("x", b"").is_err());
+        // A missing folder is never created.
+        assert!(ReadOnlyBackend::new(LocalBackend::new(d.path().join("nope"))).create_folder().is_err());
+    }
+
+    #[test]
+    fn parallel_shard_listing_matches_serial() {
+        let d = tempfile::tempdir().unwrap();
+        let mut b = LocalBackend::new(d.path());
+        for i in 0..40 {
+            b.put(&format!("{:02x}/v{i}.dblock", i % 9), b"x").unwrap();
+        }
+        b.put("top.dlist", b"y").unwrap();
+        let serial = b.list_recursive().unwrap();
+        b.list_parallelism = 4;
+        assert_eq!(b.list_recursive().unwrap(), serial);
+        assert_eq!(serial.len(), 41);
+        let out = list_partitioned(&[1, 2, 3, 4, 5], 3, |i| if *i == 4 { Err(AppError::validation("four")) } else { Ok(*i * 10) });
+        assert!(out.unwrap_err().user_message().contains("four"));
+        assert_eq!(list_partitioned(&[1, 2, 3], 8, |i| Ok(*i)).unwrap(), vec![1, 2, 3]);
     }
 
     #[test]

@@ -620,10 +620,39 @@ describe('audit trail of fleet actions', () => {
       { workflows: [{ name: 'Nested', rule: { ...RULE, workflow: { nodes: [{ kind: { type: 'action', action: { type: 'execute_custom_command' } } }] } } }] },
       { workflows: [{ name: 'Same', rule: RULE }, { name: 'same', rule: RULE }] },
       { workflows: Array.from({ length: 51 }, (_, i) => ({ name: `w${i}`, rule: RULE })) },
+      { backupTemplates: { name: 'x' } },
+      { backupTemplates: [{ name: '' }] },
+      { backupTemplates: [{ name: 'Bad', id: 'no spaces' }] },
+      { backupTemplates: [{ name: 'List', settings: [] }] },
+      { backupTemplates: [{ name: 'Broken', settings: '{not json' }] },
+      { backupTemplates: [{ name: 'Scripts', settings: { scripts: { run_before: 'rm -rf /' } } }] },
+      { backupTemplates: [{ name: 'Same' }, { name: 'same' }] },
+      { notificationProfiles: { name: 'x' } },
+      { notificationProfiles: [{ name: 'No channel' }] },
+      { notificationProfiles: [{ name: 'Typeless', notification: { url: 'x' } }] },
+      { notificationProfiles: [{ name: 'Local secret', notification: { type: 'email', credential_id: 'local-1' } }] },
+      { notificationProfiles: [{ name: 'Plain header', notification: { type: 'webhook', headers: [{ name: 'X-Token', value: 'hunter2', secret: true }] } }] },
+      { notificationProfiles: [{ name: 'Severity', minSeverity: 'info', notification: { type: 'slack' } }] },
+      { notificationProfiles: [{ name: 'Dup', notification: { type: 'slack' } }, { name: 'dup', notification: { type: 'teams' } }] },
+      { serverAccess: [] },
+      { serverAccess: { users: [{ username: 'ops', passwordHash: 'plain-password', role: 'operator' }] } },
+      { serverAccess: { users: [{ username: 'has space', passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g' }] } },
+      { serverAccess: { users: [{ username: 'ops', passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g', role: 'root' }] } },
+      { serverAccess: { users: [{ username: 'ops', passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g' }, { username: 'OPS', passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g' }] } },
+      { serverAccess: { rules: [{ principal: 'ops', jobPattern: '*', permission: 'all' }] } },
+      { serverAccess: { rules: [{ principal: '', jobPattern: '*', permission: 'read' }] } },
+      { serverBranding: [] },
+      { serverBranding: { accentColor: 'blue' } },
+      { serverBranding: { titlePrefix: 'x'.repeat(65) } },
+      { serverBranding: { logo: 'https://evil.example/logo.png' } },
+      { serverBranding: { logo: 'data:text/html;base64,PGI+' } },
+      { serverBranding: { customCss: '@import url(https://evil.example/x.css);' } },
+      { serverBranding: { customCss: 'a{background:url(https://t.example/p)}' } },
+      { serverBranding: { customCss: '</style><script>alert(1)</script>' } },
     ]) expect((await put(admin, bad)).status).toBe(400);
 
     const ok = await json<{ settings: { version: number } }>(
-      await put(admin, { updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [5, 1, 1] } }, proxy: { mode: 'pac', pacUrl: 'https://wpad/p.pac', noProxy: [' intranet ', ''] }, ai: { allowCloud: false }, transfers: { maxUploadKbps: 512, maxConcurrentRuns: 2 }, mounts: { allowedProtocols: ['S3', 'rclone', 's3'], readOnly: true, cacheMode: 'full', maxCacheMb: 2048, mountRoot: ' ~/Drives ' }, workflows: [{ name: 'Tidy Downloads!', rule: JSON.stringify(RULE) }, { id: 'archive', name: 'Archive', enabled: false, rule: RULE }] }),
+      await put(admin, { updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [5, 1, 1] } }, proxy: { mode: 'pac', pacUrl: 'https://wpad/p.pac', noProxy: [' intranet ', ''] }, ai: { allowCloud: false }, transfers: { maxUploadKbps: 512, maxConcurrentRuns: 2 }, mounts: { allowedProtocols: ['S3', 'rclone', 's3'], readOnly: true, cacheMode: 'full', maxCacheMb: 2048, mountRoot: ' ~/Drives ' }, workflows: [{ name: 'Tidy Downloads!', rule: JSON.stringify(RULE) }, { id: 'archive', name: 'Archive', enabled: false, rule: RULE }], backupTemplates: [{ name: 'Org Standard', enforced: true, settings: JSON.stringify({ retention: { type: 'keep_count', count: 7 } }) }], notificationProfiles: [{ name: 'On-call pager', minSeverity: 'error', notification: JSON.stringify({ type: 'webhook', preset: 'pagerduty', url: 'https://events.pagerduty.com/v2/enqueue', credential_id: 'central:pd', headers: [{ name: 'X-Key', secret: true, credential_id: 'central:pdh' }] }) }], serverAccess: { users: [{ username: ' ops ', passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g', role: 'operator' }], rules: [{ principal: 'ops', jobPattern: 'prod-*', permission: 'run' }] }, serverBranding: { titlePrefix: '[ACME] ', accentColor: ' #1E66F5 ', logo: 'data:image/png;base64,iVBORw0KGgo=', customCss: 'header{background:url(data:image/png;base64,AA==)}' } }),
     );
     expect(ok.status).toBe(200);
     expect(ok.body.settings.version).toBe(1);
@@ -639,6 +668,10 @@ describe('audit trail of fleet actions', () => {
         { id: 'tidy-downloads', name: 'Tidy Downloads!', enabled: true, rule: RULE },
         { id: 'archive', name: 'Archive', enabled: false, rule: RULE },
       ],
+      backupTemplates: [{ id: 'org-standard', name: 'Org Standard', description: '', enforced: true, settings: { retention: { type: 'keep_count', count: 7 } } }],
+      notificationProfiles: [{ id: 'on-call-pager', name: 'On-call pager', description: '', minSeverity: 'error', notification: { type: 'webhook', preset: 'pagerduty', url: 'https://events.pagerduty.com/v2/enqueue', credential_id: 'central:pd', headers: [{ name: 'X-Key', secret: true, credential_id: 'central:pdh' }] } }],
+      serverAccess: { users: [{ username: 'ops', passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g', role: 'operator', disabled: false }], rules: [{ principal: 'ops', jobPattern: 'prod-*', permission: 'run' }] },
+      serverBranding: { titlePrefix: '[ACME] ', productName: '', logo: 'data:image/png;base64,iVBORw0KGgo=', accentColor: '#1E66F5', customCss: 'header{background:url(data:image/png;base64,AA==)}' },
     });
     expect(b.policySetVersion).not.toBe(v0);
     const hbv = await json<{ policiesChanged: boolean }>(await hb(m.token, { policySetVersion: v0 }));

@@ -65,7 +65,7 @@ fn json_bytes<T: Serialize>(v: &T, roots: &[String]) -> Result<Vec<u8>, AppError
 }
 
 /// Build the zip at `out`. `db_path` is the job's local database (may be missing).
-pub fn create(out: &Path, job: &BackupJob, db_path: &Path, runs: &[BackupRun], log_file: Option<&Path>) -> Result<BugReport, AppError> {
+pub fn create(out: &Path, job: &BackupJob, db_path: &Path, db_key: Option<&ufop_core::backup::db::DbKey>, runs: &[BackupRun], log_file: Option<&Path>) -> Result<BugReport, AppError> {
     if let Some(d) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(d)?;
     }
@@ -104,7 +104,8 @@ pub fn create(out: &Path, job: &BackupJob, db_path: &Path, runs: &[BackupRun], l
         },
     });
     if db_path.is_file() {
-        let db = ufop_core::backup::db::BackupDb::open(db_path)?;
+        // An encrypted database is decrypted into the sanitized copy.
+        let db = ufop_core::backup::db::BackupDb::open_with_key(db_path, db_key)?;
         let s = db.export_sanitized(&tmp)?;
         rep.paths_obfuscated = s.paths_obfuscated;
         system["database"] = serde_json::to_value(ufop_core::backup::db::BackupDb::inspect(db_path)?)?;

@@ -645,11 +645,7 @@ pub async fn execute_file_transfer(
         .await?;
 
     let duration_ms = start.elapsed().as_millis() as u64;
-    let speed_bps = if duration_ms > 0 {
-        (file_size * 1000) / duration_ms
-    } else {
-        0
-    };
+    let speed_bps = (file_size * 1000).checked_div(duration_ms).unwrap_or(0);
 
     Ok(TransferResult {
         job_id: job_id.to_string(),

@@ -1,8 +1,9 @@
 /**
- * Job editor pieces for result notifications (email, Telegram, XMPP), report
- * privacy and TLS settings, and per-job log outputs (file, system log).
- * Channel passwords and bot tokens go to the secure store under each
- * notification's `credential_id`, never into the job.
+ * Job editor pieces for result notifications (email, Telegram, XMPP, Slack,
+ * Teams and webhooks with presets for Pushover, ntfy, Discord, PagerDuty and
+ * Gotify), report privacy and TLS settings, and per-job log outputs (file,
+ * system log). Channel passwords, bot tokens, webhook URLs and secret header
+ * values go to the secure store under credential ids, never into the job.
  */
 import { useEffect, useState } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
@@ -17,18 +18,41 @@ import {
   type NotificationChannel,
   type ReportConfig,
   type TlsMode,
+  type WebhookHeader,
+  type WebhookPreset,
 } from "@/stores/backup-store";
+import { PRESETS, channelLabel, previewNotification, validHeaderName, webhookPreset, type NotificationPreview, type PresetParams, type Severity } from "@/stores/backup-notify";
 import { Banner, Btn, Check, Field, Section } from "./backup-ui";
+import { AdvancedOnly } from "./advanced-only";
 
 const RESULTS = ["success", "warning", "error"] as const;
 const LEVELS: LogLevel[] = ["info", "warning", "error"];
-const SECRET_LABEL: Record<NotificationChannel["type"], string> = { email: "SMTP password", telegram: "Bot token", xmpp: "Account password" };
 
-export function newNotification(type: NotificationChannel["type"]): BackupNotification {
+function secretLabel(n: BackupNotification): string {
+  switch (n.type) {
+    case "email":
+      return "SMTP password";
+    case "telegram":
+      return "Bot token";
+    case "xmpp":
+      return "Account password";
+    case "slack":
+    case "teams":
+      return "Webhook URL";
+    case "webhook":
+      return PRESETS.find((p) => p.id === n.preset)?.secret ?? "Secret";
+  }
+}
+
+type SimpleType = Exclude<NotificationChannel["type"], "webhook">;
+
+export function newNotification(type: SimpleType): BackupNotification {
   const base = { send_on: ["warning", "error"], credential_id: crypto.randomUUID(), template: "", cert: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } };
   if (type === "telegram") return { type, chat_id: "", api_base: "", ...base };
   if (type === "xmpp") return { type, jid: "", to: "", host: "", port: null, tls: "start_tls", ...base };
-  return { type: "email", host: "", port: null, tls: "start_tls", username: "", from: "", to: [], subject: "UFOP {{operation}} {{result}}: {{name}}", ...base };
+  if (type === "slack" || type === "teams") return { type, ...base };
+  // New mail channels send HTML (with a text part); older ones keep text only.
+  return { type: "email", host: "", port: null, tls: "start_tls", username: "", from: "", to: [], subject: "UFOP {{operation}} {{result}}: {{name}}", html: true, html_template: "", ...base };
 }
 
 const splitList = (s: string) => s.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
@@ -45,34 +69,111 @@ function TlsSelect({ value, onChange }: { value: TlsMode; onChange: (t: TlsMode)
   );
 }
 
+/** Request headers; a secret one's value is sent to the secure store on save. */
+export function HeadersEditor({ value, onChange }: { value: WebhookHeader[]; onChange: (h: WebhookHeader[]) => void }) {
+  const set = (i: number, p: Partial<WebhookHeader>) => onChange(value.map((h, j) => (j === i ? { ...h, ...p } : h)));
+  return (
+    <div className="space-y-1" data-testid="webhook-headers">
+      <span className="text-xs font-medium">Headers</span>
+      {value.map((h, i) => (
+        <div key={i} className="flex gap-1 items-center">
+          <input className={`${inputCls} font-mono ${h.name && !validHeaderName(h.name) ? "border-red-500" : ""}`} placeholder="X-Api-Key" value={h.name} onChange={(e) => set(i, { name: e.target.value })} aria-label="Header name" />
+          <input
+            className={`${inputCls} font-mono`}
+            type={h.secret ? "password" : "text"}
+            autoComplete="off"
+            placeholder={h.secret && h.credential_id ? "(saved; type to replace)" : "value or {{placeholder}}"}
+            value={h.value}
+            onChange={(e) => set(i, { value: e.target.value.replace(/[\r\n]/g, "") })}
+            aria-label="Header value"
+          />
+          <Check label="Secret" checked={h.secret} onChange={(v) => set(i, { secret: v, credential_id: v ? h.credential_id || crypto.randomUUID() : h.credential_id })} />
+          <Btn tone="danger" onClick={() => onChange(value.filter((_, j) => j !== i))}>
+            ×
+          </Btn>
+        </div>
+      ))}
+      <Btn testId="webhook-header-add" onClick={() => onChange([...value, { name: "", value: "", secret: false, credential_id: "" }])}>
+        + Header
+      </Btn>
+    </div>
+  );
+}
+
+function WebhookFields({ n, upd }: { n: Extract<BackupNotification, { type: "webhook" }>; upd: (p: Record<string, unknown>) => void }) {
+  const urlFromSecret = n.url.trim().startsWith("{{raw secret}}");
+  return (
+    <div className="space-y-2">
+      {urlFromSecret ? (
+        <p className="text-xs text-zinc-500">The webhook URL is the secret below (kept in the secure store).</p>
+      ) : (
+        <Field label="URL" hint="Placeholders such as {{secret}} or {{name}} are URL-encoded.">
+          <input className={`${inputCls} font-mono`} value={n.url} placeholder="https://hooks.example.com/ufop" onChange={(e) => upd({ url: e.target.value })} data-testid="webhook-url" />
+        </Field>
+      )}
+      <AdvancedOnly>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <Field label="Method">
+            <select className={inputCls} value={n.method} onChange={(e) => upd({ method: e.target.value })} data-testid="webhook-method">
+              {["POST", "PUT", "PATCH", "GET"].map((m) => (
+                <option key={m}>{m}</option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Content type (empty = application/json)">
+            <input className={inputCls} value={n.content_type} onChange={(e) => upd({ content_type: e.target.value })} />
+          </Field>
+        </div>
+        <HeadersEditor value={n.headers} onChange={(headers) => upd({ headers })} />
+        <Field
+          label="Body template (empty = the run's values as JSON)"
+          hint="{{var}} is escaped for the body (JSON string content, form encoding); {{json var}} inserts a quoted JSON string, {{raw var}} the value as is. Variables: name, operation, result, machine, duration, files, bytes, errors, title, message, secret, pd_severity, event_action, previous_result."
+        >
+          <textarea className={`${inputCls} font-mono`} rows={4} value={n.body_template} onChange={(e) => upd({ body_template: e.target.value })} data-testid="webhook-body" />
+        </Field>
+      </AdvancedOnly>
+    </div>
+  );
+}
+
 function ChannelFields({ n, set }: { n: BackupNotification; set: (p: Partial<BackupNotification>) => void }) {
   const upd = set as (p: Record<string, unknown>) => void;
   if (n.type === "email")
     return (
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-        <Field label="SMTP server">
-          <input className={inputCls} value={n.host} placeholder="smtp.example.com" onChange={(e) => upd({ host: e.target.value })} />
-        </Field>
-        <div className="grid grid-cols-2 gap-1">
-          <Field label="Port">
-            <input className={inputCls} type="number" value={n.port ?? ""} placeholder={n.tls === "implicit" ? "465" : "587"} onChange={(e) => upd({ port: portValue(e.target.value) })} />
+      <div className="space-y-2">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <Field label="SMTP server">
+            <input className={inputCls} value={n.host} placeholder="smtp.example.com" onChange={(e) => upd({ host: e.target.value })} />
           </Field>
-          <Field label="Security">
-            <TlsSelect value={n.tls} onChange={(tls) => upd({ tls })} />
+          <div className="grid grid-cols-2 gap-1">
+            <Field label="Port">
+              <input className={inputCls} type="number" value={n.port ?? ""} placeholder={n.tls === "implicit" ? "465" : "587"} onChange={(e) => upd({ port: portValue(e.target.value) })} />
+            </Field>
+            <Field label="Security">
+              <TlsSelect value={n.tls} onChange={(tls) => upd({ tls })} />
+            </Field>
+          </div>
+          <Field label="Username (empty = no login)">
+            <input className={inputCls} value={n.username} onChange={(e) => upd({ username: e.target.value })} />
+          </Field>
+          <Field label="From">
+            <input className={inputCls} value={n.from} placeholder="backups@example.com" onChange={(e) => upd({ from: e.target.value })} />
+          </Field>
+          <Field label="To (comma or one per line)">
+            <textarea className={inputCls} rows={1} value={n.to.join("\n")} onChange={(e) => upd({ to: splitList(e.target.value) })} />
+          </Field>
+          <Field label="Subject" hint="Same placeholders as the message template.">
+            <input className={inputCls} value={n.subject} onChange={(e) => upd({ subject: e.target.value })} />
           </Field>
         </div>
-        <Field label="Username (empty = no login)">
-          <input className={inputCls} value={n.username} onChange={(e) => upd({ username: e.target.value })} />
-        </Field>
-        <Field label="From">
-          <input className={inputCls} value={n.from} placeholder="backups@example.com" onChange={(e) => upd({ from: e.target.value })} />
-        </Field>
-        <Field label="To (comma or one per line)">
-          <textarea className={inputCls} rows={1} value={n.to.join("\n")} onChange={(e) => upd({ to: splitList(e.target.value) })} />
-        </Field>
-        <Field label="Subject" hint="Same placeholders as the message template.">
-          <input className={inputCls} value={n.subject} onChange={(e) => upd({ subject: e.target.value })} />
-        </Field>
+        <Check label="Send as HTML (with a plain-text part)" checked={n.html ?? false} onChange={(html) => upd({ html })} />
+        {n.html && (
+          <AdvancedOnly>
+            <Field label="HTML template (empty = the built-in report table)" hint="Values are HTML-escaped; {{raw var}} inserts one unescaped. Extra variable: result_color.">
+              <textarea className={`${inputCls} font-mono`} rows={4} value={n.html_template ?? ""} onChange={(e) => upd({ html_template: e.target.value })} data-testid="email-html-template" />
+            </Field>
+          </AdvancedOnly>
+        )}
       </div>
     );
   if (n.type === "telegram")
@@ -86,6 +187,8 @@ function ChannelFields({ n, set }: { n: BackupNotification; set: (p: Partial<Bac
         </Field>
       </div>
     );
+  if (n.type === "slack" || n.type === "teams") return <p className="text-xs text-zinc-500">Paste the incoming-webhook URL as the secret below.</p>;
+  if (n.type === "webhook") return <WebhookFields n={n} upd={upd} />;
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
       <Field label="Sender account (JID)">
@@ -109,7 +212,69 @@ function ChannelFields({ n, set }: { n: BackupNotification; set: (p: Partial<Bac
   );
 }
 
-function NotificationCard({ n, onChange, onRemove }: { n: BackupNotification; onChange: (n: BackupNotification) => void; onRemove: () => void }) {
+/** What a channel would send for a sample run; HTML renders in a sandboxed frame. */
+export function NotificationPreviewPanel({ n }: { n: BackupNotification }) {
+  const [result, setResult] = useState<Severity>("error");
+  const [p, setP] = useState<NotificationPreview | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const load = async () => {
+    setErr(null);
+    try {
+      setP(await previewNotification(n, result));
+    } catch (e) {
+      setErr(errorText(e));
+    }
+  };
+  return (
+    <div className="space-y-1" data-testid="notification-preview">
+      <div className="flex gap-1 items-center">
+        <select className={`${inputCls} w-auto`} value={result} onChange={(e) => setResult(e.target.value as Severity)} aria-label="Sample result">
+          {RESULTS.map((r) => (
+            <option key={r}>{r}</option>
+          ))}
+        </select>
+        <Btn testId="notification-preview-btn" onClick={load}>
+          Preview
+        </Btn>
+      </div>
+      {err && <Banner tone="error">{err}</Banner>}
+      {p && (
+        <div className="space-y-1 text-xs">
+          <div>
+            <span className="font-medium">Subject:</span> {p.subject}
+          </div>
+          {p.html !== null ? (
+            <iframe title="HTML preview" sandbox="" srcDoc={p.html} className="w-full h-72 border border-zinc-200 dark:border-zinc-700 rounded bg-white" data-testid="notification-preview-html" />
+          ) : p.request !== null ? (
+            <pre className="whitespace-pre-wrap break-all font-mono bg-zinc-50 dark:bg-zinc-900 p-2 rounded" data-testid="notification-preview-request">
+              {p.request}
+            </pre>
+          ) : (
+            <pre className="whitespace-pre-wrap font-mono bg-zinc-50 dark:bg-zinc-900 p-2 rounded">{p.text}</pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One channel's settings, secret and test button. `onTest` replaces the
+ * default test (for saved profiles); `children` adds fields (profiles).
+ */
+export function NotificationCard({
+  n,
+  onChange,
+  onRemove,
+  onTest,
+  children,
+}: {
+  n: BackupNotification;
+  onChange: (n: BackupNotification) => void;
+  onRemove?: () => void;
+  onTest?: () => Promise<void>;
+  children?: React.ReactNode;
+}) {
   const [secret, setSecret] = useState("");
   const [hasSecret, setHasSecret] = useState(false);
   const [msg, setMsg] = useState<{ tone: "success" | "error"; text: string } | null>(null);
@@ -132,7 +297,8 @@ function NotificationCard({ n, onChange, onRemove }: { n: BackupNotification; on
     setBusy(true);
     setMsg(null);
     try {
-      await tauriInvoke("backup_test_notification", { notification: n });
+      if (onTest) await onTest();
+      else await tauriInvoke("backup_test_notification", { notification: n });
       setMsg({ tone: "success", text: "Test message sent." });
     } catch (e) {
       setMsg({ tone: "error", text: errorText(e) });
@@ -143,19 +309,22 @@ function NotificationCard({ n, onChange, onRemove }: { n: BackupNotification; on
   return (
     <div className="border border-zinc-200 dark:border-zinc-700 rounded p-2 space-y-2" data-testid={`notification-${n.type}`}>
       <div className="flex justify-between items-center">
-        <span className="text-xs font-medium capitalize">{n.type === "xmpp" ? "XMPP (Jabber)" : n.type}</span>
+        <span className="text-xs font-medium">{channelLabel(n)}</span>
         <div className="flex gap-1">
           <Btn testId="notification-test" disabled={busy} onClick={test}>
             {busy ? "Sending…" : "Send test"}
           </Btn>
-          <Btn tone="danger" onClick={onRemove}>
-            Remove
-          </Btn>
+          {onRemove && (
+            <Btn tone="danger" onClick={onRemove}>
+              Remove
+            </Btn>
+          )}
         </div>
       </div>
+      {children}
       <ChannelFields n={n} set={set} />
       <div className="flex gap-1 items-end">
-        <Field label={`${SECRET_LABEL[n.type]} ${hasSecret ? "(saved)" : ""}`}>
+        <Field label={`${secretLabel(n)} ${hasSecret ? "(saved)" : ""}`}>
           <input className={inputCls} type="password" autoComplete="off" value={secret} onChange={(e) => setSecret(e.target.value)} data-testid="notification-secret" />
         </Field>
         <Btn onClick={saveSecret} testId="notification-secret-save">
@@ -177,6 +346,11 @@ function NotificationCard({ n, onChange, onRemove }: { n: BackupNotification; on
       <Field label="Pinned SHA-256 fingerprints (optional)" hint="When set, only these certificates are accepted.">
         <input className={`${inputCls} font-mono`} value={(n.cert.pinned_sha256 ?? []).join(", ")} onChange={(e) => set({ cert: { ...n.cert, pinned_sha256: splitPins(e.target.value) } })} />
       </Field>
+      {(n.type === "webhook" || (n.type === "email" && n.html)) && (
+        <AdvancedOnly>
+          <NotificationPreviewPanel n={n} />
+        </AdvancedOnly>
+      )}
       {msg && (
         <Banner tone={msg.tone} onClose={() => setMsg(null)}>
           {msg.text}
@@ -186,23 +360,77 @@ function NotificationCard({ n, onChange, onRemove }: { n: BackupNotification; on
   );
 }
 
+const PRESET_INPUTS: Record<WebhookPreset, (keyof PresetParams)[]> = {
+  pushover: ["user"],
+  ntfy: ["server", "topic", "bearer"],
+  discord: [],
+  pagerduty: [],
+  gotify: ["server"],
+  generic: ["server"],
+};
+const PARAM_LABEL: Record<keyof PresetParams, string> = { server: "Server URL", topic: "Topic", user: "User or group key", bearer: "Send the token as a bearer token" };
+
+/** Add a channel: the plain ones directly, webhooks from a preset (built by the engine). */
+export function AddChannel({ onAdd }: { onAdd: (n: BackupNotification) => void }) {
+  const [preset, setPreset] = useState<WebhookPreset | null>(null);
+  const [params, setParams] = useState<PresetParams>({ server: "", topic: "", user: "", bearer: false });
+  const [err, setErr] = useState<string | null>(null);
+  const add = async () => {
+    if (!preset) return;
+    setErr(null);
+    try {
+      onAdd(await webhookPreset(preset, params));
+      setPreset(null);
+      setParams({ server: "", topic: "", user: "", bearer: false });
+    } catch (e) {
+      setErr(errorText(e));
+    }
+  };
+  return (
+    <div className="space-y-2">
+      <div className="flex gap-1 flex-wrap">
+        {(["email", "telegram", "xmpp", "slack", "teams"] as const).map((t) => (
+          <Btn key={t} testId={`notification-add-${t}`} onClick={() => onAdd(newNotification(t))}>
+            + {t === "xmpp" ? "XMPP" : t.charAt(0).toUpperCase() + t.slice(1)}
+          </Btn>
+        ))}
+        <select className={`${inputCls} w-auto`} value={preset ?? ""} onChange={(e) => setPreset((e.target.value || null) as WebhookPreset | null)} data-testid="notification-add-preset" aria-label="Add a webhook">
+          <option value="">+ Webhook…</option>
+          {PRESETS.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.label}
+            </option>
+          ))}
+        </select>
+      </div>
+      {preset && (
+        <div className="flex gap-1 items-end flex-wrap" data-testid="preset-form">
+          {PRESET_INPUTS[preset].map((k) =>
+            k === "bearer" ? (
+              <Check key={k} label={PARAM_LABEL[k]} checked={params.bearer} onChange={(bearer) => setParams({ ...params, bearer })} />
+            ) : (
+              <Field key={k} label={PARAM_LABEL[k]}>
+                <input className={inputCls} value={params[k]} placeholder={k === "server" && preset === "ntfy" ? "https://ntfy.sh" : ""} onChange={(e) => setParams({ ...params, [k]: e.target.value })} data-testid={`preset-${k}`} />
+              </Field>
+            ),
+          )}
+          <Btn tone="primary" testId="preset-add" onClick={add}>
+            Add {PRESETS.find((p) => p.id === preset)?.label}
+          </Btn>
+        </div>
+      )}
+      {err && <Banner tone="error">{err}</Banner>}
+    </div>
+  );
+}
+
 export function NotificationsEditor({ value, onChange }: { value: BackupNotification[]; onChange: (v: BackupNotification[]) => void }) {
   return (
-    <Section title="Email, Telegram and XMPP" hint="Send the run report to people or chats. Each channel has its own result filter.">
+    <Section title="Email, chat and webhooks" hint="Send the run report to people, chats or services. Each channel has its own result filter.">
       {value.map((n, i) => (
         <NotificationCard key={n.credential_id || i} n={n} onChange={(x) => onChange(value.map((y, j) => (j === i ? x : y)))} onRemove={() => onChange(value.filter((_, j) => j !== i))} />
       ))}
-      <div className="flex gap-1">
-        <Btn testId="notification-add-email" onClick={() => onChange([...value, newNotification("email")])}>
-          + Email
-        </Btn>
-        <Btn testId="notification-add-telegram" onClick={() => onChange([...value, newNotification("telegram")])}>
-          + Telegram
-        </Btn>
-        <Btn testId="notification-add-xmpp" onClick={() => onChange([...value, newNotification("xmpp")])}>
-          + XMPP
-        </Btn>
-      </div>
+      <AddChannel onAdd={(n) => onChange([...value, n])} />
     </Section>
   );
 }

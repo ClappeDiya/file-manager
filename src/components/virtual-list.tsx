@@ -1,4 +1,5 @@
 import { useRef, useCallback } from "react";
+import { formatBytes } from "@/lib/format-bytes";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@ufop/ui-components";
 import type { FileEntry } from "./data-grid";
@@ -161,9 +162,7 @@ export function VirtualList({
                   {item.name}
                 </span>
                 <span className="text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)] w-20 text-right">
-                  {item.size > 0
-                    ? `${(item.size / 1024).toFixed(1)} KB`
-                    : "--"}
+                  {item.size > 0 ? formatBytes(item.size) : "--"}
                 </span>
                 <span className="text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)] w-24 text-right">
                   {new Date(item.modified).toLocaleDateString()}

@@ -3,7 +3,10 @@
 //!
 //! - Windows: Volume Shadow Copy (VSS) through the VSS COM API, with a
 //!   selectable provider and excluded writer classes.
-//! - Linux: LVM copy-on-write snapshots, mounted read-only.
+//! - Linux: ZFS dataset snapshots (read through `.zfs/snapshot`), btrfs
+//!   read-only subvolume snapshots, or LVM copy-on-write snapshots mounted
+//!   read-only. With the `auto` provider each source's filesystem type
+//!   picks the method: `zfs` → ZFS, `btrfs` → btrfs, anything else → LVM.
 //! - macOS: APFS local snapshots (`tmutil`), mounted read-only.
 //!
 //! The scanner keeps the original paths in the backup and reads through
@@ -41,11 +44,36 @@ pub struct SnapshotOptions {
     pub vss_exclude_writers: Vec<String>,
     /// Folder for snapshot mount points (default: system temp).
     pub mount_root: Option<String>,
+    /// Linux snapshot method (`auto` picks it from each source's filesystem).
+    pub provider: SnapshotProvider,
 }
 
 impl Default for SnapshotOptions {
     fn default() -> Self {
-        Self { lvm_size: "10%ORIGIN".into(), vss_provider: None, vss_exclude_writers: Vec::new(), mount_root: None }
+        Self { lvm_size: "10%ORIGIN".into(), vss_provider: None, vss_exclude_writers: Vec::new(), mount_root: None, provider: SnapshotProvider::Auto }
+    }
+}
+
+/// Snapshot method on Linux (Windows always uses VSS, macOS APFS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotProvider {
+    /// By filesystem type: ZFS, then btrfs, else LVM.
+    #[default]
+    Auto,
+    Lvm,
+    Zfs,
+    Btrfs,
+}
+
+impl SnapshotProvider {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Lvm => "lvm",
+            Self::Zfs => "zfs",
+            Self::Btrfs => "btrfs",
+        }
     }
 }
 
@@ -191,7 +219,7 @@ pub fn create_with(sources: &[PathBuf], opts: &SnapshotOptions, cmd: Arc<dyn Cmd
         return Err(AppError::validation("No sources to snapshot"));
     }
     #[cfg(test)]
-    if let Some(maps) = test_hook::take() {
+    if let Some(maps) = test_hook::take_for(sources) {
         let mut s = Snapshot::new("test", cmd);
         for (o, r) in maps {
             s.add_map(o, r);
@@ -199,7 +227,7 @@ pub fn create_with(sources: &[PathBuf], opts: &SnapshotOptions, cmd: Arc<dyn Cmd
         return Ok(s);
     }
     #[cfg(target_os = "linux")]
-    return lvm::create(sources, opts, cmd);
+    return linux::create(sources, opts, cmd);
     #[cfg(target_os = "macos")]
     return apfs::create(sources, opts, cmd);
     #[cfg(windows)]
@@ -220,6 +248,43 @@ pub struct SnapshotDiagnostics {
     pub mappings: Vec<(String, String)>,
     pub steps: Vec<String>,
     pub error: Option<String>,
+    /// Snapshot methods of this platform and whether their tools are installed.
+    #[serde(default)]
+    pub providers: Vec<ProviderStatus>,
+}
+
+/// Whether a snapshot method can be used here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderStatus {
+    pub name: String,
+    pub available: bool,
+    pub detail: String,
+}
+
+/// Find an executable on `PATH` (no process is started).
+fn find_program(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let exts: Vec<String> = if cfg!(windows) { vec![".exe".into(), ".cmd".into(), String::new()] } else { vec![String::new()] };
+    std::env::split_paths(&path).flat_map(|d| exts.iter().map(move |e| d.join(format!("{name}{e}")))).find(|p| p.is_file())
+}
+
+/// The snapshot methods of this platform, in `auto` order.
+pub fn providers() -> Vec<ProviderStatus> {
+    let tool = |name: &str, bins: &[&str]| {
+        let missing: Vec<&str> = bins.iter().copied().filter(|b| find_program(b).is_none()).collect();
+        ProviderStatus {
+            name: name.into(),
+            available: missing.is_empty(),
+            detail: if missing.is_empty() { format!("{} found", bins.join(", ")) } else { format!("{} not installed", missing.join(", ")) },
+        }
+    };
+    if cfg!(windows) {
+        vec![ProviderStatus { name: "vss".into(), available: true, detail: "Volume Shadow Copy (needs administrator rights)".into() }]
+    } else if cfg!(target_os = "macos") {
+        vec![tool("apfs", &["tmutil", "mount_apfs"])]
+    } else {
+        vec![tool("zfs", &["zfs"]), tool("btrfs", &["btrfs"]), tool("lvm", &["lvcreate", "lvs", "lvremove", "findmnt"])]
+    }
 }
 
 /// Create and release a test snapshot, recording every step.
@@ -235,7 +300,7 @@ pub fn diagnose_with(sources: &[PathBuf], opts: &SnapshotOptions, cmd: Arc<dyn C
             l.push(m);
         }
     };
-    let mut d = SnapshotDiagnostics::default();
+    let mut d = SnapshotDiagnostics { providers: providers(), ..Default::default() };
     match create_with(sources, opts, rec) {
         Ok(s) => {
             d.method = s.method.clone();
@@ -266,8 +331,16 @@ pub(crate) mod test_hook {
     pub fn set(maps: Vec<(PathBuf, PathBuf)>) {
         *NEXT.lock().unwrap() = Some(maps);
     }
-    pub fn take() -> Option<Vec<(PathBuf, PathBuf)>> {
-        NEXT.lock().unwrap().take()
+    /// The installed mappings, when they cover `sources` (tests run in
+    /// parallel, so another test's snapshot must not take them).
+    pub fn take_for(sources: &[PathBuf]) -> Option<Vec<(PathBuf, PathBuf)>> {
+        let mut next = NEXT.lock().unwrap();
+        let covers = next.as_ref().is_some_and(|m| sources.iter().all(|s| m.iter().any(|(o, _)| s.starts_with(o))));
+        if covers {
+            next.take()
+        } else {
+            None
+        }
     }
 }
 
@@ -289,19 +362,37 @@ mod lvm {
         out
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// The mount of `src`: `TARGET`, `SOURCE` and `FSTYPE` from findmnt.
+    pub(super) fn mount_of(src: &Path, cmd: &dyn Cmd) -> Result<std::collections::HashMap<String, String>, AppError> {
+        let src_s = src.to_string_lossy();
+        let info = pairs(&cmd.run("findmnt", &["-n", "-P", "-o", "TARGET,SOURCE,FSTYPE", "-T", &src_s])?);
+        if !info.contains_key("TARGET") || !info.contains_key("SOURCE") {
+            return Err(AppError::file_op(format!("Cannot find the mount of {src_s}"), "Check that the source exists."));
+        }
+        Ok(info)
+    }
+
+    /// LVM only (Linux itself goes through `linux::create`, which also
+    /// picks ZFS and btrfs).
+    #[allow(dead_code)]
     pub(super) fn create(sources: &[PathBuf], opts: &SnapshotOptions, cmd: Arc<dyn Cmd>) -> Result<Snapshot, AppError> {
         let mut snap = Snapshot::new("lvm", cmd.clone());
         let mut done: Vec<String> = Vec::new();
         for src in sources {
-            let src_s = src.to_string_lossy();
-            let info = pairs(&cmd.run("findmnt", &["-n", "-P", "-o", "TARGET,SOURCE,FSTYPE", "-T", &src_s])?);
-            let (Some(target), Some(device)) = (info.get("TARGET"), info.get("SOURCE")) else {
-                return Err(AppError::file_op(format!("Cannot find the mount of {src_s}"), "Check that the source exists."));
-            };
-            if done.contains(target) {
+            let info = mount_of(src, cmd.as_ref())?;
+            if done.contains(&info["TARGET"]) {
                 continue;
             }
+            add(&mut snap, &src.to_string_lossy(), &info, opts, cmd.as_ref())?;
+            done.push(info["TARGET"].clone());
+        }
+        Ok(snap)
+    }
+
+    /// Snapshot the LVM volume mounted at `info["TARGET"]` and mount it.
+    pub(super) fn add(snap: &mut Snapshot, src_s: &str, info: &std::collections::HashMap<String, String>, opts: &SnapshotOptions, cmd: &dyn Cmd) -> Result<(), AppError> {
+        let (target, device) = (&info["TARGET"], &info["SOURCE"]);
+        {
             let lv = cmd.run("lvs", &["--noheadings", "--separator", "|", "-o", "vg_name,lv_name", device]).map_err(|_| {
                 AppError::file_op(format!("{src_s} is on {device}, which is not an LVM logical volume"), "LVM snapshots need the source on an LVM volume.")
             })?;
@@ -322,9 +413,115 @@ mod lvm {
             cmd.run("mount", &["-o", &mo, &format!("/dev/{vg}/{name}"), &dir.to_string_lossy()])?;
             snap.cleanup.push(("umount".into(), vec![dir.to_string_lossy().into_owned()]));
             snap.add_map(PathBuf::from(target), dir);
-            done.push(target.clone());
         }
+        Ok(())
+    }
+}
+
+/// Snapshot name stamp: UTC time plus a short random id.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stamp() -> String {
+    format!("{}-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"), short_id())
+}
+
+/// Linux: pick ZFS, btrfs or LVM per source (by filesystem type, or the
+/// configured provider) and put every snapshot into one [`Snapshot`].
+#[cfg(any(target_os = "linux", test))]
+mod linux {
+    use super::*;
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) fn create(sources: &[PathBuf], opts: &SnapshotOptions, cmd: Arc<dyn Cmd>) -> Result<Snapshot, AppError> {
+        let mut snap = Snapshot::new("lvm", cmd.clone());
+        let mut done: Vec<String> = Vec::new();
+        let mut methods: Vec<&'static str> = Vec::new();
+        for src in sources {
+            let info = lvm::mount_of(src, cmd.as_ref())?;
+            if done.contains(&info["TARGET"]) {
+                continue;
+            }
+            let provider = match (opts.provider, info.get("FSTYPE").map(String::as_str)) {
+                (SnapshotProvider::Auto, Some("zfs")) => SnapshotProvider::Zfs,
+                (SnapshotProvider::Auto, Some("btrfs")) => SnapshotProvider::Btrfs,
+                (SnapshotProvider::Auto, _) => SnapshotProvider::Lvm,
+                (p, _) => p,
+            };
+            let src_s = src.to_string_lossy();
+            match provider {
+                SnapshotProvider::Zfs => zfs::add(&mut snap, src, &info, cmd.as_ref())?,
+                SnapshotProvider::Btrfs => btrfs::add(&mut snap, src, &info, cmd.as_ref())?,
+                _ => lvm::add(&mut snap, &src_s, &info, opts, cmd.as_ref())?,
+            }
+            if !methods.contains(&provider.name()) {
+                methods.push(provider.name());
+            }
+            done.push(info["TARGET"].clone());
+        }
+        snap.method = methods.join("+");
         Ok(snap)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+mod zfs {
+    use super::*;
+
+    /// `zfs list -H -o name,mountpoint` → (dataset, mount point) of datasets
+    /// mounted at a path.
+    pub(super) fn datasets(out: &str) -> Vec<(String, PathBuf)> {
+        out.lines()
+            .filter_map(|l| {
+                let (name, mp) = l.split_once('\t')?;
+                let mp = mp.trim();
+                mp.starts_with('/').then(|| (name.trim().to_string(), PathBuf::from(mp)))
+            })
+            .collect()
+    }
+
+    /// Snapshot the dataset holding `src`; it is read through
+    /// `<mount point>/.zfs/snapshot/<name>` and destroyed on release.
+    pub(super) fn add(snap: &mut Snapshot, src: &Path, info: &std::collections::HashMap<String, String>, cmd: &dyn Cmd) -> Result<(), AppError> {
+        let list = cmd.run("zfs", &["list", "-H", "-o", "name,mountpoint"])?;
+        let (dataset, mountpoint) = datasets(&list)
+            .into_iter()
+            .filter(|(_, mp)| src.starts_with(mp))
+            .max_by_key(|(_, mp)| mp.as_os_str().len())
+            // Legacy mount points: the mount itself names the dataset.
+            .or_else(|| (info.get("FSTYPE").map(String::as_str) == Some("zfs")).then(|| (info["SOURCE"].clone(), PathBuf::from(&info["TARGET"]))))
+            .ok_or_else(|| AppError::file_op(format!("{} is not on a ZFS dataset", src.display()), "Choose another snapshot method or turn snapshots off."))?;
+        let name = format!("ufop-{}", stamp());
+        let full = format!("{dataset}@{name}");
+        cmd.run("zfs", &["snapshot", &full])?;
+        snap.cleanup.push(("zfs".into(), vec!["destroy".into(), full]));
+        snap.add_map(mountpoint.clone(), mountpoint.join(".zfs").join("snapshot").join(&name));
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+mod btrfs {
+    use super::*;
+
+    /// Snapshot the subvolume holding `src` read-only next to it
+    /// (`<subvolume>/.ufop-snap-<stamp>`); deleted on release.
+    pub(super) fn add(snap: &mut Snapshot, src: &Path, info: &std::collections::HashMap<String, String>, cmd: &dyn Cmd) -> Result<(), AppError> {
+        let target = PathBuf::from(&info["TARGET"]);
+        // The nearest folder at or above the source that is a subvolume.
+        let mut cand = src.to_path_buf();
+        let subvol = loop {
+            if cmd.run("btrfs", &["subvolume", "show", &cand.to_string_lossy()]).is_ok() {
+                break cand;
+            }
+            if cand == target || !cand.pop() || !cand.starts_with(&target) {
+                return Err(AppError::file_op(format!("No btrfs subvolume found for {}", src.display()), "btrfs snapshots need the source inside a subvolume."));
+            }
+        };
+        let dir = subvol.join(format!(".ufop-snap-{}", stamp()));
+        let dir_s = dir.to_string_lossy().into_owned();
+        cmd.run("btrfs", &["subvolume", "snapshot", "-r", &subvol.to_string_lossy(), &dir_s])?;
+        snap.cleanup.push(("btrfs".into(), vec!["subvolume".into(), "delete".into(), dir_s]));
+        snap.add_map(subvol, dir);
+        Ok(())
     }
 }
 
@@ -639,6 +836,82 @@ mod tests {
         drop(snap);
         let calls = s.calls();
         assert!(calls.last().unwrap().starts_with("tmutil deletelocalsnapshots 2026-10-21-101530"), "{calls:?}");
+    }
+
+    #[test]
+    fn zfs_flow_reads_through_dot_zfs_and_destroys() {
+        let s = Script::new(&[
+            Ok("TARGET=\"/tank/home\" SOURCE=\"tank/home\" FSTYPE=\"zfs\"\n"),
+            Ok("tank\t/tank\ntank/home\t/tank/home\ntank/swap\tnone\n"),
+            Ok(""), // zfs snapshot
+        ]);
+        let snap = linux::create(&["/tank/home/me/docs".into()], &SnapshotOptions::default(), s.clone()).unwrap();
+        assert_eq!(snap.method, "zfs");
+        let calls = s.calls();
+        assert_eq!(calls[1], "zfs list -H -o name,mountpoint");
+        assert!(calls[2].starts_with("zfs snapshot tank/home@ufop-"), "{calls:?}");
+        let name = calls[2].rsplit('@').next().unwrap().to_string();
+        assert_eq!(snap.real(Path::new("/tank/home/me/docs/a.txt")), PathBuf::from(format!("/tank/home/.zfs/snapshot/{name}/me/docs/a.txt")));
+        assert!(snap.release().is_empty());
+        assert_eq!(s.calls().last().unwrap(), &format!("zfs destroy tank/home@{name}"));
+    }
+
+    #[test]
+    fn btrfs_flow_finds_the_subvolume_and_deletes_the_snapshot() {
+        let s = Script::new(&[
+            Ok("TARGET=\"/data\" SOURCE=\"/dev/sdb1[/@data]\" FSTYPE=\"btrfs\"\n"),
+            Err("not a subvolume"), // /data/projects/app
+            Err("not a subvolume"), // /data/projects
+            Ok("data\n\tName: \t@data\n"), // /data
+            Ok(""), // snapshot
+        ]);
+        let snap = linux::create(&["/data/projects/app".into()], &SnapshotOptions::default(), s.clone()).unwrap();
+        assert_eq!(snap.method, "btrfs");
+        let calls = s.calls();
+        assert_eq!(&calls[1..4], ["btrfs subvolume show /data/projects/app", "btrfs subvolume show /data/projects", "btrfs subvolume show /data"]);
+        assert!(calls[4].starts_with("btrfs subvolume snapshot -r /data /data/.ufop-snap-"), "{calls:?}");
+        let real = snap.real(Path::new("/data/projects/app/x"));
+        assert!(real.starts_with("/data") && real.to_string_lossy().contains(".ufop-snap-") && real.ends_with("projects/app/x"), "{real:?}");
+        drop(snap);
+        assert!(s.calls().last().unwrap().starts_with("btrfs subvolume delete /data/.ufop-snap-"));
+        // No subvolume anywhere up to the mount: an error, nothing created.
+        let s = Script::new(&[Ok("TARGET=\"/d\" SOURCE=\"/dev/x\" FSTYPE=\"btrfs\""), Err("no"), Err("no")]);
+        assert!(linux::create(&["/d/a".into()], &SnapshotOptions::default(), s.clone()).is_err());
+        assert!(!s.calls().iter().any(|c| c.contains("snapshot -r")));
+    }
+
+    #[test]
+    fn auto_mixes_providers_and_explicit_provider_wins() {
+        let root = tempfile::tempdir().unwrap();
+        let opts = SnapshotOptions { mount_root: Some(root.path().to_string_lossy().into()), ..Default::default() };
+        let s = Script::new(&[
+            Ok("TARGET=\"/tank\" SOURCE=\"tank\" FSTYPE=\"zfs\""),
+            Ok("tank\t/tank\n"),
+            Ok(""),
+            Ok("TARGET=\"/home\" SOURCE=\"/dev/mapper/vg-home\" FSTYPE=\"ext4\""),
+            Ok("vg|home"),
+            Ok(""),
+            Ok(""),
+        ]);
+        let snap = linux::create(&["/tank/a".into(), "/home/b".into()], &opts, s.clone()).unwrap();
+        assert_eq!(snap.method, "zfs+lvm");
+        assert!(s.calls().iter().any(|c| c.starts_with("lvcreate")));
+        drop(snap);
+        // Forcing ZFS on a non-ZFS mount fails clearly.
+        let s = Script::new(&[Ok("TARGET=\"/\" SOURCE=\"/dev/sda1\" FSTYPE=\"ext4\""), Ok("tank\t/tank\n")]);
+        let e = linux::create(&["/srv".into()], &SnapshotOptions { provider: SnapshotProvider::Zfs, ..Default::default() }, s).err().unwrap();
+        assert!(e.user_message().contains("not on a ZFS dataset"));
+        let p: SnapshotOptions = serde_json::from_str(r#"{"provider":"btrfs"}"#).unwrap();
+        assert_eq!(p.provider, SnapshotProvider::Btrfs);
+        assert_eq!(serde_json::from_str::<SnapshotOptions>("{}").unwrap().provider, SnapshotProvider::Auto);
+    }
+
+    #[test]
+    fn diagnostics_list_providers() {
+        let names: Vec<String> = providers().into_iter().map(|p| p.name).collect();
+        #[cfg(target_os = "linux")]
+        assert_eq!(names, ["zfs", "btrfs", "lvm"]);
+        assert!(!names.is_empty());
     }
 
     #[test]

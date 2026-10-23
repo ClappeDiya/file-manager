@@ -1,12 +1,16 @@
-//! Azure Blob Storage (Shared Key or SAS), including the Azurite emulator.
+//! Azure Blob Storage, including the Azurite emulator. Sign-in with the
+//! account key, a SAS token, or Microsoft Entra ID (service principal with
+//! a secret or certificate, federated workload identity, managed identity).
 //!
-//! Large volumes go up as blocks of a configurable size; access tiers,
-//! archive rehydration and version-level immutability policies are
-//! supported.
+//! Large volumes go up as blocks of a configurable size; access tiers (also
+//! per volume kind), archive rehydration, version-level immutability
+//! policies and sharded layouts (`dir/name` blob prefixes) are supported.
 
 use super::http::{self, TlsOptions};
-use super::{direct_child, join_key, BoxFut, ObjectStore};
-use crate::connectors::azure_rest::{AzureClient, Service};
+use super::{child_within_one, direct_child, join_key, BoxFut, ClassByKind, ObjectStore};
+use crate::connectors::aws_chain::ChainEnv;
+use crate::connectors::azure_ad::{AadCredential, AadTokenSource, STORAGE_SCOPE};
+use crate::connectors::azure_rest::{AzureClient, ClientAuth, Service};
 use crate::core::error::AppError;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -29,7 +33,66 @@ pub struct AzureConfig {
     /// Rehydration priority for archived blobs: `Standard` or `High`.
     pub rehydrate_priority: String,
     pub tls: TlsOptions,
+    /// How to sign in (default: account key or SAS from the stored secret).
+    pub auth: AzureAuth,
+    /// Entra ID authority; empty = `https://login.microsoftonline.com`.
+    pub authority_host: String,
+    /// Access tier per volume kind, overriding `access_tier` (`Archive` refused).
+    pub access_tier_by_kind: ClassByKind,
 }
+
+/// Azure sign-in. The secret in the credential store holds the account key,
+/// SAS token, client secret or PFX password, depending on the method.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AzureAuth {
+    /// Account key (a SAS token is recognised too, as before).
+    #[default]
+    SharedKey,
+    Sas,
+    /// App registration with a client secret.
+    ServicePrincipalSecret {
+        #[serde(default)]
+        tenant: String,
+        #[serde(default)]
+        client_id: String,
+    },
+    /// App registration with a certificate: a PEM (private key + certificate)
+    /// or PFX file; the secret is the PFX password, if any.
+    ServicePrincipalCertificate {
+        #[serde(default)]
+        tenant: String,
+        #[serde(default)]
+        client_id: String,
+        #[serde(default)]
+        cert_path: String,
+    },
+    /// Workload identity federation: a token file used as client assertion.
+    FederatedToken {
+        #[serde(default)]
+        tenant: String,
+        #[serde(default)]
+        client_id: String,
+        #[serde(default)]
+        token_file: String,
+    },
+    /// The machine's managed identity (user-assigned: its client id).
+    ManagedIdentity {
+        #[serde(default)]
+        client_id: Option<String>,
+    },
+}
+
+impl AzureAuth {
+    /// Whether this method reads a secret from the credential store
+    /// (always for keys and client secrets; optional for certificates).
+    pub fn needs_secret(&self) -> bool {
+        matches!(self, Self::SharedKey | Self::Sas | Self::ServicePrincipalSecret { .. })
+    }
+}
+
+/// Access tiers whose blobs must be rehydrated before reading.
+pub const ARCHIVE_TIERS: &[&str] = &["Archive"];
 
 impl Default for AzureConfig {
     fn default() -> Self {
@@ -42,6 +105,9 @@ impl Default for AzureConfig {
             block_size_mb: 4,
             rehydrate_priority: "Standard".into(),
             tls: TlsOptions::default(),
+            auth: AzureAuth::SharedKey,
+            authority_host: String::new(),
+            access_tier_by_kind: ClassByKind::default(),
         }
     }
 }
@@ -54,11 +120,68 @@ pub struct AzureStore {
 impl AzureStore {
     /// `secret` = base64 account key, or a SAS token (`sv=…` / `?sv=…`).
     pub fn new(cfg: AzureConfig, secret: String) -> Result<Self, AppError> {
+        Self::with_env(cfg, Some(secret), ChainEnv::process())
+    }
+
+    /// Open with the sign-in method of `cfg.auth`; `env` is read for
+    /// managed-identity endpoints and the authority host.
+    pub fn with_env(cfg: AzureConfig, secret: Option<String>, env: ChainEnv) -> Result<Self, AppError> {
         if cfg.account.trim().is_empty() || cfg.container.trim().is_empty() {
             return Err(AppError::validation("Enter the storage account and container"));
         }
-        let client = AzureClient::new(&cfg.account, &cfg.endpoint, Service::Blob, &secret, &cfg.tls)?;
+        cfg.access_tier_by_kind.refuse(ARCHIVE_TIERS, "Access tier")?;
+        let secret = secret.unwrap_or_default();
+        let aad = |c: AadCredential| -> Result<ClientAuth, AppError> {
+            let src = AadTokenSource::new(c, Some(cfg.authority_host.as_str()), http::client(&cfg.tls)?, env.clone())?;
+            Ok(ClientAuth::Bearer(std::sync::Arc::new(src), STORAGE_SCOPE.into()))
+        };
+        let auth = match &cfg.auth {
+            AzureAuth::SharedKey => ClientAuth::Auto(secret),
+            AzureAuth::Sas => ClientAuth::Sas(secret),
+            AzureAuth::ServicePrincipalSecret { tenant, client_id } => aad(AadCredential::Secret { tenant: tenant.clone(), client_id: client_id.clone(), secret })?,
+            AzureAuth::ServicePrincipalCertificate { tenant, client_id, cert_path } => {
+                aad(AadCredential::Certificate { tenant: tenant.clone(), client_id: client_id.clone(), path: cert_path.clone(), password: Some(secret).filter(|s| !s.is_empty()) })?
+            }
+            AzureAuth::FederatedToken { tenant, client_id, token_file } => aad(AadCredential::Federated { tenant: tenant.clone(), client_id: client_id.clone(), token_file: token_file.clone() })?,
+            AzureAuth::ManagedIdentity { client_id } => aad(AadCredential::Managed { client_id: client_id.clone() })?,
+        };
+        let client = AzureClient::with_auth(&cfg.account, &cfg.endpoint, Service::Blob, auth, &cfg.tls)?;
         Ok(Self { cfg, client })
+    }
+
+    async fn list_prefix(&self, pfx: &str, delimiter: bool) -> Result<(Vec<(String, u64)>, Vec<String>), AppError> {
+        let (mut blobs, mut folders) = (Vec::new(), Vec::new());
+        let mut marker = String::new();
+        loop {
+            let mut q = vec![("restype", "container".to_string()), ("comp", "list".to_string()), ("prefix", pfx.to_string())];
+            if delimiter {
+                q.push(("delimiter", "/".to_string()));
+            }
+            if !marker.is_empty() {
+                q.push(("marker", marker.clone()));
+            }
+            let r = http::check(self.send(reqwest::Method::GET, None, &q, &[], Vec::new()).await?, "Azure listing").await?;
+            let xml = r.text().await.map_err(|e| http::net("Azure listing", e))?;
+            for b in http::xml_all(&xml, "Blob") {
+                let name = http::xml_unescape(&http::xml_one(&b, "Name").unwrap_or_default());
+                blobs.push((name, http::xml_one(&b, "Content-Length").and_then(|s| s.parse().ok()).unwrap_or(0)));
+            }
+            for p in http::xml_all(&xml, "BlobPrefix") {
+                if let Some(n) = http::xml_one(&p, "Name") {
+                    folders.push(http::xml_unescape(&n));
+                }
+            }
+            marker = http::xml_one(&xml, "NextMarker").unwrap_or_default();
+            if marker.is_empty() {
+                break;
+            }
+        }
+        Ok((blobs, folders))
+    }
+
+    fn folder_prefix(&self) -> String {
+        let prefix = self.cfg.prefix.trim_matches('/');
+        if prefix.is_empty() { String::new() } else { format!("{prefix}/") }
     }
 
     async fn send(&self, method: reqwest::Method, blob: Option<&str>, query: &[(&str, String)], extra: &[(&str, String)], body: Vec<u8>) -> Result<reqwest::Response, AppError> {
@@ -83,28 +206,36 @@ impl ObjectStore for AzureStore {
     fn list(&self) -> BoxFut<'_, Vec<RemoteFile>> {
         Box::pin(async move {
             let prefix = self.cfg.prefix.trim_matches('/');
-            let pfx = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
-            let mut out = Vec::new();
-            let mut marker = String::new();
-            loop {
-                let mut q = vec![("restype", "container".to_string()), ("comp", "list".to_string()), ("prefix", pfx.clone())];
-                if !marker.is_empty() {
-                    q.push(("marker", marker.clone()));
-                }
-                let r = http::check(self.send(reqwest::Method::GET, None, &q, &[], Vec::new()).await?, "Azure listing").await?;
-                let xml = r.text().await.map_err(|e| http::net("Azure listing", e))?;
-                for b in http::xml_all(&xml, "Blob") {
-                    let name = http::xml_unescape(&http::xml_one(&b, "Name").unwrap_or_default());
-                    let size = http::xml_one(&b, "Content-Length").and_then(|s| s.parse().ok()).unwrap_or(0);
-                    if let Some(n) = direct_child(prefix, &name) {
-                        out.push(RemoteFile { name: n.to_string(), size });
-                    }
-                }
-                marker = http::xml_one(&xml, "NextMarker").unwrap_or_default();
-                if marker.is_empty() {
-                    break;
-                }
+            let (blobs, _) = self.list_prefix(&self.folder_prefix(), true).await?;
+            Ok(blobs.into_iter().filter_map(|(n, size)| direct_child(prefix, &n).map(|n| RemoteFile { name: n.to_string(), size })).collect())
+        })
+    }
+
+    fn supports_subfolders(&self) -> bool {
+        true
+    }
+
+    fn list_recursive(&self, parallelism: usize) -> BoxFut<'_, Vec<RemoteFile>> {
+        Box::pin(async move {
+            let prefix = self.cfg.prefix.trim_matches('/').to_string();
+            let pfx = self.folder_prefix();
+            if parallelism <= 1 {
+                let (blobs, _) = self.list_prefix(&pfx, false).await?;
+                return Ok(blobs.into_iter().filter_map(|(n, size)| child_within_one(&prefix, &n).map(|name| RemoteFile { name, size })).collect());
             }
+            let (top, folders) = self.list_prefix(&pfx, true).await?;
+            let mut out: Vec<RemoteFile> = top.into_iter().filter_map(|(n, size)| direct_child(&prefix, &n).map(|n| RemoteFile { name: n.to_string(), size })).collect();
+            let p2 = prefix.clone();
+            out.extend(
+                super::list_folders(folders, parallelism, |f| {
+                    let prefix = p2.clone();
+                    async move {
+                        let (blobs, _) = self.list_prefix(&f, true).await?;
+                        Ok(blobs.into_iter().filter_map(|(n, size)| child_within_one(&prefix, &n).map(|name| RemoteFile { name, size })).collect())
+                    }
+                })
+                .await?,
+            );
             Ok(out)
         })
     }
@@ -114,8 +245,9 @@ impl ObjectStore for AzureStore {
             let key = join_key(&self.cfg.prefix, name);
             let block = (self.cfg.block_size_mb.max(1) as usize) << 20;
             let mut tier = Vec::new();
-            if !self.cfg.access_tier.is_empty() {
-                tier.push(("x-ms-access-tier", self.cfg.access_tier.clone()));
+            let t = self.cfg.access_tier_by_kind.pick(name, &self.cfg.access_tier);
+            if !t.is_empty() {
+                tier.push(("x-ms-access-tier", t));
             }
             if data.len() <= block {
                 let mut h = vec![("x-ms-blob-type", "BlockBlob".to_string()), ("content-md5", Self::md5(&data)), ("content-type", "application/octet-stream".to_string())];

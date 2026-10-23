@@ -1,5 +1,6 @@
-//! Server authentication: a single hashed UI password (Argon2id PHC
-//! string), short-lived HS256 access tokens, rotating refresh tokens
+//! Server authentication: accounts with hashed passwords (Argon2id PHC
+//! strings, see `users`; the original single server password is the
+//! `admin` account), short-lived HS256 access tokens, rotating refresh tokens
 //! (stored hashed, delivered as an HttpOnly cookie), one-time sign-in
 //! tokens, opt-in long-lived automation tokens, and "reset JWT" which
 //! rotates the signing key and revokes every outstanding token.
@@ -162,24 +163,48 @@ pub struct AuthService {
     pub throttle: Arc<LoginThrottle>,
     /// Passwords recently accepted by `login_remembered` (SHA-256 → when).
     remembered: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
+    /// The legacy password has been turned into an account.
+    accounts_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// How long `login_remembered` trusts an accepted password.
 pub const REMEMBER_LOGIN: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl AuthService {
+    /// The server's settings database (branding, flags).
+    pub fn settings(&self) -> &SettingsStore {
+        &self.settings
+    }
+
     pub fn new(settings: SettingsStore) -> Self {
-        Self { settings, throttle: Arc::new(LoginThrottle::new(10, 250)), remembered: Default::default() }
+        Self { settings, throttle: Arc::new(LoginThrottle::new(10, 250)), remembered: Default::default(), accounts_ready: Default::default() }
     }
 
+    /// Whether anyone can sign in (an account, or the not yet migrated server password).
     pub async fn has_password(&self) -> Result<bool, AppError> {
-        Ok(self.settings.get(KEY_PASSWORD).await?.is_some())
+        Ok(self.settings.get(KEY_PASSWORD).await?.is_some() || !self.users().is_empty().await?)
     }
 
+    /// Set the `admin` account's password (`--set-password`).
     pub async fn set_password(&self, pw: &str) -> Result<(), AppError> {
-        self.settings.set_secret(KEY_PASSWORD, &hash_password(pw)?).await?;
+        let hash = hash_password(pw)?;
+        self.ensure_accounts().await?;
+        self.users().set_admin_password(hash.clone()).await?;
+        self.accounts_ready.store(true, Ordering::SeqCst);
+        // Kept for older versions of the server reading this database.
+        self.settings.set_secret(KEY_PASSWORD, &hash).await?;
         // A new password invalidates every session.
         self.reset_jwt().await
+    }
+
+    /// Change one account's password and sign out its sessions.
+    pub async fn set_user_password(&self, username: &str, pw: &str) -> Result<(), AppError> {
+        if username.eq_ignore_ascii_case(super::users::ADMIN) {
+            return self.set_password(pw).await;
+        }
+        self.users().update(username, super::users::UserPatch { password: Some(pw.to_string()), ..Default::default() }).await?;
+        let u = username.to_string();
+        self.settings.pool().execute(move |c| Ok(c.execute("UPDATE server_tokens SET revoked = 1 WHERE subject = ?1 COLLATE NOCASE", [u]).map(|_| ())?)).await
     }
 
     /// Folder policies of shared folders (see `folders`).
@@ -230,6 +255,15 @@ impl AuthService {
             .await
     }
 
+    /// The CSRF token bound to a refresh token: HMAC-SHA256 under the
+    /// signing key (resetting tokens changes it), base64url.
+    pub async fn csrf_token(&self, refresh_raw: &str) -> Result<String, AppError> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.jwt_key().await?).map_err(|_| AppError::internal("bad jwt key"))?;
+        mac.update(b"ufop-csrf:");
+        mac.update(sha256_hex(refresh_raw).as_bytes());
+        Ok(B64.encode(mac.finalize().into_bytes()))
+    }
+
     pub async fn set_automation_allowed(&self, allowed: bool) -> Result<(), AppError> {
         self.settings.set(KEY_AUTOMATION, if allowed { "1" } else { "0" }).await
     }
@@ -238,29 +272,42 @@ impl AuthService {
         Ok(self.settings.get(KEY_AUTOMATION).await?.as_deref() == Some("1"))
     }
 
-    async fn issue(&self, kind: TokenKind, ttl: Duration) -> Result<IssuedToken, AppError> {
+    async fn issue(&self, sub: &str, kind: TokenKind, ttl: Duration) -> Result<IssuedToken, AppError> {
         let now = Utc::now();
-        let claims = Claims { sub: "admin".into(), kind, iat: now.timestamp(), exp: (now + ttl).timestamp(), jti: uuid::Uuid::new_v4().to_string() };
+        let claims = Claims { sub: sub.into(), kind, iat: now.timestamp(), exp: (now + ttl).timestamp(), jti: uuid::Uuid::new_v4().to_string() };
         Ok(IssuedToken { token: sign_jwt(&self.jwt_key().await?, &claims)?, expires_at: (now + ttl).to_rfc3339() })
     }
 
+    /// Access token of the `admin` account.
     pub async fn issue_access(&self) -> Result<IssuedToken, AppError> {
-        self.issue(TokenKind::Access, Duration::minutes(ACCESS_TTL_MIN)).await
+        self.issue_access_for(super::users::ADMIN).await
+    }
+
+    pub async fn issue_access_for(&self, user: &str) -> Result<IssuedToken, AppError> {
+        self.issue(user, TokenKind::Access, Duration::minutes(ACCESS_TTL_MIN)).await
     }
 
     /// Short-lived token that can be exchanged once for a session (e.g. "open UI" from the tray).
     pub async fn issue_signin(&self) -> Result<IssuedToken, AppError> {
-        self.issue(TokenKind::Signin, Duration::minutes(SIGNIN_TTL_MIN)).await
+        self.issue_signin_for(super::users::ADMIN).await
+    }
+
+    pub async fn issue_signin_for(&self, user: &str) -> Result<IssuedToken, AppError> {
+        self.issue(user, TokenKind::Signin, Duration::minutes(SIGNIN_TTL_MIN)).await
     }
 
     pub async fn issue_automation(&self) -> Result<IssuedToken, AppError> {
+        self.issue_automation_for(super::users::ADMIN).await
+    }
+
+    pub async fn issue_automation_for(&self, user: &str) -> Result<IssuedToken, AppError> {
         if !self.automation_allowed().await? {
             return Err(AppError::PermissionDenied {
                 message: "Automation tokens are disabled".into(),
                 advice: "Enable them with `ufop-server --allow-automation-tokens` or the settings API.".into(),
             });
         }
-        self.issue(TokenKind::Automation, Duration::days(AUTOMATION_TTL_DAYS)).await
+        self.issue(user, TokenKind::Automation, Duration::days(AUTOMATION_TTL_DAYS)).await
     }
 
     /// Validate a bearer token; sign-in tokens are not accepted as bearers.
@@ -272,8 +319,8 @@ impl AuthService {
         Ok(c)
     }
 
-    /// Redeem a one-time sign-in token.
-    pub async fn redeem_signin(&self, token: &str) -> Result<(), AppError> {
+    /// Redeem a one-time sign-in token; returns the account it is for.
+    pub async fn redeem_signin(&self, token: &str) -> Result<String, AppError> {
         let c = verify_jwt(&self.jwt_key().await?, token)?;
         if c.kind != TokenKind::Signin {
             return Err(auth_err("Not a sign-in token"));
@@ -292,10 +339,15 @@ impl AuthService {
         if !fresh {
             return Err(auth_err("This sign-in link was already used"));
         }
-        Ok(())
+        Ok(c.sub)
     }
 
     pub async fn issue_refresh(&self) -> Result<IssuedToken, AppError> {
+        self.issue_refresh_for(super::users::ADMIN).await
+    }
+
+    pub async fn issue_refresh_for(&self, user: &str) -> Result<IssuedToken, AppError> {
+        let sub = user.to_string();
         let raw = random_token();
         let h = sha256_hex(&raw);
         let exp = Utc::now() + Duration::days(REFRESH_TTL_DAYS);
@@ -305,8 +357,8 @@ impl AuthService {
             .pool()
             .execute(move |c| {
                 c.execute(
-                    "INSERT INTO server_tokens(id, kind, token_hash, expires_at, revoked) VALUES (?1, 'refresh', ?2, ?3, 0)",
-                    rusqlite::params![id, h, exp_s],
+                    "INSERT INTO server_tokens(id, kind, token_hash, expires_at, revoked, subject) VALUES (?1, 'refresh', ?2, ?3, 0, ?4)",
+                    rusqlite::params![id, h, exp_s, sub],
                 )?;
                 Ok(())
             })
@@ -314,24 +366,58 @@ impl AuthService {
         Ok(IssuedToken { token: raw, expires_at: exp.to_rfc3339() })
     }
 
-    /// Exchange a refresh token: revokes it and issues a new pair (rotation).
+    /// Exchange a refresh token: revokes it and issues a new pair (rotation)
+    /// for the same account, if it is still enabled.
     pub async fn refresh(&self, raw: &str) -> Result<(IssuedToken, IssuedToken), AppError> {
         let h = sha256_hex(raw);
         let now = Utc::now().to_rfc3339();
-        let ok = self
+        let sub: Option<String> = self
             .settings
             .pool()
             .execute(move |c| {
-                Ok(c.execute(
-                    "UPDATE server_tokens SET revoked = 1 WHERE kind = 'refresh' AND token_hash = ?1 AND revoked = 0 AND expires_at > ?2",
-                    rusqlite::params![h, now],
-                )? == 1)
+                use rusqlite::OptionalExtension;
+                let sub: Option<String> = c
+                    .query_row("SELECT subject FROM server_tokens WHERE kind = 'refresh' AND token_hash = ?1 AND revoked = 0 AND expires_at > ?2", rusqlite::params![h, now], |r| r.get(0))
+                    .optional()?;
+                if sub.is_some() {
+                    c.execute("UPDATE server_tokens SET revoked = 1 WHERE kind = 'refresh' AND token_hash = ?1", [&h])?;
+                }
+                Ok(sub)
             })
             .await?;
-        if !ok {
-            return Err(auth_err("Session expired"));
+        let Some(sub) = sub else { return Err(auth_err("Session expired")) };
+        self.account(&sub).await?;
+        Ok((self.issue_access_for(&sub).await?, self.issue_refresh_for(&sub).await?))
+    }
+
+    /// The enabled account a token's subject names (the legacy admin is migrated first).
+    pub async fn account(&self, username: &str) -> Result<super::users::User, AppError> {
+        self.ensure_accounts().await?;
+        match self.users().get(username).await? {
+            Some(u) if !u.disabled => Ok(u),
+            Some(_) => Err(AppError::PermissionDenied { message: "This account is disabled".into(), advice: "Ask an administrator to enable it.".into() }),
+            None => Err(auth_err("This account no longer exists")),
         }
-        Ok((self.issue_access().await?, self.issue_refresh().await?))
+    }
+
+    /// Accounts and access rules (see `users`).
+    pub fn users(&self) -> super::users::UserStore {
+        super::users::UserStore::new(self.settings.pool().clone())
+    }
+
+    /// Turn the pre-multi-user server password into the `admin` account (once).
+    pub async fn ensure_accounts(&self) -> Result<(), AppError> {
+        if self.accounts_ready.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let users = self.users();
+        if users.is_empty().await? {
+            users.migrate_legacy_admin(self.settings.get_secret(KEY_PASSWORD).await?).await?;
+        }
+        if !users.is_empty().await? {
+            self.accounts_ready.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     pub async fn revoke_refresh(&self, raw: &str) -> Result<(), AppError> {
@@ -345,13 +431,24 @@ impl AuthService {
             .await
     }
 
-    /// Throttled password login. `Ok(None)` = too many pending attempts.
+    /// Throttled password login of the `admin` account. `Ok(None)` = too many pending attempts.
     pub async fn login(&self, pw: &str) -> Result<Option<bool>, AppError> {
-        let Some(phc) = self.settings.get_secret(KEY_PASSWORD).await? else {
+        Ok(self.login_user(super::users::ADMIN, pw).await?.map(|u| u.is_some_and(|u| u.role == super::access::Role::Admin)))
+    }
+
+    /// Throttled login of any account: `Ok(None)` = too many pending
+    /// attempts, `Ok(Some(None))` = wrong name or password, or disabled.
+    pub async fn login_user(&self, username: &str, pw: &str) -> Result<Option<Option<super::users::User>>, AppError> {
+        self.ensure_accounts().await?;
+        let users = self.users();
+        if users.is_empty().await? {
             return Err(AppError::state("No server password is set", "Start ufop-server with --set-password first."));
-        };
+        }
+        let found = users.credentials(username).await?;
+        let hash = found.as_ref().map(|(_, h)| h.clone()).unwrap_or_else(|| super::users::dummy_hash().to_string());
         let pw = pw.to_string();
-        Ok(self.throttle.attempt(move || verify_password_hash(&pw, &phc)).await)
+        let ok = self.throttle.attempt(move || verify_password_hash(&pw, &hash)).await;
+        Ok(ok.map(|ok| found.filter(|(u, _)| ok && !u.disabled).map(|(u, _)| u)))
     }
 
     /// `login` for clients that send the password with every request
@@ -359,12 +456,21 @@ impl AuthService {
     /// `REMEMBER_LOGIN` without re-hashing; a password change or token reset
     /// forgets it.
     pub async fn login_remembered(&self, pw: &str) -> Result<Option<bool>, AppError> {
+        self.login_remembered_as(super::users::ADMIN, pw).await
+    }
+
+    /// `login_remembered` for an administrator account.
+    pub async fn login_remembered_as(&self, username: &str, pw: &str) -> Result<Option<bool>, AppError> {
         use sha2::Digest;
-        let key: [u8; 32] = sha2::Sha256::digest(pw.as_bytes()).into();
+        let mut h = sha2::Sha256::new();
+        h.update(username.to_lowercase().as_bytes());
+        h.update([0u8]);
+        h.update(pw.as_bytes());
+        let key: [u8; 32] = h.finalize().into();
         if self.remembered.lock().ok().and_then(|m| m.get(&key).copied()).is_some_and(|t| t.elapsed() < REMEMBER_LOGIN) {
             return Ok(Some(true));
         }
-        let r = self.login(pw).await?;
+        let r = self.login_user(username, pw).await?.map(|u| u.is_some_and(|u| u.role == super::access::Role::Admin));
         if r == Some(true) {
             if let Ok(mut m) = self.remembered.lock() {
                 m.retain(|_, t| t.elapsed() < REMEMBER_LOGIN);

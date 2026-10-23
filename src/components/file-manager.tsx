@@ -5,6 +5,7 @@ import {
 } from "@/stores/file-manager-store";
 import { formatBytes } from "@/lib/format-bytes";
 import { useUIStore } from "@/stores/ui-store";
+import { useTextSizeShortcuts } from "@/hooks/use-text-size-shortcuts";
 import { useAiStore, type AiExecutionResult } from "@/stores/ai-store";
 import { useAutomationStore } from "@/stores/automation-store";
 import { useSpacesStore } from "@/stores/spaces-store";
@@ -320,6 +321,9 @@ let migrationRunDest: string | null = null;
 
 export function FileManager() {
   useOsFileDrop();
+  useTextSizeShortcuts();
+  // Re-render the window when the size units change (formatBytes reads the setting).
+  useUIStore((s) => s.byteUnits);
   const appMode = useUIStore((s) => s.appMode);
   const sidebarOpen = useUIStore((s) => s.sidebarOpen);
   const sidebarWidth = useUIStore((s) => s.sidebarWidth);
@@ -1902,6 +1906,7 @@ export function FileManager() {
         },
         onSetTheme: (theme) =>
           useUIStore.getState().setTheme(theme as "light" | "dark" | "system"),
+        onTextSize: (step) => useUIStore.getState().stepFontScale(step),
         onSetViewMode: (mode) => {
           const store = useFileManagerStore.getState();
           store.setViewMode(store.activePaneIndex, mode as ViewMode);

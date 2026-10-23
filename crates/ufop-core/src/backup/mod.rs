@@ -1,7 +1,8 @@
 //! Versioned backup engine: block-level deduplication, per-block compression,
 //! client-side AES-256-GCM encryption and remote volumes on any [`Backend`].
 //!
-//! Remote layout (all files live flat in the destination folder):
+//! Remote layout (all files live flat in the destination folder, unless a
+//! format v2 repository uses the sharded layout, see [`layout`]):
 //!
 //! - `{prefix}-repo.json` — unencrypted repository header: format version,
 //!   KDF salt/params and a key-check value. Never contains secrets.
@@ -10,32 +11,64 @@
 //!   local database can be rebuilt from the remote alone.
 //! - `{prefix}-{UTC timestamp}.dlist[.aes]` — one backup version (file list).
 //! - `{prefix}-verification.json` — optional unencrypted SHA-256 inventory.
+//! - `{prefix}-lock.json`, `{prefix}-lock-r-{id}.json` — repository lock
+//!   leases (exclusive writer / shared readers), see [`lock`].
+//!
+//! Format v1 and v2 repositories are both read and written; see [`format`]
+//! for what v2 adds (envelope key, zstd, content-defined chunking,
+//! ChaCha20-Poly1305, sharding) and for upgrade / rollback / password change.
 //!
 //! The local database (`db`) is a cache of that remote state; `maintenance`
 //! can recreate it from the remote files when it is lost.
 
+pub mod access;
+pub mod archive;
 pub mod backend;
+pub mod bench;
+pub mod cache;
+pub mod chunker;
+pub mod copy;
 pub mod crypto;
+pub mod davserve;
 pub mod db;
 pub mod engine;
+pub mod errors;
+pub mod estimate;
 pub mod filecrypt;
 pub mod filters;
+pub mod format;
 pub mod gpg;
+pub mod ignore;
+pub mod inspect;
+pub mod layout;
+pub mod lock;
+pub mod layers;
 pub mod maintenance;
 pub mod meta;
 pub mod mirror;
+pub mod owner;
 pub mod modules;
 pub mod par2;
 pub mod photos;
+pub mod rate_limit;
+pub mod reader;
 pub mod recovery;
 pub mod restore;
+pub mod restore_mirror;
 pub mod retention;
+pub mod schedule;
+pub mod select;
+pub mod shared;
 pub mod snapshot;
+pub mod sparse;
 pub mod usn;
+pub mod verify;
+pub mod versions;
 pub mod volume;
 
-pub use backend::{Backend, LocalBackend, RemoteFile, RetryingBackend, SoftDeleteBackend};
-pub use engine::{run_backup, BackupReport};
+pub use backend::{Backend, LocalBackend, ReadOnlyBackend, RemoteFile, RetryingBackend, SoftDeleteBackend};
+pub use engine::{run_backup, run_backup_with_streams, BackupReport};
+pub use reader::StreamSource;
 pub use filters::{FilterAction, FilterKind, FilterRule, SourceFilter};
 pub use restore::{run_restore, RestoreOptions, RestoreReport};
 pub use retention::RetentionPolicy;
@@ -44,8 +77,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Repository format version written to `{prefix}-repo.json`.
-pub const REPO_FORMAT_VERSION: u32 = 1;
+/// Newest repository format version (written to new repositories by
+/// default). Format 1 stays fully readable and writable.
+pub const REPO_FORMAT_VERSION: u32 = 2;
+/// Oldest supported repository format version.
+pub const MIN_REPO_FORMAT_VERSION: u32 = 1;
 
 /// How symbolic links in the source are handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -102,6 +138,40 @@ pub enum VolumeFormat {
     Ufop,
     /// Standard ZIP archive (one entry per block, ZIP64 when needed).
     Zip,
+}
+
+/// Block compression codec in UFOP pack volumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockCodec {
+    /// Format v1 and v2.
+    #[default]
+    Deflate,
+    /// Format v2 only (the v2 default).
+    Zstd,
+}
+
+/// Compression of sealed metadata (dlist/dindex JSON).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataCompression {
+    /// Format v1.
+    #[default]
+    None,
+    /// Format v2.
+    Zstd,
+}
+
+/// How files are split into blocks (new repositories only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkerKind {
+    /// Fixed-size blocks of `block_size` (v1 and v2).
+    Fixed,
+    /// FastCDC content-defined chunking around `block_size` (v2 default).
+    #[default]
+    #[serde(rename = "fastcdc")]
+    FastCdc,
 }
 
 /// Compression method for ZIP volumes.
@@ -264,7 +334,72 @@ pub struct BackupOptions {
     pub kdf: Option<crypto::KdfParams>,
     /// What `photos://` (macOS Photos library) sources export.
     pub photos: photos::PhotosOptions,
+
+    // ── Repository format (new repositories only; existing ones keep theirs) ──
+    /// Format version for a new repository (`None` = [`REPO_FORMAT_VERSION`]).
+    pub format_version: Option<u32>,
+    /// Chunker for a new v2 repository (`None` = FastCDC). v1 is always fixed.
+    pub chunker: Option<ChunkerKind>,
+    /// Block codec for a new v2 repository (`None` = zstd). v1 is always deflate.
+    pub block_codec: Option<BlockCodec>,
+    /// Metadata compression for a new v2 repository (`None` = zstd). v1 never compresses.
+    pub metadata_compression: Option<MetadataCompression>,
+    /// AEAD for a new encrypted v2 repository (v1 is always AES-256-GCM).
+    pub cipher: crypto::CipherKind,
+    /// Destination layout for a new v2 repository.
+    pub layout: layout::RepoLayout,
+
+    // ── Repository safety ──
+    /// Repository lock lease in seconds, renewed every third of it (0 = 30 min).
+    pub lock_ttl_secs: u64,
+    /// Warn when the destination's clock differs from this computer's by at
+    /// least this many seconds (0 = never).
+    pub clock_skew_warn_secs: u64,
+    /// Refuse to write when the clocks differ by at least this (0 = never).
+    pub clock_skew_abort_secs: u64,
+    /// Upload a checkpoint (a partial version of the files finished so
+    /// far) at most this often during a long backup (0 = off).
+    pub checkpoint_interval_secs: u64,
+    /// Also checkpoint after this many uploaded bytes (0 = off).
+    pub checkpoint_interval_bytes: u64,
+
+    // ── Versions and shared repositories ──
+    /// Note stored with each new version.
+    pub default_note: Option<String>,
+    /// Tags stored with each new version.
+    pub default_tags: std::collections::BTreeMap<String, String>,
+    /// Who writes the versions. Empty host / user name = this computer's;
+    /// set them to continue another computer's history (migration).
+    pub identity: versions::ClientIdentity,
+    /// Create a new (format 2) repository as shared: several jobs or
+    /// computers write to it and deduplicate against each other.
+    pub shared_repository: bool,
+    /// Shared repositories: compaction leaves volumes younger than this
+    /// alone, so a writer that uploaded blocks but not yet its version is
+    /// safe (0 = no delay).
+    pub shared_gc_delay_hours: u32,
+
+    // ── Sources and runs ──
+    /// Do not descend into folders on another filesystem than their
+    /// source root (mount points are kept as empty folders).
+    pub one_file_system: bool,
+    /// What unreadable files, folders and unsupported entries do to the run.
+    pub error_policy: errors::ErrorPolicy,
+    /// Re-read and re-hash about this percentage (0–100) of the files that
+    /// look unchanged, to catch content that changed without a new
+    /// timestamp (silent corruption). Files are chosen deterministically
+    /// per run, so every file is covered over time.
+    pub rehash_percent: u8,
+    /// Stop the run (with a partial version) once this many bytes were
+    /// uploaded; the next run continues where it stopped.
+    pub max_upload_bytes_per_run: Option<u64>,
+    /// Files above this size are hashed and compressed by several workers
+    /// at once (0 = off). Block boundaries are identical either way.
+    pub parallel_file_threshold: u64,
 }
+
+/// Default for [`BackupOptions::parallel_file_threshold`] (256 MiB).
+pub const DEFAULT_PARALLEL_FILE_THRESHOLD: u64 = 256 * 1024 * 1024;
 
 /// How volumes are encrypted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,6 +479,27 @@ impl Default for BackupOptions {
             gpg: GpgOptions::default(),
             kdf: None,
             photos: photos::PhotosOptions::default(),
+            format_version: None,
+            chunker: None,
+            block_codec: None,
+            metadata_compression: None,
+            cipher: crypto::CipherKind::Aes256Gcm,
+            layout: layout::RepoLayout::Flat,
+            lock_ttl_secs: lock::DEFAULT_LOCK_TTL_SECS,
+            clock_skew_warn_secs: lock::DEFAULT_SKEW_WARN_SECS,
+            clock_skew_abort_secs: lock::DEFAULT_SKEW_ABORT_SECS,
+            checkpoint_interval_secs: 900,
+            checkpoint_interval_bytes: 0,
+            default_note: None,
+            default_tags: std::collections::BTreeMap::new(),
+            identity: versions::ClientIdentity::default(),
+            shared_repository: false,
+            shared_gc_delay_hours: shared::DEFAULT_GC_DELAY_HOURS,
+            one_file_system: false,
+            error_policy: errors::ErrorPolicy::default(),
+            rehash_percent: 0,
+            max_upload_bytes_per_run: None,
+            parallel_file_threshold: DEFAULT_PARALLEL_FILE_THRESHOLD,
         }
     }
 }
@@ -493,7 +649,7 @@ pub struct FileEntry {
 }
 
 /// One backup version.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Fileset {
     pub id: i64,
     /// UTC timestamp (RFC 3339).
@@ -503,6 +659,48 @@ pub struct Fileset {
     pub partial: bool,
     pub file_count: u64,
     pub total_size: u64,
+    /// Source the version belongs to (see [`versions::ClientIdentity::source_id`]);
+    /// empty for versions written before identities were recorded.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub tags: std::collections::BTreeMap<String, String>,
+    /// Kept forever (retention skips it; deleting needs `force`).
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub pin_reason: Option<String>,
+    #[serde(default)]
+    pub identity: Option<versions::ClientIdentity>,
+    /// What the version added; `None` for versions from before this was recorded.
+    #[serde(default)]
+    pub stats: Option<versions::VersionStats>,
+}
+
+impl Fileset {
+    /// The metadata stored with this version.
+    pub fn meta(&self) -> versions::VersionMeta {
+        versions::VersionMeta {
+            note: self.note.clone(),
+            tags: self.tags.clone(),
+            pinned: self.pinned,
+            pin_reason: self.pin_reason.clone(),
+            identity: self.identity.clone(),
+            stats: self.stats,
+        }
+    }
+
+    pub(crate) fn set_meta(&mut self, m: versions::VersionMeta) {
+        self.source = m.source_id();
+        self.note = m.note;
+        self.tags = m.tags;
+        self.pinned = m.pinned;
+        self.pin_reason = m.pin_reason;
+        self.identity = m.identity;
+        self.stats = m.stats;
+    }
 }
 
 pub(crate) fn hash_bytes(alg: HashAlgorithm, data: &[u8]) -> String {

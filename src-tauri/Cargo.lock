@@ -7014,7 +7014,10 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "base64 0.22.1",
+ "chacha20poly1305",
  "chrono",
+ "clap",
+ "cron",
  "csv",
  "flate2",
  "glob",
@@ -7029,6 +7032,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "tar",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -7039,6 +7043,7 @@ dependencies = [
  "xattr",
  "xxhash-rust",
  "zip 2.6.1",
+ "zstd",
 ]
 
 [[package]]

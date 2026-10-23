@@ -186,11 +186,9 @@ function formatDuration(ms: number): string {
   return `${seconds}s`;
 }
 
+/** Speed in the units chosen in Settings → Appearance. */
 function formatSpeed(bps: number): string {
-  if (bps >= 1024 ** 3) return `${(bps / 1024 ** 3).toFixed(1)} GB/s`;
-  if (bps >= 1024 ** 2) return `${(bps / 1024 ** 2).toFixed(1)} MB/s`;
-  if (bps >= 1024) return `${(bps / 1024).toFixed(1)} KB/s`;
-  return `${bps} B/s`;
+  return `${formatBytes(bps)}/s`;
 }
 
 const BACKUP_MODES: { id: BackupMode; label: string; description: string }[] = [

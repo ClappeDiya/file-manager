@@ -15,6 +15,11 @@
 //! mounted share), the destinations `ufop backup` supports; policies with
 //! other destinations are reported as not applicable — use `ufop-server`
 //! on such machines.
+//!
+//! Managed jobs run on the same schedules as on the desktop: interval or
+//! cron mode in the schedule's time zone, compaction, verification and
+//! retention on their own maintenance schedules, and settings inherited
+//! from the organization's policy templates (see [`super::agent_jobs`]).
 
 use crate::output;
 use crate::OutputFormat;
@@ -25,10 +30,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use ufop_core::agent::policy::{self, managed_job_id, policy_of_job};
-use ufop_core::agent::{parse_tags, Agent, AgentConfig, AgentHost, AgentStatus, BoxFuture, ClientInfo, FleetPolicy, JobSummary, ReportStats, RunReport};
+use super::agent_jobs;
+use ufop_core::agent::{parse_tags, Agent, AgentConfig, AgentHost, AgentStatus, BoxFuture, ClientInfo, FleetPolicy, JobSummary, ManagedBackupTemplate, ManagedSettings, ReportStats, RunReport};
+use ufop_core::backup::schedule::{BackupSchedule, MaintenanceSchedule, MAINTENANCE_TASKS};
 use ufop_core::backup::crypto::KdfParams;
 use ufop_core::backup::db::BackupDb;
-use ufop_core::backup::{run_backup, BackupOptions, LocalBackend, OpContext, RetentionPolicy, SourceFilter};
+use ufop_core::backup::engine::Repo;
+use ufop_core::backup::{maintenance, run_backup, BackupOptions, LocalBackend, OpContext, RetentionPolicy, SourceFilter};
 use ufop_core::error::AppError;
 
 #[derive(Subcommand, Debug)]
@@ -86,7 +94,26 @@ pub struct CliJob {
     pub filter: SourceFilter,
     pub options: BackupOptions,
     pub retention: RetentionPolicy,
+    /// Typical minutes between scheduled runs (reported to the console).
     pub schedule_interval_minutes: Option<u32>,
+    /// The effective backup schedule; `None` on jobs saved by older
+    /// versions, which keep running every `schedule_interval_minutes`.
+    pub schedule: Option<BackupSchedule>,
+    /// Compaction, verification and retention on their own schedules.
+    pub maintenance: MaintenanceSchedule,
+    /// Organization templates the policy names (`org:<id>`).
+    pub template_ids: Vec<String>,
+    /// The policy's job fields (credential references only, no secrets),
+    /// kept so the job is resolved again when the templates change.
+    pub policy_fields: serde_json::Map<String, Value>,
+    pub policy_name: String,
+    /// Settings the agent cannot apply (unsupported sections, calendars).
+    pub warnings: Vec<String>,
+    pub created_at: Option<String>,
+    /// Last scheduled backup slot taken (run or skipped on a day off).
+    pub last_scheduled_at: Option<String>,
+    /// Last scheduled start of each maintenance task.
+    pub last_maintenance: BTreeMap<String, String>,
     pub last_run_at: Option<String>,
     pub last_result: Option<String>,
     pub last_summary: Option<String>,
@@ -97,6 +124,8 @@ pub struct CliJob {
 struct StateFile {
     agent: AgentConfig,
     jobs: BTreeMap<String, CliJob>,
+    /// The organization's backup templates (managed app settings).
+    templates: Vec<ManagedBackupTemplate>,
 }
 
 pub struct CliHost {
@@ -172,7 +201,20 @@ impl CliHost {
     fn job_from_policy(&self, p: &FleetPolicy) -> Result<CliJob, AppError> {
         let id = managed_job_id(&p.id)?;
         let t = policy::prepare_template(&p.job)?;
-        let f = &t.fields;
+        let old = lock(&self.state).jobs.get(&id).cloned().unwrap_or_default();
+        let templates = lock(&self.state).templates.clone();
+        let mut job = Self::build_job(id, &p.id, &p.name, t.fields, t.passphrase, &templates)?;
+        job.created_at = old.created_at.or_else(|| Some(chrono::Utc::now().to_rfc3339()));
+        job.last_scheduled_at = old.last_scheduled_at;
+        job.last_maintenance = old.last_maintenance;
+        job.last_run_at = old.last_run_at;
+        job.last_result = old.last_result;
+        job.last_summary = old.last_summary;
+        Ok(job)
+    }
+
+    /// A job from a policy's prepared fields and the organization templates.
+    fn build_job(id: String, policy_id: &str, policy_name: &str, f: serde_json::Map<String, Value>, passphrase: Option<String>, templates: &[ManagedBackupTemplate]) -> Result<CliJob, AppError> {
         let get = |k: &str| f.get(k).cloned().unwrap_or(Value::Null);
         let dest = get("destination");
         let path = match dest.get("type").and_then(|t| t.as_str()) {
@@ -188,40 +230,60 @@ impl CliHost {
         if sources.iter().all(|s| s.trim().is_empty()) || path.trim().is_empty() {
             return Err(AppError::validation("The policy needs sources and a destination folder"));
         }
-        fn field<T: Default + serde::de::DeserializeOwned>(f: &serde_json::Map<String, Value>, k: &str) -> Result<T, AppError> {
-            match f.get(k) {
-                None | Some(Value::Null) => Ok(T::default()),
-                Some(v) => serde_json::from_value(v.clone()).map_err(|e| AppError::validation(format!("Policy field '{k}': {e}"))),
-            }
-        }
-        let filter: SourceFilter = field(f, "filter")?;
-        filter.clone().compile()?;
-        let options: BackupOptions = field(f, "options")?;
-        let retention: RetentionPolicy = field(f, "retention")?;
-        let schedule = get("schedule");
-        let interval = (schedule.get("enabled").and_then(|e| e.as_bool()) == Some(true))
-            .then(|| schedule.get("interval_minutes").and_then(|i| i.as_u64()).unwrap_or(1440).max(5) as u32);
+        let eff = agent_jobs::resolve(&f, templates)?;
         let encrypted = f.get("encrypted").and_then(|e| e.as_bool()).unwrap_or(true);
-        if encrypted && t.passphrase.is_none() {
+        if encrypted && passphrase.is_none() {
             return Err(AppError::validation("An encrypted policy needs a passphrase credential"));
         }
-        let old = lock(&self.state).jobs.get(&id).cloned().unwrap_or_default();
+        let schedule = eff.schedule;
         Ok(CliJob {
             id,
-            policy_id: p.id.clone(),
-            name: f.get("name").and_then(|n| n.as_str()).unwrap_or(&p.name).to_string(),
+            policy_id: policy_id.to_string(),
+            name: f.get("name").and_then(|n| n.as_str()).unwrap_or(policy_name).to_string(),
             sources,
             destination: path,
             encrypted,
-            passphrase: t.passphrase,
-            filter,
-            options,
-            retention,
-            schedule_interval_minutes: interval,
-            last_run_at: old.last_run_at,
-            last_result: old.last_result,
-            last_summary: old.last_summary,
+            passphrase,
+            filter: eff.filter,
+            options: eff.options,
+            retention: eff.retention,
+            schedule_interval_minutes: schedule.enabled.then(|| schedule.nominal_interval_minutes()),
+            schedule: Some(schedule),
+            maintenance: eff.maintenance,
+            template_ids: eff.template_ids,
+            policy_name: policy_name.to_string(),
+            warnings: eff.warnings,
+            policy_fields: f,
+            ..Default::default()
         })
+    }
+
+    /// The organization's templates changed: resolve every managed job again.
+    /// A job its new templates make invalid keeps its previous settings.
+    fn apply_templates(&self, templates: Vec<ManagedBackupTemplate>) -> Result<(), AppError> {
+        {
+            let mut st = lock(&self.state);
+            st.templates = templates;
+            let templates = st.templates.clone();
+            for j in st.jobs.values_mut().filter(|j| !j.policy_fields.is_empty()) {
+                match Self::build_job(j.id.clone(), &j.policy_id, &j.policy_name, j.policy_fields.clone(), j.passphrase.clone(), &templates) {
+                    Ok(mut n) => {
+                        n.created_at = j.created_at.take();
+                        n.last_scheduled_at = j.last_scheduled_at.take();
+                        n.last_maintenance = std::mem::take(&mut j.last_maintenance);
+                        n.last_run_at = j.last_run_at.take();
+                        n.last_result = j.last_result.take();
+                        n.last_summary = j.last_summary.take();
+                        *j = n;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Managed job {} keeps its settings: {}", j.id, e.user_message());
+                        j.warnings = vec![format!("The organization's templates do not fit this job: {}", e.user_message())];
+                    }
+                }
+            }
+        }
+        self.save_state()
     }
 
     fn db_path(&self, id: &str) -> PathBuf {
@@ -248,7 +310,13 @@ impl CliHost {
                 let be = LocalBackend::new(&j.destination);
                 let db = BackupDb::open(&db_path)?;
                 let srcs: Vec<PathBuf> = j.sources.iter().map(PathBuf::from).collect();
-                let r = run_backup(&be, &db, &srcs, &filter, &j.options, &j.retention, pass.as_deref(), KdfParams::default(), &OpContext::new())?;
+                // Maintenance on its own schedule does not also run after the backup.
+                let mut opts = j.options.clone();
+                if j.maintenance.scheduled("compact") {
+                    opts.auto_compact = false;
+                }
+                let retention = if j.maintenance.scheduled("apply_retention") { RetentionPolicy::KeepAll } else { j.retention.clone() };
+                let r = run_backup(&be, &db, &srcs, &filter, &opts, &retention, pass.as_deref(), KdfParams::default(), &OpContext::new())?;
                 let fs = db.filesets()?;
                 let stats = ReportStats {
                     version_count: fs.len() as u64,
@@ -263,7 +331,6 @@ impl CliHost {
             .and_then(|r| r),
         };
         lock(&self.busy).remove(id);
-        let finished = chrono::Utc::now();
         let (result, message, data, stats) = match res {
             Ok((data, stats)) => {
                 let n = |k: &str| data.get(k).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
@@ -273,31 +340,7 @@ impl CliHost {
             }
             Err(e) => ("error".to_string(), e.user_message(), json!({}), ReportStats { schedule_interval_minutes: job.schedule_interval_minutes, ..Default::default() }),
         };
-        {
-            let mut s = lock(&self.state);
-            if let Some(j) = s.jobs.get_mut(id) {
-                j.last_run_at = Some(finished.to_rfc3339());
-                j.last_result = Some(result.clone());
-                j.last_summary = Some(message.clone());
-            }
-        }
-        let _ = self.save_state();
-        let report = RunReport {
-            backup_id: job.id.clone(),
-            name: job.name.clone(),
-            operation: "backup".into(),
-            result,
-            started_at: Some(started.to_rfc3339()),
-            finished_at: Some(finished.to_rfc3339()),
-            duration_ms: (finished - started).num_milliseconds().max(0) as u64,
-            message,
-            data,
-            stats,
-        };
-        if let Some(a) = self.agent.get().and_then(Weak::upgrade) {
-            a.enqueue_report(&report);
-        }
-        Ok(report)
+        Ok(self.finish(&job, "backup", started, result, message, data, stats))
     }
 
     /// Wait until no managed backup runs; `true` if one was running.
@@ -310,32 +353,186 @@ impl CliHost {
         waited
     }
 
-    /// Jobs whose interval has passed since their last run.
+    /// Jobs whose schedule slot has passed since the last scheduled run (or
+    /// the job's creation); a slot missed while the agent was stopped runs
+    /// once when it starts again. Jobs from older versions without a stored
+    /// schedule run every `schedule_interval_minutes`.
     pub fn due_jobs(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
         let busy = lock(&self.busy).clone();
         lock(&self.state)
             .jobs
             .values()
             .filter(|j| !busy.contains(&j.id))
-            .filter_map(|j| {
-                let every = chrono::Duration::minutes(j.schedule_interval_minutes? as i64);
-                let last = j.last_run_at.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.with_timezone(&chrono::Utc));
-                (last.is_none_or(|l| l + every <= now)).then(|| j.id.clone())
+            .filter(|j| match &j.schedule {
+                Some(s) => {
+                    let last = j.last_scheduled_at.as_deref().or(j.created_at.as_deref()).or(j.last_run_at.as_deref()).and_then(parse_ts);
+                    s.enabled && last.map_or(true, |l| s.is_due(l, now))
+                }
+                None => j.schedule_interval_minutes.is_some_and(|m| {
+                    let last = j.last_run_at.as_deref().and_then(parse_ts);
+                    last.map_or(true, |l| l + chrono::Duration::minutes(m as i64) <= now)
+                }),
             })
+            .map(|j| j.id.clone())
             .collect()
+    }
+
+    /// Maintenance tasks whose own schedule slot has passed: (job id, task).
+    pub fn due_maintenance(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<(String, &'static str)> {
+        let busy = lock(&self.busy).clone();
+        let mut out = Vec::new();
+        for j in lock(&self.state).jobs.values().filter(|j| !busy.contains(&j.id)) {
+            for task in MAINTENANCE_TASKS {
+                let Some(s) = j.maintenance.schedule_of(task).filter(|s| s.enabled) else { continue };
+                let last = j.last_maintenance.get(task).map(String::as_str).or(j.created_at.as_deref()).and_then(parse_ts);
+                if last.map_or(true, |l| s.is_due(l, now)) {
+                    out.push((j.id.clone(), task));
+                }
+            }
+        }
+        out
+    }
+
+    /// One scheduler pass: take every due slot (so it is not taken twice)
+    /// and return the work to start. A slot that falls on a day off of a
+    /// holiday calendar is used up without running; a job gets at most one
+    /// operation per pass (its backup first).
+    pub fn take_due(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<(String, &'static str)> {
+        let mut out: Vec<(String, &'static str)> = Vec::new();
+        let ts = now.to_rfc3339();
+        let backups = self.due_jobs(now);
+        let maint = self.due_maintenance(now);
+        {
+            let mut st = lock(&self.state);
+            for id in backups {
+                let Some(j) = st.jobs.get_mut(&id) else { continue };
+                j.last_scheduled_at = Some(ts.clone());
+                match j.schedule.as_ref().and_then(|s| s.day_off(now)) {
+                    Some(cal) => tracing::info!("Skipping scheduled backup '{}': today is a day off in '{cal}'", j.name),
+                    None => out.push((id, "backup")),
+                }
+            }
+            for (id, task) in maint {
+                let Some(j) = st.jobs.get_mut(&id) else { continue };
+                j.last_maintenance.insert(task.to_string(), ts.clone());
+                if out.iter().any(|(o, _)| *o == id) {
+                    continue;
+                }
+                match j.maintenance.schedule_of(task).and_then(|s| s.day_off(now)) {
+                    Some(cal) => tracing::info!("Skipping scheduled {task} of '{}': today is a day off in '{cal}'", j.name),
+                    None => out.push((id, task)),
+                }
+            }
+        }
+        if let Err(e) = self.save_state() {
+            tracing::warn!("Could not save the agent state: {}", e.user_message());
+        }
+        out
+    }
+
+    /// Run a maintenance task (`compact`, `verify`, `apply_retention`) of a
+    /// managed job and report it like a backup.
+    pub async fn run_maintenance(&self, id: &str, task: &str) -> Result<RunReport, AppError> {
+        let job = self.job(id)?;
+        if !lock(&self.busy).insert(id.to_string()) {
+            return Err(AppError::state("This job is already running", "Wait for it to finish."));
+        }
+        let pass = self.passphrase(&job);
+        let db_path = self.db_path(id);
+        let started = chrono::Utc::now();
+        let (j, t) = (job.clone(), task.to_string());
+        let res = match pass {
+            Err(e) => Err(e),
+            Ok(pass) => tokio::task::spawn_blocking(move || -> Result<Value, AppError> {
+                if !db_path.exists() {
+                    return Err(AppError::state("The job has not been backed up yet", "Maintenance runs after the first backup."));
+                }
+                let be = LocalBackend::new(&j.destination);
+                let db = BackupDb::open(&db_path)?;
+                let repo = Repo::open(&be, &db, pass.as_deref(), &j.options, false, KdfParams::default())?;
+                let ctx = OpContext::new();
+                Ok(match t.as_str() {
+                    "compact" => serde_json::to_value(maintenance::compact(&repo, &j.options, &ctx)?)?,
+                    "verify" => serde_json::to_value(ufop_core::backup::verify::verify(&repo, &j.maintenance.verify.clone().unwrap_or_default().options, &ctx)?)?,
+                    _ => json!({ "versions_deleted": maintenance::apply_retention(&repo, &j.retention, false)? }),
+                })
+            })
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))
+            .and_then(|r| r),
+        };
+        lock(&self.busy).remove(id);
+        let (result, message, data) = match res {
+            Ok(data) => {
+                let errors = data.get("errors").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                let n = |k: &str| data.get(k).cloned().unwrap_or(json!(0));
+                let msg = match task {
+                    "compact" => format!("{} volumes removed, {} rewritten, {} bytes reclaimed", n("volumes_removed"), n("volumes_rewritten"), n("bytes_reclaimed")),
+                    "verify" => format!("{} volumes checked, {errors} problem(s)", n("checked")),
+                    _ => format!("{} version(s) deleted", n("versions_deleted")),
+                };
+                (if errors > 0 { "error" } else { "success" }.to_string(), msg, data)
+            }
+            Err(e) => ("error".to_string(), e.user_message(), json!({})),
+        };
+        Ok(self.finish(&job, task, started, result, message, data, ReportStats { schedule_interval_minutes: job.schedule_interval_minutes, ..Default::default() }))
+    }
+
+    /// Record a finished operation on the job and queue its report.
+    #[allow(clippy::too_many_arguments)]
+    fn finish(&self, job: &CliJob, operation: &str, started: chrono::DateTime<chrono::Utc>, result: String, message: String, data: Value, stats: ReportStats) -> RunReport {
+        let finished = chrono::Utc::now();
+        {
+            let mut s = lock(&self.state);
+            if let Some(j) = s.jobs.get_mut(&job.id) {
+                j.last_run_at = Some(finished.to_rfc3339());
+                j.last_result = Some(result.clone());
+                j.last_summary = Some(message.clone());
+            }
+        }
+        let _ = self.save_state();
+        let report = RunReport {
+            backup_id: job.id.clone(),
+            name: job.name.clone(),
+            operation: operation.into(),
+            result,
+            started_at: Some(started.to_rfc3339()),
+            finished_at: Some(finished.to_rfc3339()),
+            duration_ms: (finished - started).num_milliseconds().max(0) as u64,
+            message,
+            data,
+            stats,
+        };
+        if let Some(a) = self.agent.get().and_then(Weak::upgrade) {
+            a.enqueue_report(&report);
+        }
+        report
     }
 }
 
-/// Spawn a run in the background (the console gets the report when it ends).
-fn spawn_run(host_agent: &Arc<Agent<CliHost>>, id: String) {
+fn parse_ts(t: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(t).ok().map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Spawn a backup (`task` = `backup`) or maintenance task in the
+/// background (the console gets the report when it ends).
+fn spawn_task(host_agent: &Arc<Agent<CliHost>>, id: String, task: &'static str) {
     let a = host_agent.clone();
     a.host().spawned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     tokio::spawn(async move {
-        if let Err(e) = a.host().run_job(&id).await {
-            tracing::warn!("Managed backup {id} failed: {}", e.user_message());
+        let r = match task {
+            "backup" => a.host().run_job(&id).await,
+            t => a.host().run_maintenance(&id, t).await,
+        };
+        if let Err(e) = r {
+            tracing::warn!("Managed {task} of {id} failed: {}", e.user_message());
         }
         a.host().spawned.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     });
+}
+
+fn spawn_run(host_agent: &Arc<Agent<CliHost>>, id: String) {
+    spawn_task(host_agent, id, "backup");
 }
 
 impl AgentHost for CliHost {
@@ -451,6 +648,20 @@ impl AgentHost for CliHost {
 
     fn managed_policies(&self) -> BoxFuture<'_, Vec<String>> {
         Box::pin(async move { lock(&self.state).jobs.keys().filter_map(|k| policy_of_job(k).map(String::from)).collect() })
+    }
+
+    /// The CLI uses the organization's backup templates of the managed settings.
+    fn apply_managed_settings(&self, settings: Option<ManagedSettings>) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async move {
+            let templates = settings.and_then(|s| s.backup_templates).unwrap_or_default();
+            if let Some(e) = templates.iter().find_map(|t| t.validate().err()) {
+                return Err(AppError::validation(e));
+            }
+            if lock(&self.state).templates == templates {
+                return Ok(());
+            }
+            self.apply_templates(templates)
+        })
     }
 }
 
@@ -592,8 +803,8 @@ pub async fn run(cmd: AgentCommands, format: &OutputFormat, dir: PathBuf, data: 
             let sched_task = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    for id in sched.host().due_jobs(chrono::Utc::now()) {
-                        spawn_run(&sched, id);
+                    for (id, task) in sched.host().take_due(chrono::Utc::now()) {
+                        spawn_task(&sched, id, task);
                     }
                 }
             });
@@ -651,7 +862,8 @@ mod tests {
         let st = a.status();
         assert!(st.registered);
         assert!(st.managed_policies.iter().any(|p| p.policy_id == "fpl_s3" && p.error.as_deref().unwrap().contains("local folders")));
-        assert_eq!(a.host().due_jobs(chrono::Utc::now()), vec!["policy-fpl_l"]);
+        // Hourly from 02:00: due once the next slot after the job's creation has passed.
+        assert_eq!(a.host().due_jobs(chrono::Utc::now() + chrono::Duration::minutes(61)), vec!["policy-fpl_l"]);
         *commands.lock().unwrap() = vec![
             json!({ "id": "c1", "kind": "run_backup", "payload": { "jobId": "policy-fpl_l" } }),
             json!({ "id": "c2", "kind": "rpc", "payload": { "command": "backup_list_jobs", "args": {} } }),
@@ -679,5 +891,93 @@ mod tests {
         assert!(!dir.join("agent-token").exists());
         let a = open_agent(dir, data).await.unwrap();
         assert!(!a.status().registered && a.host().jobs_snapshot().is_empty());
+    }
+
+    fn policy(id: &str, job: Value) -> FleetPolicy {
+        FleetPolicy { id: id.into(), name: id.into(), version: 1, job }
+    }
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cli_agent_follows_cron_time_zones_maintenance_and_templates() {
+        let t = tempfile::tempdir().unwrap();
+        let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+        let host = CliHost::new(t.path().join("cfg"), t.path().join("data"));
+        let (s, d) = (src.to_string_lossy().to_string(), dst.to_string_lossy().to_string());
+        // 02:30 every day at UTC+02:00 = 00:30 UTC; compaction from a template on Sundays 04:00 UTC.
+        let job = json!({ "name": "Cron", "sources": [s], "encrypted": false, "destination": { "type": "local", "path": d },
+            "options": { "block_size": 4096, "volume_size": 65536, "quota_disable": true },
+            "schedule": { "enabled": true, "cron": ["30 2 * * *"], "timezone": "+02:00" },
+            "maintenance": { "verify": { "schedule": { "enabled": true, "interval_minutes": 1440, "start_time": "05:00", "timezone": "UTC" } } },
+            "template_ids": ["org:weekly"] });
+        host.apply_policy(policy("fpl_c", job)).await.unwrap();
+        let templates = vec![ManagedBackupTemplate { id: "weekly".into(), name: "Weekly".into(), enforced: false,
+            settings: json!({ "maintenance": { "compact": { "enabled": true, "cron": ["0 4 * * Sun"], "timezone": "UTC" } }, "options": { "compression_level": 9 } }), ..Default::default() }];
+        // The policy's own maintenance wins over the template's, as on the desktop.
+        host.apply_managed_settings(Some(ManagedSettings { backup_templates: Some(templates.clone()), ..Default::default() })).await.unwrap();
+        let j = host.job("policy-fpl_c").unwrap();
+        assert_eq!(j.options.compression_level, 9, "options come from the template");
+        assert!(j.maintenance.scheduled("verify") && !j.maintenance.scheduled("compact"));
+        assert_eq!(j.schedule_interval_minutes, Some(1440));
+
+        // Pretend the job was created on Friday 2026-10-23 at 12:00 UTC.
+        lock(&host.state).jobs.get_mut("policy-fpl_c").unwrap().created_at = Some("2026-10-23T12:00:00Z".into());
+        assert!(host.due_jobs(at("2026-10-24T00:29:00Z")).is_empty());
+        assert_eq!(host.due_jobs(at("2026-10-24T00:30:00Z")), vec!["policy-fpl_c"]);
+        assert!(host.due_maintenance(at("2026-10-24T04:59:00Z")).is_empty());
+        assert_eq!(host.due_maintenance(at("2026-10-24T05:00:00Z")), vec![("policy-fpl_c".to_string(), "verify")]);
+
+        // Taking the slots: one operation per job per pass, the backup first;
+        // both slots are used, so a missed run catches up once only.
+        let now = at("2026-10-24T06:00:00Z");
+        assert_eq!(host.take_due(now), vec![("policy-fpl_c".to_string(), "backup")]);
+        assert!(host.take_due(now).is_empty());
+        assert!(host.due_jobs(at("2026-10-25T00:29:00Z")).is_empty());
+        assert_eq!(host.due_jobs(at("2026-10-25T00:31:00Z")), vec!["policy-fpl_c"]);
+
+        // Template-only maintenance: dropping the policy's own maintenance
+        // lets the template's Sunday compaction apply.
+        let mut job2 = lock(&host.state).jobs["policy-fpl_c"].policy_fields.clone();
+        job2.remove("maintenance");
+        host.apply_policy(policy("fpl_c", Value::Object(job2))).await.unwrap();
+        let j = host.job("policy-fpl_c").unwrap();
+        assert!(j.maintenance.scheduled("compact") && !j.maintenance.scheduled("verify"));
+        assert_eq!(j.created_at.as_deref(), Some("2026-10-23T12:00:00Z"), "a policy update keeps the job's history");
+        assert_eq!(host.due_maintenance(at("2026-10-25T04:00:00Z")), vec![("policy-fpl_c".to_string(), "compact")]);
+
+        // An enforced template wins over the policy (retention), and removing the templates re-resolves.
+        let enforced = ManagedBackupTemplate { id: "keep".into(), name: "Keep 2".into(), enforced: true, settings: json!({ "retention": { "type": "keep_count", "count": 2 } }), ..Default::default() };
+        host.apply_managed_settings(Some(ManagedSettings { backup_templates: Some(vec![templates[0].clone(), enforced]), ..Default::default() })).await.unwrap();
+        assert_eq!(host.job("policy-fpl_c").unwrap().retention, RetentionPolicy::KeepCount { count: 2 });
+        host.apply_managed_settings(None).await.unwrap();
+        let j = host.job("policy-fpl_c").unwrap();
+        assert_eq!((j.retention, j.options.compression_level, j.maintenance.scheduled("compact")), (RetentionPolicy::KeepAll, BackupOptions::default().compression_level, false));
+        assert!(j.warnings.iter().any(|w| w.contains("org:weekly")), "{:?}", j.warnings);
+
+        // Scheduled maintenance runs against the repository and reports.
+        host.run_job("policy-fpl_c").await.unwrap();
+        for task in MAINTENANCE_TASKS {
+            let r = host.run_maintenance("policy-fpl_c", task).await.unwrap();
+            assert_eq!((r.operation.as_str(), r.result.as_str()), (task, "success"), "{}", r.message);
+        }
+        // State survives a restart.
+        let again = CliHost::new(t.path().join("cfg"), t.path().join("data"));
+        assert!(again.job("policy-fpl_c").unwrap().schedule.unwrap().is_cron());
+    }
+
+    #[test]
+    fn jobs_saved_by_older_versions_keep_their_interval() {
+        let t = tempfile::tempdir().unwrap();
+        let cfg = t.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("agent.json"), r#"{"jobs":{"policy-old":{"id":"policy-old","schedule_interval_minutes":60,"last_run_at":"2026-10-23T10:00:00Z"}}}"#).unwrap();
+        let host = CliHost::new(cfg, t.path().join("data"));
+        assert!(host.due_jobs(at("2026-10-23T10:59:00Z")).is_empty());
+        assert_eq!(host.due_jobs(at("2026-10-23T11:00:00Z")), vec!["policy-old"]);
     }
 }

@@ -40,22 +40,7 @@ impl ClientInfo {
 }
 
 /// The machine's host name (best effort; empty when unknown).
-pub fn hostname() -> String {
-    #[cfg(unix)]
-    {
-        let mut buf = [0u8; 256];
-        // SAFETY: the buffer is valid for `len` bytes; gethostname NUL-terminates on success.
-        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-        if rc == 0 {
-            let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-            let h = String::from_utf8_lossy(&buf[..end]).trim().to_string();
-            if !h.is_empty() {
-                return h;
-            }
-        }
-    }
-    std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_default()
-}
+pub use crate::session::hostname;
 
 fn os_version() -> String {
     if cfg!(target_os = "linux") {

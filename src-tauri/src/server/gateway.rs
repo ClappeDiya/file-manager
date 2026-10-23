@@ -33,6 +33,11 @@ use ufop_core::gateway::{valid_name, ErrorBody, Hello, Job, Op, NODE_TIMEOUT_SEC
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_JSON_REPLY: usize = 16 << 20;
 const MAX_QUEUE: usize = 1000;
+/// A refused upload's body is read (and discarded) up to this much before
+/// the answer goes out, so the client, still sending, reads the refusal
+/// instead of a broken pipe. Beyond it the connection is closed.
+const DRAIN_LIMIT: usize = 64 << 20;
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct Node {
     hello: Hello,
@@ -91,8 +96,15 @@ impl Hub {
         self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Queue a job for `gateway` and wait for a node's answer.
-    async fn submit(&self, gateway: &str, op: Op, upload: Option<Body>) -> Result<Reply, Response> {
+    /// Queue a job for `gateway` and wait for a node's answer. Also returns
+    /// the upload body when no node fetched it (the job was refused).
+    async fn submit(&self, gateway: &str, op: Op, upload: Option<Body>) -> (Result<Reply, Response>, Option<Body>) {
+        let mut upload = upload;
+        let r = self.submit_inner(gateway, op, &mut upload).await;
+        (r, upload)
+    }
+
+    async fn submit_inner(&self, gateway: &str, op: Op, upload: &mut Option<Body>) -> Result<Reply, Response> {
         let needs_write = matches!(op, Op::Upload { .. });
         let id = uuid::Uuid::new_v4().simple().to_string();
         let (tx, rx) = oneshot::channel();
@@ -114,11 +126,11 @@ impl Hub {
             g.queue.push_back(Job { id: id.clone(), op });
             // Every waiting node looks; the first that can take the job does.
             g.notify.notify_waiters();
-            s.pending.insert(id.clone(), Pending { reply: Some(tx), upload });
+            s.pending.insert(id.clone(), Pending { reply: Some(tx), upload: upload.take() });
         }
         let r = tokio::time::timeout(ANSWER_TIMEOUT, rx).await;
         let mut s = self.lock();
-        s.pending.remove(&id);
+        *upload = s.pending.remove(&id).and_then(|p| p.upload);
         if let Some(g) = s.gateways.get_mut(gateway) {
             g.queue.retain(|j| j.id != id);
         }
@@ -291,7 +303,7 @@ async fn files(State(st): State<ServerState>, AxPath(name): AxPath<String>, Quer
         return r;
     }
     let path = if q.path.is_empty() { "/".to_string() } else { q.path };
-    let reply = match st.gateways.submit(&name, Op::List { path }, None).await {
+    let reply = match st.gateways.submit(&name, Op::List { path }, None).await.0 {
         Ok(r) => r,
         Err(r) => return r,
     };
@@ -309,7 +321,7 @@ async fn download(State(st): State<ServerState>, AxPath(name): AxPath<String>, Q
         return r;
     }
     let file = q.path.rsplit('/').next().unwrap_or("download").to_string();
-    let reply = match st.gateways.submit(&name, Op::Download { path: q.path }, None).await {
+    let reply = match st.gateways.submit(&name, Op::Download { path: q.path }, None).await.0 {
         Ok(r) => r,
         Err(r) => return r,
     };
@@ -336,17 +348,40 @@ async fn upload(State(st): State<ServerState>, AxPath(name): AxPath<String>, Que
         return r;
     }
     let size = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
-    let reply = match st.gateways.submit(&name, Op::Upload { path: q.path, size }, Some(body)).await {
-        Ok(r) => r,
-        Err(r) => return r,
+    let (result, unread) = st.gateways.submit(&name, Op::Upload { path: q.path, size }, Some(body)).await;
+    let answer = match result {
+        Err(r) => r,
+        Ok(reply) if !reply.ok => agent_error(reply).await,
+        Ok(reply) => match axum::body::to_bytes(reply.body, MAX_JSON_REPLY).await {
+            Ok(b) => ([(header::CONTENT_TYPE, "application/json")], b).into_response(),
+            Err(_) => fail(StatusCode::BAD_GATEWAY, "The gateway's answer was cut off", ""),
+        },
     };
-    if !reply.ok {
-        return agent_error(reply).await;
+    match unread {
+        Some(b) => after_draining(b, answer).await,
+        None => answer,
     }
-    match axum::body::to_bytes(reply.body, MAX_JSON_REPLY).await {
-        Ok(b) => ([(header::CONTENT_TYPE, "application/json")], b).into_response(),
-        Err(_) => fail(StatusCode::BAD_GATEWAY, "The gateway's answer was cut off", ""),
+}
+
+/// Answer a refused upload once its body has been received (see
+/// [`DRAIN_LIMIT`]); a larger or stalled body closes the connection.
+async fn after_draining(body: Body, mut answer: Response) -> Response {
+    let drained = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        let mut stream = body.into_data_stream();
+        let mut n = 0usize;
+        while let Some(chunk) = stream.next().await {
+            n += chunk.map_err(|_| ())?.len();
+            if n > DRAIN_LIMIT {
+                return Err(());
+            }
+        }
+        Ok(())
+    })
+    .await;
+    if !matches!(drained, Ok(Ok(()))) {
+        answer.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
     }
+    answer
 }
 
 pub fn protected_routes() -> Router<ServerState> {

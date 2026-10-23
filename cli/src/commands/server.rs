@@ -15,6 +15,9 @@ pub enum ServerCommands {
     Login {
         #[arg(long, env = "UFOP_SERVER_URL", default_value = "http://127.0.0.1:8200")]
         url: String,
+        /// Account name (default: admin, the original server password)
+        #[arg(long, env = "UFOP_SERVER_USER")]
+        user: Option<String>,
         #[arg(long, env = "UFOP_SERVER_PASSWORD")]
         password: Option<String>,
         /// Use an automation or API token (ufop_pat_…) instead of a password
@@ -38,6 +41,20 @@ pub enum ServerCommands {
         #[arg(long)]
         wait: bool,
     },
+    /// Back up every job now (read-only and busy jobs are skipped)
+    RunAll {
+        /// Only these jobs (id or name, repeatable)
+        #[arg(long = "job")]
+        jobs: Vec<String>,
+        /// Only jobs with a schedule
+        #[arg(long)]
+        scheduled_only: bool,
+        #[arg(long)]
+        dry_run: bool,
+        /// Wait until every started backup finished; exit with the worst result
+        #[arg(long)]
+        wait: bool,
+    },
     /// Cancel a task or all tasks of a job
     Cancel { id: String },
     /// Pause scheduled backups
@@ -58,6 +75,13 @@ pub enum ServerCommands {
     },
     /// Issue a long-lived automation token (must be enabled on the server)
     IssueToken,
+    /// Stop the server gracefully: running backups stop at a safe point
+    /// (partial version) within the grace period, then it exits; run it again to stop at once
+    Shutdown {
+        /// Seconds running backups get (default: the server's --shutdown-grace)
+        #[arg(long)]
+        grace: Option<u64>,
+    },
     /// Named, scoped, expiring API tokens (read, run, write, admin)
     #[command(subcommand)]
     Tokens(TokenCommands),
@@ -67,6 +91,70 @@ pub enum ServerCommands {
     /// Policies of shared folders: lock, accepted types, limits, link rules, intake naming
     #[command(subcommand)]
     Folders(FolderCommands),
+    /// The signed-in account, its role and its permission on each job
+    Whoami,
+    /// Server accounts (administrators)
+    #[command(subcommand)]
+    User(UserCommands),
+    /// Per-job access rules (administrators)
+    #[command(subcommand)]
+    Acl(AclCommands),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum UserCommands {
+    /// List accounts
+    List,
+    /// Add an account (password from --password / UFOP_NEW_USER_PASSWORD, or --password-hash)
+    Add {
+        username: String,
+        /// admin, operator or viewer
+        #[arg(long, default_value = "viewer", value_parser = ["admin", "operator", "viewer"])]
+        role: String,
+        #[arg(long, env = "UFOP_NEW_USER_PASSWORD")]
+        password: Option<String>,
+        /// A ready Argon2 PHC string ($argon2id$…, see `ufop-server hash-password`)
+        #[arg(long, conflicts_with = "password")]
+        password_hash: Option<String>,
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Change an account (only the options given)
+    Set {
+        username: String,
+        #[arg(long, value_parser = ["admin", "operator", "viewer"])]
+        role: Option<String>,
+        #[arg(long)]
+        disabled: Option<bool>,
+        #[arg(long, env = "UFOP_NEW_USER_PASSWORD")]
+        password: Option<String>,
+        #[arg(long, conflicts_with = "password")]
+        password_hash: Option<String>,
+    },
+    /// Delete an account (its sessions and tokens stop working)
+    Remove { username: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AclCommands {
+    /// List rules
+    List,
+    /// Add a rule: PRINCIPAL (user, role:<role> or *) gets PERMISSION on jobs matching PATTERN
+    Add {
+        principal: String,
+        /// Job id or name, or a glob such as "prod-*"
+        pattern: String,
+        /// none, read, run, write or full
+        #[arg(value_parser = ["none", "read", "run", "write", "full"])]
+        permission: String,
+    },
+    /// Delete a rule (use --preview to see who would lose access first)
+    Remove {
+        id: String,
+        /// Only show the effect, do not delete
+        #[arg(long)]
+        preview: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -158,6 +246,10 @@ pub enum TokenCommands {
         /// Expires after this many days (1–365)
         #[arg(long, default_value_t = 90)]
         days: i64,
+        /// Limit the token to this job (id or name; repeatable). Default: every job.
+        /// A limited token cannot use server-wide routes unless its scope is admin
+        #[arg(long = "job")]
+        jobs: Vec<String>,
     },
     /// Revoke a token by id
     Revoke { id: String },
@@ -173,8 +265,18 @@ pub(crate) struct Client {
     cfg: CliConfig,
 }
 
+fn cookie_from(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    headers.get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()).find_map(|c| c.strip_prefix(prefix.as_str()).map(|r| r.split(';').next().unwrap_or("").to_string())).filter(|s| !s.is_empty())
+}
+
 fn refresh_from(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    headers.get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()).find_map(|c| c.strip_prefix("ufop_refresh=").map(|r| r.split(';').next().unwrap_or("").to_string())).filter(|s| !s.is_empty())
+    cookie_from(headers, "ufop_refresh")
+}
+
+/// The double-submit CSRF token that goes with the refresh cookie.
+fn csrf_from(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    cookie_from(headers, "ufop_csrf")
 }
 
 impl Client {
@@ -186,10 +288,16 @@ impl Client {
 
     async fn renew(&mut self) -> Result<(), String> {
         let rt = self.cfg.server_refresh.clone().ok_or("Session expired: run `ufop server login` again")?;
-        let r = self.http.post(format!("{}/api/v1/auth/refresh", self.url)).header("Cookie", format!("ufop_refresh={rt}")).send().await.map_err(|e| e.to_string())?;
+        let mut req = self.http.post(format!("{}/api/v1/auth/refresh", self.url));
+        req = match &self.cfg.server_csrf {
+            Some(c) => req.header("Cookie", format!("ufop_refresh={rt}; ufop_csrf={c}")).header("X-CSRF-Token", c),
+            None => req.header("Cookie", format!("ufop_refresh={rt}")),
+        };
+        let r = req.send().await.map_err(|e| e.to_string())?;
         if !r.status().is_success() {
             return Err("Session expired: run `ufop server login` again".into());
         }
+        self.cfg.server_csrf = csrf_from(r.headers());
         self.cfg.server_refresh = refresh_from(r.headers());
         let v: Value = r.json().await.map_err(|e| e.to_string())?;
         self.cfg.server_token = v["access_token"].as_str().map(String::from);
@@ -229,7 +337,7 @@ impl Client {
         Err("Not authorized".into())
     }
 
-    async fn job_id(&mut self, name_or_id: &str) -> Result<String, String> {
+    pub(crate) async fn job_id(&mut self, name_or_id: &str) -> Result<String, String> {
         let jobs = self.call(reqwest::Method::GET, "/jobs", None).await?;
         jobs.as_array()
             .into_iter()
@@ -250,7 +358,7 @@ pub(crate) fn show(format: &OutputFormat, v: &Value) {
 pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, Box<dyn std::error::Error>> {
     let res: Result<u8, String> = async {
         match cmd {
-            ServerCommands::Login { url, password, token } => {
+            ServerCommands::Login { url, user, password, token } => {
                 let mut cfg = CliConfig::load();
                 let url = url.trim_end_matches('/').to_string();
                 let http = reqwest::Client::new();
@@ -261,13 +369,15 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
                     }
                     cfg.server_token = Some(t);
                     cfg.server_refresh = None;
+                    cfg.server_csrf = None;
                 } else {
                     let pw = password.ok_or("Give --password (or UFOP_SERVER_PASSWORD) or --token")?;
-                    let r = http.post(format!("{url}/api/v1/auth/login")).json(&json!({"password": pw})).send().await.map_err(|e| format!("Server unreachable: {e}"))?;
+                    let r = http.post(format!("{url}/api/v1/auth/login")).json(&json!({"username": user, "password": pw})).send().await.map_err(|e| format!("Server unreachable: {e}"))?;
                     if !r.status().is_success() {
-                        return Err(if r.status() == 429 { "Too many sign-in attempts; wait and retry".into() } else { "Wrong password".into() });
+                        return Err(if r.status() == 429 { "Too many sign-in attempts; wait and retry".into() } else { "Wrong user name or password".into() });
                     }
                     cfg.server_refresh = refresh_from(r.headers());
+                    cfg.server_csrf = csrf_from(r.headers());
                     let v: Value = r.json().await.map_err(|e| e.to_string())?;
                     cfg.server_token = v["access_token"].as_str().map(String::from);
                 }
@@ -280,6 +390,7 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
                 let mut cfg = CliConfig::load();
                 cfg.server_token = None;
                 cfg.server_refresh = None;
+                cfg.server_csrf = None;
                 cfg.save().map_err(|e| e.to_string())?;
                 output::print_success(format, "Signed out");
                 Ok(0)
@@ -344,6 +455,40 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
                     _ => 2,
                 })
             }
+            ServerCommands::RunAll { jobs, scheduled_only, dry_run, wait } => {
+                let mut c = Client::new()?;
+                let mut ids = Vec::new();
+                for j in &jobs {
+                    ids.push(c.job_id(j).await?);
+                }
+                let r = c.call(reqwest::Method::POST, "/jobs/run-all", Some(json!({"job_ids": ids, "scheduled_only": scheduled_only, "dry_run": dry_run}))).await?;
+                if !wait {
+                    show(format, &r);
+                    return Ok(if r["skipped"].as_array().is_some_and(|a| !a.is_empty()) { 1 } else { 0 });
+                }
+                let started: Vec<String> = r["started"].as_array().into_iter().flatten().filter_map(|s| s["job_id"].as_str().map(String::from)).collect();
+                loop {
+                    let tasks = c.call(reqwest::Method::GET, "/tasks", None).await?;
+                    if !tasks.as_array().is_some_and(|a| a.iter().any(|x| x["job_id"].as_str().is_some_and(|j| started.iter().any(|s| s == j)))) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                let mut results = Vec::new();
+                let mut worst = 0u8;
+                for id in &started {
+                    let runs = c.call(reqwest::Method::GET, &format!("/runs?job_id={id}&limit=1"), None).await?;
+                    let last = runs.get(0).cloned().unwrap_or(Value::Null);
+                    worst = worst.max(match last["status"].as_str() {
+                        Some("success") => 0,
+                        Some("warning") => 1,
+                        _ => 2,
+                    });
+                    results.push(last);
+                }
+                show(format, &json!({"started": r["started"], "skipped": r["skipped"], "results": results}));
+                Ok(worst)
+            }
             ServerCommands::Cancel { id } => {
                 let mut c = Client::new()?;
                 show(format, &c.call(reqwest::Method::POST, &format!("/tasks/{id}/cancel"), None).await?);
@@ -371,6 +516,56 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
             ServerCommands::IssueToken => {
                 let mut c = Client::new()?;
                 show(format, &c.call(reqwest::Method::POST, "/auth/automation-token", None).await?);
+                Ok(0)
+            }
+            ServerCommands::Shutdown { grace } => {
+                let mut c = Client::new()?;
+                show(format, &c.call(reqwest::Method::POST, "/server/shutdown", Some(json!({"grace_secs": grace}))).await?);
+                Ok(0)
+            }
+            ServerCommands::Whoami => {
+                let mut c = Client::new()?;
+                show(format, &c.call(reqwest::Method::GET, "/auth/me", None).await?);
+                Ok(0)
+            }
+            ServerCommands::User(uc) => {
+                let mut c = Client::new()?;
+                let v = match uc {
+                    UserCommands::List => c.call(reqwest::Method::GET, "/users", None).await?["users"].clone(),
+                    UserCommands::Add { username, role, password, password_hash, disabled } => {
+                        if password.is_none() && password_hash.is_none() {
+                            return Err("Give --password (or UFOP_NEW_USER_PASSWORD) or --password-hash".into());
+                        }
+                        c.call(reqwest::Method::POST, "/users", Some(json!({"username": username, "role": role, "password": password, "password_hash": password_hash, "disabled": disabled}))).await?
+                    }
+                    UserCommands::Set { username, role, disabled, password, password_hash } => {
+                        c.call(reqwest::Method::PUT, &format!("/users/{}", urlencode(&username)), Some(json!({"role": role, "disabled": disabled, "password": password, "password_hash": password_hash}))).await?
+                    }
+                    UserCommands::Remove { username } => c.call(reqwest::Method::DELETE, &format!("/users/{}", urlencode(&username)), None).await?,
+                };
+                show(format, &v);
+                Ok(0)
+            }
+            ServerCommands::Acl(ac) => {
+                let mut c = Client::new()?;
+                let v = match ac {
+                    AclCommands::List => c.call(reqwest::Method::GET, "/acl", None).await?["rules"].clone(),
+                    AclCommands::Add { principal, pattern, permission } => {
+                        // A job name that is not a pattern becomes that job's id.
+                        let pattern = if pattern.contains(['*', '?']) { pattern } else { c.job_id(&pattern).await.unwrap_or(pattern) };
+                        c.call(reqwest::Method::POST, "/acl", Some(json!({"principal": principal, "job_pattern": pattern, "permission": permission}))).await?
+                    }
+                    AclCommands::Remove { id, preview } => {
+                        let effect = c.call(reqwest::Method::GET, &format!("/acl/{}/preview-delete", urlencode(&id)), None).await?;
+                        if preview {
+                            effect["changes"].clone()
+                        } else {
+                            let _ = c.call(reqwest::Method::DELETE, &format!("/acl/{}", urlencode(&id)), None).await?;
+                            json!({"deleted": id, "changes": effect["changes"]})
+                        }
+                    }
+                };
+                show(format, &v);
                 Ok(0)
             }
             ServerCommands::Folders(fc) => {
@@ -447,7 +642,14 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
                 let mut c = Client::new()?;
                 let v = match t {
                     TokenCommands::List => c.call(reqwest::Method::GET, "/auth/api-tokens", None).await?,
-                    TokenCommands::Create { name, scope, days } => c.call(reqwest::Method::POST, "/auth/api-tokens", Some(json!({"name": name, "scope": scope, "expires_in_days": days}))).await?,
+                    TokenCommands::Create { name, scope, days, jobs } => {
+                        let mut ids = Vec::new();
+                        for j in &jobs {
+                            ids.push(c.job_id(j).await?);
+                        }
+                        let job_ids = if ids.is_empty() { Value::Null } else { json!(ids) };
+                        c.call(reqwest::Method::POST, "/auth/api-tokens", Some(json!({"name": name, "scope": scope, "expires_in_days": days, "job_ids": job_ids}))).await?
+                    }
                     TokenCommands::Revoke { id } => c.call(reqwest::Method::DELETE, &format!("/auth/api-tokens/{id}"), None).await?,
                 };
                 show(format, &v);

@@ -649,8 +649,48 @@ The headless backup server (`ufop-server`, also `ufop server` in the CLI) has it
 
 - **Authentication**: `Authorization: Bearer <token>` with an access token from `POST /api/v1/auth/login` (refreshed through the `ufop_refresh` cookie), an automation token, or an API token (`ufop_pat_…`); or reverse-proxy pre-authentication (`X-UFOP-Preauth`).
 - **API token scopes**: `read` < `run` < `write` < `admin`. Each operation's `x-required-scope` in the document comes from the same function that enforces it: GETs need `read`; starting backups, operations, cancelling tasks and the scheduler need `run`; other changes need `write`; `/auth/*`, `/rpc/*`, `/oauth/*` and changing settings need `admin`.
+- **CSRF**: requests authenticated by the `ufop_refresh` cookie (`POST /auth/refresh`, `/auth/logout`) must send `X-CSRF-Token` equal to the `ufop_csrf` cookie (also returned as `csrf_token`); otherwise `403` (`error_type: csrf`). Bearer requests are exempt. See [server-operations.md](server-operations.md#browser-sessions-and-csrf).
+- **Request ids**: send `X-Request-Id` (1–128 safe characters) or get a generated UUIDv4; it is echoed in the response and included as `request_id` in error bodies.
+- **Metrics**: `GET /api/v1/metrics` (scope `read`) returns Prometheus text; see [server-operations.md](server-operations.md#prometheus-metrics).
+- **Ransomware hardening**: `GET /api/v1/jobs/{id}/hardening` (scope `read`) returns the checklist `{passed, total, checks: [{id, title, status: pass|warn|fail|unknown|info, detail, advice, doc}], probe}`; `POST /api/v1/jobs/{id}/hardening/probe` (scope `run`) writes a probe object and tries to delete it with the backup credentials first. See [backup-ransomware-hardening.md](backup-ransomware-hardening.md).
+- **Shutdown**: `POST /api/v1/server/shutdown` with `{grace_secs}` (scope `admin`, answers `202`) stops the server gracefully; while it drains, state-changing requests get `503` with `Retry-After`. See [server-operations.md](server-operations.md#graceful-shutdown).
+- **Branding**: `GET /api/v1/branding` (public: title prefix, product name, accent color, logo and stylesheet URLs), `GET /branding/logo`, `GET /branding/custom.css`; administrators read and save the layers with `GET`/`PUT /api/v1/server/branding`. See [server-operations.md](server-operations.md#web-ui-branding).
+- **Accounts and access rules**: `POST /auth/login` takes `username` (default `admin`); `GET /auth/me`; administrators manage `/users` and `/acl` (with `GET /acl/{id}/preview-delete`). Non-administrators reach only the jobs their rules allow (403 otherwise; lists are filtered). See [server-operations.md](server-operations.md#accounts-roles-and-access-rules).
+- **Tokens limited to jobs**: `POST /auth/api-tokens` takes `job_ids` (null = every job). Such a token only reaches those jobs (403 otherwise; lists are filtered) and no server-wide routes unless its scope is `admin`. See [server-operations.md](server-operations.md#api-tokens-limited-to-jobs).
 - **Errors**: `{error_type, message, advice}`; 401 (not signed in, invalid token or too narrow a scope), 403 (client address outside `--allowed-cidrs`), 421 (host not in `--allowed-hostnames`), 404, 409, 429 (sign-in throttling).
-- Areas: `auth` (sign-in, tokens, password), `jobs` (CRUD, run, operations, import/export, destination test), `browse` (versions, files, search, compare), `tasks` (tasks, run history, scheduler), `oauth` (cloud authorization broker) and `general` (health, status, modules, settings, filesystem, `rpc/{command}` for any desktop IPC command).
+- Areas: `auth` (sign-in, tokens, password), `jobs` (CRUD, run, operations including `upgrade_format`, `reshard`, `format_info`, `set_version_metadata`, `apply_retention`, `copy_versions` (target `{"type":"job","job_id":…}` or `{"type":"destination",…}`), `enable_sharing`, `sync_sources` and `delete_versions` with `force` for pinned versions, `PUT /jobs/{id}/passphrase` to change an encrypted job's passphrase, `POST /jobs/{id}/point-in-time` with `{at, name}` to open a versioned S3 destination as it was at a time as a new read-only job (scope `write`; see [backup-destinations.md](backup-destinations.md)), `GET`/`DELETE /jobs/{id}/lock` for the repository lock (break needs `confirm=true`, optionally `owner_id`), `PUT /jobs/{id}/database-encryption` to encrypt the local database, import/export, destination test, `POST /jobs/run-all` with `{job_ids, scheduled_only, dry_run}` to back up every job (scope `run`; read-only and busy jobs are skipped and listed), `GET /jobs/{id}/estimate?assumed_bytes_per_sec=` for the pre-backup estimate; see [backup-sources-and-runs.md](backup-sources-and-runs.md)), `browse` (versions with note, tags, pin, identity and storage added, `?source=` for another source of a shared repository and `?tags=k=v,k2` to filter; `PATCH /jobs/{id}/versions/{version}` with `note`, `tags`, `pinned`, `pin_reason` to change one; `GET /jobs/{id}/sources`; `POST /jobs/{id}/retention/preview` with an optional unsaved `policy`; files, search and compare also take `source`; files also take `version=latest|oldest|N|<id>`, `time` (as of) and `allow_partial`, and any of `offset`, `limit`, `sort` (`path`, `size`, `kind`, `modified`), `desc` and `filter` returns one page `{items, total, offset, limit}` instead of the array; `GET /jobs/{id}/versions/resolve` says which version a time picks; `GET /jobs/{id}/file?path=` streams one file with single `Range` support (`206`/`416`); restore operations take `selector`, `archive`, `delete_extraneous` (with `overrides.confirm_delete: true`), `restore_owner`, `error_policy`, `sparse` and `use_cache`; see [backup-restore.md](backup-restore.md)), `tasks` (tasks, run history — `GET /runs` with `offset`, `sort` (`started_at`, `finished_at`, `status`, `operation`, `job_id`), `desc` or `filter` returns a page of `limit` runs with the total —, scheduler), `oauth` (cloud authorization broker) and `general` (health, status, modules, settings, filesystem, the volume cache: `GET`/`DELETE /backup-cache` and `GET`/`PUT /backup-cache/settings`, `rpc/{command}` for any desktop IPC command).
+
+### Policy templates, effective settings and schedules
+
+See [backup-policies-and-schedules.md](backup-policies-and-schedules.md).
+
+| Method and path | Scope | |
+|---|---|---|
+| `GET /api/v1/backup-templates` | read | Local templates, then the organization's (`managed`, `enforced`, ids `org:…`) |
+| `POST /api/v1/backup-templates` | write | Create `{name, description, settings}`; `settings` is a partial job: `options`, `filter`, `retention`, `schedule`, `maintenance`, `scripts`, `notifications`, `notification_profile_ids`, `notify_on`, `throttle`, `retry`, `prevent_sleep` |
+| `GET` / `PUT` / `DELETE /api/v1/backup-templates/{id}` | read / write / write | One template; organization templates cannot be changed (`403`); deleting one in use is `409` |
+| `POST /api/v1/backup-templates/{id}/apply` | write | `{job_id}`: append the template to the job's `template_ids` |
+| `GET /api/v1/backup-templates/export?ids=a,b` | read | Template file (`format: ufop-backup-templates`) |
+| `POST /api/v1/backup-templates/import` | write | Body: a template file, list or single template; same id or name updates |
+| `GET /api/v1/jobs/{id}/effective-settings` | read | `{job_id, template_ids, overrides, settings: [{field_path, value, source, inherited}], warnings}` |
+| `POST /api/v1/backup-schedule/preview` | read | `{schedule, count}`: validate an interval or cron schedule and list the next runs (`[{at, skipped_by}]`) |
+
+Jobs have three new optional fields: `template_ids` (ordered), `overrides` (field paths the job sets itself; `null` for older jobs) and `maintenance` (`{compact, verify: {schedule, options}, retention}`). `schedule.cron` takes cron expressions. `scripts.before_mode` and `scripts.after_mode` take `required`, `optional` or `async`. The `verify` operation takes `options`: `{scope: {versions, paths}, mode: {type: structure | sample_volumes, count | sample_percent, percent | full}, files_percent, parallelism, max_errors, use_cache}`. `GET /api/v1/status` lists upcoming maintenance in `next_maintenance`.
+
+### Notification profiles, previews and webhook presets
+
+See [backup-notifications.md](backup-notifications.md).
+
+| Method and path | Scope | |
+|---|---|---|
+| `GET /api/v1/notification-profiles` | read | Local profiles, then the organization's (`managed`, ids `org:…`) |
+| `POST /api/v1/notification-profiles` | write | Create `{name, description, notification, min_severity, secret}`; `secret` and secret header values go to the secure store and are never returned |
+| `GET` / `PUT` / `DELETE /api/v1/notification-profiles/{id}` | read / write / write | One profile; organization profiles cannot be changed (`403`); deleting one in use is `409` unless `?force=true`, which returns `{removed_from, warnings}` |
+| `POST /api/v1/notification-profiles/{id}/test` | write | Send a test message through the profile |
+| `POST /api/v1/notifications/preview` | any | `{notification, result}` → `{subject, text, html, request}` for a sample run (secrets masked) |
+| `POST /api/v1/notifications/webhook-preset` | any | `{preset, params: {server, topic, user, bearer}}` → a webhook channel |
+
+Jobs and template settings take `notification_profile_ids`. Notification channels gain `slack`, `teams` and `webhook` (`url`, `method`, `content_type`, `headers: [{name, value, secret, credential_id}]`, `body_template`, `preset`); email channels gain `html` and `html_template`. HTTP reports (`reports`) take `headers` and the `PATCH` method.
 
 ### Share portal
 

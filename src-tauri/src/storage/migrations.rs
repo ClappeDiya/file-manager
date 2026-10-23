@@ -163,12 +163,25 @@ fn all_migrations() -> Vec<Migration> {
             description: "OAuth clients and refresh tokens for ufop-server's MCP endpoint",
             sql: V29_SCHEMA,
         },
+        Migration {
+            version: 30,
+            description: "ufop-server API tokens limited to jobs",
+            sql: V30_SCHEMA,
+        },
+        Migration {
+            version: 31,
+            description: "ufop-server accounts, per-job access rules, token owners",
+            sql: V31_SCHEMA,
+        },
     ]
 }
 
+/// A migration step written in Rust.
+type RustStep = fn(&Connection) -> Result<(), AppError>;
+
 /// Migration steps that cannot be expressed as static SQL. They run in the
 /// same transaction as the migration's `sql`, after it.
-fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
+fn rust_step(version: u32) -> Option<RustStep> {
     match version {
         // Hash existing audit rows into a chain, then lock the table down.
         17 => Some(crate::security::audit_chain::migrate_v17),
@@ -181,6 +194,37 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
 /// Schema v22: named `ufop-server` API tokens (SHA-256 hashes) with scopes
 /// (JSON list) and a mandatory expiry.
 /// Schema v26: folder policies of folders ufop-server shares (`server::folders`).
+/// Schema v31: `ufop-server` accounts (Argon2 PHC hashes, role, disabled,
+/// console-managed flag), per-job access rules, and the account that owns
+/// each session and API token (existing ones: `admin`).
+const V31_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_users (
+    username      TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'viewer',
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    managed       INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS server_acl (
+    id          TEXT PRIMARY KEY NOT NULL,
+    principal   TEXT NOT NULL,
+    job_pattern TEXT NOT NULL,
+    permission  TEXT NOT NULL,
+    managed     INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+ALTER TABLE server_tokens ADD COLUMN subject TEXT NOT NULL DEFAULT 'admin';
+ALTER TABLE server_api_tokens ADD COLUMN owner TEXT NOT NULL DEFAULT 'admin';
+"#;
+
+/// Schema v30: `ufop-server` API tokens limited to some jobs (`job_ids`,
+/// a JSON list; NULL = every job, as before).
+const V30_SCHEMA: &str = r#"
+ALTER TABLE server_api_tokens ADD COLUMN job_ids TEXT;
+"#;
+
 /// Schema v29: OAuth 2.1 for `ufop-server`'s `/mcp` (`server::mcp_oauth`):
 /// dynamically registered public clients and rotating refresh tokens
 /// (SHA-256 hashes), each tied to the API token it last issued.
@@ -1042,7 +1086,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 29);
+        assert_eq!(applied, 31);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -1077,7 +1121,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 29);
+        assert_eq!(first, 31);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -1090,7 +1134,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 29);
+        assert_eq!(current_version(&conn).unwrap(), 31);
     }
 
     #[test]

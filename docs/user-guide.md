@@ -38,6 +38,24 @@ UFOP is available as a native desktop application for macOS, Windows, and Linux.
 - **Windows**: Download the NSIS or WiX installer (`.exe` or `.msi`). The installer supports multiple languages (English, Spanish, French, German, Portuguese, Japanese, Chinese, Korean).
 - **Linux**: Available as `.deb`, `.rpm`, or `.AppImage`
 
+### Portable Mode (run from a USB drive)
+
+Portable mode keeps **everything** the app stores in one folder you can carry around: the settings database, backup job databases, the search index, logs, the backup volume cache, thumbnails and previews, sync state, editor drafts, temporary files and saved credentials. Nothing is written to the computer's user profile.
+
+Turn it on in one of three ways (the first that applies wins):
+
+1. Set the environment variable `UFOP_PORTABLE_DIR` to a folder (a relative path is relative to the app's folder).
+2. Put `ufop-portable.json` next to the app: `{ "data_dir": "UFOP Data" }` (relative to the app's folder; default `ufop-data`).
+3. Put an empty file named `portable` next to the app. The data goes into `ufop-data` next to it.
+
+"Next to the app" is the folder that holds the executable (`FileManager.exe` on Windows, the AppImage or binary on Linux); on macOS it can also be the folder that holds the `.app` bundle. Restart the app after adding the file. **Settings** then shows *Portable mode: on (path)* in the header, and **Settings → Storage & Portable Mode** lists the folders and where credentials are kept.
+
+Inside the portable folder: `data/` (databases, backup job databases, `data/logs`), `config/` (credential vault), `cache/` (volume cache, thumbnails, mounts) and `tmp/`. On Windows the WebView2 profile goes to `webview/`, on Linux the WebKit data to `xdg/`; on macOS the system web view cannot be pointed at a folder, so portable mode gives the window its own web data store, identified by the portable folder's path: each portable copy keeps its browser storage (window and panel preferences) apart from the installed app and from other copies. That store stays in the user profile (`~/Library/WebKit`), and needs macOS 14 or later; on older macOS the window uses the default store, shared with the installed app.
+
+**Credentials.** The system keychain cannot travel with the drive, so in portable mode passwords and keys are saved in an encrypted vault file, `config/credentials.vault` (AES-256-GCM). By default its key is a random key file next to it (`config/credentials.key`): that keeps secrets out of plain text, but anyone with the drive can open the vault, so use an encrypted drive. For real protection set `UFOP_PORTABLE_PASSPHRASE` before the first start; the vault key is then derived from the passphrase (Argon2id) and the app needs the same passphrase on every start. Credentials saved in the keychain before switching to portable mode are not copied; enter them again.
+
+`ufop-server` honours `UFOP_PORTABLE_DIR` and the marker files the same way when `--data-dir` is not given.
+
 ### First Launch - Onboarding Wizard
 
 On first launch, a 6-step onboarding wizard guides you through setup:
@@ -645,6 +663,9 @@ In Advanced mode, an automation rule can **Download a URL** into a folder. The U
 | Ctrl/Cmd+C | Copy |
 | Ctrl/Cmd+X | Cut |
 | Ctrl/Cmd+V | Paste |
+| Ctrl/Cmd++ | Larger text |
+| Ctrl/Cmd+- | Smaller text |
+| Ctrl/Cmd+0 | Default text size |
 | Space | Quick preview (when preview pane is open) |
 
 ---
@@ -659,6 +680,15 @@ In Advanced mode, an automation rule can **Download a URL** into a folder. The U
 - **High Contrast** - Optimized for visibility, meets WCAG contrast requirements
 
 Theme switching is instant with no restart required. The theme applies immediately via CSS custom properties.
+
+### Appearance settings
+
+**Settings → Appearance** collects the display preferences. They are stored with the other window preferences on this computer and apply at once:
+
+- **Theme** - the same choices as the toolbar theme switcher.
+- **Text size** - Small (87.5%), Default, Large (112.5%) or Larger (125%). It scales the root font size, so text, spacing and controls sized in `rem` grow together. Shortcuts: **Ctrl/Cmd + +** (larger), **Ctrl/Cmd + -** (smaller), **Ctrl/Cmd + 0** (default); they are also in the command palette and the `?` cheat sheet. Ctrl/Cmd + = (without Shift) stays *Compare files*. The webview's own zoom keys are off in the desktop app, so these replace them.
+- **Size units** - *Decimal* (default; 1 KB = 1,000 bytes, as macOS and disk makers count) or *Binary* (1 KiB = 1,024 bytes, labelled KiB, MiB, GiB). Every size in the app follows it: file lists, transfers, sync, backups, mounts and drives. Sizes already on screen in a panel update the next time it redraws.
+- **Backup times** - show the times of backup versions, runs and files in this computer's time zone (default) or in UTC (marked "UTC"). Schedules keep their own time zone; see [backup-policies-and-schedules.md](backup-policies-and-schedules.md#time-zone).
 
 ### Accessibility
 

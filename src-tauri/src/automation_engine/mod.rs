@@ -296,6 +296,9 @@ pub enum RuleCondition {
 }
 
 /// What action to perform when triggered and conditions match.
+// Rule configuration (a handful per rule, cloned and serialized), not hot
+// data: boxing the notification would change every place that builds one.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuleAction {
@@ -878,6 +881,9 @@ pub struct AutomationManager {
     run_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     webhook_addr: Arc<std::sync::RwLock<Option<std::net::SocketAddr>>>,
 }
+
+/// Existing files a dry run of a folder-watching rule tries (newest first).
+pub const DRY_RUN_SAMPLE: usize = 20;
 
 impl AutomationManager {
     pub fn new() -> Self {
@@ -1490,8 +1496,21 @@ impl AutomationManager {
 
     /// Dry-run a rule: which files it would act on and which steps would
     /// run, without touching anything.
+    ///
+    /// A rule without a source selection that watches a folder for new or
+    /// changed files is tried against the files already there (the most
+    /// recent [`DRY_RUN_SAMPLE`]): each matching file stands for an event
+    /// the rule would act on. Nothing is changed, nothing is saved.
     pub async fn test_rule(&self, rule: &AutomationRule) -> Result<AutomationLog, AppError> {
-        let mut log = executor::execute_rule_action(rule, None, true).await;
+        let mut probe = rule.clone();
+        if probe.options.source.is_none() {
+            if let RuleTrigger::FileAppears { watch_path, recursive } | RuleTrigger::FileModified { watch_path, recursive } = &rule.trigger {
+                if std::path::Path::new(watch_path).is_dir() {
+                    probe.options.source = Some(SourceSelection { path: watch_path.clone(), recursive: *recursive, newest: Some(DRY_RUN_SAMPLE), include_dirs: false });
+                }
+            }
+        }
+        let mut log = executor::execute_rule_action(&probe, None, true).await;
         log.trigger_event = "dry_run".to_string();
         Ok(log)
     }
@@ -1576,6 +1595,34 @@ impl Default for AutomationManager {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn dry_run_of_an_unsaved_folder_rule_tries_the_files_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["a.pdf", "b.txt", "c.pdf"] {
+            std::fs::write(dir.path().join(f), f).unwrap();
+        }
+        let mgr = AutomationManager::new();
+        let watch = dir.path().to_string_lossy().to_string();
+        let mut rule = AutomationRule::new("pdfs".into(), RuleTrigger::FileAppears { watch_path: watch.clone(), recursive: false }, RuleAction::DeleteFile { to_trash: true });
+        rule.conditions = vec![RuleCondition::ExtensionIs { extensions: vec!["pdf".into()] }];
+        let log = mgr.test_rule(&rule).await.unwrap();
+        let mut files = log.files_affected.clone();
+        files.sort();
+        assert_eq!(files, vec![format!("{watch}/a.pdf"), format!("{watch}/c.pdf")]);
+        assert_eq!((log.trigger_event.as_str(), log.status.clone()), ("dry_run", AutomationStatus::Success));
+        assert_eq!(log.steps.len(), 2, "one step per sample file");
+        // Nothing happened, and the rule was not saved.
+        assert!(dir.path().join("a.pdf").exists() && mgr.get_rule(&rule.id).await.is_none());
+        // No match: skipped, with the reason.
+        rule.conditions = vec![RuleCondition::ExtensionIs { extensions: vec!["docx".into()] }];
+        let log = mgr.test_rule(&rule).await.unwrap();
+        assert_eq!((log.status, log.error_message.as_deref()), (AutomationStatus::Skipped, Some("No files matched")));
+        // A manual rule without a source is a single step-only preview.
+        let manual = AutomationRule::new("m".into(), RuleTrigger::Manual, RuleAction::CreateFolder { path: "/x".into() });
+        let log = mgr.test_rule(&manual).await.unwrap();
+        assert!(log.files_affected.is_empty() && log.steps.len() == 1);
+    }
+
     #[tokio::test]
     async fn org_workflows_install_update_refuse_programs_and_uninstall() {
         use ufop_core::agent::ManagedWorkflow;

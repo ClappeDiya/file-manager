@@ -14,7 +14,6 @@ import {
   errorText,
   useBackupStore,
   type BackupDestination,
-  type BackupFileEntry,
   type BackupJob,
   type Fileset,
   type FoundFile,
@@ -25,6 +24,14 @@ import {
 } from "@/stores/backup-store";
 import { formatDate, inputCls } from "@/lib/backup-helpers";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
+import { AdvancedOnly } from "./advanced-only";
+import { BackupVersionTable } from "./backup-version-list";
+import { BackupFileBrowser, BackupSearchHits } from "./backup-file-browser";
+import type { SourceInfo, VersionSelector } from "@/stores/backup-store";
+import { MirrorConfirm, RestoreAsOfPicker, RestoreSafetyOptions } from "./backup-restore-extras";
+import { ArchiveExportButton, BackupFilePreview, OpenAsDriveButton, OpenDrivesList } from "./backup-access-actions";
+import { useMirrorRestore } from "./use-mirror-restore";
+import { PointInTimeOpen } from "./backup-point-in-time";
 
 function RestoreOptionsForm({ value, onChange, versionCount = 0 }: { value: RestoreOptions; onChange: (v: RestoreOptions) => void; versionCount?: number }) {
   const n = (v: string, max: number) => Math.min(max, Math.max(0, Math.floor(Number(v) || 0)));
@@ -99,6 +106,14 @@ function ReportView({ report }: { report: RestoreReport }) {
       {report.files_skipped_duplicate > 0 && `, ${report.files_skipped_duplicate} identical to a newer version`}
       {report.blocks_from_local > 0 && `; ${report.blocks_from_local} block(s) reused from local files`}.
       {report.planned.length > 0 && <div>Would write {report.planned.length} item(s).</div>}
+      {report.archive && <div>Saved the archive {report.archive}.</div>}
+      {((report.files_deleted ?? 0) > 0 || (report.folders_deleted ?? 0) > 0) && (
+        <div>Mirror: deleted {report.files_deleted} file(s) and {report.folders_deleted} folder(s) the version does not have.</div>
+      )}
+      {report.planned.length > 0 && (report.planned_deletions ?? []).length > 0 && <div>Mirror: would delete {report.planned_deletions.length} item(s).</div>}
+      {(report.owners_restored ?? 0) > 0 && <div>Restored the owner of {report.owners_restored} item(s).</div>}
+      {(report.sparse_files ?? 0) > 0 && <div>{report.sparse_files} file(s) written with holes (sparse).</div>}
+      {report.stop_reason && <div className="text-red-600">{report.stop_reason}</div>}
       {report.errors.slice(0, 20).map((e) => (
         <div key={e} className="text-red-600">{e}</div>
       ))}
@@ -109,12 +124,53 @@ function ReportView({ report }: { report: RestoreReport }) {
   );
 }
 
+/** Shared repositories (K4): pick whose versions to browse (Advanced). */
+function SourcePicker({ job, source, onChange }: { job: BackupJob; source: string | null; onChange: (s: string | null) => void }) {
+  const { listSources, execute } = useBackupStore();
+  const [sources, setSources] = useState<SourceInfo[]>([]);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    listSources(job.id).then(setSources).catch(() => setSources([]));
+  }, [job.id, listSources]);
+  if (sources.length < 2) return null;
+  return (
+    <div className="flex gap-1 items-center text-xs" data-testid="backup-source-picker">
+      <span className="text-zinc-500">Versions of</span>
+      <select className={`${inputCls} w-auto`} value={source ?? ""} onChange={(e) => onChange(e.target.value || null)} aria-label="Source">
+        <option value="">This job</option>
+        {sources
+          .filter((s) => !s.own)
+          .map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.label} · {s.versions} version(s)
+            </option>
+          ))}
+        <option value="*">All sources</option>
+      </select>
+      <Btn
+        disabled={busy}
+        title="Read other computers' latest versions from the destination"
+        onClick={async () => {
+          setBusy(true);
+          try {
+            await execute(job.id, { type: "sync_sources" });
+            setSources(await listSources(job.id));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        {busy ? "Refreshing…" : "Refresh"}
+      </Btn>
+    </div>
+  );
+}
+
 export function BackupRestoreView({ job }: { job: BackupJob }) {
-  const { execute } = useBackupStore();
+  const { execute, listVersions } = useBackupStore();
+  const [source, setSource] = useState<string | null>(null);
   const [versions, setVersions] = useState<Fileset[]>([]);
   const [version, setVersion] = useState(0);
-  const [files, setFiles] = useState<BackupFileEntry[]>([]);
-  const [filter, setFilter] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [opts, setOpts] = useState<RestoreOptions>(DEFAULT_RESTORE_OPTIONS);
   const [overrides, setOverrides] = useState<RestoreOverrides>({ download_bps: null, retries: null, network_timeout_secs: null });
@@ -124,31 +180,34 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
   const [report, setReport] = useState<RestoreReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** "Restore as it was at …" time, when the version was picked by time. */
+  const [asOf, setAsOf] = useState<string | null>(null);
+  const [asOfKey, setAsOfKey] = useState(0);
+  const [preview, setPreview] = useState<string | null>(null);
+  const mirror = useMirrorRestore(job.id, setReport);
+  // A newly picked version (or source) starts with nothing selected.
+  const pickVersion = (i: number) => {
+    setVersion(i);
+    setSelected(new Set());
+    setAsOf(null);
+    setAsOfKey((k) => k + 1);
+  };
+
+  // Another source's versions (shared repositories); omitted for the job's own.
+  const src = useMemo(() => (source ? { source } : {}), [source]);
 
   const loadVersions = useCallback(async () => {
     try {
-      setVersions(await tauriInvoke<Fileset[]>("backup_list_versions", { id: job.id }, []));
+      setVersions(await listVersions(job.id, source));
     } catch (e) {
       setError(errorText(e));
     }
-  }, [job.id]);
+  }, [job.id, source, listVersions]);
 
   useEffect(() => {
     void loadVersions();
   }, [loadVersions]);
 
-  useEffect(() => {
-    if (versions.length === 0) return;
-    setSelected(new Set());
-    tauriInvoke<BackupFileEntry[]>("backup_list_files", { id: job.id, version, prefix: null }, [])
-      .then(setFiles)
-      .catch((e) => setError(errorText(e)));
-  }, [job.id, version, versions.length]);
-
-  const shown = useMemo(() => {
-    const f = filter.toLowerCase();
-    return (f ? files.filter((x) => x.path.toLowerCase().includes(f)) : files).slice(0, 2000);
-  }, [files, filter]);
 
   const run = async (fn: () => Promise<void>) => {
     setBusy(true);
@@ -170,19 +229,44 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
       return n;
     });
 
+  const picker = (
+    <AdvancedOnly>
+      <SourcePicker
+        job={job}
+        source={source}
+        onChange={(s) => {
+          setSource(s);
+          setVersion(0);
+          setSelected(new Set());
+          setCmp(null);
+        }}
+      />
+    </AdvancedOnly>
+  );
+
   if (versions.length === 0) {
     return (
-      <div className="p-4 text-sm text-zinc-500" data-testid="backup-no-versions">
+      <div className="p-4 text-sm text-zinc-500 space-y-2" data-testid="backup-no-versions">
+        {picker}
         {error ? <Banner tone="error">{error}</Banner> : "This job has no versions yet. Run a backup first."}
+        <AdvancedOnly>
+          <PointInTimeOpen job={job} />
+        </AdvancedOnly>
       </div>
     );
   }
+  const current = versions[Math.min(version, versions.length - 1)];
+  // Picked by time: the restore names the time, so the backend picks the same version.
+  const selector: VersionSelector | null = asOf ? { type: "as_of", time: asOf, allow_partial: current.partial } : null;
+  const versionRef: number | VersionSelector = selector ?? version;
 
   return (
     <div className="p-3 space-y-3" data-testid="backup-restore-view">
       {error && <Banner tone="error" onClose={() => setError(null)}>{error}</Banner>}
+      {preview && <BackupFilePreview job={job} version={versionRef} source={source} path={preview} onClose={() => setPreview(null)} />}
       <Section title="Versions">
-        <select className={inputCls} value={version} onChange={(e) => setVersion(Number(e.target.value))} data-testid="backup-version-select">
+        {picker}
+        <select className={inputCls} value={version} onChange={(e) => pickVersion(Number(e.target.value))} data-testid="backup-version-select">
           {versions.map((v, i) => (
             <option key={v.id} value={i}>
               {i === 0 ? "Latest — " : ""}
@@ -191,21 +275,37 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
             </option>
           ))}
         </select>
+        <RestoreAsOfPicker
+          key={asOfKey}
+          versions={versions}
+          onPick={(i, iso) => {
+            if (i !== null && i !== version) {
+              setVersion(i);
+              setSelected(new Set());
+            }
+            setAsOf(i !== null ? iso : null);
+          }}
+        />
+        <BackupVersionTable job={job} versions={versions} selected={version} onSelect={pickVersion} source={source} onChanged={loadVersions} />
         <div className="flex gap-1 flex-wrap">
           <Btn
             disabled={versions.length < 2 || busy}
-            onClick={() => run(async () => setCmp(await tauriInvoke<VersionComparison>("backup_compare", { id: job.id, base: Math.min(version + 1, versions.length - 1), compare: version })))}
+            onClick={() => run(async () => setCmp(await tauriInvoke<VersionComparison>("backup_compare", { id: job.id, base: Math.min(version + 1, versions.length - 1), compare: version, ...src })))}
           >
             Compare with previous
           </Btn>
           <Btn
             tone="danger"
-            disabled={busy || versions.length < 2}
-            title="Delete this version (the last remaining version is protected)"
+            disabled={busy || versions.length < 2 || source !== null}
+            title={source !== null ? "Versions of other sources are not deleted from here" : "Delete this version (the last remaining version is protected)"}
             onClick={() =>
-              confirm(`Delete the version from ${formatDate(versions[version].timestamp)}?`) &&
+              confirm(
+                current.pinned
+                  ? `The version from ${formatDate(current.timestamp)} is set to Keep forever. Delete it anyway?`
+                  : `Delete the version from ${formatDate(current.timestamp)}?`,
+              ) &&
               run(async () => {
-                await execute(job.id, { type: "delete_versions", versions: [version], allow_full_removal: false });
+                await execute(job.id, { type: "delete_versions", versions: [version], allow_full_removal: false, force: current.pinned });
                 setVersion(0);
                 await loadVersions();
               })
@@ -232,43 +332,26 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
       <Section title="Search all versions">
         <div className="flex gap-1">
           <input className={inputCls} value={search} placeholder="name or wildcard, e.g. *.docx" onChange={(e) => setSearch(e.target.value)} />
-          <Btn disabled={!search || busy} onClick={() => run(async () => setHits(await tauriInvoke<FoundFile[]>("backup_search", { id: job.id, pattern: search, version: null })))}>
+          <Btn disabled={!search || busy} onClick={() => run(async () => setHits(await tauriInvoke<FoundFile[]>("backup_search", { id: job.id, pattern: search, version: null, ...src })))}>
             Search
           </Btn>
         </div>
         {hits && (
-          <ul className="max-h-32 overflow-y-auto text-[11px] font-mono">
-            {hits.length === 0 && <li className="text-zinc-500">No matches.</li>}
-            {hits.map((h) => (
-              <li key={`${h.version}:${h.path}`} className="flex justify-between gap-2">
-                <button className="truncate text-left hover:underline" onClick={() => { setVersion(h.version); setSelected(new Set([h.path])); }} title="Select this version of the file">
-                  {h.path}
-                </button>
-                <span className="shrink-0 text-zinc-500">{formatDate(h.timestamp)} · {formatBytes(h.size)}</span>
-              </li>
-            ))}
-          </ul>
+          <BackupSearchHits
+            hits={hits}
+            onPick={(h) => {
+              pickVersion(h.version);
+              setSelected(new Set([h.path]));
+            }}
+          />
         )}
       </Section>
 
-      <Section title={`Files (${files.length}${selected.size ? `, ${selected.size} selected` : ""})`} hint="Select nothing to restore the whole version. Selecting a folder restores everything inside it.">
-        <input className={inputCls} value={filter} placeholder="Filter…" onChange={(e) => setFilter(e.target.value)} />
-        <ul className="max-h-56 overflow-y-auto text-[11px] font-mono border border-zinc-200 dark:border-zinc-700 rounded" data-testid="backup-file-list">
-          {shown.map((f) => (
-            <li key={f.path} className="flex items-center gap-2 px-1 hover:bg-zinc-50 dark:hover:bg-zinc-800">
-              <input type="checkbox" checked={selected.has(f.path)} onChange={() => toggle(f.path)} />
-              <span className="truncate flex-1" title={f.path}>
-                {f.kind === "dir" ? "📁 " : f.kind === "symlink" ? "↪ " : ""}
-                {f.path}
-              </span>
-              {f.kind === "file" && <span className="text-zinc-500 shrink-0">{formatBytes(f.size)}</span>}
-            </li>
-          ))}
-        </ul>
-      </Section>
+      <BackupFileBrowser jobId={job.id} version={version} source={source} selected={selected} onToggle={toggle} onPreview={setPreview} />
 
       <Section title="Restore">
         <RestoreOptionsForm value={opts} onChange={setOpts} versionCount={versions.length} />
+        <RestoreSafetyOptions value={opts} onChange={setOpts} />
         <details className="text-xs" data-testid="restore-overrides">
           <summary className="cursor-pointer select-none">This restore only (overrides the job)</summary>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-2">
@@ -285,19 +368,29 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
         </details>
         <Btn
           tone="primary"
-          disabled={busy || (opts.target !== null && !opts.target.trim())}
+          disabled={busy || mirror.pending !== null || (opts.target !== null && !opts.target.trim())}
           testId="backup-restore-run"
           onClick={() =>
             run(async () => {
-              const r = await execute(job.id, { type: "restore", options: { ...opts, version, paths: [...selected] }, overrides });
-              setReport(r.report as unknown as RestoreReport);
+              await mirror.start({ ...opts, version, selector, paths: [...selected], source }, overrides);
             })
           }
         >
-          {busy ? "Working…" : opts.dry_run ? "Preview restore" : "Restore"}
+          {busy ? "Working…" : opts.dry_run ? "Preview restore" : opts.delete_extraneous ? "Restore (mirror)…" : "Restore"}
         </Btn>
+        {mirror.pending && (
+          <MirrorConfirm deletions={mirror.pending.deletions} busy={busy} onConfirm={() => run(async () => void (await mirror.confirm()))} onCancel={mirror.cancel} />
+        )}
+        <div className="flex gap-1 flex-wrap items-start">
+          <ArchiveExportButton job={job} version={versionRef} timestamp={current.timestamp} source={source} paths={[...selected]} onReport={setReport} />
+          <OpenAsDriveButton job={job} version={versionRef} source={source} />
+        </div>
+        <OpenDrivesList jobId={job.id} />
         {report && <ReportView report={report} />}
       </Section>
+      <AdvancedOnly>
+        <PointInTimeOpen job={job} />
+      </AdvancedOnly>
     </div>
   );
 }
@@ -315,6 +408,7 @@ export function DirectRestore() {
   const [adoptSources, setAdoptSources] = useState("");
   const [remapFrom, setRemapFrom] = useState("");
   const [remapTo, setRemapTo] = useState("");
+  const [adoptReadOnly, setAdoptReadOnly] = useState(false);
   const [adopted, setAdopted] = useState<string | null>(null);
   const [report, setReport] = useState<RestoreReport | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -401,6 +495,12 @@ export function DirectRestore() {
             <input className={`${inputCls} font-mono`} value={remapTo} onChange={(e) => setRemapTo(e.target.value)} />
           </Field>
         </div>
+        <Check
+          label="Read-only (restore and browse only)"
+          checked={adoptReadOnly}
+          onChange={setAdoptReadOnly}
+          hint="For someone else's backup or an archive: nothing is ever written to it from this computer."
+        />
         <Btn
           tone="primary"
           testId="backup-adopt"
@@ -412,6 +512,7 @@ export function DirectRestore() {
                 name: adoptName.trim() || null,
                 sources: adoptSources.split("\n").map((s) => s.trim()).filter(Boolean),
                 sourceMap: remapFrom.trim() ? [[remapFrom.trim(), remapTo.trim()]] : [],
+                readOnly: adoptReadOnly,
               });
               await useBackupStore.getState().loadJobs();
               setAdopted(`Job “${job.name}” created with ${job.stats.version_count} existing version(s); the next backup continues the history.`);

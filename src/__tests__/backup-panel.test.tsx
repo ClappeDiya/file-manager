@@ -79,9 +79,10 @@ describe("backup helpers", () => {
   });
 
   it("describes schedules and retention", () => {
-    expect(describeSchedule({ enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [] })).toBe("Manual only");
-    expect(describeSchedule({ enabled: true, start_time: "02:00", interval_minutes: 1440, weekdays: [0, 4], skip_on_battery: false, calendar_ids: [] })).toBe("daily from 02:00 on Mon, Fri");
-    expect(describeSchedule({ enabled: true, start_time: "00:30", interval_minutes: 60, weekdays: [], skip_on_battery: false, calendar_ids: [] })).toBe("every 1 h from 00:30");
+    expect(describeSchedule({ enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: [], timezone: null })).toBe("Manual only");
+    expect(describeSchedule({ enabled: true, start_time: "02:00", interval_minutes: 1440, weekdays: [0, 4], skip_on_battery: false, calendar_ids: [], cron: [], timezone: null })).toBe("daily from 02:00 on Mon, Fri");
+    expect(describeSchedule({ enabled: true, start_time: "00:30", interval_minutes: 60, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: [], timezone: null })).toBe("every 1 h from 00:30");
+    expect(describeSchedule({ enabled: true, start_time: "00:30", interval_minutes: 60, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: ["30 2 * * Mon-Fri", " "], timezone: null })).toBe("cron 30 2 * * Mon-Fri");
     expect(describeRetention({ type: "keep_count", count: 5 })).toBe("Keep 5 version(s)");
   });
 
@@ -162,6 +163,23 @@ describe("BackupPanel", () => {
     );
   });
 
+  it("read-only jobs show a badge, cannot run, and the editor toggles the flag", async () => {
+    backend({ backup_list_jobs: () => [{ ...savedJob(), read_only: true }] });
+    render(<BackupPanel />);
+    expect(await screen.findByTestId("read-only-badge")).toBeTruthy();
+    expect(screen.getByTestId("backup-run-now")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("backup-new"));
+    fireEvent.change(screen.getByTestId("backup-name"), { target: { value: "Viewer" } });
+    fireEvent.change(screen.getByTestId("backup-passphrase"), { target: { value: "correct horse battery staple" } });
+    fireEvent.click(screen.getByText("Sources"));
+    fireEvent.change(screen.getByTestId("backup-sources"), { target: { value: "/home/me/Photos" } });
+    fireEvent.click(screen.getByText("Destination"));
+    fireEvent.change(screen.getByTestId("backup-dest-path"), { target: { value: "/mnt/usb" } });
+    fireEvent.click(screen.getByLabelText(/Read-only \(restore and browse only\)/));
+    fireEvent.click(screen.getByTestId("backup-save"));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_save_job", expect.objectContaining({ job: expect.objectContaining({ read_only: true }) })));
+  });
+
   it("restores selected files from a chosen version", async () => {
     backend();
     render(<BackupPanel />);
@@ -170,8 +188,8 @@ describe("BackupPanel", () => {
     const list = await screen.findByTestId("backup-file-list");
     await waitFor(() => expect(list.textContent).toContain("a.txt"));
     fireEvent.change(screen.getByTestId("backup-version-select"), { target: { value: "1" } });
-    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_list_files", { id: "job-1", version: 1, prefix: null }));
-    const box = (await screen.findAllByRole("checkbox")).find((c) => c.closest("li")?.textContent?.includes("a.txt"))!;
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_list_files", expect.objectContaining({ id: "job-1", version: 1, prefix: null })));
+    const box = await screen.findByRole("checkbox", { name: "Select /home/me/Docs/a.txt" });
     fireEvent.click(box);
     fireEvent.click(screen.getByTestId("backup-restore-run"));
     await waitFor(() =>
@@ -182,6 +200,7 @@ describe("BackupPanel", () => {
           options: expect.objectContaining({ version: 1, paths: ["/home/me/Docs/a.txt"], target: null, conflict: "overwrite" }),
           overrides: { download_bps: null, retries: null, network_timeout_secs: null },
         },
+        confirmationToken: null,
       }),
     );
     expect(await screen.findByText(/Restored 1 file/)).toBeTruthy();

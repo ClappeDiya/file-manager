@@ -2,6 +2,7 @@ pub mod ai_engine;
 pub mod automation_engine;
 pub mod backup_engine;
 pub mod commands;
+pub mod paths;
 pub mod compat_engine;
 pub mod convert_engine;
 pub mod connectors;
@@ -81,6 +82,8 @@ struct AppState {
     backup_mgr: BackupManager,
     schedule_library: schedule_library::ScheduleLibrary,
     fleet_agent: fleet_agent::FleetAgent,
+    /// Optional loopback Prometheus exporter (Settings → Advanced; off by default).
+    desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics,
     background_mode: tray::BackgroundMode,
     audit_trail: security::audit::AuditTrail,
     metadata_store: metadata_engine::MetadataStore,
@@ -302,6 +305,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         safety_interlock,
         narrator,
         quickflow_suggester,
+        desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics::new(backup_mgr.clone()),
         backup_mgr,
         fleet_agent,
         background_mode,
@@ -373,6 +377,9 @@ async fn persist_on_shutdown(repo: &Repository, transfer_mgr: &TransferManager) 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Portable mode: point temp, webview and XDG folders into the portable
+    // root before anything else starts (single-threaded here).
+    paths::apply_process_env();
     let log_dir = logging::log_dir();
     logging::init(&log_dir);
     logging::Retention::load(&log_dir).apply(&log_dir);
@@ -463,6 +470,7 @@ pub fn run() {
                     safety_interlock,
                     narrator,
                     quickflow_suggester,
+                    desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics::new(backup_mgr.clone()),
                     backup_mgr,
                     fleet_agent,
                     background_mode: tray::BackgroundMode::default(),
@@ -477,8 +485,10 @@ pub fn run() {
     let setup_backup_mgr = app_state.backup_mgr.clone();
     let close_mode = app_state.background_mode.clone();
     let shutdown_transfer = app_state.transfer_mgr.clone();
+    let shutdown_backup = app_state.backup_mgr.clone();
     let setup_audit = app_state.audit_trail.clone();
     let setup_agent = app_state.fleet_agent.clone();
+    let setup_metrics = app_state.desktop_metrics.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -491,6 +501,20 @@ pub fn run() {
         .setup(move |app| {
             use tauri::Manager;
             use tauri_plugin_notification::NotificationExt;
+            // The main window is created here rather than from the config
+            // (`"create": false` in tauri.conf.json), so portable mode on
+            // macOS can give it its own web data store (macOS 14+).
+            if app.webview_windows().is_empty() {
+                if let Some(cfg) = app.config().app.windows.first().cloned() {
+                    // `from_config` does not apply the config's data store
+                    // identifier, so it is set on the builder.
+                    let mut window = tauri::WebviewWindowBuilder::from_config(app.handle(), &cfg)?;
+                    if let Some(id) = paths::webview_store_identifier(paths::dirs()) {
+                        window = window.data_store_identifier(id);
+                    }
+                    window.build()?;
+                }
+            }
             let mgr = setup_backup_mgr.clone();
             // Backup results → OS notifications (warnings and errors by default).
             let handle = app.handle().clone();
@@ -500,6 +524,11 @@ pub fn run() {
                 }
             }));
             mgr.start_scheduler();
+            // The Prometheus exporter, when the user turned it on.
+            let metrics = setup_metrics.clone();
+            tauri::async_runtime::spawn(async move {
+                metrics.start_from_settings().await;
+            });
             start_background_engines(app.handle().clone());
             // Console-managed proxy and AI limits.
             let apply_handle = app.handle().clone();
@@ -552,6 +581,7 @@ pub fn run() {
         .manage(app_state.quickflow_suggester)
         .manage(app_state.backup_mgr)
         .manage(app_state.fleet_agent)
+        .manage(app_state.desktop_metrics)
         .manage(app_state.background_mode)
         .manage(app_state.audit_trail)
         .manage(app_state.metadata_store)
@@ -568,11 +598,13 @@ pub fn run() {
             // System
             system_commands::greet,
             system_commands::get_app_version,
+            system_commands::get_portable_status,
             system_commands::get_platform_info,
             // Filesystem
             fs_commands::list_directory,
             fs_commands::pick_folder,
             fs_commands::pick_files,
+            fs_commands::pick_save_file,
             fs_commands::read_text_file_full,
             fs_commands::write_text_file_full,
             // State management
@@ -687,6 +719,7 @@ pub fn run() {
             backup_commands::backup_run,
             backup_commands::backup_execute,
             backup_commands::backup_cancel,
+            backup_commands::backup_change_passphrase,
             schedule_commands::schedules_list,
             schedule_commands::schedule_save,
             schedule_commands::schedule_delete,
@@ -702,10 +735,17 @@ pub fn run() {
             backup_commands::backup_pause,
             backup_commands::backup_resume,
             backup_commands::backup_list_versions,
+            backup_commands::backup_list_sources,
+            backup_commands::backup_preview_retention,
+            backup_commands::backup_run_all,
+            backup_commands::backup_estimate,
+            backup_commands::backup_set_version_metadata,
             backup_commands::backup_list_files,
             backup_commands::backup_search,
             backup_commands::backup_compare,
             backup_commands::backup_run_history,
+            backup_commands::desktop_metrics_status,
+            backup_commands::desktop_metrics_configure,
             backup_commands::backup_prune_history,
             backup_commands::backup_export_config,
             backup_commands::backup_import_config,
@@ -728,6 +768,11 @@ pub fn run() {
             backup_commands::backup_save_destination,
             backup_commands::backup_delete_destination,
             backup_commands::backup_adopt_repository,
+            backup_commands::backup_open_point_in_time,
+            backup_commands::backup_lock_status,
+            backup_commands::backup_hardening_report,
+            backup_commands::backup_break_lock,
+            backup_commands::backup_set_database_encryption,
             backup_commands::backup_database_inventory,
             backup_commands::backup_cleanup_databases,
             backup_commands::backup_bug_report,
@@ -749,6 +794,34 @@ pub fn run() {
             backup_commands::backup_remote_put,
             backup_commands::backup_remote_delete,
             backup_commands::backup_start_operation,
+            backup_commands::backup_resolve_version,
+            backup_commands::backup_read_file,
+            backup_commands::backup_export_file,
+            backup_commands::backup_preview_file,
+            backup_commands::backup_cache_stats,
+            backup_commands::backup_bench,
+            backup_commands::backup_clear_cache,
+            backup_commands::backup_get_cache_settings,
+            backup_commands::backup_set_cache_settings,
+            backup_commands::backup_schedule_preview,
+            backup_commands::backup_list_templates,
+            backup_commands::backup_get_template,
+            backup_commands::backup_save_template,
+            backup_commands::backup_delete_template,
+            backup_commands::backup_list_notification_profiles,
+            backup_commands::backup_get_notification_profile,
+            backup_commands::backup_save_notification_profile,
+            backup_commands::backup_delete_notification_profile,
+            backup_commands::backup_test_notification_profile,
+            backup_commands::backup_preview_notification,
+            backup_commands::backup_webhook_preset,
+            backup_commands::backup_apply_template,
+            backup_commands::backup_export_templates,
+            backup_commands::backup_import_templates,
+            backup_commands::backup_effective_settings,
+            backup_commands::backup_open_drive,
+            backup_commands::backup_close_drive,
+            backup_commands::backup_list_drives,
             backup_commands::backup_set_destination_secret,
             backup_commands::backup_has_destination_secret,
             backup_commands::backup_cloud_providers,
@@ -1180,6 +1253,15 @@ pub fn run() {
             }
             if let tauri::WindowEvent::Destroyed = event {
                 tracing::info!("Window closing, persisting state...");
+                // Running backups stop at a safe point (partial version,
+                // repository lock released) before the app exits.
+                let report = shutdown_backup.shutdown_blocking(backup_engine::shutdown::DEFAULT_GRACE);
+                if report.cancelled > 0 {
+                    tracing::info!("Stopped {} backup operation(s) on exit ({} still running)", report.cancelled, report.still_running);
+                }
+                // Backup drives and preview copies do not outlive the app.
+                shutdown_backup.close_all_drives_blocking();
+                shutdown_backup.cleanup_all_previews();
                 let repo = shutdown_repo.clone();
                 let mgr = shutdown_transfer.clone();
                 // Use spawn_blocking since we're in the event handler

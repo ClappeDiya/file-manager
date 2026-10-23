@@ -17,6 +17,9 @@ Environment=UFOP_SERVER_DATADIR=/var/lib/ufop
 ExecStart=/usr/bin/ufop-server --data-dir /var/lib/ufop
 Restart=on-failure
 RestartSec=10
+# SIGTERM drains running backups for --shutdown-grace (60 s) before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=90
 StateDirectory=ufop
 StateDirectoryMode=0700
 NoNewPrivileges=true

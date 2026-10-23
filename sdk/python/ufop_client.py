@@ -9,15 +9,21 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Union
 
 API_VERSION = "0.1.0"
+AclRule = Dict[str, Any]
 ApiToken = Dict[str, Any]
 BackupJob = Dict[str, Any]
 ApiError = Dict[str, Any]
+Fileset = Dict[str, Any]
 FolderPolicy = Dict[str, Any]
+Permission = Dict[str, Any]
+RetentionPolicy = Dict[str, Any]
+Role = Dict[str, Any]
 SchedulerStatus = Dict[str, Any]
 Scope = Dict[str, Any]
 Session = Dict[str, Any]
 Share = Dict[str, Any]
 TaskInfo = Dict[str, Any]
+User = Dict[str, Any]
 
 
 class UfopError(Exception):
@@ -43,9 +49,9 @@ class UfopClient:
         self.timeout = timeout
         self.headers = dict(headers or {})
 
-    def login(self, password: str) -> Dict[str, Any]:
-        """Sign in with the server password and use the access token from then on."""
-        session = self.post_auth_login({"password": password})
+    def login(self, password: str, username: Optional[str] = None) -> Dict[str, Any]:
+        """Sign in (account `username`, default admin) and use the access token from then on."""
+        session = self.post_auth_login({"password": password, **({"username": username} if username else {})})
         self.token = session["access_token"]
         return session
 
@@ -75,6 +81,22 @@ class UfopClient:
                 err = {}
             raise UfopError(e.code, err.get("message") or e.reason, err.get("error_type"), err.get("advice")) from None
 
+    def get_acl(self) -> Dict[str, Any]:
+        """Per-job access rules (API tokens: `admin` scope). `GET /api/v1/acl`"""
+        return self._call("GET", f"/api/v1/acl", None, None)
+
+    def post_acl(self, body: Dict[str, Any]) -> "AclRule":
+        """Add a rule: principal (user, role:<role> or *) gets permission on jobs matching job_pattern (id or glob over ids and names) (API tokens: `admin` scope). `POST /api/v1/acl`"""
+        return self._call("POST", f"/api/v1/acl", None, body)
+
+    def delete_acl_id(self, id_: str) -> Dict[str, Any]:
+        """Delete a rule (managed rules: 403) (API tokens: `admin` scope). `DELETE /api/v1/acl/{id}`"""
+        return self._call("DELETE", f"/api/v1/acl/{urllib.parse.quote(id_, safe='')}", None, None)
+
+    def get_acl_id_preview_delete(self, id_: str) -> Dict[str, Any]:
+        """What deleting the rule would change: accounts and jobs whose permission drops (API tokens: `admin` scope). `GET /api/v1/acl/{id}/preview-delete`"""
+        return self._call("GET", f"/api/v1/acl/{urllib.parse.quote(id_, safe='')}/preview-delete", None, None)
+
     def get_auth_api_tokens(self) -> Dict[str, Any]:
         """List API tokens (no secrets) (API tokens: `admin` scope). `GET /api/v1/auth/api-tokens`"""
         return self._call("GET", f"/api/v1/auth/api-tokens", None, None)
@@ -92,19 +114,23 @@ class UfopClient:
         return self._call("POST", f"/api/v1/auth/automation-token", None, None)
 
     def post_auth_login(self, body: Dict[str, Any]) -> "Session":
-        """Sign in with the server password; sets the refresh cookie. `POST /api/v1/auth/login`"""
+        """Sign in with an account's user name (default admin) and password; sets the refresh and CSRF cookies. `POST /api/v1/auth/login`"""
         return self._call("POST", f"/api/v1/auth/login", None, body)
 
     def post_auth_logout(self) -> Dict[str, Any]:
-        """Revoke the refresh cookie's session. `POST /api/v1/auth/logout`"""
+        """Revoke the refresh cookie's session; with the cookie it needs X-CSRF-Token (403 otherwise). `POST /api/v1/auth/logout`"""
         return self._call("POST", f"/api/v1/auth/logout", None, None)
+
+    def get_auth_me(self) -> Dict[str, Any]:
+        """The signed-in account (or token owner), its role, the token's limits and its permission on each job it can see (API tokens: `read` scope). `GET /api/v1/auth/me`"""
+        return self._call("GET", f"/api/v1/auth/me", None, None)
 
     def put_auth_password(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """Change the server password (API tokens: `admin` scope). `PUT /api/v1/auth/password`"""
         return self._call("PUT", f"/api/v1/auth/password", None, body)
 
     def post_auth_refresh(self) -> "Session":
-        """New access token from the refresh cookie (rotated). `POST /api/v1/auth/refresh`"""
+        """New access token from the refresh cookie (rotated); needs X-CSRF-Token equal to the ufop_csrf cookie (403 otherwise). `POST /api/v1/auth/refresh`"""
         return self._call("POST", f"/api/v1/auth/refresh", None, None)
 
     def post_auth_reset(self) -> Dict[str, Any]:
@@ -118,6 +144,62 @@ class UfopClient:
     def post_auth_signin_token(self) -> Dict[str, Any]:
         """Issue a one-time sign-in token (link for another browser) (API tokens: `admin` scope). `POST /api/v1/auth/signin-token`"""
         return self._call("POST", f"/api/v1/auth/signin-token", None, None)
+
+    def get_backup_cache(self) -> Dict[str, Any]:
+        """Local volume cache: folder, size limit, entries, bytes, hits, misses, hit rate (API tokens: `read` scope). `GET /api/v1/backup-cache`"""
+        return self._call("GET", f"/api/v1/backup-cache", None, None)
+
+    def delete_backup_cache(self) -> Dict[str, Any]:
+        """Delete every cached volume (API tokens: `write` scope). `DELETE /api/v1/backup-cache`"""
+        return self._call("DELETE", f"/api/v1/backup-cache", None, None)
+
+    def get_backup_cache_settings(self) -> Dict[str, Any]:
+        """Volume cache settings (API tokens: `read` scope). `GET /api/v1/backup-cache/settings`"""
+        return self._call("GET", f"/api/v1/backup-cache/settings", None, None)
+
+    def put_backup_cache_settings(self, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Change the volume cache folder, size limit (0 = off) and use for full restores (API tokens: `write` scope). `PUT /api/v1/backup-cache/settings`"""
+        return self._call("PUT", f"/api/v1/backup-cache/settings", None, body if body is not None else {})
+
+    def post_backup_schedule_preview(self, body: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Validate a schedule (interval or cron) and list its next runs, marking holiday skips (API tokens: `read` scope). `POST /api/v1/backup-schedule/preview`"""
+        return self._call("POST", f"/api/v1/backup-schedule/preview", None, body)
+
+    def get_backup_templates(self) -> List[Dict[str, Any]]:
+        """Policy templates (local, then the organization's) (API tokens: `read` scope). `GET /api/v1/backup-templates`"""
+        return self._call("GET", f"/api/v1/backup-templates", None, None)
+
+    def post_backup_templates(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a policy template (API tokens: `write` scope). `POST /api/v1/backup-templates`"""
+        return self._call("POST", f"/api/v1/backup-templates", None, body)
+
+    def get_backup_templates_export(self, ids: Optional[str] = None) -> Dict[str, Any]:
+        """Templates as a JSON file (API tokens: `read` scope). `GET /api/v1/backup-templates/export`"""
+        return self._call("GET", f"/api/v1/backup-templates/export", {"ids": ids}, None)
+
+    def post_backup_templates_import(self, body: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Import a template file (same id or name updates) (API tokens: `write` scope). `POST /api/v1/backup-templates/import`"""
+        return self._call("POST", f"/api/v1/backup-templates/import", None, body if body is not None else {})
+
+    def get_backup_templates_id(self, id_: str) -> Dict[str, Any]:
+        """One policy template (API tokens: `read` scope). `GET /api/v1/backup-templates/{id}`"""
+        return self._call("GET", f"/api/v1/backup-templates/{urllib.parse.quote(id_, safe='')}", None, None)
+
+    def put_backup_templates_id(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Update a local policy template (API tokens: `write` scope). `PUT /api/v1/backup-templates/{id}`"""
+        return self._call("PUT", f"/api/v1/backup-templates/{urllib.parse.quote(id_, safe='')}", None, body)
+
+    def delete_backup_templates_id(self, id_: str) -> Dict[str, Any]:
+        """Delete a local policy template no job uses (API tokens: `write` scope). `DELETE /api/v1/backup-templates/{id}`"""
+        return self._call("DELETE", f"/api/v1/backup-templates/{urllib.parse.quote(id_, safe='')}", None, None)
+
+    def post_backup_templates_id_apply(self, id_: str, body: Dict[str, Any]) -> "BackupJob":
+        """Base a job on this template too (appended: it wins over earlier ones) (API tokens: `write` scope). `POST /api/v1/backup-templates/{id}/apply`"""
+        return self._call("POST", f"/api/v1/backup-templates/{urllib.parse.quote(id_, safe='')}/apply", None, body)
+
+    def get_branding(self) -> Dict[str, Any]:
+        """Web UI branding: title prefix, product name, accent color, logo and stylesheet URLs (public). `GET /api/v1/branding`"""
+        return self._call("GET", f"/api/v1/branding", None, None)
 
     def post_destinations_test(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """Test a destination (optionally create its folder); returns the files found (API tokens: `write` scope). `POST /api/v1/destinations/test`"""
@@ -183,6 +265,10 @@ class UfopClient:
         """Import an exported job configuration (API tokens: `write` scope). `POST /api/v1/jobs/import`"""
         return self._call("POST", f"/api/v1/jobs/import", None, body)
 
+    def post_jobs_run_all(self, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Back up every job now (queued; read-only and busy jobs are skipped) (API tokens: `run` scope). `POST /api/v1/jobs/run-all`"""
+        return self._call("POST", f"/api/v1/jobs/run-all", None, body if body is not None else {})
+
     def get_jobs_id(self, id_: str) -> "BackupJob":
         """Get a job (API tokens: `read` scope). `GET /api/v1/jobs/{id}`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}", None, None)
@@ -199,37 +285,121 @@ class UfopClient:
         """The equivalent `ufop backup` command line (API tokens: `read` scope). `GET /api/v1/jobs/{id}/cli`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/cli", None, None)
 
-    def get_jobs_id_compare(self, id_: str, base: int, compare: int) -> Dict[str, Any]:
+    def get_jobs_id_compare(self, id_: str, base: int, compare: int, source: Optional[str] = None) -> Dict[str, Any]:
         """Differences between two versions (API tokens: `read` scope). `GET /api/v1/jobs/{id}/compare`"""
-        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/compare", {"base": base, "compare": compare}, None)
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/compare", {"base": base, "compare": compare, "source": source}, None)
+
+    def put_jobs_id_database_encryption(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Encrypt or decrypt the job's local database now (key kept in the credential store) (API tokens: `write` scope). `PUT /api/v1/jobs/{id}/database-encryption`"""
+        return self._call("PUT", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/database-encryption", None, body)
+
+    def get_jobs_id_effective_settings(self, id_: str) -> Dict[str, Any]:
+        """Each setting the job runs with and where it comes from (built_in, global, template, job, managed) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/effective-settings`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/effective-settings", None, None)
+
+    def get_jobs_id_estimate(self, id_: str, assumed_bytes_per_sec: Optional[int] = None) -> Dict[str, Any]:
+        """Estimate the next backup: files, new data (at most / at least) and duration; reads nothing (API tokens: `read` scope). `GET /api/v1/jobs/{id}/estimate`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/estimate", {"assumed_bytes_per_sec": assumed_bytes_per_sec}, None)
 
     def get_jobs_id_export(self, id_: str, include_passphrase: Optional[bool] = None, export_passphrase: Optional[str] = None) -> Dict[str, Any]:
         """Export the job configuration (API tokens: `read` scope). `GET /api/v1/jobs/{id}/export`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/export", {"include_passphrase": include_passphrase, "export_passphrase": export_passphrase}, None)
 
-    def get_jobs_id_files(self, id_: str, version: Optional[int] = None, prefix: Optional[str] = None) -> Dict[str, Any]:
-        """Files in a version (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files`"""
-        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/files", {"version": version, "prefix": prefix}, None)
+    def get_jobs_id_files(self, id_: str, version: Optional[str] = None, time: Optional[str] = None, allow_partial: Optional[bool] = None, prefix: Optional[str] = None, source: Optional[str] = None, offset: Optional[int] = None, limit: Optional[int] = None, sort: Optional[str] = None, desc: Optional[bool] = None, filter: Optional[str] = None) -> Dict[str, Any]:
+        """Files in a version (any of offset, limit, sort, filter returns one page with the total) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/files", {"version": version, "time": time, "allow_partial": allow_partial, "prefix": prefix, "source": source, "offset": offset, "limit": limit, "sort": sort, "desc": desc, "filter": filter}, None)
+
+    def get_jobs_id_hardening(self, id_: str) -> Dict[str, Any]:
+        """Ransomware-hardening checklist: encryption, object lock, soft delete, a replica with another provider, local database encryption, retention and pins, whether the backup credentials can delete (from the last probe), legal hold; each with pass/warn/fail/unknown/info and a link to the guide (API tokens: `read` scope). `GET /api/v1/jobs/{id}/hardening`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/hardening", None, None)
+
+    def post_jobs_id_hardening_probe(self, id_: str) -> Dict[str, Any]:
+        """Run the destination probe: write a small probe object and try to delete it with the backup credentials (cleaned up when possible), then return the checklist (API tokens: `write` scope). `POST /api/v1/jobs/{id}/hardening/probe`"""
+        return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/hardening/probe", None, None)
+
+    def get_jobs_id_lock(self, id_: str) -> Dict[str, Any]:
+        """Repository lock status: who holds the destination (host, operation, since, expires) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/lock`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/lock", None, None)
+
+    def delete_jobs_id_lock(self, id_: str, confirm: bool, owner_id: Optional[str] = None) -> Dict[str, Any]:
+        """Break the repository lock (only when its holder is no longer running) (API tokens: `write` scope). `DELETE /api/v1/jobs/{id}/lock`"""
+        return self._call("DELETE", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/lock", {"confirm": confirm, "owner_id": owner_id}, None)
 
     def post_jobs_id_operations(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Restore, verify, compact, repair, purge … (a tagged BackupOperation; not `backup`) (API tokens: `run` scope). `POST /api/v1/jobs/{id}/operations`"""
+        """Restore, verify, compact, repair, purge … (a tagged BackupOperation; not `backup`). Verify takes `options`: scope {versions, paths}, mode {type: structure | sample_volumes(count) | sample_percent(percent) | full}, files_percent, parallelism, max_errors, use_cache (API tokens: `run` scope). `POST /api/v1/jobs/{id}/operations`"""
         return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/operations", None, body)
+
+    def put_jobs_id_passphrase(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Change an encrypted job's passphrase (format 2 repositories rewrite only the header) (API tokens: `write` scope). `PUT /api/v1/jobs/{id}/passphrase`"""
+        return self._call("PUT", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/passphrase", None, body)
+
+    def post_jobs_id_point_in_time(self, id_: str, body: Dict[str, Any]) -> "BackupJob":
+        """Open the job's versioned S3 destination as it was at a time: creates a read-only job whose index is rebuilt from the object versions of then (API tokens: `write` scope). `POST /api/v1/jobs/{id}/point-in-time`"""
+        return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/point-in-time", None, body)
+
+    def post_jobs_id_retention_preview(self, id_: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """What retention would keep and delete (the job's policy or an unsaved one); changes nothing (API tokens: `write` scope). `POST /api/v1/jobs/{id}/retention/preview`"""
+        return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/retention/preview", None, body if body is not None else {})
 
     def post_jobs_id_run(self, id_: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Start a backup (queued); returns the task id (API tokens: `run` scope). `POST /api/v1/jobs/{id}/run`"""
         return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/run", None, body if body is not None else {})
 
-    def get_jobs_id_search(self, id_: str, q: str, version: Optional[int] = None) -> Dict[str, Any]:
+    def get_jobs_id_search(self, id_: str, q: str, version: Optional[int] = None, source: Optional[str] = None) -> Dict[str, Any]:
         """Search file names across versions (API tokens: `read` scope). `GET /api/v1/jobs/{id}/search`"""
-        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/search", {"q": q, "version": version}, None)
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/search", {"q": q, "version": version, "source": source}, None)
 
-    def get_jobs_id_versions(self, id_: str) -> List[Dict[str, Any]]:
-        """Backup versions of a job (API tokens: `read` scope). `GET /api/v1/jobs/{id}/versions`"""
-        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/versions", None, None)
+    def get_jobs_id_sources(self, id_: str) -> List[Dict[str, Any]]:
+        """Sources (jobs and computers) with versions in the job's repository (API tokens: `read` scope). `GET /api/v1/jobs/{id}/sources`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/sources", None, None)
+
+    def get_jobs_id_versions(self, id_: str, source: Optional[str] = None, tags: Optional[str] = None) -> List["Fileset"]:
+        """Backup versions of a job (with note, tags, pin, identity and storage added) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/versions`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/versions", {"source": source, "tags": tags}, None)
+
+    def get_jobs_id_versions_resolve(self, id_: str, version: Optional[str] = None, time: Optional[str] = None, allow_partial: Optional[bool] = None, source: Optional[str] = None) -> Dict[str, Any]:
+        """Which version a time (or latest / oldest / number / id) picks (API tokens: `read` scope). `GET /api/v1/jobs/{id}/versions/resolve`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/versions/resolve", {"version": version, "time": time, "allow_partial": allow_partial, "source": source}, None)
+
+    def patch_jobs_id_versions_version(self, id_: str, version: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Change a version's note, tags or pin (rewrites its file list) (API tokens: `write` scope). `PATCH /api/v1/jobs/{id}/versions/{version}`"""
+        return self._call("PATCH", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/versions/{urllib.parse.quote(version, safe='')}", None, body if body is not None else {})
 
     def get_modules(self) -> Dict[str, Any]:
         """Enabled and disabled modules (API tokens: `read` scope). `GET /api/v1/modules`"""
         return self._call("GET", f"/api/v1/modules", None, None)
+
+    def get_notification_profiles(self) -> List[Dict[str, Any]]:
+        """Notification profiles (local, then the organization's) (API tokens: `read` scope). `GET /api/v1/notification-profiles`"""
+        return self._call("GET", f"/api/v1/notification-profiles", None, None)
+
+    def post_notification_profiles(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a notification profile (secret values are moved to the credential store) (API tokens: `write` scope). `POST /api/v1/notification-profiles`"""
+        return self._call("POST", f"/api/v1/notification-profiles", None, body)
+
+    def get_notification_profiles_id(self, id_: str) -> Dict[str, Any]:
+        """One notification profile (API tokens: `read` scope). `GET /api/v1/notification-profiles/{id}`"""
+        return self._call("GET", f"/api/v1/notification-profiles/{urllib.parse.quote(id_, safe='')}", None, None)
+
+    def put_notification_profiles_id(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Update a local notification profile (API tokens: `write` scope). `PUT /api/v1/notification-profiles/{id}`"""
+        return self._call("PUT", f"/api/v1/notification-profiles/{urllib.parse.quote(id_, safe='')}", None, body)
+
+    def delete_notification_profiles_id(self, id_: str, force: Optional[bool] = None) -> Dict[str, Any]:
+        """Delete a local notification profile; one jobs or templates use needs force=true, which removes those references (API tokens: `write` scope). `DELETE /api/v1/notification-profiles/{id}`"""
+        return self._call("DELETE", f"/api/v1/notification-profiles/{urllib.parse.quote(id_, safe='')}", {"force": force}, None)
+
+    def post_notification_profiles_id_test(self, id_: str) -> Dict[str, Any]:
+        """Send a test message through the profile (API tokens: `write` scope). `POST /api/v1/notification-profiles/{id}/test`"""
+        return self._call("POST", f"/api/v1/notification-profiles/{urllib.parse.quote(id_, safe='')}/test", None, None)
+
+    def post_notifications_preview(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """What a channel would send for a sample run: subject, text, HTML (email) and the webhook request with secrets masked (API tokens: `write` scope). `POST /api/v1/notifications/preview`"""
+        return self._call("POST", f"/api/v1/notifications/preview", None, body)
+
+    def post_notifications_webhook_preset(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """A webhook channel set up for Pushover, ntfy, Discord, PagerDuty Events v2, Gotify or a generic endpoint (store its secret under the returned credential_id) (API tokens: `write` scope). `POST /api/v1/notifications/webhook-preset`"""
+        return self._call("POST", f"/api/v1/notifications/webhook-preset", None, body)
 
     def get_oauth_providers(self) -> List[Dict[str, Any]]:
         """Configured OAuth providers for cloud destinations (API tokens: `admin` scope). `GET /api/v1/oauth/providers`"""
@@ -243,9 +413,9 @@ class UfopClient:
         """Call a desktop IPC command by name (arguments as the JSON body); see docs/ipc-commands.md (API tokens: `admin` scope). `POST /api/v1/rpc/{command}`"""
         return self._call("POST", f"/api/v1/rpc/{urllib.parse.quote(command, safe='')}", None, body if body is not None else {})
 
-    def get_runs(self, job_id: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Run history (API tokens: `read` scope). `GET /api/v1/runs`"""
-        return self._call("GET", f"/api/v1/runs", {"job_id": job_id, "limit": limit}, None)
+    def get_runs(self, job_id: Optional[str] = None, limit: Optional[int] = None, offset: Optional[int] = None, sort: Optional[str] = None, desc: Optional[bool] = None, filter: Optional[str] = None) -> Any:
+        """Run history (any of offset, sort, filter returns one page of limit rows with the total) (API tokens: `read` scope). `GET /api/v1/runs`"""
+        return self._call("GET", f"/api/v1/runs", {"job_id": job_id, "limit": limit, "offset": offset, "sort": sort, "desc": desc, "filter": filter}, None)
 
     def post_scheduler_pause(self, body: Optional[Dict[str, Any]] = None) -> "SchedulerStatus":
         """Pause the scheduler (optionally for N minutes) (API tokens: `run` scope). `POST /api/v1/scheduler/pause`"""
@@ -254,6 +424,18 @@ class UfopClient:
     def post_scheduler_resume(self) -> "SchedulerStatus":
         """Resume the scheduler (API tokens: `run` scope). `POST /api/v1/scheduler/resume`"""
         return self._call("POST", f"/api/v1/scheduler/resume", None, None)
+
+    def get_server_branding(self) -> Dict[str, Any]:
+        """Branding layers: effective, saved, command line and console-managed (administrators) (API tokens: `admin` scope). `GET /api/v1/server/branding`"""
+        return self._call("GET", f"/api/v1/server/branding", None, None)
+
+    def put_server_branding(self, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Save the web UI branding (administrators; refused while the console manages it). The logo must be a data: URI; custom CSS may not import or load external resources (API tokens: `admin` scope). `PUT /api/v1/server/branding`"""
+        return self._call("PUT", f"/api/v1/server/branding", None, body if body is not None else {})
+
+    def post_server_shutdown(self, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Stop the server gracefully: new mutating requests get 503, running backups stop at a safe point (partial version) within grace_secs (default --shutdown-grace), then the process exits 0; a second call stops at once. Answers 202 (API tokens: `admin` scope). `POST /api/v1/server/shutdown`"""
+        return self._call("POST", f"/api/v1/server/shutdown", None, body if body is not None else {})
 
     def get_settings(self) -> Dict[str, Any]:
         """Server settings (API tokens: `read` scope). `GET /api/v1/settings`"""
@@ -290,3 +472,23 @@ class UfopClient:
     def post_tasks_id_cancel(self, id_: str) -> Dict[str, Any]:
         """Cancel a task (API tokens: `run` scope). `POST /api/v1/tasks/{id}/cancel`"""
         return self._call("POST", f"/api/v1/tasks/{urllib.parse.quote(id_, safe='')}/cancel", None, None)
+
+    def get_users(self) -> Dict[str, Any]:
+        """Server accounts (administrators) (API tokens: `admin` scope). `GET /api/v1/users`"""
+        return self._call("GET", f"/api/v1/users", None, None)
+
+    def post_users(self, body: Dict[str, Any]) -> "User":
+        """Create an account with a password or a prehashed Argon2 PHC password_hash (administrators) (API tokens: `admin` scope). `POST /api/v1/users`"""
+        return self._call("POST", f"/api/v1/users", None, body)
+
+    def get_users_username(self, username: str) -> "User":
+        """One account (API tokens: `admin` scope). `GET /api/v1/users/{username}`"""
+        return self._call("GET", f"/api/v1/users/{urllib.parse.quote(username, safe='')}", None, None)
+
+    def put_users_username(self, username: str, body: Optional[Dict[str, Any]] = None) -> "User":
+        """Change role, disabled, password or password_hash (absent = unchanged); the last enabled administrator cannot be demoted or disabled (409); managed accounts are read-only (403) (API tokens: `admin` scope). `PUT /api/v1/users/{username}`"""
+        return self._call("PUT", f"/api/v1/users/{urllib.parse.quote(username, safe='')}", None, body if body is not None else {})
+
+    def delete_users_username(self, username: str) -> Dict[str, Any]:
+        """Delete an account and revoke its sessions and tokens (API tokens: `admin` scope). `DELETE /api/v1/users/{username}`"""
+        return self._call("DELETE", f"/api/v1/users/{urllib.parse.quote(username, safe='')}", None, None)

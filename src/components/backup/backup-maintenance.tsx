@@ -11,6 +11,13 @@ import { downloadText, inputCls } from "@/lib/backup-helpers";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { BackupSupportTools } from "./backup-support-tools";
 import { BackupLegalHold } from "./backup-legal-hold";
+import { AdvancedOnly } from "./advanced-only";
+import { BackupRepositoryFormat } from "./backup-repository-format";
+import { BackupRepositorySafety } from "./backup-repository-safety";
+import { BackupSharing } from "./backup-sharing";
+import { CustomVerify } from "./backup-policies";
+import { DataGrid } from "../data-grid";
+import type { ColumnDef } from "@tanstack/react-table";
 
 
 export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDeleted: () => void }) {
@@ -37,6 +44,31 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
     }
   };
   const [ctlTarget, setCtlTarget] = useState("");
+  const remoteColumns: ColumnDef<RemoteFile>[] = [
+    { id: "name", header: "Name", accessorFn: (f) => f.name, cell: ({ row: { original: f } }) => <span className="font-mono break-all">{f.name}</span> },
+    { id: "size", header: "Size", accessorFn: (f) => f.size, cell: ({ row: { original: f } }) => formatBytes(f.size), meta: { className: "text-right whitespace-nowrap" } },
+    {
+      id: "actions",
+      header: () => <span className="sr-only">Actions</span>,
+      enableSorting: false,
+      cell: ({ row: { original: f } }) =>
+        !f.name.startsWith(`${job.options.prefix}-`) && (
+          <button
+            className="text-red-600"
+            onClick={async () => {
+              try {
+                await tauriInvoke("backup_remote_delete", { destination: job.destination, name: f.name, force: false });
+                await listFiles();
+              } catch (e) {
+                setError(errorText(e));
+              }
+            }}
+          >
+            delete
+          </button>
+        ),
+    },
+  ];
 
   const op = async (label: string, operation: BackupOperation) => {
     setBusy(label);
@@ -67,7 +99,11 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
         </Banner>
       )}
 
-      <BackupLegalHold job={job} />
+      <BackupRepositorySafety job={job} />
+
+      <AdvancedOnly>
+        <BackupLegalHold job={job} />
+      </AdvancedOnly>
 
       <Section title="Integrity">
         <div className="flex gap-1 flex-wrap">
@@ -77,7 +113,27 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
           {tool("List broken files", { type: "list_broken" }, "Files that depend on missing or damaged volumes")}
         </div>
       </Section>
+      <AdvancedOnly>
+        <CustomVerify busy={busy !== null} onRun={(o) => void op("Custom check", o)} />
+      </AdvancedOnly>
 
+      <AdvancedOnly>
+        <BackupRepositoryFormat job={job} />
+      </AdvancedOnly>
+      <AdvancedOnly>
+        <Section title="Inspect (read-only)">
+          <div className="flex gap-1 flex-wrap">
+            {tool("Repository header", { type: "inspect_header" }, "The decoded repository header: format, features, chunker, codec, cipher (ufop backup debug header)")}
+            {tool("Storage statistics", { type: "inspect_stats" }, "Files and bytes per kind, blocks, deduplication and per-version use (ufop backup debug stats)")}
+          </div>
+          <p className="text-[11px] text-zinc-500">Blocks, single volumes, index and file-list contents: use <code>ufop backup debug</code>.</p>
+        </Section>
+      </AdvancedOnly>
+      <AdvancedOnly>
+        <BackupSharing job={job} />
+      </AdvancedOnly>
+
+      <AdvancedOnly hint>
       <Section title="Repair">
         <div className="flex gap-1 flex-wrap">
           {tool("Repair", { type: "repair" }, "Re-upload missing index/file-list volumes from the local database")}
@@ -125,36 +181,24 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
           {files && <input className={inputCls} placeholder="filter" value={filter} onChange={(e) => setFilter(e.target.value)} />}
         </div>
         {files && (
-          <ul className="text-xs max-h-48 overflow-auto font-mono" data-testid="remote-files">
-            {files
-              .filter((f) => !filter || f.name.includes(filter))
-              .map((f) => (
-                <li key={f.name} className="flex gap-2">
-                  <span className="truncate flex-1">{f.name}</span>
-                  <span className="text-zinc-500">{formatBytes(f.size)}</span>
-                  {!f.name.startsWith(`${job.options.prefix}-`) && (
-                    <button
-                      className="text-red-600"
-                      onClick={async () => {
-                        try {
-                          await tauriInvoke("backup_remote_delete", { destination: job.destination, name: f.name, force: false });
-                          await listFiles();
-                        } catch (e) {
-                          setError(errorText(e));
-                        }
-                      }}
-                    >
-                      delete
-                    </button>
-                  )}
-                </li>
-              ))}
-          </ul>
+          <div data-testid="remote-files">
+            <DataGrid<RemoteFile>
+              data={files.filter((f) => !filter || f.name.toLowerCase().includes(filter.toLowerCase()))}
+              columns={remoteColumns}
+              label="Destination files"
+              dense
+              pagination
+              prefsKey="backup-remote-files"
+              getRowId={(f) => f.name}
+              emptyText={filter ? "No file matches the filter." : "The destination is empty."}
+              resetKey={filter}
+            />
+          </div>
         )}
       </Section>
 
       <Section title="Snapshot diagnostics" hint="Creates and immediately removes a test snapshot of this job's sources, listing every step.">
-        {tool("Test snapshot", { type: "snapshot_test" }, "Check that VSS / LVM / APFS snapshots work for these sources")}
+        {tool("Test snapshot", { type: "snapshot_test" }, "Check that VSS / ZFS / btrfs / LVM / APFS snapshots work for these sources, and which methods are installed")}
       </Section>
 
       <BackupSupportTools job={job} />
@@ -193,6 +237,7 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
           })()}
         </div>
       </Section>
+      </AdvancedOnly>
 
       <Section title="Export configuration">
         <Check label="Include the backup passphrase" checked={includePass} onChange={setIncludePass} hint="Only with an export passphrase, unless you store the file securely." />

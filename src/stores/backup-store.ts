@@ -32,6 +32,10 @@ export interface SourceFilter {
   exclusion_markers: string[];
   exclude_empty_folders: boolean;
   exclude_cloud_placeholders: boolean;
+  /** Ignore-file names read in every folder, gitignore syntax (default `.ufopignore`). */
+  ignore_files: string[];
+  /** Also honour `.gitignore` and `.git/info/exclude`. */
+  respect_gitignore: boolean;
 }
 
 export type BackupDestination =
@@ -136,6 +140,313 @@ export interface BackupOptions {
   object_lock: ObjectLockOptions | null;
   /** What `photos://` (macOS Photos library) sources export. */
   photos: PhotosOptions;
+  // ── Repository format: new repositories only (existing ones keep theirs) ──
+  /** 1 or 2; null = newest (2). */
+  format_version: number | null;
+  /** null = FastCDC on format 2 (format 1 is always fixed). */
+  chunker: ChunkerKind | null;
+  /** null = zstd on format 2 (format 1 is always deflate). */
+  block_codec: BlockCodec | null;
+  /** null = zstd on format 2 (format 1 never compresses metadata). */
+  metadata_compression: MetadataCompression | null;
+  /** Format 2 encrypted repositories only. */
+  cipher: CipherKind;
+  /** Format 2 only; sharded needs a destination with folders. */
+  layout: RepoLayout;
+  // ── Repository safety ──
+  /** Repository lock lease in seconds, renewed every third of it (0 = 30 min). */
+  lock_ttl_secs: number;
+  /** Warn when the destination clock differs by this many seconds (0 = never). */
+  clock_skew_warn_secs: number;
+  /** Refuse to write when the clocks differ by this many seconds (0 = never). */
+  clock_skew_abort_secs: number;
+  /** Checkpoint (partial version) at most this often during a backup (0 = off). */
+  checkpoint_interval_secs: number;
+  /** Also checkpoint after this many uploaded bytes (0 = off). */
+  checkpoint_interval_bytes: number;
+  // ── Versions and shared repositories ──
+  /** Note stored with each new version. */
+  default_note: string | null;
+  /** Tags stored with each new version. */
+  default_tags: Record<string, string>;
+  /** Who writes the versions; empty host / user = this computer's (override to continue another computer's history). */
+  identity: ClientIdentity;
+  /** Create a new (format 2) repository as shared by several jobs / computers. */
+  shared_repository: boolean;
+  /** Shared repositories: compaction leaves volumes younger than this alone. */
+  shared_gc_delay_hours: number;
+  // ── Sources and runs ──
+  /** Do not descend into folders on another filesystem (mount points stay empty). */
+  one_file_system: boolean;
+  /** What unreadable files, folders and unsupported entries do to the run. */
+  error_policy: ErrorPolicy;
+  /** Re-read and re-hash about this % (0–100) of unchanged-looking files per run. */
+  rehash_percent: number;
+  /** Stop the run with a partial version after uploading this much; null = no limit. */
+  max_upload_bytes_per_run: number | null;
+  /** Files above this size are hashed by several threads (0 = off). */
+  parallel_file_threshold: number;
+}
+
+/** Rust `ufop_core::backup::errors::ErrorPolicy`. */
+export type ErrorAction = "continue" | "fail";
+export type UnknownEntryAction = "ignore" | "warn" | "fail";
+export interface ErrorPolicy {
+  on_file_error: ErrorAction;
+  on_dir_error: ErrorAction;
+  on_unknown_entry: UnknownEntryAction;
+  /** Stop at the first error (keeping a partial version). */
+  fail_fast: boolean;
+  /** Stop after more than this many read problems; null = never. */
+  max_errors: number | null;
+}
+
+export const DEFAULT_PARALLEL_FILE_THRESHOLD = 256 * 1024 * 1024;
+
+/** Rust `hooks::StdinCommand`: a command whose output each backup stores as a file. */
+export interface StdinCommand {
+  command: string;
+  /** `name` → /stdin/name, or an absolute path such as /dumps/db.sql. */
+  path: string;
+  /** 0 = no limit. */
+  timeout_secs: number;
+}
+
+/** Rust `ufop_core::backup::estimate::BackupEstimate`. */
+export interface BackupEstimate {
+  files: number;
+  folders: number;
+  bytes_examined: number;
+  new_files: number;
+  changed_files: number;
+  unchanged_files: number;
+  deleted_files: number;
+  /** New and changed files' bytes: the most the run uploads. */
+  new_bytes_at_most: number;
+  /** New files plus the growth of changed files. */
+  new_bytes_at_least: number;
+  /** True when changed files make the figure an upper bound. */
+  upper_bound: boolean;
+  has_previous_version: boolean;
+  bytes_per_sec: number | null;
+  speed_source: "history" | "assumed" | "none";
+  estimated_duration_secs: number | null;
+  largest: { path: string; size: number; status: "new" | "changed" }[];
+  warnings: string[];
+}
+
+/** Which jobs "Back up all now" starts (`runs::RunAllFilter`). */
+export interface RunAllFilter {
+  job_ids: string[];
+  scheduled_only: boolean;
+  dry_run: boolean;
+}
+
+export interface RunAllReport {
+  started: { job_id: string; job_name: string; task_id: string }[];
+  skipped: { job_id: string; job_name: string; reason: string }[];
+}
+
+/** Rust `ufop_core::backup::versions::ClientIdentity`. */
+export interface ClientIdentity {
+  hostname: string;
+  username: string;
+  job_id: string;
+  source_label: string;
+}
+
+/** Rust `ufop_core::backup::versions::VersionStats`: what a version added. */
+export interface VersionStats {
+  /** Sealed block volumes and indexes uploaded (after compression and encryption). */
+  bytes_added: number;
+  new_blocks: number;
+  files_added: number;
+  files_changed: number;
+  files_deleted: number;
+  /** The run stopped at its upload limit (the version is partial). Absent when false. */
+  upload_cap_reached?: boolean;
+}
+
+/** Rust `MetadataPatch`: null leaves a field unchanged; "" removes a note / reason. */
+export interface MetadataPatch {
+  note: string | null;
+  tags: Record<string, string> | null;
+  pinned: boolean | null;
+  pin_reason: string | null;
+}
+
+/** Rust `retention::RetentionVerdict`. */
+export interface RetentionVerdict {
+  id: number;
+  timestamp: string;
+  keep: boolean;
+  reasons: string[];
+  /** "kept: daily 7, weekly 4" / "deleted: …" */
+  summary: string;
+}
+
+/** Rust `maintenance::RetentionPreview`. */
+export interface RetentionPreview {
+  policy: RetentionPolicy;
+  legal_hold: boolean;
+  keep: number;
+  delete: number;
+  versions: RetentionVerdict[];
+}
+
+/** Rust `shared::SourceInfo`: one job / computer writing to a repository. */
+export interface SourceInfo {
+  id: string;
+  identity: ClientIdentity | null;
+  label: string;
+  versions: number;
+  newest: string | null;
+  oldest: string | null;
+  newest_size: number;
+  own: boolean;
+}
+
+/** Rust `backup_engine::versions::CopyTarget`. */
+export type CopyTarget =
+  | { type: "job"; job_id: string }
+  | { type: "destination"; destination: BackupDestination; passphrase: string | null; prefix: string | null; options: BackupOptions | null };
+
+/** Rust `copy::CopyReport`. */
+export interface CopyReport {
+  dry_run: boolean;
+  versions_copied: number;
+  versions_skipped: number;
+  files: number;
+  blocks_copied: number;
+  blocks_reused: number;
+  bytes_copied: number;
+  bytes_uploaded: number;
+  rechunked: boolean;
+  copied: string[];
+  warnings: string[];
+}
+
+/** Rust `shared::SharingReport`. */
+export interface SharingReport {
+  already_shared: boolean;
+  versions_assigned: number;
+  source: string;
+}
+
+/** Rust `ufop_core::backup::lock::LockKind`. */
+export type LockKind = "exclusive" | "shared";
+
+/** One lock file on the destination (Rust `lock::LockEntry`). */
+export interface RepoLockEntry {
+  file: string;
+  owner_id: string;
+  hostname: string;
+  username: string;
+  pid: number;
+  app: string;
+  version: string;
+  operation: string;
+  kind: LockKind;
+  acquired_at: string;
+  expires_at: string;
+  /** Expired or unreadable: the next operation takes it over. */
+  stale: boolean;
+  damaged: boolean;
+}
+
+/** Rust `lock::LockStatus`. */
+export interface RepoLockStatus {
+  locks: RepoLockEntry[];
+  exclusive: boolean;
+  readers: number;
+  checked_at: string;
+}
+
+/** Rust `lock::BreakLockReport`. */
+export interface BreakLockReport {
+  removed: string[];
+  holders: string[];
+}
+
+/** Rust `db::RekeyReport`. */
+export interface RekeyReport {
+  encrypted: boolean;
+  files: number;
+  settings: number;
+}
+
+/** The live lock that blocks others, as "Repository in use by host (operation) since …"; null when free. */
+export function lockSummary(status: RepoLockStatus | null): string | null {
+  const live = (status?.locks ?? []).filter((l) => !l.stale);
+  const first = live.find((l) => l.kind === "exclusive") ?? live[0];
+  if (!first) return null;
+  const host = first.hostname || "another computer";
+  const since = new Date(first.acquired_at).toLocaleString();
+  const more = live.length > 1 ? ` and ${live.length - 1} other(s)` : "";
+  return `Repository in use by ${host} (${first.operation}) since ${since}${more}`;
+}
+
+/** Rust `ufop_core::backup::ChunkerKind`. */
+export type ChunkerKind = "fixed" | "fastcdc";
+/** Rust `ufop_core::backup::BlockCodec`. */
+export type BlockCodec = "deflate" | "zstd";
+/** Rust `ufop_core::backup::MetadataCompression`. */
+export type MetadataCompression = "none" | "zstd";
+/** Rust `ufop_core::backup::crypto::CipherKind`. */
+export type CipherKind = "aes256_gcm" | "chacha20_poly1305";
+/** Rust `ufop_core::backup::layout::RepoLayout`. */
+export type RepoLayout = { type: "flat" } | { type: "sharded"; prefix_len: number };
+/** Rust `ufop_core::backup::chunker::ChunkerSpec` (recorded in the repository header). */
+export type ChunkerSpec = { type: "fixed"; size: number } | { type: "fastcdc"; min: number; avg: number; max: number };
+
+/** `format_info` operation report (Rust `format::FormatInfo`). */
+export interface RepositoryFormatInfo {
+  format_version: number;
+  chunker: ChunkerSpec;
+  block_codec: BlockCodec;
+  metadata_compression: MetadataCompression;
+  /** null when unencrypted or GPG. */
+  cipher: CipherKind | null;
+  envelope_key: boolean;
+  layout: RepoLayout;
+  features: string[];
+  rollback_available: boolean;
+}
+
+/** Upgrade / rollback / password change result (Rust `format::FormatReport`). */
+export interface FormatReport {
+  from_version: number;
+  to_version: number;
+  unchanged: boolean;
+  features: string[];
+  message: string;
+}
+
+/** `reshard` operation report (Rust `layout::ReshardReport`). */
+export interface ReshardReport {
+  from: RepoLayout;
+  to: RepoLayout;
+  moved: number;
+  bytes_moved: number;
+  already_in_place: number;
+  dry_run: boolean;
+  errors: string[];
+}
+
+export type KdfPreset = "interactive" | "default" | "sensitive";
+
+/** Human description of a repository layout. */
+export function describeLayout(l: RepoLayout): string {
+  return l.type === "flat" ? "Flat (one folder)" : `Sharded (${l.prefix_len}-digit subfolders)`;
+}
+
+/** Human description of a chunker. */
+export function describeChunker(c: ChunkerSpec): string {
+  return c.type === "fixed" ? `Fixed ${formatSize(c.size)} blocks` : `Content-defined (FastCDC), ~${formatSize(c.avg)} blocks`;
+}
+
+function formatSize(n: number): string {
+  return n >= 1024 * 1024 ? `${Math.round(n / (1024 * 1024))} MiB` : `${Math.round(n / 1024)} KiB`;
 }
 
 /** Rust `ufop_core::backup::photos::PhotosOptions`. */
@@ -179,6 +490,19 @@ export interface LocalTransfer {
   sync_writes: boolean;
 }
 
+/** Request-rate limits per destination (`RequestLimits` in ufop-core); 0 = unlimited. */
+export interface RequestLimits {
+  list_per_sec: number;
+  get_per_sec: number;
+  put_per_sec: number;
+  delete_per_sec: number;
+  max_concurrent_requests: number;
+  /** Shard folders listed at once (sharded layouts). */
+  list_parallelism: number;
+}
+
+export const DEFAULT_REQUEST_LIMITS: RequestLimits = { list_per_sec: 0, get_per_sec: 0, put_per_sec: 0, delete_per_sec: 0, max_concurrent_requests: 0, list_parallelism: 0 };
+
 export type ReplicaSchedule = { type: "after_backup" } | { type: "interval"; minutes: number } | { type: "manual" };
 
 export interface Replica {
@@ -201,11 +525,15 @@ export interface RemoteFile {
 
 export type SnapshotPolicy = "off" | "auto" | "on" | "required";
 
+/** Linux snapshot method; `auto` picks ZFS, btrfs or LVM by filesystem. */
+export type SnapshotProvider = "auto" | "lvm" | "zfs" | "btrfs";
+
 export interface SnapshotOptions {
   lvm_size: string;
   vss_provider: string | null;
   vss_exclude_writers: string[];
   mount_root: string | null;
+  provider: SnapshotProvider;
 }
 
 export interface SnapshotDiagnostics {
@@ -214,6 +542,8 @@ export interface SnapshotDiagnostics {
   mappings: [string, string][];
   steps: string[];
   error: string | null;
+  /** Snapshot methods of this platform and whether their tools are installed. */
+  providers: { name: string; available: boolean; detail: string }[];
 }
 
 export type UsnPolicy = "off" | "auto" | "on" | "required";
@@ -231,7 +561,11 @@ export type RetentionPolicy =
   | { type: "keep_days"; days: number }
   | { type: "keep_count"; count: number }
   | { type: "smart" }
-  | { type: "custom"; rules: string };
+  | { type: "custom"; rules: string }
+  | { type: "counts"; keep_latest: number; keep_hourly: number; keep_daily: number; keep_weekly: number; keep_monthly: number; keep_yearly: number };
+
+/** The everyday GFS preset: 7 daily, 4 weekly, 12 monthly, 3 yearly. */
+export const GFS_PRESET: RetentionPolicy = { type: "counts", keep_latest: 0, keep_hourly: 0, keep_daily: 7, keep_weekly: 4, keep_monthly: 12, keep_yearly: 3 };
 
 export interface BackupSchedule {
   enabled: boolean;
@@ -241,12 +575,22 @@ export interface BackupSchedule {
   skip_on_battery: boolean;
   /** Holiday calendars whose days off skip runs (`schedule_library`). */
   calendar_ids: string[];
+  /** Cron mode when not empty: expressions (5, 6 or 7 fields, in the schedule's time zone) replacing start time, interval and weekdays. */
+  cron: string[];
+  /** Time zone of the schedule: null / "local" = this computer's, "UTC" or a fixed offset like "+02:00" (K123). */
+  timezone: string | null;
 }
+
+/** Mirrors `hooks::HookMode`. */
+export type HookMode = "required" | "optional" | "async";
 
 export interface ScriptConfig {
   run_before: string | null;
+  /** Older flag; `before_mode` replaces it when set. */
   run_before_required: boolean;
+  before_mode?: HookMode | null;
   run_after: string | null;
+  after_mode?: HookMode | null;
   run_on_source_release: string | null;
   timeout_secs: number;
   result_format: string;
@@ -272,7 +616,19 @@ export interface ReportConfig {
   min_log_level: LogLevel;
   /** SHA-256 fingerprints; when set, only these certificates are accepted. */
   pinned_sha256: string[];
+  /** Extra request headers; secret values live in the secure store. */
+  headers?: WebhookHeader[];
 }
+
+/** A webhook / report request header; a secret one keeps its value in the secure store under `credential_id`. */
+export interface WebhookHeader {
+  name: string;
+  value: string;
+  secret: boolean;
+  credential_id: string;
+}
+
+export type WebhookPreset = "generic" | "pushover" | "ntfy" | "discord" | "pagerduty" | "gotify";
 
 export type TlsMode = "start_tls" | "implicit" | "none";
 
@@ -283,9 +639,12 @@ export interface CertPolicy {
 }
 
 export type NotificationChannel =
-  | { type: "email"; host: string; port: number | null; tls: TlsMode; username: string; from: string; to: string[]; subject: string }
+  | { type: "email"; host: string; port: number | null; tls: TlsMode; username: string; from: string; to: string[]; subject: string; html?: boolean; html_template?: string }
   | { type: "telegram"; chat_id: string; api_base: string }
-  | { type: "xmpp"; jid: string; to: string; host: string; port: number | null; tls: TlsMode };
+  | { type: "xmpp"; jid: string; to: string; host: string; port: number | null; tls: TlsMode }
+  | { type: "slack" }
+  | { type: "teams" }
+  | { type: "webhook"; url: string; method: string; content_type: string; headers: WebhookHeader[]; body_template: string; preset: WebhookPreset };
 
 /** A notification channel (flattened) with its own result filter; the password or bot token lives under `credential_id`. */
 export type BackupNotification = NotificationChannel & {
@@ -453,6 +812,42 @@ export interface JobStats {
   version_count: number;
   source_size: number;
   backend_size: number;
+  /** Last scheduled start of each maintenance task (`compact`, `verify`, `apply_retention`). */
+  last_maintenance?: Record<string, string>;
+  /** The last ransomware-hardening destination probe ("Run checks"). */
+  last_hardening_probe?: HardeningProbe | null;
+}
+
+/** `backup_engine::hardening::ProbeResult`. */
+export interface HardeningProbe {
+  ran_at: string;
+  can_write: boolean;
+  can_delete: boolean | null;
+  gone_after_delete: boolean | null;
+  leftover: string | null;
+  detail: string;
+}
+
+export type HardeningStatus = "pass" | "warn" | "fail" | "unknown" | "info";
+
+/** `backup_engine::hardening::HardeningCheck`. */
+export interface HardeningCheck {
+  id: string;
+  title: string;
+  status: HardeningStatus;
+  detail: string;
+  advice: string;
+  /** Guide section, e.g. `docs/backup-ransomware-hardening.md#object-lock-and-immutability`. */
+  doc: string;
+}
+
+/** `backup_engine::hardening::HardeningReport`. */
+export interface HardeningReport {
+  job_id: string;
+  passed: number;
+  total: number;
+  checks: HardeningCheck[];
+  probe: HardeningProbe | null;
 }
 
 export interface BackupJob {
@@ -475,8 +870,11 @@ export interface BackupJob {
   remote_config_include_secrets: boolean;
   network_timeout_secs: number;
   local_transfer: LocalTransfer;
+  request_limits: RequestLimits;
   replicas: Replica[];
   notifications: BackupNotification[];
+  /** Reusable notification profiles this job also sends to. */
+  notification_profile_ids?: string[];
   log_outputs: LogOutputs;
   /** Secret providers used by this job besides the global ones (ids). */
   secret_providers: string[];
@@ -484,9 +882,58 @@ export interface BackupJob {
   notify_on: string[];
   /** Legal hold: while set, retention is suspended and nothing can be removed. */
   legal_hold: LegalHold | null;
+  /** Restore and browse only: every write to the destination is refused. */
+  read_only: boolean;
+  /** Encrypt the local database (key in the keychain). null: decided when saved (on for encrypted jobs); older jobs stay plain. */
+  encrypt_local_database: boolean | null;
+  /** A command whose output each backup stores as a virtual file (e.g. `pg_dump mydb`). */
+  stdin_command: StdinCommand | null;
+  /** Policy templates the job is based on, in order (later wins). */
+  template_ids: string[];
+  /** Settings the job sets itself (field paths); null = older job: every non-default setting is its own. */
+  overrides: string[] | null;
+  /** Compaction, verification and retention on their own schedules. */
+  maintenance: MaintenanceSchedule;
   created_at: string;
   updated_at: string;
   stats: JobStats;
+}
+
+/** Mirrors `ufop_core::backup::verify::VerifyMode`. */
+export type VerifyMode =
+  | { type: "structure" }
+  | { type: "sample_volumes"; count: number }
+  | { type: "sample_percent"; percent: number }
+  | { type: "full" };
+
+/** Mirrors `ufop_core::backup::verify::VerifyOptions` (scope empty = everything). */
+export interface VerifyOptions {
+  scope: { versions: string[]; paths: string[] };
+  mode: VerifyMode;
+  files_percent: number | null;
+  parallelism: number;
+  max_errors: number;
+  use_cache: boolean;
+}
+
+export function newVerifyOptions(): VerifyOptions {
+  return { scope: { versions: [], paths: [] }, mode: { type: "sample_volumes", count: 1 }, files_percent: null, parallelism: 0, max_errors: 0, use_cache: false };
+}
+
+/** Mirrors `schedule::MaintenanceSchedule`. */
+export interface MaintenanceSchedule {
+  compact: BackupSchedule | null;
+  verify: { schedule: BackupSchedule; options: VerifyOptions } | null;
+  retention: BackupSchedule | null;
+}
+
+/** Mirrors `ufop_core::backup::verify::VerifyProblem`. */
+export interface VerifyProblem {
+  kind: "missing_block" | "missing_volume" | "volume" | "block_hash" | "file";
+  volume: string | null;
+  message: string;
+  versions: string[];
+  paths: string[];
 }
 
 export interface LegalHold {
@@ -528,6 +975,16 @@ export interface Fileset {
   partial: boolean;
   file_count: number;
   total_size: number;
+  /** Source id (shared repositories); "" for versions from before identities. */
+  source: string;
+  note: string | null;
+  tags: Record<string, string>;
+  /** "Keep forever": retention skips it and deleting needs force. */
+  pinned: boolean;
+  pin_reason: string | null;
+  identity: ClientIdentity | null;
+  /** null for versions from before this was recorded ("—"). */
+  stats: VersionStats | null;
 }
 
 export type EntryKind = "file" | "dir" | "symlink";
@@ -582,7 +1039,54 @@ export interface RestoreOptions {
   legacy: boolean;
   temp_dir: string | null;
   skip_free_space_check: boolean;
+  /** Shared repositories: restore from this source (id, or "*") instead of the job's own. */
+  source: string | null;
+  /** Pick the version by time, newest/oldest or id instead of `version`. */
+  selector: VersionSelector | null;
+  /** Write a ZIP / TAR archive instead of files. */
+  archive: ArchiveTarget | null;
+  /** Mirror: delete what the restored folders in `target` hold but the version does not. */
+  delete_extraneous: boolean;
+  restore_owner: OwnerPolicy;
+  error_policy: RestoreErrorPolicy;
+  sparse: SparseMode;
+  /** Read volumes through the local volume cache. */
+  use_cache: boolean;
 }
+
+/** Wire mirror of `ufop_core::backup::select::VersionSelector`. */
+export type VersionSelector =
+  | { type: "index"; index: number }
+  | { type: "latest"; allow_partial?: boolean }
+  | { type: "oldest"; allow_partial?: boolean }
+  | { type: "as_of"; time: string; allow_partial?: boolean }
+  | { type: "id"; id: string };
+
+export type ArchiveFormat = "zip" | "zip_stored" | "tar" | "tar_gz";
+export interface ArchiveTarget {
+  path: string;
+  /** null: from the file name's extension. */
+  format: ArchiveFormat | null;
+}
+export type OwnerPolicy = "auto" | "always" | "never";
+export type SparseMode = "auto" | "off";
+export interface RestoreErrorPolicy {
+  on_write_error: ErrorAction;
+  on_dir_error: ErrorAction;
+  on_missing_data: ErrorAction;
+  on_metadata_error: UnknownEntryAction;
+  fail_fast: boolean;
+  max_errors: number | null;
+}
+
+export const DEFAULT_RESTORE_ERROR_POLICY: RestoreErrorPolicy = {
+  on_write_error: "fail",
+  on_dir_error: "fail",
+  on_missing_data: "fail",
+  on_metadata_error: "warn",
+  fail_fast: false,
+  max_errors: null,
+};
 
 export interface AutoTuneResult {
   download_threads: number;
@@ -602,6 +1106,17 @@ export interface RestoreReport {
   volumes_downloaded: number;
   blocks_from_local: number;
   planned: string[];
+  /** The restored version's number (one version restored). */
+  version_index: number | null;
+  /** The archive written (archive restores). */
+  archive: string | null;
+  /** Mirror: paths deleted (dry run: to delete); folders end in "/". */
+  planned_deletions: string[];
+  files_deleted: number;
+  folders_deleted: number;
+  owners_restored: number;
+  sparse_files: number;
+  stop_reason: string | null;
   warnings: string[];
   errors: string[];
 }
@@ -644,6 +1159,8 @@ export interface NextRun {
   job_id: string;
   job_name: string;
   next_run_at: string;
+  /** `backup`, or the maintenance task (`compact`, `verify`, `apply_retention`). */
+  operation?: string;
 }
 
 export interface SchedulerStatus {
@@ -652,6 +1169,8 @@ export interface SchedulerStatus {
   paused_until: string | null;
   tasks: TaskInfo[];
   next_runs: NextRun[];
+  /** Upcoming maintenance on its own schedule. */
+  next_maintenance?: NextRun[];
 }
 
 export type LogLevel = "info" | "warning" | "error";
@@ -691,6 +1210,8 @@ export interface RestoreOverrides {
   download_bps: number | null;
   retries: number | null;
   network_timeout_secs: number | null;
+  /** Mirror restores delete files only with this set (after confirmation). */
+  confirm_delete?: boolean;
 }
 
 export interface DbInfo {
@@ -704,6 +1225,8 @@ export interface DbInfo {
   size_bytes: number;
   integrity_ok: boolean;
   integrity: string;
+  /** Sensitive columns are encrypted with the job's key. */
+  encrypted: boolean;
 }
 
 export interface DatabaseEntry {
@@ -761,14 +1284,14 @@ export interface RecoveryConvertReport {
 
 export type BackupOperation =
   | { type: "restore"; options: RestoreOptions; overrides?: RestoreOverrides }
-  | { type: "verify"; full: boolean }
+  | { type: "verify"; full: boolean; options?: VerifyOptions | null }
   | { type: "compact" }
   | { type: "repair" }
   | { type: "recreate_database" }
   | { type: "list_broken" }
   | { type: "purge_broken"; dry_run: boolean }
   | { type: "purge"; paths: string[]; versions: number[] | null; dry_run: boolean }
-  | { type: "delete_versions"; versions: number[]; allow_full_removal: boolean }
+  | { type: "delete_versions"; versions: number[]; allow_full_removal: boolean; force?: boolean }
   | { type: "consistency" }
   | { type: "rebuild_missing" }
   | { type: "extract_control_files"; version: number; target: string }
@@ -776,7 +1299,17 @@ export type BackupOperation =
   | { type: "snapshot_test" }
   | { type: "replicate"; replica_id: string | null }
   | { type: "apply_locks"; days: number; mode: LockMode; all: boolean }
-  | { type: "list_locks" };
+  | { type: "list_locks" }
+  | { type: "upgrade_format"; rollback: boolean }
+  | { type: "reshard"; layout: RepoLayout; dry_run: boolean }
+  | { type: "format_info" }
+  | { type: "inspect_header" }
+  | { type: "inspect_stats" }
+  | { type: "set_version_metadata"; version: number; source: string | null; patch: MetadataPatch }
+  | { type: "apply_retention"; policy: RetentionPolicy | null; source: string | null }
+  | { type: "copy_versions"; versions: number[]; source: string | null; target: CopyTarget; dry_run: boolean }
+  | { type: "enable_sharing"; claim_all: boolean }
+  | { type: "sync_sources" };
 
 export interface PassphraseStrength {
   score: number;
@@ -838,6 +1371,8 @@ export function newBackupJob(): BackupJob {
       exclusion_markers: [],
       exclude_empty_folders: false,
       exclude_cloud_placeholders: false,
+      ignore_files: [".ufopignore"],
+      respect_gitignore: false,
     },
     destination: { type: "local", path: "", alternate_paths: [], marker_file: null },
     encrypted: true,
@@ -889,16 +1424,37 @@ export function newBackupJob(): BackupJob {
       auto_vacuum_interval_days: null,
       remote_case_insensitive: false,
       snapshot_policy: "off",
-      snapshot: { lvm_size: "10%ORIGIN", vss_provider: null, vss_exclude_writers: [], mount_root: null },
+      snapshot: { lvm_size: "10%ORIGIN", vss_provider: null, vss_exclude_writers: [], mount_root: null, provider: "auto" },
       encryption_module: "aes",
       gpg: { recipients: [], executable: "", homedir: "" },
       kdf: null,
       object_lock: null,
       photos: { include_hidden: false, include_trashed: false, albums: [] },
+      format_version: null,
+      chunker: null,
+      block_codec: null,
+      metadata_compression: null,
+      cipher: "aes256_gcm",
+      layout: { type: "flat" },
+      lock_ttl_secs: 1800,
+      clock_skew_warn_secs: 300,
+      clock_skew_abort_secs: 3600,
+      checkpoint_interval_secs: 900,
+      checkpoint_interval_bytes: 0,
+      default_note: null,
+      default_tags: {},
+      identity: { hostname: "", username: "", job_id: "", source_label: "" },
+      shared_repository: false,
+      shared_gc_delay_hours: 4,
+      one_file_system: false,
+      error_policy: { on_file_error: "continue", on_dir_error: "continue", on_unknown_entry: "ignore", fail_fast: false, max_errors: null },
+      rehash_percent: 0,
+      max_upload_bytes_per_run: null,
+      parallel_file_threshold: DEFAULT_PARALLEL_FILE_THRESHOLD,
     },
     retention: { type: "keep_all" },
-    schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [] },
-    scripts: { run_before: null, run_before_required: false, run_after: null, run_on_source_release: null, timeout_secs: 60, result_format: "json" },
+    schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: [], timezone: null },
+    scripts: { run_before: null, run_before_required: false, before_mode: null, run_after: null, after_mode: null, run_on_source_release: null, timeout_secs: 60, result_format: "json" },
     reports: {
       http_urls: [],
       http_method: "POST",
@@ -924,13 +1480,21 @@ export function newBackupJob(): BackupJob {
     remote_config_include_secrets: false,
     network_timeout_secs: 0,
     local_transfer: { use_move: true, verify_size: true, sync_writes: false },
+    request_limits: { ...DEFAULT_REQUEST_LIMITS },
     replicas: [],
     notifications: [],
+    notification_profile_ids: [],
     secret_providers: [],
     log_outputs: { file: null, file_filter: newLogFilter(), file_max_mb: 10, system_log: false, system_filter: { ...newLogFilter(), min_level: "warning" } },
     prevent_sleep: true,
     notify_on: ["warning", "error"],
     legal_hold: null,
+    read_only: false,
+    encrypt_local_database: null,
+    stdin_command: null,
+    template_ids: [],
+    overrides: null,
+    maintenance: { compact: null, verify: null, retention: null },
     created_at: now,
     updated_at: now,
     stats: {
@@ -965,6 +1529,14 @@ export const DEFAULT_RESTORE_OPTIONS: RestoreOptions = {
   legacy: false,
   temp_dir: null,
   skip_free_space_check: false,
+  source: null,
+  selector: null,
+  archive: null,
+  delete_extraneous: false,
+  restore_owner: "auto",
+  error_policy: DEFAULT_RESTORE_ERROR_POLICY,
+  sparse: "auto",
+  use_cache: false,
 };
 
 
@@ -996,11 +1568,33 @@ interface BackupState {
   saveJob: (job: BackupJob, passphrase?: string | null) => Promise<BackupJob>;
   deleteJob: (id: string, deleteLocalDb: boolean, deleteRemote: boolean) => Promise<void>;
   runJob: (id: string, dryRun?: boolean) => Promise<string>;
+  /** Queue a backup of every job (read-only and busy ones are skipped). */
+  runAll: (filter?: Partial<RunAllFilter>) => Promise<RunAllReport>;
+  /** Files, new data and time the next backup of a job likely needs. */
+  estimate: (id: string, assumedBytesPerSec?: number | null) => Promise<BackupEstimate>;
   cancel: (id: string) => Promise<void>;
   execute: (id: string, operation: BackupOperation) => Promise<OperationResult>;
+  /** Change an encrypted job's passphrase in place (format 2); `current` null = the stored one. */
+  changePassphrase: (id: string, current: string | null, newPassphrase: string, kdfPreset?: KdfPreset | null) => Promise<FormatReport>;
+  /** Who holds the job's repository lock right now. */
+  lockStatus: (id: string) => Promise<RepoLockStatus>;
+  /** Force-unlock (only when the holder is no longer running); `ownerId` limits it to the lock shown. */
+  breakLock: (id: string, ownerId: string | null) => Promise<BreakLockReport>;
+  /** Encrypt (or decrypt) the job's local database now. */
+  setDatabaseEncryption: (id: string, enabled: boolean) => Promise<RekeyReport>;
+  /** Versions of the job's source (`source`: another id or "*"), only those with every tag (`key=value` / `key`). */
+  listVersions: (id: string, source?: string | null, tags?: string[]) => Promise<Fileset[]>;
+  /** Sources (jobs / computers) known in the job's repository, own first. */
+  listSources: (id: string) => Promise<SourceInfo[]>;
+  /** Keep/delete per version for the job's policy or an unsaved one (changes nothing). */
+  previewRetention: (id: string, policy: RetentionPolicy | null, source?: string | null) => Promise<RetentionPreview>;
+  /** Change a version's note, tags or pin; returns the updated version. */
+  setVersionMetadata: (id: string, version: number, patch: Partial<MetadataPatch>, source?: string | null) => Promise<Fileset>;
   pause: (minutes: number | null) => Promise<void>;
   resume: () => Promise<void>;
   placeLegalHold: (id: string, matter: string, reason: string) => Promise<BackupJob>;
+  /** Ransomware-hardening checklist; `probe` writes and tries to delete a probe object (explicit action only). */
+  hardeningReport: (jobId: string, probe?: boolean) => Promise<HardeningReport>;
   releaseLegalHold: (id: string) => Promise<BackupJob>;
   exportEDiscovery: (request: EDiscoveryRequest) => Promise<EDiscoveryReport>;
   clearError: () => void;
@@ -1072,6 +1666,15 @@ export const useBackupStore = create<BackupState>((set, get) => ({
     return taskId;
   },
 
+  runAll: async (filter = {}) => {
+    const full: RunAllFilter = { job_ids: [], scheduled_only: false, dry_run: false, ...filter };
+    const report = await tauriInvoke<RunAllReport>("backup_run_all", { filter: full });
+    await get().loadStatus();
+    return report;
+  },
+
+  estimate: (id, assumedBytesPerSec = null) => tauriInvoke<BackupEstimate>("backup_estimate", { jobId: id, assumedBytesPerSec }),
+
   cancel: async (id) => {
     await tauriInvoke<boolean>("backup_cancel", { id });
     await get().loadStatus();
@@ -1083,6 +1686,40 @@ export const useBackupStore = create<BackupState>((set, get) => ({
     return result;
   },
 
+  changePassphrase: async (id, current, newPassphrase, kdfPreset = null) => {
+    const report = await tauriInvoke<FormatReport>("backup_change_passphrase", { id, current, newPassphrase, kdfPreset });
+    await get().loadJobs();
+    return report;
+  },
+
+  lockStatus: (id) => tauriInvoke<RepoLockStatus>("backup_lock_status", { jobId: id }),
+
+  breakLock: (id, ownerId) => tauriInvoke<BreakLockReport>("backup_break_lock", { jobId: id, confirm: true, ownerId }),
+
+  setDatabaseEncryption: async (id, enabled) => {
+    const report = await tauriInvoke<RekeyReport>("backup_set_database_encryption", { jobId: id, enabled });
+    await get().loadJobs();
+    return report;
+  },
+
+  listVersions: (id, source = null, tags = []) => {
+    const args: Record<string, unknown> = { id };
+    if (source) args.source = source;
+    if (tags.length) args.tags = tags;
+    return ipc<Fileset[]>("backup_list_versions", args, []);
+  },
+
+  listSources: (id) => ipc<SourceInfo[]>("backup_list_sources", { id }, []),
+
+  previewRetention: (id, policy, source = null) =>
+    ipc<RetentionPreview>("backup_preview_retention", { id, policy, source }, { policy: policy ?? { type: "keep_all" }, legal_hold: false, keep: 0, delete: 0, versions: [] }),
+
+  setVersionMetadata: async (id, version, patch, source = null) => {
+    const full: MetadataPatch = { note: null, tags: null, pinned: null, pin_reason: null, ...patch };
+    const r = await tauriInvoke<OperationResult>("backup_set_version_metadata", { id, version, source, patch: full });
+    return r.report as unknown as Fileset;
+  },
+
   pause: async (minutes) => {
     const status = await tauriInvoke<SchedulerStatus>("backup_pause", { minutes });
     set({ status });
@@ -1092,6 +1729,8 @@ export const useBackupStore = create<BackupState>((set, get) => ({
     const status = await tauriInvoke<SchedulerStatus>("backup_resume", {});
     set({ status });
   },
+
+  hardeningReport: (jobId, probe = false) => tauriInvoke<HardeningReport>("backup_hardening_report", { jobId, probe }),
 
   placeLegalHold: async (id, matter, reason) => {
     const job = await tauriInvoke<BackupJob>("backup_place_legal_hold", { id, matter, reason });
@@ -1111,8 +1750,20 @@ export const useBackupStore = create<BackupState>((set, get) => ({
 }));
 
 /** Format a schedule for display. */
+/** The pre-script's mode (maps the older `run_before_required`), like `ScriptConfig::before_mode`. */
+export function hookBeforeMode(s: ScriptConfig): HookMode {
+  return s.before_mode ?? (s.run_before_required ? "required" : "optional");
+}
+
 export function describeSchedule(s: BackupSchedule): string {
   if (!s.enabled) return "Manual only";
+  const tz = s.timezone && s.timezone.trim() && s.timezone.trim().toLowerCase() !== "local" ? ` (${s.timezone.trim()})` : "";
+  return describeScheduleTimes(s) + tz;
+}
+
+function describeScheduleTimes(s: BackupSchedule): string {
+  const cron = (s.cron ?? []).filter((c) => c.trim() !== "");
+  if (cron.length) return `cron ${cron.join(" | ")}`;
   const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   const every =
     s.interval_minutes % 1440 === 0
@@ -1138,5 +1789,48 @@ export function describeRetention(r: RetentionPolicy): string {
       return "Smart (1W:1D, 4W:1W, 12M:1M)";
     case "custom":
       return `Custom: ${r.rules}`;
+    case "counts":
+      return describeCounts(r);
   }
+}
+
+/** "Keep 7 daily, 4 weekly, 12 monthly" (all zero: keep everything). */
+export function describeCounts(r: Extract<RetentionPolicy, { type: "counts" }>): string {
+  const parts = (
+    [
+      ["latest", r.keep_latest],
+      ["hourly", r.keep_hourly],
+      ["daily", r.keep_daily],
+      ["weekly", r.keep_weekly],
+      ["monthly", r.keep_monthly],
+      ["yearly", r.keep_yearly],
+    ] as const
+  )
+    .filter(([, n]) => n > 0)
+    .map(([k, n]) => `${n} ${k}`);
+  return parts.length ? `Keep ${parts.join(", ")}` : "Keep all versions (no limits set)";
+}
+
+/** `key=value` / `key` text for a tag. */
+export function tagText(k: string, v: string): string {
+  return v ? `${k}=${v}` : k;
+}
+
+/** Parse `key=value` (or bare `key`) lines / comma lists into tags; invalid names are dropped. */
+export function parseTags(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const raw of text.split(/[,\n]/)) {
+    const item = raw.trim();
+    if (!item) continue;
+    const i = item.indexOf("=");
+    const k = (i < 0 ? item : item.slice(0, i)).trim();
+    const v = i < 0 ? "" : item.slice(i + 1).trim();
+    if (/^[A-Za-z0-9_.:-]{1,64}$/.test(k)) out[k] = v;
+  }
+  return out;
+}
+
+/** Does a version carry every tag of `filter` (bare key = any value)? Mirrors the Rust filter. */
+export function matchesTags(tags: Record<string, string>, filter: Record<string, string>): boolean {
+  return Object.entries(filter).every(([k, v]) => k in tags && (v === "" || tags[k] === v));
 }

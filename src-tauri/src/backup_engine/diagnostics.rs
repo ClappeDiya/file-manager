@@ -41,7 +41,9 @@ impl DatabaseCheck {
 pub fn check_database(db: &BackupDb, info: Option<DbInfo>, backend: &dyn Backend, prefix: &str) -> Result<DatabaseCheck, AppError> {
     let t = Instant::now();
     let mut c = DatabaseCheck { info, problems: db.integrity_problems()?, ..Default::default() };
-    let remote: HashMap<String, u64> = backend.list()?.into_iter().map(|f| (f.name, f.size)).collect();
+    // Logical volume names, wherever the repository layout keeps them.
+    let view = ufop_core::backup::layout::for_repository(backend, prefix);
+    let remote: HashMap<String, u64> = view.list()?.into_iter().map(|f| (f.name, f.size)).collect();
     c.remote_files = remote.len();
     let vols = db.volumes(None)?;
     c.tracked_volumes = vols.len();
@@ -53,10 +55,11 @@ pub fn check_database(db: &BackupDb, info: Option<DbInfo>, backend: &dyn Backend
         }
     }
     let known: std::collections::HashSet<&str> = vols.iter().map(|v| v.name.as_str()).collect();
-    let aux = [volume::repo_header_name(prefix), volume::verification_file_name(prefix)];
+    let mut aux = vec![volume::repo_header_name(prefix), volume::verification_file_name(prefix)];
+    aux.extend(ufop_core::backup::layout::header_copies(prefix));
     let mut untracked: Vec<String> = remote
         .keys()
-        .filter(|n| n.starts_with(&format!("{prefix}-")) && !known.contains(n.as_str()) && !aux.contains(n) && !n.ends_with(".par2"))
+        .filter(|n| n.starts_with(&format!("{prefix}-")) && !known.contains(n.as_str()) && !aux.contains(n) && !n.ends_with(".par2") && !ufop_core::backup::lock::is_lock_file(prefix, n))
         .cloned()
         .collect();
     untracked.sort();
@@ -197,4 +200,19 @@ pub struct Diagnostics {
     pub database_error: Option<String>,
     pub network: Option<NetworkTiming>,
     pub throughput: Option<Throughput>,
+    /// Snapshot methods of this platform and whether their tools are installed.
+    #[serde(default)]
+    pub snapshot_providers: Vec<ufop_core::backup::snapshot::ProviderStatus>,
+}
+
+/// Largest sample the desktop benchmark accepts (the CLI has no cap).
+pub const BENCH_MAX_SAMPLE: usize = 256 << 20;
+
+/// Run `ufop_core::backup::bench` off the async runtime (Settings →
+/// Benchmark, `backup_bench`). The sample is capped at [`BENCH_MAX_SAMPLE`].
+pub async fn bench(mut opts: ufop_core::backup::bench::BenchOptions) -> Result<ufop_core::backup::bench::BenchReport, AppError> {
+    opts.size = opts.size.min(BENCH_MAX_SAMPLE);
+    tokio::task::spawn_blocking(move || ufop_core::backup::bench::run(&opts, &ufop_core::backup::OpContext::new()))
+        .await
+        .map_err(|e| AppError::internal(format!("benchmark task failed: {e}")))?
 }

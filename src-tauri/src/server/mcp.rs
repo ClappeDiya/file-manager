@@ -58,10 +58,14 @@ async fn handle(State(st): State<ServerState>, headers: HeaderMap, body: Bytes) 
             return (StatusCode::FORBIDDEN, Json(json!({ "error": format!("Origin {origin} may not use this MCP endpoint") }))).into_response();
         }
     }
-    let principal = match super::authenticate(&st, &headers, &Method::POST, "/mcp").await {
+    let (principal, acc) = match super::authenticate_access(&st, &headers, &Method::POST, "/mcp").await {
         Ok(p) => p,
         Err(e) => return unauthorized(&st, &headers, &e.user_message()),
     };
+    // Server folders, not jobs: administrators only, not job-limited tokens.
+    if let Err(e) = acc.require_global(super::access::Global::Admin) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": e.user_message() }))).into_response();
+    }
     let may_write = match &principal {
         Principal::Session => true,
         Principal::ApiToken { scope, .. } => *scope >= Scope::Write,

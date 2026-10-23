@@ -53,6 +53,13 @@ pub enum Channel {
         to: Vec<String>,
         #[serde(default = "default_subject")]
         subject: String,
+        /// Send text + HTML (`multipart/alternative`). Off for channels from
+        /// before HTML mail; new channels turn it on.
+        #[serde(default)]
+        html: bool,
+        /// HTML body template (empty = the built-in report table); values are HTML-escaped.
+        #[serde(default)]
+        html_template: String,
     },
     Telegram {
         chat_id: String,
@@ -79,7 +86,33 @@ pub enum Channel {
     /// Microsoft Teams Workflows ("Post to a channel when a webhook request
     /// is received") or legacy incoming-webhook URL, stored like Slack's.
     Teams {},
+    /// Any HTTP endpoint, with custom method, headers and body template;
+    /// presets fill it in for Pushover, ntfy, Discord, PagerDuty and Gotify.
+    /// The channel secret (`{{secret}}`) lives under `credential_id`.
+    Webhook {
+        url: String,
+        #[serde(default = "default_method")]
+        method: String,
+        /// Empty = `application/json`.
+        #[serde(default)]
+        content_type: String,
+        #[serde(default)]
+        headers: Vec<webhook::WebhookHeader>,
+        /// Empty = a JSON object of the run's values.
+        #[serde(default)]
+        body_template: String,
+        #[serde(default)]
+        preset: webhook::WebhookPreset,
+    },
 }
+
+fn default_method() -> String {
+    "POST".into()
+}
+
+pub mod mime;
+pub mod profiles;
+pub mod webhook;
 
 fn default_subject() -> String {
     "UFOP {{operation}} {{result}}: {{name}}".into()
@@ -103,7 +136,7 @@ pub struct Notification {
     pub cert: CertPolicy,
 }
 
-fn default_send_on() -> Vec<String> {
+pub(crate) fn default_send_on() -> Vec<String> {
     vec!["warning".into(), "error".into()]
 }
 
@@ -186,17 +219,9 @@ impl Smtp {
     }
 }
 
-/// RFC 2047 encoding for non-ASCII header values.
-fn header_value(s: &str) -> String {
-    if s.is_ascii() {
-        s.to_string()
-    } else {
-        format!("=?UTF-8?B?{}?=", base64::engine::general_purpose::STANDARD.encode(s))
-    }
-}
-
+/// Send a mail: text only, or text + HTML (`multipart/alternative`) when `html` is set.
 #[allow(clippy::too_many_arguments)]
-pub async fn send_email(host: &str, port: Option<u16>, tls: TlsMode, username: &str, password: Option<&str>, from: &str, to: &[String], subject: &str, body: &str, cert: &CertPolicy) -> Result<(), AppError> {
+pub async fn send_email(host: &str, port: Option<u16>, tls: TlsMode, username: &str, password: Option<&str>, from: &str, to: &[String], subject: &str, body: &str, html: Option<&str>, cert: &CertPolicy) -> Result<(), AppError> {
     if to.is_empty() {
         return Err(AppError::validation("Add at least one email recipient"));
     }
@@ -245,18 +270,8 @@ pub async fn send_email(host: &str, port: Option<u16>, tls: TlsMode, username: &
     }
     s.cmd("DATA", 354, "DATA").await?;
     let domain = addr(from).rsplit('@').next().unwrap_or("localhost").to_string();
-    let mut msg = format!(
-        "From: {from}\r\nTo: {}\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: <{}@{domain}>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n",
-        to.join(", "),
-        header_value(subject),
-        chrono::Utc::now().to_rfc2822(),
-        uuid::Uuid::new_v4().simple()
-    );
-    let b64 = base64::engine::general_purpose::STANDARD.encode(body.as_bytes());
-    for chunk in b64.as_bytes().chunks(76) {
-        msg.push_str(std::str::from_utf8(chunk).unwrap_or_default());
-        msg.push_str("\r\n");
-    }
+    let mail = mime::Mail { from, to, subject, text: body, html, domain: &domain };
+    let mut msg = mime::build_message(&mail, &chrono::Utc::now().to_rfc2822(), &uuid::Uuid::new_v4().simple().to_string(), &format!("=_ufop_{}", uuid::Uuid::new_v4().simple()));
     msg.push('.');
     s.cmd(&msg, 250, "message").await?;
     let _ = s.cmd("QUIT", 221, "QUIT").await;
@@ -429,17 +444,123 @@ pub async fn send_xmpp(jid: &str, password: &str, to: &str, host: &str, port: Op
     Ok(())
 }
 
+/// Variables a channel renders with: the run's values plus `title`,
+/// `message`, the preset values ([`webhook::result_vars`]) and the secret.
+fn channel_vars(vars: &BTreeMap<String, String>, result: &str, title: &str, text: &str, secret: Option<&str>) -> BTreeMap<String, String> {
+    let mut v = vars.clone();
+    for (k, x) in webhook::result_vars(result, vars.get("previous_result").map(String::as_str).filter(|p| !p.is_empty())) {
+        v.entry(k.to_string()).or_insert(x);
+    }
+    v.insert("title".into(), title.to_string());
+    v.insert("message".into(), text.to_string());
+    if let Some(s) = secret {
+        v.insert("secret".into(), s.to_string());
+    }
+    v
+}
+
+/// What a channel would send (subject/title, text and, for HTML mail, the
+/// HTML body) — for previews; nothing is sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preview {
+    pub subject: String,
+    pub text: String,
+    pub html: Option<String>,
+    /// Webhook channels: the request line, headers (secret ones masked) and body.
+    pub request: Option<String>,
+}
+
+fn message_text(n: &Notification, vars: &BTreeMap<String, String>, body: &str) -> String {
+    if n.template.is_empty() { body.to_string() } else { format!("{}\n\n{body}", crate::backup_engine::hooks::render_template(&n.template, vars)) }
+}
+
+fn title_of(n: &Notification, vars: &BTreeMap<String, String>) -> String {
+    let t = match &n.channel {
+        Channel::Email { subject, .. } => subject.clone(),
+        _ => default_subject(),
+    };
+    crate::backup_engine::hooks::render_template(&t, vars)
+}
+
+/// Render what `n` would send for a run with `vars` and report `body`.
+pub fn preview(n: &Notification, result: &str, vars: &BTreeMap<String, String>, body: &str) -> Preview {
+    let text = message_text(n, vars, body);
+    let subject = title_of(n, vars);
+    let cv = channel_vars(vars, result, &subject, &text, None);
+    let html = match &n.channel {
+        Channel::Email { html: true, html_template, .. } => Some(mime::render_html(html_template, &cv)),
+        _ => None,
+    };
+    let request = matches!(n.channel, Channel::Webhook { .. }).then(|| {
+        let mut masked = cv.clone();
+        masked.insert("secret".into(), "******".into());
+        let mut n2 = n.clone();
+        if let Channel::Webhook { headers, .. } = &mut n2.channel {
+            for h in headers.iter_mut().filter(|h| h.secret) {
+                h.value = "******".into();
+            }
+        }
+        match webhook::build(&n2, &masked) {
+            Ok(r) => {
+                let mut s = format!("{} {}\n", r.method, r.url);
+                for (k, v) in &r.headers {
+                    s.push_str(&format!("{k}: {v}\n"));
+                }
+                if let Some(b) = r.body {
+                    s.push('\n');
+                    s.push_str(&b);
+                }
+                s
+            }
+            Err(e) => e.user_message(),
+        }
+    });
+    Preview { subject, text, html, request }
+}
+
+impl Notification {
+    /// Check the channel's settings (not its secret).
+    pub fn validate(&self) -> Result<(), AppError> {
+        match &self.channel {
+            Channel::Email { host, from, to, .. } if host.trim().is_empty() || from.trim().is_empty() || to.is_empty() => {
+                Err(AppError::validation("Email notifications need a server, a sender and at least one recipient"))
+            }
+            Channel::Telegram { chat_id, .. } if chat_id.trim().is_empty() => Err(AppError::validation("Telegram notifications need a chat id")),
+            Channel::Xmpp { jid, to, .. } if !jid.contains('@') || to.trim().is_empty() => Err(AppError::validation("XMPP notifications need an account (user@domain) and a recipient")),
+            Channel::Webhook { url, method, headers, .. } => {
+                webhook::validate_url_and_method(url, method)?;
+                webhook::validate_headers(headers)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Credential-store ids this channel uses (its secret and secret headers).
+    pub fn credential_ids(&self) -> Vec<String> {
+        let mut v: Vec<String> = Some(self.credential_id.clone()).into_iter().filter(|c| !c.is_empty()).collect();
+        if let Channel::Webhook { headers, .. } = &self.channel {
+            v.extend(headers.iter().filter(|h| h.secret && !h.credential_id.is_empty()).map(|h| h.credential_id.clone()));
+        }
+        v
+    }
+}
+
 /// Deliver to every channel whose filter matches; returns error lines.
+/// Secret webhook headers must already hold their values (the manager
+/// fills them from the credential store).
 pub async fn deliver(list: &[(Notification, Option<String>)], result: &str, subject_vars: &BTreeMap<String, String>, body: &str) -> Vec<String> {
     let mut errors = Vec::new();
+    let previous = subject_vars.get("previous_result").map(String::as_str).filter(|p| !p.is_empty());
     for (n, secret) in list {
-        if !n.send_on.iter().any(|s| s == result) {
+        if !n.send_on.iter().any(|s| s == result) || !webhook::wants(n, result, previous) {
             continue;
         }
-        let text = if n.template.is_empty() { body.to_string() } else { format!("{}\n\n{body}", crate::backup_engine::hooks::render_template(&n.template, subject_vars)) };
+        let text = message_text(n, subject_vars, body);
         let r = match &n.channel {
-            Channel::Email { host, port, tls, username, from, to, subject } => {
-                send_email(host, *port, *tls, username, secret.as_deref(), from, to, &crate::backup_engine::hooks::render_template(subject, subject_vars), &text, &n.cert).await
+            Channel::Email { host, port, tls, username, from, to, html, html_template, .. } => {
+                let subject = title_of(n, subject_vars);
+                let page = html.then(|| mime::render_html(html_template, &channel_vars(subject_vars, result, &subject, &text, None)));
+                send_email(host, *port, *tls, username, secret.as_deref(), from, to, &subject, &text, page.as_deref(), &n.cert).await
             }
             Channel::Telegram { chat_id, api_base } => match secret {
                 Some(t) => send_telegram(api_base, t, chat_id, &text, &n.cert).await,
@@ -453,6 +574,10 @@ pub async fn deliver(list: &[(Notification, Option<String>)], result: &str, subj
                     (Some(url), _) => send_teams(url, &title, &text, &n.cert).await,
                     (None, _) => Err(AppError::validation("The webhook URL is missing")),
                 }
+            }
+            Channel::Webhook { .. } => {
+                let title = title_of(n, subject_vars);
+                webhook::send(n, &channel_vars(subject_vars, result, &title, &text, secret.as_deref())).await
             }
         };
         if let Err(e) = r {

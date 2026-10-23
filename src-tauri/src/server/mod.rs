@@ -5,18 +5,27 @@
 //! The same `BackupManager` the desktop app uses runs here, so jobs,
 //! scheduling, history and maintenance behave identically.
 
+pub mod access;
+pub mod accounts;
 pub mod api_tokens;
 pub mod auth;
+pub mod branding;
+pub mod csrf;
 pub mod dav;
 pub mod folders;
 pub mod gateway;
+pub mod lifecycle;
 pub mod oauth;
+pub mod observe;
 pub mod mcp;
 pub mod mcp_oauth;
+pub mod metrics;
 pub mod openapi;
+pub mod otlp;
 pub mod sdk;
 pub mod shares;
 pub mod tls;
+pub mod users;
 /// Server settings live in `security::settings_store` (shared with the backup engine).
 pub use crate::security::settings_store as settings;
 
@@ -40,7 +49,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub const PREAUTH_HEADER: &str = "x-ufop-preauth";
-const REFRESH_COOKIE: &str = "ufop_refresh";
+pub(crate) const REFRESH_COOKIE: &str = "ufop_refresh";
 
 #[derive(Debug, Clone)]
 pub enum TlsMode {
@@ -86,6 +95,16 @@ pub struct ServerConfig {
     pub mcp_allow_write: bool,
     /// Public origin (`https://files.example.com`) for OAuth metadata; default: from the request.
     pub public_url: Option<String>,
+    /// How long running backups get to stop at a safe point on shutdown.
+    pub shutdown_grace_secs: u64,
+    /// One log line per request (method, route template, status, latency, request id).
+    pub request_log: bool,
+    /// Separate listener for Prometheus `/metrics` (off when `None`).
+    pub metrics_listen: Option<SocketAddr>,
+    /// `user:password` required (HTTP Basic) on the metrics listener.
+    pub metrics_basic_auth: Option<String>,
+    /// Push `/metrics` to a Prometheus push gateway.
+    pub pushgateway: Option<otlp::PushConfig>,
 }
 
 impl Default for ServerConfig {
@@ -110,6 +129,11 @@ impl Default for ServerConfig {
             mcp_allow_write: false,
             public_url: None,
             dav_allowed_clients: Default::default(),
+            shutdown_grace_secs: crate::backup_engine::shutdown::DEFAULT_GRACE.as_secs(),
+            request_log: true,
+            metrics_listen: None,
+            metrics_basic_auth: None,
+            pushgateway: None,
         }
     }
 }
@@ -145,6 +169,22 @@ pub struct ServerState {
     pub agent: Option<crate::fleet_agent::FleetAgent>,
     /// File gateway relay (on-premises agents and their jobs).
     pub gateways: gateway::Hub,
+    /// Graceful-shutdown switch (signals, service stop, `/server/shutdown`).
+    pub life: lifecycle::Lifecycle,
+    /// HTTP request counters and latency histograms (`/metrics`).
+    pub metrics: metrics::Metrics,
+    /// OTLP trace exporter (flushed on shutdown).
+    pub otlp: Option<otlp::OtlpHandle>,
+    /// Web UI branding (command line, saved, console layers).
+    pub branding: branding::BrandingState,
+}
+
+impl ServerState {
+    /// State with no OAuth broker, console agent or gateways (set the fields after).
+    pub fn new(mgr: BackupManager, conns: Option<ConnectionManager>, auth: AuthService, cfg: ServerConfig) -> Self {
+        let life = lifecycle::Lifecycle::new(std::time::Duration::from_secs(cfg.shutdown_grace_secs));
+        Self { mgr, conns, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None, gateways: Default::default(), life, metrics: Default::default(), otlp: None, branding: Default::default() }
+    }
 }
 
 /// HTTP error wrapper: AppError → status + sanitized `{error_type, message, advice}`.
@@ -218,12 +258,13 @@ async fn host_check(State(st): State<ServerState>, req: Request, next: Next) -> 
     next.run(req).await
 }
 
-/// Who is calling: the pre-authentication header, an API token (with
-/// enough scope for `method path`), or a session/automation token.
-pub(crate) async fn authenticate(st: &ServerState, h: &HeaderMap, method: &Method, path: &str) -> Result<Principal, AppError> {
+/// Who is calling — the pre-authentication header, an API token (with
+/// enough scope for `method path`), or a session/automation token — and
+/// with which rights (see `access`).
+pub(crate) async fn authenticate_access(st: &ServerState, h: &HeaderMap, method: &Method, path: &str) -> Result<(Principal, access::Access), AppError> {
     if let Some(t) = h.get(PREAUTH_HEADER).and_then(|v| v.to_str().ok()) {
         if !t.is_empty() && st.cfg.preauth_tokens.iter().any(|p| constant_eq(p, t)) {
-            return Ok(Principal::Session);
+            return Ok((Principal::Session, access::Access::admin()));
         }
     }
     let bearer = h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::to_string);
@@ -237,29 +278,42 @@ pub(crate) async fn authenticate(st: &ServerState, h: &HeaderMap, method: &Metho
                     advice: "Use a token with a wider scope.".into(),
                 });
             }
-            Ok(Principal::ApiToken { id: tok.id, scope: tok.scope })
+            let limit = access::TokenLimit { id: tok.id.clone(), scope: tok.scope, job_ids: tok.job_ids.clone() };
+            let acc = account_access(st, &tok.owner, Some(limit)).await?;
+            Ok((Principal::ApiToken { id: tok.id, scope: tok.scope }, acc))
         }
-        Some(t) => st.auth.validate(&t).await.map(|_| Principal::Session),
+        Some(t) => {
+            let claims = st.auth.validate(&t).await?;
+            Ok((Principal::Session, account_access(st, &claims.sub, None).await?))
+        }
         None => Err(AppError::PermissionDenied { message: "Authentication required".into(), advice: "Sign in first.".into() }),
     }
 }
 
+/// The rights of an (enabled) account, optionally through a token.
+async fn account_access(st: &ServerState, username: &str, token: Option<access::TokenLimit>) -> Result<access::Access, AppError> {
+    let user = st.auth.account(username).await?;
+    let rules = st.auth.users().rules_for(&user).await?;
+    Ok(access::Access { user: user.username, role: user.role, rules, token })
+}
+
 async fn require_auth(State(st): State<ServerState>, mut req: Request, next: Next) -> Response {
     let (method, path) = (req.method().clone(), req.uri().path().to_string());
-    match authenticate(&st, req.headers(), &method, &path).await {
-        Ok(principal) => {
+    match authenticate_access(&st, req.headers(), &method, &path).await {
+        Ok((principal, acc)) => {
             req.extensions_mut().insert(principal);
+            req.extensions_mut().insert(acc);
             next.run(req).await
         }
         Err(e) => ApiError(e).into_response(),
     }
 }
 
-fn constant_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).find_map(|kv| {
         let (k, v) = kv.trim().split_once('=')?;
         (k == name).then(|| v.to_string())
@@ -281,36 +335,58 @@ fn refresh_cookie(st: &ServerState, token: &str, max_age_days: i64) -> HeaderVal
     .unwrap_or(HeaderValue::from_static(""))
 }
 
+/// Script-readable double-submit CSRF cookie (see `csrf`).
+fn csrf_cookie(st: &ServerState, token: &str, max_age_days: i64) -> HeaderValue {
+    let secure = if matches!(st.cfg.tls, TlsMode::None) { "" } else { "; Secure" };
+    HeaderValue::from_str(&format!("{}={token}; SameSite=Strict; Path=/; Max-Age={}{secure}", csrf::CSRF_COOKIE, max_age_days * 86400)).unwrap_or(HeaderValue::from_static(""))
+}
+
+/// `{access_token, expires_at, csrf_token}` with the refresh and CSRF cookies.
+async fn with_session_cookies(st: &ServerState, access: auth::IssuedToken, refresh: auth::IssuedToken) -> Result<Response, ApiError> {
+    let csrf = st.auth.csrf_token(&refresh.token).await?;
+    let mut r = Json(json!({"access_token": access.token, "expires_at": access.expires_at, "csrf_token": csrf})).into_response();
+    r.headers_mut().insert(header::SET_COOKIE, refresh_cookie(st, &refresh.token, auth::REFRESH_TTL_DAYS));
+    r.headers_mut().append(header::SET_COOKIE, csrf_cookie(st, &csrf, auth::REFRESH_TTL_DAYS));
+    Ok(r)
+}
+
 // ── Auth routes ──
 
 #[derive(Deserialize)]
 struct LoginBody {
+    /// Account name (default `admin`, the original server password).
+    #[serde(default)]
+    username: Option<String>,
     password: String,
 }
 
-async fn session_response(st: &ServerState) -> Result<Response, ApiError> {
-    let access = st.auth.issue_access().await?;
-    let refresh = st.auth.issue_refresh().await?;
-    let mut r = Json(json!({"access_token": access.token, "expires_at": access.expires_at})).into_response();
-    r.headers_mut().insert(header::SET_COOKIE, refresh_cookie(st, &refresh.token, auth::REFRESH_TTL_DAYS));
+async fn session_response(st: &ServerState, user: &str) -> Result<Response, ApiError> {
+    let access = st.auth.issue_access_for(user).await?;
+    let refresh = st.auth.issue_refresh_for(user).await?;
+    let mut r = with_session_cookies(st, access, refresh).await?;
     r.headers_mut().append(header::SET_COOKIE, session_marker(auth::REFRESH_TTL_DAYS));
     Ok(r)
 }
 
 async fn login(State(st): State<ServerState>, Json(b): Json<LoginBody>) -> Result<Response, ApiError> {
-    match st.auth.login(&b.password).await? {
+    let username = b.username.as_deref().map(str::trim).filter(|u| !u.is_empty()).unwrap_or(users::ADMIN);
+    match st.auth.login_user(username, &b.password).await? {
         None => Ok((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error_type":"throttled","message":"Too many sign-in attempts","advice":"Wait a moment and try again."}))).into_response()),
-        Some(false) => Err(AppError::PermissionDenied { message: "Wrong password".into(), advice: "Check the server password.".into() }.into()),
-        Some(true) => session_response(&st).await,
+        Some(None) => {
+            tracing::warn!("Failed sign-in for '{username}'");
+            Err(AppError::PermissionDenied { message: "Wrong user name or password".into(), advice: "Check them (the original server password is the 'admin' account's), or ask an administrator.".into() }.into())
+        }
+        Some(Some(u)) => {
+            tracing::info!("'{}' signed in", u.username);
+            session_response(&st, &u.username).await
+        }
     }
 }
 
 async fn refresh(State(st): State<ServerState>, headers: HeaderMap) -> Result<Response, ApiError> {
     let raw = cookie_value(&headers, REFRESH_COOKIE).ok_or_else(|| AppError::PermissionDenied { message: "No session".into(), advice: "Sign in.".into() })?;
     let (access, refresh) = st.auth.refresh(&raw).await?;
-    let mut r = Json(json!({"access_token": access.token, "expires_at": access.expires_at})).into_response();
-    r.headers_mut().insert(header::SET_COOKIE, refresh_cookie(&st, &refresh.token, auth::REFRESH_TTL_DAYS));
-    Ok(r)
+    with_session_cookies(&st, access, refresh).await
 }
 
 async fn logout(State(st): State<ServerState>, headers: HeaderMap) -> Result<Response, ApiError> {
@@ -319,6 +395,7 @@ async fn logout(State(st): State<ServerState>, headers: HeaderMap) -> Result<Res
     }
     let mut r = Json(json!({"ok": true})).into_response();
     r.headers_mut().insert(header::SET_COOKIE, refresh_cookie(&st, "", 0));
+    r.headers_mut().append(header::SET_COOKIE, csrf_cookie(&st, "", 0));
     r.headers_mut().append(header::SET_COOKIE, session_marker(0));
     Ok(r)
 }
@@ -329,16 +406,17 @@ struct TokenBody {
 }
 
 async fn redeem_signin(State(st): State<ServerState>, Json(b): Json<TokenBody>) -> Result<Response, ApiError> {
-    st.auth.redeem_signin(&b.token).await?;
-    session_response(&st).await
+    let user = st.auth.redeem_signin(&b.token).await?;
+    st.auth.account(&user).await?;
+    session_response(&st, &user).await
 }
 
-async fn signin_token(State(st): State<ServerState>) -> ApiResult {
-    ok(st.auth.issue_signin().await?)
+async fn signin_token(State(st): State<ServerState>, Extension(acc): Extension<access::Access>) -> ApiResult {
+    ok(st.auth.issue_signin_for(&acc.user).await?)
 }
 
-async fn automation_token(State(st): State<ServerState>) -> ApiResult {
-    ok(st.auth.issue_automation().await?)
+async fn automation_token(State(st): State<ServerState>, Extension(acc): Extension<access::Access>) -> ApiResult {
+    ok(st.auth.issue_automation_for(&acc.user).await?)
 }
 
 #[derive(Deserialize)]
@@ -347,27 +425,47 @@ struct ApiTokenBody {
     scope: api_tokens::Scope,
     #[serde(default = "default_token_days")]
     expires_in_days: i64,
+    /// Limit the token to these jobs (ids; absent or null = every job).
+    #[serde(default)]
+    job_ids: Option<Vec<String>>,
 }
 
 fn default_token_days() -> i64 {
     90
 }
 
-async fn list_api_tokens(State(st): State<ServerState>) -> ApiResult {
-    ok(json!({"tokens": st.auth.api_tokens().list().await?}))
+/// Administrators see every token; others their own.
+async fn list_api_tokens(State(st): State<ServerState>, Extension(acc): Extension<access::Access>) -> ApiResult {
+    let mut t = st.auth.api_tokens().list().await?;
+    if !acc.is_admin() {
+        t.retain(|t| t.owner.eq_ignore_ascii_case(&acc.user));
+    }
+    ok(json!({"tokens": t}))
 }
 
 /// Minting needs an interactive sign-in: an API token cannot create more tokens.
-async fn create_api_token(State(st): State<ServerState>, Extension(who): Extension<Principal>, Json(b): Json<ApiTokenBody>) -> ApiResult {
+async fn create_api_token(State(st): State<ServerState>, Extension(who): Extension<Principal>, Extension(acc): Extension<access::Access>, Json(b): Json<ApiTokenBody>) -> ApiResult {
     if who != Principal::Session {
         return Err(AppError::PermissionDenied { message: "API tokens cannot create API tokens".into(), advice: "Sign in with the server password.".into() }.into());
     }
-    let (t, raw) = st.auth.api_tokens().create(&b.name, b.scope, b.expires_in_days).await?;
-    tracing::info!("Created API token {} ({}, {} scope)", t.id, t.name, t.scope.as_str());
+    if b.scope == api_tokens::Scope::Admin && acc.role != access::Role::Admin {
+        return Err(AppError::PermissionDenied { message: "Admin-scope tokens are not allowed for this account (administrators only)".into(), advice: "Pick the read, run or write scope.".into() }.into());
+    }
+    if let Some(ids) = &b.job_ids {
+        for id in ids.iter().map(|i| i.trim()).filter(|i| !i.is_empty()) {
+            st.mgr.get_job(id).await.map_err(|_| AppError::validation(format!("There is no job with id '{id}'")))?;
+        }
+    }
+    let (t, raw) = st.auth.api_tokens().create_owned(&b.name, b.scope, b.expires_in_days, b.job_ids, &acc.user).await?;
+    tracing::info!("Created API token {} ({}, {} scope{})", t.id, t.name, t.scope.as_str(), t.job_ids.as_ref().map(|j| format!(", {} job(s)", j.len())).unwrap_or_default());
     ok(json!({"token": raw, "info": t}))
 }
 
-async fn revoke_api_token(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+async fn revoke_api_token(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, AxPath(id): AxPath<String>) -> ApiResult {
+    let owned = st.auth.api_tokens().list().await?.into_iter().any(|t| t.id == id && t.owner.eq_ignore_ascii_case(&acc.user));
+    if !acc.is_admin() && !owned {
+        return Err(AppError::FileOperation { message: format!("API token {id} not found"), advice: "List your tokens to see their ids.".into() }.into());
+    }
     if !st.auth.api_tokens().revoke(&id).await? {
         return Err(AppError::FileOperation { message: format!("API token {id} not found"), advice: "List the tokens to see their ids.".into() }.into());
     }
@@ -386,11 +484,12 @@ struct PasswordBody {
     new_password: String,
 }
 
-async fn change_password(State(st): State<ServerState>, Json(b): Json<PasswordBody>) -> ApiResult {
-    if st.auth.login(&b.current_password).await? != Some(true) {
+/// Change the signed-in account's own password.
+async fn change_password(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, Json(b): Json<PasswordBody>) -> ApiResult {
+    if !matches!(st.auth.login_user(&acc.user, &b.current_password).await?, Some(Some(_))) {
         return Err(AppError::PermissionDenied { message: "Wrong current password".into(), advice: "Check it and try again.".into() }.into());
     }
-    st.auth.set_password(&b.new_password).await?;
+    st.auth.set_user_password(&acc.user, &b.new_password).await?;
     ok(json!({"ok": true}))
 }
 
@@ -409,8 +508,8 @@ async fn health(State(st): State<ServerState>) -> ApiResult {
     }))
 }
 
-async fn status(State(st): State<ServerState>) -> ApiResult {
-    ok(st.mgr.status().await)
+async fn status(State(st): State<ServerState>, Extension(acc): Extension<access::Access>) -> ApiResult {
+    ok(visible_status(&st, &acc).await)
 }
 
 async fn modules(State(st): State<ServerState>) -> ApiResult {
@@ -433,8 +532,27 @@ async fn put_settings(State(st): State<ServerState>, Json(b): Json<SettingsBody>
     get_settings(State(st)).await
 }
 
-async fn rpc(State(st): State<ServerState>, AxPath(cmd): AxPath<String>, body: Option<Json<Value>>) -> ApiResult {
+async fn rpc(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, AxPath(cmd): AxPath<String>, body: Option<Json<Value>>) -> ApiResult {
     let args = body.map(|b| b.0).unwrap_or(json!({}));
+    // Administrators (without a job-limited token) may call any command.
+    if !acc.is_admin() || acc.job_limited() {
+        match access::rpc_need(&cmd, &args) {
+            access::RpcNeed::Job { id, perm } => acc.require_job(&st.mgr, &id, perm).await?,
+            access::RpcNeed::Global(g) => acc.require_global(g)?,
+            access::RpcNeed::Filtered => {
+                return match cmd.as_str() {
+                    "backup_list_jobs" => ok(visible_jobs(&st, &acc).await),
+                    "backup_status" => ok(visible_status(&st, &acc).await),
+                    "backup_run_history" => {
+                        let page = args.get("page").filter(|p| !p.is_null()).cloned().map(serde_json::from_value).transpose().map_err(AppError::from)?;
+                        ok(runs_listing(&st, &acc, args.get("jobId").and_then(|v| v.as_str()).map(String::from), args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32, page).await?)
+                    }
+                    "backup_cancel" => ok(cancel_for(&st, &acc, args.get("id").and_then(|v| v.as_str()).unwrap_or("")).await?),
+                    _ => ok(run_all_for(&st, &acc, args.get("filter").cloned().map(serde_json::from_value).transpose().map_err(AppError::from)?.unwrap_or_default()).await?),
+                };
+            }
+        }
+    }
     if cmd == "server_list_directory" {
         let q = FsQuery { path: args.get("path").and_then(|v| v.as_str()).map(String::from), folders_only: true };
         return filesystem(Query(q)).await;
@@ -454,8 +572,62 @@ async fn rpc(State(st): State<ServerState>, AxPath(cmd): AxPath<String>, body: O
     Ok(Json(api::dispatch(&st.mgr, &cmd, &args).await?))
 }
 
-async fn list_jobs(State(st): State<ServerState>) -> ApiResult {
-    ok(st.mgr.list_jobs().await)
+async fn list_jobs(State(st): State<ServerState>, Extension(acc): Extension<access::Access>) -> ApiResult {
+    ok(visible_jobs(&st, &acc).await)
+}
+
+/// The jobs the caller may read.
+async fn visible_jobs(st: &ServerState, acc: &access::Access) -> Vec<crate::backup_engine::BackupJob> {
+    st.mgr.list_jobs().await.into_iter().filter(|j| acc.job_permission(&j.id, &j.name) >= access::Permission::Read).collect()
+}
+
+/// Scheduler status with only the tasks and upcoming runs of readable jobs.
+async fn visible_status(st: &ServerState, acc: &access::Access) -> crate::backup_engine::SchedulerStatus {
+    let mut s = st.mgr.status().await;
+    if !acc.is_admin() || acc.job_limited() {
+        let ids: std::collections::HashSet<String> = visible_jobs(st, acc).await.into_iter().map(|j| j.id).collect();
+        s.tasks.retain(|t| ids.contains(&t.job_id));
+        s.next_runs.retain(|t| ids.contains(&t.job_id));
+        s.next_maintenance.retain(|t| ids.contains(&t.job_id));
+    }
+    s
+}
+
+/// Run all, limited to the jobs the caller may run.
+async fn run_all_for(st: &ServerState, acc: &access::Access, mut filter: crate::backup_engine::runs::RunAllFilter) -> Result<crate::backup_engine::runs::RunAllReport, AppError> {
+    let allowed = acc.jobs_with(&st.mgr, access::Permission::Run).await;
+    let all = st.mgr.list_jobs().await;
+    let mut refused = Vec::new();
+    if filter.job_ids.is_empty() {
+        if allowed.len() < all.len() {
+            filter.job_ids = allowed.clone();
+        }
+    } else {
+        let (ok, no): (Vec<String>, Vec<String>) = filter.job_ids.into_iter().partition(|id| allowed.contains(id) || !all.iter().any(|j| &j.id == id));
+        filter.job_ids = ok;
+        refused = no;
+    }
+    let mut report = if filter.job_ids.is_empty() && allowed.len() < all.len() { Default::default() } else { st.mgr.run_all(filter).await? };
+    for id in refused {
+        let name = all.iter().find(|j| j.id == id).map(|j| j.name.clone()).unwrap_or_default();
+        report.skipped.push(crate::backup_engine::runs::SkippedRun { job_id: id, job_name: name, reason: "not allowed".into() });
+    }
+    Ok(report)
+}
+
+/// Cancel a task (or a job's tasks) the caller may run.
+async fn cancel_for(st: &ServerState, acc: &access::Access, id: &str) -> Result<bool, AppError> {
+    let tasks = st.mgr.status().await.tasks;
+    for t in tasks.iter().filter(|t| t.task_id == id || t.job_id == id) {
+        acc.require_job(&st.mgr, &t.job_id, access::Permission::Run).await?;
+    }
+    if tasks.iter().all(|t| t.task_id != id && t.job_id != id) {
+        // A job id without tasks: still only for jobs the caller may run.
+        if st.mgr.get_job(id).await.is_ok() {
+            acc.require_job(&st.mgr, id, access::Permission::Run).await?;
+        }
+    }
+    Ok(st.mgr.cancel(id))
 }
 
 #[derive(Deserialize)]
@@ -503,46 +675,268 @@ async fn run_job(State(st): State<ServerState>, AxPath(id): AxPath<String>, body
     ok(json!({"task_id": st.mgr.start_backup(&id, dry).await?}))
 }
 
-async fn job_operation(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(op): Json<BackupOperation>) -> ApiResult {
+async fn run_all_jobs(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, body: Option<Json<crate::backup_engine::runs::RunAllFilter>>) -> ApiResult {
+    ok(run_all_for(&st, &acc, body.map(|b| b.0).unwrap_or_default()).await?)
+}
+
+#[derive(Deserialize)]
+struct EstimateQuery {
+    assumed_bytes_per_sec: Option<u64>,
+}
+
+async fn estimate_job(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<EstimateQuery>) -> ApiResult {
+    ok(st.mgr.estimate(&id, q.assumed_bytes_per_sec).await?)
+}
+
+async fn job_operation(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, AxPath(id): AxPath<String>, Json(op): Json<BackupOperation>) -> ApiResult {
     if matches!(op, BackupOperation::Backup { .. }) {
         return Err(AppError::validation("Use POST /jobs/{id}/run to start a backup").into());
     }
+    acc.require_job(&st.mgr, &id, access::operation_need(&op)).await?;
     ok(st.mgr.execute(&id, op).await?)
 }
 
-async fn versions(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
-    ok(st.mgr.list_versions(&id).await?)
+#[derive(Deserialize)]
+struct PassphraseBody {
+    #[serde(default)]
+    current: Option<String>,
+    new_passphrase: String,
+    #[serde(default)]
+    kdf_preset: Option<String>,
+}
+
+/// Change an encrypted job's passphrase (format 2 repositories: header only).
+async fn change_job_passphrase(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(b): Json<PassphraseBody>) -> ApiResult {
+    let kdf = match b.kdf_preset.as_deref().filter(|p| !p.is_empty()) {
+        Some(p) => Some(ufop_core::backup::crypto::KdfParams::preset(p).ok_or_else(|| AppError::validation(format!("Unknown key-derivation preset '{p}'")))?),
+        None => None,
+    };
+    ok(st.mgr.change_passphrase(&id, b.current, b.new_passphrase, kdf).await?)
+}
+
+#[derive(Deserialize)]
+struct PointInTimeBody {
+    at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// A new read-only job reading this job's versioned S3 bucket as of `at`.
+async fn open_point_in_time(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(b): Json<PointInTimeBody>) -> ApiResult {
+    ok(st.mgr.open_point_in_time(&id, b.at, b.name).await?)
+}
+
+/// Ransomware-hardening checklist (from the job's settings and the last probe).
+async fn job_hardening(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.hardening_report(&id, false).await?)
+}
+
+/// Run the destination probe ("Run checks"): writes a probe object and tries to delete it.
+async fn job_hardening_probe(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.hardening_report(&id, true).await?)
+}
+
+/// Who holds the job's repository lock(s).
+async fn job_lock_status(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.lock_status(&id).await?)
+}
+
+#[derive(Deserialize)]
+struct BreakLockQuery {
+    #[serde(default)]
+    confirm: bool,
+    owner_id: Option<String>,
+}
+
+/// Force-unlock (`?confirm=true`, optionally `&owner_id=` of the lock shown).
+async fn break_job_lock(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<BreakLockQuery>) -> ApiResult {
+    ok(st.mgr.break_lock(&id, q.confirm, q.owner_id).await?)
+}
+
+#[derive(Deserialize)]
+struct DbEncryptionBody {
+    enabled: bool,
+}
+
+/// Encrypt (or decrypt) the job's local database now.
+async fn set_job_database_encryption(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(b): Json<DbEncryptionBody>) -> ApiResult {
+    ok(st.mgr.set_database_encryption(&id, b.enabled).await?)
+}
+
+#[derive(Deserialize)]
+struct VersionsQuery {
+    /// Another source id, or `*` for every source.
+    source: Option<String>,
+    /// Comma-separated `key=value` (or `key`) tags a version must carry.
+    tags: Option<String>,
+}
+
+async fn versions(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<VersionsQuery>) -> ApiResult {
+    let tags: Vec<String> = q.tags.unwrap_or_default().split(',').map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect();
+    ok(st.mgr.list_versions_in(&id, q.source, tags).await?)
+}
+
+#[derive(Deserialize)]
+struct VersionPatchBody {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(flatten)]
+    patch: ufop_core::backup::versions::MetadataPatch,
+}
+
+/// Change a version's note, tags or pin.
+async fn patch_version(State(st): State<ServerState>, AxPath((id, version)): AxPath<(String, usize)>, Json(b): Json<VersionPatchBody>) -> ApiResult {
+    ok(st.mgr.execute(&id, BackupOperation::SetVersionMetadata { version, source: b.source, patch: b.patch }).await?)
+}
+
+async fn sources(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.list_sources(&id).await?)
+}
+
+#[derive(Deserialize, Default)]
+struct RetentionPreviewBody {
+    #[serde(default)]
+    policy: Option<ufop_core::backup::RetentionPolicy>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// Keep/delete per version for the job's policy or an unsaved one.
+async fn retention_preview(State(st): State<ServerState>, AxPath(id): AxPath<String>, body: Option<Json<RetentionPreviewBody>>) -> ApiResult {
+    let b = body.map(|b| b.0).unwrap_or_default();
+    ok(st.mgr.preview_retention(&id, b.policy, b.source).await?)
 }
 
 #[derive(Deserialize)]
 struct FilesQuery {
+    /// Version number (0 = newest), `latest`, `oldest` or a version id.
+    version: Option<String>,
+    /// "As of" this time (RFC 3339, or `2026-10-01 09:00` in the server's time zone).
+    time: Option<String>,
     #[serde(default)]
-    version: usize,
+    allow_partial: bool,
     prefix: Option<String>,
+    source: Option<String>,
+    /// Any of these asks for a page (`{items, total, offset, limit}`).
+    offset: Option<usize>,
+    limit: Option<usize>,
+    sort: Option<String>,
+    #[serde(default)]
+    desc: bool,
+    filter: Option<String>,
 }
 
 async fn files(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<FilesQuery>) -> ApiResult {
-    ok(st.mgr.list_files(&id, q.version, q.prefix).await?)
+    let sel = crate::backup_engine::access::query_selector(q.version.as_deref(), q.time.as_deref(), q.allow_partial)?;
+    let version = st.mgr.resolve_version(&id, sel, q.source.clone()).await?.index;
+    let page = (q.offset.is_some() || q.limit.is_some() || q.sort.is_some() || q.filter.is_some())
+        .then(|| crate::backup_engine::paging::PageRequest { offset: q.offset.unwrap_or(0), limit: q.limit, sort: q.sort.clone(), descending: q.desc, filter: q.filter.clone() });
+    ok(st.mgr.list_files_listing(&id, version, q.prefix, q.source, page).await?)
+}
+
+#[derive(Deserialize)]
+struct ResolveQuery {
+    version: Option<String>,
+    time: Option<String>,
+    #[serde(default)]
+    allow_partial: bool,
+    source: Option<String>,
+}
+
+/// Which version a time (or latest / oldest / number / id) picks.
+async fn resolve_version(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<ResolveQuery>) -> ApiResult {
+    let sel = crate::backup_engine::access::query_selector(q.version.as_deref(), q.time.as_deref(), q.allow_partial)?;
+    ok(st.mgr.resolve_version(&id, sel, q.source).await?)
+}
+
+#[derive(Deserialize)]
+struct FileQuery {
+    path: String,
+    version: Option<String>,
+    time: Option<String>,
+    #[serde(default)]
+    allow_partial: bool,
+    source: Option<String>,
+}
+
+/// One backed-up file's bytes, streamed, with single `Range` support.
+async fn file_content(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<FileQuery>, headers: HeaderMap) -> Result<Response, ApiError> {
+    let sel = crate::backup_engine::access::query_selector(q.version.as_deref(), q.time.as_deref(), q.allow_partial)?;
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).map(String::from);
+    let fs = match st.mgr.stream_file(&id, sel, q.path, range, q.source).await {
+        Ok(f) => f,
+        Err(e) if e.user_message().contains("Range not satisfiable") => {
+            let mut r = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            r.headers_mut().insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            return Ok(r);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let (status, count) = match fs.range {
+        Some((a, b)) => (StatusCode::PARTIAL_CONTENT, b - a + 1),
+        None => (StatusCode::OK, fs.size),
+    };
+    let stream = futures_util::stream::unfold(fs.data, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
+    let mut r = Response::new(axum::body::Body::from_stream(stream));
+    *r.status_mut() = status;
+    let h = r.headers_mut();
+    let name = std::path::Path::new(&fs.path.replace('\\', "/")).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(ufop_core::webdav::content_type(&name)));
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(count));
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(v) = HeaderValue::from_str(&fs.etag) {
+        h.insert(header::ETAG, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{}", ufop_core::webdav::encode_segment(&name))) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    if let Some(v) = fs.mtime.and_then(|m| chrono::DateTime::from_timestamp(m, 0)).and_then(|t| HeaderValue::from_str(&ufop_core::webdav::http_date(t.into())).ok()) {
+        h.insert(header::LAST_MODIFIED, v);
+    }
+    if let Some((a, b)) = fs.range {
+        if let Ok(v) = HeaderValue::from_str(&format!("bytes {a}-{b}/{}", fs.size)) {
+            h.insert(header::CONTENT_RANGE, v);
+        }
+    }
+    Ok(r)
+}
+
+async fn cache_stats(State(st): State<ServerState>) -> ApiResult {
+    ok(st.mgr.cache_stats().await?)
+}
+
+async fn clear_cache(State(st): State<ServerState>) -> ApiResult {
+    ok(json!({ "bytes_freed": st.mgr.clear_cache().await? }))
+}
+
+async fn get_cache_settings(State(st): State<ServerState>) -> ApiResult {
+    ok(st.mgr.cache_settings().await?)
+}
+
+async fn put_cache_settings(State(st): State<ServerState>, Json(s): Json<ufop_core::backup::cache::CacheSettings>) -> ApiResult {
+    ok(st.mgr.set_cache_settings(s).await?)
 }
 
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
     version: Option<usize>,
+    source: Option<String>,
 }
 
 async fn search(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<SearchQuery>) -> ApiResult {
-    ok(st.mgr.search(&id, q.q, q.version).await?)
+    ok(st.mgr.search_in(&id, q.q, q.version, q.source).await?)
 }
 
 #[derive(Deserialize)]
 struct CompareQuery {
     base: usize,
     compare: usize,
+    source: Option<String>,
 }
 
 async fn compare(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<CompareQuery>) -> ApiResult {
-    ok(st.mgr.compare(&id, q.base, q.compare).await?)
+    ok(st.mgr.compare_in(&id, q.base, q.compare, q.source).await?)
 }
 
 #[derive(Deserialize)]
@@ -578,22 +972,78 @@ async fn import_job(State(st): State<ServerState>, Json(b): Json<ImportBody>) ->
     ok(api::import_config(&st.mgr, &b.config, b.export_passphrase.as_deref(), b.import_stats, b.save).await?)
 }
 
-async fn cancel_task(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
-    ok(json!({"cancelled": st.mgr.cancel(&id)}))
+async fn cancel_task(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(json!({"cancelled": cancel_for(&st, &acc, &id).await?}))
 }
 
-async fn tasks(State(st): State<ServerState>) -> ApiResult {
-    ok(st.mgr.status().await.tasks)
+async fn tasks(State(st): State<ServerState>, Extension(acc): Extension<access::Access>) -> ApiResult {
+    ok(visible_status(&st, &acc).await.tasks)
 }
 
 #[derive(Deserialize)]
 struct RunsQuery {
     job_id: Option<String>,
     limit: Option<u32>,
+    /// Any of these asks for a page (`{items, total, offset, limit}`) of the
+    /// whole history, `limit` rows long.
+    offset: Option<usize>,
+    sort: Option<String>,
+    #[serde(default)]
+    desc: bool,
+    filter: Option<String>,
 }
 
-async fn runs(State(st): State<ServerState>, Query(q): Query<RunsQuery>) -> ApiResult {
-    ok(st.mgr.run_history(q.job_id, q.limit.unwrap_or(50)).await?)
+async fn runs(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, Query(q): Query<RunsQuery>) -> ApiResult {
+    let page = (q.offset.is_some() || q.sort.is_some() || q.filter.is_some()).then(|| crate::backup_engine::paging::PageRequest {
+        offset: q.offset.unwrap_or(0),
+        limit: Some(q.limit.unwrap_or(50) as usize),
+        sort: q.sort.clone(),
+        descending: q.desc,
+        filter: q.filter.clone(),
+    });
+    ok(runs_listing(&st, &acc, q.job_id, q.limit.unwrap_or(50), page).await?)
+}
+
+/// [`runs_for`], or a page of the history the caller may read.
+async fn runs_listing(
+    st: &ServerState,
+    acc: &access::Access,
+    job_id: Option<String>,
+    limit: u32,
+    page: Option<crate::backup_engine::paging::PageRequest>,
+) -> Result<crate::backup_engine::paging::Listing<crate::backup_engine::BackupRun>, AppError> {
+    use crate::backup_engine::paging;
+    let Some(page) = page else {
+        return Ok(paging::Listing::All(runs_for(st, acc, job_id, limit).await?));
+    };
+    if let Some(id) = &job_id {
+        acc.require_job(&st.mgr, id, access::Permission::Read).await?;
+    }
+    if job_id.is_some() || (acc.is_admin() && !acc.job_limited()) {
+        return st.mgr.run_history_listing(job_id, limit, Some(page)).await;
+    }
+    // Only visible jobs: page the (bounded) recent history in memory.
+    let ids: std::collections::HashSet<String> = visible_jobs(st, acc).await.into_iter().map(|j| j.id).collect();
+    let mut all = st.mgr.run_history(None, 1000).await?;
+    all.retain(|r| ids.contains(&r.job_id));
+    paging::listing(all, Some(&page))
+}
+
+/// Run history of the jobs the caller may read.
+async fn runs_for(st: &ServerState, acc: &access::Access, job_id: Option<String>, limit: u32) -> Result<Vec<crate::backup_engine::BackupRun>, AppError> {
+    if let Some(id) = &job_id {
+        acc.require_job(&st.mgr, id, access::Permission::Read).await?;
+        return st.mgr.run_history(job_id, limit).await;
+    }
+    if acc.is_admin() && !acc.job_limited() {
+        return st.mgr.run_history(None, limit).await;
+    }
+    let ids: std::collections::HashSet<String> = visible_jobs(st, acc).await.into_iter().map(|j| j.id).collect();
+    // History of deleted jobs and of other jobs is left out.
+    let mut out = st.mgr.run_history(None, limit.saturating_mul(4).max(200)).await?;
+    out.retain(|r| ids.contains(&r.job_id));
+    out.truncate(limit as usize);
+    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -615,6 +1065,134 @@ struct PauseBody {
 async fn pause(State(st): State<ServerState>, body: Option<Json<PauseBody>>) -> ApiResult {
     st.mgr.pause(body.and_then(|b| b.0.minutes));
     ok(st.mgr.status().await)
+}
+
+// ── Notification profiles, previews and webhook presets ──
+
+type Profile = crate::backup_engine::notify::profiles::NotificationProfile;
+
+async fn list_notification_profiles(State(st): State<ServerState>) -> ApiResult {
+    ok(st.mgr.list_notification_profiles().await?)
+}
+
+async fn create_notification_profile(State(st): State<ServerState>, Json(mut p): Json<Profile>) -> ApiResult {
+    p.id.clear();
+    ok(st.mgr.save_notification_profile(p).await?)
+}
+
+async fn get_notification_profile(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.get_notification_profile(&id).await?)
+}
+
+async fn update_notification_profile(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(mut p): Json<Profile>) -> ApiResult {
+    st.mgr.get_notification_profile(&id).await?;
+    p.id = id;
+    ok(st.mgr.save_notification_profile(p).await?)
+}
+
+#[derive(Deserialize, Default)]
+struct ForceQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn delete_notification_profile(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<ForceQuery>) -> ApiResult {
+    ok(st.mgr.delete_notification_profile(&id, q.force).await?)
+}
+
+async fn test_notification_profile(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    st.mgr.test_notification_profile(&id).await?;
+    ok(json!({"ok": true}))
+}
+
+#[derive(Deserialize)]
+struct PreviewBody {
+    notification: crate::backup_engine::notify::Notification,
+    #[serde(default)]
+    result: Option<String>,
+}
+
+async fn preview_notification(State(st): State<ServerState>, Json(b): Json<PreviewBody>) -> ApiResult {
+    ok(st.mgr.preview_notification(&b.notification, b.result.as_deref().unwrap_or("success")))
+}
+
+#[derive(Deserialize)]
+struct PresetBody {
+    preset: crate::backup_engine::notify::webhook::WebhookPreset,
+    #[serde(default)]
+    params: crate::backup_engine::notify::webhook::PresetParams,
+}
+
+async fn webhook_preset(Json(b): Json<PresetBody>) -> ApiResult {
+    ok(crate::backup_engine::notify::webhook::preset(b.preset, &b.params)?)
+}
+
+// ── Policy templates, effective settings, schedule preview ──
+
+async fn list_templates(State(st): State<ServerState>) -> ApiResult {
+    ok(st.mgr.list_templates().await?)
+}
+
+async fn create_template(State(st): State<ServerState>, Json(mut t): Json<crate::backup_engine::templates::PolicyTemplate>) -> ApiResult {
+    t.id.clear();
+    ok(st.mgr.save_template(t).await?)
+}
+
+async fn get_template(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.get_template(&id).await?)
+}
+
+async fn update_template(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(mut t): Json<crate::backup_engine::templates::PolicyTemplate>) -> ApiResult {
+    st.mgr.get_template(&id).await?;
+    t.id = id;
+    ok(st.mgr.save_template(t).await?)
+}
+
+async fn delete_template(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    st.mgr.delete_template(&id).await?;
+    ok(json!({"ok": true}))
+}
+
+#[derive(Deserialize)]
+struct ApplyTemplateBody {
+    job_id: String,
+}
+
+async fn apply_template(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, AxPath(id): AxPath<String>, Json(b): Json<ApplyTemplateBody>) -> ApiResult {
+    acc.require_job(&st.mgr, &b.job_id, access::Permission::Write).await?;
+    ok(st.mgr.apply_template(&id, &b.job_id).await?)
+}
+
+#[derive(Deserialize, Default)]
+struct ExportTemplatesQuery {
+    /// Comma-separated ids (empty = all).
+    #[serde(default)]
+    ids: String,
+}
+
+async fn export_templates(State(st): State<ServerState>, Query(q): Query<ExportTemplatesQuery>) -> Result<Response, ApiError> {
+    let ids: Vec<String> = q.ids.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let body = st.mgr.export_templates(&ids).await?;
+    Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
+}
+
+async fn import_templates(State(st): State<ServerState>, body: String) -> ApiResult {
+    ok(st.mgr.import_templates(&body).await?)
+}
+
+async fn effective_settings(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.effective_settings(Some(&id), None).await?)
+}
+
+#[derive(Deserialize)]
+struct SchedulePreviewBody {
+    schedule: crate::backup_engine::schedule::BackupSchedule,
+    #[serde(default)]
+    count: Option<usize>,
+}
+
+async fn schedule_preview(Json(b): Json<SchedulePreviewBody>) -> ApiResult {
+    ok(b.schedule.preview(chrono::Utc::now(), b.count.unwrap_or(5))?)
 }
 
 async fn resume(State(st): State<ServerState>) -> ApiResult {
@@ -656,6 +1234,9 @@ fn inject_server_flag(index: &str) -> String {
 }
 
 async fn static_files(State(st): State<ServerState>, req: Request) -> Response {
+    if let Some(slot) = req.extensions().get::<observe::RouteSlot>() {
+        let _ = slot.0.set("static".into());
+    }
     let Some(root) = st.cfg.webroot.clone() else { return StatusCode::NOT_FOUND.into_response() };
     let rel = req.uri().path().trim_start_matches('/');
     if rel.split('/').any(|seg| seg == "..") {
@@ -672,7 +1253,8 @@ async fn static_files(State(st): State<ServerState>, req: Request) -> Response {
     let path = format!("/{rel}");
     if st.cfg.spa_paths.iter().any(|p| path.starts_with(p.as_str())) {
         if let Ok(idx) = tokio::fs::read_to_string(root.join("index.html")).await {
-            return ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], inject_server_flag(&idx)).into_response();
+            let html = branding::brand_index(&inject_server_flag(&idx), &st.branding.effective().await);
+            return ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response();
         }
     }
     StatusCode::NOT_FOUND.into_response()
@@ -714,6 +1296,9 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/auth/refresh", post(refresh))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/signin", post(redeem_signin))
+        .route("/api/v1/branding", get(branding::public_branding))
+        .route("/branding/logo", get(branding::logo))
+        .route("/branding/custom.css", get(branding::custom_css))
         .merge(oauth::public_routes())
         .merge(shares::public_routes())
         .merge(mcp_oauth::routes())
@@ -732,10 +1317,25 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/jobs", get(list_jobs).post(create_job))
         .route("/api/v1/jobs/import", post(import_job))
         .route("/api/v1/jobs/{id}", get(get_job).put(update_job).delete(delete_job))
+        .route("/api/v1/jobs/run-all", post(run_all_jobs))
         .route("/api/v1/jobs/{id}/run", post(run_job))
+        .route("/api/v1/jobs/{id}/estimate", get(estimate_job))
         .route("/api/v1/jobs/{id}/operations", post(job_operation))
+        .route("/api/v1/jobs/{id}/passphrase", axum::routing::put(change_job_passphrase))
+        .route("/api/v1/jobs/{id}/point-in-time", post(open_point_in_time))
+        .route("/api/v1/jobs/{id}/lock", get(job_lock_status).delete(break_job_lock))
+        .route("/api/v1/jobs/{id}/hardening", get(job_hardening))
+        .route("/api/v1/jobs/{id}/hardening/probe", post(job_hardening_probe))
+        .route("/api/v1/jobs/{id}/database-encryption", axum::routing::put(set_job_database_encryption))
         .route("/api/v1/jobs/{id}/versions", get(versions))
+        .route("/api/v1/jobs/{id}/versions/{version}", axum::routing::patch(patch_version))
+        .route("/api/v1/jobs/{id}/sources", get(sources))
+        .route("/api/v1/jobs/{id}/retention/preview", post(retention_preview))
         .route("/api/v1/jobs/{id}/files", get(files))
+        .route("/api/v1/jobs/{id}/file", get(file_content))
+        .route("/api/v1/jobs/{id}/versions/resolve", get(resolve_version))
+        .route("/api/v1/backup-cache", get(cache_stats).delete(clear_cache))
+        .route("/api/v1/backup-cache/settings", get(get_cache_settings).put(put_cache_settings))
         .route("/api/v1/jobs/{id}/search", get(search))
         .route("/api/v1/jobs/{id}/compare", get(compare))
         .route("/api/v1/jobs/{id}/export", get(export_job))
@@ -747,12 +1347,29 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/filesystem", get(filesystem))
         .route("/api/v1/scheduler/pause", post(pause))
         .route("/api/v1/scheduler/resume", post(resume))
+        .route("/api/v1/notification-profiles", get(list_notification_profiles).post(create_notification_profile))
+        .route("/api/v1/notification-profiles/{id}", get(get_notification_profile).put(update_notification_profile).delete(delete_notification_profile))
+        .route("/api/v1/notification-profiles/{id}/test", post(test_notification_profile))
+        .route("/api/v1/notifications/preview", post(preview_notification))
+        .route("/api/v1/notifications/webhook-preset", post(webhook_preset))
+        .route("/api/v1/backup-templates", get(list_templates).post(create_template))
+        .route("/api/v1/backup-templates/export", get(export_templates))
+        .route("/api/v1/backup-templates/import", post(import_templates))
+        .route("/api/v1/backup-templates/{id}", get(get_template).put(update_template).delete(delete_template))
+        .route("/api/v1/backup-templates/{id}/apply", post(apply_template))
+        .route("/api/v1/jobs/{id}/effective-settings", get(effective_settings))
+        .route("/api/v1/backup-schedule/preview", post(schedule_preview))
         .merge(oauth::protected_routes())
         .merge(shares::protected_routes())
         .merge(folders::protected_routes())
+        .route("/api/v1/server/shutdown", post(lifecycle::shutdown_route))
+        .route("/api/v1/server/branding", get(branding::get_admin).put(branding::put_admin))
+        .route("/api/v1/metrics", get(metrics::metrics_route))
         .merge(gateway::protected_routes())
+        .merge(accounts::protected_routes())
+        .route_layer(middleware::from_fn_with_state(st.clone(), access::authorize))
         .route_layer(middleware::from_fn_with_state(st.clone(), require_auth));
-    let mut app = public.merge(protected).merge(dav::routes());
+    let mut app = public.merge(protected).merge(dav::routes()).route_layer(middleware::from_fn(observe::record_route));
     if !st.cfg.api_only && st.cfg.webroot.is_some() {
         app = app.fallback(static_files);
     }
@@ -762,13 +1379,24 @@ pub fn router(st: ServerState) -> Router {
             tower_http::cors::CorsLayer::new()
                 .allow_origin(origins)
                 .allow_credentials(true)
-                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static(PREAUTH_HEADER)]),
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static(PREAUTH_HEADER), header::HeaderName::from_static(csrf::CSRF_HEADER), observe::REQUEST_ID])
+                .expose_headers([observe::REQUEST_ID]),
         );
     }
-    app.layer(middleware::from_fn_with_state(st.clone(), host_check))
+    app.layer(middleware::from_fn_with_state(st.clone(), csrf::csrf_guard))
+        .layer(middleware::from_fn_with_state(st.clone(), lifecycle::drain_guard))
+        .layer(middleware::from_fn_with_state(st.clone(), host_check))
         .layer(middleware::from_fn_with_state(st.clone(), ip_check))
         .layer(middleware::from_fn_with_state(st.clone(), security_headers))
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http()
+                .make_span_with(observe::make_span)
+                .on_request(observe::on_request)
+                .on_response(observe::LogResponse { enabled: st.cfg.request_log })
+                .on_failure(()),
+        )
+        .layer(middleware::from_fn_with_state(st.clone(), observe::request_context))
         .with_state(st)
 }
 
@@ -787,33 +1415,76 @@ pub fn enforce_data_dir_permissions(dir: &std::path::Path) -> Result<(), AppErro
     Ok(())
 }
 
-/// Serve until the process is stopped.
+/// Serve until stopped: a stop request (signal, service stop or
+/// `POST /server/shutdown`) drains running backups, then open connections.
 pub async fn serve(st: ServerState) -> Result<(), AppError> {
     // Several TLS backends are linked (reqwest, axum-server); pick one explicitly.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let addr = st.cfg.bind_addr()?;
     let tls = st.cfg.tls.clone();
     let min_tls = st.cfg.min_tls;
-    let app = router(st).into_make_service_with_connect_info::<SocketAddr>();
+    st.life.listen_for_signals();
+    if let Some(maddr) = st.cfg.metrics_listen {
+        let (mst, auth) = (st.clone(), st.cfg.metrics_basic_auth.clone());
+        tokio::spawn(async move {
+            if let Err(e) = metrics::serve_standalone(mst, maddr, auth).await {
+                tracing::error!("{}", e.user_message());
+            }
+        });
+    }
+    let pusher = st.cfg.pushgateway.clone().map(|p| otlp::spawn_pushgateway(st.clone(), p));
+    let handle = axum_server::Handle::new();
+    let drain = {
+        let (st, handle) = (st.clone(), handle.clone());
+        tokio::spawn(async move {
+            let report = lifecycle::drain_when_requested(st.clone()).await;
+            tracing::info!("Backups stopped ({} cancelled, {} still running after {} ms); closing connections", report.cancelled, report.still_running, report.waited_ms);
+            if st.life.is_immediate() {
+                handle.shutdown();
+            } else {
+                handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+            }
+            report
+        })
+    };
+    let app = router(st.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let io = |e: std::io::Error| AppError::Configuration { message: format!("Server failed: {e}"), advice: "Check the port and TLS settings.".into() };
-    match tls {
+    let served = match tls {
         TlsMode::None => {
             tracing::info!("ufop-server listening on http://{addr}");
-            axum_server::bind(addr).serve(app).await.map_err(io)
+            axum_server::bind(addr).handle(handle).serve(app).await.map_err(io)
         }
         TlsMode::Generated { dir, hostnames } => {
             let (chain, key) = tls::pem_to_der(&tls::GeneratedCerts::new(dir).load_or_create(&hostnames)?)?;
             let cfg = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls::server_config(chain, key, min_tls)?));
             tracing::info!("ufop-server listening on https://{addr} (TLS {:?}+)", min_tls);
-            axum_server::bind_rustls(addr, cfg).serve(app).await.map_err(io)
+            axum_server::bind_rustls(addr, cfg).handle(handle).serve(app).await.map_err(io)
         }
         TlsMode::Pfx { path, password } => {
             let (chain, key) = tls::load_pfx(&path, &password)?;
             let cfg = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls::server_config(chain, key, min_tls)?));
             tracing::info!("ufop-server listening on https://{addr} (imported certificate, TLS {:?}+)", min_tls);
-            axum_server::bind_rustls(addr, cfg).serve(app).await.map_err(io)
+            axum_server::bind_rustls(addr, cfg).handle(handle).serve(app).await.map_err(io)
+        }
+    };
+    served?;
+    // The listener only stops after a stop request, so the drain is done or ending.
+    if !drain.is_finished() {
+        st.mgr.begin_shutdown();
+        st.mgr.cancel_all();
+    }
+    drain.abort();
+    if let Some(p) = pusher {
+        // The final push runs once the drain is over.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(20), p).await;
+    }
+    if let Some(o) = &st.otlp {
+        if !o.flush(std::time::Duration::from_secs(10)).await {
+            tracing::warn!("Could not send the last trace spans");
         }
     }
+    tracing::info!("ufop-server stopped");
+    Ok(())
 }
 
 #[cfg(test)]

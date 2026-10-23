@@ -74,7 +74,8 @@ describe("findMountForPath", () => {
 describe("formatDriveSpace", () => {
   it("formats free space as a terse string", () => {
     const d = drive("/", 256 * 1024 * 1024, 1024 * 1024 * 1024);
-    expect(formatDriveSpace(d)).toMatch(/^256(\.0)? MB free$/);
+    // Decimal units by default (Settings → Appearance): 256 MiB = 268.4 MB.
+    expect(formatDriveSpace(d)).toMatch(/^268\.4 MB free$/);
   });
 
   it("returns null when total_bytes is 0 (non-accounting mount)", () => {

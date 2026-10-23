@@ -7,6 +7,7 @@
 //! a half-finished replica invisible to restores.
 
 use super::backend::Backend;
+use super::layout::LayoutBackend;
 use super::volume;
 use super::{hash_bytes, HashAlgorithm, OpContext, Phase, Progress};
 use crate::error::AppError;
@@ -42,16 +43,32 @@ pub struct MirrorReport {
     pub verified: usize,
     pub dry_run: bool,
     pub errors: Vec<String>,
+    /// Lock takeovers and clock-skew notices (see [`mirror_locked`]).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
-/// Whether `name` belongs to the repository with `prefix`.
+/// Whether `name` belongs to the repository with `prefix`. Lock files
+/// belong to one destination and are never copied or deleted.
 fn ours(prefix: &str, name: &str) -> bool {
-    name.strip_prefix(prefix).is_some_and(|r| r.starts_with('-'))
+    name.strip_prefix(prefix).is_some_and(|r| r.starts_with('-')) && !super::lock::is_lock_file(prefix, name)
 }
 
 /// Make `dst` hold the same repository files as `src`.
 pub fn mirror(src: &dyn Backend, dst: &dyn Backend, prefix: &str, opts: &MirrorOptions, ctx: &OpContext) -> Result<MirrorReport, AppError> {
     let header = volume::repo_header_name(prefix);
+    // Both sides use the source repository's layout (sharded volumes are
+    // copied into the same shard folders).
+    let src_l = super::layout::for_repository(src, prefix);
+    let layout = src_l.layout();
+    if layout.is_sharded() && !dst.supports_subfolders() {
+        return Err(AppError::state(
+            format!("{} does not support subfolders, which this sharded backup needs", dst.describe()),
+            "Reshard the backup to the flat layout first, or mirror to a destination with folders.",
+        ));
+    }
+    let dst_l = LayoutBackend::new(dst, layout, prefix);
+    let (src, dst): (&dyn Backend, &dyn Backend) = (&src_l, &dst_l);
     let source: Vec<_> = src.list()?.into_iter().filter(|f| ours(prefix, &f.name)).collect();
     if !source.iter().any(|f| f.name == header) {
         return Err(AppError::file_op(format!("No backup with prefix '{prefix}' at {}", src.describe()), "Check the source destination and prefix."));
@@ -63,9 +80,8 @@ pub fn mirror(src: &dyn Backend, dst: &dyn Backend, prefix: &str, opts: &MirrorO
     let mut r = MirrorReport { dry_run: opts.dry_run, ..Default::default() };
     let mut todo: Vec<(String, u64)> = Vec::new();
     for f in &source {
-        if f.name == header && target.contains_key(&header) {
-            r.skipped_same += 1;
-        } else if f.name != header && target.get(&f.name) == Some(&f.size) {
+        let same = if f.name == header { target.contains_key(&header) } else { target.get(&f.name) == Some(&f.size) };
+        if same {
             r.skipped_same += 1;
         } else if f.name != header {
             todo.push((f.name.clone(), f.size));
@@ -140,6 +156,31 @@ pub fn mirror(src: &dyn Backend, dst: &dyn Backend, prefix: &str, opts: &MirrorO
     Ok(r)
 }
 
+/// [`mirror`] under repository locks: shared on the source, exclusive on
+/// the target (shared for a dry run). The locks' notices (stale takeover,
+/// clock skew) are added to the report's warnings.
+pub fn mirror_locked(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    prefix: &str,
+    opts: &MirrorOptions,
+    lock: &super::lock::LockOptions,
+    ctx: &OpContext,
+) -> Result<MirrorReport, AppError> {
+    use super::lock::{with_lock, LockKind};
+    let target_kind = if opts.dry_run { LockKind::Shared } else { LockKind::Exclusive };
+    let ((mut r, w2), w1) = with_lock(src, prefix, LockKind::Shared, "mirror", lock, ctx, || {
+        if !opts.dry_run {
+            // The target folder must exist before a lock can be written in it.
+            dst.create_folder()?;
+        }
+        with_lock(dst, prefix, target_kind, "mirror", lock, ctx, || mirror(src, dst, prefix, opts, ctx))
+    })?;
+    r.warnings.extend(w1);
+    r.warnings.extend(w2);
+    Ok(r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +220,31 @@ mod tests {
         let rr = crate::backup::run_restore(&repo, &crate::backup::RestoreOptions { target: Some(out.path().into()), ..Default::default() }, &OpContext::new()).unwrap();
         assert!(rr.errors.is_empty() && rr.files_restored == 1);
         assert!(mirror(&bb, &ba, "nope", &MirrorOptions::default(), &OpContext::new()).is_err());
+    }
+
+    #[test]
+    fn lock_files_are_never_mirrored_and_locks_are_honoured() {
+        use crate::backup::lock::{LockKind, LockOptions, RepoLock};
+        let (src, a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write(src.path(), "f.bin", b"data");
+        let o = BackupOptions { block_size: 1024, volume_size: 4096, verify_samples: 0, ..Default::default() };
+        let (ba, bb) = (LocalBackend::new(a.path()), LocalBackend::new(b.path()));
+        run_backup(&ba, &BackupDb::open_in_memory().unwrap(), &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, None, KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        let lo = LockOptions { settle: std::time::Duration::from_millis(10), ..Default::default() };
+        // A reader on the source does not stop a mirror; its lock file is not copied.
+        let reader = RepoLock::acquire(&ba, "ufop", LockKind::Shared, "restore", &lo).unwrap();
+        let r = mirror_locked(&ba, &bb, "ufop", &MirrorOptions::default(), &lo, &OpContext::new()).unwrap();
+        assert!(r.errors.is_empty() && r.warnings.is_empty());
+        assert!(!std::fs::read_dir(b.path()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains("-lock")), "no lock files copied, mirror locks released");
+        drop(reader);
+        // A target lock is neither deleted as extraneous nor ignored.
+        let held = RepoLock::acquire(&bb, "ufop", LockKind::Shared, "verify", &lo).unwrap();
+        assert_eq!(mirror(&ba, &bb, "ufop", &MirrorOptions::default(), &OpContext::new()).unwrap().deleted, 0);
+        assert!(bb.get(held.file()).is_ok());
+        assert!(mirror_locked(&ba, &bb, "ufop", &MirrorOptions::default(), &lo, &OpContext::new()).unwrap_err().user_message().contains("(verify)"));
+        // A writer on the source blocks it too.
+        drop(held);
+        let _w = RepoLock::acquire(&ba, "ufop", LockKind::Exclusive, "backup", &lo).unwrap();
+        assert!(mirror_locked(&ba, &bb, "ufop", &MirrorOptions::default(), &lo, &OpContext::new()).is_err());
     }
 }

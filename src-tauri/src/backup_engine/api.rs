@@ -42,12 +42,41 @@ pub struct SourcePreview {
 pub async fn export_config(mgr: &BackupManager, id: &str, include_passphrase: bool, export_passphrase: Option<&str>, include_stats: bool) -> Result<String, AppError> {
     let job = mgr.get_job(id).await?;
     let pass = if include_passphrase { mgr.passphrase(id).await? } else { None };
-    portability::export_job(&job, pass, export_passphrase, include_stats)
+    let templates = mgr.list_templates().await?.into_iter().filter(|t| job.template_ids.contains(&t.id)).collect();
+    portability::export_job_with(&job, pass, export_passphrase, include_stats, templates)
 }
 
 pub async fn import_config(mgr: &BackupManager, json: &str, export_passphrase: Option<&str>, import_stats: bool, save: bool) -> Result<ImportPreview, AppError> {
-    let (job, pass) = portability::import_job(json, export_passphrase, import_stats)?;
+    let (mut job, pass, templates) = portability::import_job_with(json, export_passphrase, import_stats)?;
     let has_passphrase = pass.is_some();
+    if save {
+        // Templates the job is based on: reuse a local one of the same id or
+        // name, otherwise create it; ids the job cannot resolve are dropped.
+        let known = mgr.list_templates().await?;
+        // Notification profiles hold secrets and are not exported: keep the ones that exist here.
+        let profiles: Vec<String> = mgr.list_notification_profiles().await?.into_iter().map(|p| p.id).collect();
+        job.notification_profile_ids.retain(|id| profiles.contains(id));
+        let mut ids = Vec::new();
+        for id in &job.template_ids {
+            if known.iter().any(|k| &k.id == id && !k.enforced) {
+                ids.push(id.clone());
+            } else if let Some(t) = templates.iter().find(|t| &t.id == id) {
+                let local = known.iter().find(|k| !k.managed && k.name.eq_ignore_ascii_case(t.name.trim()));
+                let saved = match local {
+                    Some(l) => l.clone(),
+                    None => {
+                        let mut t = super::templates::PolicyTemplate { id: String::new(), ..t.clone() };
+                        if let Some(p) = t.settings.notification_profile_ids.as_mut() {
+                            p.retain(|id| profiles.contains(id));
+                        }
+                        mgr.save_template(t).await?
+                    }
+                };
+                ids.push(saved.id);
+            }
+        }
+        job.template_ids = ids;
+    }
     let job = if save { mgr.save_job(job, pass).await? } else { job };
     Ok(ImportPreview { job, has_passphrase })
 }
@@ -135,6 +164,11 @@ fn ok<T: Serialize>(v: T) -> Result<Value, AppError> {
 /// Execute a backup command by its Tauri name with camelCase JSON args
 /// (exactly what the frontend sends to `invoke`).
 pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<Value, AppError> {
+    // Boxed: the match holds a future per command, too large for a caller's stack frame.
+    Box::pin(dispatch_inner(mgr, command, a)).await
+}
+
+async fn dispatch_inner(mgr: &BackupManager, command: &str, a: &Value) -> Result<Value, AppError> {
     let prefix = || opt::<String>(a, "prefix").map(|p| p.unwrap_or_else(|| "ufop".into()));
     match command {
         "backup_list_jobs" => ok(mgr.list_jobs().await),
@@ -163,11 +197,18 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
             mgr.resume();
             ok(mgr.status().await)
         }
-        "backup_list_versions" => ok(mgr.list_versions(&arg::<String>(a, "id")?).await?),
-        "backup_list_files" => ok(mgr.list_files(&arg::<String>(a, "id")?, arg(a, "version")?, opt(a, "prefix")?).await?),
-        "backup_search" => ok(mgr.search(&arg::<String>(a, "id")?, arg(a, "pattern")?, opt(a, "version")?).await?),
-        "backup_compare" => ok(mgr.compare(&arg::<String>(a, "id")?, arg(a, "base")?, arg(a, "compare")?).await?),
-        "backup_run_history" => ok(mgr.run_history(opt(a, "jobId")?, opt(a, "limit")?.unwrap_or(50)).await?),
+        "backup_list_versions" => ok(mgr.list_versions_in(&arg::<String>(a, "id")?, opt(a, "source")?, opt(a, "tags")?.unwrap_or_default()).await?),
+        "backup_list_files" => ok(mgr.list_files_listing(&arg::<String>(a, "id")?, arg(a, "version")?, opt(a, "prefix")?, opt(a, "source")?, opt(a, "page")?).await?),
+        "backup_search" => ok(mgr.search_in(&arg::<String>(a, "id")?, arg(a, "pattern")?, opt(a, "version")?, opt(a, "source")?).await?),
+        "backup_compare" => ok(mgr.compare_in(&arg::<String>(a, "id")?, arg(a, "base")?, arg(a, "compare")?, opt(a, "source")?).await?),
+        "backup_list_sources" => ok(mgr.list_sources(&arg::<String>(a, "id")?).await?),
+        "backup_preview_retention" => ok(mgr.preview_retention(&arg::<String>(a, "id")?, opt(a, "policy")?, opt(a, "source")?).await?),
+        "backup_set_version_metadata" => ok(mgr
+            .execute(&arg::<String>(a, "id")?, BackupOperation::SetVersionMetadata { version: arg(a, "version")?, source: opt(a, "source")?, patch: arg(a, "patch")? })
+            .await?),
+        "backup_run_all" => ok(mgr.run_all(opt(a, "filter")?.unwrap_or_default()).await?),
+        "backup_estimate" => ok(mgr.estimate(&arg::<String>(a, "jobId")?, opt(a, "assumedBytesPerSec")?).await?),
+        "backup_run_history" => ok(mgr.run_history_listing(opt(a, "jobId")?, opt(a, "limit")?.unwrap_or(50), opt(a, "page")?).await?),
         "backup_prune_history" => ok(mgr.prune_history(arg::<u32>(a, "days")?.max(1)).await?),
         "backup_export_config" => ok(export_config(
             mgr,
@@ -218,7 +259,7 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
         "backup_recovery_list" => ok(mgr.recovery_list(arg(a, "folder")?).await?),
         "backup_recovery_restore" => ok(mgr.recovery_restore(arg(a, "folder")?, arg(a, "version")?, opt(a, "paths")?.unwrap_or_default(), arg(a, "target")?).await?),
         "backup_recovery_convert" => ok(mgr.recovery_convert(arg(a, "folder")?, arg(a, "destination")?, arg(a, "options")?).await?),
-        "backup_remote_list" => ok(mgr.remote_list(arg(a, "destination")?).await?),
+        "backup_remote_list" => ok(super::paging::listing(mgr.remote_list(arg(a, "destination")?).await?, opt::<super::paging::PageRequest>(a, "page")?.as_ref())?),
         "backup_remote_get" => ok(mgr.remote_get(arg(a, "destination")?, arg(a, "name")?, arg(a, "localPath")?).await?),
         "backup_remote_put" => ok(mgr.remote_put(arg(a, "destination")?, arg(a, "localPath")?, arg(a, "name")?).await?),
         "backup_remote_delete" => ok(mgr.remote_delete(arg(a, "destination")?, arg(a, "name")?, opt(a, "force")?.unwrap_or(false)).await?),
@@ -226,16 +267,56 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
         "backup_set_destination_secret" => ok(mgr.set_destination_secret(&arg::<String>(a, "credentialId")?, &arg::<String>(a, "secret")?).await?),
         "backup_has_destination_secret" => ok(mgr.has_destination_secret(&arg::<String>(a, "credentialId")?).await?),
         "backup_cloud_providers" => ok(super::stores::PROVIDERS.to_vec()),
+        "backup_lock_status" => ok(mgr.lock_status(&arg::<String>(a, "jobId")?).await?),
+        "backup_hardening_report" => ok(mgr.hardening_report(&arg::<String>(a, "jobId")?, opt(a, "probe")?.unwrap_or(false)).await?),
+        "backup_break_lock" => ok(mgr.break_lock(&arg::<String>(a, "jobId")?, opt(a, "confirm")?.unwrap_or(false), opt(a, "ownerId")?).await?),
+        "backup_set_database_encryption" => ok(mgr.set_database_encryption(&arg::<String>(a, "jobId")?, arg(a, "enabled")?).await?),
         "backup_adopt_repository" => ok(mgr
             .adopt_repository(
                 arg(a, "destination")?,
                 opt(a, "passphrase")?,
                 prefix()?,
-                opt(a, "name")?,
-                opt(a, "sources")?.unwrap_or_default(),
-                opt(a, "sourceMap")?.unwrap_or_default(),
+                super::AdoptOptions {
+                    name: opt(a, "name")?,
+                    sources: opt(a, "sources")?.unwrap_or_default(),
+                    source_map: opt(a, "sourceMap")?.unwrap_or_default(),
+                    read_only: opt(a, "readOnly")?.unwrap_or(false),
+                },
             )
             .await?),
+        "backup_open_point_in_time" => {
+            let at: String = arg(a, "at")?;
+            let at = chrono::DateTime::parse_from_rfc3339(&at).map_err(|e| AppError::validation(format!("Invalid time '{at}': {e}")))?.with_timezone(&chrono::Utc);
+            ok(mgr.open_point_in_time(&arg::<String>(a, "jobId")?, at, opt(a, "name")?).await?)
+        }
+        "backup_resolve_version" => ok(mgr.resolve_version(&arg::<String>(a, "id")?, arg(a, "selector")?, opt(a, "source")?).await?),
+        "backup_read_file" => ok(mgr
+            .read_file(&arg::<String>(a, "id")?, super::access::selector_of(opt(a, "version")?, opt(a, "selector")?), arg(a, "path")?, opt(a, "offset")?.unwrap_or(0), opt(a, "length")?, opt(a, "source")?)
+            .await?),
+        "backup_export_file" => ok(mgr
+            .export_file(&arg::<String>(a, "id")?, super::access::selector_of(opt(a, "version")?, opt(a, "selector")?), arg(a, "path")?, arg(a, "dest")?, opt(a, "source")?)
+            .await?),
+        "backup_cache_stats" => ok(mgr.cache_stats().await?),
+        "backup_bench" => ok(super::diagnostics::bench(opt(a, "options")?.unwrap_or_default()).await?),
+        "backup_clear_cache" => ok(mgr.clear_cache().await?),
+        "backup_get_cache_settings" => ok(mgr.cache_settings().await?),
+        "backup_set_cache_settings" => ok(mgr.set_cache_settings(arg(a, "settings")?).await?),
+        "backup_list_templates" => ok(mgr.list_templates().await?),
+        "backup_get_template" => ok(mgr.get_template(&arg::<String>(a, "id")?).await?),
+        "backup_save_template" => ok(mgr.save_template(arg(a, "template")?).await?),
+        "backup_delete_template" => ok(mgr.delete_template(&arg::<String>(a, "id")?).await?),
+        "backup_apply_template" => ok(mgr.apply_template(&arg::<String>(a, "templateId")?, &arg::<String>(a, "jobId")?).await?),
+        "backup_export_templates" => ok(mgr.export_templates(&opt::<Vec<String>>(a, "ids")?.unwrap_or_default()).await?),
+        "backup_import_templates" => ok(mgr.import_templates(&arg::<String>(a, "json")?).await?),
+        "backup_effective_settings" => ok(mgr.effective_settings(opt::<String>(a, "id")?.as_deref(), opt(a, "job")?).await?),
+        "backup_schedule_preview" => ok(arg::<super::schedule::BackupSchedule>(a, "schedule")?.preview(chrono::Utc::now(), opt(a, "count")?.unwrap_or(5))?),
+        "backup_list_notification_profiles" => ok(mgr.list_notification_profiles().await?),
+        "backup_get_notification_profile" => ok(mgr.get_notification_profile(&arg::<String>(a, "id")?).await?),
+        "backup_save_notification_profile" => ok(mgr.save_notification_profile(arg(a, "profile")?).await?),
+        "backup_delete_notification_profile" => ok(mgr.delete_notification_profile(&arg::<String>(a, "id")?, opt(a, "force")?.unwrap_or(false)).await?),
+        "backup_test_notification_profile" => ok(mgr.test_notification_profile(&arg::<String>(a, "id")?).await?),
+        "backup_preview_notification" => ok(mgr.preview_notification(&arg(a, "notification")?, opt::<String>(a, "result")?.as_deref().unwrap_or("success"))),
+        "backup_webhook_preset" => ok(super::notify::webhook::preset(arg(a, "preset")?, &opt(a, "params")?.unwrap_or_default())?),
         other => Err(AppError::validation(format!("Unknown command '{other}'"))),
     }
 }
@@ -250,5 +331,13 @@ pub const COMMANDS: &[&str] = &[
     "backup_generate_passphrase", "backup_capabilities", "backup_preview_sources", "backup_get_global_defaults",
     "backup_set_global_defaults", "backup_effective_job", "backup_list_destinations", "backup_save_destination",
     "backup_delete_destination", "backup_adopt_repository", "backup_database_inventory", "backup_cleanup_databases", "backup_bug_report", "backup_diagnose", "backup_test_notification", "backup_get_secret_settings", "backup_set_secret_settings", "backup_crypt_file", "backup_decrypt_volume", "backup_test_secret_providers", "backup_job_placeholders", "backup_recovery_download", "backup_recovery_index", "backup_recovery_list", "backup_recovery_restore", "backup_recovery_convert", "backup_remote_list", "backup_remote_get", "backup_remote_put", "backup_remote_delete", "backup_start_operation", "backup_set_destination_secret", "backup_has_destination_secret", "backup_cloud_providers",
-    "backup_photos_libraries", "backup_photos_library_info",
+    "backup_photos_libraries", "backup_photos_library_info", "backup_lock_status", "backup_break_lock", "backup_set_database_encryption",
+    "backup_list_sources", "backup_preview_retention", "backup_set_version_metadata", "backup_run_all", "backup_estimate",
+    "backup_resolve_version", "backup_read_file", "backup_export_file", "backup_cache_stats", "backup_clear_cache",
+    "backup_get_cache_settings", "backup_set_cache_settings", "backup_schedule_preview", "backup_list_templates", "backup_get_template",
+    "backup_save_template", "backup_delete_template", "backup_apply_template", "backup_export_templates", "backup_import_templates",
+    "backup_effective_settings", "backup_open_point_in_time", "backup_hardening_report",
+    "backup_list_notification_profiles", "backup_get_notification_profile", "backup_save_notification_profile",
+    "backup_delete_notification_profile", "backup_test_notification_profile", "backup_preview_notification", "backup_webhook_preset",
+    "backup_bench",
 ];

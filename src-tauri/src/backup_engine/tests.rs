@@ -71,7 +71,7 @@ async fn backup_restore_history_and_queries() {
     assert_eq!(r.report["files_restored"], 2);
     assert_eq!(std::fs::read(out.join("src/sub/b.txt")).unwrap(), b"beta");
 
-    let r = m.execute(&j.id, BackupOperation::Verify { full: true }).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Verify { full: true, options: None }).await.unwrap();
     assert_eq!(r.status, "success");
 
     let hist = m.run_history(Some(j.id.clone()), 10).await.unwrap();
@@ -95,7 +95,7 @@ async fn background_backup_status_and_scheduler() {
     let m = manager(t.path()).await;
     let mut jb = job(&src, &dst);
     jb.encrypted = false;
-    jb.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, weekdays: vec![], skip_on_battery: false, calendar_ids: vec![] };
+    jb.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, ..Default::default() };
     let j = m.save_job(jb, None).await.unwrap();
 
     // Created "now": the next slot is in the future, so not due yet …
@@ -201,7 +201,7 @@ async fn maintenance_ops_and_source_release_script() {
     let r = m.execute(&j.id, BackupOperation::RebuildMissing).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.log);
     assert!(r.report["volumes_rebuilt"].as_u64().unwrap() >= 1);
-    let r = m.execute(&j.id, BackupOperation::Verify { full: true }).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Verify { full: true, options: None }).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.log);
 }
 
@@ -225,10 +225,10 @@ async fn adopt_repository_continues_history() {
     let t2 = tempfile::tempdir().unwrap();
     let m2 = manager(t2.path()).await;
     let dest = BackupDestination::Local { path: dst.to_string_lossy().into(), alternate_paths: vec![], marker_file: None };
-    assert!(m2.adopt_repository(dest.clone(), Some("wrong".into()), "ufop".into(), None, vec![], vec![]).await.is_err());
+    assert!(m2.adopt_repository(dest.clone(), Some("wrong".into()), "ufop".into(), AdoptOptions::default()).await.is_err());
     assert!(m2.list_jobs().await.is_empty(), "failed adoption leaves no job behind");
     let adopted = m2
-        .adopt_repository(dest, Some("pw".into()), "ufop".into(), Some("Laptop".into()), vec![], vec![(src.to_string_lossy().into(), moved.to_string_lossy().into())])
+        .adopt_repository(dest, Some("pw".into()), "ufop".into(), AdoptOptions { name: Some("Laptop".into()), source_map: vec![(src.to_string_lossy().into(), moved.to_string_lossy().into())], ..Default::default() })
         .await
         .unwrap();
     assert_eq!(adopted.name, "Laptop");
@@ -296,7 +296,7 @@ async fn database_tools_recovery_and_restore_overrides() {
 
     // Restore with one-off overrides (job settings untouched).
     let out = t.path().join("out");
-    let ov = RestoreOverrides { download_bps: Some(10_000_000), retries: Some(0), network_timeout_secs: Some(30) };
+    let ov = RestoreOverrides { download_bps: Some(10_000_000), retries: Some(0), network_timeout_secs: Some(30), ..Default::default() };
     let r = m.execute(&j.id, BackupOperation::Restore { options: RestoreOptions { target: Some(out.clone()), ..Default::default() }, overrides: ov }).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.log);
     assert_eq!(m.get_job(&j.id).await.unwrap().throttle.download_bps, 0);
@@ -484,7 +484,7 @@ async fn bug_report_is_sanitized_and_diagnostics_detect_problems() {
     jb.reports.http_urls = vec!["https://hooks.example.com/notify?token=tok3n".into()];
     jb.reports.extra_fields.insert("api_key".into(), "k3y".into());
     jb.notifications = vec![notify::Notification {
-        channel: notify::Channel::Email { host: "smtp.example.com".into(), port: None, tls: Default::default(), username: "alice@example.com".into(), from: "alice@example.com".into(), to: vec!["bob@example.com".into()], subject: "s".into() },
+        channel: notify::Channel::Email { host: "smtp.example.com".into(), port: None, tls: Default::default(), username: "alice@example.com".into(), from: "alice@example.com".into(), to: vec!["bob@example.com".into()], subject: "s".into(), html: false, html_template: String::new() },
         send_on: vec!["error".into()],
         credential_id: "c".into(),
         template: String::new(),
@@ -520,6 +520,7 @@ async fn bug_report_is_sanitized_and_diagnostics_detect_problems() {
 
     // Diagnostics: healthy, then a missing volume and an untracked file.
     let d = m.diagnose(&j.id, true, 64).await.unwrap();
+    assert!(!d.snapshot_providers.is_empty(), "diagnostics list the snapshot methods");
     let db = d.database.clone().unwrap();
     assert!(db.ok(), "{db:?}");
     assert!(db.tracked_volumes >= 2 && d.network.is_none(), "local destinations have no network endpoint");
@@ -931,7 +932,7 @@ async fn legal_hold_suspends_retention_blocks_removal_and_feeds_ediscovery() {
     assert_eq!(m.list_versions(&j.id).await.unwrap().len(), 2);
 
     // Removal is refused; a dry run is not.
-    assert!(m.execute(&j.id, BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false }).await.is_err());
+    assert!(m.execute(&j.id, BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false, force: false }).await.is_err());
     assert!(m.execute(&j.id, BackupOperation::Purge { paths: vec!["/x".into()], versions: None, dry_run: false }).await.is_err());
     assert!(m.execute(&j.id, BackupOperation::Purge { paths: vec!["/x".into()], versions: None, dry_run: true }).await.is_ok());
     assert!(m.delete_job(&j.id, true, false).await.is_err());
@@ -1029,4 +1030,670 @@ async fn holiday_calendar_skips_a_scheduled_backup_slot() {
     assert!(!m.is_job_busy(&j.id));
     assert!(m.run_history(Some(j.id.clone()), 10).await.unwrap().is_empty());
     assert!(m.due_jobs(Utc::now()).await.is_empty());
+}
+
+#[tokio::test]
+async fn format_upgrade_rollback_reshard_and_passphrase_change() {
+    use ufop_core::backup::layout::RepoLayout;
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst, out) = (t.path().join("src"), t.path().join("dst"), t.path().join("out"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    let m = manager(t.path()).await;
+    // A format 1 job (as created by older versions).
+    let mut j = job(&src, &dst);
+    j.options.format_version = Some(1);
+    let j = m.save_job(j, Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let info = m.execute(&j.id, BackupOperation::FormatInfo).await.unwrap();
+    assert_eq!(info.report["format_version"], 1);
+    // v1 cannot change the passphrase in place.
+    assert!(m.change_passphrase(&j.id, None, "new-pw".into(), None).await.unwrap_err().user_message().contains("format 2"));
+
+    let up = m.execute(&j.id, BackupOperation::UpgradeFormat { rollback: false }).await.unwrap();
+    assert_eq!(up.status, "success", "{:?}", up.log);
+    assert_eq!(up.report["to_version"], 2);
+    assert_eq!(m.execute(&j.id, BackupOperation::FormatInfo).await.unwrap().report["rollback_available"], true);
+    let rb = m.execute(&j.id, BackupOperation::UpgradeFormat { rollback: true }).await.unwrap();
+    assert_eq!(rb.status, "success", "{:?}", rb.log);
+    assert_eq!(m.execute(&j.id, BackupOperation::FormatInfo).await.unwrap().report["format_version"], 1);
+    m.execute(&j.id, BackupOperation::UpgradeFormat { rollback: false }).await.unwrap();
+
+    // Reshard, then a new backup and restore through the sharded layout.
+    let rs = m.execute(&j.id, BackupOperation::Reshard { layout: RepoLayout::Sharded { prefix_len: 1 }, dry_run: false }).await.unwrap();
+    assert_eq!(rs.status, "success", "{:?}", rs.log);
+    assert!(rs.summary.contains("moved"), "{}", rs.summary);
+    std::fs::write(src.join("b.txt"), b"beta").unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let e = m.execute(&j.id, BackupOperation::UpgradeFormat { rollback: true }).await.unwrap_err();
+    assert!(e.user_message().contains("Cannot roll back"), "rollback refused after a format 2 write");
+
+    // Password change: header only, stored passphrase updated, old one refused.
+    assert!(m.change_passphrase(&j.id, Some("wrong".into()), "new-pw".into(), None).await.is_err());
+    let r = m.change_passphrase(&j.id, None, "new-pw".into(), None).await.unwrap();
+    assert_eq!(r.to_version, 2);
+    assert_eq!(m.passphrase(&j.id).await.unwrap().as_deref(), Some("new-pw"));
+    let restore = RestoreOptions { target: Some(out.clone()), ..Default::default() };
+    let r = m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(std::fs::read(out.join("src/b.txt")).unwrap(), b"beta");
+    assert!(m.browse_remote(j.destination.clone(), Some("pw".into()), "ufop".into()).await.is_err());
+    assert_eq!(m.browse_remote(j.destination.clone(), Some("new-pw".into()), "ufop".into()).await.unwrap().len(), 2);
+    // Operation JSON shape used by the frontend.
+    let op: BackupOperation = serde_json::from_value(serde_json::json!({"type": "reshard", "layout": {"type": "flat"}, "dry_run": true})).unwrap();
+    assert_eq!(op.name(), "reshard");
+    let op: BackupOperation = serde_json::from_value(serde_json::json!({"type": "upgrade_format", "rollback": true})).unwrap();
+    assert_eq!(op.name(), "rollback_format");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repository_lock_blocks_other_writers_and_can_be_broken() {
+    use ufop_core::backup::lock::{LockKind, LockOptions, RepoLock};
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    let m = manager(t.path()).await;
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    assert!(m.lock_status(&j.id).await.unwrap().locks.is_empty(), "released after the run");
+
+    // Another computer is compacting the same repository.
+    let other = LocalBackend::new(&dst);
+    let held = RepoLock::acquire(&other, "ufop", LockKind::Exclusive, "compact", &LockOptions::default()).unwrap();
+    let st = m.lock_status(&j.id).await.unwrap();
+    assert!(st.exclusive && st.summary().unwrap().contains("(compact)"));
+    let e = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap_err();
+    assert!(e.user_message().contains("Repository in use by vm (compact)") || e.user_message().contains("Repository in use by"), "{e}");
+    // Readers wait for writers too.
+    let restore = RestoreOptions { target: Some(t.path().join("out")), ..Default::default() };
+    assert!(m.execute(&j.id, BackupOperation::Restore { options: restore.clone(), overrides: RestoreOverrides::default() }).await.is_err());
+    // Format information needs no lock.
+    assert_eq!(m.execute(&j.id, BackupOperation::FormatInfo).await.unwrap().status, "success");
+
+    // Breaking it needs confirmation and the lock that was shown.
+    assert!(m.break_lock(&j.id, false, None).await.is_err());
+    assert!(m.break_lock(&j.id, true, Some("not-the-owner".into())).await.is_err());
+    let b = m.break_lock(&j.id, true, Some(held.info().owner_id)).await.unwrap();
+    assert_eq!(b.removed, ["ufop-lock.json"]);
+    drop(held);
+    assert_eq!(m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap().status, "success");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_jobs_restore_and_browse_but_never_write() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    let m = manager(t.path()).await;
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let listing = |d: &Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    };
+    let before = listing(&dst);
+
+    // Adopted on another computer as a read-only connection.
+    let t2 = tempfile::tempdir().unwrap();
+    let m2 = manager(t2.path()).await;
+    let ro = m2.adopt_repository(j.destination.clone(), Some("pw".into()), "ufop".into(), AdoptOptions { name: Some("Viewer".into()), sources: vec![src.to_string_lossy().into()], read_only: true, ..Default::default() }).await.unwrap();
+    assert!(ro.read_only);
+    assert_eq!(m2.list_versions(&ro.id).await.unwrap().len(), 1);
+    for op in [
+        BackupOperation::Backup { dry_run: false },
+        BackupOperation::Compact,
+        BackupOperation::Repair,
+        BackupOperation::DeleteVersions { versions: vec![0], allow_full_removal: true, force: false },
+        BackupOperation::Purge { paths: vec!["*".into()], versions: None, dry_run: false },
+        BackupOperation::UpgradeFormat { rollback: false },
+        BackupOperation::Reshard { layout: ufop_core::backup::layout::RepoLayout::Sharded { prefix_len: 1 }, dry_run: false },
+    ] {
+        let name = op.name();
+        let e = m2.execute(&ro.id, op).await.unwrap_err();
+        assert!(e.user_message().contains("read-only"), "{name}: {e}");
+    }
+    assert!(m2.change_passphrase(&ro.id, Some("pw".into()), "new".into(), None).await.unwrap_err().user_message().contains("read-only"));
+    assert!(m2.break_lock(&ro.id, true, None).await.is_err());
+    assert!(m2.delete_job(&ro.id, false, true).await.is_err());
+    // Reading works, and leaves no trace at the destination.
+    let out = t.path().join("out");
+    let r = m2.execute(&ro.id, BackupOperation::Restore { options: RestoreOptions { target: Some(out.clone()), ..Default::default() }, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.summary);
+    assert_eq!(std::fs::read(out.join("src/a.txt")).unwrap(), b"alpha");
+    assert_eq!(m2.execute(&ro.id, BackupOperation::Verify { full: true, options: None }).await.unwrap().status, "success");
+    assert_eq!(m2.execute(&ro.id, BackupOperation::Backup { dry_run: true }).await.unwrap().status, "success", "a dry run writes nothing");
+    assert!(m2.lock_status(&ro.id).await.unwrap().locks.is_empty());
+    assert_eq!(listing(&dst), before, "nothing written, not even a lock");
+    // Never scheduled.
+    let mut sched = m2.get_job(&ro.id).await.unwrap();
+    sched.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, ..Default::default() };
+    m2.save_job(sched, None).await.unwrap();
+    assert!(m2.due_jobs(Utc::now() + chrono::Duration::hours(3)).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_database_encryption_default_migration_and_lost_key() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("zzPrivateName.txt"), b"alpha").unwrap();
+    let m = manager(t.path()).await;
+    // New encrypted job: encrypted database by default.
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(j.encrypt_local_database, Some(true));
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let path = m.job_db_path(&j.id);
+    assert!(BackupDb::inspect(&path).unwrap().encrypted);
+    assert!(!String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains("zzPrivateName"));
+    assert!(m.search(&j.id, "zzPrivate".into(), None).await.unwrap().len() == 1);
+
+    // One-click switch off and on again keeps the history.
+    assert!(!m.set_database_encryption(&j.id, false).await.unwrap().encrypted);
+    assert!(!BackupDb::inspect(&path).unwrap().encrypted);
+    assert_eq!(m.list_versions(&j.id).await.unwrap().len(), 1);
+    assert!(m.set_database_encryption(&j.id, true).await.unwrap().encrypted);
+    assert!(BackupDb::inspect(&path).unwrap().encrypted);
+
+    // The key disappears from the keychain: the database is rebuilt from the destination.
+    let key_name = format!("{DB_KEY_PREFIX}{}", j.id);
+    m.inner.creds.delete(&key_name).await.unwrap();
+    assert_eq!(m.list_versions(&j.id).await.unwrap().len(), 1, "rebuilt automatically");
+    assert!(BackupDb::inspect(&path).unwrap().encrypted, "with a new key");
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_ne!(r.status, "error", "{:?}", r.summary);
+
+    // Jobs from before the option keep a plain database until asked.
+    let mut old = job(&src, &t.path().join("dst2"));
+    old.encrypted = false;
+    let old = m.save_job(old, None).await.unwrap();
+    assert_eq!(old.encrypt_local_database, Some(false));
+    let mut legacy = m.get_job(&old.id).await.unwrap();
+    legacy.encrypt_local_database = None;
+    m.inner.jobs.write().await.insert(legacy.id.clone(), legacy.clone());
+    assert_eq!(m.execute(&old.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    assert!(!BackupDb::inspect(&m.job_db_path(&old.id)).unwrap().encrypted);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn version_notes_pins_retention_preview_and_delete() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    let m = manager(t.path()).await;
+    let mut jb = job(&src, &dst);
+    jb.options.default_note = Some("scheduled".into());
+    jb.options.default_tags.insert("env".into(), "prod".into());
+    let j = m.save_job(jb, Some("pw".into())).await.unwrap();
+    for i in 0..3u8 {
+        std::fs::write(src.join("f.txt"), [i; 20]).unwrap();
+        assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+    let v = m.list_versions(&j.id).await.unwrap();
+    assert_eq!(v.len(), 3);
+    assert_eq!(v[0].note.as_deref(), Some("scheduled"));
+    assert_eq!(v[0].identity.as_ref().map(|i| i.job_id.clone()), Some(j.id.clone()), "the job id is the identity");
+    assert!(v[0].stats.unwrap().bytes_added > 0);
+    assert_eq!(m.list_versions_in(&j.id, None, vec!["env=prod".into()]).await.unwrap().len(), 3);
+    assert!(m.list_versions_in(&j.id, None, vec!["env=dev".into()]).await.unwrap().is_empty());
+
+    // Pin the oldest with a note; retention keeps it.
+    let patch = ufop_core::backup::versions::MetadataPatch { pinned: Some(true), note: Some("year end".into()), ..Default::default() };
+    let r = m.execute(&j.id, BackupOperation::SetVersionMetadata { version: 2, source: None, patch }).await.unwrap();
+    assert_eq!(r.report["pinned"], true, "{:?}", r.log);
+    let p = m.preview_retention(&j.id, Some(RetentionPolicy::KeepCount { count: 1 }), None).await.unwrap();
+    assert_eq!((p.keep, p.delete), (2, 1));
+    assert_eq!(p.versions[2].summary, "kept: pinned");
+    assert_eq!(m.list_versions(&j.id).await.unwrap().len(), 3, "a preview changes nothing");
+    let r = m.execute(&j.id, BackupOperation::ApplyRetention { policy: Some(RetentionPolicy::KeepCount { count: 1 }), source: None }).await.unwrap();
+    assert_eq!(r.report["versions_deleted"], 1);
+    let v = m.list_versions(&j.id).await.unwrap();
+    assert!(v[1].pinned && v[1].note.as_deref() == Some("year end"));
+    // Deleting the pinned version needs force.
+    assert!(m.execute(&j.id, BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false, force: false }).await.is_err());
+    let r = m.execute(&j.id, BackupOperation::DeleteVersions { versions: vec![1], allow_full_removal: false, force: true }).await.unwrap();
+    assert_eq!(r.report["versions_deleted"], 1);
+    // A legal hold keeps everything in the preview and refuses retention.
+    m.place_legal_hold(&j.id, "Case 1", "", "test").await.unwrap();
+    assert!(m.preview_retention(&j.id, None, None).await.unwrap().legal_hold);
+    assert!(m.execute(&j.id, BackupOperation::ApplyRetention { policy: None, source: None }).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_versions_to_another_job_and_a_new_destination() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, d1, d2, d3, out) = (t.path().join("src"), t.path().join("d1"), t.path().join("d2"), t.path().join("d3"), t.path().join("out"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.bin"), (0..50_000u32).map(|i| (i % 249) as u8).collect::<Vec<_>>()).unwrap();
+    let m = manager(t.path()).await;
+    let a = m.save_job(job(&src, &d1), Some("pw".into())).await.unwrap();
+    let mut jb = job(&src, &d2);
+    jb.name = "Archive".into();
+    jb.options.format_version = Some(1);
+    let b = m.save_job(jb, Some("pw2".into())).await.unwrap();
+    assert_eq!(m.execute(&a.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let patch = ufop_core::backup::versions::MetadataPatch { pinned: Some(true), ..Default::default() };
+    m.execute(&a.id, BackupOperation::SetVersionMetadata { version: 0, source: None, patch }).await.unwrap();
+
+    let op = |target: versions::CopyTarget, dry_run| BackupOperation::CopyVersions { versions: vec![0], source: None, target, dry_run };
+    let dry = m.execute(&a.id, op(versions::CopyTarget::Job { job_id: b.id.clone() }, true)).await.unwrap();
+    assert_eq!(dry.report["versions_copied"], 1, "{:?}", dry.log);
+    assert!(m.list_versions(&b.id).await.unwrap().is_empty());
+    let r = m.execute(&a.id, op(versions::CopyTarget::Job { job_id: b.id.clone() }, false)).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(r.report["rechunked"], true, "format 2 CDC into format 1 fixed blocks");
+    let copied = m.list_versions(&b.id).await.unwrap();
+    assert_eq!(copied.len(), 1);
+    assert!(copied[0].pinned, "pin copied");
+    assert_eq!(m.get_job(&b.id).await.unwrap().stats.version_count, 1);
+    let restore = RestoreOptions { target: Some(out.clone()), ..Default::default() };
+    let r = m.execute(&b.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.report["files_restored"], 1, "{:?}", r.log);
+    assert!(m.execute(&a.id, op(versions::CopyTarget::Job { job_id: a.id.clone() }, false)).await.is_err(), "not onto itself");
+
+    // A destination without a job, unencrypted.
+    let dest = BackupDestination::Local { path: d3.to_string_lossy().into(), alternate_paths: vec![], marker_file: None };
+    let r = m.execute(&a.id, op(versions::CopyTarget::Destination { destination: dest.clone(), passphrase: None, prefix: None, options: None }, false)).await.unwrap();
+    assert_eq!(r.report["versions_copied"], 1, "{:?}", r.log);
+    let again = m.execute(&a.id, op(versions::CopyTarget::Destination { destination: dest, passphrase: None, prefix: None, options: None }, false)).await.unwrap();
+    assert_eq!((again.report["versions_copied"].as_u64(), again.report["versions_skipped"].as_u64()), (Some(0), Some(1)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_repository_between_jobs_and_adoption_as_a_new_source() {
+    let t = tempfile::tempdir().unwrap();
+    let (sa, sb, dst) = (t.path().join("a"), t.path().join("b"), t.path().join("dst"));
+    std::fs::create_dir_all(&sa).unwrap();
+    std::fs::create_dir_all(&sb).unwrap();
+    let data: Vec<u8> = (0..60_000u32).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+    std::fs::write(sa.join("same.bin"), &data).unwrap();
+    std::fs::write(sb.join("same.bin"), &data).unwrap();
+    let m = manager(t.path()).await;
+    let a = m.save_job(job(&sa, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&a.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let r = m.execute(&a.id, BackupOperation::EnableSharing { claim_all: true }).await.unwrap();
+    assert_eq!(r.report["versions_assigned"], 0, "the job's versions already carry its identity");
+    let mut jb = job(&sb, &dst);
+    jb.name = "Other".into();
+    let b = m.save_job(jb, Some("pw".into())).await.unwrap();
+    let r = m.execute(&b.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(r.report["new_blocks"], 0, "deduplicated against job A");
+    assert_eq!(m.list_versions(&b.id).await.unwrap().len(), 1);
+    assert_eq!(m.list_versions_in(&b.id, Some("*".into()), vec![]).await.unwrap().len(), 2);
+    let r = m.execute(&a.id, BackupOperation::SyncSources).await.unwrap();
+    assert_eq!(r.report["shared"], true);
+    assert_eq!(r.report["sources"].as_array().unwrap().len(), 2);
+    let srcs = m.list_sources(&a.id).await.unwrap();
+    assert!(srcs[0].own && srcs[0].label.ends_with("(Docs)"));
+    // Retention on A never touches B's version.
+    let r = m.execute(&a.id, BackupOperation::ApplyRetention { policy: Some(RetentionPolicy::KeepCount { count: 1 }), source: None }).await.unwrap();
+    assert_eq!(r.report["versions_deleted"], 0);
+    assert_eq!(m.list_versions(&b.id).await.unwrap().len(), 1);
+
+    // Another computer adopting the shared repository becomes a new source.
+    let t2 = tempfile::tempdir().unwrap();
+    let m2 = manager(t2.path()).await;
+    let dest = BackupDestination::Local { path: dst.to_string_lossy().into(), alternate_paths: vec![], marker_file: None };
+    let adopted = m2.adopt_repository(dest, Some("pw".into()), "ufop".into(), AdoptOptions { name: Some("Laptop".into()), sources: vec![sa.to_string_lossy().into()], ..Default::default() }).await.unwrap();
+    assert_eq!(adopted.stats.version_count, 0, "no other job's history taken over");
+    assert_eq!(m2.list_sources(&adopted.id).await.unwrap().len(), 2);
+}
+
+async fn wait_idle(m: &BackupManager, ids: &[&str]) {
+    for _ in 0..600 {
+        if ids.iter().all(|id| !m.is_job_busy(id)) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("jobs did not finish");
+}
+
+#[tokio::test]
+async fn run_all_queues_writable_jobs_and_estimate_reports_new_data() {
+    let t = tempfile::tempdir().unwrap();
+    let m = manager(t.path()).await;
+    let mk = |n: &str| {
+        let (src, dst) = (t.path().join(format!("src{n}")), t.path().join(format!("dst{n}")));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f.txt"), format!("file of {n}")).unwrap();
+        let mut jb = job(&src, &dst);
+        jb.name = format!("job {n}");
+        jb.encrypted = false;
+        jb
+    };
+    let a = m.save_job(mk("a"), None).await.unwrap();
+    let b = m.save_job(mk("b"), None).await.unwrap();
+    let mut ro = mk("c");
+    ro.read_only = true;
+    let c = m.save_job(ro, None).await.unwrap();
+
+    let r = m.run_all(runs::RunAllFilter::default()).await.unwrap();
+    let started: Vec<&str> = r.started.iter().map(|s| s.job_id.as_str()).collect();
+    assert_eq!(started.len(), 2, "{r:?}");
+    assert!(started.contains(&a.id.as_str()) && started.contains(&b.id.as_str()));
+    assert_eq!(r.skipped.len(), 1);
+    assert_eq!(r.skipped[0].job_id, c.id);
+    assert!(r.skipped[0].reason.contains("read-only"));
+    assert!(crate::tray::run_all_summary(&r).contains("2 backup(s) queued"));
+    wait_idle(&m, &[&a.id, &b.id]).await;
+    for id in [&a.id, &b.id] {
+        let h = m.run_history(Some(id.clone()), 5).await.unwrap();
+        assert_eq!(h.first().map(|r| r.status.as_str()), Some("success"), "{h:?}");
+    }
+    // A filter: only scheduled jobs (none are), or named ones.
+    let r = m.run_all(runs::RunAllFilter { scheduled_only: true, ..Default::default() }).await.unwrap();
+    assert!(r.started.is_empty() && r.skipped.iter().filter(|s| s.reason == "no schedule").count() == 2, "{r:?}");
+    let r = m.run_all(runs::RunAllFilter { job_ids: vec![b.id.clone(), "nope".into()], dry_run: true, ..Default::default() }).await.unwrap();
+    assert_eq!(r.started.len(), 1);
+    assert!(r.skipped.iter().any(|s| s.job_id == "nope"));
+    wait_idle(&m, &[&b.id]).await;
+
+    // Estimate: one new file since the last backup.
+    std::fs::write(t.path().join("srca/new.bin"), vec![7u8; 10_000]).unwrap();
+    let e = m.estimate(&a.id, Some(1000)).await.unwrap();
+    assert!(e.has_previous_version);
+    assert_eq!((e.new_files, e.unchanged_files, e.new_bytes_at_most), (1, 1, 10_000), "{e:?}");
+    assert!(e.largest[0].path.ends_with("new.bin"));
+    assert!(e.estimated_duration_secs.is_some());
+    assert!(e.speed_source == "history" || e.speed_source == "assumed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdin_command_output_is_backed_up_and_a_failing_command_fails_the_run() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst, out) = (t.path().join("src"), t.path().join("dst"), t.path().join("out"));
+    std::fs::create_dir_all(&src).unwrap();
+    let m = manager(t.path()).await;
+    let mut jb = job(&src, &dst);
+    jb.encrypted = false;
+    jb.sources.clear();
+    jb.stdin_command = Some(hooks::StdinCommand { command: "sh -c 'printf \"dump of %s\" \"$UFOP_BACKUP_NAME\"'".into(), path: "db.sql".into(), timeout_secs: 30 });
+    let j = m.save_job(jb, None).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    let files = m.list_files(&j.id, 0, None).await.unwrap();
+    let f = files.iter().find(|f| f.path == "/stdin/db.sql").unwrap();
+    assert_eq!(f.size, "dump of Docs".len() as u64);
+    let restore = RestoreOptions { target: Some(out.clone()), ..Default::default() };
+    let r = m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.report["files_restored"], 1, "{:?}", r.log);
+    let restored = std::fs::read_dir(&out).unwrap().flatten().map(|e| e.path()).find(|p| p.ends_with("db.sql")).unwrap_or_else(|| out.join("stdin/db.sql"));
+    assert_eq!(std::fs::read_to_string(restored).unwrap(), "dump of Docs");
+
+    let mut jb = m.get_job(&j.id).await.unwrap();
+    jb.stdin_command = Some(hooks::StdinCommand { command: "sh -c 'printf partial; echo boom >&2; exit 3'".into(), path: "db.sql".into(), timeout_secs: 0 });
+    m.save_job(jb.clone(), None).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "error", "{:?}", r.log);
+    assert!(r.log.iter().any(|l| l.message.contains("status 3") && l.message.contains("boom")), "{:?}", r.log);
+
+    // A command that outlives its timeout is killed.
+    jb.stdin_command = Some(hooks::StdinCommand { command: "sleep 30".into(), path: "slow".into(), timeout_secs: 1 });
+    m.save_job(jb.clone(), None).await.unwrap();
+    let t0 = std::time::Instant::now();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert!(t0.elapsed().as_secs() < 20);
+    assert!(r.log.iter().any(|l| l.message.contains("timed out")), "{:?}", r.log);
+    // Without sources the job needs the command; a broken command line is refused.
+    jb.stdin_command = Some(hooks::StdinCommand { command: "sh -c 'unclosed".into(), ..Default::default() });
+    assert!(m.save_job(jb.clone(), None).await.is_err());
+    jb.stdin_command = None;
+    assert!(m.save_job(jb, None).await.is_err());
+}
+
+#[tokio::test]
+async fn restore_access_by_time_files_cache_and_mirror() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst, out) = (t.path().join("src"), t.path().join("dst"), t.path().join("out"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"one").unwrap();
+    let m = manager(t.path()).await;
+    m.set_cache_settings(ufop_core::backup::cache::CacheSettings { dir: Some(t.path().join("cache").to_string_lossy().into()), max_bytes: 1 << 30, use_for_restore: false }).await.unwrap();
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let between = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    std::fs::write(src.join("a.txt"), b"two!").unwrap();
+    std::fs::write(src.join("b.txt"), b"bee").unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+
+    // K41: which version a time picks.
+    use ufop_core::backup::select::VersionSelector;
+    let asof = VersionSelector::AsOf { time: between, allow_partial: false };
+    let r = m.resolve_version(&j.id, asof.clone(), None).await.unwrap();
+    assert_eq!(r.index, 1);
+    let restore = RestoreOptions { selector: Some(asof.clone()), target: Some(out.clone()), ..Default::default() };
+    let r = m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(r.report["version_index"], 1);
+    assert_eq!(std::fs::read(out.join("src/a.txt")).unwrap(), b"one");
+
+    // K38: read, export and preview one file; K77: the reads fill the cache.
+    let path = src.join("a.txt").to_string_lossy().into_owned();
+    let c = m.read_file(&j.id, VersionSelector::Latest { allow_partial: false }, path.clone(), 1, Some(2), None).await.unwrap();
+    use base64::Engine;
+    assert_eq!(base64::engine::general_purpose::STANDARD.decode(&c.data).unwrap(), b"wo");
+    assert_eq!((c.size, c.truncated, c.version), (4, true, 0));
+    let e = m.export_file(&j.id, asof.clone(), path.clone(), t.path().join("x/a-old.txt").to_string_lossy().into(), None).await.unwrap();
+    assert_eq!(std::fs::read(&e.local_path).unwrap(), b"one");
+    let p = m.preview_file(&j.id, VersionSelector::Index { index: 0 }, path.clone(), None).await.unwrap();
+    assert_eq!(std::fs::read(&p.local_path).unwrap(), b"two!");
+    assert!(p.local_path.ends_with("a.txt"));
+    m.cleanup_all_previews();
+    assert!(!Path::new(&p.local_path).exists());
+    assert!(m.read_file(&j.id, VersionSelector::Index { index: 0 }, "/nope".into(), 0, None, None).await.is_err());
+    let s = m.cache_stats().await.unwrap();
+    assert!(s.entries >= 1 && s.hits >= 1, "{s:?}");
+    assert!(m.clear_cache().await.unwrap() > 0);
+    assert_eq!(m.cache_stats().await.unwrap().entries, 0);
+
+    // Streaming with a range (REST GET /file).
+    let mut fs = m.stream_file(&j.id, VersionSelector::Index { index: 0 }, path.clone(), Some("bytes=1-".into()), None).await.unwrap();
+    assert_eq!(fs.range, Some((1, 3)));
+    let mut got = Vec::new();
+    while let Some(chunk) = fs.data.recv().await {
+        got.extend(chunk.unwrap());
+    }
+    assert_eq!(got, b"wo!");
+    assert!(m.stream_file(&j.id, VersionSelector::Index { index: 0 }, path.clone(), Some("bytes=9-".into()), None).await.is_err());
+
+    // K45: a mirror restore is refused without confirmation, dry run lists the deletions.
+    std::fs::write(out.join("src/junk.tmp"), b"j").unwrap();
+    let mirror = RestoreOptions { version: 1, target: Some(out.clone()), delete_extraneous: true, ..Default::default() };
+    let e = m.execute(&j.id, BackupOperation::Restore { options: mirror.clone(), overrides: RestoreOverrides::default() }).await.unwrap_err();
+    assert!(e.user_message().contains("needs confirmation"));
+    assert!(out.join("src/junk.tmp").exists());
+    let dry = RestoreOptions { dry_run: true, ..mirror.clone() };
+    let r = m.execute(&j.id, BackupOperation::Restore { options: dry, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.report["planned_deletions"].as_array().unwrap().len(), 1);
+    let r = m.execute(&j.id, BackupOperation::Restore { options: mirror, overrides: RestoreOverrides { confirm_delete: true, ..Default::default() } }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(r.report["files_deleted"], 1);
+    assert!(!out.join("src/junk.tmp").exists());
+}
+
+#[tokio::test]
+async fn backup_version_drive_serves_and_closes() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("hello.txt"), b"from the drive").unwrap();
+    let m = manager(t.path()).await;
+    m.set_cache_settings(ufop_core::backup::cache::CacheSettings { dir: Some(t.path().join("cache").to_string_lossy().into()), max_bytes: 0, use_for_restore: false }).await.unwrap();
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let d = m.open_drive(&j.id, drives::DriveRequest { mount: Some(false), ..Default::default() }).await.unwrap();
+    assert_eq!(d.version, Some(0));
+    assert!(d.url.starts_with("http://127.0.0.1:") && d.mount_point.is_none());
+    let url = d.url.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let rest = url.strip_prefix("http://").unwrap();
+        let (host, path) = rest.split_once('/').unwrap();
+        let mut s = std::net::TcpStream::connect(host).unwrap();
+        write!(s, "GET /{path}src/hello.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).unwrap();
+        raw
+    })
+    .await
+    .unwrap();
+    assert!(body.starts_with("HTTP/1.1 200") && body.ends_with("from the drive"), "{body}");
+    assert_eq!(m.list_drives().len(), 1);
+    // All versions as folders, then deleting the job closes its drives.
+    let all = m.open_drive(&j.id, drives::DriveRequest { all_versions: true, mount: Some(false), ..Default::default() }).await.unwrap();
+    assert!(all.all_versions && all.version.is_none());
+    assert!(m.close_drive(&d.id).await.unwrap());
+    assert!(!m.close_drive(&d.id).await.unwrap());
+    m.delete_job(&j.id, true, false).await.unwrap();
+    assert!(m.list_drives().is_empty());
+}
+
+/// Destination-level recovery: after "ransomware" rewrote and deleted every
+/// object of a versioned S3 bucket, a point-in-time job (read-only) rebuilt
+/// from the old versions restores the data; request limits apply to the job.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_point_in_time_recovery_through_manager() {
+    let (base, st) = stores::mock_s3::serve().await;
+    st.lock().unwrap().buckets.push("bkt".into());
+    let t = tempfile::tempdir().unwrap();
+    let (src, out) = (t.path().join("src"), t.path().join("out"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("report.txt"), b"quarterly numbers").unwrap();
+    let m = manager(t.path()).await;
+    let cfg = stores::s3::S3Config { preset: "custom".into(), endpoint: base.clone(), bucket: "bkt".into(), prefix: "pc".into(), access_key_id: "AKIDBASE".into(), path_style: true, part_size_mb: 0, ..Default::default() };
+    m.set_destination_secret("cred-s3", "basesecret").await.unwrap();
+    let mut jb = job(&src, &t.path().join("unused"));
+    jb.destination = BackupDestination::Cloud { config: stores::CloudConfig::S3(cfg.clone()), credential_id: "cred-s3".into() };
+    jb.request_limits = RequestLimits { put_per_sec: 1000.0, max_concurrent_requests: 4, list_parallelism: 2, ..Default::default() };
+    let j = m.save_job(jb, Some("pw".into())).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let good = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    // The attack: every object overwritten with garbage, the file lists deleted.
+    let live = stores::s3::S3Store::new(cfg.clone(), "basesecret".into()).unwrap();
+    for f in stores::ObjectStore::list_recursive(&live, 1).await.unwrap() {
+        if f.name.contains(".dlist") {
+            stores::ObjectStore::delete(&live, &f.name).await.unwrap();
+        } else {
+            stores::ObjectStore::put(&live, &f.name, b"encrypted by ransomware".to_vec()).await.unwrap();
+        }
+    }
+    // A point-in-time destination must be read-only.
+    let mut bad = m.get_job(&j.id).await.unwrap();
+    bad.id = String::new();
+    if let BackupDestination::Cloud { config: stores::CloudConfig::S3(c), .. } = &mut bad.destination {
+        c.point_in_time = Some(good);
+    }
+    assert!(m.save_job(bad, Some("pw".into())).await.unwrap_err().user_message().contains("read-only"));
+    assert!(m.open_point_in_time(&j.id, chrono::Utc::now() + chrono::Duration::hours(1), None).await.is_err());
+    // Open the bucket as it was before the attack and restore from it.
+    let pit = m.open_point_in_time(&j.id, good, None).await.unwrap();
+    assert!(pit.read_only && pit.name.contains("as of"));
+    assert_eq!(pit.destination.point_in_time(), Some(good));
+    assert_eq!(pit.stats.version_count, 1);
+    let writes = st.lock().unwrap().log.iter().filter(|(m, _, _)| m == "PUT" || m == "DELETE").count();
+    let r = m.execute(&pit.id, BackupOperation::Restore { options: RestoreOptions { target: Some(out.clone()), ..Default::default() }, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(std::fs::read(out.join("src/report.txt")).unwrap(), b"quarterly numbers");
+    assert_eq!(st.lock().unwrap().log.iter().filter(|(m, _, _)| m == "PUT" || m == "DELETE").count(), writes, "the view never wrote");
+    // Backups into the view are refused.
+    assert!(m.execute(&pit.id, BackupOperation::Backup { dry_run: false }).await.is_err());
+    // Other destinations cannot be opened at a time.
+    let local = m.save_job(job(&src, &t.path().join("dst")), Some("pw".into())).await.unwrap();
+    assert!(m.open_point_in_time(&local.id, good, None).await.unwrap_err().user_message().contains("S3"));
+}
+
+
+#[tokio::test]
+async fn inspect_operations_and_bench() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha beta gamma ".repeat(100)).unwrap();
+    let m = manager(t.path()).await;
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let h = m.execute(&j.id, BackupOperation::InspectHeader).await.unwrap();
+    assert_eq!(h.status, "success", "{:?}", h.log);
+    assert_eq!(h.report["header"]["encrypted"], true);
+    assert!(h.summary.starts_with("Repository header"), "{}", h.summary);
+    let s = m.execute(&j.id, BackupOperation::InspectStats).await.unwrap();
+    assert_eq!(s.status, "success", "{:?}", s.log);
+    assert_eq!(s.report["versions"].as_array().unwrap().len(), 1);
+    assert!(s.report["blocks"].as_u64().unwrap() > 0);
+    assert_eq!(BackupOperation::InspectStats.lock_kind(), Some(ufop_core::backup::lock::LockKind::Shared));
+    assert!(!BackupOperation::InspectHeader.writes_destination());
+
+    use ufop_core::backup::bench::{BenchOptions, BenchSection};
+    let o = BenchOptions { size: 64 * 1024, repeat: 1, block_size: 8 * 1024, sections: vec![BenchSection::Hashes, BenchSection::Crypto], ..Default::default() };
+    let r = super::diagnostics::bench(o).await.unwrap();
+    assert_eq!((r.hashes.len(), r.ciphers.len(), r.compression.len()), (2, 2, 0));
+    assert_eq!(r.sample.bytes, 64 * 1024);
+}
+
+#[tokio::test]
+async fn run_history_and_files_page_with_totals() {
+    let t = tempfile::tempdir().unwrap();
+    let m = manager(t.path()).await;
+    for (i, (op, status, summary)) in [("backup", "success", "3 added"), ("verify", "warning", "1 missing_file"), ("backup", "error", "disk full"), ("compact", "success", "freed 1 MB")].into_iter().enumerate() {
+        let run = BackupRun {
+            id: format!("r{i}"),
+            job_id: if i == 3 { "other".into() } else { "j1".into() },
+            operation: op.into(),
+            status: status.into(),
+            started_at: format!("2026-10-0{}T10:00:00Z", i + 1),
+            finished_at: None,
+            summary: summary.into(),
+            report: serde_json::Value::Null,
+            log: vec![],
+        };
+        m.insert_run(&run).await.unwrap();
+    }
+    let ids = |l: paging::Listing<BackupRun>| match l {
+        paging::Listing::Page(p) => (p.total, p.items.into_iter().map(|r| r.id).collect::<Vec<_>>()),
+        paging::Listing::All(_) => panic!("expected a page"),
+    };
+    // No page: the old array.
+    assert!(matches!(m.run_history_listing(None, 50, None).await.unwrap(), paging::Listing::All(v) if v.len() == 4));
+    // Default order newest first, paged.
+    let p = paging::PageRequest { limit: Some(2), ..Default::default() };
+    assert_eq!(ids(m.run_history_listing(None, 50, Some(p.clone())).await.unwrap()), (4, vec!["r3".into(), "r2".into()]));
+    assert_eq!(ids(m.run_history_listing(None, 50, Some(paging::PageRequest { offset: 2, ..p.clone() })).await.unwrap()), (4, vec!["r1".into(), "r0".into()]));
+    // Sorted by status ascending, one job only.
+    let by_status = paging::PageRequest { sort: Some("status".into()), ..Default::default() };
+    assert_eq!(ids(m.run_history_listing(Some("j1".into()), 50, Some(by_status)).await.unwrap()), (3, vec!["r2".into(), "r0".into(), "r1".into()]));
+    // Filter on summary/operation, with LIKE wildcards taken literally.
+    let f = |s: &str| paging::PageRequest { filter: Some(s.into()), ..Default::default() };
+    assert_eq!(ids(m.run_history_listing(None, 50, Some(f("BACKUP"))).await.unwrap()).0, 2);
+    assert_eq!(ids(m.run_history_listing(None, 50, Some(f("missing_"))).await.unwrap()), (1, vec!["r1".into()]));
+    assert_eq!(ids(m.run_history_listing(None, 50, Some(f("%"))).await.unwrap()).0, 0);
+    assert!(m.run_history_listing(None, 50, Some(paging::PageRequest { sort: Some("summary; DROP TABLE x".into()), ..Default::default() })).await.is_err());
+
+    // Files of a version: every file, sorted and sliced, with the total.
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    for (n, size) in [("big.bin", 3000), ("mid.txt", 200), ("small.txt", 10)] {
+        std::fs::write(src.join(n), vec![b'x'; size]).unwrap();
+    }
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    let page = paging::PageRequest { sort: Some("size".into()), descending: true, filter: Some(".TXT".into()), limit: Some(1), ..Default::default() };
+    match m.list_files_listing(&j.id, 0, None, None, Some(page)).await.unwrap() {
+        paging::Listing::Page(p) => {
+            assert_eq!(p.total, 2);
+            assert!(p.items[0].path.ends_with("mid.txt"), "{:?}", p.items[0].path);
+        }
+        paging::Listing::All(_) => panic!("expected a page"),
+    }
+    assert!(matches!(m.list_files_listing(&j.id, 0, None, None, None).await.unwrap(), paging::Listing::All(v) if v.len() >= 4));
 }

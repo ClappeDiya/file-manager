@@ -4,8 +4,10 @@
  * cadence. Each field maps 1:1 onto `BackupOptions` in ufop-core.
  */
 import { inputCls } from "@/lib/backup-helpers";
-import { KDF_PRESETS, type BackupOptions, type LockMode, type SnapshotPolicy, type UsnPolicy, type VolumeFormat, type ZipMethod } from "@/stores/backup-store";
+import { KDF_PRESETS, parseTags, tagText, type BackupOptions, type LockMode, type SnapshotPolicy, type SnapshotProvider, type UsnPolicy, type VolumeFormat, type ZipMethod } from "@/stores/backup-store";
 import { Check, Field, Section } from "./backup-ui";
+import { RepositoryFormatOptions } from "./backup-repository-format";
+import { SourcesAndRunsOptions } from "./backup-run-options";
 
 const lines = (v: string) => v.split("\n").map((s) => s.trim()).filter(Boolean);
 const num = (v: string, min = 0, max = Number.MAX_SAFE_INTEGER) => Math.min(max, Math.max(min, Math.floor(Number(v) || 0)));
@@ -96,6 +98,7 @@ export function BackupAdvancedOptions({
         </div>
       </Section>
 
+      <RepositoryFormatOptions options={o} locked={locked} onChange={onChange} />
       <Section title="Immutability (object lock)" hint="Locks each new volume so nobody — including ransomware with your credentials — can delete or overwrite it before the lock expires. The destination must support object lock (e.g. an S3 bucket with Object Lock enabled).">
         <Check
           label="Lock new volumes"
@@ -129,7 +132,7 @@ export function BackupAdvancedOptions({
         </div>
       </Section>
 
-      <Section title="Snapshots" hint="Read a frozen point-in-time copy so open or changing files are consistent: VSS on Windows, LVM on Linux, APFS on macOS (administrator/root rights needed). Test it from Maintenance.">
+      <Section title="Snapshots" hint="Read a frozen point-in-time copy so open or changing files are consistent: VSS on Windows, ZFS, btrfs or LVM on Linux, APFS on macOS (administrator/root rights needed). Test it from Maintenance.">
         <Field label="Use a snapshot">
           <select data-testid="opt-snapshot" className={inputCls} value={o.snapshot_policy} onChange={(e) => onChange({ snapshot_policy: e.target.value as SnapshotPolicy })}>
             <option value="off">Off (read live files)</option>
@@ -140,6 +143,14 @@ export function BackupAdvancedOptions({
         </Field>
         {o.snapshot_policy !== "off" && (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <Field label="Linux snapshot method" hint="Automatic picks ZFS, btrfs or LVM from each source's filesystem.">
+              <select data-testid="opt-snapshot-provider" className={inputCls} value={o.snapshot.provider ?? "auto"} onChange={(e) => onChange({ snapshot: { ...o.snapshot, provider: e.target.value as SnapshotProvider } })}>
+                <option value="auto">Automatic</option>
+                <option value="zfs">ZFS dataset snapshot</option>
+                <option value="btrfs">btrfs subvolume snapshot</option>
+                <option value="lvm">LVM volume snapshot</option>
+              </select>
+            </Field>
             <Field label="LVM snapshot size" hint="Extents like 10%ORIGIN or a size like 2G.">
               <input className={`${inputCls} font-mono`} value={o.snapshot.lvm_size} onChange={(e) => onChange({ snapshot: { ...o.snapshot, lvm_size: e.target.value.trim() || "10%ORIGIN" } })} />
             </Field>
@@ -155,6 +166,8 @@ export function BackupAdvancedOptions({
           </div>
         )}
       </Section>
+
+      <SourcesAndRunsOptions options={o} onChange={onChange} />
 
       <Section title="Metadata">
         <Check label="Extended attributes" checked={o.backup_xattrs} onChange={(v) => onChange({ backup_xattrs: v })} />
@@ -223,6 +236,59 @@ export function BackupAdvancedOptions({
           </Field>
         </div>
         <Check label="Disable capacity warnings" checked={o.quota_disable} onChange={(v) => onChange({ quota_disable: v })} />
+      </Section>
+
+      <Section title="Versions and sharing" hint="Stored with every new version; the identity decides which computer a version belongs to in a shared repository.">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <Field label="Note for new versions">
+            <input data-testid="opt-default-note" className={inputCls} maxLength={2000} value={o.default_note ?? ""} onChange={(e) => onChange({ default_note: e.target.value || null })} />
+          </Field>
+          <Field label="Tags for new versions" hint="key=value or key, separated by commas">
+            <input
+              data-testid="opt-default-tags"
+              className={`${inputCls} font-mono`}
+              defaultValue={Object.entries(o.default_tags ?? {}).map(([k, v]) => tagText(k, v)).join(", ")}
+              onBlur={(e) => onChange({ default_tags: parseTags(e.target.value) })}
+            />
+          </Field>
+          <Field label="Computer name to record (empty = this computer)" hint="Set it to the old computer's name to continue its history after moving to a new one.">
+            <input data-testid="opt-identity-host" className={inputCls} value={o.identity?.hostname ?? ""} onChange={(e) => onChange({ identity: { ...o.identity, hostname: e.target.value.trim() } })} />
+          </Field>
+          <Field label="User name to record (empty = current user)">
+            <input data-testid="opt-identity-user" className={inputCls} value={o.identity?.username ?? ""} onChange={(e) => onChange({ identity: { ...o.identity, username: e.target.value.trim() } })} />
+          </Field>
+        </div>
+        <Check
+          label="Share a new repository with other computers and jobs"
+          checked={o.shared_repository}
+          onChange={(v) => onChange({ shared_repository: v })}
+          hint={locked ? "For an existing backup use Maintenance → Sharing." : "Format 2 only. Each job keeps its own versions; identical data is stored once."}
+        />
+        {o.shared_repository && (
+          <Field label="Keep new volumes at least (hours) before compaction may remove them" hint="Protects a computer that is still uploading when another one compacts.">
+            <input data-testid="opt-gc-delay" className={inputCls} type="number" min={0} value={o.shared_gc_delay_hours} onChange={(e) => onChange({ shared_gc_delay_hours: num(e.target.value, 0, 24 * 30) })} />
+          </Field>
+        )}
+      </Section>
+
+      <Section title="Repository safety" hint="Locks keep two programs from changing one backup at once; checkpoints keep long backups restorable if they stop half way.">
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          <Field label="Lock lease (minutes)" hint="Renewed every third; an expired lock is taken over.">
+            <input data-testid="opt-lock-ttl" className={inputCls} type="number" min={1} value={Math.round((o.lock_ttl_secs || 1800) / 60)} onChange={(e) => onChange({ lock_ttl_secs: num(e.target.value, 1, 24 * 60) * 60 })} />
+          </Field>
+          <Field label="Clock difference warning (minutes, 0 = off)">
+            <input data-testid="opt-skew-warn" className={inputCls} type="number" min={0} value={Math.round(o.clock_skew_warn_secs / 60)} onChange={(e) => onChange({ clock_skew_warn_secs: num(e.target.value) * 60 })} />
+          </Field>
+          <Field label="Clock difference limit (minutes, 0 = off)" hint="Refuse to write when the destination's clock is this far off.">
+            <input data-testid="opt-skew-abort" className={inputCls} type="number" min={0} value={Math.round(o.clock_skew_abort_secs / 60)} onChange={(e) => onChange({ clock_skew_abort_secs: num(e.target.value) * 60 })} />
+          </Field>
+          <Field label="Checkpoint every (minutes, 0 = off)" hint="Uploads a partial version of the files finished so far.">
+            <input data-testid="opt-checkpoint-secs" className={inputCls} type="number" min={0} value={Math.round(o.checkpoint_interval_secs / 60)} onChange={(e) => onChange({ checkpoint_interval_secs: num(e.target.value) * 60 })} />
+          </Field>
+          <Field label="Checkpoint every (MB uploaded, 0 = off)">
+            <input data-testid="opt-checkpoint-bytes" className={inputCls} type="number" min={0} value={Math.round(o.checkpoint_interval_bytes / 1048576)} onChange={(e) => onChange({ checkpoint_interval_bytes: num(e.target.value) * 1048576 })} />
+          </Field>
+        </div>
       </Section>
     </>
   );

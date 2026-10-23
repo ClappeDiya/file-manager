@@ -206,7 +206,7 @@ impl AuditTrail {
 
     /// Anchor only when entries were added since the last anchor.
     pub async fn anchor_if_new(&self) -> Result<Option<AuditAnchor>, AppError> {
-        let pending = self.pool.execute(|c| audit_chain::unanchored_count(c)).await?;
+        let pending = self.pool.execute(audit_chain::unanchored_count).await?;
         if pending == 0 {
             return Ok(None);
         }

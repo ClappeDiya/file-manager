@@ -60,21 +60,7 @@ impl TransferCaps {
 impl GlobalDefaults {
     /// Reject unknown option names and values the engine cannot parse.
     pub fn validate(&self) -> Result<(), AppError> {
-        let base = serde_json::to_value(BackupOptions::default())?;
-        let known = base.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
-        for k in self.options.keys() {
-            if !known.contains(k) {
-                return Err(AppError::validation(format!("Unknown backup option '{k}'")));
-            }
-            if matches!(k.as_str(), "prefix" | "block_size" | "block_hash" | "file_hash" | "dry_run" | "task_config" | "changed_paths" | "deleted_paths") {
-                return Err(AppError::validation(format!("'{k}' is per job and cannot have a global default")));
-            }
-        }
-        let mut merged = base;
-        if let Some(o) = merged.as_object_mut() {
-            o.extend(self.options.clone());
-        }
-        serde_json::from_value::<BackupOptions>(merged).map_err(|e| AppError::validation(format!("Invalid default value: {e}")))?;
+        super::templates::validate_options(&self.options)?;
         if self.caps.max_concurrent_runs > ufop_core::agent::MAX_CONCURRENT_RUNS {
             return Err(AppError::validation(format!("At most {} operations can run at the same time", ufop_core::agent::MAX_CONCURRENT_RUNS)));
         }

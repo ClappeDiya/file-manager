@@ -5,9 +5,11 @@
 import { useEffect, useState } from "react";
 import { BackupPanel } from "@/components/backup/backup-panel";
 import { errorText } from "@/lib/error-text";
+import { accentStyle, productName, useServerBranding, type PublicBranding } from "@/lib/server-branding";
 import { pickFolder, setFolderPickerImpl } from "@/lib/folder-picker";
 import { ShareLinksPanel } from "@/components/server/share-links-panel";
 import { GatewaysPanel } from "@/components/server/gateways-panel";
+import { AccessPanel } from "@/components/server/access-panel";
 import {
   isSignedIn,
   login,
@@ -15,6 +17,8 @@ import {
   onAuthChange,
   refresh,
   serverRpc,
+  whoAmI,
+  type ServerMe,
 } from "@/lib/server-client";
 
 interface DirListing {
@@ -102,7 +106,13 @@ function FolderBrowser({
   );
 }
 
-function SignIn() {
+function BrandLogo({ branding, className }: { branding: PublicBranding | null; className: string }) {
+  if (!branding?.logo_url) return null;
+  return <img src={branding.logo_url} alt="" className={className} data-testid="server-brand-logo" />;
+}
+
+function SignIn({ branding }: { branding: PublicBranding | null }) {
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -115,7 +125,7 @@ function SignIn() {
           setBusy(true);
           setError(null);
           try {
-            await login(password);
+            await login(password, username.trim() || undefined);
           } catch (err) {
             setError(errorText(err));
           } finally {
@@ -123,15 +133,27 @@ function SignIn() {
           }
         }}
       >
-        <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
-          UFOP backup server
+        <BrandLogo branding={branding} className="h-10 max-w-[12rem] object-contain" />
+        <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100" data-testid="server-product-name">
+          {productName(branding)}
         </h1>
+        <label className="block text-sm text-zinc-700 dark:text-zinc-300">
+          User name
+          <input
+            id="server-username"
+            autoFocus
+            autoComplete="username"
+            placeholder="admin"
+            className="mt-1 w-full px-2 py-1.5 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+          />
+        </label>
         <label className="block text-sm text-zinc-700 dark:text-zinc-300">
           Password
           <input
             id="server-password"
             type="password"
-            autoFocus
             autoComplete="current-password"
             className="mt-1 w-full px-2 py-1.5 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800"
             value={password}
@@ -146,6 +168,7 @@ function SignIn() {
         <button
           type="submit"
           disabled={busy || !password}
+          style={accentStyle(branding)}
           className="w-full py-1.5 rounded bg-blue-500 text-white text-sm disabled:opacity-50"
         >
           {busy ? "Signing in…" : "Sign in"}
@@ -162,7 +185,21 @@ export default function ServerApp() {
     title: string;
     resolve: (p: string | null) => void;
   } | null>(null);
-  const [tab, setTab] = useState<"backups" | "shares" | "gateways">("backups");
+  const [tab, setTab] = useState<"backups" | "shares" | "gateways" | "access">(
+    "backups",
+  );
+  const [me, setMe] = useState<ServerMe | null>(null);
+  const branding = useServerBranding(signedIn ? { backups: "Backups", shares: "Share links", gateways: "Gateways", access: "Users & access" }[tab] : "Sign in");
+
+  useEffect(() => {
+    if (!signedIn) {
+      setMe(null);
+      return;
+    }
+    whoAmI()
+      .then(setMe)
+      .catch(() => setMe(null));
+  }, [signedIn]);
 
   useEffect(() => {
     const off = onAuthChange(setSignedIn);
@@ -179,31 +216,41 @@ export default function ServerApp() {
 
   if (checking)
     return <div className="p-6 text-sm text-zinc-500">Connecting…</div>;
-  if (!signedIn) return <SignIn />;
+  if (!signedIn) return <SignIn branding={branding} />;
   return (
     <div className="h-full flex flex-col">
       <div className="flex items-center gap-1 px-3 py-1 text-xs border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900">
+        <BrandLogo branding={branding} className="h-5 max-w-[8rem] object-contain mr-1" />
         <div role="tablist" className="flex gap-1">
           {(
             [
-              ["backups", "Backups"],
-              ["shares", "Share links"],
-              ["gateways", "Gateways"],
+              ["backups", "Backups", false],
+              ["shares", "Share links", true],
+              ["gateways", "Gateways", true],
+              ["access", "Users & access", true],
             ] as const
-          ).map(([id, label]) => (
-            <button
-              key={id}
-              role="tab"
-              aria-selected={tab === id}
-              className={`px-2 py-0.5 rounded ${tab === id ? "bg-blue-500 text-white" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}
-              onClick={() => setTab(id)}
-            >
-              {label}
-            </button>
-          ))}
+          )
+            .filter(([, , adminOnly]) => !adminOnly || me?.is_admin)
+            .map(([id, label]) => (
+              <button
+                key={id}
+                role="tab"
+                aria-selected={tab === id}
+                style={tab === id ? accentStyle(branding) : undefined}
+                className={`px-2 py-0.5 rounded ${tab === id ? "bg-blue-500 text-white" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}
+                onClick={() => setTab(id)}
+              >
+                {label}
+              </button>
+            ))}
         </div>
+        {me && (
+          <span className="ml-auto text-zinc-500" data-testid="server-account">
+            {me.username} ({me.role})
+          </span>
+        )}
         <button
-          className="ml-auto underline text-zinc-600 dark:text-zinc-400"
+          className={`${me ? "" : "ml-auto "}underline text-zinc-600 dark:text-zinc-400`}
           onClick={() => void logout()}
         >
           Sign out
@@ -214,6 +261,8 @@ export default function ServerApp() {
           <BackupPanel />
         ) : tab === "shares" ? (
           <ShareLinksPanel pickFolder={pickFolder} />
+        ) : tab === "access" ? (
+          <AccessPanel />
         ) : (
           <GatewaysPanel />
         )}

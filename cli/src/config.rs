@@ -32,6 +32,8 @@ pub struct Profile {
     pub server_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_refresh: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_csrf: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -47,6 +49,9 @@ pub struct CliConfig {
     pub server_token: Option<String>,
     #[serde(default)]
     pub server_refresh: Option<String>,
+    /// CSRF token sent with the refresh cookie (`X-CSRF-Token`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_csrf: Option<String>,
     /// Profile used when `--profile` is not given (`ufop profile use`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_profile: Option<String>,
@@ -136,6 +141,7 @@ impl CliConfig {
             server_url: self.server_url.clone(),
             server_token: self.server_token.clone(),
             server_refresh: self.server_refresh.clone(),
+            server_csrf: self.server_csrf.clone(),
         }
     }
 
@@ -146,6 +152,7 @@ impl CliConfig {
         self.server_url = p.server_url;
         self.server_token = p.server_token;
         self.server_refresh = p.server_refresh;
+        self.server_csrf = p.server_csrf;
     }
 
     /// Overlay a named profile (empty when it does not exist yet: saving creates it).

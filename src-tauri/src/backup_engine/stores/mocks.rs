@@ -136,6 +136,10 @@ async fn b2_mock() {
     .await;
     let store = b2::B2Store::connect(b2::B2Config { key_id: "kid".into(), bucket: "bkt".into(), prefix: "pc".into(), api_url: base.clone() }, "appkey".into()).await.unwrap();
     exercise(&store, 400_000).await;
+    // Sharded layout through prefix folders.
+    let sharded = b2::B2Store::connect(b2::B2Config { key_id: "kid".into(), bucket: "bkt".into(), prefix: "sharded".into(), api_url: base.clone() }, "appkey".into()).await.unwrap();
+    let b = std::sync::Arc::new(StoreBackend::new(Box::new(sharded), None));
+    tokio::task::spawn_blocking(move || super::tests::backup_roundtrip_with(b.as_ref(), ufop_core::backup::layout::RepoLayout::Sharded { prefix_len: 1 })).await.unwrap();
     store.put("ufop-l.dblock", b"x".to_vec()).await.unwrap();
     store.lock("ufop-l.dblock", chrono::Utc::now(), ufop_core::backup::backend::LockMode::Compliance).await.unwrap();
     assert_eq!(st.extra.lock().unwrap().get("pc/ufop-l.dblock").map(String::as_str), Some("compliance"));
@@ -189,6 +193,9 @@ async fn swift_mock() {
     let cfg = swift::SwiftConfig { auth_url: format!("{base}/v3"), username: "u".into(), project: "p".into(), region: "R1".into(), container: "cont".into(), prefix: "pc".into(), ..Default::default() };
     let store = swift::SwiftStore::connect(cfg.clone(), "pw".into()).await.unwrap();
     exercise(&store, 300_000).await;
+    let sharded = swift::SwiftStore::connect(swift::SwiftConfig { prefix: "sharded".into(), ..cfg.clone() }, "pw".into()).await.unwrap();
+    let b = std::sync::Arc::new(StoreBackend::new(Box::new(sharded), None));
+    tokio::task::spawn_blocking(move || super::tests::backup_roundtrip_with(b.as_ref(), ufop_core::backup::layout::RepoLayout::Sharded { prefix_len: 1 })).await.unwrap();
     assert!(swift::SwiftStore::connect(cfg, "bad".into()).await.is_err());
 }
 

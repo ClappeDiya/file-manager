@@ -5,6 +5,12 @@
 //! `LOG:WARN` or `LOG:ERROR` lines that become run-log entries, and are
 //! killed after their timeout. A non-zero exit from a *required* pre-script
 //! aborts the operation.
+//!
+//! Each script runs in one of three [`HookMode`]s: `required` (waits; a
+//! failure aborts), `optional` (waits; a failure is a warning) or `async`
+//! (started and not waited for: its outcome goes into the run log if the
+//! operation is still running when it ends, otherwise into the app log; the
+//! timeout still kills it in the background).
 
 use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
@@ -16,9 +22,16 @@ use std::time::Duration;
 pub struct ScriptConfig {
     /// Command line run before the operation (arguments are shell-split).
     pub run_before: Option<String>,
-    /// Abort the operation when the pre-script fails or times out.
+    /// Abort the operation when the pre-script fails or times out (older
+    /// setting; `before_mode` replaces it when set).
     pub run_before_required: bool,
+    /// How the pre-script runs (`None`: required or optional per `run_before_required`).
+    #[serde(default)]
+    pub before_mode: Option<HookMode>,
     pub run_after: Option<String>,
+    /// How the post-script runs (`None` = optional: waited for, failures logged).
+    #[serde(default)]
+    pub after_mode: Option<HookMode>,
     /// Run as soon as the backup has finished reading the sources (before
     /// uploads complete), e.g. to release a snapshot or restart a service.
     #[serde(default)]
@@ -27,6 +40,95 @@ pub struct ScriptConfig {
     pub timeout_secs: u64,
     /// `json` (default) or `text` for the result file given to post-scripts.
     pub result_format: String,
+}
+
+/// How a hook script runs relative to the operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookMode {
+    /// Wait for it; a failure or timeout aborts the operation (pre-scripts).
+    Required,
+    /// Wait for it; a failure is logged as a warning.
+    Optional,
+    /// Start it and carry on (fire-and-forget).
+    Async,
+}
+
+impl ScriptConfig {
+    /// The pre-script's mode, mapping the older `run_before_required`.
+    pub fn before_mode(&self) -> HookMode {
+        self.before_mode.unwrap_or(if self.run_before_required { HookMode::Required } else { HookMode::Optional })
+    }
+
+    /// The post-script's mode (`required` behaves as optional: the operation is over).
+    pub fn after_mode(&self) -> HookMode {
+        match self.after_mode {
+            Some(HookMode::Async) => HookMode::Async,
+            _ => HookMode::Optional,
+        }
+    }
+}
+
+/// Where an asynchronous hook's outcome goes: the run log while the
+/// operation is running ([`AsyncHookLog::close`] ends that), the app log after.
+#[derive(Clone, Default)]
+pub struct AsyncHookLog(std::sync::Arc<std::sync::Mutex<Option<Vec<LogLine>>>>);
+
+impl AsyncHookLog {
+    pub fn open() -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(Vec::new()))))
+    }
+
+    /// Deliver lines; `false` when the run log is closed (they went to the app log).
+    pub fn push(&self, lines: Vec<LogLine>) -> bool {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_mut() {
+            Some(v) => {
+                v.extend(lines);
+                true
+            }
+            None => {
+                for l in lines {
+                    match l.level {
+                        LogLevel::Error => tracing::error!(target: "ufop::backup", "async hook: {}", l.message),
+                        LogLevel::Warning => tracing::warn!(target: "ufop::backup", "async hook: {}", l.message),
+                        LogLevel::Info => tracing::info!(target: "ufop::backup", "async hook: {}", l.message),
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Lines delivered so far; later ones go to the app log.
+    pub fn close(&self) -> Vec<LogLine> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default()
+    }
+}
+
+/// Start a script without waiting for it. Its log lines and exit status
+/// go to `sink`; the timeout kills it in the background. The handle
+/// resolves to whether the outcome reached the run log.
+pub fn spawn_script(command_line: &str, env: &BTreeMap<String, String>, timeout_secs: u64, label: &str, sink: AsyncHookLog) -> tokio::task::JoinHandle<bool> {
+    let (cmd, env, label) = (command_line.to_string(), env.clone(), label.to_string());
+    tokio::spawn(async move {
+        let mut lines = match run_script(&cmd, &env, timeout_secs).await {
+            Ok(out) => {
+                let mut l = out.log.clone();
+                if out.succeeded() {
+                    l.push(LogLine::info(format!("{label} (async) finished")));
+                } else if !out.timed_out {
+                    l.push(LogLine::warn(format!("{label} (async) failed with exit code {:?}", out.exit_code)));
+                }
+                l
+            }
+            Err(e) => vec![LogLine::warn(format!("{label} (async): {}", e.user_message()))],
+        };
+        for l in &mut lines {
+            l.tag.get_or_insert_with(|| "script".into());
+        }
+        sink.push(lines)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
@@ -126,6 +228,150 @@ pub async fn run_script(command_line: &str, env: &BTreeMap<String, String>, time
     }
 }
 
+/// A command whose standard output is backed up as one virtual file of
+/// each version (for example `pg_dump mydb`). It gets the same `UFOP_*`
+/// environment as hook scripts; a non-zero exit fails the run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StdinCommand {
+    /// Command line, split like hook scripts' (no shell unless you run one).
+    pub command: String,
+    /// Name of the file in the version: `name` → `/stdin/name`, or an
+    /// absolute path such as `/dumps/mydb.sql`.
+    pub path: String,
+    /// Kill the command after this many seconds (0 = no limit).
+    pub timeout_secs: u64,
+}
+
+impl StdinCommand {
+    pub fn is_set(&self) -> bool {
+        !self.command.trim().is_empty()
+    }
+
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !self.is_set() {
+            return Ok(());
+        }
+        if shlex::split(&self.command).map_or(true, |p| p.is_empty()) {
+            return Err(AppError::validation(format!("Cannot parse the backup command line '{}'", self.command)));
+        }
+        if self.virtual_path().split('/').any(|c| c == "..") {
+            return Err(AppError::validation("The command output's file name cannot contain '..'"));
+        }
+        Ok(())
+    }
+
+    /// Path of the virtual file in the version.
+    pub fn virtual_path(&self) -> String {
+        let p = self.path.trim();
+        ufop_core::backup::reader::stream_path(if p.is_empty() { "command-output" } else { p })
+    }
+}
+
+/// Kills the command if the backup stops before reading to the end.
+struct ChildGuard {
+    child: std::sync::Mutex<Option<std::process::Child>>,
+}
+
+impl ChildGuard {
+    fn kill(&self) {
+        if let Some(c) = self.child.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+struct ChildOutput {
+    out: std::process::ChildStdout,
+    _guard: std::sync::Arc<ChildGuard>,
+}
+
+impl std::io::Read for ChildOutput {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.out.read(buf)
+    }
+}
+
+/// Start `cmd` and return its standard output as a stream source for the
+/// backup engine. Called on the engine's (blocking) thread.
+pub fn command_stream(cmd: &StdinCommand, env: &BTreeMap<String, String>) -> Result<ufop_core::backup::StreamSource, AppError> {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    cmd.validate()?;
+    let parts = shlex::split(&cmd.command).filter(|p| !p.is_empty()).ok_or_else(|| AppError::validation("The backup command is empty"))?;
+    let mut child = std::process::Command::new(&parts[0])
+        .args(&parts[1..])
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::file_op(format!("Could not start the backup command '{}': {e}", parts[0]), "Check the command and that the program is installed."))?;
+    let out = child.stdout.take().ok_or_else(|| AppError::internal("command output not captured"))?;
+    let stderr = child.stderr.take();
+    let guard = Arc::new(ChildGuard { child: Mutex::new(Some(child)) });
+    // Keep the end of stderr for the error message.
+    let err_tail: Arc<Mutex<String>> = Arc::default();
+    let err_thread = stderr.map(|mut e| {
+        let tail = err_tail.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = e.read_to_end(&mut buf);
+            let text = String::from_utf8_lossy(&buf);
+            let t = text.trim();
+            let start = t.char_indices().rev().nth(500).map(|(i, _)| i).unwrap_or(0);
+            *tail.lock().unwrap_or_else(|e| e.into_inner()) = t[start..].to_string();
+        })
+    });
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    if cmd.timeout_secs > 0 {
+        let (weak, timed_out, finished, limit) = (Arc::downgrade(&guard), timed_out.clone(), finished.clone(), std::time::Duration::from_secs(cmd.timeout_secs));
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !finished.load(Ordering::SeqCst) {
+                if start.elapsed() >= limit {
+                    if let Some(g) = weak.upgrade() {
+                        timed_out.store(true, Ordering::SeqCst);
+                        g.kill();
+                    }
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
+    let (program, timeout) = (parts[0].clone(), cmd.timeout_secs);
+    let finish_guard = guard.clone();
+    let reader = ChildOutput { out, _guard: guard };
+    Ok(ufop_core::backup::StreamSource::new(cmd.virtual_path(), reader).with_finish(move || {
+        let status = finish_guard.child.lock().unwrap_or_else(|e| e.into_inner()).take().map(|mut c| c.wait());
+        finished.store(true, Ordering::SeqCst);
+        if let Some(t) = err_thread {
+            let _ = t.join();
+        }
+        let tail = err_tail.lock().map(|t| t.clone()).unwrap_or_default();
+        let detail = if tail.is_empty() { String::new() } else { format!(": {tail}") };
+        if timed_out.load(Ordering::SeqCst) {
+            return Err(format!("'{program}' timed out after {timeout}s{detail}"));
+        }
+        match status {
+            Some(Ok(s)) if s.success() => Ok(()),
+            Some(Ok(s)) => Err(format!("'{program}' exited with {}{detail}", s.code().map(|c| format!("status {c}")).unwrap_or_else(|| "a signal".into()))),
+            Some(Err(e)) => Err(format!("'{program}': {e}")),
+            None => Err(format!("'{program}' was stopped")),
+        }
+    }))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReportFormat {
@@ -138,7 +384,7 @@ pub enum ReportFormat {
 pub struct ReportConfig {
     /// Callback URLs; each receives every report.
     pub http_urls: Vec<String>,
-    /// POST, PUT or GET.
+    /// POST, PUT, PATCH or GET.
     pub http_method: String,
     pub format: ReportFormat,
     /// Results that trigger a report: `success`, `warning`, `error`.
@@ -172,6 +418,10 @@ pub struct ReportConfig {
     /// SHA-256 certificate fingerprints; when set, only these are accepted.
     #[serde(default)]
     pub pinned_sha256: Vec<String>,
+    /// Extra request headers; values may use the template placeholders.
+    /// Secret values live in the credential store (see `WebhookHeader`).
+    #[serde(default)]
+    pub headers: Vec<super::notify::webhook::WebhookHeader>,
 }
 
 fn default_retry_delay() -> u64 {
@@ -197,6 +447,7 @@ impl Default for ReportConfig {
             retry_delay_ms: 500,
             min_log_level: LogLevel::Info,
             pinned_sha256: Vec::new(),
+            headers: Vec::new(),
         }
     }
 }
@@ -255,6 +506,10 @@ pub async fn send_reports(cfg: &ReportConfig, result: &str, vars: &BTreeMap<Stri
             &policy,
             |_| {
                 let mut req = client.request(method.clone(), url);
+                for h in &cfg.headers {
+                    let v = super::notify::webhook::render(&h.value, vars, super::notify::webhook::Escape::Header);
+                    req = req.header(h.name.trim(), v);
+                }
                 req = match (cfg.format, method == reqwest::Method::GET) {
                     (_, true) => req.query(&body.iter().filter(|(_, v)| v.is_string()).map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect::<Vec<_>>()),
                     (ReportFormat::Json, false) => req.json(&body),
@@ -313,6 +568,53 @@ mod tests {
         assert!(slow.timed_out && !slow.succeeded());
         let missing = run_script("/nonexistent/script", &env, 1).await.unwrap();
         assert!(!missing.succeeded());
+    }
+
+    #[test]
+    fn hook_modes_map_the_older_flag() {
+        let mut c = ScriptConfig::default();
+        assert_eq!(c.before_mode(), HookMode::Optional);
+        c.run_before_required = true;
+        assert_eq!(c.before_mode(), HookMode::Required);
+        c.before_mode = Some(HookMode::Async);
+        assert_eq!(c.before_mode(), HookMode::Async, "the explicit mode wins");
+        assert_eq!(c.after_mode(), HookMode::Optional);
+        c.after_mode = Some(HookMode::Required);
+        assert_eq!(c.after_mode(), HookMode::Optional);
+        // Old JSON without modes still parses.
+        let old: ScriptConfig = serde_json::from_str(r#"{"run_before":"x","run_before_required":true}"#).unwrap();
+        assert_eq!(old.before_mode(), HookMode::Required);
+        let new: ScriptConfig = serde_json::from_str(r#"{"run_before":"x","before_mode":"async"}"#).unwrap();
+        assert_eq!(new.before_mode(), HookMode::Async);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_hooks_do_not_block_and_log_late() {
+        let env = BTreeMap::new();
+        // Delivered to the run log while it is open.
+        let sink = AsyncHookLog::open();
+        let started = std::time::Instant::now();
+        let h = spawn_script("sh -c 'sleep 0.3; echo LOG:INFO done'", &env, 5, "Pre-backup script", sink.clone());
+        assert!(started.elapsed() < std::time::Duration::from_millis(200), "spawning does not wait");
+        assert!(h.await.unwrap());
+        let lines = sink.close();
+        assert!(lines.iter().any(|l| l.message == "script: done"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.message.contains("(async) finished")));
+
+        // Run already over: the outcome goes to the app log instead.
+        let sink = AsyncHookLog::open();
+        let h = spawn_script("sh -c 'sleep 0.2; exit 4'", &env, 5, "Post-backup script", sink.clone());
+        assert!(sink.close().is_empty());
+        assert!(!h.await.unwrap());
+
+        // The timeout still kills it in the background.
+        let sink = AsyncHookLog::open();
+        let started = std::time::Instant::now();
+        let h = spawn_script("sleep 30", &env, 1, "Pre-backup script", sink.clone());
+        assert!(h.await.unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(sink.close().iter().any(|l| l.message.contains("timed out")));
     }
 
     #[tokio::test]

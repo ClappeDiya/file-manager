@@ -60,8 +60,8 @@ describe("formatEntrySize", () => {
 
   it("shows the cached size when present in folderSizes", () => {
     const folder = makeFile({ is_dir: true, path: "/x/Documents", size: 0 });
-    // 5,242,880 bytes = 5.0 MB after formatFileSize rounding.
-    expect(formatEntrySize(folder, { "/x/Documents": 5242880 })).toBe("5.0 MB");
+    // 5,242,880 bytes = 5.2 MB in the default decimal units.
+    expect(formatEntrySize(folder, { "/x/Documents": 5242880 })).toBe("5.2 MB");
   });
 
   it("looks up by exact path (no case folding, no path normalisation)", () => {

@@ -496,6 +496,291 @@ ufop archive list backup.zip --json
 
 ---
 
+### `ufop backup` repository format
+
+Format commands of the versioned backup engine (all take `--dest`, `--prefix` and the passphrase options of `ufop backup run`). See [backup-repository-format.md](backup-repository-format.md).
+
+```bash
+ufop backup format-info --dest /mnt/backup                  # version, chunker, codecs, cipher, layout
+ufop backup upgrade --dest /mnt/backup                      # format 1 → 2 (header only)
+ufop backup upgrade --dest /mnt/backup --rollback           # back to format 1 before any format 2 write
+UFOP_NEW_PASSPHRASE=… ufop backup change-password --dest /mnt/backup [--new-passphrase-file F] [--kdf-preset sensitive]
+ufop backup reshard --dest /mnt/backup --layout sharded --shard-prefix-len 2 [--dry-run]
+```
+
+New backups (`ufop backup run`) take `--format-version 1|2`, `--chunker fixed|fastcdc`, `--block-codec deflate|zstd`, `--cipher aes256-gcm|chacha20-poly1305` and `--layout flat|sharded` with `--shard-prefix-len 1-4`. They apply only when the repository is created.
+
+### `ufop backup` repository safety
+
+Locks, read-only connections, checkpoints and the local database key. See [backup-safety.md](backup-safety.md).
+
+```bash
+ufop backup lock status --dest /mnt/backup                  # who holds the lock (exit 1 while in use)
+ufop backup lock break --dest /mnt/backup --yes [--owner-id ID]   # only when the holder is no longer running
+ufop backup restore --dest /mnt/backup --read-only --target ~/out # nothing is written, not even a lock
+ufop backup run … --db-key-source keyring                   # encrypted local database, key in the OS keychain
+ufop backup run … --db-key-source env:UFOP_DB_KEY           # key from an environment variable (64 hex digits)
+ufop backup db encrypt ~/.local/share/ufop/cli-backups/x.sqlite [--db-key-source env:VAR] [--decrypt]
+```
+
+Every command with `--dest` also takes `--read-only`, `--db-key-source keyring|env:VAR|none` (default `none`; an encrypted database without its key is rebuilt from the destination), `--lock-ttl-secs` (default 1800), `--clock-skew-warn-secs` (300) and `--clock-skew-abort-secs` (3600; 0 turns a limit off). `ufop backup run` takes `--checkpoint-interval-secs` (default 900) and `--checkpoint-interval-bytes` (default 0); 0 turns them off.
+
+### `ufop backup` versions, retention, copies and sharing
+
+Notes, tags, pins, retention previews, count-based retention, copying versions and shared repositories. See [backup-versions.md](backup-versions.md).
+
+```bash
+ufop backup run … --note "before upgrade" --tag env=prod --tag release
+ufop backup run … --keep-latest 2 --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --keep-yearly 3
+ufop backup list --dest /mnt/backup [--tag env=prod]          # table: time, files, size, added, pin, host, note, tags
+ufop backup pin --dest /mnt/backup 3 [--reason audit]        # Keep forever
+ufop backup unpin --dest /mnt/backup 3
+ufop backup annotate --dest /mnt/backup 0 --note "release 2.1" [--tag k=v …] [--clear-tags]
+ufop backup delete --dest /mnt/backup 3 --force              # pinned versions need --force
+ufop backup retention preview --dest /mnt/backup --keep-daily 7   # kept/deleted per version, with the reason
+ufop backup retention apply --dest /mnt/backup --keep-versions 10 [--dry-run] [--allow-full-removal]
+UFOP_TO_PASSPHRASE=… ufop backup copy-versions --dest /mnt/backup 0 2 --to /mnt/offsite \
+    [--to-prefix ufop] [--to-dbpath F] [--to-passphrase-env VAR] [--to-no-encryption] \
+    [--to-format-version 1|2] [--to-chunker fixed|fastcdc] [--dry-run]
+ufop backup run … --shared --job-id laptop-docs              # create a shared repository
+ufop backup share --dest /mnt/backup [--keep-identities]     # share an existing format 2 repository
+ufop backup sources --dest /mnt/backup                       # computers and jobs writing to it (* = this one)
+ufop backup restore --dest /mnt/backup --source-id <id> --target ~/out   # another source's version
+```
+
+Every repository command also takes `--job-id` (the source a CLI job writes as; default derived from `--dest` and `--prefix`, so give each CLI job that shares a repository its own), `--hostname` and `--username` (record another computer or user, to continue its history) and `--source-id ID|*` (work on another source of a shared repository). `ufop backup run` also takes `--shared-gc-delay-hours` (default 4): in a shared repository, compaction leaves younger volumes alone. Any non-zero `--keep-latest|hourly|daily|weekly|monthly|yearly` selects count-based retention over `--keep-versions`, `--keep-days` and `--retention-policy`.
+
+### `ufop backup` sources and runs
+
+Ignore files, one filesystem, the read-error policy, rehash, standard input, the upload limit, parallel hashing, snapshot methods, the estimate and backing up every job. See [backup-sources-and-runs.md](backup-sources-and-runs.md).
+
+```bash
+ufop backup run … --ignore-file .ufopignore --ignore-file .backupignore --respect-gitignore
+ufop backup run … --one-file-system                           # mount points inside a source stay empty
+ufop backup run … --on-file-error fail --on-dir-error continue --on-unknown-entry warn [--fail-fast] [--max-errors 50]
+ufop backup run … --rehash-percent 5                          # re-check ~5% of unchanged files per run
+ufop backup run … --max-upload 20G                            # partial version at 20 GiB; the next run continues
+ufop backup run … --parallel-file-threshold 512M              # 0 = off; blocks are identical either way
+ufop backup run … --snapshot-policy required --snapshot-provider zfs   # auto | lvm | zfs | btrfs
+pg_dump mydb | ufop backup stdin --dest /mnt/backup --name mydb.sql    # standard input as /stdin/mydb.sql
+ufop backup estimate --dest /mnt/backup --source ~/Documents [--assumed-speed 20M] [--largest 10]
+ufop server run-all [--job Docs …] [--scheduled-only] [--dry-run] [--wait]   # every job of the signed-in ufop-server
+ufop server tokens create ci --scope run --job Docs [--job …] [--days 30]   # API token limited to some jobs
+ufop server login --url https://backup:8200 --user alice --password …   # an account (default user: admin)
+ufop server user list | add NAME --role operator --password … | set NAME --disabled true | remove NAME
+ufop server acl list | add PRINCIPAL PATTERN PERMISSION | remove ID [--preview]   # e.g. acl add alice 'prod-*' run
+ufop server whoami
+ufop backup hardening Docs [--probe]   # ransomware-protection checklist of a server job (exit 0 pass, 1 warnings, 2 failures); --probe tries a delete with the backup credentials
+ufop server shutdown [--grace 120]   # stop the server gracefully (running backups write a partial version); again = stop now
+ufop backup run-all [--job Docs …] [--scheduled-only] [--wait]               # the same
+```
+
+| Flag | Default | |
+|---|---|---|
+| `--ignore-file NAME` | `.ufopignore` | Ignore-file name read in every folder (gitignore syntax; repeatable; replaces the default; `""` reads none) |
+| `--respect-gitignore` | off | Also `.gitignore` and `.git/info/exclude` |
+| `--one-file-system` | off | Do not enter folders on another filesystem |
+| `--on-file-error` / `--on-dir-error` | `continue` | `continue` (warning) or `fail` (error) |
+| `--on-unknown-entry` | `ignore` | Sockets, FIFOs, devices: `ignore`, `warn`, `fail` |
+| `--fail-fast` | off | Stop at the first error with a partial version |
+| `--max-errors N` | none | Stop after more than N read problems |
+| `--rehash-percent N` | 0 | 0–100 |
+| `--max-upload SIZE` | none | `500M`, `20G`, … (binary units) |
+| `--parallel-file-threshold SIZE` | `256M` | 0 = off |
+| `--snapshot-provider` | `auto` | Linux: `auto`, `lvm`, `zfs`, `btrfs` |
+
+`ufop backup stdin` takes the repository, retention, `--note`/`--tag` and engine flags of `ufop backup run`. Exit codes follow `run`: 0 success, 1 warnings, 2 errors or a partial version (fail-fast, error budget, upload limit).
+
+### `ufop backup` restore and reading
+
+Restore as of a time, to an archive, mirror restores, owners, the restore error policy, sparse files, reading one file, the volume cache and serving a version as a drive. See [backup-restore.md](backup-restore.md).
+
+```bash
+ufop backup restore --dest /mnt/backup --target ~/out --time "2026-10-01 09:00"   # local time; also 2026-10-01 or RFC 3339
+ufop backup restore --dest /mnt/backup --target ~/out --version oldest            # latest | oldest | N | <timestamp>
+ufop backup restore --dest /mnt/backup --archive ~/docs.zip [/home/me/Docs]       # .zip | .tar | .tar.gz | .tgz
+ufop backup restore --dest /mnt/backup --target ~/Docs --mirror [--yes]           # also delete what the version lacks
+ufop backup restore … --restore-owner always --on-missing-data continue --fail-fast --max-errors 20 --sparse off
+ufop backup cat --dest /mnt/backup /home/me/Docs/a.txt [--time …] [--offset 0 --length 4096] > a.txt
+ufop backup mount --dest /mnt/backup [--version latest | --time … | --all] [--port 0]   # read-only WebDAV until Ctrl-C
+ufop backup cache stats|clear [--cache-dir DIR]
+```
+
+| Flag | Default | |
+|---|---|---|
+| `--version` | `0` | A number (0 = newest), `latest`, `oldest`, or a version's timestamp / file-list name |
+| `--time` | none | The newest complete version made at or before this time (wins over `--version`) |
+| `--allow-partial` | off | `latest`, `oldest` and `--time` may pick interrupted versions |
+| `--archive PATH`, `--archive-format` | none | Write an archive instead of files; format `zip`, `zip-stored`, `tar` or `tgz` (default: from the name) |
+| `--mirror`, `--yes` | off | Delete extra files in the restored folders of `--target`; lists them and asks unless `--yes` (refused without a terminal) |
+| `--restore-owner` | `auto` | `auto` (when root/administrator), `always` (fail otherwise), `never` |
+| `--on-file-error`, `--on-dir-error`, `--on-missing-data` | `fail` | `fail` (error) or `continue` (warning) |
+| `--on-metadata-error` | `warn` | `ignore`, `warn`, `fail` |
+| `--fail-fast`, `--max-errors N` | off, none | Stop at the first error / after more than N problems |
+| `--sparse` | `auto` | `auto` leaves holes for zero runs; `off` writes every byte |
+| `--use-cache`, `--cache-dir`, `--cache-size` | off, user cache folder, `2G` | Read volumes through the local volume cache (`cat` and `mount` always use it; `--cache-size 0` turns it off) |
+
+`ufop backup mount` prints the drive's address (`http://127.0.0.1:PORT/<token>/`) and password. `--bind` can serve another address; anyone who can reach it and has the token can read the files.
+
+### `ufop backup` verification, templates and schedules
+
+Scoped and sampled verification works on a repository directly. Templates, effective settings and schedule previews use the signed-in `ufop-server` (`ufop server login`). See [backup-policies-and-schedules.md](backup-policies-and-schedules.md).
+
+```bash
+ufop backup verify --dest /mnt/backup --version latest --path '*/Documents/*' --percent 10 --files-percent 5 --parallel 8 --max-errors 20 --json
+ufop backup verify --dest /mnt/backup --structure          # index and listing only, no downloads
+ufop backup template list
+ufop backup template create --name Laptops --settings '{"retention":{"type":"keep_days","days":30},"options":{"compression_level":3}}'
+ufop backup template create --file laptops.json            # a template, or an export holding one
+ufop backup template update Laptops --settings '{"schedule":{"enabled":true,"cron":["30 1 * * *"]}}'
+ufop backup template apply Laptops --job Docs             # the job is based on it too (it wins over earlier ones)
+ufop backup template export [--template Laptops] [--out templates.json]
+ufop backup template import templates.json
+ufop backup template delete Laptops                       # refused while a job uses it
+ufop backup effective Docs                                # every setting and where it comes from
+ufop backup schedule-preview --cron "30 2 * * Mon-Fri" --cron "0 9 * * Sat" --count 5
+ufop backup schedule-preview --start-time 02:00 --interval-minutes 1440 --timezone +02:00   # times in that zone and this computer's
+```
+
+`--timezone` (also `"timezone"` in a schedule, e.g. `template update … --settings '{"schedule":{"enabled":true,"cron":["30 1 * * *"],"timezone":"UTC"}}'`) takes `local` (default: the server's or this computer's zone, with daylight saving), `UTC`, or a fixed offset such as `+02:00`, `-0530` or `UTC+1`; see [backup-policies-and-schedules.md](backup-policies-and-schedules.md#time-zone).
+
+| Flag (`verify`) | Default | |
+|---|---|---|
+| `--version` (repeatable) | all | A number (0 = newest), `latest`, `oldest` or a version's timestamp |
+| `--path` (repeatable) | all | A folder (everything below it) or a wildcard |
+| `--structure` | off | Check the index and listing only; nothing is downloaded |
+| `--samples N` / `--percent N` / `--full` | `--samples 3` | Download N volumes / N % of the volumes in scope / every volume, checking every block |
+| `--files-percent N` | 0 | Rebuild N % of the scoped files and compare their hashes |
+| `--parallel N` | 0 (= 4) | Downloads and file checks at once |
+| `--max-errors N` | 0 (no limit) | Stop after N problems |
+| `--use-cache` (+ `--cache-dir`, `--cache-size`) | off | Read volumes from the local volume cache |
+
+`verify` exits with 0 when it finds no problems and 2 when it finds some. With `--json` the full report is printed, including `problems` with the affected versions and paths.
+
+### `ufop backup notify-profile`
+
+Notification profiles of the signed-in `ufop-server`: reusable channels jobs and templates refer to. See [backup-notifications.md](backup-notifications.md).
+
+```bash
+ufop backup notify-profile list
+ufop backup notify-profile show "On call"
+ufop backup notify-profile create --name "On call" --preset pagerduty --min-severity warning --secret-env PD_ROUTING_KEY
+ufop backup notify-profile create --name Phone --preset ntfy --server https://ntfy.example.org --topic backups --bearer --secret-env NTFY_TOKEN
+ufop backup notify-profile create --name Pushover --preset pushover --user uQiRzpo4DXghDmr9QzzfQu27cmVRsG --secret-env PUSHOVER_TOKEN
+ufop backup notify-profile create --file ops-mail.json    # {"name": …, "notification": {…}, "min_severity": …}
+ufop backup notify-profile update "On call" --min-severity error
+ufop backup notify-profile test "On call"
+ufop backup notify-profile delete Phone [--force]         # --force also removes it from jobs and templates
+```
+
+| Flag (`create` / `update`) | |
+|---|---|
+| `--name`, `--description` | Profile name and description |
+| `--notification JSON` | The channel (`{"type":"email",…}`, `{"type":"webhook",…}`, …) |
+| `--file PATH` | A whole profile as JSON (flags win) |
+| `--min-severity success\|warning\|error\|none` | Send results at least this severe (`none` uses the channel's `send_on`) |
+| `--secret` / `--secret-env VAR` | The channel secret, stored in the server's secure store (prefer `--secret-env`) |
+| `--preset NAME` (`create`) | `pushover`, `ntfy`, `discord`, `pagerduty`, `gotify` or `generic`, with `--server`, `--topic`, `--user`, `--bearer` |
+
+### `ufop backup` destinations: request limits and point in time
+
+Every `ufop backup` command with `--dest` takes request limits (0 = unlimited) and the listing parallelism for sharded layouts. See [backup-destinations.md](backup-destinations.md).
+
+```bash
+ufop backup run --dest /mnt/nas/backup --source ~/Documents --put-rate 5 --max-concurrent-requests 4 --list-parallelism 8
+ufop backup open-at Office --point-in-time 2026-10-01T08:00:00Z [--name "Office before the attack"]
+```
+
+| Flag | Default | |
+|---|---|---|
+| `--list-rate` / `--get-rate` / `--put-rate` / `--delete-rate` | 0 | Most listing / download / upload / delete requests per second |
+| `--max-concurrent-requests` | 0 | Most requests in flight at once |
+| `--list-parallelism` | 1 | Shard folders listed at once (1–64) |
+
+`open-at` works with jobs of the signed-in `ufop-server` whose destination is a versioned S3 bucket. It creates a read-only job that reads the bucket as it was at the given RFC 3339 time and prints its name, id and version count. Restore from it on the server or in the app.
+
+### `ufop backup bench`
+
+Measures this computer with the engine's own code: block compression (stored, deflate 1/6/9, zstd 1/3/6/12/19, bzip2 for ZIP volumes), AES-256-GCM and ChaCha20-Poly1305 seal/open, Argon2id presets, the Fixed and FastCDC chunkers (speed, block count, size distribution and how much of an edited copy of the sample is found again) and SHA-256/SHA-512. Timings are the best of `--repeat` runs. Nothing is read from or written to a backup.
+
+```bash
+ufop backup bench                                         # 16 MiB of generated mixed data (seed 1)
+ufop backup bench --sample ~/Documents --size 64M         # your own data (a file or folder, first 64 MiB)
+ufop backup bench --only compression,chunkers --threads 4 --repeat 5
+ufop backup bench --kdf-target-ms 2000 --kdf-memory-kib 262144   # Argon2id parameters taking about 2 s
+ufop backup bench --print-options                          # just the recommended `ufop backup run` flags
+ufop --json backup bench                                   # the full report as JSON
+```
+
+| Flag | Default | |
+|---|---|---|
+| `--sample PATH` | generated | File or folder to read the sample from (files in name order, links not followed) |
+| `--size` | `16M` | Bytes to generate, or the most to read from `--sample` |
+| `--seed` | 1 | Generated data and the edited copy used for the deduplication figure |
+| `--repeat` | 3 | Runs per measurement; the fastest counts |
+| `--threads` | 1 | Workers for compression, encryption and hashing |
+| `--block-size` | `100K` | Unit for compression/encryption and the base size of the chunker variants |
+| `--only` | all | `compression`, `crypto`, `kdf`, `chunkers`, `hashes` (comma-separated) |
+| `--kdf-target-ms` | 1000 | Target for the suggested Argon2id parameters (0 = no suggestion) |
+| `--kdf-memory-kib` | 65536 | Memory for the suggestion (halved, down to 19 MiB, while one pass is already too slow) |
+| `--print-options` | | Print `--block-codec … --compression-level … --chunker fastcdc --block-size … --cipher … --kdf-*` |
+
+Compression is ranked by space saved weighed against speed (bzip2 is listed but only usable as a ZIP volume method, `--volume-format zip --zip-method bzip2`). When the sample barely compresses the suggestion is `--compression-level 0`. The desktop app runs the same benchmark under Settings → Benchmark (Advanced), capped at 256 MiB.
+
+### `ufop backup debug`
+
+Read-only expert views of a repository. They take the shared repository lock (like a restore) except `header` and `sessions`, which read one file each, and never change the destination or the local database.
+
+```bash
+ufop backup debug header   --dest /mnt/backup                 # repo.json decoded, format, known/unknown features
+ufop backup debug volumes  --dest /mnt/backup --kind dblock --min-size 10M [--name-prefix b3] [--max-size 60M]
+ufop backup debug stats    --dest /mnt/backup                 # count/bytes per kind, blocks, dedup, per-version use
+ufop backup debug blocks   --dest /mnt/backup --version 0 [--volume NAME] [--hash-prefix ab12] [--details] [--max-blocks 100]
+ufop backup debug block    --dest /mnt/backup <hash> [--raw|--decompressed] [--out block.bin]
+ufop backup debug index    --dest /mnt/backup ufop-i….dindex.aes
+ufop backup debug fileset  --dest /mnt/backup 0               # the decoded dlist of the newest version, with metadata
+ufop backup debug sessions --dest /mnt/backup                 # writer and readers holding the lock
+ufop backup debug db ~/.local/share/ufop/cli-backups/x.sqlite # same as `ufop backup db info`
+```
+
+`volumes` lists every file of the prefix with its kind (`dblock`, `dindex`, `dlist`, `header`, `lock`, `other`), size, shard folder (sharded layout) and the state the local database records. `stats` reports the raw block bytes, the stored dblock bytes (compression ratio), the deduplication ratio (all versions' logical size / raw block bytes) and, per version, the distinct blocks it references and the bytes only it references. `blocks` reads the local database; `--details` (implied by `--volume`) downloads the volumes involved for each block's stored size and codec. `block` checks the decoded data against the block hash (exit code 2 on a mismatch); `--raw` returns the stored, still compressed bytes of a UFOP pack entry. Add `--json` for machine-readable output. In the desktop app, Maintenance → Inspect (Advanced) shows the header and statistics.
+
+### `ufop completions` and `ufop man`
+
+Shell completion scripts and man pages generated from the CLI's own command tree (every subcommand, option and fixed value; global options such as `--json` and `--profile` on every subcommand).
+
+```bash
+ufop completions bash > ~/.local/share/bash-completion/completions/ufop
+ufop completions zsh  > "${fpath[1]}/_ufop"                 # then: autoload -U compinit && compinit
+ufop completions fish > ~/.config/fish/completions/ufop.fish
+ufop completions powershell | Out-String | Invoke-Expression  # add to $PROFILE
+ufop completions elvish > ~/.config/elvish/lib/ufop.elv       # then: use ufop
+ufop man backup run                                         # one page (roff) on stdout: ufop man backup run | man -l -
+ufop man --out ~/.local/share/man/man1                      # every page: ufop.1, ufop-backup.1, ufop-backup-run.1, …
+```
+
+`ufop-server completions <shell>` and `ufop-server man [--out DIR]` do the same for the server; its pages are in section 8 (`ufop-server.8`, `ufop-server-user-add.8`, …) so they do not collide with the `ufop server …` pages of section 1. The release packages (`.deb`, `.tar.gz`, Homebrew formula) install both sets; see [release-checklist.md](release-checklist.md).
+
+### `ufop verify-release`
+
+Checks a downloaded release: the minisign signature of `SHA256SUMS` with the release key (the app's updater key, built in) and the SHA-256 of every listed file that is in the folder. Exit code 0 when the signature and every present file match, 1 otherwise.
+
+```bash
+ufop verify-release ~/Downloads/SHA256SUMS                       # signature: ~/Downloads/SHA256SUMS.minisig
+ufop verify-release SHA256SUMS SHA256SUMS.minisig --require-all  # every listed file must be present
+ufop verify-release SHA256SUMS --pubkey-file other.pub           # another key (RW… line, minisign.pub or Tauri's base64 form)
+ufop --json verify-release SHA256SUMS                            # {signature_ok, trusted_comment, files:[{name,status}], ok}
+```
+
+| Flag | |
+|---|---|
+| `--pubkey KEY` / `--pubkey-file FILE` | Public key (default: the UFOP release key `RWQOqigyl5kY9Vj4LeRcZ2DMlAEY85jWjDqOZ94gBgYhSd1TOsJ0nxzZ`) |
+| `--dir DIR` | Folder with the downloads (default: the folder of `SHA256SUMS`) |
+| `--require-all` | Fail when a listed file is missing |
+| `--signature-only` | Check only the signature |
+
+`scripts/verify-release.sh` does the same with `minisign`, `ufop` or OpenSSL 3, and also checks `SHA256SUMS.asc` with GPG.
+
 ### `ufop server shares`
 
 Share links on a `ufop-server` started with `--share-root` (sign in first with `ufop server login`).
@@ -522,6 +807,21 @@ ufop server folders list
 ```
 
 ---
+
+### `ufop agent`
+
+Connect this machine to a UFOP management console, without the desktop app. The console's fleet policies become managed backup jobs here (local-folder destinations only; use `ufop-server` for cloud destinations), and their results are reported back.
+
+```bash
+ufop agent register --url https://console.example.com --token ufop_reg_… [--tags lab,linux]
+ufop agent claim --url https://console.example.com   # shows a code to enter in the console
+ufop agent run [--heartbeat 60]    # foreground: heartbeats, commands, policies, scheduled jobs
+ufop agent sync                    # one round now (waits for backups the console started)
+ufop --json agent status           # registration, policies, queued reports, per-job warnings
+ufop agent unregister [--force]
+```
+
+`ufop agent run` runs managed jobs on the same schedules as the desktop app: interval or cron schedules in the schedule's time zone (a slot missed while stopped runs once), compaction, verification and retention on their own maintenance schedules, and settings inherited from the organization's policy templates. See [Managed jobs on the standalone CLI agent](backup-policies-and-schedules.md#managed-jobs-on-the-standalone-cli-agent). Settings live in `~/.config/ufop/agent.json` and the token in `agent-token` next to it (both 0600); central credentials stay in memory.
 
 ### `ufop gateway`
 

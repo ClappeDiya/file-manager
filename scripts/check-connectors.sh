@@ -287,14 +287,17 @@ stripped_mod="$(strip_rust "$MOD_FILE")"
 # follows it — so `Foo::new()`, `Foo::with_config()`, `Foo::default()`,
 # `Foo { field: 1 }`, and bare-tuple `Foo()` are all recognised as a
 # registration of `Foo`. Restricting to `::new(` was an over-fit that
-# falsely failed any connector using a non-default constructor.
+# falsely failed any connector using a non-default constructor. A module
+# path (`rclone::RcloneConnector::new()`) is allowed: the struct is the
+# last CamelCase segment.
 registered_csv=","
 while IFS= read -r name; do
   [[ -z "$name" ]] && continue
   registered_csv="${registered_csv}${name},"
 done < <(echo "$stripped_mod" \
-  | grep -oE 'Arc::new\([[:space:]]*[A-Za-z_][A-Za-z0-9_]*' \
-  | sed -E 's/^Arc::new\([[:space:]]*//')
+  | grep -oE 'Arc::new\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*' \
+  | sed -E 's/^Arc::new\([[:space:]]*//' \
+  | awk -F'::' '{ n = $NF; for (i = NF; i >= 1; i--) if ($i ~ /^[A-Z]/) { n = $i; break } print n }')
 
 # Set of pub-mod-declared stems inside mod.rs.
 # Splitting on `;` first means multiple declarations on one line

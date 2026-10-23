@@ -76,7 +76,7 @@ async fn run(args: &[String], timeout: Duration) -> Result<String, AppError> {
         .map_err(|e| AppError::connection(format!("Could not start rclone: {e}"), "Install rclone (https://rclone.org/install/) or set UFOP_RCLONE to its path."))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        let line = err.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("unknown error");
+        let line = err.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("unknown error");
         let msg = line.split_once(" : ").map(|(_, m)| m).unwrap_or(line).trim();
         return Err(AppError::connection(format!("rclone: {msg}"), "Check the remote with `rclone config` and try again."));
     }

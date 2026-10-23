@@ -29,6 +29,15 @@ pub struct AwsProfile {
     pub role_arn: Option<String>,
     pub source_profile: Option<String>,
     pub credential_source: Option<String>,
+    /// OIDC token file for `AssumeRoleWithWebIdentity` (with `role_arn`).
+    #[serde(default)]
+    pub web_identity_token_file: Option<String>,
+    /// External command printing credentials (recognised, not run).
+    #[serde(default)]
+    pub credential_process: Option<String>,
+    /// Named `[sso-session …]` block (recognised, not resolved).
+    #[serde(default)]
+    pub sso_session: Option<String>,
 }
 
 /// Temporary AWS credentials (from SSO, STS, etc.).
@@ -150,6 +159,9 @@ fn profile_from_section(name: &str, kv: &HashMap<String, String>) -> AwsProfile 
         role_arn: kv.get("role_arn").cloned(),
         source_profile: kv.get("source_profile").cloned(),
         credential_source: kv.get("credential_source").cloned(),
+        web_identity_token_file: kv.get("web_identity_token_file").cloned(),
+        credential_process: kv.get("credential_process").cloned(),
+        sso_session: kv.get("sso_session").cloned(),
     }
 }
 
@@ -160,12 +172,12 @@ fn profile_from_section(name: &str, kv: &HashMap<String, String>) -> AwsProfile 
 /// The credentials file uses `[profile_name]` section headers directly
 /// (no `profile ` prefix, unlike the config file).
 pub fn parse_aws_credentials() -> Vec<AwsProfile> {
-    let path = match credentials_path() {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
+    credentials_path().map(|p| parse_credentials_file(&p)).unwrap_or_default()
+}
 
-    let content = match std::fs::read_to_string(&path) {
+/// Profiles of a credentials-style file (`[name]` sections).
+pub fn parse_credentials_file(path: &std::path::Path) -> Vec<AwsProfile> {
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!("Could not read {}: {e}", path.display());
@@ -186,12 +198,12 @@ pub fn parse_aws_credentials() -> Vec<AwsProfile> {
 /// This strips the `profile ` prefix so the returned profile names match
 /// those in the credentials file.
 pub fn parse_aws_config() -> Vec<AwsProfile> {
-    let path = match config_path() {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
+    config_path().map(|p| parse_config_file(&p)).unwrap_or_default()
+}
 
-    let content = match std::fs::read_to_string(&path) {
+/// Profiles of a config-style file (`[profile name]` sections).
+pub fn parse_config_file(path: &std::path::Path) -> Vec<AwsProfile> {
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!("Could not read {}: {e}", path.display());
@@ -219,8 +231,11 @@ pub fn parse_aws_config() -> Vec<AwsProfile> {
 /// Credentials file values take precedence for secret material (access keys),
 /// while config file values provide region and SSO/role configuration.
 pub fn resolve_profile(name: &str) -> Option<AwsProfile> {
-    let creds = parse_aws_credentials();
-    let configs = parse_aws_config();
+    resolve_profile_in(name, &parse_aws_credentials(), &parse_aws_config())
+}
+
+/// [`resolve_profile`] over already-parsed credentials and config files.
+pub fn resolve_profile_in(name: &str, creds: &[AwsProfile], configs: &[AwsProfile]) -> Option<AwsProfile> {
 
     let cred_profile = creds.iter().find(|p| p.name == name);
     let config_profile = configs.iter().find(|p| p.name == name);
@@ -265,6 +280,9 @@ pub fn resolve_profile(name: &str) -> Option<AwsProfile> {
                     .credential_source
                     .clone()
                     .or_else(|| cred.credential_source.clone()),
+                web_identity_token_file: cfg.web_identity_token_file.clone().or_else(|| cred.web_identity_token_file.clone()),
+                credential_process: cfg.credential_process.clone().or_else(|| cred.credential_process.clone()),
+                sso_session: cfg.sso_session.clone().or_else(|| cred.sso_session.clone()),
             })
         }
     }
@@ -639,9 +657,27 @@ pub async fn assume_role_with_web_identity(
     region: &str,
     session_name: Option<&str>,
 ) -> Result<AwsCredentials, AppError> {
-    let session = session_name.unwrap_or("ufop-session");
-    let client = crate::net::client();
-    let endpoint = format!("https://sts.{region}.amazonaws.com/");
+    assume_role_with_web_identity_at(&crate::net::client(), &sts_url(region, None), role_arn, web_identity_token, session_name).await
+}
+
+/// STS endpoint URL: `endpoint` (tests, GovCloud, VPC endpoints) or the
+/// regional `https://sts.<region>.amazonaws.com`, with a trailing `/`.
+pub fn sts_url(region: &str, endpoint: Option<&str>) -> String {
+    match endpoint.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => format!("{}/", e.trim_end_matches('/')),
+        None => format!("https://sts.{}.amazonaws.com/", if region.trim().is_empty() { "us-east-1" } else { region.trim() }),
+    }
+}
+
+/// `AssumeRoleWithWebIdentity` (an unsigned STS call) at `endpoint`.
+pub async fn assume_role_with_web_identity_at(
+    client: &reqwest::Client,
+    endpoint: &str,
+    role_arn: &str,
+    web_identity_token: &str,
+    session_name: Option<&str>,
+) -> Result<AwsCredentials, AppError> {
+    let session = session_name.filter(|s| !s.is_empty()).unwrap_or("ufop-session");
 
     let params = [
         ("Action", "AssumeRoleWithWebIdentity"),
@@ -652,7 +688,7 @@ pub async fn assume_role_with_web_identity(
     ];
 
     let resp = client
-        .post(&endpoint)
+        .post(endpoint)
         .form(&params)
         .send()
         .await
@@ -773,8 +809,13 @@ pub fn assume_role_request(
 /// Temporary credentials for `role`, assumed with `base` (STS AssumeRole,
 /// with the external ID when set).
 pub async fn assume_role(base: &BaseKeys, role: &crate::core::types::AssumeRoleConfig, region: &str, endpoint: Option<&str>) -> Result<AwsCredentials, AppError> {
+    assume_role_with(&crate::net::client(), base, role, region, endpoint).await
+}
+
+/// [`assume_role`] through a given HTTP client.
+pub async fn assume_role_with(client: &reqwest::Client, base: &BaseKeys, role: &crate::core::types::AssumeRoleConfig, region: &str, endpoint: Option<&str>) -> Result<AwsCredentials, AppError> {
     let (url, headers, body) = assume_role_request(base, role, region, endpoint, chrono::Utc::now())?;
-    let mut req = crate::net::client().post(&url).body(body);
+    let mut req = client.post(&url).body(body);
     for (k, v) in &headers {
         if k != "host" {
             req = req.header(k, v);

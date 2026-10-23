@@ -6,22 +6,63 @@
 //! content and wrapped key are both sealed with AES-256-GCM, so any
 //! modification of a volume is detected on read.
 //!
+//! Format v2 repositories add an envelope key: a random 256-bit master key
+//! is wrapped by the Argon2id-derived key-encryption key (KEK) and stored in
+//! the header, so changing the passphrase rewrites only the header. They may
+//! also use ChaCha20-Poly1305 instead of AES-256-GCM.
+//!
 //! Wire format of a volume:
 //! ```text
-//! "UFOPV1" | flag u8 (0 = plain, 1 = AES-256-GCM)
+//! "UFOPV1" | flag u8 (0 = plain, 1 = AES-256-GCM, 2 = external module,
+//!                     3 = ChaCha20-Poly1305)
 //! plain:  payload
-//! aes:    wrap_nonce[12] | wrapped_key[48] | nonce[12] | ciphertext+tag
+//! aead:   wrap_nonce[12] | wrapped_key[48] | nonce[12] | ciphertext+tag
 //! ```
 //! No creator or timestamp metadata is written into headers.
 
 use crate::error::AppError;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Nonce};
+use chacha20poly1305::ChaCha20Poly1305;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 6] = b"UFOPV1";
 const KEY_CHECK_PLAINTEXT: &[u8] = b"ufop-backup-key-check";
+
+/// Authenticated cipher used for volumes and the key wrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CipherKind {
+    #[default]
+    #[serde(rename = "aes256_gcm")]
+    Aes256Gcm,
+    /// Format v2 only.
+    #[serde(rename = "chacha20_poly1305")]
+    ChaCha20Poly1305,
+}
+
+impl CipherKind {
+    fn flag(self) -> u8 {
+        match self {
+            Self::Aes256Gcm => 1,
+            Self::ChaCha20Poly1305 => 3,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Aes256Gcm => "aes256_gcm",
+            Self::ChaCha20Poly1305 => "chacha20_poly1305",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().replace('-', "_").as_str() {
+            "aes" | "aes256_gcm" | "aes_256_gcm" => Some(Self::Aes256Gcm),
+            "chacha20_poly1305" | "chacha20poly1305" | "chacha" => Some(Self::ChaCha20Poly1305),
+            _ => None,
+        }
+    }
+}
 
 /// Argon2id cost parameters, stored in the repository header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +115,10 @@ impl KdfParams {
 #[derive(Clone)]
 pub struct VolumeCipher {
     key: Option<[u8; 32]>,
+    aead: CipherKind,
     external: Option<std::sync::Arc<dyn super::modules::EncryptionModule>>,
+    /// Compress JSON metadata (dlist/dindex) with zstd before sealing (v2).
+    compress_metadata: bool,
 }
 
 impl std::fmt::Debug for VolumeCipher {
@@ -100,12 +144,73 @@ fn enc_err(msg: &str) -> AppError {
 
 impl VolumeCipher {
     pub fn plain() -> Self {
-        Self { key: None, external: None }
+        Self { key: None, aead: CipherKind::Aes256Gcm, external: None, compress_metadata: false }
     }
 
     /// Use a pluggable encryption module instead of built-in AES.
     pub fn external(m: std::sync::Arc<dyn super::modules::EncryptionModule>) -> Self {
-        Self { key: None, external: Some(m) }
+        Self { key: None, aead: CipherKind::Aes256Gcm, external: Some(m), compress_metadata: false }
+    }
+
+    /// A cipher over raw key material (the v2 master key).
+    pub fn from_key(key: [u8; 32], aead: CipherKind) -> Self {
+        Self { key: Some(key), aead, external: None, compress_metadata: false }
+    }
+
+    /// A fresh random 256-bit master key (new v2 repositories).
+    pub fn random_master(aead: CipherKind) -> Self {
+        let mut k = [0u8; 32];
+        OsRng.fill_bytes(&mut k);
+        Self::from_key(k, aead)
+    }
+
+    /// Same key, sealing with `aead` (volumes of every cipher stay readable).
+    pub fn with_aead(mut self, aead: CipherKind) -> Self {
+        self.aead = aead;
+        self
+    }
+
+    pub fn aead(&self) -> CipherKind {
+        self.aead
+    }
+
+    /// Turn zstd compression of sealed JSON metadata on or off.
+    pub fn with_metadata_compression(mut self, on: bool) -> Self {
+        self.compress_metadata = on;
+        self
+    }
+
+    pub fn compresses_metadata(&self) -> bool {
+        self.compress_metadata
+    }
+
+    /// Wrap `master`'s key with this key (the KEK); hex `nonce | ciphertext+tag`.
+    pub fn wrap_key(&self, master: &VolumeCipher) -> Result<String, AppError> {
+        let (kek, mk) = match (&self.key, &master.key) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Err(AppError::internal("key wrap needs two built-in keys")),
+        };
+        let (n, ct) = Self::seal_with(self.aead, kek, mk)?;
+        Ok(hex::encode([n, ct].concat()))
+    }
+
+    /// Reverse of [`wrap_key`](Self::wrap_key): the master key as a cipher using `aead`.
+    pub fn unwrap_key(&self, wrapped: &str, aead: CipherKind) -> Result<VolumeCipher, AppError> {
+        let kek = self.key.as_ref().ok_or_else(|| AppError::validation("This backup is encrypted; a passphrase is required"))?;
+        let raw = hex::decode(wrapped).map_err(|_| enc_err("The wrapped repository key is malformed"))?;
+        if raw.len() != 12 + 48 {
+            return Err(enc_err("The wrapped repository key is malformed"));
+        }
+        let mut pt = Self::open_with(self.aead, kek, &raw[..12], &raw[12..])?;
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&pt);
+        pt.iter_mut().for_each(|b| *b = 0);
+        Ok(Self::from_key(k, aead))
+    }
+
+    /// Whether two ciphers hold the same built-in key.
+    pub fn same_key(&self, other: &VolumeCipher) -> bool {
+        matches!((&self.key, &other.key), (Some(a), Some(b)) if a == b)
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -132,7 +237,7 @@ impl VolumeCipher {
         let mut key = [0u8; 32];
         a.hash_password_into(passphrase.as_bytes(), salt, &mut key)
             .map_err(|_| enc_err("Key derivation failed"))?;
-        Ok(Self { key: Some(key), external: None })
+        Ok(Self::from_key(key, CipherKind::Aes256Gcm))
     }
 
     pub fn random_salt() -> Vec<u8> {
@@ -141,17 +246,32 @@ impl VolumeCipher {
         s
     }
 
-    fn seal_with(key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), AppError> {
-        let c = Aes256Gcm::new_from_slice(key).map_err(|_| enc_err("Cipher init failed"))?;
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-        let ct = c.encrypt(&nonce, data).map_err(|_| enc_err("Encryption failed"))?;
-        Ok((nonce.to_vec(), ct))
+    fn seal_with(aead: CipherKind, key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), AppError> {
+        let init = |_| enc_err("Cipher init failed");
+        let fail = |_| enc_err("Encryption failed");
+        match aead {
+            CipherKind::Aes256Gcm => {
+                let c = Aes256Gcm::new_from_slice(key).map_err(init)?;
+                let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+                Ok((nonce.to_vec(), c.encrypt(&nonce, data).map_err(fail)?))
+            }
+            CipherKind::ChaCha20Poly1305 => {
+                let c = ChaCha20Poly1305::new_from_slice(key).map_err(init)?;
+                let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+                Ok((nonce.to_vec(), c.encrypt(&nonce, data).map_err(fail)?))
+            }
+        }
     }
 
-    fn open_with(key: &[u8; 32], nonce: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
-        let c = Aes256Gcm::new_from_slice(key).map_err(|_| enc_err("Cipher init failed"))?;
-        c.decrypt(Nonce::from_slice(nonce), data)
-            .map_err(|_| enc_err("Decryption failed: wrong passphrase or modified volume"))
+    fn open_with(aead: CipherKind, key: &[u8; 32], nonce: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
+        let init = |_| enc_err("Cipher init failed");
+        let fail = |_| enc_err("Decryption failed: wrong passphrase or modified volume");
+        match aead {
+            CipherKind::Aes256Gcm => Aes256Gcm::new_from_slice(key).map_err(init)?.decrypt(Nonce::from_slice(nonce), data).map_err(fail),
+            CipherKind::ChaCha20Poly1305 => {
+                ChaCha20Poly1305::new_from_slice(key).map_err(init)?.decrypt(chacha20poly1305::Nonce::from_slice(nonce), data).map_err(fail)
+            }
+        }
     }
 
     /// Value stored in `repo.json` that proves a passphrase is right without
@@ -163,7 +283,7 @@ impl VolumeCipher {
         match &self.key {
             None => Ok(None),
             Some(k) => {
-                let (n, ct) = Self::seal_with(k, KEY_CHECK_PLAINTEXT)?;
+                let (n, ct) = Self::seal_with(self.aead, k, KEY_CHECK_PLAINTEXT)?;
                 Ok(Some(hex::encode([n, ct].concat())))
             }
         }
@@ -182,7 +302,7 @@ impl VolumeCipher {
         if raw.len() < 12 {
             return Err(enc_err("Repository key check is malformed"));
         }
-        let pt = Self::open_with(k, &raw[..12], &raw[12..]).map_err(|_| {
+        let pt = Self::open_with(self.aead, k, &raw[..12], &raw[12..]).map_err(|_| {
             AppError::encryption(
                 "The backup passphrase is incorrect",
                 "Enter the passphrase used when this backup was created.",
@@ -212,10 +332,10 @@ impl VolumeCipher {
             Some(master) => {
                 let mut file_key = [0u8; 32];
                 OsRng.fill_bytes(&mut file_key);
-                let (wn, wk) = Self::seal_with(master, &file_key)?;
-                let (n, ct) = Self::seal_with(&file_key, payload)?;
+                let (wn, wk) = Self::seal_with(self.aead, master, &file_key)?;
+                let (n, ct) = Self::seal_with(self.aead, &file_key, payload)?;
                 file_key.iter_mut().for_each(|b| *b = 0);
-                out.push(1);
+                out.push(self.aead.flag());
                 out.extend_from_slice(&wn);
                 out.extend_from_slice(&wk);
                 out.extend_from_slice(&n);
@@ -232,7 +352,8 @@ impl VolumeCipher {
         }
         match data[6] {
             0 => Ok(data[7..].to_vec()),
-            1 => {
+            flag @ (1 | 3) => {
+                let aead = if flag == 3 { CipherKind::ChaCha20Poly1305 } else { CipherKind::Aes256Gcm };
                 let master = self.key.as_ref().ok_or_else(|| {
                     AppError::validation("This volume is encrypted; a passphrase is required")
                 })?;
@@ -240,10 +361,10 @@ impl VolumeCipher {
                 if body.len() < 12 + 48 + 12 + 16 {
                     return Err(enc_err("Encrypted volume is truncated"));
                 }
-                let fk = Self::open_with(master, &body[..12], &body[12..60])?;
+                let fk = Self::open_with(aead, master, &body[..12], &body[12..60])?;
                 let mut file_key = [0u8; 32];
                 file_key.copy_from_slice(&fk);
-                let r = Self::open_with(&file_key, &body[60..72], &body[72..]);
+                let r = Self::open_with(aead, &file_key, &body[60..72], &body[72..]);
                 file_key.iter_mut().for_each(|b| *b = 0);
                 r
             }
@@ -340,6 +461,28 @@ mod tests {
         let last = sealed.len() - 1;
         sealed[last] ^= 1;
         assert!(c.open(&sealed).is_err());
+    }
+
+    #[test]
+    fn chacha_volumes_and_envelope_key() {
+        let salt = VolumeCipher::random_salt();
+        let kek = VolumeCipher::derive("pw", &salt, KdfParams::insecure_fast()).unwrap().with_aead(CipherKind::ChaCha20Poly1305);
+        let master = VolumeCipher::random_master(CipherKind::ChaCha20Poly1305);
+        let wrapped = kek.wrap_key(&master).unwrap();
+        let back = kek.unwrap_key(&wrapped, CipherKind::ChaCha20Poly1305).unwrap();
+        assert!(back.same_key(&master));
+        let sealed = back.seal(b"payload").unwrap();
+        assert_eq!(sealed[6], 3, "ChaCha20-Poly1305 flag");
+        // Any cipher instance with the same key opens either AEAD.
+        assert_eq!(master.clone().with_aead(CipherKind::Aes256Gcm).open(&sealed).unwrap(), b"payload");
+        let aes_sealed = master.clone().with_aead(CipherKind::Aes256Gcm).seal(b"x").unwrap();
+        assert_eq!(aes_sealed[6], 1);
+        assert_eq!(back.open(&aes_sealed).unwrap(), b"x");
+        let other = VolumeCipher::derive("other", &salt, KdfParams::insecure_fast()).unwrap().with_aead(CipherKind::ChaCha20Poly1305);
+        assert!(other.unwrap_key(&wrapped, CipherKind::ChaCha20Poly1305).is_err());
+        assert!(other.open(&sealed).is_err());
+        assert_eq!(CipherKind::parse("chacha20-poly1305"), Some(CipherKind::ChaCha20Poly1305));
+        assert_eq!(serde_json::to_string(&CipherKind::ChaCha20Poly1305).unwrap(), "\"chacha20_poly1305\"");
     }
 
     #[test]

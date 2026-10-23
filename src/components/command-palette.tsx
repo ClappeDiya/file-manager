@@ -679,6 +679,8 @@ export function getDefaultCommands(actions: {
   onToggleSidebar?: () => void;
   onSetViewMode?: (mode: string) => void;
   onSetTheme?: (theme: string) => void;
+  /** Text size one step larger (1), smaller (-1) or default (0). */
+  onTextSize?: (step: -1 | 0 | 1) => void;
   onAddToFavorites?: () => void;
   onTogglePreview?: () => void;
   /** Open the Lineage / "Show File History" panel for the first
@@ -1031,6 +1033,31 @@ export function getDefaultCommands(actions: {
       category: "Appearance",
       action: () => actions.onSetTheme?.("system"),
       keywords: ["theme", "system", "auto"],
+    },
+    // Text size (the keys are bound by useTextSizeShortcuts)
+    {
+      id: "text-size-larger",
+      label: "Larger Text",
+      shortcut: `${cmd}+`,
+      category: "Appearance",
+      action: () => actions.onTextSize?.(1),
+      keywords: ["text size", "font", "bigger", "zoom in", "accessibility"],
+    },
+    {
+      id: "text-size-smaller",
+      label: "Smaller Text",
+      shortcut: `${cmd}-`,
+      category: "Appearance",
+      action: () => actions.onTextSize?.(-1),
+      keywords: ["text size", "font", "smaller", "zoom out"],
+    },
+    {
+      id: "text-size-default",
+      label: "Default Text Size",
+      shortcut: `${cmd}0`,
+      category: "Appearance",
+      action: () => actions.onTextSize?.(0),
+      keywords: ["text size", "font", "reset", "actual size"],
     },
     // Workspace commands
     {

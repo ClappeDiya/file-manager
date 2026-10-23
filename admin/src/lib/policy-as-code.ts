@@ -74,7 +74,7 @@ export function exportPolicies(orgId: string): PolicyDocument {
   const settings = getManagedSettings(orgId);
   return {
     apiVersion: API_VERSION,
-    managedSettings: settings ? { updates: settings.updates, proxy: settings.proxy, ai: settings.ai, transfers: settings.transfers, mounts: settings.mounts, workflows: settings.workflows } : null,
+    managedSettings: settings ? { updates: settings.updates, proxy: settings.proxy, ai: settings.ai, transfers: settings.transfers, mounts: settings.mounts, workflows: settings.workflows, backupTemplates: settings.backupTemplates, notificationProfiles: settings.notificationProfiles, serverAccess: settings.serverAccess, serverBranding: settings.serverBranding } : null,
     fleetPolicies: listFleetPolicies(orgId).map((p) => {
       const job = mapStrings(p.job, portable) as Record<string, unknown>;
       if (typeof job.passphraseCredentialId === 'string' && credName.has(job.passphraseCredentialId)) job.passphraseCredentialId = `central-name:${credName.get(job.passphraseCredentialId)}`;
@@ -144,7 +144,7 @@ function resolve(orgId: string, raw: unknown): Resolved {
 function compute(orgId: string, want: Resolved, prune: boolean): Plan {
   const changes: Change[] = [];
   const cur = getManagedSettings(orgId);
-  const curBody: Record<string, unknown> = cur ? { updates: cur.updates, proxy: cur.proxy, ai: cur.ai, transfers: cur.transfers, mounts: cur.mounts, workflows: cur.workflows } : {};
+  const curBody: Record<string, unknown> = cur ? { updates: cur.updates, proxy: cur.proxy, ai: cur.ai, transfers: cur.transfers, mounts: cur.mounts, workflows: cur.workflows, backupTemplates: cur.backupTemplates, notificationProfiles: cur.notificationProfiles, serverAccess: cur.serverAccess, serverBranding: cur.serverBranding } : {};
   if (want.settings) {
     const fields = differing(curBody, want.settings as unknown as Record<string, unknown>);
     changes.push({ kind: 'managed_settings', name: 'App settings', action: !cur ? 'create' : fields.length ? 'update' : 'unchanged', ...(cur && fields.length ? { fields } : {}) });

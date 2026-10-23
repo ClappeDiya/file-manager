@@ -109,11 +109,11 @@ impl EffectivePolicy {
     /// Whether a file named `name` may be uploaded here.
     pub fn accepts(&self, name: &str) -> Result<(), String> {
         let ext = Path::new(name).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-        if self.blocked_extensions.iter().any(|b| *b == ext) {
+        if self.blocked_extensions.contains(&ext) {
             return Err(format!("{name}: .{ext} files are not accepted here"));
         }
         if let Some(allowed) = &self.allowed_extensions {
-            if !allowed.iter().any(|a| *a == ext) {
+            if !allowed.contains(&ext) {
                 return Err(format!("{name}: only {} files are accepted here", allowed.iter().map(|a| format!(".{a}")).collect::<Vec<_>>().join(", ")));
             }
         }

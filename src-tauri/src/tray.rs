@@ -64,16 +64,27 @@ fn show_main(app: &AppHandle) {
     }
 }
 
+/// One log line for "Back up all now".
+pub fn run_all_summary(r: &crate::backup_engine::runs::RunAllReport) -> String {
+    let mut s = format!("Back up all now: {} backup(s) queued", r.started.len());
+    if !r.skipped.is_empty() {
+        let names: Vec<String> = r.skipped.iter().map(|k| format!("{} ({})", if k.job_name.is_empty() { &k.job_id } else { &k.job_name }, k.reason)).collect();
+        s.push_str(&format!(", skipped {}", names.join(", ")));
+    }
+    s
+}
+
 pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
     let status_item = MenuItem::with_id(app, "status", "Loading…", false, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "Open UFOP", true, None::<&str>)?;
     let backups = MenuItem::with_id(app, "backups", "Backups…", true, None::<&str>)?;
+    let run_all = MenuItem::with_id(app, "run_all", "Back up all now", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "Pause backups for 1 hour", true, None::<&str>)?;
     let resume = MenuItem::with_id(app, "resume", "Resume backups", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&status_item, &PredefinedMenuItem::separator(app)?, &open, &backups, &PredefinedMenuItem::separator(app)?, &pause, &resume, &PredefinedMenuItem::separator(app)?, &quit],
+        &[&status_item, &PredefinedMenuItem::separator(app)?, &open, &backups, &PredefinedMenuItem::separator(app)?, &run_all, &pause, &resume, &PredefinedMenuItem::separator(app)?, &quit],
     )?;
     let m2 = mgr.clone();
     let mut builder = TrayIconBuilder::with_id("ufop").tooltip("UFOP").menu(&menu).show_menu_on_left_click(true).on_menu_event(move |app, ev| match ev.id().as_ref() {
@@ -81,6 +92,15 @@ pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
         "backups" => {
             show_main(app);
             let _ = app.emit(OPEN_BACKUPS_EVENT, ());
+        }
+        "run_all" => {
+            let m = m2.clone();
+            tauri::async_runtime::spawn(async move {
+                match m.run_all(Default::default()).await {
+                    Ok(r) => tracing::info!("{}", run_all_summary(&r)),
+                    Err(e) => tracing::warn!("Back up all now: {e}"),
+                }
+            });
         }
         "pause" => m2.pause(Some(60)),
         "resume" => m2.resume(),
@@ -117,10 +137,20 @@ mod tests {
     use crate::backup_engine::{NextRun, SchedulerStatus, TaskInfo};
 
     #[test]
+    fn run_all_summary_names_skipped_jobs() {
+        use crate::backup_engine::runs::{RunAllReport, SkippedRun, StartedRun};
+        let r = RunAllReport {
+            started: vec![StartedRun { job_id: "1".into(), job_name: "Docs".into(), task_id: "t".into() }],
+            skipped: vec![SkippedRun { job_id: "2".into(), job_name: "Archive".into(), reason: "read-only".into() }],
+        };
+        assert_eq!(run_all_summary(&r), "Back up all now: 1 backup(s) queued, skipped Archive (read-only)");
+    }
+
+    #[test]
     fn describes_states() {
-        let mut s = SchedulerStatus { running: true, paused: false, paused_until: None, tasks: vec![], next_runs: vec![] };
+        let mut s = SchedulerStatus { running: true, paused: false, paused_until: None, tasks: vec![], next_runs: vec![], next_maintenance: vec![] };
         assert_eq!(describe(&s), "No scheduled backups");
-        s.next_runs.push(NextRun { job_id: "1".into(), job_name: "Docs".into(), next_run_at: "2026-03-10T02:00:00Z".into() });
+        s.next_runs.push(NextRun { job_id: "1".into(), job_name: "Docs".into(), next_run_at: "2026-03-10T02:00:00Z".into(), operation: "backup".into() });
         assert!(describe(&s).starts_with("Next backup: Docs at "));
         s.paused = true;
         assert_eq!(describe(&s), "Backups paused");

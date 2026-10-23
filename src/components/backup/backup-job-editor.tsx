@@ -2,30 +2,41 @@
  * Backup job editor: a stepped setup wizard that also serves as the editor
  * for existing jobs. Every field maps 1:1 onto the Rust `BackupJob`.
  */
-import { HolidayCalendarPicker } from "@/components/schedule-pickers";
 import { useEffect, useMemo, useState } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import {
+  DEFAULT_REQUEST_LIMITS,
   errorText,
   useBackupStore,
   type BackupDestination,
   type BackupJob,
   type FilterRule,
+  type HookMode,
+  hookBeforeMode,
   type PassphraseStrength,
-  type RetentionPolicy,
   type SavedDestination,
   type SourcePreview,
 } from "@/stores/backup-store";
 import { inputCls, rulesToText, textToRules } from "@/lib/backup-helpers";
 import { pickFolder } from "@/lib/folder-picker";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
+import { RetentionEditor } from "./backup-retention-editor";
 import { BackupAdvancedOptions } from "./backup-advanced-options";
+import { StdinCommandEditor } from "./backup-run-options";
+import { BackupHardening } from "./backup-hardening";
 import { BackupReplicas } from "./backup-replicas";
+import { RequestLimitsEditor } from "./backup-request-limits";
 import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
-import { LogOutputsEditor, NotificationsEditor, ReportExtras } from "./backup-notifications";
+import { HeadersEditor, LogOutputsEditor, NotificationsEditor, ReportExtras } from "./backup-notifications";
+import { NotificationProfilePicker } from "./backup-notification-profiles";
 import { JobSecretProviders } from "./backup-secret-providers";
 import { PhotosSourceSection } from "./backup-photos-source";
+import { AdvancedOnly } from "./advanced-only";
+import { BackupChangePassphrase } from "./backup-repository-format";
+import { ScheduleEditor } from "./backup-schedule-editor";
+import { EffectiveSettingsPanel, MaintenanceScheduleEditor, TemplatePicker } from "./backup-policies";
+import { changedPaths, setPath } from "@/stores/backup-policy";
 
 interface ConnectionProfile {
   id: string;
@@ -37,7 +48,6 @@ interface ConnectionProfile {
 
 const STEPS = ["General", "Sources", "Destination", "Schedule", "Retention", "Options", "Hooks"] as const;
 type Step = (typeof STEPS)[number];
-const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 
 
@@ -73,6 +83,23 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
     return () => clearTimeout(t);
   }, [passphrase]);
 
+  // Template mode (`overrides` set): the form shows the effective values, and
+  // every setting changed from what it showed becomes the job's own.
+  const [baseline, setBaseline] = useState<BackupJob>(initial);
+  useEffect(() => {
+    if (initial.id === "" || initial.overrides === null || initial.overrides === undefined) return;
+    tauriInvoke<BackupJob>("backup_effective_job", { id: initial.id })
+      .then((eff) => {
+        const shown = { ...eff, template_ids: initial.template_ids, overrides: initial.overrides, stats: initial.stats };
+        setJob(shown);
+        setBaseline(shown);
+      })
+      .catch(() => {});
+  }, [initial]);
+  const resetToInherited = (path: string, value: unknown, explicit: string[]) => {
+    setJob((j) => ({ ...setPath(j, path, value), overrides: (j.overrides ?? explicit).filter((p) => p !== path) }));
+    setBaseline((b) => setPath(b, path, value));
+  };
   const patch = (p: Partial<BackupJob>) => setJob((j) => ({ ...j, ...p }));
   const patchOpts = (p: Partial<BackupJob["options"]>) => setJob((j) => ({ ...j, options: { ...j.options, ...p } }));
   const patchFilter = (p: Partial<BackupJob["filter"]>) => setJob((j) => ({ ...j, filter: { ...j.filter, ...p } }));
@@ -93,7 +120,10 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
 
   const save = () =>
     run(async () => {
-      const toSave = filterText !== null ? { ...job, filter: { ...job.filter, rules: textToRules(filterText) } } : job;
+      let toSave = filterText !== null ? { ...job, filter: { ...job.filter, rules: textToRules(filterText) } } : job;
+      if (toSave.overrides !== null && toSave.overrides !== undefined) {
+        toSave = { ...toSave, overrides: [...new Set([...toSave.overrides, ...changedPaths(baseline, toSave)])].sort() };
+      }
       // Empty passphrase = keep the stored one (the backend rejects a new encrypted job without one).
       const saved = await saveJob(toSave, passphrase || null);
       onDone(saved);
@@ -150,11 +180,26 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                   </span>
                 )}
                 {!isNew && passphrase && (
-                  <span className="block text-[11px] text-amber-600">Changing the passphrase of an existing backup makes older volumes unreadable with the new one. Use it only for a fresh destination.</span>
+                  <span className="block text-[11px] text-amber-600">Changing the passphrase of an existing backup makes older volumes unreadable with the new one. Use it only for a fresh destination, or use Change password below.</span>
                 )}
               </Field>
             )}
+            {!isNew && job.stats.version_count > 0 && <BackupChangePassphrase job={job} />}
+            <AdvancedOnly>
+              <TemplatePicker value={job.template_ids ?? []} onChange={(template_ids) => patch({ template_ids })} />
+            </AdvancedOnly>
+            <Check
+              label="Encrypt the local database on this computer"
+              checked={job.encrypt_local_database ?? (isNew ? job.encrypted : false)}
+              onChange={(v) => patch({ encrypt_local_database: v })}
+              hint="File names in the job's local cache are encrypted with a key kept in this computer's keychain. If the key is lost, the cache is rebuilt from the destination."
+            />
           </Section>
+        )}
+        {step === "General" && (
+          <AdvancedOnly>
+            <EffectiveSettingsPanel job={job} onReset={resetToInherited} />
+          </AdvancedOnly>
         )}
 
         {step === "Sources" && (
@@ -207,6 +252,10 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
               job={job}
               onChange={(sources, photos) => setJob((j) => ({ ...j, sources, options: { ...j.options, photos } }))}
             />
+
+            <AdvancedOnly>
+              <StdinCommandEditor value={job.stdin_command ?? null} onChange={(stdin_command) => patch({ stdin_command })} />
+            </AdvancedOnly>
 
             <Section title="Filters" hint="Evaluated top to bottom; the first match wins. Excluding a folder skips everything inside it.">
               <div className="flex gap-1">
@@ -271,7 +320,23 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 <Check label="Exclude temporary files (Windows)" checked={job.filter.exclude_temporary} onChange={(v) => patchFilter({ exclude_temporary: v })} />
                 <Check label="Skip cloud placeholders (OneDrive/iCloud)" checked={job.filter.exclude_cloud_placeholders} onChange={(v) => patchFilter({ exclude_cloud_placeholders: v })} />
                 <Check label="Skip empty folders" checked={job.filter.exclude_empty_folders} onChange={(v) => patchFilter({ exclude_empty_folders: v })} />
+                <Check
+                  label="Skip files listed in .gitignore"
+                  checked={!!job.filter.respect_gitignore}
+                  onChange={(v) => patchFilter({ respect_gitignore: v })}
+                  hint="Also honours .git/info/exclude. .ufopignore files are always read."
+                />
               </div>
+              <AdvancedOnly>
+                <Field label="Ignore-file names (comma separated, gitignore syntax)" hint="Read in every folder; rules apply to that folder and below. Explicit rules above win over them. Empty = none.">
+                  <input
+                    data-testid="filter-ignore-files"
+                    className={`${inputCls} font-mono`}
+                    value={(job.filter.ignore_files ?? []).join(", ")}
+                    onChange={(e) => patchFilter({ ignore_files: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })}
+                  />
+                </Field>
+              </AdvancedOnly>
               <Field label="Skip files larger than (MB, empty = no limit)">
                 <input
                   className={inputCls}
@@ -387,99 +452,33 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 Compatibility test
               </Btn>
             </div>
-            <Field label="File-name prefix" hint="Lets several backups share one folder.">
-              <input className={inputCls} value={job.options.prefix} onChange={(e) => patchOpts({ prefix: e.target.value.replace(/[^A-Za-z0-9_.]/g, "") })} />
-            </Field>
+            <Check
+              label="Read-only (restore and browse only)"
+              checked={job.read_only}
+              onChange={(v) => patch({ read_only: v })}
+              hint="Nothing is ever written to the destination: no backups, maintenance or locks. Use it to open someone else's backup or an archive safely."
+            />
+            <AdvancedOnly>
+              <Field label="File-name prefix" hint="Lets several backups share one folder.">
+                <input className={inputCls} value={job.options.prefix} onChange={(e) => patchOpts({ prefix: e.target.value.replace(/[^A-Za-z0-9_.]/g, "") })} />
+              </Field>
+            </AdvancedOnly>
           </Section>
-            <BackupReplicas replicas={job.replicas} onChange={(r) => patch({ replicas: r })} connections={connections} library={library} />
+            <AdvancedOnly hint>
+              <BackupReplicas replicas={job.replicas} onChange={(r) => patch({ replicas: r })} connections={connections} library={library} />
+            </AdvancedOnly>
+            <BackupHardening job={job} />
           </>
         )}
 
         {step === "Schedule" && (
           <Section title="Schedule" hint="Times are local; runs missed while the app was closed start as soon as it is running again.">
-            <Check label="Run automatically" checked={job.schedule.enabled} onChange={(v) => patch({ schedule: { ...job.schedule, enabled: v } })} />
-            <div className="grid grid-cols-2 gap-2">
-              <Field label="Start time">
-                <input className={inputCls} type="time" value={job.schedule.start_time} onChange={(e) => patch({ schedule: { ...job.schedule, start_time: e.target.value } })} />
-              </Field>
-              <Field label="Repeat">
-                <select className={inputCls} value={job.schedule.interval_minutes} onChange={(e) => patch({ schedule: { ...job.schedule, interval_minutes: Number(e.target.value) } })}>
-                  {[
-                    [15, "Every 15 minutes"],
-                    [60, "Hourly"],
-                    [360, "Every 6 hours"],
-                    [720, "Every 12 hours"],
-                    [1440, "Daily"],
-                    [10080, "Weekly"],
-                    [43200, "Every 30 days"],
-                  ].map(([v, l]) => (
-                    <option key={v} value={v}>{l}</option>
-                  ))}
-                </select>
-              </Field>
-            </div>
-            <div className="flex gap-2 flex-wrap text-xs">
-              {WEEKDAYS.map((d, i) => (
-                <label key={d} className="flex items-center gap-1">
-                  <input
-                    type="checkbox"
-                    checked={job.schedule.weekdays.length === 0 || job.schedule.weekdays.includes(i)}
-                    onChange={(e) => {
-                      const all = job.schedule.weekdays.length === 0 ? [0, 1, 2, 3, 4, 5, 6] : job.schedule.weekdays;
-                      const next = e.target.checked ? [...new Set([...all, i])].sort() : all.filter((x) => x !== i);
-                      patch({ schedule: { ...job.schedule, weekdays: next.length === 7 ? [] : next } });
-                    }}
-                  />
-                  {d}
-                </label>
-              ))}
-            </div>
-            <HolidayCalendarPicker value={job.schedule.calendar_ids ?? []} onChange={(ids) => patch({ schedule: { ...job.schedule, calendar_ids: ids } })} />
-            <Check
-              label="Skip scheduled runs while on battery"
-              checked={job.schedule.skip_on_battery}
-              onChange={(v) => patch({ schedule: { ...job.schedule, skip_on_battery: v } })}
-            />
+            <ScheduleEditor value={job.schedule} onChange={(schedule) => patch({ schedule })} />
             <Check label="Keep the computer awake while backing up" checked={job.prevent_sleep} onChange={(v) => patch({ prevent_sleep: v })} />
           </Section>
         )}
 
-        {step === "Retention" && (
-          <Section title="Version retention" hint="Applied after each successful backup. The newest version is never deleted.">
-            <select
-              className={inputCls}
-              value={job.retention.type}
-              onChange={(e) => {
-                const t = e.target.value as RetentionPolicy["type"];
-                const r: RetentionPolicy =
-                  t === "keep_days" ? { type: t, days: 30 } : t === "keep_count" ? { type: t, count: 10 } : t === "custom" ? { type: t, rules: "1W:1D,4W:1W,12M:1M" } : { type: t };
-                patch({ retention: r });
-              }}
-              data-testid="backup-retention"
-            >
-              <option value="keep_all">Keep all versions</option>
-              <option value="keep_days">Delete versions older than…</option>
-              <option value="keep_count">Keep a number of versions</option>
-              <option value="smart">Smart (one per day for a week, per week for a month, per month for a year)</option>
-              <option value="custom">Custom thinning rules</option>
-            </select>
-            {job.retention.type === "keep_days" && (
-              <Field label="Days">
-                <input className={inputCls} type="number" min={1} value={job.retention.days} onChange={(e) => patch({ retention: { type: "keep_days", days: Math.max(1, Number(e.target.value)) } })} />
-              </Field>
-            )}
-            {job.retention.type === "keep_count" && (
-              <Field label="Versions">
-                <input className={inputCls} type="number" min={1} value={job.retention.count} onChange={(e) => patch({ retention: { type: "keep_count", count: Math.max(1, Number(e.target.value)) } })} />
-              </Field>
-            )}
-            {job.retention.type === "custom" && (
-              <Field label="Rules (timeframe:interval, …)" hint="Units s, m, h, D, W, M, Y; interval U keeps all. Example: 7D:U,4W:1D,12M:1W">
-                <input className={`${inputCls} font-mono`} value={job.retention.rules} onChange={(e) => patch({ retention: { type: "custom", rules: e.target.value } })} />
-              </Field>
-            )}
-          </Section>
-        )}
+        {step === "Retention" && <RetentionEditor job={job} isNew={isNew} onChange={(retention) => patch({ retention })} />}
 
         {step === "Options" && (
           <>
@@ -505,6 +504,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 <input className={inputCls} value={job.options.no_compress_extensions.join(", ")} onChange={(e) => patchOpts({ no_compress_extensions: e.target.value.split(",").map((s) => s.trim().replace(/^\./, "").toLowerCase()).filter(Boolean) })} />
               </Field>
             </Section>
+            <AdvancedOnly hint>
             <BackupAdvancedOptions options={job.options} locked={!isNew && job.stats.version_count > 0} onChange={patchOpts} />
             <Section title="Source handling">
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
@@ -559,6 +559,8 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 <input className={inputCls} value={job.soft_delete_prefix ?? ""} placeholder="e.g. deleted-" onChange={(e) => patch({ soft_delete_prefix: e.target.value || null })} />
               </Field>
             </Section>
+            <MaintenanceScheduleEditor value={job.maintenance ?? { compact: null, verify: null, retention: null }} onChange={(maintenance) => patch({ maintenance })} autoCompactDays={job.options.auto_compact ? job.options.auto_compact_interval_days : null} />
+            </AdvancedOnly>
             <Section title="Network">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <Field label="Upload limit (KB/s, 0 = unlimited)">
@@ -579,18 +581,42 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
               </div>
               <Check label="Exponential backoff" checked={job.retry.exponential} onChange={(v) => patch({ retry: { ...job.retry, exponential: v } })} />
             </Section>
+            <AdvancedOnly>
+              <RequestLimitsEditor value={job.request_limits ?? DEFAULT_REQUEST_LIMITS} onChange={(request_limits) => patch({ request_limits })} />
+            </AdvancedOnly>
           </>
         )}
 
         {step === "Hooks" && (
           <>
+            <AdvancedOnly>
             <Section title="Scripts" hint="Receive UFOP_* environment variables. Lines printed as LOG:INFO / LOG:WARN / LOG:ERROR appear in the run log.">
               <Field label="Before backup">
                 <input className={`${inputCls} font-mono`} value={job.scripts.run_before ?? ""} onChange={(e) => patch({ scripts: { ...job.scripts, run_before: e.target.value || null } })} />
               </Field>
-              <Check label="Required — abort the backup if this script fails" checked={job.scripts.run_before_required} onChange={(v) => patch({ scripts: { ...job.scripts, run_before_required: v } })} />
+              <Field label="Before-backup mode" hint="Async starts the script and backs up without waiting; its result appears in the run log if it ends during the backup, otherwise in the app log.">
+                <select
+                  className={inputCls}
+                  data-testid="hook-before-mode"
+                  value={hookBeforeMode(job.scripts)}
+                  onChange={(e) => {
+                    const mode = e.target.value as HookMode;
+                    patch({ scripts: { ...job.scripts, before_mode: mode, run_before_required: mode === "required" } });
+                  }}
+                >
+                  <option value="required">Required — abort the backup if it fails</option>
+                  <option value="optional">Optional — wait, then continue even if it fails</option>
+                  <option value="async">Async — start it and don&apos;t wait</option>
+                </select>
+              </Field>
               <Field label="After backup" hint="UFOP_PARSED_RESULT holds success/warning/error; UFOP_RESULTFILE points at the result.">
                 <input className={`${inputCls} font-mono`} value={job.scripts.run_after ?? ""} onChange={(e) => patch({ scripts: { ...job.scripts, run_after: e.target.value || null } })} />
+              </Field>
+              <Field label="After-backup mode">
+                <select className={inputCls} data-testid="hook-after-mode" value={job.scripts.after_mode === "async" ? "async" : "optional"} onChange={(e) => patch({ scripts: { ...job.scripts, after_mode: e.target.value as HookMode } })}>
+                  <option value="optional">Wait for it</option>
+                  <option value="async">Async — start it and don&apos;t wait</option>
+                </select>
               </Field>
               <Field label="When sources are released" hint="Runs once all files are read, before uploads finish — e.g. to drop a snapshot or restart a service.">
                 <input className={`${inputCls} font-mono`} value={job.scripts.run_on_source_release ?? ""} onChange={(e) => patch({ scripts: { ...job.scripts, run_on_source_release: e.target.value || null } })} />
@@ -607,6 +633,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 </Field>
               </div>
             </Section>
+            </AdvancedOnly>
             <Section title="Desktop notifications">
               <div className="flex gap-3 text-xs">
                 {["success", "warning", "error"].map((r) => (
@@ -619,6 +646,9 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 ))}
               </div>
             </Section>
+            <NotificationProfilePicker value={job.notification_profile_ids ?? []} onChange={(notification_profile_ids) => patch({ notification_profile_ids })} />
+            <NotificationsEditor value={job.notifications} onChange={(notifications) => patch({ notifications })} />
+            <AdvancedOnly hint>
             <Section title="HTTP reports" hint="Sent to every URL when a run ends with a selected result.">
               <Field label="URLs (one per line)">
                 <textarea className={`${inputCls} font-mono`} rows={2} value={job.reports.http_urls.join("\n")} onChange={(e) => patch({ reports: { ...job.reports, http_urls: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) } })} />
@@ -628,6 +658,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                   <select className={inputCls} value={job.reports.http_method} onChange={(e) => patch({ reports: { ...job.reports, http_method: e.target.value } })}>
                     <option>POST</option>
                     <option>PUT</option>
+                    <option>PATCH</option>
                     <option>GET</option>
                   </select>
                 </Field>
@@ -662,12 +693,13 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                   <input className={inputCls} value={job.reports.backup_id ?? ""} onChange={(e) => patch({ reports: { ...job.reports, backup_id: e.target.value || null } })} />
                 </Field>
               </div>
+              <HeadersEditor value={job.reports.headers ?? []} onChange={(headers) => patch({ reports: { ...job.reports, headers } })} />
               <Check label="Accept invalid TLS certificates on report URLs" checked={job.reports.accept_invalid_certs} onChange={(v) => patch({ reports: { ...job.reports, accept_invalid_certs: v } })} />
               <ReportExtras reports={job.reports} onChange={(reports) => patch({ reports })} />
             </Section>
-            <NotificationsEditor value={job.notifications} onChange={(notifications) => patch({ notifications })} />
             <LogOutputsEditor value={job.log_outputs} onChange={(log_outputs) => patch({ log_outputs })} />
             <JobSecretProviders jobId={job.id} value={job.secret_providers} onChange={(secret_providers) => patch({ secret_providers })} />
+            </AdvancedOnly>
           </>
         )}
       </div>

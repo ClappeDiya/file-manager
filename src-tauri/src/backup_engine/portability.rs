@@ -8,7 +8,7 @@ use crate::core::error::AppError;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use ufop_core::backup::crypto::{KdfParams, VolumeCipher};
-use ufop_core::backup::RetentionPolicy;
+use ufop_core::backup::{RetentionPolicy, SourceFilter};
 
 const FORMAT: &str = "ufop-backup-config";
 
@@ -28,6 +28,9 @@ struct Payload {
     job: BackupJob,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     passphrase: Option<String>,
+    /// The policy templates the job is based on (created on import when missing).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    templates: Vec<super::templates::PolicyTemplate>,
 }
 
 /// Job JSON safe to store remotely: no stats, no report callback URLs
@@ -36,6 +39,9 @@ pub fn stripped_config(job: &BackupJob) -> Result<serde_json::Value, AppError> {
     let mut j = job.clone();
     j.stats = JobStats::default();
     j.reports.http_urls.clear();
+    j.reports.headers.clear();
+    // Webhook URLs and header values often embed tokens too.
+    j.notifications.retain(|n| !matches!(n.channel, super::notify::Channel::Webhook { .. }));
     Ok(serde_json::to_value(j)?)
 }
 
@@ -50,11 +56,23 @@ pub fn full_config(job: &BackupJob) -> Result<serde_json::Value, AppError> {
 /// Export a job. `passphrase` is included only when given;
 /// `export_passphrase` encrypts the whole file.
 pub fn export_job(job: &BackupJob, passphrase: Option<String>, export_passphrase: Option<&str>, include_stats: bool) -> Result<String, AppError> {
+    export_job_with(job, passphrase, export_passphrase, include_stats, Vec::new())
+}
+
+/// [`export_job`] carrying the job's policy templates.
+pub fn export_job_with(
+    job: &BackupJob,
+    passphrase: Option<String>,
+    export_passphrase: Option<&str>,
+    include_stats: bool,
+    templates: Vec<super::templates::PolicyTemplate>,
+) -> Result<String, AppError> {
     let mut j = job.clone();
     if !include_stats {
         j.stats = JobStats::default();
     }
-    let payload = Payload { job: j, passphrase };
+    let templates = templates.into_iter().map(|t| super::templates::PolicyTemplate { managed: false, enforced: false, ..t }).collect();
+    let payload = Payload { job: j, passphrase, templates };
     let file = match export_passphrase.filter(|p| !p.is_empty()) {
         None => ExportFile { format: FORMAT.into(), version: 1, encrypted: false, salt: None, payload: serde_json::to_value(&payload)? },
         Some(p) => {
@@ -81,6 +99,11 @@ pub fn is_encrypted_export(json: &str) -> bool {
 /// Parse an export (or a bare job JSON, e.g. from remote discovery). The
 /// returned job has a fresh id; statistics are kept only on request.
 pub fn import_job(json: &str, export_passphrase: Option<&str>, import_stats: bool) -> Result<(BackupJob, Option<String>), AppError> {
+    import_job_with(json, export_passphrase, import_stats).map(|(j, p, _)| (j, p))
+}
+
+/// [`import_job`] also returning the policy templates the export carried.
+pub fn import_job_with(json: &str, export_passphrase: Option<&str>, import_stats: bool) -> Result<(BackupJob, Option<String>, Vec<super::templates::PolicyTemplate>), AppError> {
     let payload: Payload = match serde_json::from_str::<ExportFile>(json) {
         Ok(f) if f.format == FORMAT => {
             if f.encrypted {
@@ -95,14 +118,14 @@ pub fn import_job(json: &str, export_passphrase: Option<&str>, import_stats: boo
                 serde_json::from_value(f.payload)?
             }
         }
-        _ => Payload { job: serde_json::from_str(json).map_err(|e| AppError::validation(format!("Not a backup configuration: {e}")))?, passphrase: None },
+        _ => Payload { job: serde_json::from_str(json).map_err(|e| AppError::validation(format!("Not a backup configuration: {e}")))?, passphrase: None, templates: Vec::new() },
     };
     let mut job = payload.job;
     job.id = String::new();
     if !import_stats {
         job.stats = JobStats::default();
     }
-    Ok((job, payload.passphrase))
+    Ok((job, payload.passphrase, payload.templates))
 }
 
 fn quote(s: &str) -> String {
@@ -148,12 +171,99 @@ pub fn cli_command(job: &BackupJob) -> String {
     parts.push(format!("--block-size={}", o.block_size));
     parts.push(format!("--volume-size={}", o.volume_size));
     parts.push(format!("--compression-level={}", o.compression_level));
+    // Repository format choices (only those differing from the defaults).
+    if let Some(v) = o.format_version {
+        parts.push(format!("--format-version={v}"));
+    }
+    if let Some(c) = o.chunker {
+        parts.push(format!("--chunker={}", if c == ufop_core::backup::ChunkerKind::Fixed { "fixed" } else { "fastcdc" }));
+    }
+    if let Some(c) = o.block_codec {
+        parts.push(format!("--block-codec={}", if c == ufop_core::backup::BlockCodec::Zstd { "zstd" } else { "deflate" }));
+    }
+    if o.cipher != ufop_core::backup::crypto::CipherKind::Aes256Gcm {
+        parts.push("--cipher=chacha20-poly1305".into());
+    }
+    if let ufop_core::backup::layout::RepoLayout::Sharded { prefix_len } = o.layout {
+        parts.push(format!("--layout=sharded --shard-prefix-len={prefix_len}"));
+    }
     match &job.retention {
         RetentionPolicy::KeepAll => {}
         RetentionPolicy::KeepDays { days } => parts.push(format!("--keep-days={days}")),
         RetentionPolicy::KeepCount { count } => parts.push(format!("--keep-versions={count}")),
         RetentionPolicy::Smart => parts.push("--retention-policy=smart".into()),
         RetentionPolicy::Custom { rules } => parts.push(format!("--retention-policy={}", quote(rules))),
+        RetentionPolicy::Counts { keep_latest, keep_hourly, keep_daily, keep_weekly, keep_monthly, keep_yearly } => {
+            for (flag, n) in [("latest", keep_latest), ("hourly", keep_hourly), ("daily", keep_daily), ("weekly", keep_weekly), ("monthly", keep_monthly), ("yearly", keep_yearly)] {
+                if *n > 0 {
+                    parts.push(format!("--keep-{flag}={n}"));
+                }
+            }
+        }
+    }
+    // Sources and runs (only those differing from the defaults).
+    let f = &job.filter;
+    if f.ignore_files != SourceFilter::default().ignore_files {
+        if f.ignore_files.is_empty() {
+            parts.push("--ignore-file=''".into());
+        }
+        for n in &f.ignore_files {
+            parts.push(format!("--ignore-file={}", quote(n)));
+        }
+    }
+    if f.respect_gitignore {
+        parts.push("--respect-gitignore".into());
+    }
+    if o.one_file_system {
+        parts.push("--one-file-system".into());
+    }
+    let ep = &o.error_policy;
+    use ufop_core::backup::errors::{ErrorAction, UnknownEntryAction};
+    if ep.on_file_error == ErrorAction::Fail {
+        parts.push("--on-file-error=fail".into());
+    }
+    if ep.on_dir_error == ErrorAction::Fail {
+        parts.push("--on-dir-error=fail".into());
+    }
+    match ep.on_unknown_entry {
+        UnknownEntryAction::Ignore => {}
+        UnknownEntryAction::Warn => parts.push("--on-unknown-entry=warn".into()),
+        UnknownEntryAction::Fail => parts.push("--on-unknown-entry=fail".into()),
+    }
+    if ep.fail_fast {
+        parts.push("--fail-fast".into());
+    }
+    if let Some(m) = ep.max_errors {
+        parts.push(format!("--max-errors={m}"));
+    }
+    if o.rehash_percent > 0 {
+        parts.push(format!("--rehash-percent={}", o.rehash_percent));
+    }
+    if let Some(cap) = o.max_upload_bytes_per_run {
+        parts.push(format!("--max-upload={cap}"));
+    }
+    if o.parallel_file_threshold != ufop_core::backup::DEFAULT_PARALLEL_FILE_THRESHOLD {
+        parts.push(format!("--parallel-file-threshold={}", o.parallel_file_threshold));
+    }
+    if o.snapshot.provider != Default::default() {
+        parts.push(format!("--snapshot-provider={}", o.snapshot.provider.name()));
+    }
+    // Versions are recorded as this job's source (shared repositories).
+    parts.push(format!("--job-id={}", quote(&job.id)));
+    if !o.identity.hostname.is_empty() {
+        parts.push(format!("--hostname={}", quote(&o.identity.hostname)));
+    }
+    if !o.identity.username.is_empty() {
+        parts.push(format!("--username={}", quote(&o.identity.username)));
+    }
+    if o.shared_repository {
+        parts.push("--shared".into());
+    }
+    if let Some(n) = o.default_note.as_deref().filter(|n| !n.is_empty()) {
+        parts.push(format!("--note={}", quote(n)));
+    }
+    for (k, v) in &o.default_tags {
+        parts.push(format!("--tag={}", quote(&if v.is_empty() { k.clone() } else { format!("{k}={v}") })));
     }
     for r in &job.filter.rules {
         let flag = match r.action {
@@ -200,6 +310,48 @@ mod tests {
             destination: BackupDestination::Local { path: "/mnt/backup".into(), alternate_paths: vec![], marker_file: None },
             stats: JobStats { version_count: 4, ..Default::default() },
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cli_command_carries_format_options() {
+        let mut j = job();
+        assert!(!cli_command(&j).contains("--cipher"));
+        j.options.cipher = ufop_core::backup::crypto::CipherKind::ChaCha20Poly1305;
+        j.options.chunker = Some(ufop_core::backup::ChunkerKind::Fixed);
+        j.options.layout = ufop_core::backup::layout::RepoLayout::Sharded { prefix_len: 2 };
+        j.options.format_version = Some(2);
+        j.retention = RetentionPolicy::Counts { keep_latest: 2, keep_hourly: 0, keep_daily: 7, keep_weekly: 4, keep_monthly: 0, keep_yearly: 0 };
+        j.options.shared_repository = true;
+        j.options.default_tags.insert("env".into(), "prod".into());
+        let c = cli_command(&j);
+        for f in ["--cipher=chacha20-poly1305", "--chunker=fixed", "--layout=sharded --shard-prefix-len=2", "--format-version=2", "--keep-latest=2", "--keep-daily=7", "--keep-weekly=4", "--shared", "--job-id=abc", "--tag='env=prod'"] {
+            assert!(c.contains(f), "{f} in {c}");
+        }
+    }
+
+    #[test]
+    fn cli_command_carries_source_and_run_options() {
+        let mut j = job();
+        let plain = cli_command(&j);
+        assert!(!plain.contains("--ignore-file") && !plain.contains("--fail-fast") && !plain.contains("--parallel-file-threshold"), "{plain}");
+        j.filter.ignore_files = vec![".backupignore".into()];
+        j.filter.respect_gitignore = true;
+        j.options.one_file_system = true;
+        j.options.error_policy = ufop_core::backup::errors::ErrorPolicy {
+            on_file_error: ufop_core::backup::errors::ErrorAction::Fail,
+            on_unknown_entry: ufop_core::backup::errors::UnknownEntryAction::Warn,
+            fail_fast: true,
+            max_errors: Some(5),
+            ..Default::default()
+        };
+        j.options.rehash_percent = 10;
+        j.options.max_upload_bytes_per_run = Some(1 << 30);
+        j.options.parallel_file_threshold = 0;
+        j.options.snapshot.provider = ufop_core::backup::snapshot::SnapshotProvider::Btrfs;
+        let c = cli_command(&j);
+        for f in ["--ignore-file=.backupignore", "--respect-gitignore", "--one-file-system", "--on-file-error=fail", "--on-unknown-entry=warn", "--fail-fast", "--max-errors=5", "--rehash-percent=10", "--max-upload=1073741824", "--parallel-file-threshold=0", "--snapshot-provider=btrfs"] {
+            assert!(c.contains(f), "{f} in {c}");
         }
     }
 

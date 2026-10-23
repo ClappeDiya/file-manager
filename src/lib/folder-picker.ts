@@ -43,3 +43,25 @@ export async function pickFiles(title?: string): Promise<string[]> {
     return [];
   }
 }
+
+/**
+ * Native "save as" dialog; null when cancelled. Outside Tauri the browser
+ * prompts for a path (dev mode) unless a host supplied a folder picker, in
+ * which case the folder is joined with `defaultName`.
+ */
+export async function pickSaveFile(title: string, defaultName: string, extensions: string[] = []): Promise<string | null> {
+  if (isTauriAvailable()) {
+    try {
+      return (await tauriInvoke<string | null>("pick_save_file", { title, defaultName, extensions })) ?? null;
+    } catch (err) {
+      console.error("Save dialog IPC failed:", err);
+      return null;
+    }
+  }
+  if (customPicker) {
+    const dir = await customPicker(title);
+    return dir ? `${dir.replace(/[\\/]+$/, "")}/${defaultName}` : null;
+  }
+  const path = window.prompt(title, defaultName);
+  return path && path.trim() ? path.trim() : null;
+}

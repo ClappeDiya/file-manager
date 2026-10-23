@@ -49,6 +49,21 @@ interface Form {
   mountCacheHours: string;
   mountRoot: string;
   workflows: WorkflowForm[];
+  backupTemplates: BackupTemplateForm[];
+  /** `notificationProfiles` as a JSON list ("" = not managed). */
+  notificationProfilesJson: string;
+  /** `serverAccess` as JSON ("" = not managed). */
+  serverAccessJson: string;
+  /** `serverBranding` as JSON ("" = not managed). */
+  serverBrandingJson: string;
+}
+
+interface BackupTemplateForm {
+  id: string;
+  name: string;
+  description: string;
+  enforced: boolean;
+  settingsJson: string;
 }
 
 interface WorkflowForm {
@@ -91,6 +106,10 @@ function toForm(s: ManagedSettings | null): Form {
     mountCacheHours: s?.mounts?.maxCacheAgeHours?.toString() ?? '',
     mountRoot: s?.mounts?.mountRoot ?? '',
     workflows: (s?.workflows ?? []).map((w) => ({ id: w.id, name: w.name, enabled: w.enabled, ruleJson: JSON.stringify(w.rule, null, 2) })),
+    backupTemplates: (s?.backupTemplates ?? []).map((t) => ({ id: t.id, name: t.name, description: t.description, enforced: t.enforced, settingsJson: JSON.stringify(t.settings, null, 2) })),
+    notificationProfilesJson: s?.notificationProfiles ? JSON.stringify(s.notificationProfiles, null, 2) : '',
+    serverAccessJson: s?.serverAccess ? JSON.stringify(s.serverAccess, null, 2) : '',
+    serverBrandingJson: s?.serverBranding ? JSON.stringify(s.serverBranding, null, 2) : '',
   };
 }
 
@@ -109,6 +128,12 @@ function toBody(f: Form): ManagedSettingsBody {
       mountRoot: f.mountRoot.trim() || null,
     },
     workflows: f.workflows.length ? f.workflows.map((w) => ({ id: w.id.trim(), name: w.name.trim(), enabled: w.enabled, rule: parseRule(w.ruleJson) })) : null,
+    backupTemplates: f.backupTemplates.length
+      ? f.backupTemplates.map((t) => ({ id: t.id.trim(), name: t.name.trim(), description: t.description.trim(), enforced: t.enforced, settings: parseRule(t.settingsJson || '{}') }))
+      : null,
+    notificationProfiles: f.notificationProfilesJson.trim() ? (parseRule(f.notificationProfilesJson) as unknown as ManagedSettingsBody['notificationProfiles']) : null,
+    serverAccess: f.serverAccessJson.trim() ? (parseRule(f.serverAccessJson) as unknown as ManagedSettingsBody['serverAccess']) : null,
+    serverBranding: f.serverBrandingJson.trim() ? (parseRule(f.serverBrandingJson) as unknown as ManagedSettingsBody['serverBranding']) : null,
   };
 }
 
@@ -302,12 +327,106 @@ export default function AppSettingsPage() {
             </Button>
           </div>
         </Card>
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Backup policy templates</CardTitle>
+            <CardDescription>
+              Templates backup jobs on every desktop can be based on; an enforced template applies to every job and wins over its own settings. In the desktop app, export a template (Settings → Policy templates) and paste its “settings” here. Templates that set scripts are refused.
+            </CardDescription>
+          </CardHeader>
+          <div className="space-y-4">
+            {form.backupTemplates.map((t, i) => {
+              const patch = (p: Partial<BackupTemplateForm>) => set({ backupTemplates: form.backupTemplates.map((x, j) => (j === i ? { ...x, ...p } : x)) });
+              return (
+                <div key={i} role="group" aria-label={`Backup template ${i + 1}`} className="space-y-2 rounded border border-border p-3">
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <Input label="Name" value={t.name} onChange={(e) => patch({ name: e.target.value })} />
+                    <Input label="Id" placeholder="From the name" value={t.id} onChange={(e) => patch({ id: e.target.value })} />
+                  </div>
+                  <Input label="Description" value={t.description} onChange={(e) => patch({ description: e.target.value })} />
+                  <label className="flex flex-col gap-1 text-sm">
+                    Settings (JSON)
+                    <textarea className="min-h-32 rounded border border-border bg-background p-2 font-mono text-xs" spellCheck={false} value={t.settingsJson} onChange={(e) => patch({ settingsJson: e.target.value })} />
+                  </label>
+                  <div className="flex items-center justify-between">
+                    <label className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={t.enforced} onChange={(e) => patch({ enforced: e.target.checked })} /> Enforced (applies to every job)
+                    </label>
+                    <Button variant="outline" onClick={() => set({ backupTemplates: form.backupTemplates.filter((_, j) => j !== i) })}>
+                      Remove
+                    </Button>
+                  </div>
+                </div>
+              );
+            })}
+            <Button variant="outline" onClick={() => set({ backupTemplates: [...form.backupTemplates, { id: '', name: '', description: '', enforced: false, settingsJson: '{}' }] })}>
+              Add backup template
+            </Button>
+          </div>
+        </Card>
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Notification profiles</CardTitle>
+            <CardDescription>
+              Notification channels every desktop can choose in its backup jobs and templates (as org:&lt;id&gt;), read-only there. Paste a profile&apos;s “notification” from the desktop app (Settings → Notification profiles). Secrets never travel here: set credential_id (and secret headers&apos; credential_id) to a console credential such as central:pagerduty-key. Leave empty to stop managing.
+            </CardDescription>
+          </CardHeader>
+          <label className="flex flex-col gap-1 text-sm">
+            Notification profiles (JSON list)
+            <textarea
+              aria-label="Notification profiles (JSON)"
+              className="min-h-32 rounded border border-border bg-background p-2 font-mono text-xs"
+              spellCheck={false}
+              placeholder={'[{ "id": "on-call", "name": "On-call pager", "minSeverity": "error", "notification": { "type": "webhook", "preset": "pagerduty", "url": "https://events.pagerduty.com/v2/enqueue", "credential_id": "central:pagerduty-key" } }]'}
+              value={form.notificationProfilesJson}
+              onChange={(e) => set({ notificationProfilesJson: e.target.value })}
+            />
+          </label>
+        </Card>
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Server accounts and access (ufop-server)</CardTitle>
+            <CardDescription>
+              Accounts and per-job access rules provisioned on every ufop-server node, read-only there. Passwords travel only as Argon2 hashes: run <code>ufop-server hash-password</code>. Roles: admin, operator, viewer. Rules give a principal (an account, role:operator, role:viewer or *) a permission (none, read, run, write, full) on jobs matching a pattern (id, or a glob such as prod-*). An account never replaces a local one of the same name. Leave empty to stop managing.
+            </CardDescription>
+          </CardHeader>
+          <label className="flex flex-col gap-1 text-sm">
+            Server access (JSON)
+            <textarea
+              aria-label="Server access (JSON)"
+              className="min-h-32 rounded border border-border bg-background p-2 font-mono text-xs"
+              spellCheck={false}
+              placeholder={'{ "users": [{ "username": "ops", "passwordHash": "$argon2id$…", "role": "operator" }], "rules": [{ "principal": "ops", "jobPattern": "prod-*", "permission": "run" }] }'}
+              value={form.serverAccessJson}
+              onChange={(e) => set({ serverAccessJson: e.target.value })}
+            />
+          </label>
+        </Card>
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Server web UI branding (ufop-server)</CardTitle>
+            <CardDescription>
+              Title prefix, product name, logo (a data: URI, ≤ 512 KiB: PNG, JPEG, SVG, WebP or GIF), accent color (#rrggbb) and a little CSS (≤ 32 KiB; no @import, external url() or scripts) for every ufop-server node&apos;s web UI. It wins over branding saved on the server, whose administrators cannot change it while it is set. Leave empty to stop managing.
+            </CardDescription>
+          </CardHeader>
+          <label className="flex flex-col gap-1 text-sm">
+            Server branding (JSON)
+            <textarea
+              aria-label="Server branding (JSON)"
+              className="min-h-24 rounded border border-border bg-background p-2 font-mono text-xs"
+              spellCheck={false}
+              placeholder={'{ "titlePrefix": "[ACME] ", "productName": "ACME Backup", "accentColor": "#1e66f5", "logo": "data:image/png;base64,…", "customCss": "" }'}
+              value={form.serverBrandingJson}
+              onChange={(e) => set({ serverBrandingJson: e.target.value })}
+            />
+          </label>
+        </Card>
       </fieldset>
       {canWrite && (
         <div className="mt-4 flex gap-2">
           <Button onClick={() => void save(toBody(form))}>Save</Button>
           {s && (
-            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null })}>
+            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null, notificationProfiles: null, serverAccess: null, serverBranding: null })}>
               Stop managing
             </Button>
           )}

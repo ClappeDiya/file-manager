@@ -22,8 +22,13 @@ import { SharingPolicySection } from "@/components/sharing-policy-section";
 import { ProxySection } from "@/components/proxy-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
 import { DiagnosticsSection } from "@/components/diagnostics-section";
+import { AppearanceSettings } from "@/components/appearance-settings";
 import { ManagedSettingsNotice } from "@/components/managed-settings-notice";
 import { FleetAgentLimits } from "@/components/fleet-agent-limits";
+import { PortableModeBadge, PortableModeDetails } from "@/components/portable-mode-status";
+import { usePortableStatus } from "@/hooks/use-portable-status";
+import { MetricsExporterSection } from "@/components/metrics-exporter-section";
+import { AdvancedOnly } from "@/components/backup/advanced-only";
 
 // ── Types ──
 
@@ -1268,6 +1273,7 @@ export default function SettingsPanel({
   onOpenNetworkWizard?: () => void;
 }) {
   const [summary, setSummary] = useState<SettingsSummary | null>(null);
+  const portable = usePortableStatus();
 
   const loadSummary = useCallback(async () => {
     const s = await tauriInvokeSafe<SettingsSummary | null>(
@@ -1287,10 +1293,15 @@ export default function SettingsPanel({
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
         <h2 className="text-sm font-semibold">Settings</h2>
+        <PortableModeBadge status={portable} />
       </div>
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        <Section title="Appearance" defaultOpen>
+          <AppearanceSettings />
+        </Section>
+
         {/* Export */}
         <Section title="Export Settings" defaultOpen>
           <ExportSection summary={summary} />
@@ -1324,6 +1335,11 @@ export default function SettingsPanel({
         {/* Privacy */}
         <Section title="Privacy">
           <PrivacySection />
+        </Section>
+
+        {/* Where this installation keeps its data (portable mode) */}
+        <Section title="Storage &amp; Portable Mode">
+          <PortableModeDetails status={portable} />
         </Section>
 
         {/* Log Controls */}
@@ -1384,6 +1400,15 @@ export default function SettingsPanel({
         {/* GSSAPI/Kerberos */}
         <Section title="GSSAPI / Kerberos">
           <GssapiSection />
+        </Section>
+
+        {/* Advanced: local monitoring (Prometheus exporter, off by default) */}
+        <Section title="Advanced">
+          <div className="pt-3" />
+          <AdvancedOnly hint>
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Prometheus metrics</h3>
+            <MetricsExporterSection />
+          </AdvancedOnly>
         </Section>
 
         {/* Network Diagnostics */}

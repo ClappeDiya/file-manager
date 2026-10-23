@@ -73,6 +73,37 @@ pub async fn pick_files(
     })
 }
 
+/// Native "save as" dialog; `None` when cancelled. `default_name` pre-fills
+/// the file name; `extensions` limits the file types offered.
+#[tauri::command]
+pub async fn pick_save_file(
+    window: tauri::Window,
+    title: Option<String>,
+    default_name: Option<String>,
+    extensions: Option<Vec<String>>,
+) -> Result<Option<String>, AppError> {
+    use tauri::Manager;
+    use tauri_plugin_dialog::DialogExt;
+
+    let dialog = window.app_handle().dialog().file();
+    #[cfg(any(windows, target_os = "macos"))]
+    let dialog = dialog.set_parent(&window);
+    let dialog = if let Some(t) = title { dialog.set_title(t) } else { dialog };
+    let dialog = if let Some(n) = default_name.filter(|n| !n.is_empty()) { dialog.set_file_name(n) } else { dialog };
+    let exts: Vec<String> = extensions.unwrap_or_default();
+    let dialog = if exts.is_empty() {
+        dialog
+    } else {
+        let refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+        dialog.add_filter("Archive", &refs)
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dialog.save_file(move |path| {
+        let _ = tx.send(path.map(|p| p.to_string()));
+    });
+    rx.await.map_err(|_| AppError::Internal { message: "Save dialog was cancelled or failed to respond".to_string() })
+}
+
 /// Maximum byte size for full-content text read/write. Matches the
 /// `MAX_FILE_SIZE` constant in `src/components/text-editor.tsx` so
 /// the backend and frontend agree on the 1 MB in-app-editor ceiling.

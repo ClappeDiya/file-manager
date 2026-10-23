@@ -418,15 +418,10 @@ pub async fn lookup(p: &SecretProvider, credential: Option<&str>, name: &str) ->
         ProviderKind::AzureKeyVault { vault_url, tenant_id, client_id, authority, tls } => {
             let secret = credential.filter(|t| !t.is_empty()).ok_or_else(|| AppError::validation(format!("{}: the client secret is missing", p.name)))?;
             let client = http::client(tls)?;
-            let auth = if authority.trim().is_empty() { "https://login.microsoftonline.com" } else { authority.trim().trim_end_matches('/') };
-            let r = client
-                .post(format!("{auth}/{tenant_id}/oauth2/v2.0/token"))
-                .form(&[("grant_type", "client_credentials"), ("client_id", client_id.as_str()), ("client_secret", secret), ("scope", "https://vault.azure.net/.default")])
-                .send()
-                .await
-                .map_err(|e| http::net("Azure sign-in", e))?;
-            let t: serde_json::Value = http::check(r, "Azure sign-in").await?.json().await.map_err(|e| http::net("Azure sign-in", e))?;
-            let token = t["access_token"].as_str().ok_or_else(|| AppError::connection("Azure returned no access token", "Check the tenant, client id and secret."))?;
+            let cred = crate::connectors::azure_ad::AadCredential::Secret { tenant: tenant_id.clone(), client_id: client_id.clone(), secret: secret.to_string() };
+            let source = crate::connectors::azure_ad::AadTokenSource::new(cred, Some(authority.as_str()), client.clone(), crate::connectors::aws_chain::ChainEnv::process())?;
+            let token = source.token(crate::connectors::azure_ad::VAULT_SCOPE).await?;
+            let token = token.as_str();
             let kv_name: String = name.chars().map(|c| if c == '_' { '-' } else { c }).collect();
             let r = client.get(format!("{}/secrets/{kv_name}", vault_url.trim_end_matches('/'))).query(&[("api-version", "7.4")]).bearer_auth(token).send().await.map_err(|e| http::net("Azure Key Vault", e))?;
             if r.status().as_u16() == 404 {

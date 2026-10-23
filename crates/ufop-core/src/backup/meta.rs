@@ -34,6 +34,13 @@ pub struct ExtMeta {
     /// The link is an NTFS junction (mount point), not a symbolic link.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub junction: bool,
+    /// Unix owner and group ids (recorded since restore-ownership support;
+    /// absent in older versions). On Windows the owner is the `O:` part of
+    /// `win_sddl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
 }
 
 impl ExtMeta {
@@ -52,6 +59,32 @@ pub fn is_junction(path: &Path) -> bool {
     return win_sec::reparse_tag(path) == Some(IO_REPARSE_TAG_MOUNT_POINT);
     #[allow(unreachable_code)]
     false
+}
+
+/// The filesystem (device) `path` lives on: `st_dev` on Unix, the volume
+/// serial number on Windows. `md` is the entry's (followed) metadata.
+#[allow(unused_variables)]
+pub fn device_id(path: &Path, md: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return Some(md.dev());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationByHandleW, FILE_FLAG_BACKUP_SEMANTICS};
+        // FILE_READ_ATTRIBUTES; backup semantics open folders too.
+        let f = std::fs::OpenOptions::new().access_mode(0x80).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path).ok()?;
+        let mut serial: u32 = 0;
+        let ok = unsafe {
+            GetVolumeInformationByHandleW(f.as_raw_handle() as _, std::ptr::null_mut(), 0, &mut serial, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0)
+        };
+        return (ok != 0).then_some(serial as u64);
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 /// Recreate a junction at `link` pointing to the folder `target`.
@@ -178,6 +211,75 @@ pub fn apply(path: &Path, m: &ExtMeta, acls: bool) -> Vec<String> {
         }
     }
     warn
+}
+
+/// Owner and group ids of an entry (Unix; `None` elsewhere).
+#[allow(unused_variables)]
+pub fn owner_of(md: &std::fs::Metadata) -> (Option<u32>, Option<u32>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return (Some(md.uid()), Some(md.gid()));
+    }
+    #[allow(unreachable_code)]
+    (None, None)
+}
+
+/// Whether this process may give files to other owners: Unix effective
+/// user 0 or `CAP_CHOWN` (Linux), Windows `SeRestorePrivilege` (enabled
+/// on the way, as an administrator holds it disabled).
+pub fn can_restore_owner() -> bool {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::geteuid() } == 0 {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // CapEff bit 0 = CAP_CHOWN.
+            if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+                if let Some(hex) = s.lines().find_map(|l| l.strip_prefix("CapEff:")) {
+                    return u64::from_str_radix(hex.trim(), 16).is_ok_and(|c| c & 1 == 1);
+                }
+            }
+        }
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        return win_sec::enable_privilege("SeRestorePrivilege");
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Set the owner (and group) of `path` without following a symbolic link.
+/// Unix: `lchown(uid, gid)`. Windows: the owner SID from `sddl`'s `O:` part.
+#[allow(unused_variables)]
+pub fn set_owner(path: &Path, m: &ExtMeta) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        if m.uid.is_none() && m.gid.is_none() {
+            return Ok(false);
+        }
+        std::os::unix::fs::lchown(path, m.uid, m.gid)?;
+        return Ok(true);
+    }
+    #[cfg(windows)]
+    {
+        let Some(owner) = m.win_sddl.as_deref().and_then(sddl_owner) else { return Ok(false) };
+        win_sec::set_owner_sddl(path, &format!("O:{owner}"))?;
+        return Ok(true);
+    }
+    #[allow(unreachable_code)]
+    Ok(false)
+}
+
+/// The owner SID (`S-1-…` or an alias like `BA`) of an SDDL string.
+pub fn sddl_owner(sddl: &str) -> Option<&str> {
+    let rest = &sddl[sddl.find("O:")? + 2..];
+    let end = ["G:", "D:", "S:"].iter().filter_map(|t| rest.find(t)).min().unwrap_or(rest.len());
+    Some(&rest[..end]).filter(|o| !o.is_empty())
 }
 
 /// macOS Time Machine and freedesktop backup-exclusion attributes.
@@ -403,6 +505,48 @@ mod win_sec {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Set only the owner from an `O:<sid>` SDDL string (needs
+    /// `SeRestorePrivilege` for owners other than the caller).
+    pub fn set_owner_sddl(path: &Path, sddl: &str) -> std::io::Result<()> {
+        let ws: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(ws.as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut()) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let w = wide(path);
+        let ok = unsafe { SetFileSecurityW(w.as_ptr(), OWNER_SECURITY_INFORMATION, sd) };
+        unsafe { LocalFree(sd as _) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Enable a privilege the process token holds (e.g. `SeRestorePrivilege`).
+    pub fn enable_privilege(name: &str) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LUID};
+        use windows_sys::Win32::Security::{AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let wname: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+            let mut luid = LUID { LowPart: 0, HighPart: 0 };
+            if LookupPrivilegeValueW(std::ptr::null(), wname.as_ptr(), &mut luid) == 0 {
+                CloseHandle(token);
+                return false;
+            }
+            let tp = TOKEN_PRIVILEGES { PrivilegeCount: 1, Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }] };
+            let ok = AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut());
+            // ERROR_NOT_ALL_ASSIGNED (1300): the token does not hold it.
+            let held = ok != 0 && GetLastError() != 1300;
+            CloseHandle(token);
+            held
+        }
     }
 
     pub fn set_attributes(path: &Path, attrs: u32) -> std::io::Result<()> {

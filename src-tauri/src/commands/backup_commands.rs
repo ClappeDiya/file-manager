@@ -7,6 +7,9 @@ use crate::backup_engine::{
 };
 use crate::backup_engine::defaults::{GlobalDefaults, SavedDestination};
 use crate::backup_engine::{DatabaseCleanupReport, DatabaseEntry};
+use crate::backup_engine::runs::{RunAllFilter, RunAllReport};
+use crate::backup_engine::paging::{Listing, PageRequest};
+use ufop_core::backup::estimate::BackupEstimate;
 use ufop_core::backup::recovery;
 use crate::core::error::AppError;
 use crate::governance::ediscovery::{self, EDiscoveryReport, EDiscoveryRequest};
@@ -17,6 +20,12 @@ use tauri::State;
 use ufop_core::backup::crypto::{self, PassphraseStrength};
 use ufop_core::backup::maintenance::{FoundFile, VersionComparison};
 use ufop_core::backup::{FileEntry, RestoreOptions, RestoreReport};
+use crate::backup_engine::access::{selector_of, ExportedFile, FileChunk, ResolvedVersion};
+use crate::backup_engine::drives::{DriveInfo, DriveRequest};
+use crate::commands::confirmation_commands::validate_confirmation;
+use crate::security::confirmation::ConfirmationManager;
+use ufop_core::backup::cache::{CacheSettings, CacheStats};
+use ufop_core::backup::select::VersionSelector;
 
 #[tauri::command]
 pub async fn backup_list_jobs(mgr: State<'_, BackupManager>) -> Result<Vec<BackupJob>, AppError> {
@@ -57,13 +66,66 @@ pub async fn backup_run(id: String, dry_run: Option<bool>, mgr: State<'_, Backup
     mgr.start_backup(&id, dry_run.unwrap_or(false)).await
 }
 
+/// Queue a backup of every job (read-only and busy jobs are skipped);
+/// runs share the normal queue and its concurrency limit.
+#[tauri::command]
+pub async fn backup_run_all(filter: Option<RunAllFilter>, mgr: State<'_, BackupManager>) -> Result<RunAllReport, AppError> {
+    mgr.run_all(filter.unwrap_or_default()).await
+}
+
+/// Files, data and time the next backup of a job is likely to need.
+#[tauri::command]
+pub async fn backup_estimate(job_id: String, assumed_bytes_per_sec: Option<u64>, mgr: State<'_, BackupManager>) -> Result<BackupEstimate, AppError> {
+    mgr.estimate(&job_id, assumed_bytes_per_sec).await
+}
+
 /// Run a maintenance/restore operation and wait for its result.
 #[tauri::command]
-pub async fn backup_execute(id: String, operation: BackupOperation, mgr: State<'_, BackupManager>) -> Result<OperationResult, AppError> {
+pub async fn backup_execute(
+    id: String,
+    operation: BackupOperation,
+    confirmation_token: Option<String>,
+    mgr: State<'_, BackupManager>,
+    confirmation_mgr: State<'_, ConfirmationManager>,
+) -> Result<OperationResult, AppError> {
     if matches!(operation, BackupOperation::Backup { .. }) {
         return Err(AppError::validation("Use backup_run to start a backup"));
     }
+    let operation = confirm_mirror(operation, confirmation_token, &confirmation_mgr).await?;
     mgr.execute(&id, operation).await
+}
+
+/// Operation name of the confirmation token a mirror restore needs.
+pub const MIRROR_RESTORE_CONFIRMATION: &str = "backup_mirror_restore";
+
+/// A mirror restore that deletes files (`confirm_delete`) needs a valid,
+/// single-use confirmation token from `request_destructive_confirmation`.
+async fn confirm_mirror(op: BackupOperation, token: Option<String>, confirmations: &ConfirmationManager) -> Result<BackupOperation, AppError> {
+    if let BackupOperation::Restore { options, overrides } = &op {
+        if overrides.confirm_delete && options.delete_extraneous && !options.dry_run {
+            let t = token.ok_or_else(|| AppError::state("A mirror restore needs confirmation", "Confirm the list of files to delete, then start the restore again."))?;
+            validate_confirmation(&t, MIRROR_RESTORE_CONFIRMATION, confirmations).await?;
+        }
+    }
+    Ok(op)
+}
+
+/// Change an encrypted job's passphrase in place (repository format 2) and
+/// store the new one. `current` defaults to the stored passphrase;
+/// `kdf_preset` (interactive | default | sensitive) sets a new Argon2id cost.
+#[tauri::command]
+pub async fn backup_change_passphrase(
+    id: String,
+    current: Option<String>,
+    new_passphrase: String,
+    kdf_preset: Option<String>,
+    mgr: State<'_, BackupManager>,
+) -> Result<ufop_core::backup::format::FormatReport, AppError> {
+    let kdf = match kdf_preset.as_deref().filter(|p| !p.is_empty()) {
+        Some(p) => Some(ufop_core::backup::crypto::KdfParams::preset(p).ok_or_else(|| AppError::validation(format!("Unknown key-derivation preset '{p}'")))?),
+        None => None,
+    };
+    mgr.change_passphrase(&id, current, new_passphrase, kdf).await
 }
 
 #[tauri::command]
@@ -90,28 +152,68 @@ pub async fn backup_resume(mgr: State<'_, BackupManager>) -> Result<SchedulerSta
 }
 
 #[tauri::command]
-pub async fn backup_list_versions(id: String, mgr: State<'_, BackupManager>) -> Result<Vec<Fileset>, AppError> {
-    mgr.list_versions(&id).await
+pub async fn backup_list_versions(id: String, source: Option<String>, tags: Option<Vec<String>>, mgr: State<'_, BackupManager>) -> Result<Vec<Fileset>, AppError> {
+    mgr.list_versions_in(&id, source, tags.unwrap_or_default()).await
+}
+
+/// Files of a version; with `page` (offset, limit, sort, descending,
+/// filter) one page of all of them plus the total.
+#[tauri::command]
+pub async fn backup_list_files(
+    id: String,
+    version: usize,
+    prefix: Option<String>,
+    source: Option<String>,
+    page: Option<PageRequest>,
+    mgr: State<'_, BackupManager>,
+) -> Result<Listing<FileEntry>, AppError> {
+    mgr.list_files_listing(&id, version, prefix, source, page).await
 }
 
 #[tauri::command]
-pub async fn backup_list_files(id: String, version: usize, prefix: Option<String>, mgr: State<'_, BackupManager>) -> Result<Vec<FileEntry>, AppError> {
-    mgr.list_files(&id, version, prefix).await
+pub async fn backup_search(id: String, pattern: String, version: Option<usize>, source: Option<String>, mgr: State<'_, BackupManager>) -> Result<Vec<FoundFile>, AppError> {
+    mgr.search_in(&id, pattern, version, source).await
 }
 
 #[tauri::command]
-pub async fn backup_search(id: String, pattern: String, version: Option<usize>, mgr: State<'_, BackupManager>) -> Result<Vec<FoundFile>, AppError> {
-    mgr.search(&id, pattern, version).await
+pub async fn backup_compare(id: String, base: usize, compare: usize, source: Option<String>, mgr: State<'_, BackupManager>) -> Result<VersionComparison, AppError> {
+    mgr.compare_in(&id, base, compare, source).await
 }
 
+/// Sources (jobs / computers) with versions in the job's repository.
 #[tauri::command]
-pub async fn backup_compare(id: String, base: usize, compare: usize, mgr: State<'_, BackupManager>) -> Result<VersionComparison, AppError> {
-    mgr.compare(&id, base, compare).await
+pub async fn backup_list_sources(id: String, mgr: State<'_, BackupManager>) -> Result<Vec<ufop_core::backup::shared::SourceInfo>, AppError> {
+    mgr.list_sources(&id).await
 }
 
+/// Keep/delete decision per version for the job's (or an unsaved) policy.
 #[tauri::command]
-pub async fn backup_run_history(job_id: Option<String>, limit: Option<u32>, mgr: State<'_, BackupManager>) -> Result<Vec<BackupRun>, AppError> {
-    mgr.run_history(job_id, limit.unwrap_or(50)).await
+pub async fn backup_preview_retention(
+    id: String,
+    policy: Option<ufop_core::backup::RetentionPolicy>,
+    source: Option<String>,
+    mgr: State<'_, BackupManager>,
+) -> Result<ufop_core::backup::maintenance::RetentionPreview, AppError> {
+    mgr.preview_retention(&id, policy, source).await
+}
+
+/// Change a version's note, tags or pin; returns the operation result
+/// (its `report` is the updated version).
+#[tauri::command]
+pub async fn backup_set_version_metadata(
+    id: String,
+    version: usize,
+    source: Option<String>,
+    patch: ufop_core::backup::versions::MetadataPatch,
+    mgr: State<'_, BackupManager>,
+) -> Result<OperationResult, AppError> {
+    mgr.execute(&id, BackupOperation::SetVersionMetadata { version, source, patch }).await
+}
+
+/// Most recent runs; with `page`, one page of the whole history plus the total.
+#[tauri::command]
+pub async fn backup_run_history(job_id: Option<String>, limit: Option<u32>, page: Option<PageRequest>, mgr: State<'_, BackupManager>) -> Result<Listing<BackupRun>, AppError> {
+    mgr.run_history_listing(job_id, limit.unwrap_or(50), page).await
 }
 
 #[tauri::command]
@@ -207,9 +309,45 @@ pub async fn backup_adopt_repository(
     name: Option<String>,
     sources: Option<Vec<String>>,
     source_map: Option<Vec<(String, String)>>,
+    read_only: Option<bool>,
     mgr: State<'_, BackupManager>,
 ) -> Result<BackupJob, AppError> {
-    mgr.adopt_repository(destination, passphrase, prefix.unwrap_or_else(|| "ufop".into()), name, sources.unwrap_or_default(), source_map.unwrap_or_default()).await
+    let opts = crate::backup_engine::AdoptOptions { name, sources: sources.unwrap_or_default(), source_map: source_map.unwrap_or_default(), read_only: read_only.unwrap_or(false) };
+    mgr.adopt_repository(destination, passphrase, prefix.unwrap_or_else(|| "ufop".into()), opts).await
+}
+
+/// "Open backup as it was at …": a read-only job for the job's versioned
+/// S3 bucket as of `at` (RFC 3339).
+#[tauri::command]
+pub async fn backup_open_point_in_time(job_id: String, at: String, name: Option<String>, mgr: State<'_, BackupManager>) -> Result<BackupJob, AppError> {
+    let at = chrono::DateTime::parse_from_rfc3339(&at).map_err(|e| AppError::validation(format!("Invalid time '{at}': {e}")))?.with_timezone(&chrono::Utc);
+    mgr.open_point_in_time(&job_id, at, name).await
+}
+
+/// Ransomware-hardening checklist of a job; `probe` also tries deleting a
+/// probe object with the backup credentials (explicit "Run checks" only).
+#[tauri::command]
+pub async fn backup_hardening_report(job_id: String, probe: Option<bool>, mgr: State<'_, BackupManager>) -> Result<crate::backup_engine::hardening::HardeningReport, AppError> {
+    mgr.hardening_report(&job_id, probe.unwrap_or(false)).await
+}
+
+/// Who holds the job's repository lock(s) right now.
+#[tauri::command]
+pub async fn backup_lock_status(job_id: String, mgr: State<'_, BackupManager>) -> Result<ufop_core::backup::lock::LockStatus, AppError> {
+    mgr.lock_status(&job_id).await
+}
+
+/// Force-unlock the job's repository (needs `confirm`; `owner_id` limits it
+/// to the lock that was shown).
+#[tauri::command]
+pub async fn backup_break_lock(job_id: String, confirm: bool, owner_id: Option<String>, mgr: State<'_, BackupManager>) -> Result<ufop_core::backup::lock::BreakLockReport, AppError> {
+    mgr.break_lock(&job_id, confirm, owner_id).await
+}
+
+/// Turn local-database encryption on or off for a job and migrate now.
+#[tauri::command]
+pub async fn backup_set_database_encryption(job_id: String, enabled: bool, mgr: State<'_, BackupManager>) -> Result<ufop_core::backup::db::RekeyReport, AppError> {
+    mgr.set_database_encryption(&job_id, enabled).await
 }
 
 #[tauri::command]
@@ -292,9 +430,10 @@ pub async fn backup_recovery_convert(folder: String, destination: BackupDestinat
     mgr.recovery_convert(folder, destination, options).await
 }
 
+/// Files at a destination; with `page`, one sorted/filtered page plus the total.
 #[tauri::command]
-pub async fn backup_remote_list(destination: BackupDestination, mgr: State<'_, BackupManager>) -> Result<Vec<ufop_core::backup::RemoteFile>, AppError> {
-    mgr.remote_list(destination).await
+pub async fn backup_remote_list(destination: BackupDestination, page: Option<PageRequest>, mgr: State<'_, BackupManager>) -> Result<Listing<ufop_core::backup::RemoteFile>, AppError> {
+    crate::backup_engine::paging::listing(mgr.remote_list(destination).await?, page.as_ref())
 }
 
 #[tauri::command]
@@ -313,8 +452,91 @@ pub async fn backup_remote_delete(destination: BackupDestination, name: String, 
 }
 
 #[tauri::command]
-pub async fn backup_start_operation(id: String, operation: BackupOperation, mgr: State<'_, BackupManager>) -> Result<String, AppError> {
+pub async fn backup_start_operation(
+    id: String,
+    operation: BackupOperation,
+    confirmation_token: Option<String>,
+    mgr: State<'_, BackupManager>,
+    confirmation_mgr: State<'_, ConfirmationManager>,
+) -> Result<String, AppError> {
+    let operation = confirm_mirror(operation, confirmation_token, &confirmation_mgr).await?;
     mgr.start_operation(&id, operation).await
+}
+
+/// The version a selector picks ("as it was at …", newest, oldest, number, id).
+#[tauri::command]
+pub async fn backup_resolve_version(id: String, selector: VersionSelector, source: Option<String>, mgr: State<'_, BackupManager>) -> Result<ResolvedVersion, AppError> {
+    mgr.resolve_version(&id, selector, source).await
+}
+
+/// Bytes of one backed-up file (base64, at most 10 MiB per call).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn backup_read_file(
+    id: String,
+    path: String,
+    version: Option<usize>,
+    selector: Option<VersionSelector>,
+    offset: Option<u64>,
+    length: Option<u64>,
+    source: Option<String>,
+    mgr: State<'_, BackupManager>,
+) -> Result<FileChunk, AppError> {
+    mgr.read_file(&id, selector_of(version, selector), path, offset.unwrap_or(0), length, source).await
+}
+
+/// Copy one backed-up file to `dest`.
+#[tauri::command]
+pub async fn backup_export_file(id: String, path: String, dest: String, version: Option<usize>, selector: Option<VersionSelector>, source: Option<String>, mgr: State<'_, BackupManager>) -> Result<ExportedFile, AppError> {
+    mgr.export_file(&id, selector_of(version, selector), path, dest, source).await
+}
+
+/// Copy one backed-up file to a temporary file for the preview pane.
+#[tauri::command]
+pub async fn backup_preview_file(id: String, path: String, version: Option<usize>, selector: Option<VersionSelector>, source: Option<String>, mgr: State<'_, BackupManager>) -> Result<ExportedFile, AppError> {
+    mgr.preview_file(&id, selector_of(version, selector), path, source).await
+}
+
+/// Benchmark codecs, ciphers, Argon2id, chunkers and hashes on this computer.
+#[tauri::command]
+pub async fn backup_bench(options: Option<ufop_core::backup::bench::BenchOptions>) -> Result<ufop_core::backup::bench::BenchReport, AppError> {
+    crate::backup_engine::diagnostics::bench(options.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub async fn backup_cache_stats(mgr: State<'_, BackupManager>) -> Result<CacheStats, AppError> {
+    mgr.cache_stats().await
+}
+
+#[tauri::command]
+pub async fn backup_clear_cache(mgr: State<'_, BackupManager>) -> Result<u64, AppError> {
+    mgr.clear_cache().await
+}
+
+#[tauri::command]
+pub async fn backup_get_cache_settings(mgr: State<'_, BackupManager>) -> Result<CacheSettings, AppError> {
+    mgr.cache_settings().await
+}
+
+#[tauri::command]
+pub async fn backup_set_cache_settings(settings: CacheSettings, mgr: State<'_, BackupManager>) -> Result<CacheStats, AppError> {
+    mgr.set_cache_settings(settings).await
+}
+
+/// Serve a version (or all versions) as a read-only drive and mount it.
+#[tauri::command]
+pub async fn backup_open_drive(id: String, request: Option<DriveRequest>, mgr: State<'_, BackupManager>) -> Result<DriveInfo, AppError> {
+    mgr.open_drive(&id, request.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub async fn backup_close_drive(drive_id: String, mgr: State<'_, BackupManager>) -> Result<bool, AppError> {
+    mgr.close_drive(&drive_id).await
+}
+
+#[tauri::command]
+pub async fn backup_list_drives(mgr: State<'_, BackupManager>) -> Result<Vec<DriveInfo>, AppError> {
+    Ok(mgr.list_drives())
 }
 
 #[tauri::command]
@@ -425,4 +647,144 @@ pub async fn ediscovery_export(
     let report = ediscovery::export(&request, mgr.inner(), ledger.inner(), audit.inner(), "user").await?;
     SecurityAudit::log(repo.inner(), "ediscovery.export", "user", &report.output, &format!("matter {}: {} entries, sha256 {}", request.matter.trim(), report.entries, report.sha256)).await;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backup_engine::RestoreOverrides;
+
+    fn mirror(confirm: bool, dry_run: bool) -> BackupOperation {
+        BackupOperation::Restore {
+            options: RestoreOptions { delete_extraneous: true, dry_run, target: Some("/tmp/x".into()), ..Default::default() },
+            overrides: RestoreOverrides { confirm_delete: confirm, ..Default::default() },
+        }
+    }
+
+    #[tokio::test]
+    async fn mirror_restore_needs_a_matching_confirmation_token() {
+        let c = ConfirmationManager::new();
+        assert!(confirm_mirror(mirror(true, false), None, &c).await.is_err(), "no token");
+        let other = c.request_confirmation("reset_database".into(), String::new()).await;
+        assert!(confirm_mirror(mirror(true, false), Some(other), &c).await.is_err(), "token for another operation");
+        let t = c.request_confirmation(MIRROR_RESTORE_CONFIRMATION.into(), "12 files".into()).await;
+        assert!(confirm_mirror(mirror(true, false), Some(t.clone()), &c).await.is_ok());
+        assert!(confirm_mirror(mirror(true, false), Some(t), &c).await.is_err(), "single use");
+        // Dry runs and restores that do not ask to delete need no token
+        // (the manager itself refuses deletions without confirm_delete).
+        assert!(confirm_mirror(mirror(true, true), None, &c).await.is_ok());
+        assert!(confirm_mirror(mirror(false, false), None, &c).await.is_ok());
+    }
+}
+
+// ── Policies, schedules and maintenance (templates, effective settings, cron) ──
+
+/// The next runs of a schedule (interval or cron), validated, with holiday skips marked.
+#[tauri::command]
+pub async fn backup_schedule_preview(schedule: crate::backup_engine::schedule::BackupSchedule, count: Option<usize>) -> Result<Vec<crate::schedule_library::PreviewRun>, AppError> {
+    schedule.preview(chrono::Utc::now(), count.unwrap_or(5))
+}
+
+use crate::backup_engine::templates::{EffectiveSettings, PolicyTemplate};
+
+/// Local and organization policy templates.
+#[tauri::command]
+pub async fn backup_list_templates(mgr: State<'_, BackupManager>) -> Result<Vec<PolicyTemplate>, AppError> {
+    mgr.list_templates().await
+}
+
+#[tauri::command]
+pub async fn backup_get_template(id: String, mgr: State<'_, BackupManager>) -> Result<PolicyTemplate, AppError> {
+    mgr.get_template(&id).await
+}
+
+/// Create (empty id) or update a local template.
+#[tauri::command]
+pub async fn backup_save_template(template: PolicyTemplate, mgr: State<'_, BackupManager>) -> Result<PolicyTemplate, AppError> {
+    mgr.save_template(template).await
+}
+
+#[tauri::command]
+pub async fn backup_delete_template(id: String, mgr: State<'_, BackupManager>) -> Result<(), AppError> {
+    mgr.delete_template(&id).await
+}
+
+/// Base a job on one more template.
+#[tauri::command]
+pub async fn backup_apply_template(template_id: String, job_id: String, mgr: State<'_, BackupManager>) -> Result<BackupJob, AppError> {
+    mgr.apply_template(&template_id, &job_id).await
+}
+
+/// Templates as a JSON file (`ids` empty or absent = all).
+#[tauri::command]
+pub async fn backup_export_templates(ids: Option<Vec<String>>, mgr: State<'_, BackupManager>) -> Result<String, AppError> {
+    mgr.export_templates(&ids.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub async fn backup_import_templates(json: String, mgr: State<'_, BackupManager>) -> Result<Vec<PolicyTemplate>, AppError> {
+    mgr.import_templates(&json).await
+}
+
+/// Each setting of a saved job (`id`) or an unsaved one (`job`), with where it came from.
+#[tauri::command]
+pub async fn backup_effective_settings(id: Option<String>, job: Option<BackupJob>, mgr: State<'_, BackupManager>) -> Result<EffectiveSettings, AppError> {
+    mgr.effective_settings(id.as_deref(), job).await
+}
+
+use crate::backup_engine::notify::profiles::{NotificationProfile, ProfileDeleteOutcome};
+
+/// Local and organization notification profiles.
+#[tauri::command]
+pub async fn backup_list_notification_profiles(mgr: State<'_, BackupManager>) -> Result<Vec<NotificationProfile>, AppError> {
+    mgr.list_notification_profiles().await
+}
+
+#[tauri::command]
+pub async fn backup_get_notification_profile(id: String, mgr: State<'_, BackupManager>) -> Result<NotificationProfile, AppError> {
+    mgr.get_notification_profile(&id).await
+}
+
+/// Create (empty id) or update a local profile; `secret` in the profile is stored, never kept.
+#[tauri::command]
+pub async fn backup_save_notification_profile(profile: NotificationProfile, mgr: State<'_, BackupManager>) -> Result<NotificationProfile, AppError> {
+    mgr.save_notification_profile(profile).await
+}
+
+/// Delete a profile; referenced ones need `force` (references are removed).
+#[tauri::command]
+pub async fn backup_delete_notification_profile(id: String, force: Option<bool>, mgr: State<'_, BackupManager>) -> Result<ProfileDeleteOutcome, AppError> {
+    mgr.delete_notification_profile(&id, force.unwrap_or(false)).await
+}
+
+#[tauri::command]
+pub async fn backup_test_notification_profile(id: String, mgr: State<'_, BackupManager>) -> Result<(), AppError> {
+    mgr.test_notification_profile(&id).await
+}
+
+/// What a channel would send for a sample run (subject, text, HTML, webhook request).
+#[tauri::command]
+pub async fn backup_preview_notification(notification: crate::backup_engine::notify::Notification, result: Option<String>, mgr: State<'_, BackupManager>) -> Result<crate::backup_engine::notify::Preview, AppError> {
+    Ok(mgr.preview_notification(&notification, result.as_deref().unwrap_or("success")))
+}
+
+/// A webhook channel set up for Pushover, ntfy, Discord, PagerDuty, Gotify or a generic endpoint.
+#[tauri::command]
+pub async fn backup_webhook_preset(preset: crate::backup_engine::notify::webhook::WebhookPreset, params: Option<crate::backup_engine::notify::webhook::PresetParams>) -> Result<crate::backup_engine::notify::Notification, AppError> {
+    crate::backup_engine::notify::webhook::preset(preset, &params.unwrap_or_default())
+}
+
+/// The desktop app's optional Prometheus exporter (Settings → Advanced).
+#[tauri::command]
+pub async fn desktop_metrics_status(m: State<'_, crate::backup_engine::metrics_exporter::DesktopMetrics>) -> Result<crate::backup_engine::metrics_exporter::MetricsStatus, AppError> {
+    Ok(m.status())
+}
+
+/// Turn the loopback `/metrics` listener on or off, set its port and token.
+#[tauri::command]
+pub async fn desktop_metrics_configure(
+    settings: crate::backup_engine::metrics_exporter::MetricsSettingsUpdate,
+    m: State<'_, crate::backup_engine::metrics_exporter::DesktopMetrics>,
+) -> Result<crate::backup_engine::metrics_exporter::MetricsStatus, AppError> {
+    m.configure(settings).await
 }

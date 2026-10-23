@@ -33,9 +33,19 @@ pub mod smb;
 pub mod swift;
 pub mod tahoe;
 #[cfg(test)]
+mod cloud_tests;
+#[cfg(test)]
+mod live_providers;
+#[cfg(test)]
+pub(crate) mod mock_azure;
+#[cfg(test)]
+pub(crate) mod mock_gcs;
+#[cfg(test)]
+pub(crate) mod mock_s3;
+#[cfg(test)]
 mod mocks;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
 
@@ -60,6 +70,103 @@ pub trait ObjectStore: Send + Sync {
     fn quota(&self) -> BoxFut<'_, Option<Quota>> {
         Box::pin(async { Ok(None) })
     }
+    /// The provider's last-modified time of an object, when it reports one
+    /// (used to compare clocks before writing).
+    fn modified<'a>(&'a self, name: &'a str) -> BoxFut<'a, Option<chrono::DateTime<chrono::Utc>>> {
+        let _ = name;
+        Box::pin(async { Ok(None) })
+    }
+    /// Whether names may be `dir/name` (one level; sharded layouts). Object
+    /// stores with prefix keys and folder-based services say yes.
+    fn supports_subfolders(&self) -> bool {
+        false
+    }
+    /// Every object, including those one folder down as `dir/name`.
+    /// `parallelism` > 1 lets stores list folders concurrently.
+    fn list_recursive(&self, parallelism: usize) -> BoxFut<'_, Vec<RemoteFile>> {
+        let _ = parallelism;
+        self.list()
+    }
+    /// True when the store itself refuses writes (e.g. a point-in-time view).
+    fn is_read_only(&self) -> bool {
+        false
+    }
+}
+
+/// Files of a recursive prefix listing that are direct children or one
+/// folder down (`dir/name`), relative to `prefix`.
+pub fn child_within_one(prefix: &str, key: &str) -> Option<String> {
+    let p = prefix.trim_matches('/');
+    let rest = if p.is_empty() { key } else { key.strip_prefix(p)?.strip_prefix('/')? };
+    if rest.is_empty() || rest.ends_with('/') {
+        return None;
+    }
+    match rest.split_once('/') {
+        Some((d, f)) if !d.is_empty() && !f.contains('/') && !d.starts_with('.') => Some(rest.to_string()),
+        Some(_) => None,
+        None => Some(rest.to_string()),
+    }
+}
+
+/// List `folders` with `f` on up to `parallelism` tasks at once, in order.
+pub async fn list_folders<'a, F, Fut>(folders: Vec<String>, parallelism: usize, f: F) -> Result<Vec<RemoteFile>, AppError>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Vec<RemoteFile>, AppError>> + 'a,
+{
+    use futures_util::StreamExt;
+    let parts: Vec<Result<Vec<RemoteFile>, AppError>> = futures_util::stream::iter(folders.into_iter().map(f)).buffered(parallelism.clamp(1, 64)).collect().await;
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend(p?);
+    }
+    Ok(out)
+}
+
+/// Storage class / access tier per kind of volume; an empty entry uses the
+/// destination's single class. Block volumes are read only on restore,
+/// index and file-list volumes on every rebuild and verification.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClassByKind {
+    pub dblock: String,
+    pub dindex: String,
+    pub dlist: String,
+    /// Header, verification, lock and other files.
+    pub other: String,
+}
+
+impl ClassByKind {
+    /// The class for object `name`, or `fallback` when none is set for its kind.
+    pub fn pick(&self, name: &str, fallback: &str) -> String {
+        use ufop_core::backup::volume::{kind_of_name, VolumeKind};
+        let v = match kind_of_name(name) {
+            Some(VolumeKind::Block) => &self.dblock,
+            Some(VolumeKind::Index) => &self.dindex,
+            Some(VolumeKind::FileList) => &self.dlist,
+            None => &self.other,
+        };
+        if v.trim().is_empty() { fallback.trim().to_string() } else { v.trim().to_string() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        [&self.dblock, &self.dindex, &self.dlist, &self.other].iter().all(|v| v.trim().is_empty())
+    }
+
+    /// Refuse classes whose objects must be thawed before they can be read
+    /// (`archive`, case-insensitive): every volume kind is read back by
+    /// verification, compaction or restore, so none may be in such a class.
+    pub fn refuse(&self, archive: &[&str], what: &str) -> Result<(), AppError> {
+        for (kind, v) in [("dblock", &self.dblock), ("dindex", &self.dindex), ("dlist", &self.dlist), ("other", &self.other)] {
+            if archive.iter().any(|a| a.eq_ignore_ascii_case(v.trim())) {
+                return Err(AppError::Configuration {
+                    message: format!("{what} '{}' for {kind} volumes needs a restore before every read", v.trim()),
+                    advice: "Per-volume classes may not use archive tiers (verification, compaction and restores must read volumes directly). Use an instant-access class (e.g. GLACIER_IR, Cold) or set the single storage class with cold-storage restore.".into(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Synchronous engine backend over an [`ObjectStore`].
@@ -67,12 +174,19 @@ pub struct StoreBackend {
     store: Box<dyn ObjectStore>,
     rt: Handle,
     timeout: Option<Duration>,
+    list_parallelism: usize,
 }
 
 impl StoreBackend {
     /// Must be created inside a Tokio runtime; used from blocking threads.
     pub fn new(store: Box<dyn ObjectStore>, timeout: Option<Duration>) -> Self {
-        Self { store, rt: Handle::current(), timeout }
+        Self { store, rt: Handle::current(), timeout, list_parallelism: 1 }
+    }
+
+    /// Folder listings run at once for sharded layouts.
+    pub fn with_list_parallelism(mut self, n: usize) -> Self {
+        self.list_parallelism = n.max(1);
+        self
     }
 
     fn wait<T>(&self, what: &str, f: BoxFut<'_, T>) -> Result<T, AppError> {
@@ -117,6 +231,23 @@ impl Backend for StoreBackend {
     }
     fn quota(&self) -> Option<Quota> {
         self.wait("Quota", self.store.quota()).ok().flatten()
+    }
+    fn modified(&self, name: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        self.wait("Reading the file time", self.store.modified(name))
+    }
+    fn supports_subfolders(&self) -> bool {
+        self.store.supports_subfolders()
+    }
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
+        if !self.store.supports_subfolders() {
+            return self.list();
+        }
+        let mut v = self.wait("Listing", self.store.list_recursive(self.list_parallelism))?;
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(v)
+    }
+    fn is_read_only(&self) -> bool {
+        self.store.is_read_only()
     }
 }
 
@@ -248,13 +379,33 @@ pub const PROVIDERS: &[ProviderInfo] = &[
     ProviderInfo { id: "movistar_cloud", name: "Movistar Cloud (MiCloud)", secret: "Account password", verified: "api-mock", hidden: true },
 ];
 
+/// How a store is opened.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenOptions {
+    /// The connection only reads (job or point-in-time view): stores that
+    /// can ask for narrower permissions do (GCS read-only scope).
+    pub read_only: bool,
+}
+
 /// Open the store for a configuration with its secret.
 pub async fn open(config: &CloudConfig, secret: Option<String>) -> Result<Box<dyn ObjectStore>, AppError> {
+    open_with(config, secret, OpenOptions::default()).await
+}
+
+/// [`open`] with options.
+pub async fn open_with(config: &CloudConfig, secret: Option<String>, opts: OpenOptions) -> Result<Box<dyn ObjectStore>, AppError> {
     let need = |s: Option<String>| s.filter(|s| !s.is_empty()).ok_or_else(|| AppError::validation("This destination's credentials are missing; edit the destination to enter them"));
     Ok(match config {
-        CloudConfig::S3(c) => Box::new(s3::S3Store::new(c.clone(), need(secret)?)?),
-        CloudConfig::Azure(c) => Box::new(azure::AzureStore::new(c.clone(), need(secret)?)?),
-        CloudConfig::Gcs(c) => Box::new(gcs::GcsStore::new(c.clone(), need(secret)?)?),
+        CloudConfig::S3(c) => {
+            // Only static keys need the stored secret; the chain finds the rest.
+            let secret = if c.credentials.is_static() { Some(need(secret)?) } else { secret };
+            Box::new(s3::S3Store::with_env(c.clone(), secret, crate::connectors::aws_chain::ChainEnv::process())?)
+        }
+        CloudConfig::Azure(c) => {
+            let secret = if c.auth.needs_secret() { Some(need(secret)?) } else { secret };
+            Box::new(azure::AzureStore::with_env(c.clone(), secret, crate::connectors::aws_chain::ChainEnv::process())?)
+        }
+        CloudConfig::Gcs(c) => Box::new(gcs::GcsStore::with_access(c.clone(), need(secret)?, opts.read_only)?),
         CloudConfig::B2(c) => Box::new(b2::B2Store::connect(c.clone(), need(secret)?).await?),
         CloudConfig::Swift(c) => Box::new(swift::SwiftStore::connect(c.clone(), need(secret)?).await?),
         CloudConfig::Dropbox(c) => Box::new(oauth_drive::DriveStore::new(oauth_drive::Kind::Dropbox, c.clone(), need(secret)?)?),

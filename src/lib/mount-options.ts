@@ -2,6 +2,7 @@
  * Mount options and the organization's mount profile (Rust:
  * `mount_engine::{MountOptions, PinReport}`, `ufop_core::agent::ManagedMounts`).
  */
+import { formatBytes } from "@/lib/format-bytes";
 import { useEffect, useState } from "react";
 import { tauriInvokeSafe } from "@/hooks/use-tauri";
 
@@ -47,16 +48,8 @@ export const CACHE_MODES: [CacheMode, string][] = [
 export const isCloudMount = (protocol: string) =>
   protocol === "rclone" || protocol === "s3";
 
-export const human = (n: number) => {
-  const u = ["B", "KB", "MB", "GB", "TB"];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return i === 0 ? `${n} B` : `${v.toFixed(1)} ${u[i]}`;
-};
+/** Sizes in the units chosen in Settings → Appearance. */
+export const human = (n: number) => formatBytes(n);
 
 /** What the profile says, in one line. */
 export function describePolicy(p: ManagedMounts): string {

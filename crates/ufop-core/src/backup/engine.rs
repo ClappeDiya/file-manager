@@ -8,22 +8,26 @@
 //! thread.
 
 use super::backend::Backend;
+use super::chunker::Chunker;
+use super::reader::{read_input, Input, Msg, StreamSource, Work, WorkerCfg};
 use super::crypto::{KdfParams, VolumeCipher};
+use super::layout::LayoutBackend;
 use super::db::BackupDb;
 use super::filters::SourceFilter;
 use super::par2::{self, Par2};
 use super::retention::RetentionPolicy;
 use super::volume::{self, BlockVolumeWriter, ControlFile, FileListVolume, IndexVolume, IndexedBlock, RepoHeader, VolumeKind};
 use super::{
-    hash_bytes, meta, BackupOptions, EntryKind, FileEntry, FileHasher, HashAlgorithm, MissingSourcePolicy, OpContext, Phase, Progress, SymlinkPolicy,
-    UsnPolicy, REPO_FORMAT_VERSION,
+    hash_bytes, meta, BackupOptions, EntryKind, FileEntry, HashAlgorithm, MissingSourcePolicy, OpContext, Phase, Progress, SymlinkPolicy,
+    UsnPolicy,
 };
+use super::errors::{ErrorClass, ErrorTracker};
 use super::snapshot::SnapshotPolicy;
+use super::versions::{VersionMeta, VersionStats};
 use crate::error::AppError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -31,13 +35,19 @@ use std::time::Instant;
 
 /// An opened repository: backend + local database + key material.
 pub struct Repo<'a> {
-    pub backend: &'a dyn Backend,
+    /// The destination seen through the repository layout (logical names).
+    pub backend: LayoutBackend<'a>,
     pub db: &'a BackupDb,
     pub cipher: VolumeCipher,
     pub header: RepoHeader,
     pub prefix: String,
     pub par2: Option<Par2>,
     pub case_insensitive: bool,
+    /// An upgraded repository still offers rollback to format 1 until the
+    /// first format-2 write (see [`Repo::note_write`]).
+    rollback_pending: AtomicBool,
+    /// Local cache of sealed volumes and this repository's namespace in it.
+    cache: Option<(Arc<super::cache::VolumeCache>, String)>,
 }
 
 impl<'a> Repo<'a> {
@@ -57,7 +67,33 @@ impl<'a> Repo<'a> {
 
     /// Like [`Repo::open`], with an optional external encryption module
     /// (e.g. GPG) instead of the passphrase-derived AES key.
+    ///
+    /// A shared repository (see [`super::shared`]) scopes `db` to the
+    /// source of `options.identity` and brings it up to date from the
+    /// destination first.
     pub fn open_with_cipher(
+        backend: &'a dyn Backend,
+        db: &'a BackupDb,
+        passphrase: Option<&str>,
+        external: Option<VolumeCipher>,
+        options: &BackupOptions,
+        create: bool,
+        kdf: KdfParams,
+    ) -> Result<Self, AppError> {
+        let repo = Self::open_unsynced(backend, db, passphrase, external, options, create, kdf)?;
+        if super::shared::is_shared(&repo.header) {
+            db.set_scope(Some(options.identity.resolve().source_id()));
+            let r = super::shared::sync_from_remote(&repo, &OpContext::new())?;
+            for w in r.warnings {
+                tracing::warn!("{w}");
+            }
+        }
+        Ok(repo)
+    }
+
+    /// [`Repo::open_with_cipher`] without the shared-repository scope and
+    /// sync (database rebuilds, header-level tools).
+    pub(crate) fn open_unsynced(
         backend: &'a dyn Backend,
         db: &'a BackupDb,
         passphrase: Option<&str>,
@@ -89,9 +125,7 @@ impl<'a> Repo<'a> {
         let found = listing.iter().find(|f| f.name == header_name || (options.remote_case_insensitive && f.name.eq_ignore_ascii_case(&header_name)));
         let (header, cipher) = if let Some(hf) = found {
             let header: RepoHeader = serde_json::from_slice(&backend.get(&hf.name)?)?;
-            if header.format_version > REPO_FORMAT_VERSION {
-                return Err(AppError::validation(format!("This backup was written by a newer version (format {}); update the app", header.format_version)));
-            }
+            super::format::check_readable(&header)?;
             let external = match external {
                 None if header.encrypted && header.encryption_module == "gpg" => Some(VolumeCipher::external(std::sync::Arc::new(super::gpg::GpgModule { recipients: header.gpg_recipients.clone(), ..(*gpg_from_options()).clone() }))),
                 other => other,
@@ -106,35 +140,14 @@ impl<'a> Repo<'a> {
             kdf.validate().or_else(|e| if kdf == KdfParams::insecure_fast() { Ok(()) } else { Err(e) })?;
             let external = match external {
                 None if options.encryption_module == super::EncryptionModuleKind::Gpg => {
-                    if options.gpg.recipients.is_empty() && passphrase.is_none_or(|p| p.is_empty()) {
+                    if options.gpg.recipients.is_empty() && passphrase.map_or(true, |p| p.is_empty()) {
                         return Err(AppError::validation("GPG encryption needs a passphrase or at least one recipient key"));
                     }
                     Some(VolumeCipher::external(gpg_from_options()))
                 }
                 other => other,
             };
-            let (cipher, salt) = match (external, passphrase.filter(|p| !p.is_empty())) {
-                (Some(ext), _) => (ext, None),
-                (None, Some(p)) => {
-                    let salt = VolumeCipher::random_salt();
-                    (VolumeCipher::derive(p, &salt, kdf)?, Some(hex::encode(&salt)))
-                }
-                (None, None) => (VolumeCipher::plain(), None),
-            };
-            let aes = salt.is_some();
-            let header = RepoHeader {
-                format_version: REPO_FORMAT_VERSION,
-                encrypted: cipher.is_encrypted(),
-                salt,
-                kdf: aes.then_some(kdf),
-                key_check: if cipher.is_encrypted() { cipher.key_check()? } else { None },
-                block_size: options.block_size.max(1024),
-                block_hash: options.block_hash,
-                file_hash: options.file_hash,
-                volume_format: options.volume_format,
-                encryption_module: if aes { "aes".into() } else if cipher.is_encrypted() { cipher.module_name() } else { String::new() },
-                gpg_recipients: if cipher.module_name() == "gpg" { options.gpg.recipients.clone() } else { Vec::new() },
-            };
+            let (header, cipher) = super::format::create_header(options, passphrase, external, kdf, backend)?;
             if !options.dry_run {
                 backend.create_folder()?;
                 backend.put(&header_name, &serde_json::to_vec_pretty(&header)?)?;
@@ -142,7 +155,52 @@ impl<'a> Repo<'a> {
             (header, cipher)
         };
         let par2 = options.par2.enabled.then(|| Par2::new(options.par2.clone(), options.temp_root()));
-        Ok(Self { backend, db, cipher, header, prefix: options.prefix.clone(), par2, case_insensitive: options.remote_case_insensitive })
+        let rollback_pending = AtomicBool::new(header.has_feature(super::format::FEATURE_V1_ROLLBACK));
+        Ok(Self {
+            backend: LayoutBackend::new(backend, header.layout, &options.prefix),
+            db,
+            cipher,
+            header,
+            prefix: options.prefix.clone(),
+            par2,
+            case_insensitive: options.remote_case_insensitive,
+            rollback_pending,
+            cache: None,
+        })
+    }
+
+    /// Read and keep downloaded volumes in `cache` (see [`super::cache`]).
+    pub fn with_cache(mut self, cache: Option<Arc<super::cache::VolumeCache>>) -> Self {
+        self.set_cache(cache);
+        self
+    }
+
+    pub fn set_cache(&mut self, cache: Option<Arc<super::cache::VolumeCache>>) {
+        let ns = super::cache::namespace(&self.backend.inner().describe(), &self.prefix);
+        self.cache = cache.filter(|c| c.max_bytes() > 0).map(|c| (c, ns));
+    }
+
+    pub fn cache(&self) -> Option<&Arc<super::cache::VolumeCache>> {
+        self.cache.as_ref().map(|c| &c.0)
+    }
+
+    /// The cache with this repository's namespace in it.
+    pub(crate) fn cache_entry(&self) -> Option<(Arc<super::cache::VolumeCache>, String)> {
+        self.cache.clone()
+    }
+
+    /// Record that format-2 data is about to be written: an upgraded
+    /// repository loses its rollback option (once, before the first write).
+    pub(crate) fn note_write(&self) -> Result<(), AppError> {
+        if self.rollback_pending.swap(false, Ordering::SeqCst) {
+            super::format::clear_rollback(self.backend.inner(), &self.prefix)?;
+        }
+        Ok(())
+    }
+
+    /// The chunker new blocks are cut with.
+    pub fn chunker(&self) -> Box<dyn Chunker> {
+        self.header.chunker_spec().build()
     }
 
     fn par2_key(name: &str) -> String {
@@ -165,6 +223,7 @@ impl<'a> Repo<'a> {
         if dry_run {
             return Ok(-1);
         }
+        self.note_write()?;
         self.db.add_volume(name, kind, data.len() as u64, &h, "uploading")?;
         self.backend.put(name, data)?;
         if kind != VolumeKind::Index {
@@ -204,10 +263,11 @@ impl<'a> Repo<'a> {
         self.get_volume_ex(name, true)
     }
 
-    /// Verification uses `allow_repair = false` so damage is reported.
+    /// Verification uses `allow_repair = false` so damage is reported; it
+    /// also never reads the cache, so it always checks the destination.
     pub(crate) fn get_volume_ex(&self, name: &str, allow_repair: bool) -> Result<Vec<u8>, AppError> {
         let (hash, rec) = self.volume_check_info(name)?;
-        self.fetcher().fetch(name, hash.as_deref(), &rec, allow_repair)
+        self.fetcher_with(allow_repair).fetch(name, hash.as_deref(), &rec, allow_repair)
     }
 
     /// Recorded hash and PAR2 file names of a volume (for [`VolumeFetcher`]).
@@ -217,9 +277,22 @@ impl<'a> Repo<'a> {
         Ok((hash, rec))
     }
 
-    /// Database-free volume downloader that worker threads can share.
+    /// Database-free volume downloader that worker threads can share. It
+    /// reads from and fills the volume cache when one is set.
     pub(crate) fn fetcher(&self) -> VolumeFetcher<'_> {
-        VolumeFetcher { backend: self.backend, par2: self.par2.as_ref(), case_insensitive: self.case_insensitive }
+        self.fetcher_with(true)
+    }
+
+    /// `read_cache = false` always downloads (verification, full restores)
+    /// but still keeps what it downloaded in the cache.
+    pub(crate) fn fetcher_with(&self, read_cache: bool) -> VolumeFetcher<'_> {
+        VolumeFetcher {
+            backend: &self.backend,
+            par2: self.par2.as_ref(),
+            case_insensitive: self.case_insensitive,
+            cache: self.cache.as_ref().map(|(c, ns)| (c.as_ref(), ns.as_str())),
+            read_cache,
+        }
     }
 
     /// Write a sealed file list for `files` and record the version.
@@ -231,25 +304,29 @@ impl<'a> Repo<'a> {
         files: &[FileEntry],
         task_config: Option<serde_json::Value>,
         control_files: Vec<ControlFile>,
+        meta: VersionMeta,
         dry_run: bool,
     ) -> Result<String, AppError> {
         let name = volume::filelist_volume_name(&self.prefix, ts, &self.cipher);
-        let fl = FileListVolume { timestamp: ts.to_rfc3339(), partial, files: files.to_vec(), task_config, control_files };
+        let fl = FileListVolume { timestamp: ts.to_rfc3339(), partial, files: files.to_vec(), task_config, control_files, meta };
         let data = volume::seal_json(&self.cipher, &fl)?;
         self.put_volume(VolumeKind::FileList, &name, &data, dry_run)?;
         if !dry_run {
-            self.db.add_fileset(&fl.timestamp, &name, partial, files)?;
+            self.db.add_fileset_with_meta(&fl.timestamp, &name, partial, files, &fl.meta)?;
             // Kept so rewrites (purge, repair) preserve them.
             self.db.set_kv(&format!("dlist_extra:{}", fl.timestamp), &serde_json::to_string(&DlistExtra { task_config: fl.task_config, control_files: fl.control_files })?)?;
         }
         Ok(fl.timestamp)
     }
 
-    /// Re-upload a version's file list (same name), preserving extras.
-    pub(crate) fn rewrite_filelist(&self, timestamp: &str, partial: bool, volume_name: &str, files: &[FileEntry]) -> Result<Vec<u8>, AppError> {
+    /// Re-upload a version's file list (same name), preserving extras and
+    /// the version's metadata.
+    pub(crate) fn rewrite_filelist(&self, fs: &super::Fileset, files: &[FileEntry]) -> Result<Vec<u8>, AppError> {
+        let (timestamp, partial, volume_name) = (fs.timestamp.as_str(), fs.partial, fs.volume_name.as_str());
         let extra: DlistExtra = self.db.get_kv(&format!("dlist_extra:{timestamp}"))?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let fl = FileListVolume { timestamp: timestamp.to_string(), partial, files: files.to_vec(), task_config: extra.task_config, control_files: extra.control_files };
+        let fl = FileListVolume { timestamp: timestamp.to_string(), partial, files: files.to_vec(), task_config: extra.task_config, control_files: extra.control_files, meta: fs.meta() };
         let data = volume::seal_json(&self.cipher, &fl)?;
+        self.note_write()?;
         self.backend.put(volume_name, &data)?;
         self.put_recovery(volume_name, &data)?;
         self.db.add_volume(volume_name, VolumeKind::FileList, data.len() as u64, &hash_bytes(HashAlgorithm::Sha256, &data), "uploaded")?;
@@ -283,9 +360,7 @@ impl<'a> Repo<'a> {
 
 /// The volume cipher for an existing repository header.
 pub fn header_cipher(header: &RepoHeader, passphrase: Option<&str>, external: Option<VolumeCipher>) -> Result<VolumeCipher, AppError> {
-    if header.format_version > REPO_FORMAT_VERSION {
-        return Err(AppError::validation(format!("This backup was written by a newer version (format {}); update the app", header.format_version)));
-    }
+    super::format::check_readable(header)?;
     let external = match external {
         None if header.encrypted && header.encryption_module == "gpg" => Some(VolumeCipher::external(std::sync::Arc::new(super::gpg::GpgModule {
             passphrase: passphrase.filter(|p| !p.is_empty()).map(String::from),
@@ -294,7 +369,7 @@ pub fn header_cipher(header: &RepoHeader, passphrase: Option<&str>, external: Op
         }))),
         other => other,
     };
-    Ok(match (header.encrypted, external) {
+    let cipher = match (header.encrypted, external) {
         (true, Some(ext)) => {
             // Key-encrypted GPG backups are written by machines that may not
             // hold the secret key, so only symmetric checks are verified.
@@ -307,12 +382,18 @@ pub fn header_cipher(header: &RepoHeader, passphrase: Option<&str>, external: Op
         (true, None) => {
             let pass = passphrase.filter(|p| !p.is_empty()).ok_or_else(|| AppError::validation("This backup is encrypted; enter its passphrase"))?;
             let salt = hex::decode(header.salt.as_deref().unwrap_or_default()).map_err(|_| AppError::validation("Repository header salt is malformed"))?;
-            let c = VolumeCipher::derive(pass, &salt, header.kdf.unwrap_or_default())?;
-            c.verify_key_check(header.key_check.as_deref().unwrap_or_default())?;
-            c
+            // v1: the derived key encrypts volumes. v2: it is the KEK that
+            // unwraps the master key.
+            let kek = VolumeCipher::derive(pass, &salt, header.kdf.unwrap_or_default())?.with_aead(header.cipher);
+            kek.verify_key_check(header.key_check.as_deref().unwrap_or_default())?;
+            match header.wrapped_master_key.as_deref() {
+                Some(w) => kek.unwrap_key(w, header.cipher)?,
+                None => kek,
+            }
         }
         (false, _) => VolumeCipher::plain(),
-    })
+    };
+    Ok(super::format::configure_cipher(header, cipher))
 }
 
 /// Downloads a volume, checks it against its recorded SHA-256 and, when
@@ -321,10 +402,35 @@ pub(crate) struct VolumeFetcher<'a> {
     backend: &'a dyn Backend,
     par2: Option<&'a Par2>,
     case_insensitive: bool,
+    cache: Option<(&'a super::cache::VolumeCache, &'a str)>,
+    read_cache: bool,
 }
 
-impl VolumeFetcher<'_> {
+impl<'a> VolumeFetcher<'a> {
+    /// A fetcher without PAR2 repair (readers that outlive a [`Repo`]).
+    pub(crate) fn new(backend: &'a dyn Backend, case_insensitive: bool, cache: Option<(&'a super::cache::VolumeCache, &'a str)>, read_cache: bool) -> Self {
+        Self { backend, par2: None, case_insensitive, cache, read_cache }
+    }
+
+    /// Download (or take from the cache) and check a volume. Only volumes
+    /// with a recorded hash go through the cache, so an entry is always checked.
     pub(crate) fn fetch(&self, name: &str, expected: Option<&str>, recovery: &[String], allow_repair: bool) -> Result<Vec<u8>, AppError> {
+        if let (Some((cache, ns)), Some(h)) = (self.cache, expected) {
+            if self.read_cache {
+                if let Some(d) = cache.get(ns, name, Some(h), None) {
+                    return Ok(d);
+                }
+            }
+            let d = self.download(name, Some(h), recovery, allow_repair)?;
+            if let Err(e) = cache.put(ns, name, &d) {
+                tracing::warn!("Volume cache: {}", e.user_message());
+            }
+            return Ok(d);
+        }
+        self.download(name, expected, recovery, allow_repair)
+    }
+
+    fn download(&self, name: &str, expected: Option<&str>, recovery: &[String], allow_repair: bool) -> Result<Vec<u8>, AppError> {
         let data = self.backend.get(name).or_else(|e| {
             // Case-changing backends: retry with the listed spelling.
             if self.case_insensitive {
@@ -367,10 +473,19 @@ impl VolumeFetcher<'_> {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct DlistExtra {
-    task_config: Option<serde_json::Value>,
+pub(crate) struct DlistExtra {
+    pub(crate) task_config: Option<serde_json::Value>,
     #[serde(default)]
-    control_files: Vec<ControlFile>,
+    pub(crate) control_files: Vec<ControlFile>,
+}
+
+/// Remember a file list's embedded configuration and control files so
+/// later rewrites (purge, repair) keep them.
+pub(crate) fn store_dlist_extra(db: &BackupDb, fl: &FileListVolume) -> Result<(), AppError> {
+    if fl.task_config.is_none() && fl.control_files.is_empty() {
+        return Ok(());
+    }
+    db.set_kv(&format!("dlist_extra:{}", fl.timestamp), &serde_json::to_string(&DlistExtra { task_config: fl.task_config.clone(), control_files: fl.control_files.clone() })?)
 }
 
 /// Result of [`Repo::consistency_check`].
@@ -416,6 +531,22 @@ pub struct BackupReport {
     pub usn_used: bool,
     /// Snapshot method used (`vss`, `lvm`, `apfs`), if any.
     pub snapshot: Option<String>,
+    /// Checkpoints (partial versions of the files finished so far) uploaded
+    /// during the run; each replaced the previous one.
+    #[serde(default)]
+    pub checkpoints: u64,
+    /// Files re-read by percentage rehash although they looked unchanged.
+    #[serde(default)]
+    pub files_rehashed: u64,
+    /// Of those, files whose content differed from the recorded hash.
+    #[serde(default)]
+    pub rehash_mismatches: u64,
+    /// The run stopped at `max_upload_bytes_per_run` (the version is partial).
+    #[serde(default)]
+    pub upload_cap_reached: bool,
+    /// Informational notes for the run log (e.g. skipped mount points).
+    #[serde(default)]
+    pub info: Vec<String>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
     pub duration_ms: u64,
@@ -429,11 +560,11 @@ pub(crate) struct Pending {
 
 impl Pending {
     pub(crate) fn for_repo(repo: &Repo, opts: &BackupOptions) -> Self {
-        Self { writer: BlockVolumeWriter::with_format(repo.header.volume_format, opts.zip_method), sizes: Vec::new(), hashes: HashSet::new() }
+        Self { writer: BlockVolumeWriter::with_format(repo.header.volume_format, opts.zip_method).with_codec(repo.header.block_codec), sizes: Vec::new(), hashes: HashSet::new() }
     }
 
     pub(crate) fn add_block(&mut self, hash: String, data: &[u8], level: u32) -> Result<(), AppError> {
-        let (flag, enc) = volume::encode_block(self.writer.format(), data, level)?;
+        let (flag, enc) = volume::encode_block(self.writer.format(), self.writer.codec(), data, level)?;
         self.add_encoded(hash, flag, enc, data.len() as u64);
         Ok(())
     }
@@ -452,8 +583,8 @@ impl Pending {
         if self.writer.is_empty() {
             return None;
         }
-        let fmt = self.writer.format();
-        let w = std::mem::replace(&mut self.writer, BlockVolumeWriter::with_format(fmt, Default::default()));
+        let (fmt, codec) = (self.writer.format(), self.writer.codec());
+        let w = std::mem::replace(&mut self.writer, BlockVolumeWriter::with_format(fmt, Default::default()).with_codec(codec));
         self.hashes.clear();
         Some((w, std::mem::take(&mut self.sizes)))
     }
@@ -501,10 +632,11 @@ pub(crate) fn flush(repo: &Repo, p: &mut Pending, opts: &BackupOptions, report: 
     if opts.dry_run {
         return Ok(());
     }
+    repo.note_write()?;
     repo.db.add_volume(&v.block_name, VolumeKind::Block, v.block_data.len() as u64, &hash_bytes(HashAlgorithm::Sha256, &v.block_data), "uploading")?;
     repo.backend.put(&v.block_name, &v.block_data)?;
     let par2_names = match &repo.par2 {
-        Some(p) => upload_recovery(repo.backend, p, &v.block_name, &v.block_data)?,
+        Some(p) => upload_recovery(&repo.backend, p, &v.block_name, &v.block_data)?,
         None => Vec::new(),
     };
     repo.backend.put(&v.index_name, &v.index_data)?;
@@ -547,11 +679,77 @@ struct Scanner<'f> {
     /// reads; `None` for previews, where nothing is read.
     staging: Option<&'f Path>,
     staged: usize,
+    /// `.ufopignore` / `.gitignore` rules, read lazily per folder.
+    ignores: super::ignore::IgnoreMatcher<'f>,
+    /// Unreadable entries go through the job's error policy.
+    errors: &'f ErrorTracker,
+    /// Informational notes for the run log (skipped mount points).
+    info: Vec<String>,
+    roots: Vec<PathBuf>,
+    /// Device of each source root (stay on one filesystem).
+    root_devs: HashMap<PathBuf, Option<u64>>,
 }
 
 impl<'f> Scanner<'f> {
-    fn new(filter: &'f SourceFilter, opts: &'f BackupOptions, snap: Option<&'f super::snapshot::Snapshot>, staging: Option<&'f Path>) -> Self {
-        Scanner { filter, opts, snap, seen_inodes: HashSet::new(), out: Vec::new(), warnings: Vec::new(), staging, staged: 0 }
+    fn new(filter: &'f SourceFilter, opts: &'f BackupOptions, snap: Option<&'f super::snapshot::Snapshot>, staging: Option<&'f Path>, errors: &'f ErrorTracker) -> Self {
+        let ignores = super::ignore::IgnoreMatcher::new(filter.ignore_config(), move |p: &Path| snap.map(|s| s.real(p)).unwrap_or_else(|| p.to_path_buf()));
+        Scanner {
+            filter,
+            opts,
+            snap,
+            seen_inodes: HashSet::new(),
+            out: Vec::new(),
+            warnings: Vec::new(),
+            staging,
+            staged: 0,
+            ignores,
+            errors,
+            info: Vec::new(),
+            roots: Vec::new(),
+            root_devs: HashMap::new(),
+        }
+    }
+
+    /// A source root: ignore files are read inside it, and with
+    /// `one_file_system` its device bounds the walk.
+    fn add_root(&mut self, root: &Path) {
+        self.ignores.add_root(root);
+        if !self.roots.iter().any(|r| r == root) {
+            self.roots.push(root.to_path_buf());
+            self.roots.sort_by_key(|r| std::cmp::Reverse(r.as_os_str().len()));
+        }
+    }
+
+    /// An unreadable or unsupported entry, filed by the error policy.
+    fn problem(&mut self, class: ErrorClass, message: String) {
+        self.errors.record(class, message);
+    }
+
+    /// A folder on another filesystem than its source root.
+    fn crosses_device(&mut self, path: &Path, md: &std::fs::Metadata) -> bool {
+        if !self.opts.one_file_system {
+            return false;
+        }
+        let Some(root) = self.roots.iter().find(|r| path.starts_with(r)).cloned() else { return false };
+        if root == path {
+            return false;
+        }
+        let root_dev = match self.root_devs.get(&root) {
+            Some(d) => *d,
+            None => {
+                let real = self.real(&root);
+                let d = std::fs::metadata(&real).ok().and_then(|m| meta::device_id(&real, &m));
+                self.root_devs.insert(root.clone(), d);
+                d
+            }
+        };
+        let dev = meta::device_id(&self.real(path), md);
+        matches!((root_dev, dev), (Some(a), Some(b)) if a != b)
+    }
+
+    /// Excluded by an ignore file (explicit filter rules win over them).
+    fn ignored(&mut self, path: &Path, is_dir: bool) -> bool {
+        self.ignores.is_active() && self.filter.evaluate(&path.to_string_lossy(), is_dir).is_none() && self.ignores.is_ignored(path, is_dir)
     }
 
     fn real(&self, path: &Path) -> PathBuf {
@@ -560,8 +758,13 @@ impl<'f> Scanner<'f> {
 
     fn entry(&self, path: &Path, kind: EntryKind, md: &std::fs::Metadata) -> FileEntry {
         let o = self.opts;
-        let meta = (!o.skip_metadata && (o.backup_xattrs || o.backup_acls))
-            .then(|| meta::capture(&self.real(path), meta::MetaOptions { xattrs: o.backup_xattrs, acls: o.backup_acls }))
+        let meta = (!o.skip_metadata)
+            .then(|| {
+                let mut m = if o.backup_xattrs || o.backup_acls { meta::capture(&self.real(path), meta::MetaOptions { xattrs: o.backup_xattrs, acls: o.backup_acls }) } else { meta::ExtMeta::default() };
+                // Owner and group, so a privileged restore can give files back.
+                (m.uid, m.gid) = meta::owner_of(md);
+                m
+            })
             .filter(|m| !m.is_empty());
         FileEntry {
             path: path.to_string_lossy().into_owned(),
@@ -599,7 +802,7 @@ impl<'f> Scanner<'f> {
         let lmd = match std::fs::symlink_metadata(&real) {
             Ok(m) => m,
             Err(e) => {
-                self.warnings.push(format!("Cannot read {}: {e}", path.display()));
+                self.problem(ErrorClass::File, format!("Cannot read {}: {e}", path.display()));
                 return None;
             }
         };
@@ -610,7 +813,7 @@ impl<'f> Scanner<'f> {
             match self.opts.symlink_policy {
                 SymlinkPolicy::Ignore => return None,
                 SymlinkPolicy::Store => {
-                    if self.filter.evaluate(&path.to_string_lossy(), false) == Some(super::FilterAction::Exclude) {
+                    if self.filter.evaluate(&path.to_string_lossy(), false) == Some(super::FilterAction::Exclude) || self.ignored(path, false) {
                         return None;
                     }
                     let mut e = self.entry(path, EntryKind::Symlink, &lmd);
@@ -624,7 +827,7 @@ impl<'f> Scanner<'f> {
                 SymlinkPolicy::Follow => match std::fs::metadata(&real) {
                     Ok(m) => m,
                     Err(e) => {
-                        self.warnings.push(format!("Broken link {}: {e}", path.display()));
+                        self.problem(ErrorClass::File, format!("Broken link {}: {e}", path.display()));
                         return None;
                     }
                 },
@@ -632,14 +835,23 @@ impl<'f> Scanner<'f> {
         } else {
             lmd
         };
-        if !self.filter.accepts(path, &md) {
+        if self.ignored(path, md.is_dir()) || !self.filter.accepts(path, &md) {
             return None;
         }
         if md.is_dir() {
             self.out.push((path.to_path_buf(), self.entry(path, EntryKind::Dir, &md)));
+            if self.crosses_device(path, &md) {
+                // Kept as an empty folder, like the mount point it is.
+                self.info.push(format!("Skipped {}: another filesystem (stay on one filesystem)", path.display()));
+                return None;
+            }
             return Some(md);
         }
-        if md.is_file() && !self.hardlink_skip(&md) {
+        if !md.is_file() {
+            self.problem(ErrorClass::UnknownEntry, format!("Skipped {}: not a regular file, folder or link", path.display()));
+            return None;
+        }
+        if !self.hardlink_skip(&md) {
             self.out.push((path.to_path_buf(), self.entry(path, EntryKind::File, &md)));
             if self.opts.backup_alternate_streams {
                 for (name, size) in meta::alternate_streams(&real) {
@@ -664,7 +876,7 @@ impl<'f> Scanner<'f> {
                 c
             }
             Err(e) => {
-                self.warnings.push(format!("Cannot list {}: {e}", path.display()));
+                self.problem(ErrorClass::Dir, format!("Cannot list {}: {e}", path.display()));
                 Vec::new()
             }
         }
@@ -745,8 +957,11 @@ impl<'f> Scanner<'f> {
     }
 
     fn walk(&mut self, path: &Path, depth: usize) {
+        if self.errors.should_stop() {
+            return;
+        }
         if depth > 256 {
-            self.warnings.push(format!("Skipping {}: directory nesting too deep", path.display()));
+            self.problem(ErrorClass::Dir, format!("Skipping {}: directory nesting too deep", path.display()));
             return;
         }
         if self.visit(path).is_some() {
@@ -755,10 +970,31 @@ impl<'f> Scanner<'f> {
             }
         }
     }
+
+    fn finish(self, entries: Vec<(PathBuf, FileEntry)>) -> ScanOut {
+        ScanOut { entries, warnings: self.warnings, info: self.info }
+    }
 }
 
 /// Scanned entries (local path + entry) and warnings.
 pub type ScanResult = (Vec<(PathBuf, FileEntry)>, Vec<String>);
+
+/// What a scan found. Entry problems are in the [`ErrorTracker`].
+struct ScanOut {
+    entries: Vec<(PathBuf, FileEntry)>,
+    warnings: Vec<String>,
+    info: Vec<String>,
+}
+
+impl ScanOut {
+    /// The public shape: problems recorded by the tracker become warnings.
+    fn into_result(mut self, errors: &ErrorTracker) -> ScanResult {
+        let (w, e) = errors.take();
+        self.warnings.extend(w);
+        self.warnings.extend(e);
+        (self.entries, self.warnings)
+    }
+}
 
 fn check_sources<'a>(sources: &'a [PathBuf], opts: &BackupOptions, warnings: &mut Vec<String>) -> Result<Vec<&'a PathBuf>, AppError> {
     let mut ok = Vec::new();
@@ -830,7 +1066,8 @@ fn drop_empty_dirs(out: &mut Vec<(PathBuf, FileEntry)>) {
 /// Photos library sources are expanded, but their `albums.json` is not
 /// written anywhere: its entry's local path is the logical one.
 pub fn scan_sources(sources: &[PathBuf], filter: &SourceFilter, opts: &BackupOptions) -> Result<ScanResult, AppError> {
-    scan_sources_in(sources, filter, opts, None, None)
+    let errors = ErrorTracker::new(opts.error_policy);
+    Ok(scan_sources_in(sources, filter, opts, None, None, &errors)?.into_result(&errors))
 }
 
 fn scan_sources_in(
@@ -839,20 +1076,22 @@ fn scan_sources_in(
     opts: &BackupOptions,
     snap: Option<&super::snapshot::Snapshot>,
     staging: Option<&Path>,
-) -> Result<ScanResult, AppError> {
+    errors: &ErrorTracker,
+) -> Result<ScanOut, AppError> {
     let (plain, libraries) = split_sources(sources);
-    let mut s = Scanner::new(filter, opts, snap, staging);
+    let mut s = Scanner::new(filter, opts, snap, staging, errors);
     for src in check_sources(&plain, opts, &mut s.warnings)? {
+        s.add_root(src);
         s.walk(src, 0);
     }
     for lib in &libraries {
         s.photos(lib)?;
     }
-    let mut out = s.out;
+    let mut out = std::mem::take(&mut s.out);
     if filter.exclude_empty_folders {
         drop_empty_dirs(&mut out);
     }
-    Ok((out, s.warnings))
+    Ok(s.finish(out))
 }
 
 /// Incremental scan: start from the previous version, then rescan only
@@ -867,7 +1106,9 @@ pub fn scan_incremental(
     filter: &SourceFilter,
     opts: &BackupOptions,
 ) -> Result<(ScanResult, u64), AppError> {
-    scan_incremental_in(sources, prev, changed, shallow, deleted, filter, opts, None, None)
+    let errors = ErrorTracker::new(opts.error_policy);
+    let (out, n) = scan_incremental_in(sources, prev, changed, shallow, deleted, filter, opts, None, None, &errors)?;
+    Ok((out.into_result(&errors), n))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -881,10 +1122,14 @@ fn scan_incremental_in(
     opts: &BackupOptions,
     snap: Option<&super::snapshot::Snapshot>,
     staging: Option<&Path>,
-) -> Result<(ScanResult, u64), AppError> {
+    errors: &ErrorTracker,
+) -> Result<(ScanOut, u64), AppError> {
     let (plain, libraries) = split_sources(sources);
-    let mut s = Scanner::new(filter, opts, snap, staging);
+    let mut s = Scanner::new(filter, opts, snap, staging, errors);
     let roots = check_sources(&plain, opts, &mut s.warnings)?;
+    for r in &roots {
+        s.add_root(r);
+    }
     let in_sources = |p: &Path| roots.iter().any(|r| p.starts_with(r));
     let changed: Vec<PathBuf> = changed.iter().map(PathBuf::from).filter(|p| in_sources(p)).collect();
     let shallow: Vec<PathBuf> = shallow.iter().map(PathBuf::from).filter(|p| in_sources(p)).collect();
@@ -946,7 +1191,7 @@ fn scan_incremental_in(
     if filter.exclude_empty_folders {
         drop_empty_dirs(&mut kept);
     }
-    Ok(((kept, s.warnings), rescanned))
+    Ok((s.finish(kept), rescanned))
 }
 
 fn compress_level(path: &Path, opts: &BackupOptions) -> u32 {
@@ -961,7 +1206,7 @@ fn compress_level(path: &Path, opts: &BackupOptions) -> u32 {
     }
 }
 
-fn unchanged(prev: &FileEntry, cur: &FileEntry, opts: &BackupOptions) -> bool {
+pub(crate) fn unchanged(prev: &FileEntry, cur: &FileEntry, opts: &BackupOptions) -> bool {
     if opts.disable_timestamp_check || prev.kind != EntryKind::File || prev.mtime.is_none() {
         return false;
     }
@@ -979,12 +1224,13 @@ fn progress(ctx: &OpContext, phase: Phase, done: u64, total: u64, bytes: u64, cu
     ctx.report(&Progress { phase, files_processed: done, files_total: total, bytes_processed: bytes, current_path: cur.map(String::from) });
 }
 
-/// Next version timestamp, strictly after the newest existing one.
-fn next_timestamp(db: &BackupDb) -> Result<DateTime<Utc>, AppError> {
+/// Next version timestamp, strictly after the newest existing one of any
+/// source (version file names are made from it).
+pub(crate) fn next_timestamp(db: &BackupDb) -> Result<DateTime<Utc>, AppError> {
     use chrono::Timelike;
     let now = Utc::now();
     let now = now.with_nanosecond(0).unwrap_or(now);
-    let latest = db.filesets()?.first().and_then(|f| DateTime::parse_from_rfc3339(&f.timestamp).ok()).map(|t| t.with_timezone(&Utc));
+    let latest = db.all_filesets()?.first().and_then(|f| DateTime::parse_from_rfc3339(&f.timestamp).ok()).map(|t| t.with_timezone(&Utc));
     Ok(match latest {
         Some(l) if l >= now => l + chrono::Duration::seconds(1),
         _ => now,
@@ -992,64 +1238,6 @@ fn next_timestamp(db: &BackupDb) -> Result<DateTime<Utc>, AppError> {
 }
 
 // ── Worker pipeline ──
-
-enum Msg {
-    Block { idx: usize, hash: String, flag: u8, data: Vec<u8>, raw_len: u64 },
-    Done { idx: usize, size: u64, hash: String },
-    Failed { idx: usize, error: String },
-}
-
-struct WorkerCfg {
-    block_size: usize,
-    read_buf: usize,
-    block_hash: HashAlgorithm,
-    file_hash: HashAlgorithm,
-    format: super::VolumeFormat,
-    respect_locks: bool,
-    background: bool,
-    /// Pause after each block (CPU intensity below 10).
-    pause: std::time::Duration,
-}
-
-fn read_file(cfg: &WorkerCfg, idx: usize, path: &Path, level: u32, tx: &mpsc::SyncSender<Msg>, stop: &dyn Fn() -> bool) -> Result<(), String> {
-    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    if cfg.respect_locks && meta::is_advisory_locked(&f) {
-        return Err("locked by another program (advisory lock)".into());
-    }
-    let mut f = std::io::BufReader::with_capacity(cfg.read_buf.max(cfg.block_size), f);
-    let mut buf = vec![0u8; cfg.block_size];
-    let mut fh = FileHasher::new(cfg.file_hash);
-    let mut size = 0u64;
-    loop {
-        if stop() {
-            return Err("cancelled".into());
-        }
-        let mut filled = 0;
-        while filled < cfg.block_size {
-            let n = f.read(&mut buf[filled..]).map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
-            }
-            filled += n;
-        }
-        if filled == 0 {
-            break;
-        }
-        let chunk = &buf[..filled];
-        fh.update(chunk);
-        size += filled as u64;
-        let hash = hash_bytes(cfg.block_hash, chunk);
-        let (flag, data) = volume::encode_block(cfg.format, chunk, level).map_err(|e| e.user_message())?;
-        tx.send(Msg::Block { idx, hash, flag, data, raw_len: filled as u64 }).map_err(|_| "pipeline closed".to_string())?;
-        if !cfg.pause.is_zero() {
-            std::thread::sleep(cfg.pause);
-        }
-        if filled < cfg.block_size {
-            break;
-        }
-    }
-    tx.send(Msg::Done { idx, size, hash: fh.finish() }).map_err(|_| "pipeline closed".to_string())
-}
 
 struct UploadResult {
     volume: SealedVolume,
@@ -1070,6 +1258,65 @@ fn upload_one(backend: &dyn Backend, par2: Option<&Par2>, v: SealedVolume) -> Up
     match r {
         Ok(par2_names) => UploadResult { volume: v, par2_names, error: None },
         Err(e) => UploadResult { volume: v, par2_names: Vec::new(), error: Some(e.user_message()) },
+    }
+}
+
+/// Periodic checkpoints of a long backup: a sealed partial version of the
+/// files whose blocks are all uploaded, replacing the run's previous
+/// checkpoint. A crash then leaves a restorable partial version, and the
+/// next run finds the uploaded blocks again (deduplication).
+struct Checkpoints {
+    every: Option<std::time::Duration>,
+    every_bytes: u64,
+    last: Instant,
+    last_bytes: u64,
+    /// Timestamp of this run's current checkpoint version.
+    current: Option<String>,
+}
+
+impl Checkpoints {
+    fn new(opts: &BackupOptions) -> Self {
+        Self {
+            every: (opts.checkpoint_interval_secs > 0).then(|| std::time::Duration::from_secs(opts.checkpoint_interval_secs)),
+            every_bytes: opts.checkpoint_interval_bytes,
+            last: Instant::now(),
+            last_bytes: 0,
+            current: None,
+        }
+    }
+
+    fn enabled(&self, opts: &BackupOptions) -> bool {
+        !opts.dry_run && (self.every.is_some() || self.every_bytes > 0)
+    }
+
+    fn due(&self, bytes_uploaded: u64) -> bool {
+        self.every.is_some_and(|d| self.last.elapsed() >= d) || (self.every_bytes > 0 && bytes_uploaded.saturating_sub(self.last_bytes) >= self.every_bytes)
+    }
+
+    /// Upload a new checkpoint, then drop the previous one.
+    fn write(&mut self, repo: &Repo, files: Vec<FileEntry>, opts: &BackupOptions, report: &mut BackupReport) -> Result<(), AppError> {
+        self.last = Instant::now();
+        self.last_bytes = report.bytes_uploaded;
+        if files.iter().all(|e| e.kind == EntryKind::Dir) {
+            return Ok(());
+        }
+        let ts = next_timestamp(repo.db)?;
+        let written = repo.write_filelist(ts, true, &files, opts.task_config.clone(), Vec::new(), version_meta(opts, report), false)?;
+        tracing::info!("Checkpoint {written}: {} entries", files.len());
+        self.remove(repo)?;
+        self.current = Some(written);
+        report.checkpoints += 1;
+        Ok(())
+    }
+
+    /// Remove this run's checkpoint (superseded by a newer version).
+    fn remove(&mut self, repo: &Repo) -> Result<(), AppError> {
+        let Some(ts) = self.current.take() else { return Ok(()) };
+        if let Some(fs) = repo.db.filesets()?.into_iter().find(|f| f.timestamp == ts) {
+            repo.delete_volume_files(&fs.volume_name)?;
+            repo.db.delete_fileset(fs.id)?;
+        }
+        Ok(())
     }
 }
 
@@ -1106,11 +1353,36 @@ pub fn run_backup_with_cipher(
     kdf: KdfParams,
     ctx: &OpContext,
 ) -> Result<BackupReport, AppError> {
+    run_backup_with_streams(backend, db, sources, filter, opts, retention, passphrase, external, kdf, ctx, Vec::new())
+}
+
+/// [`run_backup_with_cipher`] that also stores each [`StreamSource`] (a
+/// command's output, standard input) as a virtual file of the version.
+/// `sources` may be empty when streams are given.
+#[allow(clippy::too_many_arguments)]
+pub fn run_backup_with_streams(
+    backend: &dyn Backend,
+    db: &BackupDb,
+    sources: &[PathBuf],
+    filter: &SourceFilter,
+    opts: &BackupOptions,
+    retention: &RetentionPolicy,
+    passphrase: Option<&str>,
+    external: Option<VolumeCipher>,
+    kdf: KdfParams,
+    ctx: &OpContext,
+    streams: Vec<StreamSource>,
+) -> Result<BackupReport, AppError> {
     let started = Instant::now();
     let mut report = BackupReport { dry_run: opts.dry_run, ..Default::default() };
     retention.validate()?;
-    if sources.is_empty() {
+    super::versions::validate_note(opts.default_note.as_deref())?;
+    super::versions::validate_tags(&opts.default_tags)?;
+    if sources.is_empty() && streams.is_empty() {
         return Err(AppError::validation("The backup job has no source folders"));
+    }
+    if opts.rehash_percent > 100 {
+        return Err(AppError::validation("The rehash percentage must be between 0 and 100"));
     }
     if opts.background_io {
         meta::set_background_priority();
@@ -1190,15 +1462,43 @@ pub fn run_backup_with_cipher(
     let snap = snapshot.as_ref();
     // Generated source files (Photos albums.json) live here until the run ends.
     let staging = Staging::new(!split_sources(sources).1.is_empty(), opts)?;
-    let (mut entries, warnings) = match (&changed, prev_list.is_empty()) {
+    let tracker = ErrorTracker::new(opts.error_policy);
+    let scanned = match (&changed, prev_list.is_empty()) {
         (Some(c), false) => {
-            let (r, n) = scan_incremental_in(sources, &prev_list, c, &shallow, &opts.deleted_paths, filter, opts, snap, staging.path())?;
+            let (r, n) = scan_incremental_in(sources, &prev_list, c, &shallow, &opts.deleted_paths, filter, opts, snap, staging.path(), &tracker)?;
             report.rescanned_paths = n;
             r
         }
-        _ => scan_sources_in(sources, filter, opts, snap, staging.path())?,
+        _ => scan_sources_in(sources, filter, opts, snap, staging.path(), &tracker)?,
     };
-    report.warnings.extend(warnings);
+    let mut entries = scanned.entries;
+    // Virtual files of streams, after the scanned entries.
+    let mut stream_of: HashMap<usize, usize> = HashMap::new();
+    let mut stream_paths: HashSet<String> = HashSet::new();
+    for (si, st) in streams.iter().enumerate() {
+        if !stream_paths.insert(st.path.clone()) {
+            return Err(AppError::validation(format!("Two streams are named {}", st.path)));
+        }
+        for e in super::reader::stream_entries(&st.path, opts.skip_metadata)? {
+            if e.kind == EntryKind::Dir && entries.iter().any(|(_, x)| x.path == e.path) {
+                continue;
+            }
+            if e.kind == EntryKind::File {
+                stream_of.insert(entries.len(), si);
+            }
+            entries.push((PathBuf::from(&e.path), e));
+        }
+    }
+    let streams: Vec<Mutex<Option<StreamSource>>> = streams.into_iter().map(|s| Mutex::new(Some(s))).collect();
+    report.warnings.extend(scanned.warnings);
+    report.info.extend(scanned.info);
+    absorb_problems(&mut report, &tracker);
+    if tracker.should_stop() {
+        // Stopped while scanning: nothing was read, so there is nothing to keep.
+        report.errors.extend(tracker.stop_reason());
+        report.duration_ms = started.elapsed().as_millis() as u64;
+        return Ok(report);
+    }
     if entries.iter().all(|(_, e)| e.kind == EntryKind::Dir) && !opts.allow_empty_source {
         return Err(AppError::validation("The source selection contains no files; refusing to create an empty version"));
     }
@@ -1206,7 +1506,10 @@ pub fn run_backup_with_cipher(
     let prev_files: HashMap<String, FileEntry> = prev_list.into_iter().map(|f| (f.path.clone(), f)).collect();
     let total = entries.len() as u64;
     let mut results: Vec<Option<FileEntry>> = vec![None; entries.len()];
-    let mut work: VecDeque<(usize, PathBuf, u32)> = VecDeque::new();
+    let mut work: VecDeque<Work> = VecDeque::new();
+    // Unchanged-looking files re-read by percentage rehash → their recorded hash.
+    let mut rehash: HashMap<usize, Option<String>> = HashMap::new();
+    let rehash_run = rehash_run_counter(db, opts)?;
     for (i, (path, entry)) in entries.iter_mut().enumerate() {
         if entry.kind != EntryKind::File {
             results[i] = Some(entry.clone());
@@ -1214,8 +1517,18 @@ pub fn run_backup_with_cipher(
         }
         report.files_examined += 1;
         report.bytes_examined += entry.size;
+        let input = match stream_of.get(&i) {
+            Some(si) => Input::Stream(*si),
+            None => Input::Path(snap.map(|s| s.real(path)).unwrap_or_else(|| path.clone())),
+        };
         match prev_files.get(&entry.path) {
             Some(prev) if unchanged(prev, entry, opts) && prev.blocks.iter().all(|b| db.has_block(b).unwrap_or(false)) => {
+                if rehash_selected(&entry.path, rehash_run, opts.rehash_percent) {
+                    rehash.insert(i, prev.hash.clone());
+                    report.files_rehashed += 1;
+                    work.push_back(Work { idx: i, input, level: compress_level(path, opts), size: entry.size });
+                    continue;
+                }
                 let mut e = prev.clone();
                 e.mode = entry.mode;
                 e.meta = entry.meta.clone();
@@ -1226,18 +1539,22 @@ pub fn run_backup_with_cipher(
             None => report.files_added += 1,
         }
         progress(ctx, Phase::Uploading, i as u64, total, report.bytes_examined, Some(&entry.path));
-        work.push_back((i, snap.map(|s| s.real(path)).unwrap_or_else(|| path.clone()), compress_level(path, opts)));
+        work.push_back(Work { idx: i, input, level: compress_level(path, opts), size: entry.size });
     }
 
     // ── Parallel read/hash/compress → dedup/pack → concurrent upload ──
     let abort = Arc::new(AtomicBool::new(false));
+    // Set by the error policy (fail-fast, error budget) or the upload cap:
+    // stop reading, keep what is finished as a partial version.
+    let halt = Arc::new(AtomicBool::new(false));
     let stop = {
-        let abort = abort.clone();
+        let (abort, halt) = (abort.clone(), halt.clone());
         let ctx = ctx.clone();
-        move || abort.load(Ordering::SeqCst) || ctx.is_cancelled()
+        move || abort.load(Ordering::SeqCst) || halt.load(Ordering::SeqCst) || ctx.is_cancelled()
     };
     let cfg = WorkerCfg {
-        block_size: repo.header.block_size,
+        chunker: repo.chunker(),
+        codec: repo.header.block_codec,
         read_buf: opts.read_buffer_size,
         block_hash: repo.header.block_hash,
         file_hash: repo.header.file_hash,
@@ -1245,33 +1562,38 @@ pub fn run_backup_with_cipher(
         respect_locks: opts.respect_advisory_locks,
         background: opts.background_io,
         pause: std::time::Duration::from_micros((10 - opts.cpu_intensity.clamp(1, 10) as u64) * 500),
+        parallel_threshold: opts.parallel_file_threshold,
+        helpers: opts.worker_threads(),
     };
     let mut pending = Pending::for_repo(&repo, opts);
     let mut in_flight: HashSet<String> = HashSet::new();
     let mut file_blocks: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut halted_files: HashSet<usize> = HashSet::new();
     let mut upload_error: Option<String> = None;
     let mut done_count = 0u64;
     let queue = Mutex::new(work);
     let threads = opts.worker_threads();
     let uploaders = opts.upload_concurrency.max(1);
+    let mut checkpoints = Checkpoints::new(opts);
+    let checkpoints_on = checkpoints.enabled(opts);
 
     std::thread::scope(|scope| -> Result<(), AppError> {
         let (tx, rx) = mpsc::sync_channel::<Msg>(256);
         for _ in 0..threads {
             let tx = tx.clone();
-            let (queue, cfg, stop) = (&queue, &cfg, &stop);
+            let (queue, cfg, stop, streams) = (&queue, &cfg, &stop, &streams);
             scope.spawn(move || {
                 if cfg.background {
                     meta::set_background_priority();
                 }
                 loop {
                     let next = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-                    let Some((idx, path, level)) = next else { break };
+                    let Some(w) = next else { break };
                     if stop() {
                         break;
                     }
-                    if let Err(error) = read_file(cfg, idx, &path, level, &tx, stop) {
-                        if tx.send(Msg::Failed { idx, error }).is_err() {
+                    if let Err(error) = read_input(cfg, &w, streams, &tx, stop) {
+                        if tx.send(Msg::Failed { idx: w.idx, error }).is_err() {
                             break;
                         }
                     }
@@ -1285,7 +1607,7 @@ pub fn run_backup_with_cipher(
         let (res_tx, res_rx) = mpsc::channel::<UploadResult>();
         if !opts.dry_run {
             for _ in 0..uploaders {
-                let (job_rx, res_tx, par2) = (job_rx.clone(), res_tx.clone(), repo.par2.as_ref());
+                let (job_rx, res_tx, par2, backend) = (job_rx.clone(), res_tx.clone(), repo.par2.as_ref(), &repo.backend);
                 scope.spawn(move || loop {
                     let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                     let Ok(v) = job else { break };
@@ -1297,20 +1619,22 @@ pub fn run_backup_with_cipher(
         }
         drop(res_tx);
 
-        let handle_result = |r: UploadResult, in_flight: &mut HashSet<String>, upload_error: &mut Option<String>| -> Result<(), AppError> {
+        // Records a finished upload; true when a volume is now durable.
+        let handle_result = |r: UploadResult, in_flight: &mut HashSet<String>, upload_error: &mut Option<String>| -> Result<bool, AppError> {
             match r.error {
                 Some(e) => {
                     *upload_error = Some(format!("Upload of {} failed: {e}", r.volume.block_name));
                     abort.store(true, Ordering::SeqCst);
+                    Ok(false)
                 }
                 None => {
                     record_volume(&repo, &r.volume, &r.par2_names)?;
                     for (h, _) in &r.volume.blocks {
                         in_flight.remove(h);
                     }
+                    Ok(true)
                 }
             }
-            Ok(())
         };
 
         let send_volume = |pending: &mut Pending, in_flight: &mut HashSet<String>, report: &mut BackupReport| -> Result<(), AppError> {
@@ -1318,9 +1642,15 @@ pub fn run_backup_with_cipher(
             let v = seal_pending(&repo, w, blocks)?;
             report.bytes_uploaded += (v.block_data.len() + v.index_data.len()) as u64;
             report.volumes_uploaded += 1;
+            if opts.max_upload_bytes_per_run.is_some_and(|cap| report.bytes_uploaded >= cap) && !report.upload_cap_reached {
+                // Stop reading; this volume and the files finished so far still go up.
+                report.upload_cap_reached = true;
+                halt.store(true, Ordering::SeqCst);
+            }
             if opts.dry_run {
                 return Ok(());
             }
+            repo.note_write()?;
             repo.db.add_volume(&v.block_name, VolumeKind::Block, v.block_data.len() as u64, &hash_bytes(HashAlgorithm::Sha256, &v.block_data), "uploading")?;
             in_flight.extend(v.blocks.iter().map(|(h, _)| h.clone()));
             job_tx.send(v).map_err(|_| AppError::internal("upload pool stopped"))
@@ -1328,9 +1658,26 @@ pub fn run_backup_with_cipher(
 
         for msg in rx {
             while let Ok(r) = res_rx.try_recv() {
-                handle_result(r, &mut in_flight, &mut upload_error)?;
+                let durable = handle_result(r, &mut in_flight, &mut upload_error)?;
+                if durable && checkpoints_on && upload_error.is_none() && checkpoints.due(report.bytes_uploaded) {
+                    // Files whose blocks are all recorded as uploaded.
+                    let files: Vec<FileEntry> = results
+                        .iter()
+                        .flatten()
+                        .filter(|e| !e.blocks.iter().any(|b| pending.hashes.contains(b) || in_flight.contains(b)))
+                        .cloned()
+                        .collect();
+                    checkpoints.write(&repo, files, opts, &mut report)?;
+                }
             }
             match msg {
+                Msg::Block { .. } | Msg::Done { .. } if halt.load(Ordering::SeqCst) && !file_blocks.contains_key(&msg_idx(&msg)) => {
+                    // Stopped (error policy, upload limit): files not started
+                    // before the stop are left for the next run, so the stop
+                    // is prompt even with blocks queued in the channel.
+                    halted_files.insert(msg_idx(&msg));
+                }
+                Msg::Block { idx, .. } | Msg::Done { idx, .. } if halted_files.contains(&idx) => {}
                 Msg::Block { idx, hash, flag, data, raw_len } => {
                     let known = pending.hashes.contains(&hash) || in_flight.contains(&hash) || db.has_block(&hash)?;
                     if !known {
@@ -1346,6 +1693,13 @@ pub fn run_backup_with_cipher(
                     let mut e = entries[idx].1.clone();
                     e.blocks = file_blocks.remove(&idx).unwrap_or_default();
                     e.size = size;
+                    if let Some(expected) = rehash.remove(&idx) {
+                        if expected.as_deref() != Some(hash.as_str()) {
+                            report.rehash_mismatches += 1;
+                            report.files_changed += 1;
+                            report.warnings.push(format!("{}: content changed without timestamp change (possible silent corruption); the new content was backed up", e.path));
+                        }
+                    }
                     e.hash = Some(hash);
                     done_count += 1;
                     progress(ctx, Phase::Uploading, done_count, total, report.bytes_examined, Some(&e.path));
@@ -1353,11 +1707,19 @@ pub fn run_backup_with_cipher(
                 }
                 Msg::Failed { idx, error } => {
                     file_blocks.remove(&idx);
+                    rehash.remove(&idx);
                     if error != "cancelled" {
                         let path = &entries[idx].1.path;
-                        report.warnings.push(format!("Skipped {path}: {error}"));
+                        if stream_of.contains_key(&idx) {
+                            // A failed stream (its command exited non-zero) fails the run.
+                            report.errors.push(format!("Stream {path} failed: {error}"));
+                        } else {
+                            tracker.record(ErrorClass::File, format!("Skipped {path}: {error}"));
+                        }
+                        if tracker.should_stop() {
+                            halt.store(true, Ordering::SeqCst);
+                        }
                         if let Some(prev) = prev_files.get(path) {
-                            // Keep the previous good copy in this version.
                             results[idx] = Some(prev.clone());
                         }
                     }
@@ -1374,6 +1736,16 @@ pub fn run_backup_with_cipher(
         }
         Ok(())
     })?;
+    // Rehash candidates that were never re-read (the run stopped) keep
+    // their previous entry.
+    for idx in rehash.into_keys() {
+        if results[idx].is_none() {
+            let cur = &entries[idx].1;
+            results[idx] = prev_files.get(&cur.path).map(|p| FileEntry { mode: cur.mode, meta: cur.meta.clone(), ..p.clone() });
+        }
+    }
+    // From here on a final (or synthetic partial) version supersedes the checkpoint.
+    absorb_problems(&mut report, &tracker);
 
     if let Some(e) = upload_error {
         report.errors.push(e);
@@ -1386,14 +1758,24 @@ pub fn run_backup_with_cipher(
     progress(ctx, Phase::Finalizing, total, total, report.bytes_examined, None);
 
     let control_files = read_control_files(&opts.control_files, &mut report)?;
-    if ctx.is_cancelled() {
+    let halted = halt.load(Ordering::SeqCst);
+    if ctx.is_cancelled() || halted {
         // Synthetic partial version: everything finished so far stays restorable.
         if !done.is_empty() {
             let ts = next_timestamp(db)?;
-            report.version = Some(repo.write_filelist(ts, true, &done, opts.task_config.clone(), control_files, opts.dry_run)?);
+            report.version = Some(repo.write_filelist(ts, true, &done, opts.task_config.clone(), control_files, version_meta(opts, &report), opts.dry_run)?);
             report.partial = true;
+            checkpoints.remove(&repo)?;
         }
-        report.errors.push("The operation was cancelled. Start it again when ready; completed work is kept.".into());
+        match tracker.stop_reason() {
+            _ if ctx.is_cancelled() => report.errors.push("The operation was cancelled. Start it again when ready; completed work is kept.".into()),
+            Some(r) => report.errors.push(format!("{r}. The files finished so far were kept as a partial version.")),
+            None if report.upload_cap_reached => report.warnings.push(format!(
+                "Upload limit of {} per run reached; the files finished so far were kept as a partial version and the next run continues",
+                human(opts.max_upload_bytes_per_run.unwrap_or_default())
+            )),
+            None => report.errors.push("The backup stopped early; completed work is kept.".into()),
+        }
         report.duration_ms = started.elapsed().as_millis() as u64;
         return Ok(report);
     }
@@ -1406,8 +1788,10 @@ pub fn run_backup_with_cipher(
         report.skipped_unchanged = true;
     } else {
         let ts = next_timestamp(db)?;
-        report.version = Some(repo.write_filelist(ts, false, &done, opts.task_config.clone(), control_files, opts.dry_run)?);
+        report.version = Some(repo.write_filelist(ts, false, &done, opts.task_config.clone(), control_files, version_meta(opts, &report), opts.dry_run)?);
     }
+    // The complete version (or the unchanged previous one) supersedes the checkpoint.
+    checkpoints.remove(&repo)?;
     if let (Some(state), false) = (&usn_next, opts.dry_run) {
         db.set_kv(USN_KEY, &serde_json::to_string(state)?)?;
     }
@@ -1453,6 +1837,64 @@ pub fn run_backup_with_cipher(
     Ok(report)
 }
 
+fn msg_idx(m: &Msg) -> usize {
+    match m {
+        Msg::Block { idx, .. } | Msg::Done { idx, .. } | Msg::Failed { idx, .. } => *idx,
+    }
+}
+
+/// Run number for choosing rehash files (advances once per real run).
+fn rehash_run_counter(db: &BackupDb, opts: &BackupOptions) -> Result<u64, AppError> {
+    if opts.rehash_percent == 0 {
+        return Ok(0);
+    }
+    let n = db.get_kv("rehash_run")?.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) + 1;
+    if !opts.dry_run {
+        db.set_kv("rehash_run", &n.to_string())?;
+    }
+    Ok(n)
+}
+
+/// Whether `path` is among the ~`percent`% of files re-read in run `run`.
+/// A hash of (path, run) spreads the choice so every file comes up over time.
+pub(crate) fn rehash_selected(path: &str, run: u64, percent: u8) -> bool {
+    if percent == 0 {
+        return false;
+    }
+    if percent >= 100 {
+        return true;
+    }
+    let h = hash_bytes(HashAlgorithm::Sha256, format!("{run}\0{path}").as_bytes());
+    let v = u64::from_str_radix(&h[..12], 16).unwrap_or(0);
+    v % 10_000 < percent as u64 * 100
+}
+
+/// Move the problems the error policy recorded into the report.
+fn absorb_problems(report: &mut BackupReport, tracker: &ErrorTracker) {
+    let (w, e) = tracker.take();
+    report.warnings.extend(w);
+    report.errors.extend(e);
+}
+
+/// Metadata recorded with a new version: the job's default note and tags,
+/// who wrote it and what this run added so far.
+fn version_meta(opts: &BackupOptions, report: &BackupReport) -> VersionMeta {
+    VersionMeta {
+        note: opts.default_note.clone().filter(|n| !n.trim().is_empty()),
+        tags: opts.default_tags.clone(),
+        identity: Some(opts.identity.resolve()),
+        stats: Some(VersionStats {
+            bytes_added: report.bytes_uploaded,
+            new_blocks: report.new_blocks,
+            files_added: report.files_added,
+            files_changed: report.files_changed,
+            files_deleted: report.files_deleted,
+            upload_cap_reached: report.upload_cap_reached,
+        }),
+        ..Default::default()
+    }
+}
+
 fn read_control_files(paths: &[String], report: &mut BackupReport) -> Result<Vec<ControlFile>, AppError> {
     use base64::Engine;
     let mut out = Vec::new();
@@ -1472,7 +1914,7 @@ fn read_control_files(paths: &[String], report: &mut BackupReport) -> Result<Vec
 fn interval_due(db: &BackupDb, key: &str, days: Option<u32>) -> Result<bool, AppError> {
     let Some(days) = days else { return Ok(true) };
     let last = db.get_kv(key)?.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|t| t.with_timezone(&Utc));
-    Ok(last.is_none_or(|l| Utc::now() - l >= chrono::Duration::days(days as i64)))
+    Ok(last.map_or(true, |l| Utc::now() - l >= chrono::Duration::days(days as i64)))
 }
 
 /// Warn when the destination is running out of space.
@@ -1629,7 +2071,7 @@ mod tests {
         let o = BackupOptions { kdf: Some(custom), ..opts() };
         run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
         let header: RepoHeader = serde_json::from_slice(&std::fs::read(dst.path().join("ufop-repo.json")).unwrap()).unwrap();
-        assert_eq!((header.kdf, header.encryption_module.as_str(), header.format_version), (Some(custom), "aes", REPO_FORMAT_VERSION));
+        assert_eq!((header.kdf, header.encryption_module.as_str(), header.format_version), (Some(custom), "aes", crate::backup::REPO_FORMAT_VERSION));
         assert_eq!(KdfParams::preset("interactive").unwrap().memory_kib, 19 * 1024);
         assert!(KdfParams::preset("sensitive").unwrap().validate().is_ok() && KdfParams::preset("x").is_none());
     }
@@ -1814,7 +2256,7 @@ mod tests {
         assert_eq!(fl.control_files.len(), 1);
         assert_eq!(fl.control_files[0].name, "manifest.txt");
         // A rewrite (purge/repair) keeps them.
-        repo.rewrite_filelist(&fs.timestamp, fs.partial, &fs.volume_name, &db.files(fs.id).unwrap()).unwrap();
+        repo.rewrite_filelist(fs, &db.files(fs.id).unwrap()).unwrap();
         let fl: FileListVolume = volume::open_json(&repo.cipher, &be.get(&fs.volume_name).unwrap()).unwrap();
         assert_eq!(fl.control_files.len(), 1);
     }
@@ -1826,7 +2268,8 @@ mod tests {
         write(src.path(), "f", &vec![7u8; 3000]);
         let be = LocalBackend::new(dst.path());
         let db = BackupDb::open_in_memory().unwrap();
-        let o = BackupOptions { quota_size: Some(1000), quota_warning_percent: 10, ..opts() };
+        // Sizes below assume format 1 (deflate, uncompressed metadata).
+        let o = BackupOptions { quota_size: Some(1000), quota_warning_percent: 10, format_version: Some(1), ..opts() };
         let r = run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll,
             None, KdfParams::insecure_fast(), &OpContext::new()).unwrap();
         assert!(r.warnings.iter().any(|w| w.contains("nearly full")), "{:?}", r.warnings);
@@ -2056,4 +2499,109 @@ mod tests {
         assert!(!e.iter().any(|(_, e)| e.path.contains("2024")), "{:?}", e.iter().map(|x| &x.1.path).collect::<Vec<_>>());
         assert!(e.iter().any(|(_, e)| e.path.contains("2023")));
     }
+
+    /// Fails every block upload after the first `ok` ones (a dropped
+    /// connection or a crash in the middle of a run).
+    struct DiesAfter {
+        inner: LocalBackend,
+        ok: usize,
+        seen: std::sync::atomic::AtomicUsize,
+    }
+    impl Backend for DiesAfter {
+        fn describe(&self) -> String { self.inner.describe() }
+        fn list(&self) -> Result<Vec<crate::backup::RemoteFile>, AppError> { self.inner.list() }
+        fn put(&self, n: &str, d: &[u8]) -> Result<(), AppError> {
+            if n.contains(".dblock") && self.seen.fetch_add(1, Ordering::SeqCst) >= self.ok {
+                return Err(AppError::state("connection lost", "simulated"));
+            }
+            self.inner.put(n, d)
+        }
+        fn get(&self, n: &str) -> Result<Vec<u8>, AppError> { self.inner.get(n) }
+        fn delete(&self, n: &str) -> Result<(), AppError> { self.inner.delete(n) }
+        fn create_folder(&self) -> Result<(), AppError> { self.inner.create_folder() }
+    }
+
+    fn many_files(root: &Path, n: usize) {
+        for i in 0..n {
+            // Distinct, incompressible-ish content: 3 blocks per file.
+            let data: Vec<u8> = (0..3000u32).map(|j| ((j * 7919 + i as u32 * 104_729) % 251) as u8 ^ (i as u8)).collect();
+            write(root, &format!("d{}/f{i:03}.bin", i % 4), &data);
+        }
+    }
+
+    fn dlists(dir: &Path) -> usize {
+        std::fs::read_dir(dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains(".dlist")).count()
+    }
+
+    #[test]
+    fn checkpoints_replace_each_other_and_the_final_version_supersedes_them() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        many_files(src.path(), 24);
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        let o = BackupOptions { checkpoint_interval_bytes: 1, upload_concurrency: 1, compression_level: 0, verify_samples: 0, ..opts() };
+        let r = run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(r.checkpoints > 0, "{r:?}");
+        let sets = db.filesets().unwrap();
+        assert_eq!(sets.len(), 1, "only the final version is left");
+        assert!(!sets[0].partial);
+        assert_eq!(dlists(dst.path()), 1, "checkpoint file lists were deleted remotely");
+        // Off by default for short runs; 0 disables.
+        let off = BackupOptions { checkpoint_interval_secs: 0, ..o.clone() };
+        assert!(!Checkpoints::new(&off).enabled(&off) || off.checkpoint_interval_bytes > 0);
+        let none = BackupOptions { checkpoint_interval_secs: 0, checkpoint_interval_bytes: 0, ..o };
+        assert!(!Checkpoints::new(&none).enabled(&none));
+        assert!(!Checkpoints::new(&BackupOptions { dry_run: true, ..opts() }).enabled(&BackupOptions { dry_run: true, ..opts() }));
+    }
+
+    #[test]
+    fn a_run_that_dies_leaves_a_restorable_checkpoint_and_the_next_run_resumes() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        many_files(src.path(), 40);
+        let dying = DiesAfter { inner: LocalBackend::new(dst.path()), ok: 20, seen: Default::default() };
+        let db = BackupDb::open_in_memory().unwrap();
+        let o = BackupOptions { checkpoint_interval_bytes: 1, upload_concurrency: 1, hash_threads: 1, compression_level: 0, verify_samples: 0, ..opts() };
+        let r = run_backup(&dying, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        assert!(!r.errors.is_empty() && r.version.is_none(), "{r:?}");
+        assert!(r.checkpoints > 0, "{r:?}");
+        let sets = db.filesets().unwrap();
+        assert_eq!(sets.len(), 1);
+        assert!(sets[0].partial, "the checkpoint stays as a partial version");
+        assert_eq!(dlists(dst.path()), 1);
+        let saved = db.files(sets[0].id).unwrap();
+        let saved_files = saved.iter().filter(|e| e.kind == EntryKind::File).count();
+        assert!(saved_files > 0 && saved_files < 40, "{saved_files}");
+
+        // A new computer (database rebuilt from the destination) restores it.
+        let be = LocalBackend::new(dst.path());
+        let db2 = BackupDb::open_in_memory().unwrap();
+        crate::backup::maintenance::recreate_database(&be, &db2, Some("pw"), "ufop", &OpContext::new()).unwrap();
+        assert!(db2.filesets().unwrap()[0].partial);
+        let repo = Repo::open(&be, &db2, Some("pw"), &o, false, KdfParams::insecure_fast()).unwrap();
+        let rr = crate::backup::run_restore(&repo, &crate::backup::RestoreOptions { target: Some(out.path().into()), preserve_full_paths: false, ..Default::default() }, &OpContext::new()).unwrap();
+        assert!(rr.errors.is_empty(), "{:?}", rr.errors);
+        assert_eq!(rr.files_restored as usize, saved_files);
+        for e in saved.iter().filter(|e| e.kind == EntryKind::File) {
+            let name = Path::new(&e.path).file_name().unwrap().to_string_lossy().into_owned();
+            let found = walk_find(out.path(), &name).expect("restored");
+            assert_eq!(std::fs::read(found).unwrap(), std::fs::read(&e.path).unwrap());
+        }
+        drop(repo);
+
+        // The next run on the healthy destination re-uses every uploaded block.
+        let total_blocks = 40 * 3;
+        let r2 = run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        assert!(r2.errors.is_empty(), "{:?}", r2.errors);
+        assert!(r2.version.is_some());
+        assert!(r2.new_blocks < total_blocks as u64 - saved_files as u64 * 3 + 1, "{} new blocks", r2.new_blocks);
+        let sets = db.filesets().unwrap();
+        assert_eq!((sets.len(), sets[0].partial, sets[1].partial), (2, false, true));
+    }
 }
+
+#[cfg(test)]
+mod source_tests;

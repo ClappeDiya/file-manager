@@ -4,6 +4,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useUIStore } from "@/stores/ui-store";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
@@ -12,6 +13,8 @@ import { BackupRecoveryView } from "@/components/backup/backup-recovery-view";
 import { BackupSettingsView } from "@/components/backup/backup-settings-view";
 
 beforeEach(() => {
+  // These screens exercise advanced-only backup tools (K132).
+  useUIStore.setState({ backupAdvanced: true });
   mockInvoke.mockReset();
   (window as unknown as Record<string, unknown>).__TAURI__ = {};
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};

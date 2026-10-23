@@ -1,7 +1,7 @@
 //! Backblaze B2 native API (including B2 Object Lock file retention).
 
 use super::http;
-use super::{direct_child, join_key, BoxFut, ObjectStore};
+use super::{child_within_one, direct_child, join_key, BoxFut, ObjectStore};
 use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -78,6 +78,41 @@ impl B2Store {
         unreachable!()
     }
 
+    fn folder_prefix(&self) -> String {
+        let prefix = self.cfg.prefix.trim_matches('/');
+        if prefix.is_empty() { String::new() } else { format!("{prefix}/") }
+    }
+
+    /// Uploaded files under `pfx` (all pages) and, with the delimiter, the folders.
+    async fn list_names(&self, pfx: &str, delimiter: bool) -> Result<(Vec<(String, u64)>, Vec<String>), AppError> {
+        let bucket_id = self.session.lock().await.bucket_id.clone();
+        let (mut files, mut folders) = (Vec::new(), Vec::new());
+        let mut start: Option<String> = None;
+        loop {
+            let mut body = serde_json::json!({ "bucketId": bucket_id, "prefix": pfx, "maxFileCount": 1000 });
+            if delimiter {
+                body["delimiter"] = "/".into();
+            }
+            if let Some(s) = &start {
+                body["startFileName"] = s.clone().into();
+            }
+            let v = self.call("b2_list_file_names", body).await?;
+            for f in v["files"].as_array().into_iter().flatten() {
+                let name = f["fileName"].as_str().unwrap_or_default().to_string();
+                match f["action"].as_str() {
+                    Some("upload") => files.push((name, f["contentLength"].as_u64().unwrap_or(0))),
+                    Some("folder") => folders.push(name),
+                    _ => {}
+                }
+            }
+            start = v["nextFileName"].as_str().map(String::from);
+            if start.is_none() {
+                break;
+            }
+        }
+        Ok((files, folders))
+    }
+
     async fn versions(&self, key: &str) -> Result<Vec<String>, AppError> {
         let s = self.session.lock().await.clone();
         let v = self.call("b2_list_file_versions", serde_json::json!({ "bucketId": s.bucket_id, "startFileName": key, "prefix": key, "maxFileCount": 100 })).await?;
@@ -92,29 +127,31 @@ impl ObjectStore for B2Store {
     fn list(&self) -> BoxFut<'_, Vec<RemoteFile>> {
         Box::pin(async move {
             let prefix = self.cfg.prefix.trim_matches('/');
-            let pfx = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
-            let bucket_id = self.session.lock().await.bucket_id.clone();
-            let mut out = Vec::new();
-            let mut start: Option<String> = None;
-            loop {
-                let mut body = serde_json::json!({ "bucketId": bucket_id, "prefix": pfx, "delimiter": "/", "maxFileCount": 1000 });
-                if let Some(s) = &start {
-                    body["startFileName"] = s.clone().into();
-                }
-                let v = self.call("b2_list_file_names", body).await?;
-                for f in v["files"].as_array().into_iter().flatten() {
-                    if f["action"] != "upload" {
-                        continue;
-                    }
-                    if let Some(n) = direct_child(prefix, f["fileName"].as_str().unwrap_or_default()) {
-                        out.push(RemoteFile { name: n.to_string(), size: f["contentLength"].as_u64().unwrap_or(0) });
-                    }
-                }
-                start = v["nextFileName"].as_str().map(String::from);
-                if start.is_none() {
-                    break;
-                }
+            let (files, _) = self.list_names(&self.folder_prefix(), true).await?;
+            Ok(files.into_iter().filter_map(|(n, size)| direct_child(prefix, &n).map(|n| RemoteFile { name: n.to_string(), size })).collect())
+        })
+    }
+    fn supports_subfolders(&self) -> bool {
+        true
+    }
+    fn list_recursive(&self, parallelism: usize) -> BoxFut<'_, Vec<RemoteFile>> {
+        Box::pin(async move {
+            let prefix = self.cfg.prefix.trim_matches('/').to_string();
+            let within = |files: Vec<(String, u64)>, prefix: &str| files.into_iter().filter_map(|(n, size)| child_within_one(prefix, &n).map(|name| RemoteFile { name, size })).collect::<Vec<_>>();
+            if parallelism <= 1 {
+                let (files, _) = self.list_names(&self.folder_prefix(), false).await?;
+                return Ok(within(files, &prefix));
             }
+            let (top, folders) = self.list_names(&self.folder_prefix(), true).await?;
+            let mut out = within(top, &prefix);
+            let p2 = prefix.clone();
+            out.extend(
+                super::list_folders(folders, parallelism, |f| {
+                    let prefix = p2.clone();
+                    async move { Ok(within(self.list_names(&f, true).await?.0, &prefix)) }
+                })
+                .await?,
+            );
             Ok(out)
         })
     }

@@ -19,6 +19,13 @@ import {
 import { BackupAdvancedOptions } from "./backup-advanced-options";
 import { Banner, Btn, Field, PathInput, Section } from "./backup-ui";
 import { SecretProvidersEditor } from "./backup-secret-providers";
+import { AdvancedOnly } from "./advanced-only";
+import { BackupCacheSettings } from "./backup-cache-settings";
+import { BackupBenchmark } from "./backup-benchmark";
+import { useIsAdvanced } from "./use-is-advanced";
+import { TemplatesManager } from "./backup-policies";
+import { NotificationProfilesManager } from "./backup-notification-profiles";
+import { selectBackupAdvanced, useUIStore } from "@/stores/ui-store";
 
 const NO_CAPS: TransferCaps = { upload_bps: 0, download_bps: 0, max_concurrent_runs: 1 };
 const EMPTY: GlobalDefaults = { options: {}, throttle: null, retry: null, caps: NO_CAPS };
@@ -100,7 +107,9 @@ function DefaultsEditor() {
           </p>
         )}
       </Section>
-      <BackupAdvancedOptions options={opts} locked={false} onChange={(p) => setOpts({ ...opts, ...p })} />
+      <AdvancedOnly>
+        <BackupAdvancedOptions options={opts} locked={false} onChange={(p) => setOpts({ ...opts, ...p })} />
+      </AdvancedOnly>
       <div className="flex gap-1">
         <Btn tone="primary" testId="backup-defaults-save" onClick={() => void save()}>
           Save defaults
@@ -244,13 +253,50 @@ function DatabaseTools() {
   );
 }
 
+/** Per-area override: show every backup option regardless of the app mode. */
+function AdvancedToggle() {
+  const advanced = useIsAdvanced();
+  const backupAdvanced = useUIStore((s) => s.backupAdvanced);
+  const appMode = useUIStore((s) => s.appMode);
+  const setBackupAdvanced = useUIStore((s) => s.setBackupAdvanced);
+  const followed = selectBackupAdvanced({ appMode, backupAdvanced: null });
+  return (
+    <Section title="Display">
+      <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+        <input
+          type="checkbox"
+          checked={advanced}
+          data-testid="backup-advanced-toggle"
+          // Matching the app mode clears the override so later mode switches apply again.
+          onChange={(e) => setBackupAdvanced(e.target.checked === followed ? null : e.target.checked)}
+        />
+        Show advanced backup options
+      </label>
+      <p className="text-[11px] text-zinc-500">
+        {backupAdvanced === null ? `Following the app mode (${appMode}).` : "Overrides the app mode for the Backup screens only."}
+      </p>
+    </Section>
+  );
+}
+
 export function BackupSettingsView() {
   return (
     <div className="p-3 space-y-3" data-testid="backup-settings">
+      <AdvancedToggle />
       <DestinationLibrary />
-      <DatabaseTools />
-      <SecretProvidersEditor />
+      <BackupCacheSettings />
+      <AdvancedOnly hint>
+        <DatabaseTools />
+        <SecretProvidersEditor />
+      </AdvancedOnly>
       <DefaultsEditor />
+      <NotificationProfilesManager />
+      <AdvancedOnly>
+        <TemplatesManager />
+      </AdvancedOnly>
+      <AdvancedOnly>
+        <BackupBenchmark />
+      </AdvancedOnly>
     </div>
   );
 }

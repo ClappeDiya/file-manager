@@ -80,6 +80,8 @@ pub enum OutputFormat {
     Csv,
 }
 
+// Parsed once per run from the command line; variant sizes do not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Authenticate with the UFOP server
@@ -226,6 +228,30 @@ pub enum Commands {
     /// Manage named profiles (servers, tokens, output format)
     #[command(subcommand)]
     Profile(commands::profile::ProfileCommands),
+
+    /// Print a shell completion script: bash, zsh, fish, powershell, elvish
+    ///
+    /// bash: `ufop completions bash > ~/.local/share/bash-completion/completions/ufop`;
+    /// zsh: `ufop completions zsh > "${fpath[1]}/_ufop"`; fish:
+    /// `ufop completions fish > ~/.config/fish/completions/ufop.fish`;
+    /// PowerShell: `ufop completions powershell | Out-String | Invoke-Expression`.
+    Completions {
+        #[arg(value_parser = commands::completions::SHELLS)]
+        shell: String,
+    },
+
+    /// Verify a downloaded release: the minisign signature of SHA256SUMS and
+    /// the SHA-256 of every listed file that is present
+    VerifyRelease(commands::verify_release::VerifyReleaseArgs),
+
+    /// Print a man page (`ufop man backup run`), or write all of them with --out
+    Man {
+        /// Folder to write every page into (ufop.1, ufop-backup.1, …)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Command path (empty = the top page)
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -522,6 +548,24 @@ async fn main() -> ExitCode {
         Commands::Profile(cmd) => {
             commands::profile::execute(cmd, &format).await
         }
+        Commands::VerifyRelease(args) => commands::verify_release::execute(&args, &format),
+        Commands::Completions { shell } => {
+            use clap::CommandFactory;
+            commands::completions::script(&Cli::command(), &shell).map(|s| {
+                print!("{s}");
+                0
+            }).map_err(Into::into)
+        }
+        Commands::Man { out, command } => {
+            use clap::CommandFactory;
+            commands::completions::man(&Cli::command(), out.as_deref(), &command).map(|pages| {
+                match &out {
+                    Some(dir) => eprintln!("Wrote {} man page(s) to {}", pages.len(), dir.display()),
+                    None => pages.iter().for_each(|(_, body)| print!("{body}")),
+                }
+                0
+            }).map_err(Into::into)
+        }
     };
 
     match result {
@@ -545,9 +589,18 @@ mod logging_tests {
     /// (a subcommand `--limit` once collided with the global `--limit`).
     #[test]
     fn command_tree_is_valid() {
-        use clap::CommandFactory;
-        Cli::command().debug_assert();
-        Cli::try_parse_from(["ufop", "server", "shares", "log", "abc", "-n", "5"]).unwrap();
+        // Building the whole (unoptimised) command tree needs more than the
+        // 2 MiB of a test thread; the binary's main thread has 8 MiB.
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                use clap::CommandFactory;
+                Cli::command().debug_assert();
+                Cli::try_parse_from(["ufop", "server", "shares", "log", "abc", "-n", "5"]).unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

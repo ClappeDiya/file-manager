@@ -337,9 +337,7 @@ fn default_downloads_dir() -> PathBuf {
 
 /// The default folder for this device's peer identity and saved peers.
 pub fn default_peer_dir() -> PathBuf {
-    directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
-        .map(|d| d.data_dir().join("peer"))
-        .unwrap_or_else(|| ufop_core::session::user_temp_subdir("peer"))
+    crate::paths::data_dir().join("peer")
 }
 
 fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {

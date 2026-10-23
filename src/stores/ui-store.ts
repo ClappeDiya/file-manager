@@ -1,5 +1,9 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { setDefaultByteUnits, type ByteUnits } from "@/lib/format-bytes";
+import { setDefaultTimeDisplay } from "@/lib/backup-time";
+
+export type { ByteUnits };
 
 /**
  * Theme options:
@@ -9,6 +13,30 @@ import { persist } from "zustand/middleware";
  * - "high-contrast": High contrast mode for accessibility
  */
 export type Theme = "light" | "dark" | "system" | "high-contrast";
+
+/** Text size multiplier applied to the root font size (rem-based UI scales). */
+export type FontScale = 0.875 | 1 | 1.125 | 1.25;
+
+/** Text size choices, smallest first (Settings → Appearance and Ctrl/Cmd +/−/0). */
+export const FONT_SCALES: readonly { value: FontScale; label: string }[] = [
+  { value: 0.875, label: "Small" },
+  { value: 1, label: "Default" },
+  { value: 1.125, label: "Large" },
+  { value: 1.25, label: "Larger" },
+];
+
+/** Where backup timestamps are shown: local time (default) or UTC. */
+export type TimeDisplay = "local" | "utc";
+
+/** Rows per page of a sortable table; "all" scrolls one virtualized list. */
+export type TablePageSize = 25 | 50 | 100 | 250 | "all";
+export const TABLE_PAGE_SIZES: readonly TablePageSize[] = [25, 50, 100, 250, "all"];
+
+/** Remembered view of one table (K122): page size and sort column. */
+export interface TableView {
+  pageSize: TablePageSize;
+  sort: { id: string; desc: boolean } | null;
+}
 
 /**
  * Application mode:
@@ -101,6 +129,23 @@ export interface UIState {
   resolvedTheme: "light" | "dark" | "high-contrast";
   setTheme: (theme: Theme) => void;
 
+  // Text size (K121)
+  fontScale: FontScale;
+  setFontScale: (scale: FontScale) => void;
+  /** One step larger (1), smaller (-1) or back to the default (0). */
+  stepFontScale: (step: -1 | 0 | 1) => void;
+
+  // Size units (K123): applied app-wide through formatBytes
+  byteUnits: ByteUnits;
+  setByteUnits: (units: ByteUnits) => void;
+  /** Timestamps in the backup screens: this computer's time zone or UTC. */
+  timeDisplay: TimeDisplay;
+  setTimeDisplay: (t: TimeDisplay) => void;
+
+  // Table views (K122), by table id
+  tableViews: Record<string, TableView>;
+  setTableView: (id: string, patch: Partial<TableView>) => void;
+
   // Sidebar
   sidebarOpen: boolean;
   sidebarWidth: number;
@@ -111,6 +156,10 @@ export interface UIState {
   // Application mode
   appMode: AppMode;
   setAppMode: (mode: AppMode) => void;
+  /** Per-area override for the Backup screens: true/false forces advanced/simple
+   *  backup UI, null follows `appMode`. Read it through `selectBackupAdvanced`. */
+  backupAdvanced: boolean | null;
+  setBackupAdvanced: (value: boolean | null) => void;
   /** Text editor saves on its own a moment after the last edit. */
   editorAutosave: boolean;
   setEditorAutosave: (on: boolean) => void;
@@ -207,6 +256,31 @@ function applyThemeToDocument(resolvedTheme: "light" | "dark" | "high-contrast")
   }
 }
 
+/** Sets the root font size so every rem-based size follows the text size. */
+export function applyFontScaleToDocument(scale: FontScale) {
+  if (typeof document === "undefined") return;
+  const root = document.documentElement;
+  if (scale === 1) root.style.removeProperty("--ufop-font-scale");
+  else root.style.setProperty("--ufop-font-scale", String(scale));
+}
+
+/** The text size one step from `current` (clamped to the available sizes). */
+export function nextFontScale(current: FontScale, step: -1 | 0 | 1): FontScale {
+  if (step === 0) return 1;
+  const i = FONT_SCALES.findIndex((f) => f.value === current);
+  const j = Math.max(0, Math.min(FONT_SCALES.length - 1, (i < 0 ? 1 : i) + step));
+  return FONT_SCALES[j].value;
+}
+
+const isFontScale = (v: unknown): v is FontScale => FONT_SCALES.some((f) => f.value === v);
+
+const isTableView = (v: unknown): v is TableView => {
+  if (!v || typeof v !== "object") return false;
+  const t = v as TableView;
+  const sortOk = t.sort === null || (typeof t.sort === "object" && typeof t.sort.id === "string" && typeof t.sort.desc === "boolean");
+  return TABLE_PAGE_SIZES.includes(t.pageSize) && sortOk;
+};
+
 /**
  * Get the OS preferred color scheme.
  */
@@ -227,6 +301,45 @@ function resolveTheme(theme: Theme): "light" | "dark" | "high-contrast" {
   return theme;
 }
 
+/** Whether the Backup screens show their advanced (expert) sections: the
+ *  per-area override wins, otherwise the global app mode decides. */
+export function selectBackupAdvanced(state: Pick<UIState, "appMode" | "backupAdvanced">): boolean {
+  return state.backupAdvanced ?? state.appMode === "advanced";
+}
+
+/** Persisted-state schema version. v0 (no version) predates `backupAdvanced`;
+ *  v1 predates the appearance settings (text size, units, table views). */
+export const UI_STATE_VERSION = 2;
+
+/**
+ * Upgrades persisted UI state from an older version. Installs persisted before
+ * v1 always saw every backup option, so they get `backupAdvanced: true` to keep
+ * that experience; brand-new installs have no persisted state and keep the
+ * default `null` (follow `appMode`).
+ */
+export function migrateUIState(persisted: unknown, version: number): Partial<UIState> {
+  let state = (persisted && typeof persisted === "object" ? persisted : {}) as Partial<UIState>;
+  if (version < 1 && !("backupAdvanced" in state)) {
+    state = { ...state, backupAdvanced: true };
+  }
+  return sanitizeAppearance(state);
+}
+
+/** Drops unknown appearance values (hand-edited or from a newer build) so
+ *  the defaults apply instead of a broken layout. Fields that are absent stay
+ *  absent. */
+function sanitizeAppearance(state: Partial<UIState>): Partial<UIState> {
+  const out = { ...state };
+  if ("fontScale" in out && !isFontScale(out.fontScale)) delete out.fontScale;
+  if ("byteUnits" in out && out.byteUnits !== "binary" && out.byteUnits !== "decimal") delete out.byteUnits;
+  if ("timeDisplay" in out && out.timeDisplay !== "local" && out.timeDisplay !== "utc") delete out.timeDisplay;
+  if ("tableViews" in out) {
+    const views = out.tableViews && typeof out.tableViews === "object" ? out.tableViews : {};
+    out.tableViews = Object.fromEntries(Object.entries(views).filter(([, v]) => isTableView(v)));
+  }
+  return out;
+}
+
 let _activityIdCounter = 0;
 let _errorIdCounter = 0;
 
@@ -243,6 +356,37 @@ export const useUIStore = create<UIState>()(
         set({ theme, resolvedTheme: resolved });
       },
 
+      // Text size
+      fontScale: 1,
+      setFontScale: (scale: FontScale) => {
+        const next = isFontScale(scale) ? scale : 1;
+        applyFontScaleToDocument(next);
+        set({ fontScale: next });
+      },
+      stepFontScale: (step) => get().setFontScale(nextFontScale(get().fontScale, step)),
+
+      // Size units and timestamps
+      byteUnits: "decimal",
+      setByteUnits: (units: ByteUnits) => {
+        const next: ByteUnits = units === "binary" ? "binary" : "decimal";
+        setDefaultByteUnits(next);
+        set({ byteUnits: next });
+      },
+      timeDisplay: "local",
+      setTimeDisplay: (t: TimeDisplay) => {
+        const next: TimeDisplay = t === "utc" ? "utc" : "local";
+        setDefaultTimeDisplay(next);
+        set({ timeDisplay: next });
+      },
+
+      // Table views
+      tableViews: {},
+      setTableView: (id, patch) =>
+        set((state) => {
+          const prev = state.tableViews[id] ?? { pageSize: 50, sort: null };
+          return { tableViews: { ...state.tableViews, [id]: { ...prev, ...patch } } };
+        }),
+
       // Sidebar
       sidebarOpen: true,
       sidebarWidth: 256,
@@ -255,6 +399,8 @@ export const useUIStore = create<UIState>()(
       // Application mode - Simple is default per architecture rules
       appMode: "simple",
       setAppMode: (mode: AppMode) => set({ appMode: mode }),
+      backupAdvanced: null,
+      setBackupAdvanced: (value: boolean | null) => set({ backupAdvanced: value }),
       editorAutosave: false,
       setEditorAutosave: (on: boolean) => set({ editorAutosave: on }),
 
@@ -376,12 +522,19 @@ export const useUIStore = create<UIState>()(
     }),
     {
       name: "ufop-ui-state",
+      version: UI_STATE_VERSION,
+      migrate: migrateUIState,
       // Only persist these specific fields to localStorage
       partialize: (state) => ({
         theme: state.theme,
+        fontScale: state.fontScale,
+        tableViews: state.tableViews,
+        byteUnits: state.byteUnits,
+        timeDisplay: state.timeDisplay,
         sidebarOpen: state.sidebarOpen,
         sidebarWidth: state.sidebarWidth,
         appMode: state.appMode,
+        backupAdvanced: state.backupAdvanced,
         viewMode: state.viewMode,
         statusBarVisible: state.statusBarVisible,
         previewPanelOpen: state.previewPanelOpen,
@@ -400,6 +553,9 @@ export const useUIStore = create<UIState>()(
             const resolved = resolveTheme(state.theme);
             applyThemeToDocument(resolved);
             state.resolvedTheme = resolved;
+            applyFontScaleToDocument(isFontScale(state.fontScale) ? state.fontScale : 1);
+            setDefaultByteUnits(state.byteUnits);
+            setDefaultTimeDisplay(state.timeDisplay);
           }
         };
       },

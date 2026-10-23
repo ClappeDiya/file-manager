@@ -21,11 +21,14 @@ import {
 } from "@/stores/backup-store";
 import { BackupJobEditor } from "./backup-job-editor";
 import { BackupMaintenance } from "./backup-maintenance";
+import { BackupRunHistory } from "./backup-run-history";
 import { BackupRestoreView, DirectRestore } from "./backup-restore-view";
 import { BackupRecoveryView } from "./backup-recovery-view";
 import { BackupSettingsView } from "./backup-settings-view";
 import { formatDate, inputCls, statusColor } from "@/lib/backup-helpers";
 import { Banner, Btn, Section } from "./backup-ui";
+import { RunAllButton } from "./backup-estimate";
+import { useEstimate } from "./use-estimate";
 
 type View =
   | { kind: "jobs" }
@@ -83,6 +86,7 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
   const [err, setErr] = useState<string | null>(null);
   const busy = status.tasks.some((t) => t.job_id === job.id);
   const next = status.next_runs.find((n) => n.job_id === job.id);
+  const est = useEstimate(job.id);
   const start = async (dryRun: boolean) => {
     setErr(null);
     try {
@@ -101,6 +105,11 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
             {job.legal_hold && (
               <span className="ml-1 text-[10px] px-1 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" title={`Legal hold: ${job.legal_hold.matter}`} data-testid="legal-hold-badge">
                 Legal hold
+              </span>
+            )}
+            {job.read_only && (
+              <span className="ml-1 text-[10px] px-1 rounded bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300" title="Read-only: restore and browse only" data-testid="read-only-badge">
+                Read-only
               </span>
             )}
           </div>
@@ -126,61 +135,14 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
       {job.stats.last_error && <div className="text-xs text-red-600 mt-1 truncate" title={job.stats.last_error}>{job.stats.last_error}</div>}
       {err && <div className="text-xs text-red-600 mt-1">{err}</div>}
       <div className="flex gap-1 mt-2 flex-wrap">
-        <Btn tone="primary" disabled={busy} onClick={() => void start(false)} testId="backup-run-now">Run now</Btn>
+        <Btn tone="primary" disabled={busy || job.read_only} title={job.read_only ? "Read-only jobs never back up" : undefined} onClick={() => void start(false)} testId="backup-run-now">Run now</Btn>
         <Btn disabled={busy} onClick={() => void start(true)} title="Show what would be uploaded without changing anything">Dry run</Btn>
+        {!job.read_only && est.button}
         <Btn onClick={() => onView({ kind: "restore", job })} testId="backup-open-restore">Restore…</Btn>
         <Btn onClick={() => onView({ kind: "edit", job })}>Edit</Btn>
         <Btn onClick={() => onView({ kind: "maintenance", job })}>Maintenance</Btn>
       </div>
-    </div>
-  );
-}
-
-function History() {
-  const { history, loadHistory, jobs } = useBackupStore();
-  const [jobId, setJobId] = useState<string>("");
-  const [open, setOpen] = useState<string | null>(null);
-  useEffect(() => {
-    void loadHistory(jobId || null, 100);
-  }, [jobId, loadHistory]);
-  return (
-    <div className="p-3 space-y-2" data-testid="backup-history">
-      <div className="flex gap-1">
-        <select className={inputCls} value={jobId} onChange={(e) => setJobId(e.target.value)}>
-          <option value="">All jobs</option>
-          {jobs.map((j) => (
-            <option key={j.id} value={j.id}>{j.name}</option>
-          ))}
-        </select>
-        <Btn onClick={() => void tauriInvoke<number>("backup_prune_history", { days: 90 }).then(() => loadHistory(jobId || null, 100))} title="Delete run history older than 90 days">
-          Prune &gt; 90 days
-        </Btn>
-      </div>
-      {history.length === 0 && <div className="text-sm text-zinc-500 text-center py-6">No runs yet.</div>}
-      {history.map((r) => (
-        <div key={r.id} className="border border-zinc-200 dark:border-zinc-700 rounded p-2 text-xs">
-          <button className="w-full text-left flex justify-between gap-2" onClick={() => setOpen(open === r.id ? null : r.id)}>
-            <span className="truncate">
-              <span className={statusColor(r.status)}>●</span> {jobs.find((j) => j.id === r.job_id)?.name ?? "deleted job"} · {r.operation} · {r.summary}
-            </span>
-            <span className="text-zinc-500 shrink-0">{formatDate(r.started_at)}</span>
-          </button>
-          {open === r.id && (
-            <div className="mt-1 space-y-1">
-              {r.log.length > 0 && (
-                <ul className="font-mono text-[11px] max-h-40 overflow-y-auto">
-                  {r.log.map((l, i) => (
-                    <li key={i} className={l.level === "error" ? "text-red-600" : l.level === "warning" ? "text-amber-600" : ""}>
-                      [{l.level}] {l.message}
-                    </li>
-                  ))}
-                </ul>
-              )}
-              <pre className="text-[11px] max-h-40 overflow-auto bg-zinc-50 dark:bg-zinc-800 p-1 rounded">{JSON.stringify(r.report, null, 2)}</pre>
-            </div>
-          )}
-        </div>
-      ))}
+      {est.panel}
     </div>
   );
 }
@@ -370,12 +332,13 @@ export function BackupPanel() {
                 <Btn tone="success" onClick={() => setView({ kind: "edit", job: newBackupJob() })}>Create your first backup</Btn>
               </div>
             )}
+            {jobs.length > 1 && <RunAllButton />}
             {jobs.map((j) => (
               <JobCard key={j.id} job={j} onView={setView} />
             ))}
           </div>
         )}
-        {view.kind === "history" && <History />}
+        {view.kind === "history" && <BackupRunHistory />}
         {view.kind === "direct" && <DirectRestore />}
         {view.kind === "settings" && <BackupSettingsView />}
         {view.kind === "recovery" && <BackupRecoveryView />}

@@ -148,6 +148,9 @@
 #                                                       supplies an
 #                                                       explicit <T> type
 #                                                       arg (iter 34)
+#  27b. release      scripts/test-release-scripts.sh — release tooling offline
+#                                                       (plans, dry runs, CLI packages,
+#                                                       winget/Homebrew, signed SHA256SUMS)
 #  28. test          pnpm test                       — Vitest (frontend, ~49 files)
 #  29. cargo         cargo check --workspace         — Rust type-check
 #  30. clippy        cargo clippy --all-targets -D warnings
@@ -286,6 +289,7 @@ run_stage "tauri-vers"   "bash scripts/check-tauri-versions.sh"
 run_stage "hygiene"      "bash scripts/check-bash-hygiene.sh"
 run_stage "changelog"    "bash scripts/check-changelog.sh"
 run_stage "gha"          "bash scripts/check-github-actions.sh"
+run_stage "release"      "bash scripts/test-release-scripts.sh"
 run_stage "audit"        "bash scripts/check-pnpm-audit.sh"
 run_stage "ws-deps"      "bash scripts/check-workspace-deps.sh"
 run_stage "csp"          "bash scripts/check-tauri-csp.sh"

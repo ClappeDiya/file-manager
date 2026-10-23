@@ -7,13 +7,14 @@
 //! ufop-server --interface any --allowed-cidrs 10.0.0.0/8,fd00::/8   # only these clients (by TCP peer)
 //! ufop server tokens create ci --scope run --days 30                 # scoped API token (see server::api_tokens)
 //! ufop-server --share-root /srv/exchange                              # share links under /srv/exchange (/s/<token>)
+//! ufop-server user add alice --role operator                          # an account (password from UFOP_SERVER_PASSWORD or stdin)
+//! ufop-server user add bob --password-hash "$(ufop-server hash-password)"   # provision a prehashed password
 //! ```
 //! Defaults come from the machine-wide preload file (see `ufop_core::preload`).
 
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 use unified_file_ops_lib::backup_engine::{self, policy::ModulePolicy, BackupManager};
 use unified_file_ops_lib::connectors::ConnectionManager;
 use unified_file_ops_lib::fleet_agent;
@@ -40,6 +41,25 @@ struct Args {
     /// Folder with the built web UI (`pnpm build` → dist/)
     #[arg(long, env = "UFOP_SERVER_WEBROOT")]
     webroot: Option<PathBuf>,
+    /// Web UI branding from a JSON file: title_prefix, product_name, logo (data: URI or
+    /// an image file path), accent_color (#rrggbb), custom_css. The --brand-* flags win.
+    #[arg(long, env = "UFOP_SERVER_BRANDING_FILE")]
+    branding_file: Option<PathBuf>,
+    /// Text before every page title (e.g. "[ACME] ")
+    #[arg(long, env = "UFOP_SERVER_BRAND_TITLE_PREFIX")]
+    brand_title_prefix: Option<String>,
+    /// Product name in titles and the header (default: FileManager)
+    #[arg(long, env = "UFOP_SERVER_BRAND_PRODUCT_NAME")]
+    brand_product_name: Option<String>,
+    /// Logo: an image file (.png, .jpg, .svg, .webp, .gif; ≤ 512 KiB) or a data: URI
+    #[arg(long, env = "UFOP_SERVER_BRAND_LOGO")]
+    brand_logo: Option<String>,
+    /// Accent color, #rgb or #rrggbb
+    #[arg(long, env = "UFOP_SERVER_BRAND_ACCENT_COLOR")]
+    brand_accent_color: Option<String>,
+    /// Extra stylesheet (≤ 32 KiB; no @import, external url() or scripts)
+    #[arg(long, env = "UFOP_SERVER_BRAND_CSS_FILE")]
+    brand_css_file: Option<PathBuf>,
     /// Serve only the API, no web UI
     #[arg(long)]
     api_only: bool,
@@ -140,7 +160,180 @@ struct Args {
     /// Windows: run under the Service Control Manager (set by --install-service)
     #[arg(long, hide = true)]
     windows_service: bool,
+    /// Seconds running backups get to stop at a safe point (writing a partial
+    /// version) when the server is asked to stop; a second stop request is immediate
+    #[arg(long, env = "UFOP_SERVER_SHUTDOWN_GRACE", default_value_t = 60)]
+    shutdown_grace: u64,
+    /// One log line per request (method, route template, status, latency, X-Request-Id): on or off
+    #[arg(long, env = "UFOP_SERVER_REQUEST_LOG", default_value = "on", value_parser = ["on", "off"])]
+    request_log: String,
+    /// Serve Prometheus /metrics on this address too, e.g. 127.0.0.1:9464 (default: off;
+    /// /api/v1/metrics on the main port always needs a read-scope token)
+    #[arg(long, env = "UFOP_SERVER_METRICS_LISTEN")]
+    metrics_listen: Option<std::net::SocketAddr>,
+    /// Require HTTP Basic `user:password` on --metrics-listen
+    #[arg(long, env = "UFOP_SERVER_METRICS_BASIC_AUTH")]
+    metrics_basic_auth: Option<String>,
+    /// Export trace spans (HTTP requests, backup operations) over OTLP/HTTP JSON to this
+    /// collector, e.g. http://otel-collector:4318 (default: off)
+    #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
+    /// Extra headers for the collector: name=value,name2=value2
+    #[arg(long, env = "OTEL_EXPORTER_OTLP_HEADERS", default_value = "")]
+    otlp_headers: String,
+    /// service.name of the exported spans
+    #[arg(long, env = "OTEL_SERVICE_NAME", default_value = "ufop-server")]
+    otlp_service_name: String,
+    /// Share of new traces exported, 0.0-1.0 (callers' sampled traceparent wins)
+    #[arg(long, env = "UFOP_SERVER_OTLP_SAMPLE_RATIO", default_value_t = 1.0)]
+    otlp_sample_ratio: f64,
+    /// Push metrics to this Prometheus push gateway, e.g. http://pushgateway:9091 (default: off)
+    #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_URL")]
+    pushgateway_url: Option<String>,
+    /// Push gateway job label
+    #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_JOB", default_value = "ufop-server")]
+    pushgateway_job: String,
+    /// Push gateway instance label (default: the host name)
+    #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_INSTANCE")]
+    pushgateway_instance: Option<String>,
+    /// Seconds between pushes (a last push is sent on shutdown)
+    #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_INTERVAL", default_value_t = 60)]
+    pushgateway_interval: u64,
+    /// HTTP Basic `user:password` for the push gateway
+    #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_BASIC_AUTH")]
+    pushgateway_basic_auth: Option<String>,
+    /// Bearer token for the push gateway
+    #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_TOKEN")]
+    pushgateway_token: Option<String>,
+    #[command(subcommand)]
+    command: Option<Command>,
 }
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Server accounts, without the web UI (works while the server is stopped)
+    #[command(subcommand)]
+    User(UserCmd),
+    /// Print the Argon2 hash of a password (UFOP_SERVER_PASSWORD or stdin), for
+    /// `user add --password-hash` or the management console
+    HashPassword,
+    /// Print a shell completion script: bash, zsh, fish, powershell, elvish
+    Completions {
+        #[arg(value_parser = ["bash", "zsh", "fish", "powershell", "elvish"])]
+        shell: String,
+    },
+    /// Print a man page (`ufop-server man user add`), or write all of them with --out
+    Man {
+        /// Folder to write every page into
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Command path (empty = the top page)
+        command: Vec<String>,
+    },
+}
+
+/// `completions` / `man`: generated from this binary's own argument tree.
+fn print_generated(cmd: &Command) {
+    use clap::CommandFactory;
+    use ufop_core::cli_gen;
+    let tree = Args::command();
+    match cmd {
+        Command::Completions { shell } => match cli_gen::Shell::parse(shell) {
+            Some(sh) => print!("{}", cli_gen::completions(&tree, sh)),
+            None => fail(format!("unknown shell '{shell}'")),
+        },
+        Command::Man { out, command } => {
+            // Section 8 (daemons): `ufop server …` of the CLI owns ufop-server*.1.
+            let pages = cli_gen::man_pages_in(&tree, "8");
+            if let Some(dir) = out {
+                std::fs::create_dir_all(dir).unwrap_or_else(|e| fail(format!("cannot create {}: {e}", dir.display())));
+                for (name, body) in &pages {
+                    std::fs::write(dir.join(name), body).unwrap_or_else(|e| fail(format!("cannot write {name}: {e}")));
+                }
+                eprintln!("Wrote {} man page(s) to {}", pages.len(), dir.display());
+            } else {
+                let want = std::iter::once("ufop-server".to_string()).chain(command.iter().cloned()).collect::<Vec<_>>().join("-");
+                match pages.iter().find(|(n, _)| *n == format!("{want}.8")) {
+                    Some((_, body)) => print!("{body}"),
+                    None => fail(format!("no command '{}'", want.replace('-', " "))),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum UserCmd {
+    /// List accounts
+    List,
+    /// Add an account; the password comes from --password-hash, else UFOP_SERVER_PASSWORD or stdin
+    Add {
+        username: String,
+        /// admin, operator or viewer
+        #[arg(long, default_value = "viewer", value_parser = ["admin", "operator", "viewer"])]
+        role: String,
+        /// A ready Argon2 PHC string ($argon2id$…) instead of a password
+        #[arg(long)]
+        password_hash: Option<String>,
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Change an account (only the options given)
+    Set {
+        username: String,
+        #[arg(long, value_parser = ["admin", "operator", "viewer"])]
+        role: Option<String>,
+        #[arg(long)]
+        disabled: Option<bool>,
+        #[arg(long)]
+        password_hash: Option<String>,
+        /// Read a new password from UFOP_SERVER_PASSWORD or stdin
+        #[arg(long)]
+        password: bool,
+    },
+    /// Delete an account (and revoke its sessions and tokens)
+    Remove { username: String },
+}
+
+fn role_of(s: &str) -> server::access::Role {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap_or_default()
+}
+
+async fn user_command(auth: &AuthService, cmd: UserCmd) -> Result<String, unified_file_ops_lib::core::error::AppError> {
+    use server::users::{Secret, UserPatch};
+    auth.ensure_accounts().await?;
+    let users = auth.users();
+    Ok(match cmd {
+        UserCmd::List => {
+            let rows: Vec<String> = users.list().await?.into_iter().map(|u| format!("{}\t{}{}{}", u.username, u.role.as_str(), if u.disabled { "\tdisabled" } else { "" }, if u.managed { "\tmanaged" } else { "" })).collect();
+            if rows.is_empty() { "No accounts.".into() } else { rows.join("\n") }
+        }
+        UserCmd::Add { username, role, password_hash, disabled } => {
+            let secret = match password_hash {
+                Some(h) => Secret::Hash(h),
+                None => Secret::Password(read_password()),
+            };
+            let u = users.create(&username, secret, role_of(&role), disabled).await?;
+            format!("Account '{}' added ({}).", u.username, u.role.as_str())
+        }
+        UserCmd::Set { username, role, disabled, password_hash, password } => {
+            let patch = UserPatch { role: role.as_deref().map(role_of), disabled, password: password.then(read_password), password_hash };
+            let u = users.update(&username, patch).await?;
+            format!("Account '{}' changed ({}{}).", u.username, u.role.as_str(), if u.disabled { ", disabled" } else { "" })
+        }
+        UserCmd::Remove { username } => {
+            users.delete(&username).await?;
+            format!("Account '{username}' removed.")
+        }
+    })
+}
+
+/// The OTLP exporter installed with the log subscriber.
+static OTLP: std::sync::OnceLock<Option<server::otlp::OtlpHandle>> = std::sync::OnceLock::new();
+
+/// The running server's stop switch, for the Windows service handler.
+static STOP: std::sync::OnceLock<server::lifecycle::Lifecycle> = std::sync::OnceLock::new();
 
 /// Arguments forwarded to the service: everything except the install flag.
 fn service_args(argv: &[String]) -> Vec<String> {
@@ -197,27 +390,46 @@ mod winsvc {
     }
 
     fn service_main(_args: Vec<OsString>) {
-        let handler = service_control_handler::register(NAME, |ev| match ev {
+        let status_handle: std::sync::Arc<std::sync::OnceLock<service_control_handler::ServiceStatusHandle>> = Default::default();
+        let sh = status_handle.clone();
+        let handler = service_control_handler::register(NAME, move |ev| match ev {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                std::process::exit(0);
+                // Graceful: running backups stop at a safe point (a second stop is immediate).
+                match super::STOP.get() {
+                    Some(life) => {
+                        let grace = life.default_grace();
+                        if let Some(h) = sh.get() {
+                            let _ = h.set_service_status(status(ServiceState::StopPending, ServiceControlAccept::empty(), grace + Duration::from_secs(15)));
+                        }
+                        life.request(None);
+                    }
+                    None => std::process::exit(0),
+                }
+                ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         });
         let Ok(h) = handler else { return };
-        let _ = h.set_service_status(ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: ServiceState::Running,
-            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-            exit_code: ServiceExitCode::Win32(0),
-            checkpoint: 0,
-            wait_hint: Duration::default(),
-            process_id: None,
-        });
+        let _ = status_handle.set(h);
+        let _ = h.set_service_status(status(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, Duration::default()));
         // Process arguments (not the SCM start arguments) carry the configuration.
         let argv: Vec<String> = std::env::args().collect();
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(super::run(argv));
+        let _ = h.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty(), Duration::default()));
+    }
+
+    fn status(state: ServiceState, accept: ServiceControlAccept, wait_hint: Duration) -> ServiceStatus {
+        ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: accept,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint,
+            process_id: None,
+        }
     }
 }
 
@@ -237,6 +449,9 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 }
 
 fn main() {
+    // Portable mode (UFOP_PORTABLE_DIR or a marker next to the binary) moves
+    // the default data folder too; --data-dir still wins.
+    unified_file_ops_lib::paths::apply_process_env();
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--install-service" || a == "--uninstall-service" || a == "--windows-service") {
         #[cfg(windows)]
@@ -272,9 +487,43 @@ async fn run(argv: Vec<String>) {
         None => argv,
     };
     let a = Args::parse_from(argv);
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
-        .init();
+    if let Some(c @ (Command::Completions { .. } | Command::Man { .. })) = &a.command {
+        print_generated(c);
+        return;
+    }
+    if matches!(a.command, Some(Command::HashPassword)) {
+        match server::auth::hash_password(&read_password()) {
+            Ok(h) => {
+                println!("{h}");
+                return;
+            }
+            Err(e) => fail(e),
+        }
+    }
+    let otlp = match a.otlp_endpoint.as_deref().filter(|e| !e.trim().is_empty()) {
+        Some(endpoint) => {
+            if !(0.0..=1.0).contains(&a.otlp_sample_ratio) {
+                fail("--otlp-sample-ratio must be between 0 and 1");
+            }
+            let headers = server::otlp::parse_headers(&a.otlp_headers).unwrap_or_else(|e| fail(format!("--otlp-headers: {e}")));
+            Some(server::otlp::install(server::otlp::OtlpConfig { endpoint: endpoint.to_string(), headers, service_name: a.otlp_service_name.clone(), sample_ratio: a.otlp_sample_ratio, ..Default::default() }))
+        }
+        None => None,
+    };
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let (layer, handle) = otlp.map(|(l, h)| (Some(l), Some(h))).unwrap_or((None, None));
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+            .with(tracing_subscriber::fmt::layer())
+            .with(layer)
+            .init();
+        if let Some(e) = a.otlp_endpoint.as_deref().filter(|_| handle.is_some()) {
+            tracing::info!("Exporting traces to {e} (OTLP/HTTP JSON, sample ratio {})", a.otlp_sample_ratio);
+        }
+        let _ = OTLP.set(handle);
+    }
 
     let data_dir = a.data_dir.clone().unwrap_or_else(|| backup_engine::default_data_dir().parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")));
     if let Err(e) = server::enforce_data_dir_permissions(&data_dir) {
@@ -297,6 +546,32 @@ async fn run(argv: Vec<String>) {
         }
     }
     let auth = AuthService::new(store.clone());
+    // Branding: command line / config file layer, then what an administrator saved.
+    let brand = {
+        let css = a.brand_css_file.as_ref().map(|f| std::fs::read_to_string(f).unwrap_or_else(|e| fail(format!("--brand-css-file {}: {e}", f.display())))).unwrap_or_default();
+        let flags = server::branding::Branding {
+            title_prefix: a.brand_title_prefix.clone().unwrap_or_default(),
+            product_name: a.brand_product_name.clone().unwrap_or_default(),
+            logo: a.brand_logo.clone().unwrap_or_default(),
+            accent_color: a.brand_accent_color.clone().unwrap_or_default(),
+            custom_css: css,
+        };
+        let cli = server::branding::from_cli(a.branding_file.as_deref(), flags).unwrap_or_else(|e| fail(e.user_message()));
+        let b = server::branding::BrandingState::new(cli);
+        if let Err(e) = b.load_saved(&store).await {
+            tracing::warn!("Saved branding not loaded: {}", e.user_message());
+        }
+        b
+    };
+    if let Some(Command::User(cmd)) = a.command {
+        match user_command(&auth, cmd).await {
+            Ok(msg) => {
+                println!("{msg}");
+                return;
+            }
+            Err(e) => fail(e),
+        }
+    }
     if a.set_password {
         auth.set_password(&read_password()).await.unwrap_or_else(|e| fail(e));
         println!("Password set; existing sessions were signed out.");
@@ -337,13 +612,31 @@ async fn run(argv: Vec<String>) {
         None
     } else {
         let agent = fleet_agent::init_or_default(mgr.clone(), store.clone(), creds.clone(), "server").await;
-        // Of the console's app settings, the server applies the transfer caps.
+        // Of the console's app settings, the server applies the transfer caps,
+        // backup templates and server accounts with their access rules.
         let caps_mgr = mgr.clone();
+        let users = auth.users();
+        let managed_brand = brand.clone();
         agent.host().set_managed_settings_handler(Arc::new(move |settings| {
             let m = caps_mgr.clone();
+            let users = users.clone();
+            let managed_brand = managed_brand.clone();
             Box::pin(async move {
+                let mut problems = m.set_managed_templates(settings.as_ref().and_then(|s| s.backup_templates.as_deref()));
+                problems.extend(m.set_managed_notification_profiles(settings.as_ref().and_then(|s| s.notification_profiles.as_deref())));
+                match users.apply_managed(settings.as_ref().and_then(|s| s.server_access.as_ref())).await {
+                    Ok(p) => problems.extend(p),
+                    Err(e) => problems.push(format!("server accounts: {}", e.user_message())),
+                }
+                if let Err(e) = managed_brand.set_managed(settings.as_ref().and_then(|s| s.server_branding.as_ref())).await {
+                    problems.push(format!("server branding: {e}"));
+                }
                 m.set_managed_caps(settings.and_then(|s| s.transfers)).await;
-                Ok(())
+                if problems.is_empty() {
+                    Ok(())
+                } else {
+                    Err(unified_file_ops_lib::core::error::AppError::validation(format!("Some organization settings were not applied: {}", problems.join("; "))))
+                }
             })
         }));
         fleet_agent::spawn(agent.clone(), "ufop-server");
@@ -383,6 +676,18 @@ async fn run(argv: Vec<String>) {
         mcp_roots: a.mcp_roots,
         mcp_allow_write: a.mcp_allow_write,
         public_url: a.public_url,
+        shutdown_grace_secs: a.shutdown_grace,
+        request_log: a.request_log == "on",
+        metrics_listen: a.metrics_listen,
+        metrics_basic_auth: a.metrics_basic_auth.filter(|s| !s.is_empty()),
+        pushgateway: a.pushgateway_url.filter(|u| !u.trim().is_empty()).map(|url| server::otlp::PushConfig {
+            url,
+            job: a.pushgateway_job.clone(),
+            instance: a.pushgateway_instance.clone().unwrap_or_else(|| hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_else(|_| "ufop-server".into())),
+            interval: std::time::Duration::from_secs(a.pushgateway_interval.max(1)),
+            basic_auth: a.pushgateway_basic_auth.filter(|s| !s.is_empty()),
+            bearer: a.pushgateway_token.filter(|s| !s.is_empty()),
+        }),
     };
     if !cfg.mcp_roots.is_empty() {
         let roots = ufop_core::confine::Roots::new(&cfg.mcp_roots).unwrap_or_else(|e| fail(format!("--mcp-root: {e}")));
@@ -400,7 +705,8 @@ async fn run(argv: Vec<String>) {
             tracing::warn!("WebDAV is reachable over plain HTTP: passwords and tokens are sent unencrypted. Use --https or a TLS reverse proxy.");
         }
     }
-    let st = ServerState { mgr, conns: Some(conns), auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent, gateways: Default::default() };
+    let st = ServerState { oauth, agent, otlp: OTLP.get().cloned().flatten(), branding: brand, ..ServerState::new(mgr, Some(conns), auth, cfg) };
+    let _ = STOP.set(st.life.clone());
     if let Err(e) = server::serve(st).await {
         fail(e);
     }

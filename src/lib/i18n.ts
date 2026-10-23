@@ -9,6 +9,7 @@
 
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { scaleBytes } from "@/lib/format-bytes";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -217,22 +218,15 @@ export function formatNumber(
  * Format file size in a human-readable way.
  */
 export function formatFileSize(bytes: number, locale: Locale): string {
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let unitIndex = 0;
-  let size = Math.abs(bytes);
-
-  while (size >= 1024 && unitIndex < units.length - 1) {
-    size /= 1024;
-    unitIndex++;
-  }
-
+  // Units follow Settings → Appearance → Size units (binary or decimal).
+  const { value, unit } = scaleBytes(Math.abs(bytes));
   const formatted = formatNumber(
-    Math.round(size * 100) / 100,
+    Math.round(value * 100) / 100,
     locale,
-    { minimumFractionDigits: unitIndex > 0 ? 1 : 0, maximumFractionDigits: 2 },
+    { minimumFractionDigits: unit !== "B" ? 1 : 0, maximumFractionDigits: 2 },
   );
 
-  return `${formatted} ${units[unitIndex]}`;
+  return `${formatted} ${unit}`;
 }
 
 /**

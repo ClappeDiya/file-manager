@@ -8,6 +8,8 @@ import { useEffect, useState } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { inputCls } from "@/lib/backup-helpers";
 import { errorText, type CloudConfig, type CloudProviderInfo } from "@/stores/backup-store";
+import { secretHint } from "@/lib/backup-cloud-auth";
+import { CloudProviderExtras } from "./backup-cloud-advanced";
 import { Banner, Btn, Check, Field } from "./backup-ui";
 
 /** Read a TLS server's certificate fingerprint so it can be compared and pinned. */
@@ -61,14 +63,14 @@ const TLS_FIELDS: FieldDef[] = [
 /** Per-provider fields and defaults (identical to the Rust `Default`s). */
 const BASE_FIELDS: Record<string, { defaults: Record<string, unknown>; fields: FieldDef[] }> = {
   s3: {
-    defaults: { preset: "aws", endpoint: "", region: "us-east-1", bucket: "", prefix: "", access_key_id: "", path_style: false, storage_class: "", part_size_mb: 64, cold_storage: { restore_days: 3, tier: "Standard", wait_minutes: 0 }, create_with_object_lock: false, tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } },
+    defaults: { preset: "aws", endpoint: "", region: "us-east-1", bucket: "", prefix: "", access_key_id: "", path_style: false, storage_class: "", part_size_mb: 64, cold_storage: { restore_days: 3, tier: "Standard", wait_minutes: 0 }, create_with_object_lock: false, tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] }, credentials: { type: "static" }, assume_role: null, storage_class_by_kind: { dblock: "", dindex: "", dlist: "", other: "" }, point_in_time: null },
     fields: [
       { key: "preset", label: "Service", kind: "select", options: ["aws", "idrive_e2", "storj", "aliyun_oss", "tencent_cos", "wasabi", "minio", "custom"] },
       { key: "endpoint", label: "Endpoint (empty = from service + region)", hint: "e.g. https://s3.example.com or http://127.0.0.1:9000" },
       { key: "region", label: "Region" },
       { key: "bucket", label: "Bucket" },
       { key: "prefix", label: "Folder in bucket" },
-      { key: "access_key_id", label: "Access key id" },
+      { key: "access_key_id", label: "Access key id (static keys)" },
       { key: "storage_class", label: "Storage class", kind: "select", options: ["", "STANDARD", "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING", "GLACIER_IR", "GLACIER", "DEEP_ARCHIVE"] },
       { key: "part_size_mb", label: "Multipart part size (MiB, 0 = single upload)", kind: "number" },
       { key: "path_style", label: "Path-style addressing (bucket in the path)", kind: "bool" },
@@ -79,7 +81,7 @@ const BASE_FIELDS: Record<string, { defaults: Record<string, unknown>; fields: F
     ],
   },
   azure: {
-    defaults: { account: "", container: "", prefix: "", endpoint: "", access_tier: "", block_size_mb: 4, rehydrate_priority: "Standard", tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } },
+    defaults: { account: "", container: "", prefix: "", endpoint: "", access_tier: "", block_size_mb: 4, rehydrate_priority: "Standard", tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] }, auth: { type: "shared_key" }, authority_host: "", access_tier_by_kind: { dblock: "", dindex: "", dlist: "", other: "" } },
     fields: [
       { key: "account", label: "Storage account" },
       { key: "container", label: "Container" },
@@ -91,7 +93,7 @@ const BASE_FIELDS: Record<string, { defaults: Record<string, unknown>; fields: F
     ],
   },
   gcs: {
-    defaults: { bucket: "", prefix: "", project: "", storage_class: "", endpoint: "", checksums: true, tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } },
+    defaults: { bucket: "", prefix: "", project: "", storage_class: "", endpoint: "", checksums: true, tls: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] }, scope: "", storage_class_by_kind: { dblock: "", dindex: "", dlist: "", other: "" } },
     fields: [
       { key: "bucket", label: "Bucket" },
       { key: "prefix", label: "Folder" },
@@ -129,7 +131,7 @@ const BASE_FIELDS: Record<string, { defaults: Record<string, unknown>; fields: F
   },
   tahoe_lafs: { defaults: { node_url: "http://127.0.0.1:3456", dir_cap: "", path: "" }, fields: [{ key: "node_url", label: "Gateway URL" }, { key: "dir_cap", label: "Directory capability (URI:DIR2:…)" }, { key: "path", label: "Folder" }] },
   rclone: {
-    defaults: { remote: "", path: "", binary: "rclone", config_file: null, extra_args: [] },
+    defaults: { remote: "", path: "", binary: "rclone", config_file: null, extra_args: [], timeout_secs: 0, startup_timeout_secs: 0, env: {}, isolate_env: false, env_passthrough: [] },
     fields: [{ key: "remote", label: "Remote (from `rclone config`, e.g. mega)" }, { key: "path", label: "Folder" }, { key: "binary", label: "rclone executable" }],
   },
   filen: {
@@ -294,6 +296,7 @@ export function CloudDestinationForm({
           );
         })}
       </div>
+      <CloudProviderExtras config={config} onChange={onChange} />
       {"tls" in values && (
         <FingerprintFetcher
           onPin={(fp) => {
@@ -303,7 +306,7 @@ export function CloudDestinationForm({
           }}
         />
       )}
-      <Field label={`Credentials${info ? ` — ${info.secret}` : ""}`} hint={hasSecret ? "Stored. Enter a new value to replace it." : "Not stored yet."}>
+      <Field label={`Credentials${info ? ` — ${info.secret}` : ""}`} hint={[secretHint(config), hasSecret ? "Stored. Enter a new value to replace it." : "Not stored yet."].filter(Boolean).join(" ")}>
         <textarea data-testid="cloud-secret" className={`${inputCls} font-mono`} rows={2} value={secret} onChange={(e) => setSecret(e.target.value)} autoComplete="off" />
       </Field>
       <Btn disabled={!secret} testId="cloud-secret-save" onClick={() => void saveSecret()}>

@@ -149,9 +149,7 @@ fn default_state_dir() -> PathBuf {
     if cfg!(test) {
         return std::env::temp_dir().join(format!("ufop-sync-test-{}", std::process::id()));
     }
-    directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
-        .map(|d| d.data_dir().join("sync"))
-        .unwrap_or_else(|| ufop_core::session::user_temp_subdir("sync"))
+    crate::paths::data_dir().join("sync")
 }
 
 impl SyncManager {

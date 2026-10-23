@@ -5,7 +5,7 @@
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { tauriInvoke, isBackendAvailable } from "@/hooks/use-tauri";
-import { __setAccessTokenForTests, login, refresh, serverRpc } from "@/lib/server-client";
+import { __setAccessTokenForTests, csrfToken, login, logout, refresh, serverRpc } from "@/lib/server-client";
 
 const fetchMock = vi.fn();
 
@@ -20,6 +20,7 @@ beforeEach(() => {
   fetchMock.mockReset();
   __setAccessTokenForTests(null);
   document.cookie = "ufop_session=; Max-Age=0";
+  document.cookie = "ufop_csrf=; Max-Age=0";
 });
 
 afterEach(() => {
@@ -62,5 +63,25 @@ describe("server client", () => {
   it("surfaces server errors with advice", async () => {
     fetchMock.mockResolvedValueOnce(res(401, { message: "Wrong password", advice: "Check the server password." }));
     await expect(login("bad")).rejects.toMatchObject({ message: "Wrong password" });
+  });
+
+  it("sends the CSRF cookie's value with refresh and sign-out", async () => {
+    document.cookie = "ufop_session=1";
+    document.cookie = "ufop_csrf=abc-123_x";
+    expect(csrfToken()).toBe("abc-123_x");
+    fetchMock.mockResolvedValueOnce(res(200, { access_token: "t" })).mockResolvedValueOnce(res(200, { ok: true }));
+    expect(await refresh()).toBe(true);
+    expect(fetchMock.mock.calls[0][1].headers["X-CSRF-Token"]).toBe("abc-123_x");
+    await logout();
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/v1/auth/logout");
+    expect(fetchMock.mock.calls[1][1].headers["X-CSRF-Token"]).toBe("abc-123_x");
+  });
+
+  it("sends no CSRF header without the cookie", async () => {
+    document.cookie = "ufop_session=1";
+    expect(csrfToken()).toBeNull();
+    fetchMock.mockResolvedValueOnce(res(403, { message: "Missing CSRF token" }));
+    expect(await refresh()).toBe(false);
+    expect(fetchMock.mock.calls[0][1].headers).toEqual({});
   });
 });

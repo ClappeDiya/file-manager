@@ -15,8 +15,9 @@
 //! The local folder holds decrypted data: keep it somewhere private.
 
 use super::backend::Backend;
-use super::crypto::{KdfParams, VolumeCipher};
+use super::crypto::KdfParams;
 use super::engine::header_cipher;
+use super::layout::LayoutBackend;
 use super::restore::{destinations, path_selected, RestoreOptions};
 use super::volume::{self, BlockVolumeWriter, FileListVolume, IndexVolume, IndexedBlock, RepoHeader, VolumeKind};
 use super::{hash_bytes, EntryKind, FileEntry, OpContext, Phase, Progress, VolumeFormat, ZipMethod};
@@ -32,6 +33,8 @@ use std::time::{Duration, Instant};
 const HEADER_FILE: &str = "repo.json";
 const INDEX_FILE: &str = "recovery-index.json";
 const PREFIX_FILE: &str = "prefix.txt";
+/// Block hash → size, for placing variable-size (content-defined) blocks.
+const SIZES_FILE: &str = "recovery-sizes.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -76,6 +79,10 @@ pub fn download(backend: &dyn Backend, passphrase: Option<&str>, prefix: &str, d
     let raw = backend.get(&hname)?;
     let header: RepoHeader = serde_json::from_slice(&raw)?;
     let cipher = header_cipher(&header, passphrase, None)?;
+    // Volumes under their logical names, wherever the layout stores them.
+    let layout = LayoutBackend::new(backend, header.layout, prefix);
+    let backend: &dyn Backend = &layout;
+    let listing = if header.layout.is_sharded() { backend.list()? } else { listing };
     std::fs::write(dir.join(HEADER_FILE), &raw)?;
     std::fs::write(dir.join(PREFIX_FILE), prefix)?;
 
@@ -106,6 +113,10 @@ pub fn download(backend: &dyn Backend, passphrase: Option<&str>, prefix: &str, d
                 let res = backend.get(name).and_then(|d| {
                     bytes.fetch_add(d.len() as u64, Ordering::SeqCst);
                     cipher.open(&d)
+                }).and_then(|p| match volume::classify(prefix, name) {
+                    // Metadata is stored as plain JSON locally (v2 compresses it remotely).
+                    Some(VolumeKind::Index | VolumeKind::FileList) => volume::decode_meta(p),
+                    _ => Ok(p),
                 });
                 match res {
                     Ok(plain) => {
@@ -160,6 +171,7 @@ fn local_volumes(dir: &Path, kind: VolumeKind) -> Result<Vec<String>, AppError> 
 /// Map every block hash to the local block volume that holds it.
 pub fn build_index(dir: &Path, ctx: &OpContext) -> Result<IndexReport, AppError> {
     let mut map: BTreeMap<String, String> = BTreeMap::new();
+    let mut sizes: BTreeMap<String, u64> = BTreeMap::new();
     let mut r = IndexReport::default();
     let vols = local_volumes(dir, VolumeKind::Block)?;
     for (i, v) in vols.iter().enumerate() {
@@ -168,7 +180,8 @@ pub fn build_index(dir: &Path, ctx: &OpContext) -> Result<IndexReport, AppError>
         match std::fs::read(dir.join(v)).map_err(AppError::from).and_then(|d| volume::read_block_volume(&d)) {
             Ok(blocks) => {
                 r.block_volumes += 1;
-                for h in blocks.into_keys() {
+                for (h, d) in blocks {
+                    sizes.insert(h.clone(), d.len() as u64);
                     map.insert(h, v.clone());
                 }
             }
@@ -177,6 +190,7 @@ pub fn build_index(dir: &Path, ctx: &OpContext) -> Result<IndexReport, AppError>
     }
     r.blocks = map.len();
     std::fs::write(dir.join(INDEX_FILE), serde_json::to_vec(&map)?)?;
+    std::fs::write(dir.join(SIZES_FILE), serde_json::to_vec(&sizes)?)?;
     Ok(r)
 }
 
@@ -235,6 +249,13 @@ pub fn restore(dir: &Path, version: usize, paths: &[String], target: &Path, ctx:
     let ro = RestoreOptions { target: Some(target.to_path_buf()), ..Default::default() };
     let dests = destinations(&entries, &ro);
     let bs = header.block_size as u64;
+    // Content-defined blocks vary in size: offsets come from the block sizes.
+    let sizes: Option<HashMap<String, u64>> = if header.chunker_spec().is_content_defined() {
+        let d = std::fs::read(dir.join(SIZES_FILE)).map_err(|_| AppError::file_op("The recovery index has no block sizes", "Run the index step again."))?;
+        Some(serde_json::from_slice(&d)?)
+    } else {
+        None
+    };
 
     // Create folders and empty files; collect writes per volume.
     let mut writes: HashMap<&str, Vec<(usize, u64, &str)>> = HashMap::new();
@@ -263,10 +284,19 @@ pub fn restore(dir: &Path, version: usize, paths: &[String], target: &Path, ctx:
                     r.errors.push(format!("{}: {err}", e.path));
                     continue;
                 }
+                let mut off = Some(0u64);
                 for (bi, h) in e.blocks.iter().enumerate() {
-                    match index.get(h) {
-                        Some(v) => writes.entry(v.as_str()).or_default().push((i, bi as u64 * bs, h.as_str())),
-                        None => *missing.entry(i).or_default() += 1,
+                    let at = match &sizes {
+                        None => Some(bi as u64 * bs),
+                        Some(_) => off,
+                    };
+                    if let (Some(m), Some(o)) = (&sizes, off) {
+                        // A block of unknown size hides where the next ones start.
+                        off = m.get(h).map(|s| o + s);
+                    }
+                    match (index.get(h), at) {
+                        (Some(v), Some(at)) => writes.entry(v.as_str()).or_default().push((i, at, h.as_str())),
+                        _ => *missing.entry(i).or_default() += 1,
                     }
                 }
             }
@@ -369,21 +399,24 @@ pub fn convert(dir: &Path, out: &dyn Backend, opts: &ConvertOptions, ctx: &OpCon
     if out.list()?.iter().any(|f| f.name == hname) {
         return Err(AppError::validation("The target already contains a backup with this prefix"));
     }
-    let (cipher, salt) = match opts.passphrase.as_deref().filter(|p| !p.is_empty()) {
-        Some(p) => {
-            let salt = VolumeCipher::random_salt();
-            (VolumeCipher::derive(p, &salt, opts.kdf)?, Some(hex::encode(&salt)))
-        }
-        None => (VolumeCipher::plain(), None),
-    };
-    let header = RepoHeader {
-        encrypted: cipher.is_encrypted(),
-        key_check: if salt.is_some() { cipher.key_check()? } else { None },
-        kdf: salt.is_some().then_some(opts.kdf),
-        salt,
+    let v2 = old.format_version >= 2;
+    let o = super::BackupOptions {
+        prefix: opts.prefix.clone(),
+        block_size: old.block_size,
+        block_hash: old.block_hash,
+        file_hash: old.file_hash,
         volume_format: opts.volume_format,
-        ..old
+        format_version: Some(old.format_version),
+        chunker: v2.then_some(super::ChunkerKind::Fixed),
+        block_codec: v2.then_some(old.block_codec),
+        cipher: if v2 { old.cipher } else { Default::default() },
+        ..Default::default()
     };
+    // Same format, blocks and chunker; new keys (a fresh v2 master key).
+    let (mut header, cipher) = super::format::create_header(&o, opts.passphrase.as_deref(), None, opts.kdf, out)?;
+    header.block_size = old.block_size;
+    header.chunker = old.chunker;
+    super::format::sync_features(&mut header);
     let mut r = ConvertReport::default();
     let mut put = |name: &str, data: &[u8]| -> Result<(), AppError> {
         out.put(name, data)?;
@@ -399,7 +432,7 @@ pub fn convert(dir: &Path, out: &dyn Backend, opts: &ConvertOptions, ctx: &OpCon
                 continue;
             }
         };
-        let mut w = BlockVolumeWriter::with_format(opts.volume_format, opts.zip_method);
+        let mut w = BlockVolumeWriter::with_format(opts.volume_format, opts.zip_method).with_codec(header.block_codec);
         let mut idx = Vec::new();
         for (h, d) in blocks {
             if hash_bytes(header.block_hash, &d) != h {
@@ -441,7 +474,8 @@ mod tests {
     use crate::backup::{run_backup, BackupOptions, RetentionPolicy, SourceFilter};
 
     fn backup(src: &Path, dst: &Path) {
-        let o = BackupOptions { block_size: 1024, volume_size: 4096, verify_samples: 0, ..Default::default() };
+        // Fixed 1 KiB blocks: the block counts below depend on them.
+        let o = BackupOptions { block_size: 1024, volume_size: 4096, verify_samples: 0, chunker: Some(crate::backup::ChunkerKind::Fixed), ..Default::default() };
         let db = BackupDb::open_in_memory().unwrap();
         let r = run_backup(&LocalBackend::new(dst), &db, &[src.into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
         assert!(r.errors.is_empty(), "{:?}", r.errors);
@@ -530,11 +564,36 @@ mod tests {
             return;
         }
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/ufop-recover.py");
-        for fmt in [VolumeFormat::Ufop, VolumeFormat::Zip] {
+        // Python can read zstd only with 3.14+ or the zstandard package.
+        let py_zstd = std::process::Command::new("python3")
+            .args(["-c", "import importlib.util as u, sys; sys.exit(0 if u.find_spec('zstandard') or u.find_spec('compression.zstd') else 1)"])
+            .status()
+            .is_ok_and(|s| s.success());
+        let base = BackupOptions { block_size: 1024, volume_size: 4096, verify_samples: 0, ..Default::default() };
+        let mut variants = vec![
+            ("v1 ufop", BackupOptions { format_version: Some(1), ..base.clone() }),
+            ("v1 zip", BackupOptions { format_version: Some(1), volume_format: VolumeFormat::Zip, ..base.clone() }),
+            // Format 2 without zstd: envelope key, ChaCha20-Poly1305, CDC, sharded layout.
+            (
+                "v2 chacha cdc sharded",
+                BackupOptions {
+                    block_codec: Some(crate::backup::BlockCodec::Deflate),
+                    metadata_compression: Some(crate::backup::MetadataCompression::None),
+                    cipher: crate::backup::crypto::CipherKind::ChaCha20Poly1305,
+                    layout: crate::backup::layout::RepoLayout::Sharded { prefix_len: 1 },
+                    ..base.clone()
+                },
+            ),
+        ];
+        if py_zstd {
+            variants.push(("v2 default", base.clone()));
+        }
+        for (label, o) in variants {
+            let fmt = label;
             let (src, dst, out) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-            let data: Vec<u8> = (0..12_000u32).map(|i| (i * 7 % 253) as u8).collect();
+            // Non-periodic content so content-defined blocks vary in size.
+            let data: Vec<u8> = (0..12_000u64).map(|i| ((i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) >> 37) as u8).collect();
             write(src.path(), "d/file.bin", &data);
-            let o = BackupOptions { block_size: 1024, volume_size: 4096, verify_samples: 0, volume_format: fmt, ..Default::default() };
             let db = BackupDb::open_in_memory().unwrap();
             run_backup(&LocalBackend::new(dst.path()), &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
             let st = std::process::Command::new("python3")
@@ -544,8 +603,8 @@ mod tests {
                 .env("UFOP_PASSPHRASE", "pw")
                 .status()
                 .unwrap();
-            assert!(st.success(), "{fmt:?}");
-            assert_eq!(std::fs::read(out.path().join(src.path().file_name().unwrap()).join("d/file.bin")).unwrap(), data, "{fmt:?}");
+            assert!(st.success(), "{fmt}");
+            assert_eq!(std::fs::read(out.path().join(src.path().file_name().unwrap()).join("d/file.bin")).unwrap(), data, "{fmt}");
         }
     }
 }

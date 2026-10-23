@@ -33,6 +33,12 @@ pub(crate) async fn exercise(store: &dyn ObjectStore, big: usize) {
 
 /// Full engine backup + restore through a store.
 pub(crate) fn backup_roundtrip(backend: &dyn ufop_core::backup::Backend) {
+    backup_roundtrip_with(backend, ufop_core::backup::layout::RepoLayout::Flat)
+}
+
+/// [`backup_roundtrip`] with a repository layout; a sharded layout must put
+/// volumes into shard folders on the destination.
+pub(crate) fn backup_roundtrip_with(backend: &dyn ufop_core::backup::Backend, layout: ufop_core::backup::layout::RepoLayout) {
     use ufop_core::backup::crypto::KdfParams;
     use ufop_core::backup::db::BackupDb;
     use ufop_core::backup::*;
@@ -40,10 +46,15 @@ pub(crate) fn backup_roundtrip(backend: &dyn ufop_core::backup::Backend) {
     let out = tempfile::tempdir().unwrap();
     let data: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 253) as u8).collect();
     std::fs::write(src.path().join("f.bin"), &data).unwrap();
-    let o = BackupOptions { block_size: 16 * 1024, volume_size: 100_000, verify_samples: 1, quota_disable: true, ..Default::default() };
+    let o = BackupOptions { block_size: 16 * 1024, volume_size: 100_000, verify_samples: 1, quota_disable: true, layout, ..Default::default() };
     let db = BackupDb::open_in_memory().unwrap();
     let r = run_backup(backend, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
     assert!(r.errors.is_empty(), "{:?}", r.errors);
+    if layout.is_sharded() {
+        let all = backend.list_recursive().unwrap();
+        assert!(all.iter().any(|f| f.name.contains('/') && f.name.contains(".dblock")), "volumes in shard folders: {all:?}");
+        assert!(backend.list().unwrap().iter().all(|f| !f.name.contains(".dblock")), "no block volume at the top");
+    }
     let db2 = BackupDb::open_in_memory().unwrap();
     maintenance::recreate_database(backend, &db2, Some("pw"), "ufop", &OpContext::new()).unwrap();
     let repo = engine::Repo::open(backend, &db2, Some("pw"), &o, false, KdfParams::insecure_fast()).unwrap();
@@ -64,6 +75,11 @@ async fn s3_against_emulator() {
     cfg.storage_class = "STANDARD_IA".into();
     let store = s3::S3Store::new(cfg.clone(), "secret".into()).unwrap();
     exercise(&store, 12 << 20).await; // > part size: multipart path
+    // The object's server time (clock-skew check) is close to ours.
+    store.put("ufop-lock.json", b"{}".to_vec()).await.unwrap();
+    let t = store.modified("ufop-lock.json").await.unwrap().expect("Last-Modified");
+    assert!((t - chrono::Utc::now()).num_seconds().abs() < 600);
+    store.delete("ufop-lock.json").await.unwrap();
     // Engine end to end through the sync adapter.
     let backend = Arc::new(StoreBackend::new(Box::new(s3::S3Store::new(cfg, "secret".into()).unwrap()), Some(std::time::Duration::from_secs(60))));
     let b2 = backend.clone();
@@ -229,7 +245,24 @@ async fn s3_cold_storage_restore_against_emulator() {
 #[test]
 fn cloud_config_defaults_match_frontend() {
     let tls = serde_json::json!({ "accept_invalid_certs": false, "ca_pem": null, "pinned_sha256": [] });
+    let by_kind = serde_json::json!({ "dblock": "", "dindex": "", "dlist": "", "other": "" });
     let cases = [
+        (
+            CloudConfig::S3(Default::default()),
+            serde_json::json!({ "provider": "s3", "preset": "aws", "endpoint": "", "region": "us-east-1", "bucket": "", "prefix": "", "access_key_id": "", "path_style": false, "storage_class": "", "part_size_mb": 64, "cold_storage": { "restore_days": 3, "tier": "Standard", "wait_minutes": 0 }, "create_with_object_lock": false, "tls": tls, "credentials": { "type": "static" }, "assume_role": null, "storage_class_by_kind": by_kind, "point_in_time": null }),
+        ),
+        (
+            CloudConfig::Azure(Default::default()),
+            serde_json::json!({ "provider": "azure", "account": "", "container": "", "prefix": "", "endpoint": "", "access_tier": "", "block_size_mb": 4, "rehydrate_priority": "Standard", "tls": tls, "auth": { "type": "shared_key" }, "authority_host": "", "access_tier_by_kind": by_kind }),
+        ),
+        (
+            CloudConfig::Gcs(Default::default()),
+            serde_json::json!({ "provider": "gcs", "bucket": "", "prefix": "", "project": "", "storage_class": "", "endpoint": "", "checksums": true, "tls": tls, "scope": "", "storage_class_by_kind": by_kind }),
+        ),
+        (
+            CloudConfig::Rclone(Default::default()),
+            serde_json::json!({ "provider": "rclone", "remote": "", "path": "", "binary": "rclone", "config_file": null, "extra_args": [], "timeout_secs": 0, "startup_timeout_secs": 0, "env": {}, "isolate_env": false, "env_passthrough": [] }),
+        ),
         (CloudConfig::Filen(Default::default()), serde_json::json!({ "provider": "filen", "email": "", "folder": "", "use_trash": false, "gateway_url": "", "ingest_url": "", "egest_url": "", "tls": tls })),
         (CloudConfig::Drime(Default::default()), serde_json::json!({ "provider": "drime", "folder": "", "workspace_id": 0, "page_size": 50, "soft_delete": false, "api_url": "", "tls": tls })),
         (
@@ -243,7 +276,8 @@ fn cloud_config_defaults_match_frontend() {
         let back: CloudConfig = serde_json::from_value(serde_json::json!({ "provider": want["provider"] })).unwrap();
         assert_eq!(back, cfg);
         assert_eq!(back.provider(), want["provider"].as_str().unwrap());
-        assert!(PROVIDERS.iter().any(|p| p.id == back.provider() && p.verified == "api-mock"));
+        let api_mock_only = ["filen", "drime", "movistar_cloud"].contains(&back.provider());
+        assert!(PROVIDERS.iter().any(|p| p.id == back.provider() && (!api_mock_only || p.verified == "api-mock")));
     }
     let f = CloudConfig::Filen(filen::FilenConfig { email: "me@example.com".into(), folder: "B".into(), ..Default::default() });
     assert_eq!(f.network_endpoint(), Some(("gateway.filen.io".into(), 443, true)));

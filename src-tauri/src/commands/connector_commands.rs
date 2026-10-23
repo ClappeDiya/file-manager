@@ -9,6 +9,8 @@ use crate::core::types::{ConnectionProfile, ConnectionProtocol, FileEntry};
 use tauri::State;
 
 /// Connect to a remote server using the appropriate protocol connector.
+// Each IPC argument is a named parameter of the command.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn connector_connect(
     protocol: String,

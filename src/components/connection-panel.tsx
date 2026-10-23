@@ -15,6 +15,7 @@ import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { ShareLinkDialog } from "@/components/share-link-dialog";
 import { SHAREABLE_PROTOCOLS } from "@/stores/share-store";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import { formatBytes } from "@/lib/format-bytes";
 import { pickFiles, pickFolder } from "@/lib/folder-picker";
 import { promptText, confirmText } from "@/lib/prompt-dialog";
 import { errorText } from "@/lib/error-text";
@@ -172,13 +173,8 @@ const DEFAULT_PORTS: Record<string, number> = {
 
 // ── Helpers ──
 
-function formatFileSize(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  const size = bytes / Math.pow(1024, i);
-  return `${size.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
-}
+/** Sizes follow Settings → Appearance → Size units. */
+const formatFileSize = (bytes: number): string => formatBytes(bytes);
 
 function formatModified(dateStr: string): string {
   try {

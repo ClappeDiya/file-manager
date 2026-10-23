@@ -1,0 +1,75 @@
+# Live-provider contract tests (nightly + manual). Standalone: it does not
+# depend on ci.yml. Disabled like every workflow in this repository (see
+# README.md here and scripts/check-github-actions.sh); run the same suite
+# locally with scripts/live-providers.sh. To use it on GitHub:
+#   git mv .github/workflows/live-providers.yml.disabled .github/workflows/live-providers.yml
+# and add the secrets below (each provider runs only when its secrets are set).
+name: Live provider tests
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      use_mocks:
+        description: "Also run the suite against the in-process mocks"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-providers
+  cancel-in-progress: false
+
+jobs:
+  live-providers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      UFOP_LIVE_USE_MOCKS: ${{ inputs.use_mocks && '1' || '' }}
+      UFOP_LIVE_S3_ENDPOINT: ${{ secrets.UFOP_LIVE_S3_ENDPOINT }}
+      UFOP_LIVE_S3_REGION: ${{ secrets.UFOP_LIVE_S3_REGION }}
+      UFOP_LIVE_S3_BUCKET: ${{ secrets.UFOP_LIVE_S3_BUCKET }}
+      UFOP_LIVE_S3_KEY: ${{ secrets.UFOP_LIVE_S3_KEY }}
+      UFOP_LIVE_S3_SECRET: ${{ secrets.UFOP_LIVE_S3_SECRET }}
+      UFOP_LIVE_S3_PATH_STYLE: ${{ secrets.UFOP_LIVE_S3_PATH_STYLE }}
+      UFOP_LIVE_AZURE_ACCOUNT: ${{ secrets.UFOP_LIVE_AZURE_ACCOUNT }}
+      UFOP_LIVE_AZURE_CONTAINER: ${{ secrets.UFOP_LIVE_AZURE_CONTAINER }}
+      UFOP_LIVE_AZURE_KEY: ${{ secrets.UFOP_LIVE_AZURE_KEY }}
+      UFOP_LIVE_AZURE_TENANT: ${{ secrets.UFOP_LIVE_AZURE_TENANT }}
+      UFOP_LIVE_AZURE_CLIENT_ID: ${{ secrets.UFOP_LIVE_AZURE_CLIENT_ID }}
+      UFOP_LIVE_AZURE_CLIENT_SECRET: ${{ secrets.UFOP_LIVE_AZURE_CLIENT_SECRET }}
+      UFOP_LIVE_GCS_BUCKET: ${{ secrets.UFOP_LIVE_GCS_BUCKET }}
+      UFOP_LIVE_GCS_KEY_JSON: ${{ secrets.UFOP_LIVE_GCS_KEY_JSON }}
+      UFOP_LIVE_B2_KEY_ID: ${{ secrets.UFOP_LIVE_B2_KEY_ID }}
+      UFOP_LIVE_B2_KEY: ${{ secrets.UFOP_LIVE_B2_KEY }}
+      UFOP_LIVE_B2_BUCKET: ${{ secrets.UFOP_LIVE_B2_BUCKET }}
+      UFOP_LIVE_SWIFT_AUTH_URL: ${{ secrets.UFOP_LIVE_SWIFT_AUTH_URL }}
+      UFOP_LIVE_SWIFT_USER: ${{ secrets.UFOP_LIVE_SWIFT_USER }}
+      UFOP_LIVE_SWIFT_PASSWORD: ${{ secrets.UFOP_LIVE_SWIFT_PASSWORD }}
+      UFOP_LIVE_SWIFT_PROJECT: ${{ secrets.UFOP_LIVE_SWIFT_PROJECT }}
+      UFOP_LIVE_SWIFT_CONTAINER: ${{ secrets.UFOP_LIVE_SWIFT_CONTAINER }}
+      UFOP_LIVE_SWIFT_REGION: ${{ secrets.UFOP_LIVE_SWIFT_REGION }}
+      UFOP_LIVE_DROPBOX_TOKEN: ${{ secrets.UFOP_LIVE_DROPBOX_TOKEN }}
+      UFOP_LIVE_ONEDRIVE_TOKEN: ${{ secrets.UFOP_LIVE_ONEDRIVE_TOKEN }}
+      UFOP_LIVE_ONEDRIVE_DRIVE: ${{ secrets.UFOP_LIVE_ONEDRIVE_DRIVE }}
+      UFOP_LIVE_GDRIVE_TOKEN: ${{ secrets.UFOP_LIVE_GDRIVE_TOKEN }}
+      UFOP_LIVE_FILEN_EMAIL: ${{ secrets.UFOP_LIVE_FILEN_EMAIL }}
+      UFOP_LIVE_FILEN_PASSWORD: ${{ secrets.UFOP_LIVE_FILEN_PASSWORD }}
+      UFOP_LIVE_DRIME_TOKEN: ${{ secrets.UFOP_LIVE_DRIME_TOKEN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+
+      - name: Live provider contract tests
+        run: ./scripts/live-providers.sh

@@ -261,7 +261,7 @@ fn windows_proxy() -> OsProxy {
 /// A client builder with the app's proxy, timeouts and user agent.
 pub fn builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
-        .proxy(reqwest::Proxy::custom(|url| proxy_for(url)))
+        .proxy(reqwest::Proxy::custom(proxy_for))
         .connect_timeout(Duration::from_secs(30))
         .user_agent(concat!("UFOP/", env!("CARGO_PKG_VERSION")))
 }

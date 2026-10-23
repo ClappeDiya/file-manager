@@ -6,7 +6,9 @@ use ufop_core::backup::crypto::KdfParams;
 
 struct TestServer {
     base: String,
+    mgr: BackupManager,
     client: reqwest::Client,
+    jar: Arc<reqwest::cookie::Jar>,
     _dir: tempfile::TempDir,
     dir: PathBuf,
 }
@@ -17,13 +19,16 @@ async fn start(cfg: ServerConfig, oauth: Option<oauth::OAuthBroker>) -> TestServ
     let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
     let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
     auth.set_password("server-password").await.unwrap();
-    let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent: None, gateways: Default::default() };
+    let st = ServerState { oauth, ..ServerState::new(mgr.clone(), None, auth, cfg) };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
+    let jar = Arc::new(reqwest::cookie::Jar::default());
     TestServer {
         base: format!("http://127.0.0.1:{port}"),
-        client: reqwest::Client::builder().cookie_store(true).build().unwrap(),
+        mgr,
+        jar: jar.clone(),
+        client: reqwest::Client::builder().cookie_provider(jar).build().unwrap(),
         dir: dir.path().to_path_buf(),
         _dir: dir,
     }
@@ -34,6 +39,11 @@ impl TestServer {
         let r = self.client.post(format!("{}/api/v1/auth/login", self.base)).json(&json!({"password":"server-password"})).send().await.unwrap();
         assert_eq!(r.status(), 200);
         r.json::<Value>().await.unwrap()["access_token"].as_str().unwrap().to_string()
+    }
+    /// The `ufop_csrf` cookie the client holds.
+    fn csrf(&self) -> String {
+        use reqwest::cookie::CookieStore;
+        self.jar.cookies(&self.base.parse().unwrap()).and_then(|h| h.to_str().ok().and_then(|c| c.split("; ").find_map(|kv| kv.strip_prefix("ufop_csrf=").map(String::from)))).unwrap_or_default()
     }
     async fn get(&self, path: &str, tok: &str) -> reqwest::Response {
         self.client.get(format!("{}{path}", self.base)).bearer_auth(tok).send().await.unwrap()
@@ -55,7 +65,7 @@ async fn auth_flow_tokens_and_revocation() {
     assert_eq!(s.get("/api/v1/jobs", &tok).await.status(), 200);
 
     // Refresh cookie rotates: the second use of the same cookie fails.
-    let r = s.client.post(format!("{}/api/v1/auth/refresh", s.base)).send().await.unwrap();
+    let r = s.client.post(format!("{}/api/v1/auth/refresh", s.base)).header("X-CSRF-Token", s.csrf()).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let new_tok = r.json::<Value>().await.unwrap()["access_token"].as_str().unwrap().to_string();
     assert_eq!(s.get("/api/v1/status", &new_tok).await.status(), 200);
@@ -77,7 +87,8 @@ async fn auth_flow_tokens_and_revocation() {
     assert_eq!(s.post("/api/v1/auth/reset", &tok, json!({})).await.status(), 200);
     assert_eq!(s.get("/api/v1/jobs", &tok).await.status(), 401);
     assert_eq!(s.get("/api/v1/jobs", &auto).await.status(), 401);
-    assert_eq!(s.client.post(format!("{}/api/v1/auth/refresh", s.base)).send().await.unwrap().status(), 401);
+    let after_reset = s.client.post(format!("{}/api/v1/auth/refresh", s.base)).header("X-CSRF-Token", s.csrf()).send().await.unwrap().status();
+    assert!(after_reset == 401 || after_reset == 403, "{after_reset}");
 }
 
 #[tokio::test]
@@ -122,12 +133,94 @@ async fn backup_and_restore_over_rest_and_rpc() {
     // RPC endpoint speaks the desktop command names and argument shapes.
     let found = s.post("/api/v1/rpc/backup_search", &tok, json!({"id": id, "pattern":"a.txt","version":null})).await.json::<Value>().await.unwrap();
     assert_eq!(found.as_array().unwrap().len(), 1);
+    // Repository lock status and guarded force-unlock.
+    let lock = s.get(&format!("/api/v1/jobs/{id}/lock"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(lock["locks"].as_array().unwrap().len(), 0);
+    assert_eq!(lock["exclusive"], false);
+    std::fs::write(s.dir.join("dst/ufop-lock.json"), serde_json::to_vec(&json!({"owner_id":"x","hostname":"nas","operation":"compact","kind":"exclusive","acquired_at":"2030-01-01T00:00:00Z","expires_at":"2030-01-01T00:30:00Z"})).unwrap()).unwrap();
+    let lock = s.get(&format!("/api/v1/jobs/{id}/lock"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!((lock["exclusive"].as_bool(), lock["locks"][0]["hostname"].as_str()), (Some(true), Some("nas")));
+    let refused = s.client.delete(format!("{}/api/v1/jobs/{id}/lock", s.base)).bearer_auth(&tok).send().await.unwrap();
+    assert!(!refused.status().is_success(), "needs confirm=true");
+    let broken = s.client.delete(format!("{}/api/v1/jobs/{id}/lock?confirm=true&owner_id=x", s.base)).bearer_auth(&tok).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(broken["removed"][0], "ufop-lock.json");
+    let rpc = s.post("/api/v1/rpc/backup_lock_status", &tok, json!({"jobId": id})).await.json::<Value>().await.unwrap();
+    assert_eq!(rpc["locks"].as_array().unwrap().len(), 0);
+    // Local database encryption on demand.
+    let enc = s.client.put(format!("{}/api/v1/jobs/{id}/database-encryption", s.base)).bearer_auth(&tok).json(&json!({"enabled": true})).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(enc["encrypted"], true);
+    assert_eq!(s.get(&format!("/api/v1/jobs/{id}/versions"), &tok).await.json::<Value>().await.unwrap().as_array().unwrap().len(), 1);
+    // Version metadata, tag filter, sources and the retention preview.
+    let patched = s.client.patch(format!("{}/api/v1/jobs/{id}/versions/0", s.base)).bearer_auth(&tok).json(&json!({"note": "first", "pinned": true, "tags": {"env": "prod"}})).send().await.unwrap();
+    assert_eq!(patched.status(), 200, "{}", patched.text().await.unwrap());
+    let v = s.get(&format!("/api/v1/jobs/{id}/versions?tags=env=prod"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!((v[0]["note"].as_str(), v[0]["pinned"].as_bool()), (Some("first"), Some(true)));
+    assert!(v[0]["stats"]["bytes_added"].as_u64().unwrap() > 0);
+    assert!(s.get(&format!("/api/v1/jobs/{id}/versions?tags=env=dev"), &tok).await.json::<Value>().await.unwrap().as_array().unwrap().is_empty());
+    let srcs = s.get(&format!("/api/v1/jobs/{id}/sources"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(srcs[0]["own"], true);
+    let p = s.post(&format!("/api/v1/jobs/{id}/retention/preview"), &tok, json!({"policy": {"type": "counts", "keep_daily": 7}})).await.json::<Value>().await.unwrap();
+    assert_eq!((p["keep"].as_u64(), p["versions"][0]["summary"].as_str()), (Some(1), Some("kept: newest version, daily 7, pinned")));
+    let rpc = s.post("/api/v1/rpc/backup_preview_retention", &tok, json!({"id": id})).await.json::<Value>().await.unwrap();
+    assert_eq!(rpc["delete"], 0);
     let unknown = s.post("/api/v1/rpc/rm_rf", &tok, json!({})).await;
     assert_eq!(unknown.status(), 400);
     let runs = s.get(&format!("/api/v1/runs?job_id={id}"), &tok).await.json::<Value>().await.unwrap();
-    assert_eq!(runs.as_array().unwrap().len(), 2);
+    assert_eq!(runs.as_array().unwrap().len(), 3);
+    let page = s.get(&format!("/api/v1/runs?job_id={id}&limit=2&offset=1&sort=started_at&desc=true"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!((page["total"].as_u64(), page["items"].as_array().map(|a| a.len()), page["offset"].as_u64()), (Some(3), Some(2), Some(1)), "{page}");
+    assert_eq!(s.get(&format!("/api/v1/runs?job_id={id}&sort=nope"), &tok).await.status(), 400);
     let fs = s.get(&format!("/api/v1/filesystem?path={}", s.dir.display()), &tok).await.json::<Value>().await.unwrap();
     assert!(fs["entries"].as_array().unwrap().iter().any(|e| e["name"] == "src"));
+    // Restore by time, one file's bytes (with ranges) and the volume cache.
+    let cache = s.client.put(format!("{}/api/v1/backup-cache/settings", s.base)).bearer_auth(&tok).json(&json!({"dir": s.dir.join("cache"), "max_bytes": 1u64 << 30})).send().await.unwrap();
+    assert_eq!(cache.status(), 200, "{}", cache.text().await.unwrap());
+    let r = s.get(&format!("/api/v1/jobs/{id}/versions/resolve?time=2099-01-01T00:00:00Z"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(r["index"], 0, "{r}");
+    assert_eq!(s.get(&format!("/api/v1/jobs/{id}/versions/resolve?time=2001-01-01T00:00:00Z"), &tok).await.status(), 400, "before every version");
+    let files = s.get(&format!("/api/v1/jobs/{id}/files?version=latest"), &tok).await.json::<Value>().await.unwrap();
+    assert!(files.as_array().unwrap().len() >= 2);
+    let fpage = s.get(&format!("/api/v1/jobs/{id}/files?version=latest&limit=1&sort=path&filter=A.TXT"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(fpage["total"], 1, "{fpage}");
+    assert!(fpage["items"][0]["path"].as_str().unwrap().ends_with("a.txt"));
+    let rpc_page = s.post("/api/v1/rpc/backup_run_history", &tok, json!({"jobId": id, "page": {"limit": 1}})).await.json::<Value>().await.unwrap();
+    assert_eq!((rpc_page["total"].as_u64(), rpc_page["items"].as_array().map(|a| a.len())), (Some(3), Some(1)), "{rpc_page}");
+    let fpath = src.join("a.txt").to_string_lossy().replace('/', "%2F");
+    let full = s.get(&format!("/api/v1/jobs/{id}/file?path={fpath}&version=latest"), &tok).await;
+    assert_eq!(full.status(), 200);
+    assert_eq!(full.headers()["accept-ranges"], "bytes");
+    assert_eq!(full.bytes().await.unwrap().as_ref(), b"server backup");
+    let part = s.client.get(format!("{}/api/v1/jobs/{id}/file?path={fpath}&time=2099-01-01%2000:00", s.base)).bearer_auth(&tok).header("Range", "bytes=7-").send().await.unwrap();
+    assert_eq!(part.status(), 206);
+    assert_eq!(part.headers()["content-range"], "bytes 7-12/13");
+    assert_eq!(part.bytes().await.unwrap().as_ref(), b"backup");
+    let bad = s.client.get(format!("{}/api/v1/jobs/{id}/file?path={fpath}", s.base)).bearer_auth(&tok).header("Range", "bytes=99-").send().await.unwrap();
+    assert_eq!(bad.status(), 416);
+    let stats = s.get("/api/v1/backup-cache", &tok).await.json::<Value>().await.unwrap();
+    assert!(stats["entries"].as_u64().unwrap() >= 1, "{stats}");
+    let cleared = s.client.delete(format!("{}/api/v1/backup-cache", s.base)).bearer_auth(&tok).send().await.unwrap().json::<Value>().await.unwrap();
+    assert!(cleared["bytes_freed"].as_u64().unwrap() > 0);
+    let rpc = s.post("/api/v1/rpc/backup_read_file", &tok, json!({"id": id, "path": src.join("a.txt"), "offset": 0, "length": 6})).await.json::<Value>().await.unwrap();
+    assert_eq!(rpc["data"], "c2VydmVy", "{rpc}");
+    // A mirror restore over the API needs confirm_delete.
+    let mirror = s.post(&format!("/api/v1/jobs/{id}/operations"), &tok, json!({"type":"restore","options":{"target": out, "delete_extraneous": true}})).await;
+    assert_eq!(mirror.status(), 409);
+    let mirror = s.post(&format!("/api/v1/jobs/{id}/operations"), &tok, json!({"type":"restore","options":{"target": out, "delete_extraneous": true},"overrides":{"confirm_delete": true}})).await.json::<Value>().await.unwrap();
+    assert_eq!(mirror["status"], "success", "{mirror}");
+    // Estimate and run-all.
+    std::fs::write(src.join("b.txt"), b"new since the backup").unwrap();
+    let est = s.get(&format!("/api/v1/jobs/{id}/estimate?assumed_bytes_per_sec=1000"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!((est["new_files"].as_u64(), est["unchanged_files"].as_u64()), (Some(1), Some(1)), "{est}");
+    let rpc_est = s.post("/api/v1/rpc/backup_estimate", &tok, json!({"jobId": id})).await.json::<Value>().await.unwrap();
+    assert_eq!(rpc_est["new_files"], 1);
+    let all = s.post("/api/v1/jobs/run-all", &tok, json!({"dry_run": true})).await.json::<Value>().await.unwrap();
+    assert_eq!(all["started"].as_array().map(|a| a.len()), Some(1), "{all}");
+    for _ in 0..100 {
+        if s.get("/api/v1/tasks", &tok).await.json::<Value>().await.unwrap().as_array().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
@@ -160,7 +253,7 @@ async fn https_with_generated_certificate() {
     let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, d.path().join("dbs"), KdfParams::insecure_fast());
     let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
     let cfg = ServerConfig { port, tls: TlsMode::Generated { dir: d.path().join("tls"), hostnames: vec!["localhost".into()] }, ..Default::default() };
-    let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None, gateways: Default::default() };
+    let st = ServerState::new(mgr, None, auth, cfg);
     tokio::spawn(async move { serve(st).await.unwrap() });
     let ca = std::fs::read(loop {
         let p = d.path().join("tls/ufop-ca.pem");
@@ -721,6 +814,66 @@ async fn file_gateway_relays_through_an_ha_pool_without_storing() {
     assert_eq!(s.client.get(gw("/files?path=/")).bearer_auth(&read_tok).send().await.unwrap().status(), 404, "the empty gateway is gone");
 }
 
+/// An upload the gateway refuses (no such gateway, read-only, too large) is
+/// answered only once its body has been received (up to a limit), so a
+/// client still sending it reads the refusal instead of a broken pipe.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_gateway_uploads_are_answered_after_the_body_arrives() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use futures_util::StreamExt;
+    use ufop_core::gateway::{run, AgentConfig};
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    let write_tok = s.post("/api/v1/auth/api-tokens", &tok, json!({"name": "gw", "scope": "write", "expires_in_days": 1})).await.json::<Value>().await.unwrap()["token"].as_str().unwrap().to_string();
+    // A slow client: 8 MiB in 64 KiB chunks with a pause between them, with
+    // a Content-Length, as a browser or curl sends a file.
+    let slow_put = |url: String| {
+        let (c, t) = (s.client.clone(), write_tok.clone());
+        async move {
+            const LEN: usize = 8 << 20;
+            let chunks = futures_util::stream::iter((0..LEN / 65536).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![7u8; 65536])))).then(|c| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                c
+            });
+            c.put(url).bearer_auth(t).header(reqwest::header::CONTENT_LENGTH, LEN).body(reqwest::Body::wrap_stream(chunks)).send().await.map(|r| r.status().as_u16()).map_err(|e| format!("{e:?}"))
+        }
+    };
+    let gw = |name: &str, path: &str| format!("{}/api/v1/gateways/{name}/upload?path={path}", s.base);
+    assert_eq!(slow_put(gw("nobody", "/docs/a.bin")).await, Ok(404), "no such gateway");
+
+    let files = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(files.path().join("docs")).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let cfg = AgentConfig { server: s.base.clone(), token: write_tok.clone(), gateway: "office".into(), roots: vec![files.path().join("docs")], writable: true, max_upload: Some(1 << 20), concurrency: 2 };
+    let h = tokio::spawn(run(cfg, stop.clone()));
+    for _ in 0..100 {
+        if s.get("/api/v1/gateways", &write_tok).await.json::<Value>().await.unwrap()["gateways"][0]["online_nodes"] == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    for _ in 0..3 {
+        assert_eq!(slow_put(gw("office", "/docs/big.bin")).await, Ok(403), "larger than the agent accepts");
+    }
+    // A fast client, several at once: the refusal arrives while the server's
+    // receive buffer is still full.
+    let fast: Vec<_> = (0..12)
+        .map(|_| {
+            let (c, t, url) = (s.client.clone(), write_tok.clone(), gw("office", "/docs/big.bin"));
+            tokio::spawn(async move { c.put(url).bearer_auth(t).body(vec![0u8; 11 << 20]).send().await.map(|r| r.status().as_u16()).map_err(|e| format!("{e:?}")) })
+        })
+        .collect();
+    for f in fast {
+        assert_eq!(f.await.unwrap(), Ok(403));
+    }
+    for _ in 0..12 {
+        assert_eq!(s.client.put(gw("nobody", "/x")).bearer_auth(&write_tok).body(vec![0u8; 11 << 20]).send().await.map(|r| r.status().as_u16()).map_err(|e| format!("{e:?}")), Ok(404));
+    }
+    assert!(!files.path().join("docs/big.bin").exists());
+    stop.store(true, Ordering::SeqCst);
+    h.await.unwrap().unwrap();
+}
+
 /// The generated clients, run for real against a server: Python (standard
 /// library) and TypeScript (Node's type stripping), when installed.
 #[tokio::test]
@@ -915,4 +1068,808 @@ async fn mcp_is_off_without_roots() {
     assert_eq!(s.client.post(format!("{}/mcp", s.base)).json(&json!({})).send().await.unwrap().status(), 404);
     assert_eq!(s.client.get(format!("{}/.well-known/oauth-authorization-server", s.base)).send().await.unwrap().status(), 404);
     assert_eq!(s.client.post(format!("{}/oauth2/register", s.base)).json(&json!({ "redirect_uris": ["https://a.example.com/cb"] })).send().await.unwrap().status(), 404);
+}
+
+#[tokio::test]
+async fn policy_templates_effective_settings_and_schedule_preview_over_rest() {
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    let t = s.post("/api/v1/backup-templates", &tok, json!({"name": "Servers", "settings": {"retention": {"type": "keep_count", "count": 4}, "options": {"compression_level": 2}}})).await;
+    assert_eq!(t.status(), 200, "{}", t.text().await.unwrap());
+    let t = t.json::<Value>().await.unwrap();
+    let tid = t["id"].as_str().unwrap().to_string();
+    assert_eq!(s.post("/api/v1/backup-templates", &tok, json!({"name": "Bad", "settings": {"options": {"block_size": 1}}})).await.status(), 400);
+    let src = s.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let job = json!({"name":"Srv","sources":[src],"encrypted":false,"destination":{"type":"local","path": s.dir.join("dst"),"alternate_paths":[],"marker_file":null}});
+    let id = s.post("/api/v1/jobs", &tok, json!({"job": job})).await.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+    let j = s.post(&format!("/api/v1/backup-templates/{tid}/apply"), &tok, json!({"job_id": id})).await.json::<Value>().await.unwrap();
+    assert_eq!(j["template_ids"], json!([tid]));
+    let eff = s.get(&format!("/api/v1/jobs/{id}/effective-settings"), &tok).await.json::<Value>().await.unwrap();
+    let ret = eff["settings"].as_array().unwrap().iter().find(|x| x["field_path"] == "retention").unwrap().clone();
+    assert_eq!(ret["source"]["type"], "template");
+    assert_eq!(ret["value"]["count"], 4);
+    // In use: refused; listing and export.
+    assert_eq!(s.client.delete(format!("{}/api/v1/backup-templates/{tid}", s.base)).bearer_auth(&tok).send().await.unwrap().status(), 409);
+    assert_eq!(s.get("/api/v1/backup-templates", &tok).await.json::<Value>().await.unwrap().as_array().unwrap().len(), 1);
+    let exported = s.get("/api/v1/backup-templates/export", &tok).await.text().await.unwrap();
+    assert!(exported.contains("ufop-backup-templates"));
+    let imported = s.client.post(format!("{}/api/v1/backup-templates/import", s.base)).bearer_auth(&tok).body(exported).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(imported[0]["id"], tid.as_str());
+    // Organization templates are read-only here.
+    let org = ufop_core::agent::ManagedBackupTemplate { id: "std".into(), name: "Org".into(), settings: json!({}), ..Default::default() };
+    assert!(s.mgr.set_managed_templates(Some(&[org])).is_empty());
+    assert_eq!(s.client.delete(format!("{}/api/v1/backup-templates/org:std", s.base)).bearer_auth(&tok).send().await.unwrap().status(), 403);
+    // Cron schedules: preview and a friendly error.
+    let p = s.post("/api/v1/backup-schedule/preview", &tok, json!({"schedule": {"enabled": true, "cron": ["30 2 * * *"]}, "count": 3})).await.json::<Value>().await.unwrap();
+    assert_eq!(p.as_array().unwrap().len(), 3);
+    let z = s.post("/api/v1/backup-schedule/preview", &tok, json!({"schedule": {"enabled": true, "cron": ["30 2 * * *"], "timezone": "+02:00"}, "count": 1})).await.json::<Value>().await.unwrap();
+    assert!(z[0]["zoned"].as_str().unwrap().ends_with("T02:30:00+02:00"), "{z}");
+    let badz = s.post("/api/v1/backup-schedule/preview", &tok, json!({"schedule": {"enabled": true, "cron": ["30 2 * * *"], "timezone": "Europe/Berlin"}})).await;
+    assert_eq!(badz.status(), 400);
+    let bad = s.post("/api/v1/backup-schedule/preview", &tok, json!({"schedule": {"enabled": true, "cron": ["99 * * * *"]}})).await;
+    assert_eq!(bad.status(), 400);
+    assert!(bad.text().await.unwrap().contains("Invalid cron expression"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graceful_shutdown_checkpoints_running_backup_and_refuses_new_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::open_in_memory().await.unwrap();
+    let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
+    let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
+    auth.set_password("server-password").await.unwrap();
+    let st = ServerState::new(mgr.clone(), None, auth, ServerConfig::default());
+    let drain = tokio::spawn(lifecycle::drain_when_requested(st.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
+    let jar = Arc::new(reqwest::cookie::Jar::default());
+    let s = TestServer { base, mgr, client: reqwest::Client::builder().cookie_provider(jar.clone()).build().unwrap(), jar, dir: dir.path().to_path_buf(), _dir: dir };
+    let tok = s.login().await;
+
+    // A slow backup: incompressible files through a 40 kB/s upload limit.
+    let src = s.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for i in 0..24 {
+        let data: Vec<u8> = (0..16_384u32).map(|j| ((j.wrapping_mul(2_654_435_761) ^ (i * 7919)) >> 7) as u8).collect();
+        std::fs::write(src.join(format!("f{i:02}.bin")), data).unwrap();
+    }
+    let dst = s.dir.join("dst");
+    let job = json!({"name":"Slow","sources":[src],"encrypted":false,"destination":{"type":"local","path": dst,"alternate_paths":[],"marker_file":null},"options":{"block_size":4096,"volume_size":32768,"compression_level":0},"throttle":{"upload_bps":40000,"download_bps":0}});
+    let id = s.post("/api/v1/jobs", &tok, json!({"job": job})).await.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+    assert_eq!(s.post(&format!("/api/v1/jobs/{id}/run"), &tok, json!({})).await.status(), 200);
+    for _ in 0..200 {
+        let t = s.get("/api/v1/tasks", &tok).await.json::<Value>().await.unwrap();
+        if t[0]["state"] == "running" && t[0]["progress"].is_object() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let r = s.post("/api/v1/server/shutdown", &tok, json!({"grace_secs": 30})).await;
+    assert_eq!(r.status(), 202);
+    let r = r.json::<Value>().await.unwrap();
+    assert_eq!((r["immediate"].as_bool(), r["grace_secs"].as_u64(), r["running_tasks"].as_u64()), (Some(false), Some(30), Some(1)));
+    // New mutating requests are refused with Retry-After; reads still work.
+    let refused = s.post(&format!("/api/v1/jobs/{id}/run"), &tok, json!({})).await;
+    assert_eq!(refused.status(), 503);
+    assert!(refused.headers()["retry-after"].to_str().unwrap().parse::<u64>().unwrap() >= 30);
+    assert_eq!(s.get("/api/v1/jobs", &tok).await.status(), 200);
+    assert!(s.mgr.start_backup(&id, false).await.unwrap_err().user_message().contains("shutting down"));
+
+    let report = tokio::time::timeout(std::time::Duration::from_secs(40), drain).await.unwrap().unwrap();
+    assert_eq!((report.cancelled, report.still_running), (1, 0), "{report:?}");
+    // The stopped backup left a partial version and no repository lock.
+    let versions = s.mgr.list_versions(&id).await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert!(versions[0].partial, "{versions:?}");
+    assert!(s.mgr.lock_status(&id).await.unwrap().locks.is_empty());
+    let run = &s.mgr.run_history(Some(id.clone()), 1).await.unwrap()[0];
+    assert_ne!(run.status, "success", "{run:?}");
+}
+
+#[test]
+fn second_stop_request_is_immediate() {
+    let l = lifecycle::Lifecycle::new(std::time::Duration::from_secs(60));
+    assert!(!l.is_draining());
+    assert_eq!(l.request(None), lifecycle::StopRequest::Graceful);
+    assert_eq!(l.grace().as_secs(), 60);
+    assert!(l.is_draining() && !l.is_immediate());
+    assert_eq!(l.request(Some(std::time::Duration::from_secs(1))), lifecycle::StopRequest::Immediate);
+    assert!(l.is_immediate());
+    assert_eq!(l.grace().as_secs(), 60, "the first request's grace stays");
+}
+
+#[tokio::test]
+async fn csrf_double_submit_on_cookie_routes() {
+    let cfg = ServerConfig { cors_origins: vec!["https://console.example".into()], ..Default::default() };
+    let s = start(cfg, None).await;
+    let r = s.client.post(format!("{}/api/v1/auth/login", s.base)).json(&json!({"password":"server-password"})).send().await.unwrap();
+    let body: Value = r.json().await.unwrap();
+    let csrf = s.csrf();
+    assert!(!csrf.is_empty() && body["csrf_token"] == csrf.as_str(), "the cookie and the body carry the token");
+    let refresh = |hdr: Option<&str>, origin: Option<&str>| {
+        let mut rq = s.client.post(format!("{}/api/v1/auth/refresh", s.base));
+        if let Some(h) = hdr {
+            rq = rq.header("X-CSRF-Token", h);
+        }
+        if let Some(o) = origin {
+            rq = rq.header("Origin", o);
+        }
+        rq.send()
+    };
+    // Missing or mismatched token: 403, and the session is untouched.
+    let missing = refresh(None, None).await.unwrap();
+    assert_eq!(missing.status(), 403);
+    assert_eq!(missing.json::<Value>().await.unwrap()["error_type"], "csrf");
+    assert_eq!(refresh(Some("forged"), None).await.unwrap().status(), 403);
+    // A cross-site Origin is refused even with the right token; allowed origins pass.
+    assert_eq!(refresh(Some(&csrf), Some("https://evil.example")).await.unwrap().status(), 403);
+    assert_eq!(refresh(Some(&csrf), Some("null")).await.unwrap().status(), 403);
+    let ok = refresh(Some(&csrf), Some(&s.base)).await.unwrap();
+    assert_eq!(ok.status(), 200);
+    // Rotated with the refresh token: the old value no longer works.
+    let rotated = ok.json::<Value>().await.unwrap()["csrf_token"].as_str().unwrap().to_string();
+    assert_ne!(rotated, csrf);
+    assert_eq!(s.csrf(), rotated);
+    assert_eq!(refresh(Some(&csrf), None).await.unwrap().status(), 403);
+    let tok = refresh(Some(&rotated), Some("https://console.example")).await.unwrap().json::<Value>().await.unwrap()["access_token"].as_str().unwrap().to_string();
+    // A cookie value copied into the header must also match the session's HMAC.
+    let refresh_cookie = {
+        use reqwest::cookie::CookieStore;
+        let all = s.jar.cookies(&format!("{}/api/v1/auth/refresh", s.base).parse().unwrap()).unwrap();
+        all.to_str().unwrap().split("; ").find(|c| c.starts_with("ufop_refresh=")).unwrap().to_string()
+    };
+    let bare = reqwest::Client::new();
+    let jar_forged = bare.post(format!("{}/api/v1/auth/refresh", s.base)).header("X-CSRF-Token", "AAAA").header("Cookie", format!("{refresh_cookie}; ufop_csrf=AAAA")).send().await.unwrap();
+    assert_eq!(jar_forged.status(), 403);
+    // Bearer-authenticated requests are exempt (the cookie is sent along on /auth/*).
+    let mint = s.post("/api/v1/auth/signin-token", &tok, json!({})).await;
+    assert_eq!(mint.status(), 200);
+    // Sign-in routes only get the origin check.
+    let cross_login = s.client.post(format!("{}/api/v1/auth/login", s.base)).header("Origin", "https://evil.example").json(&json!({"password":"server-password"})).send().await.unwrap();
+    assert_eq!(cross_login.status(), 403);
+    // Logout with the cookie needs the token too.
+    assert_eq!(s.client.post(format!("{}/api/v1/auth/logout", s.base)).send().await.unwrap().status(), 403);
+    let csrf = s.csrf();
+    assert_eq!(s.client.post(format!("{}/api/v1/auth/logout", s.base)).header("X-CSRF-Token", &csrf).send().await.unwrap().status(), 200);
+    assert!(s.csrf().is_empty(), "logout clears the cookie");
+}
+
+#[tokio::test]
+async fn request_ids_are_echoed_generated_and_put_in_errors() {
+    let s = start(ServerConfig::default(), None).await;
+    let ok = s.client.get(format!("{}/api/v1/health", s.base)).header("X-Request-Id", "client-req.42").send().await.unwrap();
+    assert_eq!(ok.headers()["x-request-id"], "client-req.42");
+    // Unsafe or missing ids are replaced with a UUIDv4.
+    let gen = s.client.get(format!("{}/api/v1/health", s.base)).header("X-Request-Id", "bad id <x>").send().await.unwrap();
+    let id = gen.headers()["x-request-id"].to_str().unwrap().to_string();
+    assert!(uuid::Uuid::parse_str(&id).is_ok_and(|u| u.get_version_num() == 4), "{id}");
+    let none = s.client.get(format!("{}/api/v1/health", s.base)).send().await.unwrap();
+    assert_ne!(none.headers()["x-request-id"].to_str().unwrap(), id);
+    // JSON error bodies carry the id.
+    let err = s.client.get(format!("{}/api/v1/jobs", s.base)).header("X-Request-Id", "trace-me").send().await.unwrap();
+    assert_eq!(err.status(), 401);
+    assert_eq!(err.headers()["x-request-id"], "trace-me");
+    let body: Value = err.json().await.unwrap();
+    assert_eq!((body["request_id"].as_str(), body["error_type"].as_str()), (Some("trace-me"), Some("permission_denied")));
+    let missing = s.get("/api/v1/jobs/nope", &s.login().await).await;
+    let body: Value = missing.json().await.unwrap();
+    assert!(body["request_id"].is_string() && body["message"].is_string(), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prometheus_metrics_parse_and_cover_jobs_http_and_cache() {
+    use super::metrics::parse::parse;
+    let s = start(ServerConfig::default(), None).await;
+    assert_eq!(s.client.get(format!("{}/api/v1/metrics", s.base)).send().await.unwrap().status(), 401, "needs a sign-in or read token");
+    let tok = s.login().await;
+    let src = s.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"metrics").unwrap();
+    let job = json!({"name":"Metered \"job\"","sources":[src],"encrypted":false,"destination":{"type":"local","path": s.dir.join("dst"),"alternate_paths":[],"marker_file":null},"schedule":{"enabled":true,"interval_minutes":60}});
+    let id = s.post("/api/v1/jobs", &tok, json!({"job": job})).await.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+    let r = s.mgr.execute(&id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert!(matches!(r.status.as_str(), "success" | "warning"), "{r:?}");
+    let res = s.get("/api/v1/metrics", &tok).await;
+    assert_eq!(res.status(), 200);
+    assert!(res.headers()["content-type"].to_str().unwrap().starts_with("text/plain; version=0.0.4"));
+    let text = res.text().await.unwrap();
+    let (types, samples) = parse(&text);
+    let find = |name: &str, l: &[(&str, &str)]| samples.iter().find(|x| x.name == name && l.iter().all(|(k, v)| x.labels.get(*k).map(String::as_str) == Some(*v))).map(|x| x.value);
+    assert_eq!(types["ufop_http_request_duration_seconds"], "histogram");
+    assert_eq!(types["ufop_backup_runs_total"], "counter");
+    assert_eq!(find("ufop_build_info", &[("version", env!("CARGO_PKG_VERSION"))]), Some(1.0));
+    assert_eq!(find("ufop_backup_job_info", &[("job_id", &id), ("job_name", "Metered \"job\"")]), Some(1.0));
+    assert_eq!(find("ufop_backup_runs_total", &[("job_id", &id), ("operation", "backup"), ("result", &r.status)]), Some(1.0));
+    assert!(find("ufop_backup_last_success_timestamp_seconds", &[("job_id", &id)]).unwrap() > 1.7e9);
+    assert!(find("ufop_backup_last_uploaded_bytes", &[("job_id", &id)]).unwrap() > 0.0);
+    assert_eq!(find("ufop_backup_last_files", &[("job_id", &id)]), Some(1.0));
+    assert!(find("ufop_backup_last_duration_seconds", &[("job_id", &id), ("result", &r.status)]).is_some());
+    assert_eq!(find("ufop_repository_lock_held", &[("job_id", &id)]), Some(0.0));
+    assert_eq!(find("ufop_operations_queued", &[]), Some(0.0));
+    assert!(find("ufop_scheduler_next_run_timestamp_seconds", &[("job_id", &id), ("operation", "backup")]).unwrap() > 1.7e9);
+    assert!(find("ufop_volume_cache_hits_total", &[]).is_some());
+    // HTTP series use the route template, and histograms are cumulative.
+    let route = "/api/v1/jobs";
+    assert!(find("ufop_http_requests_total", &[("method", "POST"), ("route", route), ("status", "200")]).unwrap() >= 1.0);
+    assert!(find("ufop_http_requests_total", &[("method", "GET"), ("route", "/api/v1/metrics"), ("status", "401")]).is_some());
+    let inf = find("ufop_http_request_duration_seconds_bucket", &[("method", "POST"), ("route", route), ("status", "200"), ("le", "+Inf")]).unwrap();
+    let count = find("ufop_http_request_duration_seconds_count", &[("method", "POST"), ("route", route), ("status", "200")]).unwrap();
+    assert_eq!(inf, count);
+    assert!(!text.contains(&s.dir.display().to_string()), "no raw paths in labels");
+    assert!(samples.iter().all(|x| !x.labels.get("route").is_some_and(|r| r.contains(&id))), "routes are templates");
+}
+
+#[tokio::test]
+async fn standalone_metrics_listener_with_basic_auth() {
+    let s = start(ServerConfig::default(), None).await;
+    let repo = Repository::open_in_memory().await.unwrap();
+    let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
+    let st = ServerState::new(s.mgr.clone(), None, auth, ServerConfig::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, super::metrics::standalone_router(st, Some("prom:scrape-me".into()))).await.unwrap() });
+    let url = format!("http://{addr}/metrics");
+    let c = reqwest::Client::new();
+    let no = c.get(&url).send().await.unwrap();
+    assert_eq!(no.status(), 401);
+    assert!(no.headers()["www-authenticate"].to_str().unwrap().starts_with("Basic"));
+    assert_eq!(c.get(&url).basic_auth("prom", Some("wrong")).send().await.unwrap().status(), 401);
+    let ok = c.get(&url).basic_auth("prom", Some("scrape-me")).send().await.unwrap();
+    assert_eq!(ok.status(), 200);
+    assert!(ok.text().await.unwrap().contains("ufop_build_info{"));
+}
+
+/// A local HTTP receiver that records (method, path, headers, body) of every request.
+type Received = Arc<std::sync::Mutex<Vec<(String, String, HeaderMap, Vec<u8>)>>>;
+
+async fn mock_receiver() -> (SocketAddr, Received) {
+    let got: Received = Arc::default();
+    let g = got.clone();
+    let app = Router::new().fallback(move |req: Request| {
+        let g = g.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let bytes = axum::body::to_bytes(body, 16 << 20).await.unwrap_or_default();
+            g.lock().unwrap().push((parts.method.to_string(), parts.uri.path().to_string(), parts.headers, bytes.to_vec()));
+            StatusCode::OK
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (addr, got)
+}
+
+fn otlp_spans(bodies: &[(String, String, HeaderMap, Vec<u8>)]) -> Vec<Value> {
+    bodies
+        .iter()
+        .filter(|b| b.1 == "/v1/traces")
+        .flat_map(|b| {
+            let v: Value = serde_json::from_slice(&b.3).unwrap();
+            assert_eq!(v["resourceSpans"][0]["resource"]["attributes"][0], json!({"key": "service.name", "value": {"stringValue": "ufop-test"}}));
+            assert_eq!(v["resourceSpans"][0]["scopeSpans"][0]["scope"]["name"], "ufop-server");
+            v["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap().clone()
+        })
+        .collect()
+}
+
+fn attr<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
+    span["attributes"].as_array().unwrap().iter().find(|a| a["key"] == key).map(|a| &a["value"])
+}
+
+// Current-thread runtime: the server's tasks run on this thread, under the test's subscriber.
+#[tokio::test]
+async fn otlp_exports_request_and_backup_spans_with_w3c_parent() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let (addr, got) = mock_receiver().await;
+    let (layer, handle) = otlp::install(otlp::OtlpConfig { endpoint: format!("http://{addr}"), headers: vec![("x-api-key".into(), "collector-key".into())], service_name: "ufop-test".into(), ..Default::default() });
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    // Other tests register the same callsites concurrently without this subscriber.
+    tracing::callsite::rebuild_interest_cache();
+    let src = s.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"traced").unwrap();
+    let job = json!({"name":"Traced","sources":[src],"encrypted":false,"destination":{"type":"local","path": s.dir.join("dst"),"alternate_paths":[],"marker_file":null}});
+    let id = s.post("/api/v1/jobs", &tok, json!({"job": job})).await.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+    let caller = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let r = s.client.post(format!("{}/api/v1/jobs/{id}/run", s.base)).bearer_auth(&tok).header("traceparent", caller).json(&json!({})).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    for _ in 0..200 {
+        if s.mgr.active_task_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(handle.flush(std::time::Duration::from_secs(10)).await);
+
+    let bodies = got.lock().unwrap().clone();
+    assert!(bodies.iter().filter(|b| b.1 == "/v1/traces").all(|b| b.0 == "POST" && b.2["x-api-key"] == "collector-key" && b.2["content-type"] == "application/json"));
+    let spans = otlp_spans(&bodies);
+    let run = spans.iter().find(|s| s["name"] == "POST /api/v1/jobs/{id}/run").unwrap_or_else(|| panic!("{spans:#?}"));
+    assert_eq!(run["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(run["parentSpanId"], "00f067aa0ba902b7");
+    assert_eq!(run["kind"], 2);
+    assert_eq!(attr(run, "http.status_code"), Some(&json!({"intValue": "200"})));
+    assert_eq!(attr(run, "http.route"), Some(&json!({"stringValue": "/api/v1/jobs/{id}/run"})));
+    assert!(attr(run, "request_id").is_some() && attr(run, "traceparent").is_none() && attr(run, "otel.kind").is_none());
+    assert!(run["startTimeUnixNano"].as_str().unwrap().parse::<u128>().unwrap() <= run["endTimeUnixNano"].as_str().unwrap().parse::<u128>().unwrap());
+    let op = spans.iter().find(|s| s["name"] == "backup.operation" && attr(s, "job.id") == Some(&json!({"stringValue": id}))).unwrap();
+    assert_eq!((op["traceId"].as_str(), op["parentSpanId"].as_str(), op["kind"].as_u64()), (Some("4bf92f3577b34da6a3ce929d0e0e4736"), run["spanId"].as_str(), Some(1)));
+    assert_eq!(attr(op, "backup.operation"), Some(&json!({"stringValue": "backup"})));
+    assert!(matches!(attr(op, "backup.result").and_then(|v| v["stringValue"].as_str()), Some("success" | "warning")), "{op}");
+    assert_eq!(op["status"]["code"], 0);
+    // Requests without a traceparent start their own traces.
+    let login = spans.iter().find(|s| s["name"] == "POST /api/v1/jobs").unwrap_or_else(|| panic!("{spans:#?}"));
+    assert!(login.get("parentSpanId").is_none());
+    assert_ne!(login["traceId"], run["traceId"]);
+}
+
+#[tokio::test]
+async fn otlp_sampling_and_error_status() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let (addr, got) = mock_receiver().await;
+    let (layer, handle) = otlp::install(otlp::OtlpConfig { endpoint: format!("http://{addr}/v1/traces"), service_name: "ufop-test".into(), sample_ratio: 0.0, ..Default::default() });
+    {
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        // Not sampled (ratio 0, no parent): dropped with its children.
+        tracing::info_span!("http.request", http.method = "GET", http.route = "/a", http.status_code = 200u64, traceparent = "").in_scope(|| {
+            tracing::info_span!("backup.operation", backup.result = "success").in_scope(|| {});
+        });
+        // A sampled caller wins over the ratio; failures carry an error status.
+        let req = tracing::info_span!("http.request", http.method = "POST", http.route = "/b", http.status_code = tracing::field::Empty, traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01");
+        req.in_scope(|| {
+            let op = tracing::info_span!("backup.operation", backup.result = tracing::field::Empty, backup.error = tracing::field::Empty);
+            op.record("backup.result", "error");
+            op.record("backup.error", "Destination full");
+            drop(op);
+            // Unrelated spans are not exported.
+            tracing::info_span!("hyper.connection").in_scope(|| {});
+        });
+        req.record("http.status_code", 502u64);
+        drop(req);
+        // An unsampled caller is respected.
+        tracing::info_span!("http.request", http.method = "GET", traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00").in_scope(|| {});
+    }
+    assert!(handle.flush(std::time::Duration::from_secs(10)).await);
+    let spans = otlp_spans(&got.lock().unwrap());
+    assert_eq!(spans.len(), 2, "{spans:#?}");
+    let req = spans.iter().find(|s| s["name"] == "POST /b").unwrap();
+    assert_eq!(req["status"], json!({"code": 2, "message": "HTTP 502"}));
+    let op = spans.iter().find(|s| s["name"] == "backup.operation").unwrap();
+    assert_eq!(op["status"], json!({"code": 2, "message": "Destination full"}));
+    assert_eq!(op["parentSpanId"], req["spanId"]);
+    assert_eq!(handle.dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pushgateway_pushes_periodically_and_on_shutdown() {
+    let (addr, got) = mock_receiver().await;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::open_in_memory().await.unwrap();
+    let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
+    let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
+    let st = ServerState::new(mgr, None, auth, ServerConfig::default());
+    let cfg = otlp::PushConfig { url: format!("http://{addr}/"), job: "ufop".into(), instance: "node-1".into(), interval: std::time::Duration::from_secs(3600), basic_auth: Some("pg:secret".into()), bearer: None };
+    let task = otlp::spawn_pushgateway(st.clone(), cfg);
+    for _ in 0..100 {
+        if !got.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(got.lock().unwrap().len(), 1, "first push at start");
+    st.life.request(None);
+    tokio::time::timeout(std::time::Duration::from_secs(10), task).await.unwrap().unwrap();
+    let pushes = got.lock().unwrap().clone();
+    assert_eq!(pushes.len(), 2, "plus a final push on shutdown");
+    for (method, path, headers, body) in &pushes {
+        assert_eq!((method.as_str(), path.as_str()), ("PUT", "/metrics/job/ufop/instance/node-1"));
+        assert_eq!(headers["authorization"], "Basic cGc6c2VjcmV0");
+        assert!(headers["content-type"].to_str().unwrap().starts_with("text/plain; version=0.0.4"));
+        let (_, samples) = super::metrics::parse::parse(std::str::from_utf8(body).unwrap());
+        assert!(samples.iter().any(|x| x.name == "ufop_build_info"));
+    }
+    let last = std::str::from_utf8(&pushes[1].3).unwrap();
+    assert!(last.contains("ufop_shutting_down 1"), "the final push shows the drain");
+}
+
+impl TestServer {
+    /// A local job (not run) named `name`; returns its id.
+    async fn job(&self, tok: &str, name: &str) -> String {
+        let src = self.dir.join(format!("src-{name}"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f.txt"), name.as_bytes()).unwrap();
+        let job = json!({"name": name, "sources": [src], "encrypted": false, "destination": {"type": "local", "path": self.dir.join(format!("dst-{name}")), "alternate_paths": [], "marker_file": null}});
+        let r = self.post("/api/v1/jobs", tok, json!({"job": job})).await;
+        assert_eq!(r.status(), 200);
+        r.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_tokens_limited_to_jobs() {
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    let (j1, j2) = (s.job(&tok, "One").await, s.job(&tok, "Two").await);
+    s.mgr.execute(&j2, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    let mint = |scope: &'static str, jobs: Value| s.post("/api/v1/auth/api-tokens", &tok, json!({"name": format!("{scope} jobs"), "scope": scope, "job_ids": jobs}));
+    assert_eq!(mint("run", json!(["nope"])).await.status(), 400, "unknown jobs are refused");
+    assert_eq!(mint("run", json!([])).await.status(), 400);
+    let created = mint("run", json!([j1])).await.json::<Value>().await.unwrap();
+    assert_eq!(created["info"]["job_ids"], json!([j1]));
+    let run = created["token"].as_str().unwrap().to_string();
+
+    // Lists show only the token's jobs; other jobs are refused with 403.
+    let jobs = s.get("/api/v1/jobs", &run).await.json::<Value>().await.unwrap();
+    assert_eq!(jobs.as_array().unwrap().iter().map(|j| j["id"].as_str().unwrap()).collect::<Vec<_>>(), vec![j1.as_str()]);
+    assert_eq!(s.get(&format!("/api/v1/jobs/{j1}"), &run).await.status(), 200);
+    let other = s.get(&format!("/api/v1/jobs/{j2}/versions"), &run).await;
+    assert_eq!(other.status(), 403);
+    assert!(other.json::<Value>().await.unwrap()["message"].as_str().unwrap().contains("not allowed"));
+    assert_eq!(s.post(&format!("/api/v1/jobs/{j2}/run"), &run, json!({"dry_run": true})).await.status(), 403);
+    assert_eq!(s.get(&format!("/api/v1/runs?job_id={j2}"), &run).await.status(), 403);
+    assert!(s.get("/api/v1/runs", &run).await.json::<Value>().await.unwrap().as_array().unwrap().is_empty(), "j2's runs are hidden");
+    assert_eq!(s.get("/api/v1/runs?offset=0", &run).await.json::<Value>().await.unwrap()["total"], 0, "paged history is filtered too");
+    // Within the scope: run, but not destructive maintenance.
+    assert_eq!(s.post(&format!("/api/v1/jobs/{j1}/operations"), &run, json!({"type": "compact"})).await.status(), 403);
+    let all = s.post("/api/v1/jobs/run-all", &run, json!({"dry_run": true})).await.json::<Value>().await.unwrap();
+    assert_eq!(all["started"].as_array().unwrap().iter().map(|r| r["job_id"].as_str().unwrap()).collect::<Vec<_>>(), vec![j1.as_str()], "{all}");
+    let asked = s.post("/api/v1/jobs/run-all", &run, json!({"dry_run": true, "job_ids": [j2]})).await.json::<Value>().await.unwrap();
+    assert!(asked["started"].as_array().unwrap().is_empty());
+    assert_eq!(asked["skipped"][0]["reason"], "not allowed");
+    for _ in 0..100 {
+        if s.mgr.active_task_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    assert_eq!(s.post(&format!("/api/v1/tasks/{j2}/cancel"), &run, json!({})).await.status(), 403);
+    // Server-wide routes are closed to job-limited tokens without the admin scope.
+    assert_eq!(s.get("/api/v1/backup-templates", &run).await.status(), 403);
+    assert_eq!(s.get("/api/v1/settings", &run).await.status(), 403);
+    assert_eq!(s.get("/api/v1/metrics", &run).await.status(), 403);
+    assert_eq!(s.get("/api/v1/status", &run).await.status(), 200);
+
+    // An admin-scope token limited to a job: global routes, but still one job (also over RPC).
+    let adm = mint("admin", json!([j1])).await.json::<Value>().await.unwrap()["token"].as_str().unwrap().to_string();
+    assert_eq!(s.get("/api/v1/settings", &adm).await.status(), 200);
+    let listed = s.post("/api/v1/rpc/backup_list_jobs", &adm, json!({})).await.json::<Value>().await.unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(s.post("/api/v1/rpc/backup_get_job", &adm, json!({"id": j2})).await.status(), 403);
+    assert_eq!(s.post("/api/v1/rpc/backup_delete_job", &adm, json!({"id": j2, "deleteLocalDb": false, "deleteRemote": false})).await.status(), 403);
+    assert_eq!(s.post("/api/v1/rpc/backup_get_job", &adm, json!({"id": j1})).await.status(), 200);
+    let hist = s.post("/api/v1/rpc/backup_run_history", &adm, json!({})).await.json::<Value>().await.unwrap();
+    assert!(hist.as_array().unwrap().iter().all(|r| r["job_id"] == j1.as_str()));
+    // Unlimited tokens are unchanged.
+    let read_all = mint("read", Value::Null).await.json::<Value>().await.unwrap();
+    assert!(read_all["info"]["job_ids"].is_null());
+    let read_all = read_all["token"].as_str().unwrap().to_string();
+    assert_eq!(s.get("/api/v1/jobs", &read_all).await.json::<Value>().await.unwrap().as_array().unwrap().len(), 2);
+    assert_eq!(s.get("/api/v1/backup-templates", &read_all).await.status(), 200);
+}
+
+impl TestServer {
+    async fn login_as(&self, user: &str, pw: &str) -> reqwest::Response {
+        reqwest::Client::new().post(format!("{}/api/v1/auth/login", self.base)).json(&json!({"username": user, "password": pw})).send().await.unwrap()
+    }
+    async fn token_of(&self, user: &str, pw: &str) -> String {
+        let r = self.login_as(user, pw).await;
+        assert_eq!(r.status(), 200, "{user}");
+        r.json::<Value>().await.unwrap()["access_token"].as_str().unwrap().to_string()
+    }
+    async fn put(&self, path: &str, tok: &str, body: Value) -> reqwest::Response {
+        self.client.put(format!("{}{path}", self.base)).bearer_auth(tok).json(&body).send().await.unwrap()
+    }
+    async fn delete(&self, path: &str, tok: &str) -> reqwest::Response {
+        self.client.delete(format!("{}{path}", self.base)).bearer_auth(tok).send().await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn legacy_server_password_becomes_the_admin_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::open_in_memory().await.unwrap();
+    let store = settings::SettingsStore::plain(repo.pool().clone());
+    // A database from before accounts: only the hashed server password.
+    store.set_secret("server.password_hash", &auth::hash_password("legacy-password").unwrap()).await.unwrap();
+    let auth = AuthService::new(store);
+    assert!(auth.users().is_empty().await.unwrap());
+    assert!(auth.has_password().await.unwrap());
+    let old_session = auth.issue_access().await.unwrap().token;
+    let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
+    let st = ServerState::new(mgr.clone(), None, auth.clone(), ServerConfig::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
+    let c = reqwest::Client::new();
+    // Tokens issued before keep working (as admin); the password signs in without a user name.
+    let me = c.get(format!("{base}/api/v1/auth/me")).bearer_auth(&old_session).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!((me["username"].as_str(), me["role"].as_str(), me["is_admin"].as_bool()), (Some("admin"), Some("admin"), Some(true)));
+    let users = auth.users().list().await.unwrap();
+    assert_eq!(users.len(), 1);
+    assert_eq!((users[0].username.as_str(), users[0].role), ("admin", access::Role::Admin));
+    let r = c.post(format!("{base}/api/v1/auth/login")).json(&json!({"password": "legacy-password"})).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let r = c.post(format!("{base}/api/v1/auth/login")).json(&json!({"username": "admin", "password": "wrong-password"})).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+    // Old API tokens are owned by admin.
+    let (t, raw) = auth.api_tokens().create("old", api_tokens::Scope::Read, 5).await.unwrap();
+    assert_eq!(t.owner, "admin");
+    assert_eq!(c.get(format!("{base}/api/v1/jobs")).bearer_auth(&raw).send().await.unwrap().status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accounts_roles_and_access_rules() {
+    let s = start(ServerConfig::default(), None).await;
+    let admin = s.login().await;
+    let (prod, dev) = (s.job(&admin, "prod-db").await, s.job(&admin, "dev-web").await);
+    for (u, role) in [("val", "viewer"), ("ops", "operator"), ("noacl", "operator")] {
+        let r = s.post("/api/v1/users", &admin, json!({"username": u, "password": format!("{u}-password"), "role": role})).await;
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    }
+    assert_eq!(s.post("/api/v1/users", &admin, json!({"username": "val", "password": "another-pw"})).await.status(), 409, "names are unique");
+    assert_eq!(s.post("/api/v1/users", &admin, json!({"username": "bad name", "password": "another-pw"})).await.status(), 400);
+    let hashed = auth::hash_password("hashed-password").unwrap();
+    assert_eq!(s.post("/api/v1/users", &admin, json!({"username": "pre", "password_hash": hashed, "role": "viewer"})).await.status(), 200);
+    assert_eq!(s.post("/api/v1/users", &admin, json!({"username": "pre2", "password_hash": "plain"})).await.status(), 400);
+    let rule = |p: &str, pat: &str, perm: &str| s.post("/api/v1/acl", &admin, json!({"principal": p, "job_pattern": pat, "permission": perm}));
+    let ops_prod = rule("ops", "prod-*", "run").await.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+    rule("role:viewer", "*", "read").await;
+    rule("*", &dev, "write").await;
+    assert_eq!(rule("nobody here", "*", "read").await.status(), 400);
+
+    let val = s.token_of("val", "val-password").await;
+    let ops = s.token_of("ops", "ops-password").await;
+    let noacl = s.token_of("noacl", "noacl-password").await;
+    assert!(!s.token_of("pre", "hashed-password").await.is_empty(), "prehashed passwords sign in");
+    assert_eq!(s.login_as("val", "wrong").await.status(), 401);
+
+    let ids = |v: Value| -> Vec<String> { let mut x: Vec<String> = v.as_array().unwrap().iter().map(|j| j["id"].as_str().unwrap().to_string()).collect(); x.sort(); x };
+    let mut both = vec![prod.clone(), dev.clone()];
+    both.sort();
+    // Viewer: reads everything through role:viewer, the write rule is capped at read.
+    assert_eq!(ids(s.get("/api/v1/jobs", &val).await.json().await.unwrap()), both);
+    assert_eq!(s.get(&format!("/api/v1/jobs/{prod}/versions"), &val).await.status(), 200);
+    assert_eq!(s.post(&format!("/api/v1/jobs/{prod}/run"), &val, json!({"dry_run": true})).await.status(), 403);
+    assert_eq!(s.put(&format!("/api/v1/jobs/{dev}"), &val, json!({"job": {"name": "x"}})).await.status(), 403);
+    // Operator: run on prod-*, write on dev, nothing destructive.
+    assert_eq!(s.post(&format!("/api/v1/jobs/{prod}/run"), &ops, json!({"dry_run": true})).await.status(), 200);
+    let job_dev = s.get(&format!("/api/v1/jobs/{dev}"), &admin).await.json::<Value>().await.unwrap();
+    assert_eq!(s.put(&format!("/api/v1/jobs/{prod}"), &ops, json!({"job": job_dev.clone()})).await.status(), 403);
+    let mut renamed = job_dev.clone();
+    renamed["description"] = json!("changed by ops");
+    let put = s.put(&format!("/api/v1/jobs/{dev}"), &ops, json!({"job": renamed})).await;
+    assert_eq!(put.status(), 200, "{}", put.text().await.unwrap());
+    assert_eq!(s.delete(&format!("/api/v1/jobs/{dev}"), &ops).await.status(), 403);
+    assert_eq!(s.post(&format!("/api/v1/jobs/{dev}/operations"), &ops, json!({"type": "compact"})).await.status(), 403);
+    // An operator without rules for a job does not see it.
+    assert_eq!(ids(s.get("/api/v1/jobs", &noacl).await.json().await.unwrap()), vec![dev.clone()]);
+    assert_eq!(s.get(&format!("/api/v1/jobs/{prod}"), &noacl).await.status(), 403);
+    // Server-wide routes by role.
+    assert_eq!(s.get("/api/v1/settings", &val).await.status(), 200);
+    assert_eq!(s.put("/api/v1/settings", &val, json!({})).await.status(), 403);
+    assert_eq!(s.get(&format!("/api/v1/filesystem?path={}", s.dir.display()), &val).await.status(), 403);
+    assert_eq!(s.get(&format!("/api/v1/filesystem?path={}", s.dir.display()), &ops).await.status(), 200);
+    assert_eq!(s.get("/api/v1/users", &ops).await.status(), 403);
+    assert_eq!(s.post("/api/v1/server/shutdown", &ops, json!({})).await.status(), 403);
+    assert_eq!(s.post("/api/v1/jobs", &ops, json!({"job": job_dev})).await.status(), 403, "creating jobs is for administrators");
+    // RPC follows the same rules.
+    assert_eq!(ids(s.post("/api/v1/rpc/backup_list_jobs", &noacl, json!({})).await.json().await.unwrap()), vec![dev.clone()]);
+    assert_eq!(s.post("/api/v1/rpc/backup_delete_job", &ops, json!({"id": dev, "deleteLocalDb": false, "deleteRemote": false})).await.status(), 403);
+    assert_eq!(s.post("/api/v1/rpc/backup_get_job", &val, json!({"id": prod})).await.status(), 200);
+    assert_eq!(s.post("/api/v1/rpc/backup_set_global_defaults", &ops, json!({"defaults": {}})).await.status(), 403);
+    // Who am I.
+    let me = s.get("/api/v1/auth/me", &ops).await.json::<Value>().await.unwrap();
+    assert_eq!((me["username"].as_str(), me["role"].as_str(), me["is_admin"].as_bool()), (Some("ops"), Some("operator"), Some(false)));
+    let perm = |id: &str| me["jobs"].as_array().unwrap().iter().find(|j| j["job_id"] == id).map(|j| j["permission"].as_str().unwrap().to_string());
+    assert_eq!((perm(&prod).as_deref(), perm(&dev).as_deref()), (Some("run"), Some("write")));
+
+    // Tokens of an account never exceed it.
+    assert_eq!(s.post("/api/v1/auth/api-tokens", &ops, json!({"name": "too much", "scope": "admin"})).await.status(), 403);
+    let t = s.post("/api/v1/auth/api-tokens", &ops, json!({"name": "ops ci", "scope": "write"})).await.json::<Value>().await.unwrap();
+    assert_eq!(t["info"]["owner"], "ops");
+    let ops_tok = t["token"].as_str().unwrap().to_string();
+    assert!(matches!(s.post(&format!("/api/v1/jobs/{prod}/run"), &ops_tok, json!({"dry_run": true})).await.status().as_u16(), 200 | 409), "allowed (409 = still busy from the earlier run)");
+    assert_eq!(s.delete(&format!("/api/v1/jobs/{dev}"), &ops_tok).await.status(), 403, "write scope, but the owner has write only");
+    assert_eq!(ids(s.get("/api/v1/jobs", &ops_tok).await.json().await.unwrap()), both);
+    let lim = s.post("/api/v1/auth/api-tokens", &ops, json!({"name": "ops dev", "scope": "run", "job_ids": [dev]})).await.json::<Value>().await.unwrap()["token"].as_str().unwrap().to_string();
+    assert_eq!(ids(s.get("/api/v1/jobs", &lim).await.json().await.unwrap()), vec![dev.clone()]);
+    assert_eq!(s.get(&format!("/api/v1/jobs/{prod}"), &lim).await.status(), 403);
+    let mine = s.get("/api/v1/auth/api-tokens", &ops).await.json::<Value>().await.unwrap();
+    assert!(mine["tokens"].as_array().unwrap().iter().all(|t| t["owner"] == "ops"));
+    assert_eq!(s.get("/api/v1/auth/api-tokens", &admin).await.json::<Value>().await.unwrap()["tokens"].as_array().unwrap().len(), 2);
+    let admin_tok = s.post("/api/v1/auth/api-tokens", &admin, json!({"name": "adm", "scope": "read"})).await.json::<Value>().await.unwrap()["info"]["id"].as_str().unwrap().to_string();
+    assert_eq!(s.delete(&format!("/api/v1/auth/api-tokens/{admin_tok}"), &ops).await.status(), 404, "not someone else's");
+
+    // Deleting a rule: preview first.
+    let p = s.get(&format!("/api/v1/acl/{ops_prod}/preview-delete"), &admin).await.json::<Value>().await.unwrap();
+    assert_eq!(p["changes"], json!([{"username": "ops", "job_id": prod, "job_name": "prod-db", "before": "run", "after": "none"}]));
+    assert_eq!(s.delete(&format!("/api/v1/acl/{ops_prod}"), &admin).await.status(), 200);
+    assert_eq!(s.get(&format!("/api/v1/jobs/{prod}"), &ops).await.status(), 403);
+    assert_eq!(s.get("/api/v1/acl", &admin).await.json::<Value>().await.unwrap()["rules"].as_array().unwrap().len(), 2);
+
+    // Own password; disabling signs out at once; the last administrator stays.
+    assert_eq!(s.put("/api/v1/auth/password", &val, json!({"current_password": "val-password", "new_password": "val-password-2"})).await.status(), 200);
+    assert_eq!(s.login_as("val", "val-password").await.status(), 401);
+    let val = s.token_of("val", "val-password-2").await;
+    assert_eq!(s.put("/api/v1/users/val", &admin, json!({"disabled": true})).await.status(), 200);
+    assert_eq!(s.get("/api/v1/jobs", &val).await.status(), 401);
+    assert_eq!(s.login_as("val", "val-password-2").await.status(), 401);
+    assert_eq!(s.delete("/api/v1/users/admin", &admin).await.status(), 409);
+    assert_eq!(s.put("/api/v1/users/admin", &admin, json!({"role": "viewer"})).await.status(), 409);
+    assert_eq!(s.delete("/api/v1/users/ops", &admin).await.status(), 200);
+    assert_eq!(s.get("/api/v1/jobs", &ops_tok).await.status(), 401, "a deleted account's tokens stop working");
+}
+
+#[tokio::test]
+async fn console_managed_accounts_are_read_only() {
+    let s = start(ServerConfig::default(), None).await;
+    let admin = s.login().await;
+    assert_eq!(s.get("/api/v1/users", &admin).await.json::<Value>().await.unwrap()["users"].as_array().unwrap().len(), 1);
+    let m = ufop_core::agent::ManagedServerAccess {
+        users: vec![
+            ufop_core::agent::ManagedServerUser { username: "org-ops".into(), password_hash: auth::hash_password("org-password").unwrap(), role: "operator".into(), disabled: false },
+            ufop_core::agent::ManagedServerUser { username: "admin".into(), password_hash: auth::hash_password("takeover-pw").unwrap(), role: "admin".into(), disabled: false },
+        ],
+        rules: vec![ufop_core::agent::ManagedAclRule { principal: "org-ops".into(), job_pattern: "*".into(), permission: "run".into() }],
+    };
+    let users = auth::AuthService::new(settings::SettingsStore::plain(s.mgr.pool_for_tests())).users();
+    let problems = users.apply_managed(Some(&m)).await.unwrap();
+    assert_eq!(problems.len(), 1, "a local account is never replaced: {problems:?}");
+    assert_eq!(s.login_as("admin", "takeover-pw").await.status(), 401);
+    let org = s.token_of("org-ops", "org-password").await;
+    let me = s.get("/api/v1/auth/me", &org).await.json::<Value>().await.unwrap();
+    assert_eq!(me["role"], "operator");
+    let listed = s.get("/api/v1/users", &admin).await.json::<Value>().await.unwrap();
+    assert!(listed["users"].as_array().unwrap().iter().any(|u| u["username"] == "org-ops" && u["managed"] == true));
+    assert_eq!(s.put("/api/v1/users/org-ops", &admin, json!({"role": "admin"})).await.status(), 403);
+    assert_eq!(s.delete("/api/v1/users/org-ops", &admin).await.status(), 403);
+    let rid = s.get("/api/v1/acl", &admin).await.json::<Value>().await.unwrap()["rules"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(s.delete(&format!("/api/v1/acl/{rid}"), &admin).await.status(), 403);
+    // The console stops managing: its accounts and rules go away.
+    assert!(users.apply_managed(None).await.unwrap().is_empty());
+    assert_eq!(s.login_as("org-ops", "org-password").await.status(), 401);
+    assert!(s.get("/api/v1/acl", &admin).await.json::<Value>().await.unwrap()["rules"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn hardening_checklist_and_explicit_probe() {
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    let id = s.job(&tok, "Exposed").await;
+    let r = s.get(&format!("/api/v1/jobs/{id}/hardening"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(r["total"], 7);
+    let status = |r: &Value, id: &str| r["checks"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap()["status"].as_str().unwrap().to_string();
+    assert_eq!(status(&r, "credentials"), "unknown", "never probed without asking");
+    assert!(r["probe"].is_null());
+    assert!(std::fs::read_dir(s.dir.join("dst-Exposed")).map(|d| d.count()).unwrap_or(0) == 0, "reading the checklist writes nothing");
+    // Run checks: a local folder lets the backup "credentials" delete.
+    let p = s.post(&format!("/api/v1/jobs/{id}/hardening/probe"), &tok, json!({})).await;
+    assert_eq!(p.status(), 200);
+    let p = p.json::<Value>().await.unwrap();
+    assert_eq!((p["probe"]["can_write"].as_bool(), p["probe"]["can_delete"].as_bool(), p["probe"]["gone_after_delete"].as_bool()), (Some(true), Some(true), Some(true)), "{p}");
+    assert_eq!(status(&p, "credentials"), "fail");
+    let left: Vec<_> = std::fs::read_dir(s.dir.join("dst-Exposed")).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().contains("hardening-probe")).collect();
+    assert!(left.is_empty(), "the probe is cleaned up");
+    // The result is kept with the job; the RPC and REST views agree.
+    let again = s.get(&format!("/api/v1/jobs/{id}/hardening"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(status(&again, "credentials"), "fail");
+    let rpc = s.post("/api/v1/rpc/backup_hardening_report", &tok, json!({"jobId": id})).await.json::<Value>().await.unwrap();
+    assert_eq!(rpc["passed"], again["passed"]);
+    // Read-only jobs are never probed.
+    let mut j = s.get(&format!("/api/v1/jobs/{id}"), &tok).await.json::<Value>().await.unwrap();
+    j["read_only"] = json!(true);
+    assert_eq!(s.put(&format!("/api/v1/jobs/{id}"), &tok, json!({"job": j})).await.status(), 200);
+    assert!(!s.post(&format!("/api/v1/jobs/{id}/hardening/probe"), &tok, json!({})).await.status().is_success());
+}
+
+#[tokio::test]
+async fn notification_profiles_presets_and_previews_over_rest() {
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    // A preset, then a profile from it with its secret (stored, never returned).
+    let n = s.post("/api/v1/notifications/webhook-preset", &tok, json!({"preset": "gotify", "params": {"server": "https://push.example.org"}})).await.json::<Value>().await.unwrap();
+    assert_eq!(n["type"], "webhook");
+    assert_eq!(n["url"], "https://push.example.org/message?token={{secret}}");
+    assert_eq!(s.post("/api/v1/notifications/webhook-preset", &tok, json!({"preset": "gotify"})).await.status(), 400);
+    let p = s.post("/api/v1/notification-profiles", &tok, json!({"name": "Phone", "notification": n, "min_severity": "error", "secret": "AppT0ken"})).await;
+    assert_eq!(p.status(), 200);
+    let text = p.text().await.unwrap();
+    assert!(!text.contains("AppT0ken"), "{text}");
+    let p: Value = serde_json::from_str(&text).unwrap();
+    let pid = p["id"].as_str().unwrap().to_string();
+    assert!(s.mgr.has_destination_secret(p["notification"]["credential_id"].as_str().unwrap()).await.unwrap());
+    assert_eq!(s.post("/api/v1/notification-profiles", &tok, json!({"name": "Bad", "notification": {"type": "webhook", "url": "ftp://x"}})).await.status(), 400);
+    // Update and read back.
+    let mut upd = p.clone();
+    upd["description"] = json!("on call");
+    let r = s.client.put(format!("{}/api/v1/notification-profiles/{pid}", s.base)).bearer_auth(&tok).json(&upd).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(s.get(&format!("/api/v1/notification-profiles/{pid}"), &tok).await.json::<Value>().await.unwrap()["description"], "on call");
+    // Preview masks the secret.
+    let pv = s.post("/api/v1/notifications/preview", &tok, json!({"notification": n, "result": "error"})).await.json::<Value>().await.unwrap();
+    assert!(pv["request"].as_str().unwrap().contains("token=%2A%2A%2A%2A%2A%2A"), "{pv}");
+    // A job using it: delete refused (409) unless forced.
+    let src = s.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let job = json!({"name":"Srv","sources":[src],"encrypted":false,"notification_profile_ids":[pid],"destination":{"type":"local","path": s.dir.join("dst"),"alternate_paths":[],"marker_file":null}});
+    let j = s.post("/api/v1/jobs", &tok, json!({"job": job})).await.json::<Value>().await.unwrap();
+    assert_eq!(j["notification_profile_ids"], json!([pid]));
+    assert_eq!(s.client.delete(format!("{}/api/v1/notification-profiles/{pid}", s.base)).bearer_auth(&tok).send().await.unwrap().status(), 409);
+    let d = s.client.delete(format!("{}/api/v1/notification-profiles/{pid}?force=true", s.base)).bearer_auth(&tok).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(d["removed_from"], json!(["job 'Srv'"]));
+    assert_eq!(s.get("/api/v1/notification-profiles", &tok).await.json::<Value>().await.unwrap().as_array().unwrap().len(), 0);
+    // Organization profiles are read-only here.
+    let org = ufop_core::agent::ManagedNotificationProfile { id: "ops".into(), name: "Ops".into(), notification: json!({"type": "slack", "credential_id": "central:slack"}), ..Default::default() };
+    assert!(s.mgr.set_managed_notification_profiles(Some(&[org])).is_empty());
+    assert_eq!(s.client.delete(format!("{}/api/v1/notification-profiles/org:ops", s.base)).bearer_auth(&tok).send().await.unwrap().status(), 403);
+}
+
+#[tokio::test]
+async fn branding_rest_public_view_and_html() {
+    let web = tempfile::tempdir().unwrap();
+    std::fs::write(web.path().join("index.html"), "<html><head><title>FileManager</title></head><body>app</body></html>").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::open_in_memory().await.unwrap();
+    let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
+    let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
+    auth.set_password("server-password").await.unwrap();
+    let cli = branding::Branding { title_prefix: "[cli] ".into(), ..Default::default() };
+    let brand = branding::BrandingState::new(cli);
+    let st = ServerState { branding: brand.clone(), ..ServerState::new(mgr, None, auth, ServerConfig { webroot: Some(web.path().into()), ..Default::default() }) };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
+    let c = reqwest::Client::new();
+
+    // Public view without signing in; command line layer applies to the HTML.
+    let p: Value = c.get(format!("{base}/api/v1/branding")).send().await.unwrap().json().await.unwrap();
+    assert_eq!((p["title_prefix"].as_str(), p["logo_url"].is_null()), (Some("[cli] "), true));
+    let html = c.get(format!("{base}/")).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("<title>[cli] FileManager</title>"), "{html}");
+    assert_eq!(c.get(format!("{base}/branding/logo")).send().await.unwrap().status(), 404);
+
+    // Administrators save branding; invalid values are refused.
+    let tok = c.post(format!("{base}/api/v1/auth/login")).json(&json!({"password":"server-password"})).send().await.unwrap().json::<Value>().await.unwrap()["access_token"].as_str().unwrap().to_string();
+    assert_eq!(c.put(format!("{base}/api/v1/server/branding")).json(&json!({"product_name":"x"})).send().await.unwrap().status(), 401);
+    let bad = c.put(format!("{base}/api/v1/server/branding")).bearer_auth(&tok).json(&json!({"custom_css":"@import url(https://evil/x.css);"})).send().await.unwrap();
+    assert_eq!(bad.status(), 400);
+    let bad = c.put(format!("{base}/api/v1/server/branding")).bearer_auth(&tok).json(&json!({"logo":"/etc/passwd"})).send().await.unwrap();
+    assert_eq!(bad.status(), 400, "file paths only from the command line");
+    let body = json!({"title_prefix":"[ACME] ","product_name":"ACME Backup","accent_color":"#1e66f5","logo":"data:image/png;base64,iVBORw0KGgo=","custom_css":"header{border-color:var(--ufop-accent)}"});
+    let saved: Value = c.put(format!("{base}/api/v1/server/branding")).bearer_auth(&tok).json(&body).send().await.unwrap().json().await.unwrap();
+    assert_eq!(saved["effective"]["product_name"], "ACME Backup");
+    assert_eq!(saved["command_line"]["title_prefix"], "[cli] ");
+    let p: Value = c.get(format!("{base}/api/v1/branding")).send().await.unwrap().json().await.unwrap();
+    assert_eq!((p["title_prefix"].as_str(), p["accent_color"].as_str()), (Some("[ACME] "), Some("#1e66f5")));
+    assert!(p.get("custom_css").is_none() && p.get("logo").is_none(), "only URLs are public");
+    let logo = c.get(format!("{base}{}", p["logo_url"].as_str().unwrap())).send().await.unwrap();
+    assert_eq!(logo.headers()["content-type"], "image/png");
+    assert!(logo.headers()["content-security-policy"].to_str().unwrap().contains("default-src 'none'"));
+    assert_eq!(logo.bytes().await.unwrap().as_ref(), &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    let css = c.get(format!("{base}/branding/custom.css")).send().await.unwrap();
+    assert_eq!(css.headers()["content-type"], "text/css; charset=utf-8");
+    let html = c.get(format!("{base}/backups")).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("<title>[ACME] ACME Backup</title>") && html.contains("--ufop-accent:#1e66f5") && html.contains("/branding/custom.css?v="), "{html}");
+
+    // The console's settings win and lock the admin route.
+    brand.set_managed(Some(&ufop_core::agent::managed::ManagedServerBranding { title_prefix: "[Org] ".into(), ..Default::default() })).await.unwrap();
+    let p: Value = c.get(format!("{base}/api/v1/branding")).send().await.unwrap().json().await.unwrap();
+    assert_eq!((p["title_prefix"].as_str(), p["product_name"].as_str()), (Some("[Org] "), Some("ACME Backup")));
+    assert_eq!(c.put(format!("{base}/api/v1/server/branding")).bearer_auth(&tok).json(&body).send().await.unwrap().status(), 400);
+    let v: Value = c.get(format!("{base}/api/v1/server/branding")).bearer_auth(&tok).send().await.unwrap().json().await.unwrap();
+    assert_eq!(v["managed"]["title_prefix"], "[Org] ");
+
+    // Saved branding survives a restart (settings database).
+    let again = branding::BrandingState::default();
+    again.load_saved(&settings::SettingsStore::plain(repo.pool().clone())).await.unwrap();
+    assert_eq!(again.effective().await.product_name, "ACME Backup");
 }

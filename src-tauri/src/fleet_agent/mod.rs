@@ -82,10 +82,7 @@ impl BackupHost {
     async fn job_for_policy(&self, p: &FleetPolicy) -> Result<(BackupJob, Option<String>), AppError> {
         let id = managed_job_id(&p.id)?;
         let t = policy::prepare_template(&p.job)?;
-        let base = match self.mgr.get_job(&id).await {
-            Ok(j) => j,
-            Err(_) => BackupJob::default(),
-        };
+        let base = self.mgr.get_job(&id).await.unwrap_or_default();
         let mut v = serde_json::to_value(&base)?;
         policy::overlay(&mut v, &t.fields);
         v["id"] = json!(id);
@@ -278,7 +275,7 @@ impl AgentHost for BackupHost {
                 .into_iter()
                 .map(|j| JobSummary {
                     managed_by_policy: policy_of_job(&j.id).map(String::from),
-                    schedule_interval_minutes: j.schedule.enabled.then_some(j.schedule.interval_minutes),
+                    schedule_interval_minutes: j.schedule.enabled.then(|| j.schedule.nominal_interval_minutes()),
                     last_result: j.stats.last_result,
                     last_run_at: j.stats.last_run_at,
                     id: j.id,
