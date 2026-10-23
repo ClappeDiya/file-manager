@@ -8,8 +8,8 @@ Two programs that change one backup at the same time can damage it. A backup sta
 
 | Lock | File | Taken by |
 |---|---|---|
-| Exclusive | `<prefix>-lock.json` | backup, compact, repair, purge, delete versions, retention, rebuild missing volumes, object locks, format upgrade and rollback, reshard, password change, deleting the backup, the target of a mirror or convert |
-| Shared | `<prefix>-lock-r-<id>.json` (one per reader) | restore, verify, list, browse, search, recreate database, list broken files, recovery download, the source of a mirror, dry runs |
+| Exclusive | `<prefix>-lock.json` | backup, compact, repair, purge, delete versions, retention, notes/tags/pins of a version, sharing a repository, the target of a version copy, rebuild missing volumes, object locks, format upgrade and rollback, reshard, password change, deleting the backup, the target of a mirror or convert |
+| Shared | `<prefix>-lock-r-<id>.json` (one per reader) | restore, verify, list, browse, search, recreate database, syncing sources of a shared repository, the source of a version copy, list broken files, recovery download, the source of a mirror, dry runs |
 
 Several readers can run together. A reader waits for a writer and a writer waits for every reader. An operation that cannot get its lock stops right away with:
 

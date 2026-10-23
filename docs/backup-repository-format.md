@@ -78,6 +78,35 @@ Each volume is copied, read back, compared and only then deleted from its old pl
 
 Locks, the clock check, checkpoints, read-only connections and the encrypted local database are described in [backup-safety.md](backup-safety.md). Lock files (`<prefix>-lock.json`, `<prefix>-lock-r-<id>.json`) always stay at the top of the destination, in every layout.
 
+## Version metadata
+
+Every file list (`<prefix>-<time>.dlist`) can carry these optional fields next to `timestamp`, `partial` and `files`. They are written only when set:
+
+| Field | Meaning |
+|---|---|
+| `note` | Free text, up to 2000 characters |
+| `tags` | `{"key": "value"}`; keys 1–64 of `A-Z a-z 0-9 _ . : -`, values up to 256 characters, at most 32 tags |
+| `pinned`, `pin_reason` | "Keep forever": retention and purge never remove or rewrite the version, and deleting it needs `force` |
+| `identity` | `{hostname, username, job_id, source_label}` of the client that wrote the version |
+| `stats` | `{bytes_added, new_blocks, files_added, files_changed, files_deleted}` recorded at backup time. `bytes_added` counts the sealed block volumes and their indexes uploaded for the version, after compression and encryption. The file list itself is not counted. |
+
+The fields work in format 1 and format 2. File-list readers have never refused unknown fields, so older app versions read these lists and ignore the metadata. If an older version rewrites a file list (purge or repair), it drops the metadata. Editing a note, tags or a pin downloads the version's file list and checks it against its recorded hash. The list is then sealed again with the change and uploaded under the same name, which replaces the old object in one write. A database rebuild reads the metadata back. The local database keeps a copy in `filesets.meta` (schema 3), encrypted like file paths when the database is encrypted. Bug-report copies keep only the pin and the statistics.
+
+## Shared repositories and client identity
+
+A format 2 repository can be **shared**: several jobs, on one computer or on many, back up into the same destination and prefix. Data they have in common is stored once. The header then lists the feature `shared_repository`. App versions that do not know the feature refuse the repository instead of misreading it.
+
+- **Create** a shared repository with the job option *Share a new repository with other computers and jobs* (`shared_repository`, CLI `--shared`). **Share an existing one** with *Maintenance → Sharing → Share this repository with other computers/jobs*, the `enable_sharing` operation, or `ufop backup share`. The existing versions become the enabling job's own (`--keep-identities` keeps versions that already name another identity). The file lists are rewritten first and the header last. Format 1 repositories need an upgrade first.
+- **Sources.** Each version records the identity that wrote it. Its *source id* is a hash of `user@host:job` (the host name is compared without case). Listing, restore, retention, pins, purge and comparisons default to the job's own source. Another source can be named explicitly (`source` in the API, `--source-id` in the CLI, the source picker in Restore, `*` for all). `ufop backup sources`, `GET /jobs/{id}/sources` and *Maintenance → Sharing* list the sources. Retention never touches another source unless it is targeted.
+- **Identity override.** A job can record another host or user name (*Options → Advanced → Versions and sharing*, CLI `--hostname`/`--username`, `--job-id` for CLI jobs). This lets a new computer continue the old computer's history. Adopting a shared repository with *Continue this backup on this computer* always creates a new source, so the new computer does not take over another job's history.
+- **Deduplication across clients.** Before every operation the local database is brought up to date from the destination. Index volumes it has not seen add the blocks other clients uploaded, so identical data is not uploaded again. File lists it has not seen, or whose size changed, add or update other sources' versions. Volumes that disappeared (another client compacted them) are forgotten. The names of known volumes live in the database, so an unchanged repository costs one listing. Version times are unique across sources because file-list names are made from them.
+- **Writers** are serialised by the exclusive repository lock (see [backup-safety.md](backup-safety.md)). Each writer syncs while it holds the lock.
+- **Compaction** counts the blocks of every source's versions as used. It also leaves volumes younger than `shared_gc_delay_hours` (default 4) alone. The age counts from the later of when this computer first saw the volume and the destination's modification time. A writer that crashed after uploading blocks but before its file list therefore loses nothing.
+
+## Copying versions to another repository
+
+*Restore → Copy to another backup…* (Advanced), the `copy_versions` operation (target: another job or a destination with a passphrase, prefix and options for a new repository) or `ufop backup copy-versions` copy chosen versions into another repository. Only the blocks the versions use and the target lacks are transferred. Each source volume is downloaded once. Blocks are decoded and encoded again for the target's codec, cipher and volume format. When the target cuts or hashes blocks differently, for example from format 1 fixed blocks into format 2 content-defined chunking, the file contents are re-assembled and cut again. Identical contents are processed only once. Each copied version gets a new file list in the target's format with its time, note, tags, pin and identity. Its statistics describe what the copy added to the target. A version already in the target (same time and files) is skipped. A clashing time moves by one second, and the report says so. The copy takes a shared lock on the source and an exclusive lock on the target. A dry run counts blocks and bytes and writes nothing.
+
 ## Format details
 
 `ufop backup format-info --dest …` and the `format_info` operation show the version, chunker, codecs, cipher, layout and features. The independent recovery script (`scripts/ufop-recover.py`) reads both formats. Zstandard data needs Python 3.14+ or the `zstandard` package.

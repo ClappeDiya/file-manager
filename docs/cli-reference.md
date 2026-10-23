@@ -525,6 +525,31 @@ ufop backup db encrypt ~/.local/share/ufop/cli-backups/x.sqlite [--db-key-source
 
 Every command with `--dest` also takes `--read-only`, `--db-key-source keyring|env:VAR|none` (default `none`; an encrypted database without its key is rebuilt from the destination), `--lock-ttl-secs` (default 1800), `--clock-skew-warn-secs` (300) and `--clock-skew-abort-secs` (3600; 0 turns a limit off). `ufop backup run` takes `--checkpoint-interval-secs` (default 900) and `--checkpoint-interval-bytes` (default 0); 0 turns them off.
 
+### `ufop backup` versions, retention, copies and sharing
+
+Notes, tags, pins, retention previews, count-based retention, copying versions and shared repositories. See [backup-versions.md](backup-versions.md).
+
+```bash
+ufop backup run … --note "before upgrade" --tag env=prod --tag release
+ufop backup run … --keep-latest 2 --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --keep-yearly 3
+ufop backup list --dest /mnt/backup [--tag env=prod]          # table: time, files, size, added, pin, host, note, tags
+ufop backup pin --dest /mnt/backup 3 [--reason audit]        # Keep forever
+ufop backup unpin --dest /mnt/backup 3
+ufop backup annotate --dest /mnt/backup 0 --note "release 2.1" [--tag k=v …] [--clear-tags]
+ufop backup delete --dest /mnt/backup 3 --force              # pinned versions need --force
+ufop backup retention preview --dest /mnt/backup --keep-daily 7   # kept/deleted per version, with the reason
+ufop backup retention apply --dest /mnt/backup --keep-versions 10 [--dry-run] [--allow-full-removal]
+UFOP_TO_PASSPHRASE=… ufop backup copy-versions --dest /mnt/backup 0 2 --to /mnt/offsite \
+    [--to-prefix ufop] [--to-dbpath F] [--to-passphrase-env VAR] [--to-no-encryption] \
+    [--to-format-version 1|2] [--to-chunker fixed|fastcdc] [--dry-run]
+ufop backup run … --shared --job-id laptop-docs              # create a shared repository
+ufop backup share --dest /mnt/backup [--keep-identities]     # share an existing format 2 repository
+ufop backup sources --dest /mnt/backup                       # computers and jobs writing to it (* = this one)
+ufop backup restore --dest /mnt/backup --source-id <id> --target ~/out   # another source's version
+```
+
+Every repository command also takes `--job-id` (the source a CLI job writes as; default derived from `--dest` and `--prefix`, so give each CLI job that shares a repository its own), `--hostname` and `--username` (record another computer or user, to continue its history) and `--source-id ID|*` (work on another source of a shared repository). `ufop backup run` also takes `--shared-gc-delay-hours` (default 4): in a shared repository, compaction leaves younger volumes alone. Any non-zero `--keep-latest|hourly|daily|weekly|monthly|yearly` selects count-based retention over `--keep-versions`, `--keep-days` and `--retention-policy`.
+
 ### `ufop server shares`
 
 Share links on a `ufop-server` started with `--share-root` (sign in first with `ufop server login`).
