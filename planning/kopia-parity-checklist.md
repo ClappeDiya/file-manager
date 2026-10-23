@@ -85,7 +85,7 @@ Ground rules
 
 ## WP8 — Server, security, observability
 - [x] K97 Graceful server shutdown (drain, checkpoint)
-- [ ] K89 CSRF double-submit token on cookie routes
+- [x] K89 CSRF double-submit token on cookie routes
 - [ ] K93 API tokens scoped to job IDs
 - [ ] K107 Request tracing with X-Request-Id
 - [ ] K108 Prometheus `/metrics`

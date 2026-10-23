@@ -38,3 +38,30 @@ The packaged systemd unit and launchd plist send SIGTERM. With systemd, set `Tim
 The desktop app does the same when it quits (tray *Quit* or closing the window with *Keep running in the
 tray* off): running backups get up to 60 seconds to write their partial version before backup drives are
 closed and the app exits.
+
+## Browser sessions and CSRF
+
+Signing in (`POST /api/v1/auth/login`) returns a short-lived access token and sets two cookies:
+
+| Cookie | Flags | Purpose |
+|---|---|---|
+| `ufop_refresh` | `HttpOnly; SameSite=Strict; Path=/api/v1/auth` (+ `Secure` with HTTPS) | Rotating refresh token: `POST /auth/refresh` exchanges it for a new access token |
+| `ufop_csrf` | `SameSite=Strict; Path=/` (+ `Secure`), readable by scripts | Double-submit CSRF token bound to the refresh token |
+
+Because the browser attaches `ufop_refresh` on its own, every state-changing request (`POST`, `PUT`,
+`PATCH`, `DELETE`) that carries it and is **not** authenticated with `Authorization: Bearer` (or the
+reverse-proxy pre-authentication header) must send the `ufop_csrf` value in an **`X-CSRF-Token`** header.
+The server compares it in constant time with the cookie *and* with an HMAC of the refresh cookie under the
+server's signing key, so a cookie planted by another site does not help. A missing or wrong token gets
+`403` with `error_type: "csrf"`. The token rotates with every refresh, is also returned as `csrf_token` in
+the sign-in and refresh responses, and changes when tokens are reset.
+
+Defense in depth: those requests, and the sign-in routes (`/auth/login`, `/auth/signin`), are refused with
+`403` when `Origin` (or, without it, `Referer`) names a site other than the server's own `Host`,
+`--public-url` or a `--cors-origins` entry. Requests without either header (scripts, the CLI) pass this check.
+
+Bearer-token requests are exempt: they cannot be forged cross-site. The web UI and `ufop server` send the
+header for you; a script that keeps the refresh cookie must send it too
+(`curl -b jar -c jar -H "X-CSRF-Token: $(awk '/ufop_csrf/{print $7}' jar)" -X POST …/api/v1/auth/refresh`).
+After upgrading, run `ufop server login` again once so the CLI stores the token. Share-link pages (`/s/…`)
+carry their capability in the URL and use `SameSite=Lax` unlock cookies; they are not covered by this check.

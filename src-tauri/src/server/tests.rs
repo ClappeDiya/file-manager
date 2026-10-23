@@ -8,6 +8,7 @@ struct TestServer {
     base: String,
     mgr: BackupManager,
     client: reqwest::Client,
+    jar: Arc<reqwest::cookie::Jar>,
     _dir: tempfile::TempDir,
     dir: PathBuf,
 }
@@ -22,10 +23,12 @@ async fn start(cfg: ServerConfig, oauth: Option<oauth::OAuthBroker>) -> TestServ
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
+    let jar = Arc::new(reqwest::cookie::Jar::default());
     TestServer {
         base: format!("http://127.0.0.1:{port}"),
         mgr,
-        client: reqwest::Client::builder().cookie_store(true).build().unwrap(),
+        jar: jar.clone(),
+        client: reqwest::Client::builder().cookie_provider(jar).build().unwrap(),
         dir: dir.path().to_path_buf(),
         _dir: dir,
     }
@@ -36,6 +39,11 @@ impl TestServer {
         let r = self.client.post(format!("{}/api/v1/auth/login", self.base)).json(&json!({"password":"server-password"})).send().await.unwrap();
         assert_eq!(r.status(), 200);
         r.json::<Value>().await.unwrap()["access_token"].as_str().unwrap().to_string()
+    }
+    /// The `ufop_csrf` cookie the client holds.
+    fn csrf(&self) -> String {
+        use reqwest::cookie::CookieStore;
+        self.jar.cookies(&self.base.parse().unwrap()).and_then(|h| h.to_str().ok().and_then(|c| c.split("; ").find_map(|kv| kv.strip_prefix("ufop_csrf=").map(String::from)))).unwrap_or_default()
     }
     async fn get(&self, path: &str, tok: &str) -> reqwest::Response {
         self.client.get(format!("{}{path}", self.base)).bearer_auth(tok).send().await.unwrap()
@@ -57,7 +65,7 @@ async fn auth_flow_tokens_and_revocation() {
     assert_eq!(s.get("/api/v1/jobs", &tok).await.status(), 200);
 
     // Refresh cookie rotates: the second use of the same cookie fails.
-    let r = s.client.post(format!("{}/api/v1/auth/refresh", s.base)).send().await.unwrap();
+    let r = s.client.post(format!("{}/api/v1/auth/refresh", s.base)).header("X-CSRF-Token", s.csrf()).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let new_tok = r.json::<Value>().await.unwrap()["access_token"].as_str().unwrap().to_string();
     assert_eq!(s.get("/api/v1/status", &new_tok).await.status(), 200);
@@ -79,7 +87,8 @@ async fn auth_flow_tokens_and_revocation() {
     assert_eq!(s.post("/api/v1/auth/reset", &tok, json!({})).await.status(), 200);
     assert_eq!(s.get("/api/v1/jobs", &tok).await.status(), 401);
     assert_eq!(s.get("/api/v1/jobs", &auto).await.status(), 401);
-    assert_eq!(s.client.post(format!("{}/api/v1/auth/refresh", s.base)).send().await.unwrap().status(), 401);
+    let after_reset = s.client.post(format!("{}/api/v1/auth/refresh", s.base)).header("X-CSRF-Token", s.csrf()).send().await.unwrap().status();
+    assert!(after_reset == 401 || after_reset == 403, "{after_reset}");
 }
 
 #[tokio::test]
@@ -1043,7 +1052,8 @@ async fn graceful_shutdown_checkpoints_running_backup_and_refuses_new_work() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
-    let s = TestServer { base, mgr, client: reqwest::Client::builder().cookie_store(true).build().unwrap(), dir: dir.path().to_path_buf(), _dir: dir };
+    let jar = Arc::new(reqwest::cookie::Jar::default());
+    let s = TestServer { base, mgr, client: reqwest::Client::builder().cookie_provider(jar.clone()).build().unwrap(), jar, dir: dir.path().to_path_buf(), _dir: dir };
     let tok = s.login().await;
 
     // A slow backup: incompressible files through a 40 kB/s upload limit.
@@ -1098,4 +1108,60 @@ fn second_stop_request_is_immediate() {
     assert_eq!(l.request(Some(std::time::Duration::from_secs(1))), lifecycle::StopRequest::Immediate);
     assert!(l.is_immediate());
     assert_eq!(l.grace().as_secs(), 60, "the first request's grace stays");
+}
+
+#[tokio::test]
+async fn csrf_double_submit_on_cookie_routes() {
+    let cfg = ServerConfig { cors_origins: vec!["https://console.example".into()], ..Default::default() };
+    let s = start(cfg, None).await;
+    let r = s.client.post(format!("{}/api/v1/auth/login", s.base)).json(&json!({"password":"server-password"})).send().await.unwrap();
+    let body: Value = r.json().await.unwrap();
+    let csrf = s.csrf();
+    assert!(!csrf.is_empty() && body["csrf_token"] == csrf.as_str(), "the cookie and the body carry the token");
+    let refresh = |hdr: Option<&str>, origin: Option<&str>| {
+        let mut rq = s.client.post(format!("{}/api/v1/auth/refresh", s.base));
+        if let Some(h) = hdr {
+            rq = rq.header("X-CSRF-Token", h);
+        }
+        if let Some(o) = origin {
+            rq = rq.header("Origin", o);
+        }
+        rq.send()
+    };
+    // Missing or mismatched token: 403, and the session is untouched.
+    let missing = refresh(None, None).await.unwrap();
+    assert_eq!(missing.status(), 403);
+    assert_eq!(missing.json::<Value>().await.unwrap()["error_type"], "csrf");
+    assert_eq!(refresh(Some("forged"), None).await.unwrap().status(), 403);
+    // A cross-site Origin is refused even with the right token; allowed origins pass.
+    assert_eq!(refresh(Some(&csrf), Some("https://evil.example")).await.unwrap().status(), 403);
+    assert_eq!(refresh(Some(&csrf), Some("null")).await.unwrap().status(), 403);
+    let ok = refresh(Some(&csrf), Some(&s.base)).await.unwrap();
+    assert_eq!(ok.status(), 200);
+    // Rotated with the refresh token: the old value no longer works.
+    let rotated = ok.json::<Value>().await.unwrap()["csrf_token"].as_str().unwrap().to_string();
+    assert_ne!(rotated, csrf);
+    assert_eq!(s.csrf(), rotated);
+    assert_eq!(refresh(Some(&csrf), None).await.unwrap().status(), 403);
+    let tok = refresh(Some(&rotated), Some("https://console.example")).await.unwrap().json::<Value>().await.unwrap()["access_token"].as_str().unwrap().to_string();
+    // A cookie value copied into the header must also match the session's HMAC.
+    let refresh_cookie = {
+        use reqwest::cookie::CookieStore;
+        let all = s.jar.cookies(&format!("{}/api/v1/auth/refresh", s.base).parse().unwrap()).unwrap();
+        all.to_str().unwrap().split("; ").find(|c| c.starts_with("ufop_refresh=")).unwrap().to_string()
+    };
+    let bare = reqwest::Client::new();
+    let jar_forged = bare.post(format!("{}/api/v1/auth/refresh", s.base)).header("X-CSRF-Token", "AAAA").header("Cookie", format!("{refresh_cookie}; ufop_csrf=AAAA")).send().await.unwrap();
+    assert_eq!(jar_forged.status(), 403);
+    // Bearer-authenticated requests are exempt (the cookie is sent along on /auth/*).
+    let mint = s.post("/api/v1/auth/signin-token", &tok, json!({})).await;
+    assert_eq!(mint.status(), 200);
+    // Sign-in routes only get the origin check.
+    let cross_login = s.client.post(format!("{}/api/v1/auth/login", s.base)).header("Origin", "https://evil.example").json(&json!({"password":"server-password"})).send().await.unwrap();
+    assert_eq!(cross_login.status(), 403);
+    // Logout with the cookie needs the token too.
+    assert_eq!(s.client.post(format!("{}/api/v1/auth/logout", s.base)).send().await.unwrap().status(), 403);
+    let csrf = s.csrf();
+    assert_eq!(s.client.post(format!("{}/api/v1/auth/logout", s.base)).header("X-CSRF-Token", &csrf).send().await.unwrap().status(), 200);
+    assert!(s.csrf().is_empty(), "logout clears the cookie");
 }

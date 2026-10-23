@@ -230,6 +230,15 @@ impl AuthService {
             .await
     }
 
+    /// The CSRF token bound to a refresh token: HMAC-SHA256 under the
+    /// signing key (resetting tokens changes it), base64url.
+    pub async fn csrf_token(&self, refresh_raw: &str) -> Result<String, AppError> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.jwt_key().await?).map_err(|_| AppError::internal("bad jwt key"))?;
+        mac.update(b"ufop-csrf:");
+        mac.update(sha256_hex(refresh_raw).as_bytes());
+        Ok(B64.encode(mac.finalize().into_bytes()))
+    }
+
     pub async fn set_automation_allowed(&self, allowed: bool) -> Result<(), AppError> {
         self.settings.set(KEY_AUTOMATION, if allowed { "1" } else { "0" }).await
     }

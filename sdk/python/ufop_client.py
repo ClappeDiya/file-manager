@@ -98,7 +98,7 @@ class UfopClient:
         return self._call("POST", f"/api/v1/auth/login", None, body)
 
     def post_auth_logout(self) -> Dict[str, Any]:
-        """Revoke the refresh cookie's session. `POST /api/v1/auth/logout`"""
+        """Revoke the refresh cookie's session; with the cookie it needs X-CSRF-Token (403 otherwise). `POST /api/v1/auth/logout`"""
         return self._call("POST", f"/api/v1/auth/logout", None, None)
 
     def put_auth_password(self, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -106,7 +106,7 @@ class UfopClient:
         return self._call("PUT", f"/api/v1/auth/password", None, body)
 
     def post_auth_refresh(self) -> "Session":
-        """New access token from the refresh cookie (rotated). `POST /api/v1/auth/refresh`"""
+        """New access token from the refresh cookie (rotated); needs X-CSRF-Token equal to the ufop_csrf cookie (403 otherwise). `POST /api/v1/auth/refresh`"""
         return self._call("POST", f"/api/v1/auth/refresh", None, None)
 
     def post_auth_reset(self) -> Dict[str, Any]:

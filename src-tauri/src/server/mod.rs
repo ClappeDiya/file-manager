@@ -7,6 +7,7 @@
 
 pub mod api_tokens;
 pub mod auth;
+pub mod csrf;
 pub mod dav;
 pub mod folders;
 pub mod gateway;
@@ -41,7 +42,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub const PREAUTH_HEADER: &str = "x-ufop-preauth";
-const REFRESH_COOKIE: &str = "ufop_refresh";
+pub(crate) const REFRESH_COOKIE: &str = "ufop_refresh";
 
 #[derive(Debug, Clone)]
 pub enum TlsMode {
@@ -269,11 +270,11 @@ async fn require_auth(State(st): State<ServerState>, mut req: Request, next: Nex
     }
 }
 
-fn constant_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).find_map(|kv| {
         let (k, v) = kv.trim().split_once('=')?;
         (k == name).then(|| v.to_string())
@@ -295,6 +296,21 @@ fn refresh_cookie(st: &ServerState, token: &str, max_age_days: i64) -> HeaderVal
     .unwrap_or(HeaderValue::from_static(""))
 }
 
+/// Script-readable double-submit CSRF cookie (see `csrf`).
+fn csrf_cookie(st: &ServerState, token: &str, max_age_days: i64) -> HeaderValue {
+    let secure = if matches!(st.cfg.tls, TlsMode::None) { "" } else { "; Secure" };
+    HeaderValue::from_str(&format!("{}={token}; SameSite=Strict; Path=/; Max-Age={}{secure}", csrf::CSRF_COOKIE, max_age_days * 86400)).unwrap_or(HeaderValue::from_static(""))
+}
+
+/// `{access_token, expires_at, csrf_token}` with the refresh and CSRF cookies.
+async fn with_session_cookies(st: &ServerState, access: auth::IssuedToken, refresh: auth::IssuedToken) -> Result<Response, ApiError> {
+    let csrf = st.auth.csrf_token(&refresh.token).await?;
+    let mut r = Json(json!({"access_token": access.token, "expires_at": access.expires_at, "csrf_token": csrf})).into_response();
+    r.headers_mut().insert(header::SET_COOKIE, refresh_cookie(st, &refresh.token, auth::REFRESH_TTL_DAYS));
+    r.headers_mut().append(header::SET_COOKIE, csrf_cookie(st, &csrf, auth::REFRESH_TTL_DAYS));
+    Ok(r)
+}
+
 // ── Auth routes ──
 
 #[derive(Deserialize)]
@@ -305,8 +321,7 @@ struct LoginBody {
 async fn session_response(st: &ServerState) -> Result<Response, ApiError> {
     let access = st.auth.issue_access().await?;
     let refresh = st.auth.issue_refresh().await?;
-    let mut r = Json(json!({"access_token": access.token, "expires_at": access.expires_at})).into_response();
-    r.headers_mut().insert(header::SET_COOKIE, refresh_cookie(st, &refresh.token, auth::REFRESH_TTL_DAYS));
+    let mut r = with_session_cookies(st, access, refresh).await?;
     r.headers_mut().append(header::SET_COOKIE, session_marker(auth::REFRESH_TTL_DAYS));
     Ok(r)
 }
@@ -322,9 +337,7 @@ async fn login(State(st): State<ServerState>, Json(b): Json<LoginBody>) -> Resul
 async fn refresh(State(st): State<ServerState>, headers: HeaderMap) -> Result<Response, ApiError> {
     let raw = cookie_value(&headers, REFRESH_COOKIE).ok_or_else(|| AppError::PermissionDenied { message: "No session".into(), advice: "Sign in.".into() })?;
     let (access, refresh) = st.auth.refresh(&raw).await?;
-    let mut r = Json(json!({"access_token": access.token, "expires_at": access.expires_at})).into_response();
-    r.headers_mut().insert(header::SET_COOKIE, refresh_cookie(&st, &refresh.token, auth::REFRESH_TTL_DAYS));
-    Ok(r)
+    with_session_cookies(&st, access, refresh).await
 }
 
 async fn logout(State(st): State<ServerState>, headers: HeaderMap) -> Result<Response, ApiError> {
@@ -333,6 +346,7 @@ async fn logout(State(st): State<ServerState>, headers: HeaderMap) -> Result<Res
     }
     let mut r = Json(json!({"ok": true})).into_response();
     r.headers_mut().insert(header::SET_COOKIE, refresh_cookie(&st, "", 0));
+    r.headers_mut().append(header::SET_COOKIE, csrf_cookie(&st, "", 0));
     r.headers_mut().append(header::SET_COOKIE, session_marker(0));
     Ok(r)
 }
@@ -1067,10 +1081,11 @@ pub fn router(st: ServerState) -> Router {
                 .allow_origin(origins)
                 .allow_credentials(true)
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
-                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static(PREAUTH_HEADER)]),
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static(PREAUTH_HEADER), header::HeaderName::from_static(csrf::CSRF_HEADER)]),
         );
     }
-    app.layer(middleware::from_fn_with_state(st.clone(), lifecycle::drain_guard))
+    app.layer(middleware::from_fn_with_state(st.clone(), csrf::csrf_guard))
+        .layer(middleware::from_fn_with_state(st.clone(), lifecycle::drain_guard))
         .layer(middleware::from_fn_with_state(st.clone(), host_check))
         .layer(middleware::from_fn_with_state(st.clone(), ip_check))
         .layer(middleware::from_fn_with_state(st.clone(), security_headers))

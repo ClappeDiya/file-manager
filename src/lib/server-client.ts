@@ -6,7 +6,8 @@
  *
  * The access token lives only in memory; the refresh token is an
  * HttpOnly cookie scoped to /api/v1/auth, so a reload re-establishes the
- * session without exposing it to scripts.
+ * session without exposing it to scripts. Refresh and sign-out send the
+ * `ufop_csrf` cookie's value as `X-CSRF-Token` (double-submit CSRF check).
  */
 
 interface ServerFlag {
@@ -70,6 +71,25 @@ function hasSessionCookie(): boolean {
   );
 }
 
+/**
+ * The double-submit CSRF token (`ufop_csrf` cookie, set with the refresh
+ * cookie): requests authenticated by the refresh cookie send it as
+ * `X-CSRF-Token`.
+ */
+export function csrfToken(): string | null {
+  if (typeof document === "undefined") return null;
+  const c = document.cookie
+    .split(";")
+    .map((x) => x.trim())
+    .find((x) => x.startsWith("ufop_csrf="));
+  return c ? decodeURIComponent(c.slice("ufop_csrf=".length)) : null;
+}
+
+function csrfHeaders(): Record<string, string> {
+  const t = csrfToken();
+  return t ? { "X-CSRF-Token": t } : {};
+}
+
 /** Exchange the refresh cookie for a new access token. */
 export async function refresh(): Promise<boolean> {
   if (!hasSessionCookie()) {
@@ -79,6 +99,7 @@ export async function refresh(): Promise<boolean> {
   }
   const r = await fetch(api("/auth/refresh"), {
     method: "POST",
+    headers: csrfHeaders(),
     credentials: "same-origin",
   });
   if (!r.ok) {
@@ -94,6 +115,7 @@ export async function refresh(): Promise<boolean> {
 export async function logout(): Promise<void> {
   await fetch(api("/auth/logout"), {
     method: "POST",
+    headers: csrfHeaders(),
     credentials: "same-origin",
   }).catch(() => undefined);
   accessToken = null;

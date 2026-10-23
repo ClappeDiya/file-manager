@@ -23,7 +23,7 @@ export type SchedulerStatus = { paused?: boolean; running?: boolean; tasks?: Tas
 /** read < run < write < admin */
 export type Scope = "read" | "run" | "write" | "admin";
 
-export type Session = { access_token?: string; expires_at?: string };
+export type Session = { access_token?: string; csrf_token?: string; expires_at?: string };
 
 export type Share = { created_at?: string; downloads?: number; expires_at?: string | null; has_password?: boolean; id?: string; kind?: "download" | "upload" | "both"; last_access_at?: string | null; max_downloads?: number | null; max_upload_bytes?: number | null; name?: string; path?: string; revoked_at?: string | null; token_prefix?: string };
 
@@ -115,7 +115,7 @@ export class UfopClient {
     return this.call("POST", `/api/v1/auth/login`, undefined, body);
   }
 
-  /** Revoke the refresh cookie's session. `POST /api/v1/auth/logout` */
+  /** Revoke the refresh cookie's session; with the cookie it needs X-CSRF-Token (403 otherwise). `POST /api/v1/auth/logout` */
   postAuthLogout(): Promise<{ ok?: boolean }> {
     return this.call("POST", `/api/v1/auth/logout`, undefined, undefined);
   }
@@ -125,7 +125,7 @@ export class UfopClient {
     return this.call("PUT", `/api/v1/auth/password`, undefined, body);
   }
 
-  /** New access token from the refresh cookie (rotated). `POST /api/v1/auth/refresh` */
+  /** New access token from the refresh cookie (rotated); needs X-CSRF-Token equal to the ufop_csrf cookie (403 otherwise). `POST /api/v1/auth/refresh` */
   postAuthRefresh(): Promise<Session> {
     return this.call("POST", `/api/v1/auth/refresh`, undefined, undefined);
   }

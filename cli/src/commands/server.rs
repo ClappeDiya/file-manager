@@ -194,8 +194,18 @@ pub(crate) struct Client {
     cfg: CliConfig,
 }
 
+fn cookie_from(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    headers.get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()).find_map(|c| c.strip_prefix(prefix.as_str()).map(|r| r.split(';').next().unwrap_or("").to_string())).filter(|s| !s.is_empty())
+}
+
 fn refresh_from(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    headers.get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()).find_map(|c| c.strip_prefix("ufop_refresh=").map(|r| r.split(';').next().unwrap_or("").to_string())).filter(|s| !s.is_empty())
+    cookie_from(headers, "ufop_refresh")
+}
+
+/// The double-submit CSRF token that goes with the refresh cookie.
+fn csrf_from(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    cookie_from(headers, "ufop_csrf")
 }
 
 impl Client {
@@ -207,10 +217,16 @@ impl Client {
 
     async fn renew(&mut self) -> Result<(), String> {
         let rt = self.cfg.server_refresh.clone().ok_or("Session expired: run `ufop server login` again")?;
-        let r = self.http.post(format!("{}/api/v1/auth/refresh", self.url)).header("Cookie", format!("ufop_refresh={rt}")).send().await.map_err(|e| e.to_string())?;
+        let mut req = self.http.post(format!("{}/api/v1/auth/refresh", self.url));
+        req = match &self.cfg.server_csrf {
+            Some(c) => req.header("Cookie", format!("ufop_refresh={rt}; ufop_csrf={c}")).header("X-CSRF-Token", c),
+            None => req.header("Cookie", format!("ufop_refresh={rt}")),
+        };
+        let r = req.send().await.map_err(|e| e.to_string())?;
         if !r.status().is_success() {
             return Err("Session expired: run `ufop server login` again".into());
         }
+        self.cfg.server_csrf = csrf_from(r.headers());
         self.cfg.server_refresh = refresh_from(r.headers());
         let v: Value = r.json().await.map_err(|e| e.to_string())?;
         self.cfg.server_token = v["access_token"].as_str().map(String::from);
@@ -282,6 +298,7 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
                     }
                     cfg.server_token = Some(t);
                     cfg.server_refresh = None;
+                    cfg.server_csrf = None;
                 } else {
                     let pw = password.ok_or("Give --password (or UFOP_SERVER_PASSWORD) or --token")?;
                     let r = http.post(format!("{url}/api/v1/auth/login")).json(&json!({"password": pw})).send().await.map_err(|e| format!("Server unreachable: {e}"))?;
@@ -289,6 +306,7 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
                         return Err(if r.status() == 429 { "Too many sign-in attempts; wait and retry".into() } else { "Wrong password".into() });
                     }
                     cfg.server_refresh = refresh_from(r.headers());
+                    cfg.server_csrf = csrf_from(r.headers());
                     let v: Value = r.json().await.map_err(|e| e.to_string())?;
                     cfg.server_token = v["access_token"].as_str().map(String::from);
                 }
@@ -301,6 +319,7 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
                 let mut cfg = CliConfig::load();
                 cfg.server_token = None;
                 cfg.server_refresh = None;
+                cfg.server_csrf = None;
                 cfg.save().map_err(|e| e.to_string())?;
                 output::print_success(format, "Signed out");
                 Ok(0)
