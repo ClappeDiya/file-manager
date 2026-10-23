@@ -121,6 +121,10 @@ Ground rules
 - [ ] Pre-existing: `scripts/check-windows-build.sh` fails on clippy 1.97 lints in ufop-core (`unnecessary_sort_by` in sync/executor.rs, `manual_checked_ops`); `ufop-server` itself type-checks for x86_64-pc-windows-gnu
 - [ ] Pre-existing flake: `server::tests::file_gateway_relays_through_an_ha_pool_without_storing` can fail with a broken pipe under load (the 11 MB upload is refused before it is fully sent)
 
+- [ ] Portable mode on macOS: WKWebView keeps its (small) browser storage in the user profile; move it with `data_store_identifier`/a custom data store when Tauri exposes it (WP10 documented the limitation)
+- [ ] Build and smoke-test the multi-arch ufop-server image on a machine with a Docker daemon (`scripts/docker-build.sh --platforms linux/amd64,linux/arm64`); WP10 could only test the dry-run plan and review the Dockerfile
+- [ ] Pre-existing: admin `alerts.test.ts` needs a local SMTP server on 127.0.0.1:2525 (3 tests fail without it)
+
 ## Final verification
 - [ ] ufop-core tests (all features) pass
 - [ ] src-tauri `cargo test --lib` passes
