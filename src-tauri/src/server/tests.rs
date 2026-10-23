@@ -814,6 +814,66 @@ async fn file_gateway_relays_through_an_ha_pool_without_storing() {
     assert_eq!(s.client.get(gw("/files?path=/")).bearer_auth(&read_tok).send().await.unwrap().status(), 404, "the empty gateway is gone");
 }
 
+/// An upload the gateway refuses (no such gateway, read-only, too large) is
+/// answered only once its body has been received (up to a limit), so a
+/// client still sending it reads the refusal instead of a broken pipe.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_gateway_uploads_are_answered_after_the_body_arrives() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use futures_util::StreamExt;
+    use ufop_core::gateway::{run, AgentConfig};
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    let write_tok = s.post("/api/v1/auth/api-tokens", &tok, json!({"name": "gw", "scope": "write", "expires_in_days": 1})).await.json::<Value>().await.unwrap()["token"].as_str().unwrap().to_string();
+    // A slow client: 8 MiB in 64 KiB chunks with a pause between them, with
+    // a Content-Length, as a browser or curl sends a file.
+    let slow_put = |url: String| {
+        let (c, t) = (s.client.clone(), write_tok.clone());
+        async move {
+            const LEN: usize = 8 << 20;
+            let chunks = futures_util::stream::iter((0..LEN / 65536).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![7u8; 65536])))).then(|c| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                c
+            });
+            c.put(url).bearer_auth(t).header(reqwest::header::CONTENT_LENGTH, LEN).body(reqwest::Body::wrap_stream(chunks)).send().await.map(|r| r.status().as_u16()).map_err(|e| format!("{e:?}"))
+        }
+    };
+    let gw = |name: &str, path: &str| format!("{}/api/v1/gateways/{name}/upload?path={path}", s.base);
+    assert_eq!(slow_put(gw("nobody", "/docs/a.bin")).await, Ok(404), "no such gateway");
+
+    let files = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(files.path().join("docs")).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let cfg = AgentConfig { server: s.base.clone(), token: write_tok.clone(), gateway: "office".into(), roots: vec![files.path().join("docs")], writable: true, max_upload: Some(1 << 20), concurrency: 2 };
+    let h = tokio::spawn(run(cfg, stop.clone()));
+    for _ in 0..100 {
+        if s.get("/api/v1/gateways", &write_tok).await.json::<Value>().await.unwrap()["gateways"][0]["online_nodes"] == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    for _ in 0..3 {
+        assert_eq!(slow_put(gw("office", "/docs/big.bin")).await, Ok(403), "larger than the agent accepts");
+    }
+    // A fast client, several at once: the refusal arrives while the server's
+    // receive buffer is still full.
+    let fast: Vec<_> = (0..12)
+        .map(|_| {
+            let (c, t, url) = (s.client.clone(), write_tok.clone(), gw("office", "/docs/big.bin"));
+            tokio::spawn(async move { c.put(url).bearer_auth(t).body(vec![0u8; 11 << 20]).send().await.map(|r| r.status().as_u16()).map_err(|e| format!("{e:?}")) })
+        })
+        .collect();
+    for f in fast {
+        assert_eq!(f.await.unwrap(), Ok(403));
+    }
+    for _ in 0..12 {
+        assert_eq!(s.client.put(gw("nobody", "/x")).bearer_auth(&write_tok).body(vec![0u8; 11 << 20]).send().await.map(|r| r.status().as_u16()).map_err(|e| format!("{e:?}")), Ok(404));
+    }
+    assert!(!files.path().join("docs/big.bin").exists());
+    stop.store(true, Ordering::SeqCst);
+    h.await.unwrap().unwrap();
+}
+
 /// The generated clients, run for real against a server: Python (standard
 /// library) and TypeScript (Node's type stripping), when installed.
 #[tokio::test]
