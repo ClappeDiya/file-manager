@@ -2,7 +2,7 @@
  * Non-component helpers for the Backup panel: filter-rule text format,
  * downloads and display formatting. (Folder picking: `@/lib/folder-picker`.)
  */
-import type { BackupEstimate, BackupOptions, FilterRule, RunAllReport } from "@/stores/backup-store";
+import type { BackupEstimate, BackupOptions, BackupSchedule, FilterRule, RunAllReport } from "@/stores/backup-store";
 import { formatBytes } from "@/lib/format-bytes";
 
 export const inputCls =
@@ -101,3 +101,15 @@ export function describeRunAll(r: RunAllReport): string {
   return parts.join("; ");
 }
 
+/** Whether a schedule is in cron mode (`BackupSchedule::is_cron`). */
+export function isCronSchedule(s: BackupSchedule): boolean {
+  return (s.cron ?? []).some((c) => c.trim() !== "");
+}
+
+/** Cron lines as typed in the editor → the schedule's `cron` list. */
+export function cronLines(text: string): string[] {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l !== "" && !l.startsWith("#"));
+}

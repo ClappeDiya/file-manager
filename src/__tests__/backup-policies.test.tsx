@@ -10,7 +10,8 @@ import { useUIStore } from "@/stores/ui-store";
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { cronLines, isCronSchedule, ScheduleEditor } from "@/components/backup/backup-schedule-editor";
+import { ScheduleEditor } from "@/components/backup/backup-schedule-editor";
+import { cronLines, isCronSchedule } from "@/lib/backup-helpers";
 import { hookBeforeMode, newBackupJob, type BackupSchedule } from "@/stores/backup-store";
 
 beforeEach(() => {

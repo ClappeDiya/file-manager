@@ -7,7 +7,7 @@
 import { useEffect, useState } from "react";
 import { HolidayCalendarPicker } from "@/components/schedule-pickers";
 import { isBackendAvailable, tauriInvoke } from "@/hooks/use-tauri";
-import { inputCls } from "@/lib/backup-helpers";
+import { cronLines, inputCls, isCronSchedule } from "@/lib/backup-helpers";
 import { errorText, type BackupSchedule } from "@/stores/backup-store";
 import { Check, Field } from "./backup-ui";
 import { useIsAdvanced } from "./use-is-advanced";
@@ -27,18 +27,6 @@ const INTERVALS: [number, string][] = [
 export interface ScheduleRun {
   at: string;
   skipped_by: string | null;
-}
-
-export function isCronSchedule(s: BackupSchedule): boolean {
-  return (s.cron ?? []).some((c) => c.trim() !== "");
-}
-
-/** Cron lines as typed in the editor → the schedule's `cron` list. */
-export function cronLines(text: string): string[] {
-  return text
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l !== "" && !l.startsWith("#"));
 }
 
 export function ScheduleEditor({
