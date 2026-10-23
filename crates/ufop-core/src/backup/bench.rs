@@ -337,7 +337,7 @@ fn best_of<T>(repeat: u32, mut f: impl FnMut() -> Result<T, AppError>) -> Result
         let t = Instant::now();
         let v = f()?;
         let d = t.elapsed();
-        if best.as_ref().is_none_or(|(_, b)| d < *b) {
+        if best.as_ref().map_or(true, |(_, b)| d < *b) {
             best = Some((v, d));
         }
     }
