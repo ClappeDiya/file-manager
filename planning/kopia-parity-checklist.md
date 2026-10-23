@@ -124,6 +124,9 @@ Ground rules
 - [ ] Portable mode on macOS: WKWebView keeps its (small) browser storage in the user profile; move it with `data_store_identifier`/a custom data store when Tauri exposes it (WP10 documented the limitation)
 - [ ] Build and smoke-test the multi-arch ufop-server image on a machine with a Docker daemon (`scripts/docker-build.sh --platforms linux/amd64,linux/arm64`); WP10 could only test the dry-run plan and review the Dockerfile
 - [x] Pre-existing: admin `alerts.test.ts` needed a local SMTP server on 127.0.0.1:2525 (3 tests failed without it): now starts an in-process SMTP server (`smtp-mock.ts`: STARTTLS with the localhost fixture certificate, AUTH PLAIN/LOGIN, MAIL/RCPT/DATA) on an ephemeral port; admin vitest 37 files / 186 tests pass
+- [x] Pre-existing: `scripts/check-connectors.sh` reported RcloneConnector as unregistered — it is registered (`registry.register("rclone", Arc::new(rclone::RcloneConnector::new()))`); the script now accepts module-qualified constructors
+- [x] Pre-existing: `scripts/check-env-example-drift.sh` — `ADMIN_ENCRYPTION_KEY`, `ADMIN_PUBLIC_URL`, `ADMIN_DISABLE_JOBS` added to `admin/.env.example` with comments
+- [x] Pre-existing: `scripts/check-workspace-deps.sh` — admin moved from vitest 3.2.4 to 4.1.0 like the root (installed offline from the pnpm store); admin vitest and tsc pass
 
 ## Final verification
 - [ ] ufop-core tests (all features) pass
