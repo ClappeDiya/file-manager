@@ -140,7 +140,7 @@ impl<'a> Repo<'a> {
             kdf.validate().or_else(|e| if kdf == KdfParams::insecure_fast() { Ok(()) } else { Err(e) })?;
             let external = match external {
                 None if options.encryption_module == super::EncryptionModuleKind::Gpg => {
-                    if options.gpg.recipients.is_empty() && passphrase.is_none_or(|p| p.is_empty()) {
+                    if options.gpg.recipients.is_empty() && passphrase.map_or(true, |p| p.is_empty()) {
                         return Err(AppError::validation("GPG encryption needs a passphrase or at least one recipient key"));
                     }
                     Some(VolumeCipher::external(gpg_from_options()))
@@ -1914,7 +1914,7 @@ fn read_control_files(paths: &[String], report: &mut BackupReport) -> Result<Vec
 fn interval_due(db: &BackupDb, key: &str, days: Option<u32>) -> Result<bool, AppError> {
     let Some(days) = days else { return Ok(true) };
     let last = db.get_kv(key)?.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|t| t.with_timezone(&Utc));
-    Ok(last.is_none_or(|l| Utc::now() - l >= chrono::Duration::days(days as i64)))
+    Ok(last.map_or(true, |l| Utc::now() - l >= chrono::Duration::days(days as i64)))
 }
 
 /// Warn when the destination is running out of space.

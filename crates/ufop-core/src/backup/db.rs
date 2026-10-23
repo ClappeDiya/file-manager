@@ -82,7 +82,7 @@ pub fn obfuscate_path(path: &str, salt: &[u8]) -> String {
         if part.is_empty() {
             return;
         }
-        let ext = part.rsplit_once('.').map(|(stem, e)| (stem, e)).filter(|(stem, e)| !stem.is_empty() && e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric())).map(|(_, e)| e.to_string());
+        let ext = part.rsplit_once('.').filter(|(stem, e)| !stem.is_empty() && e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric())).map(|(_, e)| e.to_string());
         let mut h = Sha256::new();
         h.update(salt);
         h.update(part.as_bytes());

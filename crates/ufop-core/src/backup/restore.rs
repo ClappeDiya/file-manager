@@ -443,7 +443,9 @@ pub(crate) fn run_restore_with(repo: &Repo, opts: &RestoreOptions, ctx: &OpConte
     }
 
     // Download needed volumes in parallel and spill their blocks.
-    let mut work: Vec<(&str, Vec<&str>, Option<String>, Vec<String>)> = Vec::new();
+    // (volume, block hashes, expected volume hash, recovery records)
+    type Work<'a> = (&'a str, Vec<&'a str>, Option<String>, Vec<String>);
+    let mut work: Vec<Work> = Vec::new();
     for (vol, hashes) in by_volume {
         let (hash, rec) = repo.volume_check_info(vol)?;
         work.push((vol, hashes, hash, rec));
@@ -1274,6 +1276,7 @@ mod tests {
         let be = LocalBackend::new(dst.path());
         let db = BackupDb::open_in_memory().unwrap();
         backup(src.path(), &be, &db);
+        #[cfg(unix)]
         let entries = db.files(db.fileset_by_version(0).unwrap().id).unwrap();
         #[cfg(unix)]
         assert!(entries.iter().all(|e| e.meta.as_ref().is_some_and(|m| m.uid.is_some() && m.gid.is_some())), "owners are recorded at backup time");
@@ -1285,9 +1288,10 @@ mod tests {
         };
         let out = tempfile::tempdir().unwrap();
         let o = RestoreOptions { target: Some(out.path().into()), ..Default::default() };
-        let r = run_restore_with(&repo, &o, &OpContext::new(), OwnerRestore::new(OwnerPolicy::Auto, true, &chown).unwrap()).unwrap();
+        let _r = run_restore_with(&repo, &o, &OpContext::new(), OwnerRestore::new(OwnerPolicy::Auto, true, &chown).unwrap()).unwrap();
         #[cfg(unix)]
         {
+            let r = &_r;
             assert_eq!(r.owners_restored, 2, "the file and its folder");
             assert!(calls.lock().unwrap().iter().any(|c| c.0.as_deref() == Some("a.txt")));
         }

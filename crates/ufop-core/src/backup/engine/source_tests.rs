@@ -5,6 +5,7 @@ use super::*;
 use crate::backup::backend::LocalBackend;
 use crate::backup::crypto::KdfParams;
 use crate::backup::db::BackupDb;
+#[cfg(unix)]
 use crate::backup::errors::{ErrorAction, ErrorPolicy, UnknownEntryAction};
 use crate::backup::retention::RetentionPolicy;
 use crate::backup::test_util::write;

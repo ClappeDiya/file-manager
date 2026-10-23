@@ -80,9 +80,8 @@ pub fn mirror(src: &dyn Backend, dst: &dyn Backend, prefix: &str, opts: &MirrorO
     let mut r = MirrorReport { dry_run: opts.dry_run, ..Default::default() };
     let mut todo: Vec<(String, u64)> = Vec::new();
     for f in &source {
-        if f.name == header && target.contains_key(&header) {
-            r.skipped_same += 1;
-        } else if f.name != header && target.get(&f.name) == Some(&f.size) {
+        let same = if f.name == header { target.contains_key(&header) } else { target.get(&f.name) == Some(&f.size) };
+        if same {
             r.skipped_same += 1;
         } else if f.name != header {
             todo.push((f.name.clone(), f.size));

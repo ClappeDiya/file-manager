@@ -366,11 +366,11 @@ impl CliHost {
             .filter(|j| match &j.schedule {
                 Some(s) => {
                     let last = j.last_scheduled_at.as_deref().or(j.created_at.as_deref()).or(j.last_run_at.as_deref()).and_then(parse_ts);
-                    s.enabled && last.is_none_or(|l| s.is_due(l, now))
+                    s.enabled && last.map_or(true, |l| s.is_due(l, now))
                 }
                 None => j.schedule_interval_minutes.is_some_and(|m| {
                     let last = j.last_run_at.as_deref().and_then(parse_ts);
-                    last.is_none_or(|l| l + chrono::Duration::minutes(m as i64) <= now)
+                    last.map_or(true, |l| l + chrono::Duration::minutes(m as i64) <= now)
                 }),
             })
             .map(|j| j.id.clone())
@@ -385,7 +385,7 @@ impl CliHost {
             for task in MAINTENANCE_TASKS {
                 let Some(s) = j.maintenance.schedule_of(task).filter(|s| s.enabled) else { continue };
                 let last = j.last_maintenance.get(task).map(String::as_str).or(j.created_at.as_deref()).and_then(parse_ts);
-                if last.is_none_or(|l| s.is_due(l, now)) {
+                if last.map_or(true, |l| s.is_due(l, now)) {
                     out.push((j.id.clone(), task));
                 }
             }

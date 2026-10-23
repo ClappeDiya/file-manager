@@ -605,7 +605,7 @@ fn finish_directories(pair: &SyncPair, opts: &CopyOptions) {
     let mut dirs: Vec<_> = entries.into_iter().filter(|e| e.is_dir).collect();
     // Deepest first, so a parent's time is set after its children change it
     // and child directories are removed before their parents.
-    dirs.sort_by(|a, b| b.relative_path.len().cmp(&a.relative_path.len()));
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.relative_path.len()));
     for dir in dirs {
         if opts.copy_dir_timestamps {
             if let Ok(modified) = fs::metadata(&dir.absolute_path).and_then(|m| m.modified()) {

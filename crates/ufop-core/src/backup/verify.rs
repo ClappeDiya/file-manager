@@ -71,7 +71,7 @@ impl Default for VerifyMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VerifyOptions {
     pub scope: VerifyScope,
@@ -87,11 +87,6 @@ pub struct VerifyOptions {
     pub use_cache: bool,
 }
 
-impl Default for VerifyOptions {
-    fn default() -> Self {
-        Self { scope: VerifyScope::default(), mode: VerifyMode::default(), files_percent: None, parallelism: 0, max_errors: 0, use_cache: false }
-    }
-}
 
 impl VerifyOptions {
     /// The older `verify(samples, full)` call: `full` checks every block,

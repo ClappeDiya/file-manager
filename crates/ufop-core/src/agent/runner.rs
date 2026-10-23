@@ -302,7 +302,8 @@ impl<H: AgentHost> Agent<H> {
         Ok(())
     }
 
-    async fn finish_enrollment(&self, url: &str, machine_id: String, token: String, organization: String, heartbeat: u64, tags: Vec<String>, via: &str) -> Result<AgentStatus, AppError> {
+    async fn finish_enrollment(&self, url: &str, reg: Registration, tags: Vec<String>, via: &str) -> Result<AgentStatus, AppError> {
+        let Registration { machine_id, agent_token: token, organization, heartbeat_seconds: heartbeat } = reg;
         self.host.save_token(Some(token.clone())).await?;
         *lock(&self.token) = Some(token);
         self.update(|c| {
@@ -337,7 +338,7 @@ impl<H: AgentHost> Agent<H> {
         let client = self.client(console_url)?;
         let r = client.register(token, &self.host.client_info(), &tags).await?;
         *lock(&self.claim) = None;
-        self.finish_enrollment(client.base_url(), r.machine_id, r.agent_token, r.organization, r.heartbeat_seconds, tags, "link").await
+        self.finish_enrollment(client.base_url(), r, tags, "link").await
     }
 
     /// The console URL a browser sign-in starts at (`/fleet/connect`), for the
@@ -363,7 +364,7 @@ impl<H: AgentHost> Agent<H> {
         let client = self.client(console_url)?;
         let r = client.connect_token(code, code_verifier, redirect_uri, &self.host.client_info(), &tags).await?;
         *lock(&self.claim) = None;
-        self.finish_enrollment(client.base_url(), r.machine_id, r.agent_token, r.organization, r.heartbeat_seconds, tags, "sso").await
+        self.finish_enrollment(client.base_url(), r, tags, "sso").await
     }
 
     /// Start interactive claiming: show the returned code to the user.
@@ -386,7 +387,7 @@ impl<H: AgentHost> Agent<H> {
         match (r.status.as_str(), r.agent_token, r.machine_id) {
             ("collected", Some(token), Some(mid)) => {
                 *lock(&self.claim) = None;
-                let status = self.finish_enrollment(&url, mid, token, String::new(), 60, Vec::new(), "claim").await?;
+                let status = self.finish_enrollment(&url, Registration { machine_id: mid, agent_token: token, organization: String::new(), heartbeat_seconds: 60 }, Vec::new(), "claim").await?;
                 Ok(ClaimPollResult { state: "registered".into(), status })
             }
             ("pending", _, _) => Ok(ClaimPollResult { state: "pending".into(), status: self.status() }),

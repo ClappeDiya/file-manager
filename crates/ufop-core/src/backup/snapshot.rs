@@ -366,7 +366,7 @@ mod lvm {
     pub(super) fn mount_of(src: &Path, cmd: &dyn Cmd) -> Result<std::collections::HashMap<String, String>, AppError> {
         let src_s = src.to_string_lossy();
         let info = pairs(&cmd.run("findmnt", &["-n", "-P", "-o", "TARGET,SOURCE,FSTYPE", "-T", &src_s])?);
-        if info.get("TARGET").is_none() || info.get("SOURCE").is_none() {
+        if !info.contains_key("TARGET") || !info.contains_key("SOURCE") {
             return Err(AppError::file_op(format!("Cannot find the mount of {src_s}"), "Check that the source exists."));
         }
         Ok(info)

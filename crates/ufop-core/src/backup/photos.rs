@@ -381,7 +381,10 @@ fn read_database(conn: &Connection) -> Result<DbContent, AppError> {
 
 /// The album ↔ asset join table: `Z_<n>ASSETS` with a `Z_<n>ALBUMS` and a
 /// `Z_<m>ASSETS` column (the numbers change between macOS versions).
-fn find_album_join(conn: &Connection) -> Result<Option<(String, String, String, Option<String>)>, AppError> {
+/// The join table, its album and asset columns, and the optional order column.
+type AlbumJoin = (String, String, String, Option<String>);
+
+fn find_album_join(conn: &Connection) -> Result<Option<AlbumJoin>, AppError> {
     let mut st = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'Z\\_%ASSETS' ESCAPE '\\' ORDER BY name")?;
     let names = st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
     let numbered = |c: &str, suffix: &str| -> bool {
