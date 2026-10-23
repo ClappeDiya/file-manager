@@ -53,6 +53,9 @@ pub async fn import_config(mgr: &BackupManager, json: &str, export_passphrase: O
         // Templates the job is based on: reuse a local one of the same id or
         // name, otherwise create it; ids the job cannot resolve are dropped.
         let known = mgr.list_templates().await?;
+        // Notification profiles hold secrets and are not exported: keep the ones that exist here.
+        let profiles: Vec<String> = mgr.list_notification_profiles().await?.into_iter().map(|p| p.id).collect();
+        job.notification_profile_ids.retain(|id| profiles.contains(id));
         let mut ids = Vec::new();
         for id in &job.template_ids {
             if known.iter().any(|k| &k.id == id && !k.enforced) {
@@ -61,7 +64,13 @@ pub async fn import_config(mgr: &BackupManager, json: &str, export_passphrase: O
                 let local = known.iter().find(|k| !k.managed && k.name.eq_ignore_ascii_case(t.name.trim()));
                 let saved = match local {
                     Some(l) => l.clone(),
-                    None => mgr.save_template(super::templates::PolicyTemplate { id: String::new(), ..t.clone() }).await?,
+                    None => {
+                        let mut t = super::templates::PolicyTemplate { id: String::new(), ..t.clone() };
+                        if let Some(p) = t.settings.notification_profile_ids.as_mut() {
+                            p.retain(|id| profiles.contains(id));
+                        }
+                        mgr.save_template(t).await?
+                    }
                 };
                 ids.push(saved.id);
             }
@@ -298,6 +307,13 @@ async fn dispatch_inner(mgr: &BackupManager, command: &str, a: &Value) -> Result
         "backup_import_templates" => ok(mgr.import_templates(&arg::<String>(a, "json")?).await?),
         "backup_effective_settings" => ok(mgr.effective_settings(opt::<String>(a, "id")?.as_deref(), opt(a, "job")?).await?),
         "backup_schedule_preview" => ok(arg::<super::schedule::BackupSchedule>(a, "schedule")?.preview(chrono::Utc::now(), opt(a, "count")?.unwrap_or(5))?),
+        "backup_list_notification_profiles" => ok(mgr.list_notification_profiles().await?),
+        "backup_get_notification_profile" => ok(mgr.get_notification_profile(&arg::<String>(a, "id")?).await?),
+        "backup_save_notification_profile" => ok(mgr.save_notification_profile(arg(a, "profile")?).await?),
+        "backup_delete_notification_profile" => ok(mgr.delete_notification_profile(&arg::<String>(a, "id")?, opt(a, "force")?.unwrap_or(false)).await?),
+        "backup_test_notification_profile" => ok(mgr.test_notification_profile(&arg::<String>(a, "id")?).await?),
+        "backup_preview_notification" => ok(mgr.preview_notification(&arg(a, "notification")?, opt::<String>(a, "result")?.as_deref().unwrap_or("success"))),
+        "backup_webhook_preset" => ok(super::notify::webhook::preset(arg(a, "preset")?, &opt(a, "params")?.unwrap_or_default())?),
         other => Err(AppError::validation(format!("Unknown command '{other}'"))),
     }
 }
@@ -318,4 +334,6 @@ pub const COMMANDS: &[&str] = &[
     "backup_get_cache_settings", "backup_set_cache_settings", "backup_schedule_preview", "backup_list_templates", "backup_get_template",
     "backup_save_template", "backup_delete_template", "backup_apply_template", "backup_export_templates", "backup_import_templates",
     "backup_effective_settings", "backup_open_point_in_time", "backup_hardening_report",
+    "backup_list_notification_profiles", "backup_get_notification_profile", "backup_save_notification_profile",
+    "backup_delete_notification_profile", "backup_test_notification_profile", "backup_preview_notification", "backup_webhook_preset",
 ];

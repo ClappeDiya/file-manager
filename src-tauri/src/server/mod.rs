@@ -1013,6 +1013,66 @@ async fn pause(State(st): State<ServerState>, body: Option<Json<PauseBody>>) -> 
     ok(st.mgr.status().await)
 }
 
+// ── Notification profiles, previews and webhook presets ──
+
+type Profile = crate::backup_engine::notify::profiles::NotificationProfile;
+
+async fn list_notification_profiles(State(st): State<ServerState>) -> ApiResult {
+    ok(st.mgr.list_notification_profiles().await?)
+}
+
+async fn create_notification_profile(State(st): State<ServerState>, Json(mut p): Json<Profile>) -> ApiResult {
+    p.id.clear();
+    ok(st.mgr.save_notification_profile(p).await?)
+}
+
+async fn get_notification_profile(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.get_notification_profile(&id).await?)
+}
+
+async fn update_notification_profile(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(mut p): Json<Profile>) -> ApiResult {
+    st.mgr.get_notification_profile(&id).await?;
+    p.id = id;
+    ok(st.mgr.save_notification_profile(p).await?)
+}
+
+#[derive(Deserialize, Default)]
+struct ForceQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn delete_notification_profile(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<ForceQuery>) -> ApiResult {
+    ok(st.mgr.delete_notification_profile(&id, q.force).await?)
+}
+
+async fn test_notification_profile(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    st.mgr.test_notification_profile(&id).await?;
+    ok(json!({"ok": true}))
+}
+
+#[derive(Deserialize)]
+struct PreviewBody {
+    notification: crate::backup_engine::notify::Notification,
+    #[serde(default)]
+    result: Option<String>,
+}
+
+async fn preview_notification(State(st): State<ServerState>, Json(b): Json<PreviewBody>) -> ApiResult {
+    ok(st.mgr.preview_notification(&b.notification, b.result.as_deref().unwrap_or("success")))
+}
+
+#[derive(Deserialize)]
+struct PresetBody {
+    preset: crate::backup_engine::notify::webhook::WebhookPreset,
+    #[serde(default)]
+    params: crate::backup_engine::notify::webhook::PresetParams,
+}
+
+async fn webhook_preset(Json(b): Json<PresetBody>) -> ApiResult {
+    ok(crate::backup_engine::notify::webhook::preset(b.preset, &b.params)?)
+}
+
 // ── Policy templates, effective settings, schedule preview ──
 
 async fn list_templates(State(st): State<ServerState>) -> ApiResult {
@@ -1229,6 +1289,11 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/filesystem", get(filesystem))
         .route("/api/v1/scheduler/pause", post(pause))
         .route("/api/v1/scheduler/resume", post(resume))
+        .route("/api/v1/notification-profiles", get(list_notification_profiles).post(create_notification_profile))
+        .route("/api/v1/notification-profiles/{id}", get(get_notification_profile).put(update_notification_profile).delete(delete_notification_profile))
+        .route("/api/v1/notification-profiles/{id}/test", post(test_notification_profile))
+        .route("/api/v1/notifications/preview", post(preview_notification))
+        .route("/api/v1/notifications/webhook-preset", post(webhook_preset))
         .route("/api/v1/backup-templates", get(list_templates).post(create_template))
         .route("/api/v1/backup-templates/export", get(export_templates))
         .route("/api/v1/backup-templates/import", post(import_templates))

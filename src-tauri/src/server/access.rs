@@ -262,6 +262,8 @@ pub fn route_need(method: &Method, route: &str) -> Need {
         ("/api/v1/auth/me", true) => Any,
         ("/api/v1/modules" | "/api/v1/settings" | "/api/v1/metrics" | "/api/v1/backup-cache" | "/api/v1/backup-cache/settings", true) => User,
         ("/api/v1/backup-templates" | "/api/v1/backup-templates/{id}" | "/api/v1/backup-templates/export", true) => User,
+        ("/api/v1/notification-profiles" | "/api/v1/notification-profiles/{id}", true) => User,
+        ("/api/v1/notifications/preview" | "/api/v1/notifications/webhook-preset", false) => Any,
         // Applying needs write on the job too (checked by the handler).
         ("/api/v1/backup-templates/{id}/apply", false) => User,
         ("/api/v1/auth/api-tokens" | "/api/v1/auth/api-tokens/{id}" | "/api/v1/auth/signin-token" | "/api/v1/auth/automation-token" | "/api/v1/auth/password", _) => User,
@@ -369,8 +371,8 @@ pub fn rpc_need(cmd: &str, args: &serde_json::Value) -> RpcNeed {
             None => RpcNeed::Global(Global::Admin),
         },
         "backup_delete_job" | "backup_break_lock" | "backup_export_config" => job(P::Full),
-        "backup_passphrase_strength" | "backup_generate_passphrase" | "backup_capabilities" | "backup_cloud_providers" | "backup_export_is_encrypted" | "backup_schedule_preview" => RpcNeed::Global(Global::Any),
-        "backup_list_templates" | "backup_get_template" | "backup_cache_stats" | "backup_get_cache_settings" | "backup_get_global_defaults" | "backup_effective_settings" => RpcNeed::Global(Global::User),
+        "backup_passphrase_strength" | "backup_generate_passphrase" | "backup_capabilities" | "backup_cloud_providers" | "backup_export_is_encrypted" | "backup_schedule_preview" | "backup_webhook_preset" | "backup_preview_notification" => RpcNeed::Global(Global::Any),
+        "backup_list_templates" | "backup_get_template" | "backup_list_notification_profiles" | "backup_get_notification_profile" | "backup_cache_stats" | "backup_get_cache_settings" | "backup_get_global_defaults" | "backup_effective_settings" => RpcNeed::Global(Global::User),
         "server_list_directory" | "list_connections" | "backup_test_destination" | "backup_test_destination_compat" | "backup_preview_sources" | "backup_photos_libraries" | "backup_list_destinations" => RpcNeed::Global(Global::Operator),
         _ => RpcNeed::Global(Global::Admin),
     }

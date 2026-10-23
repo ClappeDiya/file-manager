@@ -39,6 +39,9 @@ pub fn stripped_config(job: &BackupJob) -> Result<serde_json::Value, AppError> {
     let mut j = job.clone();
     j.stats = JobStats::default();
     j.reports.http_urls.clear();
+    j.reports.headers.clear();
+    // Webhook URLs and header values often embed tokens too.
+    j.notifications.retain(|n| !matches!(n.channel, super::notify::Channel::Webhook { .. }));
     Ok(serde_json::to_value(j)?)
 }
 

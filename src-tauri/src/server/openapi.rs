@@ -28,6 +28,7 @@ pub(crate) struct Op {
 
 const ID: Param = ("id", "path", "string", true, "Job id");
 const USERNAME: Param = ("username", "path", "string", true, "Account name");
+const PROFILE_ID: Param = ("id", "path", "string", true, "Notification profile id (organization profiles start with org:)");
 const TEMPLATE_ID: Param = ("id", "path", "string", true, "Policy template id (organization templates start with org:)");
 const VERSION_Q: Param = ("version", "query", "integer", false, "Version index (0 = newest)");
 const VERSION_SEL_Q: Param = ("version", "query", "string", false, "Version: number (0 = newest), latest, oldest or a version id (timestamp or file-list name)");
@@ -44,8 +45,23 @@ fn cache_settings() -> Value {
 fn template() -> Value {
     json!({ "type": "object", "required": ["name"], "properties": {
         "id": { "type": "string" }, "name": { "type": "string" }, "description": { "type": "string" },
-        "settings": { "type": "object", "description": "Partial job settings: options (backup option name → value), filter, retention, schedule, maintenance, scripts, notifications, notify_on, throttle, retry, prevent_sleep. Absent = not set.", "additionalProperties": true },
+        "settings": { "type": "object", "description": "Partial job settings: options (backup option name → value), filter, retention, schedule, maintenance, scripts, notifications, notification_profile_ids, notify_on, throttle, retry, prevent_sleep. Absent = not set.", "additionalProperties": true },
         "updated_at": { "type": "string" }, "managed": { "type": "boolean", "description": "Delivered by the management console (read-only)" }, "enforced": { "type": "boolean", "description": "Managed only: wins over every job's own settings" } } })
+}
+fn notification() -> Value {
+    json!({ "type": "object", "required": ["type"], "description": "A notification channel (flattened `type`: email, telegram, xmpp, slack, teams, webhook) with send_on, credential_id, template and cert. Webhooks: url, method (GET/POST/PUT/PATCH), content_type, headers [{name, value, secret, credential_id}], body_template ({{var}} escaped for the body format, {{json var}}, {{raw var}}), preset (generic, pushover, ntfy, discord, pagerduty, gotify). Email: html, html_template.", "additionalProperties": true })
+}
+fn profile() -> Value {
+    json!({ "type": "object", "required": ["name", "notification"], "properties": {
+        "id": { "type": "string" }, "name": { "type": "string" }, "description": { "type": "string" },
+        "notification": notification(),
+        "min_severity": { "type": ["string", "null"], "enum": ["success", "warning", "error", null], "description": "Send results at least this severe (replaces send_on)" },
+        "secret": { "type": ["string", "null"], "writeOnly": true, "description": "Channel secret to store (password, token or webhook URL); never returned" },
+        "managed": { "type": "boolean", "readOnly": true }, "created_at": { "type": "string" }, "updated_at": { "type": "string" }
+    } })
+}
+fn profiles() -> Value {
+    json!({ "type": "array", "items": profile() })
 }
 fn templates() -> Value {
     json!({ "type": "array", "items": template() })
@@ -148,6 +164,14 @@ pub(crate) const OPS: &[Op] = &[
     op!("post" "/api/v1/scheduler/pause", "tasks", "Pause the scheduler (optionally for N minutes)", auth: true, params: &[], body: Some(|| json!({ "type": "object", "properties": { "minutes": { "type": ["integer", "null"], "minimum": 1 } } })), response: status),
     op!("post" "/api/v1/scheduler/resume", "tasks", "Resume the scheduler", auth: true, params: &[], body: None, response: status),
     op!("post" "/api/v1/backup-schedule/preview", "jobs", "Validate a schedule (interval or cron) and list its next runs, marking holiday skips", auth: true, params: &[], body: Some(|| json!({ "type": "object", "required": ["schedule"], "properties": { "schedule": schedule(), "count": { "type": "integer", "minimum": 1, "maximum": 100, "default": 5 } } })), response: || json!({ "type": "array", "items": { "type": "object", "properties": { "at": { "type": "string" }, "skipped_by": { "type": ["string", "null"] } } } })),
+    op!("get" "/api/v1/notification-profiles", "jobs", "Notification profiles (local, then the organization's)", auth: true, params: &[], body: None, response: profiles),
+    op!("post" "/api/v1/notification-profiles", "jobs", "Create a notification profile (secret values are moved to the credential store)", auth: true, params: &[], body: Some(profile), response: profile),
+    op!("get" "/api/v1/notification-profiles/{id}", "jobs", "One notification profile", auth: true, params: &[PROFILE_ID], body: None, response: profile),
+    op!("put" "/api/v1/notification-profiles/{id}", "jobs", "Update a local notification profile", auth: true, params: &[PROFILE_ID], body: Some(profile), response: profile),
+    op!("delete" "/api/v1/notification-profiles/{id}", "jobs", "Delete a local notification profile; one jobs or templates use needs force=true, which removes those references", auth: true, params: &[PROFILE_ID, ("force", "query", "boolean", false, "Also remove references from jobs and templates")], body: None, response: || json!({ "type": "object", "properties": { "removed_from": { "type": "array", "items": { "type": "string" } }, "warnings": { "type": "array", "items": { "type": "string" } } } })),
+    op!("post" "/api/v1/notification-profiles/{id}/test", "jobs", "Send a test message through the profile", auth: true, params: &[PROFILE_ID], body: None, response: ok_flag),
+    op!("post" "/api/v1/notifications/preview", "jobs", "What a channel would send for a sample run: subject, text, HTML (email) and the webhook request with secrets masked", auth: true, params: &[], body: Some(|| json!({ "type": "object", "required": ["notification"], "properties": { "notification": notification(), "result": { "type": "string", "enum": ["success", "warning", "error"], "default": "success" } } })), response: || json!({ "type": "object", "properties": { "subject": { "type": "string" }, "text": { "type": "string" }, "html": { "type": ["string", "null"] }, "request": { "type": ["string", "null"] } } })),
+    op!("post" "/api/v1/notifications/webhook-preset", "jobs", "A webhook channel set up for Pushover, ntfy, Discord, PagerDuty Events v2, Gotify or a generic endpoint (store its secret under the returned credential_id)", auth: true, params: &[], body: Some(|| json!({ "type": "object", "required": ["preset"], "properties": { "preset": { "type": "string", "enum": ["generic", "pushover", "ntfy", "discord", "pagerduty", "gotify"] }, "params": { "type": "object", "properties": { "server": { "type": "string" }, "topic": { "type": "string" }, "user": { "type": "string" }, "bearer": { "type": "boolean" } } } } })), response: notification),
     op!("get" "/api/v1/backup-templates", "jobs", "Policy templates (local, then the organization's)", auth: true, params: &[], body: None, response: templates),
     op!("post" "/api/v1/backup-templates", "jobs", "Create a policy template", auth: true, params: &[], body: Some(template), response: template),
     op!("get" "/api/v1/backup-templates/export", "jobs", "Templates as a JSON file", auth: true, params: &[("ids", "query", "string", false, "Comma-separated template ids (default: all)")], body: None, response: any),

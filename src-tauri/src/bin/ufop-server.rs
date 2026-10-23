@@ -534,6 +534,7 @@ async fn run(argv: Vec<String>) {
             let users = users.clone();
             Box::pin(async move {
                 let mut problems = m.set_managed_templates(settings.as_ref().and_then(|s| s.backup_templates.as_deref()));
+                problems.extend(m.set_managed_notification_profiles(settings.as_ref().and_then(|s| s.notification_profiles.as_deref())));
                 match users.apply_managed(settings.as_ref().and_then(|s| s.server_access.as_ref())).await {
                     Ok(p) => problems.extend(p),
                     Err(e) => problems.push(format!("server accounts: {}", e.user_message())),

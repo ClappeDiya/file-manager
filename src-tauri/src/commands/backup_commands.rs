@@ -713,3 +713,45 @@ pub async fn backup_import_templates(json: String, mgr: State<'_, BackupManager>
 pub async fn backup_effective_settings(id: Option<String>, job: Option<BackupJob>, mgr: State<'_, BackupManager>) -> Result<EffectiveSettings, AppError> {
     mgr.effective_settings(id.as_deref(), job).await
 }
+
+use crate::backup_engine::notify::profiles::{NotificationProfile, ProfileDeleteOutcome};
+
+/// Local and organization notification profiles.
+#[tauri::command]
+pub async fn backup_list_notification_profiles(mgr: State<'_, BackupManager>) -> Result<Vec<NotificationProfile>, AppError> {
+    mgr.list_notification_profiles().await
+}
+
+#[tauri::command]
+pub async fn backup_get_notification_profile(id: String, mgr: State<'_, BackupManager>) -> Result<NotificationProfile, AppError> {
+    mgr.get_notification_profile(&id).await
+}
+
+/// Create (empty id) or update a local profile; `secret` in the profile is stored, never kept.
+#[tauri::command]
+pub async fn backup_save_notification_profile(profile: NotificationProfile, mgr: State<'_, BackupManager>) -> Result<NotificationProfile, AppError> {
+    mgr.save_notification_profile(profile).await
+}
+
+/// Delete a profile; referenced ones need `force` (references are removed).
+#[tauri::command]
+pub async fn backup_delete_notification_profile(id: String, force: Option<bool>, mgr: State<'_, BackupManager>) -> Result<ProfileDeleteOutcome, AppError> {
+    mgr.delete_notification_profile(&id, force.unwrap_or(false)).await
+}
+
+#[tauri::command]
+pub async fn backup_test_notification_profile(id: String, mgr: State<'_, BackupManager>) -> Result<(), AppError> {
+    mgr.test_notification_profile(&id).await
+}
+
+/// What a channel would send for a sample run (subject, text, HTML, webhook request).
+#[tauri::command]
+pub async fn backup_preview_notification(notification: crate::backup_engine::notify::Notification, result: Option<String>, mgr: State<'_, BackupManager>) -> Result<crate::backup_engine::notify::Preview, AppError> {
+    Ok(mgr.preview_notification(&notification, result.as_deref().unwrap_or("success")))
+}
+
+/// A webhook channel set up for Pushover, ntfy, Discord, PagerDuty, Gotify or a generic endpoint.
+#[tauri::command]
+pub async fn backup_webhook_preset(preset: crate::backup_engine::notify::webhook::WebhookPreset, params: Option<crate::backup_engine::notify::webhook::PresetParams>) -> Result<crate::backup_engine::notify::Notification, AppError> {
+    crate::backup_engine::notify::webhook::preset(preset, &params.unwrap_or_default())
+}

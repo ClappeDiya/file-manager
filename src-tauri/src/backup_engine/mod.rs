@@ -266,6 +266,9 @@ pub struct BackupJob {
     /// Email / Telegram / XMPP notifications.
     #[serde(default)]
     pub notifications: Vec<notify::Notification>,
+    /// Reusable notification profiles this job also sends to (ids).
+    #[serde(default)]
+    pub notification_profile_ids: Vec<String>,
     /// Log file and system log outputs.
     #[serde(default)]
     pub log_outputs: logs::LogOutputs,
@@ -338,6 +341,7 @@ impl Default for BackupJob {
             request_limits: RequestLimits::default(),
             replicas: Vec::new(),
             notifications: Vec::new(),
+            notification_profile_ids: Vec::new(),
             log_outputs: logs::LogOutputs::default(),
             secret_providers: Vec::new(),
             masked_values: Vec::new(),
@@ -414,17 +418,9 @@ impl BackupJob {
         self.log_outputs.file_filter.validate()?;
         self.log_outputs.system_filter.validate()?;
         for n in &self.notifications {
-            match &n.channel {
-                notify::Channel::Email { host, from, to, .. } if host.trim().is_empty() || from.trim().is_empty() || to.is_empty() => {
-                    return Err(AppError::validation("Email notifications need a server, a sender and at least one recipient"))
-                }
-                notify::Channel::Telegram { chat_id, .. } if chat_id.trim().is_empty() => return Err(AppError::validation("Telegram notifications need a chat id")),
-                notify::Channel::Xmpp { jid, to, .. } if !jid.contains('@') || to.trim().is_empty() => {
-                    return Err(AppError::validation("XMPP notifications need an account (user@domain) and a recipient"))
-                }
-                _ => {}
-            }
+            n.validate()?;
         }
+        notify::webhook::validate_headers(&self.reports.headers)?;
         if self.remote_config_include_secrets && !self.encrypted {
             return Err(AppError::validation("Secrets can only be stored in the backup when it is encrypted"));
         }
@@ -804,6 +800,7 @@ struct Inner {
     managed_caps: Mutex<Option<ufop_core::agent::ManagedTransfers>>,
     /// Policy templates delivered by the console (read-only).
     managed_templates: Mutex<Vec<templates::PolicyTemplate>>,
+    managed_profiles: Mutex<Vec<notify::profiles::NotificationProfile>>,
     /// `Some(None)` = paused indefinitely.
     paused: Mutex<Option<Option<DateTime<Utc>>>>,
     scheduler_running: AtomicBool,
@@ -897,6 +894,7 @@ impl BackupManager {
                 job_locks: Mutex::new(HashMap::new()),
                 managed_caps: Mutex::new(None),
                 managed_templates: Mutex::new(Vec::new()),
+                managed_profiles: Mutex::new(Vec::new()),
                 paused: Mutex::new(None),
                 scheduler_running: AtomicBool::new(false),
                 draining: AtomicBool::new(false),
@@ -1004,6 +1002,11 @@ impl BackupManager {
         }
         job.validate()?;
         templates::validate_job_refs(&job, &self.list_templates().await?)?;
+        notify::profiles::validate_refs(&job.notification_profile_ids, &self.list_notification_profiles().await?)?;
+        for n in job.notifications.iter_mut() {
+            self.stash_notification_secrets(n).await?;
+        }
+        self.stash_report_secrets(&mut job.reports).await?;
         if !job.template_ids.is_empty() && job.overrides.is_none() {
             // First template on an older job: what it set so far stays its own.
             job.overrides = Some(templates::explicit_paths(&job)?.into_iter().collect());
@@ -2403,6 +2406,7 @@ impl BackupManager {
             log: log.clone(),
         };
         self.insert_run(&run).await?;
+        let previous_result = self.inner.jobs.read().await.get(&job.id).and_then(|j| j.stats.last_result.clone());
         self.refresh_stats(&job.id, Some((&run, err.clone(), (finished - started).num_milliseconds().max(0) as u64))).await;
 
         // Reports and ledger are fail-open.
@@ -2416,6 +2420,8 @@ impl BackupManager {
         vars.insert("files".into(), report.get("files_examined").map(|v| v.to_string()).unwrap_or_default());
         vars.insert("bytes".into(), report.get("bytes_uploaded").map(|v| v.to_string()).unwrap_or_default());
         vars.insert("errors".into(), err.clone().unwrap_or_default());
+        vars.insert("job_id".into(), job.id.clone());
+        vars.insert("previous_result".into(), previous_result.unwrap_or_default());
         for p in logs::write_run(&job.log_outputs, &job.name, op, &status, &summary, &log) {
             tracing::warn!("{p}");
         }
@@ -2457,13 +2463,18 @@ impl BackupManager {
                 schedule_interval_minutes: job.schedule.enabled.then(|| job.schedule.nominal_interval_minutes()),
             });
         }
-        for f in hooks::send_reports(&job.reports, &status, &vars, payload).await {
+        let reports = self.prepare_reports(&job.reports).await;
+        for f in hooks::send_reports(&reports, &status, &vars, payload).await {
             tracing::warn!("{f}");
         }
-        if !job.notifications.is_empty() {
+        let (channels, warnings) = self.job_notifications(job).await;
+        for w in warnings {
+            tracing::warn!("{w}");
+        }
+        if !channels.is_empty() {
             let mut list = Vec::new();
-            for n in &job.notifications {
-                list.push((n.clone(), self.destination_secret(&n.credential_id).await.unwrap_or(None)));
+            for n in channels {
+                list.push(self.prepare_notification(n).await);
             }
             for f in notify::deliver(&list, &status, &vars, &text).await {
                 tracing::warn!("Notification failed: {f}");
@@ -2683,8 +2694,8 @@ impl BackupManager {
     /// Send one message through a notification channel, resolving its
     /// secret (password, bot token or webhook URL) from the credential
     /// store. Used by automation's SendMessage action.
-    pub async fn send_message(&self, mut n: notify::Notification, title: &str, body: &str) -> Result<(), AppError> {
-        let secret = self.destination_secret(&n.credential_id).await?;
+    pub async fn send_message(&self, n: notify::Notification, title: &str, body: &str) -> Result<(), AppError> {
+        let (mut n, secret) = self.prepare_notification(n).await;
         n.send_on = vec!["message".into()];
         n.template.clear();
         if let notify::Channel::Email { subject, .. } = &mut n.channel {
@@ -2704,11 +2715,14 @@ impl BackupManager {
     }
 
     /// Send a test message through one notification channel.
-    pub async fn test_notification(&self, mut n: notify::Notification) -> Result<(), AppError> {
-        let secret = self.destination_secret(&n.credential_id).await?;
+    pub async fn test_notification(&self, n: notify::Notification) -> Result<(), AppError> {
+        n.validate()?;
+        let (mut n, secret) = self.prepare_notification(n).await;
         n.send_on = vec!["test".into()];
-        let vars: std::collections::BTreeMap<String, String> =
-            [("name", "Test"), ("operation", "test"), ("result", "test"), ("machine", "this computer")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let vars: std::collections::BTreeMap<String, String> = [("name", "Test"), ("operation", "test"), ("result", "test"), ("machine", "this computer"), ("backup_id", "test"), ("job_id", "test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         match notify::deliver(&[(n, secret)], "test", &vars, "This is a test notification from UFOP.").await.into_iter().next() {
             Some(e) => Err(AppError::validation(e)),
             None => Ok(()),

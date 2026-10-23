@@ -614,7 +614,19 @@ export interface ReportConfig {
   min_log_level: LogLevel;
   /** SHA-256 fingerprints; when set, only these certificates are accepted. */
   pinned_sha256: string[];
+  /** Extra request headers; secret values live in the secure store. */
+  headers?: WebhookHeader[];
 }
+
+/** A webhook / report request header; a secret one keeps its value in the secure store under `credential_id`. */
+export interface WebhookHeader {
+  name: string;
+  value: string;
+  secret: boolean;
+  credential_id: string;
+}
+
+export type WebhookPreset = "generic" | "pushover" | "ntfy" | "discord" | "pagerduty" | "gotify";
 
 export type TlsMode = "start_tls" | "implicit" | "none";
 
@@ -625,9 +637,12 @@ export interface CertPolicy {
 }
 
 export type NotificationChannel =
-  | { type: "email"; host: string; port: number | null; tls: TlsMode; username: string; from: string; to: string[]; subject: string }
+  | { type: "email"; host: string; port: number | null; tls: TlsMode; username: string; from: string; to: string[]; subject: string; html?: boolean; html_template?: string }
   | { type: "telegram"; chat_id: string; api_base: string }
-  | { type: "xmpp"; jid: string; to: string; host: string; port: number | null; tls: TlsMode };
+  | { type: "xmpp"; jid: string; to: string; host: string; port: number | null; tls: TlsMode }
+  | { type: "slack" }
+  | { type: "teams" }
+  | { type: "webhook"; url: string; method: string; content_type: string; headers: WebhookHeader[]; body_template: string; preset: WebhookPreset };
 
 /** A notification channel (flattened) with its own result filter; the password or bot token lives under `credential_id`. */
 export type BackupNotification = NotificationChannel & {
@@ -856,6 +871,8 @@ export interface BackupJob {
   request_limits: RequestLimits;
   replicas: Replica[];
   notifications: BackupNotification[];
+  /** Reusable notification profiles this job also sends to. */
+  notification_profile_ids?: string[];
   log_outputs: LogOutputs;
   /** Secret providers used by this job besides the global ones (ids). */
   secret_providers: string[];
@@ -1462,6 +1479,7 @@ export function newBackupJob(): BackupJob {
     request_limits: { ...DEFAULT_REQUEST_LIMITS },
     replicas: [],
     notifications: [],
+    notification_profile_ids: [],
     secret_providers: [],
     log_outputs: { file: null, file_filter: newLogFilter(), file_max_mb: 10, system_log: false, system_filter: { ...newLogFilter(), min_level: "warning" } },
     prevent_sleep: true,

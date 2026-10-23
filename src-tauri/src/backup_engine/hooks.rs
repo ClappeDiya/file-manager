@@ -384,7 +384,7 @@ pub enum ReportFormat {
 pub struct ReportConfig {
     /// Callback URLs; each receives every report.
     pub http_urls: Vec<String>,
-    /// POST, PUT or GET.
+    /// POST, PUT, PATCH or GET.
     pub http_method: String,
     pub format: ReportFormat,
     /// Results that trigger a report: `success`, `warning`, `error`.
@@ -418,6 +418,10 @@ pub struct ReportConfig {
     /// SHA-256 certificate fingerprints; when set, only these are accepted.
     #[serde(default)]
     pub pinned_sha256: Vec<String>,
+    /// Extra request headers; values may use the template placeholders.
+    /// Secret values live in the credential store (see `WebhookHeader`).
+    #[serde(default)]
+    pub headers: Vec<super::notify::webhook::WebhookHeader>,
 }
 
 fn default_retry_delay() -> u64 {
@@ -443,6 +447,7 @@ impl Default for ReportConfig {
             retry_delay_ms: 500,
             min_log_level: LogLevel::Info,
             pinned_sha256: Vec::new(),
+            headers: Vec::new(),
         }
     }
 }
@@ -501,6 +506,10 @@ pub async fn send_reports(cfg: &ReportConfig, result: &str, vars: &BTreeMap<Stri
             &policy,
             |_| {
                 let mut req = client.request(method.clone(), url);
+                for h in &cfg.headers {
+                    let v = super::notify::webhook::render(&h.value, vars, super::notify::webhook::Escape::Header);
+                    req = req.header(h.name.trim(), v);
+                }
                 req = match (cfg.format, method == reqwest::Method::GET) {
                     (_, true) => req.query(&body.iter().filter(|(_, v)| v.is_string()).map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect::<Vec<_>>()),
                     (ReportFormat::Json, false) => req.json(&body),

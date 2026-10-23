@@ -11,7 +11,7 @@
 //!
 //! A setting is addressed by its *field path*: `options.<name>` for each
 //! backup option, or a whole section (`filter`, `retention`, `schedule`,
-//! `maintenance`, `scripts`, `notifications`, `notify_on`, `throttle`,
+//! `maintenance`, `scripts`, `notifications`, `notification_profile_ids`, `notify_on`, `throttle`,
 //! `retry`, `prevent_sleep`). Which settings the job sets itself is its
 //! `overrides` list; jobs from before templates have none, and every
 //! setting that differs from the built-in default counts as theirs.
@@ -35,7 +35,7 @@ use ufop_core::backup::{BackupOptions, RetentionPolicy, SourceFilter};
 pub const TEMPLATES_KEY: &str = "backup.policy_templates";
 
 /// Job sections a template can set as a whole.
-pub const SECTIONS: &[&str] = &["filter", "retention", "schedule", "maintenance", "scripts", "notifications", "notify_on", "throttle", "retry", "prevent_sleep"];
+pub const SECTIONS: &[&str] = &["filter", "retention", "schedule", "maintenance", "scripts", "notifications", "notification_profile_ids", "notify_on", "throttle", "retry", "prevent_sleep"];
 
 /// Backup options that belong to one job (repository layout, per-run
 /// inputs): never inherited, always the job's own.
@@ -53,6 +53,8 @@ pub struct SettingsPatch {
     pub maintenance: Option<MaintenanceSchedule>,
     pub scripts: Option<hooks::ScriptConfig>,
     pub notifications: Option<Vec<notify::Notification>>,
+    /// Notification profiles (ids) jobs based on this template send to.
+    pub notification_profile_ids: Option<Vec<String>>,
     pub notify_on: Option<Vec<String>>,
     pub throttle: Option<Throttle>,
     pub retry: Option<RetryPolicy>,
@@ -414,6 +416,14 @@ impl super::BackupManager {
         t.name = t.name.trim().to_string();
         t.enforced = false;
         t.validate()?;
+        if let Some(ids) = &t.settings.notification_profile_ids {
+            notify::profiles::validate_refs(ids, &self.list_notification_profiles().await?)?;
+        }
+        if let Some(list) = t.settings.notifications.as_mut() {
+            for n in list.iter_mut() {
+                self.stash_notification_secrets(n).await?;
+            }
+        }
         let mut list = self.local_templates().await?;
         if list.iter().any(|x| x.id != t.id && x.name.eq_ignore_ascii_case(&t.name)) {
             return Err(AppError::validation(format!("A template named '{}' already exists", t.name)));
@@ -468,8 +478,12 @@ impl super::BackupManager {
     /// Import templates: same id or name updates, anything else is added.
     pub async fn import_templates(&self, json: &str) -> Result<Vec<PolicyTemplate>, AppError> {
         let existing = self.local_templates().await?;
+        let profiles: Vec<String> = self.list_notification_profiles().await?.into_iter().map(|p| p.id).collect();
         let mut saved = Vec::new();
         for mut t in import(json)? {
+            if let Some(p) = t.settings.notification_profile_ids.as_mut() {
+                p.retain(|id| profiles.contains(id));
+            }
             t.id = existing.iter().find(|x| x.id == t.id || x.name.eq_ignore_ascii_case(t.name.trim())).map(|x| x.id.clone()).unwrap_or_default();
             saved.push(self.save_template(t).await?);
         }

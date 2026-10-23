@@ -62,6 +62,7 @@ pub async fn apply(t: Targets<'_>, org: &str, settings: Option<ManagedSettings>)
     ai.set_managed(settings.as_ref().and_then(|s| s.ai.clone())).await;
     backups.set_managed_caps(settings.as_ref().and_then(|s| s.transfers.clone())).await;
     let mut problems = backups.set_managed_templates(settings.as_ref().and_then(|s| s.backup_templates.as_deref()));
+    problems.extend(backups.set_managed_notification_profiles(settings.as_ref().and_then(|s| s.notification_profiles.as_deref())));
     mounts.set_managed(settings.as_ref().and_then(|s| s.mounts.clone())).await;
     // Organization workflows: installed read-only; none listed removes them.
     let workflows = settings.as_ref().and_then(|s| s.workflows.clone()).unwrap_or_default();
@@ -74,7 +75,7 @@ pub async fn apply(t: Targets<'_>, org: &str, settings: Option<ManagedSettings>)
     if problems.is_empty() {
         Ok(())
     } else {
-        Err(AppError::validation(format!("Some organization workflows or backup templates were not installed: {}", problems.join("; "))))
+        Err(AppError::validation(format!("Some organization workflows, backup templates or notification profiles were not installed: {}", problems.join("; "))))
     }
 }
 
@@ -86,6 +87,9 @@ pub async fn activate_stored(repo: &Repository, ai: &AiAssistant, backups: &Back
     backups.set_managed_caps(s.as_ref().and_then(|s| s.transfers.clone())).await;
     for p in backups.set_managed_templates(s.as_ref().and_then(|s| s.backup_templates.as_deref())) {
         tracing::warn!("Organization backup template not installed: {p}");
+    }
+    for p in backups.set_managed_notification_profiles(s.as_ref().and_then(|s| s.notification_profiles.as_deref())) {
+        tracing::warn!("Organization notification profile not installed: {p}");
     }
     mounts.set_managed(s.and_then(|s| s.mounts)).await;
 }
@@ -124,6 +128,12 @@ mod tests {
                 settings: serde_json::json!({ "retention": { "type": "keep_count", "count": 7 } }),
                 ..Default::default()
             }]),
+            notification_profiles: Some(vec![ufop_core::agent::ManagedNotificationProfile {
+                id: "pager".into(),
+                name: "Org pager".into(),
+                notification: serde_json::json!({ "type": "webhook", "url": "https://events.pagerduty.com/v2/enqueue", "credential_id": "central:pd" }),
+                ..Default::default()
+            }]),
             server_access: None,
         };
         let automation = AutomationManager::new();
@@ -146,6 +156,8 @@ mod tests {
         let job = crate::backup_engine::BackupJob { retention: ufop_core::backup::RetentionPolicy::KeepAll, ..Default::default() };
         let r = backups.resolve_job(&job).await.unwrap();
         assert_eq!(r.job.retention, ufop_core::backup::RetentionPolicy::KeepCount { count: 7 });
+        let profiles = backups.list_notification_profiles().await.unwrap();
+        assert!(profiles.len() == 1 && profiles[0].managed && profiles[0].id == "org:pager");
 
         // Restart: the AI limit comes back from storage.
         let ai2 = AiAssistant::new();

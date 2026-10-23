@@ -1257,6 +1257,11 @@ pub enum BackupCommands {
         #[command(subcommand)]
         cmd: super::backup_policy::TemplateCommands,
     },
+    /// Notification profiles of the signed-in ufop-server
+    NotifyProfile {
+        #[command(subcommand)]
+        cmd: super::backup_notify::NotifyProfileCommands,
+    },
     /// Each setting a server job runs with and where it comes from
     Effective {
         /// Job id or name
@@ -1605,12 +1610,13 @@ pub async fn execute(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) 
         return super::server::execute(super::server::ServerCommands::RunAll { jobs, scheduled_only, dry_run, wait }, format).await;
     }
     let server_backed = match &cmd {
-        BackupCommands::Template { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } | BackupCommands::OpenAt { .. } | BackupCommands::Hardening { .. } => true,
+        BackupCommands::Template { .. } | BackupCommands::NotifyProfile { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } | BackupCommands::OpenAt { .. } | BackupCommands::Hardening { .. } => true,
         _ => false,
     };
     if server_backed {
         let r = match cmd {
             BackupCommands::Template { cmd } => super::backup_policy::template(cmd, format).await,
+            BackupCommands::NotifyProfile { cmd } => super::backup_notify::notify_profile(cmd, format).await,
             BackupCommands::Effective { job } => super::backup_policy::effective(&job, format).await,
             BackupCommands::OpenAt { job, point_in_time, name } => super::backup_policy::open_at(&job, &point_in_time, name, format).await,
             BackupCommands::Hardening { job, probe } => super::backup_policy::hardening(&job, probe, format).await,
@@ -1744,7 +1750,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             }
             Ok(0)
         }
-        BackupCommands::RunAll { .. } | BackupCommands::Template { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } | BackupCommands::OpenAt { .. } | BackupCommands::Hardening { .. } => Err(ufop_core::error::AppError::internal("server-backed commands are handled before the blocking runner")),
+        BackupCommands::RunAll { .. } | BackupCommands::Template { .. } | BackupCommands::NotifyProfile { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } | BackupCommands::OpenAt { .. } | BackupCommands::Hardening { .. } => Err(ufop_core::error::AppError::internal("server-backed commands are handled before the blocking runner")),
         BackupCommands::List { repo, tags } => with_repo(&repo, LockKind::Shared, "list", |_, db| {
             let filter = ufop_core::backup::versions::parse_tags(&tags)?;
             let v = ufop_core::backup::versions::filter_by_tags(db.filesets()?, &filter);

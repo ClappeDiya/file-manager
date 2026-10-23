@@ -28,7 +28,8 @@ import { BackupHardening } from "./backup-hardening";
 import { BackupReplicas } from "./backup-replicas";
 import { RequestLimitsEditor } from "./backup-request-limits";
 import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
-import { LogOutputsEditor, NotificationsEditor, ReportExtras } from "./backup-notifications";
+import { HeadersEditor, LogOutputsEditor, NotificationsEditor, ReportExtras } from "./backup-notifications";
+import { NotificationProfilePicker } from "./backup-notification-profiles";
 import { JobSecretProviders } from "./backup-secret-providers";
 import { PhotosSourceSection } from "./backup-photos-source";
 import { AdvancedOnly } from "./advanced-only";
@@ -645,6 +646,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 ))}
               </div>
             </Section>
+            <NotificationProfilePicker value={job.notification_profile_ids ?? []} onChange={(notification_profile_ids) => patch({ notification_profile_ids })} />
             <NotificationsEditor value={job.notifications} onChange={(notifications) => patch({ notifications })} />
             <AdvancedOnly hint>
             <Section title="HTTP reports" hint="Sent to every URL when a run ends with a selected result.">
@@ -656,6 +658,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                   <select className={inputCls} value={job.reports.http_method} onChange={(e) => patch({ reports: { ...job.reports, http_method: e.target.value } })}>
                     <option>POST</option>
                     <option>PUT</option>
+                    <option>PATCH</option>
                     <option>GET</option>
                   </select>
                 </Field>
@@ -690,6 +693,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                   <input className={inputCls} value={job.reports.backup_id ?? ""} onChange={(e) => patch({ reports: { ...job.reports, backup_id: e.target.value || null } })} />
                 </Field>
               </div>
+              <HeadersEditor value={job.reports.headers ?? []} onChange={(headers) => patch({ reports: { ...job.reports, headers } })} />
               <Check label="Accept invalid TLS certificates on report URLs" checked={job.reports.accept_invalid_certs} onChange={(v) => patch({ reports: { ...job.reports, accept_invalid_certs: v } })} />
               <ReportExtras reports={job.reports} onChange={(reports) => patch({ reports })} />
             </Section>

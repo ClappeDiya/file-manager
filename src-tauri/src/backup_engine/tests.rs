@@ -484,7 +484,7 @@ async fn bug_report_is_sanitized_and_diagnostics_detect_problems() {
     jb.reports.http_urls = vec!["https://hooks.example.com/notify?token=tok3n".into()];
     jb.reports.extra_fields.insert("api_key".into(), "k3y".into());
     jb.notifications = vec![notify::Notification {
-        channel: notify::Channel::Email { host: "smtp.example.com".into(), port: None, tls: Default::default(), username: "alice@example.com".into(), from: "alice@example.com".into(), to: vec!["bob@example.com".into()], subject: "s".into() },
+        channel: notify::Channel::Email { host: "smtp.example.com".into(), port: None, tls: Default::default(), username: "alice@example.com".into(), from: "alice@example.com".into(), to: vec!["bob@example.com".into()], subject: "s".into(), html: false, html_template: String::new() },
         send_on: vec!["error".into()],
         credential_id: "c".into(),
         template: String::new(),

@@ -11,7 +11,7 @@ import { isBackendAvailable, tauriInvoke } from "@/hooks/use-tauri";
 import type { BackupJob, BackupOptions } from "./backup-store";
 
 /** Job sections a template sets as a whole (`templates::SECTIONS`). */
-export const SETTING_SECTIONS = ["filter", "retention", "schedule", "maintenance", "scripts", "notifications", "notify_on", "throttle", "retry", "prevent_sleep"] as const;
+export const SETTING_SECTIONS = ["filter", "retention", "schedule", "maintenance", "scripts", "notifications", "notification_profile_ids", "notify_on", "throttle", "retry", "prevent_sleep"] as const;
 export type SettingSection = (typeof SETTING_SECTIONS)[number];
 
 /** Options that belong to one job and are never inherited (`templates::PER_JOB_OPTIONS`). */

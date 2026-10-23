@@ -25,6 +25,8 @@ pub struct ManagedSettings {
     pub workflows: Option<Vec<ManagedWorkflow>>,
     /// Backup policy templates the organization offers (or enforces) on its desktops.
     pub backup_templates: Option<Vec<ManagedBackupTemplate>>,
+    /// Notification profiles the organization offers on its desktops (read-only there).
+    pub notification_profiles: Option<Vec<ManagedNotificationProfile>>,
     /// Accounts and per-job access rules for `ufop-server` nodes (read-only there).
     pub server_access: Option<ManagedServerAccess>,
 }
@@ -136,6 +138,69 @@ impl ManagedBackupTemplate {
         // Scripts would run programs on every desktop: a decision for each desktop.
         if self.settings.get("scripts").is_some_and(|s| !s.is_null()) {
             return Err(format!("Backup template '{}' sets scripts; organization templates cannot", self.name));
+        }
+        Ok(())
+    }
+}
+
+/// Most organization notification profiles, and the largest one (JSON bytes).
+pub const MAX_NOTIFICATION_PROFILES: usize = 50;
+pub const MAX_NOTIFICATION_PROFILE_BYTES: usize = 64 * 1024;
+
+/// A notification profile owned by the organization (read-only on each
+/// desktop; jobs and templates refer to it as `org:<id>`). Secrets never
+/// travel in it: `credential_id` and secret headers name console
+/// credentials (`central:<id>`), delivered through the credential channel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ManagedNotificationProfile {
+    /// Stable id (letters, digits, `-`, `_`).
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// The channel as the desktop app stores a profile's `notification`
+    /// (snake_case keys, flattened `type`; checked in full by the desktop).
+    pub notification: serde_json::Value,
+    /// `success`, `warning` or `error`: send results at least this severe.
+    pub min_severity: Option<String>,
+}
+
+impl ManagedNotificationProfile {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.is_empty() || self.id.len() > 64 || !self.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err(format!("Notification profile id '{}' must be 1–64 letters, digits, '-' or '_'", self.id));
+        }
+        if self.name.trim().is_empty() || self.name.chars().count() > 200 {
+            return Err(format!("Notification profile {} needs a name (up to 200 characters)", self.id));
+        }
+        let n = self.notification.as_object().ok_or_else(|| format!("Notification profile '{}' needs a notification object", self.name))?;
+        if !n.get("type").is_some_and(|t| t.is_string()) {
+            return Err(format!("Notification profile '{}' needs a channel type", self.name));
+        }
+        if serde_json::to_vec(&self.notification).map(|v| v.len()).unwrap_or(usize::MAX) > MAX_NOTIFICATION_PROFILE_BYTES {
+            return Err(format!("Notification profile '{}' is larger than {} KB", self.name, MAX_NOTIFICATION_PROFILE_BYTES / 1024));
+        }
+        if let Some(s) = &self.min_severity {
+            if !["success", "warning", "error"].contains(&s.as_str()) {
+                return Err(format!("Notification profile '{}': unknown minimum severity '{s}'", self.name));
+            }
+        }
+        let central = |v: Option<&serde_json::Value>| match v.and_then(|c| c.as_str()).unwrap_or_default() {
+            "" => true,
+            c => c.starts_with(super::policy::CENTRAL_PREFIX) && super::policy::central_credential_id(c).is_some(),
+        };
+        if !central(n.get("credential_id")) {
+            return Err(format!("Notification profile '{}': credential_id must name a console credential (central:<id>)", self.name));
+        }
+        for h in n.get("headers").and_then(|h| h.as_array()).into_iter().flatten() {
+            if h.get("secret").and_then(|s| s.as_bool()).unwrap_or(false) {
+                if h.get("value").and_then(|v| v.as_str()).is_some_and(|v| !v.is_empty()) {
+                    return Err(format!("Notification profile '{}': secret header values cannot be sent in plain text; use a console credential", self.name));
+                }
+                if !central(h.get("credential_id")) || h.get("credential_id").and_then(|c| c.as_str()).unwrap_or_default().is_empty() {
+                    return Err(format!("Notification profile '{}': secret headers must name a console credential (central:<id>)", self.name));
+                }
+            }
         }
         Ok(())
     }
@@ -350,6 +415,18 @@ impl ManagedSettings {
                 }
             }
         }
+        if let Some(t) = &self.notification_profiles {
+            if t.len() > MAX_NOTIFICATION_PROFILES {
+                return Err(format!("At most {MAX_NOTIFICATION_PROFILES} organization notification profiles"));
+            }
+            let mut ids = std::collections::HashSet::new();
+            for p in t {
+                p.validate()?;
+                if !ids.insert(p.id.as_str()) {
+                    return Err(format!("Two notification profiles share the id '{}'", p.id));
+                }
+            }
+        }
         if let Some(t) = &self.backup_templates {
             if t.len() > MAX_BACKUP_TEMPLATES {
                 return Err(format!("At most {MAX_BACKUP_TEMPLATES} organization backup templates"));
@@ -381,7 +458,7 @@ impl ManagedSettings {
 
     /// No section managed.
     pub fn is_empty(&self) -> bool {
-        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none() && self.mounts.is_none() && self.workflows.is_none() && self.backup_templates.is_none() && self.server_access.is_none()
+        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none() && self.mounts.is_none() && self.workflows.is_none() && self.backup_templates.is_none() && self.notification_profiles.is_none() && self.server_access.is_none()
     }
 }
 
@@ -421,6 +498,23 @@ mod tests {
         let cmd = serde_json::json!({"trigger": {"type": "manual"}, "action": {"type": "notify"}, "workflow": {"nodes": [{"id": "n1", "kind": "action", "action": {"type": "run_command", "program": "sh"}}]}});
         assert!(bad(wf("x", cmd)).contains("runs a program (run_command)"));
         let dup = ManagedSettings { workflows: Some(vec![wf("a", rule.clone()), wf("a", rule)]), ..Default::default() };
+        assert!(dup.validate().unwrap_err().contains("share the id"));
+    }
+
+    #[test]
+    fn notification_profiles_validate() {
+        let s: ManagedSettings = serde_json::from_value(serde_json::json!({"notificationProfiles": [{"id": "ops", "name": "Ops pager", "minSeverity": "error", "notification": {"type": "webhook", "url": "https://events.pagerduty.com/v2/enqueue", "credential_id": "central:pd"}}]})).unwrap();
+        assert!(s.validate().is_ok() && !s.is_empty());
+        let p = |n: serde_json::Value| ManagedNotificationProfile { id: "a".into(), name: "A".into(), notification: n, ..Default::default() };
+        let bad = |b: ManagedNotificationProfile| ManagedSettings { notification_profiles: Some(vec![b]), ..Default::default() }.validate().unwrap_err();
+        assert!(bad(p(serde_json::json!([]))).contains("notification object"));
+        assert!(bad(p(serde_json::json!({"url": "x"}))).contains("channel type"));
+        assert!(bad(p(serde_json::json!({"type": "email", "credential_id": "local-123"}))).contains("console credential"));
+        assert!(bad(p(serde_json::json!({"type": "webhook", "headers": [{"name": "X-Token", "value": "hunter2", "secret": true}]}))).contains("plain text"));
+        assert!(bad(p(serde_json::json!({"type": "webhook", "headers": [{"name": "X-Token", "secret": true}]}))).contains("console credential"));
+        assert!(ManagedSettings { notification_profiles: Some(vec![p(serde_json::json!({"type": "webhook", "headers": [{"name": "X-Token", "secret": true, "credential_id": "central:tok"}]}))]), ..Default::default() }.validate().is_ok());
+        assert!(bad(ManagedNotificationProfile { min_severity: Some("info".into()), ..p(serde_json::json!({"type": "slack"})) }).contains("severity"));
+        let dup = ManagedSettings { notification_profiles: Some(vec![p(serde_json::json!({"type": "slack"})), p(serde_json::json!({"type": "teams"}))]), ..Default::default() };
         assert!(dup.validate().unwrap_err().contains("share the id"));
     }
 
