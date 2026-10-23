@@ -7,6 +7,8 @@ use crate::backup_engine::{
 };
 use crate::backup_engine::defaults::{GlobalDefaults, SavedDestination};
 use crate::backup_engine::{DatabaseCleanupReport, DatabaseEntry};
+use crate::backup_engine::runs::{RunAllFilter, RunAllReport};
+use ufop_core::backup::estimate::BackupEstimate;
 use ufop_core::backup::recovery;
 use crate::core::error::AppError;
 use crate::governance::ediscovery::{self, EDiscoveryReport, EDiscoveryRequest};
@@ -55,6 +57,19 @@ pub async fn backup_test_destination_compat(destination: BackupDestination, file
 #[tauri::command]
 pub async fn backup_run(id: String, dry_run: Option<bool>, mgr: State<'_, BackupManager>) -> Result<String, AppError> {
     mgr.start_backup(&id, dry_run.unwrap_or(false)).await
+}
+
+/// Queue a backup of every job (read-only and busy jobs are skipped);
+/// runs share the normal queue and its concurrency limit.
+#[tauri::command]
+pub async fn backup_run_all(filter: Option<RunAllFilter>, mgr: State<'_, BackupManager>) -> Result<RunAllReport, AppError> {
+    mgr.run_all(filter.unwrap_or_default()).await
+}
+
+/// Files, data and time the next backup of a job is likely to need.
+#[tauri::command]
+pub async fn backup_estimate(job_id: String, assumed_bytes_per_sec: Option<u64>, mgr: State<'_, BackupManager>) -> Result<BackupEstimate, AppError> {
+    mgr.estimate(&job_id, assumed_bytes_per_sec).await
 }
 
 /// Run a maintenance/restore operation and wait for its result.

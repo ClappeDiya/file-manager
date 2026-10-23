@@ -705,6 +705,8 @@ pub fn run() {
             backup_commands::backup_list_versions,
             backup_commands::backup_list_sources,
             backup_commands::backup_preview_retention,
+            backup_commands::backup_run_all,
+            backup_commands::backup_estimate,
             backup_commands::backup_set_version_metadata,
             backup_commands::backup_list_files,
             backup_commands::backup_search,

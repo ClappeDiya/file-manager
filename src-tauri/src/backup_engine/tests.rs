@@ -1341,3 +1341,107 @@ async fn shared_repository_between_jobs_and_adoption_as_a_new_source() {
     assert_eq!(adopted.stats.version_count, 0, "no other job's history taken over");
     assert_eq!(m2.list_sources(&adopted.id).await.unwrap().len(), 2);
 }
+
+async fn wait_idle(m: &BackupManager, ids: &[&str]) {
+    for _ in 0..600 {
+        if ids.iter().all(|id| !m.is_job_busy(id)) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("jobs did not finish");
+}
+
+#[tokio::test]
+async fn run_all_queues_writable_jobs_and_estimate_reports_new_data() {
+    let t = tempfile::tempdir().unwrap();
+    let m = manager(t.path()).await;
+    let mk = |n: &str| {
+        let (src, dst) = (t.path().join(format!("src{n}")), t.path().join(format!("dst{n}")));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f.txt"), format!("file of {n}")).unwrap();
+        let mut jb = job(&src, &dst);
+        jb.name = format!("job {n}");
+        jb.encrypted = false;
+        jb
+    };
+    let a = m.save_job(mk("a"), None).await.unwrap();
+    let b = m.save_job(mk("b"), None).await.unwrap();
+    let mut ro = mk("c");
+    ro.read_only = true;
+    let c = m.save_job(ro, None).await.unwrap();
+
+    let r = m.run_all(runs::RunAllFilter::default()).await.unwrap();
+    let started: Vec<&str> = r.started.iter().map(|s| s.job_id.as_str()).collect();
+    assert_eq!(started.len(), 2, "{r:?}");
+    assert!(started.contains(&a.id.as_str()) && started.contains(&b.id.as_str()));
+    assert_eq!(r.skipped.len(), 1);
+    assert_eq!(r.skipped[0].job_id, c.id);
+    assert!(r.skipped[0].reason.contains("read-only"));
+    assert!(crate::tray::run_all_summary(&r).contains("2 backup(s) queued"));
+    wait_idle(&m, &[&a.id, &b.id]).await;
+    for id in [&a.id, &b.id] {
+        let h = m.run_history(Some(id.clone()), 5).await.unwrap();
+        assert_eq!(h.first().map(|r| r.status.as_str()), Some("success"), "{h:?}");
+    }
+    // A filter: only scheduled jobs (none are), or named ones.
+    let r = m.run_all(runs::RunAllFilter { scheduled_only: true, ..Default::default() }).await.unwrap();
+    assert!(r.started.is_empty() && r.skipped.iter().filter(|s| s.reason == "no schedule").count() == 2, "{r:?}");
+    let r = m.run_all(runs::RunAllFilter { job_ids: vec![b.id.clone(), "nope".into()], dry_run: true, ..Default::default() }).await.unwrap();
+    assert_eq!(r.started.len(), 1);
+    assert!(r.skipped.iter().any(|s| s.job_id == "nope"));
+    wait_idle(&m, &[&b.id]).await;
+
+    // Estimate: one new file since the last backup.
+    std::fs::write(t.path().join("srca/new.bin"), vec![7u8; 10_000]).unwrap();
+    let e = m.estimate(&a.id, Some(1000)).await.unwrap();
+    assert!(e.has_previous_version);
+    assert_eq!((e.new_files, e.unchanged_files, e.new_bytes_at_most), (1, 1, 10_000), "{e:?}");
+    assert!(e.largest[0].path.ends_with("new.bin"));
+    assert!(e.estimated_duration_secs.is_some());
+    assert!(e.speed_source == "history" || e.speed_source == "assumed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdin_command_output_is_backed_up_and_a_failing_command_fails_the_run() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst, out) = (t.path().join("src"), t.path().join("dst"), t.path().join("out"));
+    std::fs::create_dir_all(&src).unwrap();
+    let m = manager(t.path()).await;
+    let mut jb = job(&src, &dst);
+    jb.encrypted = false;
+    jb.sources.clear();
+    jb.stdin_command = Some(hooks::StdinCommand { command: "sh -c 'printf \"dump of %s\" \"$UFOP_BACKUP_NAME\"'".into(), path: "db.sql".into(), timeout_secs: 30 });
+    let j = m.save_job(jb, None).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.log);
+    let files = m.list_files(&j.id, 0, None).await.unwrap();
+    let f = files.iter().find(|f| f.path == "/stdin/db.sql").unwrap();
+    assert_eq!(f.size, "dump of Docs".len() as u64);
+    let restore = RestoreOptions { target: Some(out.clone()), ..Default::default() };
+    let r = m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.report["files_restored"], 1, "{:?}", r.log);
+    let restored = std::fs::read_dir(&out).unwrap().flatten().map(|e| e.path()).find(|p| p.ends_with("db.sql")).unwrap_or_else(|| out.join("stdin/db.sql"));
+    assert_eq!(std::fs::read_to_string(restored).unwrap(), "dump of Docs");
+
+    let mut jb = m.get_job(&j.id).await.unwrap();
+    jb.stdin_command = Some(hooks::StdinCommand { command: "sh -c 'printf partial; echo boom >&2; exit 3'".into(), path: "db.sql".into(), timeout_secs: 0 });
+    m.save_job(jb.clone(), None).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_eq!(r.status, "error", "{:?}", r.log);
+    assert!(r.log.iter().any(|l| l.message.contains("status 3") && l.message.contains("boom")), "{:?}", r.log);
+
+    // A command that outlives its timeout is killed.
+    jb.stdin_command = Some(hooks::StdinCommand { command: "sleep 30".into(), path: "slow".into(), timeout_secs: 1 });
+    m.save_job(jb.clone(), None).await.unwrap();
+    let t0 = std::time::Instant::now();
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert!(t0.elapsed().as_secs() < 20);
+    assert!(r.log.iter().any(|l| l.message.contains("timed out")), "{:?}", r.log);
+    // Without sources the job needs the command; a broken command line is refused.
+    jb.stdin_command = Some(hooks::StdinCommand { command: "sh -c 'unclosed".into(), ..Default::default() });
+    assert!(m.save_job(jb.clone(), None).await.is_err());
+    jb.stdin_command = None;
+    assert!(m.save_job(jb, None).await.is_err());
+}

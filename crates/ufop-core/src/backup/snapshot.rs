@@ -372,7 +372,9 @@ mod lvm {
         Ok(info)
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// LVM only (Linux itself goes through `linux::create`, which also
+    /// picks ZFS and btrfs).
+    #[allow(dead_code)]
     pub(super) fn create(sources: &[PathBuf], opts: &SnapshotOptions, cmd: Arc<dyn Cmd>) -> Result<Snapshot, AppError> {
         let mut snap = Snapshot::new("lvm", cmd.clone());
         let mut done: Vec<String> = Vec::new();

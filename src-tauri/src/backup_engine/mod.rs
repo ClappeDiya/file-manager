@@ -19,6 +19,7 @@ pub mod logs;
 pub mod notify;
 pub mod policy;
 pub mod portability;
+pub mod runs;
 pub mod power;
 pub mod schedule;
 pub mod secrets;
@@ -272,6 +273,9 @@ pub struct BackupJob {
     /// this option existed: they stay plain until it is turned on.
     #[serde(default)]
     pub encrypt_local_database: Option<bool>,
+    /// A command whose output each backup stores as a virtual file.
+    #[serde(default)]
+    pub stdin_command: Option<hooks::StdinCommand>,
 }
 
 impl Default for BackupJob {
@@ -310,6 +314,7 @@ impl Default for BackupJob {
             legal_hold: None,
             read_only: false,
             encrypt_local_database: None,
+            stdin_command: None,
         }
     }
 }
@@ -319,8 +324,15 @@ impl BackupJob {
         if self.name.trim().is_empty() {
             return Err(AppError::validation("Give the backup job a name"));
         }
-        if self.sources.iter().all(|s| s.trim().is_empty()) {
+        let has_command = self.stdin_command.as_ref().is_some_and(|c| c.is_set());
+        if self.sources.iter().all(|s| s.trim().is_empty()) && !has_command {
             return Err(AppError::validation("Add at least one source folder"));
+        }
+        if let Some(c) = &self.stdin_command {
+            c.validate()?;
+        }
+        if self.options.rehash_percent > 100 {
+            return Err(AppError::validation("The rehash percentage must be between 0 and 100"));
         }
         if let Some(k) = &self.options.kdf {
             k.validate()?;
@@ -2133,6 +2145,9 @@ impl BackupManager {
             Ok(v) => {
                 let errors = v.get("errors").and_then(|e| e.as_array()).map(|a| a.len()).unwrap_or(0);
                 let warnings = v.get("warnings").and_then(|e| e.as_array()).map(|a| a.len()).unwrap_or(0);
+                for i in v.get("info").and_then(|e| e.as_array()).into_iter().flatten() {
+                    log.push(LogLine::info(i.as_str().unwrap_or_default()).tagged("engine"));
+                }
                 for w in v.get("warnings").and_then(|e| e.as_array()).into_iter().flatten() {
                     log.push(LogLine::warn(w.as_str().unwrap_or_default()));
                 }
@@ -2929,8 +2944,13 @@ fn dispatch(
                 (true, false) => Some(portability::stripped_config(job)?),
                 (true, true) => Some(portability::full_config(job)?),
             };
-            let sources: Vec<PathBuf> = job.sources.iter().map(PathBuf::from).collect();
-            serde_json::to_value(ufop_core::backup::run_backup(backend, db, &sources, &filter, &opts, &legal_hold::effective_retention(job), pass, kdf, ctx)?)?
+            let sources: Vec<PathBuf> = job.sources.iter().filter(|s| !s.trim().is_empty()).map(PathBuf::from).collect();
+            let streams = match job.stdin_command.as_ref().filter(|c| c.is_set()) {
+                Some(c) => vec![hooks::command_stream(c, &BackupManager::script_env(job, "backup", "STDIN"))?],
+                None => Vec::new(),
+            };
+            let retention = legal_hold::effective_retention(job);
+            serde_json::to_value(ufop_core::backup::run_backup_with_streams(backend, db, &sources, &filter, &opts, &retention, pass, None, kdf, ctx, streams)?)?
         }
         BackupOperation::Restore { options, .. } => serde_json::to_value(ufop_core::backup::run_restore(&open(false)?, &options, ctx)?)?,
         BackupOperation::Verify { full } => {

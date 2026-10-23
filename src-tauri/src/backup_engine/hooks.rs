@@ -126,6 +126,150 @@ pub async fn run_script(command_line: &str, env: &BTreeMap<String, String>, time
     }
 }
 
+/// A command whose standard output is backed up as one virtual file of
+/// each version (for example `pg_dump mydb`). It gets the same `UFOP_*`
+/// environment as hook scripts; a non-zero exit fails the run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StdinCommand {
+    /// Command line, split like hook scripts' (no shell unless you run one).
+    pub command: String,
+    /// Name of the file in the version: `name` → `/stdin/name`, or an
+    /// absolute path such as `/dumps/mydb.sql`.
+    pub path: String,
+    /// Kill the command after this many seconds (0 = no limit).
+    pub timeout_secs: u64,
+}
+
+impl StdinCommand {
+    pub fn is_set(&self) -> bool {
+        !self.command.trim().is_empty()
+    }
+
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !self.is_set() {
+            return Ok(());
+        }
+        if shlex::split(&self.command).is_none_or(|p| p.is_empty()) {
+            return Err(AppError::validation(format!("Cannot parse the backup command line '{}'", self.command)));
+        }
+        if self.virtual_path().split('/').any(|c| c == "..") {
+            return Err(AppError::validation("The command output's file name cannot contain '..'"));
+        }
+        Ok(())
+    }
+
+    /// Path of the virtual file in the version.
+    pub fn virtual_path(&self) -> String {
+        let p = self.path.trim();
+        ufop_core::backup::reader::stream_path(if p.is_empty() { "command-output" } else { p })
+    }
+}
+
+/// Kills the command if the backup stops before reading to the end.
+struct ChildGuard {
+    child: std::sync::Mutex<Option<std::process::Child>>,
+}
+
+impl ChildGuard {
+    fn kill(&self) {
+        if let Some(c) = self.child.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+struct ChildOutput {
+    out: std::process::ChildStdout,
+    _guard: std::sync::Arc<ChildGuard>,
+}
+
+impl std::io::Read for ChildOutput {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.out.read(buf)
+    }
+}
+
+/// Start `cmd` and return its standard output as a stream source for the
+/// backup engine. Called on the engine's (blocking) thread.
+pub fn command_stream(cmd: &StdinCommand, env: &BTreeMap<String, String>) -> Result<ufop_core::backup::StreamSource, AppError> {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    cmd.validate()?;
+    let parts = shlex::split(&cmd.command).filter(|p| !p.is_empty()).ok_or_else(|| AppError::validation("The backup command is empty"))?;
+    let mut child = std::process::Command::new(&parts[0])
+        .args(&parts[1..])
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::file_op(format!("Could not start the backup command '{}': {e}", parts[0]), "Check the command and that the program is installed."))?;
+    let out = child.stdout.take().ok_or_else(|| AppError::internal("command output not captured"))?;
+    let stderr = child.stderr.take();
+    let guard = Arc::new(ChildGuard { child: Mutex::new(Some(child)) });
+    // Keep the end of stderr for the error message.
+    let err_tail: Arc<Mutex<String>> = Arc::default();
+    let err_thread = stderr.map(|mut e| {
+        let tail = err_tail.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = e.read_to_end(&mut buf);
+            let text = String::from_utf8_lossy(&buf);
+            let t = text.trim();
+            let start = t.char_indices().rev().nth(500).map(|(i, _)| i).unwrap_or(0);
+            *tail.lock().unwrap_or_else(|e| e.into_inner()) = t[start..].to_string();
+        })
+    });
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    if cmd.timeout_secs > 0 {
+        let (weak, timed_out, finished, limit) = (Arc::downgrade(&guard), timed_out.clone(), finished.clone(), std::time::Duration::from_secs(cmd.timeout_secs));
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !finished.load(Ordering::SeqCst) {
+                if start.elapsed() >= limit {
+                    if let Some(g) = weak.upgrade() {
+                        timed_out.store(true, Ordering::SeqCst);
+                        g.kill();
+                    }
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
+    let (program, timeout) = (parts[0].clone(), cmd.timeout_secs);
+    let finish_guard = guard.clone();
+    let reader = ChildOutput { out, _guard: guard };
+    Ok(ufop_core::backup::StreamSource::new(cmd.virtual_path(), reader).with_finish(move || {
+        let status = finish_guard.child.lock().unwrap_or_else(|e| e.into_inner()).take().map(|mut c| c.wait());
+        finished.store(true, Ordering::SeqCst);
+        if let Some(t) = err_thread {
+            let _ = t.join();
+        }
+        let tail = err_tail.lock().map(|t| t.clone()).unwrap_or_default();
+        let detail = if tail.is_empty() { String::new() } else { format!(": {tail}") };
+        if timed_out.load(Ordering::SeqCst) {
+            return Err(format!("'{program}' timed out after {timeout}s{detail}"));
+        }
+        match status {
+            Some(Ok(s)) if s.success() => Ok(()),
+            Some(Ok(s)) => Err(format!("'{program}' exited with {}{detail}", s.code().map(|c| format!("status {c}")).unwrap_or_else(|| "a signal".into()))),
+            Some(Err(e)) => Err(format!("'{program}': {e}")),
+            None => Err(format!("'{program}' was stopped")),
+        }
+    }))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReportFormat {
