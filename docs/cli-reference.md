@@ -808,6 +808,21 @@ ufop server folders list
 
 ---
 
+### `ufop agent`
+
+Connect this machine to a UFOP management console, without the desktop app. The console's fleet policies become managed backup jobs here (local-folder destinations only; use `ufop-server` for cloud destinations), and their results are reported back.
+
+```bash
+ufop agent register --url https://console.example.com --token ufop_reg_… [--tags lab,linux]
+ufop agent claim --url https://console.example.com   # shows a code to enter in the console
+ufop agent run [--heartbeat 60]    # foreground: heartbeats, commands, policies, scheduled jobs
+ufop agent sync                    # one round now (waits for backups the console started)
+ufop --json agent status           # registration, policies, queued reports, per-job warnings
+ufop agent unregister [--force]
+```
+
+`ufop agent run` runs managed jobs on the same schedules as the desktop app: interval or cron schedules in the schedule's time zone (a slot missed while stopped runs once), compaction, verification and retention on their own maintenance schedules, and settings inherited from the organization's policy templates. See [Managed jobs on the standalone CLI agent](backup-policies-and-schedules.md#managed-jobs-on-the-standalone-cli-agent). Settings live in `~/.config/ufop/agent.json` and the token in `agent-token` next to it (both 0600); central credentials stay in memory.
+
 ### `ufop gateway`
 
 An on-premises **file gateway**: serve folders on this machine through a `ufop-server`, so the server's users can browse, download and (optionally) upload them. The agent connects out to the server over HTTPS, so no inbound port is opened. Data streams straight through and the server does not store it. Start agents with the same `--name` on several machines to share the work and fail over.

@@ -137,7 +137,7 @@ A schedule (`BackupSchedule`) works in one of two modes:
 - compaction, verification and retention on their own [maintenance schedules](#maintenance-schedule) (each reported to the console with its task as the operation); a scheduled compaction or retention no longer also runs after each backup;
 - settings inherited from the organization's **policy templates** (managed app settings `backupTemplates`): the policy's `template_ids` (`org:<id>`, in order) fill in what the policy leaves unset, enforced templates win over the policy. The resolution order is the desktop's (`ufop_core::backup::layers`).
 
-The CLI agent applies the backup options, filter, retention, schedule and maintenance. Other sections a policy or template sets (scripts, notifications, throttle, retry, prevent sleep) are ignored with a warning in `ufop agent status --format json`. Holiday calendars are not delivered to CLI machines: calendar references are dropped with a warning, so those days are not skipped. *Skip while on battery* is not checked. Jobs saved by older versions keep their plain interval until the console sends the policy again.
+The CLI agent applies the backup options, filter, retention, schedule and maintenance. Other sections a policy or template sets (scripts, notifications, throttle, retry, prevent sleep) are ignored with a warning in `ufop --json agent status`. Holiday calendars are not delivered to CLI machines: calendar references are dropped with a warning, so those days are not skipped. *Skip while on battery* is not checked. Jobs saved by older versions keep their plain interval until the console sends the policy again.
 
 ## Time zone
 
