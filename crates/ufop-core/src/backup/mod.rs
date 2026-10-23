@@ -41,6 +41,7 @@ pub mod mirror;
 pub mod modules;
 pub mod par2;
 pub mod photos;
+pub mod reader;
 pub mod recovery;
 pub mod restore;
 pub mod retention;
@@ -51,7 +52,8 @@ pub mod versions;
 pub mod volume;
 
 pub use backend::{Backend, LocalBackend, ReadOnlyBackend, RemoteFile, RetryingBackend, SoftDeleteBackend};
-pub use engine::{run_backup, BackupReport};
+pub use engine::{run_backup, run_backup_with_streams, BackupReport};
+pub use reader::StreamSource;
 pub use filters::{FilterAction, FilterKind, FilterRule, SourceFilter};
 pub use restore::{run_restore, RestoreOptions, RestoreReport};
 pub use retention::RetentionPolicy;

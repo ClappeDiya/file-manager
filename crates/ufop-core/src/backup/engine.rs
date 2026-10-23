@@ -8,7 +8,8 @@
 //! thread.
 
 use super::backend::Backend;
-use super::chunker::{for_each_chunk, Chunker};
+use super::chunker::Chunker;
+use super::reader::{read_input, Input, Msg, StreamSource, Work, WorkerCfg};
 use super::crypto::{KdfParams, VolumeCipher};
 use super::layout::LayoutBackend;
 use super::db::BackupDb;
@@ -17,7 +18,7 @@ use super::par2::{self, Par2};
 use super::retention::RetentionPolicy;
 use super::volume::{self, BlockVolumeWriter, ControlFile, FileListVolume, IndexVolume, IndexedBlock, RepoHeader, VolumeKind};
 use super::{
-    hash_bytes, meta, BackupOptions, EntryKind, FileEntry, FileHasher, HashAlgorithm, MissingSourcePolicy, OpContext, Phase, Progress, SymlinkPolicy,
+    hash_bytes, meta, BackupOptions, EntryKind, FileEntry, HashAlgorithm, MissingSourcePolicy, OpContext, Phase, Progress, SymlinkPolicy,
     UsnPolicy,
 };
 use super::errors::{ErrorClass, ErrorTracker};
@@ -1171,51 +1172,6 @@ pub(crate) fn next_timestamp(db: &BackupDb) -> Result<DateTime<Utc>, AppError> {
 
 // ── Worker pipeline ──
 
-enum Msg {
-    Block { idx: usize, hash: String, flag: u8, data: Vec<u8>, raw_len: u64 },
-    Done { idx: usize, size: u64, hash: String },
-    Failed { idx: usize, error: String },
-}
-
-struct WorkerCfg {
-    chunker: Box<dyn Chunker>,
-    codec: super::BlockCodec,
-    read_buf: usize,
-    block_hash: HashAlgorithm,
-    file_hash: HashAlgorithm,
-    format: super::VolumeFormat,
-    respect_locks: bool,
-    background: bool,
-    /// Pause after each block (CPU intensity below 10).
-    pause: std::time::Duration,
-}
-
-fn read_file(cfg: &WorkerCfg, idx: usize, path: &Path, level: u32, tx: &mpsc::SyncSender<Msg>, stop: &dyn Fn() -> bool) -> Result<(), String> {
-    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    if cfg.respect_locks && meta::is_advisory_locked(&f) {
-        return Err("locked by another program (advisory lock)".into());
-    }
-    let mut f = std::io::BufReader::with_capacity(cfg.read_buf.max(cfg.chunker.max_size()), f);
-    let mut fh = FileHasher::new(cfg.file_hash);
-    let size = for_each_chunk(&mut f, cfg.chunker.as_ref(), |chunk| {
-        if stop() {
-            return Err("cancelled".into());
-        }
-        fh.update(chunk);
-        let hash = hash_bytes(cfg.block_hash, chunk);
-        let (flag, data) = volume::encode_block(cfg.format, cfg.codec, chunk, level).map_err(|e| e.user_message())?;
-        tx.send(Msg::Block { idx, hash, flag, data, raw_len: chunk.len() as u64 }).map_err(|_| "pipeline closed".to_string())?;
-        if !cfg.pause.is_zero() {
-            std::thread::sleep(cfg.pause);
-        }
-        Ok(true)
-    })?;
-    if stop() {
-        return Err("cancelled".into());
-    }
-    tx.send(Msg::Done { idx, size, hash: fh.finish() }).map_err(|_| "pipeline closed".to_string())
-}
-
 struct UploadResult {
     volume: SealedVolume,
     par2_names: Vec<String>,
@@ -1330,13 +1286,36 @@ pub fn run_backup_with_cipher(
     kdf: KdfParams,
     ctx: &OpContext,
 ) -> Result<BackupReport, AppError> {
+    run_backup_with_streams(backend, db, sources, filter, opts, retention, passphrase, external, kdf, ctx, Vec::new())
+}
+
+/// [`run_backup_with_cipher`] that also stores each [`StreamSource`] (a
+/// command's output, standard input) as a virtual file of the version.
+/// `sources` may be empty when streams are given.
+#[allow(clippy::too_many_arguments)]
+pub fn run_backup_with_streams(
+    backend: &dyn Backend,
+    db: &BackupDb,
+    sources: &[PathBuf],
+    filter: &SourceFilter,
+    opts: &BackupOptions,
+    retention: &RetentionPolicy,
+    passphrase: Option<&str>,
+    external: Option<VolumeCipher>,
+    kdf: KdfParams,
+    ctx: &OpContext,
+    streams: Vec<StreamSource>,
+) -> Result<BackupReport, AppError> {
     let started = Instant::now();
     let mut report = BackupReport { dry_run: opts.dry_run, ..Default::default() };
     retention.validate()?;
     super::versions::validate_note(opts.default_note.as_deref())?;
     super::versions::validate_tags(&opts.default_tags)?;
-    if sources.is_empty() {
+    if sources.is_empty() && streams.is_empty() {
         return Err(AppError::validation("The backup job has no source folders"));
+    }
+    if opts.rehash_percent > 100 {
+        return Err(AppError::validation("The rehash percentage must be between 0 and 100"));
     }
     if opts.background_io {
         meta::set_background_priority();
@@ -1426,6 +1405,24 @@ pub fn run_backup_with_cipher(
         _ => scan_sources_in(sources, filter, opts, snap, staging.path(), &tracker)?,
     };
     let mut entries = scanned.entries;
+    // Virtual files of streams, after the scanned entries.
+    let mut stream_of: HashMap<usize, usize> = HashMap::new();
+    let mut stream_paths: HashSet<String> = HashSet::new();
+    for (si, st) in streams.iter().enumerate() {
+        if !stream_paths.insert(st.path.clone()) {
+            return Err(AppError::validation(format!("Two streams are named {}", st.path)));
+        }
+        for e in super::reader::stream_entries(&st.path, opts.skip_metadata)? {
+            if e.kind == EntryKind::Dir && entries.iter().any(|(_, x)| x.path == e.path) {
+                continue;
+            }
+            if e.kind == EntryKind::File {
+                stream_of.insert(entries.len(), si);
+            }
+            entries.push((PathBuf::from(&e.path), e));
+        }
+    }
+    let streams: Vec<Mutex<Option<StreamSource>>> = streams.into_iter().map(|s| Mutex::new(Some(s))).collect();
     report.warnings.extend(scanned.warnings);
     report.info.extend(scanned.info);
     absorb_problems(&mut report, &tracker);
@@ -1442,7 +1439,10 @@ pub fn run_backup_with_cipher(
     let prev_files: HashMap<String, FileEntry> = prev_list.into_iter().map(|f| (f.path.clone(), f)).collect();
     let total = entries.len() as u64;
     let mut results: Vec<Option<FileEntry>> = vec![None; entries.len()];
-    let mut work: VecDeque<(usize, PathBuf, u32)> = VecDeque::new();
+    let mut work: VecDeque<Work> = VecDeque::new();
+    // Unchanged-looking files re-read by percentage rehash → their recorded hash.
+    let mut rehash: HashMap<usize, Option<String>> = HashMap::new();
+    let rehash_run = rehash_run_counter(db, opts)?;
     for (i, (path, entry)) in entries.iter_mut().enumerate() {
         if entry.kind != EntryKind::File {
             results[i] = Some(entry.clone());
@@ -1450,8 +1450,18 @@ pub fn run_backup_with_cipher(
         }
         report.files_examined += 1;
         report.bytes_examined += entry.size;
+        let input = match stream_of.get(&i) {
+            Some(si) => Input::Stream(*si),
+            None => Input::Path(snap.map(|s| s.real(path)).unwrap_or_else(|| path.clone())),
+        };
         match prev_files.get(&entry.path) {
             Some(prev) if unchanged(prev, entry, opts) && prev.blocks.iter().all(|b| db.has_block(b).unwrap_or(false)) => {
+                if rehash_selected(&entry.path, rehash_run, opts.rehash_percent) {
+                    rehash.insert(i, prev.hash.clone());
+                    report.files_rehashed += 1;
+                    work.push_back(Work { idx: i, input, level: compress_level(path, opts), size: entry.size });
+                    continue;
+                }
                 let mut e = prev.clone();
                 e.mode = entry.mode;
                 e.meta = entry.meta.clone();
@@ -1462,7 +1472,7 @@ pub fn run_backup_with_cipher(
             None => report.files_added += 1,
         }
         progress(ctx, Phase::Uploading, i as u64, total, report.bytes_examined, Some(&entry.path));
-        work.push_back((i, snap.map(|s| s.real(path)).unwrap_or_else(|| path.clone()), compress_level(path, opts)));
+        work.push_back(Work { idx: i, input, level: compress_level(path, opts), size: entry.size });
     }
 
     // ── Parallel read/hash/compress → dedup/pack → concurrent upload ──
@@ -1485,6 +1495,8 @@ pub fn run_backup_with_cipher(
         respect_locks: opts.respect_advisory_locks,
         background: opts.background_io,
         pause: std::time::Duration::from_micros((10 - opts.cpu_intensity.clamp(1, 10) as u64) * 500),
+        parallel_threshold: opts.parallel_file_threshold,
+        helpers: opts.worker_threads(),
     };
     let mut pending = Pending::for_repo(&repo, opts);
     let mut in_flight: HashSet<String> = HashSet::new();
@@ -1501,19 +1513,19 @@ pub fn run_backup_with_cipher(
         let (tx, rx) = mpsc::sync_channel::<Msg>(256);
         for _ in 0..threads {
             let tx = tx.clone();
-            let (queue, cfg, stop) = (&queue, &cfg, &stop);
+            let (queue, cfg, stop, streams) = (&queue, &cfg, &stop, &streams);
             scope.spawn(move || {
                 if cfg.background {
                     meta::set_background_priority();
                 }
                 loop {
                     let next = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-                    let Some((idx, path, level)) = next else { break };
+                    let Some(w) = next else { break };
                     if stop() {
                         break;
                     }
-                    if let Err(error) = read_file(cfg, idx, &path, level, &tx, stop) {
-                        if tx.send(Msg::Failed { idx, error }).is_err() {
+                    if let Err(error) = read_input(cfg, &w, streams, &tx, stop) {
+                        if tx.send(Msg::Failed { idx: w.idx, error }).is_err() {
                             break;
                         }
                     }
@@ -1562,6 +1574,11 @@ pub fn run_backup_with_cipher(
             let v = seal_pending(&repo, w, blocks)?;
             report.bytes_uploaded += (v.block_data.len() + v.index_data.len()) as u64;
             report.volumes_uploaded += 1;
+            if opts.max_upload_bytes_per_run.is_some_and(|cap| report.bytes_uploaded >= cap) && !report.upload_cap_reached {
+                // Stop reading; this volume and the files finished so far still go up.
+                report.upload_cap_reached = true;
+                halt.store(true, Ordering::SeqCst);
+            }
             if opts.dry_run {
                 return Ok(());
             }
@@ -1601,6 +1618,13 @@ pub fn run_backup_with_cipher(
                     let mut e = entries[idx].1.clone();
                     e.blocks = file_blocks.remove(&idx).unwrap_or_default();
                     e.size = size;
+                    if let Some(expected) = rehash.remove(&idx) {
+                        if expected.as_deref() != Some(hash.as_str()) {
+                            report.rehash_mismatches += 1;
+                            report.files_changed += 1;
+                            report.warnings.push(format!("{}: content changed without timestamp change (possible silent corruption); the new content was backed up", e.path));
+                        }
+                    }
                     e.hash = Some(hash);
                     done_count += 1;
                     progress(ctx, Phase::Uploading, done_count, total, report.bytes_examined, Some(&e.path));
@@ -1608,14 +1632,19 @@ pub fn run_backup_with_cipher(
                 }
                 Msg::Failed { idx, error } => {
                     file_blocks.remove(&idx);
+                    rehash.remove(&idx);
                     if error != "cancelled" {
                         let path = &entries[idx].1.path;
-                        tracker.record(ErrorClass::File, format!("Skipped {path}: {error}"));
+                        if stream_of.contains_key(&idx) {
+                            // A failed stream (its command exited non-zero) fails the run.
+                            report.errors.push(format!("Stream {path} failed: {error}"));
+                        } else {
+                            tracker.record(ErrorClass::File, format!("Skipped {path}: {error}"));
+                        }
                         if tracker.should_stop() {
                             halt.store(true, Ordering::SeqCst);
                         }
                         if let Some(prev) = prev_files.get(path) {
-                            // Keep the previous good copy in this version.
                             results[idx] = Some(prev.clone());
                         }
                     }
@@ -1656,8 +1685,13 @@ pub fn run_backup_with_cipher(
             checkpoints.remove(&repo)?;
         }
         match tracker.stop_reason() {
-            Some(r) if halted => report.errors.push(format!("{r}. The files finished so far were kept as a partial version.")),
-            _ => report.errors.push("The operation was cancelled. Start it again when ready; completed work is kept.".into()),
+            _ if ctx.is_cancelled() => report.errors.push("The operation was cancelled. Start it again when ready; completed work is kept.".into()),
+            Some(r) => report.errors.push(format!("{r}. The files finished so far were kept as a partial version.")),
+            None if report.upload_cap_reached => report.warnings.push(format!(
+                "Upload limit of {} per run reached; the files finished so far were kept as a partial version and the next run continues",
+                human(opts.max_upload_bytes_per_run.unwrap_or_default())
+            )),
+            None => report.errors.push("The backup stopped early; completed work is kept.".into()),
         }
         report.duration_ms = started.elapsed().as_millis() as u64;
         return Ok(report);
@@ -1720,6 +1754,32 @@ pub fn run_backup_with_cipher(
     Ok(report)
 }
 
+/// Run number for choosing rehash files (advances once per real run).
+fn rehash_run_counter(db: &BackupDb, opts: &BackupOptions) -> Result<u64, AppError> {
+    if opts.rehash_percent == 0 {
+        return Ok(0);
+    }
+    let n = db.get_kv("rehash_run")?.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) + 1;
+    if !opts.dry_run {
+        db.set_kv("rehash_run", &n.to_string())?;
+    }
+    Ok(n)
+}
+
+/// Whether `path` is among the ~`percent`% of files re-read in run `run`.
+/// A hash of (path, run) spreads the choice so every file comes up over time.
+pub(crate) fn rehash_selected(path: &str, run: u64, percent: u8) -> bool {
+    if percent == 0 {
+        return false;
+    }
+    if percent >= 100 {
+        return true;
+    }
+    let h = hash_bytes(HashAlgorithm::Sha256, format!("{run}\0{path}").as_bytes());
+    let v = u64::from_str_radix(&h[..12], 16).unwrap_or(0);
+    v % 10_000 < percent as u64 * 100
+}
+
 /// Move the problems the error policy recorded into the report.
 fn absorb_problems(report: &mut BackupReport, tracker: &ErrorTracker) {
     let (w, e) = tracker.take();
@@ -1740,6 +1800,7 @@ fn version_meta(opts: &BackupOptions, report: &BackupReport) -> VersionMeta {
             files_added: report.files_added,
             files_changed: report.files_changed,
             files_deleted: report.files_deleted,
+            upload_cap_reached: report.upload_cap_reached,
         }),
         ..Default::default()
     }

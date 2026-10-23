@@ -89,6 +89,10 @@ pub struct VersionStats {
     pub files_added: u64,
     pub files_changed: u64,
     pub files_deleted: u64,
+    /// The run stopped at its upload limit; the version is partial and the
+    /// next run continues.
+    #[serde(skip_serializing_if = "is_false")]
+    pub upload_cap_reached: bool,
 }
 
 fn is_false(b: &bool) -> bool {

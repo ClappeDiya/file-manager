@@ -188,3 +188,169 @@ fn unknown_entries_and_scan_errors() {
         assert!(r.errors.iter().any(|e| e.contains("Cannot list")), "{r:?}");
     }
 }
+
+/// Incompressible, deterministic test data.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+fn latest_files(db: &BackupDb) -> Vec<FileEntry> {
+    db.files(db.filesets().unwrap()[0].id).unwrap()
+}
+
+#[test]
+fn rehash_selection_is_deterministic_and_spread() {
+    let paths: Vec<String> = (0..2000).map(|i| format!("/data/file-{i}.bin")).collect();
+    let pick = |run| paths.iter().filter(|p| rehash_selected(p, run, 10)).cloned().collect::<Vec<_>>();
+    let (a, b) = (pick(1), pick(2));
+    assert!((120..=280).contains(&a.len()), "about 10% of 2000: {}", a.len());
+    assert_eq!(a, pick(1), "same run, same files");
+    assert_ne!(a, b, "the next run checks other files");
+    assert!(paths.iter().all(|p| rehash_selected(p, 7, 100)));
+    assert!(!paths.iter().any(|p| rehash_selected(p, 7, 0)));
+}
+
+#[test]
+fn rehash_finds_content_changed_without_timestamp_change() {
+    let src = tempfile::tempdir().unwrap();
+    for i in 0..5 {
+        write(src.path(), &format!("f{i}"), &noise(i, 3000));
+    }
+    let dst = tempfile::tempdir().unwrap();
+    let (be, db) = (LocalBackend::new(dst.path()), BackupDb::open_in_memory().unwrap());
+    let f = SourceFilter::default().compile().unwrap();
+    let mut o = opts();
+    backup(&be, &db, src.path(), &f, &o);
+    // Silent corruption: same size, same timestamp, other bytes.
+    let p = src.path().join("f2");
+    let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+    std::fs::write(&p, noise(99, 3000)).unwrap();
+    std::fs::File::options().write(true).open(&p).unwrap().set_modified(mtime).unwrap();
+    let r = backup(&be, &db, src.path(), &f, &o);
+    assert!(r.skipped_unchanged && r.files_rehashed == 0, "without rehash the change goes unnoticed");
+    o.rehash_percent = 100;
+    let r = backup(&be, &db, src.path(), &f, &o);
+    assert_eq!((r.files_rehashed, r.rehash_mismatches), (5, 1), "{r:?}");
+    assert!(r.warnings.iter().any(|w| w.contains("f2") && w.contains("possible silent corruption")), "{:?}", r.warnings);
+    assert!(r.version.is_some());
+    let e = latest_files(&db).into_iter().find(|e| e.path.ends_with("f2")).unwrap();
+    assert_eq!(e.hash.as_deref(), Some(hash_bytes(HashAlgorithm::Sha256, &noise(99, 3000)).as_str()), "the new content is backed up");
+    // Nothing differs now: rehashing reads but changes nothing.
+    let r = backup(&be, &db, src.path(), &f, &o);
+    assert!(r.skipped_unchanged && r.rehash_mismatches == 0 && r.files_rehashed == 5, "{r:?}");
+    o.rehash_percent = 101;
+    assert!(run_backup(&be, &db, &[src.path().into()], &f, &o, &RetentionPolicy::KeepAll, None, KdfParams::insecure_fast(), &OpContext::new()).is_err());
+}
+
+fn stream_backup(be: &LocalBackend, db: &BackupDb, sources: &[PathBuf], o: &BackupOptions, streams: Vec<StreamSource>) -> BackupReport {
+    let f = SourceFilter::default().compile().unwrap();
+    run_backup_with_streams(be, db, sources, &f, o, &RetentionPolicy::KeepAll, Some("pw"), None, KdfParams::insecure_fast(), &OpContext::new(), streams).unwrap()
+}
+
+#[test]
+fn stream_is_backed_up_as_a_virtual_file_and_restores() {
+    let dst = tempfile::tempdir().unwrap();
+    let (be, db) = (LocalBackend::new(dst.path()), BackupDb::open_in_memory().unwrap());
+    let data = noise(5, 50_000);
+    let o = opts();
+    let r = stream_backup(&be, &db, &[], &o, vec![StreamSource::new("db.sql", std::io::Cursor::new(data.clone()))]);
+    assert!(r.errors.is_empty() && r.version.is_some(), "{r:?}");
+    let files = latest_files(&db);
+    let e = files.iter().find(|e| e.path == "/stdin/db.sql").unwrap();
+    assert_eq!((e.size, e.mode), (50_000, Some(0o100644)));
+    assert!(files.iter().any(|e| e.path == "/stdin" && e.kind == EntryKind::Dir));
+    // Restore it like any file.
+    let out = tempfile::tempdir().unwrap();
+    let repo = Repo::open(&be, &db, Some("pw"), &o, false, KdfParams::insecure_fast()).unwrap();
+    let rr = crate::backup::run_restore(&repo, &crate::backup::RestoreOptions { target: Some(out.path().into()), ..Default::default() }, &OpContext::new()).unwrap();
+    assert!(rr.errors.is_empty(), "{:?}", rr.errors);
+    let restored = walk(out.path()).into_iter().find(|p| p.ends_with("db.sql")).unwrap();
+    assert_eq!(std::fs::read(restored).unwrap(), data);
+
+    // Together with folders; a failing producer fails the run.
+    let src = tempfile::tempdir().unwrap();
+    write(src.path(), "a.txt", b"folder file");
+    let bad = StreamSource::new("/dumps/broken.sql", std::io::Cursor::new(b"partial".to_vec())).with_finish(|| Err("pg_dump exited with status 1".into()));
+    let good = StreamSource::new("ok.txt", std::io::Cursor::new(b"fine".to_vec()));
+    let r = stream_backup(&be, &db, &[src.path().into()], &o, vec![bad, good]);
+    assert!(r.errors.iter().any(|e| e.contains("/dumps/broken.sql") && e.contains("status 1")), "{:?}", r.errors);
+    let paths: Vec<String> = latest_files(&db).into_iter().map(|e| e.path).collect();
+    assert!(paths.iter().any(|p| p.ends_with("a.txt")) && paths.contains(&"/stdin/ok.txt".to_string()), "{paths:?}");
+    assert!(!paths.contains(&"/dumps/broken.sql".to_string()));
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[test]
+fn upload_cap_stops_with_a_partial_version_and_the_next_run_continues() {
+    let src = tempfile::tempdir().unwrap();
+    for i in 0..24 {
+        write(src.path(), &format!("f{i:02}"), &noise(100 + i, 6000));
+    }
+    let dst = tempfile::tempdir().unwrap();
+    let (be, db) = (LocalBackend::new(dst.path()), BackupDb::open_in_memory().unwrap());
+    let f = SourceFilter::default().compile().unwrap();
+    let mut o = opts();
+    o.hash_threads = 1;
+    o.max_upload_bytes_per_run = Some(30_000);
+    let r = backup(&be, &db, src.path(), &f, &o);
+    assert!(r.upload_cap_reached && r.partial && r.errors.is_empty(), "{r:?}");
+    assert!(r.warnings.iter().any(|w| w.contains("Upload limit")), "{:?}", r.warnings);
+    assert!(r.bytes_uploaded < 24 * 6000, "stopped early: {}", r.bytes_uploaded);
+    let first = db.filesets().unwrap()[0].clone();
+    assert!(first.partial && first.stats.is_some_and(|s| s.upload_cap_reached));
+    let first_files = db.files(first.id).unwrap().iter().filter(|e| e.kind == EntryKind::File).count();
+    assert!(first_files > 0 && first_files < 24, "{first_files}");
+    // The next run without a cap uploads only the rest.
+    o.max_upload_bytes_per_run = None;
+    let r2 = backup(&be, &db, src.path(), &f, &o);
+    assert!(!r2.partial && !r2.upload_cap_reached && r2.errors.is_empty(), "{r2:?}");
+    assert_eq!(latest_files(&db).iter().filter(|e| e.kind == EntryKind::File).count(), 24);
+    assert!(r2.new_blocks < 24 * 6, "already uploaded blocks are not sent again: {}", r2.new_blocks);
+}
+
+#[test]
+fn parallel_large_files_match_sequential_reading() {
+    let src = tempfile::tempdir().unwrap();
+    let big = noise(42, 3 * 1024 * 1024 + 123);
+    write(src.path(), "big.bin", &big);
+    write(src.path(), "small.txt", b"small");
+    let f = SourceFilter::default().compile().unwrap();
+    let run = |threshold: u64| {
+        let dst = tempfile::tempdir().unwrap();
+        let (be, db) = (LocalBackend::new(dst.path()), BackupDb::open_in_memory().unwrap());
+        let o = BackupOptions { block_size: 16 * 1024, volume_size: 1024 * 1024, verify_samples: 0, hash_threads: 4, parallel_file_threshold: threshold, ..Default::default() };
+        let t = Instant::now();
+        let r = run_backup_with_streams(&be, &db, &[src.path().into()], &f, &o, &RetentionPolicy::KeepAll, None, None, KdfParams::insecure_fast(), &OpContext::new(), vec![StreamSource::new("s.bin", std::io::Cursor::new(big.clone()))]).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let elapsed = t.elapsed();
+        let mut files = latest_files(&db);
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        (files.into_iter().map(|e| (e.path, e.hash, e.blocks, e.size)).collect::<Vec<_>>(), r.new_blocks, elapsed)
+    };
+    let (seq, seq_blocks, seq_t) = run(0);
+    let (par, par_blocks, par_t) = run(1024 * 1024);
+    assert_eq!(seq, par, "identical block lists and hashes");
+    assert_eq!(seq_blocks, par_blocks);
+    assert!(seq.iter().any(|(p, _, b, _)| p.ends_with("big.bin") && b.len() > 50));
+    eprintln!("large file: sequential {seq_t:?}, parallel {par_t:?} (informational)");
+}
