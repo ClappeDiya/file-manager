@@ -2,6 +2,7 @@ pub mod agent;
 pub mod archive;
 pub mod backup;
 pub mod backup_access;
+pub mod backup_debug;
 pub mod backup_notify;
 pub mod backup_policy;
 pub mod checksum;

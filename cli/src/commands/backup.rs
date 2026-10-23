@@ -1378,6 +1378,18 @@ pub enum BackupCommands {
         #[arg(long, default_value_t = 2)]
         shard_prefix_len: u8,
     },
+    /// Benchmark compression, encryption, Argon2id, chunkers and hashes on
+    /// sample data and suggest `ufop backup run` flags
+    Bench {
+        #[command(flatten)]
+        args: super::backup_debug::BenchArgs,
+    },
+    /// Read-only expert inspection: header, volumes, stats, blocks, block,
+    /// index, fileset, sessions, db
+    Debug {
+        #[command(subcommand)]
+        cmd: super::backup_debug::DebugCommands,
+    },
     /// Show the repository format (version, chunker, codec, cipher, layout)
     FormatInfo {
         #[command(flatten)]
@@ -2154,6 +2166,8 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             ok(emit(format, "Reshard", &r))?;
             Ok(if r.errors.is_empty() { 0 } else { 2 })
         }
+        BackupCommands::Bench { args } => super::backup_debug::bench(&args, format),
+        BackupCommands::Debug { cmd } => super::backup_debug::debug(cmd, format),
         BackupCommands::FormatInfo { repo } => {
             ok(emit(format, "Repository format", &ufop_core::backup::format::format_info(repo.backend().as_ref(), &repo.prefix)?))?;
             Ok(0)
