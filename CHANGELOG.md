@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Backup repository safety (see `docs/backup-safety.md`): repository lock leases (`<prefix>-lock.json` for writers, one file per reader), renewed in the background, stale locks taken over with a warning, "Repository in use by …" in Maintenance and a confirmed Break lock (`ufop backup lock status|break`, `GET`/`DELETE /api/v1/jobs/{id}/lock`); a clock check against the destination's file times (warn at 5 minutes, stop at 1 hour); periodic checkpoints that keep a long backup restorable if it stops half way; read-only jobs and connections (`--read-only`) that only restore and browse; and an encrypted local database for encrypted backups, with its key in the OS keychain, one-click migration, `--db-key-source` in the CLI and automatic rebuilding when the key is lost.
+
 - Backup repository format 2 (default for new backups; format 1 stays readable and writable): content-defined chunking (FastCDC), Zstandard blocks and compressed file lists, an envelope key so passwords change without rewriting data, ChaCha20-Poly1305, and an optional sharded folder layout. Upgrade in place with rollback until the first format 2 write, change the password, and reshard from Maintenance, the REST API or `ufop backup upgrade | change-password | reshard | format-info`. See `docs/backup-repository-format.md`.
 
 - Robocopy feature parity for sync pairs: selection (`/S /E /LEV /XD /MAXAGE /MINAGE /XA /XJ /SL`), comparison (`/XO /XN /XC /XL /IS /FFT /DST`), cleanup (`/PURGE /XX /MOV /MOVE /CREATE`), copy engine (`/COPY:T /DCOPY:T /Z /IPG /R /W /MT /RH`), `/LOG[+]`, Robocopy exit codes, and "paste a Robocopy command" import with one-click presets.

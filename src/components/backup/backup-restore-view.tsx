@@ -315,6 +315,7 @@ export function DirectRestore() {
   const [adoptSources, setAdoptSources] = useState("");
   const [remapFrom, setRemapFrom] = useState("");
   const [remapTo, setRemapTo] = useState("");
+  const [adoptReadOnly, setAdoptReadOnly] = useState(false);
   const [adopted, setAdopted] = useState<string | null>(null);
   const [report, setReport] = useState<RestoreReport | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -401,6 +402,12 @@ export function DirectRestore() {
             <input className={`${inputCls} font-mono`} value={remapTo} onChange={(e) => setRemapTo(e.target.value)} />
           </Field>
         </div>
+        <Check
+          label="Read-only (restore and browse only)"
+          checked={adoptReadOnly}
+          onChange={setAdoptReadOnly}
+          hint="For someone else's backup or an archive: nothing is ever written to it from this computer."
+        />
         <Btn
           tone="primary"
           testId="backup-adopt"
@@ -412,6 +419,7 @@ export function DirectRestore() {
                 name: adoptName.trim() || null,
                 sources: adoptSources.split("\n").map((s) => s.trim()).filter(Boolean),
                 sourceMap: remapFrom.trim() ? [[remapFrom.trim(), remapTo.trim()]] : [],
+                readOnly: adoptReadOnly,
               });
               await useBackupStore.getState().loadJobs();
               setAdopted(`Job “${job.name}” created with ${job.stats.version_count} existing version(s); the next backup continues the history.`);

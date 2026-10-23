@@ -149,6 +149,70 @@ export interface BackupOptions {
   cipher: CipherKind;
   /** Format 2 only; sharded needs a destination with folders. */
   layout: RepoLayout;
+  // ── Repository safety ──
+  /** Repository lock lease in seconds, renewed every third of it (0 = 30 min). */
+  lock_ttl_secs: number;
+  /** Warn when the destination clock differs by this many seconds (0 = never). */
+  clock_skew_warn_secs: number;
+  /** Refuse to write when the clocks differ by this many seconds (0 = never). */
+  clock_skew_abort_secs: number;
+  /** Checkpoint (partial version) at most this often during a backup (0 = off). */
+  checkpoint_interval_secs: number;
+  /** Also checkpoint after this many uploaded bytes (0 = off). */
+  checkpoint_interval_bytes: number;
+}
+
+/** Rust `ufop_core::backup::lock::LockKind`. */
+export type LockKind = "exclusive" | "shared";
+
+/** One lock file on the destination (Rust `lock::LockEntry`). */
+export interface RepoLockEntry {
+  file: string;
+  owner_id: string;
+  hostname: string;
+  username: string;
+  pid: number;
+  app: string;
+  version: string;
+  operation: string;
+  kind: LockKind;
+  acquired_at: string;
+  expires_at: string;
+  /** Expired or unreadable: the next operation takes it over. */
+  stale: boolean;
+  damaged: boolean;
+}
+
+/** Rust `lock::LockStatus`. */
+export interface RepoLockStatus {
+  locks: RepoLockEntry[];
+  exclusive: boolean;
+  readers: number;
+  checked_at: string;
+}
+
+/** Rust `lock::BreakLockReport`. */
+export interface BreakLockReport {
+  removed: string[];
+  holders: string[];
+}
+
+/** Rust `db::RekeyReport`. */
+export interface RekeyReport {
+  encrypted: boolean;
+  files: number;
+  settings: number;
+}
+
+/** The live lock that blocks others, as "Repository in use by host (operation) since …"; null when free. */
+export function lockSummary(status: RepoLockStatus | null): string | null {
+  const live = (status?.locks ?? []).filter((l) => !l.stale);
+  const first = live.find((l) => l.kind === "exclusive") ?? live[0];
+  if (!first) return null;
+  const host = first.hostname || "another computer";
+  const since = new Date(first.acquired_at).toLocaleString();
+  const more = live.length > 1 ? ` and ${live.length - 1} other(s)` : "";
+  return `Repository in use by ${host} (${first.operation}) since ${since}${more}`;
 }
 
 /** Rust `ufop_core::backup::ChunkerKind`. */
@@ -560,6 +624,10 @@ export interface BackupJob {
   notify_on: string[];
   /** Legal hold: while set, retention is suspended and nothing can be removed. */
   legal_hold: LegalHold | null;
+  /** Restore and browse only: every write to the destination is refused. */
+  read_only: boolean;
+  /** Encrypt the local database (key in the keychain). null: decided when saved (on for encrypted jobs); older jobs stay plain. */
+  encrypt_local_database: boolean | null;
   created_at: string;
   updated_at: string;
   stats: JobStats;
@@ -780,6 +848,8 @@ export interface DbInfo {
   size_bytes: number;
   integrity_ok: boolean;
   integrity: string;
+  /** Sensitive columns are encrypted with the job's key. */
+  encrypted: boolean;
 }
 
 export interface DatabaseEntry {
@@ -980,6 +1050,11 @@ export function newBackupJob(): BackupJob {
       metadata_compression: null,
       cipher: "aes256_gcm",
       layout: { type: "flat" },
+      lock_ttl_secs: 1800,
+      clock_skew_warn_secs: 300,
+      clock_skew_abort_secs: 3600,
+      checkpoint_interval_secs: 900,
+      checkpoint_interval_bytes: 0,
     },
     retention: { type: "keep_all" },
     schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [] },
@@ -1016,6 +1091,8 @@ export function newBackupJob(): BackupJob {
     prevent_sleep: true,
     notify_on: ["warning", "error"],
     legal_hold: null,
+    read_only: false,
+    encrypt_local_database: null,
     created_at: now,
     updated_at: now,
     stats: {
@@ -1085,6 +1162,12 @@ interface BackupState {
   execute: (id: string, operation: BackupOperation) => Promise<OperationResult>;
   /** Change an encrypted job's passphrase in place (format 2); `current` null = the stored one. */
   changePassphrase: (id: string, current: string | null, newPassphrase: string, kdfPreset?: KdfPreset | null) => Promise<FormatReport>;
+  /** Who holds the job's repository lock right now. */
+  lockStatus: (id: string) => Promise<RepoLockStatus>;
+  /** Force-unlock (only when the holder is no longer running); `ownerId` limits it to the lock shown. */
+  breakLock: (id: string, ownerId: string | null) => Promise<BreakLockReport>;
+  /** Encrypt (or decrypt) the job's local database now. */
+  setDatabaseEncryption: (id: string, enabled: boolean) => Promise<RekeyReport>;
   pause: (minutes: number | null) => Promise<void>;
   resume: () => Promise<void>;
   placeLegalHold: (id: string, matter: string, reason: string) => Promise<BackupJob>;
@@ -1172,6 +1255,16 @@ export const useBackupStore = create<BackupState>((set, get) => ({
 
   changePassphrase: async (id, current, newPassphrase, kdfPreset = null) => {
     const report = await tauriInvoke<FormatReport>("backup_change_passphrase", { id, current, newPassphrase, kdfPreset });
+    await get().loadJobs();
+    return report;
+  },
+
+  lockStatus: (id) => tauriInvoke<RepoLockStatus>("backup_lock_status", { jobId: id }),
+
+  breakLock: (id, ownerId) => tauriInvoke<BreakLockReport>("backup_break_lock", { jobId: id, confirm: true, ownerId }),
+
+  setDatabaseEncryption: async (id, enabled) => {
+    const report = await tauriInvoke<RekeyReport>("backup_set_database_encryption", { jobId: id, enabled });
     await get().loadJobs();
     return report;
   },

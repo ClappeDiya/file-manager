@@ -157,6 +157,12 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
               </Field>
             )}
             {!isNew && job.stats.version_count > 0 && <BackupChangePassphrase job={job} />}
+            <Check
+              label="Encrypt the local database on this computer"
+              checked={job.encrypt_local_database ?? (isNew ? job.encrypted : false)}
+              onChange={(v) => patch({ encrypt_local_database: v })}
+              hint="File names in the job's local cache are encrypted with a key kept in this computer's keychain. If the key is lost, the cache is rebuilt from the destination."
+            />
           </Section>
         )}
 
@@ -390,6 +396,12 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 Compatibility test
               </Btn>
             </div>
+            <Check
+              label="Read-only (restore and browse only)"
+              checked={job.read_only}
+              onChange={(v) => patch({ read_only: v })}
+              hint="Nothing is ever written to the destination: no backups, maintenance or locks. Use it to open someone else's backup or an archive safely."
+            />
             <AdvancedOnly>
               <Field label="File-name prefix" hint="Lets several backups share one folder.">
                 <input className={inputCls} value={job.options.prefix} onChange={(e) => patchOpts({ prefix: e.target.value.replace(/[^A-Za-z0-9_.]/g, "") })} />

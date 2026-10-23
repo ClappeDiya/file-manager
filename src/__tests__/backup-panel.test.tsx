@@ -162,6 +162,23 @@ describe("BackupPanel", () => {
     );
   });
 
+  it("read-only jobs show a badge, cannot run, and the editor toggles the flag", async () => {
+    backend({ backup_list_jobs: () => [{ ...savedJob(), read_only: true }] });
+    render(<BackupPanel />);
+    expect(await screen.findByTestId("read-only-badge")).toBeTruthy();
+    expect(screen.getByTestId("backup-run-now")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("backup-new"));
+    fireEvent.change(screen.getByTestId("backup-name"), { target: { value: "Viewer" } });
+    fireEvent.change(screen.getByTestId("backup-passphrase"), { target: { value: "correct horse battery staple" } });
+    fireEvent.click(screen.getByText("Sources"));
+    fireEvent.change(screen.getByTestId("backup-sources"), { target: { value: "/home/me/Photos" } });
+    fireEvent.click(screen.getByText("Destination"));
+    fireEvent.change(screen.getByTestId("backup-dest-path"), { target: { value: "/mnt/usb" } });
+    fireEvent.click(screen.getByLabelText(/Read-only \(restore and browse only\)/));
+    fireEvent.click(screen.getByTestId("backup-save"));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_save_job", expect.objectContaining({ job: expect.objectContaining({ read_only: true }) })));
+  });
+
   it("restores selected files from a chosen version", async () => {
     backend();
     render(<BackupPanel />);

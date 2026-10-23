@@ -76,6 +76,8 @@ ufop backup reshard --dest /mnt/backup --layout flat
 
 Each volume is copied, read back, compared and only then deleted from its old place. The header changes after every volume has moved. An interrupted run leaves every volume readable (the engine looks in both places) and running it again finishes the move. Mirror, recovery download, database recreation, diagnostics and job deletion all follow the layout.
 
+Locks, the clock check, checkpoints, read-only connections and the encrypted local database are described in [backup-safety.md](backup-safety.md). Lock files (`<prefix>-lock.json`, `<prefix>-lock-r-<id>.json`) always stay at the top of the destination, in every layout.
+
 ## Format details
 
 `ufop backup format-info --dest …` and the `format_info` operation show the version, chunker, codecs, cipher, layout and features. The independent recovery script (`scripts/ufop-recover.py`) reads both formats. Zstandard data needs Python 3.14+ or the `zstandard` package.

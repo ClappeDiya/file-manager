@@ -226,6 +226,26 @@ export function BackupAdvancedOptions({
         </div>
         <Check label="Disable capacity warnings" checked={o.quota_disable} onChange={(v) => onChange({ quota_disable: v })} />
       </Section>
+
+      <Section title="Repository safety" hint="Locks keep two programs from changing one backup at once; checkpoints keep long backups restorable if they stop half way.">
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          <Field label="Lock lease (minutes)" hint="Renewed every third; an expired lock is taken over.">
+            <input data-testid="opt-lock-ttl" className={inputCls} type="number" min={1} value={Math.round((o.lock_ttl_secs || 1800) / 60)} onChange={(e) => onChange({ lock_ttl_secs: num(e.target.value, 1, 24 * 60) * 60 })} />
+          </Field>
+          <Field label="Clock difference warning (minutes, 0 = off)">
+            <input data-testid="opt-skew-warn" className={inputCls} type="number" min={0} value={Math.round(o.clock_skew_warn_secs / 60)} onChange={(e) => onChange({ clock_skew_warn_secs: num(e.target.value) * 60 })} />
+          </Field>
+          <Field label="Clock difference limit (minutes, 0 = off)" hint="Refuse to write when the destination's clock is this far off.">
+            <input data-testid="opt-skew-abort" className={inputCls} type="number" min={0} value={Math.round(o.clock_skew_abort_secs / 60)} onChange={(e) => onChange({ clock_skew_abort_secs: num(e.target.value) * 60 })} />
+          </Field>
+          <Field label="Checkpoint every (minutes, 0 = off)" hint="Uploads a partial version of the files finished so far.">
+            <input data-testid="opt-checkpoint-secs" className={inputCls} type="number" min={0} value={Math.round(o.checkpoint_interval_secs / 60)} onChange={(e) => onChange({ checkpoint_interval_secs: num(e.target.value) * 60 })} />
+          </Field>
+          <Field label="Checkpoint every (MB uploaded, 0 = off)">
+            <input data-testid="opt-checkpoint-bytes" className={inputCls} type="number" min={0} value={Math.round(o.checkpoint_interval_bytes / 1048576)} onChange={(e) => onChange({ checkpoint_interval_bytes: num(e.target.value) * 1048576 })} />
+          </Field>
+        </div>
+      </Section>
     </>
   );
 }

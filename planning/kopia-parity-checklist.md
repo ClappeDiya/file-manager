@@ -24,11 +24,11 @@ Ground rules
 - [x] K59 Optional sharded remote layout for v2 repos (+ reshard tool)
 
 ## WP2 — Repository safety
-- [ ] K115 Remote repository lock lease (`{prefix}-lock`), renew, stale takeover, guarded force-unlock
-- [ ] K118 Clock-skew check against backend mtime; warn/abort thresholds
-- [ ] K9 Periodic checkpoints (sealed partial dlist every N minutes / bytes)
-- [ ] K70 Read-only connections (Backend wrapper refusing writes; job + adopt flag)
-- [ ] K81 Encrypted local database for encrypted repositories (key in OS keychain)
+- [x] K115 Remote repository lock lease (`{prefix}-lock`), renew, stale takeover, guarded force-unlock
+- [x] K118 Clock-skew check against backend mtime; warn/abort thresholds
+- [x] K9 Periodic checkpoints (sealed partial dlist every N minutes / bytes)
+- [x] K70 Read-only connections (Backend wrapper refusing writes; job + adopt flag)
+- [x] K81 Encrypted local database for encrypted repositories (key in OS keychain)
 
 ## WP3 — Versions, retention, shared repositories
 - [ ] K7 Version notes and tags (+ tag filter)

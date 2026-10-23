@@ -83,9 +83,10 @@ macro; if you add a new one here, register it there too.
 - `resolve_aws_profile`
 - `start_sso_auth`
 
-## `backup_commands` (69 commands)
+## `backup_commands` (72 commands)
 
 - `backup_adopt_repository`
+- `backup_break_lock`
 - `backup_browse_remote`
 - `backup_bug_report`
 - `backup_cancel`
@@ -120,6 +121,7 @@ macro; if you add a new one here, register it there too.
 - `backup_list_files`
 - `backup_list_jobs`
 - `backup_list_versions`
+- `backup_lock_status`
 - `backup_passphrase_strength`
 - `backup_pause`
 - `backup_photos_libraries`
@@ -143,6 +145,7 @@ macro; if you add a new one here, register it there too.
 - `backup_save_destination`
 - `backup_save_job`
 - `backup_search`
+- `backup_set_database_encryption`
 - `backup_set_desktop_settings`
 - `backup_set_destination_secret`
 - `backup_set_global_defaults`
@@ -708,4 +711,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 540 commands across 51 modules.
+**Surface:** 543 commands across 51 modules.

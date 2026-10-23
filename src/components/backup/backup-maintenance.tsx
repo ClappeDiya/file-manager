@@ -13,6 +13,7 @@ import { BackupSupportTools } from "./backup-support-tools";
 import { BackupLegalHold } from "./backup-legal-hold";
 import { AdvancedOnly } from "./advanced-only";
 import { BackupRepositoryFormat } from "./backup-repository-format";
+import { BackupRepositorySafety } from "./backup-repository-safety";
 
 
 export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDeleted: () => void }) {
@@ -68,6 +69,8 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
           <pre className="text-[11px] max-h-40 overflow-auto whitespace-pre-wrap">{JSON.stringify(result.report, null, 2)}</pre>
         </Banner>
       )}
+
+      <BackupRepositorySafety job={job} />
 
       <AdvancedOnly>
         <BackupLegalHold job={job} />

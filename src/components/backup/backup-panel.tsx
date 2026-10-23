@@ -103,6 +103,11 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
                 Legal hold
               </span>
             )}
+            {job.read_only && (
+              <span className="ml-1 text-[10px] px-1 rounded bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300" title="Read-only: restore and browse only" data-testid="read-only-badge">
+                Read-only
+              </span>
+            )}
           </div>
           {job.description && <div className="text-xs text-zinc-500 truncate">{job.description}</div>}
         </div>
@@ -126,7 +131,7 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
       {job.stats.last_error && <div className="text-xs text-red-600 mt-1 truncate" title={job.stats.last_error}>{job.stats.last_error}</div>}
       {err && <div className="text-xs text-red-600 mt-1">{err}</div>}
       <div className="flex gap-1 mt-2 flex-wrap">
-        <Btn tone="primary" disabled={busy} onClick={() => void start(false)} testId="backup-run-now">Run now</Btn>
+        <Btn tone="primary" disabled={busy || job.read_only} title={job.read_only ? "Read-only jobs never back up" : undefined} onClick={() => void start(false)} testId="backup-run-now">Run now</Btn>
         <Btn disabled={busy} onClick={() => void start(true)} title="Show what would be uploaded without changing anything">Dry run</Btn>
         <Btn onClick={() => onView({ kind: "restore", job })} testId="backup-open-restore">Restore…</Btn>
         <Btn onClick={() => onView({ kind: "edit", job })}>Edit</Btn>

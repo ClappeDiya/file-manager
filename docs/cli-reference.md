@@ -510,6 +510,21 @@ ufop backup reshard --dest /mnt/backup --layout sharded --shard-prefix-len 2 [--
 
 New backups (`ufop backup run`) take `--format-version 1|2`, `--chunker fixed|fastcdc`, `--block-codec deflate|zstd`, `--cipher aes256-gcm|chacha20-poly1305` and `--layout flat|sharded` with `--shard-prefix-len 1-4`. They apply only when the repository is created.
 
+### `ufop backup` repository safety
+
+Locks, read-only connections, checkpoints and the local database key. See [backup-safety.md](backup-safety.md).
+
+```bash
+ufop backup lock status --dest /mnt/backup                  # who holds the lock (exit 1 while in use)
+ufop backup lock break --dest /mnt/backup --yes [--owner-id ID]   # only when the holder is no longer running
+ufop backup restore --dest /mnt/backup --read-only --target ~/out # nothing is written, not even a lock
+ufop backup run … --db-key-source keyring                   # encrypted local database, key in the OS keychain
+ufop backup run … --db-key-source env:UFOP_DB_KEY           # key from an environment variable (64 hex digits)
+ufop backup db encrypt ~/.local/share/ufop/cli-backups/x.sqlite [--db-key-source env:VAR] [--decrypt]
+```
+
+Every command with `--dest` also takes `--read-only`, `--db-key-source keyring|env:VAR|none` (default `none`; an encrypted database without its key is rebuilt from the destination), `--lock-ttl-secs` (default 1800), `--clock-skew-warn-secs` (300) and `--clock-skew-abort-secs` (3600; 0 turns a limit off). `ufop backup run` takes `--checkpoint-interval-secs` (default 900) and `--checkpoint-interval-bytes` (default 0); 0 turns them off.
+
 ### `ufop server shares`
 
 Share links on a `ufop-server` started with `--share-root` (sign in first with `ufop server login`).
