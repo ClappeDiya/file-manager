@@ -8,7 +8,7 @@ use crate::core::error::AppError;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use ufop_core::backup::crypto::{KdfParams, VolumeCipher};
-use ufop_core::backup::RetentionPolicy;
+use ufop_core::backup::{RetentionPolicy, SourceFilter};
 
 const FORMAT: &str = "ufop-backup-config";
 
@@ -178,6 +178,53 @@ pub fn cli_command(job: &BackupJob) -> String {
             }
         }
     }
+    // Sources and runs (only those differing from the defaults).
+    let f = &job.filter;
+    if f.ignore_files != SourceFilter::default().ignore_files {
+        if f.ignore_files.is_empty() {
+            parts.push("--ignore-file=''".into());
+        }
+        for n in &f.ignore_files {
+            parts.push(format!("--ignore-file={}", quote(n)));
+        }
+    }
+    if f.respect_gitignore {
+        parts.push("--respect-gitignore".into());
+    }
+    if o.one_file_system {
+        parts.push("--one-file-system".into());
+    }
+    let ep = &o.error_policy;
+    use ufop_core::backup::errors::{ErrorAction, UnknownEntryAction};
+    if ep.on_file_error == ErrorAction::Fail {
+        parts.push("--on-file-error=fail".into());
+    }
+    if ep.on_dir_error == ErrorAction::Fail {
+        parts.push("--on-dir-error=fail".into());
+    }
+    match ep.on_unknown_entry {
+        UnknownEntryAction::Ignore => {}
+        UnknownEntryAction::Warn => parts.push("--on-unknown-entry=warn".into()),
+        UnknownEntryAction::Fail => parts.push("--on-unknown-entry=fail".into()),
+    }
+    if ep.fail_fast {
+        parts.push("--fail-fast".into());
+    }
+    if let Some(m) = ep.max_errors {
+        parts.push(format!("--max-errors={m}"));
+    }
+    if o.rehash_percent > 0 {
+        parts.push(format!("--rehash-percent={}", o.rehash_percent));
+    }
+    if let Some(cap) = o.max_upload_bytes_per_run {
+        parts.push(format!("--max-upload={cap}"));
+    }
+    if o.parallel_file_threshold != ufop_core::backup::DEFAULT_PARALLEL_FILE_THRESHOLD {
+        parts.push(format!("--parallel-file-threshold={}", o.parallel_file_threshold));
+    }
+    if o.snapshot.provider != Default::default() {
+        parts.push(format!("--snapshot-provider={}", o.snapshot.provider.name()));
+    }
     // Versions are recorded as this job's source (shared repositories).
     parts.push(format!("--job-id={}", quote(&job.id)));
     if !o.identity.hostname.is_empty() {
@@ -256,6 +303,31 @@ mod tests {
         j.options.default_tags.insert("env".into(), "prod".into());
         let c = cli_command(&j);
         for f in ["--cipher=chacha20-poly1305", "--chunker=fixed", "--layout=sharded --shard-prefix-len=2", "--format-version=2", "--keep-latest=2", "--keep-daily=7", "--keep-weekly=4", "--shared", "--job-id=abc", "--tag='env=prod'"] {
+            assert!(c.contains(f), "{f} in {c}");
+        }
+    }
+
+    #[test]
+    fn cli_command_carries_source_and_run_options() {
+        let mut j = job();
+        let plain = cli_command(&j);
+        assert!(!plain.contains("--ignore-file") && !plain.contains("--fail-fast") && !plain.contains("--parallel-file-threshold"), "{plain}");
+        j.filter.ignore_files = vec![".backupignore".into()];
+        j.filter.respect_gitignore = true;
+        j.options.one_file_system = true;
+        j.options.error_policy = ufop_core::backup::errors::ErrorPolicy {
+            on_file_error: ufop_core::backup::errors::ErrorAction::Fail,
+            on_unknown_entry: ufop_core::backup::errors::UnknownEntryAction::Warn,
+            fail_fast: true,
+            max_errors: Some(5),
+            ..Default::default()
+        };
+        j.options.rehash_percent = 10;
+        j.options.max_upload_bytes_per_run = Some(1 << 30);
+        j.options.parallel_file_threshold = 0;
+        j.options.snapshot.provider = ufop_core::backup::snapshot::SnapshotProvider::Btrfs;
+        let c = cli_command(&j);
+        for f in ["--ignore-file=.backupignore", "--respect-gitignore", "--one-file-system", "--on-file-error=fail", "--on-unknown-entry=warn", "--fail-fast", "--max-errors=5", "--rehash-percent=10", "--max-upload=1073741824", "--parallel-file-threshold=0", "--snapshot-provider=btrfs"] {
             assert!(c.contains(f), "{f} in {c}");
         }
     }
