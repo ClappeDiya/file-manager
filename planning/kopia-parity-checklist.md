@@ -94,9 +94,9 @@ Ground rules
 - [x] K87 Ransomware hardening guide + destination checklist in job editor
 
 ## WP9 — Notifications
-- [ ] K101 Reusable notification profiles
-- [ ] K104 Webhook custom headers + presets (Pushover, ntfy, Discord, PagerDuty)
-- [ ] K105 HTML email (multipart)
+- [x] K101 Reusable notification profiles
+- [x] K104 Webhook custom headers + presets (Pushover, ntfy, Discord, PagerDuty)
+- [x] K105 HTML email (multipart)
 
 ## WP10 — CLI, tooling, packaging
 - [ ] K56 `ufop backup bench` (compression, crypto, chunker)
