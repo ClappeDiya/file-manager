@@ -319,11 +319,7 @@ fn local_transfer_with_events(
 
             let elapsed = start.elapsed().as_secs().max(1);
             let speed = transferred / elapsed;
-            let remaining = if speed > 0 {
-                Some((total_bytes.saturating_sub(transferred)) / speed)
-            } else {
-                None
-            };
+            let remaining = total_bytes.saturating_sub(transferred).checked_div(speed);
 
             let event = ProgressEvent {
                 event: "progress".to_string(),

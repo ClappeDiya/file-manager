@@ -268,7 +268,9 @@ pub fn start_drive(repo: &RepoArgs, version: &VersionArgs, all: bool, bind: std:
 }
 
 /// `ufop backup mount`: serve until Ctrl-C (or `seconds`).
-pub fn mount(repo: &RepoArgs, version: &VersionArgs, all: bool, bind: &str, port: u16, cache: &CacheArgs, seconds: Option<u64>, format: &OutputFormat) -> Result<u8, AppError> {
+/// `listen`: the `--bind` address and `--port`.
+pub fn mount(repo: &RepoArgs, version: &VersionArgs, all: bool, listen: (&str, u16), cache: &CacheArgs, seconds: Option<u64>, format: &OutputFormat) -> Result<u8, AppError> {
+    let (bind, port) = listen;
     let ip: std::net::IpAddr = bind.parse().map_err(|_| AppError::validation(format!("Invalid --bind address '{bind}'")))?;
     if !ip.is_loopback() {
         tracing::warn!("Serving the backup drive on {ip}: anyone who can reach it and has the token can read the files");

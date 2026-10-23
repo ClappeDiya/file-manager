@@ -129,8 +129,8 @@ Ground rules
 - [x] Pre-existing: `scripts/check-workspace-deps.sh` — admin moved from vitest 3.2.4 to 4.1.0 like the root (installed offline from the pnpm store); admin vitest and tsc pass
 
 ## Final verification
-- [ ] ufop-core tests (all features) pass
-- [ ] src-tauri `cargo test --lib` passes
-- [ ] CLI tests pass
-- [ ] Web vitest, tsc, eslint (0 errors) pass
-- [ ] Docs updated (backup docs, cli-reference, api-reference, CHANGELOG)
+- [x] ufop-core tests (all features) pass (417 passed, 1 ignored: the manual `UFOP_DOCTEXT_SAMPLES` harness)
+- [x] src-tauri `cargo test --lib` passes (1330 passed, 1 ignored: needs LibreOffice) and `cargo test --tests` (all 8 journey files, 78 tests)
+- [x] CLI tests pass (47 + 7 integration) and `cargo clippy --all-targets -D warnings` is clean
+- [x] Web vitest (130 files, 1343 tests), tsc, eslint (0 errors, 89 warnings) pass; admin vitest (37 files, 186 tests) and tsc pass
+- [x] Docs updated (backup docs, cli-reference incl. `ufop agent`, api-reference, CHANGELOG entries for every K item, docs/README.md index links all backup docs and server-operations)

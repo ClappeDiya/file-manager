@@ -737,6 +737,8 @@ pub enum CryptCommands {
 }
 
 /// Recovery tool steps (work without the job database).
+// Parsed once per run from the command line; variant sizes do not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum RecoveryCommands {
     /// Download and decrypt every volume into a local folder (resumable)
@@ -1624,10 +1626,10 @@ pub async fn execute(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) 
     if let BackupCommands::RunAll { jobs, scheduled_only, wait } = cmd {
         return super::server::execute(super::server::ServerCommands::RunAll { jobs, scheduled_only, dry_run, wait }, format).await;
     }
-    let server_backed = match &cmd {
-        BackupCommands::Template { .. } | BackupCommands::NotifyProfile { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } | BackupCommands::OpenAt { .. } | BackupCommands::Hardening { .. } => true,
-        _ => false,
-    };
+    let server_backed = matches!(
+        &cmd,
+        BackupCommands::Template { .. } | BackupCommands::NotifyProfile { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } | BackupCommands::OpenAt { .. } | BackupCommands::Hardening { .. }
+    );
     if server_backed {
         let r = match cmd {
             BackupCommands::Template { cmd } => super::backup_policy::template(cmd, format).await,
@@ -1924,7 +1926,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             let range = (offset.is_some() || length.is_some()).then(|| (offset.unwrap_or(0), length.unwrap_or(u64::MAX)));
             super::backup_access::cat(&repo, &path, &version, &cache, range, &mut std::io::stdout().lock())
         }
-        BackupCommands::Mount { repo, version, all, bind, port, seconds, cache } => super::backup_access::mount(&repo, &version, all, &bind, port, &cache, seconds, format),
+        BackupCommands::Mount { repo, version, all, bind, port, seconds, cache } => super::backup_access::mount(&repo, &version, all, (&bind, port), &cache, seconds, format),
         BackupCommands::Cache { cmd } => super::backup_access::cache_command(cmd, format),
         BackupCommands::Verify { repo, full, samples, versions, paths, percent, structure, files_percent, parallel, max_errors, use_cache, cache } => {
             use ufop_core::backup::verify::{VerifyMode, VerifyOptions, VerifyScope};
@@ -2333,7 +2335,7 @@ mod tests {
         assert_eq!(body, "second");
         // Mirror: refused without --yes when not interactive, deletes with it.
         std::fs::write(out.join("src/extra.tmp"), b"x").unwrap();
-        assert_eq!(run(p(with(&["restore"], &["--target", &out_s, "--mirror"])), &OutputFormat::Json, false).unwrap_err().user_message().contains("--yes"), true);
+        assert!(run(p(with(&["restore"], &["--target", &out_s, "--mirror"])), &OutputFormat::Json, false).unwrap_err().user_message().contains("--yes"));
         assert!(out.join("src/extra.tmp").exists());
         assert_eq!(run(p(with(&["restore"], &["--target", &out_s, "--mirror", "--yes"])), &OutputFormat::Json, false).unwrap(), 0);
         assert!(!out.join("src/extra.tmp").exists());

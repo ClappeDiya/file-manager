@@ -80,6 +80,8 @@ pub enum OutputFormat {
     Csv,
 }
 
+// Parsed once per run from the command line; variant sizes do not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Authenticate with the UFOP server
