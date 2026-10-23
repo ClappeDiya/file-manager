@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import {
+  DEFAULT_REQUEST_LIMITS,
   errorText,
   useBackupStore,
   type BackupDestination,
@@ -24,6 +25,7 @@ import { RetentionEditor } from "./backup-retention-editor";
 import { BackupAdvancedOptions } from "./backup-advanced-options";
 import { StdinCommandEditor } from "./backup-run-options";
 import { BackupReplicas } from "./backup-replicas";
+import { RequestLimitsEditor } from "./backup-request-limits";
 import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
 import { LogOutputsEditor, NotificationsEditor, ReportExtras } from "./backup-notifications";
 import { JobSecretProviders } from "./backup-secret-providers";
@@ -576,6 +578,9 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
               </div>
               <Check label="Exponential backoff" checked={job.retry.exponential} onChange={(v) => patch({ retry: { ...job.retry, exponential: v } })} />
             </Section>
+            <AdvancedOnly>
+              <RequestLimitsEditor value={job.request_limits ?? DEFAULT_REQUEST_LIMITS} onChange={(request_limits) => patch({ request_limits })} />
+            </AdvancedOnly>
           </>
         )}
 

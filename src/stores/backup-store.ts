@@ -490,6 +490,19 @@ export interface LocalTransfer {
   sync_writes: boolean;
 }
 
+/** Request-rate limits per destination (`RequestLimits` in ufop-core); 0 = unlimited. */
+export interface RequestLimits {
+  list_per_sec: number;
+  get_per_sec: number;
+  put_per_sec: number;
+  delete_per_sec: number;
+  max_concurrent_requests: number;
+  /** Shard folders listed at once (sharded layouts). */
+  list_parallelism: number;
+}
+
+export const DEFAULT_REQUEST_LIMITS: RequestLimits = { list_per_sec: 0, get_per_sec: 0, put_per_sec: 0, delete_per_sec: 0, max_concurrent_requests: 0, list_parallelism: 0 };
+
 export type ReplicaSchedule = { type: "after_backup" } | { type: "interval"; minutes: number } | { type: "manual" };
 
 export interface Replica {
@@ -806,6 +819,7 @@ export interface BackupJob {
   remote_config_include_secrets: boolean;
   network_timeout_secs: number;
   local_transfer: LocalTransfer;
+  request_limits: RequestLimits;
   replicas: Replica[];
   notifications: BackupNotification[];
   log_outputs: LogOutputs;
@@ -1411,6 +1425,7 @@ export function newBackupJob(): BackupJob {
     remote_config_include_secrets: false,
     network_timeout_secs: 0,
     local_transfer: { use_move: true, verify_size: true, sync_writes: false },
+    request_limits: { ...DEFAULT_REQUEST_LIMITS },
     replicas: [],
     notifications: [],
     secret_providers: [],

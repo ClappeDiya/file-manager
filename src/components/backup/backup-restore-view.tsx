@@ -31,6 +31,7 @@ import type { SourceInfo, VersionSelector } from "@/stores/backup-store";
 import { MirrorConfirm, RestoreAsOfPicker, RestoreSafetyOptions } from "./backup-restore-extras";
 import { ArchiveExportButton, BackupFilePreview, OpenAsDriveButton, OpenDrivesList } from "./backup-access-actions";
 import { useMirrorRestore } from "./use-mirror-restore";
+import { PointInTimeOpen } from "./backup-point-in-time";
 
 function RestoreOptionsForm({ value, onChange, versionCount = 0 }: { value: RestoreOptions; onChange: (v: RestoreOptions) => void; versionCount?: number }) {
   const n = (v: string, max: number) => Math.min(max, Math.max(0, Math.floor(Number(v) || 0)));
@@ -259,6 +260,9 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
       <div className="p-4 text-sm text-zinc-500 space-y-2" data-testid="backup-no-versions">
         {picker}
         {error ? <Banner tone="error">{error}</Banner> : "This job has no versions yet. Run a backup first."}
+        <AdvancedOnly>
+          <PointInTimeOpen job={job} />
+        </AdvancedOnly>
       </div>
     );
   }
@@ -415,6 +419,9 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
         <OpenDrivesList jobId={job.id} />
         {report && <ReportView report={report} />}
       </Section>
+      <AdvancedOnly>
+        <PointInTimeOpen job={job} />
+      </AdvancedOnly>
     </div>
   );
 }

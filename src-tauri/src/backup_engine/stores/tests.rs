@@ -245,7 +245,24 @@ async fn s3_cold_storage_restore_against_emulator() {
 #[test]
 fn cloud_config_defaults_match_frontend() {
     let tls = serde_json::json!({ "accept_invalid_certs": false, "ca_pem": null, "pinned_sha256": [] });
+    let by_kind = serde_json::json!({ "dblock": "", "dindex": "", "dlist": "", "other": "" });
     let cases = [
+        (
+            CloudConfig::S3(Default::default()),
+            serde_json::json!({ "provider": "s3", "preset": "aws", "endpoint": "", "region": "us-east-1", "bucket": "", "prefix": "", "access_key_id": "", "path_style": false, "storage_class": "", "part_size_mb": 64, "cold_storage": { "restore_days": 3, "tier": "Standard", "wait_minutes": 0 }, "create_with_object_lock": false, "tls": tls, "credentials": { "type": "static" }, "assume_role": null, "storage_class_by_kind": by_kind, "point_in_time": null }),
+        ),
+        (
+            CloudConfig::Azure(Default::default()),
+            serde_json::json!({ "provider": "azure", "account": "", "container": "", "prefix": "", "endpoint": "", "access_tier": "", "block_size_mb": 4, "rehydrate_priority": "Standard", "tls": tls, "auth": { "type": "shared_key" }, "authority_host": "", "access_tier_by_kind": by_kind }),
+        ),
+        (
+            CloudConfig::Gcs(Default::default()),
+            serde_json::json!({ "provider": "gcs", "bucket": "", "prefix": "", "project": "", "storage_class": "", "endpoint": "", "checksums": true, "tls": tls, "scope": "", "storage_class_by_kind": by_kind }),
+        ),
+        (
+            CloudConfig::Rclone(Default::default()),
+            serde_json::json!({ "provider": "rclone", "remote": "", "path": "", "binary": "rclone", "config_file": null, "extra_args": [], "timeout_secs": 0, "startup_timeout_secs": 0, "env": {}, "isolate_env": false, "env_passthrough": [] }),
+        ),
         (CloudConfig::Filen(Default::default()), serde_json::json!({ "provider": "filen", "email": "", "folder": "", "use_trash": false, "gateway_url": "", "ingest_url": "", "egest_url": "", "tls": tls })),
         (CloudConfig::Drime(Default::default()), serde_json::json!({ "provider": "drime", "folder": "", "workspace_id": 0, "page_size": 50, "soft_delete": false, "api_url": "", "tls": tls })),
         (
@@ -259,7 +276,8 @@ fn cloud_config_defaults_match_frontend() {
         let back: CloudConfig = serde_json::from_value(serde_json::json!({ "provider": want["provider"] })).unwrap();
         assert_eq!(back, cfg);
         assert_eq!(back.provider(), want["provider"].as_str().unwrap());
-        assert!(PROVIDERS.iter().any(|p| p.id == back.provider() && p.verified == "api-mock"));
+        let api_mock_only = ["filen", "drime", "movistar_cloud"].contains(&back.provider());
+        assert!(PROVIDERS.iter().any(|p| p.id == back.provider() && (!api_mock_only || p.verified == "api-mock")));
     }
     let f = CloudConfig::Filen(filen::FilenConfig { email: "me@example.com".into(), folder: "B".into(), ..Default::default() });
     assert_eq!(f.network_endpoint(), Some(("gateway.filen.io".into(), 443, true)));
