@@ -35,6 +35,8 @@ pub mod tahoe;
 #[cfg(test)]
 mod cloud_tests;
 #[cfg(test)]
+mod live_providers;
+#[cfg(test)]
 pub(crate) mod mock_azure;
 #[cfg(test)]
 pub(crate) mod mock_gcs;

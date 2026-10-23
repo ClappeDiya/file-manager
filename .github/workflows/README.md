@@ -10,6 +10,11 @@ them (it only picks up files ending in `.yml` or `.yaml`):
 
 - `ci.yml.disabled` — former lint + test matrix for Rust + frontend
 - `release.yml.disabled` — former tag-triggered Tauri release build
+- `live-providers.yml.disabled` — nightly / manual live-provider contract
+  tests for backup destinations (S3, Azure, GCS, B2, Swift, Dropbox,
+  OneDrive, Google Drive, Filen, Drime). Standalone; run it locally with
+  `scripts/live-providers.sh`. Its secrets are listed in
+  `docs/backup-destinations.md` ("Live provider tests").
 
 Both files are preserved as a reference for porting their steps into
 local scripts if needed. **Do not rename them back to `.yml`** — that
