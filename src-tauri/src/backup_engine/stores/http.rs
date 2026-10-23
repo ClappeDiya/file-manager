@@ -60,6 +60,11 @@ pub async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Respo
 /// Marks 404 errors from [`check`] so callers can tell "missing" apart.
 const NOT_FOUND_TAG: &str = "[404]";
 
+/// A "missing" error that [`is_not_found`] recognises.
+pub fn not_found(what: &str) -> AppError {
+    AppError::not_found(format!("{what}: not found {NOT_FOUND_TAG}"))
+}
+
 /// `true` for a 404 error from [`check`].
 pub fn is_not_found(e: &AppError) -> bool {
     e.user_message().contains(NOT_FOUND_TAG)

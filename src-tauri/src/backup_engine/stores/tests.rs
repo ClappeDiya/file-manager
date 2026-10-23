@@ -33,6 +33,12 @@ pub(crate) async fn exercise(store: &dyn ObjectStore, big: usize) {
 
 /// Full engine backup + restore through a store.
 pub(crate) fn backup_roundtrip(backend: &dyn ufop_core::backup::Backend) {
+    backup_roundtrip_with(backend, ufop_core::backup::layout::RepoLayout::Flat)
+}
+
+/// [`backup_roundtrip`] with a repository layout; a sharded layout must put
+/// volumes into shard folders on the destination.
+pub(crate) fn backup_roundtrip_with(backend: &dyn ufop_core::backup::Backend, layout: ufop_core::backup::layout::RepoLayout) {
     use ufop_core::backup::crypto::KdfParams;
     use ufop_core::backup::db::BackupDb;
     use ufop_core::backup::*;
@@ -40,10 +46,15 @@ pub(crate) fn backup_roundtrip(backend: &dyn ufop_core::backup::Backend) {
     let out = tempfile::tempdir().unwrap();
     let data: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 253) as u8).collect();
     std::fs::write(src.path().join("f.bin"), &data).unwrap();
-    let o = BackupOptions { block_size: 16 * 1024, volume_size: 100_000, verify_samples: 1, quota_disable: true, ..Default::default() };
+    let o = BackupOptions { block_size: 16 * 1024, volume_size: 100_000, verify_samples: 1, quota_disable: true, layout, ..Default::default() };
     let db = BackupDb::open_in_memory().unwrap();
     let r = run_backup(backend, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
     assert!(r.errors.is_empty(), "{:?}", r.errors);
+    if layout.is_sharded() {
+        let all = backend.list_recursive().unwrap();
+        assert!(all.iter().any(|f| f.name.contains('/') && f.name.contains(".dblock")), "volumes in shard folders: {all:?}");
+        assert!(backend.list().unwrap().iter().all(|f| !f.name.contains(".dblock")), "no block volume at the top");
+    }
     let db2 = BackupDb::open_in_memory().unwrap();
     maintenance::recreate_database(backend, &db2, Some("pw"), "ufop", &OpContext::new()).unwrap();
     let repo = engine::Repo::open(backend, &db2, Some("pw"), &o, false, KdfParams::insecure_fast()).unwrap();

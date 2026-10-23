@@ -1,13 +1,19 @@
 //! Amazon S3 and S3-compatible object storage (IDrive e2, Storj gateway,
 //! Aliyun OSS, Tencent COS, Wasabi, MinIO, Ceph, …) with AWS Signature V4.
 //!
-//! Supports storage classes, S3 Object Lock retention, restoring objects
-//! from Glacier / Deep Archive (cold storage), multipart uploads, path-style
-//! or virtual-host addressing and custom TLS trust.
+//! Supports storage classes (also per volume kind), S3 Object Lock
+//! retention, restoring objects from Glacier / Deep Archive (cold storage),
+//! multipart uploads, path-style or virtual-host addressing, custom TLS
+//! trust, the AWS credential chain with STS AssumeRole, sharded layouts
+//! (prefix "folders", listed in parallel) and read-only point-in-time views
+//! of versioned buckets.
 
 use super::http::{self, TlsOptions};
-use super::{direct_child, join_key, BoxFut, ObjectStore};
+use super::{child_within_one, direct_child, join_key, BoxFut, ClassByKind, ObjectStore};
+use crate::connectors::aws_chain::{AssumeRoleOptions, ChainEnv, CredentialProvider, CredentialSource};
+use crate::connectors::aws_credentials::BaseKeys;
 use crate::core::error::AppError;
+use std::collections::HashMap;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -56,7 +62,19 @@ pub struct S3Config {
     /// When the bucket has to be created, enable S3 Object Lock on it.
     pub create_with_object_lock: bool,
     pub tls: TlsOptions,
+    /// Where the keys come from (default: the access key id above plus the
+    /// stored secret).
+    pub credentials: CredentialSource,
+    /// Assume this IAM role with the base credentials (STS AssumeRole).
+    pub assume_role: Option<AssumeRoleOptions>,
+    /// Storage class per volume kind, overriding `storage_class`.
+    pub storage_class_by_kind: ClassByKind,
+    /// Read the bucket as it was at this time (versioned buckets; read-only).
+    pub point_in_time: Option<chrono::DateTime<chrono::Utc>>,
 }
+
+/// Storage classes whose objects must be restored before reading.
+pub const ARCHIVE_CLASSES: &[&str] = &["GLACIER", "DEEP_ARCHIVE"];
 
 impl Default for S3Config {
     fn default() -> Self {
@@ -73,6 +91,10 @@ impl Default for S3Config {
             cold_storage: ColdStorage::default(),
             create_with_object_lock: false,
             tls: TlsOptions::default(),
+            credentials: CredentialSource::Static,
+            assume_role: None,
+            storage_class_by_kind: ClassByKind::default(),
+            point_in_time: None,
         }
     }
 }
@@ -83,13 +105,16 @@ pub fn preset_endpoint(preset: &str, region: &str) -> Option<String> {
     crate::connectors::presets::s3_endpoint(preset, region)
 }
 
+/// Point-in-time view: object (relative name) → (version id, size, time).
+type PitIndex = HashMap<String, (String, u64, chrono::DateTime<chrono::Utc>)>;
+
 pub struct S3Store {
     cfg: S3Config,
-    secret: String,
-    session_token: Option<String>,
+    creds: CredentialProvider,
     http: reqwest::Client,
     scheme: String,
     host: String,
+    pit: tokio::sync::Mutex<Option<PitIndex>>,
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -143,9 +168,19 @@ impl S3Store {
     /// `secret` = secret access key, optionally followed by a newline and a
     /// session token (temporary credentials).
     pub fn new(cfg: S3Config, secret: String) -> Result<Self, AppError> {
-        if cfg.bucket.trim().is_empty() || cfg.access_key_id.trim().is_empty() {
+        Self::with_env(cfg, Some(secret), ChainEnv::process())
+    }
+
+    /// Open with an optional secret (credential sources other than static
+    /// keys need none) and the environment the credential chain reads.
+    pub fn with_env(cfg: S3Config, secret: Option<String>, env: ChainEnv) -> Result<Self, AppError> {
+        if cfg.bucket.trim().is_empty() {
+            return Err(AppError::validation("Enter the bucket"));
+        }
+        if cfg.credentials.is_static() && cfg.access_key_id.trim().is_empty() {
             return Err(AppError::validation("Enter the bucket and access key id"));
         }
+        cfg.storage_class_by_kind.refuse(ARCHIVE_CLASSES, "Storage class")?;
         let endpoint = if cfg.endpoint.trim().is_empty() {
             preset_endpoint(&cfg.preset, &cfg.region).or_else(|| preset_endpoint("aws", &cfg.region)).unwrap_or_default()
         } else {
@@ -156,11 +191,27 @@ impl S3Store {
             Some(p) => format!("{}:{p}", u.host_str().unwrap_or_default()),
             None => u.host_str().unwrap_or_default().to_string(),
         };
-        let (secret, session_token) = match secret.split_once('\n') {
-            Some((s, t)) => (s.trim().to_string(), Some(t.trim().to_string()).filter(|t| !t.is_empty())),
-            None => (secret.trim().to_string(), None),
-        };
-        Ok(Self { http: http::client(&cfg.tls)?, scheme: u.scheme().to_string(), host, cfg, secret, session_token })
+        let static_keys = secret.filter(|s| !s.trim().is_empty()).map(|secret| {
+            let (secret, session_token) = match secret.split_once('\n') {
+                Some((s, t)) => (s.trim().to_string(), Some(t.trim().to_string()).filter(|t| !t.is_empty())),
+                None => (secret.trim().to_string(), None),
+            };
+            BaseKeys { access_key_id: cfg.access_key_id.trim().to_string(), secret_access_key: secret, session_token }
+        });
+        let creds = CredentialProvider::new(cfg.credentials.clone(), static_keys, cfg.assume_role.clone(), &cfg.region, env)?;
+        Ok(Self { http: http::client(&cfg.tls)?, scheme: u.scheme().to_string(), host, cfg, creds, pit: tokio::sync::Mutex::new(None) })
+    }
+
+    /// Storage class for an object (per kind, else the single class).
+    fn class_for(&self, name: &str) -> String {
+        self.cfg.storage_class_by_kind.pick(name, &self.cfg.storage_class)
+    }
+
+    fn refuse_write(&self, what: &str, name: &str) -> AppError {
+        AppError::PermissionDenied {
+            message: format!("{} is a point-in-time view and read-only: cannot {what} {name}", self.describe()),
+            advice: "Restore or browse from it, or clear 'point in time' to write to the bucket again.".into(),
+        }
     }
 
     /// (host header, request path) for an object key ("" = bucket).
@@ -174,20 +225,21 @@ impl S3Store {
     }
 
     async fn send(&self, method: reqwest::Method, key: &str, query: &[(&str, &str)], extra: &[(&str, String)], body: Vec<u8>) -> Result<reqwest::Response, AppError> {
+        let keys = self.creds.keys().await?;
         let (host, path) = self.locate(key);
         let payload_hash = sha_hex(&body);
         let mut headers: BTreeMap<String, String> = BTreeMap::new();
         headers.insert("host".into(), host.clone());
         headers.insert("x-amz-content-sha256".into(), payload_hash.clone());
         headers.insert("x-amz-date".into(), chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
-        if let Some(t) = &self.session_token {
+        if let Some(t) = &keys.session_token {
             headers.insert("x-amz-security-token".into(), t.clone());
         }
         for (k, v) in extra {
             headers.insert(k.to_lowercase(), v.clone());
         }
         let q: Vec<(String, String)> = query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        let auth = sign_v4(method.as_str(), &path, &q, &headers, &payload_hash, &self.cfg.access_key_id, &self.secret, &self.cfg.region, "s3");
+        let auth = sign_v4(method.as_str(), &path, &q, &headers, &payload_hash, &keys.access_key_id, &keys.secret_access_key, &self.cfg.region, "s3");
         let qs = {
             let mut v: Vec<String> = q.iter().map(|(k, v)| if v.is_empty() && *k != "prefix" { uri_encode(k, false) } else { format!("{}={}", uri_encode(k, false), uri_encode(v, false)) }).collect();
             v.sort();
@@ -210,8 +262,9 @@ impl S3Store {
 
     async fn put_single(&self, key: &str, data: Vec<u8>) -> Result<(), AppError> {
         let mut extra = vec![("content-md5", Self::md5_b64(&data)), ("content-type", "application/octet-stream".to_string())];
-        if !self.cfg.storage_class.is_empty() {
-            extra.push(("x-amz-storage-class", self.cfg.storage_class.clone()));
+        let class = self.class_for(key);
+        if !class.is_empty() {
+            extra.push(("x-amz-storage-class", class));
         }
         http::check(self.send(reqwest::Method::PUT, key, &[], &extra, data).await?, "S3 upload").await?;
         Ok(())
@@ -219,8 +272,9 @@ impl S3Store {
 
     async fn put_multipart(&self, key: &str, data: Vec<u8>, part: usize) -> Result<(), AppError> {
         let mut extra = vec![("content-type", "application/octet-stream".to_string())];
-        if !self.cfg.storage_class.is_empty() {
-            extra.push(("x-amz-storage-class", self.cfg.storage_class.clone()));
+        let class = self.class_for(key);
+        if !class.is_empty() {
+            extra.push(("x-amz-storage-class", class));
         }
         let r = http::check(self.send(reqwest::Method::POST, key, &[("uploads", "")], &extra, Vec::new()).await?, "S3 multipart start").await?;
         let xml = r.text().await.map_err(|e| http::net("S3 multipart start", e))?;
@@ -251,6 +305,133 @@ impl S3Store {
             let _ = self.send(reqwest::Method::DELETE, key, &[("uploadId", &upload_id)], &[], Vec::new()).await;
         }
         result
+    }
+
+    /// ListObjectsV2 of `pfx` (all pages): (key, size) of objects and,
+    /// with a delimiter, the common prefixes ("folders").
+    async fn list_v2(&self, pfx: &str, delimiter: Option<&str>) -> Result<(Vec<(String, u64)>, Vec<String>), AppError> {
+        let (mut objects, mut folders) = (Vec::new(), Vec::new());
+        let mut token: Option<String> = None;
+        loop {
+            let mut q: Vec<(&str, &str)> = vec![("list-type", "2"), ("prefix", pfx)];
+            if let Some(d) = delimiter {
+                q.push(("delimiter", d));
+            }
+            if let Some(t) = &token {
+                q.push(("continuation-token", t));
+            }
+            let r = http::check(self.send(reqwest::Method::GET, "", &q, &[], Vec::new()).await?, "S3 listing").await?;
+            let xml = r.text().await.map_err(|e| http::net("S3 listing", e))?;
+            for c in http::xml_all(&xml, "Contents") {
+                let key = http::xml_unescape(&http::xml_one(&c, "Key").unwrap_or_default());
+                objects.push((key, http::xml_one(&c, "Size").and_then(|s| s.parse().ok()).unwrap_or(0)));
+            }
+            for c in http::xml_all(&xml, "CommonPrefixes") {
+                if let Some(p) = http::xml_one(&c, "Prefix") {
+                    folders.push(http::xml_unescape(&p));
+                }
+            }
+            token = (http::xml_one(&xml, "IsTruncated").as_deref() == Some("true")).then(|| http::xml_one(&xml, "NextContinuationToken")).flatten().map(|t| http::xml_unescape(&t));
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok((objects, folders))
+    }
+
+    fn folder_prefix(&self) -> String {
+        let prefix = self.cfg.prefix.trim_matches('/');
+        if prefix.is_empty() { String::new() } else { format!("{prefix}/") }
+    }
+
+    /// Objects one folder deep at most: the top listing with a delimiter,
+    /// then each folder (`parallelism` at once).
+    async fn list_tree(&self, parallelism: usize) -> Result<Vec<RemoteFile>, AppError> {
+        let prefix = self.cfg.prefix.trim_matches('/').to_string();
+        let pfx = self.folder_prefix();
+        if parallelism <= 1 {
+            let (objects, _) = self.list_v2(&pfx, None).await?;
+            return Ok(objects.into_iter().filter_map(|(k, size)| child_within_one(&prefix, &k).map(|name| RemoteFile { name, size })).collect());
+        }
+        let (top, folders) = self.list_v2(&pfx, Some("/")).await?;
+        let mut out: Vec<RemoteFile> = top.into_iter().filter_map(|(k, size)| direct_child(&prefix, &k).map(|n| RemoteFile { name: n.to_string(), size })).collect();
+        let folders: Vec<String> = folders.into_iter().filter(|f| f.strip_prefix(&pfx).is_some_and(|d| !d.trim_end_matches('/').is_empty() && !d.starts_with('.'))).collect();
+        let prefix2 = prefix.clone();
+        out.extend(
+            super::list_folders(folders, parallelism, |f| {
+                let prefix = prefix2.clone();
+                async move {
+                    let (objs, _) = self.list_v2(&f, Some("/")).await?;
+                    Ok(objs.into_iter().filter_map(|(k, size)| child_within_one(&prefix, &k).map(|name| RemoteFile { name, size })).collect())
+                }
+            })
+            .await?,
+        );
+        Ok(out)
+    }
+
+    /// ListObjectVersions of the folder, resolved to the newest version of
+    /// each object at `at`; objects whose newest entry then is a delete
+    /// marker (or that did not exist yet) are absent.
+    pub async fn versions_at(&self, at: chrono::DateTime<chrono::Utc>) -> Result<PitIndex, AppError> {
+        let prefix = self.cfg.prefix.trim_matches('/').to_string();
+        let pfx = self.folder_prefix();
+        // name → (time, version id or None for a delete marker, size)
+        let mut best: HashMap<String, (chrono::DateTime<chrono::Utc>, Option<String>, u64)> = HashMap::new();
+        let (mut key_marker, mut vid_marker) = (String::new(), String::new());
+        loop {
+            let mut q: Vec<(&str, &str)> = vec![("versions", ""), ("prefix", &pfx)];
+            if !key_marker.is_empty() {
+                q.push(("key-marker", &key_marker));
+            }
+            if !vid_marker.is_empty() {
+                q.push(("version-id-marker", &vid_marker));
+            }
+            let r = http::check(self.send(reqwest::Method::GET, "", &q, &[], Vec::new()).await?, "S3 version listing").await?;
+            let xml = r.text().await.map_err(|e| http::net("S3 version listing", e))?;
+            let entries = http::xml_all(&xml, "Version").into_iter().map(|v| (v, false)).chain(http::xml_all(&xml, "DeleteMarker").into_iter().map(|v| (v, true)));
+            for (e, marker) in entries {
+                let key = http::xml_unescape(&http::xml_one(&e, "Key").unwrap_or_default());
+                let Some(name) = child_within_one(&prefix, &key) else { continue };
+                let Some(t) = http::xml_one(&e, "LastModified").and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(|t| t.with_timezone(&chrono::Utc)) else { continue };
+                if t > at {
+                    continue;
+                }
+                let vid = http::xml_one(&e, "VersionId").unwrap_or_else(|| "null".into());
+                let size = http::xml_one(&e, "Size").and_then(|s| s.parse().ok()).unwrap_or(0);
+                match best.get(&name) {
+                    Some((bt, _, _)) if *bt >= t => {}
+                    _ => {
+                        best.insert(name, (t, (!marker).then_some(vid), size));
+                    }
+                }
+            }
+            if http::xml_one(&xml, "IsTruncated").as_deref() != Some("true") {
+                break;
+            }
+            key_marker = http::xml_one(&xml, "NextKeyMarker").map(|k| http::xml_unescape(&k)).unwrap_or_default();
+            vid_marker = http::xml_one(&xml, "NextVersionIdMarker").unwrap_or_default();
+            if key_marker.is_empty() {
+                break;
+            }
+        }
+        Ok(best.into_iter().filter_map(|(n, (t, v, size))| v.map(|v| (n, (v, size, t)))).collect())
+    }
+
+    /// The point-in-time index, built on first use.
+    async fn pit_index(&self, at: chrono::DateTime<chrono::Utc>) -> Result<tokio::sync::MappedMutexGuard<'_, PitIndex>, AppError> {
+        let mut g = self.pit.lock().await;
+        if g.is_none() {
+            *g = Some(self.versions_at(at).await?);
+        }
+        Ok(tokio::sync::MutexGuard::map(g, |o| o.get_or_insert_with(HashMap::new)))
+    }
+
+    async fn pit_list(&self, at: chrono::DateTime<chrono::Utc>, recursive: bool) -> Result<Vec<RemoteFile>, AppError> {
+        // Every listing re-reads the versions (the bucket may have changed).
+        *self.pit.lock().await = None;
+        let idx = self.pit_index(at).await?;
+        Ok(idx.iter().filter(|(n, _)| recursive || !n.contains('/')).map(|(n, (_, size, _))| RemoteFile { name: n.clone(), size: *size }).collect())
     }
 
     /// Current Object Lock retention of a volume: (mode, retain-until),
@@ -301,44 +482,47 @@ impl S3Store {
 
 impl ObjectStore for S3Store {
     fn describe(&self) -> String {
-        format!("s3://{}/{}", self.cfg.bucket, self.cfg.prefix.trim_matches('/'))
+        let base = format!("s3://{}/{}", self.cfg.bucket, self.cfg.prefix.trim_matches('/'));
+        match self.cfg.point_in_time {
+            Some(t) => format!("{base} @ {}", t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            None => base,
+        }
     }
 
     fn list(&self) -> BoxFut<'_, Vec<RemoteFile>> {
         Box::pin(async move {
-            let prefix = self.cfg.prefix.trim_matches('/');
-            let pfx = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
-            let mut out = Vec::new();
-            let mut token: Option<String> = None;
-            loop {
-                let mut q: Vec<(&str, &str)> = vec![("list-type", "2"), ("prefix", &pfx)];
-                if let Some(t) = &token {
-                    q.push(("continuation-token", t));
-                }
-                let r = http::check(self.send(reqwest::Method::GET, "", &q, &[], Vec::new()).await?, "S3 listing").await?;
-                let xml = r.text().await.map_err(|e| http::net("S3 listing", e))?;
-                for c in http::xml_all(&xml, "Contents") {
-                    let key = http::xml_unescape(&http::xml_one(&c, "Key").unwrap_or_default());
-                    let size = http::xml_one(&c, "Size").and_then(|s| s.parse().ok()).unwrap_or(0);
-                    if let Some(name) = direct_child(prefix, &key) {
-                        out.push(RemoteFile { name: name.to_string(), size });
-                    }
-                }
-                if http::xml_one(&xml, "IsTruncated").as_deref() == Some("true") {
-                    token = http::xml_one(&xml, "NextContinuationToken");
-                    if token.is_none() {
-                        break;
-                    }
-                } else {
-                    break;
-                }
+            if let Some(at) = self.cfg.point_in_time {
+                return self.pit_list(at, false).await;
             }
-            Ok(out)
+            let prefix = self.cfg.prefix.trim_matches('/');
+            // The delimiter keeps shard folders' contents out of the listing.
+            let (objects, _) = self.list_v2(&self.folder_prefix(), Some("/")).await?;
+            Ok(objects.into_iter().filter_map(|(k, size)| direct_child(prefix, &k).map(|n| RemoteFile { name: n.to_string(), size })).collect())
         })
+    }
+
+    fn supports_subfolders(&self) -> bool {
+        true
+    }
+
+    fn list_recursive(&self, parallelism: usize) -> BoxFut<'_, Vec<RemoteFile>> {
+        Box::pin(async move {
+            if let Some(at) = self.cfg.point_in_time {
+                return self.pit_list(at, true).await;
+            }
+            self.list_tree(parallelism).await
+        })
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.cfg.point_in_time.is_some()
     }
 
     fn put<'a>(&'a self, name: &'a str, data: Vec<u8>) -> BoxFut<'a, ()> {
         Box::pin(async move {
+            if self.cfg.point_in_time.is_some() {
+                return Err(self.refuse_write("upload", name));
+            }
             let key = join_key(&self.cfg.prefix, name);
             let part = (self.cfg.part_size_mb.max(5) as usize) << 20;
             if self.cfg.part_size_mb > 0 && data.len() > part {
@@ -352,8 +536,13 @@ impl ObjectStore for S3Store {
     fn get<'a>(&'a self, name: &'a str) -> BoxFut<'a, Vec<u8>> {
         Box::pin(async move {
             let key = join_key(&self.cfg.prefix, name);
+            let version = match self.cfg.point_in_time {
+                Some(at) => Some(self.pit_index(at).await?.get(name).map(|(v, _, _)| v.clone()).ok_or_else(|| http::not_found(&format!("{name} as of {at}")))?),
+                None => None,
+            };
+            let q: Vec<(&str, &str)> = version.as_deref().map(|v| vec![("versionId", v)]).unwrap_or_default();
             for attempt in 0..2 {
-                let r = self.send(reqwest::Method::GET, &key, &[], &[], Vec::new()).await?;
+                let r = self.send(reqwest::Method::GET, &key, &q, &[], Vec::new()).await?;
                 if r.status().as_u16() == 403 {
                     let body = r.text().await.unwrap_or_default();
                     if body.contains("InvalidObjectState") && attempt == 0 {
@@ -376,6 +565,9 @@ impl ObjectStore for S3Store {
 
     fn delete<'a>(&'a self, name: &'a str) -> BoxFut<'a, ()> {
         Box::pin(async move {
+            if self.cfg.point_in_time.is_some() {
+                return Err(self.refuse_write("delete", name));
+            }
             let key = join_key(&self.cfg.prefix, name);
             http::check(self.send(reqwest::Method::DELETE, &key, &[], &[], Vec::new()).await?, "S3 delete").await?;
             Ok(())
@@ -387,6 +579,9 @@ impl ObjectStore for S3Store {
             let h = self.send(reqwest::Method::HEAD, "", &[], &[], Vec::new()).await?;
             if h.status().is_success() {
                 return Ok(());
+            }
+            if self.cfg.point_in_time.is_some() {
+                return Err(self.refuse_write("create", &self.cfg.bucket));
             }
             if h.status().as_u16() != 404 {
                 http::check(h, "S3 bucket check").await?;
@@ -407,17 +602,23 @@ impl ObjectStore for S3Store {
 
     fn modified<'a>(&'a self, name: &'a str) -> BoxFut<'a, Option<chrono::DateTime<chrono::Utc>>> {
         Box::pin(async move {
+            if let Some(at) = self.cfg.point_in_time {
+                return Ok(self.pit_index(at).await?.get(name).map(|(_, _, t)| *t));
+            }
             let key = join_key(&self.cfg.prefix, name);
             let r = http::check(self.send(reqwest::Method::HEAD, &key, &[], &[], Vec::new()).await?, "S3 file time").await?;
             Ok(r.headers().get("last-modified").and_then(|v| v.to_str().ok()).and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok()).map(|t| t.with_timezone(&chrono::Utc)))
         })
     }
     fn supports_lock(&self) -> bool {
-        true
+        self.cfg.point_in_time.is_none()
     }
 
     fn lock<'a>(&'a self, name: &'a str, until: chrono::DateTime<chrono::Utc>, mode: LockMode) -> BoxFut<'a, ()> {
         Box::pin(async move {
+            if self.cfg.point_in_time.is_some() {
+                return Err(self.refuse_write("lock", name));
+            }
             let key = join_key(&self.cfg.prefix, name);
             let m = match mode {
                 LockMode::Governance => "GOVERNANCE",
@@ -457,7 +658,8 @@ mod tests {
         assert_eq!(preset_endpoint("storj", "x").unwrap(), "https://gateway.storjshare.io");
         let s = S3Store::new(S3Config { bucket: "b".into(), access_key_id: "k".into(), ..Default::default() }, "sec\ntok".into()).unwrap();
         assert_eq!(s.host, "s3.us-east-1.amazonaws.com");
-        assert_eq!(s.session_token.as_deref(), Some("tok"));
+        let k = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(s.creds.keys()).unwrap();
+        assert_eq!((k.secret_access_key.as_str(), k.session_token.as_deref()), ("sec", Some("tok")));
         assert_eq!(s.locate("p/x").0, "b.s3.us-east-1.amazonaws.com");
     }
 }
