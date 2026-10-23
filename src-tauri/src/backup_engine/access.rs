@@ -118,9 +118,7 @@ impl ReadSetup {
 }
 
 fn default_cache_dir() -> PathBuf {
-    directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
-        .map(|d| d.cache_dir().to_path_buf())
-        .unwrap_or_else(|| ufop_core::session::user_temp_subdir("cache"))
+    crate::paths::cache_dir()
 }
 
 fn mime_of(path: &str) -> String {

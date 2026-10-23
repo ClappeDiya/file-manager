@@ -66,9 +66,7 @@ static GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::
 
 /// `<local data dir>/logs`.
 pub fn log_dir() -> PathBuf {
-    directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
-        .map(|d| d.data_local_dir().join("logs"))
-        .unwrap_or_else(|| PathBuf::from("./logs"))
+    crate::paths::data_local_dir().join("logs")
 }
 
 /// Install the global subscriber (stdout + rolling file). Call once.

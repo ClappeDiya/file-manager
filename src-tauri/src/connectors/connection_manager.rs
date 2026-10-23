@@ -299,6 +299,7 @@ mod tests {
         let cred_store = Arc::new(CredentialStore {
             cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             keychain_available: false,
+            file_vault: None,
         });
         ConnectionManager::new(repo, cred_store)
     }

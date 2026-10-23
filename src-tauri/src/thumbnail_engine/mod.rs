@@ -41,9 +41,7 @@ impl ThumbnailCache {
 
     /// `<cache dir>/thumbnails`, falling back to the temp dir.
     pub fn open_default() -> Self {
-        let dir = directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
-            .map(|d| d.cache_dir().join("thumbnails"))
-            .unwrap_or_else(|| ufop_core::session::user_temp_subdir("thumbnails"));
+        let dir = crate::paths::cache_dir().join("thumbnails");
         Self::new(dir, DEFAULT_BUDGET_BYTES)
     }
 

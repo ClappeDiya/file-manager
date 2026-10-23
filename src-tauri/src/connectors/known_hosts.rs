@@ -99,8 +99,7 @@ impl KnownHostsStore {
         if cfg!(test) {
             return Self::in_memory();
         }
-        let path = directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
-            .map(|d| d.data_dir().join("known_hosts.json"));
+        let path = Some(crate::paths::data_dir().join("known_hosts.json"));
         let system = directories::UserDirs::new()
             .map(|d| vec![d.home_dir().join(".ssh").join("known_hosts")])
             .unwrap_or_default();

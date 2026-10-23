@@ -2,6 +2,7 @@ pub mod ai_engine;
 pub mod automation_engine;
 pub mod backup_engine;
 pub mod commands;
+pub mod paths;
 pub mod compat_engine;
 pub mod convert_engine;
 pub mod connectors;
@@ -373,6 +374,9 @@ async fn persist_on_shutdown(repo: &Repository, transfer_mgr: &TransferManager) 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Portable mode: point temp, webview and XDG folders into the portable
+    // root before anything else starts (single-threaded here).
+    paths::apply_process_env();
     let log_dir = logging::log_dir();
     logging::init(&log_dir);
     logging::Retention::load(&log_dir).apply(&log_dir);
@@ -569,6 +573,7 @@ pub fn run() {
             // System
             system_commands::greet,
             system_commands::get_app_version,
+            system_commands::get_portable_status,
             system_commands::get_platform_info,
             // Filesystem
             fs_commands::list_directory,

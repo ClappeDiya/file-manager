@@ -430,6 +430,9 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 }
 
 fn main() {
+    // Portable mode (UFOP_PORTABLE_DIR or a marker next to the binary) moves
+    // the default data folder too; --data-dir still wins.
+    unified_file_ops_lib::paths::apply_process_env();
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--install-service" || a == "--uninstall-service" || a == "--windows-service") {
         #[cfg(windows)]

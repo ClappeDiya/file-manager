@@ -870,9 +870,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Default directory for per-job databases.
 pub fn default_data_dir() -> PathBuf {
-    directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
-        .map(|d| d.data_dir().join("backups"))
-        .unwrap_or_else(|| ufop_core::session::user_temp_subdir("backups"))
+    crate::paths::data_dir().join("backups")
 }
 
 impl BackupManager {

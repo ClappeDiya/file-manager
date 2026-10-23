@@ -284,9 +284,7 @@ pub struct MountManager {
 
 impl MountManager {
     pub fn new() -> Self {
-        let cache_root = directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
-            .map(|d| d.cache_dir().join("mounts"))
-            .unwrap_or_else(|| ufop_core::session::user_temp_subdir("mount-cache"));
+        let cache_root = crate::paths::cache_dir().join("mounts");
         Self::with_cache_root(cache_root)
     }
 

@@ -33,9 +33,7 @@ impl DraftStore {
     }
 
     fn default_store() -> Result<Self, AppError> {
-        directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
-            .map(|d| Self::new(d.data_dir().join("editor-drafts")))
-            .ok_or_else(|| AppError::internal("No application data directory"))
+        Ok(Self::new(crate::paths::data_dir().join("editor-drafts")))
     }
 
     fn file_for(&self, path: &str) -> PathBuf {

@@ -506,7 +506,7 @@ impl SearchManager {
 
     /// `<data dir>/search-index.sqlite`, or in memory if that fails.
     pub fn open_default() -> Self {
-        let path = directories::ProjectDirs::from("com", "ufop", "unified-file-ops").map(|d| d.data_dir().join("search-index.sqlite"));
+        let path = Some(crate::paths::data_dir().join("search-index.sqlite"));
         let index = path
             .and_then(|p| SearchIndex::open(&p).map_err(|e| tracing::warn!("Search index unavailable on disk: {e}")).ok())
             .unwrap_or_else(|| SearchIndex::open_in_memory().expect("in-memory SQLite"));
