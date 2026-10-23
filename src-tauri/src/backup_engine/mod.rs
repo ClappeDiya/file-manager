@@ -3071,8 +3071,7 @@ impl BackupManager {
             let Some(j) = snapshot else { continue };
             let _ = self.persist(&j).await;
             let m = self.resolve_job(&j).await.map(|r| r.job.maintenance).unwrap_or_else(|_| j.maintenance.clone());
-            let cal = m.schedule_of(task).map(|s| s.calendar_ids.clone()).unwrap_or_default();
-            if let Some(c) = crate::schedule_library::registry().run_blocked(None, &cal, now) {
+            if let Some(c) = m.schedule_of(task).and_then(|s| s.day_off(now)) {
                 tracing::info!("Skipping scheduled {task} of '{}': today is a day off in '{c}'", j.name);
                 continue;
             }
@@ -3103,8 +3102,8 @@ impl BackupManager {
             if let Some(j) = &snapshot {
                 let _ = self.persist(j).await;
                 // A day off in one of the job's holiday calendars uses up the slot.
-                let cal_ids = self.resolve_job(j).await.map(|r| r.job.schedule.calendar_ids).unwrap_or_else(|_| j.schedule.calendar_ids.clone());
-                if let Some(cal) = crate::schedule_library::registry().run_blocked(None, &cal_ids, now) {
+                let schedule = self.resolve_job(j).await.map(|r| r.job.schedule).unwrap_or_else(|_| j.schedule.clone());
+                if let Some(cal) = schedule.day_off(now) {
                     tracing::info!("Skipping scheduled backup '{}': today is a day off in '{cal}'", j.name);
                     continue;
                 }

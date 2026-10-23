@@ -1,8 +1,9 @@
 /**
  * Schedule fields shared by the job's backup schedule and the maintenance
  * schedules: interval mode (start time, repeat, weekdays) or, in Advanced
- * mode, "Custom (cron)" with one expression per line and a preview of the
- * next five runs. Mirrors `backup_engine::schedule::BackupSchedule`.
+ * mode, "Custom (cron)" with one expression per line, the time zone
+ * (Advanced, K123) and a preview of the next five runs in that zone and in
+ * local time. Mirrors `backup_engine::schedule::BackupSchedule`.
  */
 import { useEffect, useState } from "react";
 import { HolidayCalendarPicker } from "@/components/schedule-pickers";
@@ -10,6 +11,8 @@ import { isBackendAvailable, tauriInvoke } from "@/hooks/use-tauri";
 import { cronLines, inputCls, isCronSchedule } from "@/lib/backup-helpers";
 import { errorText, type BackupSchedule } from "@/stores/backup-store";
 import { Check, Field } from "./backup-ui";
+import { AdvancedOnly } from "./advanced-only";
+import { isLocalZone, ZONE_CHOICES, zoneValue, zoneWallClock } from "@/lib/schedule-zone";
 import { useIsAdvanced } from "./use-is-advanced";
 
 const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -27,6 +30,8 @@ const INTERVALS: [number, string][] = [
 export interface ScheduleRun {
   at: string;
   skipped_by: string | null;
+  /** `at` with the schedule zone's offset (backup schedules). */
+  zoned?: string;
 }
 
 export function ScheduleEditor({
@@ -98,7 +103,7 @@ export function ScheduleEditor({
         </Field>
       )}
       {cron ? (
-        <Field label="Cron expressions (one per line, local time)" hint="min hour day month weekday, e.g. 30 2 * * Mon-Fri. Seconds first and a year last are allowed. The earliest match of any line runs.">
+        <Field label={`Cron expressions (one per line, ${isLocalZone(value.timezone) ? "local time" : `time zone ${value.timezone}`})`} hint="min hour day month weekday, e.g. 30 2 * * Mon-Fri. Seconds first and a year last are allowed. The earliest match of any line runs.">
           <textarea
             className={`${inputCls} font-mono`}
             rows={3}
@@ -145,6 +150,18 @@ export function ScheduleEditor({
           </div>
         </>
       )}
+      <AdvancedOnly>
+        <Field label="Time zone" hint="The start time, weekdays, cron fields and holidays are read in this zone. Fixed offsets do not change for daylight saving.">
+          <select className={inputCls} value={zoneValue(value.timezone)} onChange={(e) => set({ timezone: e.target.value === "local" ? null : e.target.value })} data-testid={`${testId}-timezone`}>
+            {ZONE_CHOICES.map((z) => (
+              <option key={z.value} value={z.value}>
+                {z.label}
+              </option>
+            ))}
+            {!ZONE_CHOICES.some((z) => z.value === zoneValue(value.timezone)) && <option value={zoneValue(value.timezone)}>{value.timezone}</option>}
+          </select>
+        </Field>
+      </AdvancedOnly>
       <HolidayCalendarPicker value={value.calendar_ids ?? []} onChange={(ids) => set({ calendar_ids: ids })} />
       {showBattery && <Check label="Skip scheduled runs while on battery" checked={value.skip_on_battery} onChange={(v) => set({ skip_on_battery: v })} />}
       {value.enabled && (previewError || (preview && preview.length > 0)) && (
@@ -157,7 +174,14 @@ export function ScheduleEditor({
               <ul className="ml-3 list-disc">
                 {preview!.map((r) => (
                   <li key={r.at} className={r.skipped_by ? "line-through" : undefined}>
-                    {new Date(r.at).toLocaleString()}
+                    {!isLocalZone(value.timezone) && r.zoned ? (
+                      <>
+                        {zoneWallClock(r.zoned)}
+                        <span className="text-zinc-500"> — {new Date(r.at).toLocaleString()} on this computer</span>
+                      </>
+                    ) : (
+                      new Date(r.at).toLocaleString()
+                    )}
                     {r.skipped_by && ` (skipped: ${r.skipped_by})`}
                   </li>
                 ))}

@@ -5,11 +5,13 @@
 //!   match of any of them is the next run. Parsed by the schedule library's
 //!   cron parser (5, 6 or 7 fields).
 //!
-//! Times are evaluated in the machine's local timezone, so a 02:00 backup
-//! stays at 02:00 across daylight-saving changes; stored timestamps are UTC.
-//! The `*_in` functions take any timezone, for callers that have one.
+//! Times are evaluated in the schedule's time zone (`timezone`): the
+//! machine's local zone by default, so a 02:00 backup stays at 02:00 across
+//! daylight-saving changes, or a fixed UTC offset (`UTC`, `+02:00`, …; see
+//! [`ScheduleZone`]). Stored timestamps are UTC. The `*_in` functions take
+//! any timezone, for callers that have one.
 
-use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, NaiveDate, NaiveTime, Offset, TimeZone, Utc};
 use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
 
@@ -29,13 +31,88 @@ pub struct BackupSchedule {
     pub calendar_ids: Vec<String>,
     /// Cron mode: when not empty, these expressions replace the start time,
     /// interval and weekdays (5 fields `min hour day month weekday`, or 6/7
-    /// with seconds and year), evaluated in local time.
+    /// with seconds and year), evaluated in the schedule's time zone.
     pub cron: Vec<String>,
+    /// Time zone of the start time, weekdays, cron fields and holiday
+    /// calendars: `None` / `local` = this computer's zone, or a fixed offset
+    /// (`UTC`, `+02:00`, `UTC-05:30`). See [`ScheduleZone::parse`].
+    pub timezone: Option<String>,
+}
+
+/// The zone a schedule is evaluated in. Named IANA zones (`Europe/Berlin`)
+/// need a time-zone database the app does not ship, so only the local zone
+/// (which follows daylight saving) and fixed UTC offsets are supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleZone {
+    Local,
+    Fixed(FixedOffset),
+}
+
+/// Largest accepted UTC offset (real zones span −12:00 to +14:00).
+const MAX_OFFSET_MINUTES: i32 = 14 * 60;
+
+impl ScheduleZone {
+    /// Accepts empty / `local`, `UTC` / `GMT` / `Z` / `Etc/UTC`, and offsets
+    /// `+02:00`, `-0530`, `+2`, optionally after `UTC` or `GMT` (`UTC+1`).
+    pub fn parse(name: Option<&str>) -> Result<Self, AppError> {
+        let raw = name.map(str::trim).unwrap_or("");
+        let lower = raw.to_ascii_lowercase();
+        if lower.is_empty() || lower == "local" {
+            return Ok(Self::Local);
+        }
+        if matches!(lower.as_str(), "utc" | "gmt" | "z" | "etc/utc" | "etc/gmt" | "zulu" | "universal") {
+            return Ok(Self::Fixed(Utc.fix()));
+        }
+        let off = lower.strip_prefix("utc").or_else(|| lower.strip_prefix("gmt")).unwrap_or(&lower).trim();
+        Self::parse_offset(off).map(Self::Fixed).ok_or_else(|| {
+            AppError::validation(format!(
+                "Unknown time zone \"{raw}\". Use local (this computer's zone, with daylight saving), UTC, or a fixed offset such as +02:00 or UTC-05:00; named zones like Europe/Berlin are not supported"
+            ))
+        })
+    }
+
+    fn parse_offset(s: &str) -> Option<FixedOffset> {
+        let (sign, rest) = match s.chars().next()? {
+            '+' => (1, &s[1..]),
+            '-' => (-1, &s[1..]),
+            _ => return None,
+        };
+        let (h, m) = match rest.split_once(':') {
+            Some((h, m)) => (h, m),
+            None if rest.len() == 4 => rest.split_at(2),
+            None => (rest, "0"),
+        };
+        if h.is_empty() || h.len() > 2 || m.is_empty() || m.len() > 2 || !h.chars().chain(m.chars()).all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let (h, m): (i32, i32) = (h.parse().ok()?, m.parse().ok()?);
+        let total = h * 60 + m;
+        if m >= 60 || total > MAX_OFFSET_MINUTES {
+            return None;
+        }
+        FixedOffset::east_opt(sign * total * 60)
+    }
+
+    /// The calendar date of `t` in this zone (for weekdays and holidays).
+    pub fn date_of(&self, t: DateTime<Utc>) -> NaiveDate {
+        match self {
+            Self::Local => t.with_timezone(&Local).date_naive(),
+            Self::Fixed(o) => t.with_timezone(o).date_naive(),
+        }
+    }
+
+    /// `t` as RFC 3339 with this zone's offset.
+    pub fn rfc3339(&self, t: DateTime<Utc>) -> String {
+        match self {
+            Self::Local => t.with_timezone(&Local).to_rfc3339(),
+            Self::Fixed(o) => t.with_timezone(o).to_rfc3339(),
+        }
+    }
 }
 
 impl Default for BackupSchedule {
     fn default() -> Self {
-        Self { enabled: false, start_time: "02:00".into(), interval_minutes: 1440, weekdays: Vec::new(), skip_on_battery: false, calendar_ids: Vec::new(), cron: Vec::new() }
+        Self { enabled: false, start_time: "02:00".into(), interval_minutes: 1440, weekdays: Vec::new(), skip_on_battery: false, calendar_ids: Vec::new(), cron: Vec::new(), timezone: None }
     }
 }
 
@@ -56,7 +133,14 @@ impl BackupSchedule {
         self.cron.iter().filter(|c| !c.trim().is_empty()).map(|c| crate::schedule_library::parse_cron_any(c)).collect()
     }
 
+    /// The schedule's zone; an unparsable stored name (rejected on save)
+    /// falls back to the local zone.
+    pub fn zone(&self) -> ScheduleZone {
+        ScheduleZone::parse(self.timezone.as_deref()).unwrap_or(ScheduleZone::Local)
+    }
+
     pub fn validate(&self) -> Result<(), AppError> {
+        ScheduleZone::parse(self.timezone.as_deref())?;
         if self.is_cron() {
             let parsed = self.parsed_cron()?;
             // Too frequent: two of the next runs closer than the minimum gap.
@@ -88,9 +172,12 @@ impl BackupSchedule {
         self.weekdays.is_empty() || self.weekdays.contains(&(t.weekday().num_days_from_monday() as u8))
     }
 
-    /// First slot strictly after `after`, in local time.
+    /// First slot strictly after `after`, in the schedule's zone.
     pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.next_after_in(after, &Local)
+        match self.zone() {
+            ScheduleZone::Local => self.next_after_in(after, &Local),
+            ScheduleZone::Fixed(o) => self.next_after_in(after, &o),
+        }
     }
 
     /// First slot strictly after `after`, evaluating times of day in `tz`.
@@ -126,9 +213,18 @@ impl BackupSchedule {
         None
     }
 
-    /// The next `n` runs after `after` (local time).
+    /// The next `n` runs after `after` (in the schedule's zone).
     pub fn upcoming(&self, after: DateTime<Utc>, n: usize) -> Vec<DateTime<Utc>> {
-        self.upcoming_in(after, n, &Local)
+        match self.zone() {
+            ScheduleZone::Local => self.upcoming_in(after, n, &Local),
+            ScheduleZone::Fixed(o) => self.upcoming_in(after, n, &o),
+        }
+    }
+
+    /// The holiday calendar that makes the day of `at` (in the schedule's
+    /// zone) a day off, if any.
+    pub fn day_off(&self, at: DateTime<Utc>) -> Option<String> {
+        crate::schedule_library::registry().blocked_by(&self.calendar_ids, self.zone().date_of(at))
     }
 
     pub fn upcoming_in<Tz: TimeZone>(&self, after: DateTime<Utc>, n: usize, tz: &Tz) -> Vec<DateTime<Utc>> {
@@ -147,17 +243,16 @@ impl BackupSchedule {
     }
 
     /// Validate and list the next `n` runs (1–100), marking those a holiday
-    /// calendar skips (the "next runs" preview of the editor).
+    /// calendar skips (the "next runs" preview of the editor). `zoned` is the
+    /// same instant with the schedule zone's offset.
     pub fn preview(&self, after: DateTime<Utc>, n: usize) -> Result<Vec<crate::schedule_library::PreviewRun>, AppError> {
         self.validate()?;
         let on = Self { enabled: true, ..self.clone() };
+        let zone = self.zone();
         Ok(on
             .upcoming(after, n.clamp(1, 100))
             .into_iter()
-            .map(|t| crate::schedule_library::PreviewRun {
-                at: t.to_rfc3339(),
-                skipped_by: crate::schedule_library::registry().blocked_by(&self.calendar_ids, t.with_timezone(&Local).date_naive()),
-            })
+            .map(|t| crate::schedule_library::PreviewRun { at: t.to_rfc3339(), skipped_by: self.day_off(t), zoned: Some(zone.rfc3339(t)) })
             .collect())
     }
 
@@ -285,6 +380,63 @@ mod tests {
         assert_eq!(s.next_after_in(utc(2026, 3, 16, 0, 0), &plus2), Some(utc(2026, 3, 16, 0, 30)), "02:30 at UTC+2 is 00:30 UTC");
         // 6-field (seconds) form is accepted too.
         assert_eq!(BackupSchedule::cron(&["0 30 2 * * Mon-Fri"]).next_after_in(utc(2026, 3, 13, 3, 0), &Utc), Some(utc(2026, 3, 16, 2, 30)));
+    }
+
+    #[test]
+    fn time_zone_names_parse_and_bad_ones_are_refused() {
+        let off = |m: i32| ScheduleZone::Fixed(FixedOffset::east_opt(m * 60).unwrap());
+        assert_eq!(ScheduleZone::parse(None).unwrap(), ScheduleZone::Local);
+        assert_eq!(ScheduleZone::parse(Some(" Local ")).unwrap(), ScheduleZone::Local);
+        assert_eq!(ScheduleZone::parse(Some("")).unwrap(), ScheduleZone::Local);
+        for z in ["UTC", "utc", "GMT", "Z", "Etc/UTC", "+00:00", "UTC+0"] {
+            assert_eq!(ScheduleZone::parse(Some(z)).unwrap(), off(0), "{z}");
+        }
+        assert_eq!(ScheduleZone::parse(Some("+02:00")).unwrap(), off(120));
+        assert_eq!(ScheduleZone::parse(Some("UTC-05:30")).unwrap(), off(-330));
+        assert_eq!(ScheduleZone::parse(Some("-0530")).unwrap(), off(-330));
+        assert_eq!(ScheduleZone::parse(Some("GMT+1")).unwrap(), off(60));
+        assert_eq!(ScheduleZone::parse(Some("+14:00")).unwrap(), off(840));
+        for bad in ["Europe/Berlin", "+15:00", "+02:60", "2", "+", "UTC+", "+1:2:3", "+abc", "+123"] {
+            let e = ScheduleZone::parse(Some(bad)).unwrap_err();
+            assert!(e.user_message().contains("fixed offset"), "{bad}: {}", e.user_message());
+        }
+        let s = BackupSchedule { timezone: Some("Mars/Olympus".into()), ..Default::default() };
+        assert!(s.validate().is_err(), "saving refuses an unknown zone");
+        assert_eq!(s.zone(), ScheduleZone::Local, "a bad stored zone falls back to local time");
+    }
+
+    #[test]
+    fn interval_weekday_and_cron_follow_the_schedule_zone() {
+        // Daily 02:00 at UTC+2 runs at 00:00 UTC.
+        let daily = BackupSchedule { enabled: true, start_time: "02:00".into(), interval_minutes: 1440, timezone: Some("+02:00".into()), ..Default::default() };
+        daily.validate().unwrap();
+        assert_eq!(daily.next_after(utc(2026, 3, 16, 1, 0)), Some(utc(2026, 3, 17, 0, 0)));
+        assert_eq!(daily.next_after(utc(2026, 3, 15, 23, 0)), Some(utc(2026, 3, 16, 0, 0)));
+        // Weekdays are the zone's weekdays: Monday 01:00 at UTC+5 is Sunday 20:00 UTC.
+        let monday = BackupSchedule { enabled: true, start_time: "01:00".into(), interval_minutes: 1440, weekdays: vec![0], timezone: Some("UTC+5".into()), ..Default::default() };
+        assert_eq!(monday.next_after(utc(2026, 3, 14, 0, 0)), Some(utc(2026, 3, 15, 20, 0)), "2026-03-15 is a Sunday in UTC");
+        // Cron in UTC−05:00: 09:00 there is 14:00 UTC.
+        let cron = BackupSchedule { timezone: Some("-05:00".into()), ..BackupSchedule::cron(&["0 9 * * *"]) };
+        assert_eq!(cron.upcoming(utc(2026, 3, 16, 15, 0), 2), vec![utc(2026, 3, 17, 14, 0), utc(2026, 3, 18, 14, 0)]);
+        // Catch-up after downtime and the nominal interval use the zone too.
+        assert!(cron.is_due(utc(2026, 3, 16, 15, 0), utc(2026, 3, 17, 14, 1)));
+        assert!(!cron.is_due(utc(2026, 3, 16, 15, 0), utc(2026, 3, 17, 13, 59)));
+        assert_eq!(cron.nominal_interval_minutes(), 1440);
+        // Maintenance schedules are BackupSchedules, so they follow their zone as well.
+        let m = MaintenanceSchedule { compact: Some(cron.clone()), ..Default::default() };
+        assert_eq!(m.schedule_of("compact").and_then(|s| s.next_after(utc(2026, 3, 16, 15, 0))), Some(utc(2026, 3, 17, 14, 0)));
+    }
+
+    #[test]
+    fn preview_shows_the_zone_time_and_old_json_still_loads() {
+        let s = BackupSchedule { timezone: Some("UTC".into()), ..BackupSchedule::cron(&["30 2 * * *"]) };
+        let p = s.preview(utc(2026, 3, 16, 3, 0), 1).unwrap();
+        assert_eq!(p[0].at, utc(2026, 3, 17, 2, 30).to_rfc3339());
+        assert_eq!(p[0].zoned.as_deref(), Some("2026-03-17T02:30:00+00:00"));
+        let plus = BackupSchedule { timezone: Some("+02:00".into()), ..s };
+        assert_eq!(plus.preview(utc(2026, 3, 16, 3, 0), 1).unwrap()[0].zoned.as_deref(), Some("2026-03-17T02:30:00+02:00"));
+        let old: BackupSchedule = serde_json::from_value(serde_json::json!({"enabled": true, "start_time": "03:00", "interval_minutes": 60})).unwrap();
+        assert_eq!((old.timezone.clone(), old.zone()), (None, ScheduleZone::Local));
     }
 
     #[test]

@@ -69,7 +69,7 @@ fn templates() -> Value {
     json!({ "type": "array", "items": template() })
 }
 fn schedule() -> Value {
-    json!({ "type": "object", "description": "BackupSchedule: enabled, start_time (HH:MM), interval_minutes, weekdays (0 = Mon), cron (expressions; when set they replace start time, interval and weekdays), skip_on_battery, calendar_ids", "additionalProperties": true })
+    json!({ "type": "object", "description": "BackupSchedule: enabled, start_time (HH:MM), interval_minutes, weekdays (0 = Mon), cron (expressions; when set they replace start time, interval and weekdays), skip_on_battery, calendar_ids, timezone (null/local = the server's zone, UTC or a fixed offset such as +02:00). The preview's runs have at (UTC) and zoned (the same time with the schedule zone's offset)", "additionalProperties": true })
 }
 fn any() -> Value {
     json!({ "type": "object", "additionalProperties": true })

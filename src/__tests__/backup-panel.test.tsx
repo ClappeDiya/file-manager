@@ -79,10 +79,10 @@ describe("backup helpers", () => {
   });
 
   it("describes schedules and retention", () => {
-    expect(describeSchedule({ enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: [] })).toBe("Manual only");
-    expect(describeSchedule({ enabled: true, start_time: "02:00", interval_minutes: 1440, weekdays: [0, 4], skip_on_battery: false, calendar_ids: [], cron: [] })).toBe("daily from 02:00 on Mon, Fri");
-    expect(describeSchedule({ enabled: true, start_time: "00:30", interval_minutes: 60, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: [] })).toBe("every 1 h from 00:30");
-    expect(describeSchedule({ enabled: true, start_time: "00:30", interval_minutes: 60, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: ["30 2 * * Mon-Fri", " "] })).toBe("cron 30 2 * * Mon-Fri");
+    expect(describeSchedule({ enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: [], timezone: null })).toBe("Manual only");
+    expect(describeSchedule({ enabled: true, start_time: "02:00", interval_minutes: 1440, weekdays: [0, 4], skip_on_battery: false, calendar_ids: [], cron: [], timezone: null })).toBe("daily from 02:00 on Mon, Fri");
+    expect(describeSchedule({ enabled: true, start_time: "00:30", interval_minutes: 60, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: [], timezone: null })).toBe("every 1 h from 00:30");
+    expect(describeSchedule({ enabled: true, start_time: "00:30", interval_minutes: 60, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: ["30 2 * * Mon-Fri", " "], timezone: null })).toBe("cron 30 2 * * Mon-Fri");
     expect(describeRetention({ type: "keep_count", count: 5 })).toBe("Keep 5 version(s)");
   });
 

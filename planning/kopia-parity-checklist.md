@@ -111,7 +111,7 @@ Ground rules
 ## WP11 — Interface polish
 - [x] K122 Sort and paginate backup version/file tables
 - [x] K121 Text size setting
-- [ ] K123 Units (binary/decimal) and schedule timezone
+- [x] K123 Units (binary/decimal) and schedule timezone
 
 ## Follow-ups found during the work
 - [ ] Standalone `ufop agent` host honours cron and maintenance schedules of managed jobs (WP6 left it on plain intervals)

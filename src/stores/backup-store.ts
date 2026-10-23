@@ -575,8 +575,10 @@ export interface BackupSchedule {
   skip_on_battery: boolean;
   /** Holiday calendars whose days off skip runs (`schedule_library`). */
   calendar_ids: string[];
-  /** Cron mode when not empty: expressions (5, 6 or 7 fields, local time) replacing start time, interval and weekdays. */
+  /** Cron mode when not empty: expressions (5, 6 or 7 fields, in the schedule's time zone) replacing start time, interval and weekdays. */
   cron: string[];
+  /** Time zone of the schedule: null / "local" = this computer's, "UTC" or a fixed offset like "+02:00" (K123). */
+  timezone: string | null;
 }
 
 /** Mirrors `hooks::HookMode`. */
@@ -1451,7 +1453,7 @@ export function newBackupJob(): BackupJob {
       parallel_file_threshold: DEFAULT_PARALLEL_FILE_THRESHOLD,
     },
     retention: { type: "keep_all" },
-    schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: [] },
+    schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: [], timezone: null },
     scripts: { run_before: null, run_before_required: false, before_mode: null, run_after: null, after_mode: null, run_on_source_release: null, timeout_secs: 60, result_format: "json" },
     reports: {
       http_urls: [],
@@ -1755,6 +1757,11 @@ export function hookBeforeMode(s: ScriptConfig): HookMode {
 
 export function describeSchedule(s: BackupSchedule): string {
   if (!s.enabled) return "Manual only";
+  const tz = s.timezone && s.timezone.trim() && s.timezone.trim().toLowerCase() !== "local" ? ` (${s.timezone.trim()})` : "";
+  return describeScheduleTimes(s) + tz;
+}
+
+function describeScheduleTimes(s: BackupSchedule): string {
   const cron = (s.cron ?? []).filter((c) => c.trim() !== "");
   if (cron.length) return `cron ${cron.join(" | ")}`;
   const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];

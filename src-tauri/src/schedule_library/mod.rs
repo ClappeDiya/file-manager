@@ -166,6 +166,9 @@ pub struct PreviewRun {
     pub at: String,
     /// Calendar that skips this run, if any.
     pub skipped_by: Option<String>,
+    /// Backup schedules: `at` with the schedule time zone's offset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zoned: Option<String>,
 }
 
 /// The next `n` runs of `cron_expr`, marking those `calendar_ids` skip.
@@ -173,7 +176,7 @@ pub fn preview(cron_expr: &str, calendar_ids: &[String], after: DateTime<Utc>, n
     let s = validate_cron(cron_expr)?;
     Ok(s.after(&after)
         .take(n.clamp(1, 100))
-        .map(|t| PreviewRun { at: t.to_rfc3339(), skipped_by: registry().blocked_by(calendar_ids, t.with_timezone(&Local).date_naive()) })
+        .map(|t| PreviewRun { at: t.to_rfc3339(), skipped_by: registry().blocked_by(calendar_ids, t.with_timezone(&Local).date_naive()), zoned: None })
         .collect())
 }
 

@@ -270,7 +270,7 @@ export function EffectiveSettingsPanel({ job, onReset }: { job: BackupJob; onRes
 
 // ── Job editor: maintenance schedule ──
 
-const defaultTaskSchedule = (cron: string): BackupSchedule => ({ enabled: true, start_time: "03:00", interval_minutes: 10080, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: [cron] });
+const defaultTaskSchedule = (cron: string): BackupSchedule => ({ enabled: true, start_time: "03:00", interval_minutes: 10080, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: [cron], timezone: null });
 
 export function MaintenanceScheduleEditor({ value, onChange, autoCompactDays }: { value: MaintenanceSchedule; onChange: (m: MaintenanceSchedule) => void; autoCompactDays: number | null }) {
   const set = (p: Partial<MaintenanceSchedule>) => onChange({ ...value, ...p });

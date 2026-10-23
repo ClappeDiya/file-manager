@@ -1043,6 +1043,10 @@ async fn policy_templates_effective_settings_and_schedule_preview_over_rest() {
     // Cron schedules: preview and a friendly error.
     let p = s.post("/api/v1/backup-schedule/preview", &tok, json!({"schedule": {"enabled": true, "cron": ["30 2 * * *"]}, "count": 3})).await.json::<Value>().await.unwrap();
     assert_eq!(p.as_array().unwrap().len(), 3);
+    let z = s.post("/api/v1/backup-schedule/preview", &tok, json!({"schedule": {"enabled": true, "cron": ["30 2 * * *"], "timezone": "+02:00"}, "count": 1})).await.json::<Value>().await.unwrap();
+    assert!(z[0]["zoned"].as_str().unwrap().ends_with("T02:30:00+02:00"), "{z}");
+    let badz = s.post("/api/v1/backup-schedule/preview", &tok, json!({"schedule": {"enabled": true, "cron": ["30 2 * * *"], "timezone": "Europe/Berlin"}})).await;
+    assert_eq!(badz.status(), 400);
     let bad = s.post("/api/v1/backup-schedule/preview", &tok, json!({"schedule": {"enabled": true, "cron": ["99 * * * *"]}})).await;
     assert_eq!(bad.status(), 400);
     assert!(bad.text().await.unwrap().contains("Invalid cron expression"));

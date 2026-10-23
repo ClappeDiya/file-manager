@@ -305,8 +305,11 @@ pub async fn open_at(job: &str, point_in_time: &str, name: Option<String>, forma
 }
 
 /// Body of a schedule preview: cron expressions, or an interval schedule.
-pub fn preview_body(cron: &[String], start_time: Option<&str>, interval_minutes: Option<u32>, count: usize) -> Value {
+pub fn preview_body(cron: &[String], start_time: Option<&str>, interval_minutes: Option<u32>, timezone: Option<&str>, count: usize) -> Value {
     let mut s = json!({ "enabled": true, "cron": cron });
+    if let Some(z) = timezone {
+        s["timezone"] = json!(z);
+    }
     if let Some(t) = start_time {
         s["start_time"] = json!(t);
     }
@@ -316,23 +319,34 @@ pub fn preview_body(cron: &[String], start_time: Option<&str>, interval_minutes:
     json!({ "schedule": s, "count": count })
 }
 
-pub async fn schedule_preview(cron: &[String], start_time: Option<&str>, interval_minutes: Option<u32>, count: usize, format: &OutputFormat) -> Result<u8, String> {
+pub async fn schedule_preview(cron: &[String], start_time: Option<&str>, interval_minutes: Option<u32>, timezone: Option<&str>, count: usize, format: &OutputFormat) -> Result<u8, String> {
     let mut c = Client::new()?;
-    let v = c.call(Method::POST, "/backup-schedule/preview", Some(preview_body(cron, start_time, interval_minutes, count))).await?;
+    let v = c.call(Method::POST, "/backup-schedule/preview", Some(preview_body(cron, start_time, interval_minutes, timezone, count))).await?;
     match format {
         OutputFormat::Human => {
             for r in v.as_array().into_iter().flatten() {
-                let at = r["at"].as_str().unwrap_or_default();
-                let local = chrono::DateTime::parse_from_rfc3339(at).map(|d| d.with_timezone(&chrono::Local).format("%a %Y-%m-%d %H:%M").to_string()).unwrap_or_else(|_| at.to_string());
-                match r["skipped_by"].as_str() {
-                    Some(c) => println!("{local}  (skipped: {c})"),
-                    None => println!("{local}"),
-                }
+                let line = preview_line(r, timezone.is_some_and(|z| !z.trim().is_empty() && !z.trim().eq_ignore_ascii_case("local")));
+                println!("{line}");
             }
         }
         _ => output::print_data(format, &v),
     }
     Ok(0)
+}
+
+/// One "next run" line: the time in the schedule's zone (and this
+/// computer's equivalent when the zone is not local), plus a skipping calendar.
+fn preview_line(r: &Value, other_zone: bool) -> String {
+    let at = r["at"].as_str().unwrap_or_default();
+    let local = chrono::DateTime::parse_from_rfc3339(at).map(|d| d.with_timezone(&chrono::Local).format("%a %Y-%m-%d %H:%M").to_string()).unwrap_or_else(|_| at.to_string());
+    let mut line = match r["zoned"].as_str().and_then(|z| chrono::DateTime::parse_from_rfc3339(z).ok()) {
+        Some(z) if other_zone => format!("{}  (this computer: {local})", z.format("%a %Y-%m-%d %H:%M %:z")),
+        _ => local,
+    };
+    if let Some(c) = r["skipped_by"].as_str() {
+        line.push_str(&format!("  (skipped: {c})"));
+    }
+    line
 }
 
 #[cfg(test)]
@@ -395,10 +409,22 @@ mod tests {
 
     #[test]
     fn preview_bodies() {
-        let b = preview_body(&["30 2 * * *".into()], None, None, 5);
+        let b = preview_body(&["30 2 * * *".into()], None, None, None, 5);
         assert_eq!(b["schedule"]["cron"][0], "30 2 * * *");
         assert_eq!(b["count"], 5);
-        let b = preview_body(&[], Some("03:00"), Some(60), 3);
+        assert!(b["schedule"].get("timezone").is_none());
+        let b = preview_body(&[], Some("03:00"), Some(60), Some("+02:00"), 3);
         assert_eq!((b["schedule"]["start_time"].as_str(), b["schedule"]["interval_minutes"].as_u64()), (Some("03:00"), Some(60)));
+        assert_eq!(b["schedule"]["timezone"], "+02:00");
+    }
+
+    #[test]
+    fn preview_lines_show_the_zone_time() {
+        let r = json!({"at": "2026-03-17T00:30:00+00:00", "zoned": "2026-03-17T02:30:00+02:00", "skipped_by": "Holidays"});
+        let line = preview_line(&r, true);
+        assert!(line.starts_with("Tue 2026-03-17 02:30 +02:00  (this computer: "), "{line}");
+        assert!(line.ends_with("(skipped: Holidays)"), "{line}");
+        let plain = preview_line(&json!({"at": "2026-03-17T00:30:00+00:00", "skipped_by": null}), false);
+        assert!(!plain.contains("this computer") && !plain.contains("skipped"), "{plain}");
     }
 }

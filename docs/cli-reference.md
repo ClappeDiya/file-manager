@@ -639,7 +639,10 @@ ufop backup template import templates.json
 ufop backup template delete Laptops                       # refused while a job uses it
 ufop backup effective Docs                                # every setting and where it comes from
 ufop backup schedule-preview --cron "30 2 * * Mon-Fri" --cron "0 9 * * Sat" --count 5
+ufop backup schedule-preview --start-time 02:00 --interval-minutes 1440 --timezone +02:00   # times in that zone and this computer's
 ```
+
+`--timezone` (also `"timezone"` in a schedule, e.g. `template update … --settings '{"schedule":{"enabled":true,"cron":["30 1 * * *"],"timezone":"UTC"}}'`) takes `local` (default: the server's or this computer's zone, with daylight saving), `UTC`, or a fixed offset such as `+02:00`, `-0530` or `UTC+1`; see [backup-policies-and-schedules.md](backup-policies-and-schedules.md#time-zone).
 
 | Flag (`verify`) | Default | |
 |---|---|---|

@@ -1298,6 +1298,9 @@ pub enum BackupCommands {
         /// Interval schedules: minutes between runs
         #[arg(long)]
         interval_minutes: Option<u32>,
+        /// Time zone: local (default), UTC or a fixed offset such as +02:00
+        #[arg(long)]
+        timezone: Option<String>,
         #[arg(long, default_value_t = 5)]
         count: usize,
     },
@@ -1632,8 +1635,8 @@ pub async fn execute(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) 
             BackupCommands::Effective { job } => super::backup_policy::effective(&job, format).await,
             BackupCommands::OpenAt { job, point_in_time, name } => super::backup_policy::open_at(&job, &point_in_time, name, format).await,
             BackupCommands::Hardening { job, probe } => super::backup_policy::hardening(&job, probe, format).await,
-            BackupCommands::SchedulePreview { cron, start_time, interval_minutes, count } => {
-                super::backup_policy::schedule_preview(&cron, start_time.as_deref(), interval_minutes, count, format).await
+            BackupCommands::SchedulePreview { cron, start_time, interval_minutes, timezone, count } => {
+                super::backup_policy::schedule_preview(&cron, start_time.as_deref(), interval_minutes, timezone.as_deref(), count, format).await
             }
             _ => unreachable!("server-backed commands only"),
         };

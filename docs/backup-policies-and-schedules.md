@@ -5,6 +5,7 @@ This page covers how backup jobs share settings and when their work runs:
 - named policy templates that jobs inherit from
 - the effective-settings view: where each setting comes from
 - cron schedules for backups
+- the time zone a schedule runs in
 - separate schedules for compaction, verification and retention
 - verification scope, sampling, parallelism and an error limit
 - asynchronous (fire-and-forget) hook scripts
@@ -117,7 +118,7 @@ A schedule (`BackupSchedule`) works in one of two modes:
 | 7 fields | `0 0 3 1 * * 2027` | With a year last |
 
 - Expressions are read by the schedule library's cron parser (`schedule_library::parse_cron_any`, the same `cron` crate that sync pairs and automation rules use). Named schedules (`schedule:<id>`) are not accepted here. Paste their expression instead.
-- Times are **local**. A run at 02:30 stays at 02:30 when daylight-saving time changes. The schedule code evaluates times in any time zone (`next_after_in`, `upcoming_in`), so a time zone setting can be passed in later.
+- Times are **local** unless the schedule has a [time zone](#time-zone). A local run at 02:30 stays at 02:30 when daylight-saving time changes.
 - Validation errors are written to be readable, e.g. *Invalid cron expression '61 \* \* \* \*': … Use `min hour day month weekday`*. A schedule that would run more often than every 5 minutes, or never, is refused.
 - **Missed runs** behave as they do for interval schedules. If the app was closed when one or more runs were due, the backup runs once as soon as the scheduler is back. It does not run once per missed slot. Holiday calendars and *Skip while on battery* apply to cron schedules too.
 - The editor shows the **next five runs** and strikes out runs that a holiday calendar skips.
@@ -129,6 +130,23 @@ A schedule (`BackupSchedule`) works in one of two modes:
 | Preview | `POST /api/v1/backup-schedule/preview` with `{schedule, count}` (needs the `read` scope); `ufop backup schedule-preview --cron "30 2 * * *" [--cron …] [--count 5]` (or `--start-time 03:00 --interval-minutes 60`); IPC `backup_schedule_preview { schedule, count }` |
 
 The standalone CLI agent (`ufop agent`) still runs managed jobs on their plain interval.
+
+## Time zone
+
+Each schedule (the backup schedule and each maintenance schedule) has a `timezone`. The start time, the weekdays, the cron fields and the holiday calendars are read in that zone, and so are the next-run preview, missed-run catch-up and the "today is a day off" check.
+
+| Value | Meaning |
+|---|---|
+| `null`, `""` or `local` (default) | This computer's (or the server's) time zone. Follows daylight saving: 02:00 stays 02:00 all year. |
+| `UTC` (also `GMT`, `Z`, `Etc/UTC`) | Coordinated Universal Time |
+| `+02:00`, `-05:30`, `+0530`, `+2`, `UTC+1`, `GMT-3` | A fixed offset from UTC, −14:00 to +14:00. It does **not** change for daylight saving. |
+
+Named zones such as `Europe/Berlin` are refused with an explanation: the app ships no time-zone database (the offline build has no `chrono-tz`), so it cannot follow another region's daylight-saving rules. Use `local` on a computer in that zone, or the fixed offset you want.
+
+- **Editor** (Advanced): *Time zone* under the schedule, with this computer's zone, UTC and the common offsets. When a zone other than local is chosen, the next-run preview shows each run in that zone and the same moment on this computer, e.g. *Tue, Mar 17, 2026, 02:30 (UTC+02:00) — 3/17/2026, 1:30:00 AM on this computer*.
+- **Job JSON / templates / REST**: `"schedule": {"enabled": true, "cron": ["30 2 * * *"], "timezone": "UTC"}`. Older jobs without the field run in local time as before. A job with an unknown zone is refused on save (`400` over REST).
+- **Preview**: `POST /api/v1/backup-schedule/preview` and IPC `backup_schedule_preview` answer each run's `at` (UTC) and `zoned` (the same instant with the zone's offset). `ufop backup schedule-preview --timezone +02:00 …` prints the zone time and this computer's time.
+- The run-history and version times in the Backup screens can be shown in UTC instead of local time: Settings → Appearance → *Backup times*.
 
 ## Maintenance schedule
 
