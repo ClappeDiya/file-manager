@@ -56,3 +56,6 @@ src-tauri/WixTools/
 # Generated
 icon.png
 *.pyc
+
+# Local release staging (scripts/release-local.sh)
+release-artifacts/

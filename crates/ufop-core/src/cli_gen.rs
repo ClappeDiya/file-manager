@@ -591,6 +591,12 @@ fn roff(s: &str) -> String {
 /// Man pages for `cmd` and every subcommand: (file name, roff source),
 /// e.g. `ufop.1`, `ufop-backup.1`, `ufop-backup-run.1`.
 pub fn man_pages(cmd: &Command) -> Vec<(String, String)> {
+    man_pages_in(cmd, "1")
+}
+
+/// [`man_pages`] in manual `section` (`ufop-server` uses 8, system
+/// daemons, so its pages never collide with `ufop server …` in section 1).
+pub fn man_pages_in(cmd: &Command, section: &str) -> Vec<(String, String)> {
     let version = cmd.get_version().unwrap_or("").to_string();
     let nodes = nodes(cmd);
     nodes
@@ -598,7 +604,8 @@ pub fn man_pages(cmd: &Command) -> Vec<(String, String)> {
         .map(|n| {
             let page = n.path.join("-");
             let mut s = String::new();
-            let _ = writeln!(s, ".TH \"{}\" \"1\" \"\" \"{} {}\" \"User Commands\"", page.to_uppercase(), roff(&n.path[0]), roff(&version));
+            let title = if section == "8" { "System Administration" } else { "User Commands" };
+            let _ = writeln!(s, ".TH \"{}\" \"{section}\" \"\" \"{} {}\" \"{title}\"", page.to_uppercase(), roff(&n.path[0]), roff(&version));
             let _ = writeln!(s, ".SH NAME\n{} \\- {}", roff(&page), roff(if n.about.is_empty() { &page } else { &n.about }));
             let mut syn = format!("\\fB{}\\fR", roff(&n.path.join(" ")));
             if !n.opts.is_empty() {
@@ -635,16 +642,16 @@ pub fn man_pages(cmd: &Command) -> Vec<(String, String)> {
                 let _ = writeln!(s, ".SH SUBCOMMANDS");
                 for (name, about) in &n.subs {
                     let child = format!("{page}-{name}");
-                    let _ = writeln!(s, ".TP\n\\fB{}(1)\\fR\n{}", roff(&child), roff(about));
+                    let _ = writeln!(s, ".TP\n\\fB{}({section})\\fR\n{}", roff(&child), roff(about));
                 }
             }
             if n.path.len() > 1 {
-                let _ = writeln!(s, ".SH SEE ALSO\n\\fB{}(1)\\fR", roff(&n.path[..n.path.len() - 1].join("-")));
+                let _ = writeln!(s, ".SH SEE ALSO\n\\fB{}({section})\\fR", roff(&n.path[..n.path.len() - 1].join("-")));
             }
             if !version.is_empty() {
                 let _ = writeln!(s, ".SH VERSION\nv{}", roff(&version));
             }
-            (format!("{page}.1"), s)
+            (format!("{page}.{section}"), s)
         })
         .collect()
 }
@@ -765,6 +772,9 @@ mod tests {
         assert!(run.contains(".SH SEE ALSO\n\\fBdemo\\-backup(1)\\fR"));
         let top = &pages[0].1;
         assert!(top.contains("\\fBdemo\\-backup(1)\\fR") && top.contains("v1.2.3"));
+        let eight = man_pages_in(&cmd(), "8");
+        assert_eq!(eight[0].0, "demo.8");
+        assert!(eight[0].1.starts_with(".TH \"DEMO\" \"8\"") && eight[0].1.contains("\\fBdemo\\-backup(8)\\fR"));
         assert_eq!(roff(".x - \\y"), "\\&.x \\- \\ey");
     }
 

@@ -224,7 +224,8 @@ fn print_generated(cmd: &Command) {
             None => fail(format!("unknown shell '{shell}'")),
         },
         Command::Man { out, command } => {
-            let pages = cli_gen::man_pages(&tree);
+            // Section 8 (daemons): `ufop server …` of the CLI owns ufop-server*.1.
+            let pages = cli_gen::man_pages_in(&tree, "8");
             if let Some(dir) = out {
                 std::fs::create_dir_all(dir).unwrap_or_else(|e| fail(format!("cannot create {}: {e}", dir.display())));
                 for (name, body) in &pages {
@@ -233,7 +234,7 @@ fn print_generated(cmd: &Command) {
                 eprintln!("Wrote {} man page(s) to {}", pages.len(), dir.display());
             } else {
                 let want = std::iter::once("ufop-server".to_string()).chain(command.iter().cloned()).collect::<Vec<_>>().join("-");
-                match pages.iter().find(|(n, _)| *n == format!("{want}.1")) {
+                match pages.iter().find(|(n, _)| *n == format!("{want}.8")) {
                     Some((_, body)) => print!("{body}"),
                     None => fail(format!("no command '{}'", want.replace('-', " "))),
                 }
