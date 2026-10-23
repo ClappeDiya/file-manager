@@ -234,6 +234,33 @@ pub fn process_env(d: &AppDirs) -> Vec<(&'static str, PathBuf)> {
     v
 }
 
+/// macOS portable mode: the web view's own data store. WKWebView cannot be
+/// pointed at a folder (`data_directory` is unsupported there), so portable
+/// mode gives the window a separate data store whose identifier is derived
+/// from the portable folder: each portable copy keeps its web storage
+/// (window and panel preferences) apart from the installed app and from
+/// other copies, and finds it again on the next start. The store itself
+/// stays under `~/Library/WebKit` (Apple decides where). Needs macOS 14 or
+/// later; older versions use the default store (as before).
+pub fn webview_store_identifier(d: &AppDirs) -> Option<[u8; 16]> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    d.portable_root.as_deref().map(store_identifier_for)
+}
+
+/// A stable UUID (RFC 9562 version 8) from a folder path.
+pub fn store_identifier_for(root: &Path) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let path = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let digest = Sha256::digest(format!("ufop-webview-store:{}", path.display()).as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    id[6] = (id[6] & 0x0f) | 0x80; // version 8 (custom)
+    id[8] = (id[8] & 0x3f) | 0x80; // RFC 4122 variant
+    id
+}
+
 /// Create the portable folders and export [`process_env`] (no-op outside
 /// portable mode).
 pub fn apply_process_env() {
@@ -253,6 +280,24 @@ pub fn apply_process_env() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webview_store_identifier_is_stable_per_portable_folder() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let id = store_identifier_for(a.path());
+        assert_eq!(id, store_identifier_for(a.path()), "same folder, same store");
+        std::fs::create_dir(a.path().join("x")).unwrap();
+        assert_eq!(id, store_identifier_for(&a.path().join("x").join("..")), "the path is canonicalized");
+        assert_ne!(id, store_identifier_for(b.path()));
+        let u = uuid::Uuid::from_bytes(id);
+        assert_eq!((u.get_version_num(), u.get_variant()), (8, uuid::Variant::RFC4122));
+        // Only macOS portable mode uses a custom store.
+        let mut d = os();
+        assert_eq!(webview_store_identifier(&d), None);
+        d.portable_root = Some(a.path().into());
+        assert_eq!(webview_store_identifier(&d), cfg!(target_os = "macos").then_some(id));
+    }
 
     fn os() -> AppDirs {
         AppDirs { data: "/os/data".into(), data_local: "/os/local".into(), config: "/os/config".into(), cache: "/os/cache".into(), temp: None, portable_root: None, portable_source: None }

@@ -501,6 +501,20 @@ pub fn run() {
         .setup(move |app| {
             use tauri::Manager;
             use tauri_plugin_notification::NotificationExt;
+            // The main window is created here rather than from the config
+            // (`"create": false` in tauri.conf.json), so portable mode on
+            // macOS can give it its own web data store (macOS 14+).
+            if app.webview_windows().is_empty() {
+                if let Some(cfg) = app.config().app.windows.first().cloned() {
+                    // `from_config` does not apply the config's data store
+                    // identifier, so it is set on the builder.
+                    let mut window = tauri::WebviewWindowBuilder::from_config(app.handle(), &cfg)?;
+                    if let Some(id) = paths::webview_store_identifier(paths::dirs()) {
+                        window = window.data_store_identifier(id);
+                    }
+                    window.build()?;
+                }
+            }
             let mgr = setup_backup_mgr.clone();
             // Backup results → OS notifications (warnings and errors by default).
             let handle = app.handle().clone();
