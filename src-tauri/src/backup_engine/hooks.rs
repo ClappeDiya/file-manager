@@ -252,7 +252,7 @@ impl StdinCommand {
         if !self.is_set() {
             return Ok(());
         }
-        if shlex::split(&self.command).is_none_or(|p| p.is_empty()) {
+        if shlex::split(&self.command).map_or(true, |p| p.is_empty()) {
             return Err(AppError::validation(format!("Cannot parse the backup command line '{}'", self.command)));
         }
         if self.virtual_path().split('/').any(|c| c == "..") {

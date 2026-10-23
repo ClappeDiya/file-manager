@@ -276,10 +276,12 @@ async fn dispatch_inner(mgr: &BackupManager, command: &str, a: &Value) -> Result
                 arg(a, "destination")?,
                 opt(a, "passphrase")?,
                 prefix()?,
-                opt(a, "name")?,
-                opt(a, "sources")?.unwrap_or_default(),
-                opt(a, "sourceMap")?.unwrap_or_default(),
-                opt(a, "readOnly")?.unwrap_or(false),
+                super::AdoptOptions {
+                    name: opt(a, "name")?,
+                    sources: opt(a, "sources")?.unwrap_or_default(),
+                    source_map: opt(a, "sourceMap")?.unwrap_or_default(),
+                    read_only: opt(a, "readOnly")?.unwrap_or(false),
+                },
             )
             .await?),
         "backup_open_point_in_time" => {

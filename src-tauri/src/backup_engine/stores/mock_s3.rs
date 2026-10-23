@@ -70,15 +70,15 @@ fn param(p: &[(String, String)], k: &str) -> Option<String> {
 }
 
 /// Recompute the request's SigV4 signature for `service`.
-fn verify(st: &S3State, m: &Method, u: &Uri, h: &HeaderMap, body: &[u8], service: &str) -> Result<(), Response> {
+fn verify(st: &S3State, m: &Method, u: &Uri, h: &HeaderMap, body: &[u8], service: &str) -> Result<(), Box<Response>> {
     let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
     let cred = auth.split("Credential=").nth(1).and_then(|c| c.split(',').next()).unwrap_or("");
     let mut parts = cred.split('/');
     let (ak, _date, region) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    let Some((secret, token)) = st.keys.get(ak) else { return Err(err(StatusCode::FORBIDDEN, "InvalidAccessKeyId")) };
+    let Some((secret, token)) = st.keys.get(ak) else { return Err(Box::new(err(StatusCode::FORBIDDEN, "InvalidAccessKeyId"))) };
     if let Some(t) = token {
         if h.get("x-amz-security-token").and_then(|v| v.to_str().ok()) != Some(t.as_str()) {
-            return Err(err(StatusCode::FORBIDDEN, "InvalidToken"));
+            return Err(Box::new(err(StatusCode::FORBIDDEN, "InvalidToken")));
         }
     }
     let signed = auth.split("SignedHeaders=").nth(1).and_then(|c| c.split(',').next()).unwrap_or("");
@@ -89,11 +89,11 @@ fn verify(st: &S3State, m: &Method, u: &Uri, h: &HeaderMap, body: &[u8], service
     }
     let payload = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(body));
     if service == "s3" && h.get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) != Some(payload.as_str()) {
-        return Err(err(StatusCode::BAD_REQUEST, "XAmzContentSHA256Mismatch"));
+        return Err(Box::new(err(StatusCode::BAD_REQUEST, "XAmzContentSHA256Mismatch")));
     }
     let want = sign_v4(m.as_str(), u.path(), &params(u), &headers, &payload, ak, secret, region, service);
     if want != auth {
-        return Err(err(StatusCode::FORBIDDEN, "SignatureDoesNotMatch"));
+        return Err(Box::new(err(StatusCode::FORBIDDEN, "SignatureDoesNotMatch")));
     }
     Ok(())
 }
@@ -147,7 +147,7 @@ fn route(s: &Shared, m: Method, u: Uri, h: HeaderMap, b: Bytes) -> Response {
         match action.as_str() {
             "AssumeRole" => {
                 if let Err(r) = verify(&st, &m, &u, &h, &b, "sts") {
-                    return r;
+                    return *r;
                 }
             }
             "AssumeRoleWithWebIdentity" => {
@@ -162,7 +162,7 @@ fn route(s: &Shared, m: Method, u: Uri, h: HeaderMap, b: Bytes) -> Response {
     }
     // ── S3 (path style: /bucket[/key]) ──
     if let Err(r) = verify(&st, &m, &u, &h, &b, "s3") {
-        return r;
+        return *r;
     }
     let p = params(&u);
     let trimmed = path.trim_start_matches('/');

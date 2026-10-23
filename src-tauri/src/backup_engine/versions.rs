@@ -36,6 +36,8 @@ pub fn job_identity(job: &BackupJob) -> ClientIdentity {
 }
 
 /// Where [`BackupOperation::CopyVersions`](super::BackupOperation::CopyVersions) copies to.
+// One value per copy request; its size does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CopyTarget {
@@ -213,6 +215,16 @@ impl BackupManager {
     }
 }
 
+/// Every file of a version, optionally only those under `prefix`.
+fn files_under(db: &ufop_core::backup::db::BackupDb, version: usize, prefix: Option<String>) -> Result<Vec<ufop_core::backup::FileEntry>, AppError> {
+    let fs = db.fileset_by_version(version)?;
+    let mut files = db.files(fs.id)?;
+    if let Some(p) = prefix.filter(|p| !p.is_empty()) {
+        files.retain(|f| f.path.starts_with(&p));
+    }
+    Ok(files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,14 +249,4 @@ mod tests {
         let t: CopyTarget = serde_json::from_value(serde_json::json!({"type": "destination", "destination": {"type": "local", "path": "/mnt/b"}})).unwrap();
         assert!(matches!(t, CopyTarget::Destination { passphrase: None, .. }));
     }
-}
-
-/// Every file of a version, optionally only those under `prefix`.
-fn files_under(db: &ufop_core::backup::db::BackupDb, version: usize, prefix: Option<String>) -> Result<Vec<ufop_core::backup::FileEntry>, AppError> {
-    let fs = db.fileset_by_version(version)?;
-    let mut files = db.files(fs.id)?;
-    if let Some(p) = prefix.filter(|p| !p.is_empty()) {
-        files.retain(|f| f.path.starts_with(&p));
-    }
-    Ok(files)
 }

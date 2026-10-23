@@ -159,7 +159,7 @@ fn header_and_method_validation() {
     let h = |n: &str, v: &str| WebhookHeader { name: n.into(), value: v.into(), ..Default::default() };
     assert!(validate_headers(&[h("X-Api-Key", "abc"), h("Authorization", "Bearer {{secret}}")]).is_ok());
     for bad in [h("Bad Name", "x"), h("X:Y", "x"), h("", "x"), h("X-Ok", "a\r\nX-Injected: 1"), h("Content-Length", "1"), h("host", "evil")] {
-        assert!(validate_headers(&[bad.clone()]).is_err(), "{bad:?}");
+        assert!(validate_headers(std::slice::from_ref(&bad)).is_err(), "{bad:?}");
     }
     assert!(validate_headers(&[WebhookHeader { name: "X-Token".into(), secret: true, ..Default::default() }]).is_err(), "a secret header needs a value");
     assert!(validate_url_and_method("https://x.example/hook", "patch").is_ok());
@@ -347,8 +347,10 @@ fn decode_words(v: &str) -> String {
     v.split_whitespace().map(|w| decode_b64(w.trim_start_matches("=?UTF-8?B?").trim_end_matches("?="))).collect()
 }
 
+type Headers = BTreeMap<String, String>;
+
 /// Parse a multipart/alternative message: (headers, [(part headers, decoded body)]).
-fn parse_mime(raw: &str) -> (BTreeMap<String, String>, Vec<(BTreeMap<String, String>, String)>) {
+fn parse_mime(raw: &str) -> (Headers, Vec<(Headers, String)>) {
     let (head, body) = raw.split_once("\r\n\r\n").unwrap();
     let h = parse_headers(head);
     let ct = h["content-type"].clone();

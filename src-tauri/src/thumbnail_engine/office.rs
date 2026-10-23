@@ -143,7 +143,7 @@ impl OfficeRenderer {
                 Some((m.modified().ok()?, m.len(), e.path()))
             })
             .collect();
-        files.sort_by(|a, b| b.0.cmp(&a.0));
+        files.sort_by_key(|f| std::cmp::Reverse(f.0));
         let mut total = 0u64;
         for (_, len, p) in files {
             total += len;

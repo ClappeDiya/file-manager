@@ -96,9 +96,6 @@ impl BackupManager {
             }
         };
         // A runtime cannot be started on a thread that already drives one.
-        match std::thread::spawn(run).join() {
-            Ok(r) => r,
-            Err(_) => ShutdownReport::default(),
-        }
+        std::thread::spawn(run).join().unwrap_or_default()
     }
 }

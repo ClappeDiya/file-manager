@@ -56,7 +56,7 @@ impl ModulePolicy {
     }
 
     fn allowed(&self, allow: &Option<Vec<String>>, name: &str) -> bool {
-        !self.disabled.iter().any(|d| d == name) && allow.as_ref().is_none_or(|a| a.iter().any(|x| x == name))
+        !self.disabled.iter().any(|d| d == name) && allow.as_ref().map_or(true, |a| a.iter().any(|x| x == name))
     }
 
     pub fn modules(&self) -> Vec<ModuleInfo> {

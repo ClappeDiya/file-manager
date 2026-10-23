@@ -296,6 +296,9 @@ pub enum RuleCondition {
 }
 
 /// What action to perform when triggered and conditions match.
+// Rule configuration (a handful per rule, cloned and serialized), not hot
+// data: boxing the notification would change every place that builds one.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuleAction {

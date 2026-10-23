@@ -1264,8 +1264,10 @@ async fn standalone_metrics_listener_with_basic_auth() {
 }
 
 /// A local HTTP receiver that records (method, path, headers, body) of every request.
-async fn mock_receiver() -> (SocketAddr, Arc<std::sync::Mutex<Vec<(String, String, HeaderMap, Vec<u8>)>>>) {
-    let got: Arc<std::sync::Mutex<Vec<(String, String, HeaderMap, Vec<u8>)>>> = Arc::default();
+type Received = Arc<std::sync::Mutex<Vec<(String, String, HeaderMap, Vec<u8>)>>>;
+
+async fn mock_receiver() -> (SocketAddr, Received) {
+    let got: Received = Arc::default();
     let g = got.clone();
     let app = Router::new().fallback(move |req: Request| {
         let g = g.clone();
@@ -1567,7 +1569,7 @@ async fn accounts_roles_and_access_rules() {
     let val = s.token_of("val", "val-password").await;
     let ops = s.token_of("ops", "ops-password").await;
     let noacl = s.token_of("noacl", "noacl-password").await;
-    assert_eq!(s.token_of("pre", "hashed-password").await.is_empty(), false, "prehashed passwords sign in");
+    assert!(!s.token_of("pre", "hashed-password").await.is_empty(), "prehashed passwords sign in");
     assert_eq!(s.login_as("val", "wrong").await.status(), 401);
 
     let ids = |v: Value| -> Vec<String> { let mut x: Vec<String> = v.as_array().unwrap().iter().map(|j| j["id"].as_str().unwrap().to_string()).collect(); x.sort(); x };

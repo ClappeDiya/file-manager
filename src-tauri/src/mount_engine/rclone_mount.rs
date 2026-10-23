@@ -141,7 +141,7 @@ impl RcloneProcesses {
                     use tokio::io::AsyncReadExt;
                     let _ = e.read_to_string(&mut err).await;
                 }
-                let line = err.lines().filter(|l| !l.contains("NOTICE")).last().unwrap_or("").trim().to_string();
+                let line = err.lines().rfind(|l| !l.contains("NOTICE")).unwrap_or("").trim().to_string();
                 return Err(if line.is_empty() { format!("rclone mount exited ({status})") } else { line });
             }
             if tokio::time::Instant::now() > deadline {

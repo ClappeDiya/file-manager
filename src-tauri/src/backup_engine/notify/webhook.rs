@@ -348,7 +348,7 @@ pub fn build(n: &Notification, vars: &BTreeMap<String, String>) -> Result<Reques
         }
     }
     let needs_secret = uses_var(url, "secret") || uses_var(body_template, "secret") || headers.iter().any(|h| uses_var(&h.value, "secret"));
-    if needs_secret && vars.get("secret").is_none_or(|s| s.is_empty()) {
+    if needs_secret && vars.get("secret").map_or(true, |s| s.is_empty()) {
         return Err(AppError::validation(format!("The webhook's {} is missing; save it first", secret_label(*preset).to_lowercase())));
     }
     let method = method.to_ascii_uppercase();

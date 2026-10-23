@@ -797,7 +797,7 @@ mod tests {
             let ok = |pw: &str| std::process::Command::new("7z").args(["t", &format!("-p{pw}")]).arg(&out).output().unwrap().status.success();
             assert!(ok("s3cret pass") && !ok("nope"));
         }
-        assert!(create_zip_aes(&d.path().join("x.zip"), &[src.clone()], "").is_err());
+        assert!(create_zip_aes(&d.path().join("x.zip"), std::slice::from_ref(&src), "").is_err());
     }
 }
 

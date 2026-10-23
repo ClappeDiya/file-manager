@@ -147,7 +147,7 @@ pub async fn batch_rename_undo(
         match std::fs::rename(current_path, original_path) {
             Ok(()) => {
                 success_count += 1;
-                metadata.follow_fs_op("rename", &[original_path.clone()], &[current_path.clone()], true).await;
+                metadata.follow_fs_op("rename", std::slice::from_ref(original_path), std::slice::from_ref(current_path), true).await;
             }
             Err(e) => {
                 fail_count += 1;

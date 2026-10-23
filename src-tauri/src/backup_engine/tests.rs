@@ -225,10 +225,10 @@ async fn adopt_repository_continues_history() {
     let t2 = tempfile::tempdir().unwrap();
     let m2 = manager(t2.path()).await;
     let dest = BackupDestination::Local { path: dst.to_string_lossy().into(), alternate_paths: vec![], marker_file: None };
-    assert!(m2.adopt_repository(dest.clone(), Some("wrong".into()), "ufop".into(), None, vec![], vec![], false).await.is_err());
+    assert!(m2.adopt_repository(dest.clone(), Some("wrong".into()), "ufop".into(), AdoptOptions::default()).await.is_err());
     assert!(m2.list_jobs().await.is_empty(), "failed adoption leaves no job behind");
     let adopted = m2
-        .adopt_repository(dest, Some("pw".into()), "ufop".into(), Some("Laptop".into()), vec![], vec![(src.to_string_lossy().into(), moved.to_string_lossy().into())], false)
+        .adopt_repository(dest, Some("pw".into()), "ufop".into(), AdoptOptions { name: Some("Laptop".into()), source_map: vec![(src.to_string_lossy().into(), moved.to_string_lossy().into())], ..Default::default() })
         .await
         .unwrap();
     assert_eq!(adopted.name, "Laptop");
@@ -1139,7 +1139,7 @@ async fn read_only_jobs_restore_and_browse_but_never_write() {
     // Adopted on another computer as a read-only connection.
     let t2 = tempfile::tempdir().unwrap();
     let m2 = manager(t2.path()).await;
-    let ro = m2.adopt_repository(j.destination.clone(), Some("pw".into()), "ufop".into(), Some("Viewer".into()), vec![src.to_string_lossy().into()], vec![], true).await.unwrap();
+    let ro = m2.adopt_repository(j.destination.clone(), Some("pw".into()), "ufop".into(), AdoptOptions { name: Some("Viewer".into()), sources: vec![src.to_string_lossy().into()], read_only: true, ..Default::default() }).await.unwrap();
     assert!(ro.read_only);
     assert_eq!(m2.list_versions(&ro.id).await.unwrap().len(), 1);
     for op in [
@@ -1338,7 +1338,7 @@ async fn shared_repository_between_jobs_and_adoption_as_a_new_source() {
     let t2 = tempfile::tempdir().unwrap();
     let m2 = manager(t2.path()).await;
     let dest = BackupDestination::Local { path: dst.to_string_lossy().into(), alternate_paths: vec![], marker_file: None };
-    let adopted = m2.adopt_repository(dest, Some("pw".into()), "ufop".into(), Some("Laptop".into()), vec![sa.to_string_lossy().into()], vec![], false).await.unwrap();
+    let adopted = m2.adopt_repository(dest, Some("pw".into()), "ufop".into(), AdoptOptions { name: Some("Laptop".into()), sources: vec![sa.to_string_lossy().into()], ..Default::default() }).await.unwrap();
     assert_eq!(adopted.stats.version_count, 0, "no other job's history taken over");
     assert_eq!(m2.list_sources(&adopted.id).await.unwrap().len(), 2);
 }

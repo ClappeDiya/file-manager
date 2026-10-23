@@ -54,7 +54,7 @@ impl BackupManager {
     /// busy jobs are skipped with a reason.
     pub async fn run_all(&self, filter: RunAllFilter) -> Result<RunAllReport, AppError> {
         let mut jobs = self.list_jobs().await;
-        jobs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        jobs.sort_by_key(|j| j.name.to_lowercase());
         let mut report = RunAllReport::default();
         for id in filter.job_ids.iter().filter(|id| !jobs.iter().any(|j| &j.id == *id)) {
             report.skipped.push(SkippedRun { job_id: id.clone(), job_name: String::new(), reason: "no such job".into() });

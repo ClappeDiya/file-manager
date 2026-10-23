@@ -10,6 +10,8 @@ use tauri::State;
 
 /// Connect to a remote server using the appropriate protocol connector.
 #[tauri::command]
+// Each IPC argument is a named parameter of the command.
+#[allow(clippy::too_many_arguments)]
 pub async fn connector_connect(
     protocol: String,
     host: String,

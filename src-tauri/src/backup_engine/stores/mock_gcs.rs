@@ -75,7 +75,7 @@ fn route(s: &Shared, m: Method, u: Uri, h: HeaderMap, b: Bytes) -> Response {
         ("GET", ["storage", "v1", "b", _bucket]) => json(serde_json::json!({ "name": seg[3] })),
         ("GET", ["storage", "v1", "b", bucket, "o"]) => {
             let pfx = q.get("prefix").cloned().unwrap_or_default();
-            let delim = q.get("delimiter").is_some();
+            let delim = q.contains_key("delimiter");
             let start = format!("{bucket}/{pfx}");
             let (mut items, mut prefixes) = (Vec::new(), Vec::<String>::new());
             for (k, (d, _)) in st.objects.range(start.clone()..).take_while(|(k, _)| k.starts_with(&start)) {

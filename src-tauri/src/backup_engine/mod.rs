@@ -87,7 +87,24 @@ fn add_warnings(v: &mut serde_json::Value, extra: Vec<String>) {
 
 pub use ufop_core::backup::Fileset;
 
+/// How [`BackupManager::adopt_repository`] sets up the adopted job.
+#[derive(Debug, Clone, Default)]
+pub struct AdoptOptions {
+    /// Job name (default: the stored configuration's, else the destination's).
+    pub name: Option<String>,
+    /// Source folders, when they differ from the stored configuration's.
+    pub sources: Vec<String>,
+    /// Old source folder → new one (a computer replaced or folders moved).
+    pub source_map: Vec<(String, String)>,
+    /// Restore and browse only.
+    pub read_only: bool,
+}
+
 /// Where a job's volumes are stored.
+// Configuration values (cloned, serialized), not hot data: the size of the
+// cloud variant does not matter, and boxing it would change every place
+// that builds or matches one.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackupDestination {
@@ -519,6 +536,8 @@ pub struct DatabaseCleanupReport {
 }
 
 /// Every operation the queue can run.
+// One value per queued operation; its size does not matter (see BackupDestination).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackupOperation {
@@ -1449,7 +1468,7 @@ impl BackupManager {
     pub async fn test_secret_providers(&self, provider_id: Option<String>, probe: Vec<String>) -> Result<Vec<secrets::ProviderTest>, AppError> {
         let settings = self.secret_settings().await?;
         let mut out = Vec::new();
-        for p in settings.providers.iter().filter(|p| provider_id.as_deref().is_none_or(|id| id == p.id)) {
+        for p in settings.providers.iter().filter(|p| provider_id.as_deref().map_or(true, |id| id == p.id)) {
             let mut t = secrets::ProviderTest { provider_id: p.id.clone(), provider: p.name.clone(), kind: p.kind.label().into(), ..Default::default() };
             let cred = if p.kind.needs_credential() { self.destination_secret(&p.credential_id).await? } else { None };
             t.has_credential = !p.kind.needs_credential() || cred.as_deref().is_some_and(|c| !c.is_empty());
@@ -1762,7 +1781,7 @@ impl BackupManager {
             for r in j.replicas.iter().filter(|r| r.enabled) {
                 if let ReplicaSchedule::Interval { minutes } = r.schedule {
                     let last = r.last_run.as_deref().and_then(parse_ts);
-                    if last.is_none_or(|l| now - l >= chrono::Duration::minutes(minutes as i64)) {
+                    if last.map_or(true, |l| now - l >= chrono::Duration::minutes(minutes as i64)) {
                         out.push((j.id.clone(), r.id.clone()));
                     }
                 }
@@ -1902,16 +1921,8 @@ impl BackupManager {
     /// repository (from its stored configuration when present), map old
     /// source folders to new ones, and rebuild the local database from the
     /// destination so the version history and deduplication carry on.
-    pub async fn adopt_repository(
-        &self,
-        dest: BackupDestination,
-        passphrase: Option<String>,
-        prefix: String,
-        name: Option<String>,
-        sources: Vec<String>,
-        source_map: Vec<(String, String)>,
-        read_only: bool,
-    ) -> Result<BackupJob, AppError> {
+    pub async fn adopt_repository(&self, dest: BackupDestination, passphrase: Option<String>, prefix: String, opts: AdoptOptions) -> Result<BackupJob, AppError> {
+        let AdoptOptions { name, sources, source_map, read_only } = opts;
         let stored = self.discover_remote_config(dest.clone(), passphrase.clone(), prefix.clone()).await?;
         let mut job: BackupJob = match stored {
             Some(v) => serde_json::from_value(v).map_err(|e| AppError::validation(format!("The stored configuration is unreadable: {e}")))?,
@@ -1998,7 +2009,7 @@ impl BackupManager {
         };
         let passphrase = if job.encrypted { self.passphrase(job_id).await? } else { None };
         let name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| format!("{} (as of {})", job.name, at.format("%Y-%m-%d %H:%M UTC")));
-        self.adopt_repository(dest, passphrase, job.options.prefix.clone(), Some(name), job.sources.clone(), Vec::new(), true).await
+        self.adopt_repository(dest, passphrase, job.options.prefix.clone(), AdoptOptions { name: Some(name), sources: job.sources.clone(), read_only: true, ..Default::default() }).await
     }
 
     /// Test a destination; optionally create the folder. Returns the number of files present.
@@ -2308,7 +2319,7 @@ impl BackupManager {
                 run_core(&job2, op, backend.as_ref(), &db_path, &dbo, pass.as_deref(), kdf, cache, &ctx)
             })
             .await?;
-            let clean = v.get("errors").and_then(|e| e.as_array()).is_none_or(|a| a.is_empty()) && v.get("dry_run") != Some(&serde_json::Value::Bool(true));
+            let clean = v.get("errors").and_then(|e| e.as_array()).map_or(true, |a| a.is_empty()) && v.get("dry_run") != Some(&serde_json::Value::Bool(true));
             if clean {
                 let mut reps = Vec::new();
                 for id in after {

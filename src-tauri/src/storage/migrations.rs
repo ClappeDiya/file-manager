@@ -176,9 +176,12 @@ fn all_migrations() -> Vec<Migration> {
     ]
 }
 
+/// A migration step written in Rust.
+type RustStep = fn(&Connection) -> Result<(), AppError>;
+
 /// Migration steps that cannot be expressed as static SQL. They run in the
 /// same transaction as the migration's `sql`, after it.
-fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
+fn rust_step(version: u32) -> Option<RustStep> {
     match version {
         // Hash existing audit rows into a chain, then lock the table down.
         17 => Some(crate::security::audit_chain::migrate_v17),

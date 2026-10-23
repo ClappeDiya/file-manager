@@ -312,8 +312,8 @@ pub async fn backup_adopt_repository(
     read_only: Option<bool>,
     mgr: State<'_, BackupManager>,
 ) -> Result<BackupJob, AppError> {
-    mgr.adopt_repository(destination, passphrase, prefix.unwrap_or_else(|| "ufop".into()), name, sources.unwrap_or_default(), source_map.unwrap_or_default(), read_only.unwrap_or(false))
-        .await
+    let opts = crate::backup_engine::AdoptOptions { name, sources: sources.unwrap_or_default(), source_map: source_map.unwrap_or_default(), read_only: read_only.unwrap_or(false) };
+    mgr.adopt_repository(destination, passphrase, prefix.unwrap_or_else(|| "ufop".into()), opts).await
 }
 
 /// "Open backup as it was at …": a read-only job for the job's versioned

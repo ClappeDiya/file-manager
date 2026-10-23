@@ -26,10 +26,13 @@ struct Histogram {
     total: u64,
 }
 
+/// (method, route template, status) → latency histogram.
+type HttpSeries = BTreeMap<(String, String, u16), Histogram>;
+
 /// HTTP request counters and histograms (cheap to clone).
 #[derive(Clone, Default)]
 pub struct Metrics {
-    http: Arc<Mutex<BTreeMap<(String, String, u16), Histogram>>>,
+    http: Arc<Mutex<HttpSeries>>,
 }
 
 impl Metrics {

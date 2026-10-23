@@ -82,13 +82,16 @@ struct Session {
     validation_key: String,
 }
 
+/// File name → (media id, size) of every copy in the backup folder.
+type MediaIndex = HashMap<String, Vec<(u64, u64)>>;
+
 pub struct MovistarStore {
     cfg: MovistarConfig,
     password: String,
     http: reqwest::Client,
     session: Mutex<Option<Session>>,
     folder: Mutex<Option<u64>>,
-    cache: Mutex<Option<HashMap<String, Vec<(u64, u64)>>>>,
+    cache: Mutex<Option<MediaIndex>>,
 }
 
 /// Session expired / not signed in (the service answers with its HTML login page).
