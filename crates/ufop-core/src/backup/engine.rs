@@ -1501,6 +1501,7 @@ pub fn run_backup_with_streams(
     let mut pending = Pending::for_repo(&repo, opts);
     let mut in_flight: HashSet<String> = HashSet::new();
     let mut file_blocks: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut halted_files: HashSet<usize> = HashSet::new();
     let mut upload_error: Option<String> = None;
     let mut done_count = 0u64;
     let queue = Mutex::new(work);
@@ -1603,6 +1604,13 @@ pub fn run_backup_with_streams(
                 }
             }
             match msg {
+                Msg::Block { .. } | Msg::Done { .. } if halt.load(Ordering::SeqCst) && !file_blocks.contains_key(&msg_idx(&msg)) => {
+                    // Stopped (error policy, upload limit): files not started
+                    // before the stop are left for the next run, so the stop
+                    // is prompt even with blocks queued in the channel.
+                    halted_files.insert(msg_idx(&msg));
+                }
+                Msg::Block { idx, .. } | Msg::Done { idx, .. } if halted_files.contains(&idx) => {}
                 Msg::Block { idx, hash, flag, data, raw_len } => {
                     let known = pending.hashes.contains(&hash) || in_flight.contains(&hash) || db.has_block(&hash)?;
                     if !known {
@@ -1661,6 +1669,14 @@ pub fn run_backup_with_streams(
         }
         Ok(())
     })?;
+    // Rehash candidates that were never re-read (the run stopped) keep
+    // their previous entry.
+    for idx in rehash.into_keys() {
+        if results[idx].is_none() {
+            let cur = &entries[idx].1;
+            results[idx] = prev_files.get(&cur.path).map(|p| FileEntry { mode: cur.mode, meta: cur.meta.clone(), ..p.clone() });
+        }
+    }
     // From here on a final (or synthetic partial) version supersedes the checkpoint.
     absorb_problems(&mut report, &tracker);
 
@@ -1752,6 +1768,12 @@ pub fn run_backup_with_streams(
     progress(ctx, Phase::Completed, total, total, report.bytes_examined, None);
     report.duration_ms = started.elapsed().as_millis() as u64;
     Ok(report)
+}
+
+fn msg_idx(m: &Msg) -> usize {
+    match m {
+        Msg::Block { idx, .. } | Msg::Done { idx, .. } | Msg::Failed { idx, .. } => *idx,
+    }
 }
 
 /// Run number for choosing rehash files (advances once per real run).
