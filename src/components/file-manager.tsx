@@ -322,6 +322,8 @@ let migrationRunDest: string | null = null;
 export function FileManager() {
   useOsFileDrop();
   useTextSizeShortcuts();
+  // Re-render the window when the size units change (formatBytes reads the setting).
+  useUIStore((s) => s.byteUnits);
   const appMode = useUIStore((s) => s.appMode);
   const sidebarOpen = useUIStore((s) => s.sidebarOpen);
   const sidebarWidth = useUIStore((s) => s.sidebarWidth);

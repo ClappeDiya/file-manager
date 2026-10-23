@@ -37,3 +37,21 @@ export function runDuration(start: string, end: string | null): string {
   if (s >= 60) return `${Math.floor(s / 60)} min`;
   return `${s} s`;
 }
+
+/** Where backup timestamps are shown (Settings → Appearance, K123). The UI
+ *  store sets it; `formatBackupTime` (and so `formatDate`) follows it. */
+let timeDisplay: "local" | "utc" = "local";
+
+export function setDefaultTimeDisplay(t: "local" | "utc"): void {
+  timeDisplay = t === "utc" ? "utc" : "local";
+}
+
+/** A stored timestamp for display: this computer's time zone, or UTC with a
+ *  "UTC" suffix when the setting asks for it; "—" when empty, the text itself
+ *  when it is not a time. */
+export function formatBackupTime(s: string | null | undefined, display: "local" | "utc" = timeDisplay): string {
+  if (!s) return "—";
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return s;
+  return display === "utc" ? `${d.toLocaleString(undefined, { timeZone: "UTC" })} UTC` : d.toLocaleString();
+}

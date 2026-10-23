@@ -69,10 +69,10 @@ describe("offline actions", () => {
       return null;
     });
     render(<MountOfflineActions mountId="m1" mounted options={{ cache_mode: "full", max_cache_mb: null, max_cache_age_hours: null, read_only: true }} />);
-    expect(await screen.findByText(/3.0 MB on this computer/)).toHaveTextContent("Cache: full · read-only");
+    expect(await screen.findByText(/3.1 MB on this computer/)).toHaveTextContent("Cache: full · read-only");
     fireEvent.change(screen.getByLabelText("Folder to keep offline"), { target: { value: "projects/q3" } });
     fireEvent.click(screen.getByText("Make available offline"));
-    expect(await screen.findByRole("status")).toHaveTextContent("2 files (293.0 KB) available offline, 1 could not be read.");
+    expect(await screen.findByRole("status")).toHaveTextContent("2 files (300.0 KB) available offline, 1 could not be read.");
     expect(mockInvoke).toHaveBeenCalledWith("mount_pin_offline", { mountId: "m1", path: "projects/q3" });
   });
 

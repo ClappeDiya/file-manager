@@ -1,5 +1,9 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { setDefaultByteUnits, type ByteUnits } from "@/lib/format-bytes";
+import { setDefaultTimeDisplay } from "@/lib/backup-time";
+
+export type { ByteUnits };
 
 /**
  * Theme options:
@@ -20,6 +24,9 @@ export const FONT_SCALES: readonly { value: FontScale; label: string }[] = [
   { value: 1.125, label: "Large" },
   { value: 1.25, label: "Larger" },
 ];
+
+/** Where backup timestamps are shown: local time (default) or UTC. */
+export type TimeDisplay = "local" | "utc";
 
 /** Rows per page of a sortable table; "all" scrolls one virtualized list. */
 export type TablePageSize = 25 | 50 | 100 | 250 | "all";
@@ -127,6 +134,13 @@ export interface UIState {
   setFontScale: (scale: FontScale) => void;
   /** One step larger (1), smaller (-1) or back to the default (0). */
   stepFontScale: (step: -1 | 0 | 1) => void;
+
+  // Size units (K123): applied app-wide through formatBytes
+  byteUnits: ByteUnits;
+  setByteUnits: (units: ByteUnits) => void;
+  /** Timestamps in the backup screens: this computer's time zone or UTC. */
+  timeDisplay: TimeDisplay;
+  setTimeDisplay: (t: TimeDisplay) => void;
 
   // Table views (K122), by table id
   tableViews: Record<string, TableView>;
@@ -317,6 +331,8 @@ export function migrateUIState(persisted: unknown, version: number): Partial<UIS
 function sanitizeAppearance(state: Partial<UIState>): Partial<UIState> {
   const out = { ...state };
   if ("fontScale" in out && !isFontScale(out.fontScale)) delete out.fontScale;
+  if ("byteUnits" in out && out.byteUnits !== "binary" && out.byteUnits !== "decimal") delete out.byteUnits;
+  if ("timeDisplay" in out && out.timeDisplay !== "local" && out.timeDisplay !== "utc") delete out.timeDisplay;
   if ("tableViews" in out) {
     const views = out.tableViews && typeof out.tableViews === "object" ? out.tableViews : {};
     out.tableViews = Object.fromEntries(Object.entries(views).filter(([, v]) => isTableView(v)));
@@ -348,6 +364,20 @@ export const useUIStore = create<UIState>()(
         set({ fontScale: next });
       },
       stepFontScale: (step) => get().setFontScale(nextFontScale(get().fontScale, step)),
+
+      // Size units and timestamps
+      byteUnits: "decimal",
+      setByteUnits: (units: ByteUnits) => {
+        const next: ByteUnits = units === "binary" ? "binary" : "decimal";
+        setDefaultByteUnits(next);
+        set({ byteUnits: next });
+      },
+      timeDisplay: "local",
+      setTimeDisplay: (t: TimeDisplay) => {
+        const next: TimeDisplay = t === "utc" ? "utc" : "local";
+        setDefaultTimeDisplay(next);
+        set({ timeDisplay: next });
+      },
 
       // Table views
       tableViews: {},
@@ -499,6 +529,8 @@ export const useUIStore = create<UIState>()(
         theme: state.theme,
         fontScale: state.fontScale,
         tableViews: state.tableViews,
+        byteUnits: state.byteUnits,
+        timeDisplay: state.timeDisplay,
         sidebarOpen: state.sidebarOpen,
         sidebarWidth: state.sidebarWidth,
         appMode: state.appMode,
@@ -522,6 +554,8 @@ export const useUIStore = create<UIState>()(
             applyThemeToDocument(resolved);
             state.resolvedTheme = resolved;
             applyFontScaleToDocument(isFontScale(state.fontScale) ? state.fontScale : 1);
+            setDefaultByteUnits(state.byteUnits);
+            setDefaultTimeDisplay(state.timeDisplay);
           }
         };
       },

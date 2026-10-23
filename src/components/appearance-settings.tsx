@@ -2,7 +2,8 @@
  * Settings → Appearance: theme, text size (K121) and display units. All
  * Standard settings, stored in the persisted UI store.
  */
-import { FONT_SCALES, useUIStore, type FontScale } from "@/stores/ui-store";
+import { FONT_SCALES, useUIStore, type ByteUnits, type FontScale, type TimeDisplay } from "@/stores/ui-store";
+import { formatBytes } from "@/lib/format-bytes";
 import { ThemeSwitcher } from "./theme-switcher";
 
 /** A labelled radio group of segmented buttons. */
@@ -52,11 +53,24 @@ function Row({ label, hint, children }: { label: string; hint?: string; children
   );
 }
 
+const UNIT_CHOICES: readonly { value: ByteUnits; label: string; hint: string }[] = [
+  { value: "decimal", label: "Decimal (KB, MB, GB)", hint: "1 KB = 1,000 bytes, like macOS and disk makers" },
+  { value: "binary", label: "Binary (KiB, MiB, GiB)", hint: "1 KiB = 1,024 bytes, like Windows Explorer's numbers" },
+];
+const TIME_CHOICES: readonly { value: TimeDisplay; label: string }[] = [
+  { value: "local", label: "This computer's time" },
+  { value: "utc", label: "UTC" },
+];
+
 const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
 
 export function AppearanceSettings() {
   const fontScale = useUIStore((s) => s.fontScale);
   const setFontScale = useUIStore((s) => s.setFontScale);
+  const byteUnits = useUIStore((s) => s.byteUnits);
+  const setByteUnits = useUIStore((s) => s.setByteUnits);
+  const timeDisplay = useUIStore((s) => s.timeDisplay);
+  const setTimeDisplay = useUIStore((s) => s.setTimeDisplay);
   const mod = isMac ? "⌘" : "Ctrl";
   return (
     <div className="space-y-3 pt-3" data-testid="appearance-settings">
@@ -71,6 +85,12 @@ export function AppearanceSettings() {
           onChange={setFontScale}
           testId="text-size"
         />
+      </Row>
+      <Row label="Size units" hint={`Example: 1,500,000 bytes = ${formatBytes(1_500_000, { units: byteUnits })}. Used everywhere the app shows a size.`}>
+        <ChoiceGroup<ByteUnits> label="Size units" value={byteUnits} options={UNIT_CHOICES} onChange={setByteUnits} testId="byte-units" />
+      </Row>
+      <Row label="Backup times" hint="How the Backup screens show the times of versions, runs and files.">
+        <ChoiceGroup<TimeDisplay> label="Backup times" value={timeDisplay} options={TIME_CHOICES} onChange={setTimeDisplay} testId="time-display" />
       </Row>
     </div>
   );

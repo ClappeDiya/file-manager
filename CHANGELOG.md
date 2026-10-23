@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Interface polish:
   - **Sortable, paged backup tables**: the version list, a version's files and the search results in Restore, the run history and the destination files in Maintenance sort by a header click (keyboard too, with `aria-sort`) and page with 25/50/100/250/All rows (All is virtualized); page size and sort are remembered per table. The generic `DataGrid` gained columns, paging, server-side mode and remembered views for this. Files and run history are paged by the backend: `backup_list_files`, `backup_run_history` and `backup_remote_list` take an optional `page` `{offset, limit, sort, descending, filter}` and answer `{items, total, offset, limit}` (plain arrays without it); REST `GET /api/v1/jobs/{id}/files` and `GET /api/v1/runs` take `offset`, `limit`, `sort`, `desc`, `filter`. Paged file lists have no 20 000-row cap.
+  - **Size units** (Settings → Appearance): decimal (KB, 1,000 bytes; the default) or binary (KiB, 1,024 bytes), applied app-wide through `formatBytes` (module default set by the UI store; explicit `units`/`binary` still win); the separate size formatters of the file list, connections, server transfers, mounts, migration and localized sizes now use it. **Backup times** can show in local time or UTC (`formatDate` in the backup screens).
   - **Text size** (Settings → Appearance): Small, Default, Large or Larger, applied to the root font size so the rem-based interface scales; Ctrl/Cmd + `+` / `-` / `0`, also in the command palette and the shortcut cheat sheet. Persisted (UI state version 2; invalid stored values fall back to the default).
 - CLI, tooling and packaging:
   - **`ufop backup bench`**: compression (stored, deflate, zstd levels, bzip2), AES-256-GCM vs ChaCha20-Poly1305, Argon2id presets with suggested parameters for a target time, Fixed vs FastCDC chunkers (speed, size distribution, deduplication of an edited copy) and SHA-256 vs SHA-512 on generated (`--seed`) or your own sample data, through the engine's real code paths; `--repeat`, `--threads`, `--size`, `--only`, `--json` and `--print-options` (the recommended `ufop backup run` flags). Also Settings → Benchmark in the desktop app (Advanced) and `backup_bench`.
@@ -70,6 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Live sync progress (bar, current file, time left) with a Cancel button; one run per pair at a time.
 - Side-by-side Source | Destination preview before a sync, and a required confirmation when a run will delete files.
 - `list_config` command so the settings viewer shows stored configuration.
+
+### Changed
+
+- Sizes are shown in decimal units by default (1 KB = 1,000 bytes; before, 1,024 bytes were labelled KB). Choose *Binary* in Settings → Appearance for KiB/MiB/GiB.
 
 ### Fixed
 

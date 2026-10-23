@@ -123,9 +123,9 @@ describe("StdinCommandEditor", () => {
 
 describe("estimate", () => {
   it("summarises at most / at least and the time", () => {
-    expect(describeEstimate(EST)).toBe("2 new, 1 changed of 10 files: at most 3.0 MB to back up, about 2 min 5 s");
+    expect(describeEstimate(EST)).toBe("2 new, 1 changed of 10 files: at most 3.1 MB to back up, about 2 min 5 s");
     expect(describeEstimate({ ...EST, new_files: 0, changed_files: 0, deleted_files: 0 })).toBe("No new or changed files (10 checked)");
-    expect(describeEstimate({ ...EST, upper_bound: false, estimated_duration_secs: null })).toBe("2 new, 1 changed of 10 files: 3.0 MB to back up");
+    expect(describeEstimate({ ...EST, upper_bound: false, estimated_duration_secs: null })).toBe("2 new, 1 changed of 10 files: 3.1 MB to back up");
   });
 
   it("the Estimate button calls backup_estimate and shows the largest files", async () => {

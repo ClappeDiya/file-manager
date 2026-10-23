@@ -4,6 +4,7 @@
  */
 import type { BackupEstimate, BackupOptions, BackupSchedule, FilterRule, RunAllReport } from "@/stores/backup-store";
 import { formatBytes } from "@/lib/format-bytes";
+import { formatBackupTime } from "@/lib/backup-time";
 
 export const inputCls =
   "w-full px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-blue-500";
@@ -59,10 +60,9 @@ export function statusColor(status: string | null | undefined): string {
   }
 }
 
+/** Backup timestamps, in local time or UTC as set in Settings → Appearance. */
 export function formatDate(s: string | null | undefined): string {
-  if (!s) return "—";
-  const d = new Date(s);
-  return Number.isNaN(d.getTime()) ? s : d.toLocaleString();
+  return formatBackupTime(s);
 }
 
 /** Options that are per job by nature (the engine rejects global defaults for them). */
