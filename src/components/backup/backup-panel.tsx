@@ -26,7 +26,8 @@ import { BackupRecoveryView } from "./backup-recovery-view";
 import { BackupSettingsView } from "./backup-settings-view";
 import { formatDate, inputCls, statusColor } from "@/lib/backup-helpers";
 import { Banner, Btn, Section } from "./backup-ui";
-import { RunAllButton, useEstimate } from "./backup-estimate";
+import { RunAllButton } from "./backup-estimate";
+import { useEstimate } from "./use-estimate";
 
 type View =
   | { kind: "jobs" }

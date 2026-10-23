@@ -13,7 +13,8 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke
 
 import { SourcesAndRunsOptions, StdinCommandEditor } from "@/components/backup/backup-run-options";
 import { BackupAdvancedOptions } from "@/components/backup/backup-advanced-options";
-import { EstimatePanel, RunAllButton, useEstimate } from "@/components/backup/backup-estimate";
+import { EstimatePanel, RunAllButton } from "@/components/backup/backup-estimate";
+import { useEstimate } from "@/components/backup/use-estimate";
 import { describeEstimate, describeRunAll } from "@/lib/backup-helpers";
 import { newBackupJob, useBackupStore, type BackupEstimate, type BackupOptions } from "@/stores/backup-store";
 
