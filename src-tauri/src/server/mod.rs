@@ -543,7 +543,10 @@ async fn rpc(State(st): State<ServerState>, Extension(acc): Extension<access::Ac
                 return match cmd.as_str() {
                     "backup_list_jobs" => ok(visible_jobs(&st, &acc).await),
                     "backup_status" => ok(visible_status(&st, &acc).await),
-                    "backup_run_history" => ok(runs_for(&st, &acc, args.get("jobId").and_then(|v| v.as_str()).map(String::from), args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32).await?),
+                    "backup_run_history" => {
+                        let page = args.get("page").filter(|p| !p.is_null()).cloned().map(serde_json::from_value).transpose().map_err(AppError::from)?;
+                        ok(runs_listing(&st, &acc, args.get("jobId").and_then(|v| v.as_str()).map(String::from), args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32, page).await?)
+                    }
                     "backup_cancel" => ok(cancel_for(&st, &acc, args.get("id").and_then(|v| v.as_str()).unwrap_or("")).await?),
                     _ => ok(run_all_for(&st, &acc, args.get("filter").cloned().map(serde_json::from_value).transpose().map_err(AppError::from)?.unwrap_or_default()).await?),
                 };
@@ -814,12 +817,21 @@ struct FilesQuery {
     allow_partial: bool,
     prefix: Option<String>,
     source: Option<String>,
+    /// Any of these asks for a page (`{items, total, offset, limit}`).
+    offset: Option<usize>,
+    limit: Option<usize>,
+    sort: Option<String>,
+    #[serde(default)]
+    desc: bool,
+    filter: Option<String>,
 }
 
 async fn files(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<FilesQuery>) -> ApiResult {
     let sel = crate::backup_engine::access::query_selector(q.version.as_deref(), q.time.as_deref(), q.allow_partial)?;
     let version = st.mgr.resolve_version(&id, sel, q.source.clone()).await?.index;
-    ok(st.mgr.list_files_in(&id, version, q.prefix, q.source).await?)
+    let page = (q.offset.is_some() || q.limit.is_some() || q.sort.is_some() || q.filter.is_some())
+        .then(|| crate::backup_engine::paging::PageRequest { offset: q.offset.unwrap_or(0), limit: q.limit, sort: q.sort.clone(), descending: q.desc, filter: q.filter.clone() });
+    ok(st.mgr.list_files_listing(&id, version, q.prefix, q.source, page).await?)
 }
 
 #[derive(Deserialize)]
@@ -972,10 +984,49 @@ async fn tasks(State(st): State<ServerState>, Extension(acc): Extension<access::
 struct RunsQuery {
     job_id: Option<String>,
     limit: Option<u32>,
+    /// Any of these asks for a page (`{items, total, offset, limit}`) of the
+    /// whole history, `limit` rows long.
+    offset: Option<usize>,
+    sort: Option<String>,
+    #[serde(default)]
+    desc: bool,
+    filter: Option<String>,
 }
 
 async fn runs(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, Query(q): Query<RunsQuery>) -> ApiResult {
-    ok(runs_for(&st, &acc, q.job_id, q.limit.unwrap_or(50)).await?)
+    let page = (q.offset.is_some() || q.sort.is_some() || q.filter.is_some()).then(|| crate::backup_engine::paging::PageRequest {
+        offset: q.offset.unwrap_or(0),
+        limit: Some(q.limit.unwrap_or(50) as usize),
+        sort: q.sort.clone(),
+        descending: q.desc,
+        filter: q.filter.clone(),
+    });
+    ok(runs_listing(&st, &acc, q.job_id, q.limit.unwrap_or(50), page).await?)
+}
+
+/// [`runs_for`], or a page of the history the caller may read.
+async fn runs_listing(
+    st: &ServerState,
+    acc: &access::Access,
+    job_id: Option<String>,
+    limit: u32,
+    page: Option<crate::backup_engine::paging::PageRequest>,
+) -> Result<crate::backup_engine::paging::Listing<crate::backup_engine::BackupRun>, AppError> {
+    use crate::backup_engine::paging;
+    let Some(page) = page else {
+        return Ok(paging::Listing::All(runs_for(st, acc, job_id, limit).await?));
+    };
+    if let Some(id) = &job_id {
+        acc.require_job(&st.mgr, id, access::Permission::Read).await?;
+    }
+    if job_id.is_some() || (acc.is_admin() && !acc.job_limited()) {
+        return st.mgr.run_history_listing(job_id, limit, Some(page)).await;
+    }
+    // Only visible jobs: page the (bounded) recent history in memory.
+    let ids: std::collections::HashSet<String> = visible_jobs(st, acc).await.into_iter().map(|j| j.id).collect();
+    let mut all = st.mgr.run_history(None, 1000).await?;
+    all.retain(|r| ids.contains(&r.job_id));
+    paging::listing(all, Some(&page))
 }
 
 /// Run history of the jobs the caller may read.

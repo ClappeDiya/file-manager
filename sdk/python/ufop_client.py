@@ -305,9 +305,9 @@ class UfopClient:
         """Export the job configuration (API tokens: `read` scope). `GET /api/v1/jobs/{id}/export`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/export", {"include_passphrase": include_passphrase, "export_passphrase": export_passphrase}, None)
 
-    def get_jobs_id_files(self, id_: str, version: Optional[str] = None, time: Optional[str] = None, allow_partial: Optional[bool] = None, prefix: Optional[str] = None, source: Optional[str] = None) -> Dict[str, Any]:
-        """Files in a version (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files`"""
-        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/files", {"version": version, "time": time, "allow_partial": allow_partial, "prefix": prefix, "source": source}, None)
+    def get_jobs_id_files(self, id_: str, version: Optional[str] = None, time: Optional[str] = None, allow_partial: Optional[bool] = None, prefix: Optional[str] = None, source: Optional[str] = None, offset: Optional[int] = None, limit: Optional[int] = None, sort: Optional[str] = None, desc: Optional[bool] = None, filter: Optional[str] = None) -> Dict[str, Any]:
+        """Files in a version (any of offset, limit, sort, filter returns one page with the total) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/files", {"version": version, "time": time, "allow_partial": allow_partial, "prefix": prefix, "source": source, "offset": offset, "limit": limit, "sort": sort, "desc": desc, "filter": filter}, None)
 
     def get_jobs_id_hardening(self, id_: str) -> Dict[str, Any]:
         """Ransomware-hardening checklist: encryption, object lock, soft delete, a replica with another provider, local database encryption, retention and pins, whether the backup credentials can delete (from the last probe), legal hold; each with pass/warn/fail/unknown/info and a link to the guide (API tokens: `read` scope). `GET /api/v1/jobs/{id}/hardening`"""
@@ -413,9 +413,9 @@ class UfopClient:
         """Call a desktop IPC command by name (arguments as the JSON body); see docs/ipc-commands.md (API tokens: `admin` scope). `POST /api/v1/rpc/{command}`"""
         return self._call("POST", f"/api/v1/rpc/{urllib.parse.quote(command, safe='')}", None, body if body is not None else {})
 
-    def get_runs(self, job_id: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Run history (API tokens: `read` scope). `GET /api/v1/runs`"""
-        return self._call("GET", f"/api/v1/runs", {"job_id": job_id, "limit": limit}, None)
+    def get_runs(self, job_id: Optional[str] = None, limit: Optional[int] = None, offset: Optional[int] = None, sort: Optional[str] = None, desc: Optional[bool] = None, filter: Optional[str] = None) -> Any:
+        """Run history (any of offset, sort, filter returns one page of limit rows with the total) (API tokens: `read` scope). `GET /api/v1/runs`"""
+        return self._call("GET", f"/api/v1/runs", {"job_id": job_id, "limit": limit, "offset": offset, "sort": sort, "desc": desc, "filter": filter}, None)
 
     def post_scheduler_pause(self, body: Optional[Dict[str, Any]] = None) -> "SchedulerStatus":
         """Pause the scheduler (optionally for N minutes) (API tokens: `run` scope). `POST /api/v1/scheduler/pause`"""

@@ -198,7 +198,7 @@ async fn dispatch_inner(mgr: &BackupManager, command: &str, a: &Value) -> Result
             ok(mgr.status().await)
         }
         "backup_list_versions" => ok(mgr.list_versions_in(&arg::<String>(a, "id")?, opt(a, "source")?, opt(a, "tags")?.unwrap_or_default()).await?),
-        "backup_list_files" => ok(mgr.list_files_in(&arg::<String>(a, "id")?, arg(a, "version")?, opt(a, "prefix")?, opt(a, "source")?).await?),
+        "backup_list_files" => ok(mgr.list_files_listing(&arg::<String>(a, "id")?, arg(a, "version")?, opt(a, "prefix")?, opt(a, "source")?, opt(a, "page")?).await?),
         "backup_search" => ok(mgr.search_in(&arg::<String>(a, "id")?, arg(a, "pattern")?, opt(a, "version")?, opt(a, "source")?).await?),
         "backup_compare" => ok(mgr.compare_in(&arg::<String>(a, "id")?, arg(a, "base")?, arg(a, "compare")?, opt(a, "source")?).await?),
         "backup_list_sources" => ok(mgr.list_sources(&arg::<String>(a, "id")?).await?),
@@ -208,7 +208,7 @@ async fn dispatch_inner(mgr: &BackupManager, command: &str, a: &Value) -> Result
             .await?),
         "backup_run_all" => ok(mgr.run_all(opt(a, "filter")?.unwrap_or_default()).await?),
         "backup_estimate" => ok(mgr.estimate(&arg::<String>(a, "jobId")?, opt(a, "assumedBytesPerSec")?).await?),
-        "backup_run_history" => ok(mgr.run_history(opt(a, "jobId")?, opt(a, "limit")?.unwrap_or(50)).await?),
+        "backup_run_history" => ok(mgr.run_history_listing(opt(a, "jobId")?, opt(a, "limit")?.unwrap_or(50), opt(a, "page")?).await?),
         "backup_prune_history" => ok(mgr.prune_history(arg::<u32>(a, "days")?.max(1)).await?),
         "backup_export_config" => ok(export_config(
             mgr,
@@ -259,7 +259,7 @@ async fn dispatch_inner(mgr: &BackupManager, command: &str, a: &Value) -> Result
         "backup_recovery_list" => ok(mgr.recovery_list(arg(a, "folder")?).await?),
         "backup_recovery_restore" => ok(mgr.recovery_restore(arg(a, "folder")?, arg(a, "version")?, opt(a, "paths")?.unwrap_or_default(), arg(a, "target")?).await?),
         "backup_recovery_convert" => ok(mgr.recovery_convert(arg(a, "folder")?, arg(a, "destination")?, arg(a, "options")?).await?),
-        "backup_remote_list" => ok(mgr.remote_list(arg(a, "destination")?).await?),
+        "backup_remote_list" => ok(super::paging::listing(mgr.remote_list(arg(a, "destination")?).await?, opt::<super::paging::PageRequest>(a, "page")?.as_ref())?),
         "backup_remote_get" => ok(mgr.remote_get(arg(a, "destination")?, arg(a, "name")?, arg(a, "localPath")?).await?),
         "backup_remote_put" => ok(mgr.remote_put(arg(a, "destination")?, arg(a, "localPath")?, arg(a, "name")?).await?),
         "backup_remote_delete" => ok(mgr.remote_delete(arg(a, "destination")?, arg(a, "name")?, opt(a, "force")?.unwrap_or(false)).await?),

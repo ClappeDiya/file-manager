@@ -76,15 +76,27 @@ impl BackupManager {
 
     pub async fn list_files_in(&self, job_id: &str, version: usize, prefix: Option<String>, source: Option<String>) -> Result<Vec<ufop_core::backup::FileEntry>, AppError> {
         self.with_db_in(job_id, source, move |db| {
-            let fs = db.fileset_by_version(version)?;
-            let mut files = db.files(fs.id)?;
-            if let Some(p) = prefix.filter(|p| !p.is_empty()) {
-                files.retain(|f| f.path.starts_with(&p));
-            }
+            let mut files = files_under(db, version, prefix)?;
             files.truncate(20_000);
             Ok(files)
         })
         .await
+    }
+
+    /// [`Self::list_files_in`], or one sorted/filtered page of every file
+    /// (no 20 000-row cap) when `page` is given.
+    pub async fn list_files_listing(
+        &self,
+        job_id: &str,
+        version: usize,
+        prefix: Option<String>,
+        source: Option<String>,
+        page: Option<super::paging::PageRequest>,
+    ) -> Result<super::paging::Listing<ufop_core::backup::FileEntry>, AppError> {
+        let Some(page) = page else {
+            return Ok(super::paging::Listing::All(self.list_files_in(job_id, version, prefix, source).await?));
+        };
+        self.with_db_in(job_id, source, move |db| Ok(super::paging::Listing::Page(super::paging::paginate(files_under(db, version, prefix)?, &page)?))).await
     }
 
     pub async fn search_in(&self, job_id: &str, pattern: String, version: Option<usize>, source: Option<String>) -> Result<Vec<maintenance::FoundFile>, AppError> {
@@ -225,4 +237,14 @@ mod tests {
         let t: CopyTarget = serde_json::from_value(serde_json::json!({"type": "destination", "destination": {"type": "local", "path": "/mnt/b"}})).unwrap();
         assert!(matches!(t, CopyTarget::Destination { passphrase: None, .. }));
     }
+}
+
+/// Every file of a version, optionally only those under `prefix`.
+fn files_under(db: &ufop_core::backup::db::BackupDb, version: usize, prefix: Option<String>) -> Result<Vec<ufop_core::backup::FileEntry>, AppError> {
+    let fs = db.fileset_by_version(version)?;
+    let mut files = db.files(fs.id)?;
+    if let Some(p) = prefix.filter(|p| !p.is_empty()) {
+        files.retain(|f| f.path.starts_with(&p));
+    }
+    Ok(files)
 }

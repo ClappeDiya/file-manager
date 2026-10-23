@@ -380,8 +380,8 @@ export class UfopClient {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/export`, query, undefined);
   }
 
-  /** Files in a version (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files` */
-  getJobsIdFiles(id: string, query: { version?: string; time?: string; allow_partial?: boolean; prefix?: string; source?: string } = {}): Promise<Record<string, unknown>> {
+  /** Files in a version (any of offset, limit, sort, filter returns one page with the total) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files` */
+  getJobsIdFiles(id: string, query: { version?: string; time?: string; allow_partial?: boolean; prefix?: string; source?: string; offset?: number; limit?: number; sort?: string; desc?: boolean; filter?: string } = {}): Promise<Record<string, unknown>> {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/files`, query, undefined);
   }
 
@@ -515,8 +515,8 @@ export class UfopClient {
     return this.call("POST", `/api/v1/rpc/${encodeURIComponent(command)}`, undefined, body);
   }
 
-  /** Run history (API tokens: `read` scope). `GET /api/v1/runs` */
-  getRuns(query: { job_id?: string; limit?: number } = {}): Promise<Array<Record<string, unknown>>> {
+  /** Run history (any of offset, sort, filter returns one page of limit rows with the total) (API tokens: `read` scope). `GET /api/v1/runs` */
+  getRuns(query: { job_id?: string; limit?: number; offset?: number; sort?: string; desc?: boolean; filter?: string } = {}): Promise<Array<Record<string, unknown>> | { items?: Array<Record<string, unknown>>; limit?: number; offset?: number; total?: number }> {
     return this.call("GET", `/api/v1/runs`, query, undefined);
   }
 

@@ -1640,3 +1640,60 @@ async fn inspect_operations_and_bench() {
     assert_eq!((r.hashes.len(), r.ciphers.len(), r.compression.len()), (2, 2, 0));
     assert_eq!(r.sample.bytes, 64 * 1024);
 }
+
+#[tokio::test]
+async fn run_history_and_files_page_with_totals() {
+    let t = tempfile::tempdir().unwrap();
+    let m = manager(t.path()).await;
+    for (i, (op, status, summary)) in [("backup", "success", "3 added"), ("verify", "warning", "1 missing_file"), ("backup", "error", "disk full"), ("compact", "success", "freed 1 MB")].into_iter().enumerate() {
+        let run = BackupRun {
+            id: format!("r{i}"),
+            job_id: if i == 3 { "other".into() } else { "j1".into() },
+            operation: op.into(),
+            status: status.into(),
+            started_at: format!("2026-10-0{}T10:00:00Z", i + 1),
+            finished_at: None,
+            summary: summary.into(),
+            report: serde_json::Value::Null,
+            log: vec![],
+        };
+        m.insert_run(&run).await.unwrap();
+    }
+    let ids = |l: paging::Listing<BackupRun>| match l {
+        paging::Listing::Page(p) => (p.total, p.items.into_iter().map(|r| r.id).collect::<Vec<_>>()),
+        paging::Listing::All(_) => panic!("expected a page"),
+    };
+    // No page: the old array.
+    assert!(matches!(m.run_history_listing(None, 50, None).await.unwrap(), paging::Listing::All(v) if v.len() == 4));
+    // Default order newest first, paged.
+    let p = paging::PageRequest { limit: Some(2), ..Default::default() };
+    assert_eq!(ids(m.run_history_listing(None, 50, Some(p.clone())).await.unwrap()), (4, vec!["r3".into(), "r2".into()]));
+    assert_eq!(ids(m.run_history_listing(None, 50, Some(paging::PageRequest { offset: 2, ..p.clone() })).await.unwrap()), (4, vec!["r1".into(), "r0".into()]));
+    // Sorted by status ascending, one job only.
+    let by_status = paging::PageRequest { sort: Some("status".into()), ..Default::default() };
+    assert_eq!(ids(m.run_history_listing(Some("j1".into()), 50, Some(by_status)).await.unwrap()), (3, vec!["r2".into(), "r0".into(), "r1".into()]));
+    // Filter on summary/operation, with LIKE wildcards taken literally.
+    let f = |s: &str| paging::PageRequest { filter: Some(s.into()), ..Default::default() };
+    assert_eq!(ids(m.run_history_listing(None, 50, Some(f("BACKUP"))).await.unwrap()).0, 2);
+    assert_eq!(ids(m.run_history_listing(None, 50, Some(f("missing_"))).await.unwrap()), (1, vec!["r1".into()]));
+    assert_eq!(ids(m.run_history_listing(None, 50, Some(f("%"))).await.unwrap()).0, 0);
+    assert!(m.run_history_listing(None, 50, Some(paging::PageRequest { sort: Some("summary; DROP TABLE x".into()), ..Default::default() })).await.is_err());
+
+    // Files of a version: every file, sorted and sliced, with the total.
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    for (n, size) in [("big.bin", 3000), ("mid.txt", 200), ("small.txt", 10)] {
+        std::fs::write(src.join(n), vec![b'x'; size]).unwrap();
+    }
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    let page = paging::PageRequest { sort: Some("size".into()), descending: true, filter: Some(".TXT".into()), limit: Some(1), ..Default::default() };
+    match m.list_files_listing(&j.id, 0, None, None, Some(page)).await.unwrap() {
+        paging::Listing::Page(p) => {
+            assert_eq!(p.total, 2);
+            assert!(p.items[0].path.ends_with("mid.txt"), "{:?}", p.items[0].path);
+        }
+        paging::Listing::All(_) => panic!("expected a page"),
+    }
+    assert!(matches!(m.list_files_listing(&j.id, 0, None, None, None).await.unwrap(), paging::Listing::All(v) if v.len() >= 4));
+}

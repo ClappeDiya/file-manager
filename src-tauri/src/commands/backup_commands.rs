@@ -8,6 +8,7 @@ use crate::backup_engine::{
 use crate::backup_engine::defaults::{GlobalDefaults, SavedDestination};
 use crate::backup_engine::{DatabaseCleanupReport, DatabaseEntry};
 use crate::backup_engine::runs::{RunAllFilter, RunAllReport};
+use crate::backup_engine::paging::{Listing, PageRequest};
 use ufop_core::backup::estimate::BackupEstimate;
 use ufop_core::backup::recovery;
 use crate::core::error::AppError;
@@ -156,8 +157,17 @@ pub async fn backup_list_versions(id: String, source: Option<String>, tags: Opti
 }
 
 #[tauri::command]
-pub async fn backup_list_files(id: String, version: usize, prefix: Option<String>, source: Option<String>, mgr: State<'_, BackupManager>) -> Result<Vec<FileEntry>, AppError> {
-    mgr.list_files_in(&id, version, prefix, source).await
+/// Files of a version; with `page` (offset, limit, sort, descending,
+/// filter) one page of all of them plus the total.
+pub async fn backup_list_files(
+    id: String,
+    version: usize,
+    prefix: Option<String>,
+    source: Option<String>,
+    page: Option<PageRequest>,
+    mgr: State<'_, BackupManager>,
+) -> Result<Listing<FileEntry>, AppError> {
+    mgr.list_files_listing(&id, version, prefix, source, page).await
 }
 
 #[tauri::command]
@@ -201,8 +211,9 @@ pub async fn backup_set_version_metadata(
 }
 
 #[tauri::command]
-pub async fn backup_run_history(job_id: Option<String>, limit: Option<u32>, mgr: State<'_, BackupManager>) -> Result<Vec<BackupRun>, AppError> {
-    mgr.run_history(job_id, limit.unwrap_or(50)).await
+/// Most recent runs; with `page`, one page of the whole history plus the total.
+pub async fn backup_run_history(job_id: Option<String>, limit: Option<u32>, page: Option<PageRequest>, mgr: State<'_, BackupManager>) -> Result<Listing<BackupRun>, AppError> {
+    mgr.run_history_listing(job_id, limit.unwrap_or(50), page).await
 }
 
 #[tauri::command]
@@ -420,8 +431,9 @@ pub async fn backup_recovery_convert(folder: String, destination: BackupDestinat
 }
 
 #[tauri::command]
-pub async fn backup_remote_list(destination: BackupDestination, mgr: State<'_, BackupManager>) -> Result<Vec<ufop_core::backup::RemoteFile>, AppError> {
-    mgr.remote_list(destination).await
+/// Files at a destination; with `page`, one sorted/filtered page plus the total.
+pub async fn backup_remote_list(destination: BackupDestination, page: Option<PageRequest>, mgr: State<'_, BackupManager>) -> Result<Listing<ufop_core::backup::RemoteFile>, AppError> {
+    crate::backup_engine::paging::listing(mgr.remote_list(destination).await?, page.as_ref())
 }
 
 #[tauri::command]

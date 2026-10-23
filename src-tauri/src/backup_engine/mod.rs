@@ -9,6 +9,7 @@
 //! callbacks, run history (`backup_runs`) and the operation ledger.
 
 pub mod legal_hold;
+pub mod paging;
 pub mod access;
 pub mod api;
 pub mod bugreport;
@@ -773,6 +774,21 @@ pub struct BackupRun {
     pub summary: String,
     pub report: serde_json::Value,
     pub log: Vec<LogLine>,
+}
+
+/// A `backup_runs` row (columns as selected by the run history queries).
+fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BackupRun> {
+    Ok(BackupRun {
+        id: r.get(0)?,
+        job_id: r.get(1)?,
+        operation: r.get(2)?,
+        status: r.get(3)?,
+        started_at: r.get(4)?,
+        finished_at: r.get(5)?,
+        summary: r.get(6)?,
+        report: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
+        log: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
+    })
 }
 
 /// Result returned to callers of [`BackupManager::execute`].
@@ -2539,22 +2555,36 @@ impl BackupManager {
                     "SELECT id, job_id, operation, status, started_at, finished_at, summary, report_json, log_json FROM backup_runs
                      WHERE (?1 IS NULL OR job_id = ?1) ORDER BY started_at DESC LIMIT ?2",
                 )?;
-                let v = st
-                    .query_map(params![job_id, limit.clamp(1, 1000)], |r| {
-                        Ok(BackupRun {
-                            id: r.get(0)?,
-                            job_id: r.get(1)?,
-                            operation: r.get(2)?,
-                            status: r.get(3)?,
-                            started_at: r.get(4)?,
-                            finished_at: r.get(5)?,
-                            summary: r.get(6)?,
-                            report: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
-                            log: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
-                        })
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
+                let v = st.query_map(params![job_id, limit.clamp(1, 1000)], run_row)?.collect::<Result<Vec<_>, _>>()?;
                 Ok(v)
+            })
+            .await
+    }
+
+    /// [`Self::run_history`], or one page of the whole history (sorted by a
+    /// [`paging::RUN_SORT_FIELDS`] column, newest first by default, text
+    /// filter on the summary and operation) when `page` is given.
+    pub async fn run_history_listing(&self, job_id: Option<String>, limit: u32, page: Option<paging::PageRequest>) -> Result<paging::Listing<BackupRun>, AppError> {
+        let Some(page) = page else {
+            return Ok(paging::Listing::All(self.run_history(job_id, limit).await?));
+        };
+        page.check_sort(paging::RUN_SORT_FIELDS)?;
+        self.inner
+            .pool
+            .execute(move |c| {
+                // The column comes from the whitelist above, never from the caller's text.
+                let col = paging::RUN_SORT_FIELDS.iter().find(|f| page.sort.as_deref() == Some(**f)).copied().unwrap_or("started_at");
+                let dir = if page.sort.is_none() || page.descending { "DESC" } else { "ASC" };
+                let like = page.needle().map(|n| format!("%{}%", n.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")));
+                let filter = "(?1 IS NULL OR job_id = ?1) AND (?2 IS NULL OR lower(summary) LIKE ?2 ESCAPE '\\' OR lower(operation) LIKE ?2 ESCAPE '\\')";
+                let total: i64 = c.query_row(&format!("SELECT COUNT(*) FROM backup_runs WHERE {filter}"), params![job_id, like], |r| r.get(0))?;
+                let take = page.take();
+                let mut st = c.prepare(&format!(
+                    "SELECT id, job_id, operation, status, started_at, finished_at, summary, report_json, log_json FROM backup_runs
+                     WHERE {filter} ORDER BY {col} {dir}, started_at DESC, id LIMIT ?3 OFFSET ?4"
+                ))?;
+                let items = st.query_map(params![job_id, like, take as i64, page.offset as i64], run_row)?.collect::<Result<Vec<_>, _>>()?;
+                Ok(paging::Listing::Page(paging::Page { items, total: total.max(0) as usize, offset: page.offset, limit: take }))
             })
             .await
     }

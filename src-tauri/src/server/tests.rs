@@ -167,6 +167,9 @@ async fn backup_and_restore_over_rest_and_rpc() {
     assert_eq!(unknown.status(), 400);
     let runs = s.get(&format!("/api/v1/runs?job_id={id}"), &tok).await.json::<Value>().await.unwrap();
     assert_eq!(runs.as_array().unwrap().len(), 3);
+    let page = s.get(&format!("/api/v1/runs?job_id={id}&limit=2&offset=1&sort=started_at&desc=true"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!((page["total"].as_u64(), page["items"].as_array().map(|a| a.len()), page["offset"].as_u64()), (Some(3), Some(2), Some(1)), "{page}");
+    assert_eq!(s.get(&format!("/api/v1/runs?job_id={id}&sort=nope"), &tok).await.status(), 400);
     let fs = s.get(&format!("/api/v1/filesystem?path={}", s.dir.display()), &tok).await.json::<Value>().await.unwrap();
     assert!(fs["entries"].as_array().unwrap().iter().any(|e| e["name"] == "src"));
     // Restore by time, one file's bytes (with ranges) and the volume cache.
@@ -177,6 +180,11 @@ async fn backup_and_restore_over_rest_and_rpc() {
     assert_eq!(s.get(&format!("/api/v1/jobs/{id}/versions/resolve?time=2001-01-01T00:00:00Z"), &tok).await.status(), 400, "before every version");
     let files = s.get(&format!("/api/v1/jobs/{id}/files?version=latest"), &tok).await.json::<Value>().await.unwrap();
     assert!(files.as_array().unwrap().len() >= 2);
+    let fpage = s.get(&format!("/api/v1/jobs/{id}/files?version=latest&limit=1&sort=path&filter=A.TXT"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(fpage["total"], 1, "{fpage}");
+    assert!(fpage["items"][0]["path"].as_str().unwrap().ends_with("a.txt"));
+    let rpc_page = s.post("/api/v1/rpc/backup_run_history", &tok, json!({"jobId": id, "page": {"limit": 1}})).await.json::<Value>().await.unwrap();
+    assert_eq!((rpc_page["total"].as_u64(), rpc_page["items"].as_array().map(|a| a.len())), (Some(3), Some(1)), "{rpc_page}");
     let fpath = src.join("a.txt").to_string_lossy().replace('/', "%2F");
     let full = s.get(&format!("/api/v1/jobs/{id}/file?path={fpath}&version=latest"), &tok).await;
     assert_eq!(full.status(), 200);
@@ -1443,6 +1451,7 @@ async fn api_tokens_limited_to_jobs() {
     assert_eq!(s.post(&format!("/api/v1/jobs/{j2}/run"), &run, json!({"dry_run": true})).await.status(), 403);
     assert_eq!(s.get(&format!("/api/v1/runs?job_id={j2}"), &run).await.status(), 403);
     assert!(s.get("/api/v1/runs", &run).await.json::<Value>().await.unwrap().as_array().unwrap().is_empty(), "j2's runs are hidden");
+    assert_eq!(s.get("/api/v1/runs?offset=0", &run).await.json::<Value>().await.unwrap()["total"], 0, "paged history is filtered too");
     // Within the scope: run, but not destructive maintenance.
     assert_eq!(s.post(&format!("/api/v1/jobs/{j1}/operations"), &run, json!({"type": "compact"})).await.status(), 403);
     let all = s.post("/api/v1/jobs/run-all", &run, json!({"dry_run": true})).await.json::<Value>().await.unwrap();
