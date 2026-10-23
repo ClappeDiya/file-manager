@@ -574,6 +574,7 @@ pub fn run() {
             fs_commands::list_directory,
             fs_commands::pick_folder,
             fs_commands::pick_files,
+            fs_commands::pick_save_file,
             fs_commands::read_text_file_full,
             fs_commands::write_text_file_full,
             // State management

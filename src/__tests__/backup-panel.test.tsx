@@ -199,6 +199,7 @@ describe("BackupPanel", () => {
           options: expect.objectContaining({ version: 1, paths: ["/home/me/Docs/a.txt"], target: null, conflict: "overwrite" }),
           overrides: { download_bps: null, retries: null, network_timeout_secs: null },
         },
+        confirmationToken: null,
       }),
     );
     expect(await screen.findByText(/Restored 1 file/)).toBeTruthy();

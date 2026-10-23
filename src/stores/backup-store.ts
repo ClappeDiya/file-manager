@@ -921,7 +921,52 @@ export interface RestoreOptions {
   skip_free_space_check: boolean;
   /** Shared repositories: restore from this source (id, or "*") instead of the job's own. */
   source: string | null;
+  /** Pick the version by time, newest/oldest or id instead of `version`. */
+  selector: VersionSelector | null;
+  /** Write a ZIP / TAR archive instead of files. */
+  archive: ArchiveTarget | null;
+  /** Mirror: delete what the restored folders in `target` hold but the version does not. */
+  delete_extraneous: boolean;
+  restore_owner: OwnerPolicy;
+  error_policy: RestoreErrorPolicy;
+  sparse: SparseMode;
+  /** Read volumes through the local volume cache. */
+  use_cache: boolean;
 }
+
+/** Wire mirror of `ufop_core::backup::select::VersionSelector`. */
+export type VersionSelector =
+  | { type: "index"; index: number }
+  | { type: "latest"; allow_partial?: boolean }
+  | { type: "oldest"; allow_partial?: boolean }
+  | { type: "as_of"; time: string; allow_partial?: boolean }
+  | { type: "id"; id: string };
+
+export type ArchiveFormat = "zip" | "zip_stored" | "tar" | "tar_gz";
+export interface ArchiveTarget {
+  path: string;
+  /** null: from the file name's extension. */
+  format: ArchiveFormat | null;
+}
+export type OwnerPolicy = "auto" | "always" | "never";
+export type SparseMode = "auto" | "off";
+export interface RestoreErrorPolicy {
+  on_write_error: ErrorAction;
+  on_dir_error: ErrorAction;
+  on_missing_data: ErrorAction;
+  on_metadata_error: UnknownEntryAction;
+  fail_fast: boolean;
+  max_errors: number | null;
+}
+
+export const DEFAULT_RESTORE_ERROR_POLICY: RestoreErrorPolicy = {
+  on_write_error: "fail",
+  on_dir_error: "fail",
+  on_missing_data: "fail",
+  on_metadata_error: "warn",
+  fail_fast: false,
+  max_errors: null,
+};
 
 export interface AutoTuneResult {
   download_threads: number;
@@ -941,6 +986,17 @@ export interface RestoreReport {
   volumes_downloaded: number;
   blocks_from_local: number;
   planned: string[];
+  /** The restored version's number (one version restored). */
+  version_index: number | null;
+  /** The archive written (archive restores). */
+  archive: string | null;
+  /** Mirror: paths deleted (dry run: to delete); folders end in "/". */
+  planned_deletions: string[];
+  files_deleted: number;
+  folders_deleted: number;
+  owners_restored: number;
+  sparse_files: number;
+  stop_reason: string | null;
   warnings: string[];
   errors: string[];
 }
@@ -1030,6 +1086,8 @@ export interface RestoreOverrides {
   download_bps: number | null;
   retries: number | null;
   network_timeout_secs: number | null;
+  /** Mirror restores delete files only with this set (after confirmation). */
+  confirm_delete?: boolean;
 }
 
 export interface DbInfo {
@@ -1341,6 +1399,13 @@ export const DEFAULT_RESTORE_OPTIONS: RestoreOptions = {
   temp_dir: null,
   skip_free_space_check: false,
   source: null,
+  selector: null,
+  archive: null,
+  delete_extraneous: false,
+  restore_owner: "auto",
+  error_policy: DEFAULT_RESTORE_ERROR_POLICY,
+  sparse: "auto",
+  use_cache: false,
 };
 
 

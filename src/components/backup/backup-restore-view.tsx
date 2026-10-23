@@ -27,7 +27,10 @@ import { formatDate, inputCls } from "@/lib/backup-helpers";
 import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { AdvancedOnly } from "./advanced-only";
 import { BackupVersionTable } from "./backup-version-list";
-import type { SourceInfo } from "@/stores/backup-store";
+import type { SourceInfo, VersionSelector } from "@/stores/backup-store";
+import { MirrorConfirm, RestoreAsOfPicker, RestoreSafetyOptions } from "./backup-restore-extras";
+import { ArchiveExportButton, BackupFilePreview, OpenAsDriveButton, OpenDrivesList } from "./backup-access-actions";
+import { useMirrorRestore } from "./use-mirror-restore";
 
 function RestoreOptionsForm({ value, onChange, versionCount = 0 }: { value: RestoreOptions; onChange: (v: RestoreOptions) => void; versionCount?: number }) {
   const n = (v: string, max: number) => Math.min(max, Math.max(0, Math.floor(Number(v) || 0)));
@@ -102,6 +105,14 @@ function ReportView({ report }: { report: RestoreReport }) {
       {report.files_skipped_duplicate > 0 && `, ${report.files_skipped_duplicate} identical to a newer version`}
       {report.blocks_from_local > 0 && `; ${report.blocks_from_local} block(s) reused from local files`}.
       {report.planned.length > 0 && <div>Would write {report.planned.length} item(s).</div>}
+      {report.archive && <div>Saved the archive {report.archive}.</div>}
+      {((report.files_deleted ?? 0) > 0 || (report.folders_deleted ?? 0) > 0) && (
+        <div>Mirror: deleted {report.files_deleted} file(s) and {report.folders_deleted} folder(s) the version does not have.</div>
+      )}
+      {report.planned.length > 0 && (report.planned_deletions ?? []).length > 0 && <div>Mirror: would delete {report.planned_deletions.length} item(s).</div>}
+      {(report.owners_restored ?? 0) > 0 && <div>Restored the owner of {report.owners_restored} item(s).</div>}
+      {(report.sparse_files ?? 0) > 0 && <div>{report.sparse_files} file(s) written with holes (sparse).</div>}
+      {report.stop_reason && <div className="text-red-600">{report.stop_reason}</div>}
       {report.errors.slice(0, 20).map((e) => (
         <div key={e} className="text-red-600">{e}</div>
       ))}
@@ -170,6 +181,16 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
   const [report, setReport] = useState<RestoreReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** "Restore as it was at …" time, when the version was picked by time. */
+  const [asOf, setAsOf] = useState<string | null>(null);
+  const [asOfKey, setAsOfKey] = useState(0);
+  const [preview, setPreview] = useState<string | null>(null);
+  const mirror = useMirrorRestore(job.id, setReport);
+  const pickVersion = (i: number) => {
+    setVersion(i);
+    setAsOf(null);
+    setAsOfKey((k) => k + 1);
+  };
 
   // Another source's versions (shared repositories); omitted for the job's own.
   const src = useMemo(() => (source ? { source } : {}), [source]);
@@ -242,13 +263,17 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
     );
   }
   const current = versions[Math.min(version, versions.length - 1)];
+  // Picked by time: the restore names the time, so the backend picks the same version.
+  const selector: VersionSelector | null = asOf ? { type: "as_of", time: asOf, allow_partial: current.partial } : null;
+  const versionRef: number | VersionSelector = selector ?? version;
 
   return (
     <div className="p-3 space-y-3" data-testid="backup-restore-view">
       {error && <Banner tone="error" onClose={() => setError(null)}>{error}</Banner>}
+      {preview && <BackupFilePreview job={job} version={versionRef} source={source} path={preview} onClose={() => setPreview(null)} />}
       <Section title="Versions">
         {picker}
-        <select className={inputCls} value={version} onChange={(e) => setVersion(Number(e.target.value))} data-testid="backup-version-select">
+        <select className={inputCls} value={version} onChange={(e) => pickVersion(Number(e.target.value))} data-testid="backup-version-select">
           {versions.map((v, i) => (
             <option key={v.id} value={i}>
               {i === 0 ? "Latest — " : ""}
@@ -257,7 +282,15 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
             </option>
           ))}
         </select>
-        <BackupVersionTable job={job} versions={versions} selected={version} onSelect={setVersion} source={source} onChanged={loadVersions} />
+        <RestoreAsOfPicker
+          key={asOfKey}
+          versions={versions}
+          onPick={(i, iso) => {
+            if (i !== null) setVersion(i);
+            setAsOf(i !== null ? iso : null);
+          }}
+        />
+        <BackupVersionTable job={job} versions={versions} selected={version} onSelect={pickVersion} source={source} onChanged={loadVersions} />
         <div className="flex gap-1 flex-wrap">
           <Btn
             disabled={versions.length < 2 || busy}
@@ -312,7 +345,7 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
             {hits.length === 0 && <li className="text-zinc-500">No matches.</li>}
             {hits.map((h) => (
               <li key={`${h.version}:${h.path}`} className="flex justify-between gap-2">
-                <button className="truncate text-left hover:underline" onClick={() => { setVersion(h.version); setSelected(new Set([h.path])); }} title="Select this version of the file">
+                <button className="truncate text-left hover:underline" onClick={() => { pickVersion(h.version); setSelected(new Set([h.path])); }} title="Select this version of the file">
                   {h.path}
                 </button>
                 <span className="shrink-0 text-zinc-500">{formatDate(h.timestamp)} · {formatBytes(h.size)}</span>
@@ -333,6 +366,11 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
                 {f.path}
               </span>
               {f.kind === "file" && <span className="text-zinc-500 shrink-0">{formatBytes(f.size)}</span>}
+              {f.kind === "file" && (
+                <button className="shrink-0 text-blue-600 dark:text-blue-400 hover:underline" onClick={() => setPreview(f.path)} title="Show this file without restoring it" data-testid="backup-file-preview-open">
+                  Preview
+                </button>
+              )}
             </li>
           ))}
         </ul>
@@ -340,6 +378,7 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
 
       <Section title="Restore">
         <RestoreOptionsForm value={opts} onChange={setOpts} versionCount={versions.length} />
+        <RestoreSafetyOptions value={opts} onChange={setOpts} />
         <details className="text-xs" data-testid="restore-overrides">
           <summary className="cursor-pointer select-none">This restore only (overrides the job)</summary>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-2">
@@ -356,17 +395,24 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
         </details>
         <Btn
           tone="primary"
-          disabled={busy || (opts.target !== null && !opts.target.trim())}
+          disabled={busy || mirror.pending !== null || (opts.target !== null && !opts.target.trim())}
           testId="backup-restore-run"
           onClick={() =>
             run(async () => {
-              const r = await execute(job.id, { type: "restore", options: { ...opts, version, paths: [...selected], source }, overrides });
-              setReport(r.report as unknown as RestoreReport);
+              await mirror.start({ ...opts, version, selector, paths: [...selected], source }, overrides);
             })
           }
         >
-          {busy ? "Working…" : opts.dry_run ? "Preview restore" : "Restore"}
+          {busy ? "Working…" : opts.dry_run ? "Preview restore" : opts.delete_extraneous ? "Restore (mirror)…" : "Restore"}
         </Btn>
+        {mirror.pending && (
+          <MirrorConfirm deletions={mirror.pending.deletions} busy={busy} onConfirm={() => run(async () => void (await mirror.confirm()))} onCancel={mirror.cancel} />
+        )}
+        <div className="flex gap-1 flex-wrap items-start">
+          <ArchiveExportButton job={job} version={versionRef} timestamp={current.timestamp} source={source} paths={[...selected]} onReport={setReport} />
+          <OpenAsDriveButton job={job} version={versionRef} source={source} />
+        </div>
+        <OpenDrivesList jobId={job.id} />
         {report && <ReportView report={report} />}
       </Section>
     </div>

@@ -20,6 +20,7 @@ import { BackupAdvancedOptions } from "./backup-advanced-options";
 import { Banner, Btn, Field, PathInput, Section } from "./backup-ui";
 import { SecretProvidersEditor } from "./backup-secret-providers";
 import { AdvancedOnly } from "./advanced-only";
+import { BackupCacheSettings } from "./backup-cache-settings";
 import { useIsAdvanced } from "./use-is-advanced";
 import { selectBackupAdvanced, useUIStore } from "@/stores/ui-store";
 
@@ -280,6 +281,7 @@ export function BackupSettingsView() {
     <div className="p-3 space-y-3" data-testid="backup-settings">
       <AdvancedToggle />
       <DestinationLibrary />
+      <BackupCacheSettings />
       <AdvancedOnly hint>
         <DatabaseTools />
         <SecretProvidersEditor />
