@@ -115,7 +115,7 @@ Ground rules
 
 ## Follow-ups found during the work
 - [x] Standalone `ufop agent` host honours cron schedules, time zones, maintenance schedules and policy templates of managed jobs (WP6 left it on plain intervals); shared `ufop_core::backup::{schedule, layers}`
-- [ ] Fix pre-existing `tests/journey_06_lan_transfer.rs` build break (`PeerManager::create_hello`/`create_ping`)
+- [x] Fix pre-existing `tests/journey_06_lan_transfer.rs` build break (`PeerManager::create_hello`/`create_ping` became the private handshake of the X-1 rewrite): journey 6J now pairs two real managers over loopback TLS and runs an approved, verified transfer; `cargo test --tests --no-run` builds every integration test and all 8 journey files pass
 - [ ] Fix pre-existing orphan `test_automation_rule` IPC call (dump-ipc-commands --verify)
 - [ ] Optional K108 extra: Prometheus `/metrics` in the desktop app (setting, off by default, loopback only) — WP8 did the server only
 - [ ] Pre-existing: `scripts/check-windows-build.sh` fails on clippy 1.97 lints in ufop-core (`unnecessary_sort_by` in sync/executor.rs, `manual_checked_ops`); `ufop-server` itself type-checks for x86_64-pc-windows-gnu

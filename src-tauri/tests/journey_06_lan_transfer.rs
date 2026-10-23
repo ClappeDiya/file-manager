@@ -152,14 +152,59 @@ async fn journey6_cleanup_completed_transfers() {
     assert_eq!(cleaned, 0, "Nothing to clean initially");
 }
 
-/// Journey 6J: Peer message creation
-#[test]
-fn journey6_peer_message_creation() {
-    let peer_mgr = PeerManager::new();
+/// Journey 6J: Two computers on the LAN (loopback here): the sender connects
+/// by address (TLS hello handshake both ways, certificate pinning), asks to
+/// send a file, the receiver approves it, the bytes arrive verified and both
+/// sides see the transfer completed.
+#[tokio::test(flavor = "multi_thread")]
+async fn journey6_peer_handshake_and_approved_transfer() {
+    use unified_file_ops_lib::connectors::peer::{ManualPeerConfig, PeerStatus, PeerTransferDirection, PeerTransferStatus, TransferResponse};
 
-    let hello = peer_mgr.create_hello();
-    assert!(!format!("{:?}", hello).is_empty());
+    let dir = tempfile::tempdir().unwrap();
+    let side = |name: &str| PeerManager::open(dir.path().join(name)).with_port(0).with_downloads_dir(dir.path().join(name).join("downloads")).with_hostname(name);
+    let (alpha, beta) = (side("alpha"), side("beta"));
+    assert_ne!(alpha.local_peer_id(), beta.local_peer_id());
 
-    let ping = peer_mgr.create_ping();
-    assert!(!format!("{:?}", ping).is_empty());
+    // Handshake: each side learns who the other is and pins its certificate.
+    let port = beta.start_listener().await.unwrap();
+    assert_eq!(beta.listening_port(), port);
+    let peer_b = alpha.connect_manual(ManualPeerConfig { host: "127.0.0.1".into(), port, display_name: None }).await.unwrap();
+    assert_eq!((peer_b.id, peer_b.hostname.as_str(), peer_b.status), (beta.local_peer_id(), "beta", PeerStatus::Online));
+    assert_eq!(peer_b.tls_fingerprint.as_deref(), Some(beta.local_fingerprint().as_str()));
+    let peer_a = beta.get_peer(alpha.local_peer_id()).await.expect("the listener learned who connected");
+    assert_eq!(peer_a.hostname, "alpha");
+
+    // Request → approval → verified transfer.
+    let src = dir.path().join("report.txt");
+    std::fs::write(&src, b"quarterly numbers").unwrap();
+    let req = alpha.request_transfer(peer_b.id, vec![src.to_string_lossy().into_owned()]).await.unwrap();
+    assert_eq!((req.file_count, req.total_bytes), (1, 17));
+    let mut pending = Vec::new();
+    for _ in 0..200 {
+        pending = beta.list_pending_requests().await;
+        if !pending.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(pending.first().map(|p| p.request_id), Some(req.request_id), "the receiver is asked first");
+    let save = dir.path().join("inbox");
+    beta.respond_to_transfer(req.request_id, TransferResponse::Accepted, Some(save.to_string_lossy().into_owned())).await.unwrap();
+    for _ in 0..200 {
+        let done = |p: Option<unified_file_ops_lib::connectors::peer::PeerTransferProgress>| p.map(|p| p.status) == Some(PeerTransferStatus::Completed);
+        if done(alpha.get_transfer_progress(req.request_id).await) && done(beta.get_transfer_progress(req.request_id).await) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let sent = alpha.get_transfer_progress(req.request_id).await.unwrap();
+    let got = beta.get_transfer_progress(req.request_id).await.unwrap();
+    assert_eq!((sent.status, sent.direction, sent.transferred_bytes), (PeerTransferStatus::Completed, PeerTransferDirection::Outgoing, 17));
+    assert_eq!((got.status, got.direction), (PeerTransferStatus::Completed, PeerTransferDirection::Incoming));
+    assert_eq!(std::fs::read(save.join("report.txt")).unwrap(), b"quarterly numbers");
+    assert_eq!(alpha.list_transfers().await.len(), 1);
+    assert_eq!(beta.clear_finished_transfers().await, 1);
+
+    beta.stop_listener().await.unwrap();
+    assert!(alpha.connect_manual(ManualPeerConfig { host: "127.0.0.1".into(), port, display_name: None }).await.is_err());
 }
