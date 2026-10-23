@@ -620,10 +620,17 @@ describe('audit trail of fleet actions', () => {
       { workflows: [{ name: 'Nested', rule: { ...RULE, workflow: { nodes: [{ kind: { type: 'action', action: { type: 'execute_custom_command' } } }] } } }] },
       { workflows: [{ name: 'Same', rule: RULE }, { name: 'same', rule: RULE }] },
       { workflows: Array.from({ length: 51 }, (_, i) => ({ name: `w${i}`, rule: RULE })) },
+      { backupTemplates: { name: 'x' } },
+      { backupTemplates: [{ name: '' }] },
+      { backupTemplates: [{ name: 'Bad', id: 'no spaces' }] },
+      { backupTemplates: [{ name: 'List', settings: [] }] },
+      { backupTemplates: [{ name: 'Broken', settings: '{not json' }] },
+      { backupTemplates: [{ name: 'Scripts', settings: { scripts: { run_before: 'rm -rf /' } } }] },
+      { backupTemplates: [{ name: 'Same' }, { name: 'same' }] },
     ]) expect((await put(admin, bad)).status).toBe(400);
 
     const ok = await json<{ settings: { version: number } }>(
-      await put(admin, { updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [5, 1, 1] } }, proxy: { mode: 'pac', pacUrl: 'https://wpad/p.pac', noProxy: [' intranet ', ''] }, ai: { allowCloud: false }, transfers: { maxUploadKbps: 512, maxConcurrentRuns: 2 }, mounts: { allowedProtocols: ['S3', 'rclone', 's3'], readOnly: true, cacheMode: 'full', maxCacheMb: 2048, mountRoot: ' ~/Drives ' }, workflows: [{ name: 'Tidy Downloads!', rule: JSON.stringify(RULE) }, { id: 'archive', name: 'Archive', enabled: false, rule: RULE }] }),
+      await put(admin, { updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [5, 1, 1] } }, proxy: { mode: 'pac', pacUrl: 'https://wpad/p.pac', noProxy: [' intranet ', ''] }, ai: { allowCloud: false }, transfers: { maxUploadKbps: 512, maxConcurrentRuns: 2 }, mounts: { allowedProtocols: ['S3', 'rclone', 's3'], readOnly: true, cacheMode: 'full', maxCacheMb: 2048, mountRoot: ' ~/Drives ' }, workflows: [{ name: 'Tidy Downloads!', rule: JSON.stringify(RULE) }, { id: 'archive', name: 'Archive', enabled: false, rule: RULE }], backupTemplates: [{ name: 'Org Standard', enforced: true, settings: JSON.stringify({ retention: { type: 'keep_count', count: 7 } }) }] }),
     );
     expect(ok.status).toBe(200);
     expect(ok.body.settings.version).toBe(1);
@@ -639,6 +646,7 @@ describe('audit trail of fleet actions', () => {
         { id: 'tidy-downloads', name: 'Tidy Downloads!', enabled: true, rule: RULE },
         { id: 'archive', name: 'Archive', enabled: false, rule: RULE },
       ],
+      backupTemplates: [{ id: 'org-standard', name: 'Org Standard', description: '', enforced: true, settings: { retention: { type: 'keep_count', count: 7 } } }],
     });
     expect(b.policySetVersion).not.toBe(v0);
     const hbv = await json<{ policiesChanged: boolean }>(await hb(m.token, { policySetVersion: v0 }));

@@ -49,6 +49,15 @@ interface Form {
   mountCacheHours: string;
   mountRoot: string;
   workflows: WorkflowForm[];
+  backupTemplates: BackupTemplateForm[];
+}
+
+interface BackupTemplateForm {
+  id: string;
+  name: string;
+  description: string;
+  enforced: boolean;
+  settingsJson: string;
 }
 
 interface WorkflowForm {
@@ -91,6 +100,7 @@ function toForm(s: ManagedSettings | null): Form {
     mountCacheHours: s?.mounts?.maxCacheAgeHours?.toString() ?? '',
     mountRoot: s?.mounts?.mountRoot ?? '',
     workflows: (s?.workflows ?? []).map((w) => ({ id: w.id, name: w.name, enabled: w.enabled, ruleJson: JSON.stringify(w.rule, null, 2) })),
+    backupTemplates: (s?.backupTemplates ?? []).map((t) => ({ id: t.id, name: t.name, description: t.description, enforced: t.enforced, settingsJson: JSON.stringify(t.settings, null, 2) })),
   };
 }
 
@@ -109,6 +119,9 @@ function toBody(f: Form): ManagedSettingsBody {
       mountRoot: f.mountRoot.trim() || null,
     },
     workflows: f.workflows.length ? f.workflows.map((w) => ({ id: w.id.trim(), name: w.name.trim(), enabled: w.enabled, rule: parseRule(w.ruleJson) })) : null,
+    backupTemplates: f.backupTemplates.length
+      ? f.backupTemplates.map((t) => ({ id: t.id.trim(), name: t.name.trim(), description: t.description.trim(), enforced: t.enforced, settings: parseRule(t.settingsJson || '{}') }))
+      : null,
   };
 }
 
@@ -302,12 +315,49 @@ export default function AppSettingsPage() {
             </Button>
           </div>
         </Card>
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Backup policy templates</CardTitle>
+            <CardDescription>
+              Templates backup jobs on every desktop can be based on; an enforced template applies to every job and wins over its own settings. In the desktop app, export a template (Settings → Policy templates) and paste its “settings” here. Templates that set scripts are refused.
+            </CardDescription>
+          </CardHeader>
+          <div className="space-y-4">
+            {form.backupTemplates.map((t, i) => {
+              const patch = (p: Partial<BackupTemplateForm>) => set({ backupTemplates: form.backupTemplates.map((x, j) => (j === i ? { ...x, ...p } : x)) });
+              return (
+                <div key={i} role="group" aria-label={`Backup template ${i + 1}`} className="space-y-2 rounded border border-border p-3">
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <Input label="Name" value={t.name} onChange={(e) => patch({ name: e.target.value })} />
+                    <Input label="Id" placeholder="From the name" value={t.id} onChange={(e) => patch({ id: e.target.value })} />
+                  </div>
+                  <Input label="Description" value={t.description} onChange={(e) => patch({ description: e.target.value })} />
+                  <label className="flex flex-col gap-1 text-sm">
+                    Settings (JSON)
+                    <textarea className="min-h-32 rounded border border-border bg-background p-2 font-mono text-xs" spellCheck={false} value={t.settingsJson} onChange={(e) => patch({ settingsJson: e.target.value })} />
+                  </label>
+                  <div className="flex items-center justify-between">
+                    <label className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={t.enforced} onChange={(e) => patch({ enforced: e.target.checked })} /> Enforced (applies to every job)
+                    </label>
+                    <Button variant="outline" onClick={() => set({ backupTemplates: form.backupTemplates.filter((_, j) => j !== i) })}>
+                      Remove
+                    </Button>
+                  </div>
+                </div>
+              );
+            })}
+            <Button variant="outline" onClick={() => set({ backupTemplates: [...form.backupTemplates, { id: '', name: '', description: '', enforced: false, settingsJson: '{}' }] })}>
+              Add backup template
+            </Button>
+          </div>
+        </Card>
       </fieldset>
       {canWrite && (
         <div className="mt-4 flex gap-2">
           <Button onClick={() => void save(toBody(form))}>Save</Button>
           {s && (
-            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null })}>
+            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null })}>
               Stop managing
             </Button>
           )}

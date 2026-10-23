@@ -3,6 +3,7 @@
  * automatic checks and a blackout window, the proxy, AI, transfer caps and
  * the mount profile (what drives may be mounted, and how). Delivered with
  * the policy bundle (`managedSettings`); `null` sections stay with the user.
+ * Organization backup policy templates travel the same way (`backupTemplates`).
  * The shape mirrors `ufop_core::agent::ManagedSettings` and is validated the
  * same way, so a desktop never receives settings it would reject.
  */
@@ -28,6 +29,52 @@ export interface ManagedSettingsBody {
   mounts: ManagedMounts | null;
   /** Automation rules the organization owns on its desktops (read-only there). */
   workflows: ManagedWorkflow[] | null;
+  /** Backup policy templates offered (or, `enforced`, imposed) on every desktop. */
+  backupTemplates: ManagedBackupTemplate[] | null;
+}
+
+/** A backup policy template: `settings` as the desktop app exports a template's settings. */
+export interface ManagedBackupTemplate {
+  id: string;
+  name: string;
+  description: string;
+  enforced: boolean;
+  settings: Record<string, unknown>;
+}
+
+/** Mirrors `ufop_core::agent::{MAX_BACKUP_TEMPLATES, MAX_BACKUP_TEMPLATE_BYTES}`. */
+export const MAX_BACKUP_TEMPLATES = 50;
+export const MAX_BACKUP_TEMPLATE_BYTES = 64 * 1024;
+
+/** Validate organization backup templates (the desktop checks the settings in full). */
+export function normalizeBackupTemplates(raw: unknown): ManagedBackupTemplate[] | null {
+  if (raw === null || raw === undefined) return null;
+  if (!Array.isArray(raw)) throw new OrgError('Backup templates must be a list');
+  if (raw.length > MAX_BACKUP_TEMPLATES) throw new OrgError(`At most ${MAX_BACKUP_TEMPLATES} organization backup templates`);
+  const ids = new Set<string>();
+  const out = raw.map((t, i) => {
+    const o = (t && typeof t === 'object' ? t : {}) as Record<string, unknown>;
+    const name = str(o.name, 200);
+    if (!name) throw new OrgError(`Backup template ${i + 1} needs a name`);
+    const id = str(o.id, 64) || name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
+    if (!WORKFLOW_ID.test(id)) throw new OrgError(`Backup template id '${id}' must be 1–64 letters, digits, '-' or '_'`);
+    if (ids.has(id)) throw new OrgError(`Two backup templates share the id '${id}'`);
+    ids.add(id);
+    let settings = o.settings ?? {};
+    if (typeof settings === 'string') {
+      try {
+        settings = JSON.parse(settings);
+      } catch {
+        throw new OrgError(`Backup template '${name}' settings are not valid JSON`);
+      }
+    }
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new OrgError(`Backup template '${name}' settings must be an object (export a template from the desktop app)`);
+    if (JSON.stringify(settings).length > MAX_BACKUP_TEMPLATE_BYTES) throw new OrgError(`Backup template '${name}' is larger than ${MAX_BACKUP_TEMPLATE_BYTES / 1024} KB`);
+    const sc = (settings as Record<string, unknown>).scripts;
+    if (sc !== undefined && sc !== null) throw new OrgError(`Backup template '${name}' sets scripts; organization templates cannot`);
+    return { id, name, description: str(o.description, 1000), enforced: o.enforced === true, settings: settings as Record<string, unknown> };
+  });
+  return out.length ? out : null;
 }
 
 /** An organization workflow: an automation rule as the desktop app exports it. */
@@ -113,7 +160,7 @@ const str = (v: unknown, n = 500) => (typeof v === 'string' ? v.trim().slice(0, 
 /** Validate and normalize a settings body (throws `OrgError` with a readable message). */
 export function normalizeManagedSettings(raw: unknown): ManagedSettingsBody {
   const b = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: normalizeWorkflows(b.workflows) };
+  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: normalizeWorkflows(b.workflows), backupTemplates: normalizeBackupTemplates(b.backupTemplates) };
   if (b.updates) {
     const u = b.updates as Record<string, unknown>;
     const channel = u.channel === null || u.channel === undefined || u.channel === '' ? null : u.channel;
@@ -195,8 +242,8 @@ function row(orgId: string): Row | undefined {
 export function getManagedSettings(orgId: string): ManagedSettings | null {
   const r = row(orgId);
   if (!r || r.settings === 'null') return null;
-  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null });
-  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, mounts: b.mounts ?? null, workflows: b.workflows ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
+  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null });
+  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, mounts: b.mounts ?? null, workflows: b.workflows ?? null, backupTemplates: b.backupTemplates ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
 }
 
 /**
@@ -205,7 +252,7 @@ export function getManagedSettings(orgId: string): ManagedSettings | null {
  */
 export function setManagedSettings(orgId: string, raw: unknown, by: string): ManagedSettings | null {
   const body = normalizeManagedSettings(raw);
-  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers && !body.mounts && !body.workflows;
+  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers && !body.mounts && !body.workflows && !body.backupTemplates;
   const version = Number(row(orgId)?.version ?? 0) + 1;
   db()
     .prepare('INSERT INTO managed_settings (org_id, settings, version, updated_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(org_id) DO UPDATE SET settings = excluded.settings, version = excluded.version, updated_by = excluded.updated_by, updated_at = excluded.updated_at')
@@ -216,5 +263,5 @@ export function setManagedSettings(orgId: string, raw: unknown, by: string): Man
 /** What the agent receives: `null` when nothing is managed. */
 export function managedSettingsForAgent(orgId: string): (ManagedSettingsBody & { version: number }) | null {
   const s = getManagedSettings(orgId);
-  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers, mounts: s.mounts, workflows: s.workflows };
+  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers, mounts: s.mounts, workflows: s.workflows, backupTemplates: s.backupTemplates };
 }
