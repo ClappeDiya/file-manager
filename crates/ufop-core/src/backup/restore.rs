@@ -2,14 +2,18 @@
 //! the needed blocks, rebuild files to the original or an alternate
 //! location, verify their hashes and carry on past individual failures.
 
+use super::archive::ArchiveTarget;
 use super::backend::Backend;
 use super::engine::Repo;
+use super::errors::{ErrorClass, ErrorTracker, RestoreErrorPolicy};
+use super::owner::{OwnerPolicy, OwnerRestore};
+use super::select::VersionSelector;
+use super::sparse::{SparseMode, SparseWriter};
 use super::volume;
 use super::{hash_bytes, hash_file, meta, HashAlgorithm, EntryKind, FileEntry, OpContext, Phase, Progress};
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -70,6 +74,26 @@ pub struct RestoreOptions {
     /// source's versions numbered together) instead of the job's own.
     #[serde(default)]
     pub source: Option<String>,
+    /// Pick the version by time, newest/oldest or id instead of `version`.
+    #[serde(default)]
+    pub selector: Option<VersionSelector>,
+    /// Write a ZIP / TAR archive instead of files (`target` is ignored).
+    #[serde(default)]
+    pub archive: Option<ArchiveTarget>,
+    /// Mirror: delete what the restored folders in `target` hold but the
+    /// version does not. Needs `target`; run a dry run first to see the list.
+    #[serde(default)]
+    pub delete_extraneous: bool,
+    #[serde(default)]
+    pub restore_owner: OwnerPolicy,
+    #[serde(default)]
+    pub error_policy: RestoreErrorPolicy,
+    #[serde(default)]
+    pub sparse: SparseMode,
+    /// Read volumes from (and keep them in) the local volume cache. Off for
+    /// ordinary restores, which read each volume once.
+    #[serde(default)]
+    pub use_cache: bool,
 }
 
 impl Default for RestoreOptions {
@@ -94,6 +118,13 @@ impl Default for RestoreOptions {
             temp_dir: None,
             skip_free_space_check: false,
             source: None,
+            selector: None,
+            archive: None,
+            delete_extraneous: false,
+            restore_owner: OwnerPolicy::Auto,
+            error_policy: RestoreErrorPolicy::default(),
+            sparse: SparseMode::Auto,
+            use_cache: false,
         }
     }
 }
@@ -114,8 +145,13 @@ impl RestoreOptions {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RestoreReport {
     pub version: String,
+    /// The restored version's number (0 = newest) when one version was restored.
+    pub version_index: Option<usize>,
+    /// The archive written (archive restores).
+    pub archive: Option<String>,
     pub files_restored: u64,
     pub folders_created: u64,
     pub files_skipped_matching: u64,
@@ -128,6 +164,15 @@ pub struct RestoreReport {
     pub blocks_from_local: u64,
     /// Planned destination paths (dry run).
     pub planned: Vec<String>,
+    /// Mirror restore: paths that are (dry run: would be) deleted; folders end in `/`.
+    pub planned_deletions: Vec<String>,
+    pub files_deleted: u64,
+    pub folders_deleted: u64,
+    pub owners_restored: u64,
+    /// Files written with holes for their zero runs.
+    pub sparse_files: u64,
+    /// Why the restore stopped early (fail-fast, error budget).
+    pub stop_reason: Option<String>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
 }
@@ -197,7 +242,26 @@ pub(crate) fn destinations(entries: &[FileEntry], opts: &RestoreOptions) -> Vec<
     }
 }
 
-fn apply_metadata(path: &Path, e: &FileEntry, opts: &RestoreOptions) -> Vec<String> {
+/// Shared state of one restore's writers: error policy, owners, sparse files.
+struct Writers<'o> {
+    errors: ErrorTracker,
+    owner: OwnerRestore<'o>,
+    sparse_files: AtomicU64,
+}
+
+impl Writers<'_> {
+    fn stop(&self, ctx: &OpContext) -> bool {
+        ctx.is_cancelled() || self.errors.should_stop()
+    }
+    /// Metadata problems (attributes, owner) go through the policy.
+    fn metadata(&self, warns: Vec<String>) {
+        for w in warns {
+            self.errors.record(ErrorClass::Metadata, w);
+        }
+    }
+}
+
+fn apply_metadata(path: &Path, e: &FileEntry, opts: &RestoreOptions, w: &Writers) {
     let mut warn = Vec::new();
     if opts.restore_metadata {
         if let Some(m) = &e.meta {
@@ -210,14 +274,20 @@ fn apply_metadata(path: &Path, e: &FileEntry, opts: &RestoreOptions) -> Vec<Stri
             let _ = f.set_modified(t);
         }
     }
+    // Owner before mode: changing the owner clears set-user-id bits.
+    if let Err(msg) = w.owner.apply(path, e.meta.as_ref()) {
+        warn.push(msg);
+    }
     #[cfg(unix)]
     if opts.restore_permissions {
         if let Some(mode) = e.mode {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
+            if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777)) {
+                warn.push(format!("{}: permissions not restored ({err})", path.display()));
+            }
         }
     }
-    warn
+    w.metadata(warn);
 }
 
 /// One planned restore action.
@@ -231,18 +301,40 @@ fn is_stream_entry(path: &str) -> bool {
     super::usn::volume_root(path).is_some() && path.rsplit('\\').next().is_some_and(|last| last.contains(':'))
 }
 
+/// The version number a restore uses: the selector when given, else `version`.
+pub fn resolve_version(repo: &Repo, opts: &RestoreOptions) -> Result<usize, AppError> {
+    match &opts.selector {
+        Some(s) => s.resolve(&repo.db.filesets()?),
+        None => Ok(opts.version),
+    }
+}
+
 /// Restore from an opened repository.
 pub fn run_restore(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext) -> Result<RestoreReport, AppError> {
+    let owner = OwnerRestore::system(if opts.dry_run && opts.restore_owner == OwnerPolicy::Always { OwnerPolicy::Auto } else { opts.restore_owner })?;
+    run_restore_with(repo, opts, ctx, owner)
+}
+
+/// [`run_restore`] with an owner restorer (tests inject the privilege check and chown).
+pub(crate) fn run_restore_with(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext, owner: OwnerRestore<'_>) -> Result<RestoreReport, AppError> {
     let mut report = RestoreReport::default();
     let _scope = super::shared::selector_scope(opts.source.as_deref()).map(|s| repo.db.scoped(s));
     // Versions to restore and where each one goes.
     let multi = !opts.versions.is_empty();
-    if multi && opts.target.is_none() {
+    if multi && opts.target.is_none() && opts.archive.is_none() {
         return Err(AppError::validation("Restoring several versions needs a target folder"));
+    }
+    if multi && (opts.archive.is_some() || opts.delete_extraneous) {
+        return Err(AppError::validation("Archive and mirror restores take one version"));
+    }
+    if opts.delete_extraneous && (opts.archive.is_some() || opts.target.is_none()) {
+        return Err(AppError::file_op("A mirror restore needs a target folder", "Choose a folder to restore into; mirroring deletes files there that the backup does not have."));
     }
     let mut picks = opts.versions.clone();
     if !multi {
-        picks.push(opts.version);
+        let v = resolve_version(repo, opts)?;
+        report.version_index = Some(v);
+        picks.push(v);
     }
     picks.sort_unstable();
     picks.dedup();
@@ -261,12 +353,21 @@ pub fn run_restore(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext) -> Resul
     if sets.iter().all(|s| s.1.is_empty()) {
         return Err(AppError::validation("No backed-up files match the selected paths in this version"));
     }
+    let w = Writers { errors: ErrorTracker::for_restore(opts.error_policy), owner, sparse_files: AtomicU64::new(0) };
+    if let Some(target) = &opts.archive {
+        restore_archive(repo, &sets[0].1, opts, target, ctx, &w, &mut report)?;
+        return Ok(finish(report, w));
+    }
 
     // Plan: decide per entry what happens.
     let mut jobs: Vec<Job> = Vec::new();
+    let mut expected: Vec<PathBuf> = Vec::new();
     let mut seen_content: HashMap<&str, &str> = HashMap::new();
     for (_, entries, o) in &sets {
         for (e, d) in entries.iter().zip(destinations(entries, o)) {
+            if opts.delete_extraneous {
+                expected.push(d.clone());
+            }
             if multi && opts.unique_versions && e.kind == EntryKind::File {
                 if let Some(h) = e.hash.as_deref() {
                     if seen_content.get(e.path.as_str()) == Some(&h) {
@@ -288,7 +389,9 @@ pub fn run_restore(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext) -> Resul
                         continue;
                     }
                     ConflictPolicy::Rename => {
-                        jobs.push(Job { entry: e, dest: rename_target(&d) });
+                        let r = rename_target(&d);
+                        expected.push(r.clone());
+                        jobs.push(Job { entry: e, dest: r });
                         continue;
                     }
                     ConflictPolicy::Overwrite => {}
@@ -297,9 +400,18 @@ pub fn run_restore(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext) -> Resul
             jobs.push(Job { entry: e, dest: d });
         }
     }
+    let mirror_plan = match (opts.delete_extraneous, opts.target.as_deref()) {
+        (true, Some(t)) => {
+            let scopes: Vec<PathBuf> = sets[0].1.iter().zip(destinations(&sets[0].1, &sets[0].2)).filter(|(e, _)| e.kind == EntryKind::Dir).map(|(_, d)| d).collect();
+            let plan = super::restore_mirror::plan(t, &scopes, &expected);
+            report.planned_deletions = plan.iter().map(|x| format!("{}{}", x.path.display(), if x.is_dir { "/" } else { "" })).collect();
+            Some((t.to_path_buf(), plan))
+        }
+        _ => None,
+    };
     if opts.dry_run {
         report.planned = jobs.iter().map(|j| j.dest.to_string_lossy().into_owned()).collect();
-        return Ok(report);
+        return Ok(finish(report, w));
     }
 
     let restore_bytes: u64 = jobs.iter().filter(|j| j.entry.kind == EntryKind::File).map(|j| j.entry.size).sum();
@@ -336,16 +448,18 @@ pub fn run_restore(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext) -> Resul
         let (hash, rec) = repo.volume_check_info(vol)?;
         work.push((vol, hashes, hash, rec));
     }
-    let fetcher = repo.fetcher();
+    let fetcher = repo.fetcher_with(opts.use_cache);
     let (cipher, fetcher) = (&repo.cipher, &fetcher);
     let queue = Mutex::new(work);
     let total_vol = queue.lock().map(|q| q.len()).unwrap_or(0) as u64;
     let done = AtomicU64::new(0);
-    let shared = Mutex::new((missing_blocks, Vec::<String>::new()));
+    let failed_vols = AtomicU64::new(0);
+    let missing = Mutex::new(missing_blocks);
+    let wr = &w;
     std::thread::scope(|sc| {
         for _ in 0..opts.download_workers() {
             sc.spawn(|| loop {
-                if ctx.is_cancelled() {
+                if wr.stop(ctx) {
                     return;
                 }
                 let Some((vol, hashes, expected, rec)) = queue.lock().ok().and_then(|mut q| q.pop()) else { return };
@@ -361,31 +475,33 @@ pub fn run_restore(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext) -> Resul
                     }
                     Ok(absent)
                 });
-                let mut g = match shared.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
+                let mut g = missing.lock().unwrap_or_else(|p| p.into_inner());
                 match res {
-                    Ok(absent) => g.0.extend(absent),
+                    Ok(absent) => g.extend(absent),
                     Err(e) => {
-                        g.1.push(format!("Volume {vol}: {}", e.user_message()));
-                        g.0.extend(hashes.iter().map(|h| h.to_string()));
+                        failed_vols.fetch_add(1, Ordering::SeqCst);
+                        wr.errors.record(ErrorClass::MissingData, format!("Volume {vol}: {}", e.user_message()));
+                        g.extend(hashes.iter().map(|h| h.to_string()));
                     }
                 }
             });
         }
     });
     ctx.check()?;
-    let (missing_blocks, vol_errors) = shared.into_inner().unwrap_or_else(|p| p.into_inner());
-    report.volumes_downloaded = total_vol - vol_errors.len() as u64;
-    report.errors.extend(vol_errors);
+    let missing_blocks = missing.into_inner().unwrap_or_else(|p| p.into_inner());
+    report.volumes_downloaded = done.load(Ordering::SeqCst).min(total_vol) - failed_vols.load(Ordering::SeqCst);
 
     // Folders first (sequential), then files and links in parallel, then
     // alternate streams (their base file must exist), then folder times.
     for j in jobs.iter().filter(|j| j.entry.kind == EntryKind::Dir) {
+        if w.stop(ctx) {
+            break;
+        }
         match std::fs::create_dir_all(&j.dest) {
             Ok(()) => report.folders_created += 1,
-            Err(e) => report.errors.push(format!("{}: {}", j.entry.path, AppError::from(e).user_message())),
+            Err(e) => {
+                w.errors.record(ErrorClass::Dir, format!("{}: {}", j.entry.path, AppError::from(e).user_message()));
+            }
         }
     }
     let (streams, plain): (Vec<&Job>, Vec<&Job>) = jobs.iter().filter(|j| j.entry.kind != EntryKind::Dir).partition(|j| is_stream_entry(&j.entry.path));
@@ -398,7 +514,7 @@ pub fn run_restore(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext) -> Resul
         std::thread::scope(|sc| {
             for _ in 0..workers.max(1) {
                 sc.spawn(|| loop {
-                    if ctx.is_cancelled() {
+                    if wr.stop(ctx) {
                         return;
                     }
                     let i = next.fetch_add(1, Ordering::SeqCst) as usize;
@@ -407,10 +523,13 @@ pub fn run_restore(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext) -> Resul
                     ctx.report(&Progress { phase: Phase::Restoring, files_processed: n, files_total: total, bytes_processed: 0, current_path: Some(j.entry.path.clone()) });
                     let mut warns = Vec::new();
                     let r = match j.entry.kind {
-                        EntryKind::Symlink => restore_symlink(j.entry, &j.dest, opts, &mut warns).map(|_| None),
+                        EntryKind::Symlink => restore_symlink(j.entry, &j.dest, opts, wr, &mut warns).map(|_| None).map_err(|e| (ErrorClass::File, e)),
                         _ => match j.entry.blocks.iter().find(|b| missing_blocks.contains(b.as_str())) {
-                            Some(b) => Err(AppError::transfer(format!("data block {} is unavailable", &b[..12.min(b.len())]), "Run list-broken-files.")),
-                            None => write_file(file_hash, j.entry, &j.dest, spill.path(), opts, is_stream_entry(&j.entry.path), &mut warns).map(Some),
+                            Some(b) => Err((ErrorClass::MissingData, AppError::transfer(format!("data block {} is unavailable", &b[..12.min(b.len())]), "Run list-broken-files."))),
+                            None => write_file(file_hash, j.entry, &j.dest, spill.path(), opts, is_stream_entry(&j.entry.path), wr, &mut warns).map(Some).map_err(|e| {
+                                let class = if matches!(e, AppError::Transfer { .. }) { ErrorClass::MissingData } else { ErrorClass::File };
+                                (class, e)
+                            }),
                         },
                     };
                     let mut g = match out.lock() {
@@ -424,7 +543,9 @@ pub fn run_restore(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext) -> Resul
                             g.bytes_restored += bytes;
                         }
                         Ok(None) => {}
-                        Err(e) => g.errors.push(format!("{}: {}", j.entry.path, e.user_message())),
+                        Err((class, e)) => {
+                            wr.errors.record(class, format!("{}: {}", j.entry.path, e.user_message()));
+                        }
                     }
                 });
             }
@@ -437,10 +558,91 @@ pub fn run_restore(repo: &Repo, opts: &RestoreOptions, ctx: &OpContext) -> Resul
     let mut dirs: Vec<&Job> = jobs.iter().filter(|j| j.entry.kind == EntryKind::Dir).collect();
     dirs.sort_by_key(|j| std::cmp::Reverse(j.dest.components().count()));
     for j in dirs {
-        report.warnings.extend(apply_metadata(&j.dest, j.entry, opts));
+        apply_metadata(&j.dest, j.entry, opts, &w);
+    }
+    // Mirror: only after a restore that ran to the end, so a stopped
+    // restore never deletes what it did not replace.
+    if let Some((target, plan)) = mirror_plan {
+        if w.errors.should_stop() {
+            report.warnings.push("Mirror deletions skipped because the restore stopped early".into());
+        } else {
+            let (files, folders, errors) = super::restore_mirror::delete(&target, &plan);
+            report.files_deleted = files;
+            report.folders_deleted = folders;
+            for e in errors {
+                w.errors.record(ErrorClass::File, e);
+            }
+        }
     }
     ctx.report(&Progress { phase: Phase::Completed, files_processed: total, files_total: total, bytes_processed: report.bytes_restored, current_path: None });
-    Ok(report)
+    Ok(finish(report, w))
+}
+
+/// Move what the writers recorded into the report.
+fn finish(mut report: RestoreReport, w: Writers) -> RestoreReport {
+    let (warnings, errors) = w.errors.take();
+    report.warnings.extend(warnings);
+    report.errors.extend(errors);
+    report.stop_reason = w.errors.stop_reason();
+    report.owners_restored = w.owner.restored();
+    report.warnings.extend(w.owner.summary());
+    report.sparse_files = w.sparse_files.load(Ordering::Relaxed);
+    report
+}
+
+/// Name of an entry inside an archive: its restore destination relative to
+/// the archive root, `/`-separated.
+fn archive_names(entries: &[FileEntry], opts: &RestoreOptions) -> Vec<String> {
+    let o = RestoreOptions { target: Some(PathBuf::new()), preserve_full_paths: opts.preserve_full_paths, ..Default::default() };
+    destinations(entries, &o).iter().map(|p| super::access::components(&p.to_string_lossy()).join("/")).collect()
+}
+
+fn restore_archive(repo: &Repo, entries: &[FileEntry], opts: &RestoreOptions, target: &ArchiveTarget, ctx: &OpContext, w: &Writers, report: &mut RestoreReport) -> Result<(), AppError> {
+    target.format()?;
+    let names = archive_names(entries, opts);
+    let mut items: Vec<(&FileEntry, String)> = Vec::new();
+    let mut streams = 0;
+    for (e, n) in entries.iter().zip(names) {
+        if is_stream_entry(&e.path) {
+            streams += 1;
+        } else if !n.is_empty() && (e.kind != EntryKind::Symlink || opts.restore_symlinks) {
+            items.push((e, n));
+        }
+    }
+    if streams > 0 {
+        report.warnings.push(format!("{streams} alternate data stream(s) left out: archives have no place for them"));
+    }
+    report.archive = Some(target.path.to_string_lossy().into_owned());
+    if opts.dry_run {
+        report.planned = items.iter().map(|(_, n)| n.clone()).collect();
+        return Ok(());
+    }
+    let src = super::access::BlockSource::new(repo)?;
+    let src = if opts.use_cache { src } else { src.without_cache() };
+    let total = items.len() as u64;
+    let out = super::archive::write_archive(
+        &src,
+        repo.header.file_hash,
+        &items,
+        target,
+        !opts.skip_verify,
+        &|| w.stop(ctx),
+        &|n, p| ctx.report(&Progress { phase: Phase::Restoring, files_processed: n, files_total: total, bytes_processed: 0, current_path: Some(p.to_string()) }),
+    );
+    let out = match out {
+        Ok(o) => o,
+        Err(e) if ctx.is_cancelled() => return Err(ctx.check().err().unwrap_or(e)),
+        Err(e) => return Err(e),
+    };
+    report.files_restored = out.files + out.links;
+    report.folders_created = out.folders;
+    report.bytes_restored = out.bytes;
+    report.volumes_downloaded = src.volumes_loaded();
+    for (path, problem, _) in out.skipped {
+        w.errors.record(ErrorClass::MissingData, format!("{path}: {problem}"));
+    }
+    ctx.report(&Progress { phase: Phase::Completed, files_processed: total, files_total: total, bytes_processed: report.bytes_restored, current_path: None });
+    Ok(())
 }
 
 /// Result of [`autotune`].
@@ -580,7 +782,8 @@ impl Drop for TempDir {
     }
 }
 
-fn write_file(file_hash: HashAlgorithm, e: &FileEntry, dest: &Path, spill: &Path, opts: &RestoreOptions, stream: bool, warns: &mut Vec<String>) -> Result<u64, AppError> {
+#[allow(clippy::too_many_arguments)]
+fn write_file(file_hash: HashAlgorithm, e: &FileEntry, dest: &Path, spill: &Path, opts: &RestoreOptions, stream: bool, w: &Writers, warns: &mut Vec<String>) -> Result<u64, AppError> {
     if stream && !cfg!(windows) {
         warns.push(format!("Alternate data stream {} skipped (NTFS only)", e.path));
         return Ok(0);
@@ -590,15 +793,21 @@ fn write_file(file_hash: HashAlgorithm, e: &FileEntry, dest: &Path, spill: &Path
     }
     // Streams are written in place: a temp name + rename would detach them.
     let tmp = if stream { dest.to_path_buf() } else { dest.with_file_name(format!(".{}.ufop-restore", dest.file_name().unwrap_or_default().to_string_lossy())) };
-    let mut n = 0u64;
+    let n;
     {
         let mut f = std::fs::File::create(&tmp)?;
-        // Preallocate to the final size.
-        f.set_len(e.size)?;
+        // Holes for zero runs (sparse), else preallocate to the final size.
+        let sparse = opts.sparse == SparseMode::Auto && !stream && e.size >= 2 * super::sparse::CHUNK as u64 && super::sparse::prepare(&f);
+        if !sparse {
+            f.set_len(e.size)?;
+        }
+        let mut out = SparseWriter::new(&mut f, sparse);
         for b in &e.blocks {
-            let d = std::fs::read(spill.join(b))?;
-            n += d.len() as u64;
-            f.write_all(&d)?;
+            out.write(&std::fs::read(spill.join(b))?)?;
+        }
+        n = out.position();
+        if out.holes {
+            w.sparse_files.fetch_add(1, Ordering::Relaxed);
         }
         f.set_len(n)?;
         f.sync_all()?;
@@ -616,12 +825,12 @@ fn write_file(file_hash: HashAlgorithm, e: &FileEntry, dest: &Path, spill: &Path
     if !stream {
         std::fs::rename(&tmp, dest)?;
     }
-    warns.extend(apply_metadata(dest, e, opts));
+    apply_metadata(dest, e, opts, w);
     Ok(n)
 }
 
 #[allow(unused_variables)]
-fn restore_symlink(e: &FileEntry, dest: &Path, opts: &RestoreOptions, warns: &mut Vec<String>) -> Result<(), AppError> {
+fn restore_symlink(e: &FileEntry, dest: &Path, opts: &RestoreOptions, w: &Writers, warns: &mut Vec<String>) -> Result<(), AppError> {
     if !opts.restore_symlinks {
         return Ok(());
     }
@@ -640,6 +849,9 @@ fn restore_symlink(e: &FileEntry, dest: &Path, opts: &RestoreOptions, warns: &mu
             if let Err(err) = meta::set_symlink_mtime(dest, m) {
                 warns.push(format!("{}: link time not restored ({err})", dest.display()));
             }
+        }
+        if let Err(msg) = w.owner.apply(dest, e.meta.as_ref()) {
+            w.metadata(vec![msg]);
         }
         return Ok(());
     }
@@ -893,5 +1105,271 @@ mod tests {
         let be2 = LocalBackend::new(d2.path());
         let r = Repo::open(&be2, &empty, None, &BackupOptions::default(), true, KdfParams::insecure_fast()).unwrap();
         assert!(autotune(&r, 2, &OpContext::new()).is_err());
+    }
+
+    fn two_versions() -> (tempfile::TempDir, tempfile::TempDir, BackupDb, chrono::DateTime<chrono::Utc>) {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(src.path(), "docs/a.txt", b"first");
+        write(src.path(), "docs/old.txt", b"only in v1");
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        backup(src.path(), &be, &db);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let between = chrono::Utc::now();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write(src.path(), "docs/a.txt", b"second");
+        std::fs::remove_file(src.path().join("docs/old.txt")).unwrap();
+        write(src.path(), "docs/new.txt", b"only in v2");
+        backup(src.path(), &be, &db);
+        (src, dst, db, between)
+    }
+
+    #[test]
+    fn restore_as_of_a_time_and_by_selector() {
+        let (src, dst, db, between) = two_versions();
+        let be = LocalBackend::new(dst.path());
+        let repo = open(&be, &db);
+        let out = tempfile::tempdir().unwrap();
+        let root = out.path().join(src.path().file_name().unwrap());
+        let o = RestoreOptions { selector: Some(VersionSelector::AsOf { time: between, allow_partial: false }), target: Some(out.path().into()), ..Default::default() };
+        let r = run_restore(&repo, &o, &OpContext::new()).unwrap();
+        assert_eq!(r.version_index, Some(1), "as of the time between the runs = the older version");
+        assert_eq!(std::fs::read(root.join("docs/a.txt")).unwrap(), b"first");
+        let r = run_restore(&repo, &RestoreOptions { selector: Some(VersionSelector::Latest { allow_partial: false }), dry_run: true, target: Some(out.path().into()), ..Default::default() }, &OpContext::new()).unwrap();
+        assert_eq!(r.version_index, Some(0));
+        let r = run_restore(&repo, &RestoreOptions { selector: Some(VersionSelector::Oldest { allow_partial: false }), dry_run: true, target: Some(out.path().into()), ..Default::default() }, &OpContext::new()).unwrap();
+        assert_eq!(r.version_index, Some(1));
+        // Before the first version: refused, nothing written.
+        let early = RestoreOptions { selector: Some(VersionSelector::AsOf { time: between - chrono::Duration::days(1), allow_partial: false }), target: Some(out.path().join("x")), ..Default::default() };
+        assert!(run_restore(&repo, &early, &OpContext::new()).is_err());
+        assert!(!out.path().join("x").exists());
+        // A partial newest version is skipped by "as of now" unless allowed.
+        db.add_fileset("2099-01-01T00:00:00+00:00", "p-partial.dlist", true, &[]).unwrap();
+        let now = RestoreOptions { selector: Some(VersionSelector::AsOf { time: chrono::Utc::now() + chrono::Duration::days(36500), allow_partial: false }), dry_run: true, target: Some(out.path().into()), ..Default::default() };
+        assert_eq!(run_restore(&repo, &now, &OpContext::new()).unwrap().version_index, Some(1), "the complete newest is now number 1");
+    }
+
+    fn archive_names_and_bytes(path: &Path) -> Vec<(String, Vec<u8>)> {
+        let n = path.to_string_lossy().to_string();
+        let mut out = Vec::new();
+        if n.ends_with(".zip") {
+            let mut z = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+            for i in 0..z.len() {
+                let mut f = z.by_index(i).unwrap();
+                let mut v = Vec::new();
+                std::io::Read::read_to_end(&mut f, &mut v).unwrap();
+                out.push((f.name().to_string(), v));
+            }
+        } else {
+            let r: Box<dyn std::io::Read> = if n.ends_with(".tar") { Box::new(std::fs::File::open(path).unwrap()) } else { Box::new(flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap())) };
+            let mut a = tar::Archive::new(r);
+            for e in a.entries().unwrap() {
+                let mut e = e.unwrap();
+                let name = e.path().unwrap().to_string_lossy().into_owned();
+                let mut v = Vec::new();
+                std::io::Read::read_to_end(&mut e, &mut v).unwrap();
+                out.push((name, v));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn restore_to_zip_tar_and_tgz() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let big: Vec<u8> = (0..12_000u32).map(|i| (i * 31 % 253) as u8).collect();
+        write(src.path(), "docs/a.txt", b"alpha");
+        write(src.path(), "docs/sub/big.bin", &big);
+        write(src.path(), "other/c.txt", b"gamma");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", src.path().join("docs/link")).unwrap();
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        backup(src.path(), &be, &db);
+        let repo = open(&be, &db);
+        let out = tempfile::tempdir().unwrap();
+        let root = src.path().file_name().unwrap().to_string_lossy().into_owned();
+        for name in ["all.zip", "all.tar", "all.tgz"] {
+            let target = out.path().join(name);
+            let o = RestoreOptions { archive: Some(ArchiveTarget { path: target.clone(), format: None }), ..Default::default() };
+            let r = run_restore(&repo, &o, &OpContext::new()).unwrap();
+            assert!(r.errors.is_empty(), "{name}: {:?}", r.errors);
+            assert_eq!(r.archive.as_deref(), Some(target.to_string_lossy().as_ref()));
+            let got = archive_names_and_bytes(&target);
+            let file = |p: &str| got.iter().find(|(n, _)| n == &format!("{root}/{p}")).map(|(_, d)| d.clone());
+            assert_eq!(file("docs/a.txt").unwrap(), b"alpha", "{name}");
+            assert_eq!(file("docs/sub/big.bin").unwrap(), big, "{name}");
+            assert_eq!(file("other/c.txt").unwrap(), b"gamma");
+            assert!(got.iter().any(|(n, _)| n == &format!("{root}/docs/sub/")), "{name}: folders are kept: {:?}", got.iter().map(|g| &g.0).collect::<Vec<_>>());
+            assert!(!out.path().join(format!("{name}.partial")).exists());
+        }
+        // Selection: only docs/, names relative to the selection's parent.
+        let sel = format!("{}/docs", src.path().display());
+        let target = out.path().join("docs.zip");
+        let r = run_restore(&repo, &RestoreOptions { paths: vec![sel], archive: Some(ArchiveTarget { path: target.clone(), format: Some(super::super::archive::ArchiveFormat::ZipStored) }), ..Default::default() }, &OpContext::new()).unwrap();
+        assert!(r.errors.is_empty());
+        let names: Vec<String> = archive_names_and_bytes(&target).into_iter().map(|g| g.0).collect();
+        assert!(names.contains(&"docs/a.txt".to_string()) && names.contains(&"docs/sub/big.bin".to_string()), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("other")));
+        #[cfg(unix)]
+        {
+            let mut z = zip::ZipArchive::new(std::fs::File::open(&target).unwrap()).unwrap();
+            let l = z.by_name("docs/link").unwrap();
+            assert!(l.is_symlink(), "links are Unix link entries");
+            let t = out.path().join("all.tar");
+            let mut a = tar::Archive::new(std::fs::File::open(&t).unwrap());
+            let link = a.entries().unwrap().map(|e| e.unwrap()).find(|e| e.path().unwrap().ends_with("docs/link")).unwrap();
+            assert_eq!(link.header().entry_type(), tar::EntryType::Symlink);
+            assert_eq!(link.link_name().unwrap().unwrap().to_string_lossy(), "a.txt");
+        }
+        // Dry run lists names and writes nothing; unknown extensions are refused.
+        let r = run_restore(&repo, &RestoreOptions { dry_run: true, archive: Some(ArchiveTarget { path: out.path().join("dry.tar"), format: None }), ..Default::default() }, &OpContext::new()).unwrap();
+        assert!(r.planned.contains(&format!("{root}/docs/a.txt")));
+        assert!(!out.path().join("dry.tar").exists());
+        assert!(run_restore(&repo, &RestoreOptions { archive: Some(ArchiveTarget { path: out.path().join("x.rar"), format: None }), ..Default::default() }, &OpContext::new()).is_err());
+    }
+
+    #[test]
+    fn mirror_restore_dry_run_then_delete() {
+        let (src, dst, db, _) = two_versions();
+        let be = LocalBackend::new(dst.path());
+        let repo = open(&be, &db);
+        let out = tempfile::tempdir().unwrap();
+        let root = out.path().join(src.path().file_name().unwrap());
+        // Restore the newest version, then add junk and an outsider.
+        run_restore(&repo, &RestoreOptions { target: Some(out.path().into()), ..Default::default() }, &OpContext::new()).unwrap();
+        write(&root, "docs/junk.tmp", b"j");
+        write(&root, "docs/cache/x.bin", b"x");
+        write(out.path(), "outside.txt", b"keep me");
+        // Mirror needs a target.
+        assert!(run_restore(&repo, &RestoreOptions { delete_extraneous: true, ..Default::default() }, &OpContext::new()).is_err());
+        let o = RestoreOptions { version: 1, target: Some(out.path().into()), delete_extraneous: true, ..Default::default() };
+        let dry = run_restore(&repo, &RestoreOptions { dry_run: true, ..o.clone() }, &OpContext::new()).unwrap();
+        let mut planned: Vec<String> = dry.planned_deletions.iter().map(|p| p.strip_prefix(&root.to_string_lossy().to_string()).unwrap_or(p).replace('\\', "/")).collect();
+        planned.sort();
+        assert_eq!(planned, vec!["/docs/cache/", "/docs/cache/x.bin", "/docs/junk.tmp", "/docs/new.txt"], "new.txt is not in version 1");
+        assert!(root.join("docs/junk.tmp").exists(), "a dry run deletes nothing");
+        let r = run_restore(&repo, &o, &OpContext::new()).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.files_deleted, r.folders_deleted), (3, 1));
+        assert_eq!(std::fs::read(root.join("docs/a.txt")).unwrap(), b"first");
+        assert_eq!(std::fs::read(root.join("docs/old.txt")).unwrap(), b"only in v1");
+        assert!(!root.join("docs/new.txt").exists() && !root.join("docs/cache").exists());
+        assert!(out.path().join("outside.txt").exists(), "never outside the restored folders");
+        // Restoring only one file never deletes its siblings.
+        write(&root, "docs/junk2.tmp", b"j");
+        let one = format!("{}/docs/a.txt", src.path().display());
+        let r = run_restore(&repo, &RestoreOptions { paths: vec![one], dry_run: true, ..o.clone() }, &OpContext::new()).unwrap();
+        assert!(r.planned_deletions.is_empty(), "{:?}", r.planned_deletions);
+    }
+
+    #[test]
+    fn owner_restore_uses_the_injected_chown() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(src.path(), "a.txt", b"a");
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        backup(src.path(), &be, &db);
+        let entries = db.files(db.fileset_by_version(0).unwrap().id).unwrap();
+        #[cfg(unix)]
+        assert!(entries.iter().all(|e| e.meta.as_ref().is_some_and(|m| m.uid.is_some() && m.gid.is_some())), "owners are recorded at backup time");
+        let repo = open(&be, &db);
+        let calls = Mutex::new(Vec::new());
+        let chown = |p: &Path, m: &meta::ExtMeta| -> std::io::Result<bool> {
+            calls.lock().unwrap().push((p.file_name().map(|n| n.to_string_lossy().into_owned()), m.uid));
+            Ok(true)
+        };
+        let out = tempfile::tempdir().unwrap();
+        let o = RestoreOptions { target: Some(out.path().into()), ..Default::default() };
+        let r = run_restore_with(&repo, &o, &OpContext::new(), OwnerRestore::new(OwnerPolicy::Auto, true, &chown).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            assert_eq!(r.owners_restored, 2, "the file and its folder");
+            assert!(calls.lock().unwrap().iter().any(|c| c.0.as_deref() == Some("a.txt")));
+        }
+        // Unprivileged: one summary warning, no chown.
+        let out2 = tempfile::tempdir().unwrap();
+        let no = |_: &Path, _: &meta::ExtMeta| -> std::io::Result<bool> { panic!("not privileged") };
+        let r = run_restore_with(&repo, &RestoreOptions { target: Some(out2.path().into()), ..Default::default() }, &OpContext::new(), OwnerRestore::new(OwnerPolicy::Auto, false, &no).unwrap()).unwrap();
+        #[cfg(unix)]
+        assert_eq!(r.warnings.iter().filter(|w| w.contains("owners were not restored")).count(), 1, "{:?}", r.warnings);
+        let _ = r;
+    }
+
+    #[test]
+    fn restore_error_policy_fail_fast_and_continue() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        for i in 0..6 {
+            write(src.path(), &format!("f{i}"), &vec![i as u8 + 1; 4000]);
+        }
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        backup(src.path(), &be, &db);
+        for f in std::fs::read_dir(dst.path()).unwrap().flatten() {
+            if f.file_name().to_string_lossy().contains(".dblock") {
+                std::fs::write(f.path(), b"garbage").unwrap();
+            }
+        }
+        let repo = open(&be, &db);
+        let out = tempfile::tempdir().unwrap();
+        // Default: every problem is an error, the restore runs to the end.
+        let r = run_restore(&repo, &RestoreOptions { target: Some(out.path().into()), legacy: true, ..Default::default() }, &OpContext::new()).unwrap();
+        assert!(r.errors.len() > 1 && r.stop_reason.is_none());
+        // Fail fast stops at the first one.
+        let p = RestoreErrorPolicy { fail_fast: true, ..Default::default() };
+        let r = run_restore(&repo, &RestoreOptions { target: Some(out.path().into()), legacy: true, error_policy: p, ..Default::default() }, &OpContext::new()).unwrap();
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert!(r.stop_reason.as_deref().unwrap_or_default().contains("fail-fast"));
+        // Missing data as warnings only.
+        let p = RestoreErrorPolicy { on_missing_data: super::super::errors::ErrorAction::Continue, ..Default::default() };
+        let r = run_restore(&repo, &RestoreOptions { target: Some(out.path().into()), error_policy: p, ..Default::default() }, &OpContext::new()).unwrap();
+        assert!(r.errors.is_empty() && !r.warnings.is_empty());
+        // Error budget.
+        let p = RestoreErrorPolicy { max_errors: Some(2), ..Default::default() };
+        let r = run_restore(&repo, &RestoreOptions { target: Some(out.path().into()), legacy: true, error_policy: p, ..Default::default() }, &OpContext::new()).unwrap();
+        assert!(r.stop_reason.as_deref().unwrap_or_default().contains("more than 2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sparse_restore_keeps_holes_and_content() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let mut data = b"head".to_vec();
+        data.extend(vec![0u8; 8 << 20]);
+        data.extend(b"tail");
+        write(src.path(), "disk.img", &data);
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        let o = BackupOptions { block_size: 64 * 1024, volume_size: 1 << 20, ..Default::default() };
+        run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        let repo = open(&be, &db);
+        let out = tempfile::tempdir().unwrap();
+        let r = run_restore(&repo, &RestoreOptions { target: Some(out.path().join("s")), ..Default::default() }, &OpContext::new()).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.sparse_files, 1);
+        let p = out.path().join("s").join(src.path().file_name().unwrap()).join("disk.img");
+        assert_eq!(std::fs::read(&p).unwrap(), data, "byte-identical");
+        if crate::backup::sparse::tests::supports_holes(out.path()) {
+            let alloc = crate::backup::sparse::allocated(&p).unwrap();
+            assert!(alloc < data.len() as u64 / 2, "allocated {alloc} of {}", data.len());
+        }
+        // Off writes every byte, same content.
+        let r = run_restore(&repo, &RestoreOptions { target: Some(out.path().join("d")), sparse: SparseMode::Off, ..Default::default() }, &OpContext::new()).unwrap();
+        assert_eq!(r.sparse_files, 0);
+        assert_eq!(std::fs::read(out.path().join("d").join(src.path().file_name().unwrap()).join("disk.img")).unwrap(), data);
+    }
+
+    #[test]
+    fn restore_report_reads_old_json() {
+        let r: RestoreReport = serde_json::from_str(r#"{"version":"v","files_restored":1,"folders_created":0,"files_skipped_matching":0,"files_skipped_conflict":0,"files_skipped_duplicate":0,"bytes_restored":0,"volumes_downloaded":0,"blocks_from_local":0,"planned":[],"warnings":[],"errors":[]}"#).unwrap();
+        assert_eq!(r.files_restored, 1);
+        let o: RestoreOptions = serde_json::from_str(r#"{"version":2}"#).unwrap();
+        assert_eq!((o.version, o.restore_owner, o.sparse, o.delete_extraneous), (2, OwnerPolicy::Auto, SparseMode::Auto, false));
     }
 }

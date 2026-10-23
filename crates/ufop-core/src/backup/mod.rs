@@ -21,7 +21,10 @@
 //! The local database (`db`) is a cache of that remote state; `maintenance`
 //! can recreate it from the remote files when it is lost.
 
+pub mod access;
+pub mod archive;
 pub mod backend;
+pub mod cache;
 pub mod chunker;
 pub mod copy;
 pub mod crypto;
@@ -39,15 +42,19 @@ pub mod lock;
 pub mod maintenance;
 pub mod meta;
 pub mod mirror;
+pub mod owner;
 pub mod modules;
 pub mod par2;
 pub mod photos;
 pub mod reader;
 pub mod recovery;
 pub mod restore;
+pub mod restore_mirror;
 pub mod retention;
+pub mod select;
 pub mod shared;
 pub mod snapshot;
+pub mod sparse;
 pub mod usn;
 pub mod versions;
 pub mod volume;

@@ -46,6 +46,8 @@ pub struct Repo<'a> {
     /// An upgraded repository still offers rollback to format 1 until the
     /// first format-2 write (see [`Repo::note_write`]).
     rollback_pending: AtomicBool,
+    /// Local cache of sealed volumes and this repository's namespace in it.
+    cache: Option<(Arc<super::cache::VolumeCache>, String)>,
 }
 
 impl<'a> Repo<'a> {
@@ -163,7 +165,28 @@ impl<'a> Repo<'a> {
             par2,
             case_insensitive: options.remote_case_insensitive,
             rollback_pending,
+            cache: None,
         })
+    }
+
+    /// Read and keep downloaded volumes in `cache` (see [`super::cache`]).
+    pub fn with_cache(mut self, cache: Option<Arc<super::cache::VolumeCache>>) -> Self {
+        self.set_cache(cache);
+        self
+    }
+
+    pub fn set_cache(&mut self, cache: Option<Arc<super::cache::VolumeCache>>) {
+        let ns = super::cache::namespace(&self.backend.inner().describe(), &self.prefix);
+        self.cache = cache.filter(|c| c.max_bytes() > 0).map(|c| (c, ns));
+    }
+
+    pub fn cache(&self) -> Option<&Arc<super::cache::VolumeCache>> {
+        self.cache.as_ref().map(|c| &c.0)
+    }
+
+    /// The cache with this repository's namespace in it.
+    pub(crate) fn cache_entry(&self) -> Option<(Arc<super::cache::VolumeCache>, String)> {
+        self.cache.clone()
     }
 
     /// Record that format-2 data is about to be written: an upgraded
@@ -240,10 +263,11 @@ impl<'a> Repo<'a> {
         self.get_volume_ex(name, true)
     }
 
-    /// Verification uses `allow_repair = false` so damage is reported.
+    /// Verification uses `allow_repair = false` so damage is reported; it
+    /// also never reads the cache, so it always checks the destination.
     pub(crate) fn get_volume_ex(&self, name: &str, allow_repair: bool) -> Result<Vec<u8>, AppError> {
         let (hash, rec) = self.volume_check_info(name)?;
-        self.fetcher().fetch(name, hash.as_deref(), &rec, allow_repair)
+        self.fetcher_with(allow_repair).fetch(name, hash.as_deref(), &rec, allow_repair)
     }
 
     /// Recorded hash and PAR2 file names of a volume (for [`VolumeFetcher`]).
@@ -253,9 +277,22 @@ impl<'a> Repo<'a> {
         Ok((hash, rec))
     }
 
-    /// Database-free volume downloader that worker threads can share.
+    /// Database-free volume downloader that worker threads can share. It
+    /// reads from and fills the volume cache when one is set.
     pub(crate) fn fetcher(&self) -> VolumeFetcher<'_> {
-        VolumeFetcher { backend: &self.backend, par2: self.par2.as_ref(), case_insensitive: self.case_insensitive }
+        self.fetcher_with(true)
+    }
+
+    /// `read_cache = false` always downloads (verification, full restores)
+    /// but still keeps what it downloaded in the cache.
+    pub(crate) fn fetcher_with(&self, read_cache: bool) -> VolumeFetcher<'_> {
+        VolumeFetcher {
+            backend: &self.backend,
+            par2: self.par2.as_ref(),
+            case_insensitive: self.case_insensitive,
+            cache: self.cache.as_ref().map(|(c, ns)| (c.as_ref(), ns.as_str())),
+            read_cache,
+        }
     }
 
     /// Write a sealed file list for `files` and record the version.
@@ -365,10 +402,35 @@ pub(crate) struct VolumeFetcher<'a> {
     backend: &'a dyn Backend,
     par2: Option<&'a Par2>,
     case_insensitive: bool,
+    cache: Option<(&'a super::cache::VolumeCache, &'a str)>,
+    read_cache: bool,
 }
 
-impl VolumeFetcher<'_> {
+impl<'a> VolumeFetcher<'a> {
+    /// A fetcher without PAR2 repair (readers that outlive a [`Repo`]).
+    pub(crate) fn new(backend: &'a dyn Backend, case_insensitive: bool, cache: Option<(&'a super::cache::VolumeCache, &'a str)>, read_cache: bool) -> Self {
+        Self { backend, par2: None, case_insensitive, cache, read_cache }
+    }
+
+    /// Download (or take from the cache) and check a volume. Only volumes
+    /// with a recorded hash go through the cache, so an entry is always checked.
     pub(crate) fn fetch(&self, name: &str, expected: Option<&str>, recovery: &[String], allow_repair: bool) -> Result<Vec<u8>, AppError> {
+        if let (Some((cache, ns)), Some(h)) = (self.cache, expected) {
+            if self.read_cache {
+                if let Some(d) = cache.get(ns, name, Some(h), None) {
+                    return Ok(d);
+                }
+            }
+            let d = self.download(name, Some(h), recovery, allow_repair)?;
+            if let Err(e) = cache.put(ns, name, &d) {
+                tracing::warn!("Volume cache: {}", e.user_message());
+            }
+            return Ok(d);
+        }
+        self.download(name, expected, recovery, allow_repair)
+    }
+
+    fn download(&self, name: &str, expected: Option<&str>, recovery: &[String], allow_repair: bool) -> Result<Vec<u8>, AppError> {
         let data = self.backend.get(name).or_else(|e| {
             // Case-changing backends: retry with the listed spelling.
             if self.case_insensitive {
@@ -696,8 +758,13 @@ impl<'f> Scanner<'f> {
 
     fn entry(&self, path: &Path, kind: EntryKind, md: &std::fs::Metadata) -> FileEntry {
         let o = self.opts;
-        let meta = (!o.skip_metadata && (o.backup_xattrs || o.backup_acls))
-            .then(|| meta::capture(&self.real(path), meta::MetaOptions { xattrs: o.backup_xattrs, acls: o.backup_acls }))
+        let meta = (!o.skip_metadata)
+            .then(|| {
+                let mut m = if o.backup_xattrs || o.backup_acls { meta::capture(&self.real(path), meta::MetaOptions { xattrs: o.backup_xattrs, acls: o.backup_acls }) } else { meta::ExtMeta::default() };
+                // Owner and group, so a privileged restore can give files back.
+                (m.uid, m.gid) = meta::owner_of(md);
+                m
+            })
             .filter(|m| !m.is_empty());
         FileEntry {
             path: path.to_string_lossy().into_owned(),
