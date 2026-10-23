@@ -122,6 +122,23 @@ async fn backup_and_restore_over_rest_and_rpc() {
     // RPC endpoint speaks the desktop command names and argument shapes.
     let found = s.post("/api/v1/rpc/backup_search", &tok, json!({"id": id, "pattern":"a.txt","version":null})).await.json::<Value>().await.unwrap();
     assert_eq!(found.as_array().unwrap().len(), 1);
+    // Repository lock status and guarded force-unlock.
+    let lock = s.get(&format!("/api/v1/jobs/{id}/lock"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(lock["locks"].as_array().unwrap().len(), 0);
+    assert_eq!(lock["exclusive"], false);
+    std::fs::write(s.dir.join("dst/ufop-lock.json"), serde_json::to_vec(&json!({"owner_id":"x","hostname":"nas","operation":"compact","kind":"exclusive","acquired_at":"2030-01-01T00:00:00Z","expires_at":"2030-01-01T00:30:00Z"})).unwrap()).unwrap();
+    let lock = s.get(&format!("/api/v1/jobs/{id}/lock"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!((lock["exclusive"].as_bool(), lock["locks"][0]["hostname"].as_str()), (Some(true), Some("nas")));
+    let refused = s.client.delete(format!("{}/api/v1/jobs/{id}/lock", s.base)).bearer_auth(&tok).send().await.unwrap();
+    assert!(!refused.status().is_success(), "needs confirm=true");
+    let broken = s.client.delete(format!("{}/api/v1/jobs/{id}/lock?confirm=true&owner_id=x", s.base)).bearer_auth(&tok).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(broken["removed"][0], "ufop-lock.json");
+    let rpc = s.post("/api/v1/rpc/backup_lock_status", &tok, json!({"jobId": id})).await.json::<Value>().await.unwrap();
+    assert_eq!(rpc["locks"].as_array().unwrap().len(), 0);
+    // Local database encryption on demand.
+    let enc = s.client.put(format!("{}/api/v1/jobs/{id}/database-encryption", s.base)).bearer_auth(&tok).json(&json!({"enabled": true})).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(enc["encrypted"], true);
+    assert_eq!(s.get(&format!("/api/v1/jobs/{id}/versions"), &tok).await.json::<Value>().await.unwrap().as_array().unwrap().len(), 1);
     let unknown = s.post("/api/v1/rpc/rm_rf", &tok, json!({})).await;
     assert_eq!(unknown.status(), 400);
     let runs = s.get(&format!("/api/v1/runs?job_id={id}"), &tok).await.json::<Value>().await.unwrap();

@@ -203,6 +203,10 @@ class UfopClient:
         """Differences between two versions (API tokens: `read` scope). `GET /api/v1/jobs/{id}/compare`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/compare", {"base": base, "compare": compare}, None)
 
+    def put_jobs_id_database_encryption(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Encrypt or decrypt the job's local database now (key kept in the credential store) (API tokens: `write` scope). `PUT /api/v1/jobs/{id}/database-encryption`"""
+        return self._call("PUT", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/database-encryption", None, body)
+
     def get_jobs_id_export(self, id_: str, include_passphrase: Optional[bool] = None, export_passphrase: Optional[str] = None) -> Dict[str, Any]:
         """Export the job configuration (API tokens: `read` scope). `GET /api/v1/jobs/{id}/export`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/export", {"include_passphrase": include_passphrase, "export_passphrase": export_passphrase}, None)
@@ -210,6 +214,14 @@ class UfopClient:
     def get_jobs_id_files(self, id_: str, version: Optional[int] = None, prefix: Optional[str] = None) -> Dict[str, Any]:
         """Files in a version (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/files", {"version": version, "prefix": prefix}, None)
+
+    def get_jobs_id_lock(self, id_: str) -> Dict[str, Any]:
+        """Repository lock status: who holds the destination (host, operation, since, expires) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/lock`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/lock", None, None)
+
+    def delete_jobs_id_lock(self, id_: str, confirm: bool, owner_id: Optional[str] = None) -> Dict[str, Any]:
+        """Break the repository lock (only when its holder is no longer running) (API tokens: `write` scope). `DELETE /api/v1/jobs/{id}/lock`"""
+        return self._call("DELETE", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/lock", {"confirm": confirm, "owner_id": owner_id}, None)
 
     def post_jobs_id_operations(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
         """Restore, verify, compact, repair, purge … (a tagged BackupOperation; not `backup`) (API tokens: `run` scope). `POST /api/v1/jobs/{id}/operations`"""

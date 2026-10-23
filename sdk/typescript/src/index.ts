@@ -246,6 +246,11 @@ export class UfopClient {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/compare`, query, undefined);
   }
 
+  /** Encrypt or decrypt the job's local database now (key kept in the credential store) (API tokens: `write` scope). `PUT /api/v1/jobs/{id}/database-encryption` */
+  putJobsIdDatabaseEncryption(id: string, body: { enabled: boolean }): Promise<{ encrypted?: boolean; files?: number; settings?: number }> {
+    return this.call("PUT", `/api/v1/jobs/${encodeURIComponent(id)}/database-encryption`, undefined, body);
+  }
+
   /** Export the job configuration (API tokens: `read` scope). `GET /api/v1/jobs/{id}/export` */
   getJobsIdExport(id: string, query: { include_passphrase?: boolean; export_passphrase?: string } = {}): Promise<Record<string, unknown>> {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/export`, query, undefined);
@@ -254,6 +259,16 @@ export class UfopClient {
   /** Files in a version (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files` */
   getJobsIdFiles(id: string, query: { version?: number; prefix?: string } = {}): Promise<Record<string, unknown>> {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/files`, query, undefined);
+  }
+
+  /** Repository lock status: who holds the destination (host, operation, since, expires) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/lock` */
+  getJobsIdLock(id: string): Promise<{ checked_at?: string; exclusive?: boolean; locks?: Array<{ acquired_at?: string; app?: string; damaged?: boolean; expires_at?: string; file?: string; hostname?: string; kind?: "exclusive" | "shared"; operation?: string; owner_id?: string; pid?: number; stale?: boolean; username?: string; version?: string }>; readers?: number }> {
+    return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/lock`, undefined, undefined);
+  }
+
+  /** Break the repository lock (only when its holder is no longer running) (API tokens: `write` scope). `DELETE /api/v1/jobs/{id}/lock` */
+  deleteJobsIdLock(id: string, query: { confirm: boolean; owner_id?: string }): Promise<{ holders?: string[]; removed?: string[] }> {
+    return this.call("DELETE", `/api/v1/jobs/${encodeURIComponent(id)}/lock`, query, undefined);
   }
 
   /** Restore, verify, compact, repair, purge … (a tagged BackupOperation; not `backup`) (API tokens: `run` scope). `POST /api/v1/jobs/{id}/operations` */

@@ -190,6 +190,13 @@ pub fn is_lock_file(prefix: &str, name: &str) -> bool {
     name == lock_name(prefix) || name.strip_prefix(&format!("{prefix}-lock-r-")).is_some_and(|r| r.ends_with(".json"))
 }
 
+/// Whether `name` looks like a lock file of any repository (wrappers that
+/// do not know the prefix, such as soft deletion, use this).
+pub fn looks_like_lock_file(name: &str) -> bool {
+    let name = super::layout::logical(name);
+    name.ends_with("-lock.json") || (name.contains("-lock-r-") && name.ends_with(".json"))
+}
+
 fn now() -> DateTime<Utc> {
     Utc::now()
 }
@@ -390,8 +397,21 @@ impl<'a> RepoLock<'a> {
             }
             Ok(())
         };
-        // 1. Who holds it now?
-        let current = status(backend, prefix)?;
+        // 1. Who holds it now? A destination folder that does not exist yet
+        // holds no repository: a writer creates it, a reader has nothing to
+        // lock (the operation itself reports the missing folder).
+        let mut no_folder = false;
+        let current = match status(backend, prefix) {
+            Ok(s) => s,
+            Err(_) if kind == LockKind::Exclusive => {
+                backend.create_folder()?;
+                status(backend, prefix)?
+            }
+            Err(_) => {
+                no_folder = true;
+                LockStatus::default()
+            }
+        };
         for l in &current.locks {
             let relevant = kind == LockKind::Exclusive || l.info.kind == LockKind::Exclusive;
             if !relevant {
@@ -415,7 +435,7 @@ impl<'a> RepoLock<'a> {
             acquired_at: t,
             expires_at: t + to_chrono(opts.ttl),
         };
-        if backend.is_read_only() {
+        if backend.is_read_only() || no_folder {
             // Best effort: nothing can be written on a read-only connection.
             return Ok(Self { backend, file, info: Mutex::new(info), written: false, ttl: opts.ttl, released: AtomicBool::new(false), lost: AtomicBool::new(false), warnings });
         }
@@ -606,6 +626,7 @@ mod tests {
         let b = LocalBackend::new(d.path());
         let l = RepoLock::acquire(&b, "ufop", LockKind::Exclusive, "backup", &fast()).unwrap();
         assert!(d.path().join("ufop-lock.json").is_file());
+        assert!(crate::backup::volume::classify("ufop", "ufop-lock.json").is_none() && looks_like_lock_file("ufop-lock.json"));
         let info: LockInfo = serde_json::from_slice(&std::fs::read(d.path().join("ufop-lock.json")).unwrap()).unwrap();
         assert_eq!((info.operation.as_str(), info.kind, info.pid), ("backup", LockKind::Exclusive, std::process::id()));
         assert!(info.expires_at > info.acquired_at + chrono::Duration::minutes(29));
@@ -622,6 +643,17 @@ mod tests {
         drop(l);
         assert!(!d.path().join("ufop-lock.json").exists());
         assert!(status(&b, "ufop").unwrap().locks.is_empty());
+    }
+
+    #[test]
+    fn missing_destination_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let b = LocalBackend::new(d.path().join("new"));
+        let r = RepoLock::acquire(&b, "ufop", LockKind::Shared, "restore", &fast()).unwrap();
+        assert!(!r.is_written() && !d.path().join("new").exists(), "a reader creates nothing");
+        drop(r);
+        let w = RepoLock::acquire(&b, "ufop", LockKind::Exclusive, "backup", &fast()).unwrap();
+        assert!(w.is_written() && d.path().join("new/ufop-lock.json").is_file());
     }
 
     #[test]

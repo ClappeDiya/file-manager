@@ -225,10 +225,10 @@ async fn adopt_repository_continues_history() {
     let t2 = tempfile::tempdir().unwrap();
     let m2 = manager(t2.path()).await;
     let dest = BackupDestination::Local { path: dst.to_string_lossy().into(), alternate_paths: vec![], marker_file: None };
-    assert!(m2.adopt_repository(dest.clone(), Some("wrong".into()), "ufop".into(), None, vec![], vec![]).await.is_err());
+    assert!(m2.adopt_repository(dest.clone(), Some("wrong".into()), "ufop".into(), None, vec![], vec![], false).await.is_err());
     assert!(m2.list_jobs().await.is_empty(), "failed adoption leaves no job behind");
     let adopted = m2
-        .adopt_repository(dest, Some("pw".into()), "ufop".into(), Some("Laptop".into()), vec![], vec![(src.to_string_lossy().into(), moved.to_string_lossy().into())])
+        .adopt_repository(dest, Some("pw".into()), "ufop".into(), Some("Laptop".into()), vec![], vec![(src.to_string_lossy().into(), moved.to_string_lossy().into())], false)
         .await
         .unwrap();
     assert_eq!(adopted.name, "Laptop");
@@ -1083,4 +1083,135 @@ async fn format_upgrade_rollback_reshard_and_passphrase_change() {
     assert_eq!(op.name(), "reshard");
     let op: BackupOperation = serde_json::from_value(serde_json::json!({"type": "upgrade_format", "rollback": true})).unwrap();
     assert_eq!(op.name(), "rollback_format");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repository_lock_blocks_other_writers_and_can_be_broken() {
+    use ufop_core::backup::lock::{LockKind, LockOptions, RepoLock};
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    let m = manager(t.path()).await;
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    assert!(m.lock_status(&j.id).await.unwrap().locks.is_empty(), "released after the run");
+
+    // Another computer is compacting the same repository.
+    let other = LocalBackend::new(&dst);
+    let held = RepoLock::acquire(&other, "ufop", LockKind::Exclusive, "compact", &LockOptions::default()).unwrap();
+    let st = m.lock_status(&j.id).await.unwrap();
+    assert!(st.exclusive && st.summary().unwrap().contains("(compact)"));
+    let e = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap_err();
+    assert!(e.user_message().contains("Repository in use by vm (compact)") || e.user_message().contains("Repository in use by"), "{e}");
+    // Readers wait for writers too.
+    let restore = RestoreOptions { target: Some(t.path().join("out")), ..Default::default() };
+    assert!(m.execute(&j.id, BackupOperation::Restore { options: restore.clone(), overrides: RestoreOverrides::default() }).await.is_err());
+    // Format information needs no lock.
+    assert_eq!(m.execute(&j.id, BackupOperation::FormatInfo).await.unwrap().status, "success");
+
+    // Breaking it needs confirmation and the lock that was shown.
+    assert!(m.break_lock(&j.id, false, None).await.is_err());
+    assert!(m.break_lock(&j.id, true, Some("not-the-owner".into())).await.is_err());
+    let b = m.break_lock(&j.id, true, Some(held.info().owner_id)).await.unwrap();
+    assert_eq!(b.removed, ["ufop-lock.json"]);
+    drop(held);
+    assert_eq!(m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap().status, "success");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_jobs_restore_and_browse_but_never_write() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    let m = manager(t.path()).await;
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let listing = |d: &Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    };
+    let before = listing(&dst);
+
+    // Adopted on another computer as a read-only connection.
+    let t2 = tempfile::tempdir().unwrap();
+    let m2 = manager(t2.path()).await;
+    let ro = m2.adopt_repository(j.destination.clone(), Some("pw".into()), "ufop".into(), Some("Viewer".into()), vec![src.to_string_lossy().into()], vec![], true).await.unwrap();
+    assert!(ro.read_only);
+    assert_eq!(m2.list_versions(&ro.id).await.unwrap().len(), 1);
+    for op in [
+        BackupOperation::Backup { dry_run: false },
+        BackupOperation::Compact,
+        BackupOperation::Repair,
+        BackupOperation::DeleteVersions { versions: vec![0], allow_full_removal: true },
+        BackupOperation::Purge { paths: vec!["*".into()], versions: None, dry_run: false },
+        BackupOperation::UpgradeFormat { rollback: false },
+        BackupOperation::Reshard { layout: ufop_core::backup::layout::RepoLayout::Sharded { prefix_len: 1 }, dry_run: false },
+    ] {
+        let name = op.name();
+        let e = m2.execute(&ro.id, op).await.unwrap_err();
+        assert!(e.user_message().contains("read-only"), "{name}: {e}");
+    }
+    assert!(m2.change_passphrase(&ro.id, Some("pw".into()), "new".into(), None).await.unwrap_err().user_message().contains("read-only"));
+    assert!(m2.break_lock(&ro.id, true, None).await.is_err());
+    assert!(m2.delete_job(&ro.id, false, true).await.is_err());
+    // Reading works, and leaves no trace at the destination.
+    let out = t.path().join("out");
+    let r = m2.execute(&ro.id, BackupOperation::Restore { options: RestoreOptions { target: Some(out.clone()), ..Default::default() }, overrides: RestoreOverrides::default() }).await.unwrap();
+    assert_eq!(r.status, "success", "{:?}", r.summary);
+    assert_eq!(std::fs::read(out.join("src/a.txt")).unwrap(), b"alpha");
+    assert_eq!(m2.execute(&ro.id, BackupOperation::Verify { full: true }).await.unwrap().status, "success");
+    assert_eq!(m2.execute(&ro.id, BackupOperation::Backup { dry_run: true }).await.unwrap().status, "success", "a dry run writes nothing");
+    assert!(m2.lock_status(&ro.id).await.unwrap().locks.is_empty());
+    assert_eq!(listing(&dst), before, "nothing written, not even a lock");
+    // Never scheduled.
+    let mut sched = m2.get_job(&ro.id).await.unwrap();
+    sched.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, weekdays: vec![], skip_on_battery: false, calendar_ids: vec![] };
+    m2.save_job(sched, None).await.unwrap();
+    assert!(m2.due_jobs(Utc::now() + chrono::Duration::hours(3)).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_database_encryption_default_migration_and_lost_key() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("zzPrivateName.txt"), b"alpha").unwrap();
+    let m = manager(t.path()).await;
+    // New encrypted job: encrypted database by default.
+    let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
+    assert_eq!(j.encrypt_local_database, Some(true));
+    assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    let path = m.job_db_path(&j.id);
+    assert!(BackupDb::inspect(&path).unwrap().encrypted);
+    assert!(!String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains("zzPrivateName"));
+    assert!(m.search(&j.id, "zzPrivate".into(), None).await.unwrap().len() == 1);
+
+    // One-click switch off and on again keeps the history.
+    assert!(!m.set_database_encryption(&j.id, false).await.unwrap().encrypted);
+    assert!(!BackupDb::inspect(&path).unwrap().encrypted);
+    assert_eq!(m.list_versions(&j.id).await.unwrap().len(), 1);
+    assert!(m.set_database_encryption(&j.id, true).await.unwrap().encrypted);
+    assert!(BackupDb::inspect(&path).unwrap().encrypted);
+
+    // The key disappears from the keychain: the database is rebuilt from the destination.
+    let key_name = format!("{DB_KEY_PREFIX}{}", j.id);
+    m.inner.creds.delete(&key_name).await.unwrap();
+    assert_eq!(m.list_versions(&j.id).await.unwrap().len(), 1, "rebuilt automatically");
+    assert!(BackupDb::inspect(&path).unwrap().encrypted, "with a new key");
+    let r = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert_ne!(r.status, "error", "{:?}", r.summary);
+
+    // Jobs from before the option keep a plain database until asked.
+    let mut old = job(&src, &t.path().join("dst2"));
+    old.encrypted = false;
+    let old = m.save_job(old, None).await.unwrap();
+    assert_eq!(old.encrypt_local_database, Some(false));
+    let mut legacy = m.get_job(&old.id).await.unwrap();
+    legacy.encrypt_local_database = None;
+    m.inner.jobs.write().await.insert(legacy.id.clone(), legacy.clone());
+    assert_eq!(m.execute(&old.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
+    assert!(!BackupDb::inspect(&m.job_db_path(&old.id)).unwrap().encrypted);
 }

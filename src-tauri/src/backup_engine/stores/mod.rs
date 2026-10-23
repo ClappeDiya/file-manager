@@ -60,6 +60,12 @@ pub trait ObjectStore: Send + Sync {
     fn quota(&self) -> BoxFut<'_, Option<Quota>> {
         Box::pin(async { Ok(None) })
     }
+    /// The provider's last-modified time of an object, when it reports one
+    /// (used to compare clocks before writing).
+    fn modified<'a>(&'a self, name: &'a str) -> BoxFut<'a, Option<chrono::DateTime<chrono::Utc>>> {
+        let _ = name;
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Synchronous engine backend over an [`ObjectStore`].
@@ -117,6 +123,9 @@ impl Backend for StoreBackend {
     }
     fn quota(&self) -> Option<Quota> {
         self.wait("Quota", self.store.quota()).ok().flatten()
+    }
+    fn modified(&self, name: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        self.wait("Reading the file time", self.store.modified(name))
     }
 }
 

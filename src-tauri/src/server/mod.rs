@@ -528,6 +528,33 @@ async fn change_job_passphrase(State(st): State<ServerState>, AxPath(id): AxPath
     ok(st.mgr.change_passphrase(&id, b.current, b.new_passphrase, kdf).await?)
 }
 
+/// Who holds the job's repository lock(s).
+async fn job_lock_status(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.lock_status(&id).await?)
+}
+
+#[derive(Deserialize)]
+struct BreakLockQuery {
+    #[serde(default)]
+    confirm: bool,
+    owner_id: Option<String>,
+}
+
+/// Force-unlock (`?confirm=true`, optionally `&owner_id=` of the lock shown).
+async fn break_job_lock(State(st): State<ServerState>, AxPath(id): AxPath<String>, Query(q): Query<BreakLockQuery>) -> ApiResult {
+    ok(st.mgr.break_lock(&id, q.confirm, q.owner_id).await?)
+}
+
+#[derive(Deserialize)]
+struct DbEncryptionBody {
+    enabled: bool,
+}
+
+/// Encrypt (or decrypt) the job's local database now.
+async fn set_job_database_encryption(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(b): Json<DbEncryptionBody>) -> ApiResult {
+    ok(st.mgr.set_database_encryption(&id, b.enabled).await?)
+}
+
 async fn versions(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
     ok(st.mgr.list_versions(&id).await?)
 }
@@ -753,6 +780,8 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/jobs/{id}/run", post(run_job))
         .route("/api/v1/jobs/{id}/operations", post(job_operation))
         .route("/api/v1/jobs/{id}/passphrase", axum::routing::put(change_job_passphrase))
+        .route("/api/v1/jobs/{id}/lock", get(job_lock_status).delete(break_job_lock))
+        .route("/api/v1/jobs/{id}/database-encryption", axum::routing::put(set_job_database_encryption))
         .route("/api/v1/jobs/{id}/versions", get(versions))
         .route("/api/v1/jobs/{id}/files", get(files))
         .route("/api/v1/jobs/{id}/search", get(search))

@@ -226,6 +226,9 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
         "backup_set_destination_secret" => ok(mgr.set_destination_secret(&arg::<String>(a, "credentialId")?, &arg::<String>(a, "secret")?).await?),
         "backup_has_destination_secret" => ok(mgr.has_destination_secret(&arg::<String>(a, "credentialId")?).await?),
         "backup_cloud_providers" => ok(super::stores::PROVIDERS.to_vec()),
+        "backup_lock_status" => ok(mgr.lock_status(&arg::<String>(a, "jobId")?).await?),
+        "backup_break_lock" => ok(mgr.break_lock(&arg::<String>(a, "jobId")?, opt(a, "confirm")?.unwrap_or(false), opt(a, "ownerId")?).await?),
+        "backup_set_database_encryption" => ok(mgr.set_database_encryption(&arg::<String>(a, "jobId")?, arg(a, "enabled")?).await?),
         "backup_adopt_repository" => ok(mgr
             .adopt_repository(
                 arg(a, "destination")?,
@@ -234,6 +237,7 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
                 opt(a, "name")?,
                 opt(a, "sources")?.unwrap_or_default(),
                 opt(a, "sourceMap")?.unwrap_or_default(),
+                opt(a, "readOnly")?.unwrap_or(false),
             )
             .await?),
         other => Err(AppError::validation(format!("Unknown command '{other}'"))),
@@ -250,5 +254,5 @@ pub const COMMANDS: &[&str] = &[
     "backup_generate_passphrase", "backup_capabilities", "backup_preview_sources", "backup_get_global_defaults",
     "backup_set_global_defaults", "backup_effective_job", "backup_list_destinations", "backup_save_destination",
     "backup_delete_destination", "backup_adopt_repository", "backup_database_inventory", "backup_cleanup_databases", "backup_bug_report", "backup_diagnose", "backup_test_notification", "backup_get_secret_settings", "backup_set_secret_settings", "backup_crypt_file", "backup_decrypt_volume", "backup_test_secret_providers", "backup_job_placeholders", "backup_recovery_download", "backup_recovery_index", "backup_recovery_list", "backup_recovery_restore", "backup_recovery_convert", "backup_remote_list", "backup_remote_get", "backup_remote_put", "backup_remote_delete", "backup_start_operation", "backup_set_destination_secret", "backup_has_destination_secret", "backup_cloud_providers",
-    "backup_photos_libraries", "backup_photos_library_info",
+    "backup_photos_libraries", "backup_photos_library_info", "backup_lock_status", "backup_break_lock", "backup_set_database_encryption",
 ];

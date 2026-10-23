@@ -64,6 +64,11 @@ async fn s3_against_emulator() {
     cfg.storage_class = "STANDARD_IA".into();
     let store = s3::S3Store::new(cfg.clone(), "secret".into()).unwrap();
     exercise(&store, 12 << 20).await; // > part size: multipart path
+    // The object's server time (clock-skew check) is close to ours.
+    store.put("ufop-lock.json", b"{}".to_vec()).await.unwrap();
+    let t = store.modified("ufop-lock.json").await.unwrap().expect("Last-Modified");
+    assert!((t - chrono::Utc::now()).num_seconds().abs() < 600);
+    store.delete("ufop-lock.json").await.unwrap();
     // Engine end to end through the sync adapter.
     let backend = Arc::new(StoreBackend::new(Box::new(s3::S3Store::new(cfg, "secret".into()).unwrap()), Some(std::time::Duration::from_secs(60))));
     let b2 = backend.clone();

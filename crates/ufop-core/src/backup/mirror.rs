@@ -43,6 +43,9 @@ pub struct MirrorReport {
     pub verified: usize,
     pub dry_run: bool,
     pub errors: Vec<String>,
+    /// Lock takeovers and clock-skew notices (see [`mirror_locked`]).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Whether `name` belongs to the repository with `prefix`. Lock files
@@ -155,8 +158,8 @@ pub fn mirror(src: &dyn Backend, dst: &dyn Backend, prefix: &str, opts: &MirrorO
 }
 
 /// [`mirror`] under repository locks: shared on the source, exclusive on
-/// the target (shared for a dry run). Returns the report with the locks'
-/// warnings (stale takeover, clock skew) added to its errors-free warnings.
+/// the target (shared for a dry run). The locks' notices (stale takeover,
+/// clock skew) are added to the report's warnings.
 pub fn mirror_locked(
     src: &dyn Backend,
     dst: &dyn Backend,
@@ -164,18 +167,19 @@ pub fn mirror_locked(
     opts: &MirrorOptions,
     lock: &super::lock::LockOptions,
     ctx: &OpContext,
-) -> Result<(MirrorReport, Vec<String>), AppError> {
+) -> Result<MirrorReport, AppError> {
     use super::lock::{with_lock, LockKind};
     let target_kind = if opts.dry_run { LockKind::Shared } else { LockKind::Exclusive };
-    let ((r, mut w2), mut w1) = with_lock(src, prefix, LockKind::Shared, "mirror", lock, ctx, || {
+    let ((mut r, w2), w1) = with_lock(src, prefix, LockKind::Shared, "mirror", lock, ctx, || {
         if !opts.dry_run {
             // The target folder must exist before a lock can be written in it.
             dst.create_folder()?;
         }
         with_lock(dst, prefix, target_kind, "mirror", lock, ctx, || mirror(src, dst, prefix, opts, ctx))
     })?;
-    w1.append(&mut w2);
-    Ok((r, w1))
+    r.warnings.extend(w1);
+    r.warnings.extend(w2);
+    Ok(r)
 }
 
 #[cfg(test)]
@@ -230,8 +234,8 @@ mod tests {
         let lo = LockOptions { settle: std::time::Duration::from_millis(10), ..Default::default() };
         // A reader on the source does not stop a mirror; its lock file is not copied.
         let reader = RepoLock::acquire(&ba, "ufop", LockKind::Shared, "restore", &lo).unwrap();
-        let (r, w) = mirror_locked(&ba, &bb, "ufop", &MirrorOptions::default(), &lo, &OpContext::new()).unwrap();
-        assert!(r.errors.is_empty() && w.is_empty());
+        let r = mirror_locked(&ba, &bb, "ufop", &MirrorOptions::default(), &lo, &OpContext::new()).unwrap();
+        assert!(r.errors.is_empty() && r.warnings.is_empty());
         assert!(!std::fs::read_dir(b.path()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains("-lock")), "no lock files copied, mirror locks released");
         drop(reader);
         // A target lock is neither deleted as extraneous nor ignored.

@@ -521,6 +521,10 @@ impl<B: Backend> Backend for SoftDeleteBackend<B> {
         self.inner.get(n)
     }
     fn delete(&self, n: &str) -> Result<(), AppError> {
+        // Released repository locks are removed, not kept as deleted files.
+        if super::lock::looks_like_lock_file(n) {
+            return self.inner.delete(n);
+        }
         let target = match n.rsplit_once('/') {
             Some((dir, file)) => format!("{dir}/{}{file}", self.prefix),
             None => format!("{}{}", self.prefix, n),
@@ -720,6 +724,9 @@ mod tests {
         b.delete("v1").unwrap();
         assert!(b.list().unwrap().is_empty());
         assert!(d.path().join("deleted-v1").exists());
+        b.put("ufop-lock.json", b"{}").unwrap();
+        b.delete("ufop-lock.json").unwrap();
+        assert!(!d.path().join("deleted-ufop-lock.json").exists() && !d.path().join("ufop-lock.json").exists());
     }
 
     #[test]

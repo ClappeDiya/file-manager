@@ -10,13 +10,20 @@ use crate::OutputFormat;
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 use ufop_core::backup::crypto::KdfParams;
-use ufop_core::backup::db::BackupDb;
+use ufop_core::backup::db::{BackupDb, DbKey};
+use ufop_core::backup::lock::{self as repo_lock, LockKind, LockOptions};
 use ufop_core::backup::engine::Repo;
 use ufop_core::backup::restore::ConflictPolicy;
 use ufop_core::backup::{
-    backend, maintenance, run_backup, run_restore, BackupOptions, FilterAction, FilterKind, FilterRule, LocalBackend, OpContext,
-    RestoreOptions, RetentionPolicy, SourceFilter,
+    maintenance, run_backup, run_restore, Backend, BackupOptions, FilterAction, FilterKind, FilterRule, LocalBackend, OpContext,
+    ReadOnlyBackend, RestoreOptions, RetentionPolicy, SourceFilter,
 };
+
+/// Program name recorded in repository locks.
+const LOCK_APP: &str = "ufop-cli";
+/// Keychain service for local-database keys (shared with the desktop app).
+const KEYRING_SERVICE: &str = "unified-file-ops";
+use ufop_core::backup::backend;
 
 #[derive(Args, Debug, Clone)]
 pub struct RepoArgs {
@@ -44,6 +51,25 @@ pub struct RepoArgs {
     /// Remote file-name prefix
     #[arg(long, default_value = "ufop")]
     pub prefix: String,
+    /// Read-only connection: refuse every write to the destination
+    /// (restore, list, verify and recovery downloads still work; no lock
+    /// file is written)
+    #[arg(long)]
+    pub read_only: bool,
+    /// Key for an encrypted local database: keyring (OS keychain, created on
+    /// first use), env:VAR (64 hex digits) or none (plain database; an
+    /// encrypted one is rebuilt from the destination)
+    #[arg(long, default_value = "none")]
+    pub db_key_source: String,
+    /// Repository lock lease in seconds (renewed every third of it)
+    #[arg(long, default_value_t = ufop_core::backup::lock::DEFAULT_LOCK_TTL_SECS)]
+    pub lock_ttl_secs: u64,
+    /// Warn when the destination clock differs by this many seconds (0 = never)
+    #[arg(long, default_value_t = ufop_core::backup::lock::DEFAULT_SKEW_WARN_SECS)]
+    pub clock_skew_warn_secs: u64,
+    /// Refuse to run when the destination clock differs by this many seconds (0 = never)
+    #[arg(long, default_value_t = ufop_core::backup::lock::DEFAULT_SKEW_ABORT_SECS)]
+    pub clock_skew_abort_secs: u64,
 }
 
 /// Report a configuration problem and exit (exit code 2, like other usage errors).
@@ -75,7 +101,90 @@ impl RepoArgs {
     }
 
     fn options(&self) -> BackupOptions {
-        BackupOptions { prefix: self.prefix.clone(), ..Default::default() }
+        BackupOptions {
+            prefix: self.prefix.clone(),
+            lock_ttl_secs: self.lock_ttl_secs,
+            clock_skew_warn_secs: self.clock_skew_warn_secs,
+            clock_skew_abort_secs: self.clock_skew_abort_secs,
+            ..Default::default()
+        }
+    }
+
+    /// The destination, read-only when `--read-only` is given.
+    fn backend(&self) -> Box<dyn Backend> {
+        let b = LocalBackend::new(&self.dest);
+        if self.read_only {
+            Box::new(ReadOnlyBackend::new(b))
+        } else {
+            Box::new(b)
+        }
+    }
+
+    fn lock_options(&self) -> LockOptions {
+        LockOptions::from_backup_options(&self.options(), LOCK_APP)
+    }
+
+    /// Database key and whether the database should be encrypted.
+    fn db_key(&self) -> Result<(Option<DbKey>, bool), ufop_core::error::AppError> {
+        db_key_from_source(&self.db_key_source, &self.db_path())
+    }
+
+    /// Open the local database as `--db-key-source` says; an encrypted
+    /// database whose key is missing is set aside and rebuilt from `be`.
+    fn open_db(&self, be: &dyn Backend, ctx: &OpContext) -> Result<BackupDb, ufop_core::error::AppError> {
+        let (key, encrypt) = self.db_key()?;
+        let o = maintenance::JobDbOptions { key: key.as_ref(), encrypt };
+        let (db, notices) = maintenance::open_job_db(&self.db_path(), &o, Some(be), self.passphrase().as_deref(), &self.prefix, ctx)?;
+        for n in notices {
+            tracing::warn!(target: "ufop::backup", "{n}");
+            eprintln!("note: {n}");
+        }
+        Ok(db)
+    }
+
+    /// Run `f` under the repository lock `kind` (none: no lock).
+    fn locked<T>(&self, be: &dyn Backend, kind: Option<LockKind>, op: &str, ctx: &OpContext, f: impl FnOnce() -> Result<T, ufop_core::error::AppError>) -> Result<T, ufop_core::error::AppError> {
+        let Some(kind) = kind else { return f() };
+        let (v, warnings) = repo_lock::with_lock(be, &self.prefix, kind, op, &self.lock_options(), ctx, f)?;
+        for w in warnings {
+            tracing::warn!(target: "ufop::backup", "{op}: {w}");
+            eprintln!("warning: {w}");
+        }
+        Ok(v)
+    }
+}
+
+/// Resolve `--db-key-source`: `keyring`, `env:VAR` or `none`.
+pub fn db_key_from_source(source: &str, db_path: &std::path::Path) -> Result<(Option<DbKey>, bool), ufop_core::error::AppError> {
+    use ufop_core::error::AppError;
+    let src = source.trim();
+    if src.eq_ignore_ascii_case("none") || src.is_empty() {
+        return Ok((None, false));
+    }
+    if let Some(var) = src.strip_prefix("env:") {
+        let v = std::env::var(var).map_err(|_| AppError::validation(format!("--db-key-source {src}: {var} is not set (64 hex digits)")))?;
+        return Ok((Some(DbKey::from_hex(&v)?), true));
+    }
+    if src.eq_ignore_ascii_case("keyring") {
+        let account = format!("backup-dbkey-cli:{}", ufop_core::backup::hash_file_name_key(&db_path.to_string_lossy()));
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &account).map_err(|e| keychain_error(&e.to_string()))?;
+        return match entry.get_password() {
+            Ok(h) => Ok((Some(DbKey::from_hex(&h)?), true)),
+            Err(keyring::Error::NoEntry) => {
+                let k = DbKey::generate();
+                entry.set_password(&k.to_hex()).map_err(|e| keychain_error(&e.to_string()))?;
+                Ok((Some(k), true))
+            }
+            Err(e) => Err(keychain_error(&e.to_string())),
+        };
+    }
+    Err(AppError::validation(format!("Invalid --db-key-source '{src}' (keyring, env:VAR, none)")))
+}
+
+fn keychain_error(e: &str) -> ufop_core::error::AppError {
+    ufop_core::error::AppError::Configuration {
+        message: format!("The OS keychain is not available: {e}"),
+        advice: "Use --db-key-source env:VAR with a 64-hex-digit key, or none.".into(),
     }
 }
 
@@ -209,6 +318,12 @@ pub struct EngineArgs {
     /// Hex digits per shard folder name with --layout sharded (1–4)
     #[arg(long, default_value_t = 2)]
     pub shard_prefix_len: u8,
+    /// Upload a checkpoint (partial version) at most every N seconds (0 = off)
+    #[arg(long, default_value_t = 900)]
+    pub checkpoint_interval_secs: u64,
+    /// Also checkpoint after this many uploaded bytes (0 = off)
+    #[arg(long, default_value_t = 0)]
+    pub checkpoint_interval_bytes: u64,
 }
 
 /// Parse `--layout` / `--shard-prefix-len`.
@@ -289,6 +404,8 @@ impl EngineArgs {
             cipher: ufop_core::backup::crypto::CipherKind::parse(&self.cipher)
                 .ok_or_else(|| ufop_core::error::AppError::validation(format!("Invalid value '{}' for --cipher (aes256-gcm, chacha20-poly1305)", self.cipher)))?,
             layout: parse_layout(&self.layout, self.shard_prefix_len)?,
+            checkpoint_interval_secs: self.checkpoint_interval_secs,
+            checkpoint_interval_bytes: self.checkpoint_interval_bytes,
             photos: ufop_core::backup::photos::PhotosOptions {
                 include_hidden: self.photos_include_hidden,
                 include_trashed: self.photos_include_trashed,
@@ -324,6 +441,11 @@ impl PassArgs {
             secret_providers: self.secret_providers.clone(),
             no_encryption: false,
             prefix: String::new(),
+            read_only: true,
+            db_key_source: "none".into(),
+            lock_ttl_secs: 0,
+            clock_skew_warn_secs: 0,
+            clock_skew_abort_secs: 0,
         }
         .passphrase()
     }
@@ -412,6 +534,27 @@ pub enum RecoveryCommands {
     },
 }
 
+/// Repository lock tools.
+#[derive(Subcommand, Debug)]
+pub enum LockCommands {
+    /// Who holds the repository lock(s): host, operation, since, expiry
+    Status {
+        #[command(flatten)]
+        repo: RepoArgs,
+    },
+    /// Remove the lock(s), only when the program named in them is no longer running
+    Break {
+        #[command(flatten)]
+        repo: RepoArgs,
+        /// Confirm that the holder is no longer running
+        #[arg(long)]
+        yes: bool,
+        /// Only remove the lock with this owner id (from `lock status`)
+        #[arg(long)]
+        owner_id: Option<String>,
+    },
+}
+
 /// Local job-database tools.
 #[derive(Subcommand, Debug)]
 pub enum DbCommands {
@@ -428,7 +571,23 @@ pub enum DbCommands {
     /// Integrity and reference checks (exit 2 when problems are found)
     Check { dbpath: PathBuf },
     /// Copy for a bug report: paths hashed, job-config snapshots removed
-    Sanitize { dbpath: PathBuf, out: PathBuf },
+    Sanitize {
+        dbpath: PathBuf,
+        out: PathBuf,
+        /// Key of an encrypted database: keyring, env:VAR or none
+        #[arg(long, default_value = "none")]
+        db_key_source: String,
+    },
+    /// Encrypt a plain database in place (key from --db-key-source), or
+    /// with --decrypt turn an encrypted one back into a plain one
+    Encrypt {
+        dbpath: PathBuf,
+        /// keyring or env:VAR
+        #[arg(long, default_value = "keyring")]
+        db_key_source: String,
+        #[arg(long)]
+        decrypt: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -579,10 +738,15 @@ pub enum BackupCommands {
         #[command(subcommand)]
         cmd: RecoveryCommands,
     },
-    /// Job-database tools (info, migrate, vacuum)
+    /// Job-database tools (info, migrate, vacuum, encrypt)
     Db {
         #[command(subcommand)]
         cmd: DbCommands,
+    },
+    /// Repository lock status and guarded force-unlock
+    Lock {
+        #[command(subcommand)]
+        cmd: LockCommands,
     },
     /// Encrypt or decrypt files with the backup cipher; decrypt single volumes
     Crypt {
@@ -778,15 +942,21 @@ fn emit<T: serde::Serialize>(format: &OutputFormat, title: &str, v: &T) -> Resul
     Ok(())
 }
 
+/// Open the repository under a lock of `kind` and run `f`.
 fn with_repo<T>(
     repo: &RepoArgs,
+    kind: LockKind,
+    op: &str,
     f: impl FnOnce(&Repo, &BackupDb) -> Result<T, ufop_core::error::AppError>,
 ) -> Result<T, ufop_core::error::AppError> {
-    let be = LocalBackend::new(&repo.dest);
-    let db = BackupDb::open(&repo.db_path())?;
-    let pass = repo.passphrase();
-    let r = Repo::open(&be, &db, pass.as_deref(), &repo.options(), false, KdfParams::default())?;
-    f(&r, &db)
+    let be = repo.backend();
+    let ctx = OpContext::new();
+    repo.locked(be.as_ref(), Some(kind), op, &ctx, || {
+        let db = repo.open_db(be.as_ref(), &ctx)?;
+        let pass = repo.passphrase();
+        let r = Repo::open(be.as_ref(), &db, pass.as_deref(), &repo.options(), false, KdfParams::default())?;
+        f(&r, &db)
+    })
 }
 
 pub async fn execute(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, Box<dyn std::error::Error>> {
@@ -833,24 +1003,30 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
                 ..repo.options()
             })?;
             let retention = parse_retention(keep_versions, keep_days, retention_policy);
-            let be = LocalBackend::new(&repo.dest);
-            let db = BackupDb::open(&repo.db_path())?;
+            let be = repo.backend();
             let srcs: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
-            let r = run_backup(&be, &db, &srcs, &filter, &opts, &retention, pass.as_deref(), KdfParams::default(), &progress_ctx(format))?;
+            let ctx = progress_ctx(format);
+            let kind = if dry_run { LockKind::Shared } else { LockKind::Exclusive };
+            let lo = LockOptions::from_backup_options(&opts, LOCK_APP);
+            let (mut r, lock_warnings) = repo_lock::with_lock(be.as_ref(), &repo.prefix, kind, "backup", &lo, &ctx, || {
+                let db = repo.open_db(be.as_ref(), &ctx)?;
+                run_backup(be.as_ref(), &db, &srcs, &filter, &opts, &retention, pass.as_deref(), KdfParams::default(), &ctx)
+            })?;
+            r.warnings.extend(lock_warnings);
             log_outcome("backup", &r.warnings, &r.errors);
             ok(emit(format, "Backup finished", &r))?;
             Ok(if !r.errors.is_empty() || r.partial { 2 } else if !r.warnings.is_empty() { 1 } else { 0 })
         }
-        BackupCommands::List { repo } => with_repo(&repo, |_, db| {
+        BackupCommands::List { repo } => with_repo(&repo, LockKind::Shared, "list", |_, db| {
             let v = db.filesets()?;
             ok(emit(format, "Versions (0 = newest)", &v))?;
             Ok(0)
         }),
-        BackupCommands::Find { repo, pattern, version } => with_repo(&repo, |_, db| {
+        BackupCommands::Find { repo, pattern, version } => with_repo(&repo, LockKind::Shared, "find", |_, db| {
             ok(emit(format, "Matches", &maintenance::find(db, &pattern, version, 10_000)?))?;
             Ok(0)
         }),
-        BackupCommands::Compare { repo, base, compare } => with_repo(&repo, |_, db| {
+        BackupCommands::Compare { repo, base, compare } => with_repo(&repo, LockKind::Shared, "compare", |_, db| {
             ok(emit(format, "Differences", &maintenance::compare_versions(db, base, compare)?))?;
             Ok(0)
         }),
@@ -870,70 +1046,78 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             };
             // No local database? Rebuild a temporary one from the destination.
             let needs_recreate = !repo.db_path().exists();
-            let be = LocalBackend::new(&repo.dest);
+            let be = repo.backend();
             let pass = repo.passphrase();
-            let db = if needs_recreate { BackupDb::open_in_memory()? } else { BackupDb::open(&repo.db_path())? };
-            if needs_recreate {
-                maintenance::recreate_database(&be, &db, pass.as_deref(), &repo.prefix, &OpContext::new())?;
-            }
-            let r = Repo::open(&be, &db, pass.as_deref(), &repo.options(), false, KdfParams::default())?;
-            let rep = run_restore(&r, &opts, &progress_ctx(format))?;
+            let ctx = progress_ctx(format);
+            let rep = repo.locked(be.as_ref(), Some(LockKind::Shared), "restore", &ctx, || {
+                let db = if needs_recreate { BackupDb::open_in_memory()? } else { repo.open_db(be.as_ref(), &ctx)? };
+                if needs_recreate {
+                    maintenance::recreate_database(be.as_ref(), &db, pass.as_deref(), &repo.prefix, &OpContext::new())?;
+                }
+                let r = Repo::open(be.as_ref(), &db, pass.as_deref(), &repo.options(), false, KdfParams::default())?;
+                run_restore(&r, &opts, &ctx)
+            })?;
             log_outcome("restore", &rep.warnings, &rep.errors);
             ok(emit(format, "Restore finished", &rep))?;
             Ok(if rep.errors.is_empty() { 0 } else { 1 })
         }
-        BackupCommands::Verify { repo, full, samples } => with_repo(&repo, |r, _| {
+        BackupCommands::Verify { repo, full, samples } => with_repo(&repo, LockKind::Shared, "verify", |r, _| {
             let v = maintenance::verify(r, if full { None } else { Some(samples.unwrap_or(3)) }, full)?;
             ok(emit(format, "Verification", &v))?;
             Ok(if v.errors.is_empty() { 0 } else { 2 })
         }),
-        BackupCommands::Compact { repo } => with_repo(&repo, |r, _| {
+        BackupCommands::Compact { repo } => with_repo(&repo, LockKind::Exclusive, "compact", |r, _| {
             ok(emit(format, "Compaction", &maintenance::compact(r, &repo.options(), &OpContext::new())?))?;
             Ok(0)
         }),
-        BackupCommands::Repair { repo } => with_repo(&repo, |r, _| {
+        BackupCommands::Repair { repo } => with_repo(&repo, LockKind::Exclusive, "repair", |r, _| {
             let rep = maintenance::repair(r)?;
             ok(emit(format, "Repair", &rep))?;
             Ok(if rep.unrecoverable.is_empty() { 0 } else { 1 })
         }),
         BackupCommands::Recreate { repo } => {
-            let be = LocalBackend::new(&repo.dest);
+            let be = repo.backend();
             let path = repo.db_path();
-            let db = BackupDb::open(&path)?;
-            let rep = maintenance::recreate_database(&be, &db, repo.passphrase().as_deref(), &repo.prefix, &OpContext::new())?;
+            let ctx = OpContext::new();
+            let rep = repo.locked(be.as_ref(), Some(LockKind::Shared), "recreate_database", &ctx, || {
+                let db = repo.open_db(be.as_ref(), &ctx)?;
+                maintenance::recreate_database(be.as_ref(), &db, repo.passphrase().as_deref(), &repo.prefix, &ctx)
+            })?;
             ok(emit(format, &format!("Database recreated at {}", path.display()), &rep))?;
             Ok(0)
         }
-        BackupCommands::ListBrokenFiles { repo } => with_repo(&repo, |r, _| {
+        BackupCommands::ListBrokenFiles { repo } => with_repo(&repo, LockKind::Shared, "list_broken_files", |r, _| {
             let b = maintenance::list_broken_files(r)?;
             ok(emit(format, "Broken files", &b))?;
             Ok(if b.is_empty() { 0 } else { 1 })
         }),
-        BackupCommands::PurgeBrokenFiles { repo } => with_repo(&repo, |r, _| {
+        BackupCommands::PurgeBrokenFiles { repo } => with_repo(&repo, if dry_run { LockKind::Shared } else { LockKind::Exclusive }, "purge_broken_files", |r, _| {
             ok(emit(format, "Purge broken files", &maintenance::purge_broken_files(r, dry_run)?))?;
             Ok(0)
         }),
-        BackupCommands::Purge { repo, paths } => with_repo(&repo, |r, _| {
+        BackupCommands::Purge { repo, paths } => with_repo(&repo, if dry_run { LockKind::Shared } else { LockKind::Exclusive }, "purge", |r, _| {
             ok(emit(format, "Purge", &maintenance::purge(r, &paths, None, dry_run)?))?;
             Ok(0)
         }),
-        BackupCommands::Delete { repo, versions, allow_full_removal } => with_repo(&repo, |r, _| {
+        BackupCommands::Delete { repo, versions, allow_full_removal } => with_repo(&repo, LockKind::Exclusive, "delete_versions", |r, _| {
             let n = maintenance::delete_versions(r, &versions, allow_full_removal)?;
             ok(emit(format, "Deleted versions", &serde_json::json!({ "versions_deleted": n })))?;
             Ok(0)
         }),
-        BackupCommands::RebuildMissing { repo } => with_repo(&repo, |r, _| {
+        BackupCommands::RebuildMissing { repo } => with_repo(&repo, LockKind::Exclusive, "rebuild_missing", |r, _| {
             let rep = maintenance::rebuild_missing_block_volumes(r, &repo.options(), &progress_ctx(format))?;
             ok(emit(format, "Rebuild missing volumes", &rep))?;
             Ok(if rep.incomplete_volumes.is_empty() { 0 } else { 1 })
         }),
-        BackupCommands::ControlFiles { repo, target, version } => with_repo(&repo, |r, _| {
+        BackupCommands::ControlFiles { repo, target, version } => with_repo(&repo, LockKind::Shared, "extract_control_files", |r, _| {
             ok(emit(format, "Control files", &maintenance::extract_control_files(r, version, &target)?))?;
             Ok(0)
         }),
         BackupCommands::Mirror { dest, to, prefix, keep_extraneous, verify, threads } => {
             let o = ufop_core::backup::mirror::MirrorOptions { delete_extraneous: !keep_extraneous, verify, dry_run, threads };
-            let r = ufop_core::backup::mirror::mirror(&LocalBackend::new(&dest), &LocalBackend::new(&to), &prefix, &o, &progress_ctx(format))?;
+            let lo = LockOptions { app: LOCK_APP.into(), ..Default::default() };
+            let r = ufop_core::backup::mirror::mirror_locked(&LocalBackend::new(&dest), &LocalBackend::new(&to), &prefix, &o, &lo, &progress_ctx(format))?;
+            log_outcome("mirror", &r.warnings, &r.errors);
             ok(emit(format, "Mirror", &r))?;
             Ok(if r.errors.is_empty() { 0 } else { 2 })
         }
@@ -943,7 +1127,10 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             match cmd {
                 RecoveryCommands::Download { repo, folder, threads, no_resume, max_kbps } => {
                     let o = recovery::DownloadOptions { threads, resume: !no_resume, max_bytes_per_sec: max_kbps * 1024 };
-                    let r = recovery::download(&LocalBackend::new(&repo.dest), repo.passphrase().as_deref(), &repo.prefix, &folder, &o, &ctx)?;
+                    let be = repo.backend();
+                    let r = repo.locked(be.as_ref(), Some(LockKind::Shared), "recovery_download", &ctx, || {
+                        recovery::download(be.as_ref(), repo.passphrase().as_deref(), &repo.prefix, &folder, &o, &ctx)
+                    })?;
                     ok(emit(format, "Recovery download", &r))?;
                     Ok(if r.failed.is_empty() { 0 } else { 1 })
                 }
@@ -970,7 +1157,12 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
                         passphrase: std::env::var(&new_passphrase_env).ok().filter(|p| !p.is_empty()),
                         kdf: KdfParams::default(),
                     };
-                    ok(emit(format, "Converted repository", &recovery::convert(&folder, &LocalBackend::new(&out), &o, &ctx)?))?;
+                    let target = LocalBackend::new(&out);
+                    target.create_folder()?;
+                    let lo = LockOptions { app: LOCK_APP.into(), ..Default::default() };
+                    let (r, w) = repo_lock::with_lock(&target, &o.prefix.clone(), LockKind::Exclusive, "convert", &lo, &ctx, || recovery::convert(&folder, &target, &o, &ctx))?;
+                    log_outcome("convert", &w, &[]);
+                    ok(emit(format, "Converted repository", &r))?;
                     Ok(0)
                 }
             }
@@ -1011,9 +1203,33 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
                 ok(emit(format, "Database check", &serde_json::json!({ "ok": problems.is_empty(), "problems": problems })))?;
                 Ok(if problems.is_empty() { 0 } else { 2 })
             }
-            DbCommands::Sanitize { dbpath, out } => {
-                let r = BackupDb::open(&dbpath)?.export_sanitized(&out)?;
+            DbCommands::Sanitize { dbpath, out, db_key_source } => {
+                let (key, _) = db_key_from_source(&db_key_source, &dbpath)?;
+                let r = BackupDb::open_with_key(&dbpath, key.as_ref())?.export_sanitized(&out)?;
                 ok(emit(format, "Sanitized copy written", &serde_json::json!({ "out": out, "paths_obfuscated": r.paths_obfuscated, "settings_removed": r.settings_removed })))?;
+                Ok(0)
+            }
+            DbCommands::Encrypt { dbpath, db_key_source, decrypt } => {
+                let (key, _) = db_key_from_source(&db_key_source, &dbpath)?;
+                let key = key.ok_or_else(|| ufop_core::error::AppError::validation("Choose a key with --db-key-source keyring or env:VAR"))?;
+                let mut db = BackupDb::open_with_key(&dbpath, Some(&key))?;
+                let r = db.rekey(if decrypt { None } else { Some(&key) })?;
+                ok(emit(format, if decrypt { "Database decrypted" } else { "Database encrypted" }, &r))?;
+                Ok(0)
+            }
+        },
+        BackupCommands::Lock { cmd } => match cmd {
+            LockCommands::Status { repo } => {
+                let st = repo_lock::status(repo.backend().as_ref(), &repo.prefix)?;
+                if matches!(format, OutputFormat::Human) {
+                    eprintln!("{}", st.summary().unwrap_or_else(|| "The repository is not in use".into()));
+                }
+                ok(emit(format, "Repository locks", &st))?;
+                Ok(if st.exclusive || st.readers > 0 { 1 } else { 0 })
+            }
+            LockCommands::Break { repo, yes, owner_id } => {
+                let r = repo_lock::break_lock(repo.backend().as_ref(), &repo.prefix, yes, owner_id.as_deref())?;
+                ok(emit(format, "Repository lock broken", &r))?;
                 Ok(0)
             }
         },
@@ -1023,18 +1239,20 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             ok(emit(format, "Snapshot test", &d))?;
             Ok(if d.ok { 0 } else { 2 })
         }
-        BackupCommands::AutoTune { repo, samples } => with_repo(&repo, |r, _| {
+        BackupCommands::AutoTune { repo, samples } => with_repo(&repo, LockKind::Shared, "autotune", |r, _| {
             ok(emit(format, "Restore AutoTune", &ufop_core::backup::restore::autotune(r, samples.clamp(1, 50), &OpContext::new())?))?;
             Ok(0)
         }),
         BackupCommands::Upgrade { repo, rollback } => {
             use ufop_core::backup::format;
-            let be = LocalBackend::new(&repo.dest);
-            let r = if rollback {
-                format::rollback_upgrade(&be, &repo.prefix)?
-            } else {
-                format::upgrade_repository(&be, &repo.prefix, repo.passphrase().as_deref(), ufop_core::backup::REPO_FORMAT_VERSION)?
-            };
+            let be = repo.backend();
+            let r = repo.locked(be.as_ref(), Some(LockKind::Exclusive), "upgrade_format", &OpContext::new(), || {
+                if rollback {
+                    format::rollback_upgrade(be.as_ref(), &repo.prefix)
+                } else {
+                    format::upgrade_repository(be.as_ref(), &repo.prefix, repo.passphrase().as_deref(), ufop_core::backup::REPO_FORMAT_VERSION)
+                }
+            })?;
             ok(emit(format, if rollback { "Rollback" } else { "Upgrade" }, &r))?;
             Ok(0)
         }
@@ -1050,18 +1268,24 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
                 Some(p) => Some(KdfParams::preset(p).ok_or_else(|| ufop_core::error::AppError::validation(format!("Unknown --kdf-preset '{p}' (interactive, default, sensitive)")))?),
                 None => None,
             };
-            let r = ufop_core::backup::format::change_password(&LocalBackend::new(&repo.dest), &repo.prefix, &current, &new, kdf)?;
+            let be = repo.backend();
+            let r = repo.locked(be.as_ref(), Some(LockKind::Exclusive), "change_password", &OpContext::new(), || {
+                ufop_core::backup::format::change_password(be.as_ref(), &repo.prefix, &current, &new, kdf)
+            })?;
             ok(emit(format, "Passphrase changed", &r))?;
             Ok(0)
         }
         BackupCommands::Reshard { repo, layout, shard_prefix_len } => {
             let l = parse_layout(&layout, shard_prefix_len)?;
-            let r = ufop_core::backup::layout::reshard(&LocalBackend::new(&repo.dest), &repo.prefix, l, dry_run, &progress_ctx(format))?;
+            let be = repo.backend();
+            let ctx = progress_ctx(format);
+            let kind = if dry_run { LockKind::Shared } else { LockKind::Exclusive };
+            let r = repo.locked(be.as_ref(), Some(kind), "reshard", &ctx, || ufop_core::backup::layout::reshard(be.as_ref(), &repo.prefix, l, dry_run, &ctx))?;
             ok(emit(format, "Reshard", &r))?;
             Ok(if r.errors.is_empty() { 0 } else { 2 })
         }
         BackupCommands::FormatInfo { repo } => {
-            ok(emit(format, "Repository format", &ufop_core::backup::format::format_info(&LocalBackend::new(&repo.dest), &repo.prefix)?))?;
+            ok(emit(format, "Repository format", &ufop_core::backup::format::format_info(repo.backend().as_ref(), &repo.prefix)?))?;
             Ok(0)
         }
         BackupCommands::TestDestination { dest, files } => {
@@ -1215,5 +1439,66 @@ mod tests {
         assert_eq!(std::fs::read(ex.join("Photos/2023/03/a.heic")).unwrap(), b"shown");
         assert_eq!(std::fs::read(ex.join("Photos/2023/03/b.heic")).unwrap(), b"hidden");
         assert!(ex.join("albums.json").is_file());
+    }
+
+    #[test]
+    fn lock_read_only_and_encrypted_database_flags() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("zzCliSecret.txt"), b"cli").unwrap();
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(subcommand)]
+            c: BackupCommands,
+        }
+        let parse = |args: &[&str]| <T as clap::Parser>::try_parse_from(std::iter::once("t").chain(args.iter().copied())).unwrap().c;
+        let dest = t.path().join("dest").to_string_lossy().into_owned();
+        let db = t.path().join("db.sqlite");
+        let db_s = db.to_string_lossy().into_owned();
+        let src_s = src.to_string_lossy().into_owned();
+        std::env::set_var("UFOP_TEST_DB_KEY", ufop_core::backup::db::DbKey::generate().to_hex());
+        let base = ["--dest", dest.as_str(), "--dbpath", db_s.as_str(), "--passphrase", "pw"];
+        let with = |cmd: &[&str], extra: &[&str]| -> Vec<String> { cmd.iter().copied().chain(base.iter().copied()).chain(extra.iter().copied()).map(String::from).collect() };
+        let p = |v: Vec<String>| parse(&v.iter().map(String::as_str).collect::<Vec<_>>());
+        // Encrypted local database from an environment key, with checkpoint flags.
+        let code = run(p(with(&["run"], &["--source", &src_s, "--no-quota-warning", "--db-key-source", "env:UFOP_TEST_DB_KEY", "--checkpoint-interval-bytes", "1"])), &OutputFormat::Json, false).unwrap();
+        assert_eq!(code, 0);
+        assert!(BackupDb::inspect(&db).unwrap().encrypted);
+        assert!(!String::from_utf8_lossy(&std::fs::read(&db).unwrap()).contains("zzCliSecret"));
+        assert_eq!(run(p(with(&["list"], &["--db-key-source", "env:UFOP_TEST_DB_KEY"])), &OutputFormat::Json, false).unwrap(), 0);
+        // Without the key the database is rebuilt (plain) from the destination.
+        assert_eq!(run(p(with(&["list"], &[])), &OutputFormat::Json, false).unwrap(), 0);
+        assert!(!BackupDb::inspect(&db).unwrap().encrypted);
+        assert!(run(p(with(&["list"], &["--db-key-source", "bogus"])), &OutputFormat::Json, false).is_err());
+
+        // Lock status, contention and break.
+        assert_eq!(run(p(with(&["lock", "status"], &[])), &OutputFormat::Json, false).unwrap(), 0, "free");
+        let other = LocalBackend::new(&dest);
+        let held = repo_lock::RepoLock::acquire(&other, "ufop", LockKind::Exclusive, "compact", &LockOptions::default()).unwrap();
+        assert_eq!(run(p(with(&["lock", "status"], &[])), &OutputFormat::Json, false).unwrap(), 1, "in use");
+        let e = run(p(with(&["run"], &["--source", &src_s, "--no-quota-warning"])), &OutputFormat::Json, false).unwrap_err();
+        assert!(e.user_message().contains("Repository in use by"), "{e}");
+        assert!(run(p(with(&["lock", "break"], &[])), &OutputFormat::Json, false).is_err(), "needs --yes");
+        let owner = held.info().owner_id;
+        assert_eq!(run(p(with(&["lock", "break"], &["--yes", "--owner-id", &owner])), &OutputFormat::Json, false).unwrap(), 0);
+        drop(held);
+
+        // Read-only: restore works and writes nothing; backups are refused.
+        let before: Vec<_> = std::fs::read_dir(&dest).unwrap().flatten().map(|e| e.file_name()).collect();
+        let e = run(p(with(&["run"], &["--source", &src_s, "--no-quota-warning", "--read-only"])), &OutputFormat::Json, false).unwrap_err();
+        assert!(e.user_message().contains("read-only"), "{e}");
+        let out = t.path().join("out").to_string_lossy().into_owned();
+        assert_eq!(run(p(with(&["restore"], &["--read-only", "--target", &out])), &OutputFormat::Json, false).unwrap(), 0);
+        assert_eq!(std::fs::read(t.path().join("out/src/zzCliSecret.txt")).unwrap(), b"cli");
+        let after: Vec<_> = std::fs::read_dir(&dest).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(before.len(), after.len());
+        assert!(run(p(with(&["compact"], &["--read-only"])), &OutputFormat::Json, false).is_err());
+
+        // db encrypt / decrypt on demand.
+        assert_eq!(run(parse(&["db", "encrypt", &db_s, "--db-key-source", "env:UFOP_TEST_DB_KEY"]), &OutputFormat::Json, false).unwrap(), 0);
+        assert!(BackupDb::inspect(&db).unwrap().encrypted);
+        assert_eq!(run(parse(&["db", "encrypt", &db_s, "--db-key-source", "env:UFOP_TEST_DB_KEY", "--decrypt"]), &OutputFormat::Json, false).unwrap(), 0);
+        assert!(!BackupDb::inspect(&db).unwrap().encrypted);
     }
 }

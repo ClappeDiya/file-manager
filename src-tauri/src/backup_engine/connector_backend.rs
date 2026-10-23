@@ -123,6 +123,13 @@ impl Backend for ConnectorBackend {
         self.wait("Delete", self.connector.remove(&self.remote(name), false))
     }
 
+    /// The server's time stamp of a file, from the folder listing (clock check).
+    fn modified(&self, name: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        let dir = if self.dir.is_empty() { "/".to_string() } else { self.dir.clone() };
+        let entries = self.wait("Listing", self.connector.list_remote(&dir))?;
+        Ok(entries.into_iter().find(|e| !e.is_dir && e.name == name).and_then(|e| e.modified))
+    }
+
     fn create_folder(&self) -> Result<(), AppError> {
         if self.list().is_ok() {
             return Ok(());

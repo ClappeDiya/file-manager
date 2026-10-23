@@ -225,9 +225,30 @@ pub async fn backup_adopt_repository(
     name: Option<String>,
     sources: Option<Vec<String>>,
     source_map: Option<Vec<(String, String)>>,
+    read_only: Option<bool>,
     mgr: State<'_, BackupManager>,
 ) -> Result<BackupJob, AppError> {
-    mgr.adopt_repository(destination, passphrase, prefix.unwrap_or_else(|| "ufop".into()), name, sources.unwrap_or_default(), source_map.unwrap_or_default()).await
+    mgr.adopt_repository(destination, passphrase, prefix.unwrap_or_else(|| "ufop".into()), name, sources.unwrap_or_default(), source_map.unwrap_or_default(), read_only.unwrap_or(false))
+        .await
+}
+
+/// Who holds the job's repository lock(s) right now.
+#[tauri::command]
+pub async fn backup_lock_status(job_id: String, mgr: State<'_, BackupManager>) -> Result<ufop_core::backup::lock::LockStatus, AppError> {
+    mgr.lock_status(&job_id).await
+}
+
+/// Force-unlock the job's repository (needs `confirm`; `owner_id` limits it
+/// to the lock that was shown).
+#[tauri::command]
+pub async fn backup_break_lock(job_id: String, confirm: bool, owner_id: Option<String>, mgr: State<'_, BackupManager>) -> Result<ufop_core::backup::lock::BreakLockReport, AppError> {
+    mgr.break_lock(&job_id, confirm, owner_id).await
+}
+
+/// Turn local-database encryption on or off for a job and migrate now.
+#[tauri::command]
+pub async fn backup_set_database_encryption(job_id: String, enabled: bool, mgr: State<'_, BackupManager>) -> Result<ufop_core::backup::db::RekeyReport, AppError> {
+    mgr.set_database_encryption(&job_id, enabled).await
 }
 
 #[tauri::command]

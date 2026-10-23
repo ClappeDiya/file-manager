@@ -405,6 +405,13 @@ impl ObjectStore for S3Store {
         })
     }
 
+    fn modified<'a>(&'a self, name: &'a str) -> BoxFut<'a, Option<chrono::DateTime<chrono::Utc>>> {
+        Box::pin(async move {
+            let key = join_key(&self.cfg.prefix, name);
+            let r = http::check(self.send(reqwest::Method::HEAD, &key, &[], &[], Vec::new()).await?, "S3 file time").await?;
+            Ok(r.headers().get("last-modified").and_then(|v| v.to_str().ok()).and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok()).map(|t| t.with_timezone(&chrono::Utc)))
+        })
+    }
     fn supports_lock(&self) -> bool {
         true
     }
