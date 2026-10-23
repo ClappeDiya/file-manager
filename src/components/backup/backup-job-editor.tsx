@@ -31,6 +31,8 @@ import { PhotosSourceSection } from "./backup-photos-source";
 import { AdvancedOnly } from "./advanced-only";
 import { BackupChangePassphrase } from "./backup-repository-format";
 import { ScheduleEditor } from "./backup-schedule-editor";
+import { EffectiveSettingsPanel, MaintenanceScheduleEditor, TemplatePicker } from "./backup-policies";
+import { changedPaths, setPath } from "@/stores/backup-policy";
 
 interface ConnectionProfile {
   id: string;
@@ -77,6 +79,23 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
     return () => clearTimeout(t);
   }, [passphrase]);
 
+  // Template mode (`overrides` set): the form shows the effective values, and
+  // every setting changed from what it showed becomes the job's own.
+  const [baseline, setBaseline] = useState<BackupJob>(initial);
+  useEffect(() => {
+    if (initial.id === "" || initial.overrides === null || initial.overrides === undefined) return;
+    tauriInvoke<BackupJob>("backup_effective_job", { id: initial.id })
+      .then((eff) => {
+        const shown = { ...eff, template_ids: initial.template_ids, overrides: initial.overrides, stats: initial.stats };
+        setJob(shown);
+        setBaseline(shown);
+      })
+      .catch(() => {});
+  }, [initial]);
+  const resetToInherited = (path: string, value: unknown, explicit: string[]) => {
+    setJob((j) => ({ ...setPath(j, path, value), overrides: (j.overrides ?? explicit).filter((p) => p !== path) }));
+    setBaseline((b) => setPath(b, path, value));
+  };
   const patch = (p: Partial<BackupJob>) => setJob((j) => ({ ...j, ...p }));
   const patchOpts = (p: Partial<BackupJob["options"]>) => setJob((j) => ({ ...j, options: { ...j.options, ...p } }));
   const patchFilter = (p: Partial<BackupJob["filter"]>) => setJob((j) => ({ ...j, filter: { ...j.filter, ...p } }));
@@ -97,7 +116,10 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
 
   const save = () =>
     run(async () => {
-      const toSave = filterText !== null ? { ...job, filter: { ...job.filter, rules: textToRules(filterText) } } : job;
+      let toSave = filterText !== null ? { ...job, filter: { ...job.filter, rules: textToRules(filterText) } } : job;
+      if (toSave.overrides !== null && toSave.overrides !== undefined) {
+        toSave = { ...toSave, overrides: [...new Set([...toSave.overrides, ...changedPaths(baseline, toSave)])].sort() };
+      }
       // Empty passphrase = keep the stored one (the backend rejects a new encrypted job without one).
       const saved = await saveJob(toSave, passphrase || null);
       onDone(saved);
@@ -159,6 +181,9 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
               </Field>
             )}
             {!isNew && job.stats.version_count > 0 && <BackupChangePassphrase job={job} />}
+            <AdvancedOnly>
+              <TemplatePicker value={job.template_ids ?? []} onChange={(template_ids) => patch({ template_ids })} />
+            </AdvancedOnly>
             <Check
               label="Encrypt the local database on this computer"
               checked={job.encrypt_local_database ?? (isNew ? job.encrypted : false)}
@@ -166,6 +191,11 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
               hint="File names in the job's local cache are encrypted with a key kept in this computer's keychain. If the key is lost, the cache is rebuilt from the destination."
             />
           </Section>
+        )}
+        {step === "General" && (
+          <AdvancedOnly>
+            <EffectiveSettingsPanel job={job} onReset={resetToInherited} />
+          </AdvancedOnly>
         )}
 
         {step === "Sources" && (
@@ -524,6 +554,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 <input className={inputCls} value={job.soft_delete_prefix ?? ""} placeholder="e.g. deleted-" onChange={(e) => patch({ soft_delete_prefix: e.target.value || null })} />
               </Field>
             </Section>
+            <MaintenanceScheduleEditor value={job.maintenance ?? { compact: null, verify: null, retention: null }} onChange={(maintenance) => patch({ maintenance })} autoCompactDays={job.options.auto_compact ? job.options.auto_compact_interval_days : null} />
             </AdvancedOnly>
             <Section title="Network">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">

@@ -22,6 +22,7 @@ import { SecretProvidersEditor } from "./backup-secret-providers";
 import { AdvancedOnly } from "./advanced-only";
 import { BackupCacheSettings } from "./backup-cache-settings";
 import { useIsAdvanced } from "./use-is-advanced";
+import { TemplatesManager } from "./backup-policies";
 import { selectBackupAdvanced, useUIStore } from "@/stores/ui-store";
 
 const NO_CAPS: TransferCaps = { upload_bps: 0, download_bps: 0, max_concurrent_runs: 1 };
@@ -287,6 +288,9 @@ export function BackupSettingsView() {
         <SecretProvidersEditor />
       </AdvancedOnly>
       <DefaultsEditor />
+      <AdvancedOnly>
+        <TemplatesManager />
+      </AdvancedOnly>
     </div>
   );
 }

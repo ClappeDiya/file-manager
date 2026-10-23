@@ -15,6 +15,7 @@ import { AdvancedOnly } from "./advanced-only";
 import { BackupRepositoryFormat } from "./backup-repository-format";
 import { BackupRepositorySafety } from "./backup-repository-safety";
 import { BackupSharing } from "./backup-sharing";
+import { CustomVerify } from "./backup-policies";
 
 
 export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDeleted: () => void }) {
@@ -85,6 +86,9 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
           {tool("List broken files", { type: "list_broken" }, "Files that depend on missing or damaged volumes")}
         </div>
       </Section>
+      <AdvancedOnly>
+        <CustomVerify busy={busy !== null} onRun={(o) => void op("Custom check", o)} />
+      </AdvancedOnly>
 
       <AdvancedOnly>
         <BackupRepositoryFormat job={job} />

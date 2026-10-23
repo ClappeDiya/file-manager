@@ -782,6 +782,8 @@ export interface JobStats {
   version_count: number;
   source_size: number;
   backend_size: number;
+  /** Last scheduled start of each maintenance task (`compact`, `verify`, `apply_retention`). */
+  last_maintenance?: Record<string, string>;
 }
 
 export interface BackupJob {
@@ -819,9 +821,52 @@ export interface BackupJob {
   encrypt_local_database: boolean | null;
   /** A command whose output each backup stores as a virtual file (e.g. `pg_dump mydb`). */
   stdin_command: StdinCommand | null;
+  /** Policy templates the job is based on, in order (later wins). */
+  template_ids: string[];
+  /** Settings the job sets itself (field paths); null = older job: every non-default setting is its own. */
+  overrides: string[] | null;
+  /** Compaction, verification and retention on their own schedules. */
+  maintenance: MaintenanceSchedule;
   created_at: string;
   updated_at: string;
   stats: JobStats;
+}
+
+/** Mirrors `ufop_core::backup::verify::VerifyMode`. */
+export type VerifyMode =
+  | { type: "structure" }
+  | { type: "sample_volumes"; count: number }
+  | { type: "sample_percent"; percent: number }
+  | { type: "full" };
+
+/** Mirrors `ufop_core::backup::verify::VerifyOptions` (scope empty = everything). */
+export interface VerifyOptions {
+  scope: { versions: string[]; paths: string[] };
+  mode: VerifyMode;
+  files_percent: number | null;
+  parallelism: number;
+  max_errors: number;
+  use_cache: boolean;
+}
+
+export function newVerifyOptions(): VerifyOptions {
+  return { scope: { versions: [], paths: [] }, mode: { type: "sample_volumes", count: 1 }, files_percent: null, parallelism: 0, max_errors: 0, use_cache: false };
+}
+
+/** Mirrors `schedule::MaintenanceSchedule`. */
+export interface MaintenanceSchedule {
+  compact: BackupSchedule | null;
+  verify: { schedule: BackupSchedule; options: VerifyOptions } | null;
+  retention: BackupSchedule | null;
+}
+
+/** Mirrors `ufop_core::backup::verify::VerifyProblem`. */
+export interface VerifyProblem {
+  kind: "missing_block" | "missing_volume" | "volume" | "block_hash" | "file";
+  volume: string | null;
+  message: string;
+  versions: string[];
+  paths: string[];
 }
 
 export interface LegalHold {
@@ -1047,6 +1092,8 @@ export interface NextRun {
   job_id: string;
   job_name: string;
   next_run_at: string;
+  /** `backup`, or the maintenance task (`compact`, `verify`, `apply_retention`). */
+  operation?: string;
 }
 
 export interface SchedulerStatus {
@@ -1055,6 +1102,8 @@ export interface SchedulerStatus {
   paused_until: string | null;
   tasks: TaskInfo[];
   next_runs: NextRun[];
+  /** Upcoming maintenance on its own schedule. */
+  next_maintenance?: NextRun[];
 }
 
 export type LogLevel = "info" | "warning" | "error";
@@ -1168,7 +1217,7 @@ export interface RecoveryConvertReport {
 
 export type BackupOperation =
   | { type: "restore"; options: RestoreOptions; overrides?: RestoreOverrides }
-  | { type: "verify"; full: boolean }
+  | { type: "verify"; full: boolean; options?: VerifyOptions | null }
   | { type: "compact" }
   | { type: "repair" }
   | { type: "recreate_database" }
@@ -1372,6 +1421,9 @@ export function newBackupJob(): BackupJob {
     read_only: false,
     encrypt_local_database: null,
     stdin_command: null,
+    template_ids: [],
+    overrides: null,
+    maintenance: { compact: null, verify: null, retention: null },
     created_at: now,
     updated_at: now,
     stats: {
