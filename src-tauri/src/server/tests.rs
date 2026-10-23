@@ -1695,3 +1695,45 @@ async fn hardening_checklist_and_explicit_probe() {
     assert_eq!(s.put(&format!("/api/v1/jobs/{id}"), &tok, json!({"job": j})).await.status(), 200);
     assert!(!s.post(&format!("/api/v1/jobs/{id}/hardening/probe"), &tok, json!({})).await.status().is_success());
 }
+
+#[tokio::test]
+async fn notification_profiles_presets_and_previews_over_rest() {
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    // A preset, then a profile from it with its secret (stored, never returned).
+    let n = s.post("/api/v1/notifications/webhook-preset", &tok, json!({"preset": "gotify", "params": {"server": "https://push.example.org"}})).await.json::<Value>().await.unwrap();
+    assert_eq!(n["type"], "webhook");
+    assert_eq!(n["url"], "https://push.example.org/message?token={{secret}}");
+    assert_eq!(s.post("/api/v1/notifications/webhook-preset", &tok, json!({"preset": "gotify"})).await.status(), 400);
+    let p = s.post("/api/v1/notification-profiles", &tok, json!({"name": "Phone", "notification": n, "min_severity": "error", "secret": "AppT0ken"})).await;
+    assert_eq!(p.status(), 200);
+    let text = p.text().await.unwrap();
+    assert!(!text.contains("AppT0ken"), "{text}");
+    let p: Value = serde_json::from_str(&text).unwrap();
+    let pid = p["id"].as_str().unwrap().to_string();
+    assert!(s.mgr.has_destination_secret(p["notification"]["credential_id"].as_str().unwrap()).await.unwrap());
+    assert_eq!(s.post("/api/v1/notification-profiles", &tok, json!({"name": "Bad", "notification": {"type": "webhook", "url": "ftp://x"}})).await.status(), 400);
+    // Update and read back.
+    let mut upd = p.clone();
+    upd["description"] = json!("on call");
+    let r = s.client.put(format!("{}/api/v1/notification-profiles/{pid}", s.base)).bearer_auth(&tok).json(&upd).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(s.get(&format!("/api/v1/notification-profiles/{pid}"), &tok).await.json::<Value>().await.unwrap()["description"], "on call");
+    // Preview masks the secret.
+    let pv = s.post("/api/v1/notifications/preview", &tok, json!({"notification": n, "result": "error"})).await.json::<Value>().await.unwrap();
+    assert!(pv["request"].as_str().unwrap().contains("token=%2A%2A%2A%2A%2A%2A"), "{pv}");
+    // A job using it: delete refused (409) unless forced.
+    let src = s.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let job = json!({"name":"Srv","sources":[src],"encrypted":false,"notification_profile_ids":[pid],"destination":{"type":"local","path": s.dir.join("dst"),"alternate_paths":[],"marker_file":null}});
+    let j = s.post("/api/v1/jobs", &tok, json!({"job": job})).await.json::<Value>().await.unwrap();
+    assert_eq!(j["notification_profile_ids"], json!([pid]));
+    assert_eq!(s.client.delete(format!("{}/api/v1/notification-profiles/{pid}", s.base)).bearer_auth(&tok).send().await.unwrap().status(), 409);
+    let d = s.client.delete(format!("{}/api/v1/notification-profiles/{pid}?force=true", s.base)).bearer_auth(&tok).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(d["removed_from"], json!(["job 'Srv'"]));
+    assert_eq!(s.get("/api/v1/notification-profiles", &tok).await.json::<Value>().await.unwrap().as_array().unwrap().len(), 0);
+    // Organization profiles are read-only here.
+    let org = ufop_core::agent::ManagedNotificationProfile { id: "ops".into(), name: "Ops".into(), notification: json!({"type": "slack", "credential_id": "central:slack"}), ..Default::default() };
+    assert!(s.mgr.set_managed_notification_profiles(Some(&[org])).is_empty());
+    assert_eq!(s.client.delete(format!("{}/api/v1/notification-profiles/org:ops", s.base)).bearer_auth(&tok).send().await.unwrap().status(), 403);
+}

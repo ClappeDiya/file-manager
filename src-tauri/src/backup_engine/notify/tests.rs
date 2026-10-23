@@ -598,3 +598,33 @@ async fn profiles_crud_references_secrets_and_delete() {
     let pv = m.preview_notification(&webhook_profile("P", "https://h.example/x").notification, "error");
     assert!(pv.request.unwrap().contains("X-Token: ******"));
 }
+
+#[tokio::test]
+async fn http_reports_send_custom_and_secret_headers() {
+    use crate::backup_engine::{hooks, BackupDestination, BackupJob};
+    let t = tempfile::tempdir().unwrap();
+    let m = manager(t.path()).await;
+    let (base, seen) = recorder().await;
+    std::fs::create_dir_all(t.path().join("src")).unwrap();
+    let mut job = BackupJob { name: "Docs".into(), encrypted: false, sources: vec![t.path().join("src").to_string_lossy().into()], ..Default::default() };
+    job.destination = BackupDestination::Local { path: t.path().join("dst").to_string_lossy().into(), alternate_paths: vec![], marker_file: None };
+    job.reports.http_urls = vec![format!("{base}/report")];
+    job.reports.http_method = "PATCH".into();
+    job.reports.retries = 0;
+    job.reports.headers = vec![
+        webhook::WebhookHeader { name: "Authorization".into(), value: "Bearer r3port".into(), secret: true, credential_id: String::new() },
+        webhook::WebhookHeader { name: "X-Job".into(), value: "{{name}}/{{result}}".into(), ..Default::default() },
+    ];
+    let saved = m.save_job(job.clone(), None).await.unwrap();
+    // The secret value went to the credential store.
+    assert!(saved.reports.headers[0].value.is_empty() && !saved.reports.headers[0].credential_id.is_empty());
+    assert!(!serde_json::to_string(&saved).unwrap().contains("r3port"));
+    let ready = m.prepare_reports(&saved.reports).await;
+    assert!(hooks::send_reports(&ready, "error", &vars(&[("name", "Docs"), ("result", "error")]), serde_json::json!({})).await.is_empty());
+    let r = seen.lock().unwrap().remove(0);
+    assert_eq!((r.0.as_str(), r.1.as_str()), ("PATCH", "/report"));
+    assert_eq!(r.2["authorization"], "Bearer r3port");
+    assert_eq!(r.2["x-job"], "Docs/error");
+    job.reports.headers = vec![webhook::WebhookHeader { name: "Bad Header".into(), value: "x".into(), ..Default::default() }];
+    assert!(m.save_job(job, None).await.is_err());
+}
