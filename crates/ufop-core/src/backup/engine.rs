@@ -603,11 +603,24 @@ struct Scanner<'f> {
     /// reads; `None` for previews, where nothing is read.
     staging: Option<&'f Path>,
     staged: usize,
+    /// `.ufopignore` / `.gitignore` rules, read lazily per folder.
+    ignores: super::ignore::IgnoreMatcher<'f>,
 }
 
 impl<'f> Scanner<'f> {
     fn new(filter: &'f SourceFilter, opts: &'f BackupOptions, snap: Option<&'f super::snapshot::Snapshot>, staging: Option<&'f Path>) -> Self {
-        Scanner { filter, opts, snap, seen_inodes: HashSet::new(), out: Vec::new(), warnings: Vec::new(), staging, staged: 0 }
+        let ignores = super::ignore::IgnoreMatcher::new(filter.ignore_config(), move |p: &Path| snap.map(|s| s.real(p)).unwrap_or_else(|| p.to_path_buf()));
+        Scanner { filter, opts, snap, seen_inodes: HashSet::new(), out: Vec::new(), warnings: Vec::new(), staging, staged: 0, ignores }
+    }
+
+    /// A source root: ignore files are read inside it.
+    fn add_root(&mut self, root: &Path) {
+        self.ignores.add_root(root);
+    }
+
+    /// Excluded by an ignore file (explicit filter rules win over them).
+    fn ignored(&mut self, path: &Path, is_dir: bool) -> bool {
+        self.ignores.is_active() && self.filter.evaluate(&path.to_string_lossy(), is_dir).is_none() && self.ignores.is_ignored(path, is_dir)
     }
 
     fn real(&self, path: &Path) -> PathBuf {
@@ -666,7 +679,7 @@ impl<'f> Scanner<'f> {
             match self.opts.symlink_policy {
                 SymlinkPolicy::Ignore => return None,
                 SymlinkPolicy::Store => {
-                    if self.filter.evaluate(&path.to_string_lossy(), false) == Some(super::FilterAction::Exclude) {
+                    if self.filter.evaluate(&path.to_string_lossy(), false) == Some(super::FilterAction::Exclude) || self.ignored(path, false) {
                         return None;
                     }
                     let mut e = self.entry(path, EntryKind::Symlink, &lmd);
@@ -688,7 +701,7 @@ impl<'f> Scanner<'f> {
         } else {
             lmd
         };
-        if !self.filter.accepts(path, &md) {
+        if self.ignored(path, md.is_dir()) || !self.filter.accepts(path, &md) {
             return None;
         }
         if md.is_dir() {
@@ -899,6 +912,7 @@ fn scan_sources_in(
     let (plain, libraries) = split_sources(sources);
     let mut s = Scanner::new(filter, opts, snap, staging);
     for src in check_sources(&plain, opts, &mut s.warnings)? {
+        s.add_root(src);
         s.walk(src, 0);
     }
     for lib in &libraries {
@@ -941,6 +955,9 @@ fn scan_incremental_in(
     let (plain, libraries) = split_sources(sources);
     let mut s = Scanner::new(filter, opts, snap, staging);
     let roots = check_sources(&plain, opts, &mut s.warnings)?;
+    for r in &roots {
+        s.add_root(r);
+    }
     let in_sources = |p: &Path| roots.iter().any(|r| p.starts_with(r));
     let changed: Vec<PathBuf> = changed.iter().map(PathBuf::from).filter(|p| in_sources(p)).collect();
     let shallow: Vec<PathBuf> = shallow.iter().map(PathBuf::from).filter(|p| in_sources(p)).collect();
@@ -2303,3 +2320,6 @@ mod tests {
         assert_eq!((sets.len(), sets[0].partial, sets[1].partial), (2, false, true));
     }
 }
+
+#[cfg(test)]
+mod source_tests;

@@ -77,7 +77,13 @@ enum Matcher {
 }
 
 /// Compiled source filter with every selection option.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// Precedence: the ordered [`FilterRule`]s decide first (an explicit
+/// include re-includes what an ignore file excludes); entries no rule
+/// matches are then checked against the ignore files (see
+/// [`super::ignore`]); the attribute, size and marker exclusions apply to
+/// everything, including explicitly included entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SourceFilter {
     pub rules: Vec<FilterRule>,
@@ -92,8 +98,31 @@ pub struct SourceFilter {
     pub exclude_empty_folders: bool,
     /// Skip offline / recall-on-access cloud placeholders (Windows).
     pub exclude_cloud_placeholders: bool,
+    /// Ignore-file names read in every folder (gitignore syntax).
+    pub ignore_files: Vec<String>,
+    /// Also honour `.gitignore` files and `.git/info/exclude` of
+    /// repositories inside the sources.
+    pub respect_gitignore: bool,
     #[serde(skip)]
     compiled: Vec<(FilterAction, Matcher)>,
+}
+
+impl Default for SourceFilter {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            exclude_hidden: false,
+            exclude_system: false,
+            exclude_temporary: false,
+            max_file_size: None,
+            exclusion_markers: Vec::new(),
+            exclude_empty_folders: false,
+            exclude_cloud_placeholders: false,
+            ignore_files: vec![super::ignore::DEFAULT_IGNORE_FILE.to_string()],
+            respect_gitignore: false,
+            compiled: Vec::new(),
+        }
+    }
 }
 
 const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
@@ -183,6 +212,11 @@ impl SourceFilter {
             return false;
         }
         true
+    }
+
+    /// Which ignore files the scanner reads.
+    pub fn ignore_config(&self) -> super::ignore::IgnoreConfig {
+        super::ignore::IgnoreConfig { files: self.ignore_files.clone(), gitignore: self.respect_gitignore }
     }
 
     fn has_marker(&self, dir: &Path) -> bool {

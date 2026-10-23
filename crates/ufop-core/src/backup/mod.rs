@@ -31,6 +31,7 @@ pub mod filecrypt;
 pub mod filters;
 pub mod format;
 pub mod gpg;
+pub mod ignore;
 pub mod layout;
 pub mod lock;
 pub mod maintenance;
