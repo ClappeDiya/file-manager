@@ -365,6 +365,38 @@ class UfopClient:
         """Enabled and disabled modules (API tokens: `read` scope). `GET /api/v1/modules`"""
         return self._call("GET", f"/api/v1/modules", None, None)
 
+    def get_notification_profiles(self) -> List[Dict[str, Any]]:
+        """Notification profiles (local, then the organization's) (API tokens: `read` scope). `GET /api/v1/notification-profiles`"""
+        return self._call("GET", f"/api/v1/notification-profiles", None, None)
+
+    def post_notification_profiles(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a notification profile (secret values are moved to the credential store) (API tokens: `write` scope). `POST /api/v1/notification-profiles`"""
+        return self._call("POST", f"/api/v1/notification-profiles", None, body)
+
+    def get_notification_profiles_id(self, id_: str) -> Dict[str, Any]:
+        """One notification profile (API tokens: `read` scope). `GET /api/v1/notification-profiles/{id}`"""
+        return self._call("GET", f"/api/v1/notification-profiles/{urllib.parse.quote(id_, safe='')}", None, None)
+
+    def put_notification_profiles_id(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Update a local notification profile (API tokens: `write` scope). `PUT /api/v1/notification-profiles/{id}`"""
+        return self._call("PUT", f"/api/v1/notification-profiles/{urllib.parse.quote(id_, safe='')}", None, body)
+
+    def delete_notification_profiles_id(self, id_: str, force: Optional[bool] = None) -> Dict[str, Any]:
+        """Delete a local notification profile; one jobs or templates use needs force=true, which removes those references (API tokens: `write` scope). `DELETE /api/v1/notification-profiles/{id}`"""
+        return self._call("DELETE", f"/api/v1/notification-profiles/{urllib.parse.quote(id_, safe='')}", {"force": force}, None)
+
+    def post_notification_profiles_id_test(self, id_: str) -> Dict[str, Any]:
+        """Send a test message through the profile (API tokens: `write` scope). `POST /api/v1/notification-profiles/{id}/test`"""
+        return self._call("POST", f"/api/v1/notification-profiles/{urllib.parse.quote(id_, safe='')}/test", None, None)
+
+    def post_notifications_preview(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """What a channel would send for a sample run: subject, text, HTML (email) and the webhook request with secrets masked (API tokens: `write` scope). `POST /api/v1/notifications/preview`"""
+        return self._call("POST", f"/api/v1/notifications/preview", None, body)
+
+    def post_notifications_webhook_preset(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """A webhook channel set up for Pushover, ntfy, Discord, PagerDuty Events v2, Gotify or a generic endpoint (store its secret under the returned credential_id) (API tokens: `write` scope). `POST /api/v1/notifications/webhook-preset`"""
+        return self._call("POST", f"/api/v1/notifications/webhook-preset", None, body)
+
     def get_oauth_providers(self) -> List[Dict[str, Any]]:
         """Configured OAuth providers for cloud destinations (API tokens: `admin` scope). `GET /api/v1/oauth/providers`"""
         return self._call("GET", f"/api/v1/oauth/providers", None, None)

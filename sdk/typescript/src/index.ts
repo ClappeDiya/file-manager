@@ -455,6 +455,46 @@ export class UfopClient {
     return this.call("GET", `/api/v1/modules`, undefined, undefined);
   }
 
+  /** Notification profiles (local, then the organization's) (API tokens: `read` scope). `GET /api/v1/notification-profiles` */
+  getNotificationProfiles(): Promise<Array<{ created_at?: string; description?: string; id?: string; managed?: boolean; min_severity?: "success" | "warning" | "error" | null; name: string; notification: Record<string, unknown>; secret?: string | null; updated_at?: string }>> {
+    return this.call("GET", `/api/v1/notification-profiles`, undefined, undefined);
+  }
+
+  /** Create a notification profile (secret values are moved to the credential store) (API tokens: `write` scope). `POST /api/v1/notification-profiles` */
+  postNotificationProfiles(body: { created_at?: string; description?: string; id?: string; managed?: boolean; min_severity?: "success" | "warning" | "error" | null; name: string; notification: Record<string, unknown>; secret?: string | null; updated_at?: string }): Promise<{ created_at?: string; description?: string; id?: string; managed?: boolean; min_severity?: "success" | "warning" | "error" | null; name: string; notification: Record<string, unknown>; secret?: string | null; updated_at?: string }> {
+    return this.call("POST", `/api/v1/notification-profiles`, undefined, body);
+  }
+
+  /** One notification profile (API tokens: `read` scope). `GET /api/v1/notification-profiles/{id}` */
+  getNotificationProfilesId(id: string): Promise<{ created_at?: string; description?: string; id?: string; managed?: boolean; min_severity?: "success" | "warning" | "error" | null; name: string; notification: Record<string, unknown>; secret?: string | null; updated_at?: string }> {
+    return this.call("GET", `/api/v1/notification-profiles/${encodeURIComponent(id)}`, undefined, undefined);
+  }
+
+  /** Update a local notification profile (API tokens: `write` scope). `PUT /api/v1/notification-profiles/{id}` */
+  putNotificationProfilesId(id: string, body: { created_at?: string; description?: string; id?: string; managed?: boolean; min_severity?: "success" | "warning" | "error" | null; name: string; notification: Record<string, unknown>; secret?: string | null; updated_at?: string }): Promise<{ created_at?: string; description?: string; id?: string; managed?: boolean; min_severity?: "success" | "warning" | "error" | null; name: string; notification: Record<string, unknown>; secret?: string | null; updated_at?: string }> {
+    return this.call("PUT", `/api/v1/notification-profiles/${encodeURIComponent(id)}`, undefined, body);
+  }
+
+  /** Delete a local notification profile; one jobs or templates use needs force=true, which removes those references (API tokens: `write` scope). `DELETE /api/v1/notification-profiles/{id}` */
+  deleteNotificationProfilesId(id: string, query: { force?: boolean } = {}): Promise<{ removed_from?: string[]; warnings?: string[] }> {
+    return this.call("DELETE", `/api/v1/notification-profiles/${encodeURIComponent(id)}`, query, undefined);
+  }
+
+  /** Send a test message through the profile (API tokens: `write` scope). `POST /api/v1/notification-profiles/{id}/test` */
+  postNotificationProfilesIdTest(id: string): Promise<{ ok?: boolean }> {
+    return this.call("POST", `/api/v1/notification-profiles/${encodeURIComponent(id)}/test`, undefined, undefined);
+  }
+
+  /** What a channel would send for a sample run: subject, text, HTML (email) and the webhook request with secrets masked (API tokens: `write` scope). `POST /api/v1/notifications/preview` */
+  postNotificationsPreview(body: { notification: Record<string, unknown>; result?: "success" | "warning" | "error" }): Promise<{ html?: string | null; request?: string | null; subject?: string; text?: string }> {
+    return this.call("POST", `/api/v1/notifications/preview`, undefined, body);
+  }
+
+  /** A webhook channel set up for Pushover, ntfy, Discord, PagerDuty Events v2, Gotify or a generic endpoint (store its secret under the returned credential_id) (API tokens: `write` scope). `POST /api/v1/notifications/webhook-preset` */
+  postNotificationsWebhookPreset(body: { params?: { bearer?: boolean; server?: string; topic?: string; user?: string }; preset: "generic" | "pushover" | "ntfy" | "discord" | "pagerduty" | "gotify" }): Promise<Record<string, unknown>> {
+    return this.call("POST", `/api/v1/notifications/webhook-preset`, undefined, body);
+  }
+
   /** Configured OAuth providers for cloud destinations (API tokens: `admin` scope). `GET /api/v1/oauth/providers` */
   getOauthProviders(): Promise<Array<Record<string, unknown>>> {
     return this.call("GET", `/api/v1/oauth/providers`, undefined, undefined);
