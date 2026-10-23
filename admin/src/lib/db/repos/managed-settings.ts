@@ -37,6 +37,69 @@ export interface ManagedSettingsBody {
   notificationProfiles: ManagedNotificationProfile[] | null;
   /** Accounts and per-job access rules for ufop-server nodes (read-only there). */
   serverAccess: ManagedServerAccess | null;
+  /** Web UI branding of ufop-server nodes (title prefix, product name, logo, accent, CSS). */
+  serverBranding: ManagedServerBranding | null;
+}
+
+/** Same limits and checks as Rust `ufop_core::agent::managed::ManagedServerBranding`. */
+export interface ManagedServerBranding {
+  titlePrefix: string;
+  productName: string;
+  /** `data:image/png;base64,…` (PNG, JPEG, SVG, WebP, GIF; ≤ 512 KiB). */
+  logo: string;
+  /** `#rgb` or `#rrggbb`. */
+  accentColor: string;
+  customCss: string;
+}
+
+export const MAX_BRAND_TEXT = 64;
+export const MAX_BRAND_LOGO = 512 * 1024;
+export const MAX_BRAND_CSS = 32 * 1024;
+const BRAND_LOGO_TYPES = ['image/png', 'image/jpeg', 'image/svg+xml', 'image/webp', 'image/gif'];
+
+/** Problem with custom CSS served on the server's origin, or null. */
+export function customCssProblem(css: string): string | null {
+  if (css.length > MAX_BRAND_CSS) return `Custom CSS is larger than ${MAX_BRAND_CSS / 1024} KiB`;
+  const lower = css.toLowerCase().replace(/\s+/g, '');
+  for (const bad of ['<', '@import', 'expression(', 'javascript:', 'vbscript:', 'behavior:', '-moz-binding', '@charset', '\\']) {
+    if (lower.includes(bad)) return `Custom CSS may not contain '${bad}'`;
+  }
+  let i = lower.indexOf('url(');
+  while (i >= 0) {
+    if (!lower.slice(i + 4).replace(/^["']+/, '').startsWith('data:image/')) return 'Custom CSS may only use url(data:image/…)';
+    i = lower.indexOf('url(', i + 4);
+  }
+  return null;
+}
+
+export function normalizeServerBranding(raw: unknown): ManagedServerBranding | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new OrgError('Server branding must be an object');
+  const o = raw as Record<string, unknown>;
+  const text = (v: unknown, what: string) => {
+    const t = typeof v === 'string' ? v : '';
+    if ([...t].length > MAX_BRAND_TEXT) throw new OrgError(`${what} is longer than ${MAX_BRAND_TEXT} characters`);
+    // eslint-disable-next-line no-control-regex
+    if (/[\u0000-\u001f\u007f]/.test(t)) throw new OrgError(`${what} contains control characters`);
+    return t;
+  };
+  const titlePrefix = text(o.titlePrefix, 'Title prefix');
+  const productName = text(o.productName, 'Product name');
+  const accentColor = typeof o.accentColor === 'string' ? o.accentColor.trim() : '';
+  if (accentColor && !/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(accentColor)) throw new OrgError(`Accent color '${accentColor}' must look like #1e66f5`);
+  const logo = typeof o.logo === 'string' ? o.logo.trim() : '';
+  if (logo) {
+    const m = /^data:([^;,]+);base64,([A-Za-z0-9+/=\s]+)$/.exec(logo);
+    if (!m) throw new OrgError('The logo must be a base64 data: URI (data:image/png;base64,…)');
+    if (!BRAND_LOGO_TYPES.includes(m[1].toLowerCase())) throw new OrgError(`Logo type '${m[1]}' is not supported (PNG, JPEG, SVG, WebP, GIF)`);
+    const bytes = Math.floor((m[2].replace(/\s/g, '').length * 3) / 4);
+    if (bytes === 0 || bytes > MAX_BRAND_LOGO) throw new OrgError(`The logo must be between 1 byte and ${MAX_BRAND_LOGO / 1024} KiB`);
+  }
+  const customCss = typeof o.customCss === 'string' ? o.customCss : '';
+  const problem = customCssProblem(customCss);
+  if (problem) throw new OrgError(problem);
+  const out = { titlePrefix, productName, logo, accentColor, customCss };
+  return Object.values(out).some((v) => v.trim() !== '') ? out : null;
 }
 
 export interface ManagedServerAccess {
@@ -266,7 +329,7 @@ const str = (v: unknown, n = 500) => (typeof v === 'string' ? v.trim().slice(0, 
 /** Validate and normalize a settings body (throws `OrgError` with a readable message). */
 export function normalizeManagedSettings(raw: unknown): ManagedSettingsBody {
   const b = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: normalizeWorkflows(b.workflows), backupTemplates: normalizeBackupTemplates(b.backupTemplates), notificationProfiles: normalizeNotificationProfiles(b.notificationProfiles), serverAccess: normalizeServerAccess(b.serverAccess) };
+  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: normalizeWorkflows(b.workflows), backupTemplates: normalizeBackupTemplates(b.backupTemplates), notificationProfiles: normalizeNotificationProfiles(b.notificationProfiles), serverAccess: normalizeServerAccess(b.serverAccess), serverBranding: normalizeServerBranding(b.serverBranding) };
   if (b.updates) {
     const u = b.updates as Record<string, unknown>;
     const channel = u.channel === null || u.channel === undefined || u.channel === '' ? null : u.channel;
@@ -348,8 +411,8 @@ function row(orgId: string): Row | undefined {
 export function getManagedSettings(orgId: string): ManagedSettings | null {
   const r = row(orgId);
   if (!r || r.settings === 'null') return null;
-  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null, notificationProfiles: null, serverAccess: null });
-  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, mounts: b.mounts ?? null, workflows: b.workflows ?? null, backupTemplates: b.backupTemplates ?? null, notificationProfiles: b.notificationProfiles ?? null, serverAccess: b.serverAccess ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
+  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null, notificationProfiles: null, serverAccess: null, serverBranding: null });
+  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, mounts: b.mounts ?? null, workflows: b.workflows ?? null, backupTemplates: b.backupTemplates ?? null, notificationProfiles: b.notificationProfiles ?? null, serverAccess: b.serverAccess ?? null, serverBranding: b.serverBranding ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
 }
 
 /**
@@ -358,7 +421,7 @@ export function getManagedSettings(orgId: string): ManagedSettings | null {
  */
 export function setManagedSettings(orgId: string, raw: unknown, by: string): ManagedSettings | null {
   const body = normalizeManagedSettings(raw);
-  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers && !body.mounts && !body.workflows && !body.backupTemplates && !body.notificationProfiles && !body.serverAccess;
+  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers && !body.mounts && !body.workflows && !body.backupTemplates && !body.notificationProfiles && !body.serverAccess && !body.serverBranding;
   const version = Number(row(orgId)?.version ?? 0) + 1;
   db()
     .prepare('INSERT INTO managed_settings (org_id, settings, version, updated_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(org_id) DO UPDATE SET settings = excluded.settings, version = excluded.version, updated_by = excluded.updated_by, updated_at = excluded.updated_at')
@@ -369,5 +432,5 @@ export function setManagedSettings(orgId: string, raw: unknown, by: string): Man
 /** What the agent receives: `null` when nothing is managed. */
 export function managedSettingsForAgent(orgId: string): (ManagedSettingsBody & { version: number }) | null {
   const s = getManagedSettings(orgId);
-  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers, mounts: s.mounts, workflows: s.workflows, backupTemplates: s.backupTemplates, notificationProfiles: s.notificationProfiles, serverAccess: s.serverAccess };
+  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers, mounts: s.mounts, workflows: s.workflows, backupTemplates: s.backupTemplates, notificationProfiles: s.notificationProfiles, serverAccess: s.serverAccess, serverBranding: s.serverBranding };
 }

@@ -281,3 +281,25 @@ group. `--pushgateway-instance` defaults to the host name; values with a `/` use
 form. Authenticate with `--pushgateway-basic-auth user:password` or `--pushgateway-token` (bearer). When the
 server stops, it waits for running backups to finish draining and pushes once more, so the last values
 (including `ufop_shutting_down 1`) are kept. Delete stale groups in the Pushgateway when you retire a server.
+
+## Web UI branding
+
+Put your organization's name and colors on the server's web UI: a **title prefix** (`[ACME] ` before every page title), a **product name** (sign-in heading and titles, default *UFOP backup server*), a **logo** (sign-in screen, tab bar and favicon), an **accent color** (buttons and the selected tab; also the `--ufop-accent` CSS variable) and a little **custom CSS**.
+
+Three layers, highest first; a field left empty falls through to the next layer:
+
+1. **Management console** — *Fleet → App settings → Server web UI branding (ufop-server)* (`serverBranding`, logo as a data: URI). While it is set, the server's own branding cannot be changed (`PUT` is refused).
+2. **Saved by an administrator** — `PUT /api/v1/server/branding` (admin scope), kept in the server's settings database:
+   ```bash
+   curl -X PUT https://backup.example.com/api/v1/server/branding -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"title_prefix":"[ACME] ","product_name":"ACME Backup","accent_color":"#1e66f5","logo":"data:image/png;base64,…","custom_css":""}'
+   ```
+   `GET /api/v1/server/branding` shows the effective branding and each layer (`saved`, `command_line`, `managed`).
+3. **Command line / config file** — `--branding-file branding.json` (same fields; here `logo` may also be an image file path) and the flags `--brand-title-prefix`, `--brand-product-name`, `--brand-logo FILE|data:…`, `--brand-accent-color`, `--brand-css-file` (environment: `UFOP_SERVER_BRANDING_FILE`, `UFOP_SERVER_BRAND_*`). Flags win over the file. Invalid values stop the server at start.
+
+Limits and safety: title prefix and product name up to 64 characters without control characters; accent `#rgb` or `#rrggbb`; logo PNG, JPEG, SVG, WebP or GIF up to 512 KiB (over the API only as a data: URI, so an administrator cannot make the server publish arbitrary files); custom CSS up to 32 KiB and refused when it contains `<`, `@import`, `@charset`, `expression(`, `javascript:`, `behavior:`, `-moz-binding`, backslash escapes or any `url(…)` other than `url(data:image/…)`, so it can neither load outside resources nor escape the stylesheet.
+
+What browsers get (no sign-in needed, no secrets): `GET /api/v1/branding` → `{title_prefix, product_name, accent_color, logo_url, css_url, revision}`; the logo at `/branding/logo` (served with `Content-Security-Policy: default-src 'none'; sandbox` and `nosniff`, so an SVG cannot run scripts) and the stylesheet at `/branding/custom.css`. The server also rewrites `index.html` on the way out (title, accent variable, stylesheet link, `window.__UFOP_BRANDING__`), so the first paint is already branded.
+
+To replace the web UI entirely, serve your own folder with `--webroot DIR` (`UFOP_SERVER_WEBROOT`; the Docker image uses `/app/web`). That stays a command-line setting.

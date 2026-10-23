@@ -106,7 +106,7 @@ Ground rules
 - [x] K126 Multi-arch Docker image
 - [x] K127 Signed SHA256SUMS on releases
 - [x] K131 Portable mode for the desktop app
-- [ ] K124 ufop-server web UI branding
+- [x] K124 ufop-server web UI branding
 
 ## WP11 — Interface polish
 - [ ] K122 Sort and paginate backup version/file tables

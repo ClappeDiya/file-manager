@@ -5,6 +5,7 @@
 import { useEffect, useState } from "react";
 import { BackupPanel } from "@/components/backup/backup-panel";
 import { errorText } from "@/lib/error-text";
+import { accentStyle, productName, useServerBranding, type PublicBranding } from "@/lib/server-branding";
 import { pickFolder, setFolderPickerImpl } from "@/lib/folder-picker";
 import { ShareLinksPanel } from "@/components/server/share-links-panel";
 import { GatewaysPanel } from "@/components/server/gateways-panel";
@@ -105,7 +106,12 @@ function FolderBrowser({
   );
 }
 
-function SignIn() {
+function BrandLogo({ branding, className }: { branding: PublicBranding | null; className: string }) {
+  if (!branding?.logo_url) return null;
+  return <img src={branding.logo_url} alt="" className={className} data-testid="server-brand-logo" />;
+}
+
+function SignIn({ branding }: { branding: PublicBranding | null }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -127,8 +133,9 @@ function SignIn() {
           }
         }}
       >
-        <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
-          UFOP backup server
+        <BrandLogo branding={branding} className="h-10 max-w-[12rem] object-contain" />
+        <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100" data-testid="server-product-name">
+          {productName(branding)}
         </h1>
         <label className="block text-sm text-zinc-700 dark:text-zinc-300">
           User name
@@ -161,6 +168,7 @@ function SignIn() {
         <button
           type="submit"
           disabled={busy || !password}
+          style={accentStyle(branding)}
           className="w-full py-1.5 rounded bg-blue-500 text-white text-sm disabled:opacity-50"
         >
           {busy ? "Signing in…" : "Sign in"}
@@ -181,6 +189,7 @@ export default function ServerApp() {
     "backups",
   );
   const [me, setMe] = useState<ServerMe | null>(null);
+  const branding = useServerBranding(signedIn ? { backups: "Backups", shares: "Share links", gateways: "Gateways", access: "Users & access" }[tab] : "Sign in");
 
   useEffect(() => {
     if (!signedIn) {
@@ -207,10 +216,11 @@ export default function ServerApp() {
 
   if (checking)
     return <div className="p-6 text-sm text-zinc-500">Connecting…</div>;
-  if (!signedIn) return <SignIn />;
+  if (!signedIn) return <SignIn branding={branding} />;
   return (
     <div className="h-full flex flex-col">
       <div className="flex items-center gap-1 px-3 py-1 text-xs border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900">
+        <BrandLogo branding={branding} className="h-5 max-w-[8rem] object-contain mr-1" />
         <div role="tablist" className="flex gap-1">
           {(
             [
@@ -226,6 +236,7 @@ export default function ServerApp() {
                 key={id}
                 role="tab"
                 aria-selected={tab === id}
+                style={tab === id ? accentStyle(branding) : undefined}
                 className={`px-2 py-0.5 rounded ${tab === id ? "bg-blue-500 text-white" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}
                 onClick={() => setTab(id)}
               >

@@ -54,6 +54,8 @@ interface Form {
   notificationProfilesJson: string;
   /** `serverAccess` as JSON ("" = not managed). */
   serverAccessJson: string;
+  /** `serverBranding` as JSON ("" = not managed). */
+  serverBrandingJson: string;
 }
 
 interface BackupTemplateForm {
@@ -107,6 +109,7 @@ function toForm(s: ManagedSettings | null): Form {
     backupTemplates: (s?.backupTemplates ?? []).map((t) => ({ id: t.id, name: t.name, description: t.description, enforced: t.enforced, settingsJson: JSON.stringify(t.settings, null, 2) })),
     notificationProfilesJson: s?.notificationProfiles ? JSON.stringify(s.notificationProfiles, null, 2) : '',
     serverAccessJson: s?.serverAccess ? JSON.stringify(s.serverAccess, null, 2) : '',
+    serverBrandingJson: s?.serverBranding ? JSON.stringify(s.serverBranding, null, 2) : '',
   };
 }
 
@@ -130,6 +133,7 @@ function toBody(f: Form): ManagedSettingsBody {
       : null,
     notificationProfiles: f.notificationProfilesJson.trim() ? (parseRule(f.notificationProfilesJson) as unknown as ManagedSettingsBody['notificationProfiles']) : null,
     serverAccess: f.serverAccessJson.trim() ? (parseRule(f.serverAccessJson) as unknown as ManagedSettingsBody['serverAccess']) : null,
+    serverBranding: f.serverBrandingJson.trim() ? (parseRule(f.serverBrandingJson) as unknown as ManagedSettingsBody['serverBranding']) : null,
   };
 }
 
@@ -398,12 +402,31 @@ export default function AppSettingsPage() {
             />
           </label>
         </Card>
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Server web UI branding (ufop-server)</CardTitle>
+            <CardDescription>
+              Title prefix, product name, logo (a data: URI, ≤ 512 KiB: PNG, JPEG, SVG, WebP or GIF), accent color (#rrggbb) and a little CSS (≤ 32 KiB; no @import, external url() or scripts) for every ufop-server node&apos;s web UI. It wins over branding saved on the server, whose administrators cannot change it while it is set. Leave empty to stop managing.
+            </CardDescription>
+          </CardHeader>
+          <label className="flex flex-col gap-1 text-sm">
+            Server branding (JSON)
+            <textarea
+              aria-label="Server branding (JSON)"
+              className="min-h-24 rounded border border-border bg-background p-2 font-mono text-xs"
+              spellCheck={false}
+              placeholder={'{ "titlePrefix": "[ACME] ", "productName": "ACME Backup", "accentColor": "#1e66f5", "logo": "data:image/png;base64,…", "customCss": "" }'}
+              value={form.serverBrandingJson}
+              onChange={(e) => set({ serverBrandingJson: e.target.value })}
+            />
+          </label>
+        </Card>
       </fieldset>
       {canWrite && (
         <div className="mt-4 flex gap-2">
           <Button onClick={() => void save(toBody(form))}>Save</Button>
           {s && (
-            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null, notificationProfiles: null, serverAccess: null })}>
+            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null, notificationProfiles: null, serverAccess: null, serverBranding: null })}>
               Stop managing
             </Button>
           )}
