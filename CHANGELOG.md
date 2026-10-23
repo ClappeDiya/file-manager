@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Backup storage backends (see `docs/backup-destinations.md`):
+  - **S3 credential chain**: static keys (default), environment, AWS profiles (static keys, `role_arn` with `source_profile` or `credential_source`, web identity), web identity token files, EC2 instance metadata (IMDSv2), ECS/EKS container credentials and *Automatic* (the SDK order). Temporary credentials refresh five minutes before they expire.
+  - **STS AssumeRole** on top of any S3 credential source, with external id, session name, duration, STS endpoint and region; cached and renewed.
+  - **Azure sign-in with Microsoft Entra ID**: service principal with a client secret or a certificate (PEM or PFX), workload identity federation (token file), and managed identity (App Service endpoint or instance metadata), plus explicit SAS. The Key Vault secret provider uses the same token code.
+  - **GCS read-only scope** for read-only jobs and point-in-time views, and an explicit OAuth scope option.
+  - **rclone process control**: call and startup timeouts, process groups killed with everything rclone started (also when cancelled), extra or isolated environment variables, and rclone's stderr in error advice.
+  - **Storage class per volume kind** (data blocks, indexes, file lists, other) for S3, GCS and Azure access tiers. Tiers that need a thaw before reading (S3 Glacier/Deep Archive, Azure Archive) are refused here.
+  - **Point-in-time reads of versioned S3 buckets**: "Open backup as it was at …" creates a read-only job that reads every object as it was at a time, for recovery after ransomware (`backup_open_point_in_time`, `POST /jobs/{id}/point-in-time`, `ufop backup open-at --point-in-time`).
+  - **Request limits** per destination (requests per second for list, get, put and delete, and requests in flight) and **parallel listing** of shard folders, in the job editor and as `ufop backup` flags.
+  - **Sharded layouts on cloud destinations**: S3, Azure, GCS, B2 and Swift prefixes, and SFTP, FTP, WebDAV and S3 connections.
+  - **Live-provider contract tests** gated by `UFOP_LIVE_*` variables (`scripts/live-providers.sh`, and a nightly workflow shipped disabled per the repository's Actions policy).
+
 - Backup policies, schedules and maintenance (see `docs/backup-policies-and-schedules.md`):
   - **Policy templates** jobs are based on, in order. Settings resolve as built-in defaults < global defaults < templates < the job's own settings < enforced organization templates, and older jobs keep their behaviour. Manage them in *Settings → Policy templates*, with `ufop backup template …`, `/api/v1/backup-templates` and import/export. Organization templates come through the console's managed app settings.
   - An **effective-settings view** in the job editor shows where each setting comes from, with *Reset to inherited* (`ufop backup effective`, `GET /jobs/{id}/effective-settings`).

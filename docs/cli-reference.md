@@ -647,6 +647,23 @@ ufop backup schedule-preview --cron "30 2 * * Mon-Fri" --cron "0 9 * * Sat" --co
 
 `verify` exits with 0 when it finds no problems and 2 when it finds some. With `--json` the full report is printed, including `problems` with the affected versions and paths.
 
+### `ufop backup` destinations: request limits and point in time
+
+Every `ufop backup` command with `--dest` takes request limits (0 = unlimited) and the listing parallelism for sharded layouts. See [backup-destinations.md](backup-destinations.md).
+
+```bash
+ufop backup run --dest /mnt/nas/backup --source ~/Documents --put-rate 5 --max-concurrent-requests 4 --list-parallelism 8
+ufop backup open-at Office --point-in-time 2026-10-01T08:00:00Z [--name "Office before the attack"]
+```
+
+| Flag | Default | |
+|---|---|---|
+| `--list-rate` / `--get-rate` / `--put-rate` / `--delete-rate` | 0 | Most listing / download / upload / delete requests per second |
+| `--max-concurrent-requests` | 0 | Most requests in flight at once |
+| `--list-parallelism` | 1 | Shard folders listed at once (1–64) |
+
+`open-at` works with jobs of the signed-in `ufop-server` whose destination is a versioned S3 bucket. It creates a read-only job that reads the bucket as it was at the given RFC 3339 time and prints its name, id and version count. Restore from it on the server or in the app.
+
 ### `ufop server shares`
 
 Share links on a `ufop-server` started with `--share-root` (sign in first with `ufop server login`).
