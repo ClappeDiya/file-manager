@@ -42,12 +42,32 @@ pub struct SourcePreview {
 pub async fn export_config(mgr: &BackupManager, id: &str, include_passphrase: bool, export_passphrase: Option<&str>, include_stats: bool) -> Result<String, AppError> {
     let job = mgr.get_job(id).await?;
     let pass = if include_passphrase { mgr.passphrase(id).await? } else { None };
-    portability::export_job(&job, pass, export_passphrase, include_stats)
+    let templates = mgr.list_templates().await?.into_iter().filter(|t| job.template_ids.contains(&t.id)).collect();
+    portability::export_job_with(&job, pass, export_passphrase, include_stats, templates)
 }
 
 pub async fn import_config(mgr: &BackupManager, json: &str, export_passphrase: Option<&str>, import_stats: bool, save: bool) -> Result<ImportPreview, AppError> {
-    let (job, pass) = portability::import_job(json, export_passphrase, import_stats)?;
+    let (mut job, pass, templates) = portability::import_job_with(json, export_passphrase, import_stats)?;
     let has_passphrase = pass.is_some();
+    if save {
+        // Templates the job is based on: reuse a local one of the same id or
+        // name, otherwise create it; ids the job cannot resolve are dropped.
+        let known = mgr.list_templates().await?;
+        let mut ids = Vec::new();
+        for id in &job.template_ids {
+            if known.iter().any(|k| &k.id == id && !k.enforced) {
+                ids.push(id.clone());
+            } else if let Some(t) = templates.iter().find(|t| &t.id == id) {
+                let local = known.iter().find(|k| !k.managed && k.name.eq_ignore_ascii_case(t.name.trim()));
+                let saved = match local {
+                    Some(l) => l.clone(),
+                    None => mgr.save_template(super::templates::PolicyTemplate { id: String::new(), ..t.clone() }).await?,
+                };
+                ids.push(saved.id);
+            }
+        }
+        job.template_ids = ids;
+    }
     let job = if save { mgr.save_job(job, pass).await? } else { job };
     Ok(ImportPreview { job, has_passphrase })
 }
@@ -135,6 +155,11 @@ fn ok<T: Serialize>(v: T) -> Result<Value, AppError> {
 /// Execute a backup command by its Tauri name with camelCase JSON args
 /// (exactly what the frontend sends to `invoke`).
 pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<Value, AppError> {
+    // Boxed: the match holds a future per command, too large for a caller's stack frame.
+    Box::pin(dispatch_inner(mgr, command, a)).await
+}
+
+async fn dispatch_inner(mgr: &BackupManager, command: &str, a: &Value) -> Result<Value, AppError> {
     let prefix = || opt::<String>(a, "prefix").map(|p| p.unwrap_or_else(|| "ufop".into()));
     match command {
         "backup_list_jobs" => ok(mgr.list_jobs().await),
@@ -258,6 +283,14 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
         "backup_clear_cache" => ok(mgr.clear_cache().await?),
         "backup_get_cache_settings" => ok(mgr.cache_settings().await?),
         "backup_set_cache_settings" => ok(mgr.set_cache_settings(arg(a, "settings")?).await?),
+        "backup_list_templates" => ok(mgr.list_templates().await?),
+        "backup_get_template" => ok(mgr.get_template(&arg::<String>(a, "id")?).await?),
+        "backup_save_template" => ok(mgr.save_template(arg(a, "template")?).await?),
+        "backup_delete_template" => ok(mgr.delete_template(&arg::<String>(a, "id")?).await?),
+        "backup_apply_template" => ok(mgr.apply_template(&arg::<String>(a, "templateId")?, &arg::<String>(a, "jobId")?).await?),
+        "backup_export_templates" => ok(mgr.export_templates(&opt::<Vec<String>>(a, "ids")?.unwrap_or_default()).await?),
+        "backup_import_templates" => ok(mgr.import_templates(&arg::<String>(a, "json")?).await?),
+        "backup_effective_settings" => ok(mgr.effective_settings(opt::<String>(a, "id")?.as_deref(), opt(a, "job")?).await?),
         "backup_schedule_preview" => ok(arg::<super::schedule::BackupSchedule>(a, "schedule")?.preview(chrono::Utc::now(), opt(a, "count")?.unwrap_or(5))?),
         other => Err(AppError::validation(format!("Unknown command '{other}'"))),
     }
@@ -276,5 +309,7 @@ pub const COMMANDS: &[&str] = &[
     "backup_photos_libraries", "backup_photos_library_info", "backup_lock_status", "backup_break_lock", "backup_set_database_encryption",
     "backup_list_sources", "backup_preview_retention", "backup_set_version_metadata", "backup_run_all", "backup_estimate",
     "backup_resolve_version", "backup_read_file", "backup_export_file", "backup_cache_stats", "backup_clear_cache",
-    "backup_get_cache_settings", "backup_set_cache_settings", "backup_schedule_preview",
+    "backup_get_cache_settings", "backup_set_cache_settings", "backup_schedule_preview", "backup_list_templates", "backup_get_template",
+    "backup_save_template", "backup_delete_template", "backup_apply_template", "backup_export_templates", "backup_import_templates",
+    "backup_effective_settings",
 ];

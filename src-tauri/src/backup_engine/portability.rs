@@ -28,6 +28,9 @@ struct Payload {
     job: BackupJob,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     passphrase: Option<String>,
+    /// The policy templates the job is based on (created on import when missing).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    templates: Vec<super::templates::PolicyTemplate>,
 }
 
 /// Job JSON safe to store remotely: no stats, no report callback URLs
@@ -50,11 +53,23 @@ pub fn full_config(job: &BackupJob) -> Result<serde_json::Value, AppError> {
 /// Export a job. `passphrase` is included only when given;
 /// `export_passphrase` encrypts the whole file.
 pub fn export_job(job: &BackupJob, passphrase: Option<String>, export_passphrase: Option<&str>, include_stats: bool) -> Result<String, AppError> {
+    export_job_with(job, passphrase, export_passphrase, include_stats, Vec::new())
+}
+
+/// [`export_job`] carrying the job's policy templates.
+pub fn export_job_with(
+    job: &BackupJob,
+    passphrase: Option<String>,
+    export_passphrase: Option<&str>,
+    include_stats: bool,
+    templates: Vec<super::templates::PolicyTemplate>,
+) -> Result<String, AppError> {
     let mut j = job.clone();
     if !include_stats {
         j.stats = JobStats::default();
     }
-    let payload = Payload { job: j, passphrase };
+    let templates = templates.into_iter().map(|t| super::templates::PolicyTemplate { managed: false, enforced: false, ..t }).collect();
+    let payload = Payload { job: j, passphrase, templates };
     let file = match export_passphrase.filter(|p| !p.is_empty()) {
         None => ExportFile { format: FORMAT.into(), version: 1, encrypted: false, salt: None, payload: serde_json::to_value(&payload)? },
         Some(p) => {
@@ -81,6 +96,11 @@ pub fn is_encrypted_export(json: &str) -> bool {
 /// Parse an export (or a bare job JSON, e.g. from remote discovery). The
 /// returned job has a fresh id; statistics are kept only on request.
 pub fn import_job(json: &str, export_passphrase: Option<&str>, import_stats: bool) -> Result<(BackupJob, Option<String>), AppError> {
+    import_job_with(json, export_passphrase, import_stats).map(|(j, p, _)| (j, p))
+}
+
+/// [`import_job`] also returning the policy templates the export carried.
+pub fn import_job_with(json: &str, export_passphrase: Option<&str>, import_stats: bool) -> Result<(BackupJob, Option<String>, Vec<super::templates::PolicyTemplate>), AppError> {
     let payload: Payload = match serde_json::from_str::<ExportFile>(json) {
         Ok(f) if f.format == FORMAT => {
             if f.encrypted {
@@ -95,14 +115,14 @@ pub fn import_job(json: &str, export_passphrase: Option<&str>, import_stats: boo
                 serde_json::from_value(f.payload)?
             }
         }
-        _ => Payload { job: serde_json::from_str(json).map_err(|e| AppError::validation(format!("Not a backup configuration: {e}")))?, passphrase: None },
+        _ => Payload { job: serde_json::from_str(json).map_err(|e| AppError::validation(format!("Not a backup configuration: {e}")))?, passphrase: None, templates: Vec::new() },
     };
     let mut job = payload.job;
     job.id = String::new();
     if !import_stats {
         job.stats = JobStats::default();
     }
-    Ok((job, payload.passphrase))
+    Ok((job, payload.passphrase, payload.templates))
 }
 
 fn quote(s: &str) -> String {

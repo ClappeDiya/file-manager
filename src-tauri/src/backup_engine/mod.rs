@@ -25,6 +25,7 @@ pub mod runs;
 pub mod power;
 pub mod schedule;
 pub mod secrets;
+pub mod templates;
 pub mod stores;
 pub mod versions;
 
@@ -206,6 +207,8 @@ pub struct JobStats {
     pub version_count: u64,
     pub source_size: u64,
     pub backend_size: u64,
+    /// Last scheduled start of each maintenance task (`compact`, `verify`, `apply_retention`).
+    pub last_maintenance: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +281,18 @@ pub struct BackupJob {
     /// A command whose output each backup stores as a virtual file.
     #[serde(default)]
     pub stdin_command: Option<hooks::StdinCommand>,
+    /// Policy templates this job inherits from, in order (later wins).
+    #[serde(default)]
+    pub template_ids: Vec<String>,
+    /// Settings the job sets itself (field paths such as `retention` or
+    /// `options.compression_level`); every other setting is inherited.
+    /// `None` (jobs from before templates): every setting that differs from
+    /// the built-in default counts as set by the job.
+    #[serde(default)]
+    pub overrides: Option<Vec<String>>,
+    /// Compaction, verification and retention on their own schedules.
+    #[serde(default)]
+    pub maintenance: schedule::MaintenanceSchedule,
 }
 
 impl Default for BackupJob {
@@ -317,6 +332,9 @@ impl Default for BackupJob {
             read_only: false,
             encrypt_local_database: None,
             stdin_command: None,
+            template_ids: Vec::new(),
+            overrides: None,
+            maintenance: schedule::MaintenanceSchedule::default(),
         }
     }
 }
@@ -407,6 +425,7 @@ impl BackupJob {
         }
         self.retention.validate()?;
         self.schedule.validate()?;
+        self.maintenance.validate()?;
         self.filter.clone().compile()?;
         if self.options.block_size < 1024 || self.options.volume_size < self.options.block_size {
             return Err(AppError::validation("Block size must be ≥ 1 KiB and remote volume size ≥ block size"));
@@ -474,7 +493,14 @@ pub enum BackupOperation {
         #[serde(default)]
         overrides: RestoreOverrides,
     },
-    Verify { full: bool },
+    Verify {
+        #[serde(default)]
+        full: bool,
+        /// Scope, sampling, parallelism and error limit (`None`: `full`
+        /// and the job's sample count, as before).
+        #[serde(default)]
+        options: Option<ufop_core::backup::verify::VerifyOptions>,
+    },
     Compact,
     Repair,
     RecreateDatabase,
@@ -674,6 +700,9 @@ pub struct SchedulerStatus {
     pub paused_until: Option<String>,
     pub tasks: Vec<TaskInfo>,
     pub next_runs: Vec<NextRun>,
+    /// Upcoming maintenance on its own schedule (compact, verify, apply_retention).
+    #[serde(default)]
+    pub next_maintenance: Vec<NextRun>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -681,6 +710,13 @@ pub struct NextRun {
     pub job_id: String,
     pub job_name: String,
     pub next_run_at: String,
+    /// `backup`, or the maintenance task.
+    #[serde(default = "backup_op")]
+    pub operation: String,
+}
+
+fn backup_op() -> String {
+    "backup".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -728,6 +764,8 @@ struct Inner {
     job_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Caps set by the console's managed settings.
     managed_caps: Mutex<Option<ufop_core::agent::ManagedTransfers>>,
+    /// Policy templates delivered by the console (read-only).
+    managed_templates: Mutex<Vec<templates::PolicyTemplate>>,
     /// `Some(None)` = paused indefinitely.
     paused: Mutex<Option<Option<DateTime<Utc>>>>,
     scheduler_running: AtomicBool,
@@ -818,6 +856,7 @@ impl BackupManager {
                 gate_size: Mutex::new(1),
                 job_locks: Mutex::new(HashMap::new()),
                 managed_caps: Mutex::new(None),
+                managed_templates: Mutex::new(Vec::new()),
                 paused: Mutex::new(None),
                 scheduler_running: AtomicBool::new(false),
                 kdf,
@@ -917,6 +956,15 @@ impl BackupManager {
             r.id = uuid::Uuid::new_v4().to_string();
         }
         job.validate()?;
+        templates::validate_job_refs(&job, &self.list_templates().await?)?;
+        if !job.template_ids.is_empty() && job.overrides.is_none() {
+            // First template on an older job: what it set so far stays its own.
+            job.overrides = Some(templates::explicit_paths(&job)?.into_iter().collect());
+        }
+        if let Some(o) = job.overrides.as_mut() {
+            o.sort();
+            o.dedup();
+        }
         self.check_policy(&job).await?;
         let now = Utc::now().to_rfc3339();
         match &existing {
@@ -1732,11 +1780,10 @@ impl BackupManager {
         *size = want;
     }
 
-    /// A job with the global defaults applied (what actually runs).
+    /// A job with its inherited settings resolved (what actually runs).
     pub async fn effective_job(&self, job_id: &str) -> Result<BackupJob, AppError> {
-        let mut j = self.get_job(job_id).await?;
-        self.global_defaults().await?.apply(&mut j)?;
-        Ok(j)
+        let j = self.get_job(job_id).await?;
+        Ok(self.resolve_job(&j).await?.job)
     }
 
     pub async fn list_destinations(&self) -> Result<Vec<defaults::SavedDestination>, AppError> {
@@ -2036,8 +2083,12 @@ impl BackupManager {
         let op_name = op.name();
         let mut log: Vec<LogLine> = Vec::new();
         let mut job = job;
-        if let Err(e) = self.global_defaults().await.and_then(|d| d.apply(&mut job)) {
-            log.push(LogLine::warn(format!("Global defaults not applied: {}", e.user_message())));
+        match self.resolve_job(&job).await {
+            Ok(r) => {
+                log.extend(r.warnings.into_iter().map(LogLine::warn));
+                job = r.job;
+            }
+            Err(e) => log.push(LogLine::warn(format!("Inherited settings not applied: {}", e.user_message()))),
         }
         if let BackupOperation::Restore { overrides, options } = &mut op {
             overrides.apply(&mut job);
@@ -2760,20 +2811,28 @@ impl BackupManager {
             .collect();
         let paused = self.is_paused();
         let paused_until = lock(&self.inner.paused).and_then(|p| p.map(|t| t.to_rfc3339()));
-        let mut next_runs: Vec<NextRun> = self
-            .inner
-            .jobs
-            .read()
-            .await
-            .values()
-            .filter_map(|j| {
-                let last = j.stats.last_scheduled_at.as_deref().or(Some(j.created_at.as_str())).and_then(parse_ts)?;
-                let n = j.schedule.next_after(last)?;
-                Some(NextRun { job_id: j.id.clone(), job_name: j.name.clone(), next_run_at: n.max(Utc::now()).to_rfc3339() })
-            })
-            .collect();
+        let mut next_runs = Vec::new();
+        let mut next_maintenance = Vec::new();
+        let at = |n: DateTime<Utc>| n.max(Utc::now()).to_rfc3339();
+        for (j, eff) in self.resolved_jobs().await {
+            let last = j.stats.last_scheduled_at.as_deref().unwrap_or(j.created_at.as_str());
+            if let Some(n) = parse_ts(last).and_then(|l| eff.schedule.next_after(l)) {
+                next_runs.push(NextRun { job_id: j.id.clone(), job_name: j.name.clone(), next_run_at: at(n), operation: "backup".into() });
+            }
+            if j.read_only {
+                continue;
+            }
+            for task in schedule::MAINTENANCE_TASKS {
+                let Some(s) = eff.maintenance.schedule_of(task) else { continue };
+                let last = j.stats.last_maintenance.get(task).map(String::as_str).unwrap_or(j.created_at.as_str());
+                if let Some(n) = parse_ts(last).and_then(|l| s.next_after(l)) {
+                    next_maintenance.push(NextRun { job_id: j.id.clone(), job_name: j.name.clone(), next_run_at: at(n), operation: task.to_string() });
+                }
+            }
+        }
         next_runs.sort_by(|a, b| a.next_run_at.cmp(&b.next_run_at));
-        SchedulerStatus { running: self.inner.scheduler_running.load(Ordering::SeqCst), paused, paused_until, tasks, next_runs }
+        next_maintenance.sort_by(|a, b| a.next_run_at.cmp(&b.next_run_at));
+        SchedulerStatus { running: self.inner.scheduler_running.load(Ordering::SeqCst), paused, paused_until, tasks, next_runs, next_maintenance }
     }
 
     /// Jobs whose schedule slot has passed (missed runs included).
@@ -2782,26 +2841,98 @@ impl BackupManager {
             return Vec::new();
         }
         let on_battery = power::on_battery() == Some(true);
-        self.inner
-            .jobs
-            .read()
-            .await
-            .values()
-            .filter(|j| {
-                if j.read_only {
-                    // Read-only connections never back up.
-                    return false;
-                }
-                let last = j.stats.last_scheduled_at.as_deref().or(Some(j.created_at.as_str())).and_then(parse_ts);
-                let due = last.is_some_and(|l| j.schedule.is_due(l, now)) && !self.is_job_busy(&j.id);
-                if due && on_battery && j.schedule.skip_on_battery {
-                    tracing::info!("Skipping scheduled backup '{}' while on battery", j.name);
-                    return false;
-                }
-                due
+        let mut out = Vec::new();
+        for (j, eff) in self.resolved_jobs().await {
+            if j.read_only {
+                // Read-only connections never back up.
+                continue;
+            }
+            let last = j.stats.last_scheduled_at.as_deref().or(Some(j.created_at.as_str())).and_then(parse_ts);
+            let due = last.is_some_and(|l| eff.schedule.is_due(l, now)) && !self.is_job_busy(&j.id);
+            if due && on_battery && eff.schedule.skip_on_battery {
+                tracing::info!("Skipping scheduled backup '{}' while on battery", j.name);
+                continue;
+            }
+            if due {
+                out.push(j.id.clone());
+            }
+        }
+        out
+    }
+
+    /// Every job with its resolved settings (schedules may come from templates).
+    async fn resolved_jobs(&self) -> Vec<(BackupJob, BackupJob)> {
+        let jobs: Vec<BackupJob> = self.inner.jobs.read().await.values().cloned().collect();
+        let globals = self.global_defaults().await.unwrap_or_default();
+        let templates = self.list_templates().await.unwrap_or_default();
+        jobs.into_iter()
+            .map(|j| {
+                let eff = templates::resolve(&j, &globals, &templates).map(|r| r.job).unwrap_or_else(|_| j.clone());
+                (j, eff)
             })
-            .map(|j| j.id.clone())
             .collect()
+    }
+
+    /// Maintenance tasks whose own schedule slot has passed: (job id, task).
+    /// Missed slots run once, as for backups; read-only jobs never run them.
+    pub async fn due_maintenance(&self, now: DateTime<Utc>) -> Vec<(String, &'static str)> {
+        if self.is_paused() {
+            return Vec::new();
+        }
+        let on_battery = power::on_battery() == Some(true);
+        let mut out = Vec::new();
+        // Templates can set the maintenance schedule: use the resolved one.
+        for (j, eff) in self.resolved_jobs().await.into_iter().filter(|(j, _)| !j.read_only) {
+            let m = eff.maintenance;
+            for task in schedule::MAINTENANCE_TASKS {
+                let Some(s) = m.schedule_of(task).filter(|s| s.enabled) else { continue };
+                let last = j.stats.last_maintenance.get(task).map(String::as_str).or(Some(j.created_at.as_str())).and_then(parse_ts);
+                if last.is_some_and(|l| s.is_due(l, now)) && !(on_battery && s.skip_on_battery) {
+                    out.push((j.id.clone(), task));
+                }
+            }
+        }
+        out
+    }
+
+    /// The operation a maintenance task runs.
+    fn maintenance_operation(m: &schedule::MaintenanceSchedule, task: &str) -> BackupOperation {
+        match task {
+            "compact" => BackupOperation::Compact,
+            "verify" => BackupOperation::Verify { full: false, options: Some(m.verify.clone().unwrap_or_default().options) },
+            _ => BackupOperation::ApplyRetention { policy: None, source: None },
+        }
+    }
+
+    /// Start due maintenance tasks (one per job per pass; a busy job waits).
+    async fn run_due_maintenance(&self, now: DateTime<Utc>) -> usize {
+        let mut started = 0;
+        let mut seen = std::collections::HashSet::new();
+        for (id, task) in self.due_maintenance(now).await {
+            if self.is_job_busy(&id) || !seen.insert(id.clone()) {
+                continue;
+            }
+            let snapshot = {
+                let mut jobs = self.inner.jobs.write().await;
+                jobs.get_mut(&id).map(|j| {
+                    j.stats.last_maintenance.insert(task.to_string(), now.to_rfc3339());
+                    j.clone()
+                })
+            };
+            let Some(j) = snapshot else { continue };
+            let _ = self.persist(&j).await;
+            let m = self.resolve_job(&j).await.map(|r| r.job.maintenance).unwrap_or_else(|_| j.maintenance.clone());
+            let cal = m.schedule_of(task).map(|s| s.calendar_ids.clone()).unwrap_or_default();
+            if let Some(c) = crate::schedule_library::registry().run_blocked(None, &cal, now) {
+                tracing::info!("Skipping scheduled {task} of '{}': today is a day off in '{c}'", j.name);
+                continue;
+            }
+            match self.start_operation(&id, Self::maintenance_operation(&m, task)).await {
+                Ok(_) => started += 1,
+                Err(e) => tracing::warn!("Scheduled {task} of {id} could not start: {e}"),
+            }
+        }
+        started
     }
 
     /// One scheduler pass: start every due job.
@@ -2820,7 +2951,8 @@ impl BackupManager {
             if let Some(j) = &snapshot {
                 let _ = self.persist(j).await;
                 // A day off in one of the job's holiday calendars uses up the slot.
-                if let Some(cal) = crate::schedule_library::registry().run_blocked(None, &j.schedule.calendar_ids, now) {
+                let cal_ids = self.resolve_job(j).await.map(|r| r.job.schedule.calendar_ids).unwrap_or_else(|_| j.schedule.calendar_ids.clone());
+                if let Some(cal) = crate::schedule_library::registry().run_blocked(None, &cal_ids, now) {
                     tracing::info!("Skipping scheduled backup '{}': today is a day off in '{cal}'", j.name);
                     continue;
                 }
@@ -2838,7 +2970,8 @@ impl BackupManager {
                 tracing::warn!("Scheduled replication of {job_id} could not start: {e}");
             }
         }
-        due.len() + reps.len()
+        let maint = self.run_due_maintenance(now).await;
+        due.len() + reps.len() + maint
     }
 
     /// Start the background scheduler loop (idempotent).
@@ -2892,6 +3025,7 @@ fn summarize(op: &str, v: &serde_json::Value) -> String {
             if v.get("dry_run").and_then(|b| b.as_bool()) == Some(true) { " (dry run)" } else { "" }
         ),
         "restore" => format!("{} files restored ({}), {} unchanged skipped", n("files_restored"), human_bytes(n("bytes_restored")), n("files_skipped_matching")),
+        "verify" if n("files_checked") > 0 => format!("{} volume(s) and {} file(s) verified, {} problem(s)", n("checked"), n("files_checked"), v.get("problems").and_then(|p| p.as_array()).map(|a| a.len()).unwrap_or(0)),
         "verify" => format!("{} volume(s) verified", n("checked")),
         "compact" => format!("{} removed, {} rewritten, {} reclaimed", n("volumes_removed"), n("volumes_rewritten"), human_bytes(n("bytes_reclaimed"))),
         "rebuild_missing" => format!("{} volume(s) rebuilt, {} block(s) recovered, {} unrecoverable", n("volumes_rebuilt"), n("blocks_recovered"), n("blocks_unrecoverable")),
@@ -3003,13 +3137,18 @@ fn dispatch(
                 Some(c) => vec![hooks::command_stream(c, &BackupManager::script_env(job, "backup", "STDIN"))?],
                 None => Vec::new(),
             };
-            let retention = legal_hold::effective_retention(job);
+            // Maintenance on its own schedule does not also run after the backup.
+            if job.maintenance.scheduled("compact") {
+                opts.auto_compact = false;
+            }
+            let retention = if job.maintenance.scheduled("apply_retention") { RetentionPolicy::KeepAll } else { legal_hold::effective_retention(job) };
             serde_json::to_value(ufop_core::backup::run_backup_with_streams(backend, db, &sources, &filter, &opts, &retention, pass, None, kdf, ctx, streams)?)?
         }
         BackupOperation::Restore { options, .. } => serde_json::to_value(ufop_core::backup::run_restore(&open(false)?, &options, ctx)?)?,
-        BackupOperation::Verify { full } => {
+        BackupOperation::Verify { full, options } => {
             let samples = if full { None } else { Some(job.options.verify_samples.max(1)) };
-            serde_json::to_value(maintenance::verify(&open(false)?, samples, full)?)?
+            let o = options.unwrap_or_else(|| ufop_core::backup::verify::VerifyOptions::legacy(samples, full));
+            serde_json::to_value(ufop_core::backup::verify::verify(&open(false)?, &o, ctx)?)?
         }
         BackupOperation::Compact => serde_json::to_value(maintenance::compact(&open(false)?, &job.options, ctx)?)?,
         BackupOperation::Repair => serde_json::to_value(maintenance::repair(&open(false)?)?)?,

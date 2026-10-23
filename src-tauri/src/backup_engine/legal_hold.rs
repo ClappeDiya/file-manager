@@ -110,7 +110,7 @@ mod tests {
         assert!(guard(&job, &BackupOperation::Purge { paths: vec!["/x".into()], versions: None, dry_run: false }).is_err());
         assert!(guard(&job, &BackupOperation::Purge { paths: vec!["/x".into()], versions: None, dry_run: true }).is_ok());
         assert!(guard(&job, &BackupOperation::PurgeBroken { dry_run: false }).is_err());
-        for ok in [BackupOperation::Backup { dry_run: false }, BackupOperation::Compact, BackupOperation::Verify { full: true }, BackupOperation::ListBroken] {
+        for ok in [BackupOperation::Backup { dry_run: false }, BackupOperation::Compact, BackupOperation::Verify { full: true, options: None }, BackupOperation::ListBroken] {
             assert!(guard(&job, &ok).is_ok());
         }
         assert_eq!(effective_retention(&job), RetentionPolicy::KeepAll);

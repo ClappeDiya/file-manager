@@ -23,6 +23,50 @@ pub struct ManagedSettings {
     pub mounts: Option<ManagedMounts>,
     /// Automation rules (workflows) the organization owns on its desktops.
     pub workflows: Option<Vec<ManagedWorkflow>>,
+    /// Backup policy templates the organization offers (or enforces) on its desktops.
+    pub backup_templates: Option<Vec<ManagedBackupTemplate>>,
+}
+
+/// Most organization backup templates, and the largest one (JSON bytes).
+pub const MAX_BACKUP_TEMPLATES: usize = 50;
+pub const MAX_BACKUP_TEMPLATE_BYTES: usize = 64 * 1024;
+
+/// A backup policy template owned by the organization: read-only on each
+/// desktop. Jobs may choose an ordinary one; an `enforced` one applies to
+/// every job and wins over the job's own settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ManagedBackupTemplate {
+    /// Stable id (letters, digits, `-`, `_`).
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub enforced: bool,
+    /// The settings as the desktop app exports a template's `settings`
+    /// (snake_case keys; checked in full by the desktop).
+    pub settings: serde_json::Value,
+}
+
+impl ManagedBackupTemplate {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.is_empty() || self.id.len() > 64 || !self.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err(format!("Backup template id '{}' must be 1–64 letters, digits, '-' or '_'", self.id));
+        }
+        if self.name.trim().is_empty() || self.name.chars().count() > 200 {
+            return Err(format!("Backup template {} needs a name (up to 200 characters)", self.id));
+        }
+        if !self.settings.is_object() {
+            return Err(format!("Backup template '{}' settings must be an object (export a template from the desktop app)", self.name));
+        }
+        if serde_json::to_vec(&self.settings).map(|v| v.len()).unwrap_or(usize::MAX) > MAX_BACKUP_TEMPLATE_BYTES {
+            return Err(format!("Backup template '{}' is larger than {} KB", self.name, MAX_BACKUP_TEMPLATE_BYTES / 1024));
+        }
+        // Scripts would run programs on every desktop: a decision for each desktop.
+        if self.settings.get("scripts").is_some_and(|s| !s.is_null()) {
+            return Err(format!("Backup template '{}' sets scripts; organization templates cannot", self.name));
+        }
+        Ok(())
+    }
 }
 
 /// Most organization workflows per desktop, and the largest one (JSON bytes).
@@ -234,6 +278,18 @@ impl ManagedSettings {
                 }
             }
         }
+        if let Some(t) = &self.backup_templates {
+            if t.len() > MAX_BACKUP_TEMPLATES {
+                return Err(format!("At most {MAX_BACKUP_TEMPLATES} organization backup templates"));
+            }
+            let mut ids = std::collections::HashSet::new();
+            for bt in t {
+                bt.validate()?;
+                if !ids.insert(bt.id.as_str()) {
+                    return Err(format!("Two backup templates share the id '{}'", bt.id));
+                }
+            }
+        }
         if let Some(p) = &self.proxy {
             if !PROXY_MODES.contains(&p.mode.as_str()) {
                 return Err(format!("Unknown proxy mode '{}'", p.mode));
@@ -250,7 +306,7 @@ impl ManagedSettings {
 
     /// No section managed.
     pub fn is_empty(&self) -> bool {
-        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none() && self.mounts.is_none() && self.workflows.is_none()
+        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none() && self.mounts.is_none() && self.workflows.is_none() && self.backup_templates.is_none()
     }
 }
 
@@ -270,6 +326,20 @@ mod tests {
         let cmd = serde_json::json!({"trigger": {"type": "manual"}, "action": {"type": "notify"}, "workflow": {"nodes": [{"id": "n1", "kind": "action", "action": {"type": "run_command", "program": "sh"}}]}});
         assert!(bad(wf("x", cmd)).contains("runs a program (run_command)"));
         let dup = ManagedSettings { workflows: Some(vec![wf("a", rule.clone()), wf("a", rule)]), ..Default::default() };
+        assert!(dup.validate().unwrap_err().contains("share the id"));
+    }
+
+    #[test]
+    fn backup_templates_validate() {
+        let s: ManagedSettings = serde_json::from_value(serde_json::json!({"backupTemplates": [{"id": "std", "name": "Standard", "enforced": true, "settings": {"retention": {"type": "keep_count", "count": 5}}}]})).unwrap();
+        assert!(s.validate().is_ok() && !s.is_empty());
+        assert!(s.backup_templates.as_ref().unwrap()[0].enforced);
+        let t = |id: &str, settings: serde_json::Value| ManagedBackupTemplate { id: id.into(), name: "X".into(), settings, ..Default::default() };
+        let bad = |b: ManagedBackupTemplate| ManagedSettings { backup_templates: Some(vec![b]), ..Default::default() }.validate().unwrap_err();
+        assert!(bad(t("a b", serde_json::json!({}))).contains("letters"));
+        assert!(bad(t("a", serde_json::json!([]))).contains("object"));
+        assert!(bad(t("a", serde_json::json!({"scripts": {"run_before": "rm"}}))).contains("scripts"));
+        let dup = ManagedSettings { backup_templates: Some(vec![t("a", serde_json::json!({})), t("a", serde_json::json!({}))]), ..Default::default() };
         assert!(dup.validate().unwrap_err().contains("share the id"));
     }
 

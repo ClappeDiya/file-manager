@@ -56,7 +56,8 @@ pub fn required_scope(method: &Method, path: &str) -> Scope {
     if p.starts_with("/api/v1/gateway/") {
         return Scope::Write;
     }
-    if method == Method::GET || method == Method::HEAD {
+    // Computes upcoming run times; changes nothing.
+    if method == Method::GET || method == Method::HEAD || p == "/api/v1/backup-schedule/preview" {
         return Scope::Read;
     }
     let run = (p.starts_with("/api/v1/jobs/") && (p.ends_with("/run") || p.ends_with("/operations")))

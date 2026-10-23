@@ -71,7 +71,7 @@ async fn backup_restore_history_and_queries() {
     assert_eq!(r.report["files_restored"], 2);
     assert_eq!(std::fs::read(out.join("src/sub/b.txt")).unwrap(), b"beta");
 
-    let r = m.execute(&j.id, BackupOperation::Verify { full: true }).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Verify { full: true, options: None }).await.unwrap();
     assert_eq!(r.status, "success");
 
     let hist = m.run_history(Some(j.id.clone()), 10).await.unwrap();
@@ -201,7 +201,7 @@ async fn maintenance_ops_and_source_release_script() {
     let r = m.execute(&j.id, BackupOperation::RebuildMissing).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.log);
     assert!(r.report["volumes_rebuilt"].as_u64().unwrap() >= 1);
-    let r = m.execute(&j.id, BackupOperation::Verify { full: true }).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Verify { full: true, options: None }).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.log);
 }
 
@@ -1163,7 +1163,7 @@ async fn read_only_jobs_restore_and_browse_but_never_write() {
     let r = m2.execute(&ro.id, BackupOperation::Restore { options: RestoreOptions { target: Some(out.clone()), ..Default::default() }, overrides: RestoreOverrides::default() }).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.summary);
     assert_eq!(std::fs::read(out.join("src/a.txt")).unwrap(), b"alpha");
-    assert_eq!(m2.execute(&ro.id, BackupOperation::Verify { full: true }).await.unwrap().status, "success");
+    assert_eq!(m2.execute(&ro.id, BackupOperation::Verify { full: true, options: None }).await.unwrap().status, "success");
     assert_eq!(m2.execute(&ro.id, BackupOperation::Backup { dry_run: true }).await.unwrap().status, "success", "a dry run writes nothing");
     assert!(m2.lock_status(&ro.id).await.unwrap().locks.is_empty());
     assert_eq!(listing(&dst), before, "nothing written, not even a lock");

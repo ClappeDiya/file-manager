@@ -807,6 +807,73 @@ async fn pause(State(st): State<ServerState>, body: Option<Json<PauseBody>>) -> 
     ok(st.mgr.status().await)
 }
 
+// ── Policy templates, effective settings, schedule preview ──
+
+async fn list_templates(State(st): State<ServerState>) -> ApiResult {
+    ok(st.mgr.list_templates().await?)
+}
+
+async fn create_template(State(st): State<ServerState>, Json(mut t): Json<crate::backup_engine::templates::PolicyTemplate>) -> ApiResult {
+    t.id.clear();
+    ok(st.mgr.save_template(t).await?)
+}
+
+async fn get_template(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.get_template(&id).await?)
+}
+
+async fn update_template(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(mut t): Json<crate::backup_engine::templates::PolicyTemplate>) -> ApiResult {
+    st.mgr.get_template(&id).await?;
+    t.id = id;
+    ok(st.mgr.save_template(t).await?)
+}
+
+async fn delete_template(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    st.mgr.delete_template(&id).await?;
+    ok(json!({"ok": true}))
+}
+
+#[derive(Deserialize)]
+struct ApplyTemplateBody {
+    job_id: String,
+}
+
+async fn apply_template(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(b): Json<ApplyTemplateBody>) -> ApiResult {
+    ok(st.mgr.apply_template(&id, &b.job_id).await?)
+}
+
+#[derive(Deserialize, Default)]
+struct ExportTemplatesQuery {
+    /// Comma-separated ids (empty = all).
+    #[serde(default)]
+    ids: String,
+}
+
+async fn export_templates(State(st): State<ServerState>, Query(q): Query<ExportTemplatesQuery>) -> Result<Response, ApiError> {
+    let ids: Vec<String> = q.ids.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let body = st.mgr.export_templates(&ids).await?;
+    Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
+}
+
+async fn import_templates(State(st): State<ServerState>, body: String) -> ApiResult {
+    ok(st.mgr.import_templates(&body).await?)
+}
+
+async fn effective_settings(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.effective_settings(Some(&id), None).await?)
+}
+
+#[derive(Deserialize)]
+struct SchedulePreviewBody {
+    schedule: crate::backup_engine::schedule::BackupSchedule,
+    #[serde(default)]
+    count: Option<usize>,
+}
+
+async fn schedule_preview(Json(b): Json<SchedulePreviewBody>) -> ApiResult {
+    ok(b.schedule.preview(chrono::Utc::now(), b.count.unwrap_or(5))?)
+}
+
 async fn resume(State(st): State<ServerState>) -> ApiResult {
     st.mgr.resume();
     ok(st.mgr.status().await)
@@ -949,6 +1016,13 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/filesystem", get(filesystem))
         .route("/api/v1/scheduler/pause", post(pause))
         .route("/api/v1/scheduler/resume", post(resume))
+        .route("/api/v1/backup-templates", get(list_templates).post(create_template))
+        .route("/api/v1/backup-templates/export", get(export_templates))
+        .route("/api/v1/backup-templates/import", post(import_templates))
+        .route("/api/v1/backup-templates/{id}", get(get_template).put(update_template).delete(delete_template))
+        .route("/api/v1/backup-templates/{id}/apply", post(apply_template))
+        .route("/api/v1/jobs/{id}/effective-settings", get(effective_settings))
+        .route("/api/v1/backup-schedule/preview", post(schedule_preview))
         .merge(oauth::protected_routes())
         .merge(shares::protected_routes())
         .merge(folders::protected_routes())

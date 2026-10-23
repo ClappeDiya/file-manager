@@ -137,6 +137,42 @@ class UfopClient:
         """Change the volume cache folder, size limit (0 = off) and use for full restores (API tokens: `write` scope). `PUT /api/v1/backup-cache/settings`"""
         return self._call("PUT", f"/api/v1/backup-cache/settings", None, body if body is not None else {})
 
+    def post_backup_schedule_preview(self, body: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Validate a schedule (interval or cron) and list its next runs, marking holiday skips (API tokens: `read` scope). `POST /api/v1/backup-schedule/preview`"""
+        return self._call("POST", f"/api/v1/backup-schedule/preview", None, body)
+
+    def get_backup_templates(self) -> List[Dict[str, Any]]:
+        """Policy templates (local, then the organization's) (API tokens: `read` scope). `GET /api/v1/backup-templates`"""
+        return self._call("GET", f"/api/v1/backup-templates", None, None)
+
+    def post_backup_templates(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a policy template (API tokens: `write` scope). `POST /api/v1/backup-templates`"""
+        return self._call("POST", f"/api/v1/backup-templates", None, body)
+
+    def get_backup_templates_export(self, ids: Optional[str] = None) -> Dict[str, Any]:
+        """Templates as a JSON file (API tokens: `read` scope). `GET /api/v1/backup-templates/export`"""
+        return self._call("GET", f"/api/v1/backup-templates/export", {"ids": ids}, None)
+
+    def post_backup_templates_import(self, body: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Import a template file (same id or name updates) (API tokens: `write` scope). `POST /api/v1/backup-templates/import`"""
+        return self._call("POST", f"/api/v1/backup-templates/import", None, body if body is not None else {})
+
+    def get_backup_templates_id(self, id_: str) -> Dict[str, Any]:
+        """One policy template (API tokens: `read` scope). `GET /api/v1/backup-templates/{id}`"""
+        return self._call("GET", f"/api/v1/backup-templates/{urllib.parse.quote(id_, safe='')}", None, None)
+
+    def put_backup_templates_id(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Update a local policy template (API tokens: `write` scope). `PUT /api/v1/backup-templates/{id}`"""
+        return self._call("PUT", f"/api/v1/backup-templates/{urllib.parse.quote(id_, safe='')}", None, body)
+
+    def delete_backup_templates_id(self, id_: str) -> Dict[str, Any]:
+        """Delete a local policy template no job uses (API tokens: `write` scope). `DELETE /api/v1/backup-templates/{id}`"""
+        return self._call("DELETE", f"/api/v1/backup-templates/{urllib.parse.quote(id_, safe='')}", None, None)
+
+    def post_backup_templates_id_apply(self, id_: str, body: Dict[str, Any]) -> "BackupJob":
+        """Base a job on this template too (appended: it wins over earlier ones) (API tokens: `write` scope). `POST /api/v1/backup-templates/{id}/apply`"""
+        return self._call("POST", f"/api/v1/backup-templates/{urllib.parse.quote(id_, safe='')}/apply", None, body)
+
     def post_destinations_test(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """Test a destination (optionally create its folder); returns the files found (API tokens: `write` scope). `POST /api/v1/destinations/test`"""
         return self._call("POST", f"/api/v1/destinations/test", None, body)
@@ -229,6 +265,10 @@ class UfopClient:
         """Encrypt or decrypt the job's local database now (key kept in the credential store) (API tokens: `write` scope). `PUT /api/v1/jobs/{id}/database-encryption`"""
         return self._call("PUT", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/database-encryption", None, body)
 
+    def get_jobs_id_effective_settings(self, id_: str) -> Dict[str, Any]:
+        """Each setting the job runs with and where it comes from (built_in, global, template, job, managed) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/effective-settings`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/effective-settings", None, None)
+
     def get_jobs_id_estimate(self, id_: str, assumed_bytes_per_sec: Optional[int] = None) -> Dict[str, Any]:
         """Estimate the next backup: files, new data (at most / at least) and duration; reads nothing (API tokens: `read` scope). `GET /api/v1/jobs/{id}/estimate`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/estimate", {"assumed_bytes_per_sec": assumed_bytes_per_sec}, None)
@@ -250,7 +290,7 @@ class UfopClient:
         return self._call("DELETE", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/lock", {"confirm": confirm, "owner_id": owner_id}, None)
 
     def post_jobs_id_operations(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Restore, verify, compact, repair, purge … (a tagged BackupOperation; not `backup`) (API tokens: `run` scope). `POST /api/v1/jobs/{id}/operations`"""
+        """Restore, verify, compact, repair, purge … (a tagged BackupOperation; not `backup`). Verify takes `options`: scope {versions, paths}, mode {type: structure | sample_volumes(count) | sample_percent(percent) | full}, files_percent, parallelism, max_errors, use_cache (API tokens: `run` scope). `POST /api/v1/jobs/{id}/operations`"""
         return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/operations", None, body)
 
     def put_jobs_id_passphrase(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:

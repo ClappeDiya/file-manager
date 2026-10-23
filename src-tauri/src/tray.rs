@@ -148,9 +148,9 @@ mod tests {
 
     #[test]
     fn describes_states() {
-        let mut s = SchedulerStatus { running: true, paused: false, paused_until: None, tasks: vec![], next_runs: vec![] };
+        let mut s = SchedulerStatus { running: true, paused: false, paused_until: None, tasks: vec![], next_runs: vec![], next_maintenance: vec![] };
         assert_eq!(describe(&s), "No scheduled backups");
-        s.next_runs.push(NextRun { job_id: "1".into(), job_name: "Docs".into(), next_run_at: "2026-03-10T02:00:00Z".into() });
+        s.next_runs.push(NextRun { job_id: "1".into(), job_name: "Docs".into(), next_run_at: "2026-03-10T02:00:00Z".into(), operation: "backup".into() });
         assert!(describe(&s).starts_with("Next backup: Docs at "));
         s.paused = true;
         assert_eq!(describe(&s), "Backups paused");

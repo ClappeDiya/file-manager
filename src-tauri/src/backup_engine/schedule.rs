@@ -181,6 +181,58 @@ impl BackupSchedule {
     }
 }
 
+/// Scheduled verification: when, and how much (scope, sampling).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VerifyTask {
+    pub schedule: BackupSchedule,
+    pub options: ufop_core::backup::verify::VerifyOptions,
+}
+
+/// Maintenance that runs on its own schedule instead of after backups.
+/// A compaction schedule replaces compaction after each backup (and
+/// `auto_compact_interval_days`); a retention schedule replaces retention
+/// after each backup. Unset tasks keep the after-backup behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaintenanceSchedule {
+    pub compact: Option<BackupSchedule>,
+    pub verify: Option<VerifyTask>,
+    pub retention: Option<BackupSchedule>,
+}
+
+/// Maintenance task names (also the operation names in the run history).
+pub const MAINTENANCE_TASKS: [&str; 3] = ["compact", "verify", "apply_retention"];
+
+impl MaintenanceSchedule {
+    /// The schedule of a task (`compact`, `verify`, `apply_retention`), when set.
+    pub fn schedule_of(&self, task: &str) -> Option<&BackupSchedule> {
+        match task {
+            "compact" => self.compact.as_ref(),
+            "verify" => self.verify.as_ref().map(|v| &v.schedule),
+            "apply_retention" => self.retention.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Whether a task runs on its own (enabled) schedule.
+    pub fn scheduled(&self, task: &str) -> bool {
+        self.schedule_of(task).is_some_and(|s| s.enabled)
+    }
+
+    pub fn validate(&self) -> Result<(), AppError> {
+        for t in MAINTENANCE_TASKS {
+            if let Some(s) = self.schedule_of(t).filter(|s| s.enabled) {
+                s.validate().map_err(|e| AppError::validation(format!("Maintenance schedule ({t}): {}", e.user_message())))?;
+            }
+        }
+        if let Some(v) = &self.verify {
+            v.options.validate()?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +317,19 @@ mod tests {
         assert!(BackupSchedule::cron(&["*/5 * * * *"]).validate().is_ok());
         // Interval fields are ignored in cron mode.
         assert!(BackupSchedule { interval_minutes: 1, ..BackupSchedule::cron(&["0 * * * *"]) }.validate().is_ok());
+    }
+
+    #[test]
+    fn maintenance_schedules() {
+        let mut m = MaintenanceSchedule::default();
+        assert!(!m.scheduled("compact"));
+        m.compact = Some(BackupSchedule::cron(&["0 3 * * Sun"]));
+        m.verify = Some(VerifyTask { schedule: BackupSchedule { enabled: false, ..Default::default() }, ..Default::default() });
+        assert!(m.scheduled("compact") && !m.scheduled("verify") && !m.scheduled("apply_retention"));
+        m.validate().unwrap();
+        m.retention = Some(BackupSchedule::cron(&["* * * * *"]));
+        assert!(m.validate().unwrap_err().user_message().contains("apply_retention"));
+        let old: MaintenanceSchedule = serde_json::from_str("{}").unwrap();
+        assert_eq!(old, MaintenanceSchedule::default());
     }
 }

@@ -651,3 +651,50 @@ mod tests {
 pub async fn backup_schedule_preview(schedule: crate::backup_engine::schedule::BackupSchedule, count: Option<usize>) -> Result<Vec<crate::schedule_library::PreviewRun>, AppError> {
     schedule.preview(chrono::Utc::now(), count.unwrap_or(5))
 }
+
+use crate::backup_engine::templates::{EffectiveSettings, PolicyTemplate};
+
+/// Local and organization policy templates.
+#[tauri::command]
+pub async fn backup_list_templates(mgr: State<'_, BackupManager>) -> Result<Vec<PolicyTemplate>, AppError> {
+    mgr.list_templates().await
+}
+
+#[tauri::command]
+pub async fn backup_get_template(id: String, mgr: State<'_, BackupManager>) -> Result<PolicyTemplate, AppError> {
+    mgr.get_template(&id).await
+}
+
+/// Create (empty id) or update a local template.
+#[tauri::command]
+pub async fn backup_save_template(template: PolicyTemplate, mgr: State<'_, BackupManager>) -> Result<PolicyTemplate, AppError> {
+    mgr.save_template(template).await
+}
+
+#[tauri::command]
+pub async fn backup_delete_template(id: String, mgr: State<'_, BackupManager>) -> Result<(), AppError> {
+    mgr.delete_template(&id).await
+}
+
+/// Base a job on one more template.
+#[tauri::command]
+pub async fn backup_apply_template(template_id: String, job_id: String, mgr: State<'_, BackupManager>) -> Result<BackupJob, AppError> {
+    mgr.apply_template(&template_id, &job_id).await
+}
+
+/// Templates as a JSON file (`ids` empty or absent = all).
+#[tauri::command]
+pub async fn backup_export_templates(ids: Option<Vec<String>>, mgr: State<'_, BackupManager>) -> Result<String, AppError> {
+    mgr.export_templates(&ids.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub async fn backup_import_templates(json: String, mgr: State<'_, BackupManager>) -> Result<Vec<PolicyTemplate>, AppError> {
+    mgr.import_templates(&json).await
+}
+
+/// Each setting of a saved job (`id`) or an unsaved one (`job`), with where it came from.
+#[tauri::command]
+pub async fn backup_effective_settings(id: Option<String>, job: Option<BackupJob>, mgr: State<'_, BackupManager>) -> Result<EffectiveSettings, AppError> {
+    mgr.effective_settings(id.as_deref(), job).await
+}

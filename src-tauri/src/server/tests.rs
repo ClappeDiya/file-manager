@@ -990,3 +990,37 @@ async fn mcp_is_off_without_roots() {
     assert_eq!(s.client.get(format!("{}/.well-known/oauth-authorization-server", s.base)).send().await.unwrap().status(), 404);
     assert_eq!(s.client.post(format!("{}/oauth2/register", s.base)).json(&json!({ "redirect_uris": ["https://a.example.com/cb"] })).send().await.unwrap().status(), 404);
 }
+
+#[tokio::test]
+async fn policy_templates_effective_settings_and_schedule_preview_over_rest() {
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    let t = s.post("/api/v1/backup-templates", &tok, json!({"name": "Servers", "settings": {"retention": {"type": "keep_count", "count": 4}, "options": {"compression_level": 2}}})).await;
+    assert_eq!(t.status(), 200, "{}", t.text().await.unwrap());
+    let t = t.json::<Value>().await.unwrap();
+    let tid = t["id"].as_str().unwrap().to_string();
+    assert_eq!(s.post("/api/v1/backup-templates", &tok, json!({"name": "Bad", "settings": {"options": {"block_size": 1}}})).await.status(), 400);
+    let src = s.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let job = json!({"name":"Srv","sources":[src],"encrypted":false,"destination":{"type":"local","path": s.dir.join("dst"),"alternate_paths":[],"marker_file":null}});
+    let id = s.post("/api/v1/jobs", &tok, json!({"job": job})).await.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+    let j = s.post(&format!("/api/v1/backup-templates/{tid}/apply"), &tok, json!({"job_id": id})).await.json::<Value>().await.unwrap();
+    assert_eq!(j["template_ids"], json!([tid]));
+    let eff = s.get(&format!("/api/v1/jobs/{id}/effective-settings"), &tok).await.json::<Value>().await.unwrap();
+    let ret = eff["settings"].as_array().unwrap().iter().find(|x| x["field_path"] == "retention").unwrap().clone();
+    assert_eq!(ret["source"]["type"], "template");
+    assert_eq!(ret["value"]["count"], 4);
+    // In use: refused; listing and export.
+    assert_eq!(s.client.delete(format!("{}/api/v1/backup-templates/{tid}", s.base)).bearer_auth(&tok).send().await.unwrap().status(), 409);
+    assert_eq!(s.get("/api/v1/backup-templates", &tok).await.json::<Value>().await.unwrap().as_array().unwrap().len(), 1);
+    let exported = s.get("/api/v1/backup-templates/export", &tok).await.text().await.unwrap();
+    assert!(exported.contains("ufop-backup-templates"));
+    let imported = s.client.post(format!("{}/api/v1/backup-templates/import", s.base)).bearer_auth(&tok).body(exported).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(imported[0]["id"], tid.as_str());
+    // Cron schedules: preview and a friendly error.
+    let p = s.post("/api/v1/backup-schedule/preview", &tok, json!({"schedule": {"enabled": true, "cron": ["30 2 * * *"]}, "count": 3})).await.json::<Value>().await.unwrap();
+    assert_eq!(p.as_array().unwrap().len(), 3);
+    let bad = s.post("/api/v1/backup-schedule/preview", &tok, json!({"schedule": {"enabled": true, "cron": ["99 * * * *"]}})).await;
+    assert_eq!(bad.status(), 400);
+    assert!(bad.text().await.unwrap().contains("Invalid cron expression"));
+}

@@ -337,13 +337,18 @@ async fn run(argv: Vec<String>) {
         None
     } else {
         let agent = fleet_agent::init_or_default(mgr.clone(), store.clone(), creds.clone(), "server").await;
-        // Of the console's app settings, the server applies the transfer caps.
+        // Of the console's app settings, the server applies the transfer caps and backup templates.
         let caps_mgr = mgr.clone();
         agent.host().set_managed_settings_handler(Arc::new(move |settings| {
             let m = caps_mgr.clone();
             Box::pin(async move {
+                let problems = m.set_managed_templates(settings.as_ref().and_then(|s| s.backup_templates.as_deref()));
                 m.set_managed_caps(settings.and_then(|s| s.transfers)).await;
-                Ok(())
+                if problems.is_empty() {
+                    Ok(())
+                } else {
+                    Err(unified_file_ops_lib::core::error::AppError::validation(format!("Some organization backup templates were not installed: {}", problems.join("; "))))
+                }
             })
         }));
         fleet_agent::spawn(agent.clone(), "ufop-server");

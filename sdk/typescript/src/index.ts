@@ -165,6 +165,51 @@ export class UfopClient {
     return this.call("PUT", `/api/v1/backup-cache/settings`, undefined, body);
   }
 
+  /** Validate a schedule (interval or cron) and list its next runs, marking holiday skips (API tokens: `read` scope). `POST /api/v1/backup-schedule/preview` */
+  postBackupSchedulePreview(body: { count?: number; schedule: Record<string, unknown> }): Promise<Array<{ at?: string; skipped_by?: string | null }>> {
+    return this.call("POST", `/api/v1/backup-schedule/preview`, undefined, body);
+  }
+
+  /** Policy templates (local, then the organization's) (API tokens: `read` scope). `GET /api/v1/backup-templates` */
+  getBackupTemplates(): Promise<Array<{ description?: string; enforced?: boolean; id?: string; managed?: boolean; name: string; settings?: Record<string, unknown>; updated_at?: string }>> {
+    return this.call("GET", `/api/v1/backup-templates`, undefined, undefined);
+  }
+
+  /** Create a policy template (API tokens: `write` scope). `POST /api/v1/backup-templates` */
+  postBackupTemplates(body: { description?: string; enforced?: boolean; id?: string; managed?: boolean; name: string; settings?: Record<string, unknown>; updated_at?: string }): Promise<{ description?: string; enforced?: boolean; id?: string; managed?: boolean; name: string; settings?: Record<string, unknown>; updated_at?: string }> {
+    return this.call("POST", `/api/v1/backup-templates`, undefined, body);
+  }
+
+  /** Templates as a JSON file (API tokens: `read` scope). `GET /api/v1/backup-templates/export` */
+  getBackupTemplatesExport(query: { ids?: string } = {}): Promise<Record<string, unknown>> {
+    return this.call("GET", `/api/v1/backup-templates/export`, query, undefined);
+  }
+
+  /** Import a template file (same id or name updates) (API tokens: `write` scope). `POST /api/v1/backup-templates/import` */
+  postBackupTemplatesImport(body: Record<string, unknown> = {}): Promise<Array<{ description?: string; enforced?: boolean; id?: string; managed?: boolean; name: string; settings?: Record<string, unknown>; updated_at?: string }>> {
+    return this.call("POST", `/api/v1/backup-templates/import`, undefined, body);
+  }
+
+  /** One policy template (API tokens: `read` scope). `GET /api/v1/backup-templates/{id}` */
+  getBackupTemplatesId(id: string): Promise<{ description?: string; enforced?: boolean; id?: string; managed?: boolean; name: string; settings?: Record<string, unknown>; updated_at?: string }> {
+    return this.call("GET", `/api/v1/backup-templates/${encodeURIComponent(id)}`, undefined, undefined);
+  }
+
+  /** Update a local policy template (API tokens: `write` scope). `PUT /api/v1/backup-templates/{id}` */
+  putBackupTemplatesId(id: string, body: { description?: string; enforced?: boolean; id?: string; managed?: boolean; name: string; settings?: Record<string, unknown>; updated_at?: string }): Promise<{ description?: string; enforced?: boolean; id?: string; managed?: boolean; name: string; settings?: Record<string, unknown>; updated_at?: string }> {
+    return this.call("PUT", `/api/v1/backup-templates/${encodeURIComponent(id)}`, undefined, body);
+  }
+
+  /** Delete a local policy template no job uses (API tokens: `write` scope). `DELETE /api/v1/backup-templates/{id}` */
+  deleteBackupTemplatesId(id: string): Promise<{ ok?: boolean }> {
+    return this.call("DELETE", `/api/v1/backup-templates/${encodeURIComponent(id)}`, undefined, undefined);
+  }
+
+  /** Base a job on this template too (appended: it wins over earlier ones) (API tokens: `write` scope). `POST /api/v1/backup-templates/{id}/apply` */
+  postBackupTemplatesIdApply(id: string, body: { job_id: string }): Promise<BackupJob> {
+    return this.call("POST", `/api/v1/backup-templates/${encodeURIComponent(id)}/apply`, undefined, body);
+  }
+
   /** Test a destination (optionally create its folder); returns the files found (API tokens: `write` scope). `POST /api/v1/destinations/test` */
   postDestinationsTest(body: { create?: boolean; destination: Record<string, unknown> }): Promise<{ files?: string[] }> {
     return this.call("POST", `/api/v1/destinations/test`, undefined, body);
@@ -280,6 +325,11 @@ export class UfopClient {
     return this.call("PUT", `/api/v1/jobs/${encodeURIComponent(id)}/database-encryption`, undefined, body);
   }
 
+  /** Each setting the job runs with and where it comes from (built_in, global, template, job, managed) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/effective-settings` */
+  getJobsIdEffectiveSettings(id: string): Promise<{ job_id?: string; overrides?: string[] | null; settings?: Array<{ field_path?: string; inherited?: Record<string, unknown> | null; source?: { id?: string; name?: string; type?: "built_in" | "global" | "template" | "job" | "managed" }; value?: unknown }>; template_ids?: string[]; warnings?: string[] }> {
+    return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/effective-settings`, undefined, undefined);
+  }
+
   /** Estimate the next backup: files, new data (at most / at least) and duration; reads nothing (API tokens: `read` scope). `GET /api/v1/jobs/{id}/estimate` */
   getJobsIdEstimate(id: string, query: { assumed_bytes_per_sec?: number } = {}): Promise<{ bytes_examined?: number; bytes_per_sec?: number | null; changed_files?: number; deleted_files?: number; estimated_duration_secs?: number | null; files?: number; folders?: number; has_previous_version?: boolean; largest?: Array<{ path?: string; size?: number; status?: "new" | "changed" }>; new_bytes_at_least?: number; new_bytes_at_most?: number; new_files?: number; speed_source?: "history" | "assumed" | "none"; unchanged_files?: number; upper_bound?: boolean; warnings?: string[] }> {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/estimate`, query, undefined);
@@ -305,7 +355,7 @@ export class UfopClient {
     return this.call("DELETE", `/api/v1/jobs/${encodeURIComponent(id)}/lock`, query, undefined);
   }
 
-  /** Restore, verify, compact, repair, purge … (a tagged BackupOperation; not `backup`) (API tokens: `run` scope). `POST /api/v1/jobs/{id}/operations` */
+  /** Restore, verify, compact, repair, purge … (a tagged BackupOperation; not `backup`). Verify takes `options`: scope {versions, paths}, mode {type: structure | sample_volumes(count) | sample_percent(percent) | full}, files_percent, parallelism, max_errors, use_cache (API tokens: `run` scope). `POST /api/v1/jobs/{id}/operations` */
   postJobsIdOperations(id: string, body: { type: string; [key: string]: unknown }): Promise<Record<string, unknown>> {
     return this.call("POST", `/api/v1/jobs/${encodeURIComponent(id)}/operations`, undefined, body);
   }
