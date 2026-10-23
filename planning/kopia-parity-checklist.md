@@ -101,10 +101,10 @@ Ground rules
 ## WP10 — CLI, tooling, packaging
 - [x] K56 `ufop backup bench` (compression, crypto, chunker)
 - [x] K111 `ufop backup debug` (blocks, volumes, index, filesets)
-- [ ] K129 Shell completions
-- [ ] K125 Windows release targets
-- [ ] K126 Multi-arch Docker image
-- [ ] K127 Signed SHA256SUMS on releases
+- [x] K129 Shell completions
+- [x] K125 Windows release targets
+- [x] K126 Multi-arch Docker image
+- [x] K127 Signed SHA256SUMS on releases
 - [ ] K131 Portable mode for the desktop app
 - [ ] K124 ufop-server web UI branding
 

@@ -12,7 +12,7 @@
 #       --installer-url https://github.com/ClappeDiya/file-manager/releases/download/v1.2.0/FileManager-1.2.0-x64-setup.exe \
 #       [--sha256 <hex> | --installer-file FileManager-1.2.0-x64-setup.exe] \
 #       [--installer-type nsis|wix] [--msi-url URL --msi-sha256 HEX] \
-#       [--id ClappeDiya.FileManager] [--out DIR]
+#       [--id UFOP.UnifiedFileOps] [--out DIR]
 
 set -euo pipefail
 
@@ -23,7 +23,7 @@ FILE=""
 TYPE="nsis"
 MSI_URL=""
 MSI_SHA=""
-ID="ClappeDiya.FileManager"
+ID="UFOP.UnifiedFileOps"
 OUT="."
 
 while [[ $# -gt 0 ]]; do
@@ -113,8 +113,8 @@ PackageIdentifier: ${ID}
 PackageVersion: ${VERSION}
 PackageLocale: en-US
 Publisher: ${PUBLISHER}
-PublisherUrl: https://github.com/ClappeDiya
-PackageName: FileManager
+PublisherUrl: https://filemanager.clappe.com
+PackageName: Unified File Operations Platform
 PackageUrl: https://filemanager.clappe.com
 License: Proprietary
 LicenseUrl: https://github.com/ClappeDiya/file-manager/blob/main/LICENSE

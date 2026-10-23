@@ -95,11 +95,11 @@ else
 fi
 printf 'installer' > "$T/setup.exe"
 if packaging/windows/winget/generate-manifest.sh --version 9.8.7 --installer-url https://example.invalid/FileManager-9.8.7-x64-setup.exe --installer-file "$T/setup.exe" --out "$T/winget" >/dev/null; then
-  inst="$(cat "$T/winget/ClappeDiya.FileManager.installer.yaml")"
+  inst="$(cat "$T/winget/UFOP.UnifiedFileOps.installer.yaml")"
   sha="$(sha256sum "$T/setup.exe" | cut -d' ' -f1 | tr 'a-f' 'A-F')"
   expect_contains "winget installer manifest" "$inst" "PackageVersion: 9.8.7" "InstallerType: nsis" "InstallerSha256: $sha" "ManifestType: installer"
-  expect_contains "winget version manifest" "$(cat "$T/winget/ClappeDiya.FileManager.yaml")" "DefaultLocale: en-US" "ManifestType: version"
-  expect_contains "winget locale manifest" "$(cat "$T/winget/ClappeDiya.FileManager.locale.en-US.yaml")" "PackageName: FileManager" "ManifestType: defaultLocale"
+  expect_contains "winget version manifest" "$(cat "$T/winget/UFOP.UnifiedFileOps.yaml")" "DefaultLocale: en-US" "ManifestType: version"
+  expect_contains "winget locale manifest" "$(cat "$T/winget/UFOP.UnifiedFileOps.locale.en-US.yaml")" "PackageName: Unified File Operations Platform" "ManifestType: defaultLocale"
 else
   bad "generate-manifest.sh"
 fi

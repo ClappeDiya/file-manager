@@ -207,7 +207,7 @@ print_plan() {
   fi
   if printf '%s\n' "${TARGETS[@]}" | grep -q windows; then
     echo "  Windows signing: $(windows_signing_summary)"
-    echo "  winget: ClappeDiya.FileManager.yaml, .installer.yaml, .locale.en-US.yaml (packaging/windows/winget/generate-manifest.sh)"
+    echo "  winget: UFOP.UnifiedFileOps.yaml, .installer.yaml, .locale.en-US.yaml (packaging/windows/winget/generate-manifest.sh)"
   fi
   echo "  Checksums: SHA256SUMS over every uploaded file + SHA256SUMS.minisig ($([[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]] && echo "updater key" || echo "updater key: TAURI_SIGNING_PRIVATE_KEY not set yet"))$([[ -n "$GPG_KEY" ]] && echo " + SHA256SUMS.asc (gpg ${GPG_KEY})")"
   echo "  Verified before upload with scripts/verify-release.sh --require-all"
@@ -609,5 +609,5 @@ echo "Next steps:"
 echo "  1. Verify the Tauri updater can find latest.json at the GitHub Releases URL."
 echo "  2. Check the download: scripts/verify-release.sh --dir <folder with the downloads>"
 echo "  3. (Stable releases only) Commit ufop.rb to ClappeDiya/homebrew-tap (Formula/ufop.rb)."
-echo "  4. (Windows) Submit the winget manifests: wingetcreate submit <folder with the three ClappeDiya.FileManager*.yaml>"
+echo "  4. (Windows) Submit the winget manifests: wingetcreate submit <folder with the three UFOP.UnifiedFileOps*.yaml>"
 echo "  5. Multi-arch server image: scripts/docker-build.sh --push --tag v${VERSION}"

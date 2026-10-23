@@ -742,6 +742,42 @@ ufop backup debug db ~/.local/share/ufop/cli-backups/x.sqlite # same as `ufop ba
 
 `volumes` lists every file of the prefix with its kind (`dblock`, `dindex`, `dlist`, `header`, `lock`, `other`), size, shard folder (sharded layout) and the state the local database records. `stats` reports the raw block bytes, the stored dblock bytes (compression ratio), the deduplication ratio (all versions' logical size / raw block bytes) and, per version, the distinct blocks it references and the bytes only it references. `blocks` reads the local database; `--details` (implied by `--volume`) downloads the volumes involved for each block's stored size and codec. `block` checks the decoded data against the block hash (exit code 2 on a mismatch); `--raw` returns the stored, still compressed bytes of a UFOP pack entry. Add `--json` for machine-readable output. In the desktop app, Maintenance → Inspect (Advanced) shows the header and statistics.
 
+### `ufop completions` and `ufop man`
+
+Shell completion scripts and man pages generated from the CLI's own command tree (every subcommand, option and fixed value; global options such as `--json` and `--profile` on every subcommand).
+
+```bash
+ufop completions bash > ~/.local/share/bash-completion/completions/ufop
+ufop completions zsh  > "${fpath[1]}/_ufop"                 # then: autoload -U compinit && compinit
+ufop completions fish > ~/.config/fish/completions/ufop.fish
+ufop completions powershell | Out-String | Invoke-Expression  # add to $PROFILE
+ufop completions elvish > ~/.config/elvish/lib/ufop.elv       # then: use ufop
+ufop man backup run                                         # one page (roff) on stdout: ufop man backup run | man -l -
+ufop man --out ~/.local/share/man/man1                      # every page: ufop.1, ufop-backup.1, ufop-backup-run.1, …
+```
+
+`ufop-server completions <shell>` and `ufop-server man [--out DIR]` do the same for the server; its pages are in section 8 (`ufop-server.8`, `ufop-server-user-add.8`, …) so they do not collide with the `ufop server …` pages of section 1. The release packages (`.deb`, `.tar.gz`, Homebrew formula) install both sets; see [release-checklist.md](release-checklist.md).
+
+### `ufop verify-release`
+
+Checks a downloaded release: the minisign signature of `SHA256SUMS` with the release key (the app's updater key, built in) and the SHA-256 of every listed file that is in the folder. Exit code 0 when the signature and every present file match, 1 otherwise.
+
+```bash
+ufop verify-release ~/Downloads/SHA256SUMS                       # signature: ~/Downloads/SHA256SUMS.minisig
+ufop verify-release SHA256SUMS SHA256SUMS.minisig --require-all  # every listed file must be present
+ufop verify-release SHA256SUMS --pubkey-file other.pub           # another key (RW… line, minisign.pub or Tauri's base64 form)
+ufop --json verify-release SHA256SUMS                            # {signature_ok, trusted_comment, files:[{name,status}], ok}
+```
+
+| Flag | |
+|---|---|
+| `--pubkey KEY` / `--pubkey-file FILE` | Public key (default: the UFOP release key `RWQOqigyl5kY9Vj4LeRcZ2DMlAEY85jWjDqOZ94gBgYhSd1TOsJ0nxzZ`) |
+| `--dir DIR` | Folder with the downloads (default: the folder of `SHA256SUMS`) |
+| `--require-all` | Fail when a listed file is missing |
+| `--signature-only` | Check only the signature |
+
+`scripts/verify-release.sh` does the same with `minisign`, `ufop` or OpenSSL 3, and also checks `SHA256SUMS.asc` with GPG.
+
 ### `ufop server shares`
 
 Share links on a `ufop-server` started with `--share-root` (sign in first with `ufop server login`).
