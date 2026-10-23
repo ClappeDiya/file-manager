@@ -49,9 +49,9 @@ class UfopClient:
         self.timeout = timeout
         self.headers = dict(headers or {})
 
-    def login(self, password: str) -> Dict[str, Any]:
-        """Sign in with the server password and use the access token from then on."""
-        session = self.post_auth_login({"password": password})
+    def login(self, password: str, username: Optional[str] = None) -> Dict[str, Any]:
+        """Sign in (account `username`, default admin) and use the access token from then on."""
+        session = self.post_auth_login({"password": password, **({"username": username} if username else {})})
         self.token = session["access_token"]
         return session
 

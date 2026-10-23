@@ -80,9 +80,9 @@ export class UfopClient {
     this.token = token;
   }
 
-  /** Sign in with the server password and use the access token from then on. */
-  async login(password: string): Promise<Session> {
-    const session = await this.postAuthLogin({ password });
+  /** Sign in (account `username`, default admin) and use the access token from then on. */
+  async login(password: string, username?: string): Promise<Session> {
+    const session = await this.postAuthLogin(username ? { username, password } : { password });
     this.token = session.access_token;
     return session;
   }
