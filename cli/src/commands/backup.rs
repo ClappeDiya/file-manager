@@ -1169,14 +1169,66 @@ pub enum BackupCommands {
         #[arg(long, default_value_t = 8)]
         samples: usize,
     },
-    /// Download and check volumes
+    /// Check the backup: structure, sampled or all volumes, and files
     Verify {
         #[command(flatten)]
         repo: RepoArgs,
+        /// Download every volume in scope and check every block's hash
         #[arg(long)]
         full: bool,
+        /// Download this many volumes (default 3)
         #[arg(long)]
         samples: Option<usize>,
+        /// Only these versions: number (0 = newest), latest, oldest or a timestamp (repeatable)
+        #[arg(long = "version")]
+        versions: Vec<String>,
+        /// Only these paths: a folder or a wildcard (repeatable)
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        /// Download this percentage of the volumes in scope
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=100))]
+        percent: Option<u8>,
+        /// Check the index and the destination listing only (no downloads)
+        #[arg(long, conflicts_with_all = ["full", "samples", "percent"])]
+        structure: bool,
+        /// Rebuild this percentage of the files and check their hashes
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+        files_percent: Option<u8>,
+        /// Downloads at the same time (default 4)
+        #[arg(long, default_value_t = 0)]
+        parallel: usize,
+        /// Stop after this many problems (0 = check everything)
+        #[arg(long, default_value_t = 0)]
+        max_errors: usize,
+        /// Read volumes from the local volume cache when there (default: always download)
+        #[arg(long)]
+        use_cache: bool,
+        #[command(flatten)]
+        cache: super::backup_access::CacheArgs,
+    },
+    /// Policy templates of the signed-in ufop-server
+    Template {
+        #[command(subcommand)]
+        cmd: super::backup_policy::TemplateCommands,
+    },
+    /// Each setting a server job runs with and where it comes from
+    Effective {
+        /// Job id or name
+        job: String,
+    },
+    /// Validate a schedule and list its next runs (signed-in ufop-server)
+    SchedulePreview {
+        /// Cron expression, `min hour day month weekday` (repeatable)
+        #[arg(long)]
+        cron: Vec<String>,
+        /// Interval schedules: start time HH:MM
+        #[arg(long)]
+        start_time: Option<String>,
+        /// Interval schedules: minutes between runs
+        #[arg(long)]
+        interval_minutes: Option<u32>,
+        #[arg(long, default_value_t = 5)]
+        count: usize,
     },
     /// Remove unused data and repack sparse volumes
     Compact {
@@ -1450,6 +1502,30 @@ pub fn estimate_text(e: &ufop_core::backup::estimate::BackupEstimate) -> String 
     out
 }
 
+/// Human-readable verification report.
+pub fn verify_text(v: &ufop_core::backup::verify::VerifyReport) -> String {
+    let mut out = format!(
+        "{} version(s), {} file(s) in scope, {} block(s) referenced, {} volume(s)\nDownloaded and checked {} volume(s); rebuilt and checked {} file(s)\n",
+        v.versions_checked, v.files_in_scope, v.blocks_referenced, v.volumes_in_scope, v.checked, v.files_checked
+    );
+    if v.problems.is_empty() {
+        out.push_str("No problems found\n");
+    }
+    for p in &v.problems {
+        out.push_str(&format!("[{}] {}\n", p.kind, p.message));
+        if !p.versions.is_empty() {
+            out.push_str(&format!("    versions: {}\n", p.versions.join(", ")));
+        }
+        for path in &p.paths {
+            out.push_str(&format!("    {path}\n"));
+        }
+    }
+    if let Some(r) = &v.stop_reason {
+        out.push_str(&format!("{r}\n"));
+    }
+    out
+}
+
 fn human_duration(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs}s"),
@@ -1461,6 +1537,27 @@ fn human_duration(secs: u64) -> String {
 pub async fn execute(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, Box<dyn std::error::Error>> {
     if let BackupCommands::RunAll { jobs, scheduled_only, wait } = cmd {
         return super::server::execute(super::server::ServerCommands::RunAll { jobs, scheduled_only, dry_run, wait }, format).await;
+    }
+    let server_backed = match &cmd {
+        BackupCommands::Template { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } => true,
+        _ => false,
+    };
+    if server_backed {
+        let r = match cmd {
+            BackupCommands::Template { cmd } => super::backup_policy::template(cmd, format).await,
+            BackupCommands::Effective { job } => super::backup_policy::effective(&job, format).await,
+            BackupCommands::SchedulePreview { cron, start_time, interval_minutes, count } => {
+                super::backup_policy::schedule_preview(&cron, start_time.as_deref(), interval_minutes, count, format).await
+            }
+            _ => unreachable!("server-backed commands only"),
+        };
+        return match r {
+            Ok(code) => Ok(code),
+            Err(e) => {
+                output::print_error(format, &e);
+                Ok(2)
+            }
+        };
     }
     let fmt = format.clone();
     let res = tokio::task::spawn_blocking(move || run(cmd, &fmt, dry_run)).await?;
@@ -1579,7 +1676,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             }
             Ok(0)
         }
-        BackupCommands::RunAll { .. } => Err(ufop_core::error::AppError::internal("run-all is handled before the blocking runner")),
+        BackupCommands::RunAll { .. } | BackupCommands::Template { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } => Err(ufop_core::error::AppError::internal("server-backed commands are handled before the blocking runner")),
         BackupCommands::List { repo, tags } => with_repo(&repo, LockKind::Shared, "list", |_, db| {
             let filter = ufop_core::backup::versions::parse_tags(&tags)?;
             let v = ufop_core::backup::versions::filter_by_tags(db.filesets()?, &filter);
@@ -1739,11 +1836,31 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
         }
         BackupCommands::Mount { repo, version, all, bind, port, seconds, cache } => super::backup_access::mount(&repo, &version, all, &bind, port, &cache, seconds, format),
         BackupCommands::Cache { cmd } => super::backup_access::cache_command(cmd, format),
-        BackupCommands::Verify { repo, full, samples } => with_repo(&repo, LockKind::Shared, "verify", |r, _| {
-            let v = maintenance::verify(r, if full { None } else { Some(samples.unwrap_or(3)) }, full)?;
-            ok(emit(format, "Verification", &v))?;
-            Ok(if v.errors.is_empty() { 0 } else { 2 })
-        }),
+        BackupCommands::Verify { repo, full, samples, versions, paths, percent, structure, files_percent, parallel, max_errors, use_cache, cache } => {
+            use ufop_core::backup::verify::{VerifyMode, VerifyOptions, VerifyScope};
+            let mode = if structure {
+                VerifyMode::Structure
+            } else if full {
+                VerifyMode::Full
+            } else if let Some(p) = percent {
+                VerifyMode::SamplePercent { percent: p }
+            } else {
+                VerifyMode::SampleVolumes { count: samples.unwrap_or(3) }
+            };
+            let opts = VerifyOptions { scope: VerifyScope { versions, paths }, mode, files_percent, parallelism: parallel, max_errors, use_cache };
+            let vc = if use_cache { cache.open()? } else { None };
+            let ctx = progress_ctx(format);
+            with_repo_cache(&repo, LockKind::Shared, "verify", vc, |r, _| {
+                let v = ufop_core::backup::verify::verify(r, &opts, &ctx)?;
+                if matches!(format, OutputFormat::Human) {
+                    eprint!("\r\x1b[2K");
+                    print!("{}", verify_text(&v));
+                } else {
+                    output::print_data(format, &v);
+                }
+                Ok(if v.problems.is_empty() { 0 } else { 2 })
+            })
+        }
         BackupCommands::Compact { repo } => with_repo(&repo, LockKind::Exclusive, "compact", |r, _| {
             ok(emit(format, "Compaction", &maintenance::compact(r, &repo.options(), &OpContext::new())?))?;
             Ok(0)

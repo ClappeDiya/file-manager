@@ -243,7 +243,7 @@ impl Client {
         Err("Not authorized".into())
     }
 
-    async fn job_id(&mut self, name_or_id: &str) -> Result<String, String> {
+    pub(crate) async fn job_id(&mut self, name_or_id: &str) -> Result<String, String> {
         let jobs = self.call(reqwest::Method::GET, "/jobs", None).await?;
         jobs.as_array()
             .into_iter()
