@@ -42,6 +42,7 @@ use hooks::{LogLine, ReportConfig, ScriptConfig};
 use rusqlite::params;
 use schedule::BackupSchedule;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1743,13 +1744,17 @@ impl BackupManager {
             return Err(AppError::state("This job is already queued or running", "Wait for it to finish or cancel it."));
         }
         let (task_id, cancel, progress) = self.register_task(&job, op.name());
+        let span = op_span(&job, op.name(), &task_id);
         let me = self.clone();
         let tid = task_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = me.run_registered(job, op, tid.clone(), cancel, progress).await {
-                tracing::warn!("task {tid} failed: {e}");
+        tokio::spawn(
+            async move {
+                if let Err(e) = me.run_registered(job, op, tid.clone(), cancel, progress).await {
+                    tracing::warn!("task {tid} failed: {e}");
+                }
             }
-        });
+            .instrument(span),
+        );
         Ok(task_id)
     }
 
@@ -2082,13 +2087,17 @@ impl BackupManager {
             return Err(AppError::state("This job is already queued or running", "Wait for it to finish or cancel it."));
         }
         let (task_id, cancel, progress) = self.register_task(&job, "backup");
+        let span = op_span(&job, "backup", &task_id);
         let me = self.clone();
         let tid = task_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = me.run_registered(job, BackupOperation::Backup { dry_run }, tid.clone(), cancel, progress).await {
-                tracing::warn!("backup task {tid} failed: {e}");
+        tokio::spawn(
+            async move {
+                if let Err(e) = me.run_registered(job, BackupOperation::Backup { dry_run }, tid.clone(), cancel, progress).await {
+                    tracing::warn!("backup task {tid} failed: {e}");
+                }
             }
-        });
+            .instrument(span),
+        );
         Ok(task_id)
     }
 
@@ -2097,8 +2106,9 @@ impl BackupManager {
         self.ensure_accepting()?;
         let job = self.get_job(job_id).await?;
         let (task_id, cancel, progress) = self.register_task(&job, op.name());
+        let span = op_span(&job, op.name(), &task_id);
         // Boxed so callers that await many operations keep small frames.
-        Box::pin(self.run_registered(job, op, task_id, cancel, progress)).await
+        Box::pin(self.run_registered(job, op, task_id, cancel, progress).instrument(span)).await
     }
 
     async fn run_registered(
@@ -2124,6 +2134,20 @@ impl BackupManager {
         self.set_running(&task_id);
         let r = self.run_operation(job, op, cancel, progress).await;
         self.finish_task(&task_id);
+        // The operation span (trace export) gets the outcome.
+        let span = tracing::Span::current();
+        match &r {
+            Ok(o) => {
+                span.record("backup.result", o.status.as_str());
+                if o.status == "error" {
+                    span.record("backup.error", o.summary.as_str());
+                }
+            }
+            Err(e) => {
+                span.record("backup.result", "error");
+                span.record("backup.error", e.user_message().as_str());
+            }
+        }
         r
     }
 
@@ -3068,6 +3092,20 @@ impl BackupManager {
             }
         }
     }
+}
+
+/// The tracing span of one operation (exported as an OTLP span by ufop-server).
+fn op_span(job: &BackupJob, op: &str, task_id: &str) -> tracing::Span {
+    tracing::info_span!(
+        "backup.operation",
+        otel.kind = "internal",
+        job.id = %job.id,
+        job.name = %job.name,
+        backup.operation = op,
+        task.id = task_id,
+        backup.result = tracing::field::Empty,
+        backup.error = tracing::field::Empty,
+    )
 }
 
 fn parse_ts(s: &str) -> Option<DateTime<Utc>> {

@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod mcp_oauth;
 pub mod metrics;
 pub mod openapi;
+pub mod otlp;
 pub mod sdk;
 pub mod shares;
 pub mod tls;
@@ -98,6 +99,8 @@ pub struct ServerConfig {
     pub metrics_listen: Option<SocketAddr>,
     /// `user:password` required (HTTP Basic) on the metrics listener.
     pub metrics_basic_auth: Option<String>,
+    /// Push `/metrics` to a Prometheus push gateway.
+    pub pushgateway: Option<otlp::PushConfig>,
 }
 
 impl Default for ServerConfig {
@@ -126,6 +129,7 @@ impl Default for ServerConfig {
             request_log: true,
             metrics_listen: None,
             metrics_basic_auth: None,
+            pushgateway: None,
         }
     }
 }
@@ -165,13 +169,15 @@ pub struct ServerState {
     pub life: lifecycle::Lifecycle,
     /// HTTP request counters and latency histograms (`/metrics`).
     pub metrics: metrics::Metrics,
+    /// OTLP trace exporter (flushed on shutdown).
+    pub otlp: Option<otlp::OtlpHandle>,
 }
 
 impl ServerState {
     /// State with no OAuth broker, console agent or gateways (set the fields after).
     pub fn new(mgr: BackupManager, conns: Option<ConnectionManager>, auth: AuthService, cfg: ServerConfig) -> Self {
         let life = lifecycle::Lifecycle::new(std::time::Duration::from_secs(cfg.shutdown_grace_secs));
-        Self { mgr, conns, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None, gateways: Default::default(), life, metrics: Default::default() }
+        Self { mgr, conns, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None, gateways: Default::default(), life, metrics: Default::default(), otlp: None }
     }
 }
 
@@ -1150,6 +1156,7 @@ pub async fn serve(st: ServerState) -> Result<(), AppError> {
             }
         });
     }
+    let pusher = st.cfg.pushgateway.clone().map(|p| otlp::spawn_pushgateway(st.clone(), p));
     let handle = axum_server::Handle::new();
     let drain = {
         let (st, handle) = (st.clone(), handle.clone());
@@ -1191,6 +1198,15 @@ pub async fn serve(st: ServerState) -> Result<(), AppError> {
         st.mgr.cancel_all();
     }
     drain.abort();
+    if let Some(p) = pusher {
+        // The final push runs once the drain is over.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(20), p).await;
+    }
+    if let Some(o) = &st.otlp {
+        if !o.flush(std::time::Duration::from_secs(10)).await {
+            tracing::warn!("Could not send the last trace spans");
+        }
+    }
     tracing::info!("ufop-server stopped");
     Ok(())
 }

@@ -135,6 +135,8 @@ async fn with_request_id_in_body(res: Response, id: &str) -> Response {
 /// The request span (tower-http `TraceLayer` `make_span_with`).
 pub(crate) fn make_span(req: &Request) -> tracing::Span {
     let id = req.extensions().get::<RequestId>().map(|r| r.0.clone()).unwrap_or_default();
+    // W3C trace context of the caller (the OTLP layer makes this span its child).
+    let parent = super::otlp::remote_parent(req.headers()).unwrap_or_default();
     tracing::info_span!(
         "http.request",
         otel.kind = "server",
@@ -142,6 +144,7 @@ pub(crate) fn make_span(req: &Request) -> tracing::Span {
         http.route = tracing::field::Empty,
         http.status_code = tracing::field::Empty,
         request_id = %id,
+        traceparent = parent.as_str(),
     )
 }
 

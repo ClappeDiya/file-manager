@@ -153,7 +153,41 @@ struct Args {
     /// Require HTTP Basic `user:password` on --metrics-listen
     #[arg(long, env = "UFOP_SERVER_METRICS_BASIC_AUTH")]
     metrics_basic_auth: Option<String>,
+    /// Export trace spans (HTTP requests, backup operations) over OTLP/HTTP JSON to this
+    /// collector, e.g. http://otel-collector:4318 (default: off)
+    #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
+    /// Extra headers for the collector: name=value,name2=value2
+    #[arg(long, env = "OTEL_EXPORTER_OTLP_HEADERS", default_value = "")]
+    otlp_headers: String,
+    /// service.name of the exported spans
+    #[arg(long, env = "OTEL_SERVICE_NAME", default_value = "ufop-server")]
+    otlp_service_name: String,
+    /// Share of new traces exported, 0.0-1.0 (callers' sampled traceparent wins)
+    #[arg(long, env = "UFOP_SERVER_OTLP_SAMPLE_RATIO", default_value_t = 1.0)]
+    otlp_sample_ratio: f64,
+    /// Push metrics to this Prometheus push gateway, e.g. http://pushgateway:9091 (default: off)
+    #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_URL")]
+    pushgateway_url: Option<String>,
+    /// Push gateway job label
+    #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_JOB", default_value = "ufop-server")]
+    pushgateway_job: String,
+    /// Push gateway instance label (default: the host name)
+    #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_INSTANCE")]
+    pushgateway_instance: Option<String>,
+    /// Seconds between pushes (a last push is sent on shutdown)
+    #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_INTERVAL", default_value_t = 60)]
+    pushgateway_interval: u64,
+    /// HTTP Basic `user:password` for the push gateway
+    #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_BASIC_AUTH")]
+    pushgateway_basic_auth: Option<String>,
+    /// Bearer token for the push gateway
+    #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_TOKEN")]
+    pushgateway_token: Option<String>,
 }
+
+/// The OTLP exporter installed with the log subscriber.
+static OTLP: std::sync::OnceLock<Option<server::otlp::OtlpHandle>> = std::sync::OnceLock::new();
 
 /// The running server's stop switch, for the Windows service handler.
 static STOP: std::sync::OnceLock<server::lifecycle::Lifecycle> = std::sync::OnceLock::new();
@@ -307,9 +341,30 @@ async fn run(argv: Vec<String>) {
         None => argv,
     };
     let a = Args::parse_from(argv);
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
-        .init();
+    let otlp = match a.otlp_endpoint.as_deref().filter(|e| !e.trim().is_empty()) {
+        Some(endpoint) => {
+            if !(0.0..=1.0).contains(&a.otlp_sample_ratio) {
+                fail("--otlp-sample-ratio must be between 0 and 1");
+            }
+            let headers = server::otlp::parse_headers(&a.otlp_headers).unwrap_or_else(|e| fail(format!("--otlp-headers: {e}")));
+            Some(server::otlp::install(server::otlp::OtlpConfig { endpoint: endpoint.to_string(), headers, service_name: a.otlp_service_name.clone(), sample_ratio: a.otlp_sample_ratio, ..Default::default() }))
+        }
+        None => None,
+    };
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let (layer, handle) = otlp.map(|(l, h)| (Some(l), Some(h))).unwrap_or((None, None));
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+            .with(tracing_subscriber::fmt::layer())
+            .with(layer)
+            .init();
+        if let Some(e) = a.otlp_endpoint.as_deref().filter(|_| handle.is_some()) {
+            tracing::info!("Exporting traces to {e} (OTLP/HTTP JSON, sample ratio {})", a.otlp_sample_ratio);
+        }
+        let _ = OTLP.set(handle);
+    }
 
     let data_dir = a.data_dir.clone().unwrap_or_else(|| backup_engine::default_data_dir().parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")));
     if let Err(e) = server::enforce_data_dir_permissions(&data_dir) {
@@ -427,6 +482,14 @@ async fn run(argv: Vec<String>) {
         request_log: a.request_log == "on",
         metrics_listen: a.metrics_listen,
         metrics_basic_auth: a.metrics_basic_auth.filter(|s| !s.is_empty()),
+        pushgateway: a.pushgateway_url.filter(|u| !u.trim().is_empty()).map(|url| server::otlp::PushConfig {
+            url,
+            job: a.pushgateway_job.clone(),
+            instance: a.pushgateway_instance.clone().unwrap_or_else(|| hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_else(|_| "ufop-server".into())),
+            interval: std::time::Duration::from_secs(a.pushgateway_interval.max(1)),
+            basic_auth: a.pushgateway_basic_auth.filter(|s| !s.is_empty()),
+            bearer: a.pushgateway_token.filter(|s| !s.is_empty()),
+        }),
     };
     if !cfg.mcp_roots.is_empty() {
         let roots = ufop_core::confine::Roots::new(&cfg.mcp_roots).unwrap_or_else(|e| fail(format!("--mcp-root: {e}")));
@@ -444,7 +507,7 @@ async fn run(argv: Vec<String>) {
             tracing::warn!("WebDAV is reachable over plain HTTP: passwords and tokens are sent unencrypted. Use --https or a TLS reverse proxy.");
         }
     }
-    let st = ServerState { oauth, agent, ..ServerState::new(mgr, Some(conns), auth, cfg) };
+    let st = ServerState { oauth, agent, otlp: OTLP.get().cloned().flatten(), ..ServerState::new(mgr, Some(conns), auth, cfg) };
     let _ = STOP.set(st.life.clone());
     if let Err(e) = server::serve(st).await {
         fail(e);

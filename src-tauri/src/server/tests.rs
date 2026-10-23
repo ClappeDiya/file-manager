@@ -1250,3 +1250,159 @@ async fn standalone_metrics_listener_with_basic_auth() {
     assert_eq!(ok.status(), 200);
     assert!(ok.text().await.unwrap().contains("ufop_build_info{"));
 }
+
+/// A local HTTP receiver that records (method, path, headers, body) of every request.
+async fn mock_receiver() -> (SocketAddr, Arc<std::sync::Mutex<Vec<(String, String, HeaderMap, Vec<u8>)>>>) {
+    let got: Arc<std::sync::Mutex<Vec<(String, String, HeaderMap, Vec<u8>)>>> = Arc::default();
+    let g = got.clone();
+    let app = Router::new().fallback(move |req: Request| {
+        let g = g.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let bytes = axum::body::to_bytes(body, 16 << 20).await.unwrap_or_default();
+            g.lock().unwrap().push((parts.method.to_string(), parts.uri.path().to_string(), parts.headers, bytes.to_vec()));
+            StatusCode::OK
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (addr, got)
+}
+
+fn otlp_spans(bodies: &[(String, String, HeaderMap, Vec<u8>)]) -> Vec<Value> {
+    bodies
+        .iter()
+        .filter(|b| b.1 == "/v1/traces")
+        .flat_map(|b| {
+            let v: Value = serde_json::from_slice(&b.3).unwrap();
+            assert_eq!(v["resourceSpans"][0]["resource"]["attributes"][0], json!({"key": "service.name", "value": {"stringValue": "ufop-test"}}));
+            assert_eq!(v["resourceSpans"][0]["scopeSpans"][0]["scope"]["name"], "ufop-server");
+            v["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap().clone()
+        })
+        .collect()
+}
+
+fn attr<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
+    span["attributes"].as_array().unwrap().iter().find(|a| a["key"] == key).map(|a| &a["value"])
+}
+
+// Current-thread runtime: the server's tasks run on this thread, under the test's subscriber.
+#[tokio::test]
+async fn otlp_exports_request_and_backup_spans_with_w3c_parent() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let (addr, got) = mock_receiver().await;
+    let (layer, handle) = otlp::install(otlp::OtlpConfig { endpoint: format!("http://{addr}"), headers: vec![("x-api-key".into(), "collector-key".into())], service_name: "ufop-test".into(), ..Default::default() });
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    // Other tests register the same callsites concurrently without this subscriber.
+    tracing::callsite::rebuild_interest_cache();
+    let src = s.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"traced").unwrap();
+    let job = json!({"name":"Traced","sources":[src],"encrypted":false,"destination":{"type":"local","path": s.dir.join("dst"),"alternate_paths":[],"marker_file":null}});
+    let id = s.post("/api/v1/jobs", &tok, json!({"job": job})).await.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+    let caller = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let r = s.client.post(format!("{}/api/v1/jobs/{id}/run", s.base)).bearer_auth(&tok).header("traceparent", caller).json(&json!({})).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    for _ in 0..200 {
+        if s.mgr.active_task_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(handle.flush(std::time::Duration::from_secs(10)).await);
+
+    let bodies = got.lock().unwrap().clone();
+    assert!(bodies.iter().filter(|b| b.1 == "/v1/traces").all(|b| b.0 == "POST" && b.2["x-api-key"] == "collector-key" && b.2["content-type"] == "application/json"));
+    let spans = otlp_spans(&bodies);
+    let run = spans.iter().find(|s| s["name"] == "POST /api/v1/jobs/{id}/run").unwrap_or_else(|| panic!("{spans:#?}"));
+    assert_eq!(run["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(run["parentSpanId"], "00f067aa0ba902b7");
+    assert_eq!(run["kind"], 2);
+    assert_eq!(attr(run, "http.status_code"), Some(&json!({"intValue": "200"})));
+    assert_eq!(attr(run, "http.route"), Some(&json!({"stringValue": "/api/v1/jobs/{id}/run"})));
+    assert!(attr(run, "request_id").is_some() && attr(run, "traceparent").is_none() && attr(run, "otel.kind").is_none());
+    assert!(run["startTimeUnixNano"].as_str().unwrap().parse::<u128>().unwrap() <= run["endTimeUnixNano"].as_str().unwrap().parse::<u128>().unwrap());
+    let op = spans.iter().find(|s| s["name"] == "backup.operation" && attr(s, "job.id") == Some(&json!({"stringValue": id}))).unwrap();
+    assert_eq!((op["traceId"].as_str(), op["parentSpanId"].as_str(), op["kind"].as_u64()), (Some("4bf92f3577b34da6a3ce929d0e0e4736"), run["spanId"].as_str(), Some(1)));
+    assert_eq!(attr(op, "backup.operation"), Some(&json!({"stringValue": "backup"})));
+    assert!(matches!(attr(op, "backup.result").and_then(|v| v["stringValue"].as_str()), Some("success" | "warning")), "{op}");
+    assert_eq!(op["status"]["code"], 0);
+    // Requests without a traceparent start their own traces.
+    let login = spans.iter().find(|s| s["name"] == "POST /api/v1/jobs").unwrap_or_else(|| panic!("{spans:#?}"));
+    assert!(login.get("parentSpanId").is_none());
+    assert_ne!(login["traceId"], run["traceId"]);
+}
+
+#[tokio::test]
+async fn otlp_sampling_and_error_status() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let (addr, got) = mock_receiver().await;
+    let (layer, handle) = otlp::install(otlp::OtlpConfig { endpoint: format!("http://{addr}/v1/traces"), service_name: "ufop-test".into(), sample_ratio: 0.0, ..Default::default() });
+    {
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        // Not sampled (ratio 0, no parent): dropped with its children.
+        tracing::info_span!("http.request", http.method = "GET", http.route = "/a", http.status_code = 200u64, traceparent = "").in_scope(|| {
+            tracing::info_span!("backup.operation", backup.result = "success").in_scope(|| {});
+        });
+        // A sampled caller wins over the ratio; failures carry an error status.
+        let req = tracing::info_span!("http.request", http.method = "POST", http.route = "/b", http.status_code = tracing::field::Empty, traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01");
+        req.in_scope(|| {
+            let op = tracing::info_span!("backup.operation", backup.result = tracing::field::Empty, backup.error = tracing::field::Empty);
+            op.record("backup.result", "error");
+            op.record("backup.error", "Destination full");
+            drop(op);
+            // Unrelated spans are not exported.
+            tracing::info_span!("hyper.connection").in_scope(|| {});
+        });
+        req.record("http.status_code", 502u64);
+        drop(req);
+        // An unsampled caller is respected.
+        tracing::info_span!("http.request", http.method = "GET", traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00").in_scope(|| {});
+    }
+    assert!(handle.flush(std::time::Duration::from_secs(10)).await);
+    let spans = otlp_spans(&got.lock().unwrap());
+    assert_eq!(spans.len(), 2, "{spans:#?}");
+    let req = spans.iter().find(|s| s["name"] == "POST /b").unwrap();
+    assert_eq!(req["status"], json!({"code": 2, "message": "HTTP 502"}));
+    let op = spans.iter().find(|s| s["name"] == "backup.operation").unwrap();
+    assert_eq!(op["status"], json!({"code": 2, "message": "Destination full"}));
+    assert_eq!(op["parentSpanId"], req["spanId"]);
+    assert_eq!(handle.dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pushgateway_pushes_periodically_and_on_shutdown() {
+    let (addr, got) = mock_receiver().await;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::open_in_memory().await.unwrap();
+    let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
+    let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
+    let st = ServerState::new(mgr, None, auth, ServerConfig::default());
+    let cfg = otlp::PushConfig { url: format!("http://{addr}/"), job: "ufop".into(), instance: "node-1".into(), interval: std::time::Duration::from_secs(3600), basic_auth: Some("pg:secret".into()), bearer: None };
+    let task = otlp::spawn_pushgateway(st.clone(), cfg);
+    for _ in 0..100 {
+        if !got.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(got.lock().unwrap().len(), 1, "first push at start");
+    st.life.request(None);
+    tokio::time::timeout(std::time::Duration::from_secs(10), task).await.unwrap().unwrap();
+    let pushes = got.lock().unwrap().clone();
+    assert_eq!(pushes.len(), 2, "plus a final push on shutdown");
+    for (method, path, headers, body) in &pushes {
+        assert_eq!((method.as_str(), path.as_str()), ("PUT", "/metrics/job/ufop/instance/node-1"));
+        assert_eq!(headers["authorization"], "Basic cGc6c2VjcmV0");
+        assert!(headers["content-type"].to_str().unwrap().starts_with("text/plain; version=0.0.4"));
+        let (_, samples) = super::metrics::parse::parse(std::str::from_utf8(body).unwrap());
+        assert!(samples.iter().any(|x| x.name == "ufop_build_info"));
+    }
+    let last = std::str::from_utf8(&pushes[1].3).unwrap();
+    assert!(last.contains("ufop_shutting_down 1"), "the final push shows the drain");
+}

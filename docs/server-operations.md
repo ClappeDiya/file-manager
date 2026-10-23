@@ -131,3 +131,53 @@ scrape_configs:
 
 Example alert: `time() - ufop_backup_last_success_timestamp_seconds > 2 * 86400` (no good backup in two days).
 At most 2000 HTTP series are kept; further ones are counted under `route="other"`.
+
+## Trace export (OpenTelemetry)
+
+With `--otlp-endpoint http://otel-collector:4318` (`OTEL_EXPORTER_OTLP_ENDPOINT`) the server exports
+trace spans over **OTLP/HTTP with JSON** to `{endpoint}/v1/traces` (an endpoint that already ends in
+`/v1/traces` is used as is). Any OpenTelemetry Collector, Jaeger, Grafana Tempo, Honeycomb or another
+OTLP/HTTP receiver that accepts JSON works.
+
+| Option | Env | Default | |
+|---|---|---|---|
+| `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | off | Collector URL |
+| `--otlp-headers` | `OTEL_EXPORTER_OTLP_HEADERS` | none | `name=value,name2=value2` (values may be %-encoded), e.g. `x-honeycomb-team=…` or `authorization=Bearer%20…` |
+| `--otlp-service-name` | `OTEL_SERVICE_NAME` | `ufop-server` | `service.name` resource attribute |
+| `--otlp-sample-ratio` | `UFOP_SERVER_OTLP_SAMPLE_RATIO` | `1.0` | Share of new traces kept |
+
+Spans:
+
+- **`http.request`** (kind *server*), named `METHOD /route/template`, with `http.method`, `http.route`,
+  `http.status_code` and `request_id`; status *error* for 5xx.
+- **`backup.operation`** (kind *internal*) for every backup, restore, verification, compaction and other
+  operation, with `job.id`, `job.name`, `backup.operation`, `task.id`, `backup.result`
+  (`success`, `warning`, `error`, `cancelled`) and `backup.error`; status *error* when it failed. An
+  operation started by a request is a child of that request's span, so one trace shows the API call and the
+  backup it started.
+
+**Propagation**: a W3C `traceparent` header on an incoming request makes the request span a child of the
+caller's span, in the caller's trace, and the caller's *sampled* flag decides whether it is exported.
+Requests without one start a new trace that is kept with probability `--otlp-sample-ratio`; child spans
+follow their parent's decision.
+
+Spans are queued (up to 4096; when the collector is slow or down, further spans are dropped instead of
+slowing requests) and sent in batches of up to 512 at least every 2 seconds. The queue is flushed on
+shutdown. Export errors are logged at debug level.
+
+## Push gateway
+
+For servers that Prometheus cannot reach (behind NAT, short-lived), push the same metrics to a
+**Prometheus Pushgateway**:
+
+```bash
+ufop-server --pushgateway-url http://pushgateway:9091 --pushgateway-interval 60 \
+  --pushgateway-job ufop-server --pushgateway-instance nas-1 --pushgateway-basic-auth pg:secret
+```
+
+Every interval (default 60 s; first push at start) the server sends `PUT
+{url}/metrics/job/{job}/instance/{instance}` with the `/metrics` text, so each push replaces the previous
+group. `--pushgateway-instance` defaults to the host name; values with a `/` use the `@base64` grouping-key
+form. Authenticate with `--pushgateway-basic-auth user:password` or `--pushgateway-token` (bearer). When the
+server stops, it waits for running backups to finish draining and pushes once more, so the last values
+(including `ufop_shutting_down 1`) are kept. Delete stale groups in the Pushgateway when you retire a server.
