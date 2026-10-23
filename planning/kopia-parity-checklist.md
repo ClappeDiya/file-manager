@@ -54,15 +54,15 @@ Ground rules
 - [x] K5 Run all jobs (CLI, IPC, tray)
 
 ## WP5 — Restore and access
-- [ ] K41 Restore as of a date/time
-- [ ] K42 Restore to ZIP / TAR / TGZ
-- [ ] K45 Mirror restore (delete extras, safety-interlocked)
-- [ ] K46 Restore ownership (chown when privileged)
-- [ ] K47 Restore error policy (shared with K12/K29)
-- [ ] K48 Sparse-file restore
-- [ ] K38 Read/preview a backed-up file without restoring
-- [ ] K77 Bounded local volume cache (size limit, stats, clear)
-- [ ] K44 Mount a version as a read-only WebDAV drive
+- [x] K41 Restore as of a date/time
+- [x] K42 Restore to ZIP / TAR / TGZ
+- [x] K45 Mirror restore (delete extras, safety-interlocked)
+- [x] K46 Restore ownership (chown when privileged)
+- [x] K47 Restore error policy (shared with K12/K29)
+- [x] K48 Sparse-file restore
+- [x] K38 Read/preview a backed-up file without restoring
+- [x] K77 Bounded local volume cache (size limit, stats, clear)
+- [x] K44 Mount a version as a read-only WebDAV drive
 
 ## WP6 — Policy, schedules, maintenance
 - [ ] K17 Named policy templates inherited by jobs

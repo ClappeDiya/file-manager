@@ -52,13 +52,13 @@ impl VersionSelector {
                 }
             }
             Self::Latest { allow_partial } => usable(*allow_partial).map(|(i, _)| i).next().ok_or_else(|| none(no_complete(filesets))),
-            Self::Oldest { allow_partial } => usable(*allow_partial).map(|(i, _)| i).last().ok_or_else(|| none(no_complete(filesets))),
+            Self::Oldest { allow_partial } => usable(*allow_partial).map(|(i, _)| i).next_back().ok_or_else(|| none(no_complete(filesets))),
             Self::AsOf { time, allow_partial } => {
                 // Newest first: the first version not after `time` wins; on a
                 // tie (same second) the newer entry in the list is taken.
                 let hit = usable(*allow_partial).find(|(_, f)| parse_ts(&f.timestamp).is_some_and(|t| t <= *time)).map(|(i, _)| i);
                 hit.ok_or_else(|| {
-                    let oldest = usable(*allow_partial).last().map(|(_, f)| f.timestamp.clone());
+                    let oldest = usable(*allow_partial).next_back().map(|(_, f)| f.timestamp.clone());
                     match oldest {
                         Some(o) => AppError::file_op(
                             format!("No backup version was made at or before {}", time.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S")),

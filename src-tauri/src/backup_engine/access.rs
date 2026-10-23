@@ -320,7 +320,7 @@ impl BackupManager {
 fn cleanup_previews(dir: &Path, older_than: std::time::Duration) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
-        let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_none_or(|age| age >= older_than);
+        let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).map_or(true, |age| age >= older_than);
         if old {
             let _ = std::fs::remove_dir_all(e.path());
         }
