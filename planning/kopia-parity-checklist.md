@@ -31,14 +31,14 @@ Ground rules
 - [x] K81 Encrypted local database for encrypted repositories (key in OS keychain)
 
 ## WP3 — Versions, retention, shared repositories
-- [ ] K7 Version notes and tags (+ tag filter)
-- [ ] K22 Pin versions ("Keep forever"), honoured by retention and delete
-- [ ] K113 Storage added per version (bytes_added, new_blocks)
-- [ ] K23 Retention preview (dry-run of deletions)
-- [ ] K20 Count-based GFS retention (`RetentionPolicy::Counts`)
-- [ ] K76 Copy selected versions to another repository
-- [ ] K4 Shared multi-client repositories (cross-job/machine dedup, DB sync from remote dindex)
-- [ ] K69 Client identity (host/user) recorded per version, override option
+- [x] K7 Version notes and tags (+ tag filter)
+- [x] K22 Pin versions ("Keep forever"), honoured by retention and delete
+- [x] K113 Storage added per version (bytes_added, new_blocks)
+- [x] K23 Retention preview (dry-run of deletions)
+- [x] K20 Count-based GFS retention (`RetentionPolicy::Counts`)
+- [x] K76 Copy selected versions to another repository
+- [x] K4 Shared multi-client repositories (cross-job/machine dedup, DB sync from remote dindex)
+- [x] K69 Client identity (host/user) recorded per version, override option
 
 ## WP4 — Sources and backup runs
 - [ ] K26 `.ufopignore` and optional `.gitignore` support
