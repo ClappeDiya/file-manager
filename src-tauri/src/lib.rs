@@ -159,7 +159,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     }
 
     // Initialize peer manager (T-031) and server transfer manager (T-033)
-    let peer_mgr = PeerManager::new();
+    let peer_mgr = PeerManager::open(connectors::peer::default_peer_dir());
     let server_transfer_mgr = ServerTransferManager::new();
 
     // Initialize AI assistant (T-043..T-045)
@@ -784,6 +784,10 @@ pub fn run() {
             sync_commands::cancel_sync,
             // Peer discovery and transfer (T-031)
             peer_commands::peer_start_discovery,
+            peer_commands::peer_local_info,
+            peer_commands::peer_start_listener,
+            peer_commands::peer_stop_listener,
+            peer_commands::peer_clear_finished,
             peer_commands::peer_stop_discovery,
             peer_commands::peer_is_discovering,
             peer_commands::peer_list_peers,

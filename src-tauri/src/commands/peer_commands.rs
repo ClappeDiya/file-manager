@@ -2,8 +2,8 @@
 //! and server-to-server direct transfer (T-033).
 
 use crate::connectors::peer::{
-    ManualPeerConfig, PeerDevice, PeerFileInfo, PeerManager, PeerTransferProgress,
-    PeerTransferRequest, SavedPeer, TransferResponse, TrustLevel,
+    ManualPeerConfig, PeerDevice, PeerManager, PeerTransferProgress, PeerTransferRequest,
+    SavedPeer, TransferResponse, TrustLevel, DEFAULT_PEER_PORT,
 };
 use crate::connectors::server_to_server::{
     DirectTransferCapability, ServerTransferFile, ServerTransferJob, ServerTransferManager,
@@ -31,6 +31,38 @@ pub async fn peer_stop_discovery(
     peer_mgr: State<'_, PeerManager>,
 ) -> Result<(), AppError> {
     peer_mgr.stop_discovery().await
+}
+
+/// This device as other computers see it.
+#[derive(serde::Serialize)]
+pub struct PeerLocalInfo {
+    pub peer_id: Uuid,
+    pub fingerprint: String,
+    /// 0 while not accepting transfers.
+    pub port: u16,
+    pub discovering: bool,
+}
+
+#[tauri::command]
+pub async fn peer_local_info(peer_mgr: State<'_, PeerManager>) -> Result<PeerLocalInfo, AppError> {
+    Ok(PeerLocalInfo {
+        peer_id: peer_mgr.local_peer_id(),
+        fingerprint: peer_mgr.local_fingerprint(),
+        port: peer_mgr.listening_port(),
+        discovering: peer_mgr.is_discovering(),
+    })
+}
+
+/// Accept connections from other computers (without advertising); returns the port.
+#[tauri::command]
+pub async fn peer_start_listener(peer_mgr: State<'_, PeerManager>) -> Result<u16, AppError> {
+    peer_mgr.start_listener().await
+}
+
+/// Stop accepting connections (and stop discovery).
+#[tauri::command]
+pub async fn peer_stop_listener(peer_mgr: State<'_, PeerManager>) -> Result<(), AppError> {
+    peer_mgr.stop_listener().await
 }
 
 /// Check if peer discovery is currently active.
@@ -151,7 +183,7 @@ pub async fn peer_connect_manual(
 ) -> Result<PeerDevice, AppError> {
     let config = ManualPeerConfig {
         host,
-        port: port.unwrap_or(43210),
+        port: port.unwrap_or(DEFAULT_PEER_PORT),
         display_name,
     };
     peer_mgr.connect_manual(config).await
@@ -161,18 +193,24 @@ pub async fn peer_connect_manual(
 // T-031: Transfer Operations
 // ──────────────────────────────────────────────
 
-/// Request a file transfer to a peer device.
+/// Send local files or folders to a peer (it is asked to accept them first).
 #[tauri::command]
 pub async fn peer_request_transfer(
     peer_id: String,
-    files: Vec<PeerFileInfo>,
+    paths: Vec<String>,
     peer_mgr: State<'_, PeerManager>,
 ) -> Result<PeerTransferRequest, AppError> {
     let id = Uuid::parse_str(&peer_id).map_err(|_| AppError::Connection {
         message: "Invalid peer ID format".to_string(),
         advice: "Peer IDs must be valid UUIDs.".to_string(),
     })?;
-    peer_mgr.request_transfer(id, files).await
+    peer_mgr.request_transfer(id, paths).await
+}
+
+/// Remove finished transfers from the list.
+#[tauri::command]
+pub async fn peer_clear_finished(peer_mgr: State<'_, PeerManager>) -> Result<usize, AppError> {
+    Ok(peer_mgr.clear_finished_transfers().await)
 }
 
 /// List pending incoming transfer requests awaiting user response.
@@ -198,7 +236,6 @@ pub async fn peer_respond_transfer(
 
     let resp = match response.as_str() {
         "accepted" => TransferResponse::Accepted,
-        "denied" => TransferResponse::Denied,
         "blocked" => TransferResponse::Blocked,
         _ => TransferResponse::Denied,
     };

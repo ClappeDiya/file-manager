@@ -38,6 +38,7 @@ import {
   PinOff,
   X as CloseIcon,
   ChevronsRight,
+  MonitorSmartphone,
 } from "lucide-react";
 
 // ──────────────────────────────────────────────
@@ -331,6 +332,8 @@ export function getFileContextMenuItems(options: {
    *  infrastructure. Hidden when the caller omits the prop so the
    *  pane-only-selection (Paste-only) menu stays untouched. */
   onCompress?: () => void;
+  /** Send the selection to another computer running UFOP (local files only). */
+  onSendToComputer?: () => void;
   /** **Extract Here** — mirror of iter 14's `onCompress`. Pre-wired
    *  `archive_extract` IPC already supports zip / tar / tar.gz / 7z
    *  with optional password. The caller (FilePane) sets this prop only
@@ -605,6 +608,15 @@ export function getFileContextMenuItems(options: {
           : "Compress…",
         icon: <FileArchive className="h-3.5 w-3.5" />,
         action: options.onCompress,
+      });
+    }
+
+    if (options.onSendToComputer) {
+      items.push({
+        id: "send-to-computer",
+        label: "Send to Another Computer…",
+        icon: <MonitorSmartphone className="h-3.5 w-3.5" />,
+        action: options.onSendToComputer,
       });
     }
 

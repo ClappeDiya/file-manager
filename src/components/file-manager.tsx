@@ -56,6 +56,7 @@ import SettingsPanel from "./settings-panel";
 import { ConnectionPanel } from "./connection-panel";
 import { SyncPanel } from "./sync-panel";
 import { BackupPanel } from "./backup/backup-panel";
+import { PeerSidebar } from "./peer-sidebar";
 import { ScheduleLibraryPanel } from "./schedule-library-panel";
 import { PreviewPane } from "./preview-pane";
 import { TransferHistoryPanel } from "./transfer-history-panel";
@@ -143,6 +144,7 @@ import {
   X,
   DatabaseBackup,
   CalendarClock,
+  MonitorSmartphone,
 } from "lucide-react";
 
 // Toolbar customization definition (#14)
@@ -160,7 +162,11 @@ const ALL_TOOLBAR_ITEMS = [
   { id: "backups", label: "Backups" },
   { id: "schedules", label: "Schedules & holiday calendars" },
   { id: "operations", label: "Operations" },
+  { id: "nearby", label: "Nearby Computers" },
 ];
+
+/** Peer transfers send local files only. */
+const localPaths = (paths: string[]) => paths.filter((p) => !p.includes("://"));
 
 // ──────────────────────────────────────────────
 // FileManager - main orchestrating component
@@ -722,6 +728,17 @@ export function FileManager() {
   const [syncOpen, setSyncOpen] = useState(false);
   // Versioned backups panel (jobs, restore, maintenance, history).
   const [backupOpen, setBackupOpen] = useState(false);
+  // Nearby computers: discovery, incoming requests, and the items to send (if any).
+  const [nearbyOpen, setNearbyOpen] = useState(false);
+  const [nearbySend, setNearbySend] = useState<string[]>([]);
+  const activeFolder = useFileManagerStore((s) => {
+    const pane = s.getActivePane();
+    return pane.tabs.find((t) => t.id === pane.activeTabId)?.path ?? "";
+  });
+  const openNearby = useCallback((send: string[] = []) => {
+    setNearbySend(localPaths(send));
+    setNearbyOpen(true);
+  }, []);
   const [schedulesOpen, setSchedulesOpen] = useState(false);
   // The tray's "Backups…" item opens this panel.
   useEffect(() => {
@@ -2121,6 +2138,8 @@ export function FileManager() {
         onOpenBackups: () => {
           setBackupOpen(true);
         },
+        onOpenNearby: () => openNearby(),
+        onSendToComputer: () => openNearby(getAllSelectedPaths()),
         onOpenSchedules: appMode === "advanced" ? () => setSchedulesOpen(true) : undefined,
         onOpenTransferHistory: () => {
           setTransferHistoryOpen(true);
@@ -2437,6 +2456,18 @@ export function FileManager() {
               <DatabaseBackup className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
+          {toolbarItems.includes("nearby") && (
+            <Button
+              variant={nearbyOpen ? "secondary" : "ghost"}
+              size="icon"
+              onClick={() => (nearbyOpen ? setNearbyOpen(false) : openNearby())}
+              aria-label="Nearby computers"
+              title="Nearby computers (send and receive files)"
+              data-testid="toggle-nearby"
+            >
+              <MonitorSmartphone className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
           {appMode === "advanced" && toolbarItems.includes("schedules") && (
             <Button
               variant={schedulesOpen ? "secondary" : "ghost"}
@@ -2632,6 +2663,7 @@ export function FileManager() {
                   }
                   onCompress={(files) => setCreateArchiveSources(files)}
                   onShowTransfers={() => setTransfersOpen(true)}
+                  onSendToComputer={openNearby}
                 />
               )}
             />
@@ -2831,6 +2863,37 @@ export function FileManager() {
               </button>
               <BackupPanel />
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Nearby computers: mDNS discovery, approval of incoming files and
+          sending the chosen items. Received files go to Downloads, or to
+          the active folder with "Save here". */}
+      {nearbyOpen && (
+        <div
+          className="fixed inset-0 z-50 flex justify-end bg-black/30"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Nearby computers"
+          data-testid="nearby-backdrop"
+          onClick={() => setNearbyOpen(false)}
+        >
+          <div
+            className="relative w-[min(380px,95vw)] h-full pt-9 shadow-2xl border-l border-[var(--color-border)] bg-[var(--color-surface)]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              className="absolute top-3 right-4 z-10 h-7 w-7 flex items-center justify-center rounded text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover)]"
+              onClick={() => setNearbyOpen(false)}
+              aria-label="Close Nearby computers"
+            >
+              <X className="w-4 h-4" />
+            </button>
+            <PeerSidebar
+              sendPaths={nearbySend}
+              receiveDir={localPaths([activeFolder])[0] || undefined}
+            />
           </div>
         </div>
       )}
@@ -3272,6 +3335,8 @@ interface FilePaneProps {
    *  and completion state are visible the moment jobs land — the dock
    *  lives at FileManager scope (same lift pattern as `onCompress`). */
   onShowTransfers: () => void;
+  /** Opens Nearby computers to send these local files. */
+  onSendToComputer: (files: string[]) => void;
 }
 
 function FilePane({
@@ -3282,6 +3347,7 @@ function FilePane({
   onVerifyIntegrity,
   onCompress,
   onShowTransfers,
+  onSendToComputer,
 }: FilePaneProps) {
   const pane = useFileManagerStore((s) => s.panes[paneIndex]);
   const navigateTab = useFileManagerStore((s) => s.navigateTab);
@@ -4559,6 +4625,9 @@ function FilePane({
           const files = selectedPaths.length > 0 ? selectedPaths : [entry.path];
           onCompress(files);
         },
+        onSendToComputer: localPaths(selectedPaths.length > 0 ? selectedPaths : [entry.path]).length > 0
+          ? () => onSendToComputer(selectedPaths.length > 0 ? selectedPaths : [entry.path])
+          : undefined,
         // Iter 15: Extract Here. Only wired when the right-clicked
         // entry is an archive file — the gating happens here so the
         // context-menu doesn't need to inspect file types itself,
@@ -4615,7 +4684,7 @@ function FilePane({
       });
       onContextMenu({ position: { x: event.clientX, y: event.clientY }, items });
     },
-    [selectedPaths, currentPath, handleOpen, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleDelete, handleDeletePermanently, handleRename, handleDuplicate, handleNewFolder, handleNewFile, handleGetInfo, handleCalculateSize, handleEditRemote, handleCompareFiles, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, selectAll, invertSelection, onContextMenu, loadDirectory, isGitRepo, handleSendTo, onVerifyIntegrity, onCompress, handleExtractHere],
+    [selectedPaths, currentPath, handleOpen, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleDelete, handleDeletePermanently, handleRename, handleDuplicate, handleNewFolder, handleNewFile, handleGetInfo, handleCalculateSize, handleEditRemote, handleCompareFiles, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, selectAll, invertSelection, onContextMenu, loadDirectory, isGitRepo, handleSendTo, onVerifyIntegrity, onCompress, onSendToComputer, handleExtractHere],
   );
 
   // Keyboard shortcuts for compare (#47), quick select (#71), and the

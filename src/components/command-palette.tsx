@@ -47,6 +47,7 @@ import {
   FolderSync,
   DatabaseBackup,
   CalendarClock,
+  MonitorSmartphone,
   Upload,
   History,
   ShieldCheck,
@@ -764,6 +765,10 @@ export function getDefaultCommands(actions: {
   onOpenBackups?: () => void;
   /** Advanced mode only (undefined hides the entry). */
   onOpenSchedules?: () => void;
+  /** Open Nearby computers (peer discovery and transfers). */
+  onOpenNearby?: () => void;
+  /** Send the selection to another computer (undefined hides the entry). */
+  onSendToComputer?: () => void;
   /** Open the Transfer History (Journal) panel \u2014 searchable
    *  table of every historical transfer with status, checksum
    *  verification, retry count, duration, and speed; CSV/JSON
@@ -1181,6 +1186,28 @@ export function getDefaultCommands(actions: {
         "time machine",
       ],
     },
+    {
+      id: "open-nearby",
+      label: "Nearby Computers\u2026",
+      description: "Find other computers running UFOP on this network, accept incoming files, connect by address",
+      icon: <MonitorSmartphone className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onOpenNearby || (() => {}),
+      keywords: ["peer", "peers", "nearby", "airdrop", "lan", "local network", "computer", "device", "mdns", "bonjour", "receive"],
+    },
+    ...(actions.onSendToComputer
+      ? [
+          {
+            id: "send-to-computer",
+            label: "Send Selection to Another Computer\u2026",
+            description: "Send the selected files and folders over an encrypted connection; the other computer approves first",
+            icon: <MonitorSmartphone className="h-4 w-4" />,
+            category: "File",
+            action: actions.onSendToComputer,
+            keywords: ["send", "share", "peer", "airdrop", "transfer", "computer", "nearby"],
+          },
+        ]
+      : []),
     ...(actions.onOpenSchedules
       ? [
           {

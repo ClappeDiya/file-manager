@@ -419,6 +419,20 @@ impl rustls::client::danger::ServerCertVerifier for ExactOrWebPki {
     }
 }
 
+/// A server-certificate verifier that accepts only the pinned SHA-256
+/// fingerprints, or (with no pins) any certificate whose handshake
+/// signature checks out: the caller then reads the presented certificate
+/// and decides (trust on first use).
+pub fn server_cert_verifier(pins: &[String]) -> Result<std::sync::Arc<dyn rustls::client::danger::ServerCertVerifier>, AppError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let pins: Vec<String> = pins
+        .iter()
+        .map(|p| normalize_fingerprint(p).ok_or_else(|| AppError::validation(format!("'{p}' is not a SHA-256 certificate fingerprint (64 hex digits)"))))
+        .collect::<Result<_, _>>()?;
+    let seen = pins.is_empty().then(Default::default);
+    Ok(std::sync::Arc::new(PinVerifier { pins, provider: provider(), seen }))
+}
+
 /// Build a rustls client configuration.
 ///
 /// - `pins` non-empty: only certificates with one of these SHA-256

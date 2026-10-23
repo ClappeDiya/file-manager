@@ -333,26 +333,34 @@ Simple mode provides step-by-step wizards for:
 
 ## Peer-to-Peer Transfers
 
+Send files straight to another computer running UFOP on the same network, over an encrypted connection. Open **Nearby Computers** from the toolbar (add it in the toolbar customizer) or the command palette.
+
 ### Discovery
 
-UFOP discovers other UFOP instances on the local network using mDNS/Bonjour. Discovered peers appear in the sidebar with their hostname and display name.
+Click **Start Scanning**: UFOP advertises this computer over mDNS (Bonjour/Avahi) and lists the other UFOP computers it finds, with their name, operating system and status. While scanning, this computer also accepts incoming requests (it listens on port 43210, or another free port if that one is taken). Stop scanning to stop both. A computer that stops scanning disappears as offline.
+
+### Identity and security
+
+Each computer has its own certificate, created on first use; its fingerprint is shown at the bottom of the panel ("This device: AB12 CD34 …"). Connections use TLS with both computers presenting their certificates, so each side knows who it talks to. When you trust, block or save a computer, its certificate is remembered: if a saved computer later shows a different certificate (for example after a reinstall, or an impostor), the connection is refused until you remove it from saved devices. Compare fingerprints on both screens the first time if the network is not your own.
 
 ### Trust Levels
 
-- **Untrusted** - Requires approval for each transfer
-- **Trusted** - Automatically accept transfers
-- **Blocked** - Reject all requests
+- **Unknown / Untrusted** - you approve each transfer
+- **Trusted** - transfers are accepted automatically into your Downloads folder
+- **Blocked** - connections and requests are refused
 
 ### Transferring to Peers
 
-1. Select files
-2. Choose "Send to Another Computer" or drag to a peer in the sidebar
-3. The recipient approves (if not trusted)
-4. Transfer proceeds over a TLS-encrypted connection
+1. Select files or folders and choose **Send to Another Computer…** (right-click menu or command palette).
+2. Pick the computer in the panel and click its send button.
+3. The recipient sees the request with the sender, file count and size, and chooses **Accept** (into Downloads), **Save here** (the folder open in their file manager), **Deny**, or block the sender. Requests not answered within 5 minutes are declined.
+4. Files stream in 4 MiB pieces; each file is checked with SHA-256 and kept under a hidden name until it arrives intact, so a cancelled or failed transfer leaves no partial files. Existing files are never overwritten (copies are named `name (1).ext`), folders keep their structure, and modification times are kept. Symbolic links are skipped.
+
+Either side can cancel; progress, speed and the result show under **Transfers** on both computers.
 
 ### Manual Connection
 
-If peers are not auto-discovered, enter an IP address and port to connect manually.
+If discovery doesn't find a computer (different subnet, multicast blocked), click **+** and enter its IP address or host name and port. The other computer must be accepting transfers (scanning).
 
 ---
 

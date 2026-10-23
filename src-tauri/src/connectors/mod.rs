@@ -30,6 +30,7 @@ pub mod import_profiles;
 pub mod local_drive;
 pub mod nfs;
 pub mod peer;
+pub mod peer_wire;
 pub mod server_to_server;
 pub mod sftp;
 pub mod smb;
