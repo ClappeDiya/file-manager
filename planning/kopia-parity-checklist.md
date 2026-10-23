@@ -117,6 +117,9 @@ Ground rules
 - [ ] Standalone `ufop agent` host honours cron and maintenance schedules of managed jobs (WP6 left it on plain intervals)
 - [ ] Fix pre-existing `tests/journey_06_lan_transfer.rs` build break (`PeerManager::create_hello`/`create_ping`)
 - [ ] Fix pre-existing orphan `test_automation_rule` IPC call (dump-ipc-commands --verify)
+- [ ] Optional K108 extra: Prometheus `/metrics` in the desktop app (setting, off by default, loopback only) — WP8 did the server only
+- [ ] Pre-existing: `scripts/check-windows-build.sh` fails on clippy 1.97 lints in ufop-core (`unnecessary_sort_by` in sync/executor.rs, `manual_checked_ops`); `ufop-server` itself type-checks for x86_64-pc-windows-gnu
+- [ ] Pre-existing flake: `server::tests::file_gateway_relays_through_an_ha_pool_without_storing` can fail with a broken pipe under load (the 11 MB upload is refused before it is fully sent)
 
 ## Final verification
 - [ ] ufop-core tests (all features) pass
