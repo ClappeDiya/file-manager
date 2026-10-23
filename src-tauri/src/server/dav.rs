@@ -73,7 +73,11 @@ async fn authenticate(st: &ServerState, headers: &HeaderMap) -> Result<(), Respo
     }
     if secret.starts_with(api_tokens::PREFIX) {
         // Cheap (a hash lookup) and revocation must apply at once: never cached.
-        return st.auth.api_tokens().validate(&secret).await.map(|_| ()).map_err(|_| challenge());
+        // Server folders, not jobs: tokens limited to jobs cannot use them.
+        return match st.auth.api_tokens().validate(&secret).await {
+            Ok(t) if t.job_ids.is_none() => Ok(()),
+            _ => Err(challenge()),
+        };
     }
     if st.auth.validate(&secret).await.is_ok() {
         return Ok(());

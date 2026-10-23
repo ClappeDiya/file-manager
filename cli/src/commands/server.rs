@@ -179,6 +179,10 @@ pub enum TokenCommands {
         /// Expires after this many days (1–365)
         #[arg(long, default_value_t = 90)]
         days: i64,
+        /// Limit the token to this job (id or name; repeatable). Default: every job.
+        /// A limited token cannot use server-wide routes unless its scope is admin
+        #[arg(long = "job")]
+        jobs: Vec<String>,
     },
     /// Revoke a token by id
     Revoke { id: String },
@@ -526,7 +530,14 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
                 let mut c = Client::new()?;
                 let v = match t {
                     TokenCommands::List => c.call(reqwest::Method::GET, "/auth/api-tokens", None).await?,
-                    TokenCommands::Create { name, scope, days } => c.call(reqwest::Method::POST, "/auth/api-tokens", Some(json!({"name": name, "scope": scope, "expires_in_days": days}))).await?,
+                    TokenCommands::Create { name, scope, days, jobs } => {
+                        let mut ids = Vec::new();
+                        for j in &jobs {
+                            ids.push(c.job_id(j).await?);
+                        }
+                        let job_ids = if ids.is_empty() { Value::Null } else { json!(ids) };
+                        c.call(reqwest::Method::POST, "/auth/api-tokens", Some(json!({"name": name, "scope": scope, "expires_in_days": days, "job_ids": job_ids}))).await?
+                    }
                     TokenCommands::Revoke { id } => c.call(reqwest::Method::DELETE, &format!("/auth/api-tokens/{id}"), None).await?,
                 };
                 show(format, &v);

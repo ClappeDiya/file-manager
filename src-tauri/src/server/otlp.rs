@@ -73,7 +73,8 @@ pub fn parse_headers(s: &str) -> Result<Vec<(String, String)>, String> {
         .collect()
 }
 
-fn percent_decode(s: &str) -> String {
+/// `%XX` escapes decoded (invalid ones kept as they are).
+pub(crate) fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;

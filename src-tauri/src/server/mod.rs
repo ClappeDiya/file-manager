@@ -5,6 +5,7 @@
 //! The same `BackupManager` the desktop app uses runs here, so jobs,
 //! scheduling, history and maintenance behave identically.
 
+pub mod access;
 pub mod api_tokens;
 pub mod auth;
 pub mod csrf;
@@ -252,12 +253,13 @@ async fn host_check(State(st): State<ServerState>, req: Request, next: Next) -> 
     next.run(req).await
 }
 
-/// Who is calling: the pre-authentication header, an API token (with
-/// enough scope for `method path`), or a session/automation token.
-pub(crate) async fn authenticate(st: &ServerState, h: &HeaderMap, method: &Method, path: &str) -> Result<Principal, AppError> {
+/// Who is calling — the pre-authentication header, an API token (with
+/// enough scope for `method path`), or a session/automation token — and
+/// with which rights (see `access`).
+pub(crate) async fn authenticate_access(st: &ServerState, h: &HeaderMap, method: &Method, path: &str) -> Result<(Principal, access::Access), AppError> {
     if let Some(t) = h.get(PREAUTH_HEADER).and_then(|v| v.to_str().ok()) {
         if !t.is_empty() && st.cfg.preauth_tokens.iter().any(|p| constant_eq(p, t)) {
-            return Ok(Principal::Session);
+            return Ok((Principal::Session, access::Access::admin()));
         }
     }
     let bearer = h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::to_string);
@@ -271,18 +273,20 @@ pub(crate) async fn authenticate(st: &ServerState, h: &HeaderMap, method: &Metho
                     advice: "Use a token with a wider scope.".into(),
                 });
             }
-            Ok(Principal::ApiToken { id: tok.id, scope: tok.scope })
+            let limit = access::TokenLimit { id: tok.id.clone(), scope: tok.scope, job_ids: tok.job_ids.clone() };
+            Ok((Principal::ApiToken { id: tok.id, scope: tok.scope }, access::Access { token: Some(limit), ..access::Access::admin() }))
         }
-        Some(t) => st.auth.validate(&t).await.map(|_| Principal::Session),
+        Some(t) => st.auth.validate(&t).await.map(|_| (Principal::Session, access::Access::admin())),
         None => Err(AppError::PermissionDenied { message: "Authentication required".into(), advice: "Sign in first.".into() }),
     }
 }
 
 async fn require_auth(State(st): State<ServerState>, mut req: Request, next: Next) -> Response {
     let (method, path) = (req.method().clone(), req.uri().path().to_string());
-    match authenticate(&st, req.headers(), &method, &path).await {
-        Ok(principal) => {
+    match authenticate_access(&st, req.headers(), &method, &path).await {
+        Ok((principal, acc)) => {
             req.extensions_mut().insert(principal);
+            req.extensions_mut().insert(acc);
             next.run(req).await
         }
         Err(e) => ApiError(e).into_response(),
@@ -394,6 +398,9 @@ struct ApiTokenBody {
     scope: api_tokens::Scope,
     #[serde(default = "default_token_days")]
     expires_in_days: i64,
+    /// Limit the token to these jobs (ids; absent or null = every job).
+    #[serde(default)]
+    job_ids: Option<Vec<String>>,
 }
 
 fn default_token_days() -> i64 {
@@ -409,8 +416,13 @@ async fn create_api_token(State(st): State<ServerState>, Extension(who): Extensi
     if who != Principal::Session {
         return Err(AppError::PermissionDenied { message: "API tokens cannot create API tokens".into(), advice: "Sign in with the server password.".into() }.into());
     }
-    let (t, raw) = st.auth.api_tokens().create(&b.name, b.scope, b.expires_in_days).await?;
-    tracing::info!("Created API token {} ({}, {} scope)", t.id, t.name, t.scope.as_str());
+    if let Some(ids) = &b.job_ids {
+        for id in ids.iter().map(|i| i.trim()).filter(|i| !i.is_empty()) {
+            st.mgr.get_job(id).await.map_err(|_| AppError::validation(format!("There is no job with id '{id}'")))?;
+        }
+    }
+    let (t, raw) = st.auth.api_tokens().create_for_jobs(&b.name, b.scope, b.expires_in_days, b.job_ids).await?;
+    tracing::info!("Created API token {} ({}, {} scope{})", t.id, t.name, t.scope.as_str(), t.job_ids.as_ref().map(|j| format!(", {} job(s)", j.len())).unwrap_or_default());
     ok(json!({"token": raw, "info": t}))
 }
 
@@ -456,8 +468,8 @@ async fn health(State(st): State<ServerState>) -> ApiResult {
     }))
 }
 
-async fn status(State(st): State<ServerState>) -> ApiResult {
-    ok(st.mgr.status().await)
+async fn status(State(st): State<ServerState>, Extension(acc): Extension<access::Access>) -> ApiResult {
+    ok(visible_status(&st, &acc).await)
 }
 
 async fn modules(State(st): State<ServerState>) -> ApiResult {
@@ -480,8 +492,24 @@ async fn put_settings(State(st): State<ServerState>, Json(b): Json<SettingsBody>
     get_settings(State(st)).await
 }
 
-async fn rpc(State(st): State<ServerState>, AxPath(cmd): AxPath<String>, body: Option<Json<Value>>) -> ApiResult {
+async fn rpc(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, AxPath(cmd): AxPath<String>, body: Option<Json<Value>>) -> ApiResult {
     let args = body.map(|b| b.0).unwrap_or(json!({}));
+    // Administrators (without a job-limited token) may call any command.
+    if !acc.is_admin() || acc.job_limited() {
+        match access::rpc_need(&cmd, &args) {
+            access::RpcNeed::Job { id, perm } => acc.require_job(&st.mgr, &id, perm).await?,
+            access::RpcNeed::Global(g) => acc.require_global(g)?,
+            access::RpcNeed::Filtered => {
+                return match cmd.as_str() {
+                    "backup_list_jobs" => ok(visible_jobs(&st, &acc).await),
+                    "backup_status" => ok(visible_status(&st, &acc).await),
+                    "backup_run_history" => ok(runs_for(&st, &acc, args.get("jobId").and_then(|v| v.as_str()).map(String::from), args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32).await?),
+                    "backup_cancel" => ok(cancel_for(&st, &acc, args.get("id").and_then(|v| v.as_str()).unwrap_or("")).await?),
+                    _ => ok(run_all_for(&st, &acc, args.get("filter").cloned().map(serde_json::from_value).transpose().map_err(AppError::from)?.unwrap_or_default()).await?),
+                };
+            }
+        }
+    }
     if cmd == "server_list_directory" {
         let q = FsQuery { path: args.get("path").and_then(|v| v.as_str()).map(String::from), folders_only: true };
         return filesystem(Query(q)).await;
@@ -501,8 +529,62 @@ async fn rpc(State(st): State<ServerState>, AxPath(cmd): AxPath<String>, body: O
     Ok(Json(api::dispatch(&st.mgr, &cmd, &args).await?))
 }
 
-async fn list_jobs(State(st): State<ServerState>) -> ApiResult {
-    ok(st.mgr.list_jobs().await)
+async fn list_jobs(State(st): State<ServerState>, Extension(acc): Extension<access::Access>) -> ApiResult {
+    ok(visible_jobs(&st, &acc).await)
+}
+
+/// The jobs the caller may read.
+async fn visible_jobs(st: &ServerState, acc: &access::Access) -> Vec<crate::backup_engine::BackupJob> {
+    st.mgr.list_jobs().await.into_iter().filter(|j| acc.job_permission(&j.id, &j.name) >= access::Permission::Read).collect()
+}
+
+/// Scheduler status with only the tasks and upcoming runs of readable jobs.
+async fn visible_status(st: &ServerState, acc: &access::Access) -> crate::backup_engine::SchedulerStatus {
+    let mut s = st.mgr.status().await;
+    if !acc.is_admin() || acc.job_limited() {
+        let ids: std::collections::HashSet<String> = visible_jobs(st, acc).await.into_iter().map(|j| j.id).collect();
+        s.tasks.retain(|t| ids.contains(&t.job_id));
+        s.next_runs.retain(|t| ids.contains(&t.job_id));
+        s.next_maintenance.retain(|t| ids.contains(&t.job_id));
+    }
+    s
+}
+
+/// Run all, limited to the jobs the caller may run.
+async fn run_all_for(st: &ServerState, acc: &access::Access, mut filter: crate::backup_engine::runs::RunAllFilter) -> Result<crate::backup_engine::runs::RunAllReport, AppError> {
+    let allowed = acc.jobs_with(&st.mgr, access::Permission::Run).await;
+    let all = st.mgr.list_jobs().await;
+    let mut refused = Vec::new();
+    if filter.job_ids.is_empty() {
+        if allowed.len() < all.len() {
+            filter.job_ids = allowed.clone();
+        }
+    } else {
+        let (ok, no): (Vec<String>, Vec<String>) = filter.job_ids.into_iter().partition(|id| allowed.contains(id) || !all.iter().any(|j| &j.id == id));
+        filter.job_ids = ok;
+        refused = no;
+    }
+    let mut report = if filter.job_ids.is_empty() && allowed.len() < all.len() { Default::default() } else { st.mgr.run_all(filter).await? };
+    for id in refused {
+        let name = all.iter().find(|j| j.id == id).map(|j| j.name.clone()).unwrap_or_default();
+        report.skipped.push(crate::backup_engine::runs::SkippedRun { job_id: id, job_name: name, reason: "not allowed".into() });
+    }
+    Ok(report)
+}
+
+/// Cancel a task (or a job's tasks) the caller may run.
+async fn cancel_for(st: &ServerState, acc: &access::Access, id: &str) -> Result<bool, AppError> {
+    let tasks = st.mgr.status().await.tasks;
+    for t in tasks.iter().filter(|t| t.task_id == id || t.job_id == id) {
+        acc.require_job(&st.mgr, &t.job_id, access::Permission::Run).await?;
+    }
+    if tasks.iter().all(|t| t.task_id != id && t.job_id != id) {
+        // A job id without tasks: still only for jobs the caller may run.
+        if st.mgr.get_job(id).await.is_ok() {
+            acc.require_job(&st.mgr, id, access::Permission::Run).await?;
+        }
+    }
+    Ok(st.mgr.cancel(id))
 }
 
 #[derive(Deserialize)]
@@ -550,8 +632,8 @@ async fn run_job(State(st): State<ServerState>, AxPath(id): AxPath<String>, body
     ok(json!({"task_id": st.mgr.start_backup(&id, dry).await?}))
 }
 
-async fn run_all_jobs(State(st): State<ServerState>, body: Option<Json<crate::backup_engine::runs::RunAllFilter>>) -> ApiResult {
-    ok(st.mgr.run_all(body.map(|b| b.0).unwrap_or_default()).await?)
+async fn run_all_jobs(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, body: Option<Json<crate::backup_engine::runs::RunAllFilter>>) -> ApiResult {
+    ok(run_all_for(&st, &acc, body.map(|b| b.0).unwrap_or_default()).await?)
 }
 
 #[derive(Deserialize)]
@@ -563,10 +645,11 @@ async fn estimate_job(State(st): State<ServerState>, AxPath(id): AxPath<String>,
     ok(st.mgr.estimate(&id, q.assumed_bytes_per_sec).await?)
 }
 
-async fn job_operation(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(op): Json<BackupOperation>) -> ApiResult {
+async fn job_operation(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, AxPath(id): AxPath<String>, Json(op): Json<BackupOperation>) -> ApiResult {
     if matches!(op, BackupOperation::Backup { .. }) {
         return Err(AppError::validation("Use POST /jobs/{id}/run to start a backup").into());
     }
+    acc.require_job(&st.mgr, &id, access::operation_need(&op)).await?;
     ok(st.mgr.execute(&id, op).await?)
 }
 
@@ -827,12 +910,12 @@ async fn import_job(State(st): State<ServerState>, Json(b): Json<ImportBody>) ->
     ok(api::import_config(&st.mgr, &b.config, b.export_passphrase.as_deref(), b.import_stats, b.save).await?)
 }
 
-async fn cancel_task(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
-    ok(json!({"cancelled": st.mgr.cancel(&id)}))
+async fn cancel_task(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(json!({"cancelled": cancel_for(&st, &acc, &id).await?}))
 }
 
-async fn tasks(State(st): State<ServerState>) -> ApiResult {
-    ok(st.mgr.status().await.tasks)
+async fn tasks(State(st): State<ServerState>, Extension(acc): Extension<access::Access>) -> ApiResult {
+    ok(visible_status(&st, &acc).await.tasks)
 }
 
 #[derive(Deserialize)]
@@ -841,8 +924,25 @@ struct RunsQuery {
     limit: Option<u32>,
 }
 
-async fn runs(State(st): State<ServerState>, Query(q): Query<RunsQuery>) -> ApiResult {
-    ok(st.mgr.run_history(q.job_id, q.limit.unwrap_or(50)).await?)
+async fn runs(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, Query(q): Query<RunsQuery>) -> ApiResult {
+    ok(runs_for(&st, &acc, q.job_id, q.limit.unwrap_or(50)).await?)
+}
+
+/// Run history of the jobs the caller may read.
+async fn runs_for(st: &ServerState, acc: &access::Access, job_id: Option<String>, limit: u32) -> Result<Vec<crate::backup_engine::BackupRun>, AppError> {
+    if let Some(id) = &job_id {
+        acc.require_job(&st.mgr, id, access::Permission::Read).await?;
+        return st.mgr.run_history(job_id, limit).await;
+    }
+    if acc.is_admin() && !acc.job_limited() {
+        return st.mgr.run_history(None, limit).await;
+    }
+    let ids: std::collections::HashSet<String> = visible_jobs(st, acc).await.into_iter().map(|j| j.id).collect();
+    // History of deleted jobs and of other jobs is left out.
+    let mut out = st.mgr.run_history(None, limit.saturating_mul(4).max(200)).await?;
+    out.retain(|r| ids.contains(&r.job_id));
+    out.truncate(limit as usize);
+    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -897,7 +997,8 @@ struct ApplyTemplateBody {
     job_id: String,
 }
 
-async fn apply_template(State(st): State<ServerState>, AxPath(id): AxPath<String>, Json(b): Json<ApplyTemplateBody>) -> ApiResult {
+async fn apply_template(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, AxPath(id): AxPath<String>, Json(b): Json<ApplyTemplateBody>) -> ApiResult {
+    acc.require_job(&st.mgr, &b.job_id, access::Permission::Write).await?;
     ok(st.mgr.apply_template(&id, &b.job_id).await?)
 }
 
@@ -1092,6 +1193,7 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/server/shutdown", post(lifecycle::shutdown_route))
         .route("/api/v1/metrics", get(metrics::metrics_route))
         .merge(gateway::protected_routes())
+        .route_layer(middleware::from_fn_with_state(st.clone(), access::authorize))
         .route_layer(middleware::from_fn_with_state(st.clone(), require_auth));
     let mut app = public.merge(protected).merge(dav::routes()).route_layer(middleware::from_fn(observe::record_route));
     if !st.cfg.api_only && st.cfg.webroot.is_some() {

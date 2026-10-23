@@ -39,6 +39,27 @@ The desktop app does the same when it quits (tray *Quit* or closing the window w
 tray* off): running backups get up to 60 seconds to write their partial version before backup drives are
 closed and the app exits.
 
+## API tokens limited to jobs
+
+API tokens (`ufop_pat_…`) have a scope (`read` < `run` < `write` < `admin`) and may also be limited to some
+jobs:
+
+```bash
+ufop server tokens create ci-docs --scope run --job Docs --job Photos --days 30   # names or ids
+curl -X POST -H "Authorization: Bearer $UFOP_TOKEN" https://backup:8200/api/v1/jobs/run-all
+```
+
+`job_ids` in `POST /api/v1/auth/api-tokens` (`null` or absent = every job, as before). A limited token:
+
+- reaches `/api/v1/jobs/{id}/…` only for its jobs (`403` otherwise), with at most its scope
+  (`run` may start backups and verify, but not compact or delete — see *Permissions* below);
+- sees only its jobs in `GET /jobs`, `/tasks`, `/status`, `/runs` and the RPC equivalents; `POST /jobs/run-all`
+  starts only its jobs (others asked for are reported as skipped, "not allowed"); cancelling another job's
+  task is refused;
+- **cannot use server-wide routes** — templates, settings, metrics, the volume cache, filesystem browsing,
+  destinations, shares, folder policies, gateways, WebDAV, MCP, users and access rules — unless its scope is
+  `admin`. With the `admin` scope it may use them, but job routes and job lists still stop at its jobs.
+
 ## Browser sessions and CSRF
 
 Signing in (`POST /api/v1/auth/login`) returns a short-lived access token and sets two cookies:

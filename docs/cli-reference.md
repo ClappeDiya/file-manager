@@ -565,6 +565,7 @@ ufop backup run … --snapshot-policy required --snapshot-provider zfs   # auto 
 pg_dump mydb | ufop backup stdin --dest /mnt/backup --name mydb.sql    # standard input as /stdin/mydb.sql
 ufop backup estimate --dest /mnt/backup --source ~/Documents [--assumed-speed 20M] [--largest 10]
 ufop server run-all [--job Docs …] [--scheduled-only] [--dry-run] [--wait]   # every job of the signed-in ufop-server
+ufop server tokens create ci --scope run --job Docs [--job …] [--days 30]   # API token limited to some jobs
 ufop server shutdown [--grace 120]   # stop the server gracefully (running backups write a partial version); again = stop now
 ufop backup run-all [--job Docs …] [--scheduled-only] [--wait]               # the same
 ```

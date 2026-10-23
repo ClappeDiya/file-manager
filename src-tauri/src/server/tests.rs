@@ -1406,3 +1406,77 @@ async fn pushgateway_pushes_periodically_and_on_shutdown() {
     let last = std::str::from_utf8(&pushes[1].3).unwrap();
     assert!(last.contains("ufop_shutting_down 1"), "the final push shows the drain");
 }
+
+impl TestServer {
+    /// A local job (not run) named `name`; returns its id.
+    async fn job(&self, tok: &str, name: &str) -> String {
+        let src = self.dir.join(format!("src-{name}"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f.txt"), name.as_bytes()).unwrap();
+        let job = json!({"name": name, "sources": [src], "encrypted": false, "destination": {"type": "local", "path": self.dir.join(format!("dst-{name}")), "alternate_paths": [], "marker_file": null}});
+        let r = self.post("/api/v1/jobs", tok, json!({"job": job})).await;
+        assert_eq!(r.status(), 200);
+        r.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_tokens_limited_to_jobs() {
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    let (j1, j2) = (s.job(&tok, "One").await, s.job(&tok, "Two").await);
+    s.mgr.execute(&j2, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    let mint = |scope: &'static str, jobs: Value| s.post("/api/v1/auth/api-tokens", &tok, json!({"name": format!("{scope} jobs"), "scope": scope, "job_ids": jobs}));
+    assert_eq!(mint("run", json!(["nope"])).await.status(), 400, "unknown jobs are refused");
+    assert_eq!(mint("run", json!([])).await.status(), 400);
+    let created = mint("run", json!([j1])).await.json::<Value>().await.unwrap();
+    assert_eq!(created["info"]["job_ids"], json!([j1]));
+    let run = created["token"].as_str().unwrap().to_string();
+
+    // Lists show only the token's jobs; other jobs are refused with 403.
+    let jobs = s.get("/api/v1/jobs", &run).await.json::<Value>().await.unwrap();
+    assert_eq!(jobs.as_array().unwrap().iter().map(|j| j["id"].as_str().unwrap()).collect::<Vec<_>>(), vec![j1.as_str()]);
+    assert_eq!(s.get(&format!("/api/v1/jobs/{j1}"), &run).await.status(), 200);
+    let other = s.get(&format!("/api/v1/jobs/{j2}/versions"), &run).await;
+    assert_eq!(other.status(), 403);
+    assert!(other.json::<Value>().await.unwrap()["message"].as_str().unwrap().contains("not allowed"));
+    assert_eq!(s.post(&format!("/api/v1/jobs/{j2}/run"), &run, json!({"dry_run": true})).await.status(), 403);
+    assert_eq!(s.get(&format!("/api/v1/runs?job_id={j2}"), &run).await.status(), 403);
+    assert!(s.get("/api/v1/runs", &run).await.json::<Value>().await.unwrap().as_array().unwrap().is_empty(), "j2's runs are hidden");
+    // Within the scope: run, but not destructive maintenance.
+    assert_eq!(s.post(&format!("/api/v1/jobs/{j1}/operations"), &run, json!({"type": "compact"})).await.status(), 403);
+    let all = s.post("/api/v1/jobs/run-all", &run, json!({"dry_run": true})).await.json::<Value>().await.unwrap();
+    assert_eq!(all["started"].as_array().unwrap().iter().map(|r| r["job_id"].as_str().unwrap()).collect::<Vec<_>>(), vec![j1.as_str()], "{all}");
+    let asked = s.post("/api/v1/jobs/run-all", &run, json!({"dry_run": true, "job_ids": [j2]})).await.json::<Value>().await.unwrap();
+    assert!(asked["started"].as_array().unwrap().is_empty());
+    assert_eq!(asked["skipped"][0]["reason"], "not allowed");
+    for _ in 0..100 {
+        if s.mgr.active_task_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    assert_eq!(s.post(&format!("/api/v1/tasks/{j2}/cancel"), &run, json!({})).await.status(), 403);
+    // Server-wide routes are closed to job-limited tokens without the admin scope.
+    assert_eq!(s.get("/api/v1/backup-templates", &run).await.status(), 403);
+    assert_eq!(s.get("/api/v1/settings", &run).await.status(), 403);
+    assert_eq!(s.get("/api/v1/metrics", &run).await.status(), 403);
+    assert_eq!(s.get("/api/v1/status", &run).await.status(), 200);
+
+    // An admin-scope token limited to a job: global routes, but still one job (also over RPC).
+    let adm = mint("admin", json!([j1])).await.json::<Value>().await.unwrap()["token"].as_str().unwrap().to_string();
+    assert_eq!(s.get("/api/v1/settings", &adm).await.status(), 200);
+    let listed = s.post("/api/v1/rpc/backup_list_jobs", &adm, json!({})).await.json::<Value>().await.unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(s.post("/api/v1/rpc/backup_get_job", &adm, json!({"id": j2})).await.status(), 403);
+    assert_eq!(s.post("/api/v1/rpc/backup_delete_job", &adm, json!({"id": j2, "deleteLocalDb": false, "deleteRemote": false})).await.status(), 403);
+    assert_eq!(s.post("/api/v1/rpc/backup_get_job", &adm, json!({"id": j1})).await.status(), 200);
+    let hist = s.post("/api/v1/rpc/backup_run_history", &adm, json!({})).await.json::<Value>().await.unwrap();
+    assert!(hist.as_array().unwrap().iter().all(|r| r["job_id"] == j1.as_str()));
+    // Unlimited tokens are unchanged.
+    let read_all = mint("read", Value::Null).await.json::<Value>().await.unwrap();
+    assert!(read_all["info"]["job_ids"].is_null());
+    let read_all = read_all["token"].as_str().unwrap().to_string();
+    assert_eq!(s.get("/api/v1/jobs", &read_all).await.json::<Value>().await.unwrap().as_array().unwrap().len(), 2);
+    assert_eq!(s.get("/api/v1/backup-templates", &read_all).await.status(), 200);
+}

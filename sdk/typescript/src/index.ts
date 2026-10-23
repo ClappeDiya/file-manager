@@ -4,7 +4,7 @@
 /** API version this client was generated from. */
 export const API_VERSION = "0.1.0";
 
-export type ApiToken = { created_at?: string; expires_at?: string; id?: string; last_used_at?: string | null; name?: string; scope?: Scope; [key: string]: unknown };
+export type ApiToken = { created_at?: string; expires_at?: string; id?: string; job_ids?: string[] | null; last_used_at?: string | null; name?: string; scope?: Scope; [key: string]: unknown };
 
 /** A backup job (sources, destination, schedule, retention, filters, encryption); see docs/api-reference.md */
 export type BackupJob = Record<string, unknown>;
@@ -96,7 +96,7 @@ export class UfopClient {
   }
 
   /** Create a scoped API token (interactive sessions only); the secret is returned once (API tokens: `admin` scope). `POST /api/v1/auth/api-tokens` */
-  postAuthApiTokens(body: { expires_in_days?: number; name: string; scope: Scope }): Promise<{ info?: ApiToken; token?: string }> {
+  postAuthApiTokens(body: { expires_in_days?: number; job_ids?: string[] | null; name: string; scope: Scope }): Promise<{ info?: ApiToken; token?: string }> {
     return this.call("POST", `/api/v1/auth/api-tokens`, undefined, body);
   }
 

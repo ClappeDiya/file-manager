@@ -163,6 +163,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "OAuth clients and refresh tokens for ufop-server's MCP endpoint",
             sql: V29_SCHEMA,
         },
+        Migration {
+            version: 30,
+            description: "ufop-server API tokens limited to jobs",
+            sql: V30_SCHEMA,
+        },
     ]
 }
 
@@ -181,6 +186,12 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
 /// Schema v22: named `ufop-server` API tokens (SHA-256 hashes) with scopes
 /// (JSON list) and a mandatory expiry.
 /// Schema v26: folder policies of folders ufop-server shares (`server::folders`).
+/// Schema v30: `ufop-server` API tokens limited to some jobs (`job_ids`,
+/// a JSON list; NULL = every job, as before).
+const V30_SCHEMA: &str = r#"
+ALTER TABLE server_api_tokens ADD COLUMN job_ids TEXT;
+"#;
+
 /// Schema v29: OAuth 2.1 for `ufop-server`'s `/mcp` (`server::mcp_oauth`):
 /// dynamically registered public clients and rotating refresh tokens
 /// (SHA-256 hashes), each tied to the API token it last issued.
@@ -1042,7 +1053,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 29);
+        assert_eq!(applied, 30);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -1077,7 +1088,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 29);
+        assert_eq!(first, 30);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -1090,7 +1101,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 29);
+        assert_eq!(current_version(&conn).unwrap(), 30);
     }
 
     #[test]

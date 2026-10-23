@@ -8,6 +8,11 @@
 //! - `admin` — plus settings, raw RPC and `/auth/*` (except minting API tokens,
 //!   which needs an interactive sign-in so a leaked token cannot mint more)
 //!
+//! A token may also be limited to some jobs (`job_ids`; `None` = every job):
+//! it then reaches only those jobs' routes, lists show only them, and
+//! server-wide routes are closed to it unless it has the `admin` scope
+//! (see `access`).
+//!
 //! Every token expires (1–365 days). Resetting the JWT key revokes them all.
 
 use crate::core::error::AppError;
@@ -80,6 +85,8 @@ pub struct ApiToken {
     pub expires_at: String,
     pub last_used_at: Option<String>,
     pub revoked: bool,
+    /// Jobs the token may use (`None` = all).
+    pub job_ids: Option<Vec<String>>,
 }
 
 /// Who a request authenticated as (inserted as a request extension).
@@ -109,10 +116,11 @@ fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApiToken> {
         expires_at: r.get(4)?,
         last_used_at: r.get(5)?,
         revoked: r.get::<_, i64>(6)? != 0,
+        job_ids: r.get::<_, Option<String>>(7)?.and_then(|j| serde_json::from_str(&j).ok()),
     })
 }
 
-const COLUMNS: &str = "id, name, scopes, created_at, expires_at, last_used_at, revoked";
+const COLUMNS: &str = "id, name, scopes, created_at, expires_at, last_used_at, revoked, job_ids";
 
 #[derive(Clone)]
 pub struct ApiTokenStore {
@@ -126,6 +134,23 @@ impl ApiTokenStore {
 
     /// Create a token; the raw value is returned once and never stored.
     pub async fn create(&self, name: &str, scope: Scope, days: i64) -> Result<(ApiToken, String), AppError> {
+        self.create_for_jobs(name, scope, days, None).await
+    }
+
+    /// Create a token limited to `job_ids` (`None` = every job).
+    pub async fn create_for_jobs(&self, name: &str, scope: Scope, days: i64, job_ids: Option<Vec<String>>) -> Result<(ApiToken, String), AppError> {
+        let job_ids = match job_ids {
+            Some(ids) => {
+                let mut ids: Vec<String> = ids.into_iter().map(|i| i.trim().to_string()).filter(|i| !i.is_empty()).collect();
+                ids.sort();
+                ids.dedup();
+                if ids.is_empty() {
+                    return Err(AppError::validation("A token limited to jobs needs at least one job id"));
+                }
+                Some(ids)
+            }
+            None => None,
+        };
         let name = name.trim().to_string();
         if name.is_empty() || name.chars().count() > 80 {
             return Err(AppError::validation("A token needs a name of 1–80 characters"));
@@ -145,6 +170,7 @@ impl ApiTokenStore {
             expires_at: (now + Duration::days(days)).to_rfc3339(),
             last_used_at: None,
             revoked: false,
+            job_ids,
         };
         let (row, hash) = (t.clone(), sha256_hex(&raw));
         self.pool
@@ -154,8 +180,8 @@ impl ApiTokenStore {
                     return Err(AppError::validation(format!("At most {MAX_TOKENS} active tokens; revoke unused ones first")));
                 }
                 c.execute(
-                    "INSERT INTO server_api_tokens (id, name, token_hash, scopes, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![row.id, row.name, hash, serde_json::to_string(&[row.scope])?, row.created_at, row.expires_at],
+                    "INSERT INTO server_api_tokens (id, name, token_hash, scopes, created_at, expires_at, job_ids) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![row.id, row.name, hash, serde_json::to_string(&[row.scope])?, row.created_at, row.expires_at, row.job_ids.as_ref().map(serde_json::to_string).transpose()?],
                 )?;
                 Ok(())
             })
@@ -263,6 +289,11 @@ mod tests {
         assert!(s.revoke(&t.id).await.unwrap());
         assert!(!s.revoke(&t.id).await.unwrap());
         assert!(s.validate(&raw).await.unwrap_err().to_string().contains("revoked"));
+        let (j, raw_j) = s.create_for_jobs("one job", Scope::Run, 5, Some(vec!["b".into(), " a ".into(), "b".into()])).await.unwrap();
+        assert_eq!(j.job_ids, Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(s.validate(&raw_j).await.unwrap().job_ids, j.job_ids);
+        assert!(s.create_for_jobs("none", Scope::Run, 5, Some(vec![" ".into()])).await.is_err());
+        assert_eq!(v.job_ids, None, "unlimited tokens stay unlimited");
         let (t2, raw2) = s.create("old", Scope::Read, 1).await.unwrap();
         let past = (Utc::now() - Duration::minutes(1)).to_rfc3339();
         pool.execute(move |c| Ok(c.execute("UPDATE server_api_tokens SET expires_at = ?1 WHERE id = ?2", rusqlite::params![past, t2.id])?)).await.unwrap();
