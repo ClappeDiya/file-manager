@@ -47,6 +47,7 @@ pub mod owner;
 pub mod modules;
 pub mod par2;
 pub mod photos;
+pub mod rate_limit;
 pub mod reader;
 pub mod recovery;
 pub mod restore;

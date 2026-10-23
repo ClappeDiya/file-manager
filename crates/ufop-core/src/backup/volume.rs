@@ -78,6 +78,15 @@ pub fn verification_file_name(prefix: &str) -> String {
     format!("{prefix}-verification.json")
 }
 
+/// Volume kind from a (physical) file name alone, whatever the repository
+/// prefix: `[dir/]name.dblock[.aes|.gpg]` → `Block`. Used by stores that
+/// pick a storage class per kind.
+pub fn kind_of_name(name: &str) -> Option<VolumeKind> {
+    let n = name.rsplit_once('/').map_or(name, |(_, n)| n);
+    let n = n.strip_suffix(".aes").or_else(|| n.strip_suffix(".gpg")).unwrap_or(n);
+    VolumeKind::parse(n.rsplit_once('.')?.1)
+}
+
 /// Classify a remote file belonging to `prefix`.
 pub fn classify(prefix: &str, name: &str) -> Option<VolumeKind> {
     let rest = name.strip_prefix(prefix)?.strip_prefix('-')?;

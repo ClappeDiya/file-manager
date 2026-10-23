@@ -136,11 +136,13 @@ pub struct LocalBackend {
     pub use_move: bool,
     /// Flush each file to disk before reporting success.
     pub sync_writes: bool,
+    /// Shard folders listed at once by [`Backend::list_recursive`] (≤ 1 = one at a time).
+    pub list_parallelism: usize,
 }
 
 impl LocalBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), verify_upload_size: true, use_move: true, sync_writes: false }
+        Self { root: root.into(), verify_upload_size: true, use_move: true, sync_writes: false, list_parallelism: 1 }
     }
 
     pub fn root(&self) -> &Path {
@@ -279,6 +281,7 @@ impl Backend for LocalBackend {
 
     fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
         let mut out = self.list()?;
+        let mut dirs = Vec::new();
         for e in std::fs::read_dir(&self.root)? {
             let e = e?;
             if !e.file_type()?.is_dir() {
@@ -288,13 +291,21 @@ impl Backend for LocalBackend {
             if check_name(&dir).is_err() || dir.starts_with('.') {
                 continue;
             }
-            for f in std::fs::read_dir(e.path())? {
+            dirs.push((dir, e.path()));
+        }
+        let list_dir = |(dir, path): &(String, PathBuf)| -> Result<Vec<RemoteFile>, AppError> {
+            let mut v = Vec::new();
+            for f in std::fs::read_dir(path)? {
                 let f = f?;
                 let md = f.metadata()?;
                 if md.is_file() {
-                    out.push(RemoteFile { name: format!("{dir}/{}", f.file_name().to_string_lossy()), size: md.len() });
+                    v.push(RemoteFile { name: format!("{dir}/{}", f.file_name().to_string_lossy()), size: md.len() });
                 }
             }
+            Ok(v)
+        };
+        for part in list_partitioned(&dirs, self.list_parallelism, list_dir)? {
+            out.extend(part);
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
@@ -319,6 +330,30 @@ impl Backend for LocalBackend {
         Ok(std::fs::rename(self.root.join(from), self.root.join(to))?)
     }
 }
+
+/// Run `f` over `items` on up to `parallelism` threads (in order of the
+/// items; the first error wins). For listing shard folders concurrently.
+pub fn list_partitioned<T: Sync, R: Send>(items: &[T], parallelism: usize, f: impl Fn(&T) -> Result<R, AppError> + Sync) -> Result<Vec<R>, AppError> {
+    let n = parallelism.clamp(1, 64).min(items.len().max(1));
+    if n <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<Result<R, AppError>>>> = items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..n {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(item) = items.get(i) else { break };
+                let r = f(item);
+                *results[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            });
+        }
+    });
+    results.into_iter().map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).unwrap_or_else(|| Err(AppError::internal("listing worker stopped")))).collect()
+}
+
+pub use super::rate_limit::{RateLimitedBackend, RequestLimits};
 
 /// Retry policy for backend operations (the crate-wide policy).
 pub use crate::retry::RetryPolicy;
@@ -776,6 +811,23 @@ mod tests {
         assert!(boxed.is_read_only() && boxed.put("x", b"").is_err());
         // A missing folder is never created.
         assert!(ReadOnlyBackend::new(LocalBackend::new(d.path().join("nope"))).create_folder().is_err());
+    }
+
+    #[test]
+    fn parallel_shard_listing_matches_serial() {
+        let d = tempfile::tempdir().unwrap();
+        let mut b = LocalBackend::new(d.path());
+        for i in 0..40 {
+            b.put(&format!("{:02x}/v{i}.dblock", i % 9), b"x").unwrap();
+        }
+        b.put("top.dlist", b"y").unwrap();
+        let serial = b.list_recursive().unwrap();
+        b.list_parallelism = 4;
+        assert_eq!(b.list_recursive().unwrap(), serial);
+        assert_eq!(serial.len(), 41);
+        let out = list_partitioned(&[1, 2, 3, 4, 5], 3, |i| if *i == 4 { Err(AppError::validation("four")) } else { Ok(*i * 10) });
+        assert!(out.unwrap_err().user_message().contains("four"));
+        assert_eq!(list_partitioned(&[1, 2, 3], 8, |i| Ok(*i)).unwrap(), vec![1, 2, 3]);
     }
 
     #[test]
