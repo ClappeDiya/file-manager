@@ -38,6 +38,17 @@ impl Service {
 enum Auth {
     SharedKey(Vec<u8>),
     Sas(String),
+    /// Entra ID OAuth bearer tokens for `scope` (needs `x-ms-version` ≥ 2017-11-09).
+    Bearer(std::sync::Arc<super::azure_ad::AadTokenSource>, String),
+}
+
+/// How an [`AzureClient`] authenticates.
+pub enum ClientAuth {
+    /// Account key or SAS token, told apart by their shape.
+    Auto(String),
+    SharedKey(String),
+    Sas(String),
+    Bearer(std::sync::Arc<super::azure_ad::AadTokenSource>, String),
 }
 
 pub struct AzureClient {
@@ -66,6 +77,11 @@ impl AzureClient {
     /// a URL is used as given (Azurite: `http://127.0.0.1:10000/<account>`).
     /// `secret` = base64 account key, or a SAS token (`sv=…` / `?sv=…`).
     pub fn new(account: &str, endpoint: &str, service: Service, secret: &str, tls: &TlsOptions) -> Result<Self, AppError> {
+        Self::with_auth(account, endpoint, service, ClientAuth::Auto(secret.to_string()), tls)
+    }
+
+    /// [`new`](Self::new) with an explicit authentication method.
+    pub fn with_auth(account: &str, endpoint: &str, service: Service, auth: ClientAuth, tls: &TlsOptions) -> Result<Self, AppError> {
         let account = account.trim();
         if account.is_empty() {
             return Err(AppError::validation("Enter the storage account name"));
@@ -79,14 +95,20 @@ impl AzureClient {
             format!("https://{ep}")
         };
         let u = url::Url::parse(&base).map_err(|e| AppError::validation(format!("Invalid Azure endpoint: {e}")))?;
-        let s = secret.trim();
-        if s.is_empty() {
-            return Err(AppError::validation("Enter the account key or a SAS token"));
-        }
-        let auth = if s.starts_with("sv=") || s.starts_with("?sv=") || s.contains("&sig=") {
-            Auth::Sas(s.trim_start_matches('?').to_string())
-        } else {
-            Auth::SharedKey(base64::engine::general_purpose::STANDARD.decode(s).map_err(|_| AppError::validation("The Azure account key is not valid base64"))?)
+        let key = |s: &str| base64::engine::general_purpose::STANDARD.decode(s).map_err(|_| AppError::validation("The Azure account key is not valid base64")).map(Auth::SharedKey);
+        let need = |s: &str, what: &str| if s.trim().is_empty() { Err(AppError::validation(format!("Enter the {what}"))) } else { Ok(s.trim().to_string()) };
+        let auth = match auth {
+            ClientAuth::Auto(secret) => {
+                let s = need(&secret, "account key or a SAS token")?;
+                if s.starts_with("sv=") || s.starts_with("?sv=") || s.contains("&sig=") {
+                    Auth::Sas(s.trim_start_matches('?').to_string())
+                } else {
+                    key(&s)?
+                }
+            }
+            ClientAuth::SharedKey(secret) => key(&need(&secret, "account key")?)?,
+            ClientAuth::Sas(secret) => Auth::Sas(need(&secret, "SAS token")?.trim_start_matches('?').to_string()),
+            ClientAuth::Bearer(src, scope) => Auth::Bearer(src, scope),
         };
         Ok(Self { account: account.to_string(), service, auth, http: http::client(tls)?, base_path: u.path().trim_end_matches('/').to_string(), base })
     }
@@ -152,6 +174,9 @@ impl AzureClient {
         if let Some(a) = self.sign(method.as_str(), path, query, &headers, body.len()) {
             req = req.header("authorization", a);
         }
+        if let Auth::Bearer(src, scope) = &self.auth {
+            req = req.header("authorization", format!("Bearer {}", src.token(scope).await?));
+        }
         for (k, v) in &headers {
             req = req.header(k.as_str(), v.as_str());
         }
@@ -172,6 +197,7 @@ impl AzureClient {
         let key = match &self.auth {
             Auth::Sas(sas) => return Ok(format!("{url}?{sas}")),
             Auth::SharedKey(k) => k,
+            Auth::Bearer(..) => return Err(AppError::validation("Links need an account key or a SAS token; this connection signs in with Microsoft Entra ID")),
         };
         let now = chrono::Utc::now();
         let st = (now - chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M:%SZ").to_string();

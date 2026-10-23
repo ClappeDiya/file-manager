@@ -49,10 +49,11 @@ pub mod aws_credentials;
 pub mod azure_blob;
 pub mod openstack_swift;
 pub mod azure_rest;
+pub mod azure_ad;
 pub mod azure_adls;
 pub mod azure_files;
 #[cfg(test)]
-mod azure_tests;
+pub(crate) mod azure_tests;
 
 use crate::core::error::AppError;
 use crate::core::types::{ConnectionProfile, ConnectionProtocol, FileEntry};

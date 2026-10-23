@@ -35,6 +35,8 @@ pub mod tahoe;
 #[cfg(test)]
 mod cloud_tests;
 #[cfg(test)]
+pub(crate) mod mock_azure;
+#[cfg(test)]
 pub(crate) mod mock_s3;
 #[cfg(test)]
 mod mocks;
@@ -396,7 +398,10 @@ pub async fn open_with(config: &CloudConfig, secret: Option<String>, opts: OpenO
             let secret = if c.credentials.is_static() { Some(need(secret)?) } else { secret };
             Box::new(s3::S3Store::with_env(c.clone(), secret, crate::connectors::aws_chain::ChainEnv::process())?)
         }
-        CloudConfig::Azure(c) => Box::new(azure::AzureStore::new(c.clone(), need(secret)?)?),
+        CloudConfig::Azure(c) => {
+            let secret = if c.auth.needs_secret() { Some(need(secret)?) } else { secret };
+            Box::new(azure::AzureStore::with_env(c.clone(), secret, crate::connectors::aws_chain::ChainEnv::process())?)
+        }
         CloudConfig::Gcs(c) => Box::new(gcs::GcsStore::new(c.clone(), need(secret)?)?),
         CloudConfig::B2(c) => Box::new(b2::B2Store::connect(c.clone(), need(secret)?).await?),
         CloudConfig::Swift(c) => Box::new(swift::SwiftStore::connect(c.clone(), need(secret)?).await?),

@@ -208,3 +208,100 @@ async fn s3_point_in_time_reads_versions_and_refuses_writes() {
     let r = tokio::task::spawn_blocking(move || ufop_core::backup::Backend::is_read_only(&b)).await.unwrap();
     assert!(r);
 }
+
+// ── Azure ──
+
+use super::azure::{AzureAuth, AzureConfig, AzureStore};
+use super::mock_azure;
+
+fn azcfg(endpoint: &str, base: &str, auth: AzureAuth) -> AzureConfig {
+    AzureConfig { account: crate::connectors::azure_rest::DEV_ACCOUNT.into(), container: "backups".into(), prefix: "pc".into(), endpoint: endpoint.into(), block_size_mb: 1, auth, authority_host: base.into(), ..Default::default() }
+}
+
+fn testdata(f: &str) -> String {
+    format!("{}/src/backup_engine/stores/testdata/{f}", env!("CARGO_MANIFEST_DIR"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn azure_entra_sign_in_methods_against_mock() {
+    let (base, ep, st) = mock_azure::serve().await;
+    let none = || ChainEnv::fixed(HashMap::new());
+    let sp = AzureAuth::ServicePrincipalSecret { tenant: mock_azure::TENANT.into(), client_id: mock_azure::CLIENT.into() };
+    // Shared key still works (and is the default).
+    let key = AzureStore::with_env(azcfg(&ep, &base, AzureAuth::SharedKey), Some(crate::connectors::azure_rest::DEV_KEY.into()), none()).unwrap();
+    exercise(&key, 3 << 20).await; // block-list path
+    assert!(st.lock().unwrap().log.iter().all(|l| l.3 == "shared_key"));
+    // Service principal with a client secret: one token for many requests.
+    let s = AzureStore::with_env(azcfg(&ep, &base, sp.clone()), Some(mock_azure::CLIENT_SECRET.into()), none()).unwrap();
+    exercise(&s, 2 << 20).await;
+    {
+        let g = st.lock().unwrap();
+        assert_eq!(g.token_requests, vec![("secret".to_string(), crate::connectors::azure_ad::STORAGE_SCOPE.to_string())]);
+        assert!(g.log.iter().rev().take(5).all(|l| l.3 == "bearer"));
+    }
+    let wrong = AzureStore::with_env(azcfg(&ep, &base, sp.clone()), Some("nope".into()), none()).unwrap();
+    assert!(wrong.list().await.unwrap_err().user_message().contains("Invalid client secret"));
+    // Certificate (PEM key + certificate, and PFX with its password).
+    let tmp = tempfile::tempdir().unwrap();
+    let pem = tmp.path().join("sp.pem");
+    std::fs::write(&pem, format!("{}{}", std::fs::read_to_string(testdata("test-rsa-key.pem")).unwrap(), std::fs::read_to_string(testdata("test-rsa-cert.pem")).unwrap())).unwrap();
+    for (path, pass) in [(pem.to_string_lossy().into_owned(), None), (testdata("test-rsa.pfx"), Some("pfxpass".to_string()))] {
+        let auth = AzureAuth::ServicePrincipalCertificate { tenant: mock_azure::TENANT.into(), client_id: mock_azure::CLIENT.into(), cert_path: path };
+        let s = AzureStore::with_env(azcfg(&ep, &base, auth), pass, none()).unwrap();
+        s.create_folder().await.unwrap();
+        assert!(s.list().await.unwrap().is_empty());
+    }
+    assert_eq!(st.lock().unwrap().token_requests.iter().filter(|r| r.0 == "certificate").count(), 2);
+    // Federated token file.
+    let tf = tmp.path().join("fed");
+    std::fs::write(&tf, format!("{}\n", mock_azure::FEDERATED)).unwrap();
+    let s = AzureStore::with_env(azcfg(&ep, &base, AzureAuth::FederatedToken { tenant: mock_azure::TENANT.into(), client_id: mock_azure::CLIENT.into(), token_file: tf.to_string_lossy().into() }), None, none()).unwrap();
+    s.list().await.unwrap();
+    // Managed identity: App Service endpoint, then instance metadata with a client id.
+    let e = env(&[("IDENTITY_ENDPOINT", format!("{base}/msi")), ("IDENTITY_HEADER", mock_azure::IDENTITY_HEADER.into())]);
+    AzureStore::with_env(azcfg(&ep, &base, AzureAuth::ManagedIdentity { client_id: None }), None, e).unwrap().list().await.unwrap();
+    let e = env(&[("AZURE_POD_IDENTITY_AUTHORITY_HOST", base.clone())]);
+    AzureStore::with_env(azcfg(&ep, &base, AzureAuth::ManagedIdentity { client_id: Some("uami-1".into()) }), None, e).unwrap().list().await.unwrap();
+    {
+        let g = st.lock().unwrap();
+        let kinds: Vec<_> = g.token_requests.iter().map(|r| (r.0.as_str(), r.1.as_str())).collect();
+        assert!(kinds.contains(&("federated", crate::connectors::azure_ad::STORAGE_SCOPE)));
+        assert!(kinds.contains(&("managed-app-service", "https://storage.azure.com")));
+        assert!(kinds.contains(&("managed-imds", "https://storage.azure.com#uami-1")));
+    }
+    // Tokens about to expire are fetched again before use.
+    st.lock().unwrap().ttl = 60;
+    let s = AzureStore::with_env(azcfg(&ep, &base, sp), Some(mock_azure::CLIENT_SECRET.into()), none()).unwrap();
+    let before = st.lock().unwrap().token_requests.len();
+    s.list().await.unwrap();
+    s.list().await.unwrap();
+    assert_eq!(st.lock().unwrap().token_requests.len() - before, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn azure_sharded_backup_tiers_by_kind_and_parallel_listing() {
+    let (base, ep, st) = mock_azure::serve().await;
+    st.lock().unwrap().page = 3; // listings span pages
+    let auth = AzureAuth::ServicePrincipalSecret { tenant: mock_azure::TENANT.into(), client_id: mock_azure::CLIENT.into() };
+    let cfg = AzureConfig { access_tier: "Cool".into(), access_tier_by_kind: ClassByKind { dindex: "Hot".into(), dlist: "Hot".into(), ..Default::default() }, ..azcfg(&ep, &base, auth) };
+    let open = || AzureStore::with_env(cfg.clone(), Some(mock_azure::CLIENT_SECRET.into()), ChainEnv::fixed(HashMap::new())).unwrap();
+    let b = Arc::new(StoreBackend::new(Box::new(open()), None).with_list_parallelism(3));
+    let b2 = b.clone();
+    tokio::task::spawn_blocking(move || backup_roundtrip_with(b2.as_ref(), RepoLayout::Sharded { prefix_len: 1 })).await.unwrap();
+    {
+        let g = st.lock().unwrap();
+        let tier_of = |kind: &str| g.blobs.iter().filter(|(k, _)| k.contains(kind)).map(|(_, (_, t))| t.clone().unwrap_or_default()).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(tier_of(".dblock"), ["Cool".to_string()].into());
+        assert_eq!(tier_of(".dindex"), ["Hot".to_string()].into());
+        assert_eq!(tier_of(".dlist"), ["Hot".to_string()].into());
+        assert!(g.blobs.keys().any(|k| k.matches('/').count() == 3 && k.contains(".dblock")), "backups/pc/<shard>/<volume>");
+    }
+    let s = open();
+    let mut a = s.list_recursive(1).await.unwrap();
+    let mut p = s.list_recursive(3).await.unwrap();
+    a.sort_by(|x, y| x.name.cmp(&y.name));
+    p.sort_by(|x, y| x.name.cmp(&y.name));
+    assert_eq!(a, p);
+    let e = AzureStore::with_env(AzureConfig { access_tier_by_kind: ClassByKind { dblock: "archive".into(), ..Default::default() }, ..cfg.clone() }, Some("x".into()), ChainEnv::fixed(HashMap::new())).err().unwrap();
+    assert!(e.user_message().contains("dblock"));
+}

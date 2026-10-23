@@ -65,7 +65,7 @@ fn query_pairs(q: &str) -> Vec<(String, String)> {
 }
 
 /// The documented Shared Key string-to-sign, rebuilt from the received request.
-fn expected_signature(key: &[u8], method: &Method, raw_path: &str, raw_query: &str, h: &HeaderMap) -> String {
+pub(crate) fn expected_signature(key: &[u8], method: &Method, raw_path: &str, raw_query: &str, h: &HeaderMap) -> String {
     let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let len = match get("content-length").as_str() {
         "0" => String::new(),
