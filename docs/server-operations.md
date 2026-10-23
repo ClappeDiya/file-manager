@@ -232,6 +232,24 @@ scrape_configs:
 Example alert: `time() - ufop_backup_last_success_timestamp_seconds > 2 * 86400` (no good backup in two days).
 At most 2000 HTTP series are kept; further ones are counted under `route="other"`.
 
+### Desktop app
+
+The desktop app can export the same backup figures for a monitoring agent on the same computer. It is
+**off by default**; turn it on in Settings → Advanced → *Prometheus metrics* (Advanced mode). It listens on
+**127.0.0.1 only**, port 9464 by default (1024–65535), at `/metrics`, and can require a bearer token (at
+least 8 characters; only its SHA-256 is stored). The exposition is the backup part of the table above
+(`ufop_backup_*`, `ufop_operations_*`, `ufop_repository_lock_held`, `ufop_scheduler_*`, `ufop_volume_cache_*`)
+plus `ufop_build_info{app="desktop"}` and `ufop_uptime_seconds`; there are no HTTP series. A port in use is
+shown in Settings and does not stop the app. IPC: `desktop_metrics_status`, `desktop_metrics_configure
+{ settings: { enabled, port, token } }` (`token`: `null` keeps it, `""` removes it).
+
+```yaml
+scrape_configs:
+  - job_name: ufop-desktop
+    authorization: { credentials: "<token>" }   # only when a token is set
+    static_configs: [{ targets: ["127.0.0.1:9464"] }]
+```
+
 ## Trace export (OpenTelemetry)
 
 With `--otlp-endpoint http://otel-collector:4318` (`OTEL_EXPORTER_OTLP_ENDPOINT`) the server exports

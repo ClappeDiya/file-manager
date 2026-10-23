@@ -773,3 +773,18 @@ pub async fn backup_preview_notification(notification: crate::backup_engine::not
 pub async fn backup_webhook_preset(preset: crate::backup_engine::notify::webhook::WebhookPreset, params: Option<crate::backup_engine::notify::webhook::PresetParams>) -> Result<crate::backup_engine::notify::Notification, AppError> {
     crate::backup_engine::notify::webhook::preset(preset, &params.unwrap_or_default())
 }
+
+/// The desktop app's optional Prometheus exporter (Settings → Advanced).
+#[tauri::command]
+pub async fn desktop_metrics_status(m: State<'_, crate::backup_engine::metrics_exporter::DesktopMetrics>) -> Result<crate::backup_engine::metrics_exporter::MetricsStatus, AppError> {
+    Ok(m.status())
+}
+
+/// Turn the loopback `/metrics` listener on or off, set its port and token.
+#[tauri::command]
+pub async fn desktop_metrics_configure(
+    settings: crate::backup_engine::metrics_exporter::MetricsSettingsUpdate,
+    m: State<'_, crate::backup_engine::metrics_exporter::DesktopMetrics>,
+) -> Result<crate::backup_engine::metrics_exporter::MetricsStatus, AppError> {
+    m.configure(settings).await
+}

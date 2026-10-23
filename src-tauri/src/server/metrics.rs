@@ -11,7 +11,6 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::collections::BTreeMap;
-use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -52,37 +51,12 @@ impl Metrics {
     }
 }
 
-/// A label value escaped for the text format.
-pub fn esc(v: &str) -> String {
-    v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
-}
-
-fn labels(pairs: &[(&str, &str)]) -> String {
-    if pairs.is_empty() {
-        return String::new();
-    }
-    let inner: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}=\"{}\"", esc(v))).collect();
-    format!("{{{}}}", inner.join(","))
-}
-
-struct Out(String);
-
-impl Out {
-    fn head(&mut self, name: &str, kind: &str, help: &str) {
-        let _ = writeln!(self.0, "# HELP {name} {help}\n# TYPE {name} {kind}");
-    }
-    fn sample(&mut self, name: &str, l: &[(&str, &str)], v: impl std::fmt::Display) {
-        let _ = writeln!(self.0, "{name}{} {v}", labels(l));
-    }
-}
-
-fn ts_secs(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s).ok().map(|t| t.timestamp())
-}
+pub use crate::backup_engine::metrics::esc;
+use crate::backup_engine::metrics::Exposition as Out;
 
 /// The whole exposition.
 pub async fn render(st: &ServerState) -> String {
-    let mut o = Out(String::new());
+    let mut o = Out::default();
     o.head("ufop_build_info", "gauge", "Version of this ufop-server (always 1).");
     o.sample("ufop_build_info", &[("version", env!("CARGO_PKG_VERSION")), ("os", std::env::consts::OS), ("arch", std::env::consts::ARCH)], 1);
     o.head("ufop_uptime_seconds", "gauge", "Seconds since the server started.");
@@ -107,97 +81,7 @@ pub async fn render(st: &ServerState) -> String {
         o.sample("ufop_http_request_duration_seconds_count", &[("method", m), ("route", r), ("status", &status)], h.total);
     }
 
-    // Jobs and runs.
-    let jobs = st.mgr.list_jobs().await;
-    o.head("ufop_backup_job_info", "gauge", "One series per backup job, carrying its name.");
-    for j in &jobs {
-        o.sample("ufop_backup_job_info", &[("job_id", &j.id), ("job_name", &j.name), ("read_only", if j.read_only { "true" } else { "false" })], 1);
-    }
-    o.head("ufop_backup_versions", "gauge", "Versions in the job's repository (as of its last run).");
-    for j in &jobs {
-        o.sample("ufop_backup_versions", &[("job_id", &j.id)], j.stats.version_count);
-    }
-    o.head("ufop_backup_source_bytes", "gauge", "Size of the job's sources at its last backup.");
-    for j in &jobs {
-        o.sample("ufop_backup_source_bytes", &[("job_id", &j.id)], j.stats.source_size);
-    }
-    o.head("ufop_backup_destination_bytes", "gauge", "Size of the job's repository at its last run.");
-    for j in &jobs {
-        o.sample("ufop_backup_destination_bytes", &[("job_id", &j.id)], j.stats.backend_size);
-    }
-    match st.mgr.run_metrics().await {
-        Ok(rm) => {
-            o.head("ufop_backup_runs_total", "counter", "Finished operations by job, operation and result (from the run history).");
-            for c in &rm.counts {
-                o.sample("ufop_backup_runs_total", &[("job_id", &c.job_id), ("operation", &c.operation), ("result", &c.status)], c.count);
-            }
-            o.head("ufop_backup_last_success_timestamp_seconds", "gauge", "Unix time the job's newest successful backup finished.");
-            for l in rm.last.iter().filter(|l| l.last_success_unix.is_some()) {
-                o.sample("ufop_backup_last_success_timestamp_seconds", &[("job_id", &l.job_id)], l.last_success_unix.unwrap_or(0));
-            }
-            o.head("ufop_backup_last_duration_seconds", "gauge", "Duration of the job's newest backup run.");
-            for l in &rm.last {
-                o.sample("ufop_backup_last_duration_seconds", &[("job_id", &l.job_id), ("result", &l.status)], l.duration_secs);
-            }
-            o.head("ufop_backup_last_uploaded_bytes", "gauge", "Bytes uploaded by the job's newest backup run.");
-            for l in &rm.last {
-                o.sample("ufop_backup_last_uploaded_bytes", &[("job_id", &l.job_id)], l.bytes_uploaded);
-            }
-            o.head("ufop_backup_last_files", "gauge", "Files examined by the job's newest backup run.");
-            for l in &rm.last {
-                o.sample("ufop_backup_last_files", &[("job_id", &l.job_id)], l.files_examined);
-            }
-        }
-        Err(e) => tracing::warn!("Run metrics unavailable: {}", e.user_message()),
-    }
-
-    // Scheduler, tasks, locks.
-    let status = st.mgr.status().await;
-    let mut running: BTreeMap<String, u64> = BTreeMap::new();
-    let mut locked: BTreeMap<String, u64> = BTreeMap::new();
-    for t in status.tasks.iter().filter(|t| t.state == "running") {
-        *running.entry(t.operation.clone()).or_default() += 1;
-        locked.insert(t.job_id.clone(), 1);
-    }
-    o.head("ufop_operations_running", "gauge", "Operations running now, by operation.");
-    if running.is_empty() {
-        o.sample("ufop_operations_running", &[("operation", "backup")], 0);
-    }
-    for (op, n) in &running {
-        o.sample("ufop_operations_running", &[("operation", op)], n);
-    }
-    o.head("ufop_operations_queued", "gauge", "Operations waiting for a free slot (queue length).");
-    o.sample("ufop_operations_queued", &[], status.tasks.iter().filter(|t| t.state == "queued").count());
-    o.head("ufop_repository_lock_held", "gauge", "1 while an operation of this job runs and holds its repository lock.");
-    for j in &jobs {
-        o.sample("ufop_repository_lock_held", &[("job_id", &j.id)], locked.get(&j.id).copied().unwrap_or(0));
-    }
-    o.head("ufop_scheduler_running", "gauge", "1 when the scheduler loop runs.");
-    o.sample("ufop_scheduler_running", &[], u8::from(status.running));
-    o.head("ufop_scheduler_paused", "gauge", "1 while scheduled work is paused.");
-    o.sample("ufop_scheduler_paused", &[], u8::from(status.paused));
-    o.head("ufop_scheduler_next_run_timestamp_seconds", "gauge", "Unix time of the next scheduled run, by job and operation.");
-    for n in status.next_runs.iter().chain(status.next_maintenance.iter()) {
-        if let Some(t) = ts_secs(&n.next_run_at) {
-            o.sample("ufop_scheduler_next_run_timestamp_seconds", &[("job_id", &n.job_id), ("operation", &n.operation)], t);
-        }
-    }
-
-    // Volume cache.
-    if let Ok(c) = st.mgr.cache_stats().await {
-        o.head("ufop_volume_cache_bytes", "gauge", "Bytes in the local volume cache.");
-        o.sample("ufop_volume_cache_bytes", &[], c.bytes);
-        o.head("ufop_volume_cache_max_bytes", "gauge", "Volume cache limit (0 = off).");
-        o.sample("ufop_volume_cache_max_bytes", &[], c.max_bytes);
-        o.head("ufop_volume_cache_entries", "gauge", "Volumes in the cache.");
-        o.sample("ufop_volume_cache_entries", &[], c.entries);
-        o.head("ufop_volume_cache_hits_total", "counter", "Cache hits since start.");
-        o.sample("ufop_volume_cache_hits_total", &[], c.hits);
-        o.head("ufop_volume_cache_misses_total", "counter", "Cache misses since start.");
-        o.sample("ufop_volume_cache_misses_total", &[], c.misses);
-        o.head("ufop_volume_cache_evictions_total", "counter", "Volumes evicted since start.");
-        o.sample("ufop_volume_cache_evictions_total", &[], c.evictions);
-    }
+    crate::backup_engine::metrics::render_backup(&st.mgr, &mut o).await;
     o.0
 }
 

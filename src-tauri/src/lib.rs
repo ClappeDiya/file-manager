@@ -82,6 +82,8 @@ struct AppState {
     backup_mgr: BackupManager,
     schedule_library: schedule_library::ScheduleLibrary,
     fleet_agent: fleet_agent::FleetAgent,
+    /// Optional loopback Prometheus exporter (Settings → Advanced; off by default).
+    desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics,
     background_mode: tray::BackgroundMode,
     audit_trail: security::audit::AuditTrail,
     metadata_store: metadata_engine::MetadataStore,
@@ -303,6 +305,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         safety_interlock,
         narrator,
         quickflow_suggester,
+        desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics::new(backup_mgr.clone()),
         backup_mgr,
         fleet_agent,
         background_mode,
@@ -467,6 +470,7 @@ pub fn run() {
                     safety_interlock,
                     narrator,
                     quickflow_suggester,
+                    desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics::new(backup_mgr.clone()),
                     backup_mgr,
                     fleet_agent,
                     background_mode: tray::BackgroundMode::default(),
@@ -484,6 +488,7 @@ pub fn run() {
     let shutdown_backup = app_state.backup_mgr.clone();
     let setup_audit = app_state.audit_trail.clone();
     let setup_agent = app_state.fleet_agent.clone();
+    let setup_metrics = app_state.desktop_metrics.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -505,6 +510,11 @@ pub fn run() {
                 }
             }));
             mgr.start_scheduler();
+            // The Prometheus exporter, when the user turned it on.
+            let metrics = setup_metrics.clone();
+            tauri::async_runtime::spawn(async move {
+                metrics.start_from_settings().await;
+            });
             start_background_engines(app.handle().clone());
             // Console-managed proxy and AI limits.
             let apply_handle = app.handle().clone();
@@ -557,6 +567,7 @@ pub fn run() {
         .manage(app_state.quickflow_suggester)
         .manage(app_state.backup_mgr)
         .manage(app_state.fleet_agent)
+        .manage(app_state.desktop_metrics)
         .manage(app_state.background_mode)
         .manage(app_state.audit_trail)
         .manage(app_state.metadata_store)
@@ -719,6 +730,8 @@ pub fn run() {
             backup_commands::backup_search,
             backup_commands::backup_compare,
             backup_commands::backup_run_history,
+            backup_commands::desktop_metrics_status,
+            backup_commands::desktop_metrics_configure,
             backup_commands::backup_prune_history,
             backup_commands::backup_export_config,
             backup_commands::backup_import_config,

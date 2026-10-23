@@ -84,7 +84,7 @@ macro; if you add a new one here, register it there too.
 - `resolve_aws_profile`
 - `start_sso_auth`
 
-## `backup_commands` (107 commands)
+## `backup_commands` (109 commands)
 
 - `backup_adopt_repository`
 - `backup_apply_template`
@@ -192,6 +192,8 @@ macro; if you add a new one here, register it there too.
 - `backup_test_notification_profile`
 - `backup_test_secret_providers`
 - `backup_webhook_preset`
+- `desktop_metrics_configure`
+- `desktop_metrics_status`
 - `ediscovery_export`
 
 ## `batch_rename_commands` (4 commands)
@@ -749,4 +751,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 581 commands across 51 modules.
+**Surface:** 583 commands across 51 modules.

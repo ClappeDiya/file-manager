@@ -27,6 +27,8 @@ import { ManagedSettingsNotice } from "@/components/managed-settings-notice";
 import { FleetAgentLimits } from "@/components/fleet-agent-limits";
 import { PortableModeBadge, PortableModeDetails } from "@/components/portable-mode-status";
 import { usePortableStatus } from "@/hooks/use-portable-status";
+import { MetricsExporterSection } from "@/components/metrics-exporter-section";
+import { AdvancedOnly } from "@/components/backup/advanced-only";
 
 // ── Types ──
 
@@ -1398,6 +1400,15 @@ export default function SettingsPanel({
         {/* GSSAPI/Kerberos */}
         <Section title="GSSAPI / Kerberos">
           <GssapiSection />
+        </Section>
+
+        {/* Advanced: local monitoring (Prometheus exporter, off by default) */}
+        <Section title="Advanced">
+          <div className="pt-3" />
+          <AdvancedOnly hint>
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Prometheus metrics</h3>
+            <MetricsExporterSection />
+          </AdvancedOnly>
         </Section>
 
         {/* Network Diagnostics */}
