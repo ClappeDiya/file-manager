@@ -12,6 +12,7 @@ import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { BackupSupportTools } from "./backup-support-tools";
 import { BackupLegalHold } from "./backup-legal-hold";
 import { AdvancedOnly } from "./advanced-only";
+import { BackupRepositoryFormat } from "./backup-repository-format";
 
 
 export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDeleted: () => void }) {
@@ -80,6 +81,10 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
           {tool("List broken files", { type: "list_broken" }, "Files that depend on missing or damaged volumes")}
         </div>
       </Section>
+
+      <AdvancedOnly>
+        <BackupRepositoryFormat job={job} />
+      </AdvancedOnly>
 
       <AdvancedOnly hint>
       <Section title="Repair">

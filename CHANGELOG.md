@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Backup repository format 2 (default for new backups; format 1 stays readable and writable): content-defined chunking (FastCDC), Zstandard blocks and compressed file lists, an envelope key so passwords change without rewriting data, ChaCha20-Poly1305, and an optional sharded folder layout. Upgrade in place with rollback until the first format 2 write, change the password, and reshard from Maintenance, the REST API or `ufop backup upgrade | change-password | reshard | format-info`. See `docs/backup-repository-format.md`.
+
 - Robocopy feature parity for sync pairs: selection (`/S /E /LEV /XD /MAXAGE /MINAGE /XA /XJ /SL`), comparison (`/XO /XN /XC /XL /IS /FFT /DST`), cleanup (`/PURGE /XX /MOV /MOVE /CREATE`), copy engine (`/COPY:T /DCOPY:T /Z /IPG /R /W /MT /RH`), `/LOG[+]`, Robocopy exit codes, and "paste a Robocopy command" import with one-click presets.
 - Windows-only Robocopy switches: `/COPY:S /COPY:O /COPY:U` (`/SEC`, `/COPYALL`), `/A /M /IA /XA:<letters> /A+ /A-`, plus `/TIMFIX` and `/SECFIX` (all platforms for timestamps).
 - `ufop copy <src> <dst> [files] [/switches]` in the CLI — the same engine as the desktop app, Robocopy exit codes, `/L` list-only, `/MON` and `/MOT` monitoring, Ctrl+C stops after the current file.

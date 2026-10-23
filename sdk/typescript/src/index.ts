@@ -261,6 +261,11 @@ export class UfopClient {
     return this.call("POST", `/api/v1/jobs/${encodeURIComponent(id)}/operations`, undefined, body);
   }
 
+  /** Change an encrypted job's passphrase (format 2 repositories rewrite only the header) (API tokens: `write` scope). `PUT /api/v1/jobs/{id}/passphrase` */
+  putJobsIdPassphrase(id: string, body: { current?: string | null; kdf_preset?: "interactive" | "default" | "sensitive" | null; new_passphrase: string }): Promise<Record<string, unknown>> {
+    return this.call("PUT", `/api/v1/jobs/${encodeURIComponent(id)}/passphrase`, undefined, body);
+  }
+
   /** Start a backup (queued); returns the task id (API tokens: `run` scope). `POST /api/v1/jobs/{id}/run` */
   postJobsIdRun(id: string, body: { dry_run?: boolean } = {}): Promise<{ task_id?: string }> {
     return this.call("POST", `/api/v1/jobs/${encodeURIComponent(id)}/run`, undefined, body);

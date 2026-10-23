@@ -136,6 +136,82 @@ export interface BackupOptions {
   object_lock: ObjectLockOptions | null;
   /** What `photos://` (macOS Photos library) sources export. */
   photos: PhotosOptions;
+  // ── Repository format: new repositories only (existing ones keep theirs) ──
+  /** 1 or 2; null = newest (2). */
+  format_version: number | null;
+  /** null = FastCDC on format 2 (format 1 is always fixed). */
+  chunker: ChunkerKind | null;
+  /** null = zstd on format 2 (format 1 is always deflate). */
+  block_codec: BlockCodec | null;
+  /** null = zstd on format 2 (format 1 never compresses metadata). */
+  metadata_compression: MetadataCompression | null;
+  /** Format 2 encrypted repositories only. */
+  cipher: CipherKind;
+  /** Format 2 only; sharded needs a destination with folders. */
+  layout: RepoLayout;
+}
+
+/** Rust `ufop_core::backup::ChunkerKind`. */
+export type ChunkerKind = "fixed" | "fastcdc";
+/** Rust `ufop_core::backup::BlockCodec`. */
+export type BlockCodec = "deflate" | "zstd";
+/** Rust `ufop_core::backup::MetadataCompression`. */
+export type MetadataCompression = "none" | "zstd";
+/** Rust `ufop_core::backup::crypto::CipherKind`. */
+export type CipherKind = "aes256_gcm" | "chacha20_poly1305";
+/** Rust `ufop_core::backup::layout::RepoLayout`. */
+export type RepoLayout = { type: "flat" } | { type: "sharded"; prefix_len: number };
+/** Rust `ufop_core::backup::chunker::ChunkerSpec` (recorded in the repository header). */
+export type ChunkerSpec = { type: "fixed"; size: number } | { type: "fastcdc"; min: number; avg: number; max: number };
+
+/** `format_info` operation report (Rust `format::FormatInfo`). */
+export interface RepositoryFormatInfo {
+  format_version: number;
+  chunker: ChunkerSpec;
+  block_codec: BlockCodec;
+  metadata_compression: MetadataCompression;
+  /** null when unencrypted or GPG. */
+  cipher: CipherKind | null;
+  envelope_key: boolean;
+  layout: RepoLayout;
+  features: string[];
+  rollback_available: boolean;
+}
+
+/** Upgrade / rollback / password change result (Rust `format::FormatReport`). */
+export interface FormatReport {
+  from_version: number;
+  to_version: number;
+  unchanged: boolean;
+  features: string[];
+  message: string;
+}
+
+/** `reshard` operation report (Rust `layout::ReshardReport`). */
+export interface ReshardReport {
+  from: RepoLayout;
+  to: RepoLayout;
+  moved: number;
+  bytes_moved: number;
+  already_in_place: number;
+  dry_run: boolean;
+  errors: string[];
+}
+
+export type KdfPreset = "interactive" | "default" | "sensitive";
+
+/** Human description of a repository layout. */
+export function describeLayout(l: RepoLayout): string {
+  return l.type === "flat" ? "Flat (one folder)" : `Sharded (${l.prefix_len}-digit subfolders)`;
+}
+
+/** Human description of a chunker. */
+export function describeChunker(c: ChunkerSpec): string {
+  return c.type === "fixed" ? `Fixed ${formatSize(c.size)} blocks` : `Content-defined (FastCDC), ~${formatSize(c.avg)} blocks`;
+}
+
+function formatSize(n: number): string {
+  return n >= 1024 * 1024 ? `${Math.round(n / (1024 * 1024))} MiB` : `${Math.round(n / 1024)} KiB`;
 }
 
 /** Rust `ufop_core::backup::photos::PhotosOptions`. */
@@ -776,7 +852,10 @@ export type BackupOperation =
   | { type: "snapshot_test" }
   | { type: "replicate"; replica_id: string | null }
   | { type: "apply_locks"; days: number; mode: LockMode; all: boolean }
-  | { type: "list_locks" };
+  | { type: "list_locks" }
+  | { type: "upgrade_format"; rollback: boolean }
+  | { type: "reshard"; layout: RepoLayout; dry_run: boolean }
+  | { type: "format_info" };
 
 export interface PassphraseStrength {
   score: number;
@@ -895,6 +974,12 @@ export function newBackupJob(): BackupJob {
       kdf: null,
       object_lock: null,
       photos: { include_hidden: false, include_trashed: false, albums: [] },
+      format_version: null,
+      chunker: null,
+      block_codec: null,
+      metadata_compression: null,
+      cipher: "aes256_gcm",
+      layout: { type: "flat" },
     },
     retention: { type: "keep_all" },
     schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [] },
@@ -998,6 +1083,8 @@ interface BackupState {
   runJob: (id: string, dryRun?: boolean) => Promise<string>;
   cancel: (id: string) => Promise<void>;
   execute: (id: string, operation: BackupOperation) => Promise<OperationResult>;
+  /** Change an encrypted job's passphrase in place (format 2); `current` null = the stored one. */
+  changePassphrase: (id: string, current: string | null, newPassphrase: string, kdfPreset?: KdfPreset | null) => Promise<FormatReport>;
   pause: (minutes: number | null) => Promise<void>;
   resume: () => Promise<void>;
   placeLegalHold: (id: string, matter: string, reason: string) => Promise<BackupJob>;
@@ -1081,6 +1168,12 @@ export const useBackupStore = create<BackupState>((set, get) => ({
     const result = await tauriInvoke<OperationResult>("backup_execute", { id, operation });
     await Promise.all([get().loadJobs(), get().loadStatus()]);
     return result;
+  },
+
+  changePassphrase: async (id, current, newPassphrase, kdfPreset = null) => {
+    const report = await tauriInvoke<FormatReport>("backup_change_passphrase", { id, current, newPassphrase, kdfPreset });
+    await get().loadJobs();
+    return report;
   },
 
   pause: async (minutes) => {

@@ -496,6 +496,20 @@ ufop archive list backup.zip --json
 
 ---
 
+### `ufop backup` repository format
+
+Format commands of the versioned backup engine (all take `--dest`, `--prefix` and the passphrase options of `ufop backup run`). See [backup-repository-format.md](backup-repository-format.md).
+
+```bash
+ufop backup format-info --dest /mnt/backup                  # version, chunker, codecs, cipher, layout
+ufop backup upgrade --dest /mnt/backup                      # format 1 → 2 (header only)
+ufop backup upgrade --dest /mnt/backup --rollback           # back to format 1 before any format 2 write
+UFOP_NEW_PASSPHRASE=… ufop backup change-password --dest /mnt/backup [--new-passphrase-file F] [--kdf-preset sensitive]
+ufop backup reshard --dest /mnt/backup --layout sharded --shard-prefix-len 2 [--dry-run]
+```
+
+New backups (`ufop backup run`) take `--format-version 1|2`, `--chunker fixed|fastcdc`, `--block-codec deflate|zstd`, `--cipher aes256-gcm|chacha20-poly1305` and `--layout flat|sharded` with `--shard-prefix-len 1-4`. They apply only when the repository is created.
+
 ### `ufop server shares`
 
 Share links on a `ufop-server` started with `--share-root` (sign in first with `ufop server login`).

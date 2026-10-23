@@ -27,6 +27,7 @@ import { LogOutputsEditor, NotificationsEditor, ReportExtras } from "./backup-no
 import { JobSecretProviders } from "./backup-secret-providers";
 import { PhotosSourceSection } from "./backup-photos-source";
 import { AdvancedOnly } from "./advanced-only";
+import { BackupChangePassphrase } from "./backup-repository-format";
 
 interface ConnectionProfile {
   id: string;
@@ -151,10 +152,11 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                   </span>
                 )}
                 {!isNew && passphrase && (
-                  <span className="block text-[11px] text-amber-600">Changing the passphrase of an existing backup makes older volumes unreadable with the new one. Use it only for a fresh destination.</span>
+                  <span className="block text-[11px] text-amber-600">Changing the passphrase of an existing backup makes older volumes unreadable with the new one. Use it only for a fresh destination, or use Change password below.</span>
                 )}
               </Field>
             )}
+            {!isNew && job.stats.version_count > 0 && <BackupChangePassphrase job={job} />}
           </Section>
         )}
 

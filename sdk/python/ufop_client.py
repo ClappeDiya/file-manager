@@ -215,6 +215,10 @@ class UfopClient:
         """Restore, verify, compact, repair, purge … (a tagged BackupOperation; not `backup`) (API tokens: `run` scope). `POST /api/v1/jobs/{id}/operations`"""
         return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/operations", None, body)
 
+    def put_jobs_id_passphrase(self, id_: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Change an encrypted job's passphrase (format 2 repositories rewrite only the header) (API tokens: `write` scope). `PUT /api/v1/jobs/{id}/passphrase`"""
+        return self._call("PUT", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/passphrase", None, body)
+
     def post_jobs_id_run(self, id_: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Start a backup (queued); returns the task id (API tokens: `run` scope). `POST /api/v1/jobs/{id}/run`"""
         return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/run", None, body if body is not None else {})

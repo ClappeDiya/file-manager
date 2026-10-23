@@ -6,6 +6,7 @@
 import { inputCls } from "@/lib/backup-helpers";
 import { KDF_PRESETS, type BackupOptions, type LockMode, type SnapshotPolicy, type UsnPolicy, type VolumeFormat, type ZipMethod } from "@/stores/backup-store";
 import { Check, Field, Section } from "./backup-ui";
+import { RepositoryFormatOptions } from "./backup-repository-format";
 
 const lines = (v: string) => v.split("\n").map((s) => s.trim()).filter(Boolean);
 const num = (v: string, min = 0, max = Number.MAX_SAFE_INTEGER) => Math.min(max, Math.max(min, Math.floor(Number(v) || 0)));
@@ -96,6 +97,7 @@ export function BackupAdvancedOptions({
         </div>
       </Section>
 
+      <RepositoryFormatOptions options={o} locked={locked} onChange={onChange} />
       <Section title="Immutability (object lock)" hint="Locks each new volume so nobody — including ransomware with your credentials — can delete or overwrite it before the lock expires. The destination must support object lock (e.g. an S3 bucket with Object Lock enabled).">
         <Check
           label="Lock new volumes"

@@ -7,10 +7,19 @@ You choose the method when the backup is created (**Options → Encryption metho
 | Method | Key | Volume names | Notes |
 |---|---|---|---|
 | AES-256-GCM (default) | Argon2id from the passphrase | `….aes` | The Argon2id cost is stored in the header. |
+| ChaCha20-Poly1305 (format 2) | Argon2id from the passphrase | `….aes` | Pick it under **Options → Advanced → Repository format → Cipher** or with `--cipher chacha20-poly1305`. The header records the cipher. |
 | GPG, symmetric | the passphrase (`gpg --symmetric --cipher-algo AES256`) | `….gpg` | Needs GnuPG. The passphrase goes to gpg on stdin, never on the command line. `--no-symkey-cache` stops gpg-agent from accepting a cached key. Volumes never touch disk unencrypted: the passphrase is the first line on stdin and the volume follows. |
 | GPG, recipients | public keys (`--gpg-recipient`) | `….gpg` | Backups need no passphrase. Restores need the secret key in the keyring. |
 
 AES and symmetric GPG backups carry a key check, so a wrong passphrase is rejected before any work starts.
+
+### Envelope key (format 2)
+
+In format 1 the Argon2id key encrypts every volume, so a new passphrase means re-encrypting the whole backup. Format 2 encrypts volumes with a random 256-bit master key. The header stores that key wrapped (AES-256-GCM or ChaCha20-Poly1305) by the Argon2id key, the key-encryption key. The key check proves the key-encryption key, so a wrong passphrase is still rejected at once.
+
+**Change password** unwraps the master key with the old passphrase and wraps it with the new one. Only the header changes, written safely (temporary name, read back, previous header kept until success). The job's stored passphrase is updated too. Upgrading a format 1 backup keeps the old key as the master key, so the passphrase and all volumes keep working. See [backup-repository-format.md](backup-repository-format.md).
+
+Each volume still gets its own random file key, wrapped with the volume key, as before. A volume's flag byte says which cipher sealed it (1 AES-256-GCM, 3 ChaCha20-Poly1305), so readers handle both.
 
 ### Key derivation
 

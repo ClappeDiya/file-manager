@@ -15,13 +15,13 @@ Ground rules
 - [x] K130 SECURITY.md (disclosure policy, supported versions, response SLA)
 
 ## WP1 — Repository format v2 (ufop-core)
-- [ ] K72 Format v2, dual-version reader, in-place upgrade with v1 header backup and rollback
-- [ ] K83 Envelope key: random master key wrapped by Argon2id KEK; password change rewraps header only
-- [ ] K49 Zstd block codec in the native pack format (default for new v2 repos)
-- [ ] K52 Compress dlist/dindex metadata before sealing (v2)
-- [ ] K3 Content-defined chunking (FastCDC) behind a `Chunker` trait; chunker recorded in repo header
-- [ ] K82 ChaCha20-Poly1305 as a registered encryption module (v2 header records cipher)
-- [ ] K59 Optional sharded remote layout for v2 repos (+ reshard tool)
+- [x] K72 Format v2, dual-version reader, in-place upgrade with v1 header backup and rollback
+- [x] K83 Envelope key: random master key wrapped by Argon2id KEK; password change rewraps header only
+- [x] K49 Zstd block codec in the native pack format (default for new v2 repos)
+- [x] K52 Compress dlist/dindex metadata before sealing (v2)
+- [x] K3 Content-defined chunking (FastCDC) behind a `Chunker` trait; chunker recorded in repo header
+- [x] K82 ChaCha20-Poly1305 as a registered encryption module (v2 header records cipher)
+- [x] K59 Optional sharded remote layout for v2 repos (+ reshard tool)
 
 ## WP2 — Repository safety
 - [ ] K115 Remote repository lock lease (`{prefix}-lock`), renew, stale takeover, guarded force-unlock
