@@ -6,6 +6,7 @@
 //! scheduling, history and maintenance behave identically.
 
 pub mod access;
+pub mod accounts;
 pub mod api_tokens;
 pub mod auth;
 pub mod csrf;
@@ -23,6 +24,7 @@ pub mod otlp;
 pub mod sdk;
 pub mod shares;
 pub mod tls;
+pub mod users;
 /// Server settings live in `security::settings_store` (shared with the backup engine).
 pub use crate::security::settings_store as settings;
 
@@ -274,11 +276,22 @@ pub(crate) async fn authenticate_access(st: &ServerState, h: &HeaderMap, method:
                 });
             }
             let limit = access::TokenLimit { id: tok.id.clone(), scope: tok.scope, job_ids: tok.job_ids.clone() };
-            Ok((Principal::ApiToken { id: tok.id, scope: tok.scope }, access::Access { token: Some(limit), ..access::Access::admin() }))
+            let acc = account_access(st, &tok.owner, Some(limit)).await?;
+            Ok((Principal::ApiToken { id: tok.id, scope: tok.scope }, acc))
         }
-        Some(t) => st.auth.validate(&t).await.map(|_| (Principal::Session, access::Access::admin())),
+        Some(t) => {
+            let claims = st.auth.validate(&t).await?;
+            Ok((Principal::Session, account_access(st, &claims.sub, None).await?))
+        }
         None => Err(AppError::PermissionDenied { message: "Authentication required".into(), advice: "Sign in first.".into() }),
     }
+}
+
+/// The rights of an (enabled) account, optionally through a token.
+async fn account_access(st: &ServerState, username: &str, token: Option<access::TokenLimit>) -> Result<access::Access, AppError> {
+    let user = st.auth.account(username).await?;
+    let rules = st.auth.users().rules_for(&user).await?;
+    Ok(access::Access { user: user.username, role: user.role, rules, token })
 }
 
 async fn require_auth(State(st): State<ServerState>, mut req: Request, next: Next) -> Response {
@@ -338,22 +351,32 @@ async fn with_session_cookies(st: &ServerState, access: auth::IssuedToken, refre
 
 #[derive(Deserialize)]
 struct LoginBody {
+    /// Account name (default `admin`, the original server password).
+    #[serde(default)]
+    username: Option<String>,
     password: String,
 }
 
-async fn session_response(st: &ServerState) -> Result<Response, ApiError> {
-    let access = st.auth.issue_access().await?;
-    let refresh = st.auth.issue_refresh().await?;
+async fn session_response(st: &ServerState, user: &str) -> Result<Response, ApiError> {
+    let access = st.auth.issue_access_for(user).await?;
+    let refresh = st.auth.issue_refresh_for(user).await?;
     let mut r = with_session_cookies(st, access, refresh).await?;
     r.headers_mut().append(header::SET_COOKIE, session_marker(auth::REFRESH_TTL_DAYS));
     Ok(r)
 }
 
 async fn login(State(st): State<ServerState>, Json(b): Json<LoginBody>) -> Result<Response, ApiError> {
-    match st.auth.login(&b.password).await? {
+    let username = b.username.as_deref().map(str::trim).filter(|u| !u.is_empty()).unwrap_or(users::ADMIN);
+    match st.auth.login_user(username, &b.password).await? {
         None => Ok((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error_type":"throttled","message":"Too many sign-in attempts","advice":"Wait a moment and try again."}))).into_response()),
-        Some(false) => Err(AppError::PermissionDenied { message: "Wrong password".into(), advice: "Check the server password.".into() }.into()),
-        Some(true) => session_response(&st).await,
+        Some(None) => {
+            tracing::warn!("Failed sign-in for '{username}'");
+            Err(AppError::PermissionDenied { message: "Wrong user name or password".into(), advice: "Check them (the original server password is the 'admin' account's), or ask an administrator.".into() }.into())
+        }
+        Some(Some(u)) => {
+            tracing::info!("'{}' signed in", u.username);
+            session_response(&st, &u.username).await
+        }
     }
 }
 
@@ -380,16 +403,17 @@ struct TokenBody {
 }
 
 async fn redeem_signin(State(st): State<ServerState>, Json(b): Json<TokenBody>) -> Result<Response, ApiError> {
-    st.auth.redeem_signin(&b.token).await?;
-    session_response(&st).await
+    let user = st.auth.redeem_signin(&b.token).await?;
+    st.auth.account(&user).await?;
+    session_response(&st, &user).await
 }
 
-async fn signin_token(State(st): State<ServerState>) -> ApiResult {
-    ok(st.auth.issue_signin().await?)
+async fn signin_token(State(st): State<ServerState>, Extension(acc): Extension<access::Access>) -> ApiResult {
+    ok(st.auth.issue_signin_for(&acc.user).await?)
 }
 
-async fn automation_token(State(st): State<ServerState>) -> ApiResult {
-    ok(st.auth.issue_automation().await?)
+async fn automation_token(State(st): State<ServerState>, Extension(acc): Extension<access::Access>) -> ApiResult {
+    ok(st.auth.issue_automation_for(&acc.user).await?)
 }
 
 #[derive(Deserialize)]
@@ -407,26 +431,38 @@ fn default_token_days() -> i64 {
     90
 }
 
-async fn list_api_tokens(State(st): State<ServerState>) -> ApiResult {
-    ok(json!({"tokens": st.auth.api_tokens().list().await?}))
+/// Administrators see every token; others their own.
+async fn list_api_tokens(State(st): State<ServerState>, Extension(acc): Extension<access::Access>) -> ApiResult {
+    let mut t = st.auth.api_tokens().list().await?;
+    if !acc.is_admin() {
+        t.retain(|t| t.owner.eq_ignore_ascii_case(&acc.user));
+    }
+    ok(json!({"tokens": t}))
 }
 
 /// Minting needs an interactive sign-in: an API token cannot create more tokens.
-async fn create_api_token(State(st): State<ServerState>, Extension(who): Extension<Principal>, Json(b): Json<ApiTokenBody>) -> ApiResult {
+async fn create_api_token(State(st): State<ServerState>, Extension(who): Extension<Principal>, Extension(acc): Extension<access::Access>, Json(b): Json<ApiTokenBody>) -> ApiResult {
     if who != Principal::Session {
         return Err(AppError::PermissionDenied { message: "API tokens cannot create API tokens".into(), advice: "Sign in with the server password.".into() }.into());
+    }
+    if b.scope == api_tokens::Scope::Admin && acc.role != access::Role::Admin {
+        return Err(AppError::PermissionDenied { message: "Admin-scope tokens are not allowed for this account (administrators only)".into(), advice: "Pick the read, run or write scope.".into() }.into());
     }
     if let Some(ids) = &b.job_ids {
         for id in ids.iter().map(|i| i.trim()).filter(|i| !i.is_empty()) {
             st.mgr.get_job(id).await.map_err(|_| AppError::validation(format!("There is no job with id '{id}'")))?;
         }
     }
-    let (t, raw) = st.auth.api_tokens().create_for_jobs(&b.name, b.scope, b.expires_in_days, b.job_ids).await?;
+    let (t, raw) = st.auth.api_tokens().create_owned(&b.name, b.scope, b.expires_in_days, b.job_ids, &acc.user).await?;
     tracing::info!("Created API token {} ({}, {} scope{})", t.id, t.name, t.scope.as_str(), t.job_ids.as_ref().map(|j| format!(", {} job(s)", j.len())).unwrap_or_default());
     ok(json!({"token": raw, "info": t}))
 }
 
-async fn revoke_api_token(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+async fn revoke_api_token(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, AxPath(id): AxPath<String>) -> ApiResult {
+    let owned = st.auth.api_tokens().list().await?.into_iter().any(|t| t.id == id && t.owner.eq_ignore_ascii_case(&acc.user));
+    if !acc.is_admin() && !owned {
+        return Err(AppError::FileOperation { message: format!("API token {id} not found"), advice: "List your tokens to see their ids.".into() }.into());
+    }
     if !st.auth.api_tokens().revoke(&id).await? {
         return Err(AppError::FileOperation { message: format!("API token {id} not found"), advice: "List the tokens to see their ids.".into() }.into());
     }
@@ -445,11 +481,12 @@ struct PasswordBody {
     new_password: String,
 }
 
-async fn change_password(State(st): State<ServerState>, Json(b): Json<PasswordBody>) -> ApiResult {
-    if st.auth.login(&b.current_password).await? != Some(true) {
+/// Change the signed-in account's own password.
+async fn change_password(State(st): State<ServerState>, Extension(acc): Extension<access::Access>, Json(b): Json<PasswordBody>) -> ApiResult {
+    if !matches!(st.auth.login_user(&acc.user, &b.current_password).await?, Some(Some(_))) {
         return Err(AppError::PermissionDenied { message: "Wrong current password".into(), advice: "Check it and try again.".into() }.into());
     }
-    st.auth.set_password(&b.new_password).await?;
+    st.auth.set_user_password(&acc.user, &b.new_password).await?;
     ok(json!({"ok": true}))
 }
 
@@ -1193,6 +1230,7 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/server/shutdown", post(lifecycle::shutdown_route))
         .route("/api/v1/metrics", get(metrics::metrics_route))
         .merge(gateway::protected_routes())
+        .merge(accounts::protected_routes())
         .route_layer(middleware::from_fn_with_state(st.clone(), access::authorize))
         .route_layer(middleware::from_fn_with_state(st.clone(), require_auth));
     let mut app = public.merge(protected).merge(dav::routes()).route_layer(middleware::from_fn(observe::record_route));

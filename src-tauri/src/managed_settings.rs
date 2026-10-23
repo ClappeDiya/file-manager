@@ -124,6 +124,7 @@ mod tests {
                 settings: serde_json::json!({ "retention": { "type": "keep_count", "count": 7 } }),
                 ..Default::default()
             }]),
+            server_access: None,
         };
         let automation = AutomationManager::new();
         let mounts = MountManager::with_cache_root(t.path().join("mount-cache"));

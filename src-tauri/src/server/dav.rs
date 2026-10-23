@@ -59,10 +59,13 @@ fn challenge() -> Response {
 
 async fn authenticate(st: &ServerState, headers: &HeaderMap) -> Result<(), Response> {
     let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let mut user = String::new();
     let secret = if let Some(b) = auth.strip_prefix("Basic ") {
         let raw = base64::engine::general_purpose::STANDARD.decode(b.trim()).map_err(|_| challenge())?;
         let s = String::from_utf8(raw).map_err(|_| challenge())?;
-        s.split_once(':').map(|(_, p)| p.to_string()).ok_or_else(challenge)?
+        let (u, p) = s.split_once(':').ok_or_else(challenge)?;
+        user = u.to_string();
+        p.to_string()
     } else if let Some(t) = auth.strip_prefix("Bearer ") {
         t.trim().to_string()
     } else {
@@ -75,14 +78,21 @@ async fn authenticate(st: &ServerState, headers: &HeaderMap) -> Result<(), Respo
         // Cheap (a hash lookup) and revocation must apply at once: never cached.
         // Server folders, not jobs: tokens limited to jobs cannot use them.
         return match st.auth.api_tokens().validate(&secret).await {
-            Ok(t) if t.job_ids.is_none() => Ok(()),
+            Ok(t) if t.job_ids.is_none() && st.auth.account(&t.owner).await.is_ok_and(|u| u.role == super::access::Role::Admin) => Ok(()),
             _ => Err(challenge()),
         };
     }
-    if st.auth.validate(&secret).await.is_ok() {
-        return Ok(());
+    // Server folders: administrator accounts only.
+    if let Ok(c) = st.auth.validate(&secret).await {
+        return match st.auth.account(&c.sub).await {
+            Ok(u) if u.role == super::access::Role::Admin => Ok(()),
+            _ => Err(challenge()),
+        };
     }
-    match st.auth.login_remembered(&secret).await {
+    // A known account name signs in as that account; any other name with the admin password (as before).
+    let known = !user.is_empty() && st.auth.users().get(&user).await.ok().flatten().is_some();
+    let login = if known { st.auth.login_remembered_as(&user, &secret).await } else { st.auth.login_remembered(&secret).await };
+    match login {
         Ok(Some(true)) => Ok(()),
         Ok(None) => Err(plain(StatusCode::TOO_MANY_REQUESTS, "Too many sign-in attempts; try again shortly.")),
         _ => Err(challenge()),

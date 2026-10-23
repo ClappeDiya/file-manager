@@ -4,6 +4,8 @@
 /** API version this client was generated from. */
 export const API_VERSION = "0.1.0";
 
+export type AclRule = { created_at?: string; id?: string; job_pattern?: string; managed?: boolean; permission?: Permission; principal?: string };
+
 export type ApiToken = { created_at?: string; expires_at?: string; id?: string; job_ids?: string[] | null; last_used_at?: string | null; name?: string; scope?: Scope; [key: string]: unknown };
 
 /** A backup job (sources, destination, schedule, retention, filters, encryption); see docs/api-reference.md */
@@ -16,7 +18,13 @@ export type Fileset = { file_count?: number; id?: number; identity?: { hostname?
 /** null fields inherit from the parent folder */
 export type FolderPolicy = { allowed_extensions?: string[] | null; blocked_extensions?: string[] | null; intake_naming?: "keep" | "timestamp" | "sequence" | null; locked?: boolean | null; max_link_days?: number | null; max_upload_mb?: number | null; require_link_password?: boolean | null };
 
+/** Per-job permission, none < read < run < write < full */
+export type Permission = "none" | "read" | "run" | "write" | "full";
+
 export type RetentionPolicy = { count?: number; days?: number; keep_daily?: number; keep_hourly?: number; keep_latest?: number; keep_monthly?: number; keep_weekly?: number; keep_yearly?: number; rules?: string; type: "keep_all" | "keep_days" | "keep_count" | "smart" | "custom" | "counts" };
+
+/** admin: everything; operator: jobs through access rules (up to full), server folders and destination tests; viewer: jobs through access rules, read only */
+export type Role = "admin" | "operator" | "viewer";
 
 export type SchedulerStatus = { paused?: boolean; running?: boolean; tasks?: TaskInfo[]; [key: string]: unknown };
 
@@ -28,6 +36,8 @@ export type Session = { access_token?: string; csrf_token?: string; expires_at?:
 export type Share = { created_at?: string; downloads?: number; expires_at?: string | null; has_password?: boolean; id?: string; kind?: "download" | "upload" | "both"; last_access_at?: string | null; max_downloads?: number | null; max_upload_bytes?: number | null; name?: string; path?: string; revoked_at?: string | null; token_prefix?: string };
 
 export type TaskInfo = { elapsed_secs?: number; job_id?: string; job_name?: string; operation?: string; queued_at?: string; started_at?: string | null; state?: "queued" | "running"; task_id?: string; [key: string]: unknown };
+
+export type User = { created_at?: string; disabled?: boolean; managed?: boolean; role?: Role; updated_at?: string; username?: string };
 
 /** An error response: `{error_type, message, advice}` and the HTTP status. */
 export class UfopError extends Error {
@@ -90,6 +100,26 @@ export class UfopClient {
     return data as T;
   }
 
+  /** Per-job access rules (API tokens: `admin` scope). `GET /api/v1/acl` */
+  getAcl(): Promise<{ rules?: AclRule[] }> {
+    return this.call("GET", `/api/v1/acl`, undefined, undefined);
+  }
+
+  /** Add a rule: principal (user, role:<role> or *) gets permission on jobs matching job_pattern (id or glob over ids and names) (API tokens: `admin` scope). `POST /api/v1/acl` */
+  postAcl(body: { job_pattern: string; permission: Permission; principal: string }): Promise<AclRule> {
+    return this.call("POST", `/api/v1/acl`, undefined, body);
+  }
+
+  /** Delete a rule (managed rules: 403) (API tokens: `admin` scope). `DELETE /api/v1/acl/{id}` */
+  deleteAclId(id: string): Promise<{ ok?: boolean }> {
+    return this.call("DELETE", `/api/v1/acl/${encodeURIComponent(id)}`, undefined, undefined);
+  }
+
+  /** What deleting the rule would change: accounts and jobs whose permission drops (API tokens: `admin` scope). `GET /api/v1/acl/{id}/preview-delete` */
+  getAclIdPreviewDelete(id: string): Promise<{ changes?: Array<{ after?: Permission; before?: Permission; job_id?: string; job_name?: string; username?: string }>; rule_id?: string }> {
+    return this.call("GET", `/api/v1/acl/${encodeURIComponent(id)}/preview-delete`, undefined, undefined);
+  }
+
   /** List API tokens (no secrets) (API tokens: `admin` scope). `GET /api/v1/auth/api-tokens` */
   getAuthApiTokens(): Promise<{ tokens?: ApiToken[] }> {
     return this.call("GET", `/api/v1/auth/api-tokens`, undefined, undefined);
@@ -110,14 +140,19 @@ export class UfopClient {
     return this.call("POST", `/api/v1/auth/automation-token`, undefined, undefined);
   }
 
-  /** Sign in with the server password; sets the refresh cookie. `POST /api/v1/auth/login` */
-  postAuthLogin(body: { password: string }): Promise<Session> {
+  /** Sign in with an account's user name (default admin) and password; sets the refresh and CSRF cookies. `POST /api/v1/auth/login` */
+  postAuthLogin(body: { password: string; username?: string }): Promise<Session> {
     return this.call("POST", `/api/v1/auth/login`, undefined, body);
   }
 
   /** Revoke the refresh cookie's session; with the cookie it needs X-CSRF-Token (403 otherwise). `POST /api/v1/auth/logout` */
   postAuthLogout(): Promise<{ ok?: boolean }> {
     return this.call("POST", `/api/v1/auth/logout`, undefined, undefined);
+  }
+
+  /** The signed-in account (or token owner), its role, the token's limits and its permission on each job it can see (API tokens: `read` scope). `GET /api/v1/auth/me` */
+  getAuthMe(): Promise<{ is_admin?: boolean; jobs?: Array<{ job_id?: string; job_name?: string; permission?: Permission }>; role?: Role; token?: { id?: string; job_ids?: string[] | null; scope?: Scope } | null; username?: string }> {
+    return this.call("GET", `/api/v1/auth/me`, undefined, undefined);
   }
 
   /** Change the server password (API tokens: `admin` scope). `PUT /api/v1/auth/password` */
@@ -488,5 +523,30 @@ export class UfopClient {
   /** Cancel a task (API tokens: `run` scope). `POST /api/v1/tasks/{id}/cancel` */
   postTasksIdCancel(id: string): Promise<{ cancelled?: boolean }> {
     return this.call("POST", `/api/v1/tasks/${encodeURIComponent(id)}/cancel`, undefined, undefined);
+  }
+
+  /** Server accounts (administrators) (API tokens: `admin` scope). `GET /api/v1/users` */
+  getUsers(): Promise<{ users?: User[] }> {
+    return this.call("GET", `/api/v1/users`, undefined, undefined);
+  }
+
+  /** Create an account with a password or a prehashed Argon2 PHC password_hash (administrators) (API tokens: `admin` scope). `POST /api/v1/users` */
+  postUsers(body: { disabled?: boolean; password?: string; password_hash?: string; role?: Role; username: string }): Promise<User> {
+    return this.call("POST", `/api/v1/users`, undefined, body);
+  }
+
+  /** One account (API tokens: `admin` scope). `GET /api/v1/users/{username}` */
+  getUsersUsername(username: string): Promise<User> {
+    return this.call("GET", `/api/v1/users/${encodeURIComponent(username)}`, undefined, undefined);
+  }
+
+  /** Change role, disabled, password or password_hash (absent = unchanged); the last enabled administrator cannot be demoted or disabled (409); managed accounts are read-only (403) (API tokens: `admin` scope). `PUT /api/v1/users/{username}` */
+  putUsersUsername(username: string, body: { disabled?: boolean; password?: string; password_hash?: string; role?: Role } = {}): Promise<User> {
+    return this.call("PUT", `/api/v1/users/${encodeURIComponent(username)}`, undefined, body);
+  }
+
+  /** Delete an account and revoke its sessions and tokens (API tokens: `admin` scope). `DELETE /api/v1/users/{username}` */
+  deleteUsersUsername(username: string): Promise<{ ok?: boolean }> {
+    return this.call("DELETE", `/api/v1/users/${encodeURIComponent(username)}`, undefined, undefined);
   }
 }

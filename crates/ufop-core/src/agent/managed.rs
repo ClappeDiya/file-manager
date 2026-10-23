@@ -25,6 +25,78 @@ pub struct ManagedSettings {
     pub workflows: Option<Vec<ManagedWorkflow>>,
     /// Backup policy templates the organization offers (or enforces) on its desktops.
     pub backup_templates: Option<Vec<ManagedBackupTemplate>>,
+    /// Accounts and per-job access rules for `ufop-server` nodes (read-only there).
+    pub server_access: Option<ManagedServerAccess>,
+}
+
+/// Most organization accounts and access rules per server.
+pub const MAX_SERVER_USERS: usize = 500;
+pub const MAX_SERVER_RULES: usize = 2000;
+pub const SERVER_ROLES: [&str; 3] = ["admin", "operator", "viewer"];
+pub const SERVER_PERMISSIONS: [&str; 5] = ["none", "read", "run", "write", "full"];
+
+/// Server accounts and access rules the organization provisions on its
+/// `ufop-server` nodes. Passwords travel only as Argon2 hashes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ManagedServerAccess {
+    pub users: Vec<ManagedServerUser>,
+    pub rules: Vec<ManagedAclRule>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ManagedServerUser {
+    pub username: String,
+    /// Argon2 PHC string (`$argon2id$v=19$…`), e.g. from `ufop-server hash-password`.
+    pub password_hash: String,
+    /// `admin`, `operator` or `viewer`.
+    pub role: String,
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ManagedAclRule {
+    /// A user name, `role:<role>` or `*`.
+    pub principal: String,
+    /// A job id, or a glob (`*`, `?`) over job ids and names.
+    pub job_pattern: String,
+    /// `none`, `read`, `run`, `write` or `full`.
+    pub permission: String,
+}
+
+impl ManagedServerAccess {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.users.len() > MAX_SERVER_USERS || self.rules.len() > MAX_SERVER_RULES {
+            return Err(format!("At most {MAX_SERVER_USERS} server accounts and {MAX_SERVER_RULES} access rules"));
+        }
+        let mut names = std::collections::HashSet::new();
+        for u in &self.users {
+            let n = u.username.trim();
+            if n.is_empty() || n.len() > 64 || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b"._@-".contains(&b)) {
+                return Err(format!("Server account name '{n}' must be 1–64 letters, digits, '.', '_', '@' or '-'"));
+            }
+            if !names.insert(n.to_ascii_lowercase()) {
+                return Err(format!("Two server accounts are named '{n}'"));
+            }
+            if !u.password_hash.starts_with("$argon2") {
+                return Err(format!("Server account '{n}' needs an Argon2 password hash ($argon2id$…), not a password"));
+            }
+            if !SERVER_ROLES.contains(&u.role.as_str()) {
+                return Err(format!("Server account '{n}' has an unknown role '{}' (admin, operator or viewer)", u.role));
+            }
+        }
+        for r in &self.rules {
+            if r.principal.trim().is_empty() || r.job_pattern.trim().is_empty() {
+                return Err("Every access rule needs a principal and a job pattern".into());
+            }
+            if !SERVER_PERMISSIONS.contains(&r.permission.as_str()) {
+                return Err(format!("Unknown access permission '{}' (none, read, run, write or full)", r.permission));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Most organization backup templates, and the largest one (JSON bytes).
@@ -290,6 +362,9 @@ impl ManagedSettings {
                 }
             }
         }
+        if let Some(a) = &self.server_access {
+            a.validate()?;
+        }
         if let Some(p) = &self.proxy {
             if !PROXY_MODES.contains(&p.mode.as_str()) {
                 return Err(format!("Unknown proxy mode '{}'", p.mode));
@@ -306,13 +381,33 @@ impl ManagedSettings {
 
     /// No section managed.
     pub fn is_empty(&self) -> bool {
-        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none() && self.mounts.is_none() && self.workflows.is_none() && self.backup_templates.is_none()
+        self.updates.is_none() && self.proxy.is_none() && self.ai.is_none() && self.transfers.is_none() && self.mounts.is_none() && self.workflows.is_none() && self.backup_templates.is_none() && self.server_access.is_none()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_access_validates() {
+        let s: ManagedSettings = serde_json::from_value(serde_json::json!({"serverAccess": {
+            "users": [{"username": "ops", "passwordHash": "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaA", "role": "operator"}],
+            "rules": [{"principal": "ops", "jobPattern": "prod-*", "permission": "run"}]
+        }})).unwrap();
+        assert!(s.validate().is_ok() && !s.is_empty());
+        let a = s.server_access.clone().unwrap();
+        let bad = |f: &dyn Fn(&mut ManagedServerAccess)| {
+            let mut x = a.clone();
+            f(&mut x);
+            ManagedSettings { server_access: Some(x), ..Default::default() }.validate().unwrap_err()
+        };
+        assert!(bad(&|x| x.users[0].password_hash = "plain".into()).contains("Argon2"));
+        assert!(bad(&|x| x.users[0].role = "root".into()).contains("unknown role"));
+        assert!(bad(&|x| x.users[0].username = "has space".into()).contains("letters"));
+        assert!(bad(&|x| x.users.push(x.users[0].clone())).contains("Two server accounts"));
+        assert!(bad(&|x| x.rules[0].permission = "all".into()).contains("Unknown access permission"));
+    }
 
     #[test]
     fn workflows_validate() {

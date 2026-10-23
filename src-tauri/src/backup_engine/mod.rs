@@ -910,6 +910,12 @@ impl BackupManager {
         }
     }
 
+    /// The database the manager uses (tests that share it).
+    #[cfg(test)]
+    pub(crate) fn pool_for_tests(&self) -> DbPool {
+        self.inner.pool.clone()
+    }
+
     /// Replace the process-wide module allowlist.
     pub fn set_module_policy(&self, p: policy::ModulePolicy) {
         *self.inner.policy.write().unwrap_or_else(|e| e.into_inner()) = p;

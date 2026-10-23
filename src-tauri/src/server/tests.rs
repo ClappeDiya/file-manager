@@ -1480,3 +1480,187 @@ async fn api_tokens_limited_to_jobs() {
     assert_eq!(s.get("/api/v1/jobs", &read_all).await.json::<Value>().await.unwrap().as_array().unwrap().len(), 2);
     assert_eq!(s.get("/api/v1/backup-templates", &read_all).await.status(), 200);
 }
+
+impl TestServer {
+    async fn login_as(&self, user: &str, pw: &str) -> reqwest::Response {
+        reqwest::Client::new().post(format!("{}/api/v1/auth/login", self.base)).json(&json!({"username": user, "password": pw})).send().await.unwrap()
+    }
+    async fn token_of(&self, user: &str, pw: &str) -> String {
+        let r = self.login_as(user, pw).await;
+        assert_eq!(r.status(), 200, "{user}");
+        r.json::<Value>().await.unwrap()["access_token"].as_str().unwrap().to_string()
+    }
+    async fn put(&self, path: &str, tok: &str, body: Value) -> reqwest::Response {
+        self.client.put(format!("{}{path}", self.base)).bearer_auth(tok).json(&body).send().await.unwrap()
+    }
+    async fn delete(&self, path: &str, tok: &str) -> reqwest::Response {
+        self.client.delete(format!("{}{path}", self.base)).bearer_auth(tok).send().await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn legacy_server_password_becomes_the_admin_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::open_in_memory().await.unwrap();
+    let store = settings::SettingsStore::plain(repo.pool().clone());
+    // A database from before accounts: only the hashed server password.
+    store.set_secret("server.password_hash", &auth::hash_password("legacy-password").unwrap()).await.unwrap();
+    let auth = AuthService::new(store);
+    assert!(auth.users().is_empty().await.unwrap());
+    assert!(auth.has_password().await.unwrap());
+    let old_session = auth.issue_access().await.unwrap().token;
+    let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
+    let st = ServerState::new(mgr.clone(), None, auth.clone(), ServerConfig::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
+    let c = reqwest::Client::new();
+    // Tokens issued before keep working (as admin); the password signs in without a user name.
+    let me = c.get(format!("{base}/api/v1/auth/me")).bearer_auth(&old_session).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!((me["username"].as_str(), me["role"].as_str(), me["is_admin"].as_bool()), (Some("admin"), Some("admin"), Some(true)));
+    let users = auth.users().list().await.unwrap();
+    assert_eq!(users.len(), 1);
+    assert_eq!((users[0].username.as_str(), users[0].role), ("admin", access::Role::Admin));
+    let r = c.post(format!("{base}/api/v1/auth/login")).json(&json!({"password": "legacy-password"})).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let r = c.post(format!("{base}/api/v1/auth/login")).json(&json!({"username": "admin", "password": "wrong-password"})).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+    // Old API tokens are owned by admin.
+    let (t, raw) = auth.api_tokens().create("old", api_tokens::Scope::Read, 5).await.unwrap();
+    assert_eq!(t.owner, "admin");
+    assert_eq!(c.get(format!("{base}/api/v1/jobs")).bearer_auth(&raw).send().await.unwrap().status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accounts_roles_and_access_rules() {
+    let s = start(ServerConfig::default(), None).await;
+    let admin = s.login().await;
+    let (prod, dev) = (s.job(&admin, "prod-db").await, s.job(&admin, "dev-web").await);
+    for (u, role) in [("val", "viewer"), ("ops", "operator"), ("noacl", "operator")] {
+        let r = s.post("/api/v1/users", &admin, json!({"username": u, "password": format!("{u}-password"), "role": role})).await;
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    }
+    assert_eq!(s.post("/api/v1/users", &admin, json!({"username": "val", "password": "another-pw"})).await.status(), 409, "names are unique");
+    assert_eq!(s.post("/api/v1/users", &admin, json!({"username": "bad name", "password": "another-pw"})).await.status(), 400);
+    let hashed = auth::hash_password("hashed-password").unwrap();
+    assert_eq!(s.post("/api/v1/users", &admin, json!({"username": "pre", "password_hash": hashed, "role": "viewer"})).await.status(), 200);
+    assert_eq!(s.post("/api/v1/users", &admin, json!({"username": "pre2", "password_hash": "plain"})).await.status(), 400);
+    let rule = |p: &str, pat: &str, perm: &str| s.post("/api/v1/acl", &admin, json!({"principal": p, "job_pattern": pat, "permission": perm}));
+    let ops_prod = rule("ops", "prod-*", "run").await.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+    rule("role:viewer", "*", "read").await;
+    rule("*", &dev, "write").await;
+    assert_eq!(rule("nobody here", "*", "read").await.status(), 400);
+
+    let val = s.token_of("val", "val-password").await;
+    let ops = s.token_of("ops", "ops-password").await;
+    let noacl = s.token_of("noacl", "noacl-password").await;
+    assert_eq!(s.token_of("pre", "hashed-password").await.is_empty(), false, "prehashed passwords sign in");
+    assert_eq!(s.login_as("val", "wrong").await.status(), 401);
+
+    let ids = |v: Value| -> Vec<String> { let mut x: Vec<String> = v.as_array().unwrap().iter().map(|j| j["id"].as_str().unwrap().to_string()).collect(); x.sort(); x };
+    let mut both = vec![prod.clone(), dev.clone()];
+    both.sort();
+    // Viewer: reads everything through role:viewer, the write rule is capped at read.
+    assert_eq!(ids(s.get("/api/v1/jobs", &val).await.json().await.unwrap()), both);
+    assert_eq!(s.get(&format!("/api/v1/jobs/{prod}/versions"), &val).await.status(), 200);
+    assert_eq!(s.post(&format!("/api/v1/jobs/{prod}/run"), &val, json!({"dry_run": true})).await.status(), 403);
+    assert_eq!(s.put(&format!("/api/v1/jobs/{dev}"), &val, json!({"job": {"name": "x"}})).await.status(), 403);
+    // Operator: run on prod-*, write on dev, nothing destructive.
+    assert_eq!(s.post(&format!("/api/v1/jobs/{prod}/run"), &ops, json!({"dry_run": true})).await.status(), 200);
+    let job_dev = s.get(&format!("/api/v1/jobs/{dev}"), &admin).await.json::<Value>().await.unwrap();
+    assert_eq!(s.put(&format!("/api/v1/jobs/{prod}"), &ops, json!({"job": job_dev.clone()})).await.status(), 403);
+    let mut renamed = job_dev.clone();
+    renamed["description"] = json!("changed by ops");
+    let put = s.put(&format!("/api/v1/jobs/{dev}"), &ops, json!({"job": renamed})).await;
+    assert_eq!(put.status(), 200, "{}", put.text().await.unwrap());
+    assert_eq!(s.delete(&format!("/api/v1/jobs/{dev}"), &ops).await.status(), 403);
+    assert_eq!(s.post(&format!("/api/v1/jobs/{dev}/operations"), &ops, json!({"type": "compact"})).await.status(), 403);
+    // An operator without rules for a job does not see it.
+    assert_eq!(ids(s.get("/api/v1/jobs", &noacl).await.json().await.unwrap()), vec![dev.clone()]);
+    assert_eq!(s.get(&format!("/api/v1/jobs/{prod}"), &noacl).await.status(), 403);
+    // Server-wide routes by role.
+    assert_eq!(s.get("/api/v1/settings", &val).await.status(), 200);
+    assert_eq!(s.put("/api/v1/settings", &val, json!({})).await.status(), 403);
+    assert_eq!(s.get(&format!("/api/v1/filesystem?path={}", s.dir.display()), &val).await.status(), 403);
+    assert_eq!(s.get(&format!("/api/v1/filesystem?path={}", s.dir.display()), &ops).await.status(), 200);
+    assert_eq!(s.get("/api/v1/users", &ops).await.status(), 403);
+    assert_eq!(s.post("/api/v1/server/shutdown", &ops, json!({})).await.status(), 403);
+    assert_eq!(s.post("/api/v1/jobs", &ops, json!({"job": job_dev})).await.status(), 403, "creating jobs is for administrators");
+    // RPC follows the same rules.
+    assert_eq!(ids(s.post("/api/v1/rpc/backup_list_jobs", &noacl, json!({})).await.json().await.unwrap()), vec![dev.clone()]);
+    assert_eq!(s.post("/api/v1/rpc/backup_delete_job", &ops, json!({"id": dev, "deleteLocalDb": false, "deleteRemote": false})).await.status(), 403);
+    assert_eq!(s.post("/api/v1/rpc/backup_get_job", &val, json!({"id": prod})).await.status(), 200);
+    assert_eq!(s.post("/api/v1/rpc/backup_set_global_defaults", &ops, json!({"defaults": {}})).await.status(), 403);
+    // Who am I.
+    let me = s.get("/api/v1/auth/me", &ops).await.json::<Value>().await.unwrap();
+    assert_eq!((me["username"].as_str(), me["role"].as_str(), me["is_admin"].as_bool()), (Some("ops"), Some("operator"), Some(false)));
+    let perm = |id: &str| me["jobs"].as_array().unwrap().iter().find(|j| j["job_id"] == id).map(|j| j["permission"].as_str().unwrap().to_string());
+    assert_eq!((perm(&prod).as_deref(), perm(&dev).as_deref()), (Some("run"), Some("write")));
+
+    // Tokens of an account never exceed it.
+    assert_eq!(s.post("/api/v1/auth/api-tokens", &ops, json!({"name": "too much", "scope": "admin"})).await.status(), 403);
+    let t = s.post("/api/v1/auth/api-tokens", &ops, json!({"name": "ops ci", "scope": "write"})).await.json::<Value>().await.unwrap();
+    assert_eq!(t["info"]["owner"], "ops");
+    let ops_tok = t["token"].as_str().unwrap().to_string();
+    assert!(matches!(s.post(&format!("/api/v1/jobs/{prod}/run"), &ops_tok, json!({"dry_run": true})).await.status().as_u16(), 200 | 409), "allowed (409 = still busy from the earlier run)");
+    assert_eq!(s.delete(&format!("/api/v1/jobs/{dev}"), &ops_tok).await.status(), 403, "write scope, but the owner has write only");
+    assert_eq!(ids(s.get("/api/v1/jobs", &ops_tok).await.json().await.unwrap()), both);
+    let lim = s.post("/api/v1/auth/api-tokens", &ops, json!({"name": "ops dev", "scope": "run", "job_ids": [dev]})).await.json::<Value>().await.unwrap()["token"].as_str().unwrap().to_string();
+    assert_eq!(ids(s.get("/api/v1/jobs", &lim).await.json().await.unwrap()), vec![dev.clone()]);
+    assert_eq!(s.get(&format!("/api/v1/jobs/{prod}"), &lim).await.status(), 403);
+    let mine = s.get("/api/v1/auth/api-tokens", &ops).await.json::<Value>().await.unwrap();
+    assert!(mine["tokens"].as_array().unwrap().iter().all(|t| t["owner"] == "ops"));
+    assert_eq!(s.get("/api/v1/auth/api-tokens", &admin).await.json::<Value>().await.unwrap()["tokens"].as_array().unwrap().len(), 2);
+    let admin_tok = s.post("/api/v1/auth/api-tokens", &admin, json!({"name": "adm", "scope": "read"})).await.json::<Value>().await.unwrap()["info"]["id"].as_str().unwrap().to_string();
+    assert_eq!(s.delete(&format!("/api/v1/auth/api-tokens/{admin_tok}"), &ops).await.status(), 404, "not someone else's");
+
+    // Deleting a rule: preview first.
+    let p = s.get(&format!("/api/v1/acl/{ops_prod}/preview-delete"), &admin).await.json::<Value>().await.unwrap();
+    assert_eq!(p["changes"], json!([{"username": "ops", "job_id": prod, "job_name": "prod-db", "before": "run", "after": "none"}]));
+    assert_eq!(s.delete(&format!("/api/v1/acl/{ops_prod}"), &admin).await.status(), 200);
+    assert_eq!(s.get(&format!("/api/v1/jobs/{prod}"), &ops).await.status(), 403);
+    assert_eq!(s.get("/api/v1/acl", &admin).await.json::<Value>().await.unwrap()["rules"].as_array().unwrap().len(), 2);
+
+    // Own password; disabling signs out at once; the last administrator stays.
+    assert_eq!(s.put("/api/v1/auth/password", &val, json!({"current_password": "val-password", "new_password": "val-password-2"})).await.status(), 200);
+    assert_eq!(s.login_as("val", "val-password").await.status(), 401);
+    let val = s.token_of("val", "val-password-2").await;
+    assert_eq!(s.put("/api/v1/users/val", &admin, json!({"disabled": true})).await.status(), 200);
+    assert_eq!(s.get("/api/v1/jobs", &val).await.status(), 401);
+    assert_eq!(s.login_as("val", "val-password-2").await.status(), 401);
+    assert_eq!(s.delete("/api/v1/users/admin", &admin).await.status(), 409);
+    assert_eq!(s.put("/api/v1/users/admin", &admin, json!({"role": "viewer"})).await.status(), 409);
+    assert_eq!(s.delete("/api/v1/users/ops", &admin).await.status(), 200);
+    assert_eq!(s.get("/api/v1/jobs", &ops_tok).await.status(), 401, "a deleted account's tokens stop working");
+}
+
+#[tokio::test]
+async fn console_managed_accounts_are_read_only() {
+    let s = start(ServerConfig::default(), None).await;
+    let admin = s.login().await;
+    assert_eq!(s.get("/api/v1/users", &admin).await.json::<Value>().await.unwrap()["users"].as_array().unwrap().len(), 1);
+    let m = ufop_core::agent::ManagedServerAccess {
+        users: vec![
+            ufop_core::agent::ManagedServerUser { username: "org-ops".into(), password_hash: auth::hash_password("org-password").unwrap(), role: "operator".into(), disabled: false },
+            ufop_core::agent::ManagedServerUser { username: "admin".into(), password_hash: auth::hash_password("takeover-pw").unwrap(), role: "admin".into(), disabled: false },
+        ],
+        rules: vec![ufop_core::agent::ManagedAclRule { principal: "org-ops".into(), job_pattern: "*".into(), permission: "run".into() }],
+    };
+    let users = auth::AuthService::new(settings::SettingsStore::plain(s.mgr.pool_for_tests())).users();
+    let problems = users.apply_managed(Some(&m)).await.unwrap();
+    assert_eq!(problems.len(), 1, "a local account is never replaced: {problems:?}");
+    assert_eq!(s.login_as("admin", "takeover-pw").await.status(), 401);
+    let org = s.token_of("org-ops", "org-password").await;
+    let me = s.get("/api/v1/auth/me", &org).await.json::<Value>().await.unwrap();
+    assert_eq!(me["role"], "operator");
+    let listed = s.get("/api/v1/users", &admin).await.json::<Value>().await.unwrap();
+    assert!(listed["users"].as_array().unwrap().iter().any(|u| u["username"] == "org-ops" && u["managed"] == true));
+    assert_eq!(s.put("/api/v1/users/org-ops", &admin, json!({"role": "admin"})).await.status(), 403);
+    assert_eq!(s.delete("/api/v1/users/org-ops", &admin).await.status(), 403);
+    let rid = s.get("/api/v1/acl", &admin).await.json::<Value>().await.unwrap()["rules"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(s.delete(&format!("/api/v1/acl/{rid}"), &admin).await.status(), 403);
+    // The console stops managing: its accounts and rules go away.
+    assert!(users.apply_managed(None).await.unwrap().is_empty());
+    assert_eq!(s.login_as("org-ops", "org-password").await.status(), 401);
+    assert!(s.get("/api/v1/acl", &admin).await.json::<Value>().await.unwrap()["rules"].as_array().unwrap().is_empty());
+}

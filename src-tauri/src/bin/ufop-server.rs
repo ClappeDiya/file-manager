@@ -7,6 +7,8 @@
 //! ufop-server --interface any --allowed-cidrs 10.0.0.0/8,fd00::/8   # only these clients (by TCP peer)
 //! ufop server tokens create ci --scope run --days 30                 # scoped API token (see server::api_tokens)
 //! ufop-server --share-root /srv/exchange                              # share links under /srv/exchange (/s/<token>)
+//! ufop-server user add alice --role operator                          # an account (password from UFOP_SERVER_PASSWORD or stdin)
+//! ufop-server user add bob --password-hash "$(ufop-server hash-password)"   # provision a prehashed password
 //! ```
 //! Defaults come from the machine-wide preload file (see `ufop_core::preload`).
 
@@ -184,6 +186,84 @@ struct Args {
     /// Bearer token for the push gateway
     #[arg(long, env = "UFOP_SERVER_PUSHGATEWAY_TOKEN")]
     pushgateway_token: Option<String>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Server accounts, without the web UI (works while the server is stopped)
+    #[command(subcommand)]
+    User(UserCmd),
+    /// Print the Argon2 hash of a password (UFOP_SERVER_PASSWORD or stdin), for
+    /// `user add --password-hash` or the management console
+    HashPassword,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum UserCmd {
+    /// List accounts
+    List,
+    /// Add an account; the password comes from --password-hash, else UFOP_SERVER_PASSWORD or stdin
+    Add {
+        username: String,
+        /// admin, operator or viewer
+        #[arg(long, default_value = "viewer", value_parser = ["admin", "operator", "viewer"])]
+        role: String,
+        /// A ready Argon2 PHC string ($argon2id$…) instead of a password
+        #[arg(long)]
+        password_hash: Option<String>,
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Change an account (only the options given)
+    Set {
+        username: String,
+        #[arg(long, value_parser = ["admin", "operator", "viewer"])]
+        role: Option<String>,
+        #[arg(long)]
+        disabled: Option<bool>,
+        #[arg(long)]
+        password_hash: Option<String>,
+        /// Read a new password from UFOP_SERVER_PASSWORD or stdin
+        #[arg(long)]
+        password: bool,
+    },
+    /// Delete an account (and revoke its sessions and tokens)
+    Remove { username: String },
+}
+
+fn role_of(s: &str) -> server::access::Role {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap_or_default()
+}
+
+async fn user_command(auth: &AuthService, cmd: UserCmd) -> Result<String, unified_file_ops_lib::core::error::AppError> {
+    use server::users::{Secret, UserPatch};
+    auth.ensure_accounts().await?;
+    let users = auth.users();
+    Ok(match cmd {
+        UserCmd::List => {
+            let rows: Vec<String> = users.list().await?.into_iter().map(|u| format!("{}\t{}{}{}", u.username, u.role.as_str(), if u.disabled { "\tdisabled" } else { "" }, if u.managed { "\tmanaged" } else { "" })).collect();
+            if rows.is_empty() { "No accounts.".into() } else { rows.join("\n") }
+        }
+        UserCmd::Add { username, role, password_hash, disabled } => {
+            let secret = match password_hash {
+                Some(h) => Secret::Hash(h),
+                None => Secret::Password(read_password()),
+            };
+            let u = users.create(&username, secret, role_of(&role), disabled).await?;
+            format!("Account '{}' added ({}).", u.username, u.role.as_str())
+        }
+        UserCmd::Set { username, role, disabled, password_hash, password } => {
+            let patch = UserPatch { role: role.as_deref().map(role_of), disabled, password: password.then(read_password), password_hash };
+            let u = users.update(&username, patch).await?;
+            format!("Account '{}' changed ({}{}).", u.username, u.role.as_str(), if u.disabled { ", disabled" } else { "" })
+        }
+        UserCmd::Remove { username } => {
+            users.delete(&username).await?;
+            format!("Account '{username}' removed.")
+        }
+    })
 }
 
 /// The OTLP exporter installed with the log subscriber.
@@ -341,6 +421,15 @@ async fn run(argv: Vec<String>) {
         None => argv,
     };
     let a = Args::parse_from(argv);
+    if matches!(a.command, Some(Command::HashPassword)) {
+        match server::auth::hash_password(&read_password()) {
+            Ok(h) => {
+                println!("{h}");
+                return;
+            }
+            Err(e) => fail(e),
+        }
+    }
     let otlp = match a.otlp_endpoint.as_deref().filter(|e| !e.trim().is_empty()) {
         Some(endpoint) => {
             if !(0.0..=1.0).contains(&a.otlp_sample_ratio) {
@@ -387,6 +476,15 @@ async fn run(argv: Vec<String>) {
         }
     }
     let auth = AuthService::new(store.clone());
+    if let Some(Command::User(cmd)) = a.command {
+        match user_command(&auth, cmd).await {
+            Ok(msg) => {
+                println!("{msg}");
+                return;
+            }
+            Err(e) => fail(e),
+        }
+    }
     if a.set_password {
         auth.set_password(&read_password()).await.unwrap_or_else(|e| fail(e));
         println!("Password set; existing sessions were signed out.");
@@ -427,17 +525,24 @@ async fn run(argv: Vec<String>) {
         None
     } else {
         let agent = fleet_agent::init_or_default(mgr.clone(), store.clone(), creds.clone(), "server").await;
-        // Of the console's app settings, the server applies the transfer caps and backup templates.
+        // Of the console's app settings, the server applies the transfer caps,
+        // backup templates and server accounts with their access rules.
         let caps_mgr = mgr.clone();
+        let users = auth.users();
         agent.host().set_managed_settings_handler(Arc::new(move |settings| {
             let m = caps_mgr.clone();
+            let users = users.clone();
             Box::pin(async move {
-                let problems = m.set_managed_templates(settings.as_ref().and_then(|s| s.backup_templates.as_deref()));
+                let mut problems = m.set_managed_templates(settings.as_ref().and_then(|s| s.backup_templates.as_deref()));
+                match users.apply_managed(settings.as_ref().and_then(|s| s.server_access.as_ref())).await {
+                    Ok(p) => problems.extend(p),
+                    Err(e) => problems.push(format!("server accounts: {}", e.user_message())),
+                }
                 m.set_managed_caps(settings.and_then(|s| s.transfers)).await;
                 if problems.is_empty() {
                     Ok(())
                 } else {
-                    Err(unified_file_ops_lib::core::error::AppError::validation(format!("Some organization backup templates were not installed: {}", problems.join("; "))))
+                    Err(unified_file_ops_lib::core::error::AppError::validation(format!("Some organization settings were not applied: {}", problems.join("; "))))
                 }
             })
         }));

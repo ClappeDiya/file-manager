@@ -9,17 +9,21 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Union
 
 API_VERSION = "0.1.0"
+AclRule = Dict[str, Any]
 ApiToken = Dict[str, Any]
 BackupJob = Dict[str, Any]
 ApiError = Dict[str, Any]
 Fileset = Dict[str, Any]
 FolderPolicy = Dict[str, Any]
+Permission = Dict[str, Any]
 RetentionPolicy = Dict[str, Any]
+Role = Dict[str, Any]
 SchedulerStatus = Dict[str, Any]
 Scope = Dict[str, Any]
 Session = Dict[str, Any]
 Share = Dict[str, Any]
 TaskInfo = Dict[str, Any]
+User = Dict[str, Any]
 
 
 class UfopError(Exception):
@@ -77,6 +81,22 @@ class UfopClient:
                 err = {}
             raise UfopError(e.code, err.get("message") or e.reason, err.get("error_type"), err.get("advice")) from None
 
+    def get_acl(self) -> Dict[str, Any]:
+        """Per-job access rules (API tokens: `admin` scope). `GET /api/v1/acl`"""
+        return self._call("GET", f"/api/v1/acl", None, None)
+
+    def post_acl(self, body: Dict[str, Any]) -> "AclRule":
+        """Add a rule: principal (user, role:<role> or *) gets permission on jobs matching job_pattern (id or glob over ids and names) (API tokens: `admin` scope). `POST /api/v1/acl`"""
+        return self._call("POST", f"/api/v1/acl", None, body)
+
+    def delete_acl_id(self, id_: str) -> Dict[str, Any]:
+        """Delete a rule (managed rules: 403) (API tokens: `admin` scope). `DELETE /api/v1/acl/{id}`"""
+        return self._call("DELETE", f"/api/v1/acl/{urllib.parse.quote(id_, safe='')}", None, None)
+
+    def get_acl_id_preview_delete(self, id_: str) -> Dict[str, Any]:
+        """What deleting the rule would change: accounts and jobs whose permission drops (API tokens: `admin` scope). `GET /api/v1/acl/{id}/preview-delete`"""
+        return self._call("GET", f"/api/v1/acl/{urllib.parse.quote(id_, safe='')}/preview-delete", None, None)
+
     def get_auth_api_tokens(self) -> Dict[str, Any]:
         """List API tokens (no secrets) (API tokens: `admin` scope). `GET /api/v1/auth/api-tokens`"""
         return self._call("GET", f"/api/v1/auth/api-tokens", None, None)
@@ -94,12 +114,16 @@ class UfopClient:
         return self._call("POST", f"/api/v1/auth/automation-token", None, None)
 
     def post_auth_login(self, body: Dict[str, Any]) -> "Session":
-        """Sign in with the server password; sets the refresh cookie. `POST /api/v1/auth/login`"""
+        """Sign in with an account's user name (default admin) and password; sets the refresh and CSRF cookies. `POST /api/v1/auth/login`"""
         return self._call("POST", f"/api/v1/auth/login", None, body)
 
     def post_auth_logout(self) -> Dict[str, Any]:
         """Revoke the refresh cookie's session; with the cookie it needs X-CSRF-Token (403 otherwise). `POST /api/v1/auth/logout`"""
         return self._call("POST", f"/api/v1/auth/logout", None, None)
+
+    def get_auth_me(self) -> Dict[str, Any]:
+        """The signed-in account (or token owner), its role, the token's limits and its permission on each job it can see (API tokens: `read` scope). `GET /api/v1/auth/me`"""
+        return self._call("GET", f"/api/v1/auth/me", None, None)
 
     def put_auth_password(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """Change the server password (API tokens: `admin` scope). `PUT /api/v1/auth/password`"""
@@ -396,3 +420,23 @@ class UfopClient:
     def post_tasks_id_cancel(self, id_: str) -> Dict[str, Any]:
         """Cancel a task (API tokens: `run` scope). `POST /api/v1/tasks/{id}/cancel`"""
         return self._call("POST", f"/api/v1/tasks/{urllib.parse.quote(id_, safe='')}/cancel", None, None)
+
+    def get_users(self) -> Dict[str, Any]:
+        """Server accounts (administrators) (API tokens: `admin` scope). `GET /api/v1/users`"""
+        return self._call("GET", f"/api/v1/users", None, None)
+
+    def post_users(self, body: Dict[str, Any]) -> "User":
+        """Create an account with a password or a prehashed Argon2 PHC password_hash (administrators) (API tokens: `admin` scope). `POST /api/v1/users`"""
+        return self._call("POST", f"/api/v1/users", None, body)
+
+    def get_users_username(self, username: str) -> "User":
+        """One account (API tokens: `admin` scope). `GET /api/v1/users/{username}`"""
+        return self._call("GET", f"/api/v1/users/{urllib.parse.quote(username, safe='')}", None, None)
+
+    def put_users_username(self, username: str, body: Optional[Dict[str, Any]] = None) -> "User":
+        """Change role, disabled, password or password_hash (absent = unchanged); the last enabled administrator cannot be demoted or disabled (409); managed accounts are read-only (403) (API tokens: `admin` scope). `PUT /api/v1/users/{username}`"""
+        return self._call("PUT", f"/api/v1/users/{urllib.parse.quote(username, safe='')}", None, body if body is not None else {})
+
+    def delete_users_username(self, username: str) -> Dict[str, Any]:
+        """Delete an account and revoke its sessions and tokens (API tokens: `admin` scope). `DELETE /api/v1/users/{username}`"""
+        return self._call("DELETE", f"/api/v1/users/{urllib.parse.quote(username, safe='')}", None, None)
