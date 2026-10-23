@@ -57,6 +57,7 @@ pub mod shared;
 pub mod snapshot;
 pub mod sparse;
 pub mod usn;
+pub mod verify;
 pub mod versions;
 pub mod volume;
 

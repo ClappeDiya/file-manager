@@ -12,7 +12,6 @@ use super::volume::{self, FileListVolume, IndexVolume, IndexedBlock, VolumeKind}
 use super::{hash_bytes, BackupOptions, EntryKind, FileEntry, HashAlgorithm, OpContext};
 use crate::error::AppError;
 use chrono::{DateTime, Utc};
-use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -193,53 +192,13 @@ pub fn compact(repo: &Repo, opts: &BackupOptions, ctx: &OpContext) -> Result<Com
     Ok(r)
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct VerifyReport {
-    pub checked: usize,
-    pub errors: Vec<String>,
-}
+pub use super::verify::VerifyReport;
 
 /// Download volumes and check them. `samples = None` checks every volume;
-/// `full` also decodes each block and checks its hash.
+/// `full` also decodes each block and checks its hash. (The older form of
+/// [`super::verify::verify`], which adds scopes and file sampling.)
 pub fn verify(repo: &Repo, samples: Option<usize>, full: bool) -> Result<VerifyReport, AppError> {
-    let mut vols = repo.db.volumes(None)?;
-    if let Some(n) = samples {
-        vols.shuffle(&mut rand::thread_rng());
-        // Always include the newest file list in a sample.
-        vols.sort_by_key(|v| v.kind != VolumeKind::FileList);
-        vols.truncate(n);
-    }
-    let mut r = VerifyReport::default();
-    for v in vols {
-        r.checked += 1;
-        let res = (|| -> Result<(), AppError> {
-            let payload = repo.cipher.open(&repo.get_volume_ex(&v.name, false)?)?;
-            match v.kind {
-                VolumeKind::Block => {
-                    let m = volume::read_block_volume(&payload)?;
-                    if full {
-                        for (h, d) in &m {
-                            if hash_bytes(repo.header.block_hash, d) != *h {
-                                return Err(AppError::transfer(format!("block {h} hash mismatch"), "Run Repair."));
-                            }
-                        }
-                    }
-                }
-                VolumeKind::Index => {
-                    serde_json::from_slice::<IndexVolume>(&volume::decode_meta(payload)?)?;
-                }
-                VolumeKind::FileList => {
-                    serde_json::from_slice::<FileListVolume>(&volume::decode_meta(payload)?)?;
-                }
-            }
-            Ok(())
-        })();
-        match res {
-            Ok(()) => repo.db.set_volume_state(&v.name, "verified")?,
-            Err(e) => r.errors.push(format!("{}: {}", v.name, e.user_message())),
-        }
-    }
-    Ok(r)
+    super::verify::verify(repo, &super::verify::VerifyOptions::legacy(samples, full), &OpContext::new())
 }
 
 /// Upload `{prefix}-verification.json`: an unencrypted inventory of every
