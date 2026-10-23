@@ -2,13 +2,15 @@
 
 ## Notifications
 
-A job sends its run report through HTTP callbacks (**Hooks → HTTP reports**) and through these channels (**Hooks → Email, Telegram and XMPP**):
+A job sends its run report through HTTP callbacks (**Hooks → HTTP reports**) and through these channels (**Hooks → Email, chat and webhooks**), plus any reusable notification profiles it chooses. Profiles, webhooks with presets (Pushover, ntfy, Discord, PagerDuty, Gotify), custom and secret headers, and HTML email are described in [backup-notifications.md](backup-notifications.md).
 
 | Channel | Settings | Secret | Verified with |
 |---|---|---|---|
 | Email (SMTP) | server, port, STARTTLS / implicit TLS / none, username, from, to, subject | SMTP password | aiosmtpd with STARTTLS and AUTH |
 | Telegram | chat id, Bot API URL | bot token | API-level tests |
 | XMPP | sender JID, recipient, server, port, TLS mode | account password | Prosody with STARTTLS and SASL |
+| Slack, Teams | none | webhook URL | API-level tests |
+| Webhook | URL, method, content type, headers, body template, preset | `{{secret}}` value | local mock server per preset |
 
 Each channel has its own result filter and message prefix. It also has its own certificate policy: accept invalid certificates, or trust a CA / pinned certificate given as PEM. **Send test** delivers a test message straight away.
 

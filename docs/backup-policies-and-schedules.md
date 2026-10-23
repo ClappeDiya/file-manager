@@ -38,7 +38,8 @@ A setting is named by a **field path**:
 | `schedule` | The backup schedule (interval or cron) |
 | `maintenance` | The maintenance schedules (see below) |
 | `scripts` | Hook scripts and their modes |
-| `notifications`, `notify_on` | Email/Telegram/XMPP notifications and which results raise a desktop notification |
+| `notifications`, `notify_on` | Email/chat/webhook notifications and which results raise a desktop notification |
+| `notification_profile_ids` | Notification profiles the job sends to (see [backup-notifications.md](backup-notifications.md)) |
 | `throttle`, `retry` | Network limits and retries |
 | `prevent_sleep` | Keep the computer awake while the job runs |
 

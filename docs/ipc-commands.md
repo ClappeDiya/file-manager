@@ -83,7 +83,7 @@ macro; if you add a new one here, register it there too.
 - `resolve_aws_profile`
 - `start_sso_auth`
 
-## `backup_commands` (99 commands)
+## `backup_commands` (106 commands)
 
 - `backup_adopt_repository`
 - `backup_apply_template`
@@ -104,6 +104,7 @@ macro; if you add a new one here, register it there too.
 - `backup_decrypt_volume`
 - `backup_delete_destination`
 - `backup_delete_job`
+- `backup_delete_notification_profile`
 - `backup_delete_template`
 - `backup_diagnose`
 - `backup_direct_restore`
@@ -123,6 +124,7 @@ macro; if you add a new one here, register it there too.
 - `backup_get_desktop_settings`
 - `backup_get_global_defaults`
 - `backup_get_job`
+- `backup_get_notification_profile`
 - `backup_get_secret_settings`
 - `backup_get_template`
 - `backup_hardening_report`
@@ -134,6 +136,7 @@ macro; if you add a new one here, register it there too.
 - `backup_list_drives`
 - `backup_list_files`
 - `backup_list_jobs`
+- `backup_list_notification_profiles`
 - `backup_list_sources`
 - `backup_list_templates`
 - `backup_list_versions`
@@ -146,6 +149,7 @@ macro; if you add a new one here, register it there too.
 - `backup_photos_library_info`
 - `backup_place_legal_hold`
 - `backup_preview_file`
+- `backup_preview_notification`
 - `backup_preview_retention`
 - `backup_preview_sources`
 - `backup_prune_history`
@@ -167,6 +171,7 @@ macro; if you add a new one here, register it there too.
 - `backup_run_history`
 - `backup_save_destination`
 - `backup_save_job`
+- `backup_save_notification_profile`
 - `backup_save_template`
 - `backup_schedule_preview`
 - `backup_search`
@@ -182,7 +187,9 @@ macro; if you add a new one here, register it there too.
 - `backup_test_destination`
 - `backup_test_destination_compat`
 - `backup_test_notification`
+- `backup_test_notification_profile`
 - `backup_test_secret_providers`
+- `backup_webhook_preset`
 - `ediscovery_export`
 
 ## `batch_rename_commands` (4 commands)
@@ -739,4 +746,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 571 commands across 51 modules.
+**Surface:** 578 commands across 51 modules.

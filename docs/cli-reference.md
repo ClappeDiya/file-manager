@@ -654,6 +654,31 @@ ufop backup schedule-preview --cron "30 2 * * Mon-Fri" --cron "0 9 * * Sat" --co
 
 `verify` exits with 0 when it finds no problems and 2 when it finds some. With `--json` the full report is printed, including `problems` with the affected versions and paths.
 
+### `ufop backup notify-profile`
+
+Notification profiles of the signed-in `ufop-server`: reusable channels jobs and templates refer to. See [backup-notifications.md](backup-notifications.md).
+
+```bash
+ufop backup notify-profile list
+ufop backup notify-profile show "On call"
+ufop backup notify-profile create --name "On call" --preset pagerduty --min-severity warning --secret-env PD_ROUTING_KEY
+ufop backup notify-profile create --name Phone --preset ntfy --server https://ntfy.example.org --topic backups --bearer --secret-env NTFY_TOKEN
+ufop backup notify-profile create --name Pushover --preset pushover --user uQiRzpo4DXghDmr9QzzfQu27cmVRsG --secret-env PUSHOVER_TOKEN
+ufop backup notify-profile create --file ops-mail.json    # {"name": …, "notification": {…}, "min_severity": …}
+ufop backup notify-profile update "On call" --min-severity error
+ufop backup notify-profile test "On call"
+ufop backup notify-profile delete Phone [--force]         # --force also removes it from jobs and templates
+```
+
+| Flag (`create` / `update`) | |
+|---|---|
+| `--name`, `--description` | Profile name and description |
+| `--notification JSON` | The channel (`{"type":"email",…}`, `{"type":"webhook",…}`, …) |
+| `--file PATH` | A whole profile as JSON (flags win) |
+| `--min-severity success\|warning\|error\|none` | Send results at least this severe (`none` uses the channel's `send_on`) |
+| `--secret` / `--secret-env VAR` | The channel secret, stored in the server's secure store (prefer `--secret-env`) |
+| `--preset NAME` (`create`) | `pushover`, `ntfy`, `discord`, `pagerduty`, `gotify` or `generic`, with `--server`, `--topic`, `--user`, `--bearer` |
+
 ### `ufop backup` destinations: request limits and point in time
 
 Every `ufop backup` command with `--dest` takes request limits (0 = unlimited) and the listing parallelism for sharded layouts. See [backup-destinations.md](backup-destinations.md).

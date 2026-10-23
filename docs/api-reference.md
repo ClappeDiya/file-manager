@@ -666,7 +666,7 @@ See [backup-policies-and-schedules.md](backup-policies-and-schedules.md).
 | Method and path | Scope | |
 |---|---|---|
 | `GET /api/v1/backup-templates` | read | Local templates, then the organization's (`managed`, `enforced`, ids `org:…`) |
-| `POST /api/v1/backup-templates` | write | Create `{name, description, settings}`; `settings` is a partial job: `options`, `filter`, `retention`, `schedule`, `maintenance`, `scripts`, `notifications`, `notify_on`, `throttle`, `retry`, `prevent_sleep` |
+| `POST /api/v1/backup-templates` | write | Create `{name, description, settings}`; `settings` is a partial job: `options`, `filter`, `retention`, `schedule`, `maintenance`, `scripts`, `notifications`, `notification_profile_ids`, `notify_on`, `throttle`, `retry`, `prevent_sleep` |
 | `GET` / `PUT` / `DELETE /api/v1/backup-templates/{id}` | read / write / write | One template; organization templates cannot be changed (`403`); deleting one in use is `409` |
 | `POST /api/v1/backup-templates/{id}/apply` | write | `{job_id}`: append the template to the job's `template_ids` |
 | `GET /api/v1/backup-templates/export?ids=a,b` | read | Template file (`format: ufop-backup-templates`) |
@@ -675,6 +675,21 @@ See [backup-policies-and-schedules.md](backup-policies-and-schedules.md).
 | `POST /api/v1/backup-schedule/preview` | read | `{schedule, count}`: validate an interval or cron schedule and list the next runs (`[{at, skipped_by}]`) |
 
 Jobs have three new optional fields: `template_ids` (ordered), `overrides` (field paths the job sets itself; `null` for older jobs) and `maintenance` (`{compact, verify: {schedule, options}, retention}`). `schedule.cron` takes cron expressions. `scripts.before_mode` and `scripts.after_mode` take `required`, `optional` or `async`. The `verify` operation takes `options`: `{scope: {versions, paths}, mode: {type: structure | sample_volumes, count | sample_percent, percent | full}, files_percent, parallelism, max_errors, use_cache}`. `GET /api/v1/status` lists upcoming maintenance in `next_maintenance`.
+
+### Notification profiles, previews and webhook presets
+
+See [backup-notifications.md](backup-notifications.md).
+
+| Method and path | Scope | |
+|---|---|---|
+| `GET /api/v1/notification-profiles` | read | Local profiles, then the organization's (`managed`, ids `org:…`) |
+| `POST /api/v1/notification-profiles` | write | Create `{name, description, notification, min_severity, secret}`; `secret` and secret header values go to the secure store and are never returned |
+| `GET` / `PUT` / `DELETE /api/v1/notification-profiles/{id}` | read / write / write | One profile; organization profiles cannot be changed (`403`); deleting one in use is `409` unless `?force=true`, which returns `{removed_from, warnings}` |
+| `POST /api/v1/notification-profiles/{id}/test` | write | Send a test message through the profile |
+| `POST /api/v1/notifications/preview` | any | `{notification, result}` → `{subject, text, html, request}` for a sample run (secrets masked) |
+| `POST /api/v1/notifications/webhook-preset` | any | `{preset, params: {server, topic, user, bearer}}` → a webhook channel |
+
+Jobs and template settings take `notification_profile_ids`. Notification channels gain `slack`, `teams` and `webhook` (`url`, `method`, `content_type`, `headers: [{name, value, secret, credential_id}]`, `body_template`, `preset`); email channels gain `html` and `html_template`. HTTP reports (`reports`) take `headers` and the `PATCH` method.
 
 ### Share portal
 
