@@ -113,6 +113,11 @@ Ground rules
 - [ ] K121 Text size setting
 - [ ] K123 Units (binary/decimal) and schedule timezone
 
+## Follow-ups found during the work
+- [ ] Standalone `ufop agent` host honours cron and maintenance schedules of managed jobs (WP6 left it on plain intervals)
+- [ ] Fix pre-existing `tests/journey_06_lan_transfer.rs` build break (`PeerManager::create_hello`/`create_ping`)
+- [ ] Fix pre-existing orphan `test_automation_rule` IPC call (dump-ipc-commands --verify)
+
 ## Final verification
 - [ ] ufop-core tests (all features) pass
 - [ ] src-tauri `cargo test --lib` passes
