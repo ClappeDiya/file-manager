@@ -110,7 +110,7 @@ Ground rules
 
 ## WP11 — Interface polish
 - [ ] K122 Sort and paginate backup version/file tables
-- [ ] K121 Text size setting
+- [x] K121 Text size setting
 - [ ] K123 Units (binary/decimal) and schedule timezone
 
 ## Follow-ups found during the work

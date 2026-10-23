@@ -663,6 +663,9 @@ In Advanced mode, an automation rule can **Download a URL** into a folder. The U
 | Ctrl/Cmd+C | Copy |
 | Ctrl/Cmd+X | Cut |
 | Ctrl/Cmd+V | Paste |
+| Ctrl/Cmd++ | Larger text |
+| Ctrl/Cmd+- | Smaller text |
+| Ctrl/Cmd+0 | Default text size |
 | Space | Quick preview (when preview pane is open) |
 
 ---
@@ -677,6 +680,13 @@ In Advanced mode, an automation rule can **Download a URL** into a folder. The U
 - **High Contrast** - Optimized for visibility, meets WCAG contrast requirements
 
 Theme switching is instant with no restart required. The theme applies immediately via CSS custom properties.
+
+### Appearance settings
+
+**Settings → Appearance** collects the display preferences. They are stored with the other window preferences on this computer and apply at once:
+
+- **Theme** - the same choices as the toolbar theme switcher.
+- **Text size** - Small (87.5%), Default, Large (112.5%) or Larger (125%). It scales the root font size, so text, spacing and controls sized in `rem` grow together. Shortcuts: **Ctrl/Cmd + +** (larger), **Ctrl/Cmd + -** (smaller), **Ctrl/Cmd + 0** (default); they are also in the command palette and the `?` cheat sheet. Ctrl/Cmd + = (without Shift) stays *Compare files*. The webview's own zoom keys are off in the desktop app, so these replace them.
 
 ### Accessibility
 

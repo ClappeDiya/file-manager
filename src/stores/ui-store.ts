@@ -10,6 +10,17 @@ import { persist } from "zustand/middleware";
  */
 export type Theme = "light" | "dark" | "system" | "high-contrast";
 
+/** Text size multiplier applied to the root font size (rem-based UI scales). */
+export type FontScale = 0.875 | 1 | 1.125 | 1.25;
+
+/** Text size choices, smallest first (Settings → Appearance and Ctrl/Cmd +/−/0). */
+export const FONT_SCALES: readonly { value: FontScale; label: string }[] = [
+  { value: 0.875, label: "Small" },
+  { value: 1, label: "Default" },
+  { value: 1.125, label: "Large" },
+  { value: 1.25, label: "Larger" },
+];
+
 /**
  * Application mode:
  * - "simple": Default mode with simplified UI
@@ -100,6 +111,12 @@ export interface UIState {
   theme: Theme;
   resolvedTheme: "light" | "dark" | "high-contrast";
   setTheme: (theme: Theme) => void;
+
+  // Text size (K121)
+  fontScale: FontScale;
+  setFontScale: (scale: FontScale) => void;
+  /** One step larger (1), smaller (-1) or back to the default (0). */
+  stepFontScale: (step: -1 | 0 | 1) => void;
 
   // Sidebar
   sidebarOpen: boolean;
@@ -211,6 +228,24 @@ function applyThemeToDocument(resolvedTheme: "light" | "dark" | "high-contrast")
   }
 }
 
+/** Sets the root font size so every rem-based size follows the text size. */
+export function applyFontScaleToDocument(scale: FontScale) {
+  if (typeof document === "undefined") return;
+  const root = document.documentElement;
+  if (scale === 1) root.style.removeProperty("--ufop-font-scale");
+  else root.style.setProperty("--ufop-font-scale", String(scale));
+}
+
+/** The text size one step from `current` (clamped to the available sizes). */
+export function nextFontScale(current: FontScale, step: -1 | 0 | 1): FontScale {
+  if (step === 0) return 1;
+  const i = FONT_SCALES.findIndex((f) => f.value === current);
+  const j = Math.max(0, Math.min(FONT_SCALES.length - 1, (i < 0 ? 1 : i) + step));
+  return FONT_SCALES[j].value;
+}
+
+const isFontScale = (v: unknown): v is FontScale => FONT_SCALES.some((f) => f.value === v);
+
 /**
  * Get the OS preferred color scheme.
  */
@@ -237,8 +272,9 @@ export function selectBackupAdvanced(state: Pick<UIState, "appMode" | "backupAdv
   return state.backupAdvanced ?? state.appMode === "advanced";
 }
 
-/** Persisted-state schema version. v0 (no version) predates `backupAdvanced`. */
-export const UI_STATE_VERSION = 1;
+/** Persisted-state schema version. v0 (no version) predates `backupAdvanced`;
+ *  v1 predates the appearance settings (text size, units, table views). */
+export const UI_STATE_VERSION = 2;
 
 /**
  * Upgrades persisted UI state from an older version. Installs persisted before
@@ -247,11 +283,20 @@ export const UI_STATE_VERSION = 1;
  * default `null` (follow `appMode`).
  */
 export function migrateUIState(persisted: unknown, version: number): Partial<UIState> {
-  const state = (persisted && typeof persisted === "object" ? persisted : {}) as Partial<UIState>;
+  let state = (persisted && typeof persisted === "object" ? persisted : {}) as Partial<UIState>;
   if (version < 1 && !("backupAdvanced" in state)) {
-    return { ...state, backupAdvanced: true };
+    state = { ...state, backupAdvanced: true };
   }
-  return state;
+  return sanitizeAppearance(state);
+}
+
+/** Drops unknown appearance values (hand-edited or from a newer build) so
+ *  the defaults apply instead of a broken layout. Fields that are absent stay
+ *  absent. */
+function sanitizeAppearance(state: Partial<UIState>): Partial<UIState> {
+  const out = { ...state };
+  if ("fontScale" in out && !isFontScale(out.fontScale)) delete out.fontScale;
+  return out;
 }
 
 let _activityIdCounter = 0;
@@ -269,6 +314,15 @@ export const useUIStore = create<UIState>()(
         applyThemeToDocument(resolved);
         set({ theme, resolvedTheme: resolved });
       },
+
+      // Text size
+      fontScale: 1,
+      setFontScale: (scale: FontScale) => {
+        const next = isFontScale(scale) ? scale : 1;
+        applyFontScaleToDocument(next);
+        set({ fontScale: next });
+      },
+      stepFontScale: (step) => get().setFontScale(nextFontScale(get().fontScale, step)),
 
       // Sidebar
       sidebarOpen: true,
@@ -410,6 +464,7 @@ export const useUIStore = create<UIState>()(
       // Only persist these specific fields to localStorage
       partialize: (state) => ({
         theme: state.theme,
+        fontScale: state.fontScale,
         sidebarOpen: state.sidebarOpen,
         sidebarWidth: state.sidebarWidth,
         appMode: state.appMode,
@@ -432,6 +487,7 @@ export const useUIStore = create<UIState>()(
             const resolved = resolveTheme(state.theme);
             applyThemeToDocument(resolved);
             state.resolvedTheme = resolved;
+            applyFontScaleToDocument(isFontScale(state.fontScale) ? state.fontScale : 1);
           }
         };
       },

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Interface polish:
+  - **Text size** (Settings → Appearance): Small, Default, Large or Larger, applied to the root font size so the rem-based interface scales; Ctrl/Cmd + `+` / `-` / `0`, also in the command palette and the shortcut cheat sheet. Persisted (UI state version 2; invalid stored values fall back to the default).
 - CLI, tooling and packaging:
   - **`ufop backup bench`**: compression (stored, deflate, zstd levels, bzip2), AES-256-GCM vs ChaCha20-Poly1305, Argon2id presets with suggested parameters for a target time, Fixed vs FastCDC chunkers (speed, size distribution, deduplication of an edited copy) and SHA-256 vs SHA-512 on generated (`--seed`) or your own sample data, through the engine's real code paths; `--repeat`, `--threads`, `--size`, `--only`, `--json` and `--print-options` (the recommended `ufop backup run` flags). Also Settings → Benchmark in the desktop app (Advanced) and `backup_bench`.
   - **`ufop backup debug`**: read-only `header`, `volumes` (kind, size, shard; filters), `stats` (per kind, blocks, compression and dedup ratios, per-version referenced and unique bytes), `blocks`, `block <hash>` (`--raw`, `--out`), `index`, `fileset`, `sessions` (lock holders) and `db`. The header and statistics are also in Maintenance → Inspect (Advanced) as the `inspect_header` / `inspect_stats` operations.

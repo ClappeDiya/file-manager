@@ -22,6 +22,7 @@ import { SharingPolicySection } from "@/components/sharing-policy-section";
 import { ProxySection } from "@/components/proxy-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
 import { DiagnosticsSection } from "@/components/diagnostics-section";
+import { AppearanceSettings } from "@/components/appearance-settings";
 import { ManagedSettingsNotice } from "@/components/managed-settings-notice";
 import { FleetAgentLimits } from "@/components/fleet-agent-limits";
 import { PortableModeBadge, PortableModeDetails } from "@/components/portable-mode-status";
@@ -1295,6 +1296,10 @@ export default function SettingsPanel({
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        <Section title="Appearance" defaultOpen>
+          <AppearanceSettings />
+        </Section>
+
         {/* Export */}
         <Section title="Export Settings" defaultOpen>
           <ExportSection summary={summary} />
