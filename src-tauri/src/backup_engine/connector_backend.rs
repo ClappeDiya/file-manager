@@ -187,3 +187,99 @@ impl Backend for ConnectorBackend {
         self.wait("Creating the folder", self.connector.make_directory(&self.dir))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::FileEntry;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
+
+    /// An in-memory server with real folders: uploads into a folder that
+    /// does not exist fail (as on SFTP and WebDAV).
+    #[derive(Default)]
+    struct MemServer {
+        files: Mutex<BTreeMap<String, Vec<u8>>>,
+        dirs: Mutex<BTreeSet<String>>,
+        lists: Mutex<Vec<String>>,
+    }
+
+    fn parent(p: &str) -> String {
+        p.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default()
+    }
+
+    impl Connector for MemServer {
+        fn connect(&self, _: &ConnectionProfile) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn disconnect(&self) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn list_remote(&self, path: &str) -> Fut<'_, Vec<FileEntry>> {
+            let path = path.trim_end_matches('/').to_string();
+            Box::pin(async move {
+                self.lists.lock().unwrap().push(path.clone());
+                let entry = |name: &str, is_dir: bool, size: u64| FileEntry { name: name.into(), path: format!("{path}/{name}"), is_dir, is_symlink: false, size, modified: None, created: None, is_hidden: false, extension: None, permissions: None };
+                let mut out: Vec<FileEntry> = self.files.lock().unwrap().iter().filter(|(k, _)| parent(k) == path).map(|(k, v)| entry(k.rsplit('/').next().unwrap(), false, v.len() as u64)).collect();
+                out.extend(self.dirs.lock().unwrap().iter().filter(|d| parent(d) == path).map(|d| entry(d.rsplit('/').next().unwrap(), true, 0)));
+                Ok(out)
+            })
+        }
+        fn upload(&self, local: &str, remote: &str) -> Fut<'_, u64> {
+            let (local, remote) = (local.to_string(), remote.to_string());
+            Box::pin(async move {
+                if !self.dirs.lock().unwrap().contains(&parent(&remote)) {
+                    return Err(AppError::file_op(format!("No such directory for {remote}"), "Create it first."));
+                }
+                let d = std::fs::read(&local)?;
+                let n = d.len() as u64;
+                self.files.lock().unwrap().insert(remote, d);
+                Ok(n)
+            })
+        }
+        fn download(&self, remote: &str, local: &str) -> Fut<'_, u64> {
+            let (remote, local) = (remote.to_string(), local.to_string());
+            Box::pin(async move {
+                let d = self.files.lock().unwrap().get(&remote).cloned().ok_or_else(|| AppError::not_found(format!("{remote} not found")))?;
+                std::fs::write(&local, &d)?;
+                Ok(d.len() as u64)
+            })
+        }
+        fn make_directory(&self, remote: &str) -> Fut<'_, ()> {
+            let remote = remote.trim_end_matches('/').to_string();
+            Box::pin(async move {
+                self.dirs.lock().unwrap().insert(remote);
+                Ok(())
+            })
+        }
+        fn remove(&self, remote: &str, _is_dir: bool) -> Fut<'_, ()> {
+            let remote = remote.to_string();
+            Box::pin(async move {
+                self.files.lock().unwrap().remove(&remote);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sharded_layout_creates_and_lists_shard_folders() {
+        let server = Arc::new(MemServer::default());
+        server.dirs.lock().unwrap().insert("/backups".into());
+        let b = Arc::new(ConnectorBackend { connector: server.clone(), dir: "/backups".into(), label: "mem:///backups".into(), rt: Handle::current(), timeout: None, list_parallelism: 3 });
+        assert!(b.supports_subfolders());
+        let b2 = b.clone();
+        tokio::task::spawn_blocking(move || crate::backup_engine::stores::tests::backup_roundtrip_with(b2.as_ref(), ufop_core::backup::layout::RepoLayout::Sharded { prefix_len: 1 })).await.unwrap();
+        let dirs = server.dirs.lock().unwrap().clone();
+        assert!(dirs.len() > 1 && dirs.iter().all(|d| d == "/backups" || (d.starts_with("/backups/") && d.len() == "/backups/x".len())), "{dirs:?}");
+        // Every shard folder was listed.
+        let lists = server.lists.lock().unwrap().clone();
+        assert!(dirs.iter().filter(|d| *d != "/backups").all(|d| lists.contains(d)));
+    }
+}

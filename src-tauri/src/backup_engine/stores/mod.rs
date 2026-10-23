@@ -43,7 +43,7 @@ pub(crate) mod mock_s3;
 #[cfg(test)]
 mod mocks;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
 

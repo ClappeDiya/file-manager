@@ -1,7 +1,7 @@
 //! OpenStack Swift (Keystone v3 password or application credential, or v1 / TempAuth).
 
 use super::http::{self, TlsOptions};
-use super::{direct_child, join_key, BoxFut, ObjectStore};
+use super::{child_within_one, direct_child, join_key, BoxFut, ObjectStore};
 use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -172,6 +172,36 @@ pub struct SwiftStore {
 }
 
 impl SwiftStore {
+    fn folder_prefix(&self) -> String {
+        let prefix = self.cfg.prefix.trim_matches('/');
+        if prefix.is_empty() { String::new() } else { format!("{prefix}/") }
+    }
+
+    /// Objects under `pfx` (all pages) and, with the delimiter, the `subdir`s.
+    async fn list_names(&self, pfx: &str, delimiter: bool) -> Result<(Vec<(String, u64)>, Vec<String>), AppError> {
+        let (mut objs, mut folders) = (Vec::new(), Vec::new());
+        let mut marker = String::new();
+        loop {
+            let mut q = vec![("prefix", pfx.to_string())];
+            if delimiter {
+                q.push(("delimiter", "/".to_string()));
+            }
+            let v = self.session.list_page("Swift listing", &object_path(&self.cfg.container, None), &q, &marker, LIST_PAGE).await?;
+            if v.is_empty() {
+                break;
+            }
+            for o in &v {
+                if let Some(n) = o["name"].as_str() {
+                    objs.push((n.to_string(), o["bytes"].as_u64().unwrap_or(0)));
+                } else if let Some(d) = o["subdir"].as_str() {
+                    folders.push(d.to_string());
+                }
+            }
+            marker = v.last().and_then(|o| o["name"].as_str().or(o["subdir"].as_str())).unwrap_or_default().to_string();
+        }
+        Ok((objs, folders))
+    }
+
     pub async fn connect(cfg: SwiftConfig, password: String) -> Result<Self, AppError> {
         if cfg.auth_url.is_empty() || cfg.container.is_empty() {
             return Err(AppError::validation("Enter the Swift auth URL and container"));
@@ -198,22 +228,30 @@ impl ObjectStore for SwiftStore {
     fn list(&self) -> BoxFut<'_, Vec<RemoteFile>> {
         Box::pin(async move {
             let prefix = self.cfg.prefix.trim_matches('/');
-            let pfx = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
-            let mut out = Vec::new();
-            let mut marker = String::new();
-            loop {
-                let q = [("prefix", pfx.clone()), ("delimiter", "/".to_string())];
-                let v = self.session.list_page("Swift listing", &object_path(&self.cfg.container, None), &q, &marker, LIST_PAGE).await?;
-                if v.is_empty() {
-                    break;
-                }
-                for o in &v {
-                    if let Some(n) = o["name"].as_str().and_then(|n| direct_child(prefix, n)) {
-                        out.push(RemoteFile { name: n.to_string(), size: o["bytes"].as_u64().unwrap_or(0) });
-                    }
-                }
-                marker = v.last().and_then(|o| o["name"].as_str().or(o["subdir"].as_str())).unwrap_or_default().to_string();
+            let (objs, _) = self.list_names(&self.folder_prefix(), true).await?;
+            Ok(objs.into_iter().filter_map(|(n, size)| direct_child(prefix, &n).map(|n| RemoteFile { name: n.to_string(), size })).collect())
+        })
+    }
+    fn supports_subfolders(&self) -> bool {
+        true
+    }
+    fn list_recursive(&self, parallelism: usize) -> BoxFut<'_, Vec<RemoteFile>> {
+        Box::pin(async move {
+            let prefix = self.cfg.prefix.trim_matches('/').to_string();
+            let within = |objs: Vec<(String, u64)>, prefix: &str| objs.into_iter().filter_map(|(n, size)| child_within_one(prefix, &n).map(|name| RemoteFile { name, size })).collect::<Vec<_>>();
+            if parallelism <= 1 {
+                return Ok(within(self.list_names(&self.folder_prefix(), false).await?.0, &prefix));
             }
+            let (top, folders) = self.list_names(&self.folder_prefix(), true).await?;
+            let mut out = within(top, &prefix);
+            let p2 = prefix.clone();
+            out.extend(
+                super::list_folders(folders, parallelism, |f| {
+                    let prefix = p2.clone();
+                    async move { Ok(within(self.list_names(&f, true).await?.0, &prefix)) }
+                })
+                .await?,
+            );
             Ok(out)
         })
     }
