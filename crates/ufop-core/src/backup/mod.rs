@@ -11,6 +11,8 @@
 //!   local database can be rebuilt from the remote alone.
 //! - `{prefix}-{UTC timestamp}.dlist[.aes]` — one backup version (file list).
 //! - `{prefix}-verification.json` — optional unencrypted SHA-256 inventory.
+//! - `{prefix}-lock.json`, `{prefix}-lock-r-{id}.json` — repository lock
+//!   leases (exclusive writer / shared readers), see [`lock`].
 //!
 //! Format v1 and v2 repositories are both read and written; see [`format`]
 //! for what v2 adds (envelope key, zstd, content-defined chunking,
@@ -29,6 +31,7 @@ pub mod filters;
 pub mod format;
 pub mod gpg;
 pub mod layout;
+pub mod lock;
 pub mod maintenance;
 pub mod meta;
 pub mod mirror;
@@ -42,7 +45,7 @@ pub mod snapshot;
 pub mod usn;
 pub mod volume;
 
-pub use backend::{Backend, LocalBackend, RemoteFile, RetryingBackend, SoftDeleteBackend};
+pub use backend::{Backend, LocalBackend, ReadOnlyBackend, RemoteFile, RetryingBackend, SoftDeleteBackend};
 pub use engine::{run_backup, BackupReport};
 pub use filters::{FilterAction, FilterKind, FilterRule, SourceFilter};
 pub use restore::{run_restore, RestoreOptions, RestoreReport};
@@ -323,6 +326,20 @@ pub struct BackupOptions {
     pub cipher: crypto::CipherKind,
     /// Destination layout for a new v2 repository.
     pub layout: layout::RepoLayout,
+
+    // ── Repository safety ──
+    /// Repository lock lease in seconds, renewed every third of it (0 = 30 min).
+    pub lock_ttl_secs: u64,
+    /// Warn when the destination's clock differs from this computer's by at
+    /// least this many seconds (0 = never).
+    pub clock_skew_warn_secs: u64,
+    /// Refuse to write when the clocks differ by at least this (0 = never).
+    pub clock_skew_abort_secs: u64,
+    /// Upload a checkpoint (a partial version of the files finished so
+    /// far) at most this often during a long backup (0 = off).
+    pub checkpoint_interval_secs: u64,
+    /// Also checkpoint after this many uploaded bytes (0 = off).
+    pub checkpoint_interval_bytes: u64,
 }
 
 /// How volumes are encrypted.
@@ -409,6 +426,11 @@ impl Default for BackupOptions {
             metadata_compression: None,
             cipher: crypto::CipherKind::Aes256Gcm,
             layout: layout::RepoLayout::Flat,
+            lock_ttl_secs: lock::DEFAULT_LOCK_TTL_SECS,
+            clock_skew_warn_secs: lock::DEFAULT_SKEW_WARN_SECS,
+            clock_skew_abort_secs: lock::DEFAULT_SKEW_ABORT_SECS,
+            checkpoint_interval_secs: 900,
+            checkpoint_interval_bytes: 0,
         }
     }
 }

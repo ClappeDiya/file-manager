@@ -701,6 +701,73 @@ pub fn compare_versions(db: &BackupDb, a: usize, b: usize) -> Result<VersionComp
     Ok(c)
 }
 
+/// How the local database should be kept (see [`open_job_db`]).
+#[derive(Debug, Clone, Default)]
+pub struct JobDbOptions<'k> {
+    /// The job's database key, when one is stored.
+    pub key: Option<&'k super::db::DbKey>,
+    /// Encrypt the database (`key` must be set) or keep it plain.
+    pub encrypt: bool,
+}
+
+/// Open a job's local database the way the job wants it:
+///
+/// - encrypted with `key` when `encrypt` is set (a plain database is
+///   migrated in place), plain otherwise (an encrypted one is decrypted);
+/// - when the database is encrypted but the key is missing or wrong, the
+///   file is set aside (`<name>.undecryptable-<time>`), a new database is
+///   started and, when `backend` holds the repository, rebuilt from it.
+///
+/// Returns the database and notices for the run log.
+pub fn open_job_db(
+    path: &std::path::Path,
+    opts: &JobDbOptions,
+    backend: Option<&dyn Backend>,
+    passphrase: Option<&str>,
+    prefix: &str,
+    ctx: &OpContext,
+) -> Result<(BackupDb, Vec<String>), AppError> {
+    use super::db::KeyCheck;
+    if opts.encrypt && opts.key.is_none() {
+        return Err(AppError::validation("Encrypting the local database needs a key"));
+    }
+    let mut notices = Vec::new();
+    let check = BackupDb::key_check(path, opts.key)?;
+    if matches!(check, KeyCheck::KeyMissing | KeyCheck::WrongKey) {
+        let aside = std::path::PathBuf::from(format!("{}.undecryptable-{}", path.display(), Utc::now().format("%Y%m%dT%H%M%SZ")));
+        std::fs::rename(path, &aside)?;
+        for ext in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+        let why = if check == KeyCheck::KeyMissing { "its key is not in the keychain" } else { "the keychain holds a different key" };
+        notices.push(format!("The local database is encrypted but {why}; it was set aside as {} and rebuilt from the destination", aside.display()));
+        let mut db = BackupDb::open(path)?;
+        if opts.encrypt {
+            db.rekey(opts.key)?;
+        }
+        if let Some(b) = backend {
+            let header = volume::repo_header_name(prefix);
+            if b.list()?.iter().any(|f| f.name == header) {
+                let r = recreate_database(b, &db, passphrase, prefix, ctx)?;
+                notices.push(format!("Database rebuilt: {} version(s), {} block volume(s)", r.versions, r.block_volumes));
+            }
+        }
+        return Ok((db, notices));
+    }
+    let mut db = BackupDb::open_with_key(path, opts.key)?;
+    if opts.encrypt && !db.is_encrypted() {
+        let had_data = !db.is_empty()?;
+        db.rekey(opts.key)?;
+        if had_data {
+            notices.push("Encrypted the local database".into());
+        }
+    } else if !opts.encrypt && db.is_encrypted() {
+        db.rekey(None)?;
+        notices.push("Decrypted the local database (encryption was turned off for this job)".into());
+    }
+    Ok((db, notices))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,5 +1013,50 @@ mod tests {
         let plain = LocalBackend::new(dst.path());
         let repo2 = Repo::open(&plain, &db, Some("pw"), &opts, false, KdfParams::insecure_fast()).unwrap();
         assert!(apply_locks(&repo2, 1, LockMode::Governance, false).is_err());
+    }
+
+    #[test]
+    fn job_database_follows_the_job_and_rebuilds_without_its_key() {
+        use crate::backup::db::{DbKey, KeyCheck};
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        crate::backup::test_util::write(src.path(), "zzSecretFolder/a.txt", b"hello");
+        let be = crate::backup::LocalBackend::new(dst.path());
+        let path = data.path().join("job.sqlite");
+        let key = DbKey::generate();
+        let enc = JobDbOptions { key: Some(&key), encrypt: true };
+        let o = BackupOptions { verify_samples: 0, ..Default::default() };
+        // New job: an encrypted database from the start.
+        let (db, notes) = open_job_db(&path, &enc, Some(&be), Some("pw"), "ufop", &OpContext::new()).unwrap();
+        assert!(db.is_encrypted() && notes.is_empty());
+        crate::backup::run_backup(&be, &db, &[src.path().into()], &Default::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        drop(db);
+        assert_eq!(BackupDb::key_check(&path, Some(&key)).unwrap(), KeyCheck::Encrypted);
+
+        // Key lost: set aside, rebuilt from the destination, encrypted with the new key.
+        let new_key = DbKey::generate();
+        let enc2 = JobDbOptions { key: Some(&new_key), encrypt: true };
+        let (db, notes) = open_job_db(&path, &enc2, Some(&be), Some("pw"), "ufop", &OpContext::new()).unwrap();
+        assert!(notes[0].contains("different key") && notes[1].contains("1 version"), "{notes:?}");
+        assert!(db.is_encrypted());
+        let files = db.files(db.filesets().unwrap()[0].id).unwrap();
+        assert!(files.iter().any(|f| f.path.ends_with("a.txt")));
+        drop(db);
+        assert!(std::fs::read_dir(data.path()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(".undecryptable-")));
+        // No key at all (keychain wiped) and encryption off: rebuilt plain.
+        let (db, notes) = open_job_db(&path, &JobDbOptions::default(), Some(&be), Some("pw"), "ufop", &OpContext::new()).unwrap();
+        assert!(notes[0].contains("not in the keychain") && !db.is_encrypted());
+        assert_eq!(db.filesets().unwrap().len(), 1);
+        drop(db);
+        // Turning encryption on migrates the existing plain database.
+        let (db, notes) = open_job_db(&path, &enc, None, None, "ufop", &OpContext::new()).unwrap();
+        assert_eq!(notes, ["Encrypted the local database"]);
+        assert_eq!(db.filesets().unwrap().len(), 1);
+        drop(db);
+        // And off again decrypts it.
+        let (db, notes) = open_job_db(&path, &JobDbOptions { key: Some(&key), encrypt: false }, None, None, "ufop", &OpContext::new()).unwrap();
+        assert!(notes[0].starts_with("Decrypted") && !db.is_encrypted());
+        assert!(open_job_db(&path, &JobDbOptions { key: None, encrypt: true }, None, None, "ufop", &OpContext::new()).is_err());
     }
 }

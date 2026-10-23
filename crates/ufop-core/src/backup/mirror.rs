@@ -45,9 +45,10 @@ pub struct MirrorReport {
     pub errors: Vec<String>,
 }
 
-/// Whether `name` belongs to the repository with `prefix`.
+/// Whether `name` belongs to the repository with `prefix`. Lock files
+/// belong to one destination and are never copied or deleted.
 fn ours(prefix: &str, name: &str) -> bool {
-    name.strip_prefix(prefix).is_some_and(|r| r.starts_with('-'))
+    name.strip_prefix(prefix).is_some_and(|r| r.starts_with('-')) && !super::lock::is_lock_file(prefix, name)
 }
 
 /// Make `dst` hold the same repository files as `src`.
@@ -153,6 +154,30 @@ pub fn mirror(src: &dyn Backend, dst: &dyn Backend, prefix: &str, opts: &MirrorO
     Ok(r)
 }
 
+/// [`mirror`] under repository locks: shared on the source, exclusive on
+/// the target (shared for a dry run). Returns the report with the locks'
+/// warnings (stale takeover, clock skew) added to its errors-free warnings.
+pub fn mirror_locked(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    prefix: &str,
+    opts: &MirrorOptions,
+    lock: &super::lock::LockOptions,
+    ctx: &OpContext,
+) -> Result<(MirrorReport, Vec<String>), AppError> {
+    use super::lock::{with_lock, LockKind};
+    let target_kind = if opts.dry_run { LockKind::Shared } else { LockKind::Exclusive };
+    let ((r, mut w2), mut w1) = with_lock(src, prefix, LockKind::Shared, "mirror", lock, ctx, || {
+        if !opts.dry_run {
+            // The target folder must exist before a lock can be written in it.
+            dst.create_folder()?;
+        }
+        with_lock(dst, prefix, target_kind, "mirror", lock, ctx, || mirror(src, dst, prefix, opts, ctx))
+    })?;
+    w1.append(&mut w2);
+    Ok((r, w1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +217,31 @@ mod tests {
         let rr = crate::backup::run_restore(&repo, &crate::backup::RestoreOptions { target: Some(out.path().into()), ..Default::default() }, &OpContext::new()).unwrap();
         assert!(rr.errors.is_empty() && rr.files_restored == 1);
         assert!(mirror(&bb, &ba, "nope", &MirrorOptions::default(), &OpContext::new()).is_err());
+    }
+
+    #[test]
+    fn lock_files_are_never_mirrored_and_locks_are_honoured() {
+        use crate::backup::lock::{LockKind, LockOptions, RepoLock};
+        let (src, a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write(src.path(), "f.bin", b"data");
+        let o = BackupOptions { block_size: 1024, volume_size: 4096, verify_samples: 0, ..Default::default() };
+        let (ba, bb) = (LocalBackend::new(a.path()), LocalBackend::new(b.path()));
+        run_backup(&ba, &BackupDb::open_in_memory().unwrap(), &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, None, KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        let lo = LockOptions { settle: std::time::Duration::from_millis(10), ..Default::default() };
+        // A reader on the source does not stop a mirror; its lock file is not copied.
+        let reader = RepoLock::acquire(&ba, "ufop", LockKind::Shared, "restore", &lo).unwrap();
+        let (r, w) = mirror_locked(&ba, &bb, "ufop", &MirrorOptions::default(), &lo, &OpContext::new()).unwrap();
+        assert!(r.errors.is_empty() && w.is_empty());
+        assert!(!std::fs::read_dir(b.path()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains("-lock")), "no lock files copied, mirror locks released");
+        drop(reader);
+        // A target lock is neither deleted as extraneous nor ignored.
+        let held = RepoLock::acquire(&bb, "ufop", LockKind::Shared, "verify", &lo).unwrap();
+        assert_eq!(mirror(&ba, &bb, "ufop", &MirrorOptions::default(), &OpContext::new()).unwrap().deleted, 0);
+        assert!(bb.get(held.file()).is_ok());
+        assert!(mirror_locked(&ba, &bb, "ufop", &MirrorOptions::default(), &lo, &OpContext::new()).unwrap_err().user_message().contains("(verify)"));
+        // A writer on the source blocks it too.
+        drop(held);
+        let _w = RepoLock::acquire(&ba, "ufop", LockKind::Exclusive, "backup", &lo).unwrap();
+        assert!(mirror_locked(&ba, &bb, "ufop", &MirrorOptions::default(), &lo, &OpContext::new()).is_err());
     }
 }

@@ -73,6 +73,16 @@ pub trait Backend: Send + Sync {
     fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
         self.list()
     }
+    /// Last-modified time of a file as the destination records it (its own
+    /// clock), when the backend can tell. Used for the clock-skew check.
+    fn modified(&self, name: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        let _ = name;
+        Ok(None)
+    }
+    /// True when this connection refuses every write (see [`ReadOnlyBackend`]).
+    fn is_read_only(&self) -> bool {
+        false
+    }
     /// Connectivity test: lists the folder. `create` makes it first.
     fn test(&self, create: bool) -> Result<usize, AppError> {
         if create {
@@ -95,6 +105,9 @@ impl<T: Backend + ?Sized> Backend for Box<T> {
     fn lock(&self, n: &str, u: chrono::DateTime<chrono::Utc>, m: LockMode) -> Result<(), AppError> { (**self).lock(n, u, m) }
     fn supports_subfolders(&self) -> bool { (**self).supports_subfolders() }
     fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> { (**self).list_recursive() }
+    fn modified(&self, n: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> { (**self).modified(n) }
+    fn is_read_only(&self) -> bool { (**self).is_read_only() }
+    fn test(&self, create: bool) -> Result<usize, AppError> { (**self).test(create) }
 }
 
 fn check_name(name: &str) -> Result<(), AppError> {
@@ -218,9 +231,12 @@ impl Backend for LocalBackend {
             Ok(())
         };
         if self.use_move {
+            // Unique per write: two writers of one name (lock files) must
+            // not share a temporary file.
+            let tag = uuid::Uuid::new_v4().simple().to_string();
             let tmp = match name.split_once('/') {
-                Some((dir, file)) => self.root.join(dir).join(format!(".{file}.partial")),
-                None => self.root.join(format!(".{name}.partial")),
+                Some((dir, file)) => self.root.join(dir).join(format!(".{file}.{}.partial", &tag[..12])),
+                None => self.root.join(format!(".{name}.{}.partial", &tag[..12])),
             };
             write(&tmp)?;
             std::fs::rename(&tmp, &dest)?;
@@ -286,6 +302,12 @@ impl Backend for LocalBackend {
 
     fn create_folder(&self) -> Result<(), AppError> {
         Ok(std::fs::create_dir_all(&self.root)?)
+    }
+
+    fn modified(&self, name: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        check_path(name)?;
+        // On a mounted share the file server sets this time.
+        Ok(std::fs::metadata(self.root.join(name))?.modified().ok().map(chrono::DateTime::<chrono::Utc>::from))
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), AppError> {
@@ -450,6 +472,12 @@ impl<B: Backend> Backend for RetryingBackend<B> {
     fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
         self.retry("list", || self.inner.list_recursive())
     }
+    fn modified(&self, n: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        self.retry("stat", || self.inner.modified(n))
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
 }
 
 /// Renames volumes to `{prefix}{name}` instead of deleting them.
@@ -504,6 +532,85 @@ impl<B: Backend> Backend for SoftDeleteBackend<B> {
     }
     fn rename(&self, a: &str, b: &str) -> Result<(), AppError> {
         self.inner.rename(a, b)
+    }
+    fn modified(&self, n: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        self.inner.modified(n)
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+}
+
+/// A connection that only reads: every write (upload, delete, rename,
+/// folder creation, object lock) fails with a clear error before anything
+/// reaches the destination. Restores, browsing and verification work.
+pub struct ReadOnlyBackend<B: Backend> {
+    inner: B,
+}
+
+impl<B: Backend> ReadOnlyBackend<B> {
+    pub fn new(inner: B) -> Self {
+        Self { inner }
+    }
+
+    pub fn into_inner(self) -> B {
+        self.inner
+    }
+
+    fn refuse(&self, what: &str, name: &str) -> AppError {
+        AppError::PermissionDenied {
+            message: format!("{} is connected read-only: cannot {what} {name}", self.inner.describe()),
+            advice: "This job only restores and browses. Turn off 'Read-only' in the job's destination settings to back up or run maintenance.".into(),
+        }
+    }
+}
+
+impl<B: Backend> Backend for ReadOnlyBackend<B> {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn list(&self) -> Result<Vec<RemoteFile>, AppError> {
+        self.inner.list()
+    }
+    fn put(&self, name: &str, _data: &[u8]) -> Result<(), AppError> {
+        Err(self.refuse("upload", name))
+    }
+    fn get(&self, name: &str) -> Result<Vec<u8>, AppError> {
+        self.inner.get(name)
+    }
+    fn delete(&self, name: &str) -> Result<(), AppError> {
+        Err(self.refuse("delete", name))
+    }
+    fn create_folder(&self) -> Result<(), AppError> {
+        // Nothing to create when the folder exists; never create one.
+        self.inner.list().map(|_| ())
+    }
+    fn rename(&self, from: &str, _to: &str) -> Result<(), AppError> {
+        Err(self.refuse("rename", from))
+    }
+    fn quota(&self) -> Option<Quota> {
+        self.inner.quota()
+    }
+    fn supports_lock(&self) -> bool {
+        false
+    }
+    fn lock(&self, name: &str, _until: chrono::DateTime<chrono::Utc>, _mode: LockMode) -> Result<(), AppError> {
+        Err(self.refuse("lock", name))
+    }
+    fn supports_subfolders(&self) -> bool {
+        self.inner.supports_subfolders()
+    }
+    fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
+        self.inner.list_recursive()
+    }
+    fn modified(&self, n: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        self.inner.modified(n)
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn test(&self, _create: bool) -> Result<usize, AppError> {
+        Ok(self.inner.list()?.len())
     }
 }
 
@@ -639,6 +746,29 @@ mod tests {
         assert_eq!(p.delay_for(0), Duration::from_millis(100));
         assert_eq!(p.delay_for(1), Duration::from_millis(200));
         assert_eq!(p.delay_for(2), Duration::from_millis(350));
+    }
+
+    #[test]
+    fn read_only_refuses_every_write() {
+        let d = tempfile::tempdir().unwrap();
+        let local = LocalBackend::new(d.path());
+        local.put("a", b"1").unwrap();
+        let ro = ReadOnlyBackend::new(LocalBackend::new(d.path()));
+        assert!(ro.is_read_only() && !local.is_read_only());
+        assert_eq!(ro.get("a").unwrap(), b"1");
+        assert_eq!(ro.list().unwrap().len(), 1);
+        assert!(ro.modified("a").unwrap().is_some());
+        for e in [ro.put("b", b"2").unwrap_err(), ro.delete("a").unwrap_err(), ro.rename("a", "c").unwrap_err(), ro.lock("a", chrono::Utc::now(), LockMode::Governance).unwrap_err()] {
+            assert!(matches!(e, AppError::PermissionDenied { .. }), "{e:?}");
+            assert!(e.user_message().contains("read-only"));
+        }
+        assert!(!ro.supports_lock());
+        assert_eq!(local.list().unwrap().len(), 1, "nothing was written");
+        // Wrapped again (retry, box) it is still read-only.
+        let boxed: Box<dyn Backend> = Box::new(RetryingBackend::new(ro, RetryPolicy::default(), Throttle::default()));
+        assert!(boxed.is_read_only() && boxed.put("x", b"").is_err());
+        // A missing folder is never created.
+        assert!(ReadOnlyBackend::new(LocalBackend::new(d.path().join("nope"))).create_folder().is_err());
     }
 
     #[test]

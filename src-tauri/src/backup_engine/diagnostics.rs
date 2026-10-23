@@ -59,7 +59,7 @@ pub fn check_database(db: &BackupDb, info: Option<DbInfo>, backend: &dyn Backend
     aux.extend(ufop_core::backup::layout::header_copies(prefix));
     let mut untracked: Vec<String> = remote
         .keys()
-        .filter(|n| n.starts_with(&format!("{prefix}-")) && !known.contains(n.as_str()) && !aux.contains(n) && !n.ends_with(".par2"))
+        .filter(|n| n.starts_with(&format!("{prefix}-")) && !known.contains(n.as_str()) && !aux.contains(n) && !n.ends_with(".par2") && !ufop_core::backup::lock::is_lock_file(prefix, n))
         .cloned()
         .collect();
     untracked.sort();

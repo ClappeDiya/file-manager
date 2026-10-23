@@ -428,6 +428,10 @@ pub struct BackupReport {
     pub usn_used: bool,
     /// Snapshot method used (`vss`, `lvm`, `apfs`), if any.
     pub snapshot: Option<String>,
+    /// Checkpoints (partial versions of the files finished so far) uploaded
+    /// during the run; each replaced the previous one.
+    #[serde(default)]
+    pub checkpoints: u64,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
     pub duration_ms: u64,
@@ -1073,6 +1077,65 @@ fn upload_one(backend: &dyn Backend, par2: Option<&Par2>, v: SealedVolume) -> Up
     }
 }
 
+/// Periodic checkpoints of a long backup: a sealed partial version of the
+/// files whose blocks are all uploaded, replacing the run's previous
+/// checkpoint. A crash then leaves a restorable partial version, and the
+/// next run finds the uploaded blocks again (deduplication).
+struct Checkpoints {
+    every: Option<std::time::Duration>,
+    every_bytes: u64,
+    last: Instant,
+    last_bytes: u64,
+    /// Timestamp of this run's current checkpoint version.
+    current: Option<String>,
+}
+
+impl Checkpoints {
+    fn new(opts: &BackupOptions) -> Self {
+        Self {
+            every: (opts.checkpoint_interval_secs > 0).then(|| std::time::Duration::from_secs(opts.checkpoint_interval_secs)),
+            every_bytes: opts.checkpoint_interval_bytes,
+            last: Instant::now(),
+            last_bytes: 0,
+            current: None,
+        }
+    }
+
+    fn enabled(&self, opts: &BackupOptions) -> bool {
+        !opts.dry_run && (self.every.is_some() || self.every_bytes > 0)
+    }
+
+    fn due(&self, bytes_uploaded: u64) -> bool {
+        self.every.is_some_and(|d| self.last.elapsed() >= d) || (self.every_bytes > 0 && bytes_uploaded.saturating_sub(self.last_bytes) >= self.every_bytes)
+    }
+
+    /// Upload a new checkpoint, then drop the previous one.
+    fn write(&mut self, repo: &Repo, files: Vec<FileEntry>, opts: &BackupOptions, report: &mut BackupReport) -> Result<(), AppError> {
+        self.last = Instant::now();
+        self.last_bytes = report.bytes_uploaded;
+        if files.iter().all(|e| e.kind == EntryKind::Dir) {
+            return Ok(());
+        }
+        let ts = next_timestamp(repo.db)?;
+        let written = repo.write_filelist(ts, true, &files, opts.task_config.clone(), Vec::new(), false)?;
+        tracing::info!("Checkpoint {written}: {} entries", files.len());
+        self.remove(repo)?;
+        self.current = Some(written);
+        report.checkpoints += 1;
+        Ok(())
+    }
+
+    /// Remove this run's checkpoint (superseded by a newer version).
+    fn remove(&mut self, repo: &Repo) -> Result<(), AppError> {
+        let Some(ts) = self.current.take() else { return Ok(()) };
+        if let Some(fs) = repo.db.filesets()?.into_iter().find(|f| f.timestamp == ts) {
+            repo.delete_volume_files(&fs.volume_name)?;
+            repo.db.delete_fileset(fs.id)?;
+        }
+        Ok(())
+    }
+}
+
 /// Persisted USN journal state key.
 const USN_KEY: &str = "usn_state";
 
@@ -1255,6 +1318,8 @@ pub fn run_backup_with_cipher(
     let queue = Mutex::new(work);
     let threads = opts.worker_threads();
     let uploaders = opts.upload_concurrency.max(1);
+    let mut checkpoints = Checkpoints::new(opts);
+    let checkpoints_on = checkpoints.enabled(opts);
 
     std::thread::scope(|scope| -> Result<(), AppError> {
         let (tx, rx) = mpsc::sync_channel::<Msg>(256);
@@ -1298,20 +1363,22 @@ pub fn run_backup_with_cipher(
         }
         drop(res_tx);
 
-        let handle_result = |r: UploadResult, in_flight: &mut HashSet<String>, upload_error: &mut Option<String>| -> Result<(), AppError> {
+        // Records a finished upload; true when a volume is now durable.
+        let handle_result = |r: UploadResult, in_flight: &mut HashSet<String>, upload_error: &mut Option<String>| -> Result<bool, AppError> {
             match r.error {
                 Some(e) => {
                     *upload_error = Some(format!("Upload of {} failed: {e}", r.volume.block_name));
                     abort.store(true, Ordering::SeqCst);
+                    Ok(false)
                 }
                 None => {
                     record_volume(&repo, &r.volume, &r.par2_names)?;
                     for (h, _) in &r.volume.blocks {
                         in_flight.remove(h);
                     }
+                    Ok(true)
                 }
             }
-            Ok(())
         };
 
         let send_volume = |pending: &mut Pending, in_flight: &mut HashSet<String>, report: &mut BackupReport| -> Result<(), AppError> {
@@ -1330,7 +1397,17 @@ pub fn run_backup_with_cipher(
 
         for msg in rx {
             while let Ok(r) = res_rx.try_recv() {
-                handle_result(r, &mut in_flight, &mut upload_error)?;
+                let durable = handle_result(r, &mut in_flight, &mut upload_error)?;
+                if durable && checkpoints_on && upload_error.is_none() && checkpoints.due(report.bytes_uploaded) {
+                    // Files whose blocks are all recorded as uploaded.
+                    let files: Vec<FileEntry> = results
+                        .iter()
+                        .flatten()
+                        .filter(|e| !e.blocks.iter().any(|b| pending.hashes.contains(b) || in_flight.contains(b)))
+                        .cloned()
+                        .collect();
+                    checkpoints.write(&repo, files, opts, &mut report)?;
+                }
             }
             match msg {
                 Msg::Block { idx, hash, flag, data, raw_len } => {
@@ -1376,6 +1453,7 @@ pub fn run_backup_with_cipher(
         }
         Ok(())
     })?;
+    // From here on a final (or synthetic partial) version supersedes the checkpoint.
 
     if let Some(e) = upload_error {
         report.errors.push(e);
@@ -1394,6 +1472,7 @@ pub fn run_backup_with_cipher(
             let ts = next_timestamp(db)?;
             report.version = Some(repo.write_filelist(ts, true, &done, opts.task_config.clone(), control_files, opts.dry_run)?);
             report.partial = true;
+            checkpoints.remove(&repo)?;
         }
         report.errors.push("The operation was cancelled. Start it again when ready; completed work is kept.".into());
         report.duration_ms = started.elapsed().as_millis() as u64;
@@ -1410,6 +1489,8 @@ pub fn run_backup_with_cipher(
         let ts = next_timestamp(db)?;
         report.version = Some(repo.write_filelist(ts, false, &done, opts.task_config.clone(), control_files, opts.dry_run)?);
     }
+    // The complete version (or the unchanged previous one) supersedes the checkpoint.
+    checkpoints.remove(&repo)?;
     if let (Some(state), false) = (&usn_next, opts.dry_run) {
         db.set_kv(USN_KEY, &serde_json::to_string(state)?)?;
     }
@@ -2058,5 +2139,107 @@ mod tests {
         let (e, _) = scan_sources(&[source_uri(&lib).into()], &f, &o).unwrap();
         assert!(!e.iter().any(|(_, e)| e.path.contains("2024")), "{:?}", e.iter().map(|x| &x.1.path).collect::<Vec<_>>());
         assert!(e.iter().any(|(_, e)| e.path.contains("2023")));
+    }
+
+    /// Fails every block upload after the first `ok` ones (a dropped
+    /// connection or a crash in the middle of a run).
+    struct DiesAfter {
+        inner: LocalBackend,
+        ok: usize,
+        seen: std::sync::atomic::AtomicUsize,
+    }
+    impl Backend for DiesAfter {
+        fn describe(&self) -> String { self.inner.describe() }
+        fn list(&self) -> Result<Vec<crate::backup::RemoteFile>, AppError> { self.inner.list() }
+        fn put(&self, n: &str, d: &[u8]) -> Result<(), AppError> {
+            if n.contains(".dblock") && self.seen.fetch_add(1, Ordering::SeqCst) >= self.ok {
+                return Err(AppError::state("connection lost", "simulated"));
+            }
+            self.inner.put(n, d)
+        }
+        fn get(&self, n: &str) -> Result<Vec<u8>, AppError> { self.inner.get(n) }
+        fn delete(&self, n: &str) -> Result<(), AppError> { self.inner.delete(n) }
+        fn create_folder(&self) -> Result<(), AppError> { self.inner.create_folder() }
+    }
+
+    fn many_files(root: &Path, n: usize) {
+        for i in 0..n {
+            // Distinct, incompressible-ish content: 3 blocks per file.
+            let data: Vec<u8> = (0..3000u32).map(|j| ((j * 7919 + i as u32 * 104_729) % 251) as u8 ^ (i as u8)).collect();
+            write(root, &format!("d{}/f{i:03}.bin", i % 4), &data);
+        }
+    }
+
+    fn dlists(dir: &Path) -> usize {
+        std::fs::read_dir(dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains(".dlist")).count()
+    }
+
+    #[test]
+    fn checkpoints_replace_each_other_and_the_final_version_supersedes_them() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        many_files(src.path(), 24);
+        let be = LocalBackend::new(dst.path());
+        let db = BackupDb::open_in_memory().unwrap();
+        let o = BackupOptions { checkpoint_interval_bytes: 1, upload_concurrency: 1, compression_level: 0, verify_samples: 0, ..opts() };
+        let r = run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(r.checkpoints > 0, "{r:?}");
+        let sets = db.filesets().unwrap();
+        assert_eq!(sets.len(), 1, "only the final version is left");
+        assert!(!sets[0].partial);
+        assert_eq!(dlists(dst.path()), 1, "checkpoint file lists were deleted remotely");
+        // Off by default for short runs; 0 disables.
+        let off = BackupOptions { checkpoint_interval_secs: 0, ..o.clone() };
+        assert!(!Checkpoints::new(&off).enabled(&off) || off.checkpoint_interval_bytes > 0);
+        let none = BackupOptions { checkpoint_interval_secs: 0, checkpoint_interval_bytes: 0, ..o };
+        assert!(!Checkpoints::new(&none).enabled(&none));
+        assert!(!Checkpoints::new(&BackupOptions { dry_run: true, ..opts() }).enabled(&BackupOptions { dry_run: true, ..opts() }));
+    }
+
+    #[test]
+    fn a_run_that_dies_leaves_a_restorable_checkpoint_and_the_next_run_resumes() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        many_files(src.path(), 40);
+        let dying = DiesAfter { inner: LocalBackend::new(dst.path()), ok: 20, seen: Default::default() };
+        let db = BackupDb::open_in_memory().unwrap();
+        let o = BackupOptions { checkpoint_interval_bytes: 1, upload_concurrency: 1, hash_threads: 1, compression_level: 0, verify_samples: 0, ..opts() };
+        let r = run_backup(&dying, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        assert!(!r.errors.is_empty() && r.version.is_none(), "{r:?}");
+        assert!(r.checkpoints > 0, "{r:?}");
+        let sets = db.filesets().unwrap();
+        assert_eq!(sets.len(), 1);
+        assert!(sets[0].partial, "the checkpoint stays as a partial version");
+        assert_eq!(dlists(dst.path()), 1);
+        let saved = db.files(sets[0].id).unwrap();
+        let saved_files = saved.iter().filter(|e| e.kind == EntryKind::File).count();
+        assert!(saved_files > 0 && saved_files < 40, "{saved_files}");
+
+        // A new computer (database rebuilt from the destination) restores it.
+        let be = LocalBackend::new(dst.path());
+        let db2 = BackupDb::open_in_memory().unwrap();
+        crate::backup::maintenance::recreate_database(&be, &db2, Some("pw"), "ufop", &OpContext::new()).unwrap();
+        assert!(db2.filesets().unwrap()[0].partial);
+        let repo = Repo::open(&be, &db2, Some("pw"), &o, false, KdfParams::insecure_fast()).unwrap();
+        let rr = crate::backup::run_restore(&repo, &crate::backup::RestoreOptions { target: Some(out.path().into()), preserve_full_paths: false, ..Default::default() }, &OpContext::new()).unwrap();
+        assert!(rr.errors.is_empty(), "{:?}", rr.errors);
+        assert_eq!(rr.files_restored as usize, saved_files);
+        for e in saved.iter().filter(|e| e.kind == EntryKind::File) {
+            let name = Path::new(&e.path).file_name().unwrap().to_string_lossy().into_owned();
+            let found = walk_find(out.path(), &name).expect("restored");
+            assert_eq!(std::fs::read(found).unwrap(), std::fs::read(&e.path).unwrap());
+        }
+        drop(repo);
+
+        // The next run on the healthy destination re-uses every uploaded block.
+        let total_blocks = 40 * 3;
+        let r2 = run_backup(&be, &db, &[src.path().into()], &SourceFilter::default(), &o, &RetentionPolicy::KeepAll, Some("pw"), KdfParams::insecure_fast(), &OpContext::new()).unwrap();
+        assert!(r2.errors.is_empty(), "{:?}", r2.errors);
+        assert!(r2.version.is_some());
+        assert!(r2.new_blocks < total_blocks as u64 - saved_files as u64 * 3 + 1, "{} new blocks", r2.new_blocks);
+        let sets = db.filesets().unwrap();
+        assert_eq!((sets.len(), sets[0].partial, sets[1].partial), (2, false, true));
     }
 }

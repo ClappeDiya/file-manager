@@ -139,6 +139,12 @@ impl Backend for LayoutBackend<'_> {
     fn list_recursive(&self) -> Result<Vec<RemoteFile>, AppError> {
         self.inner.list_recursive()
     }
+    fn modified(&self, name: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        self.inner.modified(&self.physical(name))
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
 }
 
 /// `backend` seen through the layout recorded in the header of `prefix`
