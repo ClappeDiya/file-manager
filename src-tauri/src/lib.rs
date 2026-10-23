@@ -768,6 +768,7 @@ pub fn run() {
             backup_commands::backup_clear_cache,
             backup_commands::backup_get_cache_settings,
             backup_commands::backup_set_cache_settings,
+            backup_commands::backup_schedule_preview,
             backup_commands::backup_open_drive,
             backup_commands::backup_close_drive,
             backup_commands::backup_list_drives,

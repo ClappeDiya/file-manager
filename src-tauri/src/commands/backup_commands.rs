@@ -643,3 +643,11 @@ mod tests {
         assert!(confirm_mirror(mirror(false, false), None, &c).await.is_ok());
     }
 }
+
+// ── Policies, schedules and maintenance (templates, effective settings, cron) ──
+
+/// The next runs of a schedule (interval or cron), validated, with holiday skips marked.
+#[tauri::command]
+pub async fn backup_schedule_preview(schedule: crate::backup_engine::schedule::BackupSchedule, count: Option<usize>) -> Result<Vec<crate::schedule_library::PreviewRun>, AppError> {
+    schedule.preview(chrono::Utc::now(), count.unwrap_or(5))
+}

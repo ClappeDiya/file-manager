@@ -140,6 +140,26 @@ pub fn validate_cron(expr: &str) -> Result<cron::Schedule, AppError> {
     cron::Schedule::from_str(expr.trim()).map_err(|e| AppError::validation(format!("Invalid cron expression '{expr}': {e}. Use `sec min hour day month weekday [year]`, e.g. `0 30 9 * * Mon-Fri`.")))
 }
 
+/// Parse a cron expression written with 5 fields (`min hour day month
+/// weekday`, as in crontab), 6 (with seconds) or 7 (with year). Five-field
+/// expressions run at second 0. The same parser as [`validate_cron`].
+pub fn parse_cron_any(expr: &str) -> Result<cron::Schedule, AppError> {
+    let t = expr.trim();
+    if t.is_empty() {
+        return Err(AppError::validation("The cron expression is empty"));
+    }
+    if schedule_ref(t).is_some() {
+        return Err(AppError::validation(format!("'{t}' refers to a named schedule; enter its cron expression here instead")));
+    }
+    let fields = t.split_whitespace().count();
+    let full = if fields == 5 { format!("0 {t}") } else { t.to_string() };
+    cron::Schedule::from_str(&full).map_err(|e| {
+        AppError::validation(format!(
+            "Invalid cron expression '{t}': {e}. Use `min hour day month weekday` (e.g. `30 2 * * Mon-Fri`), optionally with seconds first and a year last."
+        ))
+    })
+}
+
 /// One upcoming run in a preview.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PreviewRun {

@@ -562,12 +562,20 @@ export interface BackupSchedule {
   skip_on_battery: boolean;
   /** Holiday calendars whose days off skip runs (`schedule_library`). */
   calendar_ids: string[];
+  /** Cron mode when not empty: expressions (5, 6 or 7 fields, local time) replacing start time, interval and weekdays. */
+  cron: string[];
 }
+
+/** Mirrors `hooks::HookMode`. */
+export type HookMode = "required" | "optional" | "async";
 
 export interface ScriptConfig {
   run_before: string | null;
+  /** Older flag; `before_mode` replaces it when set. */
   run_before_required: boolean;
+  before_mode?: HookMode | null;
   run_after: string | null;
+  after_mode?: HookMode | null;
   run_on_source_release: string | null;
   timeout_secs: number;
   result_format: string;
@@ -1327,8 +1335,8 @@ export function newBackupJob(): BackupJob {
       parallel_file_threshold: DEFAULT_PARALLEL_FILE_THRESHOLD,
     },
     retention: { type: "keep_all" },
-    schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [] },
-    scripts: { run_before: null, run_before_required: false, run_after: null, run_on_source_release: null, timeout_secs: 60, result_format: "json" },
+    schedule: { enabled: false, start_time: "02:00", interval_minutes: 1440, weekdays: [], skip_on_battery: false, calendar_ids: [], cron: [] },
+    scripts: { run_before: null, run_before_required: false, before_mode: null, run_after: null, after_mode: null, run_on_source_release: null, timeout_secs: 60, result_format: "json" },
     reports: {
       http_urls: [],
       http_method: "POST",
@@ -1615,8 +1623,15 @@ export const useBackupStore = create<BackupState>((set, get) => ({
 }));
 
 /** Format a schedule for display. */
+/** The pre-script's mode (maps the older `run_before_required`), like `ScriptConfig::before_mode`. */
+export function hookBeforeMode(s: ScriptConfig): HookMode {
+  return s.before_mode ?? (s.run_before_required ? "required" : "optional");
+}
+
 export function describeSchedule(s: BackupSchedule): string {
   if (!s.enabled) return "Manual only";
+  const cron = (s.cron ?? []).filter((c) => c.trim() !== "");
+  if (cron.length) return `cron ${cron.join(" | ")}`;
   const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   const every =
     s.interval_minutes % 1440 === 0

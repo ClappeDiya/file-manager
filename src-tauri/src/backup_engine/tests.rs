@@ -95,7 +95,7 @@ async fn background_backup_status_and_scheduler() {
     let m = manager(t.path()).await;
     let mut jb = job(&src, &dst);
     jb.encrypted = false;
-    jb.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, weekdays: vec![], skip_on_battery: false, calendar_ids: vec![] };
+    jb.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, ..Default::default() };
     let j = m.save_job(jb, None).await.unwrap();
 
     // Created "now": the next slot is in the future, so not due yet …
@@ -1169,7 +1169,7 @@ async fn read_only_jobs_restore_and_browse_but_never_write() {
     assert_eq!(listing(&dst), before, "nothing written, not even a lock");
     // Never scheduled.
     let mut sched = m2.get_job(&ro.id).await.unwrap();
-    sched.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, weekdays: vec![], skip_on_battery: false, calendar_ids: vec![] };
+    sched.schedule = BackupSchedule { enabled: true, start_time: "00:00".into(), interval_minutes: 60, ..Default::default() };
     m2.save_job(sched, None).await.unwrap();
     assert!(m2.due_jobs(Utc::now() + chrono::Duration::hours(3)).await.is_empty());
 }

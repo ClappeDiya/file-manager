@@ -5,6 +5,12 @@
 //! `LOG:WARN` or `LOG:ERROR` lines that become run-log entries, and are
 //! killed after their timeout. A non-zero exit from a *required* pre-script
 //! aborts the operation.
+//!
+//! Each script runs in one of three [`HookMode`]s: `required` (waits; a
+//! failure aborts), `optional` (waits; a failure is a warning) or `async`
+//! (started and not waited for: its outcome goes into the run log if the
+//! operation is still running when it ends, otherwise into the app log; the
+//! timeout still kills it in the background).
 
 use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
@@ -16,9 +22,16 @@ use std::time::Duration;
 pub struct ScriptConfig {
     /// Command line run before the operation (arguments are shell-split).
     pub run_before: Option<String>,
-    /// Abort the operation when the pre-script fails or times out.
+    /// Abort the operation when the pre-script fails or times out (older
+    /// setting; `before_mode` replaces it when set).
     pub run_before_required: bool,
+    /// How the pre-script runs (`None`: required or optional per `run_before_required`).
+    #[serde(default)]
+    pub before_mode: Option<HookMode>,
     pub run_after: Option<String>,
+    /// How the post-script runs (`None` = optional: waited for, failures logged).
+    #[serde(default)]
+    pub after_mode: Option<HookMode>,
     /// Run as soon as the backup has finished reading the sources (before
     /// uploads complete), e.g. to release a snapshot or restart a service.
     #[serde(default)]
@@ -27,6 +40,95 @@ pub struct ScriptConfig {
     pub timeout_secs: u64,
     /// `json` (default) or `text` for the result file given to post-scripts.
     pub result_format: String,
+}
+
+/// How a hook script runs relative to the operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookMode {
+    /// Wait for it; a failure or timeout aborts the operation (pre-scripts).
+    Required,
+    /// Wait for it; a failure is logged as a warning.
+    Optional,
+    /// Start it and carry on (fire-and-forget).
+    Async,
+}
+
+impl ScriptConfig {
+    /// The pre-script's mode, mapping the older `run_before_required`.
+    pub fn before_mode(&self) -> HookMode {
+        self.before_mode.unwrap_or(if self.run_before_required { HookMode::Required } else { HookMode::Optional })
+    }
+
+    /// The post-script's mode (`required` behaves as optional: the operation is over).
+    pub fn after_mode(&self) -> HookMode {
+        match self.after_mode {
+            Some(HookMode::Async) => HookMode::Async,
+            _ => HookMode::Optional,
+        }
+    }
+}
+
+/// Where an asynchronous hook's outcome goes: the run log while the
+/// operation is running ([`AsyncHookLog::close`] ends that), the app log after.
+#[derive(Clone, Default)]
+pub struct AsyncHookLog(std::sync::Arc<std::sync::Mutex<Option<Vec<LogLine>>>>);
+
+impl AsyncHookLog {
+    pub fn open() -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(Vec::new()))))
+    }
+
+    /// Deliver lines; `false` when the run log is closed (they went to the app log).
+    pub fn push(&self, lines: Vec<LogLine>) -> bool {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_mut() {
+            Some(v) => {
+                v.extend(lines);
+                true
+            }
+            None => {
+                for l in lines {
+                    match l.level {
+                        LogLevel::Error => tracing::error!(target: "ufop::backup", "async hook: {}", l.message),
+                        LogLevel::Warning => tracing::warn!(target: "ufop::backup", "async hook: {}", l.message),
+                        LogLevel::Info => tracing::info!(target: "ufop::backup", "async hook: {}", l.message),
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Lines delivered so far; later ones go to the app log.
+    pub fn close(&self) -> Vec<LogLine> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default()
+    }
+}
+
+/// Start a script without waiting for it. Its log lines and exit status
+/// go to `sink`; the timeout kills it in the background. The handle
+/// resolves to whether the outcome reached the run log.
+pub fn spawn_script(command_line: &str, env: &BTreeMap<String, String>, timeout_secs: u64, label: &str, sink: AsyncHookLog) -> tokio::task::JoinHandle<bool> {
+    let (cmd, env, label) = (command_line.to_string(), env.clone(), label.to_string());
+    tokio::spawn(async move {
+        let mut lines = match run_script(&cmd, &env, timeout_secs).await {
+            Ok(out) => {
+                let mut l = out.log.clone();
+                if out.succeeded() {
+                    l.push(LogLine::info(format!("{label} (async) finished")));
+                } else if !out.timed_out {
+                    l.push(LogLine::warn(format!("{label} (async) failed with exit code {:?}", out.exit_code)));
+                }
+                l
+            }
+            Err(e) => vec![LogLine::warn(format!("{label} (async): {}", e.user_message()))],
+        };
+        for l in &mut lines {
+            l.tag.get_or_insert_with(|| "script".into());
+        }
+        sink.push(lines)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
@@ -457,6 +559,53 @@ mod tests {
         assert!(slow.timed_out && !slow.succeeded());
         let missing = run_script("/nonexistent/script", &env, 1).await.unwrap();
         assert!(!missing.succeeded());
+    }
+
+    #[test]
+    fn hook_modes_map_the_older_flag() {
+        let mut c = ScriptConfig::default();
+        assert_eq!(c.before_mode(), HookMode::Optional);
+        c.run_before_required = true;
+        assert_eq!(c.before_mode(), HookMode::Required);
+        c.before_mode = Some(HookMode::Async);
+        assert_eq!(c.before_mode(), HookMode::Async, "the explicit mode wins");
+        assert_eq!(c.after_mode(), HookMode::Optional);
+        c.after_mode = Some(HookMode::Required);
+        assert_eq!(c.after_mode(), HookMode::Optional);
+        // Old JSON without modes still parses.
+        let old: ScriptConfig = serde_json::from_str(r#"{"run_before":"x","run_before_required":true}"#).unwrap();
+        assert_eq!(old.before_mode(), HookMode::Required);
+        let new: ScriptConfig = serde_json::from_str(r#"{"run_before":"x","before_mode":"async"}"#).unwrap();
+        assert_eq!(new.before_mode(), HookMode::Async);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_hooks_do_not_block_and_log_late() {
+        let env = BTreeMap::new();
+        // Delivered to the run log while it is open.
+        let sink = AsyncHookLog::open();
+        let started = std::time::Instant::now();
+        let h = spawn_script("sh -c 'sleep 0.3; echo LOG:INFO done'", &env, 5, "Pre-backup script", sink.clone());
+        assert!(started.elapsed() < std::time::Duration::from_millis(200), "spawning does not wait");
+        assert!(h.await.unwrap());
+        let lines = sink.close();
+        assert!(lines.iter().any(|l| l.message == "script: done"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.message.contains("(async) finished")));
+
+        // Run already over: the outcome goes to the app log instead.
+        let sink = AsyncHookLog::open();
+        let h = spawn_script("sh -c 'sleep 0.2; exit 4'", &env, 5, "Post-backup script", sink.clone());
+        assert!(sink.close().is_empty());
+        assert!(!h.await.unwrap());
+
+        // The timeout still kills it in the background.
+        let sink = AsyncHookLog::open();
+        let started = std::time::Instant::now();
+        let h = spawn_script("sleep 30", &env, 1, "Pre-backup script", sink.clone());
+        assert!(h.await.unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(sink.close().iter().any(|l| l.message.contains("timed out")));
     }
 
     #[tokio::test]

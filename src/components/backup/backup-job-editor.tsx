@@ -2,7 +2,6 @@
  * Backup job editor: a stepped setup wizard that also serves as the editor
  * for existing jobs. Every field maps 1:1 onto the Rust `BackupJob`.
  */
-import { HolidayCalendarPicker } from "@/components/schedule-pickers";
 import { useEffect, useMemo, useState } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
@@ -12,6 +11,8 @@ import {
   type BackupDestination,
   type BackupJob,
   type FilterRule,
+  type HookMode,
+  hookBeforeMode,
   type PassphraseStrength,
   type SavedDestination,
   type SourcePreview,
@@ -29,6 +30,7 @@ import { JobSecretProviders } from "./backup-secret-providers";
 import { PhotosSourceSection } from "./backup-photos-source";
 import { AdvancedOnly } from "./advanced-only";
 import { BackupChangePassphrase } from "./backup-repository-format";
+import { ScheduleEditor } from "./backup-schedule-editor";
 
 interface ConnectionProfile {
   id: string;
@@ -40,7 +42,6 @@ interface ConnectionProfile {
 
 const STEPS = ["General", "Sources", "Destination", "Schedule", "Retention", "Options", "Hooks"] as const;
 type Step = (typeof STEPS)[number];
-const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 
 
@@ -437,49 +438,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
 
         {step === "Schedule" && (
           <Section title="Schedule" hint="Times are local; runs missed while the app was closed start as soon as it is running again.">
-            <Check label="Run automatically" checked={job.schedule.enabled} onChange={(v) => patch({ schedule: { ...job.schedule, enabled: v } })} />
-            <div className="grid grid-cols-2 gap-2">
-              <Field label="Start time">
-                <input className={inputCls} type="time" value={job.schedule.start_time} onChange={(e) => patch({ schedule: { ...job.schedule, start_time: e.target.value } })} />
-              </Field>
-              <Field label="Repeat">
-                <select className={inputCls} value={job.schedule.interval_minutes} onChange={(e) => patch({ schedule: { ...job.schedule, interval_minutes: Number(e.target.value) } })}>
-                  {[
-                    [15, "Every 15 minutes"],
-                    [60, "Hourly"],
-                    [360, "Every 6 hours"],
-                    [720, "Every 12 hours"],
-                    [1440, "Daily"],
-                    [10080, "Weekly"],
-                    [43200, "Every 30 days"],
-                  ].map(([v, l]) => (
-                    <option key={v} value={v}>{l}</option>
-                  ))}
-                </select>
-              </Field>
-            </div>
-            <div className="flex gap-2 flex-wrap text-xs">
-              {WEEKDAYS.map((d, i) => (
-                <label key={d} className="flex items-center gap-1">
-                  <input
-                    type="checkbox"
-                    checked={job.schedule.weekdays.length === 0 || job.schedule.weekdays.includes(i)}
-                    onChange={(e) => {
-                      const all = job.schedule.weekdays.length === 0 ? [0, 1, 2, 3, 4, 5, 6] : job.schedule.weekdays;
-                      const next = e.target.checked ? [...new Set([...all, i])].sort() : all.filter((x) => x !== i);
-                      patch({ schedule: { ...job.schedule, weekdays: next.length === 7 ? [] : next } });
-                    }}
-                  />
-                  {d}
-                </label>
-              ))}
-            </div>
-            <HolidayCalendarPicker value={job.schedule.calendar_ids ?? []} onChange={(ids) => patch({ schedule: { ...job.schedule, calendar_ids: ids } })} />
-            <Check
-              label="Skip scheduled runs while on battery"
-              checked={job.schedule.skip_on_battery}
-              onChange={(v) => patch({ schedule: { ...job.schedule, skip_on_battery: v } })}
-            />
+            <ScheduleEditor value={job.schedule} onChange={(schedule) => patch({ schedule })} />
             <Check label="Keep the computer awake while backing up" checked={job.prevent_sleep} onChange={(v) => patch({ prevent_sleep: v })} />
           </Section>
         )}
@@ -596,9 +555,29 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
               <Field label="Before backup">
                 <input className={`${inputCls} font-mono`} value={job.scripts.run_before ?? ""} onChange={(e) => patch({ scripts: { ...job.scripts, run_before: e.target.value || null } })} />
               </Field>
-              <Check label="Required — abort the backup if this script fails" checked={job.scripts.run_before_required} onChange={(v) => patch({ scripts: { ...job.scripts, run_before_required: v } })} />
+              <Field label="Before-backup mode" hint="Async starts the script and backs up without waiting; its result appears in the run log if it ends during the backup, otherwise in the app log.">
+                <select
+                  className={inputCls}
+                  data-testid="hook-before-mode"
+                  value={hookBeforeMode(job.scripts)}
+                  onChange={(e) => {
+                    const mode = e.target.value as HookMode;
+                    patch({ scripts: { ...job.scripts, before_mode: mode, run_before_required: mode === "required" } });
+                  }}
+                >
+                  <option value="required">Required — abort the backup if it fails</option>
+                  <option value="optional">Optional — wait, then continue even if it fails</option>
+                  <option value="async">Async — start it and don&apos;t wait</option>
+                </select>
+              </Field>
               <Field label="After backup" hint="UFOP_PARSED_RESULT holds success/warning/error; UFOP_RESULTFILE points at the result.">
                 <input className={`${inputCls} font-mono`} value={job.scripts.run_after ?? ""} onChange={(e) => patch({ scripts: { ...job.scripts, run_after: e.target.value || null } })} />
+              </Field>
+              <Field label="After-backup mode">
+                <select className={inputCls} data-testid="hook-after-mode" value={job.scripts.after_mode === "async" ? "async" : "optional"} onChange={(e) => patch({ scripts: { ...job.scripts, after_mode: e.target.value as HookMode } })}>
+                  <option value="optional">Wait for it</option>
+                  <option value="async">Async — start it and don&apos;t wait</option>
+                </select>
               </Field>
               <Field label="When sources are released" hint="Runs once all files are read, before uploads finish — e.g. to drop a snapshot or restart a service.">
                 <input className={`${inputCls} font-mono`} value={job.scripts.run_on_source_release ?? ""} onChange={(e) => patch({ scripts: { ...job.scripts, run_on_source_release: e.target.value || null } })} />

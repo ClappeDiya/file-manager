@@ -2063,13 +2063,24 @@ impl BackupManager {
         let _awake = job.prevent_sleep.then(|| power::SleepInhibitor::acquire(&format!("UFOP {op_name}: {}", job.name)));
         let is_backup = matches!(op, BackupOperation::Backup { .. });
 
+        // Asynchronous hooks report here while the operation runs.
+        let async_log = hooks::AsyncHookLog::open();
         if is_backup {
             if let Some(cmd) = job.scripts.run_before.as_deref().filter(|c| !c.trim().is_empty()) {
-                let out = hooks::run_script(cmd, &Self::script_env(&job, op_name, "BEFORE"), job.scripts.timeout_secs).await?;
-                log.extend(out.log.clone());
-                if job.scripts.run_before_required && !out.succeeded() {
-                    let err = AppError::state("The required pre-backup script failed", "Fix the script or make it optional.");
-                    return self.record(&job, op_name, started, Err(err), log).await;
+                let env = Self::script_env(&job, op_name, "BEFORE");
+                match job.scripts.before_mode() {
+                    hooks::HookMode::Async => {
+                        hooks::spawn_script(cmd, &env, job.scripts.timeout_secs, "Pre-backup script", async_log.clone());
+                        log.push(LogLine::info("Pre-backup script started (async, not waited for)").tagged("script"));
+                    }
+                    mode => {
+                        let out = hooks::run_script(cmd, &env, job.scripts.timeout_secs).await?;
+                        log.extend(out.log.clone());
+                        if mode == hooks::HookMode::Required && !out.succeeded() {
+                            let err = AppError::state("The required pre-backup script failed", "Fix the script or make it optional.");
+                            return self.record(&job, op_name, started, Err(err), log).await;
+                        }
+                    }
                 }
             }
         }
@@ -2153,6 +2164,7 @@ impl BackupManager {
         .await;
 
         log.append(&mut lock(&release_log));
+        log.extend(async_log.close());
         if cancel.load(Ordering::SeqCst) {
             log.push(LogLine::warn("Operation was cancelled"));
         }
@@ -2202,10 +2214,21 @@ impl BackupManager {
                 if std::fs::write(&rf, body).is_ok() {
                     env.insert("UFOP_RESULTFILE".into(), rf.to_string_lossy().into_owned());
                 }
-                if let Ok(out) = hooks::run_script(cmd, &env, job.scripts.timeout_secs).await {
-                    log.extend(out.log);
+                if job.scripts.after_mode() == hooks::HookMode::Async {
+                    // The run ends now: the outcome goes to the app log; the
+                    // result file is removed once the script is done with it.
+                    let h = hooks::spawn_script(cmd, &env, job.scripts.timeout_secs, "Post-backup script", hooks::AsyncHookLog::default());
+                    tokio::spawn(async move {
+                        let _ = h.await;
+                        let _ = std::fs::remove_file(rf);
+                    });
+                    log.push(LogLine::info("Post-backup script started (async, not waited for)").tagged("script"));
+                } else {
+                    if let Ok(out) = hooks::run_script(cmd, &env, job.scripts.timeout_secs).await {
+                        log.extend(out.log);
+                    }
+                    let _ = std::fs::remove_file(rf);
                 }
-                let _ = std::fs::remove_file(rf);
             }
         }
 
@@ -2281,7 +2304,7 @@ impl BackupManager {
                 summary: summary.clone(),
                 report: data,
                 stats,
-                schedule_interval_minutes: job.schedule.enabled.then_some(job.schedule.interval_minutes),
+                schedule_interval_minutes: job.schedule.enabled.then(|| job.schedule.nominal_interval_minutes()),
             });
         }
         for f in hooks::send_reports(&job.reports, &status, &vars, payload).await {
@@ -3058,3 +3081,5 @@ fn dispatch(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_policy;

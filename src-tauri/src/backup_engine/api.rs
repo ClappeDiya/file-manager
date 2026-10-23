@@ -258,6 +258,7 @@ pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<V
         "backup_clear_cache" => ok(mgr.clear_cache().await?),
         "backup_get_cache_settings" => ok(mgr.cache_settings().await?),
         "backup_set_cache_settings" => ok(mgr.set_cache_settings(arg(a, "settings")?).await?),
+        "backup_schedule_preview" => ok(arg::<super::schedule::BackupSchedule>(a, "schedule")?.preview(chrono::Utc::now(), opt(a, "count")?.unwrap_or(5))?),
         other => Err(AppError::validation(format!("Unknown command '{other}'"))),
     }
 }
@@ -275,5 +276,5 @@ pub const COMMANDS: &[&str] = &[
     "backup_photos_libraries", "backup_photos_library_info", "backup_lock_status", "backup_break_lock", "backup_set_database_encryption",
     "backup_list_sources", "backup_preview_retention", "backup_set_version_metadata", "backup_run_all", "backup_estimate",
     "backup_resolve_version", "backup_read_file", "backup_export_file", "backup_cache_stats", "backup_clear_cache",
-    "backup_get_cache_settings", "backup_set_cache_settings",
+    "backup_get_cache_settings", "backup_set_cache_settings", "backup_schedule_preview",
 ];
