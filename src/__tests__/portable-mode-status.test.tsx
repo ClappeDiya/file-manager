@@ -8,7 +8,8 @@ import { render, screen } from "@testing-library/react";
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { PortableModeBadge, PortableModeDetails, usePortableStatus, type PortableStatus } from "@/components/portable-mode-status";
+import { PortableModeBadge, PortableModeDetails } from "@/components/portable-mode-status";
+import { usePortableStatus, type PortableStatus } from "@/hooks/use-portable-status";
 
 const ON: PortableStatus = {
   enabled: true,

@@ -24,7 +24,8 @@ import { FleetAgentSection } from "@/components/fleet-agent-section";
 import { DiagnosticsSection } from "@/components/diagnostics-section";
 import { ManagedSettingsNotice } from "@/components/managed-settings-notice";
 import { FleetAgentLimits } from "@/components/fleet-agent-limits";
-import { PortableModeBadge, PortableModeDetails, usePortableStatus } from "@/components/portable-mode-status";
+import { PortableModeBadge, PortableModeDetails } from "@/components/portable-mode-status";
+import { usePortableStatus } from "@/hooks/use-portable-status";
 
 // ── Types ──
 

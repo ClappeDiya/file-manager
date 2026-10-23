@@ -4,19 +4,7 @@
  * the folders and where credentials are stored. Mirrors Rust
  * `paths::PortableStatus` (`get_portable_status`).
  */
-import { useEffect, useState } from "react";
-import { tauriInvokeSafe } from "@/hooks/use-tauri";
-
-export interface PortableStatus {
-  enabled: boolean;
-  root: string | null;
-  source: "env" | "config_file" | "marker" | null;
-  data_dir: string;
-  config_dir: string;
-  cache_dir: string;
-  /** `keychain`, `vault_file` (portable) or `memory` (this session only). */
-  credential_store: "keychain" | "vault_file" | "memory" | string;
-}
+import type { PortableStatus } from "@/hooks/use-portable-status";
 
 const SOURCE_LABEL: Record<string, string> = {
   env: "UFOP_PORTABLE_DIR",
@@ -29,20 +17,6 @@ const CREDENTIALS_LABEL: Record<string, string> = {
   vault_file: "the encrypted vault file in the portable folder",
   memory: "memory only (until the app quits)",
 };
-
-export function usePortableStatus(): PortableStatus | null {
-  const [status, setStatus] = useState<PortableStatus | null>(null);
-  useEffect(() => {
-    let live = true;
-    void tauriInvokeSafe<PortableStatus | null>("get_portable_status", undefined, null).then((s) => {
-      if (live) setStatus(s);
-    });
-    return () => {
-      live = false;
-    };
-  }, []);
-  return status;
-}
 
 /** "Portable mode: on (path)" — rendered only when portable mode is on. */
 export function PortableModeBadge({ status }: { status: PortableStatus | null }) {
