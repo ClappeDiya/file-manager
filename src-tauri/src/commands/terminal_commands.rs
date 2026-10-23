@@ -337,9 +337,9 @@ fn validate_ssh_token(kind: &str, value: &str, allow_colon: bool) -> Result<(), 
 
 /// Create a new remote terminal session by running the system `ssh` client on
 /// a PTY, so keys, agents, known_hosts and password prompts all behave as usual.
-#[tauri::command]
 // Each IPC argument is a named parameter of the command.
 #[allow(clippy::too_many_arguments)]
+#[tauri::command]
 pub async fn terminal_create_remote(
     host: String,
     port: u16,
