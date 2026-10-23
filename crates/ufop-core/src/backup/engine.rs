@@ -1139,7 +1139,7 @@ fn compress_level(path: &Path, opts: &BackupOptions) -> u32 {
     }
 }
 
-fn unchanged(prev: &FileEntry, cur: &FileEntry, opts: &BackupOptions) -> bool {
+pub(crate) fn unchanged(prev: &FileEntry, cur: &FileEntry, opts: &BackupOptions) -> bool {
     if opts.disable_timestamp_check || prev.kind != EntryKind::File || prev.mtime.is_none() {
         return false;
     }

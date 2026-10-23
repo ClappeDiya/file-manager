@@ -28,6 +28,7 @@ pub mod crypto;
 pub mod db;
 pub mod engine;
 pub mod errors;
+pub mod estimate;
 pub mod filecrypt;
 pub mod filters;
 pub mod format;
