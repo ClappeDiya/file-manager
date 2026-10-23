@@ -101,7 +101,8 @@ export const useNotifyStore = create<NotifyState>((set, get) => ({
   loadProfiles: async () => {
     if (!isBackendAvailable()) return;
     try {
-      set({ profiles: await tauriInvoke<NotificationProfile[]>("backup_list_notification_profiles"), error: null });
+      const list = await tauriInvoke<NotificationProfile[] | null>("backup_list_notification_profiles", undefined, []);
+      set({ profiles: Array.isArray(list) ? list : [], error: null });
     } catch (e) {
       set({ error: String((e as { message?: string })?.message ?? e) });
     }
