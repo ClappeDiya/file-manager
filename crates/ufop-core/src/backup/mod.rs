@@ -28,6 +28,7 @@ pub mod cache;
 pub mod chunker;
 pub mod copy;
 pub mod crypto;
+pub mod davserve;
 pub mod db;
 pub mod engine;
 pub mod errors;

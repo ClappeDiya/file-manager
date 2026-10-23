@@ -24,5 +24,6 @@ pub mod preload;
 pub mod retry;
 pub mod session;
 pub mod stability;
+pub mod webdav;
 pub mod sync;
 pub mod sync_types;
