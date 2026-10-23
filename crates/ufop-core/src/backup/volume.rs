@@ -360,19 +360,107 @@ pub fn read_block_volume(payload: &[u8]) -> Result<HashMap<String, Vec<u8>>, App
         let flag = take(&mut p, 1)?[0];
         let len = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
         let d = take(&mut p, len)?;
-        let raw = match flag {
-            0 => d.to_vec(),
-            1 => {
-                let mut v = Vec::new();
-                DeflateDecoder::new(d).read_to_end(&mut v).map_err(|_| corrupt())?;
-                v
-            }
-            2 => zstd_decode(d, MAX_BLOCK).map_err(|_| corrupt())?,
-            _ => return Err(corrupt()),
-        };
-        out.insert(h, raw);
+        out.insert(h, decode_block(flag, d).map_err(|_| corrupt())?);
     }
     Ok(out)
+}
+
+/// Decompress one UFOP pack entry stored with `flag` (0 stored, 1 deflate,
+/// 2 zstd), as written by [`encode_block`].
+pub fn decode_block(flag: u8, data: &[u8]) -> Result<Vec<u8>, AppError> {
+    let corrupt = || AppError::transfer("Block volume is corrupt", "Run Verify and Repair on this backup.");
+    Ok(match flag {
+        0 => data.to_vec(),
+        1 => {
+            let mut v = Vec::new();
+            DeflateDecoder::new(data).read_to_end(&mut v).map_err(|_| corrupt())?;
+            v
+        }
+        2 => zstd_decode(data, MAX_BLOCK).map_err(|_| corrupt())?,
+        _ => return Err(corrupt()),
+    })
+}
+
+/// One entry of a block volume as stored (before decompression).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredBlock {
+    pub hash: String,
+    /// `stored`, `deflate`, `zstd` (UFOP packs) or the ZIP entry method.
+    pub codec: String,
+    /// Bytes on the destination (inside the sealed volume).
+    pub stored_size: u64,
+    /// Bytes after decompression (ZIP: from the entry header; UFOP: decoded).
+    pub size: u64,
+}
+
+/// Name of a UFOP pack entry flag.
+pub fn block_flag_name(flag: u8) -> &'static str {
+    match flag {
+        0 => "stored",
+        1 => "deflate",
+        2 => "zstd",
+        _ => "unknown",
+    }
+}
+
+/// The entries of a dblock payload with their codec and stored size,
+/// without keeping the decompressed data (UFOP packs are decoded to learn
+/// the raw size; ZIP volumes report it from the entry headers).
+pub fn list_block_volume(payload: &[u8]) -> Result<Vec<StoredBlock>, AppError> {
+    if payload.starts_with(b"PK\x03\x04") || payload.starts_with(b"PK\x05\x06") {
+        let corrupt = |_| AppError::transfer("ZIP block volume is corrupt", "Run Verify and Repair on this backup.");
+        let mut a = zip::ZipArchive::new(std::io::Cursor::new(payload)).map_err(corrupt)?;
+        let mut out = Vec::with_capacity(a.len());
+        for i in 0..a.len() {
+            let f = a.by_index_raw(i).map_err(corrupt)?;
+            out.push(StoredBlock { hash: f.name().to_string(), codec: f.compression().to_string().to_ascii_lowercase(), stored_size: f.compressed_size(), size: f.size() });
+        }
+        return Ok(out);
+    }
+    let corrupt = || AppError::transfer("Block volume is corrupt", "Run Verify and Repair on this backup.");
+    let count = u32::from_le_bytes(payload.get(..4).ok_or_else(corrupt)?.try_into().map_err(|_| corrupt())?) as usize;
+    if count > payload.len() / 6 {
+        return Err(corrupt());
+    }
+    let mut p = 4usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let hl = *payload.get(p).ok_or_else(corrupt)? as usize;
+        let h = std::str::from_utf8(payload.get(p + 1..p + 1 + hl).ok_or_else(corrupt)?).map_err(|_| corrupt())?.to_string();
+        p += 1 + hl;
+        let flag = *payload.get(p).ok_or_else(corrupt)?;
+        let len = u32::from_le_bytes(payload.get(p + 1..p + 5).ok_or_else(corrupt)?.try_into().map_err(|_| corrupt())?) as usize;
+        p += 5;
+        let d = payload.get(p..p + len).ok_or_else(corrupt)?;
+        p += len;
+        let size = decode_block(flag, d)?.len() as u64;
+        out.push(StoredBlock { hash: h, codec: block_flag_name(flag).into(), stored_size: len as u64, size });
+    }
+    Ok(out)
+}
+
+/// The stored (still compressed) bytes and flag of block `hash` in a UFOP
+/// pack payload; `None` when absent or when the volume is a ZIP archive.
+pub fn raw_block_entry(payload: &[u8], hash: &str) -> Option<(u8, Vec<u8>)> {
+    if payload.starts_with(b"PK") {
+        return None;
+    }
+    let count = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?) as usize;
+    let mut p = 4usize;
+    for _ in 0..count.min(payload.len() / 6) {
+        let hl = *payload.get(p)? as usize;
+        let h = payload.get(p + 1..p + 1 + hl)?;
+        p += 1 + hl;
+        let flag = *payload.get(p)?;
+        let len = u32::from_le_bytes(payload.get(p + 1..p + 5)?.try_into().ok()?) as usize;
+        p += 5;
+        let d = payload.get(p..p + len)?;
+        p += len;
+        if h == hash.as_bytes() {
+            return Some((flag, d.to_vec()));
+        }
+    }
+    None
 }
 
 /// dindex payload: which blocks a dblock contains.

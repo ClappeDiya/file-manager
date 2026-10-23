@@ -24,6 +24,7 @@
 pub mod access;
 pub mod archive;
 pub mod backend;
+pub mod bench;
 pub mod cache;
 pub mod chunker;
 pub mod copy;
@@ -38,6 +39,7 @@ pub mod filters;
 pub mod format;
 pub mod gpg;
 pub mod ignore;
+pub mod inspect;
 pub mod layout;
 pub mod lock;
 pub mod maintenance;
