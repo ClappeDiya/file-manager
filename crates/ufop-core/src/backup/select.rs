@@ -93,6 +93,23 @@ impl VersionSelector {
         }
     }
 
+    /// From query parameters or CLI flags: `time` ("as of") wins over
+    /// `version` (`latest`, `oldest`, a number or a version id); neither =
+    /// the newest version. `allow_partial` applies to latest/oldest/time.
+    pub fn from_parts(version: Option<&str>, time: Option<&str>, allow_partial: bool) -> Result<Self, AppError> {
+        if let Some(t) = time.filter(|t| !t.trim().is_empty()) {
+            return Self::as_of(t, allow_partial);
+        }
+        match version.filter(|v| !v.trim().is_empty()) {
+            None => Ok(Self::Index { index: 0 }),
+            Some(v) => Ok(match Self::parse(v)? {
+                Self::Latest { .. } => Self::Latest { allow_partial },
+                Self::Oldest { .. } => Self::Oldest { allow_partial },
+                other => other,
+            }),
+        }
+    }
+
     /// `as_of` from a user-typed time (see [`parse_time`]).
     pub fn as_of(s: &str, allow_partial: bool) -> Result<Self, AppError> {
         Ok(Self::AsOf { time: parse_time(s)?, allow_partial })
@@ -230,6 +247,11 @@ mod tests {
         assert_eq!(VersionSelector::parse("3").unwrap(), VersionSelector::Index { index: 3 });
         assert_eq!(VersionSelector::parse("2026-10-01T09:00:00Z").unwrap(), VersionSelector::Id { id: "2026-10-01T09:00:00Z".into() });
         assert!(VersionSelector::parse(" ").is_err());
+        assert_eq!(VersionSelector::from_parts(None, None, false).unwrap(), VersionSelector::Index { index: 0 });
+        assert_eq!(VersionSelector::from_parts(Some("oldest"), None, true).unwrap(), VersionSelector::Oldest { allow_partial: true });
+        assert_eq!(VersionSelector::from_parts(Some("2"), Some(""), false).unwrap(), VersionSelector::Index { index: 2 });
+        assert!(matches!(VersionSelector::from_parts(Some("2"), Some("2026-10-01T09:00:00Z"), false).unwrap(), VersionSelector::AsOf { .. }), "time wins");
+        assert!(VersionSelector::from_parts(None, Some("garbage"), false).is_err());
     }
 
     #[test]

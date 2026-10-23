@@ -96,7 +96,7 @@ fn fail(msg: &str) -> ! {
 }
 
 impl RepoArgs {
-    fn passphrase(&self) -> Option<String> {
+    pub(super) fn passphrase(&self) -> Option<String> {
         if self.no_encryption {
             return None;
         }
@@ -110,7 +110,7 @@ impl RepoArgs {
         raw.filter(|p| !p.is_empty()).map(|p| crate::secrets::resolve(&p, &self.secret_providers).unwrap_or_else(|e| fail(&e)))
     }
 
-    fn db_path(&self) -> PathBuf {
+    pub(super) fn db_path(&self) -> PathBuf {
         self.dbpath.clone().unwrap_or_else(|| {
             let h = ufop_core::backup::hash_file_name_key(&format!("{}|{}", self.dest, self.prefix));
             dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("ufop").join("cli-backups").join(format!("{h}.sqlite"))
@@ -129,13 +129,13 @@ impl RepoArgs {
     }
 
     /// Apply `--source-id` to an opened database.
-    fn apply_source(&self, db: &BackupDb) {
+    pub(super) fn apply_source(&self, db: &BackupDb) {
         if let Some(s) = ufop_core::backup::shared::selector_scope(self.source_id.as_deref()) {
             db.set_scope(s);
         }
     }
 
-    fn options(&self) -> BackupOptions {
+    pub(super) fn options(&self) -> BackupOptions {
         BackupOptions {
             prefix: self.prefix.clone(),
             identity: self.identity(),
@@ -147,7 +147,7 @@ impl RepoArgs {
     }
 
     /// The destination, read-only when `--read-only` is given.
-    fn backend(&self) -> Box<dyn Backend> {
+    pub(super) fn backend(&self) -> Box<dyn Backend> {
         let b = LocalBackend::new(&self.dest);
         if self.read_only {
             Box::new(ReadOnlyBackend::new(b))
@@ -167,7 +167,7 @@ impl RepoArgs {
 
     /// Open the local database as `--db-key-source` says; an encrypted
     /// database whose key is missing is set aside and rebuilt from `be`.
-    fn open_db(&self, be: &dyn Backend, ctx: &OpContext) -> Result<BackupDb, ufop_core::error::AppError> {
+    pub(super) fn open_db(&self, be: &dyn Backend, ctx: &OpContext) -> Result<BackupDb, ufop_core::error::AppError> {
         let (key, encrypt) = self.db_key()?;
         let o = maintenance::JobDbOptions { key: key.as_ref(), encrypt };
         let (db, notices) = maintenance::open_job_db(&self.db_path(), &o, Some(be), self.passphrase().as_deref(), &self.prefix, ctx)?;
@@ -179,7 +179,7 @@ impl RepoArgs {
     }
 
     /// Run `f` under the repository lock `kind` (none: no lock).
-    fn locked<T>(&self, be: &dyn Backend, kind: Option<LockKind>, op: &str, ctx: &OpContext, f: impl FnOnce() -> Result<T, ufop_core::error::AppError>) -> Result<T, ufop_core::error::AppError> {
+    pub(super) fn locked<T>(&self, be: &dyn Backend, kind: Option<LockKind>, op: &str, ctx: &OpContext, f: impl FnOnce() -> Result<T, ufop_core::error::AppError>) -> Result<T, ufop_core::error::AppError> {
         let Some(kind) = kind else { return f() };
         let (v, warnings) = repo_lock::with_lock(be, &self.prefix, kind, op, &self.lock_options(), ctx, f)?;
         for w in warnings {
@@ -1018,8 +1018,9 @@ pub enum BackupCommands {
         repo: RepoArgs,
         /// Paths/folders/wildcards to restore (default: everything)
         paths: Vec<String>,
-        #[arg(long, default_value_t = 0)]
-        version: usize,
+        /// Version: a number (0 = newest), latest, oldest, or a version's timestamp
+        #[arg(long, default_value = "0")]
+        version: String,
         /// Restore below this folder instead of the original location
         #[arg(long)]
         target: Option<PathBuf>,
@@ -1055,6 +1056,51 @@ pub enum BackupCommands {
         /// Do not re-apply extended attributes / Windows attributes
         #[arg(long)]
         no_metadata: bool,
+        #[command(flatten)]
+        extra: super::backup_access::RestoreExtraArgs,
+    },
+    /// Write one backed-up file to standard output
+    Cat {
+        #[command(flatten)]
+        repo: RepoArgs,
+        /// Backed-up path of the file
+        path: String,
+        #[command(flatten)]
+        version: super::backup_access::VersionArgs,
+        /// Start at this byte
+        #[arg(long)]
+        offset: Option<u64>,
+        /// Write at most this many bytes
+        #[arg(long)]
+        length: Option<u64>,
+        #[command(flatten)]
+        cache: super::backup_access::CacheArgs,
+    },
+    /// Serve a version (or every version) as a read-only WebDAV drive until Ctrl-C
+    Mount {
+        #[command(flatten)]
+        repo: RepoArgs,
+        #[command(flatten)]
+        version: super::backup_access::VersionArgs,
+        /// Every version as a folder named by its date and time
+        #[arg(long)]
+        all: bool,
+        /// Address to listen on (default: this computer only)
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Port (0 = any free port)
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Stop after this many seconds instead of waiting for Ctrl-C
+        #[arg(long, hide = true)]
+        seconds: Option<u64>,
+        #[command(flatten)]
+        cache: super::backup_access::CacheArgs,
+    },
+    /// The local volume cache used by cat, mount and --use-cache restores
+    Cache {
+        #[command(subcommand)]
+        cmd: super::backup_access::CacheCommands,
     },
     /// Rebuild missing block volumes from the source files on this computer
     RebuildMissing {
@@ -1246,7 +1292,7 @@ pub fn parse_retention(keep_versions: Option<u32>, keep_days: Option<u32>, polic
     }
 }
 
-fn progress_ctx(format: &OutputFormat) -> OpContext {
+pub(super) fn progress_ctx(format: &OutputFormat) -> OpContext {
     let ctx = OpContext::new();
     let human = matches!(format, OutputFormat::Human);
     if human {
@@ -1263,7 +1309,7 @@ fn progress_ctx(format: &OutputFormat) -> OpContext {
 }
 
 /// Send an operation's warnings and errors to the console/file log.
-fn log_outcome(op: &str, warnings: &[String], errors: &[String]) {
+pub(super) fn log_outcome(op: &str, warnings: &[String], errors: &[String]) {
     for w in warnings {
         tracing::warn!(target: "ufop::backup", "{op}: {w}");
     }
@@ -1289,7 +1335,7 @@ fn cancel_on_ctrl_c(ctx: OpContext) {
     }
 }
 
-fn emit<T: serde::Serialize>(format: &OutputFormat, title: &str, v: &T) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) fn emit<T: serde::Serialize>(format: &OutputFormat, title: &str, v: &T) -> Result<(), Box<dyn std::error::Error>> {
     match format {
         OutputFormat::Human => {
             eprint!("\r\x1b[2K");
@@ -1302,10 +1348,21 @@ fn emit<T: serde::Serialize>(format: &OutputFormat, title: &str, v: &T) -> Resul
 }
 
 /// Open the repository under a lock of `kind` and run `f`.
-fn with_repo<T>(
+pub(super) fn with_repo<T>(
     repo: &RepoArgs,
     kind: LockKind,
     op: &str,
+    f: impl FnOnce(&Repo, &BackupDb) -> Result<T, ufop_core::error::AppError>,
+) -> Result<T, ufop_core::error::AppError> {
+    with_repo_cache(repo, kind, op, None, f)
+}
+
+/// [`with_repo`] reading volumes through a local volume cache.
+pub(super) fn with_repo_cache<T>(
+    repo: &RepoArgs,
+    kind: LockKind,
+    op: &str,
+    cache: Option<std::sync::Arc<ufop_core::backup::cache::VolumeCache>>,
     f: impl FnOnce(&Repo, &BackupDb) -> Result<T, ufop_core::error::AppError>,
 ) -> Result<T, ufop_core::error::AppError> {
     let be = repo.backend();
@@ -1313,7 +1370,7 @@ fn with_repo<T>(
     repo.locked(be.as_ref(), Some(kind), op, &ctx, || {
         let db = repo.open_db(be.as_ref(), &ctx)?;
         let pass = repo.passphrase();
-        let r = Repo::open(be.as_ref(), &db, pass.as_deref(), &repo.options(), false, KdfParams::default())?;
+        let r = Repo::open(be.as_ref(), &db, pass.as_deref(), &repo.options(), false, KdfParams::default())?.with_cache(cache);
         repo.apply_source(&db);
         f(&r, &db)
     })
@@ -1637,19 +1694,21 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
         }),
         BackupCommands::Restore {
             repo, paths, version, target, conflict, restore_permissions, preserve_full_paths, skip_verify, versions, unique, use_local_blocks,
-            download_threads, file_threads, legacy, tempdir, skip_free_space_check, no_metadata,
+            download_threads, file_threads, legacy, tempdir, skip_free_space_check, no_metadata, extra,
         } => {
             let conflict = match conflict.as_str() {
                 "rename" => ConflictPolicy::Rename,
                 "skip" => ConflictPolicy::Skip,
                 _ => ConflictPolicy::Overwrite,
             };
-            let opts = RestoreOptions {
-                version, versions, unique_versions: unique, paths, target, conflict, restore_permissions, preserve_full_paths, skip_verify, dry_run,
+            let mut opts = RestoreOptions {
+                versions, unique_versions: unique, paths, target, conflict, restore_permissions, preserve_full_paths, skip_verify, dry_run,
                 use_local_blocks, download_threads, file_threads, legacy, temp_dir: tempdir, skip_free_space_check, restore_metadata: !no_metadata,
                 source: repo.source_id.clone(),
                 ..Default::default()
             };
+            extra.apply(&version, &mut opts)?;
+            let cache = extra.cache()?;
             // No local database? Rebuild a temporary one from the destination.
             let needs_recreate = !repo.db_path().exists();
             let be = repo.backend();
@@ -1660,13 +1719,26 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
                 if needs_recreate {
                     maintenance::recreate_database(be.as_ref(), &db, pass.as_deref(), &repo.prefix, &OpContext::new())?;
                 }
-                let r = Repo::open(be.as_ref(), &db, pass.as_deref(), &repo.options(), false, KdfParams::default())?;
+                let r = Repo::open(be.as_ref(), &db, pass.as_deref(), &repo.options(), false, KdfParams::default())?.with_cache(cache);
+                if opts.delete_extraneous && !opts.dry_run {
+                    // List what the mirror deletes and ask first.
+                    let plan = run_restore(&r, &RestoreOptions { dry_run: true, ..opts.clone() }, &OpContext::new())?;
+                    if !super::backup_access::confirm_mirror(&plan.planned_deletions, extra.yes)? {
+                        return Err(ufop_core::error::AppError::state("Mirror restore cancelled", "Nothing was restored or deleted."));
+                    }
+                }
                 run_restore(&r, &opts, &ctx)
             })?;
             log_outcome("restore", &rep.warnings, &rep.errors);
             ok(emit(format, "Restore finished", &rep))?;
             Ok(if rep.errors.is_empty() { 0 } else { 1 })
         }
+        BackupCommands::Cat { repo, path, version, offset, length, cache } => {
+            let range = (offset.is_some() || length.is_some()).then(|| (offset.unwrap_or(0), length.unwrap_or(u64::MAX)));
+            super::backup_access::cat(&repo, &path, &version, &cache, range, &mut std::io::stdout().lock())
+        }
+        BackupCommands::Mount { repo, version, all, bind, port, seconds, cache } => super::backup_access::mount(&repo, &version, all, &bind, port, &cache, seconds, format),
+        BackupCommands::Cache { cmd } => super::backup_access::cache_command(cmd, format),
         BackupCommands::Verify { repo, full, samples } => with_repo(&repo, LockKind::Shared, "verify", |r, _| {
             let v = maintenance::verify(r, if full { None } else { Some(samples.unwrap_or(3)) }, full)?;
             ok(emit(format, "Verification", &v))?;
@@ -2007,6 +2079,80 @@ mod tests {
         let code = run(restore_cmd, &OutputFormat::Json, false).unwrap();
         assert_eq!(code, 0);
         assert_eq!(std::fs::read(out.join("src/f.txt")).unwrap(), b"cli");
+    }
+
+    #[test]
+    fn restore_by_time_archive_mirror_cat_mount_and_cache() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f.txt"), b"first").unwrap();
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(subcommand)]
+            c: BackupCommands,
+        }
+        let parse = |args: &[&str]| <T as clap::Parser>::try_parse_from(std::iter::once("t").chain(args.iter().copied())).unwrap().c;
+        let dest = t.path().join("dest").to_string_lossy().into_owned();
+        let db = t.path().join("db.sqlite").to_string_lossy().into_owned();
+        let cache = t.path().join("cache").to_string_lossy().into_owned();
+        let src_s = src.to_string_lossy().into_owned();
+        let backup = || run(parse(&["run", "--dest", &dest, "--dbpath", &db, "--passphrase", "pw", "--source", &src_s, "--block-size", "4096", "--no-quota-warning"]), &OutputFormat::Json, false).unwrap();
+        assert_eq!(backup(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let between = chrono::Utc::now().to_rfc3339();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(src.join("f.txt"), b"second").unwrap();
+        assert_eq!(backup(), 0);
+        let repo = ["--dest", dest.as_str(), "--dbpath", db.as_str(), "--passphrase", "pw"];
+        let with = |cmd: &[&str], more: &[&str]| -> Vec<String> { cmd.iter().chain(repo.iter()).chain(more.iter()).map(|s| s.to_string()).collect() };
+        let p = |v: Vec<String>| parse(&v.iter().map(String::as_str).collect::<Vec<_>>());
+        // --time picks the older version; --version oldest too.
+        let out = t.path().join("out");
+        let out_s = out.to_string_lossy().into_owned();
+        assert_eq!(run(p(with(&["restore"], &["--target", &out_s, "--time", &between])), &OutputFormat::Json, false).unwrap(), 0);
+        assert_eq!(std::fs::read(out.join("src/f.txt")).unwrap(), b"first");
+        let out2 = t.path().join("out2").to_string_lossy().into_owned();
+        assert_eq!(run(p(with(&["restore"], &["--target", &out2, "--version", "oldest"])), &OutputFormat::Json, false).unwrap(), 0);
+        assert_eq!(std::fs::read(t.path().join("out2/src/f.txt")).unwrap(), b"first");
+        // An archive.
+        let zip = t.path().join("v.zip").to_string_lossy().into_owned();
+        assert_eq!(run(p(with(&["restore"], &["--archive", &zip, "--version", "latest"])), &OutputFormat::Json, false).unwrap(), 0);
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&zip).unwrap()).unwrap();
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut z.by_name("src/f.txt").unwrap(), &mut body).unwrap();
+        assert_eq!(body, "second");
+        // Mirror: refused without --yes when not interactive, deletes with it.
+        std::fs::write(out.join("src/extra.tmp"), b"x").unwrap();
+        assert_eq!(run(p(with(&["restore"], &["--target", &out_s, "--mirror"])), &OutputFormat::Json, false).unwrap_err().user_message().contains("--yes"), true);
+        assert!(out.join("src/extra.tmp").exists());
+        assert_eq!(run(p(with(&["restore"], &["--target", &out_s, "--mirror", "--yes"])), &OutputFormat::Json, false).unwrap(), 0);
+        assert!(!out.join("src/extra.tmp").exists());
+        assert_eq!(std::fs::read(out.join("src/f.txt")).unwrap(), b"second");
+        // cat, with a range and through the cache.
+        let path = src.join("f.txt").to_string_lossy().into_owned();
+        let BackupCommands::Cat { repo: r, path: fp, version, offset: _, length: _, cache: c } = p(with(&["cat"], &[&path, "--time", &between, "--cache-dir", &cache])) else { panic!() };
+        let mut buf = Vec::new();
+        assert_eq!(super::super::backup_access::cat(&r, &fp, &version, &c, None, &mut buf).unwrap(), 0);
+        assert_eq!(buf, b"first");
+        let mut buf = Vec::new();
+        super::super::backup_access::cat(&r, &fp, &super::super::backup_access::VersionArgs { version: "latest".into(), ..Default::default() }, &c, Some((1, 3)), &mut buf).unwrap();
+        assert_eq!(buf, b"eco");
+        assert_eq!(run(p(vec!["cache".into(), "stats".into(), "--cache-dir".into(), cache.clone()]), &OutputFormat::Json, false).unwrap(), 0);
+        assert!(std::fs::read_dir(&cache).unwrap().count() > 0, "cat filled the cache");
+        assert_eq!(run(p(vec!["cache".into(), "clear".into(), "--cache-dir".into(), cache.clone()]), &OutputFormat::Json, false).unwrap(), 0);
+        // mount: the drive serves the file.
+        let BackupCommands::Mount { repo: r, version, all, cache: c, .. } = p(with(&["mount"], &["--version", "latest", "--cache-size", "0"])) else { panic!() };
+        let (srv, label) = super::super::backup_access::start_drive(&r, &version, all, "127.0.0.1:0".parse().unwrap(), &c).unwrap();
+        assert!(label.starts_with("version 0"));
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(srv.addr()).unwrap();
+        write!(s, "GET /{}/src/f.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", srv.token()).unwrap();
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).unwrap();
+        assert!(raw.starts_with("HTTP/1.1 200") && raw.ends_with("second"), "{raw}");
+        srv.stop();
+        assert_eq!(run(p(with(&["mount"], &["--all", "--seconds", "0", "--cache-size", "0"])), &OutputFormat::Json, false).unwrap(), 0);
     }
 
     #[test]

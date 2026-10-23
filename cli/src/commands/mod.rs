@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod archive;
 pub mod backup;
+pub mod backup_access;
 pub mod checksum;
 pub mod compat;
 pub mod connection;

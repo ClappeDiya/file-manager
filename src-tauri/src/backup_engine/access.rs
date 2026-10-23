@@ -33,17 +33,7 @@ pub fn selector_of(version: Option<usize>, selector: Option<VersionSelector>) ->
 /// `2026-10-01 09:00`) wins over `version` (`latest`, `oldest`, a number
 /// or a version id); neither = the newest version.
 pub fn query_selector(version: Option<&str>, time: Option<&str>, allow_partial: bool) -> Result<VersionSelector, AppError> {
-    if let Some(t) = time.filter(|t| !t.trim().is_empty()) {
-        return VersionSelector::as_of(t, allow_partial);
-    }
-    match version.filter(|v| !v.trim().is_empty()) {
-        None => Ok(VersionSelector::Index { index: 0 }),
-        Some(v) => Ok(match VersionSelector::parse(v)? {
-            VersionSelector::Latest { .. } => VersionSelector::Latest { allow_partial },
-            VersionSelector::Oldest { .. } => VersionSelector::Oldest { allow_partial },
-            other => other,
-        }),
-    }
+    VersionSelector::from_parts(version, time, allow_partial)
 }
 
 /// A backed-up file being streamed: what is sent and the data in pieces.
@@ -388,11 +378,7 @@ mod tests {
         assert_eq!(selector_of(Some(3), Some(VersionSelector::Latest { allow_partial: false })), VersionSelector::Latest { allow_partial: false });
         assert_eq!(mime_of("a.PNG"), "image/png");
         assert_eq!(mime_of("a.bin"), "application/octet-stream");
-        assert_eq!(query_selector(None, None, false).unwrap(), VersionSelector::Index { index: 0 });
-        assert_eq!(query_selector(Some("oldest"), None, true).unwrap(), VersionSelector::Oldest { allow_partial: true });
-        assert_eq!(query_selector(Some("2"), None, false).unwrap(), VersionSelector::Index { index: 2 });
         assert!(matches!(query_selector(Some("2"), Some("2026-10-01T09:00:00Z"), false).unwrap(), VersionSelector::AsOf { .. }), "time wins");
-        assert!(query_selector(None, Some("garbage"), false).is_err());
     }
 
     #[test]

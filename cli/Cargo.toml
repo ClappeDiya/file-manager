@@ -37,3 +37,5 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 tempfile = "3"
 # Synthetic Photos libraries in tests (same version ufop-core already links).
 rusqlite = { version = "0.35", features = ["bundled"] }
+# Reading archives written by `restore --archive` in tests (same version ufop-core links).
+zip = { version = "2", default-features = false, features = ["deflate"] }
