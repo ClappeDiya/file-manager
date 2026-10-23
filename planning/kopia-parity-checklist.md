@@ -114,7 +114,7 @@ Ground rules
 - [x] K123 Units (binary/decimal) and schedule timezone
 
 ## Follow-ups found during the work
-- [ ] Standalone `ufop agent` host honours cron and maintenance schedules of managed jobs (WP6 left it on plain intervals)
+- [x] Standalone `ufop agent` host honours cron schedules, time zones, maintenance schedules and policy templates of managed jobs (WP6 left it on plain intervals); shared `ufop_core::backup::{schedule, layers}`
 - [ ] Fix pre-existing `tests/journey_06_lan_transfer.rs` build break (`PeerManager::create_hello`/`create_ping`)
 - [ ] Fix pre-existing orphan `test_automation_rule` IPC call (dump-ipc-commands --verify)
 - [ ] Optional K108 extra: Prometheus `/metrics` in the desktop app (setting, off by default, loopback only) — WP8 did the server only

@@ -377,6 +377,21 @@ impl MaintenanceSchedule {
 mod tests {
     use super::*;
 
+    #[test]
+    fn holiday_calendars_from_the_registry_skip_days() {
+        let s = BackupSchedule { enabled: true, calendar_ids: vec!["core-test-cal".into()], timezone: Some("UTC".into()), ..Default::default() };
+        assert!(s.validate().unwrap_err().user_message().contains("core-test-cal"));
+        let day = NaiveDate::from_ymd_opt(2026, 12, 25).unwrap();
+        crate::calendar::registry().put(crate::calendar::HolidayCalendar { id: "core-test-cal".into(), name: "Xmas".into(), dates: vec![day], ..Default::default() });
+        s.validate().unwrap();
+        let at = Utc.with_ymd_and_hms(2026, 12, 25, 2, 0, 0).unwrap();
+        assert_eq!(s.day_off(at).as_deref(), Some("Xmas"));
+        assert_eq!(s.day_off(at + Duration::days(1)), None);
+        let p = s.preview(at - Duration::hours(1), 2).unwrap();
+        assert_eq!((p[0].skipped_by.as_deref(), p[1].skipped_by.as_deref()), (Some("Xmas"), None));
+        crate::calendar::registry().remove("core-test-cal");
+    }
+
     fn local(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
         Local.with_ymd_and_hms(y, m, d, h, min, 0).earliest().unwrap().with_timezone(&Utc)
     }

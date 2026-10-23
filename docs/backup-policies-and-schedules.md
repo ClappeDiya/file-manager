@@ -117,7 +117,7 @@ A schedule (`BackupSchedule`) works in one of two modes:
 | 6 fields | `0 30 2 * * Mon-Fri` | With seconds first |
 | 7 fields | `0 0 3 1 * * 2027` | With a year last |
 
-- Expressions are read by the schedule library's cron parser (`schedule_library::parse_cron_any`, the same `cron` crate that sync pairs and automation rules use). Named schedules (`schedule:<id>`) are not accepted here. Paste their expression instead.
+- Expressions are read by the schedule library's cron parser (`ufop_core::backup::schedule::parse_cron_any`, the same `cron` crate that sync pairs and automation rules use). Named schedules (`schedule:<id>`) are not accepted here. Paste their expression instead.
 - Times are **local** unless the schedule has a [time zone](#time-zone). A local run at 02:30 stays at 02:30 when daylight-saving time changes.
 - Validation errors are written to be readable, e.g. *Invalid cron expression '61 \* \* \* \*': … Use `min hour day month weekday`*. A schedule that would run more often than every 5 minutes, or never, is refused.
 - **Missed runs** behave as they do for interval schedules. If the app was closed when one or more runs were due, the backup runs once as soon as the scheduler is back. It does not run once per missed slot. Holiday calendars and *Skip while on battery* apply to cron schedules too.
@@ -129,7 +129,15 @@ A schedule (`BackupSchedule`) works in one of two modes:
 | Job JSON | `"schedule": {"enabled": true, "cron": ["30 2 * * Mon-Fri", "0 9 * * Sat"]}` (REST `POST`/`PUT /api/v1/jobs`, templates) |
 | Preview | `POST /api/v1/backup-schedule/preview` with `{schedule, count}` (needs the `read` scope); `ufop backup schedule-preview --cron "30 2 * * *" [--cron …] [--count 5]` (or `--start-time 03:00 --interval-minutes 60`); IPC `backup_schedule_preview { schedule, count }` |
 
-The standalone CLI agent (`ufop agent`) still runs managed jobs on their plain interval.
+### Managed jobs on the standalone CLI agent
+
+`ufop agent run` uses the same schedule code as the desktop app and `ufop-server` (`ufop_core::backup::schedule`), so a managed job runs on the same slots everywhere:
+
+- interval and cron schedules, in the schedule's [time zone](#time-zone), with one catch-up run for slots missed while the agent was stopped;
+- compaction, verification and retention on their own [maintenance schedules](#maintenance-schedule) (each reported to the console with its task as the operation); a scheduled compaction or retention no longer also runs after each backup;
+- settings inherited from the organization's **policy templates** (managed app settings `backupTemplates`): the policy's `template_ids` (`org:<id>`, in order) fill in what the policy leaves unset, enforced templates win over the policy. The resolution order is the desktop's (`ufop_core::backup::layers`).
+
+The CLI agent applies the backup options, filter, retention, schedule and maintenance. Other sections a policy or template sets (scripts, notifications, throttle, retry, prevent sleep) are ignored with a warning in `ufop agent status --format json`. Holiday calendars are not delivered to CLI machines: calendar references are dropped with a warning, so those days are not skipped. *Skip while on battery* is not checked. Jobs saved by older versions keep their plain interval until the console sends the policy again.
 
 ## Time zone
 

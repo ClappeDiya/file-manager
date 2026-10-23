@@ -75,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`ufop agent` schedules**: the standalone CLI agent now runs managed jobs on their real schedules (cron mode, time zones, one catch-up after downtime), runs compaction, verification and retention on their own maintenance schedules (reported with the task as the operation) and applies the organization's policy templates (`template_ids`, enforced templates) with the desktop's resolution order. The schedule math, the holiday calendar registry and settings layering moved to `ufop_core::backup::{schedule, layers}` and `ufop_core::calendar::registry`; the desktop app and `ufop-server` use the same code.
 - Sizes are shown in decimal units by default (1 KB = 1,000 bytes; before, 1,024 bytes were labelled KB). Choose *Binary* in Settings → Appearance for KiB/MiB/GiB.
 
 ### Fixed

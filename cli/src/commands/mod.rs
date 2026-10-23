@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_jobs;
 pub mod archive;
 pub mod backup;
 pub mod backup_access;
