@@ -360,6 +360,74 @@ pub struct EngineArgs {
     /// Also checkpoint after this many uploaded bytes (0 = off)
     #[arg(long, default_value_t = 0)]
     pub checkpoint_interval_bytes: u64,
+    /// Linux snapshot method: auto | lvm | zfs | btrfs (auto picks it by filesystem)
+    #[arg(long, default_value = "auto")]
+    pub snapshot_provider: String,
+    /// Do not descend into folders on another filesystem (mount points stay empty)
+    #[arg(long)]
+    pub one_file_system: bool,
+    /// Stop at the first error, keeping a partial version of what is finished
+    #[arg(long)]
+    pub fail_fast: bool,
+    /// Unreadable files: continue (warn) | fail (error)
+    #[arg(long, default_value = "continue")]
+    pub on_file_error: String,
+    /// Unlistable folders: continue (warn) | fail (error)
+    #[arg(long, default_value = "continue")]
+    pub on_dir_error: String,
+    /// Sockets, FIFOs, devices: ignore | warn | fail
+    #[arg(long, default_value = "ignore")]
+    pub on_unknown_entry: String,
+    /// Stop after more than N read problems
+    #[arg(long)]
+    pub max_errors: Option<u32>,
+    /// Re-read and re-hash about N% of unchanged-looking files per run (0–100)
+    #[arg(long, default_value_t = 0)]
+    pub rehash_percent: u8,
+    /// Stop after uploading this much (e.g. 500M, 20G) with a partial version; the next run continues
+    #[arg(long)]
+    pub max_upload: Option<String>,
+    /// Hash files larger than this with several threads (e.g. 256M; 0 = off)
+    #[arg(long, default_value = "256M")]
+    pub parallel_file_threshold: String,
+}
+
+/// Ignore files (`--ignore-file`, `--respect-gitignore`).
+#[derive(Args, Debug, Clone, Default)]
+pub struct IgnoreArgs {
+    /// Ignore-file name read in every folder, gitignore syntax (repeatable;
+    /// replaces the default `.ufopignore`; `--ignore-file ""` reads none)
+    #[arg(long = "ignore-file")]
+    pub ignore_files: Vec<String>,
+    /// Also honour .gitignore files and .git/info/exclude
+    #[arg(long)]
+    pub respect_gitignore: bool,
+}
+
+impl IgnoreArgs {
+    fn apply(&self, f: &mut SourceFilter) {
+        if !self.ignore_files.is_empty() {
+            f.ignore_files = self.ignore_files.iter().filter(|n| !n.trim().is_empty()).cloned().collect();
+        }
+        f.respect_gitignore = self.respect_gitignore;
+    }
+}
+
+/// `10G`, `500MB`, `1.5GiB`, `4096` → bytes (binary units).
+pub fn parse_bytes(s: &str) -> Result<u64, ufop_core::error::AppError> {
+    let t = s.trim();
+    let split = t.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let n: f64 = num.parse().map_err(|_| ufop_core::error::AppError::validation(format!("Invalid size '{s}' (e.g. 500M, 20G)")))?;
+    let mult: u64 = match unit.trim().to_ascii_uppercase().trim_end_matches("IB").trim_end_matches('B') {
+        "" => 1,
+        "K" => 1 << 10,
+        "M" => 1 << 20,
+        "G" => 1 << 30,
+        "T" => 1 << 40,
+        _ => return Err(ufop_core::error::AppError::validation(format!("Invalid size unit in '{s}' (K, M, G, T)"))),
+    };
+    Ok((n * mult as f64) as u64)
 }
 
 /// Count-based GFS retention (`--keep-daily 7 --keep-weekly 4 …`). Any
@@ -479,7 +547,18 @@ impl EngineArgs {
             vss_provider: self.vss_provider.clone(),
             vss_exclude_writers: self.vss_exclude_writers.clone(),
             mount_root: None,
+            provider: parse_enum("snapshot-provider", &self.snapshot_provider).unwrap_or_default(),
         }
+    }
+
+    fn error_policy(&self) -> Result<ufop_core::backup::errors::ErrorPolicy, ufop_core::error::AppError> {
+        Ok(ufop_core::backup::errors::ErrorPolicy {
+            on_file_error: parse_enum("on-file-error", &self.on_file_error)?,
+            on_dir_error: parse_enum("on-dir-error", &self.on_dir_error)?,
+            on_unknown_entry: parse_enum("on-unknown-entry", &self.on_unknown_entry)?,
+            fail_fast: self.fail_fast,
+            max_errors: self.max_errors,
+        })
     }
 
     fn apply(&self, o: BackupOptions) -> Result<BackupOptions, ufop_core::error::AppError> {
@@ -521,6 +600,15 @@ impl EngineArgs {
             layout: parse_layout(&self.layout, self.shard_prefix_len)?,
             checkpoint_interval_secs: self.checkpoint_interval_secs,
             checkpoint_interval_bytes: self.checkpoint_interval_bytes,
+            one_file_system: self.one_file_system,
+            error_policy: self.error_policy()?,
+            rehash_percent: if self.rehash_percent <= 100 {
+                self.rehash_percent
+            } else {
+                return Err(ufop_core::error::AppError::validation("--rehash-percent must be between 0 and 100"));
+            },
+            max_upload_bytes_per_run: self.max_upload.as_deref().map(parse_bytes).transpose()?.filter(|b| *b > 0),
+            parallel_file_threshold: parse_bytes(&self.parallel_file_threshold)?,
             photos: ufop_core::backup::photos::PhotosOptions {
                 include_hidden: self.photos_include_hidden,
                 include_trashed: self.photos_include_trashed,
@@ -729,6 +817,8 @@ pub enum BackupCommands {
         exclude_hidden: bool,
         #[arg(long)]
         skip_files_larger_than: Option<u64>,
+        #[command(flatten)]
+        ignore: IgnoreArgs,
         #[arg(long, default_value_t = 100 * 1024)]
         block_size: usize,
         #[arg(long, default_value_t = 50 * 1024 * 1024)]
@@ -759,6 +849,66 @@ pub enum BackupCommands {
         no_auto_compact: bool,
         #[command(flatten)]
         engine: EngineArgs,
+    },
+    /// Back up standard input as one file of a new version
+    /// (`pg_dump db | ufop backup stdin --name db.sql --dest …`)
+    Stdin {
+        #[command(flatten)]
+        repo: RepoArgs,
+        /// File name in the version: `name` → /stdin/name, or an absolute path
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value_t = 100 * 1024)]
+        block_size: usize,
+        #[arg(long, default_value_t = 50 * 1024 * 1024)]
+        volume_size: usize,
+        #[arg(long, default_value_t = 6)]
+        compression_level: u32,
+        #[command(flatten)]
+        retention: RetentionArgs,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[command(flatten)]
+        engine: EngineArgs,
+    },
+    /// Estimate the next backup: files, new data and duration (reads no file contents)
+    Estimate {
+        #[command(flatten)]
+        repo: RepoArgs,
+        #[arg(long = "source", required = true)]
+        sources: Vec<String>,
+        #[arg(long)]
+        include: Vec<String>,
+        #[arg(long)]
+        exclude: Vec<String>,
+        #[arg(long)]
+        exclude_hidden: bool,
+        #[arg(long)]
+        skip_files_larger_than: Option<u64>,
+        #[command(flatten)]
+        ignore: IgnoreArgs,
+        /// Assumed upload speed for the duration (e.g. 20M per second; 0 = none)
+        #[arg(long, default_value = "20M")]
+        assumed_speed: String,
+        /// List this many of the largest new or changed files
+        #[arg(long, default_value_t = 10)]
+        largest: usize,
+        #[command(flatten)]
+        engine: EngineArgs,
+    },
+    /// Back up every job of the signed-in ufop-server now (see `ufop server login`)
+    RunAll {
+        /// Only these jobs (id or name, repeatable)
+        #[arg(long = "job")]
+        jobs: Vec<String>,
+        /// Only jobs with a schedule
+        #[arg(long)]
+        scheduled_only: bool,
+        /// Wait until every started backup finished; exit with the worst result
+        #[arg(long)]
+        wait: bool,
     },
     /// List backup versions (with note, tags, pin, host and storage added)
     List {
@@ -1214,7 +1364,47 @@ pub fn version_table(v: &[ufop_core::backup::Fileset]) -> String {
     out
 }
 
+/// Human-readable estimate.
+pub fn estimate_text(e: &ufop_core::backup::estimate::BackupEstimate) -> String {
+    let mut out = format!(
+        "{} files ({}) in {} folders: {} new, {} changed, {} unchanged, {} deleted\n",
+        e.files,
+        short_bytes(e.bytes_examined),
+        e.folders,
+        e.new_files,
+        e.changed_files,
+        e.unchanged_files,
+        e.deleted_files
+    );
+    if e.upper_bound {
+        out.push_str(&format!("New data: at most {} (at least {})\n", short_bytes(e.new_bytes_at_most), short_bytes(e.new_bytes_at_least)));
+    } else {
+        out.push_str(&format!("New data: {}\n", short_bytes(e.new_bytes_at_most)));
+    }
+    if let (Some(d), Some(b)) = (e.estimated_duration_secs, e.bytes_per_sec) {
+        out.push_str(&format!("Estimated time: {} at {}/s ({})\n", human_duration(d), short_bytes(b), e.speed_source));
+    }
+    for f in &e.largest {
+        out.push_str(&format!("  {:>10}  {:<7}  {}\n", short_bytes(f.size), f.status, f.path));
+    }
+    for w in &e.warnings {
+        out.push_str(&format!("warning: {w}\n"));
+    }
+    out
+}
+
+fn human_duration(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
 pub async fn execute(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, Box<dyn std::error::Error>> {
+    if let BackupCommands::RunAll { jobs, scheduled_only, wait } = cmd {
+        return super::server::execute(super::server::ServerCommands::RunAll { jobs, scheduled_only, dry_run, wait }, format).await;
+    }
     let fmt = format.clone();
     let res = tokio::task::spawn_blocking(move || run(cmd, &fmt, dry_run)).await?;
     match res {
@@ -1230,7 +1420,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
     let ok = |v: Result<(), Box<dyn std::error::Error>>| v.map_err(|e| ufop_core::error::AppError::internal(e.to_string()));
     match cmd {
         BackupCommands::Run {
-            repo, sources, include, exclude, exclude_hidden, skip_files_larger_than, block_size, volume_size, compression_level,
+            repo, sources, include, exclude, exclude_hidden, skip_files_larger_than, ignore, block_size, volume_size, compression_level,
             retention, note, tags, shared, shared_gc_delay_hours, verify_samples, upload_unchanged, no_auto_compact, engine,
         } => {
             let pass = repo.passphrase();
@@ -1246,6 +1436,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             filter.rules = rules;
             filter.exclude_hidden = exclude_hidden;
             filter.max_file_size = skip_files_larger_than;
+            ignore.apply(&mut filter);
             let filter = filter.compile()?;
             let opts = engine.apply(BackupOptions {
                 block_size,
@@ -1276,6 +1467,62 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             ok(emit(format, "Backup finished", &r))?;
             Ok(if !r.errors.is_empty() || r.partial { 2 } else if !r.warnings.is_empty() { 1 } else { 0 })
         }
+        BackupCommands::Stdin { repo, name, block_size, volume_size, compression_level, retention, note, tags, engine } => {
+            let pass = repo.passphrase();
+            if pass.is_none() && !repo.no_encryption {
+                return Err(ufop_core::error::AppError::validation(format!("No passphrase: set {} (or pass --no-encryption)", repo.passphrase_env)));
+            }
+            let opts = engine.apply(BackupOptions {
+                block_size,
+                volume_size,
+                compression_level,
+                dry_run,
+                default_note: note,
+                default_tags: ufop_core::backup::versions::parse_tags(&tags)?,
+                ..repo.options()
+            })?;
+            let retention = retention.policy();
+            let be = repo.backend();
+            let ctx = progress_ctx(format);
+            let kind = if dry_run { LockKind::Shared } else { LockKind::Exclusive };
+            let lo = LockOptions::from_backup_options(&opts, LOCK_APP);
+            let filter = SourceFilter::default().compile()?;
+            let (mut r, lock_warnings) = repo_lock::with_lock(be.as_ref(), &repo.prefix, kind, "backup", &lo, &ctx, || {
+                let db = repo.open_db(be.as_ref(), &ctx)?;
+                let stream = ufop_core::backup::StreamSource::new(name.clone(), std::io::stdin());
+                ufop_core::backup::run_backup_with_streams(be.as_ref(), &db, &[], &filter, &opts, &retention, pass.as_deref(), None, KdfParams::default(), &ctx, vec![stream])
+            })?;
+            r.warnings.extend(lock_warnings);
+            log_outcome("backup", &r.warnings, &r.errors);
+            ok(emit(format, &format!("Stored standard input as {}", ufop_core::backup::reader::stream_path(&name)), &r))?;
+            Ok(if !r.errors.is_empty() || r.partial { 2 } else if !r.warnings.is_empty() { 1 } else { 0 })
+        }
+        BackupCommands::Estimate { repo, sources, include, exclude, exclude_hidden, skip_files_larger_than, ignore, assumed_speed, largest, engine } => {
+            let mut filter = SourceFilter::default();
+            filter.rules = include.iter().map(|s| parse_filter(s, FilterAction::Include)).chain(exclude.iter().map(|s| parse_filter(s, FilterAction::Exclude))).collect();
+            filter.exclude_hidden = exclude_hidden;
+            filter.max_file_size = skip_files_larger_than;
+            ignore.apply(&mut filter);
+            let filter = filter.compile()?;
+            let opts = engine.apply(repo.options())?;
+            let srcs: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
+            let eo = ufop_core::backup::estimate::EstimateOptions { history_bytes_per_sec: None, assumed_bytes_per_sec: parse_bytes(&assumed_speed)?, largest };
+            // A destination without a backup yet: everything is new.
+            let be = repo.backend();
+            let est = match be.list() {
+                Ok(l) if l.iter().any(|f| f.name == ufop_core::backup::volume::repo_header_name(&repo.prefix)) => {
+                    with_repo(&repo, LockKind::Shared, "estimate", |_, db| ufop_core::backup::estimate::estimate(db, &srcs, &filter, &opts, &eo))?
+                }
+                _ => ufop_core::backup::estimate::estimate(&ufop_core::backup::db::BackupDb::open_in_memory()?, &srcs, &filter, &opts, &eo)?,
+            };
+            if matches!(format, OutputFormat::Human) {
+                print!("{}", estimate_text(&est));
+            } else {
+                ok(emit(format, "Estimate", &est))?;
+            }
+            Ok(0)
+        }
+        BackupCommands::RunAll { .. } => Err(ufop_core::error::AppError::internal("run-all is handled before the blocking runner")),
         BackupCommands::List { repo, tags } => with_repo(&repo, LockKind::Shared, "list", |_, db| {
             let filter = ufop_core::backup::versions::parse_tags(&tags)?;
             let v = ufop_core::backup::versions::filter_by_tags(db.filesets()?, &filter);
@@ -1665,6 +1912,67 @@ mod tests {
         assert_eq!(parse_filter("{cache_files}", FilterAction::Exclude).kind, FilterKind::Group);
         assert_eq!(parse_filter("*.log", FilterAction::Exclude).kind, FilterKind::Wildcard);
         assert_eq!(parse_filter("/a/b", FilterAction::Include).kind, FilterKind::Exact);
+    }
+
+    #[test]
+    fn sizes_and_run_flags() {
+        assert_eq!(parse_bytes("4096").unwrap(), 4096);
+        assert_eq!(parse_bytes("500M").unwrap(), 500 << 20);
+        assert_eq!(parse_bytes("20GB").unwrap(), 20 << 30);
+        assert_eq!(parse_bytes("1.5GiB").unwrap(), 3 << 29);
+        assert!(parse_bytes("ten").is_err() && parse_bytes("5X").is_err());
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(subcommand)]
+            c: BackupCommands,
+        }
+        let c = <T as clap::Parser>::try_parse_from([
+            "t", "run", "--dest", "/d", "--source", "/s", "--ignore-file", ".a", "--ignore-file", ".b", "--respect-gitignore", "--one-file-system", "--fail-fast",
+            "--on-file-error", "fail", "--on-dir-error", "fail", "--on-unknown-entry", "warn", "--max-errors", "3", "--rehash-percent", "10", "--max-upload", "1G",
+            "--parallel-file-threshold", "0", "--snapshot-provider", "zfs",
+        ])
+        .unwrap()
+        .c;
+        let BackupCommands::Run { engine, ignore, .. } = c else { panic!("expected run") };
+        let o = engine.apply(BackupOptions::default()).unwrap();
+        use ufop_core::backup::errors::{ErrorAction, UnknownEntryAction};
+        assert!(o.one_file_system && o.error_policy.fail_fast);
+        assert_eq!((o.error_policy.on_file_error, o.error_policy.on_dir_error, o.error_policy.on_unknown_entry), (ErrorAction::Fail, ErrorAction::Fail, UnknownEntryAction::Warn));
+        assert_eq!((o.error_policy.max_errors, o.rehash_percent, o.max_upload_bytes_per_run, o.parallel_file_threshold), (Some(3), 10, Some(1 << 30), 0));
+        assert_eq!(o.snapshot.provider, ufop_core::backup::snapshot::SnapshotProvider::Zfs);
+        let mut f = SourceFilter::default();
+        ignore.apply(&mut f);
+        assert_eq!((f.ignore_files, f.respect_gitignore), (vec![".a".to_string(), ".b".to_string()], true));
+        // Defaults keep today's behaviour.
+        let c = <T as clap::Parser>::try_parse_from(["t", "run", "--dest", "/d", "--source", "/s"]).unwrap().c;
+        let BackupCommands::Run { engine, ignore, .. } = c else { panic!() };
+        let o = engine.apply(BackupOptions::default()).unwrap();
+        assert_eq!(o.error_policy, Default::default());
+        assert_eq!(o.parallel_file_threshold, ufop_core::backup::DEFAULT_PARALLEL_FILE_THRESHOLD);
+        let mut f = SourceFilter::default();
+        ignore.apply(&mut f);
+        assert_eq!(f.ignore_files, vec![".ufopignore".to_string()]);
+        assert!(<T as clap::Parser>::try_parse_from(["t", "run-all", "--job", "Docs", "--scheduled-only", "--wait"]).is_ok());
+        assert!(<T as clap::Parser>::try_parse_from(["t", "stdin", "--dest", "/d", "--name", "x"]).is_ok());
+    }
+
+    #[test]
+    fn estimate_text_says_at_most() {
+        let e = ufop_core::backup::estimate::BackupEstimate {
+            files: 3,
+            new_files: 1,
+            changed_files: 1,
+            new_bytes_at_most: 5 << 20,
+            new_bytes_at_least: 1 << 20,
+            upper_bound: true,
+            bytes_per_sec: Some(1 << 20),
+            speed_source: "history".into(),
+            estimated_duration_secs: Some(65),
+            ..Default::default()
+        };
+        let t = estimate_text(&e);
+        assert!(t.contains("at most 5.0 MB") || t.contains("at most 5"), "{t}");
+        assert!(t.contains("1m 5s") && t.contains("history"), "{t}");
     }
 
     #[test]

@@ -38,6 +38,20 @@ pub enum ServerCommands {
         #[arg(long)]
         wait: bool,
     },
+    /// Back up every job now (read-only and busy jobs are skipped)
+    RunAll {
+        /// Only these jobs (id or name, repeatable)
+        #[arg(long = "job")]
+        jobs: Vec<String>,
+        /// Only jobs with a schedule
+        #[arg(long)]
+        scheduled_only: bool,
+        #[arg(long)]
+        dry_run: bool,
+        /// Wait until every started backup finished; exit with the worst result
+        #[arg(long)]
+        wait: bool,
+    },
     /// Cancel a task or all tasks of a job
     Cancel { id: String },
     /// Pause scheduled backups
@@ -343,6 +357,40 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
                     Some("warning") => 1,
                     _ => 2,
                 })
+            }
+            ServerCommands::RunAll { jobs, scheduled_only, dry_run, wait } => {
+                let mut c = Client::new()?;
+                let mut ids = Vec::new();
+                for j in &jobs {
+                    ids.push(c.job_id(j).await?);
+                }
+                let r = c.call(reqwest::Method::POST, "/jobs/run-all", Some(json!({"job_ids": ids, "scheduled_only": scheduled_only, "dry_run": dry_run}))).await?;
+                if !wait {
+                    show(format, &r);
+                    return Ok(if r["skipped"].as_array().is_some_and(|a| !a.is_empty()) { 1 } else { 0 });
+                }
+                let started: Vec<String> = r["started"].as_array().into_iter().flatten().filter_map(|s| s["job_id"].as_str().map(String::from)).collect();
+                loop {
+                    let tasks = c.call(reqwest::Method::GET, "/tasks", None).await?;
+                    if !tasks.as_array().is_some_and(|a| a.iter().any(|x| x["job_id"].as_str().is_some_and(|j| started.iter().any(|s| s == j)))) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                let mut results = Vec::new();
+                let mut worst = 0u8;
+                for id in &started {
+                    let runs = c.call(reqwest::Method::GET, &format!("/runs?job_id={id}&limit=1"), None).await?;
+                    let last = runs.get(0).cloned().unwrap_or(Value::Null);
+                    worst = worst.max(match last["status"].as_str() {
+                        Some("success") => 0,
+                        Some("warning") => 1,
+                        _ => 2,
+                    });
+                    results.push(last);
+                }
+                show(format, &json!({"started": r["started"], "skipped": r["skipped"], "results": results}));
+                Ok(worst)
             }
             ServerCommands::Cancel { id } => {
                 let mut c = Client::new()?;
