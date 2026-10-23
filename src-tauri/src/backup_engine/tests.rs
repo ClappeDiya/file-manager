@@ -520,6 +520,7 @@ async fn bug_report_is_sanitized_and_diagnostics_detect_problems() {
 
     // Diagnostics: healthy, then a missing volume and an untracked file.
     let d = m.diagnose(&j.id, true, 64).await.unwrap();
+    assert!(!d.snapshot_providers.is_empty(), "diagnostics list the snapshot methods");
     let db = d.database.clone().unwrap();
     assert!(db.ok(), "{db:?}");
     assert!(db.tracked_volumes >= 2 && d.network.is_none(), "local destinations have no network endpoint");

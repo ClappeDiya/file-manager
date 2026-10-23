@@ -2563,7 +2563,7 @@ impl BackupManager {
     /// network path. `throughput_kb` = 0 skips the upload/download test.
     pub async fn diagnose(&self, job_id: &str, network: bool, throughput_kb: u32) -> Result<diagnostics::Diagnostics, AppError> {
         let job = self.resolve_job_secrets(&self.effective_job(job_id).await?).await?;
-        let mut d = diagnostics::Diagnostics::default();
+        let mut d = diagnostics::Diagnostics { snapshot_providers: ufop_core::backup::snapshot::providers(), ..Default::default() };
         if network {
             if let Some((host, port, tls)) = self.destination_endpoint(&job.destination).await? {
                 let timeout = std::time::Duration::from_secs(if job.network_timeout_secs > 0 { job.network_timeout_secs } else { 15 });

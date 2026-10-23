@@ -200,4 +200,7 @@ pub struct Diagnostics {
     pub database_error: Option<String>,
     pub network: Option<NetworkTiming>,
     pub throughput: Option<Throughput>,
+    /// Snapshot methods of this platform and whether their tools are installed.
+    #[serde(default)]
+    pub snapshot_providers: Vec<ufop_core::backup::snapshot::ProviderStatus>,
 }

@@ -170,7 +170,7 @@ export function BackupMaintenance({ job, onDeleted }: { job: BackupJob; onDelete
       </Section>
 
       <Section title="Snapshot diagnostics" hint="Creates and immediately removes a test snapshot of this job's sources, listing every step.">
-        {tool("Test snapshot", { type: "snapshot_test" }, "Check that VSS / LVM / APFS snapshots work for these sources")}
+        {tool("Test snapshot", { type: "snapshot_test" }, "Check that VSS / ZFS / btrfs / LVM / APFS snapshots work for these sources, and which methods are installed")}
       </Section>
 
       <BackupSupportTools job={job} />
