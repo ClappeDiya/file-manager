@@ -20,3 +20,4 @@ pub mod server;
 pub mod status;
 pub mod sync;
 pub mod transfer;
+pub mod verify_release;

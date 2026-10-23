@@ -238,6 +238,10 @@ pub enum Commands {
         shell: String,
     },
 
+    /// Verify a downloaded release: the minisign signature of SHA256SUMS and
+    /// the SHA-256 of every listed file that is present
+    VerifyRelease(commands::verify_release::VerifyReleaseArgs),
+
     /// Print a man page (`ufop man backup run`), or write all of them with --out
     Man {
         /// Folder to write every page into (ufop.1, ufop-backup.1, …)
@@ -542,6 +546,7 @@ async fn main() -> ExitCode {
         Commands::Profile(cmd) => {
             commands::profile::execute(cmd, &format).await
         }
+        Commands::VerifyRelease(args) => commands::verify_release::execute(&args, &format),
         Commands::Completions { shell } => {
             use clap::CommandFactory;
             commands::completions::script(&Cli::command(), &shell).map(|s| {
