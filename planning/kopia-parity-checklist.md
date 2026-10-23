@@ -88,7 +88,7 @@ Ground rules
 - [x] K89 CSRF double-submit token on cookie routes
 - [ ] K93 API tokens scoped to job IDs
 - [x] K107 Request tracing with X-Request-Id
-- [ ] K108 Prometheus `/metrics`
+- [x] K108 Prometheus `/metrics`
 - [ ] K109 OpenTelemetry trace export + Prometheus pushgateway
 - [ ] K92 Multi-user server accounts and per-job ACL
 - [ ] K87 Ransomware hardening guide + destination checklist in job editor

@@ -146,6 +146,13 @@ struct Args {
     /// One log line per request (method, route template, status, latency, X-Request-Id): on or off
     #[arg(long, env = "UFOP_SERVER_REQUEST_LOG", default_value = "on", value_parser = ["on", "off"])]
     request_log: String,
+    /// Serve Prometheus /metrics on this address too, e.g. 127.0.0.1:9464 (default: off;
+    /// /api/v1/metrics on the main port always needs a read-scope token)
+    #[arg(long, env = "UFOP_SERVER_METRICS_LISTEN")]
+    metrics_listen: Option<std::net::SocketAddr>,
+    /// Require HTTP Basic `user:password` on --metrics-listen
+    #[arg(long, env = "UFOP_SERVER_METRICS_BASIC_AUTH")]
+    metrics_basic_auth: Option<String>,
 }
 
 /// The running server's stop switch, for the Windows service handler.
@@ -418,6 +425,8 @@ async fn run(argv: Vec<String>) {
         public_url: a.public_url,
         shutdown_grace_secs: a.shutdown_grace,
         request_log: a.request_log == "on",
+        metrics_listen: a.metrics_listen,
+        metrics_basic_auth: a.metrics_basic_auth.filter(|s| !s.is_empty()),
     };
     if !cfg.mcp_roots.is_empty() {
         let roots = ufop_core::confine::Roots::new(&cfg.mcp_roots).unwrap_or_else(|e| fail(format!("--mcp-root: {e}")));

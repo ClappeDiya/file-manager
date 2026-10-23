@@ -88,3 +88,46 @@ query string with sensitive parameters (`token`, `access_token`, `authid`, `code
 `key`, `signature`, `X-Amz-*`, SAS `sig`/`se`/`sp`, anything ending in `token`, `secret` or `password`)
 replaced by `REDACTED`, and the headers with `Authorization`, `Cookie`, `Set-Cookie`, `X-UFOP-PreAuth` and
 `X-CSRF-Token` replaced. Quote the request id when reporting a problem; search the log for it.
+
+## Prometheus metrics
+
+Metrics are served in the Prometheus text format (0.0.4):
+
+- on the main port at **`GET /api/v1/metrics`**, for any signed-in user or API token with the `read` scope
+  (`ufop server tokens create prometheus --scope read --days 365`);
+- optionally on a **separate listener**, `--metrics-listen 127.0.0.1:9464` (`UFOP_SERVER_METRICS_LISTEN`),
+  at `/metrics` without sign-in, or with HTTP Basic when `--metrics-basic-auth prom:<password>`
+  (`UFOP_SERVER_METRICS_BASIC_AUTH`) is set. It is off by default; keep it on loopback or a monitoring
+  network, since the job names in `ufop_backup_job_info` are visible to anyone who can reach it.
+
+```yaml
+scrape_configs:
+  - job_name: ufop
+    metrics_path: /api/v1/metrics
+    scheme: https
+    authorization: { credentials_file: /etc/prometheus/ufop-token }   # ufop_pat_… (read scope)
+    static_configs: [{ targets: ["backup.example.com:8200"] }]
+```
+
+| Metric | Type | Labels | |
+|---|---|---|---|
+| `ufop_build_info` | gauge | `version`, `os`, `arch` | Always 1 |
+| `ufop_uptime_seconds`, `ufop_shutting_down` | gauge | | Seconds since start; 1 while draining |
+| `ufop_http_requests_total` | counter | `method`, `route`, `status` | `route` is the route template (`/api/v1/jobs/{id}/run`, `static`, `unmatched`) |
+| `ufop_http_request_duration_seconds` | histogram | `method`, `route`, `status` | Buckets 5 ms … 60 s |
+| `ufop_backup_job_info` | gauge | `job_id`, `job_name`, `read_only` | One per job (join on `job_id` for names) |
+| `ufop_backup_runs_total` | counter | `job_id`, `operation`, `result` | From the run history (survives restarts; pruning the history resets it) |
+| `ufop_backup_last_success_timestamp_seconds` | gauge | `job_id` | Newest successful (or warning) backup |
+| `ufop_backup_last_duration_seconds` | gauge | `job_id`, `result` | Newest backup run |
+| `ufop_backup_last_uploaded_bytes`, `ufop_backup_last_files` | gauge | `job_id` | Newest backup run: bytes uploaded, files examined |
+| `ufop_backup_versions`, `ufop_backup_source_bytes`, `ufop_backup_destination_bytes` | gauge | `job_id` | As of the job's last run |
+| `ufop_operations_running` | gauge | `operation` | Running now |
+| `ufop_operations_queued` | gauge | | Queue length |
+| `ufop_repository_lock_held` | gauge | `job_id` | 1 while an operation of the job runs (it holds the repository lock) |
+| `ufop_scheduler_running`, `ufop_scheduler_paused` | gauge | | |
+| `ufop_scheduler_next_run_timestamp_seconds` | gauge | `job_id`, `operation` | Next backup and maintenance runs |
+| `ufop_volume_cache_bytes`, `_max_bytes`, `_entries` | gauge | | Local volume cache |
+| `ufop_volume_cache_hits_total`, `_misses_total`, `_evictions_total` | counter | | Since start |
+
+Example alert: `time() - ufop_backup_last_success_timestamp_seconds > 2 * 86400` (no good backup in two days).
+At most 2000 HTTP series are kept; further ones are counted under `route="other"`.

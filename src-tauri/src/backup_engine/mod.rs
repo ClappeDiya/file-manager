@@ -24,6 +24,7 @@ pub mod portability;
 pub mod runs;
 pub mod power;
 pub mod schedule;
+pub mod metrics;
 pub mod secrets;
 pub mod shutdown;
 pub mod templates;

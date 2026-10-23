@@ -1187,3 +1187,66 @@ async fn request_ids_are_echoed_generated_and_put_in_errors() {
     let body: Value = missing.json().await.unwrap();
     assert!(body["request_id"].is_string() && body["message"].is_string(), "{body}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prometheus_metrics_parse_and_cover_jobs_http_and_cache() {
+    use super::metrics::parse::parse;
+    let s = start(ServerConfig::default(), None).await;
+    assert_eq!(s.client.get(format!("{}/api/v1/metrics", s.base)).send().await.unwrap().status(), 401, "needs a sign-in or read token");
+    let tok = s.login().await;
+    let src = s.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"metrics").unwrap();
+    let job = json!({"name":"Metered \"job\"","sources":[src],"encrypted":false,"destination":{"type":"local","path": s.dir.join("dst"),"alternate_paths":[],"marker_file":null},"schedule":{"enabled":true,"interval_minutes":60}});
+    let id = s.post("/api/v1/jobs", &tok, json!({"job": job})).await.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+    let r = s.mgr.execute(&id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    assert!(matches!(r.status.as_str(), "success" | "warning"), "{r:?}");
+    let res = s.get("/api/v1/metrics", &tok).await;
+    assert_eq!(res.status(), 200);
+    assert!(res.headers()["content-type"].to_str().unwrap().starts_with("text/plain; version=0.0.4"));
+    let text = res.text().await.unwrap();
+    let (types, samples) = parse(&text);
+    let find = |name: &str, l: &[(&str, &str)]| samples.iter().find(|x| x.name == name && l.iter().all(|(k, v)| x.labels.get(*k).map(String::as_str) == Some(*v))).map(|x| x.value);
+    assert_eq!(types["ufop_http_request_duration_seconds"], "histogram");
+    assert_eq!(types["ufop_backup_runs_total"], "counter");
+    assert_eq!(find("ufop_build_info", &[("version", env!("CARGO_PKG_VERSION"))]), Some(1.0));
+    assert_eq!(find("ufop_backup_job_info", &[("job_id", &id), ("job_name", "Metered \"job\"")]), Some(1.0));
+    assert_eq!(find("ufop_backup_runs_total", &[("job_id", &id), ("operation", "backup"), ("result", &r.status)]), Some(1.0));
+    assert!(find("ufop_backup_last_success_timestamp_seconds", &[("job_id", &id)]).unwrap() > 1.7e9);
+    assert!(find("ufop_backup_last_uploaded_bytes", &[("job_id", &id)]).unwrap() > 0.0);
+    assert_eq!(find("ufop_backup_last_files", &[("job_id", &id)]), Some(1.0));
+    assert!(find("ufop_backup_last_duration_seconds", &[("job_id", &id), ("result", &r.status)]).is_some());
+    assert_eq!(find("ufop_repository_lock_held", &[("job_id", &id)]), Some(0.0));
+    assert_eq!(find("ufop_operations_queued", &[]), Some(0.0));
+    assert!(find("ufop_scheduler_next_run_timestamp_seconds", &[("job_id", &id), ("operation", "backup")]).unwrap() > 1.7e9);
+    assert!(find("ufop_volume_cache_hits_total", &[]).is_some());
+    // HTTP series use the route template, and histograms are cumulative.
+    let route = "/api/v1/jobs";
+    assert!(find("ufop_http_requests_total", &[("method", "POST"), ("route", route), ("status", "200")]).unwrap() >= 1.0);
+    assert!(find("ufop_http_requests_total", &[("method", "GET"), ("route", "/api/v1/metrics"), ("status", "401")]).is_some());
+    let inf = find("ufop_http_request_duration_seconds_bucket", &[("method", "POST"), ("route", route), ("status", "200"), ("le", "+Inf")]).unwrap();
+    let count = find("ufop_http_request_duration_seconds_count", &[("method", "POST"), ("route", route), ("status", "200")]).unwrap();
+    assert_eq!(inf, count);
+    assert!(!text.contains(&s.dir.display().to_string()), "no raw paths in labels");
+    assert!(samples.iter().all(|x| !x.labels.get("route").is_some_and(|r| r.contains(&id))), "routes are templates");
+}
+
+#[tokio::test]
+async fn standalone_metrics_listener_with_basic_auth() {
+    let s = start(ServerConfig::default(), None).await;
+    let repo = Repository::open_in_memory().await.unwrap();
+    let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
+    let st = ServerState::new(s.mgr.clone(), None, auth, ServerConfig::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, super::metrics::standalone_router(st, Some("prom:scrape-me".into()))).await.unwrap() });
+    let url = format!("http://{addr}/metrics");
+    let c = reqwest::Client::new();
+    let no = c.get(&url).send().await.unwrap();
+    assert_eq!(no.status(), 401);
+    assert!(no.headers()["www-authenticate"].to_str().unwrap().starts_with("Basic"));
+    assert_eq!(c.get(&url).basic_auth("prom", Some("wrong")).send().await.unwrap().status(), 401);
+    let ok = c.get(&url).basic_auth("prom", Some("scrape-me")).send().await.unwrap();
+    assert_eq!(ok.status(), 200);
+    assert!(ok.text().await.unwrap().contains("ufop_build_info{"));
+}

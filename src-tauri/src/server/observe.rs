@@ -85,13 +85,16 @@ pub fn redacted_headers(h: &HeaderMap) -> String {
 
 /// Outermost: assign the request id, record the route, echo the id and put
 /// it into JSON error bodies.
-pub(crate) async fn request_context(State(_st): State<ServerState>, mut req: Request, next: Next) -> Response {
+pub(crate) async fn request_context(State(st): State<ServerState>, mut req: Request, next: Next) -> Response {
     let id = request_id_of(req.headers());
     let slot = RouteSlot::default();
     req.extensions_mut().insert(RequestId(id.clone()));
     req.extensions_mut().insert(slot.clone());
+    let method = req.method().clone();
+    let started = std::time::Instant::now();
     let res = next.run(req).await;
     let mut res = if res.status().as_u16() >= 400 { with_request_id_in_body(res, &id).await } else { res };
+    st.metrics.observe_http(method.as_str(), slot.get(), res.status().as_u16(), started.elapsed());
     if let Ok(v) = HeaderValue::from_str(&id) {
         res.headers_mut().insert(REQUEST_ID, v);
     }

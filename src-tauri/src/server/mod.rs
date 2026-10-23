@@ -16,6 +16,7 @@ pub mod oauth;
 pub mod observe;
 pub mod mcp;
 pub mod mcp_oauth;
+pub mod metrics;
 pub mod openapi;
 pub mod sdk;
 pub mod shares;
@@ -93,6 +94,10 @@ pub struct ServerConfig {
     pub shutdown_grace_secs: u64,
     /// One log line per request (method, route template, status, latency, request id).
     pub request_log: bool,
+    /// Separate listener for Prometheus `/metrics` (off when `None`).
+    pub metrics_listen: Option<SocketAddr>,
+    /// `user:password` required (HTTP Basic) on the metrics listener.
+    pub metrics_basic_auth: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -119,6 +124,8 @@ impl Default for ServerConfig {
             dav_allowed_clients: Default::default(),
             shutdown_grace_secs: crate::backup_engine::shutdown::DEFAULT_GRACE.as_secs(),
             request_log: true,
+            metrics_listen: None,
+            metrics_basic_auth: None,
         }
     }
 }
@@ -156,13 +163,15 @@ pub struct ServerState {
     pub gateways: gateway::Hub,
     /// Graceful-shutdown switch (signals, service stop, `/server/shutdown`).
     pub life: lifecycle::Lifecycle,
+    /// HTTP request counters and latency histograms (`/metrics`).
+    pub metrics: metrics::Metrics,
 }
 
 impl ServerState {
     /// State with no OAuth broker, console agent or gateways (set the fields after).
     pub fn new(mgr: BackupManager, conns: Option<ConnectionManager>, auth: AuthService, cfg: ServerConfig) -> Self {
         let life = lifecycle::Lifecycle::new(std::time::Duration::from_secs(cfg.shutdown_grace_secs));
-        Self { mgr, conns, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None, gateways: Default::default(), life }
+        Self { mgr, conns, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None, gateways: Default::default(), life, metrics: Default::default() }
     }
 }
 
@@ -957,6 +966,9 @@ fn inject_server_flag(index: &str) -> String {
 }
 
 async fn static_files(State(st): State<ServerState>, req: Request) -> Response {
+    if let Some(slot) = req.extensions().get::<observe::RouteSlot>() {
+        let _ = slot.0.set("static".into());
+    }
     let Some(root) = st.cfg.webroot.clone() else { return StatusCode::NOT_FOUND.into_response() };
     let rel = req.uri().path().trim_start_matches('/');
     if rel.split('/').any(|seg| seg == "..") {
@@ -1072,6 +1084,7 @@ pub fn router(st: ServerState) -> Router {
         .merge(shares::protected_routes())
         .merge(folders::protected_routes())
         .route("/api/v1/server/shutdown", post(lifecycle::shutdown_route))
+        .route("/api/v1/metrics", get(metrics::metrics_route))
         .merge(gateway::protected_routes())
         .route_layer(middleware::from_fn_with_state(st.clone(), require_auth));
     let mut app = public.merge(protected).merge(dav::routes()).route_layer(middleware::from_fn(observe::record_route));
@@ -1129,6 +1142,14 @@ pub async fn serve(st: ServerState) -> Result<(), AppError> {
     let tls = st.cfg.tls.clone();
     let min_tls = st.cfg.min_tls;
     st.life.listen_for_signals();
+    if let Some(maddr) = st.cfg.metrics_listen {
+        let (mst, auth) = (st.clone(), st.cfg.metrics_basic_auth.clone());
+        tokio::spawn(async move {
+            if let Err(e) = metrics::serve_standalone(mst, maddr, auth).await {
+                tracing::error!("{}", e.user_message());
+            }
+        });
+    }
     let handle = axum_server::Handle::new();
     let drain = {
         let (st, handle) = (st.clone(), handle.clone());
