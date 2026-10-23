@@ -27,6 +27,7 @@ pub mod copy;
 pub mod crypto;
 pub mod db;
 pub mod engine;
+pub mod errors;
 pub mod filecrypt;
 pub mod filters;
 pub mod format;
@@ -360,7 +361,28 @@ pub struct BackupOptions {
     /// alone, so a writer that uploaded blocks but not yet its version is
     /// safe (0 = no delay).
     pub shared_gc_delay_hours: u32,
+
+    // ── Sources and runs ──
+    /// Do not descend into folders on another filesystem than their
+    /// source root (mount points are kept as empty folders).
+    pub one_file_system: bool,
+    /// What unreadable files, folders and unsupported entries do to the run.
+    pub error_policy: errors::ErrorPolicy,
+    /// Re-read and re-hash about this percentage (0–100) of the files that
+    /// look unchanged, to catch content that changed without a new
+    /// timestamp (silent corruption). Files are chosen deterministically
+    /// per run, so every file is covered over time.
+    pub rehash_percent: u8,
+    /// Stop the run (with a partial version) once this many bytes were
+    /// uploaded; the next run continues where it stopped.
+    pub max_upload_bytes_per_run: Option<u64>,
+    /// Files above this size are hashed and compressed by several workers
+    /// at once (0 = off). Block boundaries are identical either way.
+    pub parallel_file_threshold: u64,
 }
+
+/// Default for [`BackupOptions::parallel_file_threshold`] (256 MiB).
+pub const DEFAULT_PARALLEL_FILE_THRESHOLD: u64 = 256 * 1024 * 1024;
 
 /// How volumes are encrypted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,6 +478,11 @@ impl Default for BackupOptions {
             identity: versions::ClientIdentity::default(),
             shared_repository: false,
             shared_gc_delay_hours: shared::DEFAULT_GC_DELAY_HOURS,
+            one_file_system: false,
+            error_policy: errors::ErrorPolicy::default(),
+            rehash_percent: 0,
+            max_upload_bytes_per_run: None,
+            parallel_file_threshold: DEFAULT_PARALLEL_FILE_THRESHOLD,
         }
     }
 }

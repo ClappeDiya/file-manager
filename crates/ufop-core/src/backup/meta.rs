@@ -54,6 +54,32 @@ pub fn is_junction(path: &Path) -> bool {
     false
 }
 
+/// The filesystem (device) `path` lives on: `st_dev` on Unix, the volume
+/// serial number on Windows. `md` is the entry's (followed) metadata.
+#[allow(unused_variables)]
+pub fn device_id(path: &Path, md: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return Some(md.dev());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationByHandleW, FILE_FLAG_BACKUP_SEMANTICS};
+        // FILE_READ_ATTRIBUTES; backup semantics open folders too.
+        let f = std::fs::OpenOptions::new().access_mode(0x80).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path).ok()?;
+        let mut serial: u32 = 0;
+        let ok = unsafe {
+            GetVolumeInformationByHandleW(f.as_raw_handle() as _, std::ptr::null_mut(), 0, &mut serial, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0)
+        };
+        return (ok != 0).then_some(serial as u64);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 /// Recreate a junction at `link` pointing to the folder `target`.
 #[allow(unused_variables)]
 pub fn create_junction(link: &Path, target: &str) -> std::io::Result<()> {

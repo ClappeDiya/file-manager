@@ -20,6 +20,7 @@ use super::{
     hash_bytes, meta, BackupOptions, EntryKind, FileEntry, FileHasher, HashAlgorithm, MissingSourcePolicy, OpContext, Phase, Progress, SymlinkPolicy,
     UsnPolicy,
 };
+use super::errors::{ErrorClass, ErrorTracker};
 use super::snapshot::SnapshotPolicy;
 use super::versions::{VersionMeta, VersionStats};
 use crate::error::AppError;
@@ -471,6 +472,18 @@ pub struct BackupReport {
     /// during the run; each replaced the previous one.
     #[serde(default)]
     pub checkpoints: u64,
+    /// Files re-read by percentage rehash although they looked unchanged.
+    #[serde(default)]
+    pub files_rehashed: u64,
+    /// Of those, files whose content differed from the recorded hash.
+    #[serde(default)]
+    pub rehash_mismatches: u64,
+    /// The run stopped at `max_upload_bytes_per_run` (the version is partial).
+    #[serde(default)]
+    pub upload_cap_reached: bool,
+    /// Informational notes for the run log (e.g. skipped mount points).
+    #[serde(default)]
+    pub info: Vec<String>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
     pub duration_ms: u64,
@@ -605,17 +618,70 @@ struct Scanner<'f> {
     staged: usize,
     /// `.ufopignore` / `.gitignore` rules, read lazily per folder.
     ignores: super::ignore::IgnoreMatcher<'f>,
+    /// Unreadable entries go through the job's error policy.
+    errors: &'f ErrorTracker,
+    /// Informational notes for the run log (skipped mount points).
+    info: Vec<String>,
+    roots: Vec<PathBuf>,
+    /// Device of each source root (stay on one filesystem).
+    root_devs: HashMap<PathBuf, Option<u64>>,
 }
 
 impl<'f> Scanner<'f> {
-    fn new(filter: &'f SourceFilter, opts: &'f BackupOptions, snap: Option<&'f super::snapshot::Snapshot>, staging: Option<&'f Path>) -> Self {
+    fn new(filter: &'f SourceFilter, opts: &'f BackupOptions, snap: Option<&'f super::snapshot::Snapshot>, staging: Option<&'f Path>, errors: &'f ErrorTracker) -> Self {
         let ignores = super::ignore::IgnoreMatcher::new(filter.ignore_config(), move |p: &Path| snap.map(|s| s.real(p)).unwrap_or_else(|| p.to_path_buf()));
-        Scanner { filter, opts, snap, seen_inodes: HashSet::new(), out: Vec::new(), warnings: Vec::new(), staging, staged: 0, ignores }
+        Scanner {
+            filter,
+            opts,
+            snap,
+            seen_inodes: HashSet::new(),
+            out: Vec::new(),
+            warnings: Vec::new(),
+            staging,
+            staged: 0,
+            ignores,
+            errors,
+            info: Vec::new(),
+            roots: Vec::new(),
+            root_devs: HashMap::new(),
+        }
     }
 
-    /// A source root: ignore files are read inside it.
+    /// A source root: ignore files are read inside it, and with
+    /// `one_file_system` its device bounds the walk.
     fn add_root(&mut self, root: &Path) {
         self.ignores.add_root(root);
+        if !self.roots.iter().any(|r| r == root) {
+            self.roots.push(root.to_path_buf());
+            self.roots.sort_by_key(|r| std::cmp::Reverse(r.as_os_str().len()));
+        }
+    }
+
+    /// An unreadable or unsupported entry, filed by the error policy.
+    fn problem(&mut self, class: ErrorClass, message: String) {
+        self.errors.record(class, message);
+    }
+
+    /// A folder on another filesystem than its source root.
+    fn crosses_device(&mut self, path: &Path, md: &std::fs::Metadata) -> bool {
+        if !self.opts.one_file_system {
+            return false;
+        }
+        let Some(root) = self.roots.iter().find(|r| path.starts_with(r)).cloned() else { return false };
+        if root == path {
+            return false;
+        }
+        let root_dev = match self.root_devs.get(&root) {
+            Some(d) => *d,
+            None => {
+                let real = self.real(&root);
+                let d = std::fs::metadata(&real).ok().and_then(|m| meta::device_id(&real, &m));
+                self.root_devs.insert(root.clone(), d);
+                d
+            }
+        };
+        let dev = meta::device_id(&self.real(path), md);
+        matches!((root_dev, dev), (Some(a), Some(b)) if a != b)
     }
 
     /// Excluded by an ignore file (explicit filter rules win over them).
@@ -668,7 +734,7 @@ impl<'f> Scanner<'f> {
         let lmd = match std::fs::symlink_metadata(&real) {
             Ok(m) => m,
             Err(e) => {
-                self.warnings.push(format!("Cannot read {}: {e}", path.display()));
+                self.problem(ErrorClass::File, format!("Cannot read {}: {e}", path.display()));
                 return None;
             }
         };
@@ -693,7 +759,7 @@ impl<'f> Scanner<'f> {
                 SymlinkPolicy::Follow => match std::fs::metadata(&real) {
                     Ok(m) => m,
                     Err(e) => {
-                        self.warnings.push(format!("Broken link {}: {e}", path.display()));
+                        self.problem(ErrorClass::File, format!("Broken link {}: {e}", path.display()));
                         return None;
                     }
                 },
@@ -706,9 +772,18 @@ impl<'f> Scanner<'f> {
         }
         if md.is_dir() {
             self.out.push((path.to_path_buf(), self.entry(path, EntryKind::Dir, &md)));
+            if self.crosses_device(path, &md) {
+                // Kept as an empty folder, like the mount point it is.
+                self.info.push(format!("Skipped {}: another filesystem (stay on one filesystem)", path.display()));
+                return None;
+            }
             return Some(md);
         }
-        if md.is_file() && !self.hardlink_skip(&md) {
+        if !md.is_file() {
+            self.problem(ErrorClass::UnknownEntry, format!("Skipped {}: not a regular file, folder or link", path.display()));
+            return None;
+        }
+        if !self.hardlink_skip(&md) {
             self.out.push((path.to_path_buf(), self.entry(path, EntryKind::File, &md)));
             if self.opts.backup_alternate_streams {
                 for (name, size) in meta::alternate_streams(&real) {
@@ -733,7 +808,7 @@ impl<'f> Scanner<'f> {
                 c
             }
             Err(e) => {
-                self.warnings.push(format!("Cannot list {}: {e}", path.display()));
+                self.problem(ErrorClass::Dir, format!("Cannot list {}: {e}", path.display()));
                 Vec::new()
             }
         }
@@ -814,8 +889,11 @@ impl<'f> Scanner<'f> {
     }
 
     fn walk(&mut self, path: &Path, depth: usize) {
+        if self.errors.should_stop() {
+            return;
+        }
         if depth > 256 {
-            self.warnings.push(format!("Skipping {}: directory nesting too deep", path.display()));
+            self.problem(ErrorClass::Dir, format!("Skipping {}: directory nesting too deep", path.display()));
             return;
         }
         if self.visit(path).is_some() {
@@ -824,10 +902,31 @@ impl<'f> Scanner<'f> {
             }
         }
     }
+
+    fn finish(self, entries: Vec<(PathBuf, FileEntry)>) -> ScanOut {
+        ScanOut { entries, warnings: self.warnings, info: self.info }
+    }
 }
 
 /// Scanned entries (local path + entry) and warnings.
 pub type ScanResult = (Vec<(PathBuf, FileEntry)>, Vec<String>);
+
+/// What a scan found. Entry problems are in the [`ErrorTracker`].
+struct ScanOut {
+    entries: Vec<(PathBuf, FileEntry)>,
+    warnings: Vec<String>,
+    info: Vec<String>,
+}
+
+impl ScanOut {
+    /// The public shape: problems recorded by the tracker become warnings.
+    fn into_result(mut self, errors: &ErrorTracker) -> ScanResult {
+        let (w, e) = errors.take();
+        self.warnings.extend(w);
+        self.warnings.extend(e);
+        (self.entries, self.warnings)
+    }
+}
 
 fn check_sources<'a>(sources: &'a [PathBuf], opts: &BackupOptions, warnings: &mut Vec<String>) -> Result<Vec<&'a PathBuf>, AppError> {
     let mut ok = Vec::new();
@@ -899,7 +998,8 @@ fn drop_empty_dirs(out: &mut Vec<(PathBuf, FileEntry)>) {
 /// Photos library sources are expanded, but their `albums.json` is not
 /// written anywhere: its entry's local path is the logical one.
 pub fn scan_sources(sources: &[PathBuf], filter: &SourceFilter, opts: &BackupOptions) -> Result<ScanResult, AppError> {
-    scan_sources_in(sources, filter, opts, None, None)
+    let errors = ErrorTracker::new(opts.error_policy);
+    Ok(scan_sources_in(sources, filter, opts, None, None, &errors)?.into_result(&errors))
 }
 
 fn scan_sources_in(
@@ -908,9 +1008,10 @@ fn scan_sources_in(
     opts: &BackupOptions,
     snap: Option<&super::snapshot::Snapshot>,
     staging: Option<&Path>,
-) -> Result<ScanResult, AppError> {
+    errors: &ErrorTracker,
+) -> Result<ScanOut, AppError> {
     let (plain, libraries) = split_sources(sources);
-    let mut s = Scanner::new(filter, opts, snap, staging);
+    let mut s = Scanner::new(filter, opts, snap, staging, errors);
     for src in check_sources(&plain, opts, &mut s.warnings)? {
         s.add_root(src);
         s.walk(src, 0);
@@ -918,11 +1019,11 @@ fn scan_sources_in(
     for lib in &libraries {
         s.photos(lib)?;
     }
-    let mut out = s.out;
+    let mut out = std::mem::take(&mut s.out);
     if filter.exclude_empty_folders {
         drop_empty_dirs(&mut out);
     }
-    Ok((out, s.warnings))
+    Ok(s.finish(out))
 }
 
 /// Incremental scan: start from the previous version, then rescan only
@@ -937,7 +1038,9 @@ pub fn scan_incremental(
     filter: &SourceFilter,
     opts: &BackupOptions,
 ) -> Result<(ScanResult, u64), AppError> {
-    scan_incremental_in(sources, prev, changed, shallow, deleted, filter, opts, None, None)
+    let errors = ErrorTracker::new(opts.error_policy);
+    let (out, n) = scan_incremental_in(sources, prev, changed, shallow, deleted, filter, opts, None, None, &errors)?;
+    Ok((out.into_result(&errors), n))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -951,9 +1054,10 @@ fn scan_incremental_in(
     opts: &BackupOptions,
     snap: Option<&super::snapshot::Snapshot>,
     staging: Option<&Path>,
-) -> Result<(ScanResult, u64), AppError> {
+    errors: &ErrorTracker,
+) -> Result<(ScanOut, u64), AppError> {
     let (plain, libraries) = split_sources(sources);
-    let mut s = Scanner::new(filter, opts, snap, staging);
+    let mut s = Scanner::new(filter, opts, snap, staging, errors);
     let roots = check_sources(&plain, opts, &mut s.warnings)?;
     for r in &roots {
         s.add_root(r);
@@ -1019,7 +1123,7 @@ fn scan_incremental_in(
     if filter.exclude_empty_folders {
         drop_empty_dirs(&mut kept);
     }
-    Ok(((kept, s.warnings), rescanned))
+    Ok((s.finish(kept), rescanned))
 }
 
 fn compress_level(path: &Path, opts: &BackupOptions) -> u32 {
@@ -1312,15 +1416,25 @@ pub fn run_backup_with_cipher(
     let snap = snapshot.as_ref();
     // Generated source files (Photos albums.json) live here until the run ends.
     let staging = Staging::new(!split_sources(sources).1.is_empty(), opts)?;
-    let (mut entries, warnings) = match (&changed, prev_list.is_empty()) {
+    let tracker = ErrorTracker::new(opts.error_policy);
+    let scanned = match (&changed, prev_list.is_empty()) {
         (Some(c), false) => {
-            let (r, n) = scan_incremental_in(sources, &prev_list, c, &shallow, &opts.deleted_paths, filter, opts, snap, staging.path())?;
+            let (r, n) = scan_incremental_in(sources, &prev_list, c, &shallow, &opts.deleted_paths, filter, opts, snap, staging.path(), &tracker)?;
             report.rescanned_paths = n;
             r
         }
-        _ => scan_sources_in(sources, filter, opts, snap, staging.path())?,
+        _ => scan_sources_in(sources, filter, opts, snap, staging.path(), &tracker)?,
     };
-    report.warnings.extend(warnings);
+    let mut entries = scanned.entries;
+    report.warnings.extend(scanned.warnings);
+    report.info.extend(scanned.info);
+    absorb_problems(&mut report, &tracker);
+    if tracker.should_stop() {
+        // Stopped while scanning: nothing was read, so there is nothing to keep.
+        report.errors.extend(tracker.stop_reason());
+        report.duration_ms = started.elapsed().as_millis() as u64;
+        return Ok(report);
+    }
     if entries.iter().all(|(_, e)| e.kind == EntryKind::Dir) && !opts.allow_empty_source {
         return Err(AppError::validation("The source selection contains no files; refusing to create an empty version"));
     }
@@ -1353,10 +1467,13 @@ pub fn run_backup_with_cipher(
 
     // ── Parallel read/hash/compress → dedup/pack → concurrent upload ──
     let abort = Arc::new(AtomicBool::new(false));
+    // Set by the error policy (fail-fast, error budget) or the upload cap:
+    // stop reading, keep what is finished as a partial version.
+    let halt = Arc::new(AtomicBool::new(false));
     let stop = {
-        let abort = abort.clone();
+        let (abort, halt) = (abort.clone(), halt.clone());
         let ctx = ctx.clone();
-        move || abort.load(Ordering::SeqCst) || ctx.is_cancelled()
+        move || abort.load(Ordering::SeqCst) || halt.load(Ordering::SeqCst) || ctx.is_cancelled()
     };
     let cfg = WorkerCfg {
         chunker: repo.chunker(),
@@ -1493,7 +1610,10 @@ pub fn run_backup_with_cipher(
                     file_blocks.remove(&idx);
                     if error != "cancelled" {
                         let path = &entries[idx].1.path;
-                        report.warnings.push(format!("Skipped {path}: {error}"));
+                        tracker.record(ErrorClass::File, format!("Skipped {path}: {error}"));
+                        if tracker.should_stop() {
+                            halt.store(true, Ordering::SeqCst);
+                        }
                         if let Some(prev) = prev_files.get(path) {
                             // Keep the previous good copy in this version.
                             results[idx] = Some(prev.clone());
@@ -1513,6 +1633,7 @@ pub fn run_backup_with_cipher(
         Ok(())
     })?;
     // From here on a final (or synthetic partial) version supersedes the checkpoint.
+    absorb_problems(&mut report, &tracker);
 
     if let Some(e) = upload_error {
         report.errors.push(e);
@@ -1525,7 +1646,8 @@ pub fn run_backup_with_cipher(
     progress(ctx, Phase::Finalizing, total, total, report.bytes_examined, None);
 
     let control_files = read_control_files(&opts.control_files, &mut report)?;
-    if ctx.is_cancelled() {
+    let halted = halt.load(Ordering::SeqCst);
+    if ctx.is_cancelled() || halted {
         // Synthetic partial version: everything finished so far stays restorable.
         if !done.is_empty() {
             let ts = next_timestamp(db)?;
@@ -1533,7 +1655,10 @@ pub fn run_backup_with_cipher(
             report.partial = true;
             checkpoints.remove(&repo)?;
         }
-        report.errors.push("The operation was cancelled. Start it again when ready; completed work is kept.".into());
+        match tracker.stop_reason() {
+            Some(r) if halted => report.errors.push(format!("{r}. The files finished so far were kept as a partial version.")),
+            _ => report.errors.push("The operation was cancelled. Start it again when ready; completed work is kept.".into()),
+        }
         report.duration_ms = started.elapsed().as_millis() as u64;
         return Ok(report);
     }
@@ -1593,6 +1718,13 @@ pub fn run_backup_with_cipher(
     progress(ctx, Phase::Completed, total, total, report.bytes_examined, None);
     report.duration_ms = started.elapsed().as_millis() as u64;
     Ok(report)
+}
+
+/// Move the problems the error policy recorded into the report.
+fn absorb_problems(report: &mut BackupReport, tracker: &ErrorTracker) {
+    let (w, e) = tracker.take();
+    report.warnings.extend(w);
+    report.errors.extend(e);
 }
 
 /// Metadata recorded with a new version: the job's default note and tags,
