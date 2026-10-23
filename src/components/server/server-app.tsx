@@ -8,6 +8,7 @@ import { errorText } from "@/lib/error-text";
 import { pickFolder, setFolderPickerImpl } from "@/lib/folder-picker";
 import { ShareLinksPanel } from "@/components/server/share-links-panel";
 import { GatewaysPanel } from "@/components/server/gateways-panel";
+import { AccessPanel } from "@/components/server/access-panel";
 import {
   isSignedIn,
   login,
@@ -15,6 +16,8 @@ import {
   onAuthChange,
   refresh,
   serverRpc,
+  whoAmI,
+  type ServerMe,
 } from "@/lib/server-client";
 
 interface DirListing {
@@ -103,6 +106,7 @@ function FolderBrowser({
 }
 
 function SignIn() {
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -115,7 +119,7 @@ function SignIn() {
           setBusy(true);
           setError(null);
           try {
-            await login(password);
+            await login(password, username.trim() || undefined);
           } catch (err) {
             setError(errorText(err));
           } finally {
@@ -127,11 +131,22 @@ function SignIn() {
           UFOP backup server
         </h1>
         <label className="block text-sm text-zinc-700 dark:text-zinc-300">
+          User name
+          <input
+            id="server-username"
+            autoFocus
+            autoComplete="username"
+            placeholder="admin"
+            className="mt-1 w-full px-2 py-1.5 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+          />
+        </label>
+        <label className="block text-sm text-zinc-700 dark:text-zinc-300">
           Password
           <input
             id="server-password"
             type="password"
-            autoFocus
             autoComplete="current-password"
             className="mt-1 w-full px-2 py-1.5 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800"
             value={password}
@@ -162,7 +177,20 @@ export default function ServerApp() {
     title: string;
     resolve: (p: string | null) => void;
   } | null>(null);
-  const [tab, setTab] = useState<"backups" | "shares" | "gateways">("backups");
+  const [tab, setTab] = useState<"backups" | "shares" | "gateways" | "access">(
+    "backups",
+  );
+  const [me, setMe] = useState<ServerMe | null>(null);
+
+  useEffect(() => {
+    if (!signedIn) {
+      setMe(null);
+      return;
+    }
+    whoAmI()
+      .then(setMe)
+      .catch(() => setMe(null));
+  }, [signedIn]);
 
   useEffect(() => {
     const off = onAuthChange(setSignedIn);
@@ -186,24 +214,32 @@ export default function ServerApp() {
         <div role="tablist" className="flex gap-1">
           {(
             [
-              ["backups", "Backups"],
-              ["shares", "Share links"],
-              ["gateways", "Gateways"],
+              ["backups", "Backups", false],
+              ["shares", "Share links", true],
+              ["gateways", "Gateways", true],
+              ["access", "Users & access", true],
             ] as const
-          ).map(([id, label]) => (
-            <button
-              key={id}
-              role="tab"
-              aria-selected={tab === id}
-              className={`px-2 py-0.5 rounded ${tab === id ? "bg-blue-500 text-white" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}
-              onClick={() => setTab(id)}
-            >
-              {label}
-            </button>
-          ))}
+          )
+            .filter(([, , adminOnly]) => !adminOnly || me?.is_admin)
+            .map(([id, label]) => (
+              <button
+                key={id}
+                role="tab"
+                aria-selected={tab === id}
+                className={`px-2 py-0.5 rounded ${tab === id ? "bg-blue-500 text-white" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}
+                onClick={() => setTab(id)}
+              >
+                {label}
+              </button>
+            ))}
         </div>
+        {me && (
+          <span className="ml-auto text-zinc-500" data-testid="server-account">
+            {me.username} ({me.role})
+          </span>
+        )}
         <button
-          className="ml-auto underline text-zinc-600 dark:text-zinc-400"
+          className={`${me ? "" : "ml-auto "}underline text-zinc-600 dark:text-zinc-400`}
           onClick={() => void logout()}
         >
           Sign out
@@ -214,6 +250,8 @@ export default function ServerApp() {
           <BackupPanel />
         ) : tab === "shares" ? (
           <ShareLinksPanel pickFolder={pickFolder} />
+        ) : tab === "access" ? (
+          <AccessPanel />
         ) : (
           <GatewaysPanel />
         )}

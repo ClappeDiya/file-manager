@@ -627,10 +627,17 @@ describe('audit trail of fleet actions', () => {
       { backupTemplates: [{ name: 'Broken', settings: '{not json' }] },
       { backupTemplates: [{ name: 'Scripts', settings: { scripts: { run_before: 'rm -rf /' } } }] },
       { backupTemplates: [{ name: 'Same' }, { name: 'same' }] },
+      { serverAccess: [] },
+      { serverAccess: { users: [{ username: 'ops', passwordHash: 'plain-password', role: 'operator' }] } },
+      { serverAccess: { users: [{ username: 'has space', passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g' }] } },
+      { serverAccess: { users: [{ username: 'ops', passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g', role: 'root' }] } },
+      { serverAccess: { users: [{ username: 'ops', passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g' }, { username: 'OPS', passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g' }] } },
+      { serverAccess: { rules: [{ principal: 'ops', jobPattern: '*', permission: 'all' }] } },
+      { serverAccess: { rules: [{ principal: '', jobPattern: '*', permission: 'read' }] } },
     ]) expect((await put(admin, bad)).status).toBe(400);
 
     const ok = await json<{ settings: { version: number } }>(
-      await put(admin, { updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [5, 1, 1] } }, proxy: { mode: 'pac', pacUrl: 'https://wpad/p.pac', noProxy: [' intranet ', ''] }, ai: { allowCloud: false }, transfers: { maxUploadKbps: 512, maxConcurrentRuns: 2 }, mounts: { allowedProtocols: ['S3', 'rclone', 's3'], readOnly: true, cacheMode: 'full', maxCacheMb: 2048, mountRoot: ' ~/Drives ' }, workflows: [{ name: 'Tidy Downloads!', rule: JSON.stringify(RULE) }, { id: 'archive', name: 'Archive', enabled: false, rule: RULE }], backupTemplates: [{ name: 'Org Standard', enforced: true, settings: JSON.stringify({ retention: { type: 'keep_count', count: 7 } }) }] }),
+      await put(admin, { updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [5, 1, 1] } }, proxy: { mode: 'pac', pacUrl: 'https://wpad/p.pac', noProxy: [' intranet ', ''] }, ai: { allowCloud: false }, transfers: { maxUploadKbps: 512, maxConcurrentRuns: 2 }, mounts: { allowedProtocols: ['S3', 'rclone', 's3'], readOnly: true, cacheMode: 'full', maxCacheMb: 2048, mountRoot: ' ~/Drives ' }, workflows: [{ name: 'Tidy Downloads!', rule: JSON.stringify(RULE) }, { id: 'archive', name: 'Archive', enabled: false, rule: RULE }], backupTemplates: [{ name: 'Org Standard', enforced: true, settings: JSON.stringify({ retention: { type: 'keep_count', count: 7 } }) }], serverAccess: { users: [{ username: ' ops ', passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g', role: 'operator' }], rules: [{ principal: 'ops', jobPattern: 'prod-*', permission: 'run' }] } }),
     );
     expect(ok.status).toBe(200);
     expect(ok.body.settings.version).toBe(1);
@@ -647,6 +654,7 @@ describe('audit trail of fleet actions', () => {
         { id: 'archive', name: 'Archive', enabled: false, rule: RULE },
       ],
       backupTemplates: [{ id: 'org-standard', name: 'Org Standard', description: '', enforced: true, settings: { retention: { type: 'keep_count', count: 7 } } }],
+      serverAccess: { users: [{ username: 'ops', passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g', role: 'operator', disabled: false }], rules: [{ principal: 'ops', jobPattern: 'prod-*', permission: 'run' }] },
     });
     expect(b.policySetVersion).not.toBe(v0);
     const hbv = await json<{ policiesChanged: boolean }>(await hb(m.token, { policySetVersion: v0 }));

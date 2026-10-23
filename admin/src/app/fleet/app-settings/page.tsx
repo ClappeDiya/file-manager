@@ -50,6 +50,8 @@ interface Form {
   mountRoot: string;
   workflows: WorkflowForm[];
   backupTemplates: BackupTemplateForm[];
+  /** `serverAccess` as JSON ("" = not managed). */
+  serverAccessJson: string;
 }
 
 interface BackupTemplateForm {
@@ -101,6 +103,7 @@ function toForm(s: ManagedSettings | null): Form {
     mountRoot: s?.mounts?.mountRoot ?? '',
     workflows: (s?.workflows ?? []).map((w) => ({ id: w.id, name: w.name, enabled: w.enabled, ruleJson: JSON.stringify(w.rule, null, 2) })),
     backupTemplates: (s?.backupTemplates ?? []).map((t) => ({ id: t.id, name: t.name, description: t.description, enforced: t.enforced, settingsJson: JSON.stringify(t.settings, null, 2) })),
+    serverAccessJson: s?.serverAccess ? JSON.stringify(s.serverAccess, null, 2) : '',
   };
 }
 
@@ -122,6 +125,7 @@ function toBody(f: Form): ManagedSettingsBody {
     backupTemplates: f.backupTemplates.length
       ? f.backupTemplates.map((t) => ({ id: t.id.trim(), name: t.name.trim(), description: t.description.trim(), enforced: t.enforced, settings: parseRule(t.settingsJson || '{}') }))
       : null,
+    serverAccess: f.serverAccessJson.trim() ? (parseRule(f.serverAccessJson) as unknown as ManagedSettingsBody['serverAccess']) : null,
   };
 }
 
@@ -352,12 +356,31 @@ export default function AppSettingsPage() {
             </Button>
           </div>
         </Card>
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Server accounts and access (ufop-server)</CardTitle>
+            <CardDescription>
+              Accounts and per-job access rules provisioned on every ufop-server node, read-only there. Passwords travel only as Argon2 hashes: run <code>ufop-server hash-password</code>. Roles: admin, operator, viewer. Rules give a principal (an account, role:operator, role:viewer or *) a permission (none, read, run, write, full) on jobs matching a pattern (id, or a glob such as prod-*). An account never replaces a local one of the same name. Leave empty to stop managing.
+            </CardDescription>
+          </CardHeader>
+          <label className="flex flex-col gap-1 text-sm">
+            Server access (JSON)
+            <textarea
+              aria-label="Server access (JSON)"
+              className="min-h-32 rounded border border-border bg-background p-2 font-mono text-xs"
+              spellCheck={false}
+              placeholder={'{ "users": [{ "username": "ops", "passwordHash": "$argon2id$…", "role": "operator" }], "rules": [{ "principal": "ops", "jobPattern": "prod-*", "permission": "run" }] }'}
+              value={form.serverAccessJson}
+              onChange={(e) => set({ serverAccessJson: e.target.value })}
+            />
+          </label>
+        </Card>
       </fieldset>
       {canWrite && (
         <div className="mt-4 flex gap-2">
           <Button onClick={() => void save(toBody(form))}>Save</Button>
           {s && (
-            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null })}>
+            <Button variant="outline" onClick={() => confirm('Stop managing app settings? Desktops give the settings back to their users.') && void save({ updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null, serverAccess: null })}>
               Stop managing
             </Button>
           )}

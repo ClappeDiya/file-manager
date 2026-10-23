@@ -52,12 +52,16 @@ async function errorFrom(r: Response): Promise<unknown> {
   }
 }
 
-export async function login(password: string): Promise<void> {
+/** Sign in; `username` defaults to `admin` (the original server password). */
+export async function login(
+  password: string,
+  username?: string,
+): Promise<void> {
   const r = await fetch(api("/auth/login"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
-    body: JSON.stringify({ password }),
+    body: JSON.stringify(username ? { username, password } : { password }),
   });
   if (!r.ok) throw await errorFrom(r);
   accessToken = (await r.json()).access_token;
@@ -187,6 +191,19 @@ export function serverRpc<T>(
     `/rpc/${encodeURIComponent(command)}`,
     args ?? {},
   );
+}
+
+/** The signed-in account (`GET /auth/me`). */
+export interface ServerMe {
+  username: string;
+  role: "admin" | "operator" | "viewer";
+  is_admin: boolean;
+  token: { id: string; scope: string; job_ids: string[] | null } | null;
+  jobs: { job_id: string; job_name: string; permission: string }[];
+}
+
+export function whoAmI(): Promise<ServerMe> {
+  return serverApi<ServerMe>("GET", "/auth/me");
 }
 
 /** Test hook. */

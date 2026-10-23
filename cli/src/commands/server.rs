@@ -15,6 +15,9 @@ pub enum ServerCommands {
     Login {
         #[arg(long, env = "UFOP_SERVER_URL", default_value = "http://127.0.0.1:8200")]
         url: String,
+        /// Account name (default: admin, the original server password)
+        #[arg(long, env = "UFOP_SERVER_USER")]
+        user: Option<String>,
         #[arg(long, env = "UFOP_SERVER_PASSWORD")]
         password: Option<String>,
         /// Use an automation or API token (ufop_pat_…) instead of a password
@@ -88,6 +91,70 @@ pub enum ServerCommands {
     /// Policies of shared folders: lock, accepted types, limits, link rules, intake naming
     #[command(subcommand)]
     Folders(FolderCommands),
+    /// The signed-in account, its role and its permission on each job
+    Whoami,
+    /// Server accounts (administrators)
+    #[command(subcommand)]
+    User(UserCommands),
+    /// Per-job access rules (administrators)
+    #[command(subcommand)]
+    Acl(AclCommands),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum UserCommands {
+    /// List accounts
+    List,
+    /// Add an account (password from --password / UFOP_NEW_USER_PASSWORD, or --password-hash)
+    Add {
+        username: String,
+        /// admin, operator or viewer
+        #[arg(long, default_value = "viewer", value_parser = ["admin", "operator", "viewer"])]
+        role: String,
+        #[arg(long, env = "UFOP_NEW_USER_PASSWORD")]
+        password: Option<String>,
+        /// A ready Argon2 PHC string ($argon2id$…, see `ufop-server hash-password`)
+        #[arg(long, conflicts_with = "password")]
+        password_hash: Option<String>,
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Change an account (only the options given)
+    Set {
+        username: String,
+        #[arg(long, value_parser = ["admin", "operator", "viewer"])]
+        role: Option<String>,
+        #[arg(long)]
+        disabled: Option<bool>,
+        #[arg(long, env = "UFOP_NEW_USER_PASSWORD")]
+        password: Option<String>,
+        #[arg(long, conflicts_with = "password")]
+        password_hash: Option<String>,
+    },
+    /// Delete an account (its sessions and tokens stop working)
+    Remove { username: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AclCommands {
+    /// List rules
+    List,
+    /// Add a rule: PRINCIPAL (user, role:<role> or *) gets PERMISSION on jobs matching PATTERN
+    Add {
+        principal: String,
+        /// Job id or name, or a glob such as "prod-*"
+        pattern: String,
+        /// none, read, run, write or full
+        #[arg(value_parser = ["none", "read", "run", "write", "full"])]
+        permission: String,
+    },
+    /// Delete a rule (use --preview to see who would lose access first)
+    Remove {
+        id: String,
+        /// Only show the effect, do not delete
+        #[arg(long)]
+        preview: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -291,7 +358,7 @@ pub(crate) fn show(format: &OutputFormat, v: &Value) {
 pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, Box<dyn std::error::Error>> {
     let res: Result<u8, String> = async {
         match cmd {
-            ServerCommands::Login { url, password, token } => {
+            ServerCommands::Login { url, user, password, token } => {
                 let mut cfg = CliConfig::load();
                 let url = url.trim_end_matches('/').to_string();
                 let http = reqwest::Client::new();
@@ -305,9 +372,9 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
                     cfg.server_csrf = None;
                 } else {
                     let pw = password.ok_or("Give --password (or UFOP_SERVER_PASSWORD) or --token")?;
-                    let r = http.post(format!("{url}/api/v1/auth/login")).json(&json!({"password": pw})).send().await.map_err(|e| format!("Server unreachable: {e}"))?;
+                    let r = http.post(format!("{url}/api/v1/auth/login")).json(&json!({"username": user, "password": pw})).send().await.map_err(|e| format!("Server unreachable: {e}"))?;
                     if !r.status().is_success() {
-                        return Err(if r.status() == 429 { "Too many sign-in attempts; wait and retry".into() } else { "Wrong password".into() });
+                        return Err(if r.status() == 429 { "Too many sign-in attempts; wait and retry".into() } else { "Wrong user name or password".into() });
                     }
                     cfg.server_refresh = refresh_from(r.headers());
                     cfg.server_csrf = csrf_from(r.headers());
@@ -454,6 +521,51 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
             ServerCommands::Shutdown { grace } => {
                 let mut c = Client::new()?;
                 show(format, &c.call(reqwest::Method::POST, "/server/shutdown", Some(json!({"grace_secs": grace}))).await?);
+                Ok(0)
+            }
+            ServerCommands::Whoami => {
+                let mut c = Client::new()?;
+                show(format, &c.call(reqwest::Method::GET, "/auth/me", None).await?);
+                Ok(0)
+            }
+            ServerCommands::User(uc) => {
+                let mut c = Client::new()?;
+                let v = match uc {
+                    UserCommands::List => c.call(reqwest::Method::GET, "/users", None).await?["users"].clone(),
+                    UserCommands::Add { username, role, password, password_hash, disabled } => {
+                        if password.is_none() && password_hash.is_none() {
+                            return Err("Give --password (or UFOP_NEW_USER_PASSWORD) or --password-hash".into());
+                        }
+                        c.call(reqwest::Method::POST, "/users", Some(json!({"username": username, "role": role, "password": password, "password_hash": password_hash, "disabled": disabled}))).await?
+                    }
+                    UserCommands::Set { username, role, disabled, password, password_hash } => {
+                        c.call(reqwest::Method::PUT, &format!("/users/{}", urlencode(&username)), Some(json!({"role": role, "disabled": disabled, "password": password, "password_hash": password_hash}))).await?
+                    }
+                    UserCommands::Remove { username } => c.call(reqwest::Method::DELETE, &format!("/users/{}", urlencode(&username)), None).await?,
+                };
+                show(format, &v);
+                Ok(0)
+            }
+            ServerCommands::Acl(ac) => {
+                let mut c = Client::new()?;
+                let v = match ac {
+                    AclCommands::List => c.call(reqwest::Method::GET, "/acl", None).await?["rules"].clone(),
+                    AclCommands::Add { principal, pattern, permission } => {
+                        // A job name that is not a pattern becomes that job's id.
+                        let pattern = if pattern.contains(['*', '?']) { pattern } else { c.job_id(&pattern).await.unwrap_or(pattern) };
+                        c.call(reqwest::Method::POST, "/acl", Some(json!({"principal": principal, "job_pattern": pattern, "permission": permission}))).await?
+                    }
+                    AclCommands::Remove { id, preview } => {
+                        let effect = c.call(reqwest::Method::GET, &format!("/acl/{}/preview-delete", urlencode(&id)), None).await?;
+                        if preview {
+                            effect["changes"].clone()
+                        } else {
+                            let _ = c.call(reqwest::Method::DELETE, &format!("/acl/{}", urlencode(&id)), None).await?;
+                            json!({"deleted": id, "changes": effect["changes"]})
+                        }
+                    }
+                };
+                show(format, &v);
                 Ok(0)
             }
             ServerCommands::Folders(fc) => {

@@ -39,6 +39,85 @@ The desktop app does the same when it quits (tray *Quit* or closing the window w
 tray* off): running backups get up to 60 seconds to write their partial version before backup drives are
 closed and the app exits.
 
+## Accounts, roles and access rules
+
+`ufop-server` has its own accounts, separate from the management console's users (the console can
+provision them, see below). Each account has a user name, an Argon2id password hash, a role and an
+enabled flag.
+
+| Role | Jobs | Server-wide |
+|---|---|---|
+| `admin` | `full` on every job | Everything: accounts, rules, settings, tokens of everyone, shares, folder policies, gateways, WebDAV, MCP, the volume cache, templates, creating and importing jobs, shutdown |
+| `operator` | Through access rules, up to `full` | Read settings and templates; browse the server's folders and test destinations (for editing jobs); own API tokens |
+| `viewer` | Through access rules, at most `read` | Read settings and templates; own API tokens |
+
+**Upgrading**: the original server password becomes the password of the account **`admin`** (role
+`admin`) the first time the server starts or someone signs in. Signing in without a user name still means
+`admin`, existing sessions, automation tokens and API tokens keep working as `admin`'s, and
+`ufop-server --set-password` sets `admin`'s password.
+
+**Access rules** give a *principal* — a user name, `role:operator`, `role:viewer` or `*` (everyone) — a
+*permission* on the jobs that match a *job pattern*: a job id, or a glob (`*` any text, `?` one character)
+matched against job ids and names (`prod-*`, `*-db`). For each job the **strongest** matching rule wins,
+capped by the role (a viewer never gets more than `read`); without a matching rule an operator or viewer
+does not see the job at all. Administrators need no rules.
+
+### Permissions
+
+| Permission | Allows |
+|---|---|
+| `none` | Nothing (a rule with `none` grants nothing; it does not take away what another rule gives) |
+| `read` | See the job, its settings, versions, files, history, estimate, lock status; download files; retention preview |
+| `run` | Plus start backups (`/run`, run-all), cancel its tasks, verify, check consistency, list locks and broken files, replicate, sync sources, recreate the local database |
+| `write` | Plus change the job, restore (writes files on the server), change version notes, tags and pins, extract control files, copy versions, local database encryption, apply a template |
+| `full` | Plus delete the job, compact, delete or purge versions, apply retention, repair, rebuild, lock volumes, change the format or sharding, change the passphrase, break the repository lock, export the configuration |
+
+Lists (`GET /jobs`, `/tasks`, `/status`, `/runs`, RPC `backup_list_jobs`, `backup_status`,
+`backup_run_history`) contain only the jobs the caller may read; run-all starts only jobs it may run.
+Denied requests get `403` (`"You are not allowed to …"`). Every request is checked: REST routes by their
+route, operations by their type, and the web UI's RPC commands by the command and its job argument.
+
+**Tokens never exceed their owner.** An API token is owned by the account that created it. Its effective
+permission on a job is the smallest of the owner's permission, the token's scope (`read` → read,
+`run` → run, `write`/`admin` → full) and its job list. Only administrators can create `admin`-scope tokens.
+Accounts see and revoke their own tokens; administrators see all. Deleting or disabling an account signs it
+out and stops its tokens at once.
+
+### Managing accounts
+
+Web UI: *Users & access* (administrators). Previewing a rule deletion lists every account and job whose
+permission would drop.
+
+```bash
+# On the server (works while it is stopped; the password comes from UFOP_SERVER_PASSWORD or stdin)
+ufop-server user add alice --role operator
+ufop-server user add bob --role viewer --password-hash '$argon2id$v=19$m=19456,t=2,p=1$…'
+UFOP_SERVER_PASSWORD='…' ufop-server hash-password     # prints a PHC string for --password-hash or the console
+ufop-server user list | user set alice --disabled true | user remove bob
+
+# Remotely, as an administrator (ufop server login --user admin)
+ufop server user add carol --role viewer --password '…'
+ufop server acl add role:viewer '*' read
+ufop server acl add alice 'prod-*' run
+ufop server acl remove acl_1a2b3c --preview          # who would lose what
+ufop server whoami                                    # account, role, token limits, permission per job
+```
+
+REST: `GET/POST /api/v1/users`, `GET/PUT/DELETE /api/v1/users/{username}`, `GET/POST /api/v1/acl`,
+`DELETE /api/v1/acl/{id}`, `GET /api/v1/acl/{id}/preview-delete`, `GET /api/v1/auth/me`; sign in with
+`POST /api/v1/auth/login {"username", "password"}`; change your own password with
+`PUT /api/v1/auth/password`. The last enabled administrator cannot be deleted, disabled or demoted (`409`).
+WebDAV accepts an administrator account's name and password (any other name with `admin`'s password, as
+before).
+
+### Accounts from the management console
+
+When the server is registered with the management console, *Fleet → App settings → Server accounts and
+access* provisions accounts (with Argon2 hashes only) and rules on every server. They are marked
+*organization* (`managed: true`), cannot be changed or deleted on the server (`403`), are replaced as a
+whole on every change and disappear when the console stops managing them. A provisioned account never
+replaces a local account with the same name (the conflict is reported to the console).
+
 ## API tokens limited to jobs
 
 API tokens (`ufop_pat_…`) have a scope (`read` < `run` < `write` < `admin`) and may also be limited to some
@@ -52,7 +131,7 @@ curl -X POST -H "Authorization: Bearer $UFOP_TOKEN" https://backup:8200/api/v1/j
 `job_ids` in `POST /api/v1/auth/api-tokens` (`null` or absent = every job, as before). A limited token:
 
 - reaches `/api/v1/jobs/{id}/…` only for its jobs (`403` otherwise), with at most its scope
-  (`run` may start backups and verify, but not compact or delete — see *Permissions* below);
+  (`run` may start backups and verify, but not compact or delete — see [Permissions](#permissions));
 - sees only its jobs in `GET /jobs`, `/tasks`, `/status`, `/runs` and the RPC equivalents; `POST /jobs/run-all`
   starts only its jobs (others asked for are reported as skipped, "not allowed"); cancelling another job's
   task is refused;

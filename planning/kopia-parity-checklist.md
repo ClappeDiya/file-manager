@@ -90,7 +90,7 @@ Ground rules
 - [x] K107 Request tracing with X-Request-Id
 - [x] K108 Prometheus `/metrics`
 - [x] K109 OpenTelemetry trace export + Prometheus pushgateway
-- [ ] K92 Multi-user server accounts and per-job ACL
+- [x] K92 Multi-user server accounts and per-job ACL
 - [ ] K87 Ransomware hardening guide + destination checklist in job editor
 
 ## WP9 — Notifications

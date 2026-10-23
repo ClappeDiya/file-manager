@@ -566,6 +566,10 @@ pg_dump mydb | ufop backup stdin --dest /mnt/backup --name mydb.sql    # standar
 ufop backup estimate --dest /mnt/backup --source ~/Documents [--assumed-speed 20M] [--largest 10]
 ufop server run-all [--job Docs …] [--scheduled-only] [--dry-run] [--wait]   # every job of the signed-in ufop-server
 ufop server tokens create ci --scope run --job Docs [--job …] [--days 30]   # API token limited to some jobs
+ufop server login --url https://backup:8200 --user alice --password …   # an account (default user: admin)
+ufop server user list | add NAME --role operator --password … | set NAME --disabled true | remove NAME
+ufop server acl list | add PRINCIPAL PATTERN PERMISSION | remove ID [--preview]   # e.g. acl add alice 'prod-*' run
+ufop server whoami
 ufop server shutdown [--grace 120]   # stop the server gracefully (running backups write a partial version); again = stop now
 ufop backup run-all [--job Docs …] [--scheduled-only] [--wait]               # the same
 ```

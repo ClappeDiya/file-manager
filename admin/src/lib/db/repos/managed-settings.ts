@@ -3,7 +3,9 @@
  * automatic checks and a blackout window, the proxy, AI, transfer caps and
  * the mount profile (what drives may be mounted, and how). Delivered with
  * the policy bundle (`managedSettings`); `null` sections stay with the user.
- * Organization backup policy templates travel the same way (`backupTemplates`).
+ * Organization backup policy templates travel the same way (`backupTemplates`),
+ * and so do accounts and per-job access rules for ufop-server nodes
+ * (`serverAccess`; passwords only as Argon2 hashes).
  * The shape mirrors `ufop_core::agent::ManagedSettings` and is validated the
  * same way, so a desktop never receives settings it would reject.
  */
@@ -31,6 +33,53 @@ export interface ManagedSettingsBody {
   workflows: ManagedWorkflow[] | null;
   /** Backup policy templates offered (or, `enforced`, imposed) on every desktop. */
   backupTemplates: ManagedBackupTemplate[] | null;
+  /** Accounts and per-job access rules for ufop-server nodes (read-only there). */
+  serverAccess: ManagedServerAccess | null;
+}
+
+export interface ManagedServerAccess {
+  users: { username: string; passwordHash: string; role: 'admin' | 'operator' | 'viewer'; disabled: boolean }[];
+  rules: { principal: string; jobPattern: string; permission: 'none' | 'read' | 'run' | 'write' | 'full' }[];
+}
+
+/** Mirrors `ufop_core::agent::{MAX_SERVER_USERS, MAX_SERVER_RULES}`. */
+export const MAX_SERVER_USERS = 500;
+export const MAX_SERVER_RULES = 2000;
+const SERVER_ROLES = ['admin', 'operator', 'viewer'] as const;
+const SERVER_PERMISSIONS = ['none', 'read', 'run', 'write', 'full'] as const;
+const SERVER_USERNAME = /^[A-Za-z0-9._@-]{1,64}$/;
+
+/** Validate server accounts and access rules (same checks as the server). */
+export function normalizeServerAccess(raw: unknown): ManagedServerAccess | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new OrgError('Server access must be an object with users and rules');
+  const o = raw as Record<string, unknown>;
+  const users = Array.isArray(o.users) ? o.users : [];
+  const rules = Array.isArray(o.rules) ? o.rules : [];
+  if (users.length > MAX_SERVER_USERS || rules.length > MAX_SERVER_RULES) throw new OrgError(`At most ${MAX_SERVER_USERS} server accounts and ${MAX_SERVER_RULES} access rules`);
+  const names = new Set<string>();
+  const outUsers = users.map((u) => {
+    const x = (u && typeof u === 'object' ? u : {}) as Record<string, unknown>;
+    const username = str(x.username, 64);
+    if (!SERVER_USERNAME.test(username)) throw new OrgError(`Server account name '${username}' must be 1–64 letters, digits, '.', '_', '@' or '-'`);
+    if (names.has(username.toLowerCase())) throw new OrgError(`Two server accounts are named '${username}'`);
+    names.add(username.toLowerCase());
+    const passwordHash = str(x.passwordHash, 1000);
+    if (!passwordHash.startsWith('$argon2')) throw new OrgError(`Server account '${username}' needs an Argon2 password hash ($argon2id$…, from ufop-server hash-password), not a password`);
+    const role = String(x.role ?? 'viewer') as (typeof SERVER_ROLES)[number];
+    if (!SERVER_ROLES.includes(role)) throw new OrgError(`Server account '${username}' has an unknown role '${role}' (admin, operator or viewer)`);
+    return { username, passwordHash, role, disabled: x.disabled === true };
+  });
+  const outRules = rules.map((r) => {
+    const x = (r && typeof r === 'object' ? r : {}) as Record<string, unknown>;
+    const principal = str(x.principal, 80);
+    const jobPattern = str(x.jobPattern, 200);
+    if (!principal || !jobPattern) throw new OrgError('Every access rule needs a principal and a job pattern');
+    const permission = String(x.permission ?? '') as (typeof SERVER_PERMISSIONS)[number];
+    if (!SERVER_PERMISSIONS.includes(permission)) throw new OrgError(`Unknown access permission '${permission}' (none, read, run, write or full)`);
+    return { principal, jobPattern, permission };
+  });
+  return outUsers.length || outRules.length ? { users: outUsers, rules: outRules } : null;
 }
 
 /** A backup policy template: `settings` as the desktop app exports a template's settings. */
@@ -160,7 +209,7 @@ const str = (v: unknown, n = 500) => (typeof v === 'string' ? v.trim().slice(0, 
 /** Validate and normalize a settings body (throws `OrgError` with a readable message). */
 export function normalizeManagedSettings(raw: unknown): ManagedSettingsBody {
   const b = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: normalizeWorkflows(b.workflows), backupTemplates: normalizeBackupTemplates(b.backupTemplates) };
+  const out: ManagedSettingsBody = { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: normalizeWorkflows(b.workflows), backupTemplates: normalizeBackupTemplates(b.backupTemplates), serverAccess: normalizeServerAccess(b.serverAccess) };
   if (b.updates) {
     const u = b.updates as Record<string, unknown>;
     const channel = u.channel === null || u.channel === undefined || u.channel === '' ? null : u.channel;
@@ -242,8 +291,8 @@ function row(orgId: string): Row | undefined {
 export function getManagedSettings(orgId: string): ManagedSettings | null {
   const r = row(orgId);
   if (!r || r.settings === 'null') return null;
-  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null });
-  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, mounts: b.mounts ?? null, workflows: b.workflows ?? null, backupTemplates: b.backupTemplates ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
+  const b = parseJson<ManagedSettingsBody>(r.settings, { updates: null, proxy: null, ai: null, transfers: null, mounts: null, workflows: null, backupTemplates: null, serverAccess: null });
+  return { updates: b.updates ?? null, proxy: b.proxy ?? null, ai: b.ai ?? null, transfers: b.transfers ?? null, mounts: b.mounts ?? null, workflows: b.workflows ?? null, backupTemplates: b.backupTemplates ?? null, serverAccess: b.serverAccess ?? null, version: Number(r.version), updatedBy: r.updated_by as string, updatedAt: r.updated_at as string };
 }
 
 /**
@@ -252,7 +301,7 @@ export function getManagedSettings(orgId: string): ManagedSettings | null {
  */
 export function setManagedSettings(orgId: string, raw: unknown, by: string): ManagedSettings | null {
   const body = normalizeManagedSettings(raw);
-  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers && !body.mounts && !body.workflows && !body.backupTemplates;
+  const empty = !body.updates && !body.proxy && !body.ai && !body.transfers && !body.mounts && !body.workflows && !body.backupTemplates && !body.serverAccess;
   const version = Number(row(orgId)?.version ?? 0) + 1;
   db()
     .prepare('INSERT INTO managed_settings (org_id, settings, version, updated_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(org_id) DO UPDATE SET settings = excluded.settings, version = excluded.version, updated_by = excluded.updated_by, updated_at = excluded.updated_at')
@@ -263,5 +312,5 @@ export function setManagedSettings(orgId: string, raw: unknown, by: string): Man
 /** What the agent receives: `null` when nothing is managed. */
 export function managedSettingsForAgent(orgId: string): (ManagedSettingsBody & { version: number }) | null {
   const s = getManagedSettings(orgId);
-  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers, mounts: s.mounts, workflows: s.workflows, backupTemplates: s.backupTemplates };
+  return s && { version: s.version, updates: s.updates, proxy: s.proxy, ai: s.ai, transfers: s.transfers, mounts: s.mounts, workflows: s.workflows, backupTemplates: s.backupTemplates, serverAccess: s.serverAccess };
 }
