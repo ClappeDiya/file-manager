@@ -440,6 +440,11 @@ export class UfopClient {
     return this.call("POST", `/api/v1/scheduler/resume`, undefined, undefined);
   }
 
+  /** Stop the server gracefully: new mutating requests get 503, running backups stop at a safe point (partial version) within grace_secs (default --shutdown-grace), then the process exits 0; a second call stops at once. Answers 202 (API tokens: `admin` scope). `POST /api/v1/server/shutdown` */
+  postServerShutdown(body: { grace_secs?: number | null } = {}): Promise<{ accepted?: boolean; grace_secs?: number; immediate?: boolean; running_tasks?: number }> {
+    return this.call("POST", `/api/v1/server/shutdown`, undefined, body);
+  }
+
   /** Server settings (API tokens: `read` scope). `GET /api/v1/settings` */
   getSettings(): Promise<{ allow_automation_tokens?: boolean }> {
     return this.call("GET", `/api/v1/settings`, undefined, undefined);

@@ -10,6 +10,7 @@ pub mod auth;
 pub mod dav;
 pub mod folders;
 pub mod gateway;
+pub mod lifecycle;
 pub mod oauth;
 pub mod mcp;
 pub mod mcp_oauth;
@@ -86,6 +87,8 @@ pub struct ServerConfig {
     pub mcp_allow_write: bool,
     /// Public origin (`https://files.example.com`) for OAuth metadata; default: from the request.
     pub public_url: Option<String>,
+    /// How long running backups get to stop at a safe point on shutdown.
+    pub shutdown_grace_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -110,6 +113,7 @@ impl Default for ServerConfig {
             mcp_allow_write: false,
             public_url: None,
             dav_allowed_clients: Default::default(),
+            shutdown_grace_secs: crate::backup_engine::shutdown::DEFAULT_GRACE.as_secs(),
         }
     }
 }
@@ -145,6 +149,16 @@ pub struct ServerState {
     pub agent: Option<crate::fleet_agent::FleetAgent>,
     /// File gateway relay (on-premises agents and their jobs).
     pub gateways: gateway::Hub,
+    /// Graceful-shutdown switch (signals, service stop, `/server/shutdown`).
+    pub life: lifecycle::Lifecycle,
+}
+
+impl ServerState {
+    /// State with no OAuth broker, console agent or gateways (set the fields after).
+    pub fn new(mgr: BackupManager, conns: Option<ConnectionManager>, auth: AuthService, cfg: ServerConfig) -> Self {
+        let life = lifecycle::Lifecycle::new(std::time::Duration::from_secs(cfg.shutdown_grace_secs));
+        Self { mgr, conns, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None, gateways: Default::default(), life }
+    }
 }
 
 /// HTTP error wrapper: AppError → status + sanitized `{error_type, message, advice}`.
@@ -1039,6 +1053,7 @@ pub fn router(st: ServerState) -> Router {
         .merge(oauth::protected_routes())
         .merge(shares::protected_routes())
         .merge(folders::protected_routes())
+        .route("/api/v1/server/shutdown", post(lifecycle::shutdown_route))
         .merge(gateway::protected_routes())
         .route_layer(middleware::from_fn_with_state(st.clone(), require_auth));
     let mut app = public.merge(protected).merge(dav::routes());
@@ -1055,7 +1070,8 @@ pub fn router(st: ServerState) -> Router {
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static(PREAUTH_HEADER)]),
         );
     }
-    app.layer(middleware::from_fn_with_state(st.clone(), host_check))
+    app.layer(middleware::from_fn_with_state(st.clone(), lifecycle::drain_guard))
+        .layer(middleware::from_fn_with_state(st.clone(), host_check))
         .layer(middleware::from_fn_with_state(st.clone(), ip_check))
         .layer(middleware::from_fn_with_state(st.clone(), security_headers))
         .with_state(st)
@@ -1076,33 +1092,58 @@ pub fn enforce_data_dir_permissions(dir: &std::path::Path) -> Result<(), AppErro
     Ok(())
 }
 
-/// Serve until the process is stopped.
+/// Serve until stopped: a stop request (signal, service stop or
+/// `POST /server/shutdown`) drains running backups, then open connections.
 pub async fn serve(st: ServerState) -> Result<(), AppError> {
     // Several TLS backends are linked (reqwest, axum-server); pick one explicitly.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let addr = st.cfg.bind_addr()?;
     let tls = st.cfg.tls.clone();
     let min_tls = st.cfg.min_tls;
-    let app = router(st).into_make_service_with_connect_info::<SocketAddr>();
+    st.life.listen_for_signals();
+    let handle = axum_server::Handle::new();
+    let drain = {
+        let (st, handle) = (st.clone(), handle.clone());
+        tokio::spawn(async move {
+            let report = lifecycle::drain_when_requested(st.clone()).await;
+            tracing::info!("Backups stopped ({} cancelled, {} still running after {} ms); closing connections", report.cancelled, report.still_running, report.waited_ms);
+            if st.life.is_immediate() {
+                handle.shutdown();
+            } else {
+                handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+            }
+            report
+        })
+    };
+    let app = router(st.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let io = |e: std::io::Error| AppError::Configuration { message: format!("Server failed: {e}"), advice: "Check the port and TLS settings.".into() };
-    match tls {
+    let served = match tls {
         TlsMode::None => {
             tracing::info!("ufop-server listening on http://{addr}");
-            axum_server::bind(addr).serve(app).await.map_err(io)
+            axum_server::bind(addr).handle(handle).serve(app).await.map_err(io)
         }
         TlsMode::Generated { dir, hostnames } => {
             let (chain, key) = tls::pem_to_der(&tls::GeneratedCerts::new(dir).load_or_create(&hostnames)?)?;
             let cfg = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls::server_config(chain, key, min_tls)?));
             tracing::info!("ufop-server listening on https://{addr} (TLS {:?}+)", min_tls);
-            axum_server::bind_rustls(addr, cfg).serve(app).await.map_err(io)
+            axum_server::bind_rustls(addr, cfg).handle(handle).serve(app).await.map_err(io)
         }
         TlsMode::Pfx { path, password } => {
             let (chain, key) = tls::load_pfx(&path, &password)?;
             let cfg = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls::server_config(chain, key, min_tls)?));
             tracing::info!("ufop-server listening on https://{addr} (imported certificate, TLS {:?}+)", min_tls);
-            axum_server::bind_rustls(addr, cfg).serve(app).await.map_err(io)
+            axum_server::bind_rustls(addr, cfg).handle(handle).serve(app).await.map_err(io)
         }
+    };
+    served?;
+    // The listener only stops after a stop request, so the drain is done or ending.
+    if !drain.is_finished() {
+        st.mgr.begin_shutdown();
+        st.mgr.cancel_all();
     }
+    drain.abort();
+    tracing::info!("ufop-server stopped");
+    Ok(())
 }
 
 #[cfg(test)]

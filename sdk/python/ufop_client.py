@@ -357,6 +357,10 @@ class UfopClient:
         """Resume the scheduler (API tokens: `run` scope). `POST /api/v1/scheduler/resume`"""
         return self._call("POST", f"/api/v1/scheduler/resume", None, None)
 
+    def post_server_shutdown(self, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Stop the server gracefully: new mutating requests get 503, running backups stop at a safe point (partial version) within grace_secs (default --shutdown-grace), then the process exits 0; a second call stops at once. Answers 202 (API tokens: `admin` scope). `POST /api/v1/server/shutdown`"""
+        return self._call("POST", f"/api/v1/server/shutdown", None, body if body is not None else {})
+
     def get_settings(self) -> Dict[str, Any]:
         """Server settings (API tokens: `read` scope). `GET /api/v1/settings`"""
         return self._call("GET", f"/api/v1/settings", None, None)

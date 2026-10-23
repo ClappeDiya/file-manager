@@ -13,7 +13,6 @@
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 use unified_file_ops_lib::backup_engine::{self, policy::ModulePolicy, BackupManager};
 use unified_file_ops_lib::connectors::ConnectionManager;
 use unified_file_ops_lib::fleet_agent;
@@ -140,7 +139,14 @@ struct Args {
     /// Windows: run under the Service Control Manager (set by --install-service)
     #[arg(long, hide = true)]
     windows_service: bool,
+    /// Seconds running backups get to stop at a safe point (writing a partial
+    /// version) when the server is asked to stop; a second stop request is immediate
+    #[arg(long, env = "UFOP_SERVER_SHUTDOWN_GRACE", default_value_t = 60)]
+    shutdown_grace: u64,
 }
+
+/// The running server's stop switch, for the Windows service handler.
+static STOP: std::sync::OnceLock<server::lifecycle::Lifecycle> = std::sync::OnceLock::new();
 
 /// Arguments forwarded to the service: everything except the install flag.
 fn service_args(argv: &[String]) -> Vec<String> {
@@ -197,27 +203,46 @@ mod winsvc {
     }
 
     fn service_main(_args: Vec<OsString>) {
-        let handler = service_control_handler::register(NAME, |ev| match ev {
+        let status_handle: std::sync::Arc<std::sync::OnceLock<service_control_handler::ServiceStatusHandle>> = Default::default();
+        let sh = status_handle.clone();
+        let handler = service_control_handler::register(NAME, move |ev| match ev {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                std::process::exit(0);
+                // Graceful: running backups stop at a safe point (a second stop is immediate).
+                match super::STOP.get() {
+                    Some(life) => {
+                        let grace = life.default_grace();
+                        if let Some(h) = sh.get() {
+                            let _ = h.set_service_status(status(ServiceState::StopPending, ServiceControlAccept::empty(), grace + Duration::from_secs(15)));
+                        }
+                        life.request(None);
+                    }
+                    None => std::process::exit(0),
+                }
+                ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         });
         let Ok(h) = handler else { return };
-        let _ = h.set_service_status(ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: ServiceState::Running,
-            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-            exit_code: ServiceExitCode::Win32(0),
-            checkpoint: 0,
-            wait_hint: Duration::default(),
-            process_id: None,
-        });
+        let _ = status_handle.set(h);
+        let _ = h.set_service_status(status(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, Duration::default()));
         // Process arguments (not the SCM start arguments) carry the configuration.
         let argv: Vec<String> = std::env::args().collect();
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(super::run(argv));
+        let _ = h.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty(), Duration::default()));
+    }
+
+    fn status(state: ServiceState, accept: ServiceControlAccept, wait_hint: Duration) -> ServiceStatus {
+        ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: accept,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint,
+            process_id: None,
+        }
     }
 }
 
@@ -388,6 +413,7 @@ async fn run(argv: Vec<String>) {
         mcp_roots: a.mcp_roots,
         mcp_allow_write: a.mcp_allow_write,
         public_url: a.public_url,
+        shutdown_grace_secs: a.shutdown_grace,
     };
     if !cfg.mcp_roots.is_empty() {
         let roots = ufop_core::confine::Roots::new(&cfg.mcp_roots).unwrap_or_else(|e| fail(format!("--mcp-root: {e}")));
@@ -405,7 +431,8 @@ async fn run(argv: Vec<String>) {
             tracing::warn!("WebDAV is reachable over plain HTTP: passwords and tokens are sent unencrypted. Use --https or a TLS reverse proxy.");
         }
     }
-    let st = ServerState { mgr, conns: Some(conns), auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent, gateways: Default::default() };
+    let st = ServerState { oauth, agent, ..ServerState::new(mgr, Some(conns), auth, cfg) };
+    let _ = STOP.set(st.life.clone());
     if let Err(e) = server::serve(st).await {
         fail(e);
     }

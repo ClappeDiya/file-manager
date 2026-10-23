@@ -187,6 +187,7 @@ pub(crate) const OPS: &[Op] = &[
     op!("get" "/api/v1/gateways/{name}/files", "gateways", "List a folder through a gateway (`/` = its roots)", auth: true, params: &[("name", "path", "string", true, "Gateway name"), ("path", "query", "string", false, "/<root>/<folder>")], body: None, response: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "entries": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "is_dir": { "type": "boolean" }, "size": { "type": "integer" }, "modified": { "type": ["string", "null"] } } } } } })),
     Op { method: "get", path: "/api/v1/gateways/{name}/download", tag: "gateways", summary: "Download a file through a gateway (streamed, not stored)", auth: true, params: &[("name", "path", "string", true, "Gateway name"), ("path", "query", "string", true, "/<root>/<file>")], body: None, response: || json!({ "type": "string", "format": "binary" }), content_type: "application/octet-stream" },
     op!("put" "/api/v1/gateways/{name}/upload", "gateways", "Upload the request body as a file through a writable gateway", auth: true, params: &[("name", "path", "string", true, "Gateway name"), ("path", "query", "string", true, "/<root>/<file>")], body: None, response: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "bytes": { "type": "integer" } } })),
+    Op { method: "post", path: "/api/v1/server/shutdown", tag: "general", summary: "Stop the server gracefully: new mutating requests get 503, running backups stop at a safe point (partial version) within grace_secs (default --shutdown-grace), then the process exits 0; a second call stops at once. Answers 202", auth: true, params: &[], body: Some(|| json!({ "type": "object", "properties": { "grace_secs": { "type": ["integer", "null"], "minimum": 0 } } })), response: || json!({ "type": "object", "properties": { "accepted": { "type": "boolean" }, "immediate": { "type": "boolean" }, "grace_secs": { "type": "integer" }, "running_tasks": { "type": "integer" } } }), content_type: "application/json" },
     op!("get" "/oauth/token", "oauth", "Access token for an AuthID (the AuthID is the credential)", auth: false, params: &[("authid", "query", "string", true, "AuthID from the callback")], body: None, response: || json!({ "type": "object", "properties": { "access_token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" } } })),
 ];
 
@@ -243,6 +244,9 @@ pub fn document() -> Value {
         o["responses"]["400"] = error("Invalid request");
         o["responses"]["403"] = error("The client address is outside --allowed-cidrs");
         o["responses"]["421"] = error("The Host header is not in --allowed-hostnames");
+        if op.method != "get" {
+            o["responses"]["503"] = error("The server is shutting down (see Retry-After)");
+        }
         paths.entry(op.path.to_string()).or_insert_with(|| json!({}))[op.method] = o;
     }
     json!({

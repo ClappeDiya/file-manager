@@ -25,6 +25,7 @@ pub mod runs;
 pub mod power;
 pub mod schedule;
 pub mod secrets;
+pub mod shutdown;
 pub mod templates;
 pub mod stores;
 pub mod versions;
@@ -801,6 +802,8 @@ struct Inner {
     /// `Some(None)` = paused indefinitely.
     paused: Mutex<Option<Option<DateTime<Utc>>>>,
     scheduler_running: AtomicBool,
+    /// Shutting down: no new operations (see `shutdown`).
+    draining: AtomicBool,
     kdf: KdfParams,
     policy: std::sync::RwLock<policy::ModulePolicy>,
     secrets: std::sync::OnceLock<SettingsStore>,
@@ -891,6 +894,7 @@ impl BackupManager {
                 managed_templates: Mutex::new(Vec::new()),
                 paused: Mutex::new(None),
                 scheduler_running: AtomicBool::new(false),
+                draining: AtomicBool::new(false),
                 kdf,
                 policy: std::sync::RwLock::new(policy::ModulePolicy::from_env()),
                 secrets: std::sync::OnceLock::new(),
@@ -1732,6 +1736,7 @@ impl BackupManager {
 
     /// Queue any operation in the background; returns the task id.
     pub async fn start_operation(&self, job_id: &str, op: BackupOperation) -> Result<String, AppError> {
+        self.ensure_accepting()?;
         let job = self.get_job(job_id).await?;
         if self.is_job_busy(job_id) {
             return Err(AppError::state("This job is already queued or running", "Wait for it to finish or cancel it."));
@@ -2070,6 +2075,7 @@ impl BackupManager {
 
     /// Queue a backup in the background; returns the task id.
     pub async fn start_backup(&self, job_id: &str, dry_run: bool) -> Result<String, AppError> {
+        self.ensure_accepting()?;
         let job = self.get_job(job_id).await?;
         if self.is_job_busy(job_id) {
             return Err(AppError::state("This job is already queued or running", "Wait for it to finish or cancel it."));
@@ -2087,6 +2093,7 @@ impl BackupManager {
 
     /// Run an operation and wait for its result.
     pub async fn execute(&self, job_id: &str, op: BackupOperation) -> Result<OperationResult, AppError> {
+        self.ensure_accepting()?;
         let job = self.get_job(job_id).await?;
         let (task_id, cancel, progress) = self.register_task(&job, op.name());
         // Boxed so callers that await many operations keep small frames.
@@ -2995,6 +3002,9 @@ impl BackupManager {
 
     /// One scheduler pass: start every due job.
     pub async fn tick(&self) -> usize {
+        if self.is_shutting_down() {
+            return 0;
+        }
         self.close_idle_drives().await;
         let now = Utc::now();
         let due = self.due_jobs(now).await;

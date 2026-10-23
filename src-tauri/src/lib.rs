@@ -1212,6 +1212,12 @@ pub fn run() {
             }
             if let tauri::WindowEvent::Destroyed = event {
                 tracing::info!("Window closing, persisting state...");
+                // Running backups stop at a safe point (partial version,
+                // repository lock released) before the app exits.
+                let report = shutdown_backup.shutdown_blocking(backup_engine::shutdown::DEFAULT_GRACE);
+                if report.cancelled > 0 {
+                    tracing::info!("Stopped {} backup operation(s) on exit ({} still running)", report.cancelled, report.still_running);
+                }
                 // Backup drives and preview copies do not outlive the app.
                 shutdown_backup.close_all_drives_blocking();
                 shutdown_backup.cleanup_all_previews();

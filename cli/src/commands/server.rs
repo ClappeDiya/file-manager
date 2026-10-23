@@ -72,6 +72,13 @@ pub enum ServerCommands {
     },
     /// Issue a long-lived automation token (must be enabled on the server)
     IssueToken,
+    /// Stop the server gracefully: running backups stop at a safe point
+    /// (partial version) within the grace period, then it exits; run it again to stop at once
+    Shutdown {
+        /// Seconds running backups get (default: the server's --shutdown-grace)
+        #[arg(long)]
+        grace: Option<u64>,
+    },
     /// Named, scoped, expiring API tokens (read, run, write, admin)
     #[command(subcommand)]
     Tokens(TokenCommands),
@@ -419,6 +426,11 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
             ServerCommands::IssueToken => {
                 let mut c = Client::new()?;
                 show(format, &c.call(reqwest::Method::POST, "/auth/automation-token", None).await?);
+                Ok(0)
+            }
+            ServerCommands::Shutdown { grace } => {
+                let mut c = Client::new()?;
+                show(format, &c.call(reqwest::Method::POST, "/server/shutdown", Some(json!({"grace_secs": grace}))).await?);
                 Ok(0)
             }
             ServerCommands::Folders(fc) => {

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ufop-server operations and security (see `docs/server-operations.md`):
+  - **Graceful shutdown** on SIGTERM/SIGINT, Windows service stop and `POST /api/v1/server/shutdown {grace_secs}` (`ufop server shutdown`): new state-changing requests get `503` with `Retry-After`, running backups stop at a safe point and write a partial version within the grace period (`--shutdown-grace`, default 60 s), then the server exits 0; a second request stops at once. The desktop app drains running backups the same way when it quits.
+
 - Backup storage backends (see `docs/backup-destinations.md`):
   - **S3 credential chain**: static keys (default), environment, AWS profiles (static keys, `role_arn` with `source_profile` or `credential_source`, web identity), web identity token files, EC2 instance metadata (IMDSv2), ECS/EKS container credentials and *Automatic* (the SDK order). Temporary credentials refresh five minutes before they expire.
   - **STS AssumeRole** on top of any S3 credential source, with external id, session name, duration, STS endpoint and region; cached and renewed.

@@ -84,7 +84,7 @@ Ground rules
 - [x] K58 Live-provider contract test harness (env-gated) + CI workflow
 
 ## WP8 — Server, security, observability
-- [ ] K97 Graceful server shutdown (drain, checkpoint)
+- [x] K97 Graceful server shutdown (drain, checkpoint)
 - [ ] K89 CSRF double-submit token on cookie routes
 - [ ] K93 API tokens scoped to job IDs
 - [ ] K107 Request tracing with X-Request-Id

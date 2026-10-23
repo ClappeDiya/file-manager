@@ -18,7 +18,7 @@ async fn start(cfg: ServerConfig, oauth: Option<oauth::OAuthBroker>) -> TestServ
     let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
     let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
     auth.set_password("server-password").await.unwrap();
-    let st = ServerState { mgr: mgr.clone(), conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent: None, gateways: Default::default() };
+    let st = ServerState { oauth, ..ServerState::new(mgr.clone(), None, auth, cfg) };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
@@ -236,7 +236,7 @@ async fn https_with_generated_certificate() {
     let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, d.path().join("dbs"), KdfParams::insecure_fast());
     let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
     let cfg = ServerConfig { port, tls: TlsMode::Generated { dir: d.path().join("tls"), hostnames: vec!["localhost".into()] }, ..Default::default() };
-    let st = ServerState { mgr, conns: None, auth, cfg: Arc::new(cfg), started: Instant::now(), oauth: None, agent: None, gateways: Default::default() };
+    let st = ServerState::new(mgr, None, auth, cfg);
     tokio::spawn(async move { serve(st).await.unwrap() });
     let ca = std::fs::read(loop {
         let p = d.path().join("tls/ufop-ca.pem");
@@ -1029,4 +1029,73 @@ async fn policy_templates_effective_settings_and_schedule_preview_over_rest() {
     let bad = s.post("/api/v1/backup-schedule/preview", &tok, json!({"schedule": {"enabled": true, "cron": ["99 * * * *"]}})).await;
     assert_eq!(bad.status(), 400);
     assert!(bad.text().await.unwrap().contains("Invalid cron expression"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graceful_shutdown_checkpoints_running_backup_and_refuses_new_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::open_in_memory().await.unwrap();
+    let mgr = BackupManager::with_kdf(repo.pool().clone(), Arc::new(CredentialStore::new()), None, None, dir.path().join("dbs"), KdfParams::insecure_fast());
+    let auth = AuthService::new(settings::SettingsStore::plain(repo.pool().clone()));
+    auth.set_password("server-password").await.unwrap();
+    let st = ServerState::new(mgr.clone(), None, auth, ServerConfig::default());
+    let drain = tokio::spawn(lifecycle::drain_when_requested(st.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router(st).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
+    let s = TestServer { base, mgr, client: reqwest::Client::builder().cookie_store(true).build().unwrap(), dir: dir.path().to_path_buf(), _dir: dir };
+    let tok = s.login().await;
+
+    // A slow backup: incompressible files through a 40 kB/s upload limit.
+    let src = s.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for i in 0..24 {
+        let data: Vec<u8> = (0..16_384u32).map(|j| ((j.wrapping_mul(2_654_435_761) ^ (i * 7919)) >> 7) as u8).collect();
+        std::fs::write(src.join(format!("f{i:02}.bin")), data).unwrap();
+    }
+    let dst = s.dir.join("dst");
+    let job = json!({"name":"Slow","sources":[src],"encrypted":false,"destination":{"type":"local","path": dst,"alternate_paths":[],"marker_file":null},"options":{"block_size":4096,"volume_size":32768,"compression_level":0},"throttle":{"upload_bps":40000,"download_bps":0}});
+    let id = s.post("/api/v1/jobs", &tok, json!({"job": job})).await.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+    assert_eq!(s.post(&format!("/api/v1/jobs/{id}/run"), &tok, json!({})).await.status(), 200);
+    for _ in 0..200 {
+        let t = s.get("/api/v1/tasks", &tok).await.json::<Value>().await.unwrap();
+        if t[0]["state"] == "running" && t[0]["progress"].is_object() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let r = s.post("/api/v1/server/shutdown", &tok, json!({"grace_secs": 30})).await;
+    assert_eq!(r.status(), 202);
+    let r = r.json::<Value>().await.unwrap();
+    assert_eq!((r["immediate"].as_bool(), r["grace_secs"].as_u64(), r["running_tasks"].as_u64()), (Some(false), Some(30), Some(1)));
+    // New mutating requests are refused with Retry-After; reads still work.
+    let refused = s.post(&format!("/api/v1/jobs/{id}/run"), &tok, json!({})).await;
+    assert_eq!(refused.status(), 503);
+    assert!(refused.headers()["retry-after"].to_str().unwrap().parse::<u64>().unwrap() >= 30);
+    assert_eq!(s.get("/api/v1/jobs", &tok).await.status(), 200);
+    assert!(s.mgr.start_backup(&id, false).await.unwrap_err().user_message().contains("shutting down"));
+
+    let report = tokio::time::timeout(std::time::Duration::from_secs(40), drain).await.unwrap().unwrap();
+    assert_eq!((report.cancelled, report.still_running), (1, 0), "{report:?}");
+    // The stopped backup left a partial version and no repository lock.
+    let versions = s.mgr.list_versions(&id).await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert!(versions[0].partial, "{versions:?}");
+    assert!(s.mgr.lock_status(&id).await.unwrap().locks.is_empty());
+    let run = &s.mgr.run_history(Some(id.clone()), 1).await.unwrap()[0];
+    assert_ne!(run.status, "success", "{run:?}");
+}
+
+#[test]
+fn second_stop_request_is_immediate() {
+    let l = lifecycle::Lifecycle::new(std::time::Duration::from_secs(60));
+    assert!(!l.is_draining());
+    assert_eq!(l.request(None), lifecycle::StopRequest::Graceful);
+    assert_eq!(l.grace().as_secs(), 60);
+    assert!(l.is_draining() && !l.is_immediate());
+    assert_eq!(l.request(Some(std::time::Duration::from_secs(1))), lifecycle::StopRequest::Immediate);
+    assert!(l.is_immediate());
+    assert_eq!(l.grace().as_secs(), 60, "the first request's grace stays");
 }

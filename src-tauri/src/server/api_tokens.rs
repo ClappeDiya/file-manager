@@ -45,7 +45,7 @@ impl Scope {
 /// The scope a request needs.
 pub fn required_scope(method: &Method, path: &str) -> Scope {
     let p = path.trim_end_matches('/');
-    if p.starts_with("/api/v1/auth/") || p.starts_with("/api/v1/rpc/") || p.starts_with("/api/v1/oauth/") || (p == "/api/v1/settings" && method != Method::GET) {
+    if p.starts_with("/api/v1/auth/") || p.starts_with("/api/v1/rpc/") || p.starts_with("/api/v1/server/") || p.starts_with("/api/v1/oauth/") || (p == "/api/v1/settings" && method != Method::GET) {
         return Scope::Admin;
     }
     // MCP checks write access per tool call.
@@ -238,6 +238,7 @@ mod tests {
         assert_eq!(required_scope(&Method::GET, "/api/v1/gateways/office/download"), Scope::Read);
         assert_eq!(required_scope(&Method::PUT, "/api/v1/gateways/office/upload"), Scope::Write);
         assert_eq!(required_scope(&post, "/api/v1/rpc/anything"), Scope::Admin);
+        assert_eq!(required_scope(&post, "/api/v1/server/shutdown"), Scope::Admin);
         assert_eq!(required_scope(&get, "/api/v1/auth/api-tokens"), Scope::Admin);
         assert!(Scope::Admin > Scope::Write && Scope::Write > Scope::Run && Scope::Run > Scope::Read);
     }
