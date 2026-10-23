@@ -250,6 +250,7 @@ pub fn route_need(method: &Method, route: &str) -> Need {
             (_, true) => Need::Job(P::Read),
             ("/run" | "/operations", _) => Need::Job(P::Run),
             ("/retention/preview", _) => Need::Job(P::Read),
+            ("/hardening/probe", _) => Need::Job(P::Run),
             ("", _) if method == Method::DELETE => Need::Job(P::Full),
             ("/lock" | "/passphrase", _) => Need::Job(P::Full),
             _ => Need::Job(P::Write),
@@ -354,6 +355,8 @@ pub fn rpc_need(cmd: &str, args: &serde_json::Value) -> RpcNeed {
         "backup_list_jobs" | "backup_status" | "backup_run_history" | "backup_run_all" | "backup_cancel" => RpcNeed::Filtered,
         "backup_get_job" | "backup_list_versions" | "backup_list_files" | "backup_search" | "backup_compare" | "backup_list_sources" | "backup_preview_retention" | "backup_estimate" | "backup_export_cli" | "backup_effective_job"
         | "backup_lock_status" | "backup_resolve_version" | "backup_read_file" | "backup_job_placeholders" => job(P::Read),
+        "backup_hardening_report" if args.get("probe").and_then(|v| v.as_bool()) == Some(true) => job(P::Run),
+        "backup_hardening_report" => job(P::Read),
         "backup_effective_settings" if !id().is_empty() => job(P::Read),
         "backup_run" => job(P::Run),
         "backup_execute" | "backup_start_operation" => match args.get("operation").cloned().map(serde_json::from_value::<crate::backup_engine::BackupOperation>) {

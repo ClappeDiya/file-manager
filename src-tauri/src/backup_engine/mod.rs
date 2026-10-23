@@ -16,6 +16,7 @@ pub mod connector_backend;
 pub mod defaults;
 pub mod diagnostics;
 pub mod drives;
+pub mod hardening;
 pub mod hooks;
 pub mod logs;
 pub mod notify;
@@ -220,6 +221,8 @@ pub struct JobStats {
     pub backend_size: u64,
     /// Last scheduled start of each maintenance task (`compact`, `verify`, `apply_retention`).
     pub last_maintenance: BTreeMap<String, String>,
+    /// Result of the last ransomware-hardening destination probe ("Run checks").
+    pub last_hardening_probe: Option<hardening::ProbeResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

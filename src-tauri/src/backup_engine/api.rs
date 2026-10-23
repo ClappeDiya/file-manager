@@ -259,6 +259,7 @@ async fn dispatch_inner(mgr: &BackupManager, command: &str, a: &Value) -> Result
         "backup_has_destination_secret" => ok(mgr.has_destination_secret(&arg::<String>(a, "credentialId")?).await?),
         "backup_cloud_providers" => ok(super::stores::PROVIDERS.to_vec()),
         "backup_lock_status" => ok(mgr.lock_status(&arg::<String>(a, "jobId")?).await?),
+        "backup_hardening_report" => ok(mgr.hardening_report(&arg::<String>(a, "jobId")?, opt(a, "probe")?.unwrap_or(false)).await?),
         "backup_break_lock" => ok(mgr.break_lock(&arg::<String>(a, "jobId")?, opt(a, "confirm")?.unwrap_or(false), opt(a, "ownerId")?).await?),
         "backup_set_database_encryption" => ok(mgr.set_database_encryption(&arg::<String>(a, "jobId")?, arg(a, "enabled")?).await?),
         "backup_adopt_repository" => ok(mgr
@@ -316,5 +317,5 @@ pub const COMMANDS: &[&str] = &[
     "backup_resolve_version", "backup_read_file", "backup_export_file", "backup_cache_stats", "backup_clear_cache",
     "backup_get_cache_settings", "backup_set_cache_settings", "backup_schedule_preview", "backup_list_templates", "backup_get_template",
     "backup_save_template", "backup_delete_template", "backup_apply_template", "backup_export_templates", "backup_import_templates",
-    "backup_effective_settings", "backup_open_point_in_time",
+    "backup_effective_settings", "backup_open_point_in_time", "backup_hardening_report",
 ];

@@ -313,6 +313,13 @@ pub async fn backup_open_point_in_time(job_id: String, at: String, name: Option<
     mgr.open_point_in_time(&job_id, at, name).await
 }
 
+/// Ransomware-hardening checklist of a job; `probe` also tries deleting a
+/// probe object with the backup credentials (explicit "Run checks" only).
+#[tauri::command]
+pub async fn backup_hardening_report(job_id: String, probe: Option<bool>, mgr: State<'_, BackupManager>) -> Result<crate::backup_engine::hardening::HardeningReport, AppError> {
+    mgr.hardening_report(&job_id, probe.unwrap_or(false)).await
+}
+
 /// Who holds the job's repository lock(s) right now.
 #[tauri::command]
 pub async fn backup_lock_status(job_id: String, mgr: State<'_, BackupManager>) -> Result<ufop_core::backup::lock::LockStatus, AppError> {

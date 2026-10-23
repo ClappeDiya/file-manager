@@ -1664,3 +1664,34 @@ async fn console_managed_accounts_are_read_only() {
     assert_eq!(s.login_as("org-ops", "org-password").await.status(), 401);
     assert!(s.get("/api/v1/acl", &admin).await.json::<Value>().await.unwrap()["rules"].as_array().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn hardening_checklist_and_explicit_probe() {
+    let s = start(ServerConfig::default(), None).await;
+    let tok = s.login().await;
+    let id = s.job(&tok, "Exposed").await;
+    let r = s.get(&format!("/api/v1/jobs/{id}/hardening"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(r["total"], 7);
+    let status = |r: &Value, id: &str| r["checks"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap()["status"].as_str().unwrap().to_string();
+    assert_eq!(status(&r, "credentials"), "unknown", "never probed without asking");
+    assert!(r["probe"].is_null());
+    assert!(std::fs::read_dir(s.dir.join("dst-Exposed")).map(|d| d.count()).unwrap_or(0) == 0, "reading the checklist writes nothing");
+    // Run checks: a local folder lets the backup "credentials" delete.
+    let p = s.post(&format!("/api/v1/jobs/{id}/hardening/probe"), &tok, json!({})).await;
+    assert_eq!(p.status(), 200);
+    let p = p.json::<Value>().await.unwrap();
+    assert_eq!((p["probe"]["can_write"].as_bool(), p["probe"]["can_delete"].as_bool(), p["probe"]["gone_after_delete"].as_bool()), (Some(true), Some(true), Some(true)), "{p}");
+    assert_eq!(status(&p, "credentials"), "fail");
+    let left: Vec<_> = std::fs::read_dir(s.dir.join("dst-Exposed")).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().contains("hardening-probe")).collect();
+    assert!(left.is_empty(), "the probe is cleaned up");
+    // The result is kept with the job; the RPC and REST views agree.
+    let again = s.get(&format!("/api/v1/jobs/{id}/hardening"), &tok).await.json::<Value>().await.unwrap();
+    assert_eq!(status(&again, "credentials"), "fail");
+    let rpc = s.post("/api/v1/rpc/backup_hardening_report", &tok, json!({"jobId": id})).await.json::<Value>().await.unwrap();
+    assert_eq!(rpc["passed"], again["passed"]);
+    // Read-only jobs are never probed.
+    let mut j = s.get(&format!("/api/v1/jobs/{id}"), &tok).await.json::<Value>().await.unwrap();
+    j["read_only"] = json!(true);
+    assert_eq!(s.put(&format!("/api/v1/jobs/{id}"), &tok, json!({"job": j})).await.status(), 200);
+    assert!(!s.post(&format!("/api/v1/jobs/{id}/hardening/probe"), &tok, json!({})).await.status().is_success());
+}

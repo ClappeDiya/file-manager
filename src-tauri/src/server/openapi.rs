@@ -77,6 +77,9 @@ fn save_job() -> Value {
 fn folder_policy_result() -> Value {
     json!({ "type": "object", "properties": { "path": { "type": "string" }, "own": { "oneOf": [{ "$ref": "#/components/schemas/FolderPolicy" }, { "type": "null" }] }, "effective": { "type": "object", "additionalProperties": true } } })
 }
+fn hardening() -> Value {
+    json!({ "type": "object", "properties": { "job_id": { "type": "string" }, "passed": { "type": "integer" }, "total": { "type": "integer" }, "checks": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "title": { "type": "string" }, "status": { "type": "string", "enum": ["pass", "warn", "fail", "unknown", "info"] }, "detail": { "type": "string" }, "advice": { "type": "string" }, "doc": { "type": "string" } } } }, "probe": { "type": ["object", "null"], "properties": { "ran_at": { "type": "string" }, "can_write": { "type": "boolean" }, "can_delete": { "type": ["boolean", "null"] }, "gone_after_delete": { "type": ["boolean", "null"] }, "leftover": { "type": ["string", "null"] }, "detail": { "type": "string" } } } } })
+}
 fn html() -> Value {
     json!({ "type": "string" })
 }
@@ -200,6 +203,8 @@ pub(crate) const OPS: &[Op] = &[
     op!("post" "/api/v1/acl", "accounts", "Add a rule: principal (user, role:<role> or *) gets permission on jobs matching job_pattern (id or glob over ids and names)", auth: true, params: &[], body: Some(|| json!({ "type": "object", "required": ["principal", "job_pattern", "permission"], "properties": { "principal": { "type": "string" }, "job_pattern": { "type": "string" }, "permission": { "$ref": "#/components/schemas/Permission" } } })), response: || json!({ "$ref": "#/components/schemas/AclRule" })),
     op!("delete" "/api/v1/acl/{id}", "accounts", "Delete a rule (managed rules: 403)", auth: true, params: &[("id", "path", "string", true, "Rule id")], body: None, response: ok_flag),
     op!("get" "/api/v1/acl/{id}/preview-delete", "accounts", "What deleting the rule would change: accounts and jobs whose permission drops", auth: true, params: &[("id", "path", "string", true, "Rule id")], body: None, response: || json!({ "type": "object", "properties": { "rule_id": { "type": "string" }, "changes": { "type": "array", "items": { "type": "object", "properties": { "username": { "type": "string" }, "job_id": { "type": "string" }, "job_name": { "type": "string" }, "before": { "$ref": "#/components/schemas/Permission" }, "after": { "$ref": "#/components/schemas/Permission" } } } } } })),
+    op!("get" "/api/v1/jobs/{id}/hardening", "jobs", "Ransomware-hardening checklist: encryption, object lock, soft delete, a replica with another provider, local database encryption, retention and pins, whether the backup credentials can delete (from the last probe), legal hold; each with pass/warn/fail/unknown/info and a link to the guide", auth: true, params: &[ID], body: None, response: hardening),
+    op!("post" "/api/v1/jobs/{id}/hardening/probe", "jobs", "Run the destination probe: write a small probe object and try to delete it with the backup credentials (cleaned up when possible), then return the checklist", auth: true, params: &[ID], body: None, response: hardening),
     op!("get" "/oauth/token", "oauth", "Access token for an AuthID (the AuthID is the credential)", auth: false, params: &[("authid", "query", "string", true, "AuthID from the callback")], body: None, response: || json!({ "type": "object", "properties": { "access_token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" } } })),
 ];
 

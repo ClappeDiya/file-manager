@@ -720,6 +720,16 @@ async fn open_point_in_time(State(st): State<ServerState>, AxPath(id): AxPath<St
     ok(st.mgr.open_point_in_time(&id, b.at, b.name).await?)
 }
 
+/// Ransomware-hardening checklist (from the job's settings and the last probe).
+async fn job_hardening(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.hardening_report(&id, false).await?)
+}
+
+/// Run the destination probe ("Run checks"): writes a probe object and tries to delete it.
+async fn job_hardening_probe(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    ok(st.mgr.hardening_report(&id, true).await?)
+}
+
 /// Who holds the job's repository lock(s).
 async fn job_lock_status(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
     ok(st.mgr.lock_status(&id).await?)
@@ -1196,6 +1206,8 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/jobs/{id}/passphrase", axum::routing::put(change_job_passphrase))
         .route("/api/v1/jobs/{id}/point-in-time", post(open_point_in_time))
         .route("/api/v1/jobs/{id}/lock", get(job_lock_status).delete(break_job_lock))
+        .route("/api/v1/jobs/{id}/hardening", get(job_hardening))
+        .route("/api/v1/jobs/{id}/hardening/probe", post(job_hardening_probe))
         .route("/api/v1/jobs/{id}/database-encryption", axum::routing::put(set_job_database_encryption))
         .route("/api/v1/jobs/{id}/versions", get(versions))
         .route("/api/v1/jobs/{id}/versions/{version}", axum::routing::patch(patch_version))
