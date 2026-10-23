@@ -14,6 +14,7 @@ use ufop_core::backup::db::{BackupDb, DbKey};
 use ufop_core::backup::lock::{self as repo_lock, LockKind, LockOptions};
 use ufop_core::backup::engine::Repo;
 use ufop_core::backup::restore::ConflictPolicy;
+use ufop_core::backup::versions::MetadataPatch;
 use ufop_core::backup::{
     maintenance, run_backup, run_restore, Backend, BackupOptions, FilterAction, FilterKind, FilterRule, LocalBackend, OpContext,
     ReadOnlyBackend, RestoreOptions, RetentionPolicy, SourceFilter,
@@ -70,6 +71,22 @@ pub struct RepoArgs {
     /// Refuse to run when the destination clock differs by this many seconds (0 = never)
     #[arg(long, default_value_t = ufop_core::backup::lock::DEFAULT_SKEW_ABORT_SECS)]
     pub clock_skew_abort_secs: u64,
+    /// Job id recorded in each version's identity: the source in a shared
+    /// repository (default: derived from --dest and --prefix; give each
+    /// CLI job that shares a repository its own)
+    #[arg(long)]
+    pub job_id: Option<String>,
+    /// Record this host name instead of this computer's (continue another
+    /// computer's history after a migration)
+    #[arg(long)]
+    pub hostname: Option<String>,
+    /// Record this user name instead of the current one
+    #[arg(long)]
+    pub username: Option<String>,
+    /// Shared repositories: work on another source's versions (id from
+    /// `ufop backup sources`, or * for all) instead of this job's
+    #[arg(long)]
+    pub source_id: Option<String>,
 }
 
 /// Report a configuration problem and exit (exit code 2, like other usage errors).
@@ -100,9 +117,28 @@ impl RepoArgs {
         })
     }
 
+    /// Who this CLI job writes versions as.
+    fn identity(&self) -> ufop_core::backup::versions::ClientIdentity {
+        let job = self.job_id.clone().filter(|j| !j.trim().is_empty());
+        ufop_core::backup::versions::ClientIdentity {
+            hostname: self.hostname.clone().unwrap_or_default(),
+            username: self.username.clone().unwrap_or_default(),
+            source_label: job.clone().unwrap_or_else(|| "ufop CLI".into()),
+            job_id: job.unwrap_or_else(|| format!("cli-{}", ufop_core::backup::hash_file_name_key(&format!("{}|{}", self.dest, self.prefix)))),
+        }
+    }
+
+    /// Apply `--source-id` to an opened database.
+    fn apply_source(&self, db: &BackupDb) {
+        if let Some(s) = ufop_core::backup::shared::selector_scope(self.source_id.as_deref()) {
+            db.set_scope(s);
+        }
+    }
+
     fn options(&self) -> BackupOptions {
         BackupOptions {
             prefix: self.prefix.clone(),
+            identity: self.identity(),
             lock_ttl_secs: self.lock_ttl_secs,
             clock_skew_warn_secs: self.clock_skew_warn_secs,
             clock_skew_abort_secs: self.clock_skew_abort_secs,
@@ -326,6 +362,85 @@ pub struct EngineArgs {
     pub checkpoint_interval_bytes: u64,
 }
 
+/// Count-based GFS retention (`--keep-daily 7 --keep-weekly 4 …`). Any
+/// non-zero count selects it over --keep-versions / --keep-days.
+#[derive(Args, Debug, Clone, Default)]
+pub struct CountArgs {
+    /// Keep the N newest versions
+    #[arg(long, default_value_t = 0)]
+    pub keep_latest: u32,
+    /// Keep the newest version of each of the N most recent hours
+    #[arg(long, default_value_t = 0)]
+    pub keep_hourly: u32,
+    /// … days (UTC)
+    #[arg(long, default_value_t = 0)]
+    pub keep_daily: u32,
+    /// … ISO weeks
+    #[arg(long, default_value_t = 0)]
+    pub keep_weekly: u32,
+    /// … months
+    #[arg(long, default_value_t = 0)]
+    pub keep_monthly: u32,
+    /// … years
+    #[arg(long, default_value_t = 0)]
+    pub keep_yearly: u32,
+}
+
+impl CountArgs {
+    fn policy(&self) -> Option<RetentionPolicy> {
+        let c = [self.keep_latest, self.keep_hourly, self.keep_daily, self.keep_weekly, self.keep_monthly, self.keep_yearly];
+        c.iter().any(|n| *n > 0).then_some(RetentionPolicy::Counts {
+            keep_latest: self.keep_latest,
+            keep_hourly: self.keep_hourly,
+            keep_daily: self.keep_daily,
+            keep_weekly: self.keep_weekly,
+            keep_monthly: self.keep_monthly,
+            keep_yearly: self.keep_yearly,
+        })
+    }
+}
+
+/// Retention flags shared by `run` and `retention preview|apply`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct RetentionArgs {
+    #[arg(long)]
+    pub keep_versions: Option<u32>,
+    #[arg(long)]
+    pub keep_days: Option<u32>,
+    /// `smart` or custom rules like `1W:1D,4W:1W,12M:1M`
+    #[arg(long)]
+    pub retention_policy: Option<String>,
+    #[command(flatten)]
+    pub counts: CountArgs,
+}
+
+impl RetentionArgs {
+    pub fn policy(&self) -> RetentionPolicy {
+        self.counts.policy().unwrap_or_else(|| parse_retention(self.keep_versions, self.keep_days, self.retention_policy.clone()))
+    }
+}
+
+/// Retention tools.
+#[derive(Subcommand, Debug)]
+pub enum RetentionCommands {
+    /// Show which versions a policy keeps (and why) and which it deletes; changes nothing
+    Preview {
+        #[command(flatten)]
+        repo: RepoArgs,
+        #[command(flatten)]
+        retention: RetentionArgs,
+    },
+    /// Apply a policy now (pinned and locked versions are kept)
+    Apply {
+        #[command(flatten)]
+        repo: RepoArgs,
+        #[command(flatten)]
+        retention: RetentionArgs,
+        #[arg(long)]
+        allow_full_removal: bool,
+    },
+}
+
 /// Parse `--layout` / `--shard-prefix-len`.
 pub fn parse_layout(layout: &str, prefix_len: u8) -> Result<ufop_core::backup::layout::RepoLayout, ufop_core::error::AppError> {
     use ufop_core::backup::layout::RepoLayout;
@@ -446,6 +561,10 @@ impl PassArgs {
             lock_ttl_secs: 0,
             clock_skew_warn_secs: 0,
             clock_skew_abort_secs: 0,
+            job_id: None,
+            hostname: None,
+            username: None,
+            source_id: None,
         }
         .passphrase()
     }
@@ -616,13 +735,21 @@ pub enum BackupCommands {
         volume_size: usize,
         #[arg(long, default_value_t = 6)]
         compression_level: u32,
+        #[command(flatten)]
+        retention: RetentionArgs,
+        /// Note stored with the new version
         #[arg(long)]
-        keep_versions: Option<u32>,
+        note: Option<String>,
+        /// Tag stored with the new version, `key=value` or `key` (repeatable)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Create the repository as shared (format 2): other jobs and
+        /// computers can write to it and deduplicate against each other
         #[arg(long)]
-        keep_days: Option<u32>,
-        /// `smart` or custom rules like `1W:1D,4W:1W,12M:1M`
-        #[arg(long)]
-        retention_policy: Option<String>,
+        shared: bool,
+        /// Shared repositories: compaction leaves volumes younger than this alone
+        #[arg(long, default_value_t = ufop_core::backup::shared::DEFAULT_GC_DELAY_HOURS)]
+        shared_gc_delay_hours: u32,
         /// Volumes to sample-verify after the backup
         #[arg(long, default_value_t = 1)]
         verify_samples: usize,
@@ -633,10 +760,89 @@ pub enum BackupCommands {
         #[command(flatten)]
         engine: EngineArgs,
     },
-    /// List backup versions
+    /// List backup versions (with note, tags, pin, host and storage added)
     List {
         #[command(flatten)]
         repo: RepoArgs,
+        /// Only versions carrying this tag, `key=value` or `key` (repeatable)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// Pin a version ("Keep forever"): retention never removes it and
+    /// `delete` needs --force
+    Pin {
+        #[command(flatten)]
+        repo: RepoArgs,
+        version: usize,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Remove a version's pin
+    Unpin {
+        #[command(flatten)]
+        repo: RepoArgs,
+        version: usize,
+    },
+    /// Change a version's note or tags
+    Annotate {
+        #[command(flatten)]
+        repo: RepoArgs,
+        version: usize,
+        /// New note (empty string removes it)
+        #[arg(long)]
+        note: Option<String>,
+        /// Replace the tags with these, `key=value` or `key` (repeatable)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Remove every tag
+        #[arg(long)]
+        clear_tags: bool,
+    },
+    /// Retention preview and apply
+    Retention {
+        #[command(subcommand)]
+        cmd: RetentionCommands,
+    },
+    /// Copy versions to another repository (only the blocks it lacks;
+    /// re-cut when its chunker differs)
+    CopyVersions {
+        #[command(flatten)]
+        repo: RepoArgs,
+        /// Version numbers to copy (0 = newest)
+        #[arg(required = true)]
+        versions: Vec<usize>,
+        /// Destination folder of the target repository (created when empty)
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "ufop")]
+        to_prefix: String,
+        /// Local database of the target (default: derived from --to)
+        #[arg(long)]
+        to_dbpath: Option<PathBuf>,
+        /// Environment variable with the target's passphrase
+        #[arg(long, default_value = "UFOP_TO_PASSPHRASE")]
+        to_passphrase_env: String,
+        #[arg(long)]
+        to_no_encryption: bool,
+        /// Format of a new target repository: 1 | 2
+        #[arg(long)]
+        to_format_version: Option<u32>,
+        /// Chunker of a new format 2 target: fixed | fastcdc
+        #[arg(long)]
+        to_chunker: Option<String>,
+    },
+    /// Sources (jobs / computers) with versions in a shared repository
+    Sources {
+        #[command(flatten)]
+        repo: RepoArgs,
+    },
+    /// Make a format 2 repository shared by several jobs or computers
+    Share {
+        #[command(flatten)]
+        repo: RepoArgs,
+        /// Assign only versions without an identity to this job (default: all)
+        #[arg(long)]
+        keep_identities: bool,
     },
     /// Search backed-up paths (substring or wildcard)
     Find {
@@ -816,6 +1022,9 @@ pub enum BackupCommands {
         versions: Vec<usize>,
         #[arg(long)]
         allow_full_removal: bool,
+        /// Also delete pinned versions
+        #[arg(long)]
+        force: bool,
     },
     /// Upgrade the repository to format 2 (rewrites only the header), or
     /// with --rollback restore the saved format 1 header (only until the
@@ -955,8 +1164,54 @@ fn with_repo<T>(
         let db = repo.open_db(be.as_ref(), &ctx)?;
         let pass = repo.passphrase();
         let r = Repo::open(be.as_ref(), &db, pass.as_deref(), &repo.options(), false, KdfParams::default())?;
+        repo.apply_source(&db);
         f(&r, &db)
     })
+}
+
+/// Change a version's metadata under the exclusive lock and show it.
+fn set_meta(repo: &RepoArgs, version: usize, patch: MetadataPatch, format: &OutputFormat) -> Result<u8, ufop_core::error::AppError> {
+    with_repo(repo, LockKind::Exclusive, "set_version_metadata", |r, _| {
+        let f = ufop_core::backup::versions::set_version_metadata(r, version, &patch)?;
+        if matches!(format, OutputFormat::Human) {
+            print!("{}", version_table(std::slice::from_ref(&f)));
+        } else {
+            output::print_data(format, &f);
+        }
+        Ok(0)
+    })
+}
+
+fn short_bytes(b: u64) -> String {
+    let mut v = b as f64;
+    for u in ["B", "KB", "MB", "GB", "TB"] {
+        if v < 1024.0 {
+            return if u == "B" { format!("{b} B") } else { format!("{v:.1} {u}") };
+        }
+        v /= 1024.0;
+    }
+    format!("{v:.1} PB")
+}
+
+/// Human version list: index, time, files, size, storage added, flags,
+/// host, note and tags ("—" where an older version has no data).
+pub fn version_table(v: &[ufop_core::backup::Fileset]) -> String {
+    let mut out = format!("{:>3}  {:<25}  {:>7}  {:>10}  {:>10}  {:<5}  {:<16}  {}\n", "#", "Time", "Files", "Size", "Added", "Flags", "Host", "Note / tags");
+    for (i, f) in v.iter().enumerate() {
+        let added = f.stats.map(|s| short_bytes(s.bytes_added)).unwrap_or_else(|| "—".into());
+        let flags = format!("{}{}", if f.pinned { "P" } else { "" }, if f.partial { "~" } else { "" });
+        let host = f.identity.as_ref().map(|i| i.hostname.clone()).unwrap_or_else(|| "—".into());
+        let tags: Vec<String> = f.tags.iter().map(|(k, v)| if v.is_empty() { k.clone() } else { format!("{k}={v}") }).collect();
+        let mut extra = f.note.clone().unwrap_or_default();
+        if !tags.is_empty() {
+            if !extra.is_empty() {
+                extra.push_str("  ");
+            }
+            extra.push_str(&format!("[{}]", tags.join(", ")));
+        }
+        out.push_str(&format!("{i:>3}  {:<25}  {:>7}  {:>10}  {:>10}  {:<5}  {:<16}  {extra}\n", f.timestamp, f.file_count, short_bytes(f.total_size), added, flags, host));
+    }
+    out
 }
 
 pub async fn execute(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, Box<dyn std::error::Error>> {
@@ -976,7 +1231,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
     match cmd {
         BackupCommands::Run {
             repo, sources, include, exclude, exclude_hidden, skip_files_larger_than, block_size, volume_size, compression_level,
-            keep_versions, keep_days, retention_policy, verify_samples, upload_unchanged, no_auto_compact, engine,
+            retention, note, tags, shared, shared_gc_delay_hours, verify_samples, upload_unchanged, no_auto_compact, engine,
         } => {
             let pass = repo.passphrase();
             if pass.is_none() && !repo.no_encryption {
@@ -1000,9 +1255,13 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
                 upload_unchanged_backups: upload_unchanged,
                 auto_compact: !no_auto_compact,
                 dry_run,
+                default_note: note,
+                default_tags: ufop_core::backup::versions::parse_tags(&tags)?,
+                shared_repository: shared,
+                shared_gc_delay_hours,
                 ..repo.options()
             })?;
-            let retention = parse_retention(keep_versions, keep_days, retention_policy);
+            let retention = retention.policy();
             let be = repo.backend();
             let srcs: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
             let ctx = progress_ctx(format);
@@ -1017,9 +1276,108 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             ok(emit(format, "Backup finished", &r))?;
             Ok(if !r.errors.is_empty() || r.partial { 2 } else if !r.warnings.is_empty() { 1 } else { 0 })
         }
-        BackupCommands::List { repo } => with_repo(&repo, LockKind::Shared, "list", |_, db| {
-            let v = db.filesets()?;
-            ok(emit(format, "Versions (0 = newest)", &v))?;
+        BackupCommands::List { repo, tags } => with_repo(&repo, LockKind::Shared, "list", |_, db| {
+            let filter = ufop_core::backup::versions::parse_tags(&tags)?;
+            let v = ufop_core::backup::versions::filter_by_tags(db.filesets()?, &filter);
+            if matches!(format, OutputFormat::Human) {
+                print!("{}", version_table(&v));
+            } else {
+                ok(emit(format, "Versions (0 = newest)", &v))?;
+            }
+            Ok(0)
+        }),
+        BackupCommands::Pin { repo, version, reason } => {
+            let patch = MetadataPatch { pinned: Some(true), pin_reason: reason, ..Default::default() };
+            set_meta(&repo, version, patch, format)
+        }
+        BackupCommands::Unpin { repo, version } => set_meta(&repo, version, MetadataPatch { pinned: Some(false), ..Default::default() }, format),
+        BackupCommands::Annotate { repo, version, note, tags, clear_tags } => {
+            let tags = if clear_tags { Some(Default::default()) } else if tags.is_empty() { None } else { Some(ufop_core::backup::versions::parse_tags(&tags)?) };
+            if note.is_none() && tags.is_none() {
+                return Err(ufop_core::error::AppError::validation("Give --note, --tag or --clear-tags"));
+            }
+            set_meta(&repo, version, MetadataPatch { note, tags, ..Default::default() }, format)
+        }
+        BackupCommands::Retention { cmd } => match cmd {
+            RetentionCommands::Preview { repo, retention } => with_repo(&repo, LockKind::Shared, "retention_preview", |_, db| {
+                let p = maintenance::preview_retention(db, &retention.policy(), false)?;
+                if matches!(format, OutputFormat::Human) {
+                    for (i, v) in p.versions.iter().enumerate() {
+                        println!("{i:>4}  {:<25}  {}", v.timestamp, v.summary);
+                    }
+                    println!("{} kept, {} deleted", p.keep, p.delete);
+                } else {
+                    ok(emit(format, "Retention preview", &p))?;
+                }
+                Ok(0)
+            }),
+            RetentionCommands::Apply { repo, retention, allow_full_removal } => with_repo(&repo, if dry_run { LockKind::Shared } else { LockKind::Exclusive }, "apply_retention", |r, db| {
+                if dry_run {
+                    ok(emit(format, "Retention (dry run)", &maintenance::preview_retention(db, &retention.policy(), false)?))?;
+                    return Ok(0);
+                }
+                let n = maintenance::apply_retention(r, &retention.policy(), allow_full_removal)?;
+                ok(emit(format, "Retention applied", &serde_json::json!({ "versions_deleted": n })))?;
+                Ok(0)
+            }),
+        },
+        BackupCommands::CopyVersions { repo, versions, to, to_prefix, to_dbpath, to_passphrase_env, to_no_encryption, to_format_version, to_chunker } => {
+            let target = RepoArgs {
+                dest: to,
+                dbpath: to_dbpath,
+                passphrase: None,
+                passphrase_env: to_passphrase_env,
+                passphrase_file: None,
+                secret_providers: repo.secret_providers.clone(),
+                no_encryption: to_no_encryption,
+                prefix: to_prefix,
+                read_only: false,
+                db_key_source: repo.db_key_source.clone(),
+                lock_ttl_secs: repo.lock_ttl_secs,
+                clock_skew_warn_secs: repo.clock_skew_warn_secs,
+                clock_skew_abort_secs: repo.clock_skew_abort_secs,
+                job_id: None,
+                hostname: None,
+                username: None,
+                source_id: None,
+            };
+            let dst_opts = BackupOptions {
+                format_version: to_format_version,
+                chunker: to_chunker.as_deref().map(|c| parse_enum("to-chunker", c)).transpose()?,
+                dry_run,
+                ..target.options()
+            };
+            let (sb, tb) = (repo.backend(), target.backend());
+            let ctx = progress_ctx(format);
+            let opts = ufop_core::backup::copy::CopyOptions { versions, source: repo.source_id.clone(), dry_run };
+            let rep = repo.locked(sb.as_ref(), Some(LockKind::Shared), "copy_versions", &ctx, || {
+                let sdb = repo.open_db(sb.as_ref(), &ctx)?;
+                let src = Repo::open(sb.as_ref(), &sdb, repo.passphrase().as_deref(), &repo.options(), false, KdfParams::default())?;
+                target.locked(tb.as_ref(), Some(if dry_run { LockKind::Shared } else { LockKind::Exclusive }), "copy_versions", &ctx, || {
+                    let ddb = target.open_db(tb.as_ref(), &ctx)?;
+                    let dst = Repo::open(tb.as_ref(), &ddb, target.passphrase().as_deref(), &dst_opts, true, KdfParams::default())?;
+                    ufop_core::backup::copy::copy_versions(&src, &dst, &opts, &dst_opts, &ctx)
+                })
+            })?;
+            log_outcome("copy_versions", &rep.warnings, &[]);
+            ok(emit(format, "Copy versions", &rep))?;
+            Ok(if rep.warnings.is_empty() { 0 } else { 1 })
+        }
+        BackupCommands::Sources { repo } => with_repo(&repo, LockKind::Shared, "sources", |r, db| {
+            let own = repo.identity().resolve().source_id();
+            let list = ufop_core::backup::shared::list_sources(db, Some(&own))?;
+            if matches!(format, OutputFormat::Human) {
+                println!("Shared repository: {}", if ufop_core::backup::shared::is_shared(&r.header) { "yes" } else { "no" });
+                for s in &list {
+                    println!("{} {:<16}  {:>4} version(s)  newest {}  {}", if s.own { "*" } else { " " }, s.id, s.versions, s.newest.as_deref().unwrap_or("-"), s.label);
+                }
+            } else {
+                ok(emit(format, "Sources", &list))?;
+            }
+            Ok(0)
+        }),
+        BackupCommands::Share { repo, keep_identities } => with_repo(&repo, LockKind::Exclusive, "enable_sharing", |r, _| {
+            ok(emit(format, "Sharing", &ufop_core::backup::shared::enable_sharing(r, &repo.identity(), !keep_identities)?))?;
             Ok(0)
         }),
         BackupCommands::Find { repo, pattern, version } => with_repo(&repo, LockKind::Shared, "find", |_, db| {
@@ -1042,6 +1400,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             let opts = RestoreOptions {
                 version, versions, unique_versions: unique, paths, target, conflict, restore_permissions, preserve_full_paths, skip_verify, dry_run,
                 use_local_blocks, download_threads, file_threads, legacy, temp_dir: tempdir, skip_free_space_check, restore_metadata: !no_metadata,
+                source: repo.source_id.clone(),
                 ..Default::default()
             };
             // No local database? Rebuild a temporary one from the destination.
@@ -1099,8 +1458,8 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             ok(emit(format, "Purge", &maintenance::purge(r, &paths, None, dry_run)?))?;
             Ok(0)
         }),
-        BackupCommands::Delete { repo, versions, allow_full_removal } => with_repo(&repo, LockKind::Exclusive, "delete_versions", |r, _| {
-            let n = maintenance::delete_versions(r, &versions, allow_full_removal)?;
+        BackupCommands::Delete { repo, versions, allow_full_removal, force } => with_repo(&repo, LockKind::Exclusive, "delete_versions", |r, _| {
+            let n = maintenance::delete_versions_ex(r, &versions, allow_full_removal, force)?;
             ok(emit(format, "Deleted versions", &serde_json::json!({ "versions_deleted": n })))?;
             Ok(0)
         }),
@@ -1392,6 +1751,69 @@ mod tests {
         let code = run(parse(&["restore", "--dest", &dest, "--dbpath", &missing, "--passphrase", "pw2", "--target", &out]), &OutputFormat::Json, false).unwrap();
         assert_eq!(code, 0);
         assert_eq!(std::fs::read(t.path().join("out/src/f.txt")).unwrap(), b"cli");
+    }
+
+    #[test]
+    fn versions_pins_retention_copy_and_sharing_commands() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(subcommand)]
+            c: BackupCommands,
+        }
+        let parse = |args: &[String]| <T as clap::Parser>::try_parse_from(std::iter::once("t".to_string()).chain(args.iter().cloned())).unwrap().c;
+        let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let (dest, db, src_s) = (s(&t.path().join("dest")), s(&t.path().join("db.sqlite")), s(&src));
+        let base = |cmd: &str, extra: &[&str]| -> Vec<String> {
+            [cmd, "--dest", &dest, "--dbpath", &db, "--passphrase", "pw"].iter().chain(extra.iter()).map(|x| x.to_string()).collect()
+        };
+        let go = |args: Vec<String>, dry: bool| run(parse(&args), &OutputFormat::Json, dry).unwrap();
+        for i in 0..3u8 {
+            std::fs::write(src.join("f.txt"), [i; 10]).unwrap();
+            assert_eq!(go(base("run", &["--source", &src_s, "--note", "nightly", "--tag", "env=prod", "--shared", "--job-id", "laptop-docs", "--no-quota-warning"]), false), 0);
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+        }
+        let open = || BackupDb::open(std::path::Path::new(&db)).unwrap();
+        let v = open().all_filesets().unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!((v[0].note.as_deref(), v[0].tags.get("env").map(String::as_str)), (Some("nightly"), Some("prod")));
+        assert_eq!(v[0].identity.as_ref().unwrap().job_id, "laptop-docs");
+        assert!(ufop_core::backup::shared::repository_is_shared(&LocalBackend::new(&dest), "ufop").unwrap());
+        let job = ["--job-id", "laptop-docs"];
+        assert_eq!(go(base("list", &[&job[..], &["--tag", "env=prod"]].concat()), false), 0);
+        assert!(version_table(&v).contains("P") || !v[0].pinned);
+        // Pin the oldest, preview and apply GFS retention, delete needs --force.
+        assert_eq!(go(base("pin", &[&job[..], &["2", "--reason", "audit"]].concat()), false), 0);
+        assert!(open().all_filesets().unwrap()[2].pinned);
+        assert_eq!(go(base("annotate", &[&job[..], &["0", "--note", "latest", "--tag", "keep"]].concat()), false), 0);
+        assert_eq!(open().all_filesets().unwrap()[0].note.as_deref(), Some("latest"));
+        assert_eq!(go(base("retention", &[]).into_iter().take(1).chain(base("preview", &[&job[..], &["--keep-latest", "1"]].concat())).collect(), false), 0);
+        assert_eq!(open().all_filesets().unwrap().len(), 3, "preview changes nothing");
+        assert_eq!(go(base("retention", &[]).into_iter().take(1).chain(base("apply", &[&job[..], &["--keep-latest", "1"]].concat())).collect(), false), 0);
+        assert_eq!(open().all_filesets().unwrap().len(), 2, "newest and pinned kept");
+        assert!(run(parse(&base("delete", &[&job[..], &["1"]].concat())), &OutputFormat::Json, false).is_err(), "pinned: refused");
+        assert_eq!(go(base("unpin", &[&job[..], &["1"]].concat()), false), 0);
+        assert_eq!(go(base("sources", &job), false), 0);
+        // Copy the newest version into a new format 1 repository (re-cut).
+        let to = s(&t.path().join("copy"));
+        let todb = s(&t.path().join("copy.sqlite"));
+        std::env::set_var("UFOP_TO_PASSPHRASE_TEST", "pw2");
+        let copy = base("copy-versions", &[&job[..], &["0", "--to", &to, "--to-dbpath", &todb, "--to-passphrase-env", "UFOP_TO_PASSPHRASE_TEST", "--to-format-version", "1"]].concat());
+        assert_eq!(go(copy.clone(), true), 0);
+        assert!(BackupDb::open(std::path::Path::new(&todb)).unwrap().all_filesets().unwrap().is_empty(), "dry run");
+        assert_eq!(go(copy, false), 0);
+        let copied = BackupDb::open(std::path::Path::new(&todb)).unwrap().all_filesets().unwrap();
+        assert_eq!(copied[0].note.as_deref(), Some("latest"));
+        assert_eq!(ufop_core::backup::format::format_info(&LocalBackend::new(&to), "ufop").unwrap().format_version, 1);
+        // A second CLI job on the shared repository sees only its own versions.
+        let other = ["--job-id", "nas-photos"];
+        assert_eq!(go(base("run", &[&other[..], &["--source", &src_s, "--no-quota-warning"]].concat()), false), 0);
+        let db2 = BackupDb::open(std::path::Path::new(&db)).unwrap();
+        ufop_core::backup::shared::scope_db(&db2, &ufop_core::backup::versions::ClientIdentity { job_id: "nas-photos".into(), ..Default::default() }).unwrap();
+        assert_eq!(db2.filesets().unwrap().len(), 1);
+        assert_eq!(db2.all_filesets().unwrap().len(), 3);
     }
 
     #[test]
