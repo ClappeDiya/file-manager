@@ -6,7 +6,8 @@
 //!   and automation schedulers use, in UTC) plus holiday calendars whose
 //!   days it skips.
 //! - A **holiday calendar** (`ufop_core::calendar`) lists days off; dates
-//!   are local dates.
+//!   are local dates. Calendars live in `ufop_core::calendar::registry`,
+//!   which the backup schedules (`ufop_core::backup::schedule`) consult.
 //! - Everything lives in one process-wide [`registry`] that the schedulers
 //!   consult when they check what is due, so editing a schedule or calendar
 //!   applies everywhere at once, without re-registering anything. The
@@ -38,7 +39,10 @@ pub struct NamedSchedule {
 #[derive(Default)]
 struct State {
     schedules: HashMap<String, NamedSchedule>,
-    calendars: HashMap<String, HolidayCalendar>,
+}
+
+fn calendars() -> &'static ufop_core::calendar::CalendarRegistry {
+    ufop_core::calendar::registry()
 }
 
 /// The live schedules and calendars.
@@ -67,7 +71,7 @@ impl Registry {
     }
 
     pub fn calendar(&self, id: &str) -> Option<HolidayCalendar> {
-        self.read().calendars.get(id).cloned()
+        calendars().get(id)
     }
 
     /// The cron expression of a named schedule.
@@ -77,8 +81,7 @@ impl Registry {
 
     /// Name of the first of `calendar_ids` that blocks local date `d`.
     pub fn blocked_by(&self, calendar_ids: &[String], d: NaiveDate) -> Blocked {
-        let s = self.read();
-        calendar_ids.iter().filter_map(|id| s.calendars.get(id)).find(|c| c.blocks(d)).map(|c| c.name.clone())
+        calendars().blocked_by(calendar_ids, d)
     }
 
     /// Whether a run of `schedule_id` (plus `extra` calendars) at `at` falls on a day off.
@@ -93,13 +96,13 @@ impl Registry {
         self.write().schedules.insert(s.id.clone(), s);
     }
     fn put_calendar(&self, c: HolidayCalendar) {
-        self.write().calendars.insert(c.id.clone(), c);
+        calendars().put(c);
     }
     fn remove_schedule(&self, id: &str) {
         self.write().schedules.remove(id);
     }
     fn remove_calendar(&self, id: &str) {
-        self.write().calendars.remove(id);
+        calendars().remove(id);
     }
 
     #[cfg(test)]
@@ -114,13 +117,9 @@ impl Registry {
 }
 
 /// A schedule field (sync pair, automation rule) holds a cron expression or
-/// a reference to a named schedule: `schedule:<id>`.
-pub const REF_PREFIX: &str = "schedule:";
-
-/// The named schedule a schedule field refers to.
-pub fn schedule_ref(expr: &str) -> Option<&str> {
-    expr.trim().strip_prefix(REF_PREFIX).map(str::trim).filter(|s| !s.is_empty())
-}
+/// a reference to a named schedule: `schedule:<id>`. Cron parsing and the
+/// preview row are shared with the backup schedules in ufop-core.
+pub use ufop_core::backup::schedule::{parse_cron_any, schedule_ref, PreviewRun, REF_PREFIX};
 
 /// The field's current schedule: parsed cron, its text, and the named
 /// schedule it came from. A named schedule is looked up each time, so its
@@ -138,37 +137,6 @@ pub fn resolve(expr: &str) -> Result<(cron::Schedule, String, Option<String>), A
 /// Validate a cron expression in the schedulers' format.
 pub fn validate_cron(expr: &str) -> Result<cron::Schedule, AppError> {
     cron::Schedule::from_str(expr.trim()).map_err(|e| AppError::validation(format!("Invalid cron expression '{expr}': {e}. Use `sec min hour day month weekday [year]`, e.g. `0 30 9 * * Mon-Fri`.")))
-}
-
-/// Parse a cron expression written with 5 fields (`min hour day month
-/// weekday`, as in crontab), 6 (with seconds) or 7 (with year). Five-field
-/// expressions run at second 0. The same parser as [`validate_cron`].
-pub fn parse_cron_any(expr: &str) -> Result<cron::Schedule, AppError> {
-    let t = expr.trim();
-    if t.is_empty() {
-        return Err(AppError::validation("The cron expression is empty"));
-    }
-    if schedule_ref(t).is_some() {
-        return Err(AppError::validation(format!("'{t}' refers to a named schedule; enter its cron expression here instead")));
-    }
-    let fields = t.split_whitespace().count();
-    let full = if fields == 5 { format!("0 {t}") } else { t.to_string() };
-    cron::Schedule::from_str(&full).map_err(|e| {
-        AppError::validation(format!(
-            "Invalid cron expression '{t}': {e}. Use `min hour day month weekday` (e.g. `30 2 * * Mon-Fri`), optionally with seconds first and a year last."
-        ))
-    })
-}
-
-/// One upcoming run in a preview.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct PreviewRun {
-    pub at: String,
-    /// Calendar that skips this run, if any.
-    pub skipped_by: Option<String>,
-    /// Backup schedules: `at` with the schedule time zone's offset.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub zoned: Option<String>,
 }
 
 /// The next `n` runs of `cron_expr`, marking those `calendar_ids` skip.
@@ -231,7 +199,7 @@ impl ScheduleLibrary {
     }
 
     pub async fn list_calendars(&self) -> Vec<HolidayCalendar> {
-        let mut v: Vec<HolidayCalendar> = registry().read().calendars.values().cloned().collect();
+        let mut v: Vec<HolidayCalendar> = calendars().all();
         v.sort_by_key(|a| a.name.to_lowercase());
         v
     }
@@ -283,7 +251,7 @@ impl ScheduleLibrary {
         c.annual.sort();
         c.annual.dedup();
         c.validate().map_err(AppError::validation)?;
-        if registry().read().calendars.values().any(|o| o.id != c.id && o.name.eq_ignore_ascii_case(&c.name)) {
+        if calendars().all().iter().any(|o| o.id != c.id && o.name.eq_ignore_ascii_case(&c.name)) {
             return Err(AppError::validation(format!("A calendar named '{}' already exists", c.name)));
         }
         if c.id.is_empty() {

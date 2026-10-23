@@ -82,6 +82,52 @@ pub fn blocking<'a>(calendars: impl IntoIterator<Item = &'a HolidayCalendar>, d:
     calendars.into_iter().find(|c| c.blocks(d))
 }
 
+/// The live holiday calendars of this process, by id. Schedules check it
+/// when they decide whether a day is off: the desktop app and `ufop-server`
+/// load their saved calendars into it; a host with none (the `ufop agent`)
+/// leaves it empty.
+#[derive(Default)]
+pub struct CalendarRegistry(std::sync::RwLock<std::collections::HashMap<String, HolidayCalendar>>);
+
+/// The process-wide calendar registry.
+pub fn registry() -> &'static CalendarRegistry {
+    static R: std::sync::OnceLock<CalendarRegistry> = std::sync::OnceLock::new();
+    R.get_or_init(CalendarRegistry::default)
+}
+
+impl CalendarRegistry {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, std::collections::HashMap<String, HolidayCalendar>> {
+        self.0.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn get(&self, id: &str) -> Option<HolidayCalendar> {
+        self.read().get(id).cloned()
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.read().contains_key(id)
+    }
+
+    /// Every calendar (unordered).
+    pub fn all(&self) -> Vec<HolidayCalendar> {
+        self.read().values().cloned().collect()
+    }
+
+    pub fn put(&self, c: HolidayCalendar) {
+        self.0.write().unwrap_or_else(|p| p.into_inner()).insert(c.id.clone(), c);
+    }
+
+    pub fn remove(&self, id: &str) {
+        self.0.write().unwrap_or_else(|p| p.into_inner()).remove(id);
+    }
+
+    /// Name of the first of `calendar_ids` that blocks local date `d`.
+    pub fn blocked_by(&self, calendar_ids: &[String], d: NaiveDate) -> Option<String> {
+        let s = self.read();
+        calendar_ids.iter().filter_map(|id| s.get(id)).find(|c| c.blocks(d)).map(|c| c.name.clone())
+    }
+}
+
 struct IcsEvent {
     start: NaiveDate,
     end_exclusive: NaiveDate,

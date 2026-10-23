@@ -34,12 +34,10 @@ use ufop_core::backup::{BackupOptions, RetentionPolicy, SourceFilter};
 /// Config-table key of the local templates.
 pub const TEMPLATES_KEY: &str = "backup.policy_templates";
 
-/// Job sections a template can set as a whole.
-pub const SECTIONS: &[&str] = &["filter", "retention", "schedule", "maintenance", "scripts", "notifications", "notification_profile_ids", "notify_on", "throttle", "retry", "prevent_sleep"];
-
-/// Backup options that belong to one job (repository layout, per-run
-/// inputs): never inherited, always the job's own.
-pub const PER_JOB_OPTIONS: &[&str] = &["prefix", "block_size", "block_hash", "file_hash", "dry_run", "task_config", "changed_paths", "deleted_paths"];
+/// Field paths, layers and the resolution order are shared with the
+/// standalone `ufop agent` host (`ufop_core::backup::layers`).
+pub use ufop_core::backup::layers::{all_paths, EffectiveSetting, Inherited, SettingSource, PER_JOB_OPTIONS, SECTIONS};
+use ufop_core::backup::layers::{self as layers, set_path as set, Layer};
 
 /// A partial set of job settings: `None` / absent = not set.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -71,14 +69,7 @@ impl PartialEq for SettingsPatch {
 impl SettingsPatch {
     /// The patch as field path → value.
     pub fn paths(&self) -> Result<Vec<(String, Value)>, AppError> {
-        let mut out: Vec<(String, Value)> = self.options.iter().map(|(k, v)| (format!("options.{k}"), v.clone())).collect();
-        let v = serde_json::to_value(self)?;
-        for s in SECTIONS {
-            if let Some(x) = v.get(*s).filter(|x| !x.is_null()) {
-                out.push((s.to_string(), x.clone()));
-            }
-        }
-        Ok(out)
+        Ok(layers::patch_paths(&serde_json::to_value(self)?))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -161,72 +152,12 @@ impl PolicyTemplate {
 /// Id prefix of console-delivered templates.
 pub const MANAGED_PREFIX: &str = "org:";
 
-/// Where an effective setting came from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum SettingSource {
-    BuiltIn,
-    Global,
-    Template { id: String, name: String },
-    Job,
-    Managed { id: String, name: String },
-}
-
-/// The value a setting would have without the job's own (or managed) value.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Inherited {
-    pub value: Value,
-    pub source: SettingSource,
-}
-
-/// One setting as the job runs with it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EffectiveSetting {
-    pub field_path: String,
-    pub value: Value,
-    pub source: SettingSource,
-    /// Set when the job (or the console) overrides an inherited value: what
-    /// "reset to inherited" gives.
-    pub inherited: Option<Inherited>,
-}
-
 /// [`resolve`]'s result.
 #[derive(Debug, Clone)]
 pub struct Resolution {
     pub job: BackupJob,
     pub settings: Vec<EffectiveSetting>,
     pub warnings: Vec<String>,
-}
-
-/// Every field path a job has.
-pub fn all_paths() -> Vec<String> {
-    let opts = serde_json::to_value(BackupOptions::default()).ok();
-    let mut v: Vec<String> = opts.as_ref().and_then(|o| o.as_object()).map(|o| o.keys().map(|k| format!("options.{k}")).collect()).unwrap_or_default();
-    v.sort();
-    v.extend(SECTIONS.iter().map(|s| s.to_string()));
-    v
-}
-
-fn get<'v>(job: &'v Value, path: &str) -> Option<&'v Value> {
-    match path.split_once('.') {
-        Some((a, b)) => job.get(a)?.get(b),
-        None => job.get(path),
-    }
-}
-
-fn set(job: &mut Value, path: &str, value: Value) {
-    match path.split_once('.') {
-        Some((a, b)) => {
-            if let Some(o) = job.get_mut(a).and_then(|x| x.as_object_mut()) {
-                o.insert(b.to_string(), value);
-            }
-        }
-        None => {
-            if let Some(o) = job.as_object_mut() {
-                o.insert(path.to_string(), value);
-            }
-        }
-    }
 }
 
 fn apply_paths(job: &mut BackupJob, paths: &[(String, Value)]) -> Result<(), AppError> {
@@ -238,26 +169,12 @@ fn apply_paths(job: &mut BackupJob, paths: &[(String, Value)]) -> Result<(), App
     Ok(())
 }
 
-fn is_per_job(path: &str) -> bool {
-    path.strip_prefix("options.").is_some_and(|k| PER_JOB_OPTIONS.contains(&k))
-}
-
 /// The settings `job` sets itself: its `overrides`, or (older jobs) every
 /// setting that differs from the built-in default. Per-job options always count.
 pub fn explicit_paths(job: &BackupJob) -> Result<BTreeSet<String>, AppError> {
     let builtin = serde_json::to_value(BackupJob::default())?;
     let jv = serde_json::to_value(job)?;
-    let mut out = BTreeSet::new();
-    for p in all_paths() {
-        let own = match &job.overrides {
-            Some(list) => list.contains(&p),
-            None => get(&jv, &p) != get(&builtin, &p),
-        };
-        if own || (is_per_job(&p) && get(&jv, &p) != get(&builtin, &p)) {
-            out.insert(p);
-        }
-    }
-    Ok(out)
+    Ok(layers::explicit_paths(&builtin, &jv, job.overrides.as_deref(), &all_paths()))
 }
 
 /// Check a job's template ids and override paths.
@@ -288,7 +205,7 @@ pub fn resolve(job: &BackupJob, globals: &GlobalDefaults, templates: &[PolicyTem
     let mut warnings = Vec::new();
 
     // Layers below the job, in order.
-    let mut layers: Vec<(SettingSource, Vec<(String, Value)>)> = Vec::new();
+    let mut layers: Vec<Layer> = Vec::new();
     let mut g: Vec<(String, Value)> = globals.options.iter().map(|(k, v)| (format!("options.{k}"), v.clone())).collect();
     if let Some(t) = globals.throttle {
         g.push(("throttle".into(), serde_json::to_value(t)?));
@@ -296,52 +213,20 @@ pub fn resolve(job: &BackupJob, globals: &GlobalDefaults, templates: &[PolicyTem
     if let Some(r) = globals.retry {
         g.push(("retry".into(), serde_json::to_value(r)?));
     }
-    layers.push((SettingSource::Global, g));
+    layers.push(Layer { source: SettingSource::Global, paths: g });
     for id in &job.template_ids {
         match templates.iter().find(|t| &t.id == id && !t.enforced) {
-            Some(t) => layers.push((SettingSource::Template { id: t.id.clone(), name: t.name.clone() }, t.settings.paths()?)),
+            Some(t) => layers.push(Layer { source: SettingSource::Template { id: t.id.clone(), name: t.name.clone() }, paths: t.settings.paths()? }),
             None => warnings.push(format!("Policy template {id} no longer exists; its settings are not applied")),
         }
     }
-    let managed: Vec<(SettingSource, Vec<(String, Value)>)> = templates
+    let managed: Vec<Layer> = templates
         .iter()
         .filter(|t| t.managed && t.enforced)
-        .map(|t| Ok((SettingSource::Managed { id: t.id.clone(), name: t.name.clone() }, t.settings.paths()?)))
+        .map(|t| Ok(Layer { source: SettingSource::Managed { id: t.id.clone(), name: t.name.clone() }, paths: t.settings.paths()? }))
         .collect::<Result<_, AppError>>()?;
     let explicit = explicit_paths(job)?;
-
-    let mut out = jv.clone();
-    let mut settings = Vec::new();
-    for p in all_paths() {
-        let mut value = get(&builtin, &p).cloned().unwrap_or(Value::Null);
-        let mut source = SettingSource::BuiltIn;
-        if !is_per_job(&p) {
-            for (src, paths) in &layers {
-                if let Some((_, v)) = paths.iter().rev().find(|(k, _)| *k == p) {
-                    value = v.clone();
-                    source = src.clone();
-                }
-            }
-        }
-        let below = Inherited { value: value.clone(), source: source.clone() };
-        let mut inherited = None;
-        if explicit.contains(&p) {
-            value = get(&jv, &p).cloned().unwrap_or(Value::Null);
-            source = SettingSource::Job;
-            inherited = Some(below.clone());
-        }
-        if !is_per_job(&p) {
-            for (src, paths) in &managed {
-                if let Some((_, v)) = paths.iter().rev().find(|(k, _)| *k == p) {
-                    value = v.clone();
-                    source = src.clone();
-                    inherited.get_or_insert_with(|| below.clone());
-                }
-            }
-        }
-        set(&mut out, &p, value.clone());
-        settings.push(EffectiveSetting { field_path: p, value, source, inherited });
-    }
+    let (out, settings) = layers::resolve_paths(&builtin, &jv, &all_paths(), &explicit, &layers, &managed);
     let mut resolved: BackupJob = serde_json::from_value(out).map_err(|e| AppError::validation(format!("Inherited settings do not fit this job: {e}")))?;
     resolved.masked_values = job.masked_values.clone();
     Ok(Resolution { job: resolved, settings, warnings })
