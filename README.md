@@ -57,3 +57,5 @@ Source-available under [PolyForm Shield 1.0.0](LICENSE). Free for any use except
 ## Contributing & Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, architecture overview, and the AI-agent governance setup used by this repo.
+
+To report a security vulnerability privately, see [SECURITY.md](SECURITY.md).

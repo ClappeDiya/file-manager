@@ -12,7 +12,7 @@ Ground rules
 
 ## WP0 — Foundations
 - [x] K132 Backup screens honour Simple/Advanced mode (`AdvancedOnly` gate + store selector)
-- [ ] K130 SECURITY.md (disclosure policy, supported versions, response SLA)
+- [x] K130 SECURITY.md (disclosure policy, supported versions, response SLA)
 
 ## WP1 — Repository format v2 (ufop-core)
 - [ ] K72 Format v2, dual-version reader, in-place upgrade with v1 header backup and rollback
