@@ -10,6 +10,8 @@ pub mod agent;
 #[cfg(feature = "doctext")]
 pub mod doctext;
 pub mod calendar;
+#[cfg(feature = "cli-gen")]
+pub mod cli_gen;
 pub mod confine;
 pub mod error;
 pub mod fsutil;

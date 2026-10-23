@@ -22,6 +22,8 @@ gateway = ["agent", "reqwest/stream", "tokio/fs", "tokio/io-util", "tokio/rt", "
 mcp = ["dep:base64", "dep:md-5", "dep:sha1"]
 # Text from office documents (docx/xlsx/pptx, OpenDocument, RTF) and PDF for previews and search.
 doctext = ["dep:zip", "dep:flate2"]
+# Shell completions and man pages from a clap command tree (`cli_gen` module).
+cli-gen = ["dep:clap"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -53,6 +55,7 @@ sha1 = { version = "0.10", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json"] }
 tokio = { version = "1", optional = true, features = ["time", "sync", "macros"] }
 tokio-util = { version = "0.7", optional = true, features = ["io"] }
+clap = { version = "4", optional = true, default-features = false, features = ["std", "help"] }
 
 # Backup metadata (xattrs, POSIX ACLs via system.* xattrs), advisory locks,
 # I/O priority and free-space checks.
@@ -78,4 +81,5 @@ windows = { version = "0.61", optional = true, features = ["Win32_Foundation", "
 
 [dev-dependencies]
 tempfile = "3"
+clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }

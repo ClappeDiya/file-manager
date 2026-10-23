@@ -7,6 +7,7 @@ pub mod backup_notify;
 pub mod backup_policy;
 pub mod checksum;
 pub mod compat;
+pub mod completions;
 pub mod connection;
 pub mod copy;
 pub mod duplicates;

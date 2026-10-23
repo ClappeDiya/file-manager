@@ -198,6 +198,49 @@ enum Command {
     /// Print the Argon2 hash of a password (UFOP_SERVER_PASSWORD or stdin), for
     /// `user add --password-hash` or the management console
     HashPassword,
+    /// Print a shell completion script: bash, zsh, fish, powershell, elvish
+    Completions {
+        #[arg(value_parser = ["bash", "zsh", "fish", "powershell", "elvish"])]
+        shell: String,
+    },
+    /// Print a man page (`ufop-server man user add`), or write all of them with --out
+    Man {
+        /// Folder to write every page into
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Command path (empty = the top page)
+        command: Vec<String>,
+    },
+}
+
+/// `completions` / `man`: generated from this binary's own argument tree.
+fn print_generated(cmd: &Command) {
+    use clap::CommandFactory;
+    use ufop_core::cli_gen;
+    let tree = Args::command();
+    match cmd {
+        Command::Completions { shell } => match cli_gen::Shell::parse(shell) {
+            Some(sh) => print!("{}", cli_gen::completions(&tree, sh)),
+            None => fail(format!("unknown shell '{shell}'")),
+        },
+        Command::Man { out, command } => {
+            let pages = cli_gen::man_pages(&tree);
+            if let Some(dir) = out {
+                std::fs::create_dir_all(dir).unwrap_or_else(|e| fail(format!("cannot create {}: {e}", dir.display())));
+                for (name, body) in &pages {
+                    std::fs::write(dir.join(name), body).unwrap_or_else(|e| fail(format!("cannot write {name}: {e}")));
+                }
+                eprintln!("Wrote {} man page(s) to {}", pages.len(), dir.display());
+            } else {
+                let want = std::iter::once("ufop-server".to_string()).chain(command.iter().cloned()).collect::<Vec<_>>().join("-");
+                match pages.iter().find(|(n, _)| *n == format!("{want}.1")) {
+                    Some((_, body)) => print!("{body}"),
+                    None => fail(format!("no command '{}'", want.replace('-', " "))),
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -421,6 +464,10 @@ async fn run(argv: Vec<String>) {
         None => argv,
     };
     let a = Args::parse_from(argv);
+    if let Some(c @ (Command::Completions { .. } | Command::Man { .. })) = &a.command {
+        print_generated(c);
+        return;
+    }
     if matches!(a.command, Some(Command::HashPassword)) {
         match server::auth::hash_password(&read_password()) {
             Ok(h) => {

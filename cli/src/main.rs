@@ -226,6 +226,26 @@ pub enum Commands {
     /// Manage named profiles (servers, tokens, output format)
     #[command(subcommand)]
     Profile(commands::profile::ProfileCommands),
+
+    /// Print a shell completion script: bash, zsh, fish, powershell, elvish
+    ///
+    /// bash: `ufop completions bash > ~/.local/share/bash-completion/completions/ufop`;
+    /// zsh: `ufop completions zsh > "${fpath[1]}/_ufop"`; fish:
+    /// `ufop completions fish > ~/.config/fish/completions/ufop.fish`;
+    /// PowerShell: `ufop completions powershell | Out-String | Invoke-Expression`.
+    Completions {
+        #[arg(value_parser = commands::completions::SHELLS)]
+        shell: String,
+    },
+
+    /// Print a man page (`ufop man backup run`), or write all of them with --out
+    Man {
+        /// Folder to write every page into (ufop.1, ufop-backup.1, …)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Command path (empty = the top page)
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -521,6 +541,23 @@ async fn main() -> ExitCode {
         }
         Commands::Profile(cmd) => {
             commands::profile::execute(cmd, &format).await
+        }
+        Commands::Completions { shell } => {
+            use clap::CommandFactory;
+            commands::completions::script(&Cli::command(), &shell).map(|s| {
+                print!("{s}");
+                0
+            }).map_err(Into::into)
+        }
+        Commands::Man { out, command } => {
+            use clap::CommandFactory;
+            commands::completions::man(&Cli::command(), out.as_deref(), &command).map(|pages| {
+                match &out {
+                    Some(dir) => eprintln!("Wrote {} man page(s) to {}", pages.len(), dir.display()),
+                    None => pages.iter().for_each(|(_, body)| print!("{body}")),
+                }
+                0
+            }).map_err(Into::into)
         }
     };
 
