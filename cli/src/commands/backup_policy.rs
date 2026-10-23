@@ -230,6 +230,55 @@ pub async fn effective(job: &str, format: &OutputFormat) -> Result<u8, String> {
     Ok(0)
 }
 
+/// `ufop backup hardening <job> [--probe]`.
+pub async fn hardening(job: &str, probe: bool, format: &OutputFormat) -> Result<u8, String> {
+    let mut c = Client::new()?;
+    let id = c.job_id(job).await?;
+    let v = if probe {
+        c.call(Method::POST, &format!("/jobs/{}/hardening/probe", urlencode(&id)), None).await?
+    } else {
+        c.call(Method::GET, &format!("/jobs/{}/hardening", urlencode(&id)), None).await?
+    };
+    match format {
+        OutputFormat::Human => print!("{}", hardening_text(&v)),
+        _ => output::print_data(format, &v),
+    }
+    Ok(hardening_exit(&v))
+}
+
+/// 0 = every check passes, 1 = warnings or unchecked, 2 = a failure.
+pub fn hardening_exit(v: &Value) -> u8 {
+    let st: Vec<&str> = v["checks"].as_array().into_iter().flatten().filter_map(|c| c["status"].as_str()).collect();
+    if st.contains(&"fail") {
+        2
+    } else if st.iter().any(|s| *s == "warn" || *s == "unknown") {
+        1
+    } else {
+        0
+    }
+}
+
+pub fn hardening_text(v: &Value) -> String {
+    let mut out = format!("Protection: {}/{}\n", v["passed"].as_u64().unwrap_or(0), v["total"].as_u64().unwrap_or(0));
+    for c in v["checks"].as_array().into_iter().flatten() {
+        let mark = match c["status"].as_str().unwrap_or("") {
+            "pass" => "PASS",
+            "warn" => "WARN",
+            "fail" => "FAIL",
+            "unknown" => "  ? ",
+            _ => "info",
+        };
+        out.push_str(&format!("[{mark}] {}: {}\n", c["title"].as_str().unwrap_or(""), c["detail"].as_str().unwrap_or("")));
+        if let Some(a) = c["advice"].as_str().filter(|a| !a.is_empty() && c["status"] != "pass") {
+            out.push_str(&format!("       → {a} ({})\n", c["doc"].as_str().unwrap_or("")));
+        }
+    }
+    if let Some(l) = v["probe"]["leftover"].as_str() {
+        out.push_str(&format!("Probe object left at the destination: {l}\n"));
+    }
+    out
+}
+
 /// Body of `POST /jobs/{id}/point-in-time`; the time must be RFC 3339.
 pub fn open_at_body(point_in_time: &str, name: Option<String>) -> Result<Value, String> {
     let at = chrono::DateTime::parse_from_rfc3339(point_in_time.trim()).map_err(|e| format!("--point-in-time must be an RFC 3339 time such as 2026-10-01T08:00:00Z: {e}"))?;
@@ -289,6 +338,26 @@ pub async fn schedule_preview(cron: &[String], start_time: Option<&str>, interva
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardening_output_and_exit_codes() {
+        let v = json!({"passed": 1, "total": 2, "checks": [
+            {"id": "encryption", "title": "Backups are encrypted", "status": "pass", "detail": "Yes.", "advice": "", "doc": "g#a"},
+            {"id": "credentials", "title": "The backup credentials cannot delete", "status": "unknown", "detail": "Not checked yet.", "advice": "Run the checks.", "doc": "g#b"},
+            {"id": "legal_hold", "title": "Legal hold", "status": "info", "detail": "No legal hold.", "advice": "Place one.", "doc": "g#c"}
+        ], "probe": {"leftover": "ufop-hardening-probe-1.tmp"}});
+        let t = hardening_text(&v);
+        assert!(t.starts_with("Protection: 1/2\n"));
+        assert!(t.contains("[PASS] Backups are encrypted: Yes."));
+        assert!(t.contains("→ Run the checks. (g#b)"));
+        assert!(t.contains("left at the destination: ufop-hardening-probe-1.tmp"));
+        assert_eq!(hardening_exit(&v), 1);
+        let mut f = v.clone();
+        f["checks"][1]["status"] = json!("fail");
+        assert_eq!(hardening_exit(&f), 2);
+        f["checks"][1]["status"] = json!("pass");
+        assert_eq!(hardening_exit(&f), 0, "info does not count");
+    }
 
     #[test]
     fn template_bodies_merge_file_and_flags() {

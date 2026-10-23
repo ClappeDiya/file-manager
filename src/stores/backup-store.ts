@@ -797,6 +797,40 @@ export interface JobStats {
   backend_size: number;
   /** Last scheduled start of each maintenance task (`compact`, `verify`, `apply_retention`). */
   last_maintenance?: Record<string, string>;
+  /** The last ransomware-hardening destination probe ("Run checks"). */
+  last_hardening_probe?: HardeningProbe | null;
+}
+
+/** `backup_engine::hardening::ProbeResult`. */
+export interface HardeningProbe {
+  ran_at: string;
+  can_write: boolean;
+  can_delete: boolean | null;
+  gone_after_delete: boolean | null;
+  leftover: string | null;
+  detail: string;
+}
+
+export type HardeningStatus = "pass" | "warn" | "fail" | "unknown" | "info";
+
+/** `backup_engine::hardening::HardeningCheck`. */
+export interface HardeningCheck {
+  id: string;
+  title: string;
+  status: HardeningStatus;
+  detail: string;
+  advice: string;
+  /** Guide section, e.g. `docs/backup-ransomware-hardening.md#object-lock-and-immutability`. */
+  doc: string;
+}
+
+/** `backup_engine::hardening::HardeningReport`. */
+export interface HardeningReport {
+  job_id: string;
+  passed: number;
+  total: number;
+  checks: HardeningCheck[];
+  probe: HardeningProbe | null;
 }
 
 export interface BackupJob {
@@ -1537,6 +1571,8 @@ interface BackupState {
   pause: (minutes: number | null) => Promise<void>;
   resume: () => Promise<void>;
   placeLegalHold: (id: string, matter: string, reason: string) => Promise<BackupJob>;
+  /** Ransomware-hardening checklist; `probe` writes and tries to delete a probe object (explicit action only). */
+  hardeningReport: (jobId: string, probe?: boolean) => Promise<HardeningReport>;
   releaseLegalHold: (id: string) => Promise<BackupJob>;
   exportEDiscovery: (request: EDiscoveryRequest) => Promise<EDiscoveryReport>;
   clearError: () => void;
@@ -1671,6 +1707,8 @@ export const useBackupStore = create<BackupState>((set, get) => ({
     const status = await tauriInvoke<SchedulerStatus>("backup_resume", {});
     set({ status });
   },
+
+  hardeningReport: (jobId, probe = false) => tauriInvoke<HardeningReport>("backup_hardening_report", { jobId, probe }),
 
   placeLegalHold: async (id, matter, reason) => {
     const job = await tauriInvoke<BackupJob>("backup_place_legal_hold", { id, matter, reason });

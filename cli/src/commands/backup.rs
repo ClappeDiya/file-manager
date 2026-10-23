@@ -1274,6 +1274,14 @@ pub enum BackupCommands {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Ransomware-hardening checklist of a server job (exit 0 all pass, 1 warnings, 2 failures)
+    Hardening {
+        /// Job id or name (signed-in ufop-server)
+        job: String,
+        /// Also try deleting a probe object with the backup credentials (writes to the destination)
+        #[arg(long)]
+        probe: bool,
+    },
     /// Validate a schedule and list its next runs (signed-in ufop-server)
     SchedulePreview {
         /// Cron expression, `min hour day month weekday` (repeatable)
@@ -1597,7 +1605,7 @@ pub async fn execute(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) 
         return super::server::execute(super::server::ServerCommands::RunAll { jobs, scheduled_only, dry_run, wait }, format).await;
     }
     let server_backed = match &cmd {
-        BackupCommands::Template { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } | BackupCommands::OpenAt { .. } => true,
+        BackupCommands::Template { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } | BackupCommands::OpenAt { .. } | BackupCommands::Hardening { .. } => true,
         _ => false,
     };
     if server_backed {
@@ -1605,6 +1613,7 @@ pub async fn execute(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) 
             BackupCommands::Template { cmd } => super::backup_policy::template(cmd, format).await,
             BackupCommands::Effective { job } => super::backup_policy::effective(&job, format).await,
             BackupCommands::OpenAt { job, point_in_time, name } => super::backup_policy::open_at(&job, &point_in_time, name, format).await,
+            BackupCommands::Hardening { job, probe } => super::backup_policy::hardening(&job, probe, format).await,
             BackupCommands::SchedulePreview { cron, start_time, interval_minutes, count } => {
                 super::backup_policy::schedule_preview(&cron, start_time.as_deref(), interval_minutes, count, format).await
             }
@@ -1735,7 +1744,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             }
             Ok(0)
         }
-        BackupCommands::RunAll { .. } | BackupCommands::Template { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } | BackupCommands::OpenAt { .. } => Err(ufop_core::error::AppError::internal("server-backed commands are handled before the blocking runner")),
+        BackupCommands::RunAll { .. } | BackupCommands::Template { .. } | BackupCommands::Effective { .. } | BackupCommands::SchedulePreview { .. } | BackupCommands::OpenAt { .. } | BackupCommands::Hardening { .. } => Err(ufop_core::error::AppError::internal("server-backed commands are handled before the blocking runner")),
         BackupCommands::List { repo, tags } => with_repo(&repo, LockKind::Shared, "list", |_, db| {
             let filter = ufop_core::backup::versions::parse_tags(&tags)?;
             let v = ufop_core::backup::versions::filter_by_tags(db.filesets()?, &filter);

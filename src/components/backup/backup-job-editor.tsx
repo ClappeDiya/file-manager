@@ -24,6 +24,7 @@ import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { RetentionEditor } from "./backup-retention-editor";
 import { BackupAdvancedOptions } from "./backup-advanced-options";
 import { StdinCommandEditor } from "./backup-run-options";
+import { BackupHardening } from "./backup-hardening";
 import { BackupReplicas } from "./backup-replicas";
 import { RequestLimitsEditor } from "./backup-request-limits";
 import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
@@ -465,6 +466,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
             <AdvancedOnly hint>
               <BackupReplicas replicas={job.replicas} onChange={(r) => patch({ replicas: r })} connections={connections} library={library} />
             </AdvancedOnly>
+            <BackupHardening job={job} />
           </>
         )}
 

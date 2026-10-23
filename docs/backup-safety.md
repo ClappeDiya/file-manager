@@ -85,3 +85,5 @@ A key check stored in the database tells whether a key is the right one. Volume 
 **Losing the key** does not lose the backup. When the database is encrypted and its key is missing or different, the app sets the file aside as `<name>.undecryptable-<time>`, starts a new database and rebuilds it from the destination (Recreate database). The run log says so, and the next backup continues normally.
 
 Ignore files, the read-error policy, snapshots (including ZFS and btrfs), the estimate and backing up every job are described in [backup-sources-and-runs.md](backup-sources-and-runs.md).
+
+See also [backup-ransomware-hardening.md](backup-ransomware-hardening.md): least-privilege credentials per provider, the two-credential model, object lock, append-only SFTP and offline copies, and the per-job protection checklist.

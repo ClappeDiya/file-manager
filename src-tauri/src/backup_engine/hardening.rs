@@ -290,4 +290,27 @@ mod tests {
         assert_eq!(by("replica"), CheckStatus::Warn);
         assert_eq!(by("retention"), CheckStatus::Warn);
     }
+
+    /// GitHub-style anchors of the guide's headings.
+    fn anchors() -> Vec<String> {
+        include_str!("../../../docs/backup-ransomware-hardening.md")
+            .lines()
+            .filter(|l| l.starts_with('#'))
+            .map(|l| l.trim_start_matches('#').trim().to_lowercase().chars().filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-').collect::<String>().replace(' ', "-"))
+            .collect()
+    }
+
+    #[test]
+    fn every_check_links_to_a_guide_section() {
+        let a = anchors();
+        let mut j = job();
+        j.legal_hold = Some(crate::backup_engine::legal_hold::LegalHold { matter: "m".into(), reason: "r".into(), placed_by: "u".into(), placed_at: "t".into() });
+        let probes = [None, Some(ProbeResult { can_write: true, can_delete: Some(false), ..Default::default() }), Some(ProbeResult::default())];
+        for p in &probes {
+            for c in evaluate(&j, 0, p.as_ref()).into_iter().chain(evaluate(&job(), 0, p.as_ref())) {
+                let anchor = c.doc.split('#').nth(1).unwrap();
+                assert!(a.iter().any(|x| x == anchor), "{} links to missing #{anchor}; headings: {a:?}", c.id);
+            }
+        }
+    }
 }

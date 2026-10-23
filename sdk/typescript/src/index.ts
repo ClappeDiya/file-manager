@@ -380,6 +380,16 @@ export class UfopClient {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/files`, query, undefined);
   }
 
+  /** Ransomware-hardening checklist: encryption, object lock, soft delete, a replica with another provider, local database encryption, retention and pins, whether the backup credentials can delete (from the last probe), legal hold; each with pass/warn/fail/unknown/info and a link to the guide (API tokens: `read` scope). `GET /api/v1/jobs/{id}/hardening` */
+  getJobsIdHardening(id: string): Promise<{ checks?: Array<{ advice?: string; detail?: string; doc?: string; id?: string; status?: "pass" | "warn" | "fail" | "unknown" | "info"; title?: string }>; job_id?: string; passed?: number; probe?: { can_delete?: boolean | null; can_write?: boolean; detail?: string; gone_after_delete?: boolean | null; leftover?: string | null; ran_at?: string } | null; total?: number }> {
+    return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/hardening`, undefined, undefined);
+  }
+
+  /** Run the destination probe: write a small probe object and try to delete it with the backup credentials (cleaned up when possible), then return the checklist (API tokens: `write` scope). `POST /api/v1/jobs/{id}/hardening/probe` */
+  postJobsIdHardeningProbe(id: string): Promise<{ checks?: Array<{ advice?: string; detail?: string; doc?: string; id?: string; status?: "pass" | "warn" | "fail" | "unknown" | "info"; title?: string }>; job_id?: string; passed?: number; probe?: { can_delete?: boolean | null; can_write?: boolean; detail?: string; gone_after_delete?: boolean | null; leftover?: string | null; ran_at?: string } | null; total?: number }> {
+    return this.call("POST", `/api/v1/jobs/${encodeURIComponent(id)}/hardening/probe`, undefined, undefined);
+  }
+
   /** Repository lock status: who holds the destination (host, operation, since, expires) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/lock` */
   getJobsIdLock(id: string): Promise<{ checked_at?: string; exclusive?: boolean; locks?: Array<{ acquired_at?: string; app?: string; damaged?: boolean; expires_at?: string; file?: string; hostname?: string; kind?: "exclusive" | "shared"; operation?: string; owner_id?: string; pid?: number; stale?: boolean; username?: string; version?: string }>; readers?: number }> {
     return this.call("GET", `/api/v1/jobs/${encodeURIComponent(id)}/lock`, undefined, undefined);

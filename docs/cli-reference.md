@@ -570,6 +570,7 @@ ufop server login --url https://backup:8200 --user alice --password …   # an a
 ufop server user list | add NAME --role operator --password … | set NAME --disabled true | remove NAME
 ufop server acl list | add PRINCIPAL PATTERN PERMISSION | remove ID [--preview]   # e.g. acl add alice 'prod-*' run
 ufop server whoami
+ufop backup hardening Docs [--probe]   # ransomware-protection checklist of a server job (exit 0 pass, 1 warnings, 2 failures); --probe tries a delete with the backup credentials
 ufop server shutdown [--grace 120]   # stop the server gracefully (running backups write a partial version); again = stop now
 ufop backup run-all [--job Docs …] [--scheduled-only] [--wait]               # the same
 ```

@@ -305,6 +305,14 @@ class UfopClient:
         """Files in a version (API tokens: `read` scope). `GET /api/v1/jobs/{id}/files`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/files", {"version": version, "time": time, "allow_partial": allow_partial, "prefix": prefix, "source": source}, None)
 
+    def get_jobs_id_hardening(self, id_: str) -> Dict[str, Any]:
+        """Ransomware-hardening checklist: encryption, object lock, soft delete, a replica with another provider, local database encryption, retention and pins, whether the backup credentials can delete (from the last probe), legal hold; each with pass/warn/fail/unknown/info and a link to the guide (API tokens: `read` scope). `GET /api/v1/jobs/{id}/hardening`"""
+        return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/hardening", None, None)
+
+    def post_jobs_id_hardening_probe(self, id_: str) -> Dict[str, Any]:
+        """Run the destination probe: write a small probe object and try to delete it with the backup credentials (cleaned up when possible), then return the checklist (API tokens: `write` scope). `POST /api/v1/jobs/{id}/hardening/probe`"""
+        return self._call("POST", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/hardening/probe", None, None)
+
     def get_jobs_id_lock(self, id_: str) -> Dict[str, Any]:
         """Repository lock status: who holds the destination (host, operation, since, expires) (API tokens: `read` scope). `GET /api/v1/jobs/{id}/lock`"""
         return self._call("GET", f"/api/v1/jobs/{urllib.parse.quote(id_, safe='')}/lock", None, None)

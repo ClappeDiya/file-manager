@@ -91,7 +91,7 @@ Ground rules
 - [x] K108 Prometheus `/metrics`
 - [x] K109 OpenTelemetry trace export + Prometheus pushgateway
 - [x] K92 Multi-user server accounts and per-job ACL
-- [ ] K87 Ransomware hardening guide + destination checklist in job editor
+- [x] K87 Ransomware hardening guide + destination checklist in job editor
 
 ## WP9 — Notifications
 - [ ] K101 Reusable notification profiles
