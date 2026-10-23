@@ -121,6 +121,52 @@ fn write_private(path: &Path, content: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Lowest TLS protocol version the server accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MinTls {
+    #[default]
+    Tls12,
+    Tls13,
+}
+
+impl std::str::FromStr for MinTls {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().trim_start_matches("tls").trim_start_matches(['v', '-', '_']) {
+            "1.2" | "12" => Ok(Self::Tls12),
+            "1.3" | "13" => Ok(Self::Tls13),
+            other => Err(format!("unsupported minimum TLS version '{other}' (1.2 or 1.3)")),
+        }
+    }
+}
+
+/// A rustls server configuration with the protocol floor applied (TLS 1.0/1.1
+/// are never offered), HTTP/2 + HTTP/1.1 ALPN and no client certificates.
+pub fn server_config(chain: Vec<Vec<u8>>, key: Vec<u8>, min: MinTls) -> Result<rustls::ServerConfig, AppError> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let versions: &[&'static rustls::SupportedProtocolVersion] = match min {
+        MinTls::Tls12 => &[&rustls::version::TLS13, &rustls::version::TLS12],
+        MinTls::Tls13 => &[&rustls::version::TLS13],
+    };
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let key = PrivateKeyDer::try_from(key).map_err(tls_err)?;
+    let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(versions)
+        .map_err(tls_err)?
+        .with_no_client_auth()
+        .with_single_cert(chain.into_iter().map(CertificateDer::from).collect(), key)
+        .map_err(tls_err)?;
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(cfg)
+}
+
+/// PEM chain + key → DER, for `server_config`.
+pub fn pem_to_der(p: &PemPair) -> Result<(Vec<Vec<u8>>, Vec<u8>), AppError> {
+    let chain = rustls_pemfile::certs(&mut p.cert_chain_pem.as_bytes()).map(|c| c.map(|c| c.to_vec())).collect::<Result<Vec<_>, _>>().map_err(tls_err)?;
+    let key = rustls_pemfile::private_key(&mut p.key_pem.as_bytes()).map_err(tls_err)?.ok_or_else(|| tls_err("no private key in the PEM file"))?;
+    Ok((chain, key.secret_der().to_vec()))
+}
+
 /// Read a PFX/P12 bundle into DER chain + PKCS#8 key.
 pub fn load_pfx(path: &Path, password: &str) -> Result<(Vec<Vec<u8>>, Vec<u8>), AppError> {
     let data = std::fs::read(path)?;
@@ -132,6 +178,46 @@ pub fn load_pfx(path: &Path, password: &str) -> Result<(Vec<Vec<u8>>, Vec<u8>), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Handshake a client limited to `client` versions against a server with `min`.
+    async fn handshake(min: MinTls, client: &[&'static rustls::SupportedProtocolVersion]) -> Result<rustls::ProtocolVersion, String> {
+        let d = tempfile::tempdir().unwrap();
+        let g = GeneratedCerts::new(d.path());
+        let pair = g.load_or_create(&["localhost".to_string()]).unwrap();
+        let (chain, key) = pem_to_der(&pair).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config(chain, key, min).unwrap()));
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut std::fs::read(g.ca_cert_path()).unwrap().as_slice()) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let ccfg = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(client)
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(sock).await;
+        });
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(ccfg)).connect(name, sock).await.map_err(|e| e.to_string())?;
+        Ok(tls.get_ref().1.protocol_version().unwrap())
+    }
+
+    #[tokio::test]
+    async fn minimum_tls_version_is_enforced() {
+        use rustls::version::{TLS12, TLS13};
+        assert_eq!(handshake(MinTls::Tls12, &[&TLS12]).await.unwrap(), rustls::ProtocolVersion::TLSv1_2);
+        assert_eq!(handshake(MinTls::Tls12, &[&TLS13, &TLS12]).await.unwrap(), rustls::ProtocolVersion::TLSv1_3);
+        assert!(handshake(MinTls::Tls13, &[&TLS12]).await.is_err(), "a TLS 1.2-only client is refused");
+        assert_eq!(handshake(MinTls::Tls13, &[&TLS13]).await.unwrap(), rustls::ProtocolVersion::TLSv1_3);
+        assert_eq!("1.3".parse::<MinTls>().unwrap(), MinTls::Tls13);
+        assert_eq!("TLSv1.2".parse::<MinTls>().unwrap(), MinTls::Tls12);
+        assert!("1.1".parse::<MinTls>().is_err());
+    }
 
     #[test]
     fn generates_and_reuses_until_renewal() {

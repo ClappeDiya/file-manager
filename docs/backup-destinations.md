@@ -52,6 +52,28 @@ With **Lock new volumes** set, every new volume is locked through the destinatio
 
 Retention and compaction skip locked volumes. Maintenance → **Object locks** can lock existing volumes or extend every lock.
 
+## Legal hold and eDiscovery
+
+Maintenance → **Legal hold** places a hold on a job with a matter (case reference) and a reason. While it is held:
+
+- retention is suspended, so every backup keeps all versions;
+- deleting versions and purging files, broken ones included, is refused, except as a dry run;
+- the job itself cannot be deleted, and saving the job in the editor keeps the hold.
+
+Placing and releasing a hold are written to the tamper-evident audit log (`security.legal_hold.place` / `security.legal_hold.release`). Retention applies again from the first backup after the hold is released.
+
+**eDiscovery export** writes one zip (`ediscovery_export`, format `ufop-ediscovery/1`):
+
+| Entry | Contents |
+|---|---|
+| `audit/audit-log.jsonl`, `audit/verification.json` | The complete audit log, and its hash-chain check at export time |
+| `ledger/events.jsonl` | File operations in the time range under the paths of interest |
+| `backups/<job>/` | The job's configuration without secrets, its legal hold, versions, and per version the backed-up files under the paths |
+| `files/<job>/…` | Optional: those files restored from the newest version (2 GB limit by default) |
+| `manifest.json` | The request, the result, and the SHA-256 and size of every other entry |
+
+The zip is written next to the target as `.zip.part` and renamed only when complete. The export is recorded in the audit log together with the zip's SHA-256.
+
 ## Running the destination tests
 
 The emulator tests run when the matching environment variable is set:

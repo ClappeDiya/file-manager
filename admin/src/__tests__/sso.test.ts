@@ -18,7 +18,7 @@ import * as samlify from 'samlify';
 import { createProvider, identitiesOf } from '@/lib/db/repos/sso';
 import { createGroup, groupMembers } from '@/lib/db/repos/groups';
 import { findUserByEmail, getUser } from '@/lib/db/repos/users';
-import { effectiveRole } from '@/lib/db/repos/orgs';
+import { createOrg, effectiveRole } from '@/lib/db/repos/orgs';
 import { hotp, totpStep } from '@/lib/totp';
 import { cookieFrom, json, makeUser, req } from './helpers';
 import * as start from '@/app/api/auth/sso/[id]/start/route';
@@ -26,6 +26,7 @@ import * as callback from '@/app/api/auth/sso/[id]/callback/route';
 import * as metadata from '@/app/api/auth/sso/[id]/metadata/route';
 import * as discoverRoute from '@/app/api/auth/sso/discover/route';
 import * as ssoAdmin from '@/app/api/sso/route';
+import * as attemptsRoute from '@/app/api/sso/[id]/attempts/route';
 import * as identities from '@/app/api/account/identities/route';
 import * as accountMfa from '@/app/api/account/mfa/route';
 import * as mfaVerify from '@/app/api/auth/mfa/verify/route';
@@ -207,6 +208,32 @@ describe('OIDC sign-in', () => {
     expect(blocked.status).toBe(409);
   });
 
+  it('records each sign-in step for diagnostics, without tokens', async () => {
+    const p = oidcProvider({ name: 'Diag OIDC' });
+    await signInWith(p.id, 'alice');
+    await signInWith(p.id, 'bob'); // unverified email
+    const admin = makeUser('diag-admin@x.org', 'org_owner');
+    const r = await json<{ attempts: { ok: boolean; stage: string; error: string | null; email: string; steps: { step: string; ok: boolean; detail?: Record<string, unknown> }[] }[] }>(await attemptsRoute.GET(await req('GET', `/api/sso/${p.id}/attempts`, { as: admin }), params(p.id)));
+    expect(r.status).toBe(200);
+    const [bob, alice] = r.body.attempts;
+    expect(alice).toMatchObject({ ok: true, stage: 'done', email: 'alice@corp.example', error: null });
+    expect(alice.steps.map((x) => x.step)).toEqual(expect.arrayContaining(['idp_response', 'discovery', 'token_exchange', 'token_verify', 'claims', 'account', 'sign_in']));
+    const claims = alice.steps.find((x) => x.step === 'claims')!.detail!;
+    expect(claims).toMatchObject({ email: 'alice@corp.example', groupsClaim: 'groups' });
+    expect(claims.names).toEqual(expect.arrayContaining(['sub', 'email', 'iss', 'aud']));
+    expect(alice.steps.find((x) => x.step === 'token_verify')!.detail).toMatchObject({ issuer, audience: 'ufop-console' });
+    expect(bob).toMatchObject({ ok: false, stage: 'account', error: expect.stringContaining('did not verify this email'), email: 'bob@corp.example' });
+    // Never the tokens themselves.
+    expect(JSON.stringify(r.body)).not.toMatch(/eyJ[\w-]+\.eyJ/);
+    // A forged state is recorded as the failing step too.
+    await callback.GET(await req('GET', `/api/auth/sso/${p.id}/callback?code=x&state=forged`), params(p.id));
+    const again = await json<{ attempts: { stage: string; ok: boolean }[] }>(await attemptsRoute.GET(await req('GET', `/api/sso/${p.id}/attempts`, { as: admin }), params(p.id)));
+    expect(again.body.attempts[0]).toMatchObject({ ok: false, stage: 'state' });
+    // Other organizations' administrators cannot read them.
+    const outsider = makeUser('diag-out@x.org', 'org_owner', createOrg({ name: 'Diag other' }).id);
+    expect((await attemptsRoute.GET(await req('GET', `/api/sso/${p.id}/attempts`, { as: outsider }), params(p.id))).status).toBe(404);
+  });
+
   it('rejects a replayed or forged state', async () => {
     const p = oidcProvider();
     const s = await start.GET(await req('GET', `/api/auth/sso/${p.id}/start`), params(p.id));
@@ -372,6 +399,22 @@ describe('SAML sign-in', () => {
     expect(u.ssoProvider).toBe('saml');
     expect(effectiveRole(u.id, 'org_default')).toBe('operator');
     expect(groupMembers(ops.id).map((m) => m.userId)).toEqual([u.id]);
+  });
+
+  it('records SAML diagnostics: attributes on success, the validation error on a forged response', async () => {
+    const p = samlProvider();
+    await samlResponse(p.id, { email: 'diag@corp.example', name: 'Diag', groups: 'ops-team' });
+    await samlResponse(p.id, { email: 'forged@corp.example', name: 'F', groups: '' }, { keyPair: otherKeyPair });
+    const admin = makeUser('saml-diag-admin@x.org', 'org_owner');
+    const r = await json<{ attempts: { ok: boolean; stage: string; error: string | null; email: string; steps: { step: string; ok: boolean; detail?: Record<string, unknown> }[] }[] }>(await attemptsRoute.GET(await req('GET', `/api/sso/${p.id}/attempts`, { as: admin }), params(p.id)));
+    const [failed, ok] = r.body.attempts;
+    expect(ok).toMatchObject({ ok: true, stage: 'done', email: 'diag@corp.example' });
+    const assertion = ok.steps.find((x) => x.step === 'assertion')!;
+    expect(assertion.detail).toMatchObject({ nameId: 'diag@corp.example', email: 'diag@corp.example', groups: 'ops-team' });
+    expect(assertion.detail!.attributes).toEqual(expect.arrayContaining(['mail', 'groups']));
+    expect(failed).toMatchObject({ ok: false, stage: 'saml_validate', error: expect.stringContaining('SAML response was rejected') });
+    expect(failed.steps.at(-1)!.detail).toMatchObject({ expectedAudience: `${ORIGIN}/api/auth/sso/${p.id}/metadata`, expectedIssuer: 'https://idp.corp.example/metadata' });
+    expect(JSON.stringify(r.body)).not.toContain('SignatureValue');
   });
 
   it('rejects a response signed by another key, a tampered assertion and an unsolicited response', async () => {

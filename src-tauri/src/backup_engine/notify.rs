@@ -73,6 +73,12 @@ pub enum Channel {
         #[serde(default)]
         tls: TlsMode,
     },
+    /// Slack incoming webhook. The URL is a secret: it lives in the
+    /// credential store under `credential_id`.
+    Slack {},
+    /// Microsoft Teams Workflows ("Post to a channel when a webhook request
+    /// is received") or legacy incoming-webhook URL, stored like Slack's.
+    Teams {},
 }
 
 fn default_subject() -> String {
@@ -272,6 +278,72 @@ pub async fn send_telegram(api_base: &str, token: &str, chat_id: &str, text: &st
     Ok(())
 }
 
+// ── Slack and Microsoft Teams webhooks ──
+
+fn webhook_client(cert: &CertPolicy) -> Result<reqwest::Client, AppError> {
+    super::stores::http::client(&super::stores::http::TlsOptions {
+        accept_invalid_certs: cert.accept_invalid_certs,
+        ca_pem: cert.ca_pem.clone(),
+        pinned_sha256: cert.pinned_sha256.clone(),
+    })
+}
+
+fn check_webhook_url(url: &str, service: &str) -> Result<(), AppError> {
+    let u = url::Url::parse(url).map_err(|_| AppError::validation(format!("The {service} webhook URL is not a valid URL")))?;
+    if u.scheme() != "https" && !matches!(u.host_str(), Some("127.0.0.1" | "localhost")) {
+        return Err(AppError::validation(format!("The {service} webhook URL must use https")));
+    }
+    Ok(())
+}
+
+/// Post `title` and `text` to a Slack incoming webhook.
+pub async fn send_slack(webhook_url: &str, title: &str, text: &str, cert: &CertPolicy) -> Result<(), AppError> {
+    check_webhook_url(webhook_url, "Slack")?;
+    let text: String = format!("*{title}*\n{text}").chars().take(39_000).collect();
+    let r = webhook_client(cert)?
+        .post(webhook_url)
+        .json(&serde_json::json!({ "text": text, "mrkdwn": true }))
+        .send()
+        .await
+        .map_err(|e| super::stores::http::net("Slack", e))?;
+    super::stores::http::check(r, "Slack").await?;
+    Ok(())
+}
+
+/// The Adaptive Card Teams Workflows expects (also accepted by legacy
+/// incoming webhooks).
+pub fn teams_payload(title: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "contentUrl": null,
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.4",
+                "body": [
+                    { "type": "TextBlock", "text": title, "weight": "Bolder", "size": "Medium", "wrap": true },
+                    { "type": "TextBlock", "text": text.chars().take(20_000).collect::<String>(), "wrap": true }
+                ]
+            }
+        }]
+    })
+}
+
+/// Post an Adaptive Card to a Microsoft Teams webhook.
+pub async fn send_teams(webhook_url: &str, title: &str, text: &str, cert: &CertPolicy) -> Result<(), AppError> {
+    check_webhook_url(webhook_url, "Teams")?;
+    let r = webhook_client(cert)?
+        .post(webhook_url)
+        .json(&teams_payload(title, text))
+        .send()
+        .await
+        .map_err(|e| super::stores::http::net("Teams", e))?;
+    super::stores::http::check(r, "Teams").await?;
+    Ok(())
+}
+
 // ── XMPP ──
 
 fn xml_escape(s: &str) -> String {
@@ -374,6 +446,14 @@ pub async fn deliver(list: &[(Notification, Option<String>)], result: &str, subj
                 None => Err(AppError::validation("The Telegram bot token is missing")),
             },
             Channel::Xmpp { jid, to, host, port, tls } => send_xmpp(jid, secret.as_deref().unwrap_or_default(), to, host, *port, *tls, &text, &n.cert).await,
+            Channel::Slack {} | Channel::Teams {} => {
+                let title = crate::backup_engine::hooks::render_template(&default_subject(), subject_vars);
+                match (secret, &n.channel) {
+                    (Some(url), Channel::Slack {}) => send_slack(url, &title, &text, &n.cert).await,
+                    (Some(url), _) => send_teams(url, &title, &text, &n.cert).await,
+                    (None, _) => Err(AppError::validation("The webhook URL is missing")),
+                }
+            }
         };
         if let Err(e) = r {
             errors.push(e.user_message());

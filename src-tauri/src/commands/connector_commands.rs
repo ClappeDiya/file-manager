@@ -64,6 +64,7 @@ pub async fn connector_connect(
         ftp_force_passive_ip: None,
         ftp_post_login_commands: None,
         symlink_policy: None,
+        extras: Default::default(),
     };
 
     connector.connect_with_secret(&profile, secret).await
@@ -163,6 +164,7 @@ pub async fn connector_list_remote(
     protocol: String,
     path: String,
     registry: State<'_, ConnectorRegistry>,
+    search: State<'_, crate::search_engine::SearchManager>,
 ) -> Result<Vec<FileEntry>, AppError> {
     let connector = registry
         .get(&protocol)
@@ -171,7 +173,28 @@ pub async fn connector_list_remote(
             advice: "Use one of: sftp, ftp, ftps, webdav, smb, nfs, local.".to_string(),
         })?;
 
-    connector.list_remote(&path).await
+    let entries = connector.list_remote(&path).await?;
+    // Remember what was seen, so global search can find it later. Local
+    // "remote" listings are already covered by the folder index.
+    if protocol != "local" {
+        let listing: Vec<_> = entries
+            .iter()
+            .map(|e| crate::search_engine::ListingEntry {
+                name: e.name.clone(),
+                path: e.path.clone(),
+                is_dir: e.is_dir,
+                size: e.size,
+                modified_ms: e.modified.map(|t| t.timestamp_millis()).unwrap_or(0),
+            })
+            .collect();
+        let index = search.index_arc();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = index.record_listing(&protocol, &path, &listing) {
+                tracing::debug!("Listing not recorded for search: {e}");
+            }
+        });
+    }
+    Ok(entries)
 }
 
 /// Check if a protocol connector is connected.
@@ -196,4 +219,45 @@ pub async fn connector_list_protocols(
     registry: State<'_, ConnectorRegistry>,
 ) -> Result<Vec<String>, AppError> {
     Ok(registry.protocols())
+}
+
+/// The connector for `protocol`, connected with the saved connection's
+/// secret when it isn't already.
+pub async fn ensure_connected(
+    registry: &ConnectorRegistry,
+    connections: &crate::connectors::ConnectionManager,
+    protocol: &str,
+    connection_id: Option<&str>,
+) -> Result<std::sync::Arc<dyn crate::connectors::Connector>, AppError> {
+    let connector = registry
+        .get(protocol)
+        .ok_or_else(|| AppError::validation(format!("Unsupported protocol '{protocol}'")))?;
+    if !connector.is_connected() {
+        if let Some(cid) = connection_id.filter(|c| !c.is_empty()) {
+            let id = uuid::Uuid::parse_str(cid).map_err(|_| AppError::validation(format!("Invalid connection id '{cid}'")))?;
+            let profile = connections
+                .get_connection(id)
+                .await?
+                .ok_or_else(|| AppError::validation(format!("Saved connection {cid} not found")))?;
+            let secret = connections.get_password(id).await.unwrap_or(None);
+            connector
+                .connect_with_secret(&profile, secret)
+                .await
+                .map_err(|e| AppError::connection(format!("Cannot connect to {}: {e}", profile.name), "Check the connection's settings."))?;
+        }
+    }
+    Ok(connector)
+}
+
+/// rclone remotes from the user's rclone config (`rclone listremotes`).
+#[tauri::command]
+pub async fn rclone_list_remotes() -> Result<Vec<crate::connectors::rclone::RcloneRemote>, AppError> {
+    crate::connectors::rclone::list_remotes().await
+}
+
+/// Provider presets for the connection form (S3-compatible stores,
+/// hosted SFTP services).
+#[tauri::command]
+pub async fn connection_presets() -> Result<Vec<crate::connectors::presets::ProviderPreset>, AppError> {
+    Ok(crate::connectors::presets::PRESETS.to_vec())
 }

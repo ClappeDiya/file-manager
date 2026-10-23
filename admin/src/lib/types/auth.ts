@@ -136,6 +136,10 @@ export interface AdminUser {
   lastLoginAt?: string;
   createdAt: string;
   isActive: boolean;
+  /** IANA time zone for showing times (null = the browser's). */
+  timeZone?: string | null;
+  /** Console language (`en`, `de`, …; null = the browser's). */
+  locale?: string | null;
 }
 
 export interface SSOConfig {

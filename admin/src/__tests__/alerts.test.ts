@@ -182,6 +182,26 @@ describe('channels', () => {
     expect(ch?.lastError).toBe('HTTP 500: nope');
   });
 
+  it('posts an Adaptive Card to a Microsoft Teams workflow', async () => {
+    const admin = makeUser('teams@x.org', 'org_admin');
+    const bad = async (secret: string | undefined) => (await channels.POST(await req('POST', '/api/alerts/channels', { as: admin, body: { name: 'T', kind: 'teams', config: {}, secret } }))).status;
+    expect(await bad(undefined)).toBe(400);
+    expect(await bad('http://insecure.example/x')).toBe(400);
+    const teamsUrl = slackUrl.replace('/services/T0/B0/x', '/services/teams/workflow');
+    const id = (await json<{ channel: { id: string } }>(await channels.POST(await req('POST', '/api/alerts/channels', { as: admin, body: { name: 'Teams', kind: 'teams', config: {}, secret: teamsUrl } })))).body.channel.id;
+    const listed = await (await channels.GET(await req('GET', '/api/alerts/channels', { as: admin }))).text();
+    expect(listed).not.toContain(teamsUrl);
+    expect((await channelTest.POST(await req('POST', `/api/alerts/channels/${id}/test`, { as: admin }), P(id))).status).toBe(200);
+    const hit = hits.find((h) => h.path === '/services/teams/workflow')!;
+    const card = JSON.parse(hit.body);
+    expect(card.type).toBe('message');
+    expect(card.attachments[0].contentType).toBe('application/vnd.microsoft.card.adaptive');
+    const body = card.attachments[0].content.body;
+    expect(body[0]).toMatchObject({ type: 'TextBlock', text: '[UFOP] Test notification', weight: 'Bolder' });
+    expect(body[1].text).toContain('sent by teams@x.org');
+    expect(body[2]).toEqual({ type: 'FactSet', facts: [{ title: 'event', value: 'test' }] });
+  });
+
   it('delivers email over STARTTLS with AUTH, trusting only the configured CA', async () => {
     if (!smtpUp) throw new Error(`Start the local SMTP server on 127.0.0.1:${SMTP_PORT} (see the file header)`);
     const admin = makeUser('admin@x.org', 'org_admin');

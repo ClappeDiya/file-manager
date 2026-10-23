@@ -1,3 +1,4 @@
+import { isEnabled, notAvailable } from '@/lib/features';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
@@ -18,6 +19,7 @@ let connectors: Connector[] = [
 
 /** GET /api/connectors - List all connectors */
 export async function GET(request: NextRequest) {
+  if (!isEnabled('connectors')) return notAvailable('connectors');
   const authResult = await requireRole(request, 'viewer');
   if (!isAuthorized(authResult)) return authResult;
 
@@ -26,6 +28,7 @@ export async function GET(request: NextRequest) {
 
 /** POST /api/connectors - Add a new connector */
 export async function POST(request: NextRequest) {
+  if (!isEnabled('connectors')) return notAvailable('connectors');
   const authResult = await requireRole(request, 'manager');
   if (!isAuthorized(authResult)) return authResult;
 
@@ -55,6 +58,7 @@ export async function POST(request: NextRequest) {
 
 /** DELETE /api/connectors - Remove a connector */
 export async function DELETE(request: NextRequest) {
+  if (!isEnabled('connectors')) return notAvailable('connectors');
   const authResult = await requireRole(request, 'manager');
   if (!isAuthorized(authResult)) return authResult;
 

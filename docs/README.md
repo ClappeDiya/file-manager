@@ -17,6 +17,13 @@
 | Sprint Plan | `../planning/sprint-plan-summary.md` | 42 sprints across 8 phases |
 | Epics Summary | `../planning/epics-summary.md` | 47 epics mapped to sprints |
 
+## Operations
+
+| Document | Location | Description |
+|----------|----------|-------------|
+| Admin console | `admin-console.md` | Console setup, fleet, policies |
+| Silent install & enrollment | `silent-install.md` | Unattended installs, preload enrollment, managed app settings |
+
 ## Agent Configurations
 
 See `../ai-agents/README.md` for the full agent pack documentation.

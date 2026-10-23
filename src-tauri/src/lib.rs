@@ -3,6 +3,7 @@ pub mod automation_engine;
 pub mod backup_engine;
 pub mod commands;
 pub mod compat_engine;
+pub mod convert_engine;
 pub mod connectors;
 pub mod core;
 pub mod fleet_agent;
@@ -10,12 +11,20 @@ pub mod fs_engine;
 pub mod governance;
 pub mod ledger;
 pub mod lineage;
+pub mod metadata_engine;
+pub mod logging;
+pub mod diagnostics;
+pub mod managed_settings;
+pub mod net;
+pub mod search_engine;
+pub mod thumbnail_engine;
 pub mod mount_engine;
 pub mod narrator;
 pub mod safety;
 pub mod security;
 pub mod server;
 pub mod storage;
+pub mod schedule_library;
 pub mod sync_engine;
 pub mod spaces_engine;
 pub mod transfer_engine;
@@ -26,7 +35,7 @@ use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -70,9 +79,15 @@ struct AppState {
     narrator: OperationNarrator,
     quickflow_suggester: LedgerSuggester,
     backup_mgr: BackupManager,
+    schedule_library: schedule_library::ScheduleLibrary,
     fleet_agent: fleet_agent::FleetAgent,
     background_mode: tray::BackgroundMode,
     audit_trail: security::audit::AuditTrail,
+    metadata_store: metadata_engine::MetadataStore,
+    search_manager: search_engine::SearchManager,
+    thumbnails: std::sync::Arc<thumbnail_engine::ThumbnailCache>,
+    office_renderer: std::sync::Arc<thumbnail_engine::office::OfficeRenderer>,
+    credential_store: std::sync::Arc<CredentialStore>,
 }
 
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
@@ -123,6 +138,13 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     let gdrive_connector = std::sync::Arc::new(GoogleDriveConnector::new());
     let onedrive_connector = std::sync::Arc::new(OneDriveConnector::new());
 
+    // Named schedules and holiday calendars, loaded before anything that is
+    // scheduled by them (sync pairs, automation rules, backup jobs).
+    let schedule_library = schedule_library::ScheduleLibrary::new(repo.pool().clone());
+    if let Err(e) = schedule_library.load().await {
+        tracing::warn!("Failed to load the schedule library (non-fatal): {e}");
+    }
+
     // Initialize sync manager (T-039..T-042)
     let sync_mgr = SyncManager::new();
     // Restore saved pairs and re-arm their triggers. Non-fatal, matching the
@@ -137,11 +159,11 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     }
 
     // Initialize peer manager (T-031) and server transfer manager (T-033)
-    let peer_mgr = PeerManager::new();
+    let peer_mgr = PeerManager::open(connectors::peer::default_peer_dir());
     let server_transfer_mgr = ServerTransferManager::new();
 
     // Initialize AI assistant (T-043..T-045)
-    let ai_assistant = AiAssistant::new();
+    let ai_assistant = AiAssistant::with_audit(repo.pool().clone());
 
     // Initialize terminal manager (T-046)
     let terminal_mgr = TerminalManager::new();
@@ -184,12 +206,12 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // Initialize automation manager (Quickflows)
     let mut automation_mgr = AutomationManager::new();
     automation_mgr.set_ledger(ledger.clone());
+    automation_mgr.set_repo(repo.clone());
     if let Err(e) = automation_mgr.load_rules_from_db(&repo).await {
         tracing::warn!("Failed to load automation rules (non-fatal): {e}");
     }
-    if let Err(e) = automation_mgr.start_all_watchers().await {
-        tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
-    }
+    // Watchers and cron schedules start in `setup`: tasks spawned on this
+    // init runtime would die when it is dropped.
 
     // Initialize Smart Spaces manager
     let spaces_mgr = SpacesManager::new();
@@ -241,6 +263,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // Tamper-evident security audit log: anchors are signed with a key in
     // the OS keychain (or the encrypted settings store as a fallback).
     let agent_store = settings_store.clone().unwrap_or_else(|| crate::security::settings_store::SettingsStore::plain(repo.pool().clone()));
+    let repo_for_metadata = repo.clone();
     let audit_trail =
         security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), settings_store);
     if let Err(e) = backup_mgr.load_from_db().await {
@@ -275,6 +298,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         spaces_mgr,
         confirmation_mgr,
         ledger,
+        schedule_library,
         safety_interlock,
         narrator,
         quickflow_suggester,
@@ -282,7 +306,58 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         fleet_agent,
         background_mode,
         audit_trail,
+        metadata_store: metadata_engine::MetadataStore::new(repo_for_metadata),
+        search_manager: search_engine::SearchManager::open_default(),
+        thumbnails: std::sync::Arc::new(thumbnail_engine::ThumbnailCache::open_default()),
+        office_renderer: std::sync::Arc::new(thumbnail_engine::office::OfficeRenderer::open_default()),
+        credential_store: credential_store.clone(),
     })
+}
+
+/// Start the long-running automation and sync triggers on the app runtime:
+/// file watchers and cron schedules for automation rules, and the cron loop
+/// for scheduled sync pairs. Both used to be armed but never run.
+fn start_background_engines(app: tauri::AppHandle) {
+    use tauri::Manager;
+    let automation = app.state::<AutomationManager>();
+    automation.set_services(std::sync::Arc::new(
+        automation_engine::tauri_services::TauriActionServices::new(app.clone()),
+    ));
+
+    let sync_app = app.clone();
+    app.state::<SyncManager>().start_scheduler(std::sync::Arc::new(move |pair_id: uuid::Uuid| {
+        let app = sync_app.clone();
+        tauri::async_runtime::spawn(async move {
+            let manager = app.state::<SyncManager>();
+            let ledger = app.state::<OperationLedger>();
+            let repo = app.state::<Repository>();
+            match commands::sync_commands::run_sync_pair(&manager, &ledger, &repo, &pair_id.to_string()).await {
+                Ok(report) => tracing::info!("Scheduled sync {} finished: {:?}", report.pair_name, report.status),
+                Err(e) => tracing::warn!("Scheduled sync {pair_id} failed: {e}"),
+            }
+        });
+    }));
+
+    tauri::async_runtime::spawn(async move {
+        // Rules and proxy first, so no watcher or scheduled job runs unchecked
+        // or connects around the proxy.
+        commands::policy_commands::activate_stored(&app.state::<Repository>()).await;
+        commands::proxy_commands::activate_stored(&app.state::<Repository>(), &app.state::<std::sync::Arc<CredentialStore>>()).await;
+        managed_settings::activate_stored(&app.state::<Repository>(), &app.state::<AiAssistant>(), &app.state::<BackupManager>(), &app.state::<MountManager>()).await;
+        let automation = app.state::<AutomationManager>();
+        if let Err(e) = automation.start_all_watchers().await {
+            tracing::warn!("Failed to start automation watchers (non-fatal): {e}");
+        }
+        automation.start_scheduler();
+        // The webhook listener only runs when some rule uses it.
+        let uses_webhooks = automation.list_rules().await.iter().any(|r| r.trigger == automation_engine::RuleTrigger::Webhook);
+        if uses_webhooks {
+            let addr = commands::automation_commands::webhook_bind_addr(&app.state::<Repository>()).await;
+            if let Err(e) = automation.start_webhook_listener(addr).await {
+                tracing::warn!("Automation webhook listener unavailable on {addr}: {e}");
+            }
+        }
+    });
 }
 
 /// Persist transfer queue and workspace state on shutdown.
@@ -298,12 +373,9 @@ async fn persist_on_shutdown(repo: &Repository, transfer_mgr: &TransferManager) 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let log_dir = logging::log_dir();
+    logging::init(&log_dir);
+    logging::Retention::load(&log_dir).apply(&log_dir);
 
     tracing::info!("Starting Unified File Operations Platform");
 
@@ -336,6 +408,7 @@ pub fn run() {
                 let quickflow_suggester = LedgerSuggester::new(ledger.clone());
                 let mut automation_mgr = AutomationManager::new();
                 automation_mgr.set_ledger(ledger.clone());
+                automation_mgr.set_repo(repo.clone());
                 // Backup jobs can still be created and run this session; the
                 // scheduler is not started because nothing persists.
                 let backup_mgr = BackupManager::new(
@@ -354,8 +427,17 @@ pub fn run() {
                     credential_store.clone(),
                     "desktop",
                 ));
-                let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store), None);
+                let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), None);
+                let ai_assistant = AiAssistant::with_audit(repo.pool().clone());
+                let fallback_schedules = schedule_library::ScheduleLibrary::new(repo.pool().clone());
                 AppState {
+                    metadata_store: metadata_engine::MetadataStore::new(repo.clone()),
+                    search_manager: search_engine::SearchManager::new(
+                        search_engine::SearchIndex::open_in_memory().expect("in-memory SQLite"),
+                    ),
+                    thumbnails: std::sync::Arc::new(thumbnail_engine::ThumbnailCache::open_default()),
+                    office_renderer: std::sync::Arc::new(thumbnail_engine::office::OfficeRenderer::open_default()),
+                    credential_store: credential_store.clone(),
                     repo,
                     transfer_mgr,
                     connection_mgr,
@@ -364,7 +446,7 @@ pub fn run() {
                     sync_mgr: SyncManager::new(),
                     peer_mgr: PeerManager::new(),
                     server_transfer_mgr: ServerTransferManager::new(),
-                    ai_assistant: AiAssistant::new(),
+                    ai_assistant,
                     terminal_mgr: TerminalManager::new(),
                     vault_mgr,
                     master_pw_mgr: MasterPasswordManager::new(),
@@ -377,6 +459,7 @@ pub fn run() {
                     spaces_mgr: SpacesManager::new(),
                     confirmation_mgr: ConfirmationManager::new(),
                     ledger,
+                    schedule_library: fallback_schedules,
                     safety_interlock,
                     narrator,
                     quickflow_suggester,
@@ -417,6 +500,17 @@ pub fn run() {
                 }
             }));
             mgr.start_scheduler();
+            start_background_engines(app.handle().clone());
+            // Console-managed proxy and AI limits.
+            let apply_handle = app.handle().clone();
+            setup_agent.host().set_managed_settings_handler(std::sync::Arc::new(move |settings| {
+                let h = apply_handle.clone();
+                Box::pin(async move {
+                    let org = h.state::<fleet_agent::FleetAgent>().status().organization;
+                    let targets = managed_settings::Targets { repo: &h.state::<Repository>(), creds: &h.state::<std::sync::Arc<CredentialStore>>(), ai: &h.state::<AiAssistant>(), backups: &h.state::<BackupManager>(), mounts: &h.state::<MountManager>(), automation: &h.state::<AutomationManager>() };
+                    managed_settings::apply(targets, &org, settings).await
+                })
+            }));
             fleet_agent::spawn(setup_agent.clone(), "unified-file-ops");
             // Signed audit checkpoints: once at start-up, then hourly.
             tauri::async_runtime::spawn(setup_audit.clone().run_anchor_loop(security::audit::ANCHOR_INTERVAL));
@@ -452,6 +546,7 @@ pub fn run() {
         .manage(app_state.spaces_mgr)
         .manage(app_state.confirmation_mgr)
         .manage(app_state.ledger)
+        .manage(app_state.schedule_library)
         .manage(app_state.safety_interlock)
         .manage(app_state.narrator)
         .manage(app_state.quickflow_suggester)
@@ -459,6 +554,11 @@ pub fn run() {
         .manage(app_state.fleet_agent)
         .manage(app_state.background_mode)
         .manage(app_state.audit_trail)
+        .manage(app_state.metadata_store)
+        .manage(app_state.search_manager)
+        .manage(app_state.thumbnails)
+        .manage(app_state.office_renderer)
+        .manage(app_state.credential_store)
         .invoke_handler(tauri::generate_handler![
             // Security audit log (tamper-evident, append-only)
             audit_commands::verify_audit_log,
@@ -567,6 +667,11 @@ pub fn run() {
             fleet_agent_commands::fleet_agent_status,
             fleet_agent_commands::fleet_agent_register,
             fleet_agent_commands::fleet_agent_start_claim,
+            fleet_agent_commands::fleet_agent_connect_start,
+            fleet_agent_commands::fleet_agent_connect_finish,
+            fleet_agent_commands::fleet_agent_connect_cancel,
+            fleet_agent_commands::fleet_agent_get_limits,
+            fleet_agent_commands::fleet_agent_set_limits,
             fleet_agent_commands::fleet_agent_poll_claim,
             fleet_agent_commands::fleet_agent_cancel_claim,
             fleet_agent_commands::fleet_agent_unregister,
@@ -582,6 +687,17 @@ pub fn run() {
             backup_commands::backup_run,
             backup_commands::backup_execute,
             backup_commands::backup_cancel,
+            schedule_commands::schedules_list,
+            schedule_commands::schedule_save,
+            schedule_commands::schedule_delete,
+            schedule_commands::calendars_list,
+            schedule_commands::calendar_save,
+            schedule_commands::calendar_delete,
+            schedule_commands::calendar_import_ics,
+            schedule_commands::schedule_preview,
+            backup_commands::backup_place_legal_hold,
+            backup_commands::backup_release_legal_hold,
+            backup_commands::ediscovery_export,
             backup_commands::backup_status,
             backup_commands::backup_pause,
             backup_commands::backup_resume,
@@ -605,6 +721,7 @@ pub fn run() {
             backup_commands::backup_photos_libraries,
             backup_commands::backup_photos_library_info,
             backup_commands::backup_get_global_defaults,
+            backup_commands::backup_effective_caps,
             backup_commands::backup_set_global_defaults,
             backup_commands::backup_effective_job,
             backup_commands::backup_list_destinations,
@@ -667,6 +784,10 @@ pub fn run() {
             sync_commands::cancel_sync,
             // Peer discovery and transfer (T-031)
             peer_commands::peer_start_discovery,
+            peer_commands::peer_local_info,
+            peer_commands::peer_start_listener,
+            peer_commands::peer_stop_listener,
+            peer_commands::peer_clear_finished,
             peer_commands::peer_stop_discovery,
             peer_commands::peer_is_discovering,
             peer_commands::peer_list_peers,
@@ -699,6 +820,8 @@ pub fn run() {
             // AI features (T-043..T-045)
             ai_commands::ai_explain_error,
             ai_commands::ai_chat,
+            ai_commands::ai_help,
+            ai_commands::ai_activity_report,
             ai_commands::ai_get_chat_history,
             ai_commands::ai_clear_chat,
             ai_commands::ai_generate_suggestions,
@@ -760,6 +883,45 @@ pub fn run() {
             master_password_commands::master_decrypt_credential,
             // File operations
             file_ops_commands::copy_files,
+            file_ops_commands::copy_files_to_many,
+            commands::editor_draft_commands::editor_draft_save,
+            commands::editor_draft_commands::editor_draft_load,
+            commands::editor_draft_commands::editor_draft_discard,
+            commands::editor_draft_commands::editor_draft_list,
+            commands::policy_commands::filename_policies_list,
+            commands::policy_commands::filename_policies_save,
+            commands::policy_commands::filename_policy_check,
+            commands::search_commands::search_index_roots,
+            commands::search_commands::search_index_add,
+            commands::search_commands::search_index_refresh,
+            commands::search_commands::search_index_remove,
+            commands::search_commands::search_index_cancel,
+            commands::search_commands::search_files_query,
+            commands::thumbnail_commands::thumbnail_get,
+            commands::thumbnail_commands::thumbnail_cache_clear,
+            commands::convert_commands::convert_capabilities,
+            commands::convert_commands::convert_images,
+            commands::convert_commands::convert_documents,
+            commands::gpg_commands::gpg_status,
+            commands::gpg_commands::gpg_list_keys,
+            commands::gpg_commands::gpg_import_keys,
+            commands::gpg_commands::gpg_export_public,
+            commands::gpg_commands::gpg_encrypt_files,
+            commands::gpg_commands::gpg_decrypt_files,
+            commands::gpg_commands::gpg_recrypt_files,
+            commands::gpg_commands::gpg_generate_key,
+            commands::gpg_commands::gpg_sign_files,
+            commands::gpg_commands::gpg_verify,
+            commands::share_commands::sharing_policy_get,
+            commands::share_commands::sharing_policy_set,
+            commands::share_commands::connector_create_share_link,
+            commands::operations_commands::operations_snapshot,
+            commands::operations_commands::operations_cancel,
+            commands::proxy_commands::proxy_get,
+            commands::proxy_commands::proxy_set,
+            commands::proxy_commands::proxy_test,
+            commands::connector_commands::rclone_list_remotes,
+            commands::connector_commands::connection_presets,
             file_ops_commands::move_files,
             file_ops_commands::rename_file,
             file_ops_commands::duplicate_files,
@@ -782,8 +944,10 @@ pub fn run() {
             batch_rename_commands::batch_rename_preview,
             batch_rename_commands::batch_rename_apply,
             batch_rename_commands::batch_rename_undo,
+            batch_rename_commands::naming_preview,
             // Preview Engine (T-061)
             preview_commands::preview_file,
+            preview_commands::preview_office_render,
             preview_commands::preview_get_exif,
             // Archive Tools (T-062)
             archive_commands::archive_browse,
@@ -807,6 +971,15 @@ pub fn run() {
             integrity_commands::integrity_list_smart_folders,
             integrity_commands::integrity_delete_smart_folder,
             integrity_commands::integrity_run_smart_folder,
+            integrity_commands::integrity_set_metadata,
+            integrity_commands::integrity_remove_metadata,
+            integrity_commands::integrity_search_metadata,
+            integrity_commands::integrity_metadata_keys,
+            integrity_commands::metadata_list_schemas,
+            integrity_commands::metadata_save_schema,
+            integrity_commands::metadata_delete_schema,
+            integrity_commands::metadata_schema_for,
+            integrity_commands::metadata_check_compliance,
             // Mount Engine (Finder-mounted remote storage)
             mount_commands::check_mount_capability,
             mount_commands::mount_remote,
@@ -814,6 +987,10 @@ pub fn run() {
             mount_commands::list_mounts,
             mount_commands::get_mount_status,
             mount_commands::save_mount_config,
+            mount_commands::mount_policy,
+            mount_commands::mount_pin_offline,
+            mount_commands::mount_cache_usage,
+            mount_commands::mount_clear_cache,
             mount_commands::delete_mount_config,
             // Settings Export/Import & Sync
             settings_commands::export_all_settings,
@@ -906,6 +1083,11 @@ pub fn run() {
             editor_commands::list_watched_files,
             // Log Controls & Structured Export
             log_commands::get_log_level,
+            log_commands::get_log_retention,
+            commands::proxy_commands::managed_settings_get,
+            log_commands::set_log_retention,
+            log_commands::diagnostics_create,
+            log_commands::diagnostics_send,
             log_commands::set_log_level,
             log_commands::get_log_directory,
             log_commands::export_logs_json,
@@ -919,7 +1101,12 @@ pub fn run() {
             // SSH Key Generation
             ssh_key_commands::generate_ssh_key,
             ssh_key_commands::list_ssh_keys,
+            ssh_key_commands::list_known_hosts,
+            ssh_key_commands::forget_known_host,
             // Automation engine (Quickflows)
+            automation_commands::automation_rule_revisions,
+            automation_commands::automation_restore_revision,
+            automation_commands::automation_convert_to_workflow,
             automation_commands::create_automation_rule,
             automation_commands::update_automation_rule,
             automation_commands::delete_automation_rule,
@@ -928,6 +1115,9 @@ pub fn run() {
             automation_commands::enable_automation_rule,
             automation_commands::run_automation_rule,
             automation_commands::test_automation_rule,
+            automation_commands::approve_automation_command,
+            automation_commands::clone_automation_rule,
+            automation_commands::rotate_automation_webhook,
             automation_commands::list_automation_logs,
             automation_commands::clear_automation_logs,
             automation_commands::parse_automation_nl,

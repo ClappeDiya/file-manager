@@ -1096,7 +1096,7 @@ impl super::Connector for WebDavConnector {
             let auth_method = config.auth_method.clone();
 
             let client = {
-                let builder = reqwest::Client::builder()
+                let builder = crate::net::builder()
                     .timeout(std::time::Duration::from_secs(request_timeout as u64))
                     .connect_timeout(std::time::Duration::from_secs(connect_timeout as u64))
                     .user_agent(&user_agent)
@@ -1258,7 +1258,15 @@ impl super::Connector for WebDavConnector {
 
     fn upload(&self, local_path: &str, remote_path: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, AppError>> + Send + '_>> {
         let (l, r) = (local_path.to_string(), remote_path.to_string());
-        Box::pin(async move { self.upload_file(&l, &r, None).await })
+        Box::pin(async move {
+            super::staged_upload(
+                &r,
+                |temp| async move { self.upload_file(&l, &temp, None).await },
+                |from, to| async move { self.rename(&from, &to).await },
+                |p| async move { self.delete(&p).await },
+            )
+            .await
+        })
     }
 
     fn download(&self, remote_path: &str, local_path: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, AppError>> + Send + '_>> {

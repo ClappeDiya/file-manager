@@ -178,7 +178,7 @@ impl OneDriveConnector {
     pub fn new() -> Self {
         Self {
             oauth: Arc::new(RwLock::new(None)),
-            http: reqwest::Client::new(),
+            http: crate::net::client(),
             account_type: Arc::new(RwLock::new(AccountType::Personal)),
         }
     }
@@ -927,6 +927,40 @@ impl Connector for OneDriveConnector {
     fn is_connected(&self) -> bool {
         false // Conservative default
     }
+
+    fn create_share_link(
+        &self,
+        remote_path: &str,
+        options: &super::ShareOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<super::ShareLink, AppError>> + Send + '_>> {
+        let (r, o) = (remote_path.to_string(), options.clone());
+        Box::pin(async move {
+            let token = self.get_token().await?;
+            let path = r.trim_matches('/');
+            if path.is_empty() {
+                return Err(AppError::validation("Choose a file or folder to share"));
+            }
+            let encoded = percent_encoding::percent_encode(path.as_bytes(), percent_encoding::NON_ALPHANUMERIC);
+            let url = format!("{GRAPH_API_BASE}/me/drive/root:/{encoded}:/createLink");
+            let resp = self
+                .http
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&onedrive_link_body(&o, chrono::Utc::now()))
+                .send()
+                .await
+                .map_err(|e| AppError::connection(format!("OneDrive share failed: {e}"), "Check your network connection."))?;
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(AppError::Connection {
+                    message: format!("OneDrive refused the share link (HTTP {status}): {}", graph_error_message(&body)),
+                    advice: "Expiry dates and passwords need a OneDrive plan that allows them; organization links need a work account.".into(),
+                });
+            }
+            parse_onedrive_link(&body, o.scope)
+        })
+    }
 }
 
 // ── Naming Restriction Enforcement ──
@@ -1109,8 +1143,57 @@ fn graph_item_to_file_entry(item: GraphDriveItem) -> FileEntry {
     }
 }
 
+/// `createLink` request body for the options.
+pub(crate) fn onedrive_link_body(o: &super::ShareOptions, now: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    let mut b = serde_json::json!({
+        "type": if o.allow_edit { "edit" } else { "view" },
+        "scope": match o.scope { super::ShareScope::Anyone => "anonymous", super::ShareScope::Organization => "organization" },
+    });
+    if let Some(s) = o.expires_in_secs {
+        b["expirationDateTime"] = (now + chrono::Duration::seconds(s as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into();
+    }
+    if let Some(p) = o.password.as_deref().filter(|p| !p.is_empty()) {
+        b["password"] = p.into();
+    }
+    b
+}
+
+pub(crate) fn parse_onedrive_link(body: &str, scope: super::ShareScope) -> Result<super::ShareLink, AppError> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| AppError::connection(format!("Unexpected OneDrive reply: {e}"), "Try again."))?;
+    let url = v["link"]["webUrl"].as_str().ok_or_else(|| AppError::connection("OneDrive returned no link", "Try again."))?;
+    Ok(super::ShareLink {
+        url: url.to_string(),
+        expires_at: v["expirationDateTime"].as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.with_timezone(&chrono::Utc)),
+        scope,
+        provider: "onedrive".into(),
+        note: None,
+    })
+}
+
+/// `error.message` of a Graph error body, else the body.
+fn graph_error_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+        .unwrap_or_else(|| body.chars().take(200).collect())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn share_link_body_and_reply() {
+        use crate::connectors::{ShareOptions, ShareScope};
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-22T10:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let b = super::onedrive_link_body(&ShareOptions { expires_in_secs: Some(3600), password: Some("pw".into()), scope: ShareScope::Organization, allow_edit: true }, now);
+        assert_eq!(b, serde_json::json!({"type": "edit", "scope": "organization", "expirationDateTime": "2026-10-22T11:00:00Z", "password": "pw"}));
+        assert_eq!(super::onedrive_link_body(&ShareOptions::default(), now), serde_json::json!({"type": "view", "scope": "anonymous"}));
+        let link = super::parse_onedrive_link(r#"{"id":"x","expirationDateTime":"2026-10-22T11:00:00Z","link":{"type":"view","webUrl":"https://1drv.ms/b/s!abc"}}"#, ShareScope::Anyone).unwrap();
+        assert_eq!(link.url, "https://1drv.ms/b/s!abc");
+        assert_eq!(link.expires_at, Some(now + chrono::Duration::hours(1)));
+        assert!(super::parse_onedrive_link("{}", ShareScope::Anyone).is_err());
+        assert_eq!(super::graph_error_message(r#"{"error":{"code":"x","message":"Expiration not allowed"}}"#), "Expiration not allowed");
+    }
+
     use super::*;
 
     #[test]

@@ -98,6 +98,11 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
           <div className="text-sm font-medium text-zinc-900 dark:text-zinc-100 truncate">
             <span className={statusColor(job.stats.last_result)} title={job.stats.last_result ?? "never run"}>●</span> {job.name}
             {job.encrypted && <span className="ml-1 text-[10px] text-zinc-500" title="Encrypted">🔒</span>}
+            {job.legal_hold && (
+              <span className="ml-1 text-[10px] px-1 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" title={`Legal hold: ${job.legal_hold.matter}`} data-testid="legal-hold-badge">
+                Legal hold
+              </span>
+            )}
           </div>
           {job.description && <div className="text-xs text-zinc-500 truncate">{job.description}</div>}
         </div>

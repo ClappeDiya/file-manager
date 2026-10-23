@@ -164,7 +164,9 @@ async fn swift_mock() {
             ("PUT", true) => StatusCode::CREATED.into_response(),
             ("GET", true) => {
                 let pfx = q(&u, "prefix").unwrap_or_default();
-                let v: Vec<Value> = st.files.lock().unwrap().iter().filter(|(k, _)| k.starts_with(&pfx)).map(|(k, v)| json!({ "name": k, "bytes": v.len() })).collect();
+                let marker = q(&u, "marker").unwrap_or_default();
+                // Pages of at most 2, like a server with a low listing limit.
+                let v: Vec<Value> = st.files.lock().unwrap().iter().filter(|(k, _)| k.starts_with(&pfx) && k.as_str() > marker.as_str()).take(2).map(|(k, v)| json!({ "name": k, "bytes": v.len() })).collect();
                 jsonr(Value::Array(v))
             }
             ("PUT", false) => {

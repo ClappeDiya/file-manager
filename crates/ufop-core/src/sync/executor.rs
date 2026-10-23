@@ -542,6 +542,12 @@ pub fn execute_sync_with(
         ),
     };
 
+    if report.status == SyncRunStatus::Success {
+        if let Err(e) = write_completion_marker(pair, &report) {
+            tracing::warn!("Could not write the completion marker for {}: {e}", pair.name);
+        }
+    }
+
     // Record the destination state for trusted-inventory runs.
     if pair.dest_state == DestStateMode::TrustedInventory && report.errors == 0 && !hooks.cancelled() {
         let state = if pair.mode == SyncMode::TwoWay {
@@ -641,7 +647,7 @@ fn add_file(pair: &SyncPair, entry: &SyncDiffEntry) -> Result<OperationResult, A
 
     // For versioned backup, add version suffix
     let target = if pair.mode == SyncMode::VersionedBackup {
-        generate_versioned_path(&dest_file)
+        versioned_path(&dest_file, pair.run_options.version_template.as_deref())?
     } else {
         dest_file
     };
@@ -674,7 +680,7 @@ fn execute_single_operation(
 
             if pair.mode == SyncMode::VersionedBackup {
                 // Keep old version, write new version
-                let target = generate_versioned_path(&dest_file);
+                let target = versioned_path(&dest_file, pair.run_options.version_template.as_deref())?;
                 let bytes = copier::copy_file(&source_file, &target, opts)?;
                 Ok(OperationResult::Modified(bytes))
             } else {
@@ -833,26 +839,92 @@ pub fn apply_manual_resolution(
     Ok((rollback.snapshots, quarantined))
 }
 
-/// Generate a versioned path for versioned backup mode.
-/// e.g., "file.txt" -> "file.v2.txt" (incrementing version)
-fn generate_versioned_path(path: &Path) -> PathBuf {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = path.extension().and_then(|s| s.to_str());
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+/// Default name for kept versions: `file.txt` -> `file.v2.txt`.
+pub const DEFAULT_VERSION_TEMPLATE: &str = "{name}.v{num}.{ext}";
 
-    let mut version = 1;
-    loop {
-        let new_name = if let Some(ext) = ext {
-            format!("{}.v{}.{}", stem, version, ext)
-        } else {
-            format!("{}.v{}", stem, version)
-        };
-        let candidate = parent.join(new_name);
-        if !candidate.exists() {
-            return candidate;
-        }
-        version += 1;
+/// Name for the next kept version of `path` from the pair's template; the
+/// first free one. A template without `{num}` gets ` (n)` added on clashes.
+fn versioned_path(path: &Path, template: Option<&str>) -> Result<PathBuf, AppError> {
+    use crate::naming::{render, sanitize_segment, TokenContext, UnknownTokens};
+    let template = template.map(str::trim).filter(|t| !t.is_empty()).unwrap_or(DEFAULT_VERSION_TEMPLATE);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let has_ext = path.extension().is_some();
+    let mut base = TokenContext::for_path(path);
+    // A first version has no file yet: date tokens use the run time.
+    if base.modified.is_none() {
+        base.modified = Some(Utc::now());
     }
+    let numbered = template.contains("{num") || template.contains("{counter");
+    for n in 1..100_000u64 {
+        let mut name = render(template, &base.clone().with_counter(n, 0), UnknownTokens::Error).map_err(|e| AppError::Sync {
+            message: format!("Version name template \"{template}\" is invalid: {e}"),
+            advice: "Fix the version naming template in the pair's options.".to_string(),
+        })?;
+        // "{name}.{ext}" on a file without an extension would end in a dot.
+        if !has_ext {
+            name = name.trim_end_matches('.').to_string();
+        }
+        if !numbered && n > 1 {
+            name = match name.rsplit_once('.') {
+                Some((stem, ext)) if has_ext => format!("{stem} ({n}).{ext}"),
+                _ => format!("{name} ({n})"),
+            };
+        }
+        let candidate = parent.join(sanitize_segment(name));
+        if candidate != path && !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::Sync {
+        message: format!("No free version name for {}", path.display()),
+        advice: "Clean up old versions at the destination.".to_string(),
+    })
+}
+
+/// Reject run options that would fail every run: a broken version
+/// template or a marker name that isn't a plain file name.
+pub fn validate_run_options(o: &crate::sync_types::SyncRunOptions) -> Result<(), AppError> {
+    if let Some(t) = o.version_template.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let ctx = crate::naming::TokenContext {
+            file_name: "file.txt".into(),
+            stem: "file".into(),
+            ext: "txt".into(),
+            modified: Some(Utc::now()),
+            ..Default::default()
+        }
+        .with_counter(1, 0);
+        crate::naming::render(t, &ctx, crate::naming::UnknownTokens::Error).map_err(|e| AppError::Sync {
+            message: format!("Version name template \"{t}\" is invalid: {e}"),
+            advice: "Use tokens like {name}, {ext}, {num} and {now:%Y-%m-%d}.".to_string(),
+        })?;
+    }
+    if let Some(m) = o.completion_marker.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        if m.contains(['/', '\\']) || m == "." || m == ".." || planner::is_internal_entry(m) {
+            return Err(AppError::Sync {
+                message: format!("Completion marker \"{m}\" must be a plain file name"),
+                advice: "Use a name like _SYNC_COMPLETE; it is written at the destination root.".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Write the pair's completion marker at the destination root.
+fn write_completion_marker(pair: &SyncPair, report: &SyncReport) -> std::io::Result<()> {
+    let Some(name) = pair.run_options.completion_marker.as_deref().map(str::trim).filter(|m| !m.is_empty()) else {
+        return Ok(());
+    };
+    let summary = serde_json::json!({
+        "pair": pair.name,
+        "run_id": report.id,
+        "finished_at": report.ended_at,
+        "files_added": report.files_added,
+        "files_modified": report.files_modified,
+        "files_deleted": report.files_deleted,
+        "bytes_transferred": report.bytes_transferred,
+    });
+    let path = Path::new(&pair.dest_path).join(crate::naming::sanitize_segment(name.to_string()));
+    crate::fsutil::write_private_atomic(&path, &serde_json::to_vec_pretty(&summary).map_err(std::io::Error::other)?)
 }
 
 /// Verify sync results using checksum comparison (T-042).
@@ -1210,8 +1282,29 @@ mod tests {
     fn test_generate_versioned_path() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("file.txt");
-        let versioned = generate_versioned_path(&path);
-        assert!(versioned.to_string_lossy().contains("v1"));
+        assert_eq!(versioned_path(&path, None).unwrap(), dir.path().join("file.v1.txt"));
+        fs::write(dir.path().join("file.v1.txt"), "x").unwrap();
+        assert_eq!(versioned_path(&path, Some("  ")).unwrap(), dir.path().join("file.v2.txt"));
+        let bare = dir.path().join("README");
+        assert_eq!(versioned_path(&bare, None).unwrap(), dir.path().join("README.v1"));
+    }
+
+    #[test]
+    fn version_template_names_and_clashes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("report.pdf");
+        fs::write(&path, "x").unwrap();
+        let t = Some("{name} (old {num:3}).{ext}");
+        assert_eq!(versioned_path(&path, t).unwrap(), dir.path().join("report (old 001).pdf"));
+        // No counter in the template: clashes get " (n)".
+        let dated = Some("{name}-{now:%Y}.{ext}");
+        let first = versioned_path(&path, dated).unwrap();
+        fs::write(&first, "x").unwrap();
+        let second = versioned_path(&path, dated).unwrap();
+        assert!(second.file_name().unwrap().to_string_lossy().ends_with(" (2).pdf"), "{second:?}");
+        // Slashes can't escape the folder; unknown tokens are errors.
+        assert_eq!(versioned_path(&path, Some("../{name}.{ext}")).unwrap().parent().unwrap(), dir.path());
+        assert!(versioned_path(&path, Some("{nmae}.{ext}")).is_err());
     }
 
     // ── Robocopy-equivalent options ──
@@ -1231,6 +1324,95 @@ mod tests {
     fn set_age_days(path: &Path, days: u64) {
         let t = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
         copier::set_mtime(path, t);
+    }
+
+    #[test]
+    fn settle_window_defers_files_still_being_written() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("old.txt"), "done").unwrap();
+        set_age_days(&src.path().join("old.txt"), 1);
+        fs::write(src.path().join("growing.log"), "partial").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.run_options.settle_secs = 60;
+        let preview = planner::compute_preview(&pair).unwrap();
+        assert!(preview.skipped.iter().any(|e| e.relative_path == "growing.log" && e.reason.starts_with("Still changing")));
+        let report = run_with(pair.clone());
+        assert_eq!(report.files_added, 1);
+        assert!(dst.path().join("old.txt").exists() && !dst.path().join("growing.log").exists());
+        // Once it has settled, the next run copies it.
+        set_age_days(&src.path().join("growing.log"), 1);
+        assert_eq!(run_with(pair).files_added, 1);
+        assert!(dst.path().join("growing.log").exists());
+    }
+
+    #[test]
+    fn completion_marker_written_on_success_and_never_purged() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "a").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::Mirror;
+        pair.run_options.completion_marker = Some("_SYNC_COMPLETE".into());
+        let report = run_with(pair.clone());
+        assert_eq!(report.status, SyncRunStatus::Success);
+        let marker: serde_json::Value = serde_json::from_slice(&fs::read(dst.path().join("_SYNC_COMPLETE")).unwrap()).unwrap();
+        assert_eq!(marker["files_added"], 1);
+        assert_eq!(marker["run_id"], serde_json::json!(report.id));
+        // A mirror run must not delete it as an extra; it is rewritten.
+        let again = run_with(pair);
+        assert_eq!(again.files_deleted, 0);
+        assert!(dst.path().join("_SYNC_COMPLETE").exists());
+    }
+
+    #[test]
+    fn filename_policy_blocks_files_in_sync() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("ok.txt"), "a").unwrap();
+        fs::write(src.path().join("bad.zz-sync-policy"), "b").unwrap();
+        // Unique extension: the active set is process-wide.
+        crate::policy::set_active(
+            crate::policy::PolicySet::new(vec![crate::policy::FilenameRule {
+                blocked_extensions: vec!["zz-sync-policy".into()],
+                ..crate::policy::FilenameRule::new("t", "")
+            }])
+            .unwrap(),
+        );
+        let pair = make_test_pair(src.path(), dst.path());
+        let preview = planner::compute_preview(&pair).unwrap();
+        let report = run_with(pair);
+        crate::policy::set_active(crate::policy::PolicySet::default());
+        assert!(preview.skipped.iter().any(|e| e.relative_path == "bad.zz-sync-policy" && e.reason.starts_with("Blocked by filename policy")));
+        assert_eq!(report.files_added, 1);
+        assert!(!dst.path().join("bad.zz-sync-policy").exists());
+    }
+
+    #[test]
+    fn run_options_validation() {
+        use crate::sync_types::SyncRunOptions;
+        let ok = SyncRunOptions { settle_secs: 5, completion_marker: Some("_DONE".into()), version_template: Some("{name}.{now:%Y}.{ext}".into()) };
+        assert!(validate_run_options(&ok).is_ok());
+        assert!(validate_run_options(&SyncRunOptions { version_template: Some("{nope}".into()), ..Default::default() }).is_err());
+        for bad in ["a/b", "..", ".ufop-sync-inventory.json"] {
+            assert!(validate_run_options(&SyncRunOptions { completion_marker: Some(bad.into()), ..Default::default() }).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn versioned_backup_uses_template() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("doc.txt"), "v1").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::VersionedBackup;
+        pair.run_options.version_template = Some("{name}~{num}.{ext}".into());
+        run_with(pair.clone());
+        assert!(dst.path().join("doc~1.txt").exists());
+        pair.run_options.version_template = Some("{bogus}".into());
+        fs::write(src.path().join("new.txt"), "n").unwrap();
+        let bad = run_with(pair);
+        assert!(bad.errors > 0 && bad.error_messages.iter().any(|m| m.contains("template")));
     }
 
     #[test]

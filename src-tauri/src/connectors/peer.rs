@@ -1,46 +1,48 @@
-//! Peer Discovery and Computer-to-Computer Transfer (T-031).
+//! Peer discovery and computer-to-computer transfer (T-031).
 //!
-//! Features:
-//! - mDNS/Bonjour/Avahi peer discovery on LAN
-//! - Discovered devices: hostname, OS, IP, app version, online/offline
-//! - Encrypted transfer channel (TLS via rustls)
-//! - Accept/deny prompt on receiving device with "Trust this device" option
-//! - Saved peers in sidebar
-//! - Manual IP:port fallback when discovery unavailable
-//! - Guided "Transfer to another computer" flow
+//! - Discovery: each running app advertises `_ufop._tcp` over mDNS
+//!   (Bonjour/Avahi compatible) with its id, name, OS, version and
+//!   certificate fingerprint, and browses for the others.
+//! - Transport: TLS with both ends presenting their device certificate
+//!   (see [`peer_wire`](super::peer_wire)); a saved device whose certificate
+//!   changes is refused.
+//! - Transfers: the sender asks, the receiver approves (trusted devices
+//!   are accepted automatically, blocked ones refused), then files stream
+//!   in 4 MiB frames, each file checked with SHA-256 and written under a
+//!   hidden name until complete. Either side can cancel.
+//! - Manual connection by host name or IP when discovery is unavailable.
+//! - Saved devices (trust, names, pinned fingerprints) persist across runs.
 
+use super::peer_wire::{self as wire, Frame, PeerIdentity};
 use crate::core::error::AppError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::HashMap;
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{oneshot, RwLock};
 use uuid::Uuid;
 
 // ── Constants ──
 
 /// mDNS service type for UFOP peer discovery.
-#[allow(dead_code)]
 const MDNS_SERVICE_TYPE: &str = "_ufop._tcp.local.";
-/// Default port for peer-to-peer file transfers.
-const DEFAULT_PEER_PORT: u16 = 43210;
-/// Peer discovery timeout in seconds.
-#[allow(dead_code)]
-const DISCOVERY_TIMEOUT_SECS: u64 = 30;
-/// Heartbeat interval in seconds to check peer liveness.
-const HEARTBEAT_INTERVAL_SECS: u64 = 15;
-/// Maximum time without heartbeat before marking peer offline.
-const PEER_TIMEOUT_SECS: u64 = 45;
-/// TLS protocol version identifier.
-#[allow(dead_code)]
-const PROTOCOL_VERSION: &str = "ufop-peer/1.0";
-/// Chunk size for peer transfers (4 MB, matching LanPeer MediaType).
-#[allow(dead_code)]
-const PEER_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+/// Default port for peer-to-peer transfers.
+pub const DEFAULT_PEER_PORT: u16 = 43210;
+/// How long a receiver has to approve a transfer.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Connect and handshake time limit.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Most entries one transfer may list.
+const MAX_FILES: usize = 100_000;
 
 // ── Types ──
+
 
 /// Operating system type of a discovered peer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,66 +151,48 @@ impl TrustLevel {
     }
 }
 
-/// A discovered peer device on the LAN.
+/// A discovered or saved peer device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerDevice {
-    /// Unique peer ID (persisted across sessions).
+    /// Device id (persistent on that device).
     pub id: Uuid,
-    /// Hostname of the peer device.
     pub hostname: String,
-    /// Operating system.
     pub os: PeerOs,
-    /// IP addresses (may have both IPv4 and IPv6).
+    /// Addresses it was seen at (IPv4 and/or IPv6).
     pub addresses: Vec<IpAddr>,
-    /// Port for peer-to-peer transfers.
+    /// Port its transfer listener uses.
     pub port: u16,
-    /// UFOP application version running on the peer.
     pub app_version: String,
-    /// Current online/offline status.
     pub status: PeerStatus,
-    /// Trust level set by the user.
     pub trust: TrustLevel,
-    /// When the peer was first discovered.
     pub discovered_at: DateTime<Utc>,
-    /// Last time we received a heartbeat or message.
     pub last_seen: DateTime<Utc>,
-    /// User-assigned display name (optional).
+    /// User-assigned display name.
     pub display_name: Option<String>,
-    /// TLS fingerprint for identity verification.
+    /// SHA-256 fingerprint of the device certificate.
     pub tls_fingerprint: Option<String>,
 }
 
 /// Transfer request sent from one peer to another.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerTransferRequest {
-    /// Unique request ID.
     pub request_id: Uuid,
-    /// Sender peer ID.
     pub sender_id: Uuid,
-    /// Sender hostname for display.
     pub sender_hostname: String,
-    /// Sender OS for display.
     pub sender_os: PeerOs,
-    /// Files to transfer.
     pub files: Vec<PeerFileInfo>,
-    /// Total size in bytes.
     pub total_bytes: u64,
-    /// Total file count.
     pub file_count: u64,
-    /// When the request was sent.
     pub requested_at: DateTime<Utc>,
 }
 
-/// Information about a file in a peer transfer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A file or folder in a peer transfer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerFileInfo {
-    /// Relative path from the transfer root.
+    /// Path below the transfer root, `/`-separated (`photos/2024/a.jpg`).
     pub relative_path: String,
-    /// File size in bytes.
     pub size: u64,
-    /// Whether this is a directory.
     pub is_dir: bool,
-    /// File modification time.
     pub modified: Option<DateTime<Utc>>,
 }
 
@@ -218,8 +202,16 @@ pub struct PeerFileInfo {
 pub enum TransferResponse {
     Accepted,
     Denied,
-    /// Denied and trust set to blocked.
+    /// Denied and the sender blocked.
     Blocked,
+}
+
+/// Which way a transfer goes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerTransferDirection {
+    Outgoing,
+    Incoming,
 }
 
 /// Progress of a peer-to-peer transfer.
@@ -227,6 +219,8 @@ pub enum TransferResponse {
 pub struct PeerTransferProgress {
     pub request_id: Uuid,
     pub peer_id: Uuid,
+    pub peer_name: String,
+    pub direction: PeerTransferDirection,
     pub transferred_bytes: u64,
     pub total_bytes: u64,
     pub current_file: String,
@@ -235,12 +229,17 @@ pub struct PeerTransferProgress {
     pub speed_bps: u64,
     pub eta_seconds: Option<u64>,
     pub status: PeerTransferStatus,
+    /// Incoming: the folder files are saved in.
+    pub save_path: Option<String>,
+    /// Why it failed or was refused.
+    pub error: Option<String>,
 }
 
 /// Status of a peer transfer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerTransferStatus {
+    /// Waiting for the receiver to approve.
     Pending,
     Connecting,
     Transferring,
@@ -264,75 +263,39 @@ impl PeerTransferStatus {
             Self::Denied => "denied",
         }
     }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled | Self::Denied)
+    }
 }
 
 /// Manual peer connection configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManualPeerConfig {
+    /// IP address or host name.
     pub host: String,
     pub port: u16,
     pub display_name: Option<String>,
 }
 
-/// Message types for the peer protocol.
+/// Messages of the peer protocol (JSON frames; file bytes travel as data frames).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PeerMessage {
-    /// Initial handshake with device info.
-    Hello {
-        peer_id: Uuid,
-        hostname: String,
-        os: PeerOs,
-        app_version: String,
-        port: u16,
-    },
-    /// Heartbeat/keepalive.
+    /// First message each way: who is talking.
+    Hello { peer_id: Uuid, hostname: String, os: PeerOs, app_version: String, port: u16 },
     Ping { peer_id: Uuid, timestamp: i64 },
-    /// Heartbeat response.
     Pong { peer_id: Uuid, timestamp: i64 },
-    /// Transfer request.
     TransferRequest(PeerTransferRequest),
-    /// Transfer response (accept/deny).
-    TransferResponse {
-        request_id: Uuid,
-        response: TransferResponse,
-        save_path: Option<String>,
-    },
-    /// File chunk data.
-    FileChunk {
-        request_id: Uuid,
-        file_index: u64,
-        chunk_index: u32,
-        offset: u64,
-        data_len: u64,
-        hash: u64,
-    },
-    /// Transfer complete notification.
-    TransferComplete {
-        request_id: Uuid,
-        files_transferred: u64,
-        bytes_transferred: u64,
-        verification_passed: bool,
-    },
-    /// Error notification.
-    Error {
-        request_id: Option<Uuid>,
-        message: String,
-    },
-    /// Goodbye (peer going offline).
+    TransferResponse { request_id: Uuid, response: TransferResponse },
+    /// Entry `index` of the request follows (its bytes as data frames).
+    FileStart { request_id: Uuid, index: u64 },
+    /// Entry `index` is complete; its SHA-256.
+    FileEnd { request_id: Uuid, index: u64, sha256: String },
+    TransferComplete { request_id: Uuid, files_transferred: u64, bytes_transferred: u64, verification_passed: bool },
+    Error { request_id: Option<Uuid>, message: String },
+    /// End of the conversation.
     Bye { peer_id: Uuid },
-}
-
-// ── Internal State ──
-
-/// Internal state for a single peer connection.
-#[allow(dead_code)]
-struct PeerConnectionState {
-    peer: PeerDevice,
-    /// Active transfer requests (outgoing).
-    outgoing_transfers: HashMap<Uuid, PeerTransferProgress>,
-    /// Active transfer requests (incoming).
-    incoming_transfers: HashMap<Uuid, PeerTransferRequest>,
 }
 
 /// Saved peer data persisted to disk.
@@ -350,30 +313,76 @@ pub struct SavedPeer {
     pub saved_at: DateTime<Utc>,
 }
 
-// ── Peer Discovery Manager ──
+/// A peer as seen by discovery or a handshake.
+#[derive(Debug, Clone)]
+pub struct PeerSighting {
+    pub id: Uuid,
+    pub hostname: String,
+    pub os: PeerOs,
+    pub addresses: Vec<IpAddr>,
+    pub port: u16,
+    pub app_version: String,
+    pub fingerprint: Option<String>,
+}
 
-/// Manages peer discovery, connections, and transfers.
+type Decision = (TransferResponse, Option<String>);
+type Tls<S> = tokio_rustls::TlsStream<S>;
+
+/// The default folder for received files.
+fn default_downloads_dir() -> PathBuf {
+    directories::UserDirs::new()
+        .and_then(|d| d.download_dir().map(Path::to_path_buf).or_else(|| Some(d.home_dir().join("Downloads"))))
+        .unwrap_or_else(|| std::env::temp_dir().join("ufop-received"))
+}
+
+/// The default folder for this device's peer identity and saved peers.
+pub fn default_peer_dir() -> PathBuf {
+    directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
+        .map(|d| d.data_dir().join("peer"))
+        .unwrap_or_else(|| ufop_core::session::user_temp_subdir("peer"))
+}
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Stopped by a cancel on either side (the status says which).
+fn cancelled() -> AppError {
+    AppError::transfer("The transfer was cancelled", "Send it again if needed.")
+}
+
+fn not_found(peer_id: Uuid) -> AppError {
+    AppError::connection(format!("Peer {peer_id} not found"), "The peer may have gone offline.")
+}
+
+// ── Peer Manager ──
+
+/// Discovery, connections and transfers. Cloning shares the state.
+#[derive(Clone)]
 pub struct PeerManager {
-    /// Our own peer identity.
-    local_peer_id: Uuid,
+    identity: Arc<PeerIdentity>,
     local_hostname: String,
     local_os: PeerOs,
-    local_port: u16,
     app_version: String,
+    /// Port to listen on (0: any free port).
+    preferred_port: u16,
+    /// Port actually listened on (0 while not listening).
+    local_port: Arc<AtomicU16>,
+    /// Where saved peers are kept (`None`: not persisted).
+    data_dir: Option<PathBuf>,
+    downloads_dir: PathBuf,
 
-    /// Discovered peers indexed by peer ID.
     peers: Arc<RwLock<HashMap<Uuid, PeerDevice>>>,
-    /// Saved/trusted peers persisted across sessions.
     saved_peers: Arc<RwLock<HashMap<Uuid, SavedPeer>>>,
-    /// Active transfers.
     transfers: Arc<RwLock<HashMap<Uuid, PeerTransferProgress>>>,
-    /// Pending incoming transfer requests awaiting user response.
     pending_requests: Arc<RwLock<HashMap<Uuid, PeerTransferRequest>>>,
+    /// Pending requests' connections waiting for the user's answer.
+    responders: Arc<std::sync::Mutex<HashMap<Uuid, oneshot::Sender<Decision>>>>,
+    cancels: Arc<std::sync::Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
 
-    /// Whether mDNS discovery is active.
+    listener: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    mdns: Arc<std::sync::Mutex<Option<(mdns_sd::ServiceDaemon, String)>>>,
     discovery_active: Arc<AtomicBool>,
-    /// Whether the peer listener (TLS server) is active.
-    listener_active: Arc<AtomicBool>,
 }
 
 impl Default for PeerManager {
@@ -383,185 +392,292 @@ impl Default for PeerManager {
 }
 
 impl PeerManager {
-    /// Create a new PeerManager with auto-detected local device info.
+    /// A manager with a new identity that persists nothing.
     pub fn new() -> Self {
-        let hostname = hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "unknown-host".to_string());
+        let identity = PeerIdentity::generate().expect("generating a self-signed certificate");
+        Self::with_identity(identity, None)
+    }
 
+    /// A manager whose identity and saved peers live in `dir`.
+    pub fn open(dir: PathBuf) -> Self {
+        let identity = PeerIdentity::load_or_create(&dir.join("identity.json")).unwrap_or_else(|e| {
+            tracing::warn!("Peer identity could not be stored ({e}); using a temporary one");
+            PeerIdentity::generate().expect("generating a self-signed certificate")
+        });
+        let mgr = Self::with_identity(identity, Some(dir));
+        mgr.load_saved();
+        mgr
+    }
+
+    fn with_identity(identity: PeerIdentity, data_dir: Option<PathBuf>) -> Self {
+        let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_else(|_| "unknown-host".to_string());
         Self {
-            local_peer_id: Uuid::new_v4(),
+            identity: Arc::new(identity),
             local_hostname: hostname,
             local_os: PeerOs::current(),
-            local_port: DEFAULT_PEER_PORT,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            peers: Arc::new(RwLock::new(HashMap::new())),
-            saved_peers: Arc::new(RwLock::new(HashMap::new())),
-            transfers: Arc::new(RwLock::new(HashMap::new())),
-            pending_requests: Arc::new(RwLock::new(HashMap::new())),
+            preferred_port: DEFAULT_PEER_PORT,
+            local_port: Arc::new(AtomicU16::new(0)),
+            data_dir,
+            downloads_dir: default_downloads_dir(),
+            peers: Default::default(),
+            saved_peers: Default::default(),
+            transfers: Default::default(),
+            pending_requests: Default::default(),
+            responders: Default::default(),
+            cancels: Default::default(),
+            listener: Default::default(),
+            mdns: Default::default(),
             discovery_active: Arc::new(AtomicBool::new(false)),
-            listener_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Get our local peer ID.
+    /// Listen on `port` (0: any free port).
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.preferred_port = port;
+        self
+    }
+
+    /// Save accepted files in `dir` unless the user picks another folder.
+    pub fn with_downloads_dir(mut self, dir: PathBuf) -> Self {
+        self.downloads_dir = dir;
+        self
+    }
+
+    /// Name this device announces.
+    pub fn with_hostname(mut self, name: &str) -> Self {
+        self.local_hostname = name.to_string();
+        self
+    }
+
     pub fn local_peer_id(&self) -> Uuid {
-        self.local_peer_id
+        self.identity.id
+    }
+
+    /// This device's certificate fingerprint, for comparing with the other computer.
+    pub fn local_fingerprint(&self) -> String {
+        self.identity.fingerprint()
+    }
+
+    /// The listening port (0 while not listening).
+    pub fn listening_port(&self) -> u16 {
+        self.local_port.load(Ordering::Relaxed)
+    }
+
+    // ── Saved peers ──
+
+    fn saved_file(&self) -> Option<PathBuf> {
+        self.data_dir.as_ref().map(|d| d.join("saved-peers.json"))
+    }
+
+    fn load_saved(&self) {
+        let Some(path) = self.saved_file() else { return };
+        let Ok(raw) = std::fs::read(&path) else { return };
+        let list: Vec<SavedPeer> = match serde_json::from_slice(&raw) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("Saved peers at {} are unreadable: {e}", path.display());
+                return;
+            }
+        };
+        // Saved devices are listed (offline until seen) so they can be sent to directly.
+        let (Ok(mut saved), Ok(mut peers)) = (self.saved_peers.try_write(), self.peers.try_write()) else { return };
+        for s in list {
+            peers.insert(
+                s.id,
+                PeerDevice {
+                    id: s.id,
+                    hostname: s.hostname.clone(),
+                    os: s.os,
+                    addresses: s.last_addresses.clone(),
+                    port: s.port,
+                    app_version: String::new(),
+                    status: PeerStatus::Offline,
+                    trust: s.trust,
+                    discovered_at: s.saved_at,
+                    last_seen: s.last_seen,
+                    display_name: s.display_name.clone(),
+                    tls_fingerprint: s.tls_fingerprint.clone(),
+                },
+            );
+            saved.insert(s.id, s);
+        }
+    }
+
+    async fn persist_saved(&self) {
+        let Some(path) = self.saved_file() else { return };
+        let list: Vec<SavedPeer> = self.saved_peers.read().await.values().cloned().collect();
+        let r = path.parent().map(std::fs::create_dir_all).transpose().map_err(AppError::from).and_then(|_| wire::write_private(&path, &serde_json::to_vec_pretty(&list).unwrap_or_default()));
+        if let Err(e) = r {
+            tracing::warn!("Could not save the peer list: {e}");
+        }
+    }
+
+    fn saved_from(peer: &PeerDevice, trust: TrustLevel) -> SavedPeer {
+        SavedPeer {
+            id: peer.id,
+            hostname: peer.hostname.clone(),
+            os: peer.os,
+            last_addresses: peer.addresses.clone(),
+            port: peer.port,
+            trust,
+            display_name: peer.display_name.clone(),
+            tls_fingerprint: peer.tls_fingerprint.clone(),
+            last_seen: peer.last_seen,
+            saved_at: Utc::now(),
+        }
     }
 
     // ── Discovery ──
 
-    /// Start mDNS peer discovery on the local network.
-    /// Registers our service and begins browsing for peers.
+    /// Advertise this device over mDNS and browse for others. Starts the
+    /// listener first (the advertisement names its port).
     pub async fn start_discovery(&self) -> Result<(), AppError> {
         if self.discovery_active.load(Ordering::Relaxed) {
             return Ok(());
         }
+        let port = self.start_listener().await?;
+        let mdns_err = |e: mdns_sd::Error| AppError::connection(format!("Network discovery is unavailable: {e}"), "Connect to the other computer by its address instead.");
+        let daemon = mdns_sd::ServiceDaemon::new().map_err(mdns_err)?;
+        let host: String = self.local_hostname.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
+        let instance = self.identity.id.simple().to_string();
+        let props = [
+            ("id", self.identity.id.to_string()),
+            ("name", self.local_hostname.clone()),
+            ("os", self.local_os.as_str().to_string()),
+            ("ver", self.app_version.clone()),
+            ("fp", self.identity.fingerprint()),
+        ];
+        let info = mdns_sd::ServiceInfo::new(MDNS_SERVICE_TYPE, &instance, &format!("{host}.local."), "", port, &props[..]).map_err(mdns_err)?.enable_addr_auto();
+        let fullname = info.get_fullname().to_string();
+        daemon.register(info).map_err(mdns_err)?;
+        let events = daemon.browse(MDNS_SERVICE_TYPE).map_err(mdns_err)?;
+        *lock(&self.mdns) = Some((daemon, fullname));
         self.discovery_active.store(true, Ordering::Relaxed);
 
-        tracing::info!(
-            "Starting mDNS peer discovery as {} ({}:{})",
-            self.local_hostname,
-            self.local_os.display_name(),
-            self.local_port
-        );
-
-        // Register our service via mDNS
-        // In production, this would use mdns-sd crate:
-        //   let mdns = ServiceDaemon::new()?;
-        //   let service = ServiceInfo::new(MDNS_SERVICE_TYPE, &self.local_hostname, ...);
-        //   mdns.register(service)?;
-        //   let receiver = mdns.browse(MDNS_SERVICE_TYPE)?;
-
-        // Start background task for discovery events
-        let peers = self.peers.clone();
-        let _saved_peers = self.saved_peers.clone();
-        let discovery_active = self.discovery_active.clone();
-        let local_id = self.local_peer_id;
-
+        let me = self.clone();
         tokio::spawn(async move {
-            tracing::info!("mDNS discovery background task started");
-
-            // In production, this loop would process mDNS browse events.
-            // For now, we run the heartbeat checker to mark stale peers offline.
-            while discovery_active.load(Ordering::Relaxed) {
-                // Check for stale peers
-                {
-                    let mut peers_lock = peers.write().await;
-                    let now = Utc::now();
-                    for peer in peers_lock.values_mut() {
-                        if peer.id != local_id {
-                            let elapsed = (now - peer.last_seen).num_seconds();
-                            if elapsed > PEER_TIMEOUT_SECS as i64
-                                && peer.status != PeerStatus::Offline
-                            {
-                                tracing::info!("Peer {} went offline ({}s since last seen)", peer.hostname, elapsed);
-                                peer.status = PeerStatus::Offline;
+            while let Ok(ev) = events.recv_async().await {
+                match ev {
+                    mdns_sd::ServiceEvent::ServiceResolved(info) => {
+                        if let Some(s) = sighting_from_mdns(&info) {
+                            if s.id != me.identity.id {
+                                me.on_mdns_sighting(s).await;
                             }
                         }
                     }
+                    mdns_sd::ServiceEvent::ServiceRemoved(_, fullname) => {
+                        if let Some(id) = fullname.split('.').next().and_then(|i| Uuid::parse_str(i).ok()) {
+                            me.on_peer_offline(id).await;
+                        }
+                    }
+                    mdns_sd::ServiceEvent::SearchStopped(_) => break,
+                    _ => {}
                 }
-
-                tokio::time::sleep(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
             }
-
-            tracing::info!("mDNS discovery background task stopped");
         });
-
+        tracing::info!("Peer discovery started as {} on port {port}", self.local_hostname);
         Ok(())
     }
 
-    /// Stop mDNS peer discovery.
+    async fn on_mdns_sighting(&self, s: PeerSighting) {
+        // A saved device's pinned certificate is not replaced by an advertisement.
+        if let Some(fp) = &s.fingerprint {
+            if let Some(saved) = self.saved_peers.read().await.get(&s.id).and_then(|p| p.tls_fingerprint.clone()) {
+                if &saved != fp {
+                    tracing::warn!("Ignoring an mDNS advertisement for saved peer {} with a different certificate", s.id);
+                    return;
+                }
+            }
+        }
+        self.on_peer_discovered(s).await;
+    }
+
+    /// Stop advertising and browsing (sends an mDNS goodbye).
     pub async fn stop_discovery(&self) -> Result<(), AppError> {
-        tracing::info!("Stopping mDNS peer discovery");
         self.discovery_active.store(false, Ordering::Relaxed);
+        if let Some((daemon, fullname)) = lock(&self.mdns).take() {
+            if let Ok(rx) = daemon.unregister(&fullname) {
+                let _ = rx.recv_timeout(Duration::from_secs(1));
+            }
+            let _ = daemon.stop_browse(MDNS_SERVICE_TYPE);
+            let _ = daemon.shutdown();
+        }
         Ok(())
     }
 
-    /// Whether discovery is currently active.
     pub fn is_discovering(&self) -> bool {
         self.discovery_active.load(Ordering::Relaxed)
     }
 
     // ── Peer Management ──
 
-    /// List all currently discovered peers.
     pub async fn list_peers(&self) -> Vec<PeerDevice> {
-        let peers = self.peers.read().await;
-        peers.values().cloned().collect()
+        self.peers.read().await.values().cloned().collect()
     }
 
-    /// List only online peers.
     pub async fn list_online_peers(&self) -> Vec<PeerDevice> {
-        let peers = self.peers.read().await;
-        peers
-            .values()
-            .filter(|p| p.status == PeerStatus::Online || p.status == PeerStatus::Transferring)
-            .cloned()
-            .collect()
+        self.peers.read().await.values().filter(|p| p.status == PeerStatus::Online || p.status == PeerStatus::Transferring).cloned().collect()
     }
 
-    /// Get a specific peer by ID.
     pub async fn get_peer(&self, peer_id: Uuid) -> Option<PeerDevice> {
-        let peers = self.peers.read().await;
-        peers.get(&peer_id).cloned()
+        self.peers.read().await.get(&peer_id).cloned()
     }
 
-    /// Handle a discovered peer (from mDNS or manual connection).
-    pub async fn on_peer_discovered(
-        &self,
-        peer_id: Uuid,
-        hostname: String,
-        os: PeerOs,
-        addresses: Vec<IpAddr>,
-        port: u16,
-        app_version: String,
-    ) -> PeerDevice {
-        let mut peers = self.peers.write().await;
+    /// Record a peer seen by discovery or a handshake.
+    pub async fn on_peer_discovered(&self, s: PeerSighting) -> PeerDevice {
         let now = Utc::now();
-
-        // Check if peer already exists
-        if let Some(existing) = peers.get_mut(&peer_id) {
-            existing.addresses = addresses;
-            existing.port = port;
-            existing.app_version = app_version;
-            existing.status = PeerStatus::Online;
-            existing.last_seen = now;
-            return existing.clone();
-        }
-
-        // Check saved peers for trust info
-        let saved = self.saved_peers.read().await;
-        let trust = saved
-            .get(&peer_id)
-            .map(|s| s.trust)
-            .unwrap_or(TrustLevel::Unknown);
-        let display_name = saved.get(&peer_id).and_then(|s| s.display_name.clone());
-        let tls_fingerprint = saved.get(&peer_id).and_then(|s| s.tls_fingerprint.clone());
-
-        let peer = PeerDevice {
-            id: peer_id,
-            hostname,
-            os,
-            addresses,
-            port,
-            app_version,
+        let saved = self.saved_peers.read().await.get(&s.id).cloned();
+        let mut peers = self.peers.write().await;
+        let peer = peers.entry(s.id).or_insert_with(|| PeerDevice {
+            id: s.id,
+            hostname: s.hostname.clone(),
+            os: s.os,
+            addresses: Vec::new(),
+            port: s.port,
+            app_version: String::new(),
             status: PeerStatus::Online,
-            trust,
+            trust: saved.as_ref().map(|p| p.trust).unwrap_or(TrustLevel::Unknown),
             discovered_at: now,
             last_seen: now,
-            display_name,
-            tls_fingerprint,
-        };
-
-        peers.insert(peer_id, peer.clone());
+            display_name: saved.as_ref().and_then(|p| p.display_name.clone()),
+            tls_fingerprint: saved.as_ref().and_then(|p| p.tls_fingerprint.clone()),
+        });
+        peer.hostname = s.hostname;
+        peer.os = s.os;
+        if !s.addresses.is_empty() {
+            peer.addresses = s.addresses;
+        }
+        peer.port = s.port;
+        peer.app_version = s.app_version;
+        if peer.status == PeerStatus::Offline {
+            peer.status = PeerStatus::Online;
+        }
+        peer.last_seen = now;
+        if peer.tls_fingerprint.is_none() {
+            peer.tls_fingerprint = s.fingerprint;
+        }
+        let peer = peer.clone();
+        drop(peers);
+        if saved.is_some() {
+            let mut saved = self.saved_peers.write().await;
+            if let Some(sp) = saved.get_mut(&peer.id) {
+                sp.last_addresses = peer.addresses.clone();
+                sp.port = peer.port;
+                sp.last_seen = now;
+                sp.hostname = peer.hostname.clone();
+                if sp.tls_fingerprint.is_none() {
+                    sp.tls_fingerprint = peer.tls_fingerprint.clone();
+                }
+            }
+            drop(saved);
+            self.persist_saved().await;
+        }
         peer
     }
 
-    /// Update a peer's heartbeat timestamp.
     pub async fn on_peer_heartbeat(&self, peer_id: Uuid) {
-        let mut peers = self.peers.write().await;
-        if let Some(peer) = peers.get_mut(&peer_id) {
+        if let Some(peer) = self.peers.write().await.get_mut(&peer_id) {
             peer.last_seen = Utc::now();
             if peer.status == PeerStatus::Offline {
                 peer.status = PeerStatus::Online;
@@ -569,868 +685,724 @@ impl PeerManager {
         }
     }
 
-    /// Mark a peer as offline.
     pub async fn on_peer_offline(&self, peer_id: Uuid) {
-        let mut peers = self.peers.write().await;
-        if let Some(peer) = peers.get_mut(&peer_id) {
+        if let Some(peer) = self.peers.write().await.get_mut(&peer_id) {
             peer.status = PeerStatus::Offline;
+        }
+    }
+
+    async fn set_status(&self, peer_id: Uuid, status: PeerStatus) {
+        if let Some(peer) = self.peers.write().await.get_mut(&peer_id) {
+            peer.status = status;
+        }
+    }
+
+    /// Refuse a device whose certificate differs from the one on record.
+    async fn check_identity(&self, peer_id: Uuid, fingerprint: &str) -> Result<(), AppError> {
+        let known = match self.saved_peers.read().await.get(&peer_id).and_then(|p| p.tls_fingerprint.clone()) {
+            Some(f) => Some(f),
+            None => self.peers.read().await.get(&peer_id).and_then(|p| p.tls_fingerprint.clone()),
+        };
+        match known {
+            Some(f) if f != fingerprint => Err(AppError::connection(
+                "This computer's identity has changed since it was last seen, so the connection was refused",
+                "If it was reinstalled, remove it from saved devices and connect again; otherwise someone may be impersonating it.",
+            )),
+            _ => Ok(()),
         }
     }
 
     // ── Trust Management ──
 
-    /// Set the trust level for a peer device.
+    /// Set the trust level (saving the peer, with its certificate pinned).
     pub async fn set_trust(&self, peer_id: Uuid, trust: TrustLevel) -> Result<(), AppError> {
-        // Update in active peers
-        {
+        let peer = {
             let mut peers = self.peers.write().await;
-            if let Some(peer) = peers.get_mut(&peer_id) {
-                peer.trust = trust;
-            }
-        }
-
-        // Update in saved peers
+            peers.get_mut(&peer_id).map(|p| {
+                p.trust = trust;
+                p.clone()
+            })
+        };
         {
             let mut saved = self.saved_peers.write().await;
-            if let Some(sp) = saved.get_mut(&peer_id) {
-                sp.trust = trust;
-            } else {
-                // If not saved yet, create a saved entry
-                let peers = self.peers.read().await;
-                if let Some(peer) = peers.get(&peer_id) {
-                    saved.insert(
-                        peer_id,
-                        SavedPeer {
-                            id: peer_id,
-                            hostname: peer.hostname.clone(),
-                            os: peer.os,
-                            last_addresses: peer.addresses.clone(),
-                            port: peer.port,
-                            trust,
-                            display_name: peer.display_name.clone(),
-                            tls_fingerprint: peer.tls_fingerprint.clone(),
-                            last_seen: peer.last_seen,
-                            saved_at: Utc::now(),
-                        },
-                    );
+            match (saved.get_mut(&peer_id), peer) {
+                (Some(sp), _) => sp.trust = trust,
+                (None, Some(p)) => {
+                    saved.insert(peer_id, Self::saved_from(&p, trust));
                 }
+                (None, None) => return Err(not_found(peer_id)),
             }
         }
-
+        self.persist_saved().await;
         Ok(())
     }
 
-    /// Save a peer for future sessions.
     pub async fn save_peer(&self, peer_id: Uuid) -> Result<SavedPeer, AppError> {
-        let peers = self.peers.read().await;
-        let peer = peers.get(&peer_id).ok_or_else(|| AppError::Connection {
-            message: format!("Peer {peer_id} not found"),
-            advice: "The peer may have gone offline.".to_string(),
-        })?;
-
-        let saved = SavedPeer {
-            id: peer.id,
-            hostname: peer.hostname.clone(),
-            os: peer.os,
-            last_addresses: peer.addresses.clone(),
-            port: peer.port,
-            trust: peer.trust,
-            display_name: peer.display_name.clone(),
-            tls_fingerprint: peer.tls_fingerprint.clone(),
-            last_seen: peer.last_seen,
-            saved_at: Utc::now(),
-        };
-
-        let mut saved_peers = self.saved_peers.write().await;
-        saved_peers.insert(peer_id, saved.clone());
-
+        let peer = self.peers.read().await.get(&peer_id).cloned().ok_or_else(|| not_found(peer_id))?;
+        let saved = Self::saved_from(&peer, peer.trust);
+        self.saved_peers.write().await.insert(peer_id, saved.clone());
+        self.persist_saved().await;
         Ok(saved)
     }
 
-    /// Remove a saved peer.
+    /// Forget a saved peer (and its pinned certificate).
     pub async fn remove_saved_peer(&self, peer_id: Uuid) -> Result<(), AppError> {
-        let mut saved = self.saved_peers.write().await;
-        saved.remove(&peer_id);
+        self.saved_peers.write().await.remove(&peer_id);
+        let mut peers = self.peers.write().await;
+        if peers.get(&peer_id).is_some_and(|p| p.status == PeerStatus::Offline) {
+            peers.remove(&peer_id);
+        } else if let Some(p) = peers.get_mut(&peer_id) {
+            p.trust = TrustLevel::Unknown;
+            p.tls_fingerprint = None;
+        }
+        drop(peers);
+        self.persist_saved().await;
         Ok(())
     }
 
-    /// List all saved peers.
     pub async fn list_saved_peers(&self) -> Vec<SavedPeer> {
-        let saved = self.saved_peers.read().await;
-        saved.values().cloned().collect()
+        self.saved_peers.read().await.values().cloned().collect()
     }
 
-    /// Set a display name for a peer.
-    pub async fn set_peer_display_name(
-        &self,
-        peer_id: Uuid,
-        name: String,
-    ) -> Result<(), AppError> {
-        {
-            let mut peers = self.peers.write().await;
-            if let Some(peer) = peers.get_mut(&peer_id) {
-                peer.display_name = Some(name.clone());
-            }
+    pub async fn set_peer_display_name(&self, peer_id: Uuid, name: String) -> Result<(), AppError> {
+        let name = Some(name.trim().to_string()).filter(|n| !n.is_empty());
+        if let Some(peer) = self.peers.write().await.get_mut(&peer_id) {
+            peer.display_name = name.clone();
         }
-        {
-            let mut saved = self.saved_peers.write().await;
-            if let Some(sp) = saved.get_mut(&peer_id) {
-                sp.display_name = Some(name);
-            }
+        if let Some(sp) = self.saved_peers.write().await.get_mut(&peer_id) {
+            sp.display_name = name;
         }
+        self.persist_saved().await;
         Ok(())
     }
 
-    // ── Manual Connection ──
+    // ── Connections ──
 
-    /// Manually connect to a peer by IP:port when mDNS discovery is unavailable.
-    pub async fn connect_manual(
-        &self,
-        config: ManualPeerConfig,
-    ) -> Result<PeerDevice, AppError> {
-        let addr: IpAddr = config.host.parse().map_err(|_| AppError::Connection {
-            message: format!("Invalid IP address: {}", config.host),
-            advice: "Enter a valid IPv4 or IPv6 address.".to_string(),
-        })?;
-
-        tracing::info!(
-            "Attempting manual peer connection to {}:{}",
-            config.host,
-            config.port
-        );
-
-        // In production, this would:
-        // 1. Establish a TLS connection to addr:port
-        // 2. Exchange Hello messages
-        // 3. Verify TLS fingerprint
-        // For now, create a pending peer entry
-
-        let peer_id = Uuid::new_v4();
-        let peer = self
-            .on_peer_discovered(
-                peer_id,
-                config.display_name.unwrap_or_else(|| config.host.clone()),
-                PeerOs::Unknown, // Will be updated after Hello exchange
-                vec![addr],
-                config.port,
-                "unknown".to_string(), // Will be updated after Hello exchange
-            )
-            .await;
-
-        Ok(peer)
+    fn hello(&self) -> PeerMessage {
+        PeerMessage::Hello {
+            peer_id: self.identity.id,
+            hostname: self.local_hostname.clone(),
+            os: self.local_os,
+            app_version: self.app_version.clone(),
+            port: self.listening_port(),
+        }
     }
 
-    // ── Transfer Operations ──
-
-    /// Initiate a transfer request to a peer.
-    pub async fn request_transfer(
-        &self,
-        peer_id: Uuid,
-        files: Vec<PeerFileInfo>,
-    ) -> Result<PeerTransferRequest, AppError> {
-        let peers = self.peers.read().await;
-        let peer = peers.get(&peer_id).ok_or_else(|| AppError::Connection {
-            message: format!("Peer {peer_id} not found"),
-            advice: "The peer may have gone offline.".to_string(),
-        })?;
-
-        if peer.status == PeerStatus::Offline {
-            return Err(AppError::Connection {
-                message: format!("Peer {} is offline", peer.hostname),
-                advice: "Wait for the peer to come back online and try again.".to_string(),
-            });
-        }
-
-        if peer.trust == TrustLevel::Blocked {
-            return Err(AppError::Connection {
-                message: format!("Peer {} is blocked", peer.hostname),
-                advice: "Unblock the peer in settings to transfer files.".to_string(),
-            });
-        }
-
-        let total_bytes: u64 = files.iter().map(|f| f.size).sum();
-        let file_count = files.len() as u64;
-
-        let request = PeerTransferRequest {
-            request_id: Uuid::new_v4(),
-            sender_id: self.local_peer_id,
-            sender_hostname: self.local_hostname.clone(),
-            sender_os: self.local_os,
-            files,
-            total_bytes,
-            file_count,
-            requested_at: Utc::now(),
-        };
-
-        // Create progress tracker
-        let progress = PeerTransferProgress {
-            request_id: request.request_id,
-            peer_id,
-            transferred_bytes: 0,
-            total_bytes,
-            current_file: String::new(),
-            files_completed: 0,
-            files_total: file_count,
-            speed_bps: 0,
-            eta_seconds: None,
-            status: PeerTransferStatus::Pending,
-        };
-
-        let mut transfers = self.transfers.write().await;
-        transfers.insert(request.request_id, progress);
-
-        // In production, this would send the request over the TLS channel to the peer
-        tracing::info!(
-            "Transfer request {} created for peer {} ({} files, {} bytes)",
-            request.request_id,
-            peer.hostname,
-            file_count,
-            total_bytes
-        );
-
-        Ok(request)
-    }
-
-    /// Handle an incoming transfer request from a peer.
-    /// The request is queued for user approval.
-    pub async fn on_transfer_request(
-        &self,
-        request: PeerTransferRequest,
-    ) -> Result<(), AppError> {
-        let peers = self.peers.read().await;
-        let peer = peers.get(&request.sender_id);
-
-        // Auto-deny if peer is blocked
-        if let Some(p) = peer {
-            if p.trust == TrustLevel::Blocked {
-                tracing::info!(
-                    "Auto-denied transfer from blocked peer {}",
-                    p.hostname
-                );
-                return Ok(());
-            }
-        }
-
-        tracing::info!(
-            "Incoming transfer request {} from {} ({} files, {} bytes)",
-            request.request_id,
-            request.sender_hostname,
-            request.file_count,
-            request.total_bytes
-        );
-
-        let mut pending = self.pending_requests.write().await;
-        pending.insert(request.request_id, request);
-
-        Ok(())
-    }
-
-    /// Respond to an incoming transfer request (accept/deny).
-    pub async fn respond_to_transfer(
-        &self,
-        request_id: Uuid,
-        response: TransferResponse,
-        save_path: Option<String>,
-    ) -> Result<(), AppError> {
-        let mut pending = self.pending_requests.write().await;
-        let request = pending.remove(&request_id).ok_or_else(|| AppError::Transfer {
-            message: format!("Transfer request {request_id} not found"),
-            advice: "The request may have expired.".to_string(),
-        })?;
-
-        match response {
-            TransferResponse::Accepted => {
-                tracing::info!(
-                    "Accepted transfer request {} from {}",
-                    request_id,
-                    request.sender_hostname
-                );
-                // In production: send accept message and begin receiving files
-                let _dest = save_path.unwrap_or_else(|| {
-                    directories::UserDirs::new()
-                        .map(|d| {
-                            d.home_dir()
-                                .join("Downloads")
-                                .to_string_lossy()
-                                .to_string()
-                        })
-                        .unwrap_or_else(|| "/tmp".to_string())
-                });
-
-                let progress = PeerTransferProgress {
-                    request_id,
-                    peer_id: request.sender_id,
-                    transferred_bytes: 0,
-                    total_bytes: request.total_bytes,
-                    current_file: String::new(),
-                    files_completed: 0,
-                    files_total: request.file_count,
-                    speed_bps: 0,
-                    eta_seconds: None,
-                    status: PeerTransferStatus::Connecting,
+    /// Open a TLS connection to one of `addrs` and exchange Hellos. With
+    /// `expected` the other end's certificate must match it.
+    async fn dial(&self, addrs: &[SocketAddr], expected: Option<&str>) -> Result<(Tls<tokio::net::TcpStream>, PeerDevice), AppError> {
+        let connector = tokio_rustls::TlsConnector::from(self.identity.client_config(expected)?);
+        let mut last = AppError::connection("The computer has no known address", "Connect to it by address.");
+        for addr in addrs {
+            let attempt = async {
+                let tcp = tokio::net::TcpStream::connect(addr).await.map_err(wire::io_err)?;
+                let _ = tcp.set_nodelay(true);
+                let tls = connector.connect(wire::server_name(), tcp).await.map_err(|e| {
+                    AppError::connection(format!("Secure connection to {addr} failed: {e}"), "If the computer was reinstalled, remove it from saved devices and connect again.")
+                })?;
+                let fp = wire::peer_fingerprint(tls.get_ref().1.peer_certificates()).ok_or_else(|| wire::protocol("no certificate"))?;
+                let mut tls = Tls::from(tls);
+                wire::write_msg(&mut tls, &self.hello()).await?;
+                let (peer_id, hostname, os, app_version, port) = match wire::read_msg(&mut tls).await? {
+                    PeerMessage::Hello { peer_id, hostname, os, app_version, port } => (peer_id, hostname, os, app_version, port),
+                    PeerMessage::Error { message, .. } => return Err(AppError::connection(message, "Ask the other computer's user to allow it.")),
+                    _ => return Err(wire::protocol("expected a hello")),
                 };
-
-                let mut transfers = self.transfers.write().await;
-                transfers.insert(request_id, progress);
-            }
-            TransferResponse::Denied => {
-                tracing::info!(
-                    "Denied transfer request {} from {}",
-                    request_id,
-                    request.sender_hostname
-                );
-            }
-            TransferResponse::Blocked => {
-                tracing::info!(
-                    "Blocked transfer request {} from {} and blocking peer",
-                    request_id,
-                    request.sender_hostname
-                );
-                // Block the sender
-                let _ = self.set_trust(request.sender_id, TrustLevel::Blocked).await;
+                self.check_identity(peer_id, &fp).await?;
+                let peer = self.on_peer_discovered(PeerSighting { id: peer_id, hostname, os, addresses: vec![addr.ip()], port, app_version, fingerprint: Some(fp) }).await;
+                Ok::<_, AppError>((tls, peer))
+            };
+            match tokio::time::timeout(CONNECT_TIMEOUT, attempt).await {
+                Ok(Ok(r)) => return Ok(r),
+                Ok(Err(e)) => last = e,
+                Err(_) => last = AppError::connection(format!("{addr} did not answer in time"), "Check the other computer is running UFOP and on the same network."),
             }
         }
+        Err(last)
+    }
 
+    /// Socket addresses to try for `peer`, LAN IPv4 first.
+    fn addrs_of(peer: &PeerDevice) -> Vec<SocketAddr> {
+        let mut ips = peer.addresses.clone();
+        ips.sort_by_key(|ip| (ip.is_loopback(), ip.is_ipv6()));
+        ips.into_iter().map(|ip| SocketAddr::new(ip, peer.port)).collect()
+    }
+
+    /// Connect to a computer by address when discovery does not find it;
+    /// its identity is learned from the handshake.
+    pub async fn connect_manual(&self, config: ManualPeerConfig) -> Result<PeerDevice, AppError> {
+        let host = config.host.trim().trim_start_matches('[').trim_end_matches(']').to_string();
+        if host.is_empty() {
+            return Err(AppError::validation("Enter the other computer's address"));
+        }
+        let addrs: Vec<SocketAddr> = match host.parse::<IpAddr>() {
+            Ok(ip) => vec![SocketAddr::new(ip, config.port)],
+            Err(_) => tokio::net::lookup_host((host.as_str(), config.port))
+                .await
+                .map_err(|e| AppError::connection(format!("Cannot find {host}: {e}"), "Check the name, or enter its IP address."))?
+                .collect(),
+        };
+        let (mut tls, peer) = self.dial(&addrs, None).await?;
+        let _ = wire::write_msg(&mut tls, &PeerMessage::Bye { peer_id: self.identity.id }).await;
+        let _ = tls.shutdown().await;
+        if let Some(name) = config.display_name.filter(|n| !n.trim().is_empty()) {
+            self.set_peer_display_name(peer.id, name).await?;
+        }
+        Ok(self.get_peer(peer.id).await.unwrap_or(peer))
+    }
+
+    // ── Listener ──
+
+    /// Listen for peers (the preferred port, else any free one); returns the port.
+    pub async fn start_listener(&self) -> Result<u16, AppError> {
+        if lock(&self.listener).is_some() {
+            return Ok(self.listening_port());
+        }
+        let bind = |port: u16| tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port)));
+        let listener = match bind(self.preferred_port).await {
+            Ok(l) => l,
+            Err(e) if self.preferred_port != 0 => {
+                tracing::warn!("Peer port {} is unavailable ({e}); using another", self.preferred_port);
+                bind(0).await.map_err(wire::io_err)?
+            }
+            Err(e) => return Err(wire::io_err(e)),
+        };
+        let port = listener.local_addr().map_err(wire::io_err)?.port();
+        let acceptor = tokio_rustls::TlsAcceptor::from(self.identity.server_config()?);
+        let me = self.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, remote)) = listener.accept().await else { continue };
+                let (me, acceptor) = (me.clone(), acceptor.clone());
+                tokio::spawn(async move {
+                    let _ = tcp.set_nodelay(true);
+                    let tls = match tokio::time::timeout(CONNECT_TIMEOUT, acceptor.accept(tcp)).await {
+                        Ok(Ok(t)) => t,
+                        _ => return,
+                    };
+                    if let Err(e) = me.serve(Tls::from(tls), remote).await {
+                        tracing::info!("Peer connection from {remote} ended: {e}");
+                    }
+                });
+            }
+        });
+        *lock(&self.listener) = Some(task);
+        self.local_port.store(port, Ordering::Relaxed);
+        tracing::info!("Peer listener on port {port}");
+        Ok(port)
+    }
+
+    /// Stop listening (and discovery, which advertises the listener).
+    pub async fn stop_listener(&self) -> Result<(), AppError> {
+        self.stop_discovery().await?;
+        if let Some(t) = lock(&self.listener).take() {
+            t.abort();
+        }
+        self.local_port.store(0, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// One incoming connection.
+    async fn serve<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(&self, mut tls: Tls<S>, remote: SocketAddr) -> Result<(), AppError> {
+        let fp = wire::peer_fingerprint(tls.get_ref().1.peer_certificates()).ok_or_else(|| wire::protocol("no client certificate"))?;
+        let first = tokio::time::timeout(CONNECT_TIMEOUT, wire::read_msg(&mut tls)).await.map_err(|_| wire::protocol("no hello"))??;
+        let PeerMessage::Hello { peer_id, hostname, os, app_version, port } = first else { return Err(wire::protocol("expected a hello")) };
+        let refuse = |message: String| PeerMessage::Error { request_id: None, message };
+        if let Err(e) = self.check_identity(peer_id, &fp).await {
+            let _ = wire::write_msg(&mut tls, &refuse(e.user_message())).await;
+            return Err(e);
+        }
+        if self.peers.read().await.get(&peer_id).is_some_and(|p| p.trust == TrustLevel::Blocked) {
+            let _ = wire::write_msg(&mut tls, &refuse("This computer does not accept connections from you.".into())).await;
+            return Ok(());
+        }
+        let peer = self.on_peer_discovered(PeerSighting { id: peer_id, hostname, os, addresses: vec![remote.ip()], port, app_version, fingerprint: Some(fp) }).await;
+        wire::write_msg(&mut tls, &self.hello()).await?;
+        loop {
+            match wire::read_frame::<_, PeerMessage>(&mut tls).await? {
+                None | Some(Frame::Msg(PeerMessage::Bye { .. })) => return Ok(()),
+                Some(Frame::Msg(PeerMessage::Ping { timestamp, .. })) => {
+                    self.on_peer_heartbeat(peer_id).await;
+                    wire::write_msg(&mut tls, &PeerMessage::Pong { peer_id: self.identity.id, timestamp }).await?;
+                }
+                Some(Frame::Msg(PeerMessage::TransferRequest(req))) => return self.receive(tls, &peer, req).await,
+                Some(_) => return Err(wire::protocol("unexpected message")),
+            }
+        }
+    }
+
+    // ── Transfers: receiving ──
+
+    /// Answer a transfer request (asking the user unless the peer is trusted), then receive it.
+    async fn receive<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(&self, tls: Tls<S>, peer: &PeerDevice, req: PeerTransferRequest) -> Result<(), AppError> {
+        let (mut rd, mut wr) = tokio::io::split(tls);
+        let request_id = req.request_id;
+        let bad = req.sender_id != peer.id
+            || req.files.len() > MAX_FILES
+            || req.files.iter().any(|f| wire::safe_relative(&f.relative_path).is_none())
+            || self.transfers.read().await.contains_key(&request_id);
+        if bad {
+            let _ = wire::write_msg(&mut wr, &PeerMessage::Error { request_id: Some(request_id), message: "The transfer request is not valid.".into() }).await;
+            return Err(wire::protocol("invalid transfer request"));
+        }
+        let (response, save_path) = if peer.trust == TrustLevel::Trusted {
+            (TransferResponse::Accepted, None)
+        } else {
+            let (tx, rx) = oneshot::channel();
+            lock(&self.responders).insert(request_id, tx);
+            self.pending_requests.write().await.insert(request_id, req.clone());
+            // The sender says nothing while waiting; a frame from it means it gave up.
+            let gave_up = wire::read_frame::<_, PeerMessage>(&mut rd);
+            let decision = tokio::select! {
+                d = rx => d.ok(),
+                _ = tokio::time::sleep(APPROVAL_TIMEOUT) => Some((TransferResponse::Denied, None)),
+                _ = gave_up => None,
+            };
+            lock(&self.responders).remove(&request_id);
+            self.pending_requests.write().await.remove(&request_id);
+            match decision {
+                Some(d) => d,
+                None => return Ok(()),
+            }
+        };
+        if response == TransferResponse::Blocked {
+            let _ = self.set_trust(peer.id, TrustLevel::Blocked).await;
+        }
+        wire::write_msg(&mut wr, &PeerMessage::TransferResponse { request_id, response }).await?;
+        if response != TransferResponse::Accepted {
+            return Ok(());
+        }
+        let dest = save_path.map(PathBuf::from).unwrap_or_else(|| self.downloads_dir.clone());
+        let cancel = self.track(&req, peer, PeerTransferDirection::Incoming, Some(dest.to_string_lossy().into_owned())).await;
+        self.set_status(peer.id, PeerStatus::Transferring).await;
+        let result = self.receive_files(&mut rd, &mut wr, &req, &dest, &cancel).await;
+        self.set_status(peer.id, PeerStatus::Online).await;
+        self.finish(request_id, result.as_ref().err().map(AppError::user_message), &cancel).await;
+        result
+    }
+
+    async fn receive_files<R, W>(&self, rd: &mut R, wr: &mut W, req: &PeerTransferRequest, dest: &Path, cancel: &AtomicBool) -> Result<(), AppError>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        tokio::fs::create_dir_all(dest).await?;
+        let start = Instant::now();
+        let mut bytes = 0u64;
+        let mut done = 0u64;
+        // The file being received: (entry, part file, writer, hash, bytes left, final path).
+        let mut current: Option<(u64, PathBuf, tokio::fs::File, sha2::Sha256, u64, PathBuf)> = None;
+        let cleanup = |c: &Option<(u64, PathBuf, tokio::fs::File, sha2::Sha256, u64, PathBuf)>| {
+            if let Some((_, part, ..)) = c {
+                let _ = std::fs::remove_file(part);
+            }
+        };
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                cleanup(&current);
+                let _ = wire::write_msg(wr, &PeerMessage::Error { request_id: Some(req.request_id), message: "cancelled".into() }).await;
+                return Err(cancelled());
+            }
+            let frame = match wire::read_frame::<_, PeerMessage>(rd).await {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    cleanup(&current);
+                    return Err(AppError::connection("The sender disconnected before the transfer finished", "Ask them to send it again."));
+                }
+                Err(e) => {
+                    cleanup(&current);
+                    return Err(e);
+                }
+            };
+            let step: Result<bool, AppError> = async {
+                match frame {
+                    Frame::Msg(PeerMessage::FileStart { index, .. }) if current.is_none() => {
+                        let entry = req.files.get(index as usize).ok_or_else(|| wire::protocol("unknown file"))?;
+                        let rel = wire::safe_relative(&entry.relative_path).ok_or_else(|| wire::protocol("unsafe path"))?;
+                        let target = dest.join(&rel);
+                        self.update(req.request_id, |p| p.current_file = entry.relative_path.clone()).await;
+                        if entry.is_dir {
+                            tokio::fs::create_dir_all(&target).await?;
+                            done += 1;
+                            return Ok(false);
+                        }
+                        if let Some(parent) = target.parent() {
+                            tokio::fs::create_dir_all(parent).await?;
+                        }
+                        let target = unique_path(&target);
+                        let part = target.with_file_name(format!(".{}{}", target.file_name().unwrap_or_default().to_string_lossy(), super::STAGING_SUFFIX));
+                        let f = tokio::fs::File::create(&part).await?;
+                        current = Some((index, part, f, sha2::Sha256::new(), entry.size, target));
+                        Ok(false)
+                    }
+                    Frame::Data(d) => {
+                        let (_, _, f, h, left, _) = current.as_mut().ok_or_else(|| wire::protocol("file data outside a file"))?;
+                        if d.len() as u64 > *left {
+                            return Err(wire::protocol("more data than announced"));
+                        }
+                        f.write_all(&d).await?;
+                        h.update(&d);
+                        *left -= d.len() as u64;
+                        bytes += d.len() as u64;
+                        self.progress(req.request_id, bytes, done, start).await;
+                        Ok(false)
+                    }
+                    Frame::Msg(PeerMessage::FileEnd { index, sha256, .. }) => {
+                        let (i, part, mut f, h, left, target) = current.take().ok_or_else(|| wire::protocol("file end outside a file"))?;
+                        f.flush().await?;
+                        f.sync_all().await?;
+                        drop(f);
+                        if i != index || left != 0 || hex::encode(h.finalize()) != sha256 {
+                            let _ = tokio::fs::remove_file(&part).await;
+                            return Err(AppError::transfer(format!("{} did not arrive intact", req.files[i as usize].relative_path), "Ask the sender to send it again."));
+                        }
+                        tokio::fs::rename(&part, &target).await?;
+                        if let Some(m) = req.files[i as usize].modified {
+                            let _ = std::fs::File::options().write(true).open(&target).and_then(|f| f.set_modified(std::time::SystemTime::from(m)));
+                        }
+                        done += 1;
+                        self.progress(req.request_id, bytes, done, start).await;
+                        Ok(false)
+                    }
+                    Frame::Msg(PeerMessage::TransferComplete { .. }) if current.is_none() => {
+                        let ok = done == req.files.len() as u64 && bytes == req.total_bytes;
+                        wire::write_msg(wr, &PeerMessage::TransferComplete { request_id: req.request_id, files_transferred: done, bytes_transferred: bytes, verification_passed: ok }).await?;
+                        if ok { Ok(true) } else { Err(AppError::transfer("Some files were missing from the transfer", "Ask the sender to send it again.")) }
+                    }
+                    Frame::Msg(PeerMessage::Error { message, .. }) if message == "cancelled" => {
+                        cancel.store(true, Ordering::Relaxed);
+                        Err(cancelled())
+                    }
+                    Frame::Msg(PeerMessage::Error { message, .. }) => Err(AppError::transfer(format!("The sender stopped: {message}"), "Ask them to send it again.")),
+                    _ => Err(wire::protocol("unexpected message during the transfer")),
+                }
+            }
+            .await;
+            match step {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => {
+                    cleanup(&current);
+                    if !cancel.load(Ordering::Relaxed) {
+                        let _ = wire::write_msg(wr, &PeerMessage::Error { request_id: Some(req.request_id), message: e.user_message() }).await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
     }
 
     /// List pending incoming transfer requests.
     pub async fn list_pending_requests(&self) -> Vec<PeerTransferRequest> {
-        let pending = self.pending_requests.read().await;
-        pending.values().cloned().collect()
+        self.pending_requests.read().await.values().cloned().collect()
     }
 
-    /// Get the progress of a transfer.
-    pub async fn get_transfer_progress(
-        &self,
-        request_id: Uuid,
-    ) -> Option<PeerTransferProgress> {
-        let transfers = self.transfers.read().await;
-        transfers.get(&request_id).cloned()
+    /// Accept, deny or block a pending incoming request. Accepted files go
+    /// to `save_path` (default: the Downloads folder).
+    pub async fn respond_to_transfer(&self, request_id: Uuid, response: TransferResponse, save_path: Option<String>) -> Result<(), AppError> {
+        let save_path = match save_path.filter(|p| !p.trim().is_empty()) {
+            Some(p) if !Path::new(&p).is_absolute() => return Err(AppError::validation("Choose a folder to save the files in")),
+            p => p,
+        };
+        let tx = lock(&self.responders).remove(&request_id);
+        self.pending_requests.write().await.remove(&request_id);
+        let tx = tx.ok_or_else(|| AppError::transfer(format!("Transfer request {request_id} not found"), "The sender may have cancelled it, or it expired."))?;
+        tx.send((response, save_path)).map_err(|_| AppError::transfer("The sender is no longer waiting", "Ask them to send it again."))
     }
 
-    /// List all active transfers.
-    pub async fn list_transfers(&self) -> Vec<PeerTransferProgress> {
-        let transfers = self.transfers.read().await;
-        transfers.values().cloned().collect()
-    }
+    // ── Transfers: sending ──
 
-    /// Cancel a peer transfer.
-    pub async fn cancel_transfer(&self, request_id: Uuid) -> Result<(), AppError> {
-        let mut transfers = self.transfers.write().await;
-        if let Some(transfer) = transfers.get_mut(&request_id) {
-            transfer.status = PeerTransferStatus::Cancelled;
-            tracing::info!("Cancelled peer transfer {}", request_id);
-            Ok(())
-        } else {
-            Err(AppError::Transfer {
-                message: format!("Transfer {request_id} not found"),
-                advice: "The transfer may have already completed.".to_string(),
-            })
+    /// Ask `peer_id` to accept `paths` (files or folders) and send them
+    /// once accepted. Returns at once; progress shows in [`Self::list_transfers`].
+    pub async fn request_transfer(&self, peer_id: Uuid, paths: Vec<String>) -> Result<PeerTransferRequest, AppError> {
+        let peer = self.get_peer(peer_id).await.ok_or_else(|| not_found(peer_id))?;
+        if peer.trust == TrustLevel::Blocked {
+            return Err(AppError::connection(format!("Peer {} is blocked", peer.hostname), "Unblock the peer to transfer files."));
         }
-    }
-
-    // ── TLS Listener ──
-
-    /// Start the TLS listener for incoming peer connections.
-    pub async fn start_listener(&self) -> Result<(), AppError> {
-        if self.listener_active.load(Ordering::Relaxed) {
-            return Ok(());
+        let entries = tokio::task::spawn_blocking(move || collect_entries(&paths)).await.map_err(|e| AppError::internal(e.to_string()))??;
+        if entries.is_empty() {
+            return Err(AppError::validation("Choose files or folders to send"));
         }
-        self.listener_active.store(true, Ordering::Relaxed);
-
-        tracing::info!("Starting peer TLS listener on port {}", self.local_port);
-
-        // In production, this would:
-        // 1. Generate or load a self-signed TLS certificate
-        // 2. Start a TLS listener on self.local_port
-        // 3. Accept connections and handle PeerMessage protocol
-        // Using rustls for TLS
-
-        let listener_active = self.listener_active.clone();
-        let port = self.local_port;
-
+        if entries.len() > MAX_FILES {
+            return Err(AppError::validation(format!("Send at most {MAX_FILES} files at a time")));
+        }
+        let files: Vec<PeerFileInfo> = entries.iter().map(|(f, _)| f.clone()).collect();
+        let request = PeerTransferRequest {
+            request_id: Uuid::new_v4(),
+            sender_id: self.identity.id,
+            sender_hostname: self.local_hostname.clone(),
+            sender_os: self.local_os,
+            total_bytes: files.iter().map(|f| f.size).sum(),
+            file_count: files.len() as u64,
+            files,
+            requested_at: Utc::now(),
+        };
+        let cancel = self.track(&request, &peer, PeerTransferDirection::Outgoing, None).await;
+        self.update(request.request_id, |p| p.status = PeerTransferStatus::Connecting).await;
+        let (me, req) = (self.clone(), request.clone());
         tokio::spawn(async move {
-            tracing::info!("TLS listener running on port {}", port);
-
-            // Simulated listener loop
-            while listener_active.load(Ordering::Relaxed) {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            }
-
-            tracing::info!("TLS listener stopped");
+            let result = me.send(&peer, &req, &entries, &cancel).await;
+            me.set_status(peer.id, PeerStatus::Online).await;
+            me.finish(req.request_id, result.err().map(|e| e.user_message()), &cancel).await;
         });
-
-        Ok(())
+        Ok(request)
     }
 
-    /// Stop the TLS listener.
-    pub async fn stop_listener(&self) -> Result<(), AppError> {
-        tracing::info!("Stopping peer TLS listener");
-        self.listener_active.store(false, Ordering::Relaxed);
-        Ok(())
-    }
-
-    // ── Protocol Helpers ──
-
-    /// Create a Hello message for this device.
-    pub fn create_hello(&self) -> PeerMessage {
-        PeerMessage::Hello {
-            peer_id: self.local_peer_id,
-            hostname: self.local_hostname.clone(),
-            os: self.local_os,
-            app_version: self.app_version.clone(),
-            port: self.local_port,
+    async fn send(&self, peer: &PeerDevice, req: &PeerTransferRequest, entries: &[(PeerFileInfo, PathBuf)], cancel: &AtomicBool) -> Result<(), AppError> {
+        if self.listening_port() == 0 {
+            // Our Hello names a port the receiver could answer on; not required to send.
+            let _ = self.start_listener().await;
         }
-    }
+        let (tls, _) = self.dial(&Self::addrs_of(peer), peer.tls_fingerprint.as_deref()).await?;
+        let (mut rd, mut wr) = tokio::io::split(tls);
+        wire::write_msg(&mut wr, &PeerMessage::TransferRequest(req.clone())).await?;
+        self.update(req.request_id, |p| p.status = PeerTransferStatus::Pending).await;
 
-    /// Create a Ping message.
-    pub fn create_ping(&self) -> PeerMessage {
-        PeerMessage::Ping {
-            peer_id: self.local_peer_id,
-            timestamp: Utc::now().timestamp(),
-        }
-    }
-
-    /// Handle an incoming protocol message.
-    pub async fn handle_message(&self, msg: PeerMessage) -> Option<PeerMessage> {
-        match msg {
-            PeerMessage::Hello {
-                peer_id,
-                hostname,
-                os,
-                app_version,
-                port,
-            } => {
-                // Register the peer
-                self.on_peer_discovered(peer_id, hostname, os, vec![], port, app_version)
-                    .await;
-                // Reply with our own Hello
-                Some(self.create_hello())
-            }
-
-            PeerMessage::Ping {
-                peer_id,
-                timestamp,
-            } => {
-                self.on_peer_heartbeat(peer_id).await;
-                Some(PeerMessage::Pong {
-                    peer_id: self.local_peer_id,
-                    timestamp,
-                })
-            }
-
-            PeerMessage::Pong {
-                peer_id,
-                timestamp: _,
-            } => {
-                self.on_peer_heartbeat(peer_id).await;
-                None
-            }
-
-            PeerMessage::TransferRequest(request) => {
-                let _ = self.on_transfer_request(request).await;
-                // Response is sent later when user accepts/denies
-                None
-            }
-
-            PeerMessage::TransferResponse {
-                request_id,
-                response,
-                save_path: _,
-            } => {
-                let mut transfers = self.transfers.write().await;
-                if let Some(transfer) = transfers.get_mut(&request_id) {
-                    match response {
-                        TransferResponse::Accepted => {
-                            transfer.status = PeerTransferStatus::Transferring;
-                        }
-                        TransferResponse::Denied | TransferResponse::Blocked => {
-                            transfer.status = PeerTransferStatus::Denied;
+        // Wait for the answer, watching for a cancel meanwhile.
+        let answer = {
+            let answer = wire::read_msg::<_, PeerMessage>(&mut rd);
+            tokio::pin!(answer);
+            loop {
+                tokio::select! {
+                    m = &mut answer => break m?,
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                        if cancel.load(Ordering::Relaxed) {
+                            let _ = wire::write_msg(&mut wr, &PeerMessage::Error { request_id: Some(req.request_id), message: "cancelled".into() }).await;
+                            return Err(cancelled());
                         }
                     }
                 }
-                None
             }
-
-            PeerMessage::TransferComplete {
-                request_id,
-                files_transferred: _,
-                bytes_transferred: _,
-                verification_passed,
-            } => {
-                let mut transfers = self.transfers.write().await;
-                if let Some(transfer) = transfers.get_mut(&request_id) {
-                    transfer.status = if verification_passed {
-                        PeerTransferStatus::Completed
-                    } else {
-                        PeerTransferStatus::Failed
-                    };
-                }
-                None
+        };
+        match answer {
+            PeerMessage::TransferResponse { response: TransferResponse::Accepted, request_id } if request_id == req.request_id => {}
+            PeerMessage::TransferResponse { .. } => {
+                self.update(req.request_id, |p| p.status = PeerTransferStatus::Denied).await;
+                return Err(AppError::transfer("The other computer declined the transfer", "Ask its user to accept it."));
             }
+            PeerMessage::Error { message, .. } => return Err(AppError::transfer(message, "Check the transfer on the other computer.")),
+            _ => return Err(wire::protocol("unexpected answer")),
+        }
 
-            PeerMessage::Bye { peer_id } => {
-                self.on_peer_offline(peer_id).await;
-                None
-            }
-
-            PeerMessage::FileChunk { .. } => {
-                // File chunk handling would update transfer progress
-                None
-            }
-
-            PeerMessage::Error {
-                request_id,
-                message,
-            } => {
-                tracing::error!("Peer error: {message}");
-                if let Some(rid) = request_id {
-                    let mut transfers = self.transfers.write().await;
-                    if let Some(transfer) = transfers.get_mut(&rid) {
-                        transfer.status = PeerTransferStatus::Failed;
+        self.update(req.request_id, |p| p.status = PeerTransferStatus::Transferring).await;
+        self.set_status(peer.id, PeerStatus::Transferring).await;
+        let start = Instant::now();
+        let (mut bytes, mut done) = (0u64, 0u64);
+        let mut buf = vec![0u8; wire::MAX_DATA_FRAME];
+        for (index, (info, local)) in entries.iter().enumerate() {
+            self.update(req.request_id, |p| p.current_file = info.relative_path.clone()).await;
+            wire::write_msg(&mut wr, &PeerMessage::FileStart { request_id: req.request_id, index: index as u64 }).await?;
+            if !info.is_dir {
+                use tokio::io::AsyncReadExt;
+                let mut f = tokio::fs::File::open(local).await?;
+                let mut h = sha2::Sha256::new();
+                let mut left = info.size;
+                while left > 0 {
+                    if cancel.load(Ordering::Relaxed) {
+                        let _ = wire::write_msg(&mut wr, &PeerMessage::Error { request_id: Some(req.request_id), message: "cancelled".into() }).await;
+                        return Err(cancelled());
                     }
+                    let want = left.min(buf.len() as u64) as usize;
+                    let n = f.read(&mut buf[..want]).await?;
+                    if n == 0 {
+                        let msg = format!("{} changed while it was being sent", info.relative_path);
+                        let _ = wire::write_msg(&mut wr, &PeerMessage::Error { request_id: Some(req.request_id), message: msg.clone() }).await;
+                        return Err(AppError::transfer(msg, "Send it again once it is no longer being written."));
+                    }
+                    h.update(&buf[..n]);
+                    wire::write_data(&mut wr, &buf[..n]).await.map_err(|e| self.receiver_gone(e))?;
+                    left -= n as u64;
+                    bytes += n as u64;
+                    self.progress(req.request_id, bytes, done, start).await;
                 }
-                None
+                wire::write_msg(&mut wr, &PeerMessage::FileEnd { request_id: req.request_id, index: index as u64, sha256: hex::encode(h.finalize()) }).await?;
+            }
+            done += 1;
+            self.progress(req.request_id, bytes, done, start).await;
+        }
+        self.update(req.request_id, |p| p.status = PeerTransferStatus::Verifying).await;
+        wire::write_msg(&mut wr, &PeerMessage::TransferComplete { request_id: req.request_id, files_transferred: done, bytes_transferred: bytes, verification_passed: true }).await?;
+        match wire::read_msg::<_, PeerMessage>(&mut rd).await? {
+            PeerMessage::TransferComplete { verification_passed: true, .. } => {
+                let _ = wr.shutdown().await;
+                Ok(())
+            }
+            PeerMessage::Error { message, .. } => Err(AppError::transfer(message, "Send it again.")),
+            _ => Err(AppError::transfer("The other computer could not verify the files", "Send them again.")),
+        }
+    }
+
+    fn receiver_gone(&self, e: AppError) -> AppError {
+        AppError::transfer(format!("The other computer stopped receiving ({e})"), "It may have cancelled the transfer.")
+    }
+
+    // ── Transfer bookkeeping ──
+
+    async fn track(&self, req: &PeerTransferRequest, peer: &PeerDevice, direction: PeerTransferDirection, save_path: Option<String>) -> Arc<AtomicBool> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        lock(&self.cancels).insert(req.request_id, cancel.clone());
+        self.transfers.write().await.insert(
+            req.request_id,
+            PeerTransferProgress {
+                request_id: req.request_id,
+                peer_id: peer.id,
+                peer_name: peer.display_name.clone().unwrap_or_else(|| peer.hostname.clone()),
+                direction,
+                transferred_bytes: 0,
+                total_bytes: req.total_bytes,
+                current_file: String::new(),
+                files_completed: 0,
+                files_total: req.file_count,
+                speed_bps: 0,
+                eta_seconds: None,
+                status: PeerTransferStatus::Transferring,
+                save_path,
+                error: None,
+            },
+        );
+        cancel
+    }
+
+    async fn update(&self, id: Uuid, f: impl FnOnce(&mut PeerTransferProgress)) {
+        if let Some(p) = self.transfers.write().await.get_mut(&id) {
+            if !p.status.is_finished() {
+                f(p);
             }
         }
+    }
+
+    async fn progress(&self, id: Uuid, bytes: u64, done: u64, start: Instant) {
+        let secs = start.elapsed().as_secs_f64().max(0.001);
+        self.update(id, |p| {
+            p.transferred_bytes = bytes;
+            p.files_completed = done;
+            p.speed_bps = (bytes as f64 / secs) as u64;
+            p.eta_seconds = (p.speed_bps > 0).then(|| p.total_bytes.saturating_sub(bytes) / p.speed_bps);
+        })
+        .await;
+    }
+
+    async fn finish(&self, id: Uuid, error: Option<String>, cancel: &AtomicBool) {
+        lock(&self.cancels).remove(&id);
+        if let Some(p) = self.transfers.write().await.get_mut(&id) {
+            if p.status.is_finished() {
+                return;
+            }
+            match error {
+                None => {
+                    p.status = PeerTransferStatus::Completed;
+                    p.eta_seconds = Some(0);
+                }
+                Some(_) if cancel.load(Ordering::Relaxed) => p.status = PeerTransferStatus::Cancelled,
+                Some(e) => {
+                    p.status = PeerTransferStatus::Failed;
+                    p.error = Some(e);
+                }
+            }
+        }
+    }
+
+    pub async fn get_transfer_progress(&self, request_id: Uuid) -> Option<PeerTransferProgress> {
+        self.transfers.read().await.get(&request_id).cloned()
+    }
+
+    pub async fn list_transfers(&self) -> Vec<PeerTransferProgress> {
+        self.transfers.read().await.values().cloned().collect()
+    }
+
+    /// Cancel a transfer in either direction.
+    pub async fn cancel_transfer(&self, request_id: Uuid) -> Result<(), AppError> {
+        let flag = lock(&self.cancels).get(&request_id).cloned();
+        let mut transfers = self.transfers.write().await;
+        match (transfers.get_mut(&request_id), flag) {
+            (Some(t), Some(flag)) if !t.status.is_finished() => {
+                flag.store(true, Ordering::Relaxed);
+                t.status = PeerTransferStatus::Cancelled;
+                Ok(())
+            }
+            (Some(_), _) => Err(AppError::transfer("This transfer has already finished", "Nothing to cancel.")),
+            (None, _) => Err(AppError::transfer(format!("Transfer {request_id} not found"), "The transfer may have already completed.")),
+        }
+    }
+
+    /// Forget finished transfers; returns how many were removed.
+    pub async fn clear_finished_transfers(&self) -> usize {
+        let mut t = self.transfers.write().await;
+        let before = t.len();
+        t.retain(|_, p| !p.status.is_finished());
+        before - t.len()
     }
 }
 
-impl Clone for PeerManager {
-    fn clone(&self) -> Self {
-        Self {
-            local_peer_id: self.local_peer_id,
-            local_hostname: self.local_hostname.clone(),
-            local_os: self.local_os,
-            local_port: self.local_port,
-            app_version: self.app_version.clone(),
-            peers: self.peers.clone(),
-            saved_peers: self.saved_peers.clone(),
-            transfers: self.transfers.clone(),
-            pending_requests: self.pending_requests.clone(),
-            discovery_active: self.discovery_active.clone(),
-            listener_active: self.listener_active.clone(),
+/// Parse an mDNS advertisement of another UFOP device.
+fn sighting_from_mdns(info: &mdns_sd::ServiceInfo) -> Option<PeerSighting> {
+    let prop = |k: &str| info.get_property_val_str(k).map(str::to_string);
+    let id = Uuid::parse_str(&prop("id")?).ok()?;
+    let mut addresses: Vec<IpAddr> = info.get_addresses().iter().copied().collect();
+    addresses.sort();
+    Some(PeerSighting {
+        id,
+        hostname: prop("name").unwrap_or_else(|| info.get_hostname().trim_end_matches(".local.").to_string()),
+        os: PeerOs::from_str_lossy(&prop("os").unwrap_or_default()),
+        addresses,
+        port: info.get_port(),
+        app_version: prop("ver").unwrap_or_default(),
+        fingerprint: prop("fp").and_then(|f| crate::security::tls::normalize_fingerprint(&f)),
+    })
+}
+
+/// `path`, or `name (1).ext`, `name (2).ext`… if it exists.
+fn unique_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    (1..).map(|i| path.with_file_name(format!("{stem} ({i}){ext}"))).find(|p| !p.exists()).unwrap_or_else(|| path.to_path_buf())
+}
+
+/// The entries to send for `paths`: each file, and each folder with
+/// everything under it (symbolic links are skipped), named relative to
+/// the chosen item's parent.
+fn collect_entries(paths: &[String]) -> Result<Vec<(PeerFileInfo, PathBuf)>, AppError> {
+    fn info(rel: String, meta: &std::fs::Metadata) -> PeerFileInfo {
+        PeerFileInfo { relative_path: rel, size: if meta.is_dir() { 0 } else { meta.len() }, is_dir: meta.is_dir(), modified: meta.modified().ok().map(DateTime::<Utc>::from) }
+    }
+    fn walk(dir: &Path, rel: &str, out: &mut Vec<(PeerFileInfo, PathBuf)>) -> Result<(), AppError> {
+        let mut children: Vec<_> = std::fs::read_dir(dir)?.filter_map(Result::ok).collect();
+        children.sort_by_key(|e| e.file_name());
+        for c in children {
+            let meta = std::fs::symlink_metadata(c.path())?;
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let r = format!("{rel}/{}", c.file_name().to_string_lossy());
+            out.push((info(r.clone(), &meta), c.path()));
+            if meta.is_dir() {
+                walk(&c.path(), &r, out)?;
+            }
+            if out.len() > MAX_FILES {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    for p in paths {
+        let path = PathBuf::from(p);
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| AppError::validation(format!("Cannot read {p}: {e}")))?;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| AppError::validation(format!("Cannot send {p}")))?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        out.push((info(name.clone(), &meta), path.clone()));
+        if meta.is_dir() {
+            walk(&path, &name, &mut out)?;
         }
     }
+    Ok(out)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_peer_manager_creation() {
-        let mgr = PeerManager::new();
-        assert!(!mgr.is_discovering());
-        assert_eq!(mgr.list_peers().await.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_peer_discovery() {
-        let mgr = PeerManager::new();
-
-        let peer = mgr
-            .on_peer_discovered(
-                Uuid::new_v4(),
-                "test-mac".to_string(),
-                PeerOs::MacOs,
-                vec!["192.168.1.100".parse().unwrap()],
-                43210,
-                "0.1.0".to_string(),
-            )
-            .await;
-
-        assert_eq!(peer.hostname, "test-mac");
-        assert_eq!(peer.os, PeerOs::MacOs);
-        assert_eq!(peer.status, PeerStatus::Online);
-        assert_eq!(peer.trust, TrustLevel::Unknown);
-
-        let peers = mgr.list_peers().await;
-        assert_eq!(peers.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_peer_trust_management() {
-        let mgr = PeerManager::new();
-        let peer_id = Uuid::new_v4();
-
-        mgr.on_peer_discovered(
-            peer_id,
-            "trusted-pc".to_string(),
-            PeerOs::Windows,
-            vec!["192.168.1.101".parse().unwrap()],
-            43210,
-            "0.1.0".to_string(),
-        )
-        .await;
-
-        // Trust the peer
-        mgr.set_trust(peer_id, TrustLevel::Trusted).await.unwrap();
-
-        let peer = mgr.get_peer(peer_id).await.unwrap();
-        assert_eq!(peer.trust, TrustLevel::Trusted);
-
-        // Save the peer
-        let saved = mgr.save_peer(peer_id).await.unwrap();
-        assert_eq!(saved.trust, TrustLevel::Trusted);
-
-        let saved_list = mgr.list_saved_peers().await;
-        assert_eq!(saved_list.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_transfer_blocked_peer() {
-        let mgr = PeerManager::new();
-        let peer_id = Uuid::new_v4();
-
-        mgr.on_peer_discovered(
-            peer_id,
-            "blocked-pc".to_string(),
-            PeerOs::Linux,
-            vec!["192.168.1.102".parse().unwrap()],
-            43210,
-            "0.1.0".to_string(),
-        )
-        .await;
-
-        // Block the peer
-        mgr.set_trust(peer_id, TrustLevel::Blocked).await.unwrap();
-
-        // Try to transfer - should fail
-        let result = mgr.request_transfer(peer_id, vec![]).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_transfer_offline_peer() {
-        let mgr = PeerManager::new();
-        let peer_id = Uuid::new_v4();
-
-        mgr.on_peer_discovered(
-            peer_id,
-            "offline-pc".to_string(),
-            PeerOs::MacOs,
-            vec!["192.168.1.103".parse().unwrap()],
-            43210,
-            "0.1.0".to_string(),
-        )
-        .await;
-
-        // Mark offline
-        mgr.on_peer_offline(peer_id).await;
-
-        // Try to transfer - should fail
-        let result = mgr
-            .request_transfer(
-                peer_id,
-                vec![PeerFileInfo {
-                    relative_path: "test.txt".to_string(),
-                    size: 1024,
-                    is_dir: false,
-                    modified: None,
-                }],
-            )
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_transfer_request_flow() {
-        let mgr = PeerManager::new();
-        let peer_id = Uuid::new_v4();
-
-        mgr.on_peer_discovered(
-            peer_id,
-            "target-pc".to_string(),
-            PeerOs::Windows,
-            vec!["192.168.1.104".parse().unwrap()],
-            43210,
-            "0.1.0".to_string(),
-        )
-        .await;
-
-        let files = vec![
-            PeerFileInfo {
-                relative_path: "photo.jpg".to_string(),
-                size: 5_000_000,
-                is_dir: false,
-                modified: Some(Utc::now()),
-            },
-            PeerFileInfo {
-                relative_path: "docs/readme.txt".to_string(),
-                size: 1024,
-                is_dir: false,
-                modified: Some(Utc::now()),
-            },
-        ];
-
-        let request = mgr.request_transfer(peer_id, files).await.unwrap();
-        assert_eq!(request.total_bytes, 5_001_024);
-        assert_eq!(request.file_count, 2);
-
-        // Check progress tracker was created
-        let progress = mgr
-            .get_transfer_progress(request.request_id)
-            .await
-            .unwrap();
-        assert_eq!(progress.status, PeerTransferStatus::Pending);
-    }
-
-    #[tokio::test]
-    async fn test_incoming_request_and_response() {
-        let mgr = PeerManager::new();
-
-        let request = PeerTransferRequest {
-            request_id: Uuid::new_v4(),
-            sender_id: Uuid::new_v4(),
-            sender_hostname: "sender-mac".to_string(),
-            sender_os: PeerOs::MacOs,
-            files: vec![PeerFileInfo {
-                relative_path: "video.mp4".to_string(),
-                size: 100_000_000,
-                is_dir: false,
-                modified: None,
-            }],
-            total_bytes: 100_000_000,
-            file_count: 1,
-            requested_at: Utc::now(),
-        };
-
-        let req_id = request.request_id;
-        mgr.on_transfer_request(request).await.unwrap();
-
-        let pending = mgr.list_pending_requests().await;
-        assert_eq!(pending.len(), 1);
-
-        // Accept the transfer
-        mgr.respond_to_transfer(req_id, TransferResponse::Accepted, None)
-            .await
-            .unwrap();
-
-        let pending = mgr.list_pending_requests().await;
-        assert_eq!(pending.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_hello_message_exchange() {
-        let mgr = PeerManager::new();
-
-        let remote_hello = PeerMessage::Hello {
-            peer_id: Uuid::new_v4(),
-            hostname: "remote-pc".to_string(),
-            os: PeerOs::Linux,
-            app_version: "0.1.0".to_string(),
-            port: 43210,
-        };
-
-        let response = mgr.handle_message(remote_hello).await;
-        assert!(response.is_some());
-
-        // Verify peer was registered
-        let peers = mgr.list_peers().await;
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].hostname, "remote-pc");
-    }
-
-    #[tokio::test]
-    async fn test_manual_peer_connection() {
-        let mgr = PeerManager::new();
-
-        let config = ManualPeerConfig {
-            host: "192.168.1.200".to_string(),
-            port: 43210,
-            display_name: Some("Office Mac".to_string()),
-        };
-
-        let peer = mgr.connect_manual(config).await.unwrap();
-        assert_eq!(peer.hostname, "Office Mac");
-        assert_eq!(peer.port, 43210);
-    }
-
-    #[tokio::test]
-    async fn test_manual_connection_invalid_ip() {
-        let mgr = PeerManager::new();
-
-        let config = ManualPeerConfig {
-            host: "not-an-ip".to_string(),
-            port: 43210,
-            display_name: None,
-        };
-
-        let result = mgr.connect_manual(config).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_peer_os_detection() {
-        let os = PeerOs::current();
-        // On macOS CI, this should be MacOs
-        #[cfg(target_os = "macos")]
-        assert_eq!(os, PeerOs::MacOs);
-        #[cfg(target_os = "windows")]
-        assert_eq!(os, PeerOs::Windows);
-        #[cfg(target_os = "linux")]
-        assert_eq!(os, PeerOs::Linux);
-    }
-
-    #[tokio::test]
-    async fn test_cancel_transfer() {
-        let mgr = PeerManager::new();
-        let peer_id = Uuid::new_v4();
-
-        mgr.on_peer_discovered(
-            peer_id,
-            "cancel-target".to_string(),
-            PeerOs::MacOs,
-            vec!["192.168.1.105".parse().unwrap()],
-            43210,
-            "0.1.0".to_string(),
-        )
-        .await;
-
-        let request = mgr
-            .request_transfer(
-                peer_id,
-                vec![PeerFileInfo {
-                    relative_path: "big-file.zip".to_string(),
-                    size: 1_000_000_000,
-                    is_dir: false,
-                    modified: None,
-                }],
-            )
-            .await
-            .unwrap();
-
-        mgr.cancel_transfer(request.request_id).await.unwrap();
-
-        let progress = mgr
-            .get_transfer_progress(request.request_id)
-            .await
-            .unwrap();
-        assert_eq!(progress.status, PeerTransferStatus::Cancelled);
-    }
-
-    #[tokio::test]
-    async fn test_peer_display_name() {
-        let mgr = PeerManager::new();
-        let peer_id = Uuid::new_v4();
-
-        mgr.on_peer_discovered(
-            peer_id,
-            "DESKTOP-ABC123".to_string(),
-            PeerOs::Windows,
-            vec!["192.168.1.106".parse().unwrap()],
-            43210,
-            "0.1.0".to_string(),
-        )
-        .await;
-
-        mgr.set_peer_display_name(peer_id, "Dad's PC".to_string())
-            .await
-            .unwrap();
-
-        let peer = mgr.get_peer(peer_id).await.unwrap();
-        assert_eq!(peer.display_name, Some("Dad's PC".to_string()));
-    }
-}
+#[path = "peer_tests.rs"]
+mod tests;

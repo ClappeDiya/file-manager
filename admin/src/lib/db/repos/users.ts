@@ -9,6 +9,7 @@ export interface UserRecord extends AdminUser {
   totpPendingCiphertext: string | null;
   recoveryCodes: string[];
   lastTotpStep: number | null;
+  passwordChangedAt: string | null;
 }
 
 function fromRow(r: Row): UserRecord {
@@ -29,12 +30,15 @@ function fromRow(r: Row): UserRecord {
     totpPendingCiphertext: (r.totp_pending_ciphertext as string) ?? null,
     recoveryCodes: parseJson<string[]>(r.recovery_codes, []),
     lastTotpStep: (r.last_totp_step as number) ?? null,
+    passwordChangedAt: (r.password_changed_at as string) ?? null,
+    timeZone: (r.time_zone as string) ?? null,
+    locale: (r.locale as string) ?? null,
   };
 }
 
 /** The public shape (no secrets). */
 export function publicUser(u: UserRecord): AdminUser & { mfaEnabled: boolean } {
-  return { id: u.id, email: u.email, name: u.name, role: u.role, permissions: u.permissions, organizationId: u.organizationId, lastLoginAt: u.lastLoginAt, createdAt: u.createdAt, isActive: u.isActive, ssoProvider: u.ssoProvider, mfaEnabled: u.mfaEnabled };
+  return { id: u.id, email: u.email, name: u.name, role: u.role, permissions: u.permissions, organizationId: u.organizationId, lastLoginAt: u.lastLoginAt, createdAt: u.createdAt, isActive: u.isActive, ssoProvider: u.ssoProvider, mfaEnabled: u.mfaEnabled, timeZone: u.timeZone ?? null, locale: u.locale ?? null };
 }
 
 export function getUser(id: string): UserRecord | null {
@@ -68,12 +72,13 @@ export function createUser(u: NewUser): UserRecord {
   const id = newId('usr');
   const email = u.email.trim().toLowerCase();
   db()
-    .prepare(`INSERT INTO users (id, email, name, role, password_hash, permissions, organization_id, created_at, is_active, sso_provider) VALUES (?, ?, ?, ?, ?, '[]', ?, ?, 1, ?)`)
-    .run(id, email, u.name?.trim() || email.split('@')[0], u.role, u.passwordHash ?? null, u.organizationId, now(), u.ssoProvider ?? null);
+    .prepare(`INSERT INTO users (id, email, name, role, password_hash, permissions, organization_id, created_at, is_active, sso_provider, password_changed_at) VALUES (?, ?, ?, ?, ?, '[]', ?, ?, 1, ?, ?)`)
+    .run(id, email, u.name?.trim() || email.split('@')[0], u.role, u.passwordHash ?? null, u.organizationId, now(), u.ssoProvider ?? null, u.passwordHash ? now() : null);
   return getUser(id)!;
 }
 
 export interface UserUpdate {
+  email?: string;
   name?: string;
   role?: Role;
   isActive?: boolean;
@@ -85,9 +90,13 @@ export interface UserUpdate {
   totpPendingCiphertext?: string | null;
   recoveryCodes?: string[];
   lastTotpStep?: number | null;
+  passwordChangedAt?: string | null;
+  timeZone?: string | null;
+  locale?: string | null;
 }
 
 const COLUMNS: Record<keyof UserUpdate, string> = {
+  email: 'email',
   name: 'name',
   role: 'role',
   isActive: 'is_active',
@@ -99,6 +108,9 @@ const COLUMNS: Record<keyof UserUpdate, string> = {
   totpPendingCiphertext: 'totp_pending_ciphertext',
   recoveryCodes: 'recovery_codes',
   lastTotpStep: 'last_totp_step',
+  passwordChangedAt: 'password_changed_at',
+  timeZone: 'time_zone',
+  locale: 'locale',
 };
 
 export function updateUser(id: string, u: UserUpdate): boolean {

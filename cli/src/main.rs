@@ -19,9 +19,13 @@ use std::process::ExitCode;
 #[derive(Parser, Debug)]
 #[command(name = "ufop", version, about, long_about = None)]
 pub struct Cli {
-    /// Output format
-    #[arg(long, global = true, default_value = "human")]
-    format: OutputFormat,
+    /// Output format (default: the profile's `default_format`, else human)
+    #[arg(long, global = true)]
+    format: Option<OutputFormat>,
+
+    /// Named profile (API server, tokens, format) from the config file
+    #[arg(long, global = true, env = "UFOP_PROFILE")]
+    profile: Option<String>,
 
     /// Output as JSON (shorthand for --format json)
     #[arg(long, global = true, conflicts_with = "yaml")]
@@ -30,6 +34,10 @@ pub struct Cli {
     /// Output as YAML (shorthand for --format yaml)
     #[arg(long, global = true, conflicts_with = "json")]
     yaml: bool,
+
+    /// Output as CSV (shorthand for --format csv)
+    #[arg(long, global = true, conflicts_with_all = ["json", "yaml"])]
+    csv: bool,
 
     /// Dry run - show what would happen without executing
     #[arg(long, global = true)]
@@ -68,6 +76,8 @@ pub enum OutputFormat {
     Human,
     Json,
     Yaml,
+    /// Comma-separated values (RFC 4180) on stdout; messages go to stderr.
+    Csv,
 }
 
 #[derive(Subcommand, Debug)]
@@ -136,6 +146,10 @@ pub enum Commands {
     #[command(subcommand)]
     Agent(commands::agent::AgentCommands),
 
+    /// File gateway: serve local folders through a ufop-server, or use one
+    #[command(subcommand)]
+    Gateway(commands::gateway::GatewayCommands),
+
     /// Check compatibility of paths across platforms
     Compat {
         /// Paths to check
@@ -173,7 +187,7 @@ pub enum Commands {
     Rename {
         /// Files or directory to rename
         path: String,
-        /// Pattern with tokens: {name}, {ext}, {num}, {date}, {parent}, {counter}
+        /// Pattern with tokens: {name} {ext} {num:3} {date} {yyyy} {mm} {dd} {parent} {size} {modified:%Y-%m}; filters {name|lower} {name|slug}
         #[arg(long)]
         pattern: Option<String>,
         /// Find string (literal or regex)
@@ -205,6 +219,13 @@ pub enum Commands {
 
     /// Show server/platform status
     Status,
+
+    /// Serve file tools to an AI client over the Model Context Protocol (stdio), confined to --root directories
+    Mcp(commands::mcp::McpArgs),
+
+    /// Manage named profiles (servers, tokens, output format)
+    #[command(subcommand)]
+    Profile(commands::profile::ProfileCommands),
 }
 
 #[derive(Subcommand, Debug)]
@@ -314,8 +335,12 @@ impl Cli {
             OutputFormat::Json
         } else if self.yaml {
             OutputFormat::Yaml
+        } else if self.csv {
+            OutputFormat::Csv
+        } else if let Some(f) = &self.format {
+            f.clone()
         } else {
-            self.format.clone()
+            config::CliConfig::load().default_format.as_deref().and_then(|f| commands::profile::parse_format(f).ok()).unwrap_or(OutputFormat::Human)
         }
     }
 
@@ -421,7 +446,16 @@ async fn main() -> ExitCode {
     }
 
     tracing::info!(target: "ufop", "ufop {} started", redact_args(std::env::args().skip(1)).join(" "));
+    config::select(cli.profile.clone(), cli.api_url.clone());
     let format = cli.effective_format();
+    // A named profile must exist, except where the command creates it (sign-in) or manages profiles.
+    if let Some(p) = cli.profile.as_deref().filter(|p| !p.is_empty()) {
+        let creates = matches!(cli.command, Commands::Login { .. } | Commands::Profile(_) | Commands::Server(commands::server::ServerCommands::Login { .. }));
+        if !config::valid_profile_name(p) || (!creates && !config::CliConfig::load_raw(&config::CliConfig::path()).has_profile(p)) {
+            output::print_error(&format, &format!("no profile named '{p}' (see `ufop profile list`)"));
+            return ExitCode::from(2);
+        }
+    }
     let dry_run = cli.dry_run;
     let rate_limit = cli.rate_limit_bps();
 
@@ -455,6 +489,9 @@ async fn main() -> ExitCode {
         Commands::Agent(cmd) => {
             commands::agent::execute(cmd, &format).await
         }
+        Commands::Gateway(cmd) => {
+            commands::gateway::execute(cmd, &format).await
+        }
         Commands::Compat { paths, targets } => {
             commands::compat::execute(paths, targets, &format).await
         }
@@ -479,6 +516,12 @@ async fn main() -> ExitCode {
         Commands::Status => {
             commands::status::execute(&format).await
         }
+        Commands::Mcp(args) => {
+            commands::mcp::execute(args).await
+        }
+        Commands::Profile(cmd) => {
+            commands::profile::execute(cmd, &format).await
+        }
     };
 
     match result {
@@ -497,6 +540,15 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod logging_tests {
     use super::*;
+
+    /// Every subcommand's arguments are consistent with the global ones
+    /// (a subcommand `--limit` once collided with the global `--limit`).
+    #[test]
+    fn command_tree_is_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        Cli::try_parse_from(["ufop", "server", "shares", "log", "abc", "-n", "5"]).unwrap();
+    }
 
     #[test]
     fn redacts_secret_options_and_parses_levels() {

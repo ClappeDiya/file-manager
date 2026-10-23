@@ -5,6 +5,7 @@
 //! small job store.
 
 use super::policy;
+use super::managed::ManagedSettings;
 use super::protocol::*;
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,8 @@ pub const RPC_ALLOW: &[&str] = &[
 
 /// Reports kept while the console is unreachable (oldest dropped first).
 pub const MAX_PENDING_REPORTS: usize = 100;
+/// Key of the managed app settings in applied/error reports.
+pub const MANAGED_SETTINGS_KEY: &str = "managed_settings";
 const MIN_HEARTBEAT: u64 = 15;
 const MAX_HEARTBEAT: u64 = 3600;
 const MAX_BACKOFF: u64 = 300;
@@ -70,6 +73,8 @@ pub struct AgentConfig {
     pub dropped_reports: u64,
     /// Set by an explicit unregister: preload/env auto-registration stays off.
     pub auto_register_declined: bool,
+    /// Version of the managed app settings in force (0 = none).
+    pub managed_settings_version: u64,
 }
 
 impl AgentConfig {
@@ -153,6 +158,15 @@ pub trait AgentHost: Send + Sync + 'static {
     fn remove_policy(&self, policy_id: String) -> BoxFuture<'_, Result<(), AppError>>;
     /// Policy ids that have a managed job here.
     fn managed_policies(&self) -> BoxFuture<'_, Vec<String>>;
+    /// Build a diagnostics bundle (logs, versions, OS; no secrets). Hosts
+    /// without one keep the default.
+    /// Apply the organization's app settings (`None`: release them to the user).
+    fn apply_managed_settings(&self, _settings: Option<ManagedSettings>) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn diagnostics(&self) -> BoxFuture<'_, Result<DiagnosticsUpload, AppError>> {
+        Box::pin(async { Err(AppError::state("Diagnostics are not available on this client", "Collect logs on the machine instead.")) })
+    }
 }
 
 struct PendingClaim {
@@ -326,6 +340,32 @@ impl<H: AgentHost> Agent<H> {
         self.finish_enrollment(client.base_url(), r.machine_id, r.agent_token, r.organization, r.heartbeat_seconds, tags, "link").await
     }
 
+    /// The console URL a browser sign-in starts at (`/fleet/connect`), for the
+    /// loopback `redirect_uri`, `state` and PKCE S256 `code_challenge`.
+    pub fn connect_url(&self, console_url: &str, redirect_uri: &str, state: &str, code_challenge: &str) -> Result<String, AppError> {
+        self.ensure_unregistered()?;
+        let base = normalize_console_url(console_url)?;
+        let info = self.host.client_info();
+        let mut u = reqwest::Url::parse(&format!("{base}/fleet/connect")).map_err(|e| AppError::validation(format!("Invalid console URL: {e}")))?;
+        u.query_pairs_mut()
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("state", state)
+            .append_pair("code_challenge", code_challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("hostname", &info.hostname)
+            .append_pair("name", info.name.as_deref().unwrap_or(&info.hostname));
+        Ok(u.to_string())
+    }
+
+    /// Finish a browser sign-in: redeem the code from the loopback redirect.
+    pub async fn register_with_code(&self, console_url: &str, code: &str, code_verifier: &str, redirect_uri: &str, tags: Vec<String>) -> Result<AgentStatus, AppError> {
+        self.ensure_unregistered()?;
+        let client = self.client(console_url)?;
+        let r = client.connect_token(code, code_verifier, redirect_uri, &self.host.client_info(), &tags).await?;
+        *lock(&self.claim) = None;
+        self.finish_enrollment(client.base_url(), r.machine_id, r.agent_token, r.organization, r.heartbeat_seconds, tags, "sso").await
+    }
+
     /// Start interactive claiming: show the returned code to the user.
     pub async fn start_claim(&self, console_url: &str) -> Result<ClaimStatus, AppError> {
         self.ensure_unregistered()?;
@@ -382,6 +422,11 @@ impl<H: AgentHost> Agent<H> {
         }
         for cred in &c.central_credentials {
             let _ = self.host.store_credential(cred.clone(), None).await;
+        }
+        if c.managed_settings_version > 0 {
+            if let Err(e) = self.host.apply_managed_settings(None).await {
+                tracing::warn!("Could not release the managed app settings: {}", e.user_message());
+            }
         }
         self.host.save_token(None).await?;
         *lock(&self.token) = None;
@@ -487,6 +532,7 @@ impl<H: AgentHost> Agent<H> {
                 _ => Err(AppError::validation("run_backup needs a jobId")),
             },
             "apply_policies" => self.sync_policies(client, token).await.and_then(|s| Ok(serde_json::to_value(s)?)),
+            "collect_diagnostics" => self.upload_diagnostics(client, token).await.map(|id| json!({ "diagnosticsId": id })),
             other => Err(AppError::validation(format!("Unknown command kind '{other}'"))),
         };
         match r {
@@ -495,18 +541,45 @@ impl<H: AgentHost> Agent<H> {
         }
     }
 
+    async fn upload_diagnostics(&self, client: &AgentClient, token: &str) -> Result<String, AppError> {
+        let d = self.host.diagnostics().await?;
+        if d.bytes.len() > MAX_DIAGNOSTICS_BYTES {
+            return Err(AppError::validation(format!("The diagnostics bundle is {} bytes; the limit is {MAX_DIAGNOSTICS_BYTES}", d.bytes.len())));
+        }
+        Ok(client.diagnostics(token, &d).await?)
+    }
+
+    /// Build a diagnostics bundle and send it to the console ("Send diagnostics").
+    pub async fn send_diagnostics(&self) -> Result<String, AppError> {
+        let c = self.config();
+        let t = self.token().filter(|_| c.is_registered()).ok_or_else(|| AppError::state("This machine is not registered", "Register it with a console first."))?;
+        self.upload_diagnostics(&self.client(&c.console_url)?, &t).await
+    }
+
     async fn sync_policies(&self, client: &AgentClient, token: &str) -> Result<PolicySync, AppError> {
         let bundle = client.policies(token).await?;
         let mut delivered = Vec::new();
         let mut errors = BTreeMap::new();
+        // Versions of the credentials now in the secure store, reported to the
+        // console as `credential:<id>` so it can follow a rotation.
+        let mut credential_versions = BTreeMap::new();
         for c in bundle.credentials {
             let Some(id) = policy::central_credential_id(&c.credential_id) else {
                 tracing::warn!("Ignoring a central credential with a malformed id");
                 continue;
             };
+            let key = format!("credential:{}", id.trim_start_matches(policy::CENTRAL_PREFIX));
             match self.host.store_credential(id.clone(), Some(c.secret)).await {
-                Ok(()) => delivered.push(id),
-                Err(e) => tracing::warn!("Could not store central credential {id}: {}", e.user_message()),
+                Ok(()) => {
+                    if c.version > 0 {
+                        credential_versions.insert(key, c.version);
+                    }
+                    delivered.push(id)
+                }
+                Err(e) => {
+                    tracing::warn!("Could not store central credential {id}: {}", e.user_message());
+                    errors.insert(key, e.user_message());
+                }
             }
         }
         let previous = self.config();
@@ -537,7 +610,34 @@ impl<H: AgentHost> Agent<H> {
                 Err(e) => tracing::warn!("Could not remove the managed job of policy {id}: {}", e.user_message()),
             }
         }
-        if let Err(e) = client.policies_applied(token, &applied, &errors).await {
+        let mut settings_version = previous.managed_settings_version;
+        let wanted = bundle.managed_settings.as_ref().map(|s| s.version).unwrap_or(0);
+        // Also once per start: hosts that keep no copy get them back.
+        let first_sync = !self.policies_fetched.load(Ordering::SeqCst);
+        if wanted != settings_version || (first_sync && wanted > 0) {
+            let r = match &bundle.managed_settings {
+                Some(s) => s.validate().map_err(AppError::validation),
+                None => Ok(()),
+            };
+            match r {
+                Ok(()) => match self.host.apply_managed_settings(bundle.managed_settings.clone()).await {
+                    Ok(()) => settings_version = wanted,
+                    Err(e) => {
+                        errors.insert(MANAGED_SETTINGS_KEY.into(), e.user_message());
+                    }
+                },
+                Err(e) => {
+                    errors.insert(MANAGED_SETTINGS_KEY.into(), e.user_message());
+                }
+            }
+        }
+        // The console sees the settings version next to the policies.
+        let mut reported = applied.clone();
+        reported.extend(credential_versions);
+        if settings_version > 0 {
+            reported.insert(MANAGED_SETTINGS_KEY.into(), settings_version);
+        }
+        if let Err(e) = client.policies_applied(token, &reported, &errors).await {
             tracing::warn!("Could not report applied policies: {e}");
         }
         self.update(|c| {
@@ -545,6 +645,7 @@ impl<H: AgentHost> Agent<H> {
             c.applied_policies = applied.clone();
             c.policy_errors = errors.clone();
             c.central_credentials = delivered;
+            c.managed_settings_version = settings_version;
         });
         self.policies_fetched.store(true, Ordering::SeqCst);
         self.persist().await;

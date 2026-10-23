@@ -1,5 +1,6 @@
 use crate::core::error::AppError;
 use crate::core::types::FileEntry;
+use crate::metadata_engine::MetadataStore;
 use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -213,6 +214,46 @@ pub async fn copy_files(
     with_fs_failure_record(&ledger, "copy", &source_paths, outcome).await
 }
 
+/// Outcome of copying a selection into one of several destinations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DestinationOutcome {
+    pub dest_dir: String,
+    pub result: Option<FileOpResult>,
+    pub error: Option<String>,
+}
+
+/// Copy the same selection into several folders. Each destination is its
+/// own ledger operation (own undo); one failing does not stop the others.
+#[tauri::command]
+pub async fn copy_files_to_many(
+    source_paths: Vec<String>,
+    dest_dirs: Vec<String>,
+    ledger: tauri::State<'_, OperationLedger>,
+) -> Result<Vec<DestinationOutcome>, AppError> {
+    copy_files_to_many_impl(source_paths, dest_dirs, &ledger).await
+}
+
+pub async fn copy_files_to_many_impl(
+    source_paths: Vec<String>,
+    dest_dirs: Vec<String>,
+    ledger: &OperationLedger,
+) -> Result<Vec<DestinationOutcome>, AppError> {
+    if dest_dirs.is_empty() {
+        return Err(AppError::validation("Choose at least one destination folder."));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for dest_dir in dest_dirs.into_iter().filter(|d| seen.insert(d.clone())) {
+        let outcome = copy_files_impl(source_paths.clone(), dest_dir.clone(), ledger).await;
+        let outcome = with_fs_failure_record(ledger, "copy", &source_paths, outcome).await;
+        out.push(match outcome {
+            Ok(r) => DestinationOutcome { dest_dir, result: Some(r), error: None },
+            Err(e) => DestinationOutcome { dest_dir, result: None, error: Some(e.user_message()) },
+        });
+    }
+    Ok(out)
+}
+
 /// What a selection would actually touch on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AffectedFiles {
@@ -386,6 +427,7 @@ pub async fn copy_files_impl(
             "Check that the destination folder exists.",
         ));
     }
+    super::policy_commands::enforce_copy(&source_paths, &dest_dir)?;
 
     let mut dest_paths = Vec::new();
     let mut copied_sources = Vec::new();
@@ -421,9 +463,12 @@ pub async fn move_files(
     source_paths: Vec<String>,
     dest_dir: String,
     ledger: tauri::State<'_, OperationLedger>,
+    metadata: tauri::State<'_, MetadataStore>,
 ) -> Result<FileOpResult, AppError> {
     let outcome = move_files_impl(source_paths.clone(), dest_dir, &ledger).await;
-    with_fs_failure_record(&ledger, "move", &source_paths, outcome).await
+    let result = with_fs_failure_record(&ledger, "move", &source_paths, outcome).await?;
+    metadata.follow_fs_op("move", &result.source_paths, &result.dest_paths, false).await;
+    Ok(result)
 }
 
 /// Move a single entry into `dest_dir`, returning the path it landed at.
@@ -506,6 +551,7 @@ pub async fn move_files_impl(
         ));
     }
 
+    super::policy_commands::enforce_copy(&source_paths, &dest_dir)?;
     // Measure first: once moved, the sources are gone from their old paths.
     let affected_files = measure_paths(&source_paths);
     let mut dest_paths = Vec::new();
@@ -543,10 +589,13 @@ pub async fn rename_file(
     path: String,
     new_name: String,
     ledger: tauri::State<'_, OperationLedger>,
+    metadata: tauri::State<'_, MetadataStore>,
 ) -> Result<FileOpResult, AppError> {
     let sources = vec![path.clone()];
     let outcome = rename_file_impl(path, new_name, &ledger).await;
-    with_fs_failure_record(&ledger, "rename", &sources, outcome).await
+    let result = with_fs_failure_record(&ledger, "rename", &sources, outcome).await?;
+    metadata.follow_fs_op("rename", &result.source_paths, &result.dest_paths, false).await;
+    Ok(result)
 }
 
 pub async fn rename_file_impl(
@@ -580,6 +629,9 @@ pub async fn rename_file_impl(
             format!("A file named '{new_name}' already exists"),
             "Choose a different name.",
         ));
+    }
+    if !src.is_dir() {
+        super::policy_commands::enforce_path(&target)?;
     }
 
     std::fs::rename(src, &target).map_err(|e| {
@@ -681,12 +733,16 @@ pub async fn delete_files(
     paths: Vec<String>,
     permanent: bool,
     ledger: tauri::State<'_, OperationLedger>,
+    metadata: tauri::State<'_, MetadataStore>,
 ) -> Result<FileOpResult, AppError> {
     // Mirror the kind the impl records on success, so a failed delete lands
     // under the same kind as a successful one in the timeline.
     let kind = if permanent { "delete_permanent" } else { "delete_trash" };
     let outcome = delete_files_impl(paths.clone(), permanent, &ledger).await;
-    with_fs_failure_record(&ledger, kind, &paths, outcome).await
+    let result = with_fs_failure_record(&ledger, kind, &paths, outcome).await?;
+    // Trashed items keep their metadata so an undo restores it intact.
+    metadata.follow_fs_op(kind, &result.source_paths, &result.dest_paths, false).await;
+    Ok(result)
 }
 
 /// Delete a single existing entry, to the OS trash unless `permanent`.
@@ -877,6 +933,7 @@ pub async fn create_file_impl(
         ));
     }
 
+    super::policy_commands::enforce_path(p)?;
     // Ensure parent directory exists
     if let Some(parent) = p.parent() {
         if !parent.exists() {
@@ -909,9 +966,22 @@ pub async fn create_file_impl(
     })
 }
 
-/// Undo a previous file operation by reversing it.
+/// Undo a previous file operation by reversing it; metadata follows moved
+/// and renamed files back.
 #[tauri::command]
 pub async fn undo_file_operation(
+    operation: String,
+    source_paths: Vec<String>,
+    dest_paths: Vec<String>,
+    metadata: tauri::State<'_, MetadataStore>,
+) -> Result<bool, AppError> {
+    let done = undo_file_operation_inner(operation.clone(), source_paths.clone(), dest_paths.clone()).await?;
+    metadata.follow_fs_op(&operation, &source_paths, &dest_paths, true).await;
+    Ok(done)
+}
+
+/// The filesystem part of [`undo_file_operation`].
+pub async fn undo_file_operation_inner(
     operation: String,
     source_paths: Vec<String>,
     dest_paths: Vec<String>,
@@ -998,6 +1068,18 @@ pub async fn undo_file_operation(
 /// why the redo could not complete.
 #[tauri::command]
 pub async fn redo_file_operation(
+    operation: String,
+    source_paths: Vec<String>,
+    dest_paths: Vec<String>,
+    metadata: tauri::State<'_, MetadataStore>,
+) -> Result<bool, AppError> {
+    let done = redo_file_operation_inner(operation.clone(), source_paths.clone(), dest_paths.clone()).await?;
+    metadata.follow_fs_op(&operation, &source_paths, &dest_paths, false).await;
+    Ok(done)
+}
+
+/// The filesystem part of [`redo_file_operation`].
+pub async fn redo_file_operation_inner(
     operation: String,
     source_paths: Vec<String>,
     dest_paths: Vec<String>,
@@ -1922,6 +2004,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filename_policy_blocks_copy_move_rename_and_create() {
+        use ufop_core::policy::{set_active, FilenameRule, PolicySet};
+        let dir = tempdir().unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+        let folder = dir.path().join("pkg");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("inner.zz-fileops"), "x").unwrap();
+        let ok = dir.path().join("ok.txt");
+        fs::write(&ok, "x").unwrap();
+        let dest = dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        // Unique extension: the active set is process-wide.
+        set_active(PolicySet::new(vec![FilenameRule { blocked_extensions: vec!["zz-fileops".into()], ..FilenameRule::new("t", "") }]).unwrap());
+        let l = test_ledger();
+        let copy = copy_files_impl(vec![s(&folder)], s(&dest), &l).await;
+        let mv = move_files_impl(vec![s(&folder)], s(&dest), &l).await;
+        let ren = rename_file_impl(s(&ok), "ok.zz-fileops".into(), &l).await;
+        let create = create_file_impl(s(&dest.join("new.zz-fileops")), &l).await;
+        let allowed = copy_files_impl(vec![s(&ok)], s(&dest), &l).await;
+        set_active(PolicySet::default());
+        for r in [copy.map(|_| ()), mv.map(|_| ()), ren.map(|_| ()), create.map(|_| ())] {
+            assert!(r.unwrap_err().to_string().contains("Blocked by filename policy"));
+        }
+        assert!(allowed.is_ok());
+        assert!(!dest.join("pkg").exists() && folder.exists() && ok.exists());
+    }
+
+    #[tokio::test]
+    async fn copy_to_many_continues_past_a_bad_destination() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, "x").unwrap();
+        let (d1, d2) = (dir.path().join("d1"), dir.path().join("d2"));
+        fs::create_dir(&d1).unwrap();
+        fs::create_dir(&d2).unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+        let l = test_ledger();
+        let out = copy_files_to_many_impl(
+            vec![s(&src)],
+            vec![s(&d1), s(&dir.path().join("missing")), s(&d2), s(&d1)],
+            &l,
+        )
+        .await
+        .unwrap();
+        // Duplicates collapse; the missing folder fails alone.
+        assert_eq!(out.len(), 3);
+        assert!(out[0].result.is_some() && out[2].result.is_some());
+        assert!(out[1].error.as_deref().unwrap().contains("does not exist"));
+        assert!(d1.join("a.txt").exists() && d2.join("a.txt").exists());
+        assert_ne!(out[0].result.as_ref().unwrap().undo_id, out[2].result.as_ref().unwrap().undo_id);
+        assert!(copy_files_to_many_impl(vec![s(&src)], vec![], &l).await.is_err());
+    }
+
+    #[tokio::test]
     async fn test_copy_files_conflict_resolution() {
         let dir = tempdir().unwrap();
         let src = dir.path().join("file.txt");
@@ -2014,7 +2150,7 @@ mod tests {
         .await
         .unwrap();
 
-        let undo_result = undo_file_operation(
+        let undo_result = undo_file_operation_inner(
             result.operation,
             result.source_paths,
             result.dest_paths.clone(),
@@ -2040,7 +2176,7 @@ mod tests {
         .await
         .unwrap();
 
-        undo_file_operation(
+        undo_file_operation_inner(
             result.operation,
             result.source_paths,
             result.dest_paths,
@@ -2059,7 +2195,7 @@ mod tests {
         let l = test_ledger();
         let result = create_file_impl(file_path.clone(), &l).await.unwrap();
 
-        undo_file_operation(
+        undo_file_operation_inner(
             result.operation,
             result.source_paths,
             result.dest_paths,

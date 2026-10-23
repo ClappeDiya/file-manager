@@ -103,6 +103,66 @@ fn all_migrations() -> Vec<Migration> {
             // The work needs SHA-256, so it runs in Rust: see `rust_step`.
             sql: "",
         },
+        Migration {
+            version: 18,
+            description: "File metadata - color tags, labels, key-value metadata, smart folders",
+            sql: V18_SCHEMA,
+        },
+        Migration {
+            version: 19,
+            description: "Automation v1.5 - condition trees, steps, options; per-step run results",
+            sql: V19_SCHEMA,
+        },
+        Migration {
+            version: 20,
+            description: "Sync run options - settle window, completion marker, version naming",
+            sql: V20_SCHEMA,
+        },
+        Migration {
+            version: 21,
+            description: "Connection settings_json - persists advanced options and extras",
+            sql: V21_SCHEMA,
+        },
+        Migration {
+            version: 22,
+            description: "ufop-server scoped, expiring API tokens",
+            sql: V22_SCHEMA,
+        },
+        Migration {
+            version: 23,
+            description: "Metadata schemas - typed, required fields per folder",
+            sql: V23_SCHEMA,
+        },
+        Migration {
+            version: 24,
+            description: "ufop-server share portal - links and their access log",
+            sql: V24_SCHEMA,
+        },
+        Migration {
+            version: 25,
+            description: "Mount options - cache mode, cache limits, read-only; mount error column",
+            sql: V25_SCHEMA,
+        },
+        Migration {
+            version: 26,
+            description: "ufop-server folder policies - lock, extensions, limits, link rules, intake naming",
+            sql: V26_SCHEMA,
+        },
+        Migration {
+            version: 27,
+            description: "Named schedules and holiday calendars shared by sync, automation and backup",
+            sql: V27_SCHEMA,
+        },
+        Migration {
+            version: 28,
+            description: "Automation rule revisions (workflow history)",
+            sql: V28_SCHEMA,
+        },
+        Migration {
+            version: 29,
+            description: "OAuth clients and refresh tokens for ufop-server's MCP endpoint",
+            sql: V29_SCHEMA,
+        },
     ]
 }
 
@@ -115,6 +175,189 @@ fn rust_step(version: u32) -> Option<fn(&Connection) -> Result<(), AppError>> {
         _ => None,
     }
 }
+
+/// Schema v21: profile fields with no column (upload modes, FTP tuning,
+/// symlink policy, connector extras) as JSON; previously never saved.
+/// Schema v22: named `ufop-server` API tokens (SHA-256 hashes) with scopes
+/// (JSON list) and a mandatory expiry.
+/// Schema v26: folder policies of folders ufop-server shares (`server::folders`).
+/// Schema v29: OAuth 2.1 for `ufop-server`'s `/mcp` (`server::mcp_oauth`):
+/// dynamically registered public clients and rotating refresh tokens
+/// (SHA-256 hashes), each tied to the API token it last issued.
+const V29_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_oauth_clients (
+    client_id     TEXT PRIMARY KEY NOT NULL,
+    client_name   TEXT NOT NULL,
+    redirect_uris TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS server_oauth_refresh (
+    token_hash      TEXT PRIMARY KEY NOT NULL,
+    client_id       TEXT NOT NULL REFERENCES server_oauth_clients(client_id) ON DELETE CASCADE,
+    scope           TEXT NOT NULL,
+    access_token_id TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    revoked         INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
+/// Schema v28: earlier versions of automation rules, kept when a rule is edited.
+const V28_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS automation_rule_revisions (
+    rule_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    saved_at TEXT NOT NULL,
+    PRIMARY KEY (rule_id, revision)
+);
+"#;
+
+/// Schema v27: the schedule library (`schedule_library`): named cron
+/// schedules and holiday calendars (each as JSON).
+const V27_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS named_schedules (
+    id TEXT PRIMARY KEY NOT NULL,
+    data TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS holiday_calendars (
+    id TEXT PRIMARY KEY NOT NULL,
+    data TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
+const V26_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_folder_policies (
+    path TEXT PRIMARY KEY NOT NULL,
+    settings TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
+/// Schema v25: per-mount options (`mount_engine::MountOptions` as JSON), and
+/// the `error_message` column the mount engine always wrote but v7 never
+/// created (every mount ended in a database error).
+const V25_SCHEMA: &str = r#"
+ALTER TABLE mount_configs ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE mount_configs ADD COLUMN error_message TEXT;
+"#;
+
+/// Schema v24: ufop-server share links (`server::shares`). Only a hash of
+/// each link's token is stored.
+const V24_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_shares (
+    id TEXT PRIMARY KEY NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    token_prefix TEXT NOT NULL,
+    name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    password_hash TEXT,
+    expires_at TEXT,
+    max_downloads INTEGER,
+    downloads INTEGER NOT NULL DEFAULT 0,
+    max_upload_bytes INTEGER,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT,
+    last_access_at TEXT
+);
+CREATE TABLE IF NOT EXISTS server_share_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    share_id TEXT NOT NULL REFERENCES server_shares(id) ON DELETE CASCADE,
+    at TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_server_share_events_share ON server_share_events(share_id, id);
+"#;
+
+/// Schema v23: metadata schemas (`metadata_engine::schema`). One per folder;
+/// `recursive` schemas also govern subfolders (the nearest one wins).
+const V23_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS metadata_schemas (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    folder TEXT NOT NULL UNIQUE,
+    fields_json TEXT NOT NULL DEFAULT '[]',
+    strict INTEGER NOT NULL DEFAULT 0,
+    recursive INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
+const V22_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_api_tokens (
+    id           TEXT PRIMARY KEY NOT NULL,
+    name         TEXT NOT NULL,
+    token_hash   TEXT NOT NULL UNIQUE,
+    scopes       TEXT NOT NULL DEFAULT '[]',
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked      INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
+const V21_SCHEMA: &str = r#"
+ALTER TABLE connections ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}';
+"#;
+
+/// Schema v20: per-pair run options (`SyncRunOptions`); `{}` = defaults.
+const V20_SCHEMA: &str = r#"
+ALTER TABLE sync_pairs ADD COLUMN run_options_json TEXT NOT NULL DEFAULT '{}';
+"#;
+
+/// Schema v19: automation rule extras (condition tree, steps, options) and
+/// per-step results/attempt counts on runs. Old rows read as `{}`/`[]`,
+/// which deserialize to the previous behaviour.
+const V19_SCHEMA: &str = r#"
+ALTER TABLE automation_rules ADD COLUMN extra_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE automation_logs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE automation_logs ADD COLUMN steps_json TEXT NOT NULL DEFAULT '[]';
+"#;
+
+/// Schema v18: file metadata (previously held in memory and lost on quit).
+/// Rows are keyed by absolute path; see `metadata_engine`.
+const V18_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS file_tag_defs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    color TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS file_tag_links (
+    path TEXT NOT NULL,
+    tag_id TEXT NOT NULL REFERENCES file_tag_defs(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (path, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_file_tag_links_tag ON file_tag_links(tag_id);
+CREATE TABLE IF NOT EXISTS file_labels (
+    path TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (path, label)
+);
+CREATE TABLE IF NOT EXISTS file_metadata (
+    path TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (path, key)
+);
+CREATE INDEX IF NOT EXISTS idx_file_metadata_key_value ON file_metadata(key, value);
+CREATE TABLE IF NOT EXISTS smart_folders (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    query_json TEXT NOT NULL,
+    icon TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
 
 /// Schema v16: every finished sync run, kept across restarts.
 const V16_SCHEMA: &str = r#"
@@ -799,7 +1042,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 17);
+        assert_eq!(applied, 29);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -824,6 +1067,9 @@ mod tests {
         assert!(tables.contains(&"mount_configs".to_string()));
         assert!(tables.contains(&"backup_jobs".to_string()));
         assert!(tables.contains(&"backup_runs".to_string()));
+        for t in ["file_tag_defs", "file_tag_links", "file_labels", "file_metadata", "smart_folders"] {
+            assert!(tables.contains(&t.to_string()), "missing {t}");
+        }
         assert!(tables.contains(&"_migrations".to_string()));
     }
 
@@ -831,7 +1077,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 17);
+        assert_eq!(first, 29);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -844,7 +1090,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 17);
+        assert_eq!(current_version(&conn).unwrap(), 29);
     }
 
     #[test]

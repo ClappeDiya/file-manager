@@ -81,7 +81,7 @@ struct TokenResponse {
 
 impl OAuthBroker {
     pub fn new(cfg: BrokerConfig, store: Arc<dyn Backend>) -> Self {
-        Self { cfg: Arc::new(cfg), store, pending: Arc::new(Mutex::new(HashMap::new())), http: reqwest::Client::new() }
+        Self { cfg: Arc::new(cfg), store, pending: Arc::new(Mutex::new(HashMap::new())), http: crate::net::client() }
     }
 
     fn redirect_uri(&self) -> String {
@@ -218,8 +218,8 @@ async fn callback(State(st): State<ServerState>, Query(q): Query<CallbackQuery>)
     .into_response())
 }
 
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+pub(crate) fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
 
 #[derive(Deserialize)]

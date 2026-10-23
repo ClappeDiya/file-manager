@@ -1,5 +1,6 @@
 /**
- * Single sign-on flows.
+ * Single sign-on flows (LDAP directory sign-in is in `ldap.ts`; it shares
+ * `resolveUser`).
  *
  * OIDC: authorization code with PKCE (S256), `state` and `nonce`; the ID
  * token is verified against the issuer's JWKS (signature, issuer, audience,
@@ -15,11 +16,37 @@
 import crypto from 'crypto';
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
 import { SAML, ValidateInResponseTo } from '@node-saml/node-saml';
-import { getProvider, providerSecret, samlRequestCache, saveState, findIdentity, linkIdentity, type OidcConfig, type SamlConfig, type SsoProvider } from './db/repos/sso';
+import { getProvider, providerSecret, samlRequestCache, saveState, findIdentity, linkIdentity, type OidcConfig, type SamlConfig, type SsoProvider, type SsoStep } from './db/repos/sso';
 import { createUser, findUserByEmail, getUser, type UserRecord } from './db/repos/users';
 import { effectiveRole, OrgError, setMembership } from './db/repos/orgs';
 import { getGroup, setGroupMember } from './db/repos/groups';
 import { appendAudit } from './db/repos/audit';
+
+/**
+ * What happened during one sign-in, step by step, for Settings → SSO →
+ * Diagnostics. It records claim names and the identity fields the console
+ * uses (subject, email, name, groups, issuer, audience, times), never tokens,
+ * assertions or signatures.
+ */
+export class SsoTrace {
+  readonly steps: SsoStep[] = [];
+  stage = 'start';
+  email = '';
+
+  ok(step: string, detail?: Record<string, unknown>): void {
+    this.stage = step;
+    this.steps.push({ step, ok: true, ...(detail ? { detail } : {}) });
+  }
+
+  fail(step: string, message: string, detail?: Record<string, unknown>): OrgError {
+    this.stage = step;
+    this.steps.push({ step, ok: false, detail: { error: message, ...detail } });
+    return new OrgError(message, 401);
+  }
+}
+
+const noTrace = () => new SsoTrace();
+const unixTime = (v: unknown) => (typeof v === 'number' ? new Date(v * 1000).toISOString() : null);
 
 interface Discovery {
   issuer: string;
@@ -74,6 +101,8 @@ export function samlMetadata(p: SsoProvider, origin: string): string {
 /** Where to send the browser to start signing in. */
 export async function startUrl(p: SsoProvider, origin: string, redirect: string, linkUserId: string | null): Promise<string> {
   if (!p.enabled) throw new OrgError('This sign-in method is disabled', 403);
+  // Directory sign-in takes a user name and password on the console's own page.
+  if (p.kind === 'ldap') throw new OrgError('Sign in with your directory user name and password on the sign-in page', 400);
   const state = b64url(crypto.randomBytes(24));
   if (p.kind === 'oidc') {
     const c = p.config as OidcConfig;
@@ -108,9 +137,15 @@ export interface IdpIdentity {
 }
 
 /** OIDC callback: exchange the code and verify the ID token. */
-export async function oidcIdentity(p: SsoProvider, origin: string, code: string, st: { nonce: string; codeVerifier: string }): Promise<IdpIdentity> {
+export async function oidcIdentity(p: SsoProvider, origin: string, code: string, st: { nonce: string; codeVerifier: string }, trace: SsoTrace = noTrace()): Promise<IdpIdentity> {
   const c = p.config as OidcConfig;
-  const d = await discover(c.issuer);
+  let d: Discovery;
+  try {
+    d = await discover(c.issuer);
+  } catch (e) {
+    throw trace.fail('discovery', (e as Error).message, { issuer: c.issuer });
+  }
+  trace.ok('discovery', { issuer: d.issuer, tokenEndpoint: d.token_endpoint, jwksUri: d.jwks_uri });
   const secret = providerSecret(p.id) ?? '';
   const res = await fetch(d.token_endpoint, {
     method: 'POST',
@@ -119,16 +154,33 @@ export async function oidcIdentity(p: SsoProvider, origin: string, code: string,
     signal: AbortSignal.timeout(15_000),
   });
   const tok = (await res.json().catch(() => ({}))) as { id_token?: string; access_token?: string; error?: string; error_description?: string };
-  if (!res.ok || !tok.id_token) throw new OrgError(`Sign-in failed at the identity provider: ${tok.error_description ?? tok.error ?? `HTTP ${res.status}`}`, 401);
+  if (!res.ok || !tok.id_token) throw trace.fail('token_exchange', `Sign-in failed at the identity provider: ${tok.error_description ?? tok.error ?? `HTTP ${res.status}`}`, { status: res.status, error: tok.error ?? null, idToken: !!tok.id_token });
+  trace.ok('token_exchange', { status: res.status, accessToken: !!tok.access_token });
   let jwks = jwksCache.get(d.jwks_uri);
   if (!jwks) jwksCache.set(d.jwks_uri, (jwks = createRemoteJWKSet(new URL(d.jwks_uri))));
   let claims: JWTPayload & Record<string, unknown>;
   try {
     claims = (await jwtVerify(tok.id_token, jwks, { issuer: d.issuer, audience: c.clientId, clockTolerance: 60 })).payload as JWTPayload & Record<string, unknown>;
   } catch (e) {
-    throw new OrgError(`The identity token could not be verified: ${(e as Error).message}`, 401);
+    // Show what the token claimed (unverified) next to what was expected.
+    let unverified: Record<string, unknown> = {};
+    try {
+      unverified = JSON.parse(Buffer.from(tok.id_token.split('.')[1] ?? '', 'base64url').toString('utf8'));
+    } catch {
+      // not a JWT
+    }
+    throw trace.fail('token_verify', `The identity token could not be verified: ${(e as Error).message}`, {
+      expectedIssuer: d.issuer,
+      expectedAudience: c.clientId,
+      issuer: unverified.iss ?? null,
+      audience: unverified.aud ?? null,
+      issuedAt: unixTime(unverified.iat),
+      expiresAt: unixTime(unverified.exp),
+      serverTime: new Date().toISOString(),
+    });
   }
-  if (claims.nonce !== st.nonce) throw new OrgError('The identity token does not belong to this sign-in (nonce mismatch)', 401);
+  trace.ok('token_verify', { issuer: claims.iss, audience: claims.aud, issuedAt: unixTime(claims.iat), expiresAt: unixTime(claims.exp) });
+  if (claims.nonce !== st.nonce) throw trace.fail('nonce', 'The identity token does not belong to this sign-in (nonce mismatch)');
   const groupsClaim = c.groupsClaim || 'groups';
   // Conforming providers keep scope claims out of the ID token when an access
   // token is issued; fetch them from userinfo (same subject required).
@@ -136,8 +188,10 @@ export async function oidcIdentity(p: SsoProvider, origin: string, code: string,
     const ui = await fetch(d.userinfo_endpoint, { headers: { authorization: `Bearer ${tok.access_token}` }, signal: AbortSignal.timeout(10_000) });
     const info = ui.ok ? ((await ui.json().catch(() => ({}))) as Record<string, unknown>) : {};
     if (info.sub === claims.sub) for (const [k, v] of Object.entries(info)) if (claims[k] === undefined) claims[k] = v;
+    trace.ok('userinfo', { status: ui.status, sameSubject: info.sub === claims.sub, fields: Object.keys(info).sort() });
   }
   const g = claims[groupsClaim];
+  trace.ok('claims', { names: Object.keys(claims).sort(), sub: claims.sub, email: claims.email ?? null, emailVerified: claims.email_verified ?? null, name: claims.name ?? claims.preferred_username ?? null, groupsClaim, groups: Array.isArray(g) ? g.slice(0, 50) : (g ?? null) });
   return {
     subject: String(claims.sub ?? ''),
     email: String(claims.email ?? '').toLowerCase(),
@@ -148,18 +202,20 @@ export async function oidcIdentity(p: SsoProvider, origin: string, code: string,
 }
 
 /** SAML ACS: validate the posted response. Returns the identity and our RelayState. */
-export async function samlIdentity(p: SsoProvider, origin: string, body: Record<string, string>): Promise<{ identity: IdpIdentity; relayState: string }> {
+export async function samlIdentity(p: SsoProvider, origin: string, body: Record<string, string>, trace: SsoTrace = noTrace()): Promise<{ identity: IdpIdentity; relayState: string }> {
   const c = p.config as SamlConfig;
   let profile;
   try {
     ({ profile } = await samlClient(p, origin).validatePostResponseAsync(body));
   } catch (e) {
-    throw new OrgError(`The SAML response was rejected: ${(e as Error).message}`, 401);
+    throw trace.fail('saml_validate', `The SAML response was rejected: ${(e as Error).message}`, { expectedAudience: `${origin}/api/auth/sso/${p.id}/metadata`, expectedIssuer: (p.config as SamlConfig).idpIssuer ?? null, serverTime: new Date().toISOString() });
   }
-  if (!profile) throw new OrgError('The SAML response contained no assertion', 401);
+  if (!profile) throw trace.fail('saml_validate', 'The SAML response contained no assertion');
+  trace.ok('saml_validate', { issuer: profile.issuer ?? null, nameIdFormat: profile.nameIDFormat ?? null });
   const attr = (name: string | undefined) => (name ? profile[name] : undefined);
   const email = String(attr(c.emailAttribute) ?? profile.email ?? profile.mail ?? profile['urn:oid:0.9.2342.19200300.100.1.3'] ?? (profile.nameID?.includes('@') ? profile.nameID : '')).toLowerCase();
   const groups = attr(c.groupsAttribute || 'groups');
+  trace.ok('assertion', { nameId: profile.nameID, attributes: Object.keys(profile).filter((k) => !['issuer', 'nameID', 'nameIDFormat', 'sessionIndex', 'getAssertionXml', 'getAssertion', 'getSamlResponseXml'].includes(k)).sort(), email: email || null, groups: Array.isArray(groups) ? groups.slice(0, 50) : (groups ?? null) });
   return {
     identity: { subject: profile.nameID, email, emailVerified: !!email, name: String(attr(c.nameAttribute || 'displayName') ?? ''), groups: Array.isArray(groups) ? groups.map(String) : typeof groups === 'string' ? [groups] : [] },
     relayState: body.RelayState ?? '',
@@ -167,41 +223,51 @@ export async function samlIdentity(p: SsoProvider, origin: string, body: Record<
 }
 
 /** Map the IdP identity to a console account (see the module comment). */
-export function resolveUser(p: SsoProvider, id: IdpIdentity, linkUserId: string | null, ip: string): UserRecord {
-  if (!id.subject) throw new OrgError('The identity provider sent no subject', 401);
+export function resolveUser(p: SsoProvider, id: IdpIdentity, linkUserId: string | null, ip: string, trace: SsoTrace = noTrace()): UserRecord {
+  trace.email = id.email;
+  const account = (how: string, u: UserRecord) => {
+    trace.ok('account', { how, userId: u.id, email: u.email });
+    return u;
+  };
+  // Account rules keep their own status codes (403 deactivated, 409 existing account).
+  const refuse = (message: string, status: number) => {
+    trace.fail('account', message);
+    return new OrgError(message, status);
+  };
+  if (!id.subject) throw refuse('The identity provider sent no subject', 401);
   const audit = (description: string, userId: string, email: string, eventType = 'auth.sso') => appendAudit({ eventType, orgId: p.orgId, userId, userEmail: email, ipAddress: ip, description, metadata: { providerId: p.id } });
   // Explicit link from an already signed-in user (linked login methods).
   if (linkUserId) {
     const u = getUser(linkUserId);
-    if (!u?.isActive) throw new OrgError('Sign in again before linking', 401);
+    if (!u?.isActive) throw refuse('Sign in again before linking', 401);
     linkIdentity(u.id, p.id, id.subject, id.email);
     audit(`Linked ${p.name} sign-in to the account`, u.id, u.email, 'auth.identity_link');
-    return u;
+    return account('linked by the signed-in user', u);
   }
   const known = findIdentity(p.id, id.subject);
   if (known) {
     const u = getUser(known.userId);
-    if (!u?.isActive) throw new OrgError('Account is deactivated', 403);
+    if (!u?.isActive) throw refuse('Account is deactivated', 403);
     linkIdentity(u.id, p.id, id.subject, id.email);
-    return u;
+    return account('known identity', u);
   }
   const c = p.config as OidcConfig;
-  if (!id.email) throw new OrgError('The identity provider did not send an email address', 401);
-  if (!id.emailVerified && !(p.kind === 'oidc' && c.allowUnverifiedEmail)) throw new OrgError('The identity provider did not verify this email address', 401);
+  if (!id.email) throw refuse('The identity provider did not send an email address', 401);
+  if (!id.emailVerified && !(p.kind === 'oidc' && c.allowUnverifiedEmail)) throw refuse('The identity provider did not verify this email address', 401);
   const domain = id.email.split('@')[1] ?? '';
   const domainOk = p.domains.length === 0 || p.domains.includes(domain);
   const existing = findUserByEmail(id.email);
   if (existing) {
     // Automatic linking only for addresses in a domain the provider owns.
-    if (!domainOk || p.domains.length === 0) throw new OrgError('An account with this email exists. Sign in with your password and link this method from your profile.', 409);
-    if (!existing.isActive) throw new OrgError('Account is deactivated', 403);
+    if (!domainOk || p.domains.length === 0) throw refuse('An account with this email exists. Sign in with your password and link this method from your profile.', 409);
+    if (!existing.isActive) throw refuse('Account is deactivated', 403);
     linkIdentity(existing.id, p.id, id.subject, id.email);
     if (!effectiveRole(existing.id, p.orgId)) setMembership(existing.id, p.orgId, p.defaultRole);
     audit(`Linked ${p.name} sign-in by verified email`, existing.id, existing.email, 'auth.identity_link');
-    return existing;
+    return account('linked by verified email', existing);
   }
-  if (!p.allowJit) throw new OrgError('Ask an administrator to invite you first', 403);
-  if (!domainOk) throw new OrgError('This email domain cannot sign up through this provider', 403);
+  if (!p.allowJit) throw refuse('Ask an administrator to invite you first', 403);
+  if (!domainOk) throw refuse('This email domain cannot sign up through this provider', 403);
   const u = createUser({ email: id.email, name: id.name || id.email.split('@')[0], role: p.defaultRole, organizationId: p.orgId, passwordHash: null, ssoProvider: p.kind === 'saml' ? 'saml' : null });
   setMembership(u.id, p.orgId, p.defaultRole);
   // First-login group assignment: the provider's default group plus mapped IdP groups.
@@ -211,7 +277,7 @@ export function resolveUser(p: SsoProvider, id: IdpIdentity, linkUserId: string 
   for (const gid of groups) if (getGroup(gid)?.orgId === p.orgId) setGroupMember(gid, u.id, 'member');
   linkIdentity(u.id, p.id, id.subject, id.email);
   audit(`Created account on first ${p.name} sign-in (${p.defaultRole}, ${groups.size} group(s))`, u.id, u.email, 'auth.sso_signup');
-  return u;
+  return account(`created on first sign-in (${p.defaultRole}, ${groups.size} group(s))`, u);
 }
 
 export function providerOrThrow(id: string): SsoProvider {

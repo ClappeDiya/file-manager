@@ -447,6 +447,43 @@ impl OperationLedger {
             .await
     }
 
+    /// Events in `[since, until]` (RFC 3339, either open) whose subject or
+    /// target path is one of `paths` or below one (all paths when empty),
+    /// oldest first, at most `limit` — for eDiscovery exports.
+    pub async fn export_range(&self, since: Option<String>, until: Option<String>, paths: Vec<String>, limit: u32) -> Result<Vec<LedgerEvent>, AppError> {
+        self.pool
+            .execute(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, occurred_at, engine, kind, status,
+                            subject_path, target_path, bytes,
+                            correlation_id, summary, details_json, undo_token
+                     FROM operation_ledger
+                     WHERE (?1 IS NULL OR occurred_at >= datetime(?1)) AND (?2 IS NULL OR occurred_at <= datetime(?2))
+                     ORDER BY occurred_at ASC, rowid ASC",
+                )?;
+                let under = |p: &Option<String>| {
+                    p.as_deref().is_some_and(|p| {
+                        paths.iter().any(|root| {
+                            let r = root.trim_end_matches(['/', '\\']);
+                            p == r || p.strip_prefix(r).is_some_and(|rest| rest.starts_with(['/', '\\']))
+                        })
+                    })
+                };
+                let mut out = Vec::new();
+                for ev in stmt.query_map(rusqlite::params![since, until], row_to_event)? {
+                    let ev = ev?;
+                    if paths.is_empty() || under(&ev.subject_path) || under(&ev.target_path) {
+                        out.push(ev);
+                        if out.len() >= limit as usize {
+                            break;
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .await
+    }
+
     /// Return every event whose `subject_path` OR `target_path` equals the
     /// given path. Ordered oldest-first so callers walking a causal chain
     /// see renames/moves in the order they happened. Capped at `limit` to
@@ -1063,6 +1100,29 @@ mod tests {
         assert_eq!(recent[0].status, "ok");
         assert_eq!(recent[0].bytes, Some(1024));
         assert_eq!(recent[0].subject_path.as_deref(), Some("/src/a.bin"));
+    }
+
+    #[tokio::test]
+    async fn export_range_filters_by_time_and_path_scope() {
+        let ledger = fresh_ledger().await;
+        for (subject, target) in [("/data/legal/a.pdf", None), ("/data/legal-old/b.pdf", None), ("/tmp/x", Some("/data/legal/x")), ("/data/legal", None)] {
+            let mut ev = RecordEvent::new(LedgerEngine::Transfer, "transfer.completed").subject(subject);
+            if let Some(t) = target {
+                ev = ev.target(t);
+            }
+            ledger.record(ev).await;
+        }
+        let paths = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let subjects = |evs: Vec<LedgerEvent>| evs.into_iter().filter_map(|e| e.subject_path).collect::<Vec<_>>();
+        // Path scope: exact match or a child, via subject or target; never a sibling prefix.
+        let got = subjects(ledger.export_range(None, None, paths(&["/data/legal/"]), 100).await.unwrap());
+        assert_eq!(got, vec!["/data/legal/a.pdf", "/tmp/x", "/data/legal"]);
+        assert_eq!(ledger.export_range(None, None, vec![], 100).await.unwrap().len(), 4);
+        assert_eq!(ledger.export_range(None, None, vec![], 2).await.unwrap().len(), 2);
+        // Time bounds take RFC 3339.
+        assert_eq!(ledger.export_range(Some("2000-01-01T00:00:00Z".into()), None, vec![], 100).await.unwrap().len(), 4);
+        assert!(ledger.export_range(Some("2999-01-01T00:00:00+02:00".into()), None, vec![], 100).await.unwrap().is_empty());
+        assert!(ledger.export_range(None, Some("2000-01-01T00:00:00Z".into()), vec![], 100).await.unwrap().is_empty());
     }
 
     #[tokio::test]

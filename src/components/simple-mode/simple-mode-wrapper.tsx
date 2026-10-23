@@ -13,6 +13,8 @@
  * Mode switch is instant -- no restart required.
  */
 import { useState } from "react";
+import { SimpleSearchView } from "./simple-search-view";
+import { useFileManagerStore } from "@/stores/file-manager-store";
 import { useUIStore } from "@/stores/ui-store";
 import { cn } from "@ufop/ui-components";
 import { Button } from "@ufop/ui-components";
@@ -106,11 +108,11 @@ export function SimpleModeWrapper({
         );
       case "search":
         return searchView || (
-          <SimplePlaceholder
-            title="Search"
-            description="Find files and folders across all your connected locations."
-            actionLabel="Search Files"
-            onAction={() => {}}
+          <SimpleSearchView
+            onOpen={(path, isDir) => {
+              useFileManagerStore.getState().revealPath(useFileManagerStore.getState().activePaneIndex, path, isDir);
+              setActiveSection("files");
+            }}
           />
         );
       case "favorites":

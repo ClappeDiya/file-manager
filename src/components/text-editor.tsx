@@ -35,6 +35,14 @@ interface TextEditorProps {
    *  unsaved edits. Optional so direct consumers (if any ever
    *  exist outside `TextEditorModal`) don't break. */
   onDirtyChange?: (isDirty: boolean) => void;
+  /** Start dirty (a recovered draft that isn't on disk yet). */
+  initialDirty?: boolean;
+  /** Fired with the text after every edit while dirty (draft keeping). */
+  onContentChange?: (content: string) => void;
+  /** Save automatically this long after the last edit; off when null. */
+  autosaveMs?: number | null;
+  /** Extra controls in the toolbar (e.g. the autosave toggle). */
+  toolbarExtra?: React.ReactNode;
 }
 
 export function TextEditor({
@@ -46,9 +54,16 @@ export function TextEditor({
   onSave,
   onClose,
   onDirtyChange,
+  initialDirty = false,
+  onContentChange,
+  autosaveMs = null,
+  toolbarExtra,
 }: TextEditorProps) {
   const [content, setContent] = useState(initialContent);
-  const [isDirty, setIsDirty] = useState(false);
+  const [isDirty, setIsDirty] = useState(initialDirty);
+  // Content whose save was refused (conflict, write error): autosave must
+  // not retry it in a loop — only a new edit (or an explicit Save) does.
+  const failedContentRef = useRef<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [showFind, setShowFind] = useState(false);
   const [findQuery, setFindQuery] = useState("");
@@ -65,7 +80,9 @@ export function TextEditor({
     try {
       await onSave(content);
       setIsDirty(false);
+      failedContentRef.current = null;
     } catch {
+      failedContentRef.current = content;
       // Iter 34: host either blocked the save (external-edit
       // conflict from iter 33) or the write itself failed.
       // Either way, keep `isDirty=true` so the "Modified"
@@ -118,6 +135,16 @@ export function TextEditor({
     onDirtyChange?.(isDirty);
   }, [isDirty, onDirtyChange]);
 
+  useEffect(() => {
+    if (isDirty) onContentChange?.(content);
+  }, [content, isDirty, onContentChange]);
+
+  useEffect(() => {
+    if (!autosaveMs || !isDirty || saving || readOnly || tooLarge || failedContentRef.current === content) return;
+    const t = setTimeout(() => void handleSave(), autosaveMs);
+    return () => clearTimeout(t);
+  }, [autosaveMs, isDirty, saving, readOnly, tooLarge, content, handleSave]);
+
   // Update match count when find query changes
   useEffect(() => {
     if (!findQuery) {
@@ -167,6 +194,7 @@ export function TextEditor({
           {readOnly && <span className="text-text-tertiary italic">Read-only</span>}
         </div>
         <div className="flex items-center gap-2">
+          {toolbarExtra}
           <span className="text-text-tertiary">{lineCount} lines</span>
           {!readOnly && (
             <button

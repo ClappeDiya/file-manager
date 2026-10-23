@@ -83,24 +83,47 @@ export interface PeerTransferRequestData {
   sender_id: string;
   sender_hostname: string;
   sender_os: PeerOs;
-  files: { relative_path: string; size: number; is_dir: boolean }[];
+  files: { relative_path: string; size: number; is_dir: boolean; modified: string | null }[];
   total_bytes: number;
   file_count: number;
   requested_at: string;
 }
 
+/** Mirrors `PeerTransferStatus` (connectors/peer.rs). */
+export type PeerTransferStatus = "pending" | "connecting" | "transferring" | "verifying" | "completed" | "failed" | "cancelled" | "denied";
+
+/** Mirrors `PeerTransferProgress` (connectors/peer.rs). */
 export interface PeerTransferProgress {
   request_id: string;
   peer_id: string;
-  peer_hostname: string;
+  peer_name: string;
   direction: "outgoing" | "incoming";
-  status: "pending" | "active" | "completed" | "failed" | "cancelled";
-  total_bytes: number;
+  status: PeerTransferStatus;
   transferred_bytes: number;
-  file_count: number;
-  files_transferred: number;
+  total_bytes: number;
+  current_file: string;
+  files_completed: number;
+  files_total: number;
+  speed_bps: number;
+  eta_seconds: number | null;
+  save_path: string | null;
   error: string | null;
-  started_at: string;
+}
+
+/** Mirrors `PeerLocalInfo` (commands/peer_commands.rs). */
+export interface PeerLocalInfo {
+  peer_id: string;
+  fingerprint: string;
+  port: number;
+  discovering: boolean;
+}
+
+const FINISHED: PeerTransferStatus[] = ["completed", "failed", "cancelled", "denied"];
+
+/** `ab12cd34…` grouped for reading aloud: `AB12 CD34 …` (first 16 digits). */
+function shortFingerprint(fp: string | null | undefined): string {
+  if (!fp) return "unknown";
+  return (fp.slice(0, 16).toUpperCase().match(/.{1,4}/g) ?? []).join(" ");
 }
 
 // ──────────────────────────────────────────────
@@ -160,6 +183,29 @@ function getStatusColor(status: PeerStatus): string {
   }
 }
 
+const PEER_IPC = {
+  startDiscovery: async () => { await tauriInvoke("peer_start_discovery"); },
+  stopDiscovery: async () => { await tauriInvoke("peer_stop_discovery"); },
+  isDiscovering: () => tauriInvoke<boolean>("peer_is_discovering", undefined, false),
+  listPeers: () => tauriInvoke<PeerDeviceData[]>("peer_list_peers", undefined, []),
+  listSaved: () => tauriInvoke<SavedPeerData[]>("peer_list_saved", undefined, []),
+  listPending: () => tauriInvoke<PeerTransferRequestData[]>("peer_list_pending_requests", undefined, []),
+  setTrust: async (peerId: string, trust: TrustLevel) => { await tauriInvoke("peer_set_trust", { peerId, trust }); },
+  savePeer: async (peerId: string) => { await tauriInvoke("peer_save_peer", { peerId }); },
+  removeSaved: async (peerId: string) => { await tauriInvoke("peer_remove_saved", { peerId }); },
+  setDisplayName: async (peerId: string, name: string) => { await tauriInvoke("peer_set_display_name", { peerId, name }); },
+  connectManual: (host: string, port: number, displayName?: string) => tauriInvoke<PeerDeviceData>("peer_connect_manual", { host, port, displayName }),
+  respond: async (requestId: string, response: "accepted" | "denied" | "blocked", savePath?: string) => {
+    await tauriInvoke("peer_respond_transfer", { requestId, response, savePath });
+  },
+  requestTransfer: (peerId: string, paths: string[]) => tauriInvoke<PeerTransferRequestData>("peer_request_transfer", { peerId, paths }),
+  localInfo: () => tauriInvoke<PeerLocalInfo>("peer_local_info"),
+  clearFinished: async () => { await tauriInvoke("peer_clear_finished"); },
+  listTransfers: () => tauriInvoke<PeerTransferProgress[]>("peer_list_transfers", undefined, []),
+  getPeer: (peerId: string) => tauriInvoke<PeerDeviceData | null>("peer_get_peer", { peerId }, null),
+  cancelTransfer: async (requestId: string) => { await tauriInvoke("peer_cancel_transfer", { requestId }); },
+};
+
 // ──────────────────────────────────────────────
 // PeerSidebar Component
 // ──────────────────────────────────────────────
@@ -191,13 +237,18 @@ interface PeerSidebarProps {
     port: number,
     displayName?: string,
   ) => Promise<PeerDeviceData>;
-  /** Initiate transfer to a peer (or request transfer via Tauri). */
+  /** Initiate transfer to a peer (default: send `sendPaths`). */
   onTransferTo?: (peerId: string) => void;
-  /** Request a file transfer to a peer. */
-  onRequestTransfer?: (
-    peerId: string,
-    files: { relative_path: string; size: number; is_dir: boolean }[],
-  ) => Promise<PeerTransferRequestData>;
+  /** Send local files or folders to a peer (it is asked to accept first). */
+  onRequestTransfer?: (peerId: string, paths: string[]) => Promise<PeerTransferRequestData>;
+  /** Files and folders chosen to send (e.g. the file manager's selection). */
+  sendPaths?: string[];
+  /** Offer "Save here" for incoming files (e.g. the current folder). */
+  receiveDir?: string;
+  /** This device's id and certificate fingerprint. */
+  onLocalInfo?: () => Promise<PeerLocalInfo>;
+  /** Remove finished transfers from the list. */
+  onClearFinished?: () => Promise<void>;
   /** List active peer transfers. */
   onListTransfers?: () => Promise<PeerTransferProgress[]>;
   /** Get detailed info for a specific peer. */
@@ -233,93 +284,37 @@ export function PeerSidebar({
   onGetPeer: onGetPeerProp,
   onCancelTransfer: onCancelTransferProp,
   onRespondTransfer: onRespondTransferProp,
-  refreshInterval = 5000,
+  sendPaths = [],
+  receiveDir,
+  onLocalInfo: onLocalInfoProp,
+  onClearFinished: onClearFinishedProp,
+  refreshInterval = 2000,
   className,
 }: PeerSidebarProps) {
-  // Wire to Tauri IPC when no callback props are provided and Tauri is available
-  const onStartDiscovery = onStartDiscoveryProp ?? (isTauriAvailable()
-    ? async () => { await tauriInvoke("peer_start_discovery"); }
-    : undefined);
-
-  const onStopDiscovery = onStopDiscoveryProp ?? (isTauriAvailable()
-    ? async () => { await tauriInvoke("peer_stop_discovery"); }
-    : undefined);
-
-  const onIsDiscovering = onIsDiscoveringProp ?? (isTauriAvailable()
-    ? async () => tauriInvoke<boolean>("peer_is_discovering", undefined, false)
-    : undefined);
-
-  const onListPeers = onListPeersProp ?? (isTauriAvailable()
-    ? async () => tauriInvoke<PeerDeviceData[]>("peer_list_peers", undefined, [])
-    : undefined);
-
-  const onListSavedPeers = onListSavedPeersProp ?? (isTauriAvailable()
-    ? async () => tauriInvoke<SavedPeerData[]>("peer_list_saved", undefined, [])
-    : undefined);
-
-  const onListPendingRequests = onListPendingRequestsProp ?? (isTauriAvailable()
-    ? async () => tauriInvoke<PeerTransferRequestData[]>("peer_list_pending_requests", undefined, [])
-    : undefined);
-
-  const onSetTrust = onSetTrustProp ?? (isTauriAvailable()
-    ? async (peerId: string, trust: TrustLevel) => { await tauriInvoke("peer_set_trust", { peerId, trust }); }
-    : undefined);
-
-  const onSavePeer = onSavePeerProp ?? (isTauriAvailable()
-    ? async (peerId: string) => { await tauriInvoke("peer_save_peer", { peerId }); }
-    : undefined);
-
-  const onRemoveSavedPeer = onRemoveSavedPeerProp ?? (isTauriAvailable()
-    ? async (peerId: string) => { await tauriInvoke("peer_remove_saved", { peerId }); }
-    : undefined);
-
-  const onSetDisplayName = onSetDisplayNameProp ?? (isTauriAvailable()
-    ? async (peerId: string, name: string) => { await tauriInvoke("peer_set_display_name", { peerId, name }); }
-    : undefined);
-
-  const onConnectManual = onConnectManualProp ?? (isTauriAvailable()
-    ? async (host: string, port: number, displayName?: string) =>
-        tauriInvoke<PeerDeviceData>("peer_connect_manual", { host, port, displayName })
-    : undefined);
-
-  const onRespondTransfer = onRespondTransferProp ?? (isTauriAvailable()
-    ? async (requestId: string, response: "accepted" | "denied" | "blocked", savePath?: string) => {
-        await tauriInvoke("peer_respond_transfer", { requestId, response, savePath });
-      }
-    : undefined);
-
-  // Wire peer_request_transfer: fallback for onTransferTo when Tauri is available
-  const onRequestTransfer = onRequestTransferProp ?? (isTauriAvailable()
-    ? async (peerId: string, files: { relative_path: string; size: number; is_dir: boolean }[]) =>
-        tauriInvoke<PeerTransferRequestData>("peer_request_transfer", { peerId, files })
-    : undefined);
-
-  // If onTransferTo prop is not provided but Tauri is available, default to requesting
-  // transfer with an empty files array (actual file selection happens in a dialog)
-  const onTransferTo = onTransferToProp ?? (isTauriAvailable() && onRequestTransfer
-    ? (peerId: string) => {
-        onRequestTransfer(peerId, []).catch((err) => {
-          console.error("peer_request_transfer failed:", err);
-        });
-      }
-    : undefined);
-
-  // Wire peer_list_transfers: periodically fetch active peer transfers
-  const onListTransfers = onListTransfersProp ?? (isTauriAvailable()
-    ? async () => tauriInvoke<PeerTransferProgress[]>("peer_list_transfers", undefined, [])
-    : undefined);
-
-  // Wire peer_get_peer: retrieve detailed info for a specific peer
-  const onGetPeer = onGetPeerProp ?? (isTauriAvailable()
-    ? async (peerId: string) => tauriInvoke<PeerDeviceData | null>("peer_get_peer", { peerId }, null)
-    : undefined);
-
-  // Wire peer_cancel_transfer: cancel an active peer transfer
-  const onCancelTransfer = onCancelTransferProp ?? (isTauriAvailable()
-    ? async (requestId: string) => { await tauriInvoke("peer_cancel_transfer", { requestId }); }
-    : undefined);
+  // Props win; otherwise the Tauri commands (stable functions, so the
+  // refresh callback and its polling effect are not recreated each render).
+  const ipc = isTauriAvailable() ? PEER_IPC : undefined;
+  const onStartDiscovery = onStartDiscoveryProp ?? ipc?.startDiscovery;
+  const onStopDiscovery = onStopDiscoveryProp ?? ipc?.stopDiscovery;
+  const onIsDiscovering = onIsDiscoveringProp ?? ipc?.isDiscovering;
+  const onListPeers = onListPeersProp ?? ipc?.listPeers;
+  const onListSavedPeers = onListSavedPeersProp ?? ipc?.listSaved;
+  const onListPendingRequests = onListPendingRequestsProp ?? ipc?.listPending;
+  const onSetTrust = onSetTrustProp ?? ipc?.setTrust;
+  const onSavePeer = onSavePeerProp ?? ipc?.savePeer;
+  const onRemoveSavedPeer = onRemoveSavedPeerProp ?? ipc?.removeSaved;
+  const onSetDisplayName = onSetDisplayNameProp ?? ipc?.setDisplayName;
+  const onConnectManual = onConnectManualProp ?? ipc?.connectManual;
+  const onRespondTransfer = onRespondTransferProp ?? ipc?.respond;
+  const onRequestTransfer = onRequestTransferProp ?? ipc?.requestTransfer;
+  const onLocalInfo = onLocalInfoProp ?? ipc?.localInfo;
+  const onClearFinished = onClearFinishedProp ?? ipc?.clearFinished;
+  const onListTransfers = onListTransfersProp ?? ipc?.listTransfers;
+  const onGetPeer = onGetPeerProp ?? ipc?.getPeer;
+  const onCancelTransfer = onCancelTransferProp ?? ipc?.cancelTransfer;
 
   const [peers, setPeers] = useState<PeerDeviceData[]>([]);
+  const [localInfo, setLocalInfo] = useState<PeerLocalInfo | null>(null);
   const [savedPeers, setSavedPeers] = useState<SavedPeerData[]>([]);
   const [pendingRequests, setPendingRequests] = useState<
     PeerTransferRequestData[]
@@ -358,10 +353,22 @@ export function PeerSidebar({
         const d = await onIsDiscovering();
         setDiscovering(d);
       }
+      if (onLocalInfo) setLocalInfo(await onLocalInfo());
     } catch {
       // Non-critical; sidebar will just show stale data
     }
-  }, [onListPeers, onListSavedPeers, onListPendingRequests, onListTransfers, onIsDiscovering]);
+  }, [onListPeers, onListSavedPeers, onListPendingRequests, onListTransfers, onIsDiscovering, onLocalInfo]);
+
+  const [sendError, setSendError] = useState<string | null>(null);
+  // Sends the chosen files; nothing to send means no Send button.
+  const onTransferTo = onTransferToProp ?? (onRequestTransfer && sendPaths.length > 0
+    ? (peerId: string) => {
+        setSendError(null);
+        onRequestTransfer(peerId, sendPaths)
+          .then(refresh)
+          .catch((err) => setSendError(errorText(err)));
+      }
+    : undefined);
 
   // Fetch peer details when expanding a peer row
   const fetchPeerDetail = useCallback(async (peerId: string) => {
@@ -391,9 +398,11 @@ export function PeerSidebar({
     }
   }, [refresh, refreshInterval]);
 
-  // Toggle discovery
+  // Toggle discovery (which also accepts incoming transfers while on)
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const toggleDiscovery = useCallback(async () => {
     setLoading(true);
+    setDiscoveryError(null);
     try {
       if (discovering) {
         if (onStopDiscovery) await onStopDiscovery();
@@ -402,12 +411,13 @@ export function PeerSidebar({
         if (onStartDiscovery) await onStartDiscovery();
         setDiscovering(true);
       }
-    } catch {
-      // Discovery toggle failed
+    } catch (err) {
+      setDiscoveryError(errorText(err));
     } finally {
       setLoading(false);
+      refresh();
     }
-  }, [discovering, onStartDiscovery, onStopDiscovery]);
+  }, [discovering, onStartDiscovery, onStopDiscovery, refresh]);
 
   const toggleSection = useCallback((section: string) => {
     setExpandedSections((prev) => {
@@ -488,6 +498,19 @@ export function PeerSidebar({
           </div>
         </div>
 
+        {discoveryError && (
+          <p role="alert" className="px-3 pb-1 text-[length:var(--font-size-xs)] text-[color:var(--color-error)]">
+            {discoveryError}
+          </p>
+        )}
+
+        {sendPaths.length > 0 && (
+          <div className="mx-2 mb-1 px-2 py-1.5 rounded-md bg-[var(--color-primary)]/10 text-[length:var(--font-size-xs)] text-[color:var(--color-text)]" data-testid="peer-send-banner">
+            Choose a device to send {sendPaths.length} item{sendPaths.length !== 1 ? "s" : ""} to.
+            {sendError && <span role="alert" className="block text-[color:var(--color-error)]">{sendError}</span>}
+          </div>
+        )}
+
         {/* Manual connect form */}
         {showManualConnect && (
           <ManualConnectForm
@@ -511,6 +534,8 @@ export function PeerSidebar({
                 key={req.request_id}
                 request={req}
                 onRespond={onRespondTransfer}
+                receiveDir={receiveDir}
+                onRefresh={refresh}
               />
             ))}
           </PeerSection>
@@ -572,6 +597,7 @@ export function PeerSidebar({
               <PeerRow
                 key={peer.id}
                 peer={peer}
+                onTransferTo={savedPeers.some((s) => s.id === peer.id) ? onTransferTo : undefined}
                 onSetTrust={onSetTrust}
                 onSavePeer={onSavePeer}
                 onSetDisplayName={onSetDisplayName}
@@ -592,6 +618,14 @@ export function PeerSidebar({
             onToggle={() => toggleSection("transfers")}
             testId="peers-transfers"
           >
+            {onClearFinished && activeTransfers.some((t) => FINISHED.includes(t.status)) && (
+              <button
+                className="mx-3 mb-1 text-[10px] text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)]"
+                onClick={() => onClearFinished().then(refresh).catch(() => {})}
+              >
+                Clear finished
+              </button>
+            )}
             {activeTransfers.map((transfer) => (
               <ActiveTransferRow
                 key={transfer.request_id}
@@ -601,6 +635,13 @@ export function PeerSidebar({
               />
             ))}
           </PeerSection>
+        )}
+
+        {localInfo && (
+          <p className="px-3 pt-2 text-[10px] text-[color:var(--color-text-tertiary)]" data-testid="peer-local-info" title={localInfo.fingerprint}>
+            This device: {shortFingerprint(localInfo.fingerprint)}
+            {localInfo.port > 0 ? ` · receiving on port ${localInfo.port}` : " · not receiving"}
+          </p>
         )}
 
         {/* No peers message */}
@@ -782,7 +823,7 @@ function PeerRow({
 
         {/* Actions */}
         <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-theme">
-          {isOnline && onTransferTo && peer.trust !== "blocked" && (
+          {onTransferTo && peer.trust !== "blocked" && (
             <button
               className="h-5 w-5 flex items-center justify-center rounded-sm text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-primary)]"
               onClick={() => onTransferTo(peer.id)}
@@ -1001,6 +1042,8 @@ function SavedPeerRow({
 function IncomingRequestRow({
   request,
   onRespond,
+  receiveDir,
+  onRefresh,
 }: {
   request: PeerTransferRequestData;
   onRespond?: (
@@ -1008,23 +1051,28 @@ function IncomingRequestRow({
     response: "accepted" | "denied" | "blocked",
     savePath?: string,
   ) => Promise<void>;
+  receiveDir?: string;
+  onRefresh?: () => void;
 }) {
   const [responding, setResponding] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const OsIcon = getOsIcon(request.sender_os);
 
   const handleRespond = useCallback(
-    async (response: "accepted" | "denied" | "blocked") => {
+    async (response: "accepted" | "denied" | "blocked", savePath?: string) => {
       if (!onRespond) return;
       setResponding(true);
+      setError(null);
       try {
-        await onRespond(request.request_id, response);
-      } catch {
-        // Response failed
+        await onRespond(request.request_id, response, savePath);
+        onRefresh?.();
+      } catch (err) {
+        setError(errorText(err));
       } finally {
         setResponding(false);
       }
     },
-    [request.request_id, onRespond],
+    [request.request_id, onRespond, onRefresh],
   );
 
   return (
@@ -1050,6 +1098,12 @@ function IncomingRequestRow({
         </span>{" "}
         ({formatBytes(request.total_bytes)})
       </p>
+      <ul className="mb-2 max-h-16 overflow-hidden text-[9px] text-[color:var(--color-text-tertiary)]">
+        {request.files.filter((f) => !f.relative_path.includes("/")).slice(0, 3).map((f) => (
+          <li key={f.relative_path} className="truncate">{f.relative_path}{f.is_dir ? "/" : ""}</li>
+        ))}
+      </ul>
+      {error && <p role="alert" className="mb-1 text-[9px] text-[color:var(--color-error)]">{error}</p>}
 
       {responding ? (
         <div className="flex items-center gap-2 text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)]">
@@ -1061,10 +1115,20 @@ function IncomingRequestRow({
           <button
             onClick={() => handleRespond("accepted")}
             className="flex-1 px-2 py-1 text-[length:var(--font-size-xs)] rounded-md bg-[var(--color-success)] text-white hover:opacity-90 transition-theme flex items-center justify-center gap-1"
+            title="Save in the Downloads folder"
           >
             <Check className="h-3 w-3" />
             Accept
           </button>
+          {receiveDir && (
+            <button
+              onClick={() => handleRespond("accepted", receiveDir)}
+              className="px-2 py-1 text-[length:var(--font-size-xs)] rounded-md border border-[var(--color-success)] text-[color:var(--color-success)] hover:bg-[var(--color-success)]/10 transition-theme"
+              title={`Save in ${receiveDir}`}
+            >
+              Save here
+            </button>
+          )}
           <button
             onClick={() => handleRespond("denied")}
             className="flex-1 px-2 py-1 text-[length:var(--font-size-xs)] rounded-md border border-[var(--color-border)] text-[color:var(--color-text-secondary)] hover:bg-[var(--color-hover-bg)] transition-theme flex items-center justify-center gap-1"
@@ -1104,7 +1168,7 @@ function ActiveTransferRow({
       ? Math.round((transfer.transferred_bytes / transfer.total_bytes) * 100)
       : 0;
 
-  const isActive = transfer.status === "active" || transfer.status === "pending";
+  const isActive = !FINISHED.includes(transfer.status);
 
   const handleCancel = useCallback(async () => {
     if (!onCancel) return;
@@ -1121,9 +1185,11 @@ function ActiveTransferRow({
 
   const statusColor = (() => {
     switch (transfer.status) {
-      case "active": return "text-[color:var(--color-primary)]";
+      case "transferring":
+      case "verifying": return "text-[color:var(--color-primary)]";
       case "completed": return "text-[color:var(--color-success)]";
-      case "failed": return "text-[color:var(--color-error)]";
+      case "failed":
+      case "denied": return "text-[color:var(--color-error)]";
       case "cancelled": return "text-[color:var(--color-text-tertiary)]";
       default: return "text-[color:var(--color-warning)]";
     }
@@ -1142,10 +1208,10 @@ function ActiveTransferRow({
         <div className="flex items-center gap-1.5 min-w-0">
           <ArrowUpDown className="h-3 w-3 text-[color:var(--color-text-tertiary)] shrink-0" />
           <span className="text-[length:var(--font-size-xs)] font-medium text-[color:var(--color-text)] truncate">
-            {transfer.peer_hostname}
+            {transfer.peer_name}
           </span>
           <span className={cn("text-[9px] capitalize", statusColor)}>
-            {transfer.status}
+            {transfer.status === "pending" ? (transfer.direction === "outgoing" ? "waiting for approval" : "pending") : transfer.status}
           </span>
         </div>
         <span className="text-[9px] text-[color:var(--color-text-tertiary)] capitalize shrink-0">
@@ -1171,7 +1237,8 @@ function ActiveTransferRow({
       <div className="flex items-center justify-between">
         <span className="text-[9px] text-[color:var(--color-text-tertiary)]">
           {formatBytes(transfer.transferred_bytes)} / {formatBytes(transfer.total_bytes)}
-          {" "}({transfer.files_transferred}/{transfer.file_count} files)
+          {" "}({transfer.files_completed}/{transfer.files_total} files)
+          {transfer.status === "transferring" && transfer.speed_bps > 0 && ` · ${formatBytes(transfer.speed_bps)}/s`}
         </span>
         {isActive && onCancel && (
           <button
@@ -1183,7 +1250,7 @@ function ActiveTransferRow({
               "transition-theme disabled:opacity-50",
             )}
             title="Cancel transfer"
-            aria-label={`Cancel transfer to ${transfer.peer_hostname}`}
+            aria-label={`Cancel transfer ${transfer.direction === "outgoing" ? "to" : "from"} ${transfer.peer_name}`}
           >
             {cancelling ? (
               <Loader2 className="h-2.5 w-2.5 animate-spin" />
@@ -1195,6 +1262,11 @@ function ActiveTransferRow({
         )}
       </div>
 
+      {transfer.status === "completed" && transfer.save_path && (
+        <p className="mt-1 text-[9px] text-[color:var(--color-text-tertiary)] truncate" title={transfer.save_path}>
+          Saved in {transfer.save_path}
+        </p>
+      )}
       {transfer.error && (
         <p className="mt-1 text-[9px] text-[color:var(--color-error)] truncate">
           {transfer.error}

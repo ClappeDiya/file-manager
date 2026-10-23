@@ -9,7 +9,11 @@
  * - Conflict resolution UI
  * - Reports and rollback
  */
+import { NamedSchedulePicker } from "@/components/schedule-pickers";
+import { refId, useScheduleStore } from "@/stores/schedule-store";
 import { useState, useCallback, useEffect } from "react";
+import { SyncRunOptionsSection } from "@/components/sync-run-options";
+import { DEFAULT_RUN_OPTIONS, type SyncRunOptions } from "@/stores/sync-store";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import { SyncProgressCard } from "@/components/sync-progress-card";
@@ -187,7 +191,9 @@ function triggerName(trigger: string | { scheduled: { cron_expr: string } }): st
     }
   }
   if ("scheduled" in trigger) {
-    return `Scheduled (${trigger.scheduled.cron_expr})`;
+    const named = refId(trigger.scheduled.cron_expr);
+    const name = named && useScheduleStore.getState().schedules.find((s) => s.id === named)?.name;
+    return `Scheduled (${name ?? trigger.scheduled.cron_expr})`;
   }
   return "Unknown";
 }
@@ -256,6 +262,7 @@ export function SyncPanel() {
     minSize: 0,
     timeOffsetSecs: null as number | null,
     copyOptions: DEFAULT_COPY_OPTIONS as CopyOptions,
+    runOptions: DEFAULT_RUN_OPTIONS as SyncRunOptions,
     presetId: null as string | null,
   });
 
@@ -299,6 +306,7 @@ export function SyncPanel() {
         checksumAlgorithm: createForm.checksumAlgorithm,
         timeOffsetSecs: createForm.timeOffsetSecs,
         optionsJson: JSON.stringify(createForm.copyOptions),
+        runOptionsJson: JSON.stringify(createForm.runOptions),
       });
 
       setView("list");
@@ -323,6 +331,7 @@ export function SyncPanel() {
         minSize: 0,
         timeOffsetSecs: null,
         copyOptions: DEFAULT_COPY_OPTIONS,
+        runOptions: DEFAULT_RUN_OPTIONS,
         presetId: null,
       });
       _setDetectedOffset(null);
@@ -730,11 +739,9 @@ function CreatePairView({
     const timeout = setTimeout(async () => {
       setCronValidating(true);
       try {
-        const result = await tauriInvoke<{ valid: boolean; next_runs: string[]; error: string | null }>(
-          "validate_sync_cron",
-          { cronExpr: form.cronExpr }
-        );
-        setCronValidation(result);
+        // Next runs of the cron (or named schedule), days off marked.
+        const runs = await tauriInvoke<{ at: string; skipped_by: string | null }[]>("schedule_preview", { cronExpr: form.cronExpr, count: 3 });
+        setCronValidation({ valid: true, next_runs: runs.map((r) => (r.skipped_by ? `${r.at}|${r.skipped_by}` : r.at)), error: null });
       } catch (e: any) {
         setCronValidation({ valid: false, next_runs: [], error: e?.message || "Validation failed" });
       } finally {
@@ -837,6 +844,13 @@ function CreatePairView({
         </select>
       </label>
 
+      <SyncRunOptionsSection
+        mode={form.mode}
+        runOptions={form.runOptions}
+        copyOptions={form.copyOptions}
+        onChange={(runOptions, copyOptions) => setForm({ ...form, runOptions, copyOptions })}
+      />
+
       <CopyPresetPicker
         activeId={form.presetId}
         onPick={(preset) =>
@@ -865,7 +879,13 @@ function CreatePairView({
 
       {form.trigger === "scheduled" && (
         <div className="space-y-1">
-          <label className="block text-xs text-zinc-600 dark:text-zinc-400">
+          <NamedSchedulePicker
+            className="block w-full px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
+            value={form.cronExpr}
+            customCron={refId(form.cronExpr) ? "0 0 */6 * * * *" : form.cronExpr}
+            onChange={(cron) => update("cronExpr", cron)}
+          />
+          <label className={`block text-xs text-zinc-600 dark:text-zinc-400 ${refId(form.cronExpr) ? "hidden" : ""}`}>
             Cron Expression
             <input
               type="text"
@@ -893,9 +913,15 @@ function CreatePairView({
                 <div className="p-1.5 bg-green-50 dark:bg-green-900/20 rounded text-[11px] text-green-700 dark:text-green-400">
                   <div className="font-medium">Valid - Next 3 runs:</div>
                   <ul className="mt-0.5 space-y-0.5">
-                    {cronValidation.next_runs.slice(0, 3).map((run, i) => (
-                      <li key={i}>{new Date(run).toLocaleString()}</li>
-                    ))}
+                    {cronValidation.next_runs.slice(0, 3).map((run, i) => {
+                      const [at, skipped] = run.split("|");
+                      return (
+                        <li key={i} className={skipped ? "line-through opacity-70" : ""}>
+                          {new Date(at).toLocaleString()}
+                          {skipped && ` (skipped: ${skipped})`}
+                        </li>
+                      );
+                    })}
                   </ul>
                 </div>
               ) : (

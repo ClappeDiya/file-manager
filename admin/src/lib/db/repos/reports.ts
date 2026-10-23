@@ -7,6 +7,7 @@
  * data: BackupReport}`), so clients can report without the agent.
  */
 import { db, newId, now, parseJson, type Row } from '../index';
+import { enqueueEvent } from './webhooks';
 
 export interface NormalizedReport {
   backupId: string;
@@ -132,6 +133,13 @@ export function ingestReport(orgId: string, machineId: string, rep: NormalizedRe
       );
     }
     d.prepare('UPDATE machines SET last_report_at = ? WHERE id = ?').run(now(), machineId);
+    if (rep.operation === 'backup') {
+      enqueueEvent(orgId, `backup.${rep.status}`, {
+        reportId: id, machineId, backupId: rep.backupId, backupName: rep.backupName, status: rep.status, finishedAt: rep.finishedAt, durationMs: rep.durationMs,
+        filesExamined: rep.filesExamined, filesAdded: rep.filesAdded, filesModified: rep.filesModified, filesDeleted: rep.filesDeleted, bytesUploaded: rep.bytesUploaded,
+        warnings: rep.warnings, errors: rep.errors, message: rep.message,
+      });
+    }
   })();
   return fromRow(d.prepare('SELECT * FROM backup_reports WHERE id = ?').get(id) as Row);
 }
@@ -179,7 +187,7 @@ export function listBackups(orgIds: string[], machineIds?: string[]): BackupRoll
   }));
 }
 
-export function listReports(o: { orgIds: string[]; machineId?: string; backupId?: string; status?: string; since?: string; limit?: number; machineIds?: string[] }): StoredReport[] {
+export function listReports(o: { orgIds: string[]; machineId?: string; backupId?: string; status?: string; since?: string; limit?: number; offset?: number; machineIds?: string[] }): StoredReport[] {
   if (!o.orgIds.length || (o.machineIds && !o.machineIds.length)) return [];
   const where = [`org_id IN (${o.orgIds.map(() => '?').join(',')})`];
   const args: unknown[] = [...o.orgIds];
@@ -188,7 +196,7 @@ export function listReports(o: { orgIds: string[]; machineId?: string; backupId?
   if (o.backupId) { where.push('backup_id = ?'); args.push(o.backupId); }
   if (o.status) { where.push('status = ?'); args.push(o.status); }
   if (o.since) { where.push('finished_at >= ?'); args.push(o.since); }
-  return (db().prepare(`SELECT * FROM backup_reports WHERE ${where.join(' AND ')} ORDER BY finished_at DESC LIMIT ?`).all(...args, Math.min(o.limit ?? 100, 5000)) as Row[]).map(fromRow);
+  return (db().prepare(`SELECT * FROM backup_reports WHERE ${where.join(' AND ')} ORDER BY finished_at DESC, rowid DESC LIMIT ? OFFSET ?`).all(...args, Math.min(o.limit ?? 100, 5000), o.offset ?? 0) as Row[]).map(fromRow);
 }
 
 export function reportRaw(id: string): unknown {

@@ -14,6 +14,8 @@ export async function GET(request: NextRequest) {
     role: ctx.role,
     permissions: ctx.permissions,
     amr: ctx.amr,
+    // Read-only "view as": who is really signed in, and until when.
+    viewAs: ctx.viewAs ? { actor: publicUser(ctx.viewAs.actor), until: ctx.viewAs.until } : null,
     organizations: accessibleOrgs(ctx.user.id).map(({ org: o, role }) => ({ id: o.id, name: o.name, path: orgPath(o.id), role, parentId: o.parentId })),
   });
 }

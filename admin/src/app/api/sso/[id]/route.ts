@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { audit, badRequest, isContext, readJson, requirePermission } from '@/lib/session';
+import { audit, badRequest, isContext, readJson, requireStepUp } from '@/lib/session';
 import { deleteProvider, updateProvider, type ProviderInput } from '@/lib/db/repos/sso';
 import { orgErrorResponse } from '@/lib/route-helpers';
 
 type Params = { params: Promise<{ id: string }> };
 
 export async function PATCH(request: NextRequest, { params }: Params) {
-  const ctx = await requirePermission(request, 'sso.configure');
+  const ctx = await requireStepUp(request, 'sso.configure');
   if (!isContext(ctx)) return ctx;
   const { id } = await params;
   const b = await readJson<Partial<ProviderInput>>(request);
@@ -22,7 +22,7 @@ export async function PATCH(request: NextRequest, { params }: Params) {
 }
 
 export async function DELETE(request: NextRequest, { params }: Params) {
-  const ctx = await requirePermission(request, 'sso.configure');
+  const ctx = await requireStepUp(request, 'sso.configure');
   if (!isContext(ctx)) return ctx;
   const { id } = await params;
   if (!deleteProvider(ctx.orgId, id)) return badRequest('Not found', 404);

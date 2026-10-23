@@ -79,7 +79,7 @@ impl ConnectorBackend {
     }
 
     fn staging(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("ufop-vol-{}-{name}", uuid::Uuid::new_v4().simple()))
+        ufop_core::session::user_temp_subdir("volumes").join(format!("{}-{name}", uuid::Uuid::new_v4().simple()))
     }
 }
 

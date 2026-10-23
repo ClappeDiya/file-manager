@@ -16,6 +16,7 @@ import { listAudit, verifyAudit } from '@/lib/db/repos/audit';
 import { json, makeUser, req } from './helpers';
 import * as settings from '@/app/api/ai/settings/route';
 import * as analyzeRoute from '@/app/api/ai/analyze/route';
+import * as transcript from '@/app/api/ai/transcripts/[id]/route';
 
 type Mode = { kind: 'text'; text: string } | { kind: 'refusal' } | { kind: 'status'; status: number; type: string } | { kind: 'max_tokens' };
 let mode: Mode = { kind: 'text', text: 'All good.' };
@@ -237,5 +238,41 @@ describe('scheduled summaries', () => {
     db().prepare("UPDATE organizations SET status = 'offboarding' WHERE id = 'org_default'").run();
     expect(await runScheduledSummaries(new Date(t0.getTime() + 96 * 3600_000))).toBe(0);
     expect(verifyAudit()).toMatchObject({ ok: true });
+  });
+});
+
+describe('AI transcripts', () => {
+  it('keeps the full exchange, hashes it onto the audit chain and detects later changes', async () => {
+    const admin = makeUser('tr-admin@x.org', 'org_admin');
+    seedFleet();
+    await configure(admin);
+    mode = { kind: 'text', text: 'Transcript answer.' };
+    const r = await json<{ report: { id: string } }>(await analyzeRoute.POST(await req('POST', '/api/ai/analyze', { as: admin, body: { question: 'What failed?' } })));
+    const get = async (id: string, as = admin) => json<{ transcript: { request: string; response: string; systemPrompt: string; model: string; sha256: string; verification: { matches: boolean; chainOk: boolean; auditSequence: number; reason: string | null } } }>(await transcript.GET(await req('GET', `/api/ai/transcripts/${id}`, { as }), { params: Promise.resolve({ id }) }));
+    const t = await get(r.body.report.id);
+    expect(t.status).toBe(200);
+    expect(t.body.transcript).toMatchObject({ response: 'Transcript answer.', model: 'claude-opus-5-5', verification: { matches: true, chainOk: true, reason: null } });
+    expect(t.body.transcript.request).toContain('Question: What failed?');
+    expect(t.body.transcript.systemPrompt).toContain('backup operations analyst');
+    expect(t.body.transcript.request).toBe((calls.at(-1)!.body.messages as { content: string }[])[0].content); // exactly what was sent
+    const entry = listAudit({ eventType: 'ai.transcript' }).entries[0];
+    expect(entry.metadata).toMatchObject({ sha256: t.body.transcript.sha256, inputTokens: 1234, outputTokens: 321 });
+    expect(entry.sequence).toBe(t.body.transcript.verification.auditSequence);
+
+    // Failed runs are kept too.
+    mode = { kind: 'refusal' };
+    const failed = await json<{ report: { id: string } }>(await analyzeRoute.POST(await req('POST', '/api/ai/analyze', { as: admin, body: {} })));
+    expect((await get(failed.body.report.id)).body.transcript.response).toMatch(/^\[error\] The model declined/);
+
+    // Someone edits the stored transcript afterwards.
+    db().prepare("UPDATE ai_transcripts SET response = 'Everything is fine.' WHERE report_id = ?").run(r.body.report.id);
+    const tampered = await get(r.body.report.id);
+    expect(tampered.body.transcript.verification).toMatchObject({ matches: false, chainOk: true, reason: 'The transcript was changed after it was recorded' });
+
+    // Needs audit read as well as AI read; other organizations cannot see it.
+    expect((await transcript.GET(await req('GET', `/api/ai/transcripts/${r.body.report.id}`, { as: makeUser('tr-op@x.org', 'approver') }), { params: Promise.resolve({ id: r.body.report.id }) })).status).toBe(403);
+    const other = makeUser('tr-other@x.org', 'org_admin', createOrg({ name: 'Transcript other' }).id);
+    expect((await get(r.body.report.id, other)).status).toBe(404);
+    expect(listAudit({ eventType: 'ai.transcript_view' }).total).toBeGreaterThan(0);
   });
 });

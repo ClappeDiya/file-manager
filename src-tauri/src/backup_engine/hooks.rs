@@ -219,10 +219,10 @@ pub async fn send_reports(cfg: &ReportConfig, result: &str, vars: &BTreeMap<Stri
     if cfg.http_urls.is_empty() || !cfg.send_on.iter().any(|s| s == result) {
         return Vec::new();
     }
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30)).danger_accept_invalid_certs(cfg.accept_invalid_certs);
+    let mut builder = crate::net::builder().timeout(Duration::from_secs(30)).danger_accept_invalid_certs(cfg.accept_invalid_certs);
     if !cfg.pinned_sha256.is_empty() {
         match crate::security::tls::client_config(false, None, &cfg.pinned_sha256) {
-            Ok(tls) => builder = reqwest::Client::builder().timeout(Duration::from_secs(30)).use_preconfigured_tls(tls),
+            Ok(tls) => builder = crate::net::builder().timeout(Duration::from_secs(30)).use_preconfigured_tls(tls),
             Err(e) => return vec![e.user_message()],
         }
     } else if let Some(pem) = cfg.ca_pem.as_deref().filter(|p| !p.trim().is_empty()) {
@@ -245,30 +245,34 @@ pub async fn send_reports(cfg: &ReportConfig, result: &str, vars: &BTreeMap<Stri
     }
     body.insert("data".into(), payload);
     let mut failures = Vec::new();
+    // Same schedule as before: first delay `retry_delay_ms`, doubling, at
+    // most 64× (shared policy, see ufop_core::retry).
+    let first = cfg.retry_delay_ms.max(1);
+    let policy = ufop_core::retry::RetryPolicy { retries: cfg.retries, delay_ms: first, exponential: true, max_delay_ms: first.saturating_mul(64) };
+    let method = reqwest::Method::from_bytes(cfg.http_method.to_uppercase().as_bytes()).unwrap_or(reqwest::Method::POST);
     for url in &cfg.http_urls {
-        let mut last = String::new();
-        let mut ok = false;
-        for attempt in 0..=cfg.retries {
-            let method = reqwest::Method::from_bytes(cfg.http_method.to_uppercase().as_bytes()).unwrap_or(reqwest::Method::POST);
-            let mut req = client.request(method.clone(), url);
-            req = match (cfg.format, method == reqwest::Method::GET) {
-                (_, true) => req.query(&body.iter().filter(|(_, v)| v.is_string()).map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect::<Vec<_>>()),
-                (ReportFormat::Json, false) => req.json(&body),
-                (ReportFormat::Form, false) => req.form(&[("message", body["message"].as_str().unwrap_or_default().to_string()), ("data", serde_json::Value::Object(body.clone()).to_string())]),
-            };
-            match req.send().await {
-                Ok(r) if r.status().is_success() => {
-                    ok = true;
-                    break;
+        let sent = ufop_core::retry::retry_async(
+            &policy,
+            |_| {
+                let mut req = client.request(method.clone(), url);
+                req = match (cfg.format, method == reqwest::Method::GET) {
+                    (_, true) => req.query(&body.iter().filter(|(_, v)| v.is_string()).map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect::<Vec<_>>()),
+                    (ReportFormat::Json, false) => req.json(&body),
+                    (ReportFormat::Form, false) => req.form(&[("message", body["message"].as_str().unwrap_or_default().to_string()), ("data", serde_json::Value::Object(body.clone()).to_string())]),
+                };
+                async move {
+                    match req.send().await {
+                        Ok(r) if r.status().is_success() => Ok(()),
+                        Ok(r) => Err(format!("HTTP {}", r.status())),
+                        Err(e) => Err(e.to_string()),
+                    }
                 }
-                Ok(r) => last = format!("HTTP {}", r.status()),
-                Err(e) => last = e.to_string(),
-            }
-            if attempt < cfg.retries {
-                tokio::time::sleep(Duration::from_millis(cfg.retry_delay_ms.max(1) * (1 << attempt.min(6)))).await;
-            }
-        }
-        if !ok {
+            },
+            |_| true,
+            |_, _, _| {},
+        )
+        .await;
+        if let Err(last) = sent.result {
             failures.push(format!("report to {url} failed: {last}"));
         }
     }

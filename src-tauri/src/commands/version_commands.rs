@@ -128,7 +128,7 @@ async fn restore_version_google_drive(
         "https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media&supportsAllDrives=true"
     );
 
-    let resp = reqwest::Client::new()
+    let resp = crate::net::client()
         .patch(&url)
         .bearer_auth(&token)
         .header("Content-Type", "application/octet-stream")
@@ -230,7 +230,7 @@ async fn list_versions_onedrive(
         "https://graph.microsoft.com/v1.0/me/drive/items/{file_id}/versions"
     );
 
-    let resp = reqwest::Client::new()
+    let resp = crate::net::client()
         .get(&url)
         .bearer_auth(&token)
         .send()
@@ -283,7 +283,7 @@ async fn restore_version_onedrive(
         "https://graph.microsoft.com/v1.0/me/drive/items/{file_id}/versions/{version_id}/restoreVersion"
     );
 
-    let resp = reqwest::Client::new()
+    let resp = crate::net::client()
         .post(&url)
         .bearer_auth(&token)
         .send()

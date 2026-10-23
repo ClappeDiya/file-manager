@@ -78,16 +78,9 @@ impl Default for S3Config {
 }
 
 /// Endpoint for well-known S3-compatible services.
+/// Endpoint for a provider preset (the shared catalog in `connectors::presets`).
 pub fn preset_endpoint(preset: &str, region: &str) -> Option<String> {
-    Some(match preset {
-        "aws" => format!("https://s3.{region}.amazonaws.com"),
-        "idrive_e2" => format!("https://{region}"),
-        "storj" => "https://gateway.storjshare.io".into(),
-        "aliyun_oss" => format!("https://oss-{region}.aliyuncs.com"),
-        "tencent_cos" => format!("https://cos.{region}.myqcloud.com"),
-        "wasabi" => format!("https://s3.{region}.wasabisys.com"),
-        _ => return None,
-    })
+    crate::connectors::presets::s3_endpoint(preset, region)
 }
 
 pub struct S3Store {

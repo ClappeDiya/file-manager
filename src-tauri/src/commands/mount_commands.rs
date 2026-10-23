@@ -6,7 +6,7 @@
 
 use crate::connectors::ConnectionManager;
 use crate::core::error::AppError;
-use crate::mount_engine::{MountCapability, MountConfig, MountInfo, MountManager, MountResult, MountStatus};
+use crate::mount_engine::{MountCapability, MountConfig, MountInfo, MountManager, MountOptions, MountResult, MountStatus, PinReport};
 use crate::storage::Repository;
 use tauri::State;
 use uuid::Uuid;
@@ -28,6 +28,7 @@ pub async fn check_mount_capability(
 pub async fn mount_remote(
     connection_id: String,
     mount_point: String,
+    options: Option<MountOptions>,
     mount_mgr: State<'_, MountManager>,
     repo: State<'_, Repository>,
     connection_mgr: State<'_, ConnectionManager>,
@@ -46,7 +47,7 @@ pub async fn mount_remote(
     }
 
     mount_mgr
-        .mount_remote(cid, mount_point, &repo, &connection_mgr)
+        .mount_remote_with(cid, mount_point, options.unwrap_or_default(), None, &repo, &connection_mgr)
         .await
 }
 
@@ -100,6 +101,7 @@ pub async fn save_mount_config(
     connection_id: String,
     mount_point: String,
     auto_mount: bool,
+    options: Option<MountOptions>,
     mount_mgr: State<'_, MountManager>,
     repo: State<'_, Repository>,
     connection_mgr: State<'_, ConnectionManager>,
@@ -117,7 +119,7 @@ pub async fn save_mount_config(
     }
 
     mount_mgr
-        .save_mount_config(cid, mount_point, auto_mount, &repo, &connection_mgr)
+        .save_mount_config(cid, mount_point, auto_mount, options, &repo, &connection_mgr)
         .await
 }
 
@@ -134,4 +136,32 @@ pub async fn delete_mount_config(
     ))?;
 
     mount_mgr.delete_mount_config(mid, &repo).await
+}
+
+fn mount_uuid(mount_id: &str) -> Result<Uuid, AppError> {
+    Uuid::parse_str(mount_id).map_err(|_| AppError::validation(format!("Invalid mount ID: {mount_id}")))
+}
+
+/// The organization's mount profile in force (`null` = none).
+#[tauri::command]
+pub async fn mount_policy(mount_mgr: State<'_, MountManager>) -> Result<Option<ufop_core::agent::ManagedMounts>, AppError> {
+    Ok(mount_mgr.managed().await)
+}
+
+/// Make a folder of a mounted cloud drive available offline (full cache mode).
+#[tauri::command]
+pub async fn mount_pin_offline(mount_id: String, path: Option<String>, mount_mgr: State<'_, MountManager>) -> Result<PinReport, AppError> {
+    mount_mgr.pin_offline(mount_uuid(&mount_id)?, path.as_deref().unwrap_or("")).await
+}
+
+/// Bytes in a mount's local cache.
+#[tauri::command]
+pub async fn mount_cache_usage(mount_id: String, mount_mgr: State<'_, MountManager>) -> Result<u64, AppError> {
+    Ok(mount_mgr.cache_usage(mount_uuid(&mount_id)?))
+}
+
+/// Delete a mount's local cache (unmounted drives only); returns the bytes freed.
+#[tauri::command]
+pub async fn mount_clear_cache(mount_id: String, mount_mgr: State<'_, MountManager>) -> Result<u64, AppError> {
+    mount_mgr.clear_cache(mount_uuid(&mount_id)?).await
 }

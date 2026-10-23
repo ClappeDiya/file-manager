@@ -6,15 +6,17 @@
  * open alerts — no file paths beyond what reports already contain, and no
  * credentials. Each organization brings its own API key (sealed at rest).
  */
+import { effectiveBranding } from './branding';
+import crypto from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
-import { db, newId, now, parseJson, type Row } from './db/index';
+import { db, newId, now, parseJson, tx, type Row } from './db/index';
 import { openOpt, sealOpt } from './crypto';
 import { getOrg, listOrgs, OrgError } from './db/repos/orgs';
 import { listMachines } from './db/repos/machines';
 import { listBackups, listReports } from './db/repos/reports';
 import { listAlerts } from './db/repos/alerts';
 import { deliverTo } from './mailer';
-import { appendAudit } from './db/repos/audit';
+import { appendAudit, canonical, lastAuditPrune, verifyAudit } from './db/repos/audit';
 
 export const DEFAULT_MODEL = 'claude-opus-5-5';
 
@@ -133,6 +135,57 @@ function client(s: AiSettings): Anthropic {
   return new Anthropic({ apiKey: key, baseURL: s.apiBase || undefined, maxRetries: 2, timeout: 10 * 60_000 });
 }
 
+// ── Transcripts ──
+
+export interface AiTranscript {
+  reportId: string;
+  orgId: string;
+  model: string;
+  systemPrompt: string;
+  request: string;
+  response: string;
+  sha256: string;
+  auditId: string;
+  createdAt: string;
+}
+
+/** The hash recorded on the audit chain: over model, prompts and response. */
+export function transcriptHash(t: Pick<AiTranscript, 'reportId' | 'model' | 'systemPrompt' | 'request' | 'response'>): string {
+  return crypto.createHash('sha256').update(canonical({ reportId: t.reportId, model: t.model, systemPrompt: t.systemPrompt, request: t.request, response: t.response })).digest('hex');
+}
+
+/**
+ * Keep the full exchange with the model and put its hash on the audit chain
+ * (`ai.transcript`), so a later change to the stored transcript is detectable.
+ */
+function recordTranscript(o: { reportId: string; orgId: string; model: string; system: string; request: string; response: string; by: string; usage?: { input_tokens: number; output_tokens: number } }): void {
+  const sha256 = transcriptHash({ reportId: o.reportId, model: o.model, systemPrompt: o.system, request: o.request, response: o.response });
+  const a = appendAudit({ eventType: 'ai.transcript', orgId: o.orgId, userEmail: o.by, description: `AI transcript for report ${o.reportId}`, resourceType: 'ai_report', resourceId: o.reportId, metadata: { sha256, model: o.model, inputTokens: o.usage?.input_tokens ?? 0, outputTokens: o.usage?.output_tokens ?? 0 } });
+  db().prepare('INSERT INTO ai_transcripts (report_id, org_id, model, system_prompt, request, response, sha256, audit_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(o.reportId, o.orgId, o.model, o.system, o.request, o.response, sha256, a.id, now());
+}
+
+export interface TranscriptVerification {
+  /** The stored transcript still hashes to what the audit chain recorded. */
+  matches: boolean;
+  /** The audit chain itself verifies. */
+  chainOk: boolean;
+  auditSequence: number | null;
+  reason: string | null;
+}
+
+export function getTranscript(orgId: string, reportId: string): (AiTranscript & { verification: TranscriptVerification }) | null {
+  const r = db().prepare('SELECT * FROM ai_transcripts WHERE org_id = ? AND report_id = ?').get(orgId, reportId) as Row | undefined;
+  if (!r) return null;
+  const t: AiTranscript = { reportId: r.report_id as string, orgId: r.org_id as string, model: r.model as string, systemPrompt: r.system_prompt as string, request: r.request as string, response: r.response as string, sha256: r.sha256 as string, auditId: r.audit_id as string, createdAt: r.created_at as string };
+  const entry = db().prepare('SELECT sequence, metadata FROM audit_entries WHERE id = ?').get(t.auditId) as Row | undefined;
+  const recorded = entry ? (parseJson<{ sha256?: string }>(entry.metadata, {}).sha256 ?? null) : null;
+  const matches = !!recorded && recorded === transcriptHash(t);
+  const chain = verifyAudit();
+  const pruned = !entry && (lastAuditPrune()?.throughSequence ?? 0) > 0 && db().prepare('SELECT 1 FROM audit_prunes WHERE created_at >= ?').get(t.createdAt);
+  const reason = !entry ? (pruned ? 'The audit entry for this transcript was removed by audit-log retention' : 'The audit entry for this transcript is missing') : !matches ? 'The transcript was changed after it was recorded' : !chain.ok ? `The audit chain does not verify: ${chain.reason}` : null;
+  return { ...t, verification: { matches, chainOk: chain.ok, auditSequence: entry ? Number(entry.sequence) : null, reason } };
+}
+
 /** Run an analysis now and store the result. */
 export async function analyze(orgId: string, o: { kind: AiReport['kind']; machineId?: string; question?: string; days?: number; by: string }): Promise<AiReport> {
   const s = getAiSettings(orgId);
@@ -147,12 +200,14 @@ export async function analyze(orgId: string, o: { kind: AiReport['kind']; machin
     .filter(Boolean)
     .join('\n\n');
   const id = newId('air');
-  const store = (content: string, error: string | null, usage?: { input_tokens: number; output_tokens: number }) => {
-    db()
-      .prepare('INSERT INTO ai_reports (id, org_id, kind, scope, model, input_tokens, output_tokens, content, error, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(id, orgId, o.kind, JSON.stringify(scope), s.model, usage?.input_tokens ?? 0, usage?.output_tokens ?? 0, content, error, o.by, now());
-    return reportFromRow(db().prepare('SELECT * FROM ai_reports WHERE id = ?').get(id) as Row);
-  };
+  const store = (content: string, error: string | null, usage?: { input_tokens: number; output_tokens: number }) =>
+    tx(() => {
+      db()
+        .prepare('INSERT INTO ai_reports (id, org_id, kind, scope, model, input_tokens, output_tokens, content, error, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(id, orgId, o.kind, JSON.stringify(scope), s.model, usage?.input_tokens ?? 0, usage?.output_tokens ?? 0, content, error, o.by, now());
+      recordTranscript({ reportId: id, orgId, model: s.model, system: SYSTEM, request: user, response: content || `[error] ${error ?? ''}`, by: o.by, usage });
+      return reportFromRow(db().prepare('SELECT * FROM ai_reports WHERE id = ?').get(id) as Row);
+    });
   try {
     const stream = client(s).beta.messages.stream({
       model: s.model,
@@ -188,7 +243,7 @@ export async function runScheduledSummaries(at = new Date()): Promise<number> {
     db().prepare('UPDATE ai_settings SET last_run_at = ? WHERE org_id = ?').run(at.toISOString(), org.id);
     const r = await analyze(org.id, { kind: 'summary', days: s.schedule === 'daily' ? 1 : 7, by: 'scheduler' });
     n++;
-    if (r.content && s.channelIds.length) await deliverTo(org.id, s.channelIds, { subject: `[UFOP] ${s.schedule === 'daily' ? 'Daily' : 'Weekly'} backup summary — ${org.name}`, text: r.content, data: { event: 'ai_summary', reportId: r.id } });
+    if (r.content && s.channelIds.length) await deliverTo(org.id, s.channelIds, { subject: `[${effectiveBranding(org.id).displayName}] ${s.schedule === 'daily' ? 'Daily' : 'Weekly'} backup summary — ${org.name}`, text: r.content, data: { event: 'ai_summary', reportId: r.id } });
     appendAudit({ eventType: 'ai.summary', orgId: org.id, description: r.error ? `Scheduled AI summary failed: ${r.error}` : 'Scheduled AI summary created', resourceType: 'ai_report', resourceId: r.id, severity: r.error ? 'warning' : 'info' });
   }
   return n;

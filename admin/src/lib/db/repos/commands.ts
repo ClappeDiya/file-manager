@@ -8,12 +8,13 @@
  * - `run_backup`     {jobId}
  * - `apply_policies` {} — re-fetch and apply fleet policies now
  * - `rotate_token`   {} — the agent swaps to a new token
+ * - `collect_diagnostics` {} — the agent uploads a diagnostics bundle
  */
 import { db, newId, now, parseJson, type Row } from '../index';
 
-export type CommandKind = 'rpc' | 'run_backup' | 'apply_policies' | 'rotate_token';
+export type CommandKind = 'rpc' | 'run_backup' | 'apply_policies' | 'rotate_token' | 'collect_diagnostics';
 export type CommandStatus = 'queued' | 'delivered' | 'succeeded' | 'failed' | 'expired' | 'cancelled';
-export const COMMAND_KINDS: CommandKind[] = ['rpc', 'run_backup', 'apply_policies', 'rotate_token'];
+export const COMMAND_KINDS: CommandKind[] = ['rpc', 'run_backup', 'apply_policies', 'rotate_token', 'collect_diagnostics'];
 
 export interface AgentCommand {
   id: string;

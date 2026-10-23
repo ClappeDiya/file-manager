@@ -7,6 +7,7 @@
  * removed; re-enrollment creates a fresh token). Admins can rotate tokens;
  * the agent picks the new one up on its next request.
  */
+import { createHash } from 'node:crypto';
 import { db, hashToken, newId, newToken, now, parseJson, tx, type Row } from '../index';
 import { open, seal } from '../../crypto';
 import { getOrg, license, OrgError } from './orgs';
@@ -326,6 +327,56 @@ export function collectClaim(claimId: string, secret: string): { status: Claim['
 
 export function pendingClaims(): Claim[] {
   return (db().prepare("SELECT * FROM machine_claims WHERE status = 'pending' AND expires_at > ? ORDER BY created_at DESC").all(now()) as Row[]).map(claimFromRow);
+}
+
+// ── Browser sign-in from the desktop (RFC 8252 loopback redirect + PKCE) ──
+
+const CONNECT_MINUTES = 5;
+
+/** Only native-app loopback redirects: `http://127.0.0.1:<port>/…`, `[::1]` or `localhost`. */
+export function isLoopbackRedirect(uri: string): boolean {
+  try {
+    const u = new URL(uri);
+    return u.protocol === 'http:' && ['127.0.0.1', '[::1]', 'localhost'].includes(u.hostname) && !!u.port && !u.username && !u.password && !u.hash;
+  } catch {
+    return false;
+  }
+}
+
+const S256 = (verifier: string) => createHash('sha256').update(verifier).digest('base64url');
+
+/**
+ * A signed-in user approved enrolling a desktop: a one-time code (5 min)
+ * bound to the PKCE challenge and the loopback redirect. Returns the URL the
+ * browser goes back to.
+ */
+export function createConnectCode(orgId: string, by: string, o: { redirectUri: string; state: string; codeChallenge: string; name?: string; tags?: string[] }): string {
+  if (!isLoopbackRedirect(o.redirectUri)) throw new OrgError('The sign-in must return to this computer (a loopback address)', 400);
+  if (!/^[A-Za-z0-9_-]{43,128}$/.test(o.codeChallenge)) throw new OrgError('Invalid code challenge', 400);
+  if (!o.state || o.state.length > 200) throw new OrgError('Invalid state', 400);
+  checkSeats(orgId);
+  const code = newToken('ufop_connect', 24);
+  const ts = now();
+  db()
+    .prepare('INSERT INTO desktop_connect_codes (code_hash, org_id, user_email, code_challenge, redirect_uri, name, tags, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(hashToken(code), orgId, by, o.codeChallenge, o.redirectUri, clip(o.name ?? ''), JSON.stringify(normalizeTags(o.tags ?? [])), ts, new Date(Date.now() + CONNECT_MINUTES * 60_000).toISOString());
+  const back = new URL(o.redirectUri);
+  back.searchParams.set('code', code);
+  back.searchParams.set('state', o.state);
+  return back.toString();
+}
+
+/** The desktop exchanges the code (once) with its PKCE verifier for an agent token. */
+export function redeemConnectCode(code: string, verifier: string, redirectUri: string, info: ClientInfo, extraTags: string[] = []): { machine: Machine; token: string; by: string } {
+  const r = db().prepare('SELECT * FROM desktop_connect_codes WHERE code_hash = ?').get(hashToken(code)) as Row | undefined;
+  // Burn the code first (outside any transaction): every attempt uses it up,
+  // so a stolen code with a wrong verifier cannot be retried.
+  const burned = r && db().prepare('UPDATE desktop_connect_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?').run(now(), r.code_hash, now()).changes === 1;
+  if (!r || !burned) throw new OrgError('The sign-in code is not valid or has expired; sign in again', 401);
+  if (r.redirect_uri !== redirectUri || S256(verifier) !== r.code_challenge) throw new OrgError('The sign-in code does not belong to this request', 401);
+  const name = (r.name as string) || info.name;
+  const { machine, token } = tx(() => insertMachine(r.org_id as string, { ...info, name }, `sso:${r.user_email}`, [...parseJson<string[]>(r.tags, []), ...extraTags]));
+  return { machine, token, by: r.user_email as string };
 }
 
 // ── Agent authentication & lifecycle ──

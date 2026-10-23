@@ -102,7 +102,7 @@ impl OAuthClient {
     pub fn new(config: OAuthConfig) -> Self {
         Self {
             config,
-            http: reqwest::Client::new(),
+            http: crate::net::client(),
             token: Arc::new(RwLock::new(None)),
             pkce: Arc::new(RwLock::new(None)),
         }

@@ -1,10 +1,12 @@
 /** Alert rules and alert instances. Evaluation lives in lib/alerts.ts. */
 import { db, newId, now, parseJson, type Row } from '../index';
+import { enqueueEvent } from './webhooks';
 import { OrgError } from './orgs';
 import { normalizeTags } from './machines';
+import { isTimeZone } from '../../zoned-time';
 
-export type AlertKind = 'backup_failed' | 'missed_backup' | 'changed_files' | 'duration_anomaly';
-export const ALERT_KINDS: AlertKind[] = ['backup_failed', 'missed_backup', 'changed_files', 'duration_anomaly'];
+export type AlertKind = 'backup_failed' | 'missed_backup' | 'expected_arrival' | 'changed_files' | 'duration_anomaly';
+export const ALERT_KINDS: AlertKind[] = ['backup_failed', 'missed_backup', 'expected_arrival', 'changed_files', 'duration_anomaly'];
 
 export interface AlertParams {
   /** backup_failed: also alert on warnings. */
@@ -24,6 +26,14 @@ export interface AlertParams {
   detectShort?: boolean;
   /** Notify when the alert resolves. */
   notifyOnResolve?: boolean;
+  /** expected_arrival: a successful backup must arrive by this local time (`HH:MM`)… */
+  expectedBy?: string;
+  /** …on these days (0 = Sunday … 6; empty = every day)… */
+  days?: number[];
+  /** …in this IANA time zone (default UTC). */
+  timeZone?: string;
+  /** expected_arrival: only these backup ids (empty = every backup in scope). */
+  backupIds?: string[];
 }
 
 export interface AlertScope {
@@ -66,6 +76,12 @@ function validate(orgId: string, r: RuleInput) {
   if (r.kind === 'changed_files' && !p.maxChangedFiles && !p.maxChangedPercent && !p.maxDeletedFiles) throw new OrgError('Set at least one changed-file threshold');
   for (const k of ['graceMinutes', 'defaultIntervalHours', 'maxChangedFiles', 'maxChangedPercent', 'maxDeletedFiles', 'minSamples', 'factor', 'stdDevs'] as const) {
     if (p[k] !== undefined && (typeof p[k] !== 'number' || (p[k] as number) < 0)) throw new OrgError(`${k} must be a non-negative number`);
+  }
+  if (r.kind === 'expected_arrival') {
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(p.expectedBy ?? '')) throw new OrgError('Set the expected time as HH:MM');
+    if (p.days && !(Array.isArray(p.days) && p.days.every((d) => Number.isInteger(d) && d >= 0 && d <= 6))) throw new OrgError('Days are 0 (Sunday) to 6 (Saturday)');
+    if (p.timeZone && !isTimeZone(p.timeZone)) throw new OrgError(`Unknown time zone '${p.timeZone}'`);
+    if (p.backupIds && !(Array.isArray(p.backupIds) && p.backupIds.every((b) => typeof b === 'string'))) throw new OrgError('backupIds must be a list of backup ids');
   }
   for (const id of r.channelIds ?? []) if (!db().prepare('SELECT 1 FROM notification_channels WHERE org_id = ? AND id = ?').get(orgId, id)) throw new OrgError(`Channel ${id} does not exist`);
 }
@@ -121,6 +137,11 @@ export interface Alert {
   lastNotifiedAt: string | null;
   resolvedAt: string | null;
   notified: { channelId: string; ok: boolean; error?: string; at: string }[];
+  /** Acknowledged alerts stay open but are not notified again. */
+  acknowledgedAt: string | null;
+  acknowledgedBy: string | null;
+  /** No notifications before this time. */
+  snoozedUntil: string | null;
 }
 
 function alertFromRow(r: Row): Alert {
@@ -139,7 +160,28 @@ function alertFromRow(r: Row): Alert {
     lastNotifiedAt: (r.last_notified_at as string) ?? null,
     resolvedAt: (r.resolved_at as string) ?? null,
     notified: parseJson(r.notified, []),
+    acknowledgedAt: (r.acknowledged_at as string) ?? null,
+    acknowledgedBy: (r.acknowledged_by as string) ?? null,
+    snoozedUntil: (r.snoozed_until as string) ?? null,
   };
+}
+
+/** Whether an open alert may notify now (not acknowledged, not snoozed). */
+export function mayNotify(a: Alert, at = Date.now()): boolean {
+  return !a.acknowledgedAt && !(a.snoozedUntil && new Date(a.snoozedUntil).getTime() > at);
+}
+
+export function acknowledgeAlert(orgId: string, id: string, by: string): boolean {
+  return db().prepare('UPDATE alerts SET acknowledged_at = ?, acknowledged_by = ? WHERE org_id = ? AND id = ? AND resolved_at IS NULL').run(now(), by, orgId, id).changes > 0;
+}
+
+export function unacknowledgeAlert(orgId: string, id: string): boolean {
+  return db().prepare('UPDATE alerts SET acknowledged_at = NULL, acknowledged_by = NULL WHERE org_id = ? AND id = ? AND resolved_at IS NULL').run(orgId, id).changes > 0;
+}
+
+/** Snooze until `until` (null wakes it up). */
+export function snoozeAlert(orgId: string, id: string, until: Date | null): boolean {
+  return db().prepare('UPDATE alerts SET snoozed_until = ? WHERE org_id = ? AND id = ? AND resolved_at IS NULL').run(until?.toISOString() ?? null, orgId, id).changes > 0;
 }
 
 export function openAlert(fingerprint: string): Alert | null {
@@ -147,12 +189,14 @@ export function openAlert(fingerprint: string): Alert | null {
   return r ? alertFromRow(r) : null;
 }
 
-export function insertAlert(a: Omit<Alert, 'id' | 'createdAt' | 'lastNotifiedAt' | 'resolvedAt' | 'notified'>): Alert {
+export function insertAlert(a: Omit<Alert, 'id' | 'createdAt' | 'lastNotifiedAt' | 'resolvedAt' | 'notified' | 'acknowledgedAt' | 'acknowledgedBy' | 'snoozedUntil'>): Alert {
   const id = newId('alt');
   db()
     .prepare('INSERT INTO alerts (id, org_id, rule_id, machine_id, backup_id, kind, severity, message, details, fingerprint, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .run(id, a.orgId, a.ruleId, a.machineId, a.backupId, a.kind, a.severity, a.message, JSON.stringify(a.details), a.fingerprint, now());
-  return alertFromRow(db().prepare('SELECT * FROM alerts WHERE id = ?').get(id) as Row);
+  const alert = alertFromRow(db().prepare('SELECT * FROM alerts WHERE id = ?').get(id) as Row);
+  enqueueEvent(a.orgId, 'alert.opened', { alertId: id, kind: a.kind, severity: a.severity, message: a.message, machineId: a.machineId, backupId: a.backupId, ruleId: a.ruleId });
+  return alert;
 }
 
 export function recordNotification(id: string, deliveries: { channelId: string; ok: boolean; error?: string }[]): void {
@@ -162,7 +206,9 @@ export function recordNotification(id: string, deliveries: { channelId: string; 
 }
 
 export function resolveAlert(id: string): void {
-  db().prepare('UPDATE alerts SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL').run(now(), id);
+  if (db().prepare('UPDATE alerts SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL').run(now(), id).changes === 0) return;
+  const a = alertFromRow(db().prepare('SELECT * FROM alerts WHERE id = ?').get(id) as Row);
+  enqueueEvent(a.orgId, 'alert.resolved', { alertId: id, kind: a.kind, severity: a.severity, message: a.message, machineId: a.machineId, backupId: a.backupId, ruleId: a.ruleId });
 }
 
 export function listAlerts(o: { orgIds: string[]; open?: boolean; machineIds?: string[]; limit?: number }): Alert[] {

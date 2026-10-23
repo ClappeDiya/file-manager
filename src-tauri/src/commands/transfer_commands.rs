@@ -53,6 +53,12 @@ pub async fn enqueue_transfer(
     manager: State<'_, TransferManager>,
     ledger: State<'_, OperationLedger>,
 ) -> Result<TransferJob, AppError> {
+    // `dest` may name the file or the folder it goes into.
+    let target = match std::path::Path::new(&dest) {
+        d if d.is_dir() => d.join(std::path::Path::new(&source).file_name().unwrap_or_default()),
+        d => d.to_path_buf(),
+    };
+    super::policy_commands::enforce_path(&target)?;
     let job = manager.enqueue(&source, &dest, total_bytes).await?;
     // Run it: a queued job otherwise never starts.
     manager.spawn_runner(job.id).await;

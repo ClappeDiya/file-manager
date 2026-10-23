@@ -22,12 +22,14 @@ cargo build --release
 
 | Flag | Description |
 |------|-------------|
-| `--format <FORMAT>` | Output format: `human` (default), `json`, `yaml` |
+| `--format <FORMAT>` | Output format: `human`, `json`, `yaml`, `csv` (default: the profile's `default_format`, else `human`) |
 | `--json` | Shorthand for `--format json` |
 | `--yaml` | Shorthand for `--format yaml` |
+| `--csv` | Shorthand for `--format csv` |
+| `--profile <NAME>` | Named profile to use for this run (or set `UFOP_PROFILE`); see `ufop profile` |
 | `--dry-run` | Show what would happen without executing |
 | `--limit <RATE>` | Bandwidth limit (e.g., `1M`, `500K`, `2G`) |
-| `--api-url <URL>` | API server URL (or set `UFOP_API_URL` env var) |
+| `--api-url <URL>` | API server URL for this run (or set `UFOP_API_URL`); not saved unless a command changes it |
 | `-v`, `-vv`, `-vvv` | Verbosity level (info, debug, trace) |
 
 ### Exit Codes
@@ -39,6 +41,27 @@ cargo build --release
 | 2 | Full failure |
 | 3 | Authentication error |
 | 4 | Policy violation |
+
+### CSV output
+
+`--csv` writes RFC 4180 records (CRLF line ends) to stdout; status messages go to stderr, so `ufop … --csv > out.csv` is pure data. Lists become one row per item (columns in first-seen order), a single result one row, and nested values compact JSON. Cells a spreadsheet would treat as a formula (starting `=`, `+`, `-`, `@`, other than numbers) are prefixed with `'`. In `--json` mode `ufop transfer` also streams progress events, one JSON object per line; YAML and CSV print only the result.
+
+### Configuration and profiles
+
+Settings live in `~/.config/ufop/config.toml` (owner-only; `UFOP_CONFIG` overrides the path). Named profiles keep separate API servers, tokens, `ufop server` sign-ins and default output formats; saved connections are shared.
+
+```bash
+ufop profile create staging --api https://staging.example.com --default-format json
+ufop --profile staging login --token <TOKEN>      # signs in to that profile only
+ufop --profile lab server login --url http://lab:8200 --password …
+ufop profile use staging                           # default for later runs
+ufop profile list                                  # `*` marks the active profile
+ufop profile show                                  # tokens are masked
+ufop --profile default status                      # the top-level settings
+ufop profile remove staging                        # not while it is in use
+```
+
+The active profile is `--profile` / `UFOP_PROFILE`, else the one chosen with `ufop profile use`, else `default`. A `--profile` that does not exist is an error, except for `login` and `server login`, which create it. `ufop profile create --from <name>` copies another profile, tokens included.
 
 ---
 
@@ -470,6 +493,78 @@ ufop archive list backup.zip --json
 | Flag | Description |
 |------|-------------|
 | `--password <PASS>` | Password for encrypted archives |
+
+---
+
+### `ufop server shares`
+
+Share links on a `ufop-server` started with `--share-root` (sign in first with `ufop server login`).
+
+```bash
+ufop server shares create /srv/share/q3 --name "Q3 reports" --expires-in-days 14 --max-downloads 20
+ufop server shares create /srv/share/inbox --kind upload --password "$PW" --max-upload-mb 500
+ufop server shares list --csv
+ufop server shares log <id> -n 100
+ufop server shares revoke <id>
+```
+
+`create` prints the full link once (only its hash is kept). Kinds: `download`, `upload` (drop box), `both`.
+
+Folder policies (inherited by subfolders):
+
+```bash
+ufop server folders set /srv/share/inbox --allow pdf,docx --intake sequence --max-upload-mb 200
+ufop server folders set /srv/share/archive --lock --require-password true --max-link-days 14
+ufop server folders show /srv/share/inbox/2026     # own policy, the one in force and its sources
+ufop server folders copy /srv/share/inbox /srv/share/hr
+ufop server folders clear /srv/share/archive
+ufop server folders list
+```
+
+---
+
+### `ufop gateway`
+
+An on-premises **file gateway**: serve folders on this machine through a `ufop-server`, so the server's users can browse, download and (optionally) upload them. The agent connects out to the server over HTTPS, so no inbound port is opened. Data streams straight through and the server does not store it. Start agents with the same `--name` on several machines to share the work and fail over.
+
+```bash
+# On the machine with the files (token: ufop server tokens create gw --scope write)
+UFOP_GATEWAY_TOKEN=ufop_pat_… ufop gateway serve --server https://files.example.com \
+    --name office --root /srv/projects --root /srv/scans [--writable] [--max-upload-mb 500]
+
+# Anywhere, after `ufop server login`
+ufop gateway list                                  # gateways and their nodes
+ufop gateway ls office /projects                   # list a folder (/ = the roots)
+ufop gateway get office /projects/q3/report.pdf    # download (-o to choose the file)
+ufop gateway put office ./notes.txt /projects/notes.txt   # upload (writable gateways)
+```
+
+Paths are `/<root folder name>/…`. They stay inside the roots after symlinks are resolved, and dot-files are neither listed nor served. Uploads are written under a hidden temporary name and renamed into place. Ctrl+C stops an agent, which leaves the pool at once.
+
+### `ufop mcp`
+
+Serve file tools to an AI client (Claude Desktop, Claude Code, any MCP client) over the Model Context Protocol on stdio. Every path is confined to the `--root` directories: paths are resolved and symlinks followed before the check, so `..`, absolute paths and links pointing outside are refused. Read-only unless `--allow-write`.
+
+```bash
+ufop mcp --root ~/Projects/reports                       # read-only
+ufop mcp --root ~/Inbox --root /srv/share --allow-write  # several roots, with write tools
+```
+
+Client configuration (e.g. `claude_desktop_config.json`):
+
+```json
+{ "mcpServers": { "ufop": { "command": "ufop", "args": ["mcp", "--root", "/home/me/Projects"], "env": { "UFOP_LOG_FILE": "/home/me/.ufop-mcp.log" } } } }
+```
+
+| Flag | Description |
+|------|-------------|
+| `--root <DIR>` | Directory the client may use (repeatable, required). Named after its last component (`docs`, `docs-2`, …). |
+| `--allow-write` | Also offer `write_file`, `create_directory`, `copy_file`, `move`, `delete` |
+| `--max-read-bytes <N>` | Largest read per call (default 4 MiB) |
+
+For remote clients, `ufop-server --mcp-root <DIR>` serves the same tools over HTTP at `/mcp` with OAuth sign-in (see *MCP over HTTP* in the API reference).
+
+Tools: `list_roots`, `list_directory` (optionally recursive; symlinks listed, not followed), `get_file_info`, `read_text_file` (byte ranges; `encoding: base64` for binary), `search_files` (glob on names), `checksum` (sha256/sha1/md5); with `--allow-write`: `write_file` (atomic; `overwrite` to replace), `create_directory`, `copy_file`, `move`, `delete` (`recursive` for non-empty directories; roots and symlinks cannot be deleted or written through). Paths are `<root>:relative/path`, absolute inside a root, or relative to the first root. Tool annotations mark read-only and destructive tools. Each call is logged (tool, arguments, outcome) to the log (`--log-file` / `UFOP_LOG_FILE`); stdout carries only protocol messages.
 
 ---
 

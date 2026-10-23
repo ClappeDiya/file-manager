@@ -27,7 +27,19 @@ export interface SyncPair {
   time_offset_secs: number | null;
   /** Robocopy-equivalent copy options (see components/robocopy-options.tsx). */
   copy_options?: import("@/lib/copy-options").CopyOptions;
+  /** Mirrors `SyncRunOptions` (ufop-core sync_types.rs). */
+  run_options?: SyncRunOptions;
 }
+
+export interface SyncRunOptions {
+  settle_secs: number;
+  completion_marker: string | null;
+  version_template: string | null;
+}
+
+export const DEFAULT_RUN_OPTIONS: SyncRunOptions = { settle_secs: 0, completion_marker: null, version_template: null };
+/** Mirrors `DEFAULT_VERSION_TEMPLATE` in ufop-core sync/executor.rs. */
+export const DEFAULT_VERSION_TEMPLATE = "{name}.v{num}.{ext}";
 
 export interface SyncFilter {
   include_patterns: string[];

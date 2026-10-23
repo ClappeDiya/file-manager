@@ -15,7 +15,8 @@ export type RuleTrigger =
   | { type: "file_modified"; watch_path: string; recursive: boolean }
   | { type: "file_deleted"; watch_path: string; recursive: boolean }
   | { type: "schedule"; cron_expr: string; cron_human?: string | null }
-  | { type: "manual" };
+  | { type: "manual" }
+  | { type: "webhook" };
 
 export type RuleCondition =
   | { type: "extension_is"; extensions: string[] }
@@ -23,7 +24,30 @@ export type RuleCondition =
   | { type: "size_greater_than"; bytes: number }
   | { type: "size_less_than"; bytes: number }
   | { type: "created_within"; seconds: number }
-  | { type: "path_contains"; substring: string };
+  | { type: "path_contains"; substring: string }
+  | { type: "older_than"; seconds: number }
+  | { type: "modified_within"; seconds: number }
+  | { type: "name_regex"; pattern: string };
+
+/** AND/OR/NOT tree of conditions (mirrors `ConditionNode`). */
+export type ConditionNode =
+  | { type: "all"; nodes: ConditionNode[] }
+  | { type: "any"; nodes: ConditionNode[] }
+  | { type: "not"; node: ConditionNode }
+  | { type: "condition"; condition: RuleCondition };
+
+/** A backup-style notification channel (mirrors `notify::Notification`);
+ *  its secret lives in the credential store under `credential_id`. */
+export type MessageNotification = {
+  credential_id: string;
+  send_on?: string[];
+  template?: string;
+} & (
+  | { type: "email"; host: string; port: number | null; tls: "start_tls" | "implicit" | "none"; username: string; from: string; to: string[]; subject?: string }
+  | { type: "slack" }
+  | { type: "teams" }
+  | { type: "telegram"; chat_id: string; api_base?: string }
+);
 
 export type RuleAction =
   | { type: "move_file"; dest_path: string }
@@ -35,12 +59,108 @@ export type RuleAction =
   | { type: "transfer_to_connector"; connector_protocol: string; connection_id: string; remote_path: string }
   | { type: "execute_custom_command"; command_id: string }
   | { type: "notify"; title: string; body: string }
+  | { type: "create_folder"; path: string }
+  | { type: "extract_archive"; dest_path: string; max_entries: number; delete_archive: boolean }
+  | { type: "run_command"; program: string; args: string[]; working_dir: string | null; timeout_secs: number }
+  | { type: "send_message"; notification: MessageNotification; title: string; body: string }
   /** Replay a captured set of file operations exactly as the user once
    *  performed them. Created by the **Operation Pin** flow from a single
    *  ledger event — carries its own source list so the trigger doesn't
    *  need to provide a file. Mirrors `RuleAction::ReplayOp` in the Rust
    *  automation engine. */
-  | { type: "replay_op"; kind: string; source_paths: string[]; dest_path: string };
+  | { type: "replay_op"; kind: string; source_paths: string[]; dest_path: string }
+  /** Download a URL into a folder (templates allowed in url, dest_path, file_name, sha256). */
+  | {
+      type: "download_url";
+      url: string;
+      dest_path: string;
+      file_name: string | null;
+      overwrite: boolean;
+      max_mb: number;
+      sha256: string | null;
+      allow_private: boolean;
+    }
+  /** Resize and/or change an image's format; the result (in `dest_path`, empty = same folder) is handed on. */
+  | { type: "convert_image"; format: ImageFormat | null; max_width: number | null; max_height: number | null; quality: number | null; dest_path: string }
+  /** Convert an office document with LibreOffice; the result is handed on. */
+  | { type: "convert_document"; to: DocumentFormat; dest_path: string }
+  /** Check a delivered batch against member and content rules (`automation_engine::validate`). */
+  | { type: "validate_batch"; folder: string; rules: BatchRules; report_folder: string | null; fail_on_invalid: boolean }
+  /** The local AI model applies `instruction` to the file's text; the answer is saved as `<name>.<suffix>`. */
+  | { type: "ai_task"; instruction: string; dest_path: string; suffix: string; max_chars: number }
+  /** Scan with ClamAV; an infected file is moved to `quarantine_path` and the step fails. */
+  | { type: "scan_for_malware"; quarantine_path: string; notify: boolean };
+
+/** `validate::MemberRule`: files matching `pattern` must number `min..=max`, each at least `min_bytes`. */
+export interface MemberRule {
+  pattern: string;
+  min: number;
+  max: number | null;
+  min_bytes: number | null;
+}
+
+export type ContentCheck =
+  | { type: "not_empty" }
+  | { type: "json" }
+  | { type: "csv"; required_columns: string[]; min_rows: number | null; delimiter: string | null }
+  | { type: "sha256_manifest" };
+
+export interface ContentRule {
+  pattern: string;
+  check: ContentCheck;
+}
+
+export interface BatchRules {
+  members: MemberRule[];
+  content: ContentRule[];
+  no_extra_files: boolean;
+}
+
+/** `convert_engine::IMAGE_FORMATS` */
+export const IMAGE_FORMATS = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] as const;
+export type ImageFormat = (typeof IMAGE_FORMATS)[number];
+/** `convert_engine::DOCUMENT_FORMATS` */
+export const DOCUMENT_FORMATS = ["pdf", "docx", "odt", "rtf", "txt", "html", "xlsx", "ods", "csv", "pptx", "odp"] as const;
+export type DocumentFormat = (typeof DOCUMENT_FORMATS)[number];
+
+export type OverwritePolicy =
+  | "rename"
+  | "skip_always"
+  | "overwrite_always"
+  | "overwrite_if_newer"
+  | "overwrite_if_larger"
+  | "ask_each_time";
+
+export interface RetryPolicy {
+  retries: number;
+  delay_ms: number;
+  exponential: boolean;
+  max_delay_ms: number;
+}
+
+export interface SourceSelection {
+  path: string;
+  recursive: boolean;
+  newest: number | null;
+  include_dirs: boolean;
+}
+
+export interface RuleOptions {
+  overwrite: OverwritePolicy;
+  retry: RetryPolicy;
+  priority: number;
+  allow_overlap: boolean;
+  settle_secs: number;
+  source?: SourceSelection | null;
+  /** Set only by `approve_automation_command` (read-only for the UI). */
+  command_approval?: string | null;
+  webhook_secret_hash?: string | null;
+}
+
+export interface ActionStep {
+  action: RuleAction;
+  continue_on_error: boolean;
+}
 
 export interface AutomationRule {
   id: string;
@@ -55,6 +175,56 @@ export interface AutomationRule {
   trigger_count: number;
   error_count: number;
   last_error: string | null;
+  condition_tree?: ConditionNode | null;
+  steps?: ActionStep[];
+  options?: RuleOptions;
+  /** When set, the rule runs this graph instead of `action` + `steps`. */
+  workflow?: Workflow | null;
+  /** Organization that owns the rule (managed settings); read-only here. */
+  managed_by?: string | null;
+}
+
+/** `automation_engine::workflow`: a rule's actions as a DAG. */
+export type EdgeOn = "success" | "failure" | "always" | "true" | "false";
+
+export type WorkflowNodeKind =
+  | { kind: "action"; action: RuleAction }
+  | { kind: "condition"; condition: ConditionNode }
+  | { kind: "delay"; seconds: number }
+  | { kind: "join"; all: boolean }
+  | { kind: "sub_rule"; rule_id: string };
+
+export type WorkflowNode = WorkflowNodeKind & { id: string; label: string; x: number; y: number };
+
+export interface WorkflowEdge {
+  from: string;
+  to: string;
+  on: EdgeOn;
+}
+
+export interface Workflow {
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+}
+
+export interface RuleRevision {
+  revision: number;
+  saved_at: string;
+  name: string;
+  workflow: boolean;
+  actions: number;
+  rule: AutomationRule;
+}
+
+export interface StepResult {
+  step: number;
+  action: string;
+  file: string | null;
+  ok: boolean;
+  attempts: number;
+  message: string | null;
+  /** Workflow step id (workflow runs). */
+  node?: string | null;
 }
 
 export interface AutomationLog {
@@ -67,6 +237,15 @@ export interface AutomationLog {
   status: "success" | "failed" | "skipped" | "running";
   files_affected: string[];
   error_message: string | null;
+  attempts?: number;
+  steps?: StepResult[];
+}
+
+/** URL for a webhook-triggered rule (the token is shown only once). */
+export interface WebhookInfo {
+  url: string;
+  token: string;
+  listening: boolean;
 }
 
 /**
@@ -108,8 +287,12 @@ interface AutomationState {
 
   // Data Actions
   loadRules: () => Promise<void>;
-  createRule: (rule: AutomationRule) => Promise<void>;
-  updateRule: (rule: AutomationRule) => Promise<void>;
+  /** Resolve to the saved rule; reject with the backend's message. */
+  createRule: (rule: AutomationRule) => Promise<AutomationRule>;
+  updateRule: (rule: AutomationRule) => Promise<AutomationRule>;
+  cloneRule: (id: string) => Promise<AutomationRule | null>;
+  approveCommand: (id: string) => Promise<AutomationRule>;
+  rotateWebhook: (id: string) => Promise<WebhookInfo>;
   deleteRule: (id: string) => Promise<void>;
   toggleRule: (id: string, enabled: boolean) => Promise<void>;
   runRule: (id: string) => Promise<AutomationLog | null>;
@@ -180,21 +363,38 @@ export const useAutomationStore = create<AutomationState>()(
       },
 
       createRule: async (rule) => {
-        try {
-          await tauriInvoke("create_automation_rule", { rule });
-          await get().loadRules();
-        } catch (e) {
-          console.error("Failed to create automation rule:", e);
-        }
+        const saved = await tauriInvoke<AutomationRule>("create_automation_rule", { rule });
+        await get().loadRules();
+        return saved;
       },
 
       updateRule: async (rule) => {
+        const saved = await tauriInvoke<AutomationRule>("update_automation_rule", { rule });
+        await get().loadRules();
+        return saved;
+      },
+
+      cloneRule: async (id) => {
         try {
-          await tauriInvoke("update_automation_rule", { rule });
+          const copy = await tauriInvoke<AutomationRule>("clone_automation_rule", { ruleId: id });
           await get().loadRules();
+          return copy;
         } catch (e) {
-          console.error("Failed to update automation rule:", e);
+          console.error("Failed to clone automation rule:", e);
+          return null;
         }
+      },
+
+      approveCommand: async (id) => {
+        const rule = await tauriInvoke<AutomationRule>("approve_automation_command", { ruleId: id });
+        await get().loadRules();
+        return rule;
+      },
+
+      rotateWebhook: async (id) => {
+        const info = await tauriInvoke<WebhookInfo>("rotate_automation_webhook", { ruleId: id });
+        await get().loadRules();
+        return info;
       },
 
       deleteRule: async (id) => {

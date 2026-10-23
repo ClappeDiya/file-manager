@@ -3,6 +3,9 @@
 //!
 //! Provides `AiAssistant` for AI-powered features (T-043..T-045).
 
+pub mod docs_help;
+pub mod report;
+
 use crate::core::error::AppError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -134,16 +137,32 @@ pub struct AiAssistant {
     suggestions: Arc<RwLock<Vec<AiSuggestion>>>,
     audit_log: Arc<RwLock<Vec<AiAuditEntry>>>,
     feature_toggles: Arc<RwLock<AiFeatureToggles>>,
+    /// Limits set by the organization's console (on top of the user's toggles).
+    managed: Arc<RwLock<Option<ufop_core::agent::ManagedAi>>>,
     pending_confirmations: Arc<RwLock<Vec<String>>>,
+    /// The tamper-evident audit chain (`audit_events`): AI actions and chat
+    /// transcripts are appended there and read back from it.
+    audit_pool: Option<crate::storage::pool::DbPool>,
     // Ollama integration
     http_client: reqwest::Client,
     ollama_available: Arc<RwLock<Option<bool>>>,
     ollama_model: Arc<RwLock<String>>,
+    /// Ollama's address (`UFOP_OLLAMA_URL`, default `http://localhost:11434`).
+    ollama_base: String,
+}
+
+/// An answer from the documentation (`ai_help`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HelpAnswer {
+    pub answer: String,
+    pub sources: Vec<docs_help::DocHit>,
+    /// `model` (written by the local model from the sources) or `docs` (the sources themselves).
+    pub generated_by: String,
 }
 
 impl AiAssistant {
     pub fn new() -> Self {
-        let http_client = reqwest::Client::builder()
+        let http_client = crate::net::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_default();
@@ -153,10 +172,34 @@ impl AiAssistant {
             suggestions: Arc::new(RwLock::new(Vec::new())),
             audit_log: Arc::new(RwLock::new(Vec::new())),
             feature_toggles: Arc::new(RwLock::new(AiFeatureToggles::default())),
+            managed: Arc::new(RwLock::new(None)),
             pending_confirmations: Arc::new(RwLock::new(Vec::new())),
+            audit_pool: None,
             http_client,
             ollama_available: Arc::new(RwLock::new(None)),
             ollama_model: Arc::new(RwLock::new("llama3.2".to_string())),
+            ollama_base: std::env::var("UFOP_OLLAMA_URL").ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "http://localhost:11434".into()).trim_end_matches('/').to_string(),
+        }
+    }
+
+    /// The same assistant talking to Ollama at `url`.
+    pub fn with_ollama_url(mut self, url: &str) -> Self {
+        self.ollama_base = url.trim_end_matches('/').to_string();
+        self
+    }
+
+    /// An assistant whose AI actions and chat transcripts go to the audit
+    /// chain in `pool` (persisted, hash-linked, covered by signed anchors).
+    pub fn with_audit(pool: crate::storage::pool::DbPool) -> Self {
+        Self { audit_pool: Some(pool), ..Self::new() }
+    }
+
+    /// Append to the audit chain (non-fatal: a failure is logged, the in-memory log keeps the entry).
+    async fn chain(&self, event_type: String, resource: String, details: serde_json::Value) {
+        let Some(pool) = &self.audit_pool else { return };
+        let event = crate::core::types::AuditEvent { id: Uuid::new_v4(), timestamp: Utc::now(), event_type, actor: "user".into(), resource, details: details.to_string() };
+        if let Err(e) = pool.execute(move |c| crate::security::audit_chain::append_event(c, &event).map(|_| ())).await {
+            tracing::warn!("Could not record an AI audit event: {e}");
         }
     }
 
@@ -174,7 +217,7 @@ impl AiAssistant {
 
         let result = self
             .http_client
-            .get("http://localhost:11434/api/tags")
+            .get(format!("{}/api/tags", self.ollama_base))
             .timeout(Duration::from_millis(500))
             .send()
             .await;
@@ -226,7 +269,7 @@ impl AiAssistant {
         let mut cached = self.ollama_available.write().await;
         *cached = Some(available);
         if available {
-            tracing::info!("Ollama detected at localhost:11434");
+            tracing::info!("Ollama detected at {}", self.ollama_base);
         }
         available
     }
@@ -269,7 +312,7 @@ Return ONLY valid JSON with these fields:
 - intent: one of "sync" | "transfer" | "backup" | "automation" | "filter" | "navigate" | "vault" | "rename" | "exclusion"
 - source_path: string or null (use ~ for home directory)
 - dest_path: string or null
-- dest_connector: one of "s3" | "google_drive" | "dropbox" | "onedrive" | "sftp" | "ftp" | "webdav" | "smb" | "local" | "azure_blob" | "backblaze_b2" or null
+- dest_connector: one of "s3" | "google_drive" | "dropbox" | "onedrive" | "sftp" | "ftp" | "webdav" | "smb" | "local" | "azure_blob" | "adls_gen2" | "azure_files" | "backblaze_b2" or null
 - schedule: cron expression string or null (use "watch" for real-time)
 - schedule_human: human-readable schedule description or null
 - direction: "one_way" | "bidirectional" or null
@@ -294,7 +337,7 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
 
         let resp = self
             .http_client
-            .post("http://localhost:11434/api/generate")
+            .post(format!("{}/api/generate", self.ollama_base))
             .timeout(Duration::from_secs(8))
             .json(&payload)
             .send()
@@ -327,6 +370,80 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
             })?;
 
         Ok(config)
+    }
+
+    /// Free text from the local model (no JSON mode). Fails when no model is running.
+    pub async fn generate_text(&self, prompt: &str, timeout: Duration) -> Result<String, AppError> {
+        if !self.probe_ollama().await {
+            return Err(AppError::Configuration {
+                message: "No local AI model is running".into(),
+                advice: "Install Ollama and pull a model (for example `ollama pull llama3.2`), then try again.".into(),
+            });
+        }
+        let model = self.ollama_model.read().await.clone();
+        let resp = self
+            .http_client
+            .post(format!("{}/api/generate", self.ollama_base))
+            .timeout(timeout)
+            .json(&serde_json::json!({ "model": model, "prompt": prompt, "stream": false }))
+            .send()
+            .await
+            .map_err(|e| AppError::Internal { message: format!("Ollama request failed: {e}") })?;
+        if !resp.status().is_success() {
+            return Err(AppError::Internal { message: format!("Ollama returned status {}", resp.status()) });
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| AppError::Internal { message: format!("Failed to parse Ollama response: {e}") })?;
+        body.get("response").and_then(|v| v.as_str()).map(|t| t.trim().to_string()).ok_or_else(|| AppError::Internal { message: "Ollama response missing 'response' field".into() })
+    }
+
+    /// Answer a question from the bundled documentation: written by the
+    /// local model from the best sections when AI is on and a model runs,
+    /// otherwise the sections themselves.
+    pub async fn help(&self, question: &str) -> HelpAnswer {
+        let hits = docs_help::DocIndex::bundled().search(question, 4);
+        if !hits.is_empty() && self.effective_toggles().await.ai_master_enabled {
+            if let Ok(answer) = self.generate_text(&docs_help::grounded_prompt(question, &hits), Duration::from_secs(60)).await {
+                if !answer.is_empty() {
+                    return HelpAnswer { answer, sources: hits, generated_by: "model".into() };
+                }
+            }
+        }
+        HelpAnswer { answer: docs_help::offline_answer(&hits), sources: hits, generated_by: "docs".into() }
+    }
+
+    /// The activity report for the last `days`, with a short summary from
+    /// the local model when AI is on and one runs (it sees only the report).
+    pub async fn activity_report(&self, days: u32, logs: &[crate::automation_engine::AutomationLog], events: &[crate::ledger::LedgerEvent]) -> report::ActivityReport {
+        let mut r = report::activity_report(days, Utc::now(), logs, events);
+        if self.effective_toggles().await.ai_master_enabled {
+            r.summary = self.generate_text(&report::summary_prompt(&r), Duration::from_secs(90)).await.ok().filter(|s| !s.is_empty());
+        }
+        r
+    }
+
+    /// An unattended AI task (automation): `instruction` applied to a
+    /// file's text by the local model. File contents only go to a model
+    /// when content analysis is allowed; every task is audited.
+    pub async fn run_task(&self, instruction: &str, file_name: &str, text: &str) -> Result<String, AppError> {
+        let toggles = self.effective_toggles().await;
+        if !toggles.ai_master_enabled {
+            return Err(AppError::Configuration { message: "AI features are disabled".into(), advice: "Enable AI in Settings > AI Controls.".into() });
+        }
+        if !toggles.content_analysis_opt_in {
+            return Err(AppError::Configuration {
+                message: "AI tasks read file contents, and content analysis is off".into(),
+                advice: "Allow content analysis in Settings > AI Controls to let automation send file text to your local model.".into(),
+            });
+        }
+        let prompt = format!("{instruction}\n\nFile: {file_name}\n---\n{text}\n---\nResult:");
+        let out = self.generate_text(&prompt, Duration::from_secs(300)).await?;
+        self.chain(
+            "ai.task".into(),
+            file_name.to_string(),
+            serde_json::json!({ "instruction": bounded(instruction), "input_chars": text.chars().count(), "response": bounded(&out) }),
+        )
+        .await;
+        Ok(out)
     }
 
     // ── T-043: Error Explanations ──
@@ -520,7 +637,7 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
         &self,
         context: &SuggestionContext,
     ) -> Vec<AiSuggestion> {
-        let toggles = self.feature_toggles.read().await;
+        let toggles = self.effective_toggles().await;
         if !toggles.ai_master_enabled || !toggles.suggestions {
             return vec![];
         }
@@ -706,7 +823,7 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
         input: &str,
         context_path: Option<&str>,
     ) -> Result<ParsedJobConfig, AppError> {
-        let toggles = self.feature_toggles.read().await;
+        let toggles = self.effective_toggles().await;
         if !toggles.ai_master_enabled || !toggles.nl_job_creation {
             return Err(AppError::Configuration {
                 message: "AI natural language processing is disabled".to_string(),
@@ -877,7 +994,7 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
 
     /// Send a chat message and get a response.
     pub async fn chat(&self, user_message: &str) -> Result<AiChatMessage, AppError> {
-        let toggles = self.feature_toggles.read().await;
+        let toggles = self.effective_toggles().await;
         if !toggles.ai_master_enabled {
             return Err(AppError::Configuration {
                 message: "AI features are disabled".to_string(),
@@ -897,8 +1014,9 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
         let mut history = self.chat_history.write().await;
         history.push(user_msg);
 
-        // Generate response based on content analysis
-        let response_content = self.generate_chat_response(user_message).await;
+        // From the documentation first; canned guidance when it has nothing.
+        let help = self.help(user_message).await;
+        let response_content = if help.sources.is_empty() { self.generate_chat_response(user_message).await } else { help.answer };
 
         let assistant_msg = AiChatMessage {
             id: Uuid::new_v4().to_string(),
@@ -908,6 +1026,14 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
         };
 
         history.push(assistant_msg.clone());
+        drop(history);
+        // The transcript: what was asked and what the assistant answered.
+        self.chain(
+            "ai.chat".into(),
+            "chat".into(),
+            serde_json::json!({ "prompt": bounded(user_message), "response": bounded(&assistant_msg.content), "message_id": assistant_msg.id }),
+        )
+        .await;
 
         Ok(assistant_msg)
     }
@@ -956,23 +1082,71 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
             || action_payload.contains("overwrite")
     }
 
-    /// Get all AI audit log entries.
+    /// AI audit log entries, oldest first: from the audit chain when the
+    /// assistant has one (so they survive restarts), else this session's.
     pub async fn get_audit_log(&self, limit: usize, offset: usize) -> Vec<AiAuditEntry> {
+        if let Some(pool) = &self.audit_pool {
+            let (limit, offset) = (limit as i64, offset as i64);
+            match pool
+                .execute(move |c| {
+                    let mut st = c.prepare("SELECT id, timestamp, event_type, details FROM audit_events WHERE event_type LIKE 'ai.%' ORDER BY sequence LIMIT ?1 OFFSET ?2")?;
+                    let rows = st
+                        .query_map(rusqlite::params![limit, offset], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                })
+                .await
+            {
+                Ok(rows) => return rows.into_iter().map(|(id, ts, ty, details)| entry_from_chain(&id, &ts, &ty, &details)).collect(),
+                Err(e) => tracing::warn!("Could not read the AI audit log: {e}"),
+            }
+        }
         let log = self.audit_log.read().await;
         let start = offset.min(log.len());
         let end = (start + limit).min(log.len());
         log[start..end].to_vec()
     }
 
-    /// Get feature toggles.
+    /// Get feature toggles (as in force: the user's, limited by the console).
     pub async fn get_feature_toggles(&self) -> AiFeatureToggles {
-        let toggles = self.feature_toggles.read().await;
-        toggles.clone()
+        self.effective_toggles().await
     }
 
-    /// Update feature toggles.
-    pub async fn set_feature_toggles(&self, toggles: AiFeatureToggles) {
+    /// The user's toggles with the organization's limits applied.
+    pub async fn effective_toggles(&self) -> AiFeatureToggles {
+        let mut t = self.feature_toggles.read().await.clone();
+        if let Some(m) = self.managed.read().await.as_ref() {
+            if m.enabled == Some(false) {
+                t.ai_master_enabled = false;
+            }
+            if m.allow_cloud == Some(false) {
+                t.model_routing = "local".into();
+            }
+        }
+        t
+    }
+
+    /// Set (or clear) the console's AI limits.
+    pub async fn set_managed(&self, managed: Option<ufop_core::agent::ManagedAi>) {
+        *self.managed.write().await = managed;
+    }
+
+    pub async fn managed(&self) -> Option<ufop_core::agent::ManagedAi> {
+        self.managed.read().await.clone()
+    }
+
+    /// Update feature toggles. Fields the console overrides keep the user's
+    /// own value, so saving the effective toggles never bakes the limit in.
+    pub async fn set_feature_toggles(&self, mut toggles: AiFeatureToggles) {
         let mut current = self.feature_toggles.write().await;
+        if let Some(m) = self.managed.read().await.as_ref() {
+            if m.enabled == Some(false) {
+                toggles.ai_master_enabled = current.ai_master_enabled;
+            }
+            if m.allow_cloud == Some(false) {
+                toggles.model_routing = current.model_routing.clone();
+            }
+        }
         *current = toggles;
     }
 
@@ -1010,8 +1184,17 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
             destructive,
             metadata: None,
         };
-        let mut log = self.audit_log.write().await;
-        log.push(entry);
+        let details = serde_json::json!({
+            "entry_id": entry.id,
+            "input": bounded(&entry.input_summary),
+            "output": bounded(&entry.output_summary),
+            "user_confirmed": entry.user_confirmed,
+            "destructive": entry.destructive,
+        });
+        let event_type = format!("ai.{}", entry.action_type);
+        let resource = entry.action_type.clone();
+        self.audit_log.write().await.push(entry);
+        self.chain(event_type, resource, details).await;
     }
 
     /// Generate a chat response using local context analysis.
@@ -1128,6 +1311,9 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
             ("onedrive", "onedrive"),
             ("s3", "aws_s3"),
             ("aws", "aws_s3"),
+            ("data lake", "adls_gen2"),
+            ("adls", "adls_gen2"),
+            ("azure files", "azure_files"),
             ("azure", "azure_blob"),
             ("backblaze", "backblaze_b2"),
             ("b2", "backblaze_b2"),
@@ -1358,9 +1544,127 @@ pub fn parsed_job_to_automation_rule(
     rule
 }
 
+/// Transcript text kept in the audit chain (bounded so one entry cannot bloat the log).
+const TRANSCRIPT_MAX: usize = 16 * 1024;
+
+fn bounded(s: &str) -> String {
+    if s.len() <= TRANSCRIPT_MAX {
+        return s.to_string();
+    }
+    let mut end = TRANSCRIPT_MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [truncated {} bytes]", &s[..end], s.len() - end)
+}
+
+/// An `ai.*` audit-chain row as an `AiAuditEntry`.
+fn entry_from_chain(id: &str, ts: &str, event_type: &str, details: &str) -> AiAuditEntry {
+    let d: serde_json::Value = serde_json::from_str(details).unwrap_or_default();
+    let text = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let chat = event_type == "ai.chat";
+    AiAuditEntry {
+        id: d.get("entry_id").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| id.to_string()),
+        timestamp: DateTime::parse_from_rfc3339(ts).map(|t| t.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+        action_type: event_type.trim_start_matches("ai.").to_string(),
+        input_summary: if chat { text("prompt") } else { text("input") },
+        output_summary: if chat { text("response") } else { text("output") },
+        user_confirmed: d.get("user_confirmed").and_then(|v| v.as_bool()).unwrap_or(false),
+        destructive: d.get("destructive").and_then(|v| v.as_bool()).unwrap_or(false),
+        metadata: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in Ollama: lists one model and answers every prompt with
+    /// `reply`; the prompts it received are returned.
+    async fn mock_ollama(reply: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = prompts.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let body = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some(i) = text.find("\r\n\r\n") {
+                            let len = text[..i].lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                            if buf.len() >= i + 4 + len {
+                                break (text[..i].to_string(), String::from_utf8_lossy(&buf[i + 4..i + 4 + len]).to_string());
+                            }
+                        }
+                    };
+                    let json = if body.0.starts_with("GET /api/tags") {
+                        serde_json::json!({ "models": [{ "name": "llama3.2:latest" }] })
+                    } else {
+                        let req: serde_json::Value = serde_json::from_str(&body.1).unwrap_or_default();
+                        seen.lock().unwrap().push(req["prompt"].as_str().unwrap_or_default().to_string());
+                        serde_json::json!({ "response": reply })
+                    };
+                    let out = json.to_string();
+                    let _ = sock.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{out}", out.len()).as_bytes()).await;
+                });
+            }
+        });
+        (url, prompts)
+    }
+
+    #[tokio::test]
+    async fn help_is_grounded_in_the_docs_with_or_without_a_model() {
+        // No model: the best sections themselves.
+        let offline = AiAssistant::new().with_ollama_url("http://127.0.0.1:9");
+        let a = offline.help("how do I re-encrypt a gpg file for another key").await;
+        assert_eq!(a.generated_by, "docs");
+        assert!(a.answer.starts_with("From the User Guide") && a.sources.iter().any(|s| s.section.contains("OpenPGP")), "{a:?}");
+        // With a model: its answer, from a prompt built on those sections.
+        let (url, prompts) = mock_ollama("Right-click the file and choose Re-encrypt with GPG.").await;
+        let ai = AiAssistant::new().with_ollama_url(&url);
+        let a = ai.help("how do I re-encrypt a gpg file for another key").await;
+        assert_eq!((a.generated_by.as_str(), a.answer.as_str()), ("model", "Right-click the file and choose Re-encrypt with GPG."));
+        let p = prompts.lock().unwrap()[0].clone();
+        assert!(p.contains("ONLY the documentation") && p.contains("OpenPGP") && p.contains("Question: how do I re-encrypt"), "{p}");
+        // Chat answers from the docs too.
+        assert_eq!(ai.chat("re-encrypt a gpg file").await.unwrap().content, "Right-click the file and choose Re-encrypt with GPG.");
+        // AI switched off: no model call, the docs still help.
+        let mut t = ai.get_feature_toggles().await;
+        t.ai_master_enabled = false;
+        ai.set_feature_toggles(t).await;
+        let before = prompts.lock().unwrap().len();
+        assert_eq!(ai.help("convert documents to pdf").await.generated_by, "docs");
+        assert_eq!(prompts.lock().unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn unattended_tasks_need_content_analysis_and_a_model() {
+        let (url, prompts) = mock_ollama("Invoice from ACME, total 42 EUR").await;
+        let ai = AiAssistant::new().with_ollama_url(&url);
+        let refused = ai.run_task("Summarize", "inv.txt", "ACME invoice 42").await.unwrap_err();
+        assert!(refused.user_message().contains("content analysis is off"), "{}", refused.user_message());
+        assert!(prompts.lock().unwrap().is_empty(), "nothing was sent");
+        let mut t = ai.get_feature_toggles().await;
+        t.content_analysis_opt_in = true;
+        ai.set_feature_toggles(t).await;
+        assert_eq!(ai.run_task("Summarize", "inv.txt", "ACME invoice 42").await.unwrap(), "Invoice from ACME, total 42 EUR");
+        assert!(prompts.lock().unwrap()[0].contains("Summarize\n\nFile: inv.txt\n---\nACME invoice 42"));
+        let none = AiAssistant::new().with_ollama_url("http://127.0.0.1:9");
+        let mut t = none.get_feature_toggles().await;
+        t.content_analysis_opt_in = true;
+        none.set_feature_toggles(t).await;
+        assert!(none.run_task("Summarize", "a", "b").await.unwrap_err().user_message().contains("No local AI model"));
+    }
 
     #[test]
     fn test_explain_file_error() {
@@ -1467,6 +1771,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_limits_override_the_users_toggles() {
+        let ai = AiAssistant::new();
+        let mut t = ai.get_feature_toggles().await;
+        t.model_routing = "cloud".into();
+        ai.set_feature_toggles(t).await;
+        ai.set_managed(Some(ufop_core::agent::ManagedAi { enabled: None, allow_cloud: Some(false) })).await;
+        assert_eq!(ai.get_feature_toggles().await.model_routing, "local");
+        assert!(ai.get_feature_toggles().await.ai_master_enabled);
+        ai.set_managed(Some(ufop_core::agent::ManagedAi { enabled: Some(false), allow_cloud: None })).await;
+        assert!(ai.chat("hi").await.is_err());
+        assert!(ai.parse_natural_language("copy a to b").await.is_err());
+        // Turning AI on in Settings does not lift the organization's limit.
+        let mut t = ai.get_feature_toggles().await;
+        t.ai_master_enabled = true;
+        ai.set_feature_toggles(t).await;
+        assert!(!ai.get_feature_toggles().await.ai_master_enabled);
+        ai.set_managed(None).await;
+        assert!(ai.get_feature_toggles().await.ai_master_enabled);
+        assert_eq!(ai.get_feature_toggles().await.model_routing, "cloud");
+    }
+
+    #[tokio::test]
     async fn test_feature_toggles_disable() {
         let ai = AiAssistant::new();
         let mut toggles = ai.get_feature_toggles().await;
@@ -1485,6 +1811,34 @@ mod tests {
         let _ = ai.parse_natural_language("sync my documents").await;
         let log = ai.get_audit_log(10, 0).await;
         assert!(!log.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ai_actions_and_chat_transcripts_go_to_the_audit_chain() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let ai = AiAssistant::with_audit(repo.pool().clone());
+        ai.chat("how do I sync my photos?").await.unwrap();
+        let _ = ai.parse_natural_language("sync my documents to drive every night").await;
+        let long = "x".repeat(TRANSCRIPT_MAX + 10);
+        ai.chat(&long).await.unwrap();
+
+        // A fresh assistant on the same database (a restart) still sees them, in order.
+        let again = AiAssistant::with_audit(repo.pool().clone());
+        let log = again.get_audit_log(50, 0).await;
+        assert!(log.len() >= 3, "{log:?}");
+        assert_eq!(log[0].action_type, "chat");
+        assert_eq!(log[0].input_summary, "how do I sync my photos?");
+        assert!(!log[0].output_summary.is_empty());
+        assert!(log.iter().any(|e| e.action_type != "chat"), "the NL action is logged too");
+        let last = log.iter().rev().find(|e| e.action_type == "chat").unwrap();
+        assert!(last.input_summary.ends_with("[truncated 10 bytes]"));
+        assert_eq!(again.get_audit_log(1, 1).await[0].id, log[1].id);
+
+        // They are links of the tamper-evident chain.
+        let v = repo.pool().execute(|c| crate::security::audit_chain::verify(c, None)).await.unwrap();
+        assert!(v.ok, "{v:?}");
+        let n: i64 = repo.pool().execute(|c| Ok(c.query_row("SELECT COUNT(*) FROM audit_events WHERE event_type LIKE 'ai.%' AND hash IS NOT NULL", [], |r| r.get(0))?)).await.unwrap();
+        assert_eq!(n as usize, log.len());
     }
 
     #[tokio::test]

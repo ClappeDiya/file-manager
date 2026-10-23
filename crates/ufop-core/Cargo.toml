@@ -15,7 +15,13 @@ sqlite = ["dep:rusqlite"]
 backup = ["sqlite", "dep:windows", "dep:aes-gcm", "dep:argon2", "dep:flate2", "dep:rand", "dep:hex", "dep:zip", "dep:base64"]
 # Fleet agent: client side of the admin console's `/api/agent/*` protocol
 # (registration, claiming, heartbeats, commands, policies, reports).
-agent = ["dep:reqwest", "dep:tokio"]
+agent = ["dep:reqwest", "dep:tokio", "dep:base64"]
+# File gateway agent (`gateway` module): serves local folders through ufop-server.
+gateway = ["agent", "reqwest/stream", "tokio/fs", "tokio/io-util", "tokio/rt", "dep:tokio-util"]
+# Model Context Protocol file tools (`mcp` module): stdio and HTTP transports use the same handler.
+mcp = ["dep:base64", "dep:md-5", "dep:sha1"]
+# Text from office documents (docx/xlsx/pptx, OpenDocument, RTF) and PDF for previews and search.
+doctext = ["dep:zip", "dep:flate2"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -37,9 +43,12 @@ rand = { version = "0.8", optional = true }
 hex = { version = "0.4", optional = true }
 zip = { version = "2", optional = true, default-features = false, features = ["deflate", "bzip2", "zstd"] }
 base64 = { version = "0.22", optional = true }
+md-5 = { version = "0.10", optional = true }
+sha1 = { version = "0.10", optional = true }
 # TLS backends come from the consumer (the desktop app / CLI enable theirs).
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json"] }
 tokio = { version = "1", optional = true, features = ["time", "sync", "macros"] }
+tokio-util = { version = "0.7", optional = true, features = ["io"] }
 
 # Backup metadata (xattrs, POSIX ACLs via system.* xattrs), advisory locks,
 # I/O priority and free-space checks.

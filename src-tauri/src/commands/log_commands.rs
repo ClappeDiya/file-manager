@@ -66,6 +66,39 @@ static CURRENT_LOG_LEVEL: std::sync::LazyLock<
     tokio::sync::RwLock<LogLevel>,
 > = std::sync::LazyLock::new(|| tokio::sync::RwLock::new(LogLevel::Info));
 
+// ── Retention and diagnostics ──
+
+#[tauri::command]
+pub async fn get_log_retention() -> Result<crate::logging::Retention, AppError> {
+    Ok(crate::logging::Retention::load(&crate::logging::log_dir()))
+}
+
+/// Save the retention and prune now; returns how many files were removed.
+#[tauri::command]
+pub async fn set_log_retention(retention: crate::logging::Retention) -> Result<usize, AppError> {
+    let dir = crate::logging::log_dir();
+    retention.save(&dir).map_err(AppError::validation)?;
+    Ok(retention.apply(&dir))
+}
+
+/// Build a diagnostics bundle (logs, versions, OS; secrets scrubbed) and
+/// save it to `out_path` (a file, or a folder for the default name).
+#[tauri::command]
+pub async fn diagnostics_create(out_path: String) -> Result<crate::diagnostics::SavedBundle, AppError> {
+    tokio::task::spawn_blocking(move || {
+        let (b, _) = crate::diagnostics::collect("desktop")?;
+        crate::diagnostics::save(&b, std::path::Path::new(&out_path))
+    })
+    .await
+    .map_err(|e| AppError::internal(format!("Diagnostics task failed: {e}")))?
+}
+
+/// Send a diagnostics bundle to the management console; returns its id there.
+#[tauri::command]
+pub async fn diagnostics_send(agent: tauri::State<'_, crate::fleet_agent::FleetAgent>) -> Result<String, AppError> {
+    agent.send_diagnostics().await
+}
+
 // ── Log Level Controls ──
 
 /// Get the current log level.
@@ -79,6 +112,8 @@ pub async fn get_log_level() -> Result<LogLevel, AppError> {
 #[tauri::command]
 pub async fn set_log_level(level: LogLevel) -> Result<(), AppError> {
     tracing::info!("Log level changing to: {:?}", level);
+    // Before, this only stored the value: the running filter never changed.
+    crate::logging::set_level(&format!("{:?}", level).to_lowercase()).map_err(AppError::internal)?;
     let mut current = CURRENT_LOG_LEVEL.write().await;
     *current = level;
     Ok(())
@@ -240,32 +275,19 @@ pub struct GssapiStatus {
 // ── Helpers ──
 
 fn get_log_dir_path() -> PathBuf {
-    directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
-        .map(|d| d.data_local_dir().join("logs"))
-        .unwrap_or_else(|| PathBuf::from("./logs"))
+    crate::logging::log_dir()
 }
 
-fn find_latest_log_file(log_dir: &PathBuf) -> Result<PathBuf, AppError> {
+fn find_latest_log_file(log_dir: &std::path::Path) -> Result<PathBuf, AppError> {
     if !log_dir.exists() {
         return Err(AppError::internal("Log directory does not exist. Logs may not have been written yet."));
     }
-
-    let mut entries: Vec<_> = std::fs::read_dir(log_dir)
-        .map_err(|e| AppError::internal(format!("Cannot read log directory: {e}")))?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "log")
-                .unwrap_or(false)
-        })
-        .collect();
-
-    entries.sort_by_key(|e| std::cmp::Reverse(e.metadata().ok().and_then(|m| m.modified().ok())));
-
-    entries
-        .first()
-        .map(|e| e.path())
+    // Rolling files are named ufop.<date>.log (the old filter wanted a
+    // ".log" extension, which matched nothing the app wrote).
+    crate::logging::log_files(log_dir)
+        .into_iter()
+        .next()
+        .map(|(p, ..)| p)
         .ok_or_else(|| AppError::internal("No log files found in log directory."))
 }
 

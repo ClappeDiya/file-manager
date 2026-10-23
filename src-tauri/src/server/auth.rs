@@ -160,11 +160,16 @@ impl LoginThrottle {
 pub struct AuthService {
     settings: SettingsStore,
     pub throttle: Arc<LoginThrottle>,
+    /// Passwords recently accepted by `login_remembered` (SHA-256 → when).
+    remembered: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
 }
+
+/// How long `login_remembered` trusts an accepted password.
+pub const REMEMBER_LOGIN: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl AuthService {
     pub fn new(settings: SettingsStore) -> Self {
-        Self { settings, throttle: Arc::new(LoginThrottle::new(10, 250)) }
+        Self { settings, throttle: Arc::new(LoginThrottle::new(10, 250)), remembered: Default::default() }
     }
 
     pub async fn has_password(&self) -> Result<bool, AppError> {
@@ -177,6 +182,26 @@ impl AuthService {
         self.reset_jwt().await
     }
 
+    /// Folder policies of shared folders (see `folders`).
+    pub fn folder_policies(&self) -> super::folders::FolderPolicyStore {
+        super::folders::FolderPolicyStore::new(self.settings.pool().clone())
+    }
+
+    /// Share links (see `shares`).
+    pub fn shares(&self) -> super::shares::ShareStore {
+        super::shares::ShareStore::new(self.settings.pool().clone())
+    }
+
+    /// Named, scoped API tokens (see `api_tokens`).
+    /// The server database (OAuth clients and refresh tokens live there too).
+    pub fn settings_pool(&self) -> &crate::storage::pool::DbPool {
+        self.settings.pool()
+    }
+
+    pub fn api_tokens(&self) -> super::api_tokens::ApiTokenStore {
+        super::api_tokens::ApiTokenStore::new(self.settings.pool().clone())
+    }
+
     async fn jwt_key(&self) -> Result<Vec<u8>, AppError> {
         if let Some(k) = self.settings.get_secret(KEY_JWT).await? {
             return hex::decode(k).map_err(|_| AppError::internal("corrupt jwt key"));
@@ -187,8 +212,11 @@ impl AuthService {
         Ok(k)
     }
 
-    /// Rotate the signing key and revoke all refresh tokens.
+    /// Rotate the signing key and revoke all refresh and API tokens.
     pub async fn reset_jwt(&self) -> Result<(), AppError> {
+        if let Ok(mut m) = self.remembered.lock() {
+            m.clear();
+        }
         let mut k = vec![0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut k);
         self.settings.set_secret(KEY_JWT, &hex::encode(&k)).await?;
@@ -196,6 +224,7 @@ impl AuthService {
             .pool()
             .execute(|c| {
                 c.execute("UPDATE server_tokens SET revoked = 1", [])?;
+                c.execute("UPDATE server_api_tokens SET revoked = 1", [])?;
                 Ok(())
             })
             .await
@@ -323,6 +352,26 @@ impl AuthService {
         };
         let pw = pw.to_string();
         Ok(self.throttle.attempt(move || verify_password_hash(&pw, &phc)).await)
+    }
+
+    /// `login` for clients that send the password with every request
+    /// (WebDAV Basic auth): an accepted password is trusted for
+    /// `REMEMBER_LOGIN` without re-hashing; a password change or token reset
+    /// forgets it.
+    pub async fn login_remembered(&self, pw: &str) -> Result<Option<bool>, AppError> {
+        use sha2::Digest;
+        let key: [u8; 32] = sha2::Sha256::digest(pw.as_bytes()).into();
+        if self.remembered.lock().ok().and_then(|m| m.get(&key).copied()).is_some_and(|t| t.elapsed() < REMEMBER_LOGIN) {
+            return Ok(Some(true));
+        }
+        let r = self.login(pw).await?;
+        if r == Some(true) {
+            if let Ok(mut m) = self.remembered.lock() {
+                m.retain(|_, t| t.elapsed() < REMEMBER_LOGIN);
+                m.insert(key, std::time::Instant::now());
+            }
+        }
+        Ok(r)
     }
 }
 

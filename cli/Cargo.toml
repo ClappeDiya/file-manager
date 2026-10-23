@@ -13,13 +13,14 @@ path = "src/main.rs"
 
 [dependencies]
 # Same sync/copy engine as the desktop app (Robocopy-compatible `ufop copy`).
-ufop-core = { path = "../crates/ufop-core", features = ["backup", "agent"] }
+ufop-core = { path = "../crates/ufop-core", features = ["backup", "agent", "gateway", "mcp"] }
 clap = { version = "4", features = ["derive", "env", "color"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "native-tls"] }
+reqwest = { version = "0.12", features = ["json", "native-tls", "stream"] }
+tokio-util = { version = "0.7", features = ["io"] }
 indicatif = "0.18"
 dirs = "6"
 toml = "0.8"
@@ -28,9 +29,7 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
-md-5 = "0.10"
-sha1 = "0.10"
-sha2 = "0.10"
+glob = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

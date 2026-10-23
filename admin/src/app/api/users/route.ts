@@ -1,12 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { publicOrigin } from '@/lib/route-helpers';
+import { paged } from '@/lib/pagination';
+import { revokeUserApiTokens } from '@/lib/db/repos/api-tokens';
+import { orgErrorResponse, pagedJson, publicOrigin, readPage } from '@/lib/route-helpers';
 import { ROLE_HIERARCHY, type Role } from '@/lib/types/auth';
-import { audit, badRequest, can, canIn, isContext, readJson, requirePermission } from '@/lib/session';
+import { audit, badRequest, can, canIn, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
 import { canManageRole } from '@/lib/utils/permissions';
-import { effectiveRole, membersOf, membershipsOf, OrgError, removeMembership, setMembership } from '@/lib/db/repos/orgs';
+import { effectiveRole, membersOf, membershipsOf, OrgError, setMembership } from '@/lib/db/repos/orgs';
+import { listRemovedMembers, offboardMember, restoreMember, RESTORE_DAYS, setMembershipExpiry } from '@/lib/offboarding';
 import { listUsers, publicUser, updateUser } from '@/lib/db/repos/users';
 import { groupsOfUser } from '@/lib/db/repos/groups';
 import { createInvitation, listInvitations } from '@/lib/db/repos/invitations';
+import { revokeUserSessions } from '@/lib/db/repos/sessions';
 import { sendInvitationEmail } from '@/lib/mailer';
 
 /** GET /api/users — the organization's roster: members (with groups) and invitations. */
@@ -23,13 +27,19 @@ export async function GET(request: NextRequest) {
     ...publicUser(u),
     role: byId.get(u.id)!.role,
     memberSince: byId.get(u.id)!.createdAt,
+    expiresAt: byId.get(u.id)!.expiresAt,
     groups: groupsOfUser(u.id).filter((g) => g.orgId === ctx.orgId).map((g) => ({ id: g.id, name: g.name, role: g.memberRole })),
   }));
   if (role) users = users.filter((u) => u.role === role);
   if (active !== null) users = users.filter((u) => u.isActive === (active === 'true'));
   if (search) users = users.filter((u) => u.name.toLowerCase().includes(search) || u.email.toLowerCase().includes(search));
   const invitations = can(ctx, 'users.invite') ? listInvitations(ctx.orgId) : [];
-  return NextResponse.json({ users, total: users.length, invitations });
+  const removed = can(ctx, 'users.remove') ? listRemovedMembers(ctx.orgId) : [];
+  // Every member unless a page is asked for (the Users screen shows all).
+  const pr = readPage(request, { defaultLimit: Infinity });
+  if (pr instanceof NextResponse) return pr;
+  const { items, page } = paged(users, pr);
+  return pagedJson(request, { users: items, total: users.length, invitations, removed, restoreDays: RESTORE_DAYS }, page);
 }
 
 /** POST /api/users — invite someone to this organization (optionally into a group). */
@@ -53,14 +63,29 @@ export async function POST(request: NextRequest) {
   }
 }
 
-/** PATCH /api/users — bulk actions on members of this organization. */
+/**
+ * PATCH /api/users — bulk actions on members of this organization:
+ * deactivate | activate | sign_out | set_role {role} | remove {successorId?} |
+ * set_expiry {expiresAt: ISO | null} | restore (members removed in the last RESTORE_DAYS days).
+ */
 export async function PATCH(request: NextRequest) {
-  const b = await readJson<{ action?: string; userIds?: string[]; role?: Role }>(request);
-  const perm = b?.action === 'remove' ? 'users.remove' : b?.action === 'set_role' ? 'roles.write' : 'users.deactivate';
-  const ctx = await requirePermission(request, perm);
+  const b = await readJson<{ action?: string; userIds?: string[]; role?: Role; successorId?: string | null; expiresAt?: string | null }>(request);
+  const perm = b?.action === 'remove' || b?.action === 'restore' || b?.action === 'set_expiry' ? 'users.remove' : b?.action === 'set_role' ? 'roles.write' : 'users.deactivate'; // deactivate, activate, sign_out
+  // Removing, restoring and expiring members and changing roles are sensitive: they need a recent sign-in.
+  const sensitive = ['remove', 'restore', 'set_expiry', 'set_role'].includes(b?.action ?? '');
+  const ctx = sensitive ? await requireStepUp(request, perm) : await requirePermission(request, perm);
   if (!isContext(ctx)) return ctx;
   if (!b?.action || !Array.isArray(b.userIds) || b.userIds.length === 0) return badRequest('Action and userIds required');
   if (b.userIds.includes(ctx.user.id)) return badRequest('Cannot modify your own account via bulk operations', 403);
+  if (b.action === 'restore') {
+    try {
+      const restored = b.userIds.map((id) => restoreMember(ctx.orgId, id));
+      audit(ctx, { eventType: 'admin.user_restore', severity: 'warning', description: `Restored ${restored.map((r) => `${r.email} (${r.role})`).join(', ')}`, metadata: { userIds: b.userIds } });
+      return NextResponse.json({ success: true, affected: restored.length });
+    } catch (e) {
+      return orgErrorResponse(e);
+    }
+  }
   const members = new Map(membersOf(ctx.orgId).map((m) => [m.userId, m]));
   for (const id of b.userIds) {
     const m = members.get(id);
@@ -69,7 +94,7 @@ export async function PATCH(request: NextRequest) {
     const theirs = effectiveRole(id, ctx.orgId) ?? m.role;
     if (ctx.role !== 'org_owner' && !canManageRole(ctx.role, theirs)) return badRequest('You cannot change someone whose role is at or above your own', 403);
     // Deactivation locks the whole account: only when every organization it belongs to is yours to manage.
-    if ((b.action === 'deactivate' || b.action === 'activate') && membershipsOf(id).some((x) => x.orgId !== ctx.orgId && !canIn(ctx, x.orgId, 'users.deactivate'))) {
+    if ((b.action === 'deactivate' || b.action === 'activate' || b.action === 'sign_out') && membershipsOf(id).some((x) => x.orgId !== ctx.orgId && !canIn(ctx, x.orgId, 'users.deactivate'))) {
       return badRequest('This account also belongs to other organizations; remove it from this organization instead', 403);
     }
   }
@@ -77,11 +102,34 @@ export async function PATCH(request: NextRequest) {
   switch (b.action) {
     case 'deactivate':
     case 'activate':
-      for (const id of b.userIds) updateUser(id, { isActive: b.action === 'activate' });
+      for (const id of b.userIds) {
+        updateUser(id, { isActive: b.action === 'activate' });
+        if (b.action === 'deactivate') {
+          revokeUserSessions(id, 'deactivated');
+          revokeUserApiTokens(id);
+        }
+      }
       break;
-    case 'remove':
+    case 'sign_out':
+      for (const id of b.userIds) revokeUserSessions(id, `signed out by ${ctx.user.email}`);
+      break;
+    case 'remove': {
       if (owners.length === 0) return badRequest('Cannot remove the last organization owner', 403);
-      for (const id of b.userIds) removeMembership(id, ctx.orgId);
+      if (b.successorId && b.userIds.includes(b.successorId)) return badRequest('The successor cannot be one of the members being removed');
+      try {
+        const results = b.userIds.map((id) => offboardMember(ctx.orgId, id, { by: ctx.user.email, reason: 'removed', successor: b.successorId ?? null }));
+        audit(ctx, { eventType: 'admin.user_remove', severity: 'warning', description: `remove ${b.userIds.length} user(s)${b.successorId ? ' with a successor' : ''} (restorable for ${RESTORE_DAYS} days)`, metadata: { userIds: b.userIds, successorId: b.successorId ?? null, results } });
+        return NextResponse.json({ success: true, affected: b.userIds.length, results });
+      } catch (e) {
+        return orgErrorResponse(e);
+      }
+    }
+    case 'set_expiry':
+      try {
+        for (const id of b.userIds) setMembershipExpiry(ctx.orgId, id, b.expiresAt ?? null);
+      } catch (e) {
+        return orgErrorResponse(e);
+      }
       break;
     case 'set_role': {
       if (!b.role || !(b.role in ROLE_HIERARCHY)) return badRequest('Unknown role');
@@ -93,7 +141,7 @@ export async function PATCH(request: NextRequest) {
     default:
       return badRequest('Unknown action');
   }
-  const event = { deactivate: 'admin.user_deactivate', activate: 'admin.user_activate', remove: 'admin.user_remove', set_role: 'admin.role_change' }[b.action] ?? 'admin.settings_change';
-  audit(ctx, { eventType: event, description: `${b.action} ${b.userIds.length} user(s)${b.role ? ` → ${b.role}` : ''}`, metadata: { userIds: b.userIds } });
+  const event = { deactivate: 'admin.user_deactivate', activate: 'admin.user_activate', set_role: 'admin.role_change', sign_out: 'admin.user_sign_out', set_expiry: 'admin.user_expiry' }[b.action] ?? 'admin.settings_change';
+  audit(ctx, { eventType: event, description: `${b.action} ${b.userIds.length} user(s)${b.role ? ` → ${b.role}` : ''}${b.action === 'set_expiry' ? ` → ${b.expiresAt ?? 'no expiry'}` : ''}`, metadata: { userIds: b.userIds } });
   return NextResponse.json({ success: true, affected: b.userIds.length });
 }

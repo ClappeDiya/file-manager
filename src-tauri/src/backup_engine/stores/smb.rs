@@ -42,7 +42,7 @@ struct TempPath(std::path::PathBuf);
 
 impl TempPath {
     fn new() -> Result<Self, AppError> {
-        let p = std::env::temp_dir().join(format!("ufop-smb-{}", uuid::Uuid::new_v4().simple()));
+        let p = ufop_core::session::user_temp_subdir("smb").join(uuid::Uuid::new_v4().simple().to_string());
         std::fs::File::create(&p).map_err(|e| AppError::internal(e.to_string()))?;
         #[cfg(unix)]
         {

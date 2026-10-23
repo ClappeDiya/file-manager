@@ -13,8 +13,9 @@ import { ErrorBanner, Loading } from '@/components/fleet/badges';
 import { useApi } from '@/lib/use-api';
 import { api, errorText } from '@/lib/api-client';
 import { ROLE_LABELS, type Role } from '@/lib/types/auth';
-import type { OidcConfig, SamlConfig, SsoKind, SsoProvider } from '@/lib/db/repos/sso';
+import type { LdapConfig, OidcConfig, SamlConfig, SsoKind, SsoProvider } from '@/lib/db/repos/sso';
 import type { Group } from '@/lib/db/repos/groups';
+import { SsoDiagnostics } from '@/components/users/sso-diagnostics';
 
 type Row = SsoProvider & { callbackUrl: string; metadataUrl: string | null };
 
@@ -24,6 +25,7 @@ interface Draft {
   kind: SsoKind;
   oidc: OidcConfig;
   saml: SamlConfig;
+  ldap: LdapConfig;
   secret: string;
   hasSecret: boolean;
   defaultRole: Role;
@@ -38,6 +40,7 @@ interface Draft {
 const JIT_ROLES: Role[] = ['user', 'read_only_auditor', 'operator', 'org_admin'];
 const emptyOidc: OidcConfig = { issuer: '', clientId: '', scopes: 'openid email profile', allowUnverifiedEmail: false, groupsClaim: 'groups' };
 const emptySaml: SamlConfig = { entryPoint: '', idpCert: '', idpIssuer: '', emailAttribute: '', nameAttribute: 'displayName', groupsAttribute: 'groups' };
+const emptyLdap: LdapConfig = { url: 'ldaps://', startTls: false, caCert: '', bindDn: '', baseDn: '', userFilter: '(&(objectClass=user)(|(sAMAccountName={username})(mail={username})))', emailAttribute: 'mail', nameAttribute: 'displayName', groupsAttribute: 'memberOf', idAttribute: '' };
 
 /** "idp-group = console group" lines ↔ mapping object. */
 const toLines = (m: Record<string, string>, groups: Group[]) => Object.entries(m).map(([k, v]) => `${k} = ${groups.find((g) => g.id === v)?.name ?? v}`).join('\n');
@@ -56,6 +59,7 @@ export default function SsoSettingsPage() {
   const groups = useApi<{ groups: Group[] }>('/api/groups');
   const [draft, setDraft] = useState<Draft | null>(null);
   const [formErr, setFormErr] = useState<string | null>(null);
+  const [diagnose, setDiagnose] = useState<SsoProvider | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const gs = groups.data?.groups ?? [];
 
@@ -63,8 +67,8 @@ export default function SsoSettingsPage() {
     setFormErr(null);
     setDraft(
       p
-        ? { id: p.id, name: p.name, kind: p.kind, oidc: p.kind === 'oidc' ? { ...emptyOidc, ...(p.config as OidcConfig) } : emptyOidc, saml: p.kind === 'saml' ? { ...emptySaml, ...(p.config as SamlConfig) } : emptySaml, secret: '', hasSecret: p.hasSecret, defaultRole: p.defaultRole, defaultGroupId: p.defaultGroupId ?? '', mapping: toLines(p.groupMapping, gs), requireMfa: p.requireMfa, allowJit: p.allowJit, domains: p.domains.join(', '), enabled: p.enabled }
-        : { id: null, name: '', kind: 'oidc', oidc: emptyOidc, saml: emptySaml, secret: '', hasSecret: false, defaultRole: 'user', defaultGroupId: '', mapping: '', requireMfa: false, allowJit: true, domains: '', enabled: true },
+        ? { id: p.id, name: p.name, kind: p.kind, oidc: p.kind === 'oidc' ? { ...emptyOidc, ...(p.config as OidcConfig) } : emptyOidc, saml: p.kind === 'saml' ? { ...emptySaml, ...(p.config as SamlConfig) } : emptySaml, ldap: p.kind === 'ldap' ? { ...emptyLdap, ...(p.config as LdapConfig) } : emptyLdap, secret: '', hasSecret: p.hasSecret, defaultRole: p.defaultRole, defaultGroupId: p.defaultGroupId ?? '', mapping: toLines(p.groupMapping, gs), requireMfa: p.requireMfa, allowJit: p.allowJit, domains: p.domains.join(', '), enabled: p.enabled }
+        : { id: null, name: '', kind: 'oidc', oidc: emptyOidc, saml: emptySaml, ldap: emptyLdap, secret: '', hasSecret: false, defaultRole: 'user', defaultGroupId: '', mapping: '', requireMfa: false, allowJit: true, domains: '', enabled: true },
     );
   };
 
@@ -74,7 +78,7 @@ export default function SsoSettingsPage() {
     const body: Record<string, unknown> = {
       name: draft.name,
       kind: draft.kind,
-      config: draft.kind === 'oidc' ? draft.oidc : draft.saml,
+      config: draft.kind === 'oidc' ? draft.oidc : draft.kind === 'saml' ? draft.saml : draft.ldap,
       defaultRole: draft.defaultRole,
       defaultGroupId: draft.defaultGroupId || null,
       groupMapping: fromLines(draft.mapping, gs),
@@ -137,9 +141,15 @@ export default function SsoSettingsPage() {
                     Domains: {p.domains.join(', ') || 'any (no automatic account linking)'} · new accounts: {p.allowJit ? ROLE_LABELS[p.defaultRole] : 'invitation only'}
                     {p.requireMfa ? ' · requires two-factor' : ''}
                   </p>
-                  <p className="mt-2 text-xs text-foreground-tertiary">
-                    {p.kind === 'oidc' ? 'Redirect URI' : 'ACS URL'}: <code className="break-all">{p.callbackUrl}</code>
-                  </p>
+                  {p.kind === 'ldap' ? (
+                    <p className="mt-2 text-xs text-foreground-tertiary">
+                      Directory: <code className="break-all">{(p.config as LdapConfig).url}</code> · people sign in with their directory user name and password
+                    </p>
+                  ) : (
+                    <p className="mt-2 text-xs text-foreground-tertiary">
+                      {p.kind === 'oidc' ? 'Redirect URI' : 'ACS URL'}: <code className="break-all">{p.callbackUrl}</code>
+                    </p>
+                  )}
                   {p.metadataUrl && (
                     <p className="text-xs text-foreground-tertiary">
                       SP metadata:{' '}
@@ -150,6 +160,9 @@ export default function SsoSettingsPage() {
                   )}
                 </div>
                 <div className="flex shrink-0 gap-2">
+                  <Button size="sm" variant="outline" onClick={() => setDiagnose(p)}>
+                    Diagnostics
+                  </Button>
                   <Button size="sm" variant="outline" onClick={() => edit(p)}>
                     Edit
                   </Button>
@@ -173,7 +186,7 @@ export default function SsoSettingsPage() {
             <ErrorBanner message={formErr} />
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Input label="Name shown on the sign-in page" value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} />
-              <Select label="Protocol" value={draft.kind} disabled={!!draft.id} onChange={(e) => setDraft({ ...draft, kind: e.target.value as SsoKind })} options={[{ value: 'oidc', label: 'OpenID Connect' }, { value: 'saml', label: 'SAML 2.0' }]} />
+              <Select label="Protocol" value={draft.kind} disabled={!!draft.id} onChange={(e) => setDraft({ ...draft, kind: e.target.value as SsoKind })} options={[{ value: 'oidc', label: 'OpenID Connect' }, { value: 'saml', label: 'SAML 2.0' }, { value: 'ldap', label: 'LDAP / Active Directory' }]} />
             </div>
             {draft.kind === 'oidc' ? (
               <>
@@ -190,6 +203,32 @@ export default function SsoSettingsPage() {
                   <input type="checkbox" checked={!!draft.oidc.allowUnverifiedEmail} onChange={(e) => setDraft({ ...draft, oidc: { ...draft.oidc, allowUnverifiedEmail: e.target.checked } })} />
                   Accept email addresses the provider has not verified
                 </label>
+              </>
+            ) : draft.kind === 'ldap' ? (
+              <>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <Input label="Directory URL" placeholder="ldaps://dc.example.com:636" value={draft.ldap.url} onChange={(e) => setDraft({ ...draft, ldap: { ...draft.ldap, url: e.target.value } })} />
+                  <label className="flex items-center gap-2 pt-6 text-sm">
+                    <input type="checkbox" checked={!!draft.ldap.startTls} onChange={(e) => setDraft({ ...draft, ldap: { ...draft.ldap, startTls: e.target.checked } })} /> StartTLS (for ldap:// URLs)
+                  </label>
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <Input label="Service account DN" placeholder="CN=ufop-svc,OU=Service,DC=example,DC=com" value={draft.ldap.bindDn} onChange={(e) => setDraft({ ...draft, ldap: { ...draft.ldap, bindDn: e.target.value } })} />
+                  <Input label="Service account password" type="password" autoComplete="new-password" placeholder={draft.hasSecret ? '•••••• (unchanged)' : ''} value={draft.secret} onChange={(e) => setDraft({ ...draft, secret: e.target.value })} />
+                </div>
+                <Input label="Base DN for users" placeholder="DC=example,DC=com" value={draft.ldap.baseDn} onChange={(e) => setDraft({ ...draft, ldap: { ...draft.ldap, baseDn: e.target.value } })} />
+                <Input label="User filter ({username} is what people type)" value={draft.ldap.userFilter} onChange={(e) => setDraft({ ...draft, ldap: { ...draft.ldap, userFilter: e.target.value } })} />
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
+                  <Input label="Email attribute" value={draft.ldap.emailAttribute ?? ''} onChange={(e) => setDraft({ ...draft, ldap: { ...draft.ldap, emailAttribute: e.target.value } })} />
+                  <Input label="Name attribute" value={draft.ldap.nameAttribute ?? ''} onChange={(e) => setDraft({ ...draft, ldap: { ...draft.ldap, nameAttribute: e.target.value } })} />
+                  <Input label="Groups attribute" value={draft.ldap.groupsAttribute ?? ''} onChange={(e) => setDraft({ ...draft, ldap: { ...draft.ldap, groupsAttribute: e.target.value } })} />
+                  <Input label="ID attribute" placeholder="objectGUID / entryUUID" value={draft.ldap.idAttribute ?? ''} onChange={(e) => setDraft({ ...draft, ldap: { ...draft.ldap, idAttribute: e.target.value } })} />
+                </div>
+                <label className="flex flex-col gap-1.5 text-sm font-medium text-foreground">
+                  Directory CA certificate (PEM, if not publicly trusted)
+                  <textarea className="min-h-20 rounded-md border border-border bg-background p-2 font-mono text-xs" value={draft.ldap.caCert ?? ''} onChange={(e) => setDraft({ ...draft, ldap: { ...draft.ldap, caCert: e.target.value } })} spellCheck={false} />
+                </label>
+                <p className="text-xs text-foreground-secondary">Group mappings below may use a group&apos;s CN (Domain Admins) or its full DN.</p>
               </>
             ) : (
               <>
@@ -238,6 +277,7 @@ export default function SsoSettingsPage() {
           <Button onClick={() => void save()}>Save</Button>
         </DialogFooter>
       </Dialog>
+      <SsoDiagnostics provider={diagnose} onClose={() => setDiagnose(null)} />
     </div>
   );
 }

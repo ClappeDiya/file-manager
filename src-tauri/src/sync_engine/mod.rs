@@ -151,7 +151,7 @@ fn default_state_dir() -> PathBuf {
     }
     directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
         .map(|d| d.data_dir().join("sync"))
-        .unwrap_or_else(|| std::env::temp_dir().join("ufop-sync"))
+        .unwrap_or_else(|| ufop_core::session::user_temp_subdir("sync"))
 }
 
 impl SyncManager {
@@ -214,6 +214,11 @@ impl SyncManager {
     /// Latest progress of a running sync, or `None` when it isn't running.
     pub fn get_progress(&self, pair_id: Uuid) -> Option<executor::SyncProgress> {
         self.progress.lock().ok().and_then(|m| m.get(&pair_id).cloned())
+    }
+
+    /// Progress of every running sync.
+    pub fn all_progress(&self) -> Vec<executor::SyncProgress> {
+        self.progress.lock().map(|m| m.values().cloned().collect()).unwrap_or_default()
     }
 
     /// Ask a running sync to stop after the file it is copying.
@@ -502,6 +507,22 @@ impl SyncManager {
     }
 
     /// Add a scheduled sync pair.
+    /// Start the cron loop that runs scheduled pairs through `run`. Without
+    /// this, `Scheduled` triggers are armed but never fire.
+    pub fn start_scheduler(&self, run: scheduler::ScheduleCallback) {
+        self.scheduler.start(run);
+    }
+
+    /// Whether the cron loop is running.
+    pub fn scheduler_running(&self) -> bool {
+        self.scheduler.is_running()
+    }
+
+    #[cfg(test)]
+    fn start_scheduler_every(&self, run: scheduler::ScheduleCallback, interval: std::time::Duration) {
+        self.scheduler.start_with_interval(run, interval);
+    }
+
     pub async fn add_schedule(
         &self,
         pair_id: Uuid,
@@ -772,8 +793,8 @@ impl SyncManager {
                     "INSERT INTO sync_pairs (id, name, source_path, dest_path, mode, enabled, \
                      last_run, trigger_mode, cron_expr, filter_json, conflict_policy, \
                      verify_mode, checksum_enabled, created_at, time_offset_secs, options_json, \
-                     dest_state, checksum_algorithm) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) \
+                     dest_state, checksum_algorithm, run_options_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) \
                      ON CONFLICT(id) DO UPDATE SET \
                      name = excluded.name, source_path = excluded.source_path, \
                      dest_path = excluded.dest_path, mode = excluded.mode, \
@@ -786,7 +807,8 @@ impl SyncManager {
                      time_offset_secs = excluded.time_offset_secs, \
                      options_json = excluded.options_json, \
                      dest_state = excluded.dest_state, \
-                     checksum_algorithm = excluded.checksum_algorithm",
+                     checksum_algorithm = excluded.checksum_algorithm, \
+                     run_options_json = excluded.run_options_json",
                     rusqlite::params![
                         p.id.to_string(),
                         p.name,
@@ -806,6 +828,7 @@ impl SyncManager {
                         options_json,
                         serde_json::to_value(p.dest_state).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "scan".into()),
                         serde_json::to_value(p.checksum_algorithm).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "xxh3".into()),
+                        serde_json::to_string(&p.run_options).unwrap_or_else(|_| "{}".into()),
                     ],
                 )?;
                 Ok(())
@@ -843,7 +866,7 @@ impl SyncManager {
                     "SELECT id, name, source_path, dest_path, mode, enabled, last_run, \
                      trigger_mode, cron_expr, filter_json, conflict_policy, verify_mode, \
                      checksum_enabled, created_at, time_offset_secs, options_json, \
-                     dest_state, checksum_algorithm \
+                     dest_state, checksum_algorithm, run_options_json \
                      FROM sync_pairs ORDER BY created_at ASC",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -859,6 +882,7 @@ impl SyncManager {
                     let options_json: String = row.get(15)?;
                     let dest_state: String = row.get(16)?;
                     let checksum_algorithm: String = row.get(17)?;
+                    let run_options_json: String = row.get(18)?;
 
                     Ok(SyncPair {
                         // A row we cannot parse is a row we cannot honour, but
@@ -890,6 +914,7 @@ impl SyncManager {
                         copy_options: serde_json::from_str(&options_json).unwrap_or_default(),
                         dest_state: serde_json::from_value(serde_json::Value::String(dest_state)).unwrap_or_default(),
                         checksum_algorithm: serde_json::from_value(serde_json::Value::String(checksum_algorithm)).unwrap_or_default(),
+                        run_options: serde_json::from_str(&run_options_json).unwrap_or_default(),
                     })
                 })?;
                 let mut out = Vec::new();
@@ -1125,6 +1150,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_options_survive_a_restart() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = SyncManager::new();
+        let pair = SyncPair {
+            run_options: ufop_core::sync_types::SyncRunOptions {
+                settle_secs: 30,
+                completion_marker: Some("_DONE".into()),
+                version_template: Some("{name}~{num}.{ext}".into()),
+            },
+            ..SyncPair::default()
+        };
+        mgr.save_pair_to_db(&repo, &pair).await.unwrap();
+        let restarted = SyncManager::new();
+        restarted.load_pairs_from_db(&repo).await.unwrap();
+        assert_eq!(restarted.pairs.read().await.get(&pair.id).unwrap().run_options, pair.run_options);
+    }
+
+    #[tokio::test]
     async fn saving_the_same_pair_twice_updates_rather_than_duplicates() {
         let repo = crate::storage::Repository::open_in_memory().await.unwrap();
         let mgr = SyncManager::new();
@@ -1250,6 +1293,35 @@ mod tests {
         let preview = mgr.dry_run(pair.id).await.unwrap();
         assert_eq!(preview.total_additions, 1);
         assert_eq!(preview.total_bytes, 5);
+    }
+
+    /// Regression: `Scheduled` pairs were armed but the cron loop was never
+    /// started, so they never ran. The loop now drives the run callback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduled_pair_runs_through_the_scheduler() {
+        let mgr = Arc::new(SyncManager::new());
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), "alpha").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.trigger = SyncTrigger::Scheduled { cron_expr: "* * * * * * *".into() };
+        mgr.create_pair(pair.clone()).await.unwrap();
+
+        let handle = tokio::runtime::Handle::current();
+        let runner = mgr.clone();
+        mgr.start_scheduler_every(
+            Arc::new(move |id: Uuid| {
+                let runner = runner.clone();
+                handle.spawn(async move { let _ = runner.execute_sync(id).await; });
+            }),
+            std::time::Duration::from_millis(100),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !dst.path().join("a.txt").exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        mgr.scheduler.stop();
+        assert!(dst.path().join("a.txt").exists(), "scheduled sync never ran");
     }
 
     #[tokio::test]

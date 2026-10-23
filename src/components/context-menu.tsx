@@ -38,6 +38,7 @@ import {
   PinOff,
   X as CloseIcon,
   ChevronsRight,
+  MonitorSmartphone,
 } from "lucide-react";
 
 // ──────────────────────────────────────────────
@@ -276,6 +277,15 @@ export function getFileContextMenuItems(options: {
   /** Direct pane-to-pane transfers (dual-pane workflows). */
   onCopyToOtherPane?: () => void;
   onMoveToOtherPane?: () => void;
+  /** Copy the selection into several folders at once. */
+  onCopyToMany?: () => void;
+  /** OpenPGP actions on the selected files; `gpgDecrypt` / `gpgVerify`
+   *  say whether the selection looks encrypted / like signatures. */
+  onGpg?: (mode: "encrypt" | "decrypt" | "recrypt" | "sign" | "verify") => void;
+  gpgDecrypt?: boolean;
+  gpgVerify?: boolean;
+  /** Convert the selected images or documents (only when the selection is convertible). */
+  onConvert?: () => void;
   onPaste: () => void;
   onDelete: () => void;
   onRename: () => void;
@@ -322,6 +332,8 @@ export function getFileContextMenuItems(options: {
    *  infrastructure. Hidden when the caller omits the prop so the
    *  pane-only-selection (Paste-only) menu stays untouched. */
   onCompress?: () => void;
+  /** Send the selection to another computer running UFOP (local files only). */
+  onSendToComputer?: () => void;
   /** **Extract Here** — mirror of iter 14's `onCompress`. Pre-wired
    *  `archive_extract` IPC already supports zip / tar / tar.gz / 7z
    *  with optional password. The caller (FilePane) sets this prop only
@@ -525,6 +537,14 @@ export function getFileContextMenuItems(options: {
         action: options.onCopyToOtherPane,
       });
     }
+    if (options.onCopyToMany) {
+      items.push({
+        id: "copy-to-many",
+        label: "Copy to Several Folders…",
+        icon: <Copy className="h-3.5 w-3.5" />,
+        action: options.onCopyToMany,
+      });
+    }
     if (options.onMoveToOtherPane) {
       items.push({
         id: "move-to-other-pane",
@@ -589,6 +609,29 @@ export function getFileContextMenuItems(options: {
         icon: <FileArchive className="h-3.5 w-3.5" />,
         action: options.onCompress,
       });
+    }
+
+    if (options.onSendToComputer) {
+      items.push({
+        id: "send-to-computer",
+        label: "Send to Another Computer…",
+        icon: <MonitorSmartphone className="h-3.5 w-3.5" />,
+        action: options.onSendToComputer,
+      });
+    }
+
+    if (options.onConvert && !options.isDirectory) {
+      items.push({ id: "convert", label: options.selectionCount > 1 ? `Convert ${options.selectionCount} Files…` : "Convert…", icon: <RefreshCw className="h-3.5 w-3.5" />, action: options.onConvert });
+    }
+
+    // OpenPGP: files only; decrypt/verify only where the names fit.
+    if (options.onGpg && !options.isDirectory) {
+      const gpg = options.onGpg;
+      items.push({ id: "gpg-encrypt", label: "Encrypt with GPG…", icon: <Lock className="h-3.5 w-3.5" />, advancedOnly: true, action: () => gpg("encrypt") });
+      if (options.gpgDecrypt) items.push({ id: "gpg-decrypt", label: "Decrypt with GPG…", icon: <Lock className="h-3.5 w-3.5" />, action: () => gpg("decrypt") });
+      if (options.gpgDecrypt) items.push({ id: "gpg-recrypt", label: "Re-encrypt with GPG…", icon: <Lock className="h-3.5 w-3.5" />, advancedOnly: true, action: () => gpg("recrypt") });
+      items.push({ id: "gpg-sign", label: "Sign with GPG…", icon: <Lock className="h-3.5 w-3.5" />, advancedOnly: true, action: () => gpg("sign") });
+      if (options.gpgVerify) items.push({ id: "gpg-verify", label: "Verify Signature", icon: <Lock className="h-3.5 w-3.5" />, action: () => gpg("verify") });
     }
 
     items.push({ id: "sep2", label: "", separator: true });

@@ -9,6 +9,7 @@
  */
 import crypto from 'crypto';
 import { db, newId, now, parseJson, tx, type Row } from '../index';
+import { enqueueEvent } from './webhooks';
 import { sign, timingSafeEqualHex } from '../../crypto';
 
 export interface AuditInput {
@@ -132,6 +133,8 @@ export function appendAudit(e: AuditInput): AuditRecord {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(base.id, base.sequence, base.eventType, base.severity, base.timestamp, base.orgId, base.userId, base.userEmail, base.ipAddress, base.userAgent, base.description, JSON.stringify(metadata), integrityHash, base.previousHash);
+    // Same transaction: an audited action and its webhook deliveries are recorded together.
+    enqueueEvent(base.orgId, base.eventType, { auditId: base.id, severity: base.severity, description: base.description, actor: base.userEmail || null, resourceType: e.resourceType ?? null, resourceId: e.resourceId ?? null, metadata });
     return { ...base, organizationId: base.orgId, resourceType: e.resourceType, resourceId: e.resourceId, integrityHash };
   });
 }
@@ -139,6 +142,10 @@ export function appendAudit(e: AuditInput): AuditRecord {
 export interface AuditQuery {
   orgIds?: string[];
   eventType?: string;
+  /** Any of these event types (e.g. a category). */
+  eventTypes?: string[];
+  /** Match every event type starting with this prefix, e.g. `ai.`. */
+  eventPrefix?: string;
   severity?: string;
   userId?: string;
   from?: string;
@@ -146,6 +153,10 @@ export interface AuditQuery {
   search?: string;
   limit?: number;
   offset?: number;
+  /** Only entries up to this sequence (a stable snapshot for paging exports). */
+  untilSequence?: number;
+  /** Oldest first (default newest first). */
+  ascending?: boolean;
 }
 
 export function listAudit(q: AuditQuery = {}): { entries: AuditRecord[]; total: number } {
@@ -156,10 +167,13 @@ export function listAudit(q: AuditQuery = {}): { entries: AuditRecord[]; total: 
     args.push(...q.orgIds);
   }
   if (q.eventType) { where.push('event_type = ?'); args.push(q.eventType); }
+  if (q.eventTypes) { where.push(`event_type IN (${q.eventTypes.map(() => '?').join(',') || "''"})`); args.push(...q.eventTypes); }
+  if (q.eventPrefix) { where.push("event_type LIKE ? ESCAPE '\\'"); args.push(`${q.eventPrefix.replace(/[\\%_]/g, (c) => `\\${c}`)}%`); }
   if (q.severity) { where.push('severity = ?'); args.push(q.severity); }
   if (q.userId) { where.push('user_id = ?'); args.push(q.userId); }
   if (q.from) { where.push('timestamp >= ?'); args.push(q.from); }
   if (q.to) { where.push('timestamp <= ?'); args.push(q.to); }
+  if (q.untilSequence !== undefined) { where.push('sequence <= ?'); args.push(q.untilSequence); }
   if (q.search) {
     where.push('(lower(description) LIKE ? OR lower(event_type) LIKE ? OR lower(user_email) LIKE ?)');
     const s = `%${q.search.toLowerCase()}%`;
@@ -168,9 +182,35 @@ export function listAudit(q: AuditQuery = {}): { entries: AuditRecord[]; total: 
   const w = where.join(' AND ');
   const total = (db().prepare(`SELECT COUNT(*) n FROM audit_entries WHERE ${w}`).get(...args) as { n: number }).n;
   const rows = db()
-    .prepare(`SELECT * FROM audit_entries WHERE ${w} ORDER BY sequence DESC LIMIT ? OFFSET ?`)
+    .prepare(`SELECT * FROM audit_entries WHERE ${w} ORDER BY sequence ${q.ascending ? 'ASC' : 'DESC'} LIMIT ? OFFSET ?`)
     .all(...args, Math.min(q.limit ?? 50, 10_000), q.offset ?? 0) as Row[];
   return { entries: rows.map(fromRow), total };
+}
+
+/** How many entries each event type has in these organizations. */
+export function auditCounts(orgIds: string[]): Record<string, number> {
+  if (!orgIds.length) return {};
+  const rows = db().prepare(`SELECT event_type, COUNT(*) AS n FROM audit_entries WHERE org_id IN (${orgIds.map(() => '?').join(',')}) GROUP BY event_type`).all(...orgIds) as Row[];
+  return Object.fromEntries(rows.map((r) => [r.event_type as string, Number(r.n)]));
+}
+
+/** Entries of these organizations after a sequence number, oldest first (forwarding). */
+export function auditAfter(orgIds: string[], afterSequence: number, limit: number): AuditRecord[] {
+  if (!orgIds.length) return [];
+  const rows = db()
+    .prepare(`SELECT * FROM audit_entries WHERE sequence > ? AND org_id IN (${orgIds.map(() => '?').join(',')}) ORDER BY sequence LIMIT ?`)
+    .all(afterSequence, ...orgIds, limit) as Row[];
+  return rows.map(fromRow);
+}
+
+export function countAuditAfter(orgIds: string[], afterSequence: number): number {
+  if (!orgIds.length) return 0;
+  return (db().prepare(`SELECT COUNT(*) AS n FROM audit_entries WHERE sequence > ? AND org_id IN (${orgIds.map(() => '?').join(',')})`).get(afterSequence, ...orgIds) as { n: number }).n;
+}
+
+/** The newest sequence number (0 when empty). */
+export function auditHead(): number {
+  return Number((db().prepare('SELECT MAX(sequence) AS s FROM audit_entries').get() as Row).s ?? 0);
 }
 
 export interface AuditVerification {
@@ -183,12 +223,24 @@ export interface AuditVerification {
   headHash: string;
 }
 
-/** Recompute the whole chain and check every anchor. */
+/** The most recent anchored prune: entries up to `throughSequence` were removed. */
+export function lastAuditPrune(): { throughSequence: number; throughHash: string; anchorId: string; pruned: number; createdAt: string } | null {
+  const r = db().prepare('SELECT * FROM audit_prunes ORDER BY through_sequence DESC LIMIT 1').get() as Row | undefined;
+  return r ? { throughSequence: Number(r.through_sequence), throughHash: r.through_hash as string, anchorId: r.anchor_id as string, pruned: Number(r.pruned), createdAt: r.created_at as string } : null;
+}
+
+/**
+ * Recompute the chain and check every anchor. After an anchored prune the
+ * chain starts at the prune point: the first remaining entry must link to
+ * the pruned entry's hash, which a signed anchor vouches for.
+ */
 export function verifyAudit(): AuditVerification {
   const rows = db().prepare('SELECT * FROM audit_entries WHERE sequence IS NOT NULL ORDER BY sequence ASC').all() as Row[];
-  let prev = '';
-  let expected = 1;
+  const prune = lastAuditPrune();
+  let prev = prune?.throughHash ?? '';
+  let expected = (prune?.throughSequence ?? 0) + 1;
   const hashes = new Map<number, string>();
+  if (prune) hashes.set(prune.throughSequence, prune.throughHash);
   const fail = (seq: number, reason: string, n: number): AuditVerification => ({ ok: false, entriesChecked: n, firstBadSequence: seq, reason, anchorsChecked: 0, headSequence: seq, headHash: '' });
   for (let i = 0; i < rows.length; i++) {
     const r = fromRow(rows[i]);
@@ -201,14 +253,47 @@ export function verifyAudit(): AuditVerification {
     prev = integrityHash;
     expected++;
   }
+  const head = expected - 1;
   const anchors = db().prepare('SELECT * FROM audit_anchors ORDER BY last_sequence ASC').all() as Row[];
+  if (prune) {
+    const a = anchors.find((x) => x.id === prune.anchorId);
+    if (!a || Number(a.last_sequence) !== prune.throughSequence || a.last_hash !== prune.throughHash) return fail(prune.throughSequence, 'the prune point is not a signed anchor', rows.length);
+  }
   for (const a of anchors) {
     const seq = Number(a.last_sequence);
     const payload = `${seq}:${a.last_hash}:${a.entry_count}:${a.created_at}`;
     if (!timingSafeEqualHex(sign(payload), a.signature as string)) return { ...fail(seq, 'anchor signature is invalid', rows.length), anchorsChecked: 0 };
-    if (hashes.get(seq) !== a.last_hash) return { ...fail(seq, seq > rows.length ? 'entries after an anchor were removed' : 'chain differs from a signed anchor', rows.length) };
+    // Anchors before the prune point vouch for entries that were removed on purpose.
+    if (prune && seq < prune.throughSequence) continue;
+    if (hashes.get(seq) !== a.last_hash) return { ...fail(seq, seq > head ? 'entries after an anchor were removed' : 'chain differs from a signed anchor', rows.length) };
   }
-  return { ok: true, entriesChecked: rows.length, firstBadSequence: null, reason: null, anchorsChecked: anchors.length, headSequence: rows.length, headHash: prev };
+  return { ok: true, entriesChecked: rows.length, firstBadSequence: null, reason: null, anchorsChecked: anchors.length, headSequence: head, headHash: prev };
+}
+
+/**
+ * Remove entries older than `before`, but only up to the newest signed
+ * anchor at or before that point (and never past `limitSequence`, e.g. what
+ * SIEM destinations have not forwarded yet). Refused when the chain does not
+ * verify, so evidence of tampering is never pruned. Returns how many entries
+ * were removed (0 when there is no suitable anchor).
+ */
+export function pruneAudit(before: Date, o: { by: string; limitSequence?: number } = { by: 'system' }): number {
+  const v = verifyAudit();
+  if (!v.ok) throw new Error(`The audit log does not verify (${v.reason}); nothing was pruned`);
+  const old = db().prepare('SELECT MAX(sequence) AS s FROM audit_entries WHERE timestamp < ?').get(before.toISOString()) as Row;
+  let limit = Number(old.s ?? 0);
+  if (o.limitSequence !== undefined) limit = Math.min(limit, o.limitSequence);
+  const from = lastAuditPrune()?.throughSequence ?? 0;
+  const anchor = db().prepare('SELECT * FROM audit_anchors WHERE last_sequence <= ? AND last_sequence > ? ORDER BY last_sequence DESC LIMIT 1').get(limit, from) as Row | undefined;
+  if (!anchor) return 0;
+  const through = Number(anchor.last_sequence);
+  return tx(() => {
+    db().exec('DROP TRIGGER audit_no_delete');
+    const pruned = db().prepare('DELETE FROM audit_entries WHERE sequence <= ?').run(through).changes;
+    db().exec("CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit_entries BEGIN SELECT RAISE(ABORT, 'audit entries are append-only'); END");
+    db().prepare('INSERT INTO audit_prunes (id, through_sequence, through_hash, anchor_id, pruned, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(newId('apr'), through, anchor.last_hash, anchor.id, pruned, o.by, now());
+    return pruned;
+  });
 }
 
 /** Sign the current chain head. Returns null when the log is empty. */

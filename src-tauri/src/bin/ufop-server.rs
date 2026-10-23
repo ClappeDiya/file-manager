@@ -3,6 +3,10 @@
 //! ```text
 //! ufop-server --set-password            # first run (reads UFOP_SERVER_PASSWORD or prompts)
 //! ufop-server --interface any --allowed-hostnames backup.lan --https auto
+//! ufop-server --https pfx --pfx cert.p12 --min-tls 1.3 --hsts-max-age 63072000   # TLS floor + HSTS (on by default with HTTPS)
+//! ufop-server --interface any --allowed-cidrs 10.0.0.0/8,fd00::/8   # only these clients (by TCP peer)
+//! ufop server tokens create ci --scope run --days 30                 # scoped API token (see server::api_tokens)
+//! ufop-server --share-root /srv/exchange                              # share links under /srv/exchange (/s/<token>)
 //! ```
 //! Defaults come from the machine-wide preload file (see `ufop_core::preload`).
 
@@ -46,6 +50,9 @@ struct Args {
     #[arg(long, env = "UFOP_SERVER_CORS_ORIGINS", value_delimiter = ',')]
     cors_origins: Vec<String>,
     /// Reverse-proxy pre-authentication tokens (sent in X-UFOP-PreAuth)
+    /// Client address ranges allowed to connect, e.g. 10.0.0.0/8,192.168.1.0/24 (default: any).
+    #[arg(long, env = "UFOP_SERVER_ALLOWED_CIDRS", value_delimiter = ',')]
+    allowed_cidrs: Vec<String>,
     #[arg(long, env = "UFOP_SERVER_PREAUTH_TOKENS", value_delimiter = ',')]
     preauth_tokens: Vec<String>,
     /// `off`, `auto` (local CA + certificate) or `pfx`
@@ -54,6 +61,33 @@ struct Args {
     /// Hostnames for the generated certificate
     #[arg(long, value_delimiter = ',', default_value = "localhost,127.0.0.1")]
     cert_hostnames: Vec<String>,
+    /// Lowest TLS version accepted with HTTPS: 1.2 or 1.3
+    #[arg(long, env = "UFOP_SERVER_MIN_TLS", default_value = "1.2")]
+    min_tls: String,
+    /// HSTS max-age in seconds with HTTPS (0 = do not send Strict-Transport-Security)
+    #[arg(long, env = "UFOP_SERVER_HSTS_MAX_AGE", default_value_t = 31_536_000)]
+    hsts_max_age: u64,
+    /// Add includeSubDomains to the HSTS header
+    #[arg(long)]
+    hsts_include_subdomains: bool,
+    /// Folder whose files and subfolders may be shared by link (repeat or comma-separate; default: sharing off)
+    #[arg(long = "share-root", env = "UFOP_SERVER_SHARE_ROOTS", value_delimiter = ',')]
+    share_roots: Vec<PathBuf>,
+    /// Folder served read-only over WebDAV at /dav/<folder name>/ (repeat or comma-separate; default: WebDAV off)
+    #[arg(long = "dav-root", env = "UFOP_SERVER_DAV_ROOTS", value_delimiter = ',')]
+    dav_roots: Vec<PathBuf>,
+    /// Client address ranges allowed to use WebDAV, on top of --allowed-cidrs (default: any)
+    #[arg(long, env = "UFOP_SERVER_DAV_ALLOWED_CIDRS", value_delimiter = ',')]
+    dav_allowed_cidrs: Vec<String>,
+    /// Folder the MCP endpoint (/mcp, OAuth-protected) may use (repeat or comma-separate; default: MCP off)
+    #[arg(long = "mcp-root", env = "UFOP_SERVER_MCP_ROOTS", value_delimiter = ',')]
+    mcp_roots: Vec<PathBuf>,
+    /// Offer MCP tools that create, change, move and delete files (to clients granted mcp:write)
+    #[arg(long, env = "UFOP_SERVER_MCP_ALLOW_WRITE")]
+    mcp_allow_write: bool,
+    /// Public origin for OAuth metadata behind a proxy, e.g. https://files.example.com (default: from the request)
+    #[arg(long, env = "UFOP_SERVER_PUBLIC_URL")]
+    public_url: Option<String>,
     #[arg(long, env = "UFOP_SERVER_PFX")]
     pfx: Option<PathBuf>,
     #[arg(long, env = "UFOP_SERVER_PFX_PASSWORD", default_value = "")]
@@ -285,9 +319,14 @@ async fn run(argv: Vec<String>) {
     let mgr = BackupManager::new(repo.pool().clone(), creds.clone(), Some(conns.clone()), Some(ledger), data_dir.join("backups"));
     mgr.set_settings_store(store.clone());
     mgr.set_module_policy(ModulePolicy::from_lists(a.allowed_backends.as_deref(), a.allowed_encryption.as_deref(), a.allowed_compression.as_deref(), a.disable_modules.as_deref()));
+    // Holiday calendars used by backup schedules.
+    if let Err(e) = unified_file_ops_lib::schedule_library::ScheduleLibrary::new(repo.pool().clone()).load().await {
+        tracing::warn!("Could not load holiday calendars: {e}");
+    }
     if let Err(e) = mgr.load_from_db().await {
         fail(e);
     }
+    mgr.refresh_caps().await;
     if !a.no_scheduler {
         mgr.start_scheduler();
     }
@@ -298,6 +337,15 @@ async fn run(argv: Vec<String>) {
         None
     } else {
         let agent = fleet_agent::init_or_default(mgr.clone(), store.clone(), creds.clone(), "server").await;
+        // Of the console's app settings, the server applies the transfer caps.
+        let caps_mgr = mgr.clone();
+        agent.host().set_managed_settings_handler(Arc::new(move |settings| {
+            let m = caps_mgr.clone();
+            Box::pin(async move {
+                m.set_managed_caps(settings.and_then(|s| s.transfers)).await;
+                Ok(())
+            })
+        }));
         fleet_agent::spawn(agent.clone(), "ufop-server");
         Some(agent)
     };
@@ -325,8 +373,34 @@ async fn run(argv: Vec<String>) {
         cors_origins: a.cors_origins,
         preauth_tokens: a.preauth_tokens,
         tls,
+        min_tls: a.min_tls.parse().unwrap_or_else(|e: String| fail(format!("--min-tls: {e}"))),
+        hsts_max_age: a.hsts_max_age,
+        hsts_include_subdomains: a.hsts_include_subdomains,
+        allowed_clients: ufop_core::netacl::IpAllowlist::parse(&a.allowed_cidrs).unwrap_or_else(|e| fail(format!("--allowed-cidrs: {e}"))),
+        share_roots: a.share_roots,
+        dav_roots: a.dav_roots,
+        dav_allowed_clients: ufop_core::netacl::IpAllowlist::parse(&a.dav_allowed_cidrs).unwrap_or_else(|e| fail(format!("--dav-allowed-cidrs: {e}"))),
+        mcp_roots: a.mcp_roots,
+        mcp_allow_write: a.mcp_allow_write,
+        public_url: a.public_url,
     };
-    let st = ServerState { mgr, conns: Some(conns), auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent };
+    if !cfg.mcp_roots.is_empty() {
+        let roots = ufop_core::confine::Roots::new(&cfg.mcp_roots).unwrap_or_else(|e| fail(format!("--mcp-root: {e}")));
+        let names: Vec<&str> = roots.list().iter().map(|r| r.name.as_str()).collect();
+        tracing::info!("MCP at /mcp ({}): {}", if cfg.mcp_allow_write { "read-write" } else { "read-only" }, names.join(", "));
+        if matches!(cfg.tls, TlsMode::None) && !matches!(cfg.interface.as_str(), "loopback" | "") {
+            tracing::warn!("MCP and its OAuth sign-in are reachable over plain HTTP. Use --https or a TLS reverse proxy.");
+        }
+    }
+    if !cfg.dav_roots.is_empty() {
+        let roots = ufop_core::confine::Roots::new(&cfg.dav_roots).unwrap_or_else(|e| fail(format!("--dav-root: {e}")));
+        let names: Vec<&str> = roots.list().iter().map(|r| r.name.as_str()).collect();
+        tracing::info!("WebDAV (read-only) at /dav/: {}", names.join(", "));
+        if matches!(cfg.tls, TlsMode::None) && !matches!(cfg.interface.as_str(), "loopback" | "") {
+            tracing::warn!("WebDAV is reachable over plain HTTP: passwords and tokens are sent unencrypted. Use --https or a TLS reverse proxy.");
+        }
+    }
+    let st = ServerState { mgr, conns: Some(conns), auth, cfg: Arc::new(cfg), started: Instant::now(), oauth, agent, gateways: Default::default() };
     if let Err(e) = server::serve(st).await {
         fail(e);
     }

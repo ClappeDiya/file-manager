@@ -11,6 +11,102 @@ use crate::storage::pool::DbPool;
 use chrono::Utc;
 use uuid::Uuid;
 
+const CONNECTION_COLUMNS: &str = "id, name, protocol, host, port, username, credential_ref, \
+     remote_path, created_at, last_used, group_id, bandwidth_limit_bps, \
+     conflict_policy, retry_policy, verify_checksums, checksum_algorithm, \
+     proxy_type, proxy_host, proxy_port, proxy_username, proxy_password, \
+     default_local_dir, default_remote_dir, charset, settings_json";
+
+/// Profile fields without columns of their own (`settings_json`, v21).
+/// Before v21 these were never saved and reset on every restart.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct StoredConnectionSettings {
+    default_file_mode: Option<String>,
+    default_dir_mode: Option<String>,
+    ftp_use_mlsd: Option<bool>,
+    ftp_force_passive_ip: Option<bool>,
+    ftp_post_login_commands: Option<Vec<String>>,
+    symlink_policy: Option<String>,
+    extras: crate::core::types::ConnectionExtras,
+}
+
+impl StoredConnectionSettings {
+    fn from(p: &ConnectionProfile) -> Self {
+        Self {
+            default_file_mode: p.default_file_mode.clone(),
+            default_dir_mode: p.default_dir_mode.clone(),
+            ftp_use_mlsd: p.ftp_use_mlsd,
+            ftp_force_passive_ip: p.ftp_force_passive_ip,
+            ftp_post_login_commands: p.ftp_post_login_commands.clone(),
+            symlink_policy: p.symlink_policy.clone(),
+            extras: p.extras.clone(),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
+    }
+}
+
+/// Map a `SELECT {CONNECTION_COLUMNS}` row.
+fn row_to_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConnectionProfile> {
+    let extra: StoredConnectionSettings = row
+        .get::<_, Option<String>>(24)?
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default();
+    Ok(ConnectionProfile {
+                            id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+                            name: row.get(1)?,
+                            protocol: ConnectionProtocol::from_str_lossy(&row.get::<_, String>(2)?),
+                            host: row.get(3)?,
+                            port: row.get(4)?,
+                            username: row.get(5)?,
+                            credential_ref: row.get(6)?,
+                            remote_path: row.get(7)?,
+                            created_at: chrono::DateTime::parse_from_rfc3339(
+                                &row.get::<_, String>(8)?,
+                            )
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now()),
+                            last_used: row
+                                .get::<_, Option<String>>(9)?
+                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                                .map(|dt| dt.with_timezone(&Utc)),
+                            group_id: row
+                                .get::<_, Option<String>>(10)?
+                                .and_then(|s| Uuid::parse_str(&s).ok()),
+                            bandwidth_limit_bps: row.get::<_, Option<i64>>(11)?.unwrap_or(0) as u64,
+                            conflict_policy: row
+                                .get::<_, Option<String>>(12)?
+                                .map(|s| ConflictPolicy::from_str_lossy(&s)),
+                            retry_policy: row
+                                .get::<_, Option<String>>(13)?
+                                .and_then(|s| serde_json::from_str(&s).ok()),
+                            verify_checksums: row.get::<_, Option<bool>>(14)?.unwrap_or(false),
+                            checksum_algorithm: row
+                                .get::<_, Option<String>>(15)?
+                                .map(|s| ChecksumAlgorithm::from_str_lossy(&s)),
+                            proxy_type: row.get(16)?,
+                            proxy_host: row.get(17)?,
+                            proxy_port: row.get(18)?,
+                            proxy_username: row.get(19)?,
+                            // NOTE(security/M-2): proxy_password stored in plaintext; use MasterPasswordManager.master_encrypt_credential for encryption at rest
+                            proxy_password: row.get(20)?,
+                            default_local_dir: row.get(21)?,
+                            default_remote_dir: row.get(22)?,
+                            charset: row.get(23)?,
+                            default_file_mode: extra.default_file_mode,
+        default_dir_mode: extra.default_dir_mode,
+        ftp_use_mlsd: extra.ftp_use_mlsd,
+        ftp_force_passive_ip: extra.ftp_force_passive_ip,
+        ftp_post_login_commands: extra.ftp_post_login_commands,
+        symlink_policy: extra.symlink_policy,
+        extras: extra.extras,
+    })
+}
+
+
 /// Repository wrapping a database pool.
 #[derive(Clone, Debug)]
 pub struct Repository {
@@ -262,9 +358,9 @@ impl Repository {
                      credential_ref, remote_path, created_at, last_used, group_id,
                      bandwidth_limit_bps, conflict_policy, retry_policy, verify_checksums,
                      checksum_algorithm, proxy_type, proxy_host, proxy_port, proxy_username,
-                     proxy_password, default_local_dir, default_remote_dir, charset)
+                     proxy_password, default_local_dir, default_remote_dir, charset, settings_json)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                             ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                             ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
                      ON CONFLICT(id) DO UPDATE SET
                         name = ?2, protocol = ?3, host = ?4, port = ?5,
                         username = ?6, credential_ref = ?7, remote_path = ?8,
@@ -274,7 +370,7 @@ impl Repository {
                         proxy_type = ?17, proxy_host = ?18, proxy_port = ?19,
                         proxy_username = ?20, proxy_password = ?21,
                         default_local_dir = ?22, default_remote_dir = ?23,
-                        charset = ?24",
+                        charset = ?24, settings_json = ?25",
                     rusqlite::params![
                         profile.id.to_string(),
                         profile.name,
@@ -304,6 +400,7 @@ impl Repository {
                         profile.default_local_dir,
                         profile.default_remote_dir,
                         profile.charset,
+                        StoredConnectionSettings::from(&profile).to_json(),
                     ],
                 )?;
                 Ok(())
@@ -315,63 +412,11 @@ impl Repository {
         self.pool
             .execute(|conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT id, name, protocol, host, port, username, credential_ref,
-                            remote_path, created_at, last_used, group_id, bandwidth_limit_bps,
-                            conflict_policy, retry_policy, verify_checksums, checksum_algorithm,
-                            proxy_type, proxy_host, proxy_port, proxy_username, proxy_password,
-                            default_local_dir, default_remote_dir, charset
-                     FROM connections ORDER BY name",
+                    &format!("SELECT {CONNECTION_COLUMNS} FROM connections ORDER BY name"),
                 )?;
                 let connections = stmt
                     .query_map([], |row| {
-                        Ok(ConnectionProfile {
-                            id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
-                            name: row.get(1)?,
-                            protocol: ConnectionProtocol::from_str_lossy(&row.get::<_, String>(2)?),
-                            host: row.get(3)?,
-                            port: row.get(4)?,
-                            username: row.get(5)?,
-                            credential_ref: row.get(6)?,
-                            remote_path: row.get(7)?,
-                            created_at: chrono::DateTime::parse_from_rfc3339(
-                                &row.get::<_, String>(8)?,
-                            )
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now()),
-                            last_used: row
-                                .get::<_, Option<String>>(9)?
-                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                                .map(|dt| dt.with_timezone(&Utc)),
-                            group_id: row
-                                .get::<_, Option<String>>(10)?
-                                .and_then(|s| Uuid::parse_str(&s).ok()),
-                            bandwidth_limit_bps: row.get::<_, Option<i64>>(11)?.unwrap_or(0) as u64,
-                            conflict_policy: row
-                                .get::<_, Option<String>>(12)?
-                                .map(|s| ConflictPolicy::from_str_lossy(&s)),
-                            retry_policy: row
-                                .get::<_, Option<String>>(13)?
-                                .and_then(|s| serde_json::from_str(&s).ok()),
-                            verify_checksums: row.get::<_, Option<bool>>(14)?.unwrap_or(false),
-                            checksum_algorithm: row
-                                .get::<_, Option<String>>(15)?
-                                .map(|s| ChecksumAlgorithm::from_str_lossy(&s)),
-                            proxy_type: row.get(16)?,
-                            proxy_host: row.get(17)?,
-                            proxy_port: row.get(18)?,
-                            proxy_username: row.get(19)?,
-                            // NOTE(security/M-2): proxy_password stored in plaintext; use MasterPasswordManager.master_encrypt_credential for encryption at rest
-                            proxy_password: row.get(20)?,
-                            default_local_dir: row.get(21)?,
-                            default_remote_dir: row.get(22)?,
-                            charset: row.get(23)?,
-                            default_file_mode: None,
-                            default_dir_mode: None,
-                            ftp_use_mlsd: None,
-                            ftp_force_passive_ip: None,
-                            ftp_post_login_commands: None,
-                            symlink_policy: None,
-                        })
+                        row_to_profile(row)
                     })?
                     .filter_map(|r| r.ok())
                     .collect();
@@ -396,63 +441,11 @@ impl Repository {
         self.pool
             .execute(move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT id, name, protocol, host, port, username, credential_ref,
-                            remote_path, created_at, last_used, group_id, bandwidth_limit_bps,
-                            conflict_policy, retry_policy, verify_checksums, checksum_algorithm,
-                            proxy_type, proxy_host, proxy_port, proxy_username, proxy_password,
-                            default_local_dir, default_remote_dir, charset
-                     FROM connections WHERE id = ?1",
+                    &format!("SELECT {CONNECTION_COLUMNS} FROM connections WHERE id = ?1"),
                 )?;
                 let result = stmt
                     .query_row(rusqlite::params![id.to_string()], |row| {
-                        Ok(ConnectionProfile {
-                            id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
-                            name: row.get(1)?,
-                            protocol: ConnectionProtocol::from_str_lossy(&row.get::<_, String>(2)?),
-                            host: row.get(3)?,
-                            port: row.get(4)?,
-                            username: row.get(5)?,
-                            credential_ref: row.get(6)?,
-                            remote_path: row.get(7)?,
-                            created_at: chrono::DateTime::parse_from_rfc3339(
-                                &row.get::<_, String>(8)?,
-                            )
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now()),
-                            last_used: row
-                                .get::<_, Option<String>>(9)?
-                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                                .map(|dt| dt.with_timezone(&Utc)),
-                            group_id: row
-                                .get::<_, Option<String>>(10)?
-                                .and_then(|s| Uuid::parse_str(&s).ok()),
-                            bandwidth_limit_bps: row.get::<_, Option<i64>>(11)?.unwrap_or(0) as u64,
-                            conflict_policy: row
-                                .get::<_, Option<String>>(12)?
-                                .map(|s| ConflictPolicy::from_str_lossy(&s)),
-                            retry_policy: row
-                                .get::<_, Option<String>>(13)?
-                                .and_then(|s| serde_json::from_str(&s).ok()),
-                            verify_checksums: row.get::<_, Option<bool>>(14)?.unwrap_or(false),
-                            checksum_algorithm: row
-                                .get::<_, Option<String>>(15)?
-                                .map(|s| ChecksumAlgorithm::from_str_lossy(&s)),
-                            proxy_type: row.get(16)?,
-                            proxy_host: row.get(17)?,
-                            proxy_port: row.get(18)?,
-                            proxy_username: row.get(19)?,
-                            // NOTE(security/M-2): proxy_password stored in plaintext; use MasterPasswordManager.master_encrypt_credential for encryption at rest
-                            proxy_password: row.get(20)?,
-                            default_local_dir: row.get(21)?,
-                            default_remote_dir: row.get(22)?,
-                            charset: row.get(23)?,
-                            default_file_mode: None,
-                            default_dir_mode: None,
-                            ftp_use_mlsd: None,
-                            ftp_force_passive_ip: None,
-                            ftp_post_login_commands: None,
-                            symlink_policy: None,
-                        })
+                        row_to_profile(row)
                     })
                     .ok();
                 Ok(result)
@@ -796,7 +789,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 29);
     }
 
     #[tokio::test]

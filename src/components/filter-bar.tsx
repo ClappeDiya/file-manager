@@ -3,6 +3,7 @@ import { cn } from "@ufop/ui-components";
 import { Button, Badge } from "@ufop/ui-components";
 import { Search, X, Filter, Save, ChevronDown, Wind, Archive } from "lucide-react";
 import { useFileManagerStore, type SavedSearch } from "@/stores/file-manager-store";
+import type { SearchScope } from "@/stores/search-store";
 
 // ──────────────────────────────────────────────
 // FilterBar - real-time filter-as-you-type
@@ -12,7 +13,11 @@ interface FilterBarProps {
   paneIndex: 0 | 1;
   totalCount: number;
   filteredCount: number;
-  onContentSearch?: (query: string, path: string) => void;
+  /** Where to search: this folder's listing (live filter), names in all
+   *  subfolders, or file contents (both from the search index). Shown
+   *  only when `onScopeChange` is given. */
+  scope?: SearchScope;
+  onScopeChange?: (scope: SearchScope) => void;
   className?: string;
   /** **Stale Files Filter** — number of files in the current directory
    *  that the unified ledger has NOT seen any activity on within the
@@ -43,7 +48,8 @@ export function FilterBar({
   paneIndex,
   totalCount,
   filteredCount,
-  onContentSearch,
+  scope = "folder",
+  onScopeChange,
   className,
   staleCount,
   staleActive,
@@ -53,8 +59,6 @@ export function FilterBar({
   const filterText = useFileManagerStore((s) => s.panes[paneIndex].filterText);
   const setFilterText = useFileManagerStore((s) => s.setFilterText);
   const inputRef = useRef<HTMLInputElement>(null);
-  const [searchContents, setSearchContents] = useState(false);
-  const contentSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Focus filter on Cmd+F. Both pane FilterBars mount window-level
   // listeners, so we MUST gate on `activePaneIndex` — otherwise both
@@ -76,25 +80,6 @@ export function FilterBar({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [paneIndex]);
-
-  // Debounced content search
-  useEffect(() => {
-    if (searchContents && filterText.length >= 3 && onContentSearch) {
-      if (contentSearchTimerRef.current) {
-        clearTimeout(contentSearchTimerRef.current);
-      }
-      contentSearchTimerRef.current = setTimeout(() => {
-        const store = useFileManagerStore.getState();
-        const activePath = store.getActivePath(paneIndex);
-        onContentSearch(filterText, activePath);
-      }, 500);
-    }
-    return () => {
-      if (contentSearchTimerRef.current) {
-        clearTimeout(contentSearchTimerRef.current);
-      }
-    };
-  }, [searchContents, filterText, paneIndex, onContentSearch]);
 
   const handleClear = useCallback(() => {
     setFilterText(paneIndex, "");
@@ -137,16 +122,17 @@ export function FilterBar({
           <X className="h-3 w-3" aria-hidden="true" />
         </button>
       )}
-      {onContentSearch && (
-        <label className="flex items-center gap-1 text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)] shrink-0 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={searchContents}
-            onChange={(e) => setSearchContents(e.target.checked)}
-            className="h-3 w-3"
-          />
-          Contents
-        </label>
+      {onScopeChange && (
+        <select
+          value={scope}
+          onChange={(e) => onScopeChange(e.target.value as SearchScope)}
+          aria-label="Search in"
+          className="h-5 shrink-0 rounded border border-[var(--color-border)] bg-transparent text-[length:var(--font-size-xs)] text-[color:var(--color-text-secondary)]"
+        >
+          <option value="folder">This folder</option>
+          <option value="names">All subfolders</option>
+          <option value="contents">File contents</option>
+        </select>
       )}
       {/* Stale Files chip — surfaces files in this folder that the
           unified ledger has not seen activity on within the staleness

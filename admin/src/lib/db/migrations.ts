@@ -308,6 +308,424 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 7,
+    description: 'AI governance settings per organization',
+    up(d) {
+      d.exec(`
+        CREATE TABLE ai_governance (
+          org_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+          settings TEXT NOT NULL DEFAULT '{}',
+          updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+        );
+      `);
+    },
+  },
+  {
+    version: 8,
+    description: 'Diagnostics bundles uploaded by machines',
+    up(d) {
+      d.exec(`
+        CREATE TABLE machine_diagnostics (
+          id TEXT PRIMARY KEY,
+          org_id TEXT NOT NULL,
+          machine_id TEXT NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+          file_name TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+          summary TEXT NOT NULL DEFAULT '{}', data BLOB NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE INDEX machine_diagnostics_machine ON machine_diagnostics(machine_id, created_at);
+      `);
+    },
+  },
+  {
+    version: 9,
+    description: 'Browser sign-in codes for desktop enrollment (loopback + PKCE)',
+    up(d) {
+      d.exec(`
+        CREATE TABLE desktop_connect_codes (
+          code_hash TEXT PRIMARY KEY,
+          org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          user_email TEXT NOT NULL, code_challenge TEXT NOT NULL, redirect_uri TEXT NOT NULL,
+          name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT
+        );
+      `);
+    },
+  },
+  {
+    version: 10,
+    description: 'Managed app settings per organization (updates, proxy, AI)',
+    up(d) {
+      d.exec(`
+        CREATE TABLE managed_settings (
+          org_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+          settings TEXT NOT NULL, version INTEGER NOT NULL,
+          updated_by TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+      `);
+    },
+  },
+  {
+    version: 11,
+    description: 'Central credential versions and rotation history',
+    up(d) {
+      d.exec(`
+        ALTER TABLE central_credentials ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+        CREATE TABLE credential_versions (
+          credential_id TEXT NOT NULL REFERENCES central_credentials(id) ON DELETE CASCADE,
+          version INTEGER NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY (credential_id, version)
+        );
+        INSERT INTO credential_versions (credential_id, version, created_by, created_at)
+          SELECT id, 1, created_by, created_at FROM central_credentials;
+      `);
+    },
+  },
+  {
+    version: 12,
+    description: 'Outbound webhooks and their delivery queue',
+    up(d) {
+      d.exec(`
+        CREATE TABLE webhooks (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, url TEXT NOT NULL, events TEXT NOT NULL DEFAULT '[]', headers TEXT NOT NULL DEFAULT '{}',
+          secret_ciphertext TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, paused_reason TEXT,
+          consecutive_failures INTEGER NOT NULL DEFAULT 0, last_success_at TEXT, last_failure_at TEXT,
+          created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_webhooks_org ON webhooks(org_id);
+        CREATE TABLE webhook_deliveries (
+          id TEXT PRIMARY KEY, webhook_id TEXT NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+          org_id TEXT NOT NULL, event TEXT NOT NULL, payload TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at TEXT, last_status INTEGER, last_error TEXT, duration_ms INTEGER,
+          created_at TEXT NOT NULL, delivered_at TEXT
+        );
+        CREATE INDEX idx_webhook_deliveries_due ON webhook_deliveries(status, next_attempt_at);
+        CREATE INDEX idx_webhook_deliveries_hook ON webhook_deliveries(webhook_id, created_at);
+      `);
+    },
+  },
+  {
+    version: 13,
+    description: 'Notification outbox (email, Slack, webhook channels) with retries',
+    up(d) {
+      d.exec(`
+        CREATE TABLE channel_outbox (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL,
+          channel_id TEXT NOT NULL REFERENCES notification_channels(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL, subject TEXT NOT NULL, message TEXT NOT NULL, context TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at TEXT, last_error TEXT, created_at TEXT NOT NULL, sent_at TEXT
+        );
+        CREATE INDEX idx_channel_outbox_due ON channel_outbox(status, next_attempt_at);
+        CREATE INDEX idx_channel_outbox_org ON channel_outbox(org_id, created_at);
+      `);
+    },
+  },
+  {
+    version: 14,
+    description: 'Alert acknowledgement and snooze',
+    up(d) {
+      d.exec(`
+        ALTER TABLE alerts ADD COLUMN acknowledged_at TEXT;
+        ALTER TABLE alerts ADD COLUMN acknowledged_by TEXT;
+        ALTER TABLE alerts ADD COLUMN snoozed_until TEXT;
+      `);
+    },
+  },
+  {
+    version: 15,
+    description: 'SCIM 2.0 provisioning tokens and resource links',
+    up(d) {
+      d.exec(`
+        CREATE TABLE scim_tokens (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, token_prefix TEXT NOT NULL,
+          default_role TEXT NOT NULL DEFAULT 'user', created_by TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT
+        );
+        CREATE TABLE scim_links (
+          org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, external_id TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          PRIMARY KEY (org_id, resource_type, resource_id)
+        );
+        CREATE UNIQUE INDEX idx_scim_links_external ON scim_links(org_id, resource_type, external_id) WHERE external_id IS NOT NULL;
+      `);
+    },
+  },
+  {
+    version: 16,
+    description: 'Organization security settings, password age and reset tokens',
+    up(d) {
+      d.exec(`
+        CREATE TABLE org_security (
+          org_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+          settings TEXT NOT NULL DEFAULT '{}', updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+        );
+        ALTER TABLE users ADD COLUMN password_changed_at TEXT;
+        UPDATE users SET password_changed_at = created_at WHERE password_hash IS NOT NULL;
+        CREATE TABLE password_resets (
+          token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          purpose TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT
+        );
+      `);
+    },
+  },
+  {
+    version: 17,
+    description: 'WebAuthn passkeys',
+    up(d) {
+      d.exec(`
+        CREATE TABLE passkeys (
+          credential_id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, public_key TEXT NOT NULL, alg INTEGER NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0,
+          transports TEXT NOT NULL DEFAULT '[]', aaguid TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_used_at TEXT
+        );
+        CREATE INDEX idx_passkeys_user ON passkeys(user_id);
+        CREATE TABLE webauthn_challenges (
+          id TEXT PRIMARY KEY, user_id TEXT, purpose TEXT NOT NULL, challenge TEXT NOT NULL,
+          created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT
+        );
+      `);
+    },
+  },
+  {
+    version: 18,
+    description: 'Server-side sessions (idle timeout, revocation)',
+    up(d) {
+      d.exec(`
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          method TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+          revoked_at TEXT, revoked_reason TEXT
+        );
+        CREATE INDEX idx_sessions_user ON sessions(user_id, revoked_at);
+      `);
+    },
+  },
+  {
+    version: 19,
+    description: 'Step-up re-authentication time on sessions',
+    up(d) {
+      d.exec('ALTER TABLE sessions ADD COLUMN verified_at TEXT');
+    },
+  },
+  {
+    version: 20,
+    description: 'Personal API tokens (scoped, expiring)',
+    up(d) {
+      d.exec(`
+        CREATE TABLE api_tokens (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL,
+          permissions TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+          last_used_at TEXT, last_used_ip TEXT, revoked_at TEXT
+        );
+        CREATE INDEX idx_api_tokens_user ON api_tokens(user_id);
+        CREATE INDEX idx_api_tokens_org ON api_tokens(org_id);
+      `);
+    },
+  },
+  {
+    version: 21,
+    description: 'Membership expiry; removed members kept for restore',
+    up(d) {
+      d.exec(`
+        ALTER TABLE org_memberships ADD COLUMN expires_at TEXT;
+        CREATE TABLE removed_members (
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          role TEXT NOT NULL, group_ids TEXT NOT NULL DEFAULT '[]', reason TEXT NOT NULL DEFAULT '',
+          removed_by TEXT NOT NULL DEFAULT '', removed_at TEXT NOT NULL, purge_after TEXT NOT NULL,
+          account_disabled INTEGER NOT NULL DEFAULT 0, reassigned_to TEXT,
+          PRIMARY KEY (user_id, org_id)
+        );
+      `);
+    },
+  },
+  {
+    version: 22,
+    description: 'User time zone preference',
+    up(d) {
+      d.exec('ALTER TABLE users ADD COLUMN time_zone TEXT');
+    },
+  },
+  {
+    version: 23,
+    description: 'Fleet policy inheritance, locks and child-organization opt-outs',
+    up(d) {
+      d.exec(`
+        ALTER TABLE fleet_policies ADD COLUMN inherit INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE fleet_policies ADD COLUMN locked INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE policy_opt_outs (
+          org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          policy_id TEXT NOT NULL REFERENCES fleet_policies(id) ON DELETE CASCADE,
+          opted_out_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+          PRIMARY KEY (org_id, policy_id)
+        );
+      `);
+    },
+  },
+  {
+    version: 24,
+    description: 'SIEM forwarding destinations with a per-destination audit cursor',
+    up(d) {
+      d.exec(`
+        CREATE TABLE siem_destinations (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, kind TEXT NOT NULL, config TEXT NOT NULL DEFAULT '{}', secret_ciphertext TEXT,
+          include_children INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+          cursor INTEGER NOT NULL DEFAULT 0, forwarded_total INTEGER NOT NULL DEFAULT 0,
+          failures INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, last_error TEXT, last_attempt_at TEXT, last_success_at TEXT,
+          created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_siem_org ON siem_destinations(org_id);
+      `);
+    },
+  },
+  {
+    version: 25,
+    description: 'AI transcripts (their hashes are on the audit chain)',
+    up(d) {
+      d.exec(`
+        CREATE TABLE ai_transcripts (
+          report_id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          model TEXT NOT NULL, system_prompt TEXT NOT NULL, request TEXT NOT NULL, response TEXT NOT NULL,
+          sha256 TEXT NOT NULL, audit_id TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+      `);
+    },
+  },
+  {
+    version: 26,
+    description: 'API request log and SSO sign-in diagnostics',
+    up(d) {
+      d.exec(`
+        CREATE TABLE api_requests (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL DEFAULT '', at TEXT NOT NULL,
+          method TEXT NOT NULL, path TEXT NOT NULL, status INTEGER NOT NULL, outcome TEXT NOT NULL DEFAULT '',
+          auth TEXT NOT NULL, token_id TEXT, user_id TEXT, user_email TEXT NOT NULL DEFAULT '',
+          ip TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX idx_api_requests_org ON api_requests(org_id, at);
+        CREATE TABLE sso_attempts (
+          id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, org_id TEXT NOT NULL, kind TEXT NOT NULL,
+          at TEXT NOT NULL, ok INTEGER NOT NULL, stage TEXT NOT NULL, error TEXT,
+          steps TEXT NOT NULL DEFAULT '[]', email TEXT NOT NULL DEFAULT '', user_id TEXT, ip TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX idx_sso_attempts_provider ON sso_attempts(provider_id, at);
+      `);
+    },
+  },
+  {
+    version: 27,
+    description: 'Report schedules and report runs',
+    up(d) {
+      d.exec(`
+        CREATE TABLE report_schedules (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, report_id TEXT NOT NULL, days INTEGER NOT NULL, format TEXT NOT NULL DEFAULT 'csv',
+          frequency TEXT NOT NULL, hour INTEGER NOT NULL, weekday INTEGER, day_of_month INTEGER, time_zone TEXT NOT NULL,
+          channel_ids TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1, next_run_at TEXT,
+          created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_report_schedules_due ON report_schedules(enabled, next_run_at);
+        CREATE TABLE report_runs (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          report_id TEXT NOT NULL, schedule_id TEXT, days INTEGER NOT NULL, status TEXT NOT NULL,
+          row_count INTEGER NOT NULL DEFAULT 0, summary TEXT NOT NULL DEFAULT '', result TEXT, error TEXT,
+          delivery TEXT NOT NULL DEFAULT '[]', requested_by TEXT NOT NULL DEFAULT '',
+          started_at TEXT NOT NULL, finished_at TEXT
+        );
+        CREATE INDEX idx_report_runs_org ON report_runs(org_id, started_at);
+      `);
+    },
+  },
+  {
+    version: 28,
+    description: 'Log retention settings and anchored audit pruning',
+    up(d) {
+      d.exec(`
+        CREATE TABLE console_settings (
+          key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+        );
+        CREATE TABLE audit_prunes (
+          id TEXT PRIMARY KEY, through_sequence INTEGER NOT NULL, through_hash TEXT NOT NULL,
+          anchor_id TEXT NOT NULL, pruned INTEGER NOT NULL, created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+        );
+        CREATE TRIGGER audit_prune_no_update BEFORE UPDATE ON audit_prunes
+          BEGIN SELECT RAISE(ABORT, 'audit prune records are append-only'); END;
+        CREATE TRIGGER audit_prune_no_delete BEFORE DELETE ON audit_prunes
+          BEGIN SELECT RAISE(ABORT, 'audit prune records are append-only'); END;
+      `);
+    },
+  },
+  {
+    version: 29,
+    description: 'Background export jobs',
+    up(d) {
+      d.exec(`
+        CREATE TABLE export_jobs (
+          id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL, format TEXT NOT NULL, params TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
+          total INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, file BLOB, size INTEGER NOT NULL DEFAULT 0,
+          sha256 TEXT, error TEXT, requested_by TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, expires_at TEXT
+        );
+        CREATE INDEX idx_export_jobs_queue ON export_jobs(status, created_at);
+      `);
+    },
+  },
+  {
+    version: 30,
+    description: 'User console language',
+    up(d) {
+      d.exec('ALTER TABLE users ADD COLUMN locale TEXT');
+    },
+  },
+  {
+    version: 31,
+    description: 'Billing accounts and processed billing events',
+    up(d) {
+      d.exec(`
+        CREATE TABLE billing_accounts (
+          org_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+          provider TEXT NOT NULL, customer_id TEXT, subscription_id TEXT, plan TEXT, seats INTEGER,
+          status TEXT NOT NULL DEFAULT 'none', current_period_end TEXT, cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX idx_billing_customer ON billing_accounts(provider, customer_id);
+        CREATE TABLE billing_events (
+          id TEXT PRIMARY KEY, provider TEXT NOT NULL, org_id TEXT, type TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '', received_at TEXT NOT NULL
+        );
+      `);
+    },
+  },
+  {
+    version: 32,
+    description: 'Organization branding and email templates',
+    up(d) {
+      d.exec(`
+        CREATE TABLE org_branding (
+          org_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+          settings TEXT NOT NULL, logo TEXT, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+      `);
+    },
+  },
+  {
+    version: 33,
+    description: 'Read-only "view as" on sessions',
+    up(d) {
+      d.exec(`
+        ALTER TABLE sessions ADD COLUMN view_as_user_id TEXT;
+        ALTER TABLE sessions ADD COLUMN view_as_until TEXT;
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

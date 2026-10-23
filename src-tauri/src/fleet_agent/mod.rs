@@ -23,10 +23,14 @@ use crate::security::CredentialStore;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use ufop_core::agent::policy::{self, managed_job_id, policy_of_job};
-use ufop_core::agent::{Agent, AgentConfig, AgentHost, BoxFuture, ClientInfo, FleetPolicy, JobSummary, ReportStats, RunReport};
+use ufop_core::agent::{Agent, AgentConfig, AgentHost, AgentLimits, BoxFuture, ClientInfo, DiagnosticsUpload, ManagedSettings, FleetPolicy, JobSummary, ReportStats, RunReport};
 
 pub const CONFIG_KEY: &str = "fleet_agent.config";
 pub const TOKEN_KEY: &str = "fleet-agent-token";
+/// The owner's limits on the console (never sent to or changed by it).
+pub const LIMITS_KEY: &str = "fleet_agent.limits";
+/// A root nothing is inside, used when the saved limits cannot be read.
+const UNREADABLE_ROOT: &str = "/ufop-limits-unreadable";
 /// PEM file with an extra CA certificate for a console behind a private CA.
 pub const ENV_CA_FILE: &str = "UFOP_CONSOLE_CA_FILE";
 
@@ -38,11 +42,37 @@ pub struct BackupHost {
     settings: SettingsStore,
     creds: Arc<CredentialStore>,
     agent_kind: &'static str,
+    managed_handler: std::sync::Mutex<Option<ManagedSettingsHandler>>,
 }
+
+/// Applies the console's app settings on this kind of client (the desktop
+/// app sets one; the server and CLI have no proxy or AI settings to manage).
+pub type ManagedSettingsHandler = Arc<dyn Fn(Option<ManagedSettings>) -> BoxFuture<'static, Result<(), AppError>> + Send + Sync>;
 
 impl BackupHost {
     pub fn new(mgr: BackupManager, settings: SettingsStore, creds: Arc<CredentialStore>, agent_kind: &'static str) -> Self {
-        Self { mgr, settings, creds, agent_kind }
+        Self { mgr, settings, creds, agent_kind, managed_handler: std::sync::Mutex::new(None) }
+    }
+
+    /// The owner's limits on what the console may do here (local only).
+    pub async fn limits(&self) -> AgentLimits {
+        match self.settings.get(LIMITS_KEY).await {
+            Ok(Some(s)) => serde_json::from_str(&s).unwrap_or_else(|e| {
+                // Unreadable limits must not silently lift them: confine to nothing.
+                tracing::warn!("Unreadable console limits, refusing console changes: {e}");
+                AgentLimits { roots: vec![UNREADABLE_ROOT.into()], read_only: true, allow_scripts: false, ..Default::default() }
+            }),
+            _ => AgentLimits::default(),
+        }
+    }
+
+    pub async fn set_limits(&self, limits: &AgentLimits) -> Result<(), AppError> {
+        limits.validate().map_err(AppError::validation)?;
+        self.settings.set(LIMITS_KEY, &serde_json::to_string(limits)?).await
+    }
+
+    pub fn set_managed_settings_handler(&self, h: ManagedSettingsHandler) {
+        *self.managed_handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
     }
 
     fn keychain(&self) -> bool {
@@ -200,7 +230,13 @@ pub async fn dispatch(agent: &FleetAgent, command: &str, a: &Value) -> Result<Va
 
 impl AgentHost for BackupHost {
     fn client_info(&self) -> ClientInfo {
-        ClientInfo::detect(self.agent_kind, env!("CARGO_PKG_VERSION"))
+        let mut info = ClientInfo::detect(self.agent_kind, env!("CARGO_PKG_VERSION"));
+        // On a shared host (Remote Desktop, Citrix, xrdp) each user's app is
+        // its own machine in the console: name it after the user too.
+        if info.name.is_none() && self.agent_kind == "desktop" {
+            info.name = ufop_core::session::SessionInfo::detect().machine_name(&info.hostname);
+        }
+        info
     }
 
     fn load(&self) -> BoxFuture<'_, Result<(AgentConfig, Option<String>), AppError>> {
@@ -253,7 +289,15 @@ impl AgentHost for BackupHost {
     }
 
     fn rpc(&self, command: String, args: Value) -> BoxFuture<'_, Result<Value, AppError>> {
-        Box::pin(async move { api::dispatch(&self.mgr, &command, &args).await })
+        Box::pin(async move {
+            let limits = self.limits().await;
+            let job = match (command.as_str(), args.get("id").and_then(Value::as_str)) {
+                ("backup_execute" | "backup_start_operation", Some(id)) => self.mgr.get_job(id).await.ok().and_then(|j| serde_json::to_value(j).ok()),
+                _ => None,
+            };
+            guard::check_rpc(&limits, &command, &args, job.as_ref())?;
+            api::dispatch(&self.mgr, &command, &args).await
+        })
     }
 
     fn run_backup(&self, job_id: String) -> BoxFuture<'_, Result<Value, AppError>> {
@@ -266,7 +310,10 @@ impl AgentHost for BackupHost {
 
     fn apply_policy(&self, p: FleetPolicy) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
+            let limits = self.limits().await;
+            limits.check_write("applying a fleet policy")?;
             let (job, pass) = self.job_for_policy(&p).await?;
+            guard::check_job(&limits, &serde_json::to_value(&job)?)?;
             self.mgr.save_job(job, pass).await.map(|_| ())
         })
     }
@@ -284,7 +331,30 @@ impl AgentHost for BackupHost {
     fn managed_policies(&self) -> BoxFuture<'_, Vec<String>> {
         Box::pin(async move { self.mgr.list_jobs().await.iter().filter_map(|j| policy_of_job(&j.id).map(String::from)).collect() })
     }
+
+    fn apply_managed_settings(&self, settings: Option<ManagedSettings>) -> BoxFuture<'_, Result<(), AppError>> {
+        let h = self.managed_handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        Box::pin(async move {
+            match h {
+                Some(h) => h(settings).await,
+                None => Ok(()),
+            }
+        })
+    }
+
+    fn diagnostics(&self) -> BoxFuture<'_, Result<DiagnosticsUpload, AppError>> {
+        let kind = self.agent_kind;
+        Box::pin(async move {
+            let (b, summary) = tokio::task::spawn_blocking(move || crate::diagnostics::collect(kind))
+                .await
+                .map_err(|e| AppError::internal(format!("Diagnostics task failed: {e}")))??;
+            Ok(DiagnosticsUpload { file_name: b.file_name, summary, bytes: b.bytes })
+        })
+    }
 }
+
+pub mod guard;
+pub mod loopback;
 
 #[cfg(test)]
 mod tests;

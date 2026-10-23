@@ -1,0 +1,499 @@
+[
+  {
+    "id": "00000000-0000-4000-8000-000000000000",
+    "name": "Notify on new files",
+    "enabled": false,
+    "trigger": {
+      "type": "file_appears",
+      "watch_path": "/inbox",
+      "recursive": false
+    },
+    "conditions": [],
+    "condition_tree": null,
+    "action": {
+      "type": "notify",
+      "title": "New file in {parent}",
+      "body": "{filename} ({size} bytes)"
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": null
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "name": "File by date",
+    "enabled": false,
+    "trigger": {
+      "type": "file_appears",
+      "watch_path": "/inbox",
+      "recursive": false
+    },
+    "conditions": [],
+    "condition_tree": null,
+    "action": {
+      "type": "move_file",
+      "dest_path": "/inbox/Filed/{yyyy}/{mm}"
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": null
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000002",
+    "name": "Expire files older than 30 days",
+    "enabled": false,
+    "trigger": {
+      "type": "schedule",
+      "cron_expr": "0 0 2 * * * *",
+      "cron_human": "Every day at 02:00"
+    },
+    "conditions": [
+      {
+        "type": "older_than",
+        "seconds": 2592000
+      }
+    ],
+    "condition_tree": null,
+    "action": {
+      "type": "delete_file",
+      "to_trash": true
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": {
+        "path": "/inbox",
+        "recursive": false,
+        "newest": null,
+        "include_dirs": false
+      }
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000003",
+    "name": "Scan new files for malware",
+    "enabled": false,
+    "trigger": {
+      "type": "file_appears",
+      "watch_path": "/inbox",
+      "recursive": false
+    },
+    "conditions": [],
+    "condition_tree": null,
+    "action": {
+      "type": "scan_for_malware",
+      "quarantine_path": "/inbox-quarantine",
+      "notify": true
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": null
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000004",
+    "name": "Extract arriving zips",
+    "enabled": false,
+    "trigger": {
+      "type": "file_appears",
+      "watch_path": "/inbox",
+      "recursive": false
+    },
+    "conditions": [
+      {
+        "type": "extension_is",
+        "extensions": [
+          "zip"
+        ]
+      }
+    ],
+    "condition_tree": null,
+    "action": {
+      "type": "extract_archive",
+      "dest_path": "/inbox/{name}",
+      "max_entries": 10000,
+      "delete_archive": false
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": null
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000005",
+    "name": "R",
+    "enabled": false,
+    "trigger": {
+      "type": "webhook"
+    },
+    "conditions": [],
+    "condition_tree": {
+      "type": "any",
+      "nodes": [
+        {
+          "type": "not",
+          "node": {
+            "type": "condition",
+            "condition": {
+              "type": "modified_within",
+              "seconds": 30
+            }
+          }
+        },
+        {
+          "type": "condition",
+          "condition": {
+            "type": "name_regex",
+            "pattern": "^(?P<y>\\d{4})"
+          }
+        }
+      ]
+    },
+    "action": {
+      "type": "send_message",
+      "notification": {
+        "type": "teams",
+        "credential_id": "cred-1"
+      },
+      "title": "{rule}",
+      "body": "{customer}"
+    },
+    "steps": [
+      {
+        "action": {
+          "type": "run_command",
+          "program": "/bin/echo",
+          "args": [
+            "{payload}"
+          ],
+          "working_dir": null,
+          "timeout_secs": 30
+        },
+        "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "download_url",
+          "url": "https://example.com/{customer}.csv",
+          "dest_path": "/in/{yyyy}",
+          "file_name": null,
+          "overwrite": true,
+          "max_mb": 50,
+          "sha256": null,
+          "allow_private": false
+        },
+        "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "convert_image",
+          "format": "webp",
+          "max_width": 800,
+          "max_height": null,
+          "quality": null,
+          "dest_path": "/in/small"
+        },
+        "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "convert_document",
+          "to": "pdf",
+          "dest_path": ""
+        },
+        "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "validate_batch",
+          "folder": "",
+          "rules": {
+            "members": [
+              {
+                "pattern": "orders_*.csv",
+                "min": 1,
+                "max": 10,
+                "min_bytes": 20
+              }
+            ],
+            "content": [
+              {
+                "pattern": "*.csv",
+                "check": {
+                  "type": "csv",
+                  "required_columns": [
+                    "id",
+                    "total"
+                  ],
+                  "min_rows": 1,
+                  "delimiter": ";"
+                }
+              },
+              {
+                "pattern": "SHA256SUMS",
+                "check": {
+                  "type": "sha256_manifest"
+                }
+              },
+              {
+                "pattern": "*.json",
+                "check": {
+                  "type": "json"
+                }
+              },
+              {
+                "pattern": "*",
+                "check": {
+                  "type": "not_empty"
+                }
+              }
+            ],
+            "no_extra_files": true
+          },
+          "report_folder": "/reports/{yyyy}",
+          "fail_on_invalid": true
+        },
+        "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "ai_task",
+          "instruction": "Classify {filename}",
+          "dest_path": "/ai",
+          "suffix": "class.txt",
+          "max_chars": 5000
+        },
+        "continue_on_error": true
+      },
+      {
+        "action": {
+          "type": "scan_for_malware",
+          "quarantine_path": "/quarantine/{yyyy}",
+          "notify": false
+        },
+        "continue_on_error": false
+      }
+    ],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": -1,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": {
+        "path": "/inbox",
+        "recursive": true,
+        "newest": 5,
+        "include_dirs": false
+      }
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000006",
+    "name": "R",
+    "enabled": false,
+    "trigger": {
+      "type": "manual"
+    },
+    "conditions": [],
+    "condition_tree": null,
+    "action": {
+      "type": "move_file",
+      "dest_path": "/pdf"
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": null
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null,
+    "workflow": {
+      "nodes": [
+        {
+          "id": "n1",
+          "kind": "condition",
+          "condition": {
+            "type": "condition",
+            "condition": {
+              "type": "extension_is",
+              "extensions": [
+                "pdf"
+              ]
+            }
+          },
+          "label": "PDF?",
+          "x": 0,
+          "y": 0
+        },
+        {
+          "id": "n2",
+          "kind": "action",
+          "action": {
+            "type": "move_file",
+            "dest_path": "/pdf"
+          },
+          "label": "",
+          "x": -120,
+          "y": 120
+        },
+        {
+          "id": "n3",
+          "kind": "delay",
+          "seconds": 5,
+          "label": "",
+          "x": 120,
+          "y": 120
+        },
+        {
+          "id": "n4",
+          "kind": "join",
+          "all": true,
+          "label": "",
+          "x": 0,
+          "y": 240
+        },
+        {
+          "id": "n5",
+          "kind": "sub_rule",
+          "rule_id": "00000000-0000-4000-8000-000000000000",
+          "label": "",
+          "x": 0,
+          "y": 360
+        }
+      ],
+      "edges": [
+        {
+          "from": "n1",
+          "to": "n2",
+          "on": "true"
+        },
+        {
+          "from": "n1",
+          "to": "n3",
+          "on": "false"
+        },
+        {
+          "from": "n2",
+          "to": "n4",
+          "on": "success"
+        },
+        {
+          "from": "n3",
+          "to": "n4",
+          "on": "always"
+        },
+        {
+          "from": "n4",
+          "to": "n5",
+          "on": "failure"
+        }
+      ]
+    }
+  }
+]

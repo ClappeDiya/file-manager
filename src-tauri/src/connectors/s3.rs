@@ -269,7 +269,17 @@ pub struct CompletedPart {
 struct S3State {
     credentials: S3Credentials,
     http: reqwest::Client,
+    /// Changes on every connect, so a role refresher of an earlier
+    /// connection stops instead of overwriting the new credentials.
+    epoch: u64,
 }
+
+static S3_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Refresh assumed-role credentials this long before they expire.
+const ROLE_REFRESH_EARLY_SECS: i64 = 300;
+/// Never retry faster than this (tests: immediately).
+const ROLE_MIN_WAIT_SECS: i64 = if cfg!(test) { 0 } else { 30 };
 
 /// Amazon S3 connector implementing the Connector trait.
 pub struct S3Connector {
@@ -285,7 +295,7 @@ impl S3Connector {
 
     /// Connect using S3 credentials directly (not via ConnectionProfile).
     pub async fn connect_with_credentials(&self, creds: S3Credentials) -> Result<(), AppError> {
-        let http = reqwest::Client::builder()
+        let http = crate::net::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| AppError::Connection {
@@ -297,10 +307,61 @@ impl S3Connector {
         let state = S3State {
             credentials: creds,
             http,
+            epoch: S3_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
 
         let mut lock = self.state.write().await;
         *lock = Some(state);
+        Ok(())
+    }
+
+    /// Connect with a role assumed from `base` and keep it fresh: a
+    /// background task re-assumes the role shortly before the temporary
+    /// credentials expire, until the connection is replaced or closed.
+    pub async fn connect_with_role(
+        &self,
+        base: super::aws_credentials::BaseKeys,
+        role: crate::core::types::AssumeRoleConfig,
+        mut creds: S3Credentials,
+        sts_endpoint: Option<String>,
+    ) -> Result<(), AppError> {
+        let temp = super::aws_credentials::assume_role(&base, &role, &creds.region, sts_endpoint.as_deref()).await?;
+        let mut expires = expiry_of(&temp);
+        creds.access_key_id = temp.access_key_id;
+        creds.secret_access_key = temp.secret_access_key;
+        creds.session_token = Some(temp.session_token);
+        let region = creds.region.clone();
+        self.connect_with_credentials(creds).await?;
+        let epoch = self.state.read().await.as_ref().map(|s| s.epoch).unwrap_or(0);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            loop {
+                let wait = (expires - chrono::Utc::now()).num_seconds() - ROLE_REFRESH_EARLY_SECS;
+                tokio::time::sleep(std::time::Duration::from_secs(wait.max(ROLE_MIN_WAIT_SECS) as u64)).await;
+                if state.read().await.as_ref().map(|s| s.epoch) != Some(epoch) {
+                    return; // reconnected or disconnected
+                }
+                match super::aws_credentials::assume_role(&base, &role, &region, sts_endpoint.as_deref()).await {
+                    Ok(t) => {
+                        expires = expiry_of(&t);
+                        let mut st = state.write().await;
+                        match st.as_mut() {
+                            Some(s) if s.epoch == epoch => {
+                                s.credentials.access_key_id = t.access_key_id;
+                                s.credentials.secret_access_key = t.secret_access_key;
+                                s.credentials.session_token = Some(t.session_token);
+                                tracing::debug!("Refreshed assumed-role S3 credentials");
+                            }
+                            _ => return,
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Assumed-role refresh failed, retrying: {e}");
+                        expires = chrono::Utc::now() + chrono::Duration::seconds(ROLE_REFRESH_EARLY_SECS + 60);
+                    }
+                }
+            }
+        });
         Ok(())
     }
 
@@ -355,12 +416,43 @@ impl S3Connector {
     }
 
     /// List objects in a bucket with optional prefix (virtual folder browsing).
+    ///
+    /// Follows `NextContinuationToken` until the listing is complete: a single
+    /// ListObjectsV2 call returns at most 1,000 keys, and stopping there made
+    /// large folders look silently truncated.
     pub async fn list_objects(
         &self,
         bucket: &str,
         prefix: &str,
         delimiter: Option<&str>,
     ) -> Result<Vec<FileEntry>, AppError> {
+        let mut entries = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = self.list_objects_page(bucket, prefix, delimiter, token.as_deref()).await?;
+            entries.extend(page.entries);
+            match page.next_token {
+                Some(next) if Some(&next) != token.as_ref() => token = Some(next),
+                Some(_) => {
+                    return Err(AppError::Connection {
+                        message: "S3 returned the same continuation token twice".to_string(),
+                        advice: "The server's listing is inconsistent; try again.".to_string(),
+                    })
+                }
+                None => break,
+            }
+        }
+        Ok(entries)
+    }
+
+    /// One ListObjectsV2 page.
+    async fn list_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        continuation_token: Option<&str>,
+    ) -> Result<ListPage, AppError> {
         let state = self.state.read().await;
         let state = state.as_ref().ok_or_else(|| AppError::Connection {
             message: "Not connected to S3".to_string(),
@@ -380,12 +472,10 @@ impl S3Connector {
         if let Some(delim) = delimiter {
             query_params.push(("delimiter", delim.to_string()));
         }
-
-        let query_string: String = query_params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, percent_encoding::percent_encode(v.as_bytes(), percent_encoding::NON_ALPHANUMERIC)))
-            .collect::<Vec<_>>()
-            .join("&");
+        if let Some(t) = continuation_token {
+            query_params.push(("continuation-token", t.to_string()));
+        }
+        let query_string = canonical_query(&query_params);
 
         let url = format!("{endpoint}{path}?{query_string}");
 
@@ -434,8 +524,16 @@ impl S3Connector {
             advice: "Try again.".to_string(),
         })?;
 
-        let entries = parse_list_objects_xml(&body, prefix);
-        Ok(entries)
+        let truncated = extract_xml_value(&body, "IsTruncated").is_some_and(|v| v.trim() == "true");
+        let next_token = if truncated {
+            Some(extract_xml_value(&body, "NextContinuationToken").ok_or_else(|| AppError::Connection {
+                message: "S3 listing is truncated but has no continuation token".to_string(),
+                advice: "The server may not support ListObjectsV2 pagination.".to_string(),
+            })?)
+        } else {
+            None
+        };
+        Ok(ListPage { entries: parse_list_objects_xml(&body, prefix), next_token })
     }
 
     /// Upload a file to S3. Uses multipart for files > 5MB.
@@ -2079,13 +2177,7 @@ impl S3Connector {
         let now = Utc::now();
         let (endpoint, path) = self.bucket_url(&state.credentials, bucket);
 
-        let query_string = format!(
-            "prefix={}&versions=",
-            percent_encoding::percent_encode(
-                key.as_bytes(),
-                percent_encoding::NON_ALPHANUMERIC
-            )
-        );
+        let query_string = canonical_query(&[("prefix", key.to_string()), ("versions", String::new())]);
 
         let url = format!("{endpoint}{path}?{query_string}");
 
@@ -2153,20 +2245,20 @@ impl S3Connector {
         let now = Utc::now();
         let (endpoint, path) = self.bucket_url(&state.credentials, bucket);
 
-        let encoded_key = percent_encoding::percent_encode(
-            key.as_bytes(),
-            percent_encoding::NON_ALPHANUMERIC,
-        );
+        // Same encoding for the URL and the signed path (`/` kept), or
+        // nested keys and keys with spaces fail SigV4.
+        let encoded_key = percent_encode_path(key);
         let url = format!("{endpoint}{path}{encoded_key}");
 
         let canonical_path = if state.credentials.path_style {
-            format!("/{bucket}/{key}")
+            format!("/{bucket}/{encoded_key}")
         } else {
-            format!("/{key}")
+            format!("/{encoded_key}")
         };
 
         let copy_source = format!(
-            "/{bucket}/{key}?versionId={version_id}"
+            "/{bucket}/{encoded_key}?versionId={}",
+            percent_encoding::percent_encode(version_id.as_bytes(), S3_ENCODE_SET)
         );
 
         let headers = self.sign_request(
@@ -2703,7 +2795,17 @@ impl Connector for S3Connector {
                 path_style,
                 session_token: None,
             };
-            self.connect_with_credentials(creds).await?;
+            match profile.extras.assume_role.clone().filter(|r| !r.role_arn.trim().is_empty()) {
+                Some(role) => {
+                    let base = super::aws_credentials::BaseKeys {
+                        access_key_id: creds.access_key_id.clone(),
+                        secret_access_key: creds.secret_access_key.clone(),
+                        session_token: None,
+                    };
+                    self.connect_with_role(base, role, creds, None).await?;
+                }
+                None => self.connect_with_credentials(creds).await?,
+            }
             // Fail now (bad keys, unreachable endpoint) rather than on first browse.
             if let Err(e) = self.list_buckets().await {
                 *self.state.write().await = None;
@@ -2772,6 +2874,58 @@ impl Connector for S3Connector {
             self.delete_object(&bucket, &key).await
         })
     }
+
+    fn create_share_link(
+        &self,
+        remote_path: &str,
+        options: &super::ShareOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<super::ShareLink, AppError>> + Send + '_>> {
+        let (r, o) = (remote_path.to_string(), options.clone());
+        Box::pin(async move {
+            let secs = presign_expiry(&o)?;
+            let (bucket, key) = super::split_bucket_key(&r)?;
+            let state = self.state.read().await;
+            let st = state.as_ref().ok_or_else(|| AppError::connection("Not connected to S3", "Connect first."))?;
+            let url = self.generate_presigned_url(&st.credentials, &bucket, &key, secs)?;
+            Ok(super::ShareLink {
+                url,
+                expires_at: Some(Utc::now() + chrono::Duration::seconds(secs as i64)),
+                scope: super::ShareScope::Anyone,
+                provider: "s3".into(),
+                note: Some("Pre-signed download link: anyone holding it can download until it expires.".into()),
+            })
+        })
+    }
+}
+
+/// When temporary credentials expire (an hour if STS didn't say).
+fn expiry_of(c: &super::aws_credentials::AwsCredentials) -> chrono::DateTime<Utc> {
+    c.expiration
+        .as_deref()
+        .and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok())
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(1))
+}
+
+/// SigV4 pre-signed URLs live at most 7 days; default one day. They are
+/// bearer links for downloading only.
+pub(crate) const PRESIGN_MAX_SECS: u64 = 7 * 24 * 3600;
+
+pub(crate) fn presign_expiry(o: &super::ShareOptions) -> Result<u64, AppError> {
+    if o.password.as_deref().is_some_and(|p| !p.is_empty()) {
+        return Err(super::share_unsupported("set a password"));
+    }
+    if o.allow_edit {
+        return Err(super::share_unsupported("allow editing"));
+    }
+    if o.scope != super::ShareScope::Anyone {
+        return Err(super::share_unsupported("limit links to your organization"));
+    }
+    let secs = o.expires_in_secs.unwrap_or(24 * 3600);
+    if secs == 0 || secs > PRESIGN_MAX_SECS {
+        return Err(AppError::validation("S3 links must expire within 7 days"));
+    }
+    Ok(secs)
 }
 
 // ── AWS Signature V4 helpers ──
@@ -2804,6 +2958,30 @@ const S3_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHAN
     .remove(b'_')
     .remove(b'~');
 
+/// One page of a ListObjectsV2 response.
+struct ListPage {
+    entries: Vec<FileEntry>,
+    next_token: Option<String>,
+}
+
+/// SigV4 canonical query string, also used verbatim as the request query:
+/// keys and values RFC 3986-encoded (unreserved characters kept, `/`
+/// encoded) and sorted by key. Unsorted or over-encoded queries (e.g. a `-`
+/// sent as `%2D`) make S3 reject the signature.
+fn canonical_query(params: &[(&str, String)]) -> String {
+    let mut pairs: Vec<(String, String)> = params
+        .iter()
+        .map(|(k, v)| {
+            (
+                percent_encoding::percent_encode(k.as_bytes(), S3_ENCODE_SET).to_string(),
+                percent_encoding::percent_encode(v.as_bytes(), S3_ENCODE_SET).to_string(),
+            )
+        })
+        .collect();
+    pairs.sort();
+    pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
+}
+
 fn percent_encode_path(path: &str) -> String {
     path.split('/')
         .map(|segment| {
@@ -2833,7 +3011,20 @@ fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].to_string())
+    Some(xml_unescape(&xml[start..end]))
+}
+
+/// Decode the five predefined XML entities (S3 escapes `&` in keys and
+/// tokens, and `"` in ETags).
+fn xml_unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn parse_list_buckets_xml(xml: &str) -> Vec<FileEntry> {
@@ -3338,6 +3529,93 @@ fn parse_object_versions_xml(xml: &str, key_filter: &str) -> Vec<S3ObjectVersion
 }
 
 #[cfg(test)]
+mod share_tests {
+    use super::*;
+    use crate::connectors::{ShareOptions, ShareScope};
+
+    #[tokio::test]
+    async fn assumes_role_with_external_id_and_refreshes() {
+        use axum::{routing::post, Router};
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let c2 = calls.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |headers: axum::http::HeaderMap, body: String| {
+                let calls = c2.clone();
+                async move {
+                    let n = {
+                        let mut v = calls.lock().unwrap();
+                        v.push((headers.get("authorization").map(|h| h.to_str().unwrap().to_string()).unwrap_or_default(), body));
+                        v.len()
+                    };
+                    // Expires inside the refresh window, so a refresh follows at once.
+                    let exp = (chrono::Utc::now() + chrono::Duration::seconds(10)).to_rfc3339();
+                    format!("<AssumeRoleResponse><AssumeRoleResult><Credentials><AccessKeyId>ASIA{n}</AccessKeyId><SecretAccessKey>sk{n}</SecretAccessKey><SessionToken>tok{n}</SessionToken><Expiration>{exp}</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let c = S3Connector::new();
+        let base = crate::connectors::aws_credentials::BaseKeys { access_key_id: "AKIDBASE".into(), secret_access_key: "basesecret".into(), session_token: None };
+        let role = crate::core::types::AssumeRoleConfig { role_arn: "arn:aws:iam::123456789012:role/Reader".into(), external_id: Some("ext-42".into()), session_name: None, duration_secs: Some(900) };
+        let creds = S3Credentials { access_key_id: String::new(), secret_access_key: String::new(), region: "eu-west-1".into(), endpoint: None, path_style: false, session_token: None };
+        c.connect_with_role(base, role, creds, Some(format!("http://{addr}"))).await.unwrap();
+        {
+            let st = c.state.read().await;
+            let cr = &st.as_ref().unwrap().credentials;
+            assert_eq!((cr.access_key_id.as_str(), cr.session_token.as_deref()), ("ASIA1", Some("tok1")));
+        }
+        let (auth, body) = calls.lock().unwrap()[0].clone();
+        assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDBASE/") && auth.contains("/eu-west-1/sts/aws4_request"), "{auth}");
+        assert!(body.contains("Action=AssumeRole") && body.contains("ExternalId=ext-42") && body.contains("DurationSeconds=900"), "{body}");
+        assert!(body.contains("RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2FReader"));
+        // The refresher swaps in new credentials before expiry.
+        for _ in 0..100 {
+            if c.state.read().await.as_ref().unwrap().credentials.access_key_id != "ASIA1" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_ne!(c.state.read().await.as_ref().unwrap().credentials.access_key_id, "ASIA1");
+        // Reconnecting stops the old refresher from touching the new state.
+        c.connect_with_credentials(S3Credentials { access_key_id: "PLAIN".into(), secret_access_key: "x".into(), region: "eu-west-1".into(), endpoint: None, path_style: false, session_token: None }).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(c.state.read().await.as_ref().unwrap().credentials.access_key_id, "PLAIN");
+    }
+
+    #[test]
+    fn assume_role_validates_arn() {
+        let base = crate::connectors::aws_credentials::BaseKeys { access_key_id: "a".into(), secret_access_key: "b".into(), session_token: Some("t".into()) };
+        let bad = crate::core::types::AssumeRoleConfig { role_arn: "Reader".into(), ..Default::default() };
+        assert!(crate::connectors::aws_credentials::assume_role_request(&base, &bad, "us-east-1", None, chrono::Utc::now()).is_err());
+        let ok = crate::core::types::AssumeRoleConfig { role_arn: "arn:aws:iam::1:role/R".into(), duration_secs: Some(60), ..Default::default() };
+        let (url, headers, body) = crate::connectors::aws_credentials::assume_role_request(&base, &ok, "us-east-1", None, chrono::Utc::now()).unwrap();
+        assert_eq!(url, "https://sts.us-east-1.amazonaws.com/");
+        assert!(body.contains("DurationSeconds=900"), "clamped to the STS minimum");
+        assert!(!body.contains("ExternalId"));
+        assert_eq!(headers.get("x-amz-security-token").map(String::as_str), Some("t"));
+    }
+
+    #[test]
+    fn presign_expiry_rules() {
+        assert_eq!(presign_expiry(&ShareOptions::default()).unwrap(), 86_400);
+        assert_eq!(presign_expiry(&ShareOptions { expires_in_secs: Some(600), ..Default::default() }).unwrap(), 600);
+        for bad in [
+            ShareOptions { expires_in_secs: Some(PRESIGN_MAX_SECS + 1), ..Default::default() },
+            ShareOptions { expires_in_secs: Some(0), ..Default::default() },
+            ShareOptions { password: Some("x".into()), ..Default::default() },
+            ShareOptions { allow_edit: true, ..Default::default() },
+            ShareOptions { scope: ShareScope::Organization, ..Default::default() },
+        ] {
+            assert!(presign_expiry(&bad).is_err(), "{bad:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3529,5 +3807,152 @@ mod tests {
     #[test]
     fn test_multipart_threshold() {
         assert_eq!(MULTIPART_THRESHOLD, 5 * 1024 * 1024);
+    }
+
+    // ── ListObjectsV2 pagination (regression: listings stopped at 1,000) ──
+
+    /// Mock S3 that checks every request's SigV4 signature against the
+    /// reference signer and serves `pages` ListObjectsV2 pages of keys.
+    async fn mock_s3(pages: usize) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::http::{HeaderMap, Uri};
+        use std::collections::BTreeMap;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let app = axum::Router::new().fallback(move |uri: Uri, h: HeaderMap| {
+            let log = log.clone();
+            async move {
+                let query = uri.query().unwrap_or("").to_string();
+                log.lock().unwrap().push(query.clone());
+                let params: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                let mut signed = BTreeMap::new();
+                for k in ["host", "x-amz-content-sha256", "x-amz-date"] {
+                    signed.insert(k.to_string(), h[k].to_str().unwrap().to_string());
+                }
+                let expected = crate::backup_engine::stores::s3::sign_v4(
+                    "GET", uri.path(), &params, &signed, "UNSIGNED-PAYLOAD", "AKID", "SECRET", "us-east-1", "s3",
+                );
+                if h["authorization"].to_str().unwrap() != expected {
+                    return (axum::http::StatusCode::FORBIDDEN, "SignatureDoesNotMatch".to_string());
+                }
+                let page: usize = params
+                    .iter()
+                    .find(|(k, _)| k == "continuation-token")
+                    .map(|(_, v)| v.trim_start_matches("tok&").parse().unwrap())
+                    .unwrap_or(0);
+                let mut xml = String::from("<ListBucketResult>");
+                for i in 0..3 {
+                    xml.push_str(&format!("<Contents><Key>my-dir/p{page}-k{i}.txt</Key><Size>1</Size></Contents>"));
+                }
+                if page + 1 < pages {
+                    xml.push_str(&format!(
+                        "<IsTruncated>true</IsTruncated><NextContinuationToken>tok&amp;{}</NextContinuationToken>",
+                        page + 1
+                    ));
+                } else {
+                    xml.push_str("<IsTruncated>false</IsTruncated>");
+                }
+                xml.push_str("</ListBucketResult>");
+                (axum::http::StatusCode::OK, xml)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, seen)
+    }
+
+    async fn connected(endpoint: String) -> S3Connector {
+        let c = S3Connector::new();
+        c.connect_with_credentials(S3Credentials {
+            access_key_id: "AKID".into(),
+            secret_access_key: "SECRET".into(),
+            region: "us-east-1".into(),
+            endpoint: Some(endpoint),
+            path_style: true,
+            session_token: None,
+        })
+        .await
+        .unwrap();
+        c
+    }
+
+    #[tokio::test]
+    async fn list_objects_follows_continuation_tokens() {
+        let (base, seen) = mock_s3(3).await;
+        let c = connected(base).await;
+        let entries = c.list_objects("bucket", "my-dir/", Some("/")).await.unwrap();
+        assert_eq!(entries.len(), 9, "all three pages must be returned");
+        let queries = seen.lock().unwrap().clone();
+        assert_eq!(queries.len(), 3);
+        assert!(!queries[0].contains("continuation-token"));
+        // XML-escaped token is decoded, then re-encoded for the next request.
+        assert!(queries[1].contains("continuation-token=tok%261"), "{}", queries[1]);
+        assert!(queries[2].contains("continuation-token=tok%262"));
+    }
+
+    /// Regression: the query was unsorted and over-encoded (`-` as `%2D`),
+    /// so any listing with a delimiter or a dashed prefix failed SigV4.
+    #[tokio::test]
+    async fn list_objects_signs_a_canonical_query() {
+        let (base, seen) = mock_s3(1).await;
+        let c = connected(base).await;
+        c.list_objects("bucket", "my-dir/", Some("/")).await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            "delimiter=%2F&list-type=2&max-keys=1000&prefix=my-dir%2F"
+        );
+    }
+
+    #[test]
+    fn canonical_query_sorts_and_encodes_like_sigv4() {
+        assert_eq!(
+            canonical_query(&[("prefix", "a b/c-d_e.f~g".into()), ("versions", String::new())]),
+            "prefix=a%20b%2Fc-d_e.f~g&versions="
+        );
+    }
+
+    #[test]
+    fn xml_values_are_unescaped() {
+        assert_eq!(extract_xml_value("<Key>a&amp;b&lt;c</Key>", "Key").as_deref(), Some("a&b<c"));
+        assert_eq!(extract_xml_value("<ETag>&quot;x&quot;</ETag>", "ETag").as_deref(), Some("\"x\""));
+    }
+
+    /// Regression: the URL encoded `/` in nested keys while the signed path
+    /// used the raw key, so restoring `dir/my file.txt` failed SigV4.
+    #[tokio::test]
+    async fn restore_version_signs_nested_keys() {
+        use axum::http::{HeaderMap, Method, Uri};
+        use std::collections::BTreeMap;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let app = axum::Router::new().fallback(move |m: Method, uri: Uri, h: HeaderMap| {
+            let log = log.clone();
+            async move {
+                let mut signed = BTreeMap::new();
+                for k in ["host", "x-amz-content-sha256", "x-amz-date"] {
+                    signed.insert(k.to_string(), h[k].to_str().unwrap().to_string());
+                }
+                let expected = crate::backup_engine::stores::s3::sign_v4(
+                    m.as_str(), uri.path(), &[], &signed, "UNSIGNED-PAYLOAD", "AKID", "SECRET", "us-east-1", "s3",
+                );
+                log.lock().unwrap().push(format!("{} {}", uri.path(), h["x-amz-copy-source"].to_str().unwrap()));
+                if h["authorization"].to_str().unwrap() == expected {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::FORBIDDEN
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = connected(base).await;
+        c.restore_object_version("bucket", "dir/my file.txt", "v1").await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            "/bucket/dir/my%20file.txt /bucket/dir/my%20file.txt?versionId=v1"
+        );
     }
 }

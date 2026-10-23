@@ -1,0 +1,8 @@
+[project]
+name = "ufop-client"
+version = "0.1.0"
+description = "Python client for the ufop-server REST API (generated from its OpenAPI document; standard library only)"
+requires-python = ">=3.8"
+
+[tool.setuptools]
+py-modules = ["ufop_client"]

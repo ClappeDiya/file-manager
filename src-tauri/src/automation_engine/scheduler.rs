@@ -5,55 +5,72 @@
 //! - Debounced events prevent rapid-fire triggers
 //! - Cooldown window prevents circular trigger chains
 
-use super::evaluator::evaluate_conditions;
-use super::executor::execute_rule_action;
-use super::{AutomationLog, AutomationRule, AutomationStatus, RuleAction, RuleCondition, RuleTrigger};
-use chrono::Utc;
+use super::evaluator::evaluate_rule;
+use super::{FireContext, RuleTrigger};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use ufop_core::stability::Stability;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-/// Debounce window for filesystem events (prevents rapid-fire triggers).
-const DEBOUNCE_MS: u64 = 2000;
-
 /// Cooldown per file per rule to prevent circular triggers (seconds).
 const COOLDOWN_SECS: u64 = 5;
 
+/// Trigger event recorded for watcher-driven runs.
+pub const EVENT_FILE: &str = "file";
+
 /// A handle to an active filesystem watcher. Dropping it stops the watcher.
 pub struct WatchHandle {
-    pub rule_id: String,
+    pub folder: String,
     _watcher: RecommendedWatcher,
 }
 
-/// Start a filesystem watcher for an automation rule.
-#[allow(clippy::too_many_arguments)]
-pub fn start_file_watcher(
-    rule_id: String,
-    watch_path: String,
+/// Whether `trigger` reacts to an event of `kind`.
+fn trigger_matches(trigger: &RuleTrigger, kind: &EventKind) -> bool {
+    matches!(
+        (trigger, kind),
+        (RuleTrigger::FileAppears { .. }, EventKind::Create(_))
+            | (RuleTrigger::FileModified { .. }, EventKind::Modify(_))
+            | (RuleTrigger::FileDeleted { .. }, EventKind::Remove(_))
+    )
+}
+
+fn trigger_recursive(trigger: &RuleTrigger) -> bool {
+    matches!(
+        trigger,
+        RuleTrigger::FileAppears { recursive: true, .. }
+            | RuleTrigger::FileModified { recursive: true, .. }
+            | RuleTrigger::FileDeleted { recursive: true, .. }
+    )
+}
+
+/// Watch one folder for every rule in `members`.
+///
+/// For each event, the rules it concerns run one after another in
+/// priority order (lower first, then oldest rule), so several rules on one
+/// intake folder act in a predictable sequence. Rules are read fresh for
+/// every event, so edits apply without restarting the watcher.
+pub(crate) fn start_folder_watcher(
+    folder: String,
     recursive: bool,
-    trigger: RuleTrigger,
-    conditions: Vec<RuleCondition>,
-    action: RuleAction,
+    members: Arc<RwLock<Vec<String>>>,
     exec_semaphore: Arc<tokio::sync::Semaphore>,
     cooldowns: Arc<RwLock<HashMap<String, Instant>>>,
-    rules: Arc<RwLock<Vec<AutomationRule>>>,
-    logs: Arc<RwLock<Vec<AutomationLog>>>,
-    ledger: Option<crate::ledger::OperationLedger>,
+    ctx: FireContext,
 ) -> Result<WatchHandle, crate::core::error::AppError> {
-    let path = PathBuf::from(&watch_path);
-
+    let path = PathBuf::from(&folder);
     if !path.exists() {
         return Err(crate::core::error::AppError::FileOperation {
-            message: format!("Watch path does not exist: {}", watch_path),
+            message: format!("Watch path does not exist: {}", folder),
             advice: "Create the directory or update the automation rule.".to_string(),
         });
     }
 
-    let (tx, rx) = std::sync::mpsc::channel::<Event>();
-
+    // Async channel: the event loop awaits instead of blocking a worker
+    // thread, and ends when the watcher (and with it `tx`) is dropped.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let mut watcher = RecommendedWatcher::new(
         move |result: Result<Event, notify::Error>| {
             if let Ok(event) = result {
@@ -66,172 +83,97 @@ pub fn start_file_watcher(
         message: format!("Cannot create filesystem watcher: {e}"),
         advice: "Check OS filesystem notification support.".to_string(),
     })?;
+    let mode = if recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
+    watcher.watch(&path, mode).map_err(|e| crate::core::error::AppError::State {
+        message: format!("Cannot watch path '{}': {e}", folder),
+        advice: "Check that the path exists and is accessible.".to_string(),
+    })?;
 
-    let mode = if recursive {
-        RecursiveMode::Recursive
-    } else {
-        RecursiveMode::NonRecursive
-    };
-
-    watcher
-        .watch(&path, mode)
-        .map_err(|e| crate::core::error::AppError::State {
-            message: format!("Cannot watch path '{}': {e}", watch_path),
-            advice: "Check that the path exists and is accessible.".to_string(),
-        })?;
-
-    // Spawn a background task to process events
-    let rule_id_clone = rule_id.clone();
+    let root = path.clone();
     tokio::spawn(async move {
-        let mut last_event_time: Option<Instant> = None;
+        while let Some(event) = rx.recv().await {
+            for file in &event.paths {
+                if file.is_dir() {
+                    continue;
+                }
+                let file_str = file.to_string_lossy().to_string();
+                let direct_child = file.parent() == Some(root.as_path());
 
-        loop {
-            // Check for events with a timeout
-            match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(event) => {
-                    // Debounce: skip if we just processed an event
-                    if let Some(last) = last_event_time {
-                        if last.elapsed() < Duration::from_millis(DEBOUNCE_MS) {
-                            continue;
-                        }
-                    }
-
-                    // Filter by trigger type
-                    let is_relevant = matches!(
-                        (&trigger, &event.kind),
-                        (RuleTrigger::FileAppears { .. }, EventKind::Create(_))
-                            | (RuleTrigger::FileModified { .. }, EventKind::Modify(_))
-                            | (RuleTrigger::FileDeleted { .. }, EventKind::Remove(_))
-                    );
-
-                    if !is_relevant {
+                // Rules this event concerns, in run order.
+                let ids = members.read().await.clone();
+                let mut rules = Vec::new();
+                for id in ids {
+                    let Some(rule) = ctx.rule(&id).await else { continue };
+                    if !rule.enabled || !trigger_matches(&rule.trigger, &event.kind) {
                         continue;
                     }
+                    if !direct_child && !trigger_recursive(&rule.trigger) {
+                        continue;
+                    }
+                    if !evaluate_rule(&rule, &file_str).matched {
+                        continue;
+                    }
+                    rules.push(rule);
+                }
+                if rules.is_empty() {
+                    continue;
+                }
+                rules.sort_by(|a, b| a.options.priority.cmp(&b.options.priority).then_with(|| a.created_at.cmp(&b.created_at)));
 
-                    // Process each affected path
-                    for path in &event.paths {
-                        let path_str = path.to_string_lossy().to_string();
-
-                        // Skip directories for file-based actions
-                        if path.is_dir() {
+                // Cooldown per rule and file stops a rule re-triggering on
+                // its own output (and the burst of events one write makes).
+                let mut due = Vec::new();
+                {
+                    let mut cd = cooldowns.write().await;
+                    for rule in rules {
+                        let key = format!("{}:{}", rule.id, file_str);
+                        if cd.get(&key).is_some_and(|t| t.elapsed() < Duration::from_secs(COOLDOWN_SECS)) {
                             continue;
                         }
+                        cd.insert(key, Instant::now());
+                        due.push(rule);
+                    }
+                }
+                if due.is_empty() {
+                    continue;
+                }
 
-                        // Check cooldown to prevent circular triggers
-                        let cooldown_key = format!("{}:{}", rule_id_clone, path_str);
-                        {
-                            let cd = cooldowns.read().await;
-                            if let Some(last) = cd.get(&cooldown_key) {
-                                if last.elapsed() < Duration::from_secs(COOLDOWN_SECS) {
-                                    tracing::debug!(
-                                        "Skipping '{}' for rule '{}' (cooldown)",
-                                        path_str, rule_id_clone
-                                    );
+                let (ctx, semaphore, file_str) = (ctx.clone(), exec_semaphore.clone(), file_str.clone());
+                tokio::spawn(async move {
+                    let Ok(_permit) = semaphore.acquire_owned().await else { return };
+                    for rule in due {
+                        if rule.options.settle_secs > 0 && !matches!(rule.trigger, RuleTrigger::FileDeleted { .. }) {
+                            let quiet = Duration::from_secs(rule.options.settle_secs);
+                            let limit = (quiet * 20).min(Duration::from_secs(1800));
+                            match ufop_core::stability::wait_until_stable(Path::new(&file_str), quiet, Duration::from_millis(250), limit).await {
+                                Stability::Stable => {}
+                                Stability::Gone => continue,
+                                Stability::StillChanging => {
+                                    ctx.record_skip(&rule.id, Some(&file_str), EVENT_FILE, "The file was still changing; it was left alone").await;
                                     continue;
                                 }
                             }
                         }
-
-                        // Evaluate conditions
-                        if !evaluate_conditions(&conditions, &path_str) {
-                            tracing::debug!(
-                                "Conditions not met for '{}' in rule '{}'",
-                                path_str, rule_id_clone
-                            );
-                            continue;
+                        if let Some(log) = ctx.fire_if_enabled(&rule.id, Some(&file_str), EVENT_FILE).await {
+                            tracing::info!("Automation '{}' executed for '{}': {:?}", log.rule_name, file_str, log.status);
                         }
-
-                        // Acquire semaphore permit for bounded concurrency
-                        let permit = exec_semaphore.clone().acquire_owned().await;
-                        if permit.is_err() {
-                            tracing::warn!("Automation semaphore closed, stopping watcher");
-                            return;
-                        }
-                        let _permit = permit.unwrap();
-
-                        // Set cooldown
-                        cooldowns
-                            .write()
-                            .await
-                            .insert(cooldown_key.clone(), Instant::now());
-
-                        // Build a temporary rule for execution
-                        let temp_rule = AutomationRule {
-                            id: rule_id_clone.clone(),
-                            name: format!("auto-{}", rule_id_clone),
-                            enabled: true,
-                            trigger: trigger.clone(),
-                            conditions: conditions.clone(),
-                            action: action.clone(),
-                            created_at: String::new(),
-                            updated_at: String::new(),
-                            last_triggered: None,
-                            trigger_count: 0,
-                            error_count: 0,
-                            last_error: None,
-                        };
-
-                        // Execute the action
-                        let log =
-                            execute_rule_action(&temp_rule, Some(&path_str), false).await;
-
-                        // Update rule stats
-                        {
-                            let mut rules_guard = rules.write().await;
-                            if let Some(r) = rules_guard.iter_mut().find(|r| r.id == rule_id_clone)
-                            {
-                                r.trigger_count += 1;
-                                r.last_triggered = Some(Utc::now().to_rfc3339());
-                                if log.status == AutomationStatus::Failed {
-                                    r.error_count += 1;
-                                    r.last_error = log.error_message.clone();
-                                } else {
-                                    r.error_count = 0;
-                                    r.last_error = None;
-                                }
-                            }
-                        }
-
-                        // Store log
-                        logs.write().await.push(log.clone());
-
-                        // Emit unified-ledger event for the autonomous fire.
-                        // This is the ONLY way users see autonomous activity
-                        // in the cross-engine timeline. Fail-open.
-                        if let Some(led) = &ledger {
-                            super::record_automation_log(led, &log).await;
-                        }
-
-                        tracing::info!(
-                            "Automation '{}' executed for '{}': {:?}",
-                            rule_id_clone, path_str, log.status
-                        );
-
-                        last_event_time = Some(Instant::now());
                     }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // No events, continue loop (allows checking if watcher should stop)
-                    continue;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    tracing::info!("Watcher channel closed for rule '{}'", rule_id_clone);
-                    return;
-                }
+                });
             }
         }
+        tracing::info!("Watcher channel closed for '{}'", root.display());
     });
 
-    Ok(WatchHandle {
-        rule_id,
-        _watcher: watcher,
-    })
+    Ok(WatchHandle { folder, _watcher: watcher })
 }
 
 /// Validate a cron expression.
 pub fn validate_cron(cron_expr: &str) -> Result<(), crate::core::error::AppError> {
     use cron::Schedule;
     use std::str::FromStr;
+    if crate::schedule_library::schedule_ref(cron_expr).is_some() {
+        return crate::schedule_library::resolve(cron_expr).map(|_| ());
+    }
 
     Schedule::from_str(cron_expr).map_err(|e| crate::core::error::AppError::State {
         message: format!("Invalid cron expression '{}': {e}", cron_expr),

@@ -8,6 +8,7 @@
 //! missed-run catch-up and pause/resume, pre/post scripts, HTTP report
 //! callbacks, run history (`backup_runs`) and the operation ledger.
 
+pub mod legal_hold;
 pub mod api;
 pub mod bugreport;
 pub mod connector_backend;
@@ -233,6 +234,9 @@ pub struct BackupJob {
     pub created_at: String,
     pub updated_at: String,
     pub stats: JobStats,
+    /// While set, nothing in the backup set can be removed (see `legal_hold`).
+    #[serde(default)]
+    pub legal_hold: Option<legal_hold::LegalHold>,
 }
 
 impl Default for BackupJob {
@@ -268,6 +272,7 @@ impl Default for BackupJob {
             created_at: now.clone(),
             updated_at: now,
             stats: JobStats::default(),
+            legal_hold: None,
         }
     }
 }
@@ -554,7 +559,13 @@ struct Inner {
     data_dir: PathBuf,
     jobs: RwLock<HashMap<String, BackupJob>>,
     tasks: Mutex<Vec<TaskSlot>>,
+    /// Operations running at once (resized by the transfer caps).
     gate: Semaphore,
+    gate_size: Mutex<usize>,
+    /// One operation per job at a time, whatever the gate allows.
+    job_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Caps set by the console's managed settings.
+    managed_caps: Mutex<Option<ufop_core::agent::ManagedTransfers>>,
     /// `Some(None)` = paused indefinitely.
     paused: Mutex<Option<Option<DateTime<Utc>>>>,
     scheduler_running: AtomicBool,
@@ -612,7 +623,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub fn default_data_dir() -> PathBuf {
     directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
         .map(|d| d.data_dir().join("backups"))
-        .unwrap_or_else(|| std::env::temp_dir().join("ufop-backups"))
+        .unwrap_or_else(|| ufop_core::session::user_temp_subdir("backups"))
 }
 
 impl BackupManager {
@@ -638,6 +649,9 @@ impl BackupManager {
                 jobs: RwLock::new(HashMap::new()),
                 tasks: Mutex::new(Vec::new()),
                 gate: Semaphore::new(1),
+                gate_size: Mutex::new(1),
+                job_locks: Mutex::new(HashMap::new()),
+                managed_caps: Mutex::new(None),
                 paused: Mutex::new(None),
                 scheduler_running: AtomicBool::new(false),
                 kdf,
@@ -741,6 +755,8 @@ impl BackupManager {
             Some(old) => {
                 job.created_at = old.created_at.clone();
                 job.stats = old.stats.clone();
+                // Only the hold commands place or release a hold.
+                job.legal_hold = old.legal_hold.clone();
                 if old.options.block_size != job.options.block_size && old.stats.version_count > 0 {
                     return Err(AppError::validation(
                         "Block size cannot change after the first backup; create a new job for a new block size",
@@ -752,6 +768,7 @@ impl BackupManager {
                     job.id = uuid::Uuid::new_v4().to_string();
                 }
                 job.created_at = now.clone();
+                job.legal_hold = None;
             }
         }
         job.updated_at = now;
@@ -1064,6 +1081,7 @@ impl BackupManager {
             return Err(AppError::state("This job has a running or queued operation", "Cancel it first."));
         }
         let job = self.get_job(id).await?;
+        legal_hold::guard_delete(&job)?;
         if delete_remote {
             let backend = self.build_backend(&job).await?;
             let prefix = job.options.prefix.clone();
@@ -1344,7 +1362,45 @@ impl BackupManager {
     pub async fn set_global_defaults(&self, d: defaults::GlobalDefaults) -> Result<defaults::GlobalDefaults, AppError> {
         d.validate()?;
         self.config_set(defaults::DEFAULTS_KEY, serde_json::to_string(&d)?).await?;
+        self.refresh_caps().await;
         Ok(d)
+    }
+
+    /// The caps in force: the machine's own, with the console's on top.
+    pub async fn effective_caps(&self) -> defaults::TransferCaps {
+        let own = self.global_defaults().await.map(|d| d.caps).unwrap_or_default();
+        let managed = self.inner.managed_caps.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        own.with_managed(managed.as_ref())
+    }
+
+    /// Set (or clear) the console's caps and apply.
+    pub async fn set_managed_caps(&self, m: Option<ufop_core::agent::ManagedTransfers>) {
+        *self.inner.managed_caps.lock().unwrap_or_else(|e| e.into_inner()) = m;
+        self.refresh_caps().await;
+    }
+
+    /// Apply the effective caps: shared upload/download rates and the run gate.
+    pub async fn refresh_caps(&self) {
+        let caps = self.effective_caps().await;
+        ufop_core::backup::backend::GLOBAL_UPLOAD.set(caps.upload_bps);
+        ufop_core::backup::backend::GLOBAL_DOWNLOAD.set(caps.download_bps);
+        self.resize_gate(caps.concurrency());
+    }
+
+    fn resize_gate(&self, want: usize) {
+        let mut size = self.inner.gate_size.lock().unwrap_or_else(|e| e.into_inner());
+        if want > *size {
+            self.inner.gate.add_permits(want - *size);
+        } else if want < *size {
+            // Take the extra permits back as running operations release them.
+            let (inner, n) = (self.inner.clone(), (*size - want) as u32);
+            tokio::spawn(async move {
+                if let Ok(p) = inner.gate.acquire_many(n).await {
+                    p.forget();
+                }
+            });
+        }
+        *size = want;
     }
 
     /// A job with the global defaults applied (what actually runs).
@@ -1579,6 +1635,11 @@ impl BackupManager {
         cancel: Arc<AtomicBool>,
         progress: Arc<Mutex<Option<Progress>>>,
     ) -> Result<OperationResult, AppError> {
+        let job_lock = {
+            let mut locks = self.inner.job_locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks.entry(job.id.clone()).or_default().clone()
+        };
+        let _job_guard = job_lock.lock().await;
         let _permit = match self.inner.gate.acquire().await {
             Ok(p) => p,
             Err(_) => {
@@ -1745,7 +1806,7 @@ impl BackupManager {
             if let Some(cmd) = job.scripts.run_after.as_deref().filter(|c| !c.trim().is_empty()) {
                 let mut env = Self::script_env(job, op, "AFTER");
                 env.insert("UFOP_PARSED_RESULT".into(), status.clone());
-                let rf = std::env::temp_dir().join(format!("ufop-result-{}.txt", uuid::Uuid::new_v4().simple()));
+                let rf = ufop_core::session::user_temp_subdir("results").join(format!("{}.txt", uuid::Uuid::new_v4().simple()));
                 let body = if job.scripts.result_format == "text" { summary.clone() } else { report.to_string() };
                 if std::fs::write(&rf, body).is_ok() {
                     env.insert("UFOP_RESULTFILE".into(), rf.to_string_lossy().into_owned());
@@ -2040,6 +2101,29 @@ impl BackupManager {
         .await
     }
 
+    /// Send one message through a notification channel, resolving its
+    /// secret (password, bot token or webhook URL) from the credential
+    /// store. Used by automation's SendMessage action.
+    pub async fn send_message(&self, mut n: notify::Notification, title: &str, body: &str) -> Result<(), AppError> {
+        let secret = self.destination_secret(&n.credential_id).await?;
+        n.send_on = vec!["message".into()];
+        n.template.clear();
+        if let notify::Channel::Email { subject, .. } = &mut n.channel {
+            *subject = title.to_string();
+        }
+        let vars: std::collections::BTreeMap<String, String> =
+            [("name", title), ("operation", "automation"), ("result", "message")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let body = match &n.channel {
+            // Slack/Teams show the title separately; email has it as subject.
+            notify::Channel::Telegram { .. } | notify::Channel::Xmpp { .. } => format!("{title}\n\n{body}"),
+            _ => body.to_string(),
+        };
+        match notify::deliver(&[(n, secret)], "message", &vars, &body).await.into_iter().next() {
+            Some(e) => Err(AppError::connection(e, "Check the channel settings with Send test in Backup → Notifications.")),
+            None => Ok(()),
+        }
+    }
+
     /// Send a test message through one notification channel.
     pub async fn test_notification(&self, mut n: notify::Notification) -> Result<(), AppError> {
         let secret = self.destination_secret(&n.credential_id).await?;
@@ -2082,10 +2166,10 @@ impl BackupManager {
                         P::Sftp => (22, false),
                         P::Ftp => (21, false),
                         P::Ftps => (990, false),
-                        P::WebDav | P::S3 | P::GoogleDrive | P::Dropbox | P::OneDrive | P::AzureBlob | P::Swift => (443, true),
+                        P::WebDav | P::S3 | P::GoogleDrive | P::Dropbox | P::OneDrive | P::AzureBlob | P::AdlsGen2 | P::AzureFiles | P::Swift => (443, true),
                         P::Smb => (445, false),
                         P::Nfs => (2049, false),
-                        P::Local => return None,
+                        P::Local | P::Rclone => return None,
                     };
                     let host = p.host.trim_start_matches("https://").trim_start_matches("http://").split('/').next().unwrap_or_default().to_string();
                     (!host.is_empty()).then(|| (host, p.port.unwrap_or(port), tls))
@@ -2280,8 +2364,13 @@ impl BackupManager {
                     j.clone()
                 })
             };
-            if let Some(j) = snapshot {
-                let _ = self.persist(&j).await;
+            if let Some(j) = &snapshot {
+                let _ = self.persist(j).await;
+                // A day off in one of the job's holiday calendars uses up the slot.
+                if let Some(cal) = crate::schedule_library::registry().run_blocked(None, &j.schedule.calendar_ids, now) {
+                    tracing::info!("Skipping scheduled backup '{}': today is a day off in '{cal}'", j.name);
+                    continue;
+                }
             }
             if let Err(e) = self.start_backup(id, false).await {
                 tracing::warn!("Scheduled backup {id} could not start: {e}");
@@ -2386,6 +2475,7 @@ fn run_core(
     kdf: KdfParams,
     ctx: &OpContext,
 ) -> Result<serde_json::Value, AppError> {
+    legal_hold::guard(job, &op)?;
     let db = BackupDb::open(db_path)?;
     let open = |create: bool| Repo::open(backend, &db, pass, &job.options, create, kdf);
     let v = match op {
@@ -2399,7 +2489,7 @@ fn run_core(
                 (true, true) => Some(portability::full_config(job)?),
             };
             let sources: Vec<PathBuf> = job.sources.iter().map(PathBuf::from).collect();
-            serde_json::to_value(ufop_core::backup::run_backup(backend, &db, &sources, &filter, &opts, &job.retention, pass, kdf, ctx)?)?
+            serde_json::to_value(ufop_core::backup::run_backup(backend, &db, &sources, &filter, &opts, &legal_hold::effective_retention(job), pass, kdf, ctx)?)?
         }
         BackupOperation::Restore { options, .. } => serde_json::to_value(ufop_core::backup::run_restore(&open(false)?, &options, ctx)?)?,
         BackupOperation::Verify { full } => {

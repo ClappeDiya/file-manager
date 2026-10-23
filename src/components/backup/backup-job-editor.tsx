@@ -2,6 +2,7 @@
  * Backup job editor: a stepped setup wizard that also serves as the editor
  * for existing jobs. Every field maps 1:1 onto the Rust `BackupJob`.
  */
+import { HolidayCalendarPicker } from "@/components/schedule-pickers";
 import { useEffect, useMemo, useState } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
@@ -433,6 +434,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 </label>
               ))}
             </div>
+            <HolidayCalendarPicker value={job.schedule.calendar_ids ?? []} onChange={(ids) => patch({ schedule: { ...job.schedule, calendar_ids: ids } })} />
             <Check
               label="Skip scheduled runs while on battery"
               checked={job.schedule.skip_on_battery}

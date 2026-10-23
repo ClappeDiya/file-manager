@@ -8,6 +8,15 @@
 //! reports `MountCapability::NotSupported` with a clear explanation.
 //!
 //! Mount metadata is persisted in SQLite for auto-mount on startup.
+//!
+//! rclone mounts take cache options (up to full offline caching, with
+//! "make available offline" pinning) and follow the organization's mount
+//! profile (`policy`).
+
+pub mod policy;
+pub mod rclone_mount;
+
+pub use policy::{CacheMode, MountOptions};
 
 use crate::connectors::ConnectionManager;
 use crate::core::error::AppError;
@@ -63,6 +72,12 @@ pub struct MountInfo {
     pub auto_mount: bool,
     pub created_at: DateTime<Utc>,
     pub error_message: Option<String>,
+    /// Cache and read-only options in force (after the mount profile).
+    #[serde(default)]
+    pub options: MountOptions,
+    /// What the organization's mount profile changed.
+    #[serde(default)]
+    pub policy_notes: Vec<String>,
 }
 
 /// Result returned when mounting a remote drive.
@@ -96,6 +111,8 @@ struct VirtualMount {
     auto_mount: bool,
     created_at: DateTime<Utc>,
     error_message: Option<String>,
+    options: MountOptions,
+    policy_notes: Vec<String>,
 }
 
 impl VirtualMount {
@@ -110,8 +127,25 @@ impl VirtualMount {
             auto_mount: self.auto_mount,
             created_at: self.created_at,
             error_message: self.error_message.clone(),
+            options: self.options.clone(),
+            policy_notes: self.policy_notes.clone(),
         }
     }
+}
+
+/// Statements the engine writes mounts with (checked against the schema in tests).
+const INSERT_MOUNT_SQL: &str = "INSERT INTO mount_configs (id, connection_id, mount_point, auto_mount, status, error_message, created_at, options_json) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7)";
+const UPDATE_MOUNT_STATUS_SQL: &str = "UPDATE mount_configs SET status = ?2, error_message = ?3 WHERE id = ?1";
+
+/// Result of "make available offline".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinReport {
+    pub files: u64,
+    pub bytes: u64,
+    /// Files that could not be read (offline already, permissions…).
+    pub failed: u64,
+    /// Stopped at the cache size limit.
+    pub truncated: bool,
 }
 
 // ──────────────────────────────────────────────
@@ -128,6 +162,18 @@ pub enum MountCapability {
     RequiresInstall { tool: String, install_hint: String },
     /// Protocol cannot be mounted as a filesystem.
     NotSupported { reason: String },
+}
+
+/// Expand a leading `~` to the home directory.
+pub fn expand_home(p: &str) -> String {
+    let home = || directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
+    match p.strip_prefix("~") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') => match home() {
+            Some(h) => format!("{}{}", h.display(), rest),
+            None => p.to_string(),
+        },
+        _ => p.to_string(),
+    }
 }
 
 /// Check what mount capability exists for a given protocol on the current OS.
@@ -198,6 +244,20 @@ pub fn check_mount_capability(protocol: &str) -> MountCapability {
                 MountCapability::NotSupported { reason: "WebDAV mount not supported on this OS".to_string() }
             }
         }
+        // Cloud storage mounts through rclone + FUSE.
+        "rclone" | "s3" => {
+            if !rclone_mount::rclone_available() {
+                MountCapability::RequiresInstall { tool: "rclone".to_string(), install_hint: "Install rclone from https://rclone.org/install/".to_string() }
+            } else {
+                match rclone_mount::fuse_available() {
+                    Ok(()) => MountCapability::NativeMount { command: "rclone mount".to_string() },
+                    Err((tool, install_hint)) => MountCapability::RequiresInstall { tool, install_hint },
+                }
+            }
+        }
+        "google_drive" | "dropbox" | "onedrive" | "azure_blob" | "adls_gen2" | "azure_files" | "b2" | "swift" => MountCapability::NotSupported {
+            reason: "Add this account as an rclone remote (`rclone config`), create an rclone connection for it, and mount that.".to_string(),
+        },
         _ => MountCapability::NotSupported {
             reason: format!("Protocol '{}' cannot be mounted as a filesystem. Use sync or transfer instead.", protocol),
         },
@@ -213,13 +273,42 @@ pub fn check_mount_capability(protocol: &str) -> MountCapability {
 pub struct MountManager {
     /// Active mounts keyed by mount ID.
     mounts: Arc<RwLock<HashMap<Uuid, VirtualMount>>>,
+    /// rclone processes serving cloud mounts.
+    rclone: rclone_mount::RcloneProcesses,
+    /// The organization's mount profile (managed settings).
+    managed: Arc<RwLock<Option<ufop_core::agent::ManagedMounts>>>,
+    /// rclone VFS caches, one folder per mount.
+    cache_root: std::path::PathBuf,
 }
 
 impl MountManager {
     pub fn new() -> Self {
+        let cache_root = directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
+            .map(|d| d.cache_dir().join("mounts"))
+            .unwrap_or_else(|| ufop_core::session::user_temp_subdir("mount-cache"));
+        Self::with_cache_root(cache_root)
+    }
+
+    pub fn with_cache_root(cache_root: impl Into<std::path::PathBuf>) -> Self {
         Self {
             mounts: Arc::new(RwLock::new(HashMap::new())),
+            rclone: rclone_mount::RcloneProcesses::default(),
+            managed: Arc::new(RwLock::new(None)),
+            cache_root: cache_root.into(),
         }
+    }
+
+    /// Apply (or release) the organization's mount profile; it governs new mounts.
+    pub async fn set_managed(&self, profile: Option<ufop_core::agent::ManagedMounts>) {
+        *self.managed.write().await = profile;
+    }
+
+    pub async fn managed(&self) -> Option<ufop_core::agent::ManagedMounts> {
+        self.managed.read().await.clone()
+    }
+
+    fn cache_dir(&self, mount_id: Uuid) -> std::path::PathBuf {
+        self.cache_root.join(mount_id.to_string())
     }
 
     /// Check mount capability for a protocol.
@@ -236,6 +325,21 @@ impl MountManager {
         &self,
         connection_id: Uuid,
         mount_point: String,
+        repo: &Repository,
+        connection_mgr: &ConnectionManager,
+    ) -> Result<MountResult, AppError> {
+        self.mount_remote_with(connection_id, mount_point, MountOptions::default(), None, repo, connection_mgr).await
+    }
+
+    /// Mount with cache/read-only `options` (subject to the mount profile).
+    /// `config_id` mounts a saved configuration in place (its row is updated,
+    /// not duplicated).
+    pub async fn mount_remote_with(
+        &self,
+        connection_id: Uuid,
+        mount_point: String,
+        options: MountOptions,
+        config_id: Option<Uuid>,
         repo: &Repository,
         connection_mgr: &ConnectionManager,
     ) -> Result<MountResult, AppError> {
@@ -281,6 +385,8 @@ impl MountManager {
             MountCapability::NativeMount { .. } => {}
         }
 
+        // "~/x" (what the mount dialog suggests) means the home folder.
+        let mount_point = expand_home(&mount_point);
         // Validate mount point: must be absolute, no path traversal, within user home
         let mp_path = std::path::Path::new(&mount_point);
         if !mp_path.is_absolute() {
@@ -318,6 +424,16 @@ impl MountManager {
             }
         }
 
+        // The organization's mount profile: allowed protocols, mount root, forced options.
+        let is_rclone = matches!(protocol_str, "rclone" | "s3");
+        let (options, policy_notes) = policy::effective(&options, protocol_str, &canonical, self.managed().await.as_ref())?;
+        if !is_rclone && options.read_only {
+            return Err(AppError::PermissionDenied {
+                message: format!("{protocol_str} drives can't be mounted read-only here, and read-only is required"),
+                advice: "Mount it through an rclone connection, or ask your administrator.".into(),
+            });
+        }
+
         // Ensure mount point directory exists
         if !mp_path.exists() {
             std::fs::create_dir_all(mp_path).map_err(|e| {
@@ -328,14 +444,19 @@ impl MountManager {
             })?;
         }
 
-        // Execute native OS mount command
-        let mount_result = Self::execute_native_mount(
-            protocol_str,
-            &profile,
-            &mount_point,
-        ).await;
-
-        let mount_id = Uuid::new_v4();
+        let mount_id = config_id.unwrap_or_else(Uuid::new_v4);
+        let mount_result = if is_rclone {
+            let secret = connection_mgr.get_password(connection_id).await.ok().flatten();
+            match rclone_mount::spec_for(&profile, secret.as_deref()) {
+                Ok(spec) => {
+                    let flags = policy::rclone_flags(&options, &self.cache_dir(mount_id));
+                    self.rclone.mount(mount_id, &spec, &mount_point, &flags).await
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            Self::execute_native_mount(protocol_str, &profile, &mount_point).await
+        };
         let now = Utc::now();
 
         let (status, error_message, msg) = match mount_result {
@@ -358,25 +479,29 @@ impl MountManager {
             protocol: protocol_str.to_string(),
             mount_point: mount_point.clone(),
             status,
-            auto_mount: false,
+            auto_mount: config_id.is_some(),
             created_at: now,
             error_message: error_message.clone(),
+            options: options.clone(),
+            policy_notes: policy_notes.clone(),
         };
 
-        // Persist to SQLite
+        // Persist to SQLite: a saved configuration keeps its row.
         let mp = mount_point.clone();
         let cid = connection_id.to_string();
         let mid = mount_id.to_string();
         let ts = now.to_rfc3339();
         let status_str = status.as_str().to_string();
         let err_msg = error_message.clone();
+        let opts = serde_json::to_string(&options)?;
+        let saved = config_id.is_some();
         repo.pool()
             .execute(move |conn| {
-                conn.execute(
-                    "INSERT INTO mount_configs (id, connection_id, mount_point, auto_mount, status, error_message, created_at)
-                     VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
-                    rusqlite::params![mid, cid, mp, status_str, err_msg, ts],
-                )?;
+                if saved {
+                    conn.execute(UPDATE_MOUNT_STATUS_SQL, rusqlite::params![mid, status_str, err_msg])?;
+                } else {
+                    conn.execute(INSERT_MOUNT_SQL, rusqlite::params![mid, cid, mp, status_str, err_msg, ts, opts])?;
+                }
                 Ok(())
             })
             .await?;
@@ -403,7 +528,7 @@ impl MountManager {
             mount_id,
             mount_point,
             status,
-            message: msg,
+            message: if policy_notes.is_empty() { msg } else { format!("{msg} ({})", policy_notes.join(", ")) },
         })
     }
 
@@ -522,6 +647,11 @@ impl MountManager {
         let mid = mount_id.to_string();
 
         if let Some(info) = &mount_info {
+            if self.rclone.unmount(mount_id, &info.mount_point).await {
+                tracing::info!("Unmounted rclone mount '{}' (mount_id: {})", info.mount_point, mount_id);
+            }
+        }
+        if let Some(info) = mount_info.as_ref().filter(|i| !matches!(i.protocol.as_str(), "rclone" | "s3")) {
             // Execute real OS unmount
             let mp = &info.mount_point;
             let cmd_name = if cfg!(target_os = "macos") { "umount" } else { "fusermount" };
@@ -599,16 +729,16 @@ impl MountManager {
         repo: &Repository,
         connection_mgr: &ConnectionManager,
     ) -> (usize, usize) {
-        let configs: Vec<(String, String)> = match repo
+        let configs: Vec<(String, String, String, String)> = match repo
             .pool()
             .execute(move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT connection_id, mount_point FROM mount_configs \
+                    "SELECT connection_id, mount_point, id, options_json FROM mount_configs \
                      WHERE auto_mount = 1 ORDER BY created_at ASC",
                 )?;
                 let rows = stmt
                     .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
                     })?
                     .filter_map(|r| r.ok())
                     .collect();
@@ -624,7 +754,7 @@ impl MountManager {
         };
 
         let (mut mounted, mut failed) = (0usize, 0usize);
-        for (connection_id, mount_point) in configs {
+        for (connection_id, mount_point, config_id, options_json) in configs {
             let Ok(cid) = Uuid::parse_str(&connection_id) else {
                 tracing::warn!("Auto-mount: skipping config with invalid connection id {connection_id}");
                 failed += 1;
@@ -633,7 +763,9 @@ impl MountManager {
             // `mount_remote` is idempotent enough for this: it rejects a
             // duplicate mount point that is already Mounted, so a race with a
             // manual mount degrades to a logged skip rather than a double mount.
-            match self.mount_remote(cid, mount_point.clone(), repo, connection_mgr).await {
+            let options: MountOptions = serde_json::from_str(&options_json).unwrap_or_default();
+            let config_id = Uuid::parse_str(&config_id).ok();
+            match self.mount_remote_with(cid, mount_point.clone(), options, config_id, repo, connection_mgr).await {
                 Ok(_) => {
                     mounted += 1;
                     tracing::info!("Auto-mounted {mount_point}");
@@ -665,11 +797,11 @@ impl MountManager {
         // Also load saved configs from DB that aren't currently active
         let active_ids: Vec<String> = active.iter().map(|m| m.id.to_string()).collect();
 
-        let saved_configs: Vec<(String, String, String, bool, String, String)> = repo
+        let saved_configs: Vec<(String, String, String, bool, String, String, String)> = repo
             .pool()
             .execute(move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT id, connection_id, mount_point, auto_mount, status, created_at
+                    "SELECT id, connection_id, mount_point, auto_mount, status, created_at, options_json
                      FROM mount_configs ORDER BY created_at DESC",
                 )?;
                 let rows = stmt
@@ -681,6 +813,7 @@ impl MountManager {
                             row.get::<_, bool>(3)?,
                             row.get::<_, String>(4)?,
                             row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
                         ))
                     })?
                     .filter_map(|r| r.ok())
@@ -692,7 +825,7 @@ impl MountManager {
         let mut result = active;
 
         // Add saved configs that aren't currently active in memory
-        for (id, cid, mp, auto_mount, status, created_at) in saved_configs {
+        for (id, cid, mp, auto_mount, status, created_at, options_json) in saved_configs {
             if active_ids.contains(&id) {
                 continue;
             }
@@ -720,10 +853,100 @@ impl MountManager {
                 auto_mount,
                 created_at: ts,
                 error_message: None,
+                options: serde_json::from_str(&options_json).unwrap_or_default(),
+                policy_notes: Vec::new(),
             });
         }
 
         Ok(result)
+    }
+
+    /// "Make available offline": read every file under `rel` (inside the
+    /// mount) so a full-cache mount keeps it locally. Stops at the cache size
+    /// limit. Needs a mounted rclone drive in `full` cache mode.
+    pub async fn pin_offline(&self, mount_id: Uuid, rel: &str) -> Result<PinReport, AppError> {
+        let m = self.mounts.read().await.get(&mount_id).cloned().ok_or_else(|| AppError::validation("That drive is not mounted"))?;
+        if m.status != MountStatus::Mounted || !matches!(m.protocol.as_str(), "rclone" | "s3") {
+            return Err(AppError::validation("Only mounted cloud drives (rclone) can be made available offline"));
+        }
+        if m.options.cache_mode != CacheMode::Full {
+            return Err(AppError::validation("Turn on the full cache for this drive to keep files offline"));
+        }
+        let limit = m.options.max_cache_mb.map(|mb| mb * 1024 * 1024);
+        let roots = ufop_core::confine::Roots::new(&[std::path::PathBuf::from(&m.mount_point)]).map_err(AppError::validation)?;
+        let start = roots.resolve(&std::path::Path::new(&m.mount_point).join(rel.trim_start_matches(['/', '\\'])).to_string_lossy(), true).map_err(AppError::validation)?;
+        tokio::task::spawn_blocking(move || {
+            let mut r = PinReport { files: 0, bytes: 0, failed: 0, truncated: false };
+            let mut stack = vec![start];
+            let mut buf = vec![0u8; 1024 * 1024];
+            while let Some(p) = stack.pop() {
+                let Ok(md) = std::fs::symlink_metadata(&p) else {
+                    r.failed += 1;
+                    continue;
+                };
+                if md.is_dir() {
+                    if let Ok(rd) = std::fs::read_dir(&p) {
+                        stack.extend(rd.filter_map(Result::ok).map(|e| e.path()));
+                    }
+                } else if md.is_file() {
+                    if limit.is_some_and(|l| r.bytes + md.len() > l) {
+                        r.truncated = true;
+                        continue;
+                    }
+                    use std::io::Read;
+                    match std::fs::File::open(&p).and_then(|mut f| {
+                        let mut n = 0u64;
+                        loop {
+                            let k = f.read(&mut buf)?;
+                            if k == 0 {
+                                break Ok(n);
+                            }
+                            n += k as u64;
+                        }
+                    }) {
+                        Ok(n) => {
+                            r.files += 1;
+                            r.bytes += n;
+                        }
+                        Err(_) => r.failed += 1,
+                    }
+                }
+            }
+            r
+        })
+        .await
+        .map_err(|e| AppError::internal(format!("Offline pinning failed: {e}")))
+    }
+
+    /// Bytes in a mount's local cache.
+    pub fn cache_usage(&self, mount_id: Uuid) -> u64 {
+        fn size(p: &std::path::Path) -> u64 {
+            std::fs::read_dir(p)
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .map(|e| match e.file_type() {
+                            Ok(t) if t.is_dir() => size(&e.path()),
+                            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+                            _ => 0,
+                        })
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+        size(&self.cache_dir(mount_id))
+    }
+
+    /// Delete a mount's local cache (only while it is not mounted: rclone owns it then).
+    pub async fn clear_cache(&self, mount_id: Uuid) -> Result<u64, AppError> {
+        if self.mounts.read().await.get(&mount_id).is_some_and(|m| m.status == MountStatus::Mounted) {
+            return Err(AppError::validation("Unmount the drive before clearing its cache (uploads may be pending)"));
+        }
+        let freed = self.cache_usage(mount_id);
+        let dir = self.cache_dir(mount_id);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        Ok(freed)
     }
 
     /// Get the status of a specific mount.
@@ -741,6 +964,7 @@ impl MountManager {
         connection_id: Uuid,
         mount_point: String,
         auto_mount: bool,
+        options: Option<MountOptions>,
         repo: &Repository,
         connection_mgr: &ConnectionManager,
     ) -> Result<MountConfig, AppError> {
@@ -753,27 +977,36 @@ impl MountManager {
                 "Check the connection ID.",
             ))?;
 
-        let config_id = Uuid::new_v4();
         let now = Utc::now();
-
-        let mid = config_id.to_string();
         let cid = connection_id.to_string();
-        let mp = mount_point.clone();
+        let mp = expand_home(&mount_point);
         let am = auto_mount;
         let ts = now.to_rfc3339();
+        let opts = options.map(|o| serde_json::to_string(&o)).transpose()?;
 
-        repo.pool()
+        // One row per connection and mount point: the mount the dialog just
+        // made (or an earlier save) is updated rather than duplicated.
+        let config_id = repo
+            .pool()
             .execute(move |conn| {
+                let existing: Option<String> = rusqlite::OptionalExtension::optional(conn.query_row(
+                    "SELECT id FROM mount_configs WHERE connection_id = ?1 AND mount_point = ?2 ORDER BY created_at DESC LIMIT 1",
+                    rusqlite::params![cid, mp],
+                    |r| r.get(0),
+                ))?;
+                let id = existing.unwrap_or_else(|| Uuid::new_v4().to_string());
                 conn.execute(
-                    "INSERT INTO mount_configs (id, connection_id, mount_point, auto_mount, status, created_at)
-                     VALUES (?1, ?2, ?3, ?4, 'unmounted', ?5)
-                     ON CONFLICT(id) DO UPDATE SET
-                         mount_point = ?3, auto_mount = ?4",
-                    rusqlite::params![mid, cid, mp, am, ts],
+                    "INSERT INTO mount_configs (id, connection_id, mount_point, auto_mount, status, created_at, options_json)
+                     VALUES (?1, ?2, ?3, ?4, 'unmounted', ?5, COALESCE(?6, '{}'))
+                     ON CONFLICT(id) DO UPDATE SET auto_mount = ?4, options_json = COALESCE(?6, options_json)",
+                    rusqlite::params![id, cid, mp, am, ts, opts],
                 )?;
-                Ok(())
+                // Older duplicates of the same mount (before this was fixed).
+                conn.execute("DELETE FROM mount_configs WHERE connection_id = ?1 AND mount_point = ?2 AND id != ?3", rusqlite::params![cid, mp, id])?;
+                Ok(id)
             })
             .await?;
+        let config_id = Uuid::parse_str(&config_id).unwrap_or_else(|_| Uuid::nil());
 
         tracing::info!(
             "Saved mount config: connection={}, mount_point={}, auto_mount={}",
@@ -785,7 +1018,7 @@ impl MountManager {
         Ok(MountConfig {
             id: config_id,
             connection_id,
-            mount_point,
+            mount_point: expand_home(&mount_point),
             auto_mount,
             created_at: now,
         })
@@ -898,6 +1131,34 @@ mod tests {
         assert_eq!(failed, 3, "every flagged config is attempted despite failures");
     }
 
+    /// Regression: the engine wrote `error_message`, a column the schema did
+    /// not have, so every successful OS mount ended in a database error.
+    #[tokio::test]
+    async fn mount_writes_match_the_schema() {
+        let (repo, _) = auto_mount_fixture().await;
+        repo.pool()
+            .execute(|c| {
+                c.execute(INSERT_MOUNT_SQL, rusqlite::params!["m1", "c1", "/mnt/x", "mounted", Option::<String>::None, "2026-01-01T00:00:00Z", "{}"])?;
+                c.execute(UPDATE_MOUNT_STATUS_SQL, rusqlite::params!["m1", "error", "boom"])?;
+                let (st, err): (String, String) = c.query_row("SELECT status, error_message FROM mount_configs WHERE id = 'm1'", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                assert_eq!((st.as_str(), err.as_str()), ("error", "boom"));
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Regression: the dialog's default "~/UFOP-Mounts/x" was rejected as
+    /// not absolute.
+    #[test]
+    fn tilde_mount_points_expand_to_home() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert_eq!(expand_home("~/UFOP-Mounts/a"), format!("{}/UFOP-Mounts/a", home.display()));
+        assert!(std::path::Path::new(&expand_home("~/x")).is_absolute());
+        assert_eq!(expand_home("/abs/x"), "/abs/x");
+        assert_eq!(expand_home("~other/x"), "~other/x");
+    }
+
     #[tokio::test]
     async fn auto_mount_is_a_noop_with_nothing_saved() {
         let (repo, conns) = auto_mount_fixture().await;
@@ -927,5 +1188,117 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let status = rt.block_on(mgr.get_mount_status(Uuid::new_v4()));
         assert_eq!(status, MountStatus::Unmounted);
+    }
+
+    fn rclone_profile(remote: &str, path: &str) -> crate::core::types::ConnectionProfile {
+        crate::core::types::ConnectionProfile {
+            id: Uuid::new_v4(),
+            name: "local via rclone".into(),
+            protocol: crate::core::types::ConnectionProtocol::Rclone,
+            host: remote.into(),
+            port: None,
+            username: None,
+            credential_ref: None,
+            remote_path: path.into(),
+            created_at: Utc::now(),
+            last_used: None,
+            group_id: None,
+            bandwidth_limit_bps: 0,
+            conflict_policy: None,
+            retry_policy: None,
+            verify_checksums: false,
+            checksum_algorithm: None,
+            proxy_type: None,
+            proxy_host: None,
+            proxy_port: None,
+            proxy_username: None,
+            proxy_password: None,
+            default_local_dir: None,
+            default_remote_dir: None,
+            charset: None,
+            default_file_mode: None,
+            default_dir_mode: None,
+            ftp_use_mlsd: None,
+            ftp_force_passive_ip: None,
+            ftp_post_login_commands: None,
+            symlink_policy: None,
+            extras: Default::default(),
+        }
+    }
+
+    /// Real rclone + FUSE: cache options reach rclone, files are pinned for
+    /// offline use, the mount profile forces read-only and is enforced, and
+    /// saving/auto-mounting keeps one row per mount.
+    #[tokio::test]
+    async fn cache_offline_pinning_and_mount_profile_with_real_rclone() {
+        if !rclone_mount::rclone_available() || rclone_mount::fuse_available().is_err() {
+            return;
+        }
+        // An rclone remote of type local, defined through the environment.
+        std::env::set_var("RCLONE_CONFIG_UFOPMNTTEST_TYPE", "local");
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("projects/q3")).unwrap();
+        std::fs::write(src.path().join("projects/q3/a.bin"), vec![7u8; 300_000]).unwrap();
+        std::fs::write(src.path().join("projects/q3/b.txt"), "plan").unwrap();
+        std::fs::write(src.path().join("top.txt"), "top").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mp = home.path().join("Drives/team");
+        let (repo, conns) = auto_mount_fixture().await;
+        let profile = conns.save_connection(rclone_profile("ufopmnttest:/", &src.path().to_string_lossy()), None).await.unwrap();
+        let mgr = MountManager::with_cache_root(home.path().join("cache"));
+
+        let opts = MountOptions { cache_mode: CacheMode::Full, max_cache_mb: Some(64), max_cache_age_hours: Some(12), read_only: false };
+        let r = match mgr.mount_remote_with(profile.id, mp.to_string_lossy().into(), opts.clone(), None, &repo, &conns).await {
+            Ok(r) => r,
+            // FUSE present but not permitted (unprivileged container): nothing to verify.
+            Err(e) if ["fusermount", "/dev/fuse", "Operation not permitted", "permission denied"].iter().any(|k| format!("{e:?}").contains(k)) => {
+                eprintln!("skipping: FUSE not permitted here: {e}");
+                return;
+            }
+            Err(e) => panic!("mount failed: {e:?}"),
+        };
+        assert_eq!(std::fs::read_to_string(mp.join("top.txt")).unwrap(), "top");
+        let info = mgr.list_mounts(&repo, &conns).await.unwrap().into_iter().find(|m| m.id == r.mount_id).unwrap();
+        assert_eq!(info.options, opts);
+        // Pin a folder: its files land in this mount's own cache.
+        let pinned = mgr.pin_offline(r.mount_id, "projects").await.unwrap();
+        assert_eq!((pinned.files, pinned.bytes, pinned.failed, pinned.truncated), (2, 300_004, 0, false));
+        assert!(mgr.cache_usage(r.mount_id) >= 300_000, "cache holds the pinned files: {}", mgr.cache_usage(r.mount_id));
+        assert!(mgr.pin_offline(r.mount_id, "../../etc").await.is_err(), "pinning is confined to the mount");
+        assert!(mgr.clear_cache(r.mount_id).await.is_err(), "not while mounted");
+        // Writable without a profile.
+        std::fs::write(mp.join("new.txt"), "w").unwrap();
+
+        // Saving the mount for auto-mount updates its row instead of adding one.
+        mgr.save_mount_config(profile.id, mp.to_string_lossy().into(), true, Some(opts.clone()), &repo, &conns).await.unwrap();
+        let rows = || async {
+            repo.pool().execute(|c| Ok(c.query_row("SELECT COUNT(*) FROM mount_configs", [], |r| r.get::<_, i64>(0))?)).await.unwrap()
+        };
+        assert_eq!(rows().await, 1);
+        mgr.unmount_remote(r.mount_id, &repo).await.unwrap();
+        assert!(mgr.cache_usage(r.mount_id) > 0, "the cache outlives the mount (offline copies)");
+
+        // The organization's profile: read-only and a capped cache; a remount
+        // (auto-mount after restart) reuses the saved row.
+        mgr.set_managed(Some(ufop_core::agent::ManagedMounts { read_only: Some(true), max_cache_mb: Some(32), ..Default::default() })).await;
+        let (mounted, failed) = mgr.auto_mount_saved(&repo, &conns).await;
+        assert_eq!((mounted, failed), (1, 0));
+        assert_eq!(rows().await, 1, "auto-mount does not duplicate the saved mount");
+        let info = mgr.list_mounts(&repo, &conns).await.unwrap().into_iter().find(|m| m.status == MountStatus::Mounted).unwrap();
+        assert!(info.options.read_only && info.options.max_cache_mb == Some(32), "{:?}", info.options);
+        assert_eq!(info.policy_notes.len(), 2, "{:?}", info.policy_notes);
+        assert!(std::fs::write(mp.join("blocked.txt"), "x").is_err(), "read-only mount refuses writes");
+        mgr.unmount_remote(info.id, &repo).await.unwrap();
+
+        // Profiles refuse protocols and places outside their rules.
+        mgr.set_managed(Some(ufop_core::agent::ManagedMounts { allowed_protocols: Some(vec!["smb".into()]), ..Default::default() })).await;
+        let e = mgr.mount_remote(profile.id, mp.to_string_lossy().into(), &repo, &conns).await.unwrap_err();
+        assert!(e.to_string().contains("does not allow mounting rclone"), "{e}");
+        mgr.set_managed(Some(ufop_core::agent::ManagedMounts { mount_root: Some(home.path().join("Elsewhere").to_string_lossy().into()), ..Default::default() })).await;
+        assert!(mgr.mount_remote(profile.id, mp.to_string_lossy().into(), &repo, &conns).await.unwrap_err().to_string().contains("must be inside"));
+
+        // Unmounted: the cache can be cleared.
+        assert!(mgr.clear_cache(info.id).await.unwrap() > 0);
+        assert_eq!(mgr.cache_usage(info.id), 0);
     }
 }

@@ -1,25 +1,24 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { cookies } from 'next/headers';
+import { jwtVerify } from 'jose';
 import { logger } from '@/lib/utils/logger';
+import { clientIp, SESSION_COOKIE } from '@/lib/session';
+import { revokeSession } from '@/lib/db/repos/sessions';
 
-/**
- * POST /api/auth/logout
- * Clear the session cookie and invalidate the user session.
- */
+/** POST /api/auth/logout — end the server-side session and clear the cookie. */
 export async function POST(request: NextRequest) {
-  const email = request.headers.get('x-user-email') || 'unknown';
-  const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
-
-  const cookieStore = await cookies();
-  cookieStore.set('ufop-admin-session', '', {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict',
-    maxAge: 0,
-    path: '/',
-  });
-
-  logger.info('auth.logout', { email, ip });
-
-  return NextResponse.json({ success: true });
+  const token = request.cookies.get(SESSION_COOKIE)?.value;
+  let email = 'unknown';
+  if (token && process.env.NEXTAUTH_SECRET) {
+    try {
+      const { payload } = await jwtVerify(token, new TextEncoder().encode(process.env.NEXTAUTH_SECRET));
+      if (typeof payload.sid === 'string') revokeSession(payload.sid, 'signed out');
+      email = String(payload.sub ?? email);
+    } catch {
+      // An expired or foreign cookie: just clear it.
+    }
+  }
+  logger.info('auth.logout', { email, ip: clientIp(request) });
+  const res = NextResponse.json({ success: true });
+  res.cookies.set(SESSION_COOKIE, '', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict', maxAge: 0, path: '/' });
+  return res;
 }

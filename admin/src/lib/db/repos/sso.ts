@@ -1,6 +1,6 @@
 /**
- * Identity providers (OIDC / SAML) per organization, linked identities and
- * short-lived authorization state.
+ * Identity providers (OIDC / SAML / LDAP) per organization, linked
+ * identities and short-lived authorization state.
  */
 import { db, newId, now, parseJson, type Row } from '../index';
 import { openOpt, sealOpt } from '../../crypto';
@@ -8,8 +8,11 @@ import type { Role } from '../../types/auth';
 import { ROLE_HIERARCHY } from '../../types/auth';
 import { OrgError } from './orgs';
 import { getGroup } from './groups';
+import { validateLdapConfig, type LdapConfig } from '../../ldap-config';
 
-export type SsoKind = 'oidc' | 'saml';
+export type { LdapConfig };
+
+export type SsoKind = 'oidc' | 'saml' | 'ldap';
 
 export interface OidcConfig {
   issuer: string;
@@ -37,7 +40,7 @@ export interface SsoProvider {
   orgId: string;
   name: string;
   kind: SsoKind;
-  config: OidcConfig | SamlConfig;
+  config: OidcConfig | SamlConfig | LdapConfig;
   hasSecret: boolean;
   defaultRole: Role;
   defaultGroupId: string | null;
@@ -58,7 +61,7 @@ function fromRow(r: Row): SsoProvider {
     orgId: r.org_id as string,
     name: r.name as string,
     kind: r.kind as SsoKind,
-    config: config as unknown as OidcConfig | SamlConfig,
+    config: config as unknown as OidcConfig | SamlConfig | LdapConfig,
     hasSecret: !!r.secret_ciphertext,
     defaultRole: r.default_role as Role,
     defaultGroupId: (r.default_group_id as string) ?? null,
@@ -123,7 +126,11 @@ function validate(orgId: string, p: ProviderInput, existingSecret: boolean) {
       throw new OrgError('Enter the IdP sign-on URL');
     }
     if (!/-----BEGIN CERTIFICATE-----/.test(c.idpCert ?? '')) throw new OrgError('Paste the IdP signing certificate (PEM)');
-  } else throw new OrgError('Provider type is oidc or saml');
+  } else if (p.kind === 'ldap') {
+    const problem = validateLdapConfig(p.config as Partial<LdapConfig>);
+    if (problem) throw new OrgError(problem);
+    if (!p.secret && !existingSecret) throw new OrgError('Enter the service account password');
+  } else throw new OrgError('Provider type is oidc, saml or ldap');
   if (p.defaultRole && !(p.defaultRole in ROLE_HIERARCHY)) throw new OrgError('Unknown default role');
   if (p.defaultRole === 'org_owner') throw new OrgError('Automatic sign-up cannot grant the owner role');
   const groups = [p.defaultGroupId, ...Object.values(p.groupMapping ?? {})].filter(Boolean) as string[];
@@ -250,3 +257,57 @@ export const samlRequestCache = {
     return (r?.value as string) ?? null;
   },
 };
+
+// ── Sign-in diagnostics ──
+
+/** One step of an SSO sign-in, with what the provider sent (no tokens or signatures). */
+export interface SsoStep {
+  step: string;
+  ok: boolean;
+  detail?: Record<string, unknown>;
+}
+
+export interface SsoAttempt {
+  id: string;
+  providerId: string;
+  orgId: string;
+  kind: SsoKind;
+  at: string;
+  ok: boolean;
+  /** The step that failed, or `done`. */
+  stage: string;
+  error: string | null;
+  steps: SsoStep[];
+  email: string;
+  userId: string | null;
+  ip: string;
+}
+
+/** Attempts kept per provider. */
+export const KEEP_ATTEMPTS = 200;
+
+export function recordSsoAttempt(p: Pick<SsoProvider, 'id' | 'orgId' | 'kind'>, a: { ok: boolean; stage: string; error: string | null; steps: SsoStep[]; email: string; userId: string | null; ip: string }): void {
+  db()
+    .prepare('INSERT INTO sso_attempts (id, provider_id, org_id, kind, at, ok, stage, error, steps, email, user_id, ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(newId('ssa'), p.id, p.orgId, p.kind, now(), a.ok ? 1 : 0, a.stage, a.error, JSON.stringify(a.steps), a.email, a.userId, a.ip);
+  db()
+    .prepare('DELETE FROM sso_attempts WHERE provider_id = ? AND id NOT IN (SELECT id FROM sso_attempts WHERE provider_id = ? ORDER BY at DESC, rowid DESC LIMIT ?)')
+    .run(p.id, p.id, KEEP_ATTEMPTS);
+}
+
+export function listSsoAttempts(orgId: string, providerId: string, limit = 50, offset = 0): SsoAttempt[] {
+  return (db().prepare('SELECT * FROM sso_attempts WHERE org_id = ? AND provider_id = ? ORDER BY at DESC, rowid DESC LIMIT ? OFFSET ?').all(orgId, providerId, Math.min(limit, KEEP_ATTEMPTS), offset) as Row[]).map((r) => ({
+    id: r.id as string,
+    providerId: r.provider_id as string,
+    orgId: r.org_id as string,
+    kind: r.kind as SsoKind,
+    at: r.at as string,
+    ok: !!r.ok,
+    stage: r.stage as string,
+    error: (r.error as string) ?? null,
+    steps: parseJson<SsoStep[]>(r.steps, []),
+    email: r.email as string,
+    userId: (r.user_id as string) ?? null,
+    ip: r.ip as string,
+  }));
+}

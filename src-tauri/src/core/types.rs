@@ -671,7 +671,13 @@ pub enum ConnectionProtocol {
     OneDrive,
     Local,
     AzureBlob,
+    /// Azure Data Lake Storage Gen2 (`dfs` endpoint).
+    AdlsGen2,
+    /// Azure Files (REST).
+    AzureFiles,
     Swift,
+    /// Any rclone remote (GCS, Box, pCloud, Mega…).
+    Rclone,
 }
 
 impl ConnectionProtocol {
@@ -689,7 +695,10 @@ impl ConnectionProtocol {
             Self::OneDrive => "onedrive",
             Self::Local => "local",
             Self::AzureBlob => "azure_blob",
+            Self::AdlsGen2 => "adls_gen2",
+            Self::AzureFiles => "azure_files",
             Self::Swift => "swift",
+            Self::Rclone => "rclone",
         }
     }
 
@@ -707,7 +716,10 @@ impl ConnectionProtocol {
             "onedrive" => Self::OneDrive,
             "local" => Self::Local,
             "azure_blob" => Self::AzureBlob,
+            "adls_gen2" => Self::AdlsGen2,
+            "azure_files" => Self::AzureFiles,
             "swift" => Self::Swift,
+            "rclone" => Self::Rclone,
             _ => Self::Local,
         }
     }
@@ -785,6 +797,65 @@ pub struct ConnectionProfile {
     /// "follow" = resolve and transfer target, "skip" = ignore symlinks,
     /// "preserve" = recreate symlinks at destination (default).
     pub symlink_policy: Option<String>,
+
+    /// Connector-specific settings (role assumption, rclone remote, preset).
+    #[serde(default)]
+    pub extras: ConnectionExtras,
+}
+
+/// STS AssumeRole on top of a connection's keys.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssumeRoleConfig {
+    pub role_arn: String,
+    /// Required by many cross-account trust policies.
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub session_name: Option<String>,
+    /// 900..=43200 seconds; default 3600.
+    #[serde(default)]
+    pub duration_secs: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ConnectionExtras {
+    pub assume_role: Option<AssumeRoleConfig>,
+    /// rclone remote name (`gdrive:`) for rclone connections.
+    pub rclone_remote: Option<String>,
+    /// Provider preset the connection was created from (`r2`, `egnyte`…).
+    pub preset: Option<String>,
+    /// OpenStack Swift sign-in settings.
+    pub swift: Option<SwiftSettings>,
+}
+
+/// How a Swift connection signs in.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SwiftAuthKind {
+    /// Keystone v3 user name and password, scoped to a project.
+    #[default]
+    Password,
+    /// Keystone v3 application credential (id + secret).
+    ApplicationCredential,
+    /// TempAuth / v1 (`X-Auth-User` / `X-Auth-Key`).
+    TempAuth,
+}
+
+/// OpenStack Swift settings. The secret is the password, the application
+/// credential secret or the TempAuth key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SwiftSettings {
+    pub auth_kind: SwiftAuthKind,
+    /// Keystone or TempAuth URL; when empty, `https://<host>:<port>/v3`.
+    pub auth_url: Option<String>,
+    pub project_name: Option<String>,
+    /// User and project domain (Keystone password sign-in); default `Default`.
+    pub domain_name: Option<String>,
+    /// Catalog region to use when the project has several.
+    pub region: Option<String>,
+    pub application_credential_id: Option<String>,
 }
 
 /// Global proxy configuration.
@@ -1013,6 +1084,8 @@ mod tests {
             ConnectionProtocol::OneDrive,
             ConnectionProtocol::Local,
             ConnectionProtocol::AzureBlob,
+            ConnectionProtocol::AdlsGen2,
+            ConnectionProtocol::AzureFiles,
             ConnectionProtocol::Swift,
         ];
         for p in &protocols {

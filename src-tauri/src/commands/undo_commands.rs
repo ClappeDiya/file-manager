@@ -45,7 +45,8 @@
 //! undo/redo therefore works without any new schema or storage — the
 //! markers stack naturally in the existing `operation_ledger` table.
 
-use crate::commands::file_ops_commands::{redo_file_operation, undo_file_operation};
+use crate::commands::file_ops_commands::{redo_file_operation_inner, undo_file_operation_inner};
+use crate::metadata_engine::MetadataStore;
 use crate::core::error::AppError;
 use crate::ledger::{LedgerEngine, LedgerEvent, LedgerStatus, OperationLedger, RecordEvent};
 use serde::{Deserialize, Serialize};
@@ -226,12 +227,13 @@ fn decide_undo_last(rows: &[LedgerEvent]) -> UndoLastDecision {
 #[tauri::command]
 pub async fn undo_last(
     ledger: State<'_, OperationLedger>,
+    metadata: State<'_, MetadataStore>,
 ) -> Result<UndoOutcome, AppError> {
     let rows = ledger.recent(undo_scan_limit(1)).await?;
     match decide_undo_last(&rows) {
         UndoLastDecision::Proceed(op) => {
             let op = with_full_group(&ledger, op, assemble_undoable_groups).await?;
-            perform_undo(op, &ledger).await
+            perform_undo(op, &ledger, &metadata).await
         }
         UndoLastDecision::Blocked { kind } => Ok(UndoOutcome {
             success: false,
@@ -258,6 +260,7 @@ pub async fn undo_last(
 pub async fn undo_by_correlation(
     correlation_id: String,
     ledger: State<'_, OperationLedger>,
+    metadata: State<'_, MetadataStore>,
 ) -> Result<UndoOutcome, AppError> {
     // Query the group directly: it is named, so there is no reason to scan the
     // recent tail hoping it is still in the window.
@@ -268,7 +271,7 @@ pub async fn undo_by_correlation(
             "It may have already been undone, or may be older than the 30-day ledger retention.",
         ));
     };
-    perform_undo(op, &ledger).await
+    perform_undo(op, &ledger, &metadata).await
 }
 
 /// Shared worker: call the existing fs inverse logic, then emit an
@@ -276,16 +279,18 @@ pub async fn undo_by_correlation(
 async fn perform_undo(
     op: UndoableOp,
     ledger: &OperationLedger,
+    metadata: &MetadataStore,
 ) -> Result<UndoOutcome, AppError> {
     // Delegate the actual reverse operation to the one place it lives.
     // If this fails, propagate — and intentionally do NOT write the marker,
     // so the user can retry.
-    let _ = undo_file_operation(
+    let _ = undo_file_operation_inner(
         op.kind.clone(),
         op.source_paths.clone(),
         op.dest_paths.clone(),
     )
     .await?;
+    metadata.follow_fs_op(&op.kind, &op.source_paths, &op.dest_paths, true).await;
 
     // Write the marker. Note this shares `correlation_id = op.correlation_id`
     // so it's trivially discoverable and future calls to
@@ -351,6 +356,7 @@ pub async fn list_redoable_impl(
 #[tauri::command]
 pub async fn redo_last(
     ledger: State<'_, OperationLedger>,
+    metadata: State<'_, MetadataStore>,
 ) -> Result<RedoOutcome, AppError> {
     let ops = list_redoable_impl(&ledger, 1).await?;
     let Some(op) = ops.into_iter().next() else {
@@ -363,7 +369,7 @@ pub async fn redo_last(
         });
     };
     let op = with_full_group(&ledger, op, assemble_redoable_groups).await?;
-    perform_redo(op, &ledger).await
+    perform_redo(op, &ledger, &metadata).await
 }
 
 /// Re-apply a specific correlation group (the "Redo" button in the timeline).
@@ -371,6 +377,7 @@ pub async fn redo_last(
 pub async fn redo_by_correlation(
     correlation_id: String,
     ledger: State<'_, OperationLedger>,
+    metadata: State<'_, MetadataStore>,
 ) -> Result<RedoOutcome, AppError> {
     // Mirror of `undo_by_correlation`: the group is named, so query it.
     let rows = ledger.by_correlation(correlation_id.clone()).await?;
@@ -380,7 +387,7 @@ pub async fn redo_by_correlation(
             "It may have already been redone, or may be older than the 30-day ledger retention.",
         ));
     };
-    perform_redo(op, &ledger).await
+    perform_redo(op, &ledger, &metadata).await
 }
 
 /// Shared worker: call the existing forward fs op via [`redo_file_operation`],
@@ -388,16 +395,18 @@ pub async fn redo_by_correlation(
 async fn perform_redo(
     op: UndoableOp,
     ledger: &OperationLedger,
+    metadata: &MetadataStore,
 ) -> Result<RedoOutcome, AppError> {
     // Delegate the actual forward operation to the one place it lives.
     // If this fails, propagate — and intentionally do NOT write the marker,
     // so the user can retry.
-    let _ = redo_file_operation(
+    let _ = redo_file_operation_inner(
         op.kind.clone(),
         op.source_paths.clone(),
         op.dest_paths.clone(),
     )
     .await?;
+    metadata.follow_fs_op(&op.kind, &op.source_paths, &op.dest_paths, false).await;
 
     // Write the marker. Shares `correlation_id = op.correlation_id` with the
     // original op so the next `currently_undone_ids` scan sees it as the
@@ -612,6 +621,33 @@ mod tests {
     use super::*;
     use crate::ledger::{LedgerEngine, OperationLedger, RecordEvent};
     use crate::storage::Repository;
+
+    async fn fresh_metadata() -> MetadataStore {
+        MetadataStore::new(Repository::open_in_memory().await.unwrap())
+    }
+
+    /// Universal undo of a rename moves the file's tags back with it.
+    #[tokio::test]
+    async fn undo_rename_carries_metadata_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("foo.txt");
+        let renamed = tmp.path().join("bar.txt");
+        std::fs::write(&renamed, b"hi").unwrap();
+        let (o, r) = (original.to_string_lossy().to_string(), renamed.to_string_lossy().to_string());
+
+        let ledger = fresh_ledger().await;
+        ledger
+            .record(RecordEvent::new(LedgerEngine::Fs, "rename").correlation("rn-m").subject(o.clone()).target(r.clone()).summary("rename"))
+            .await;
+        let metadata = fresh_metadata().await;
+        metadata.set_metadata(&r, "client", "Acme").await.unwrap();
+
+        let ops = list_undoable_impl(&ledger, 10).await.unwrap();
+        perform_undo(ops.into_iter().next().unwrap(), &ledger, &metadata).await.unwrap();
+        assert!(original.exists());
+        assert_eq!(metadata.file_info(&o).await.unwrap().metadata["client"], "Acme");
+        assert!(metadata.file_info(&r).await.unwrap().metadata.is_empty());
+    }
 
     async fn fresh_ledger() -> OperationLedger {
         let repo = Repository::open_in_memory().await.unwrap();
@@ -883,7 +919,7 @@ mod tests {
         let ops = list_undoable_impl(&ledger, 10).await.unwrap();
         assert_eq!(ops.len(), 1);
 
-        let outcome = perform_undo(ops.into_iter().next().unwrap(), &ledger)
+        let outcome = perform_undo(ops.into_iter().next().unwrap(), &ledger, &fresh_metadata().await)
             .await
             .unwrap();
         assert!(outcome.success);
@@ -1037,7 +1073,7 @@ mod tests {
 
         // Undo brings the file back.
         let undo_ops = list_undoable_impl(&ledger, 10).await.unwrap();
-        let undo_outcome = perform_undo(undo_ops.into_iter().next().unwrap(), &ledger)
+        let undo_outcome = perform_undo(undo_ops.into_iter().next().unwrap(), &ledger, &fresh_metadata().await)
             .await
             .unwrap();
         assert!(undo_outcome.success);
@@ -1046,7 +1082,7 @@ mod tests {
         // Redo re-applies the rename.
         let redo_ops = list_redoable_impl(&ledger, 10).await.unwrap();
         assert_eq!(redo_ops.len(), 1);
-        let redo_outcome = perform_redo(redo_ops.into_iter().next().unwrap(), &ledger)
+        let redo_outcome = perform_redo(redo_ops.into_iter().next().unwrap(), &ledger, &fresh_metadata().await)
             .await
             .unwrap();
         assert!(redo_outcome.success);
@@ -1086,7 +1122,7 @@ mod tests {
             // Undo: file at original.
             let undo_ops = list_undoable_impl(&ledger, 10).await.unwrap();
             assert_eq!(undo_ops.len(), 1);
-            perform_undo(undo_ops.into_iter().next().unwrap(), &ledger)
+            perform_undo(undo_ops.into_iter().next().unwrap(), &ledger, &fresh_metadata().await)
                 .await
                 .unwrap();
             assert!(original.exists() && !renamed.exists());
@@ -1094,7 +1130,7 @@ mod tests {
             // Redo: file at renamed.
             let redo_ops = list_redoable_impl(&ledger, 10).await.unwrap();
             assert_eq!(redo_ops.len(), 1);
-            perform_redo(redo_ops.into_iter().next().unwrap(), &ledger)
+            perform_redo(redo_ops.into_iter().next().unwrap(), &ledger, &fresh_metadata().await)
                 .await
                 .unwrap();
             assert!(!original.exists() && renamed.exists());

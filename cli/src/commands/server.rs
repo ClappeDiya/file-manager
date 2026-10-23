@@ -1,6 +1,6 @@
 //! `ufop server …` — control a running `ufop-server` (ServerUtil
 //! equivalent): sign in and store credentials, list/run jobs, pause and
-//! resume the scheduler, read logs, issue automation tokens and check
+//! resume the scheduler, read logs, manage automation and scoped API tokens and check
 //! health with script-friendly exit codes (0 healthy, 1 degraded, 2 down).
 
 use crate::config::CliConfig;
@@ -17,7 +17,7 @@ pub enum ServerCommands {
         url: String,
         #[arg(long, env = "UFOP_SERVER_PASSWORD")]
         password: Option<String>,
-        /// Use a long-lived automation token instead of a password
+        /// Use an automation or API token (ufop_pat_…) instead of a password
         #[arg(long, env = "UFOP_SERVER_TOKEN")]
         token: Option<String>,
     },
@@ -58,11 +58,118 @@ pub enum ServerCommands {
     },
     /// Issue a long-lived automation token (must be enabled on the server)
     IssueToken,
+    /// Named, scoped, expiring API tokens (read, run, write, admin)
+    #[command(subcommand)]
+    Tokens(TokenCommands),
+    /// Share links to files and folders under the server's --share-root
+    #[command(subcommand)]
+    Shares(ShareCommands),
+    /// Policies of shared folders: lock, accepted types, limits, link rules, intake naming
+    #[command(subcommand)]
+    Folders(FolderCommands),
 }
 
-struct Client {
+#[derive(Subcommand, Debug)]
+pub enum FolderCommands {
+    /// Folders that have a policy of their own
+    List,
+    /// A folder's own policy and the one in force (with what it inherits)
+    Show { path: String },
+    /// Change a folder's own policy (only the options given change)
+    Set {
+        path: String,
+        /// Take no uploads and no upload links
+        #[arg(long, conflicts_with = "unlock")]
+        lock: bool,
+        #[arg(long)]
+        unlock: bool,
+        /// Accept only these extensions (comma-separated; "" = inherit)
+        #[arg(long, value_delimiter = ',')]
+        allow: Option<Vec<String>>,
+        /// Refuse these extensions (comma-separated; "" = inherit)
+        #[arg(long, value_delimiter = ',')]
+        block: Option<Vec<String>>,
+        /// Largest upload per file, in MB (0 = inherit)
+        #[arg(long)]
+        max_upload_mb: Option<i64>,
+        /// Links must have a password (true/false)
+        #[arg(long)]
+        require_password: Option<bool>,
+        /// Links must expire within N days (0 = inherit)
+        #[arg(long)]
+        max_link_days: Option<i64>,
+        /// How uploads are named: keep, timestamp or sequence
+        #[arg(long, value_parser = ["keep", "timestamp", "sequence"])]
+        intake: Option<String>,
+    },
+    /// Remove a folder's own policy (it inherits again)
+    Clear { path: String },
+    /// Copy one folder's own policy to another
+    Copy { from: String, to: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ShareCommands {
+    /// List links (their tokens are never shown again)
+    List,
+    /// Create a link; the URL is shown once
+    Create {
+        /// File or folder on the server (under a --share-root)
+        path: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// download (browse and download), upload (drop box) or both
+        #[arg(long, default_value = "download", value_parser = ["download", "upload", "both"])]
+        kind: String,
+        /// Require this password (8+ characters)
+        #[arg(long, env = "UFOP_SHARE_PASSWORD")]
+        password: Option<String>,
+        /// Expire after this many days
+        #[arg(long)]
+        expires_in_days: Option<i64>,
+        /// Stop after this many downloads
+        #[arg(long)]
+        max_downloads: Option<i64>,
+        /// Largest upload per file, in MB (default 1024)
+        #[arg(long)]
+        max_upload_mb: Option<i64>,
+    },
+    /// Turn a link off
+    Revoke { id: String },
+    /// A link's access log
+    Log {
+        id: String,
+        /// Newest N events
+        #[arg(long = "last", short = 'n', default_value_t = 50)]
+        last: i64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TokenCommands {
+    /// List API tokens (never their values)
+    List,
+    /// Create a token; its value is shown once
+    Create {
+        name: String,
+        /// read (GETs), run (+ start/cancel backups, pause/resume), write (+ change jobs), admin (everything)
+        #[arg(long, default_value = "read", value_parser = ["read", "run", "write", "admin"])]
+        scope: String,
+        /// Expires after this many days (1–365)
+        #[arg(long, default_value_t = 90)]
+        days: i64,
+    },
+    /// Revoke a token by id
+    Revoke { id: String },
+}
+
+pub(crate) fn urlencode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+pub(crate) struct Client {
     http: reqwest::Client,
-    url: String,
+    pub(crate) url: String,
     cfg: CliConfig,
 }
 
@@ -71,7 +178,7 @@ fn refresh_from(headers: &reqwest::header::HeaderMap) -> Option<String> {
 }
 
 impl Client {
-    fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         let cfg = CliConfig::load();
         let url = cfg.server_url.clone().ok_or("Not signed in: run `ufop server login --url …` first")?;
         Ok(Self { http: reqwest::Client::new(), url, cfg })
@@ -89,7 +196,16 @@ impl Client {
         self.cfg.save().map_err(|e| e.to_string())
     }
 
-    async fn call(&mut self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, String> {
+    /// A request with the stored credentials (for streamed bodies).
+    pub(crate) fn raw(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        let req = self.http.request(method, format!("{}/api/v1{path}", self.url));
+        match &self.cfg.server_token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
+    }
+
+    pub(crate) async fn call(&mut self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, String> {
         for attempt in 0..2 {
             let mut req = self.http.request(method.clone(), format!("{}/api/v1{path}", self.url));
             if let Some(t) = &self.cfg.server_token {
@@ -124,7 +240,7 @@ impl Client {
     }
 }
 
-fn show(format: &OutputFormat, v: &Value) {
+pub(crate) fn show(format: &OutputFormat, v: &Value) {
     match format {
         OutputFormat::Human => println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()),
         _ => output::print_data(format, v),
@@ -255,6 +371,86 @@ pub async fn execute(cmd: ServerCommands, format: &OutputFormat) -> Result<u8, B
             ServerCommands::IssueToken => {
                 let mut c = Client::new()?;
                 show(format, &c.call(reqwest::Method::POST, "/auth/automation-token", None).await?);
+                Ok(0)
+            }
+            ServerCommands::Folders(fc) => {
+                let mut c = Client::new()?;
+                let v = match fc {
+                    FolderCommands::List => c.call(reqwest::Method::GET, "/folder-policies", None).await?["policies"].clone(),
+                    FolderCommands::Show { path } => c.call(reqwest::Method::GET, &format!("/folder-policies/effective?path={}", urlencode(&path)), None).await?,
+                    FolderCommands::Clear { path } => c.call(reqwest::Method::PUT, "/folder-policies", Some(json!({"path": path, "policy": {}}))).await?,
+                    FolderCommands::Copy { from, to } => c.call(reqwest::Method::POST, "/folder-policies/copy", Some(json!({"from": from, "to": to}))).await?,
+                    FolderCommands::Set { path, lock, unlock, allow, block, max_upload_mb, require_password, max_link_days, intake } => {
+                        let cur = c.call(reqwest::Method::GET, &format!("/folder-policies/effective?path={}", urlencode(&path)), None).await?;
+                        let mut p = cur["own"].as_object().cloned().unwrap_or_default();
+                        let list = |v: Vec<String>| {
+                            let v: Vec<String> = v.into_iter().map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect();
+                            if v.is_empty() { Value::Null } else { json!(v) }
+                        };
+                        if lock || unlock {
+                            p.insert("locked".into(), json!(lock));
+                        }
+                        if let Some(a) = allow {
+                            p.insert("allowed_extensions".into(), list(a));
+                        }
+                        if let Some(b) = block {
+                            p.insert("blocked_extensions".into(), list(b));
+                        }
+                        if let Some(m) = max_upload_mb {
+                            p.insert("max_upload_mb".into(), if m == 0 { Value::Null } else { json!(m) });
+                        }
+                        if let Some(r) = require_password {
+                            p.insert("require_link_password".into(), json!(r));
+                        }
+                        if let Some(d) = max_link_days {
+                            p.insert("max_link_days".into(), if d == 0 { Value::Null } else { json!(d) });
+                        }
+                        if let Some(i) = intake {
+                            p.insert("intake_naming".into(), json!(i));
+                        }
+                        c.call(reqwest::Method::PUT, "/folder-policies", Some(json!({"path": path, "policy": p}))).await?
+                    }
+                };
+                show(format, &v);
+                Ok(0)
+            }
+            ServerCommands::Shares(sc) => {
+                let mut c = Client::new()?;
+                let v = match sc {
+                    ShareCommands::List => {
+                        let v = c.call(reqwest::Method::GET, "/shares", None).await?;
+                        // Rows for people and spreadsheets; JSON/YAML keep the share roots too.
+                        if matches!(format, OutputFormat::Human | OutputFormat::Csv) {
+                            v["shares"].clone()
+                        } else {
+                            v
+                        }
+                    }
+                    ShareCommands::Create { path, name, kind, password, expires_in_days, max_downloads, max_upload_mb } => {
+                        let name = name.unwrap_or_else(|| path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("Shared").to_string());
+                        let mut v = c
+                            .call(reqwest::Method::POST, "/shares", Some(json!({"name": name, "path": path, "kind": kind, "password": password, "expires_in_days": expires_in_days, "max_downloads": max_downloads, "max_upload_mb": max_upload_mb})))
+                            .await?;
+                        // The full link, ready to send.
+                        if let Some(u) = v["url"].as_str() {
+                            v["url"] = json!(format!("{}{u}", c.url.trim_end_matches('/')));
+                        }
+                        v
+                    }
+                    ShareCommands::Revoke { id } => c.call(reqwest::Method::DELETE, &format!("/shares/{id}"), None).await?,
+                    ShareCommands::Log { id, last } => c.call(reqwest::Method::GET, &format!("/shares/{id}/events?limit={last}"), None).await?["events"].clone(),
+                };
+                show(format, &v);
+                Ok(0)
+            }
+            ServerCommands::Tokens(t) => {
+                let mut c = Client::new()?;
+                let v = match t {
+                    TokenCommands::List => c.call(reqwest::Method::GET, "/auth/api-tokens", None).await?,
+                    TokenCommands::Create { name, scope, days } => c.call(reqwest::Method::POST, "/auth/api-tokens", Some(json!({"name": name, "scope": scope, "expires_in_days": days}))).await?,
+                    TokenCommands::Revoke { id } => c.call(reqwest::Method::DELETE, &format!("/auth/api-tokens/{id}"), None).await?,
+                };
+                show(format, &v);
                 Ok(0)
             }
         }

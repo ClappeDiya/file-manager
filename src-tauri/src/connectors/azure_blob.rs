@@ -1,502 +1,234 @@
-//! Azure Blob Storage Connector
+//! Azure Blob Storage connector (Shared Key, SAS token or connection
+//! string; public, government and China clouds, Azurite).
 //!
-//! Features:
-//! - SAS token authentication
-//! - Azure AD (OAuth 2.0) authentication
-//! - Connection string authentication
-//! - Container listing as top-level folders
-//! - Blob operations: list, upload, download, delete, copy
-//! - Block blob upload for large files
-//! - Blob properties: content type, metadata, access tier
-//! - Shared Access Signature (SAS) URL generation
+//! - `/` lists containers; `/container/dir/` lists blobs one level deep
+//!   (virtual folders from the `/` delimiter).
+//! - Uploads stream in 4 MiB blocks (Put Block + Put Block List; small files
+//!   in one Put Blob), so a blob only appears once complete.
+//! - Folders are zero-byte `dir/` marker blobs; `/container` creates the
+//!   container. Folders and containers are removed only when empty.
+//! - Share links are read-only service SAS URLs.
 
+use super::azure_rest::{self as az, Service, Slot};
 use crate::connectors::Connector;
 use crate::core::error::AppError;
 use crate::core::types::{ConnectionProfile, FileEntry};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use base64::Engine;
+use reqwest::Method;
 use std::future::Future;
 use std::pin::Pin;
-use tokio::sync::RwLock;
-use zeroize::Zeroize;
 
-// Block size for block blob uploads: 4MB
-#[allow(dead_code)]
-const BLOCK_SIZE: u64 = 4 * 1024 * 1024;
-// Max blocks per blob (Azure limit: 50,000)
-#[allow(dead_code)]
-const MAX_BLOCKS: u64 = 50_000;
+const WHAT: &str = "Azure Blob Storage";
 
-// ── Azure Blob Types ──
+type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
 
-/// Azure Blob access tier.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "PascalCase")]
-pub enum AzureAccessTier {
-    Hot,
-    Cool,
-    Cold,
-    Archive,
-}
-
-impl AzureAccessTier {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Hot => "Hot",
-            Self::Cool => "Cool",
-            Self::Cold => "Cold",
-            Self::Archive => "Archive",
-        }
-    }
-
-    pub fn parse(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "cool" => Self::Cool,
-            "cold" => Self::Cold,
-            "archive" => Self::Archive,
-            _ => Self::Hot,
-        }
-    }
-}
-
-/// Azure Blob type.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum AzureBlobType {
-    BlockBlob,
-    AppendBlob,
-    PageBlob,
-}
-
-/// Azure authentication method.
-///
-/// Secret fields implement `Drop` via the containing struct's `Zeroize` derive
-/// to clear credentials from memory when no longer needed.
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
-#[serde(rename_all = "snake_case")]
-#[zeroize(drop)]
-pub enum AzureAuthMethod {
-    /// Storage account key
-    AccountKey { account_name: String, account_key: String },
-    /// SAS token
-    SasToken { account_name: String, sas_token: String },
-    /// Connection string
-    ConnectionString { connection_string: String },
-    /// Azure AD OAuth 2.0 (tenant_id, client_id, client_secret)
-    AzureAd {
-        tenant_id: String,
-        client_id: String,
-        client_secret: String,
-    },
-}
-
-/// Azure Blob connector configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AzureBlobConfig {
-    pub auth_method: AzureAuthMethod,
-    /// Custom endpoint URL (for Azure Government, Azure China, Azurite emulator).
-    pub endpoint_url: Option<String>,
-    /// Default access tier for uploads.
-    pub default_access_tier: AzureAccessTier,
-}
-
-impl Default for AzureBlobConfig {
-    fn default() -> Self {
-        Self {
-            auth_method: AzureAuthMethod::AccountKey {
-                account_name: String::new(),
-                account_key: String::new(),
-            },
-            endpoint_url: None,
-            default_access_tier: AzureAccessTier::Hot,
-        }
-    }
-}
-
-/// Azure Blob object properties.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AzureBlobProperties {
-    pub name: String,
-    pub container: String,
-    pub content_type: Option<String>,
-    pub content_length: u64,
-    pub last_modified: Option<String>,
-    pub etag: Option<String>,
-    pub access_tier: Option<AzureAccessTier>,
-    pub blob_type: AzureBlobType,
-    pub content_md5: Option<String>,
-    pub metadata: HashMap<String, String>,
-    pub lease_status: Option<String>,
-}
-
-/// Azure container properties.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AzureContainerInfo {
-    pub name: String,
-    pub last_modified: Option<String>,
-    pub public_access: Option<String>,
-    pub lease_status: Option<String>,
-}
-
-/// Internal connection state.
-struct AzureConnection {
-    config: AzureBlobConfig,
-    connected: bool,
-    account_name: String,
-}
-
-/// Azure Blob Storage connector.
+#[derive(Default)]
 pub struct AzureBlobConnector {
-    state: RwLock<Option<AzureConnection>>,
-}
-
-impl Default for AzureBlobConnector {
-    fn default() -> Self {
-        Self::new()
-    }
+    slot: Slot,
 }
 
 impl AzureBlobConnector {
     pub fn new() -> Self {
-        Self {
-            state: RwLock::new(None),
+        Self::default()
+    }
+
+    async fn list_containers(&self) -> Result<Vec<FileEntry>, AppError> {
+        let c = self.slot.get(WHAT).await?;
+        let mut out = Vec::new();
+        let mut marker = String::new();
+        loop {
+            let mut q = vec![("comp", "list".to_string())];
+            if !marker.is_empty() {
+                q.push(("marker", marker.clone()));
+            }
+            let xml = c.call("Azure container listing", Method::GET, "/", &q, &[], Vec::new()).await?.text().await.unwrap_or_default();
+            for x in http::xml_all(&xml, "Container") {
+                let name = http::xml_unescape(&http::xml_one(&x, "Name").unwrap_or_default());
+                let modified = http::xml_one(&x, "Last-Modified").and_then(|t| az::parse_time(&t));
+                out.push(az::entry("", &name, true, 0, modified));
+            }
+            marker = http::xml_one(&xml, "NextMarker").unwrap_or_default();
+            if marker.is_empty() {
+                return Ok(out);
+            }
         }
     }
 
-    /// Get the base endpoint URL.
-    fn endpoint_url(account_name: &str, custom: &Option<String>) -> String {
-        custom.clone().unwrap_or_else(|| {
-            format!("https://{account_name}.blob.core.windows.net")
-        })
-    }
-
-    /// List containers in the storage account.
-    pub async fn list_containers(&self) -> Result<Vec<AzureContainerInfo>, AppError> {
-        let state = self.state.read().await;
-        let conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected to Azure Blob Storage", "Connect first.")
-        })?;
-
-        // Simulate container listing (actual implementation would use Azure REST API)
-        tracing::info!("Listing containers for account: {}", conn.account_name);
-        Ok(vec![])
-    }
-
-    /// List blobs in a container with optional prefix.
-    pub async fn list_blobs(
-        &self,
-        container: &str,
-        prefix: Option<&str>,
-    ) -> Result<Vec<FileEntry>, AppError> {
-        let state = self.state.read().await;
-        let conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected to Azure Blob Storage", "Connect first.")
-        })?;
-
-        tracing::info!(
-            "Listing blobs in {}/{} for account: {}",
-            container,
-            prefix.unwrap_or(""),
-            conn.account_name
-        );
-        Ok(vec![])
-    }
-
-    /// Get blob properties.
-    pub async fn get_blob_properties(
-        &self,
-        container: &str,
-        blob_name: &str,
-    ) -> Result<AzureBlobProperties, AppError> {
-        let state = self.state.read().await;
-        let conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        tracing::info!("Getting properties for {}/{}", container, blob_name);
-        Ok(AzureBlobProperties {
-            name: blob_name.to_string(),
-            container: container.to_string(),
-            content_type: None,
-            content_length: 0,
-            last_modified: None,
-            etag: None,
-            access_tier: Some(conn.config.default_access_tier.clone()),
-            blob_type: AzureBlobType::BlockBlob,
-            content_md5: None,
-            metadata: HashMap::new(),
-            lease_status: None,
-        })
-    }
-
-    /// Set blob access tier.
-    pub async fn set_access_tier(
-        &self,
-        container: &str,
-        blob_name: &str,
-        tier: AzureAccessTier,
-    ) -> Result<(), AppError> {
-        let state = self.state.read().await;
-        let _conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        tracing::info!("Setting access tier for {}/{} to {:?}", container, blob_name, tier);
-        Ok(())
-    }
-
-    /// Generate a SAS URL for temporary access to a blob.
-    ///
-    /// Implements Azure Storage Service SAS v2023-01-03 with HMAC-SHA256 signing.
-    pub async fn generate_sas_url(
-        &self,
-        container: &str,
-        blob_name: &str,
-        expiry_hours: u32,
-    ) -> Result<String, AppError> {
-        let state = self.state.read().await;
-        let conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        let account_key = match &conn.config.auth_method {
-            AzureAuthMethod::AccountKey { account_key, .. } => {
-                if account_key.is_empty() {
-                    return Err(AppError::Configuration {
-                        message: "Account key is empty".to_string(),
-                        advice: "Provide an Azure Storage account key to generate SAS URLs.".to_string(),
-                    });
+    /// Blobs and virtual folders directly under `prefix` (no trailing `/`).
+    async fn list_level(&self, container: &str, prefix: &str, limit: Option<u32>) -> Result<Vec<FileEntry>, AppError> {
+        let c = self.slot.get(WHAT).await?;
+        let pfx = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
+        let parent = format!("/{container}{}", if prefix.is_empty() { String::new() } else { format!("/{prefix}") });
+        let mut out = Vec::new();
+        let mut marker = String::new();
+        loop {
+            let mut q = vec![("restype", "container".to_string()), ("comp", "list".to_string()), ("delimiter", "/".to_string()), ("prefix", pfx.clone())];
+            if let Some(n) = limit {
+                q.push(("maxresults", n.to_string()));
+            }
+            if !marker.is_empty() {
+                q.push(("marker", marker.clone()));
+            }
+            let xml = c.call("Azure listing", Method::GET, &format!("/{}", az::encode_path(container)), &q, &[], Vec::new()).await?.text().await.unwrap_or_default();
+            for x in http::xml_all(&xml, "BlobPrefix") {
+                let name = http::xml_unescape(&http::xml_one(&x, "Name").unwrap_or_default());
+                let n = name.strip_prefix(&pfx).unwrap_or(&name).trim_end_matches('/');
+                if !n.is_empty() {
+                    out.push(az::entry(&parent, n, true, 0, None));
                 }
-                account_key.clone()
             }
-            AzureAuthMethod::SasToken { sas_token, .. } => {
-                // Already have a SAS token — append it directly
-                let base = Self::endpoint_url(&conn.account_name, &conn.config.endpoint_url);
-                let token = sas_token.trim_start_matches('?');
-                return Ok(format!("{base}/{container}/{blob_name}?{token}"));
+            for x in http::xml_all(&xml, "Blob") {
+                let name = http::xml_unescape(&http::xml_one(&x, "Name").unwrap_or_default());
+                let n = name.strip_prefix(&pfx).unwrap_or(&name);
+                if n.is_empty() || n.ends_with('/') {
+                    continue; // this folder's own marker
+                }
+                let size = http::xml_one(&x, "Content-Length").and_then(|s| s.parse().ok()).unwrap_or(0);
+                out.push(az::entry(&parent, n, false, size, http::xml_one(&x, "Last-Modified").and_then(|t| az::parse_time(&t))));
             }
-            _ => {
-                return Err(AppError::Configuration {
-                    message: "SAS URL generation requires AccountKey or SasToken auth".to_string(),
-                    advice: "Switch to AccountKey authentication to generate SAS URLs.".to_string(),
-                });
+            marker = http::xml_one(&xml, "NextMarker").unwrap_or_default();
+            if marker.is_empty() || limit.is_some() {
+                return Ok(out);
             }
-        };
-
-        let base = Self::endpoint_url(&conn.account_name, &conn.config.endpoint_url);
-        let sv = "2023-01-03";
-        let sp = "r"; // read permission
-        let sr = "b"; // blob resource
-        let st = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let se = (chrono::Utc::now() + chrono::Duration::hours(expiry_hours as i64))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
-        let spr = "https";
-        let canonicalized_resource = format!("/blob/{}/{}/{}", conn.account_name, container, blob_name);
-
-        // Build string-to-sign per Azure Storage SAS v2023-01-03 spec
-        let string_to_sign = format!(
-            "{sp}\n{st}\n{se}\n{cr}\n\n\n{spr}\n{sv}\n{sr}\n\n\n\n\n\n",
-            sp = sp,
-            st = st,
-            se = se,
-            cr = canonicalized_resource,
-            spr = spr,
-            sv = sv,
-            sr = sr,
-        );
-
-        // HMAC-SHA256 sign with Base64-decoded account key
-        let key_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &account_key,
-        )
-        .map_err(|e| AppError::Configuration {
-            message: format!("Invalid account key (Base64 decode failed): {e}"),
-            advice: "Check that the Azure Storage account key is correctly copied.".to_string(),
-        })?;
-
-        use hmac::{Hmac, Mac};
-        type HmacSha256 = Hmac<sha2::Sha256>;
-
-        let mut mac = HmacSha256::new_from_slice(&key_bytes)
-            .map_err(|e| AppError::Internal { message: format!("HMAC init failed: {e}") })?;
-        mac.update(string_to_sign.as_bytes());
-        let signature = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            mac.finalize().into_bytes(),
-        );
-
-        let sig_encoded = percent_encoding::utf8_percent_encode(
-            &signature,
-            percent_encoding::NON_ALPHANUMERIC,
-        );
-
-        let url = format!(
-            "{base}/{container}/{blob_name}?sv={sv}&st={st}&se={se}&sr={sr}&sp={sp}&spr={spr}&sig={sig}",
-            base = base,
-            container = container,
-            blob_name = blob_name,
-            sv = sv,
-            st = st,
-            se = se,
-            sr = sr,
-            sp = sp,
-            spr = spr,
-            sig = sig_encoded,
-        );
-
-        tracing::info!("Generated SAS URL for {}/{} (expires in {}h)", container, blob_name, expiry_hours);
-        Ok(url)
+        }
     }
 
-    /// Delete a blob.
-    pub async fn delete_blob(
-        &self,
-        container: &str,
-        blob_name: &str,
-    ) -> Result<(), AppError> {
-        let state = self.state.read().await;
-        let _conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        tracing::info!("Deleting blob {}/{}", container, blob_name);
-        Ok(())
-    }
-
-    /// Set blob metadata.
-    pub async fn set_blob_metadata(
-        &self,
-        container: &str,
-        blob_name: &str,
-        metadata: HashMap<String, String>,
-    ) -> Result<(), AppError> {
-        let state = self.state.read().await;
-        let _conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        tracing::info!("Setting metadata for {}/{}: {:?}", container, blob_name, metadata);
-        Ok(())
+    async fn upload_blob(&self, local: &str, remote: &str) -> Result<u64, AppError> {
+        let (container, blob) = az::split_root(remote);
+        if container.is_empty() || blob.is_empty() {
+            return Err(AppError::validation("Upload into a container: /container/path/file"));
+        }
+        let c = self.slot.get(WHAT).await?;
+        let path = format!("/{}/{}", az::encode_path(&container), az::encode_path(&blob));
+        let len = tokio::fs::metadata(local).await?.len();
+        let ct = [("content-type", "application/octet-stream".to_string())];
+        if len <= az::CHUNK as u64 {
+            let data = tokio::fs::read(local).await?;
+            let h = [("x-ms-blob-type", "BlockBlob".to_string()), ct[0].clone()];
+            c.call("Azure upload", Method::PUT, &path, &[], &h, data).await?;
+            return Ok(len);
+        }
+        let mut ids = Vec::new();
+        let n = az::for_each_chunk(local, |off, chunk| {
+            // Block ids must have equal length within a blob.
+            let id = base64::engine::general_purpose::STANDARD.encode(format!("{:012}", off / az::CHUNK as u64));
+            ids.push(id.clone());
+            let (c, path) = (c.clone(), path.clone());
+            async move { c.call("Azure block upload", Method::PUT, &path, &[("comp", "block".into()), ("blockid", id)], &[], chunk).await.map(|_| ()) }
+        })
+        .await?;
+        let body: String = ids.iter().map(|i| format!("<Latest>{i}</Latest>")).collect();
+        let body = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>{body}</BlockList>").into_bytes();
+        let h = [("content-type", "application/xml".to_string()), ("x-ms-blob-content-type", "application/octet-stream".to_string())];
+        c.call("Azure block list", Method::PUT, &path, &[("comp", "blocklist".into())], &h, body).await?;
+        Ok(n)
     }
 }
 
+use crate::backup_engine::stores::http;
+
 impl Connector for AzureBlobConnector {
-    fn connect(
-        &self,
-        profile: &ConnectionProfile,
-    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+    fn connect(&self, profile: &ConnectionProfile) -> Fut<'_, ()> {
+        self.connect_with_secret(profile, None)
+    }
+
+    fn connect_with_secret(&self, profile: &ConnectionProfile, secret: Option<String>) -> Fut<'_, ()> {
         let profile = profile.clone();
         Box::pin(async move {
-            let account_name = profile.username.clone().unwrap_or_default();
-            let config = AzureBlobConfig {
-                auth_method: AzureAuthMethod::AccountKey {
-                    account_name: account_name.clone(),
-                    account_key: String::new(), // Would be loaded from credential store
-                },
-                endpoint_url: if profile.host.is_empty() || profile.host == "blob.core.windows.net" {
-                    None
-                } else {
-                    Some(format!("https://{}", profile.host))
-                },
-                default_access_tier: AzureAccessTier::Hot,
-            };
-
-            tracing::info!("Connecting to Azure Blob Storage account: {}", account_name);
-
-            *self.state.write().await = Some(AzureConnection {
-                config,
-                connected: true,
-                account_name,
-            });
-
+            let client = az::client_for_profile(&profile, secret, Service::Blob)?;
+            self.slot.set(Some(client)).await;
+            // Verify the credentials: the account's containers, or (for a
+            // container-scoped SAS) the container in the remote path.
+            let (container, _) = az::split_root(&profile.remote_path);
+            let check = if container.is_empty() { self.list_containers().await.map(|_| ()) } else { self.list_level(&container, "", Some(1)).await.map(|_| ()) };
+            if let Err(e) = check {
+                self.slot.set(None).await;
+                return Err(e);
+            }
             Ok(())
         })
     }
 
-    fn disconnect(&self) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+    fn disconnect(&self) -> Fut<'_, ()> {
         Box::pin(async move {
-            *self.state.write().await = None;
-            tracing::info!("Disconnected from Azure Blob Storage");
+            self.slot.set(None).await;
             Ok(())
         })
     }
 
-    fn list_remote(
-        &self,
-        path: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<FileEntry>, AppError>> + Send + '_>> {
-        let path = path.to_string();
+    fn list_remote(&self, path: &str) -> Fut<'_, Vec<FileEntry>> {
+        let (container, prefix) = az::split_root(path);
         Box::pin(async move {
-            let state = self.state.read().await;
-            let _conn = state.as_ref().ok_or_else(|| {
-                AppError::connection("Not connected to Azure Blob Storage", "Connect first.")
-            })?;
-
-            // Parse path: "/" = list containers, "/container" = list blobs, "/container/prefix" = filtered
-            if path == "/" || path.is_empty() {
-                // List containers as directories
-                let containers = self.list_containers().await?;
-                Ok(containers
-                    .into_iter()
-                    .map(|c| FileEntry {
-                        name: c.name.clone(),
-                        path: format!("/{}", c.name),
-                        is_dir: true,
-                        is_symlink: false,
-                        size: 0,
-                        modified: None,
-                        created: None,
-                        is_hidden: false,
-                        extension: None,
-                        permissions: c.public_access,
-                    })
-                    .collect())
+            if container.is_empty() {
+                self.list_containers().await
             } else {
-                let parts: Vec<&str> = path.trim_start_matches('/').splitn(2, '/').collect();
-                let container = parts[0];
-                let prefix = parts.get(1).copied();
-                self.list_blobs(container, prefix).await
+                self.list_level(&container, &prefix, None).await
             }
         })
     }
 
     fn is_connected(&self) -> bool {
-        // Can't do async here, use try_read
-        self.state
-            .try_read()
-            .map(|s| s.as_ref().map(|c| c.connected).unwrap_or(false))
-            .unwrap_or(false)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_access_tier_parse() {
-        assert_eq!(AzureAccessTier::parse("hot"), AzureAccessTier::Hot);
-        assert_eq!(AzureAccessTier::parse("cool"), AzureAccessTier::Cool);
-        assert_eq!(AzureAccessTier::parse("archive"), AzureAccessTier::Archive);
-        assert_eq!(AzureAccessTier::parse("unknown"), AzureAccessTier::Hot);
+        self.slot.is_set()
     }
 
-    #[test]
-    fn test_endpoint_url() {
-        assert_eq!(
-            AzureBlobConnector::endpoint_url("myaccount", &None),
-            "https://myaccount.blob.core.windows.net"
-        );
-        assert_eq!(
-            AzureBlobConnector::endpoint_url("myaccount", &Some("https://custom.endpoint".to_string())),
-            "https://custom.endpoint"
-        );
+    fn upload(&self, local_path: &str, remote_path: &str) -> Fut<'_, u64> {
+        let (l, r) = (local_path.to_string(), remote_path.to_string());
+        Box::pin(async move { self.upload_blob(&l, &r).await })
     }
 
-    #[tokio::test]
-    async fn test_connector_lifecycle() {
-        let connector = AzureBlobConnector::new();
-        assert!(!connector.is_connected());
+    fn download(&self, remote_path: &str, local_path: &str) -> Fut<'_, u64> {
+        let (r, l) = (remote_path.to_string(), local_path.to_string());
+        Box::pin(async move {
+            let c = self.slot.get(WHAT).await?;
+            let resp = c.call("Azure download", Method::GET, &az::encode_path(&format!("/{}", r.trim_start_matches('/'))), &[], &[], Vec::new()).await?;
+            az::save_body(resp, &l).await
+        })
+    }
+
+    fn make_directory(&self, remote_path: &str) -> Fut<'_, ()> {
+        let (container, dir) = az::split_root(remote_path);
+        Box::pin(async move {
+            let c = self.slot.get(WHAT).await?;
+            if container.is_empty() {
+                return Err(AppError::validation("Give the folder or container name"));
+            }
+            if dir.is_empty() {
+                c.call("Azure container creation", Method::PUT, &format!("/{}", az::encode_path(&container)), &[("restype", "container".into())], &[], Vec::new()).await?;
+                return Ok(());
+            }
+            let path = format!("/{}/{}/", az::encode_path(&container), az::encode_path(&dir));
+            c.call("Azure folder creation", Method::PUT, &path, &[], &[("x-ms-blob-type", "BlockBlob".to_string())], Vec::new()).await?;
+            Ok(())
+        })
+    }
+
+    fn remove(&self, remote_path: &str, is_dir: bool) -> Fut<'_, ()> {
+        let (container, key) = az::split_root(remote_path);
+        let remote_path = remote_path.to_string();
+        Box::pin(async move {
+            let c = self.slot.get(WHAT).await?;
+            if key.is_empty() {
+                return Err(az::refuse_root_delete("container"));
+            }
+            if is_dir {
+                if !self.list_level(&container, &key, Some(1)).await?.is_empty() {
+                    return Err(AppError::validation(format!("{remote_path} is not empty")));
+                }
+                // Virtual folders may have no marker; deleting a missing one is fine.
+                let r = c.send(Method::DELETE, &format!("/{}/{}/", az::encode_path(&container), az::encode_path(&key)), &[], &[], Vec::new()).await?;
+                if r.status().is_success() || r.status().as_u16() == 404 {
+                    return Ok(());
+                }
+                http::check(r, "Azure folder delete").await?;
+                return Ok(());
+            }
+            c.call("Azure delete", Method::DELETE, &format!("/{}/{}", az::encode_path(&container), az::encode_path(&key)), &[], &[], Vec::new()).await?;
+            Ok(())
+        })
+    }
+
+    fn create_share_link(&self, remote_path: &str, options: &super::ShareOptions) -> Fut<'_, super::ShareLink> {
+        let (r, o) = (remote_path.to_string(), options.clone());
+        Box::pin(async move { az::share_link(&self.slot, WHAT, "azure_blob", &r, &o).await })
     }
 }

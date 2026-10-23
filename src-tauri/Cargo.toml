@@ -16,9 +16,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # Shared error type + sync/copy engine (also used by the `ufop` CLI).
-ufop-core = { path = "../crates/ufop-core", features = ["sqlite", "backup", "agent"] }
+ufop-core = { path = "../crates/ufop-core", features = ["sqlite", "backup", "agent", "doctext", "gateway", "mcp"] }
 shlex = "1"
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
@@ -43,6 +43,10 @@ rustls-pemfile = "2"
 digest = "0.10"
 # Transfer integrity: xxHash3 for fast hashing, ring for SHA-256
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32fast = "1"
+# PAC proxy files.
+rquickjs = { version = "0.9", features = ["parallel"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 ring = "0.17"
 # Platform-specific low-level I/O
 libc = "0.2"
@@ -59,11 +63,14 @@ ssh2 = "0.9"
 suppaftp = { version = "10", features = ["native-tls"] }
 # T-022: WebDAV - URL encoding
 urlencoding = "2"
+futures-util = "0.3"
 # T-026..T-030: Cloud connector dependencies
-reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "native-tls", "cookies", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "native-tls", "cookies", "rustls-tls", "socks"] }
 url = "2"
 hmac = "0.12"
 hex = "0.4"
+bytes = "1"
+mdns-sd = "0.13"
 percent-encoding = "2"
 async-trait = "0.1"
 # T-034..T-038: Unicode normalization and compatibility engine
@@ -73,7 +80,7 @@ notify = { version = "8", features = ["macos_fsevent"] }
 cron = "0.12"
 glob = "0.3"
 regex = "1"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "2", default-features = false, features = ["deflate", "aes-crypto"] }
 # T-047: Encryption (in-transit and at-rest)
 aes-gcm = "0.10"
 argon2 = "0.5"
@@ -91,8 +98,9 @@ tauri-plugin-notification = "2"
 tracing-appender = "0.2"
 portable-pty = "0.9.0"
 quick-xml = "0.38"
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "multipart"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tokio-util = { version = "0.7", features = ["io"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rcgen = { version = "0.13", features = ["x509-parser"] }
 p12-keystore = "0.2.1"

@@ -18,6 +18,8 @@
 import { useState, useCallback, useEffect } from "react";
 import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
+import { MountCacheFields, MountOfflineActions } from "@/components/mount-options";
+import { DEFAULT_MOUNT_OPTIONS, describePolicy, isCloudMount, useMountPolicy, type MountOptions } from "@/lib/mount-options";
 import { pickFolder } from "@/lib/folder-picker";
 import {
   HardDrive,
@@ -45,6 +47,38 @@ interface MountInfo {
   auto_mount: boolean;
   created_at: string;
   error_message: string | null;
+  /** Cache and read-only options in force. */
+  options?: MountOptions;
+  /** What the organization's mount profile changed. */
+  policy_notes?: string[];
+}
+
+/** Mirrors `mount_engine::MountCapability`. */
+type MountCapability =
+  | { native_mount: { command: string } }
+  | { requires_install: { tool: string; install_hint: string } }
+  | { not_supported: { reason: string } };
+
+function CapabilityBadge({ capability }: { capability: MountCapability }) {
+  if ("native_mount" in capability) {
+    return (
+      <p className="text-xs text-green-600" data-testid="mount-capability">
+        Can be mounted (uses {capability.native_mount.command})
+      </p>
+    );
+  }
+  if ("requires_install" in capability) {
+    return (
+      <p className="text-xs text-amber-600" data-testid="mount-capability">
+        Needs {capability.requires_install.tool}: <code>{capability.requires_install.install_hint}</code>
+      </p>
+    );
+  }
+  return (
+    <p className="text-xs text-gray-500" data-testid="mount-capability">
+      Can't be mounted: {capability.not_supported.reason}
+    </p>
+  );
 }
 
 interface MountResult {
@@ -107,6 +141,25 @@ function MountNewDriveForm({
   const [mounting, setMounting] = useState(false);
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
+  const [capability, setCapability] = useState<MountCapability | null>(null);
+  const [options, setOptions] = useState<MountOptions>(DEFAULT_MOUNT_OPTIONS);
+  const policy = useMountPolicy();
+  const selected = connections.find((c) => c.id === selectedConnectionId);
+  const cloud = !!selected && isCloudMount(selected.protocol);
+
+  // What mounting this connection needs (rclone, FUSE, sshfs…), shown as a badge.
+  useEffect(() => {
+    setCapability(null);
+    const conn = connections.find((c) => c.id === selectedConnectionId);
+    if (!conn) return;
+    let live = true;
+    tauriInvoke<MountCapability>("check_mount_capability", { protocol: conn.protocol })
+      .then((c) => live && setCapability(c))
+      .catch(() => live && setCapability(null));
+    return () => {
+      live = false;
+    };
+  }, [selectedConnectionId, connections]);
 
   // Auto-generate mount point based on selected connection
   useEffect(() => {
@@ -138,6 +191,7 @@ function MountNewDriveForm({
       const result = await tauriInvoke<MountResult>("mount_remote", {
         connectionId: selectedConnectionId,
         mountPoint: mountPoint.trim(),
+        options: cloud ? options : null,
       });
 
       if (result.status === "mounted") {
@@ -148,6 +202,7 @@ function MountNewDriveForm({
             connectionId: selectedConnectionId,
             mountPoint: mountPoint.trim(),
             autoMount: true,
+            options: cloud ? options : null,
           });
         }
         onMounted();
@@ -187,6 +242,8 @@ function MountNewDriveForm({
         </select>
       </div>
 
+      {capability && <CapabilityBadge capability={capability} />}
+
       <div>
         <label className="block text-xs font-medium mb-1">Mount Point</label>
         <div className="flex gap-2">
@@ -214,6 +271,13 @@ function MountNewDriveForm({
         </p>
       </div>
 
+      {cloud && <MountCacheFields value={options} onChange={setOptions} policy={policy} />}
+      {policy && describePolicy(policy) && (
+        <p className="text-xs text-gray-500" data-testid="mount-policy">
+          Your organization's mount profile: {describePolicy(policy)}
+        </p>
+      )}
+
       <label className="flex items-center gap-2 text-sm cursor-pointer">
         <input
           type="checkbox"
@@ -234,7 +298,7 @@ function MountNewDriveForm({
       <div className="flex justify-end">
         <button
           type="submit"
-          disabled={mounting || !selectedConnectionId}
+          disabled={mounting || !selectedConnectionId || (capability !== null && !("native_mount" in capability))}
           className="inline-flex items-center gap-1.5 text-sm px-4 py-1.5 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <Plug size={14} />
@@ -278,6 +342,10 @@ function ActiveMountItem({
             {mount.error_message}
           </p>
         )}
+        {!!mount.policy_notes?.length && <p className="text-xs text-gray-400 pl-5">Profile: {mount.policy_notes.join(", ")}</p>}
+        {isCloudMount(mount.protocol) && mount.options && (
+          <MountOfflineActions mountId={mount.id} mounted={mount.status === "mounted"} options={mount.options} />
+        )}
       </div>
       {mount.status === "mounted" && (
         <button
@@ -311,6 +379,7 @@ function SavedConfigItem({
       <div className="flex-1 min-w-0">
         <span className="text-sm truncate">{connectionName}</span>
         <p className="text-xs text-gray-400 truncate">{config.mount_point}</p>
+        {isCloudMount(config.protocol) && config.options && <MountOfflineActions mountId={config.id} mounted={false} options={config.options} />}
       </div>
       <div className="flex items-center gap-2 flex-shrink-0">
         <span

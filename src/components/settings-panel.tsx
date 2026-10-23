@@ -14,7 +14,16 @@ import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useAiStore } from "@/stores/ai-store";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
 import { SecurityAuditSection } from "@/components/security-audit-section";
+import { TrustedSshHostsSection } from "@/components/trusted-ssh-hosts-section";
+import { FilenamePoliciesSection } from "@/components/filename-policies-section";
+import { SearchIndexFolders } from "@/components/search-index-folders";
+import { GpgKeysSection } from "@/components/gpg-keys-section";
+import { SharingPolicySection } from "@/components/sharing-policy-section";
+import { ProxySection } from "@/components/proxy-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
+import { DiagnosticsSection } from "@/components/diagnostics-section";
+import { ManagedSettingsNotice } from "@/components/managed-settings-notice";
+import { FleetAgentLimits } from "@/components/fleet-agent-limits";
 
 // ── Types ──
 
@@ -1320,16 +1329,51 @@ export default function SettingsPanel({
         {/* Log Controls */}
         <Section title="Logging">
           <LogControlsSection />
+          <DiagnosticsSection />
         </Section>
 
         {/* Management console agent */}
         <Section title="Managed by Console">
           <FleetAgentSection />
+          <ManagedSettingsNotice />
+          <FleetAgentLimits />
         </Section>
 
         {/* Tamper-evident security audit log */}
         <Section title="Security Audit Log">
           <SecurityAuditSection />
+        </Section>
+
+        {/* Folders indexed for subfolder and content search */}
+        <Section title="Search Index">
+          <div className="pt-3">
+            <SearchIndexFolders />
+          </div>
+        </Section>
+
+        {/* Which names may be written where (enforced by the engines) */}
+        <Section title="Filename Policies">
+          <FilenamePoliciesSection />
+        </Section>
+
+        {/* Proxy for every outbound connection */}
+        <Section title="Network Proxy">
+          <ProxySection />
+        </Section>
+
+        {/* Which share links may be created from cloud connections */}
+        <Section title="Sharing">
+          <SharingPolicySection />
+        </Section>
+
+        {/* GnuPG keyring for file encryption and signatures */}
+        <Section title="OpenPGP Keys">
+          <GpgKeysSection />
+        </Section>
+
+        {/* Persisted host keys (trust on first use) */}
+        <Section title="Trusted SSH Hosts">
+          <TrustedSshHostsSection />
         </Section>
 
         {/* Trusted SSH Host CAs */}

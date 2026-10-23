@@ -12,10 +12,13 @@
  * - Delete connection groups
  */
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { ShareLinkDialog } from "@/components/share-link-dialog";
+import { SHAREABLE_PROTOCOLS } from "@/stores/share-store";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { pickFiles, pickFolder } from "@/lib/folder-picker";
 import { promptText, confirmText } from "@/lib/prompt-dialog";
 import { errorText } from "@/lib/error-text";
+import { PRESET_FIELD_LABELS, fillPreset, type ProviderPreset } from "@/lib/provider-presets";
 
 // ── Types (mirrors Rust types) ──
 
@@ -47,6 +50,34 @@ interface ConnectionProfile {
   // Upload-time permission defaults
   default_file_mode: string | null;
   default_dir_mode: string | null;
+  /** Mirrors `ConnectionExtras` (core/types.rs). */
+  extras?: ConnectionExtras;
+}
+
+interface AssumeRoleConfig {
+  role_arn: string;
+  external_id: string | null;
+  session_name: string | null;
+  duration_secs: number | null;
+}
+
+type SwiftAuthKind = "password" | "application_credential" | "temp_auth";
+
+/** Mirrors `SwiftSettings` (core/types.rs). */
+interface SwiftSettings {
+  auth_kind: SwiftAuthKind;
+  auth_url: string | null;
+  project_name: string | null;
+  domain_name: string | null;
+  region: string | null;
+  application_credential_id: string | null;
+}
+
+interface ConnectionExtras {
+  assume_role: AssumeRoleConfig | null;
+  rclone_remote: string | null;
+  preset: string | null;
+  swift: SwiftSettings | null;
 }
 
 interface ConnectionGroup {
@@ -92,6 +123,14 @@ interface AwsProfile {
 
 type ThirdPartySource = "filezilla" | "cyberduck" | "winscp" | "transmit";
 
+/** Azure storage services: account + key/SAS/connection string + optional endpoint. */
+const AZURE_PROTOCOLS = new Set(["azure_blob", "adls_gen2", "azure_files"]);
+const AZURE_ENDPOINT_HINT: Record<string, string> = {
+  azure_blob: "myaccount.blob.core.usgovcloudapi.net or http://127.0.0.1:10000/devstoreaccount1",
+  adls_gen2: "myaccount.dfs.core.chinacloudapi.cn",
+  azure_files: "myaccount.file.core.usgovcloudapi.net",
+};
+
 const FALLBACK_PROTOCOLS: ProtocolOption[] = [
   { value: "sftp", label: "SFTP", port: 22 },
   { value: "ftp", label: "FTP", port: 21 },
@@ -101,10 +140,13 @@ const FALLBACK_PROTOCOLS: ProtocolOption[] = [
   { value: "nfs", label: "NFS", port: 2049 },
   { value: "s3", label: "S3", port: 443 },
   { value: "azure_blob", label: "Azure Blob Storage", port: 443 },
+  { value: "adls_gen2", label: "Azure Data Lake Storage Gen2", port: 443 },
+  { value: "azure_files", label: "Azure Files", port: 443 },
   { value: "swift", label: "OpenStack Swift", port: 5000 },
   { value: "google_drive", label: "Google Drive", port: 443 },
   { value: "dropbox", label: "Dropbox", port: 443 },
   { value: "onedrive", label: "OneDrive", port: 443 },
+  { value: "rclone", label: "rclone (GCS, Box, Mega, 70+ more)", port: 0 },
 ];
 
 // Default port mapping for dynamically fetched protocols
@@ -117,6 +159,8 @@ const DEFAULT_PORTS: Record<string, number> = {
   nfs: 2049,
   s3: 443,
   azure_blob: 443,
+  adls_gen2: 443,
+  azure_files: 443,
   swift: 5000,
   google_drive: 443,
   dropbox: 443,
@@ -125,19 +169,6 @@ const DEFAULT_PORTS: Record<string, number> = {
   http: 80,
 };
 
-// S3-compatible provider presets
-const S3_PRESETS = [
-  { id: "aws", label: "Amazon S3", endpoint: "", region: "us-east-1", helpText: "" },
-  { id: "wasabi", label: "Wasabi", endpoint: "s3.wasabisys.com", region: "us-east-1", helpText: "" },
-  { id: "minio", label: "MinIO", endpoint: "localhost:9000", region: "us-east-1", helpText: "Self-hosted MinIO instance" },
-  {
-    id: "gcs",
-    label: "Google Cloud Storage (S3 Compatible)",
-    endpoint: "storage.googleapis.com",
-    region: "auto",
-    helpText: "Create HMAC keys in GCP Console > Cloud Storage > Settings > Interoperability",
-  },
-] as const;
 
 // ── Helpers ──
 
@@ -482,21 +513,43 @@ function ConnectionForm({
   const [awsProfilesLoaded, setAwsProfilesLoaded] = useState(false);
 
   // S3-compatible preset selector
-  const [selectedS3Preset, setSelectedS3Preset] = useState("");
+  const [selectedPreset, setSelectedPreset] = useState(initialData?.extras?.preset ?? "");
+  const [presets, setPresets] = useState<ProviderPreset[]>([]);
+  const [presetValues, setPresetValues] = useState<Record<string, string>>({});
+  useEffect(() => {
+    tauriInvoke<ProviderPreset[]>("connection_presets", undefined, []).then((p) => setPresets(p ?? []), () => setPresets([]));
+  }, []);
 
-  // Azure Blob Storage fields
-  const [azureAccountName, setAzureAccountName] = useState("");
-  const [azureAuthMethod, setAzureAuthMethod] = useState<
-    "account_key" | "sas_token" | "connection_string" | "azure_ad"
-  >("account_key");
-  const [azureSecret, setAzureSecret] = useState("");
-  const [azureCustomEndpoint, setAzureCustomEndpoint] = useState("");
+  // rclone remotes from the user's rclone config
+  const [rcloneRemotes, setRcloneRemotes] = useState<{ name: string; backend: string }[] | null>(null);
+  const [rcloneError, setRcloneError] = useState<string | null>(null);
+  useEffect(() => {
+    if (protocol !== "rclone" || rcloneRemotes !== null) return;
+    tauriInvoke<{ name: string; backend: string }[]>("rclone_list_remotes")
+      .then((r) => setRcloneRemotes(r ?? []))
+      .catch((e) => {
+        setRcloneRemotes([]);
+        setRcloneError(errorText(e));
+      });
+  }, [protocol, rcloneRemotes]);
+
+  // STS AssumeRole (S3): temporary credentials from the keys above
+  const [roleArn, setRoleArn] = useState(initialData?.extras?.assume_role?.role_arn ?? "");
+  const [externalId, setExternalId] = useState(initialData?.extras?.assume_role?.external_id ?? "");
+  const [roleDuration, setRoleDuration] = useState(String(initialData?.extras?.assume_role?.duration_secs ?? ""));
+
+  // Azure (Blob, Data Lake, Files): the account is the user name, the
+  // endpoint the host and the key / SAS / connection string the password.
+  const [azureAuthMethod, setAzureAuthMethod] = useState<"account_key" | "sas_token" | "connection_string">("account_key");
 
   // OpenStack Swift fields
-  const [swiftAuthUrl, setSwiftAuthUrl] = useState("");
-  const [swiftProjectName, setSwiftProjectName] = useState("");
-  const [swiftDomainName, setSwiftDomainName] = useState("Default");
-  const [swiftRegion, setSwiftRegion] = useState("");
+  const initialSwift = initialData?.extras?.swift;
+  const [swiftAuthKind, setSwiftAuthKind] = useState<SwiftAuthKind>(initialSwift?.auth_kind ?? "password");
+  const [swiftAuthUrl, setSwiftAuthUrl] = useState(initialSwift?.auth_url ?? "");
+  const [swiftProjectName, setSwiftProjectName] = useState(initialSwift?.project_name ?? "");
+  const [swiftDomainName, setSwiftDomainName] = useState(initialSwift?.domain_name ?? "Default");
+  const [swiftRegion, setSwiftRegion] = useState(initialSwift?.region ?? "");
+  const [swiftCredentialId, setSwiftCredentialId] = useState(initialSwift?.application_credential_id ?? "");
 
   // Auto-expand Advanced section when editing a connection that has advanced fields set
   useEffect(() => {
@@ -563,20 +616,21 @@ function ConnectionForm({
   );
 
   // Handle S3 preset selection
-  const handleS3PresetSelect = useCallback(
-    (presetId: string) => {
-      setSelectedS3Preset(presetId);
-      const preset = S3_PRESETS.find((p) => p.id === presetId);
-      if (preset && preset.endpoint) {
-        setHost(preset.endpoint);
-      }
+  // Apply a provider preset: host (and port) from its template.
+  const applyPreset = useCallback(
+    (presetId: string, values: Record<string, string>) => {
+      const preset = presets.find((p) => p.id === presetId);
+      if (!preset) return;
+      const vals = { region: preset.default_region ?? "", ...values };
+      setHost(fillPreset(preset.host, vals));
+      if (preset.port) setPort(String(preset.port));
     },
-    []
+    [presets],
   );
-
   const isFtpProtocol = protocol === "ftp" || protocol === "ftps";
   const isSshProtocol = protocol === "sftp";
-  const isAzureBlob = protocol === "azure_blob";
+  const isAzure = AZURE_PROTOCOLS.has(protocol);
+  const isRclone = protocol === "rclone";
   const isSwift = protocol === "swift";
   const isS3 = protocol === "s3";
 
@@ -608,6 +662,24 @@ function ConnectionForm({
       // Upload-time permission defaults (SFTP/FTP only)
       defaultFileMode: isSshProtocol || isFtpProtocol ? defaultFileMode || null : null,
       defaultDirMode: isSshProtocol || isFtpProtocol ? defaultDirMode || null : null,
+      extras: {
+        rclone_remote: protocol === "rclone" ? host.trim() || null : initialData?.extras?.rclone_remote ?? null,
+        preset: selectedPreset || null,
+        assume_role:
+          isS3 && roleArn.trim()
+            ? { role_arn: roleArn.trim(), external_id: externalId.trim() || null, session_name: null, duration_secs: roleDuration ? Number(roleDuration) : null }
+            : null,
+        swift: isSwift
+          ? {
+              auth_kind: swiftAuthKind,
+              auth_url: swiftAuthUrl.trim() || null,
+              project_name: swiftAuthKind === "password" ? swiftProjectName.trim() || null : null,
+              domain_name: swiftAuthKind === "password" ? swiftDomainName.trim() || null : null,
+              region: swiftAuthKind === "temp_auth" ? null : swiftRegion.trim() || null,
+              application_credential_id: swiftAuthKind === "application_credential" ? swiftCredentialId.trim() || null : null,
+            }
+          : null,
+      } satisfies ConnectionExtras,
     });
   };
 
@@ -653,6 +725,8 @@ function ConnectionForm({
           />
         </div>
       </div>
+      {!isAzure && (
+      <>
       <div>
         <div className="flex items-center gap-1 mb-1">
           <label className="block text-xs font-medium">Host</label>
@@ -670,7 +744,7 @@ function ConnectionForm({
             setSshConfigHint(null);
           }}
           onBlur={handleHostBlur}
-          required
+          required={!(isSwift && swiftAuthUrl.trim())}
           placeholder="example.com"
           className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
         />
@@ -696,6 +770,8 @@ function ConnectionForm({
           />
         </div>
       </div>
+      </>
+      )}
       {/* SSH Key Generation (SFTP only) */}
       {isSshProtocol && (
         <SshKeyGenSection
@@ -727,144 +803,245 @@ function ConnectionForm({
           </p>
         </div>
       )}
-      {/* S3-compatible provider presets (S3 only) */}
-      {isS3 && (
+      {/* Provider presets (S3-compatible stores, hosted SFTP) */}
+      {presets.some((p) => p.protocol === protocol) && (() => {
+        const preset = presets.find((p) => p.id === selectedPreset && p.protocol === protocol);
+        return (
+          <div className="space-y-1">
+            <label className="block text-xs font-medium mb-1" htmlFor="provider-preset">Provider</label>
+            <select
+              id="provider-preset"
+              value={preset ? selectedPreset : ""}
+              onChange={(e) => {
+                setSelectedPreset(e.target.value);
+                setPresetValues({});
+                applyPreset(e.target.value, {});
+              }}
+              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+            >
+              <option value="">{isS3 ? "Custom / Amazon S3" : "Custom server"}</option>
+              {presets.filter((p) => p.protocol === protocol).map((p) => (
+                <option key={p.id} value={p.id}>{p.label}</option>
+              ))}
+            </select>
+            {preset?.fields.map((f) => (
+              <div key={f}>
+                <label className="block text-xs font-medium mb-1" htmlFor={`preset-${f}`}>{PRESET_FIELD_LABELS[f] ?? f}</label>
+                <input
+                  id={`preset-${f}`}
+                  value={presetValues[f] ?? (f === "region" ? preset.default_region ?? "" : "")}
+                  onChange={(e) => {
+                    const next = { ...presetValues, [f]: e.target.value };
+                    setPresetValues(next);
+                    applyPreset(preset.id, next);
+                  }}
+                  className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+                />
+              </div>
+            ))}
+            {preset?.username && (
+              <p className="text-[10px] text-blue-500 dark:text-blue-400" data-testid="preset-username">
+                Username format: {fillPreset(preset.username, { ...presetValues, user: "your-username" })}
+              </p>
+            )}
+            {preset?.help && <p className="text-[10px] text-blue-500 dark:text-blue-400">{preset.help}</p>}
+          </div>
+        );
+      })()}
+      {/* rclone remote picker */}
+      {isRclone && (
         <div>
-          <label className="block text-xs font-medium mb-1">S3 Provider Preset</label>
+          <label className="block text-xs font-medium mb-1" htmlFor="rclone-remote">rclone remote</label>
           <select
-            value={selectedS3Preset}
-            onChange={(e) => handleS3PresetSelect(e.target.value)}
+            id="rclone-remote"
+            value={rcloneRemotes?.some((r) => r.name === host) ? host : ""}
+            onChange={(e) => {
+              setHost(e.target.value);
+              if (!name) setName(e.target.value.replace(/:$/, ""));
+            }}
             className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
           >
-            <option value="">Custom / Amazon S3</option>
-            {S3_PRESETS.filter((p) => p.id !== "aws").map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.label}
-              </option>
+            <option value="">{rcloneRemotes === null ? "Loading…" : rcloneRemotes.length ? "Choose a remote…" : "No remotes configured"}</option>
+            {rcloneRemotes?.map((r) => (
+              <option key={r.name} value={r.name}>{r.name} ({r.backend})</option>
             ))}
           </select>
-          {selectedS3Preset && (() => {
-            const preset = S3_PRESETS.find((p) => p.id === selectedS3Preset);
-            return preset?.helpText ? (
-              <p className="text-[10px] text-blue-500 dark:text-blue-400 mt-0.5">
-                {preset.helpText}
-              </p>
-            ) : null;
-          })()}
+          <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">
+            {rcloneError ?? "Remotes come from `rclone config`. You can also type one in Host, e.g. gcs:my-bucket or :s3,provider=AWS:."}
+          </p>
         </div>
       )}
-      {/* Azure Blob Storage fields */}
-      {isAzureBlob && (
-        <div className="space-y-2">
+      {/* STS AssumeRole (S3 only) */}
+      {isS3 && (
+        <details className="rounded border border-gray-200 dark:border-gray-700 p-2" open={!!roleArn}>
+          <summary className="text-xs font-medium cursor-pointer">Assume an IAM role</summary>
+          <div className="space-y-2 mt-2">
+            <div>
+              <label className="block text-xs font-medium mb-1" htmlFor="role-arn">Role ARN</label>
+              <input id="role-arn" value={roleArn} onChange={(e) => setRoleArn(e.target.value)} placeholder="arn:aws:iam::123456789012:role/Reader" className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 font-mono" />
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-xs font-medium mb-1" htmlFor="role-external-id">External ID</label>
+                <input id="role-external-id" value={externalId} onChange={(e) => setExternalId(e.target.value)} placeholder="optional" className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1" htmlFor="role-duration">Session length (s)</label>
+                <input id="role-duration" type="number" min={900} max={43200} value={roleDuration} onChange={(e) => setRoleDuration(e.target.value)} placeholder="3600" className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900" />
+              </div>
+            </div>
+            <p className="text-[10px] text-gray-400 dark:text-gray-500">
+              The access key and secret above sign the AssumeRole call; the app uses the temporary credentials and renews them before they expire.
+            </p>
+          </div>
+        </details>
+      )}
+      {/* Azure Blob / Data Lake / Files fields */}
+      {isAzure && (
+        <div className="space-y-2" data-testid="azure-fields">
           <div>
-            <label className="block text-xs font-medium mb-1">Account Name</label>
+            <label className="block text-xs font-medium mb-1" htmlFor="azure-account">Storage account</label>
             <input
+              id="azure-account"
               type="text"
-              value={azureAccountName}
-              onChange={(e) => setAzureAccountName(e.target.value)}
-              placeholder="mystorageaccount"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder={azureAuthMethod === "connection_string" ? "(from the connection string)" : "mystorageaccount"}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
             />
           </div>
           <div>
-            <label className="block text-xs font-medium mb-1">Auth Method</label>
+            <label className="block text-xs font-medium mb-1" htmlFor="azure-auth">Sign in with</label>
             <select
+              id="azure-auth"
               value={azureAuthMethod}
               onChange={(e) => setAzureAuthMethod(e.target.value as typeof azureAuthMethod)}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
             >
-              <option value="account_key">Account Key</option>
-              <option value="sas_token">SAS Token</option>
-              <option value="connection_string">Connection String</option>
-              <option value="azure_ad">Azure AD</option>
+              <option value="account_key">Account key</option>
+              <option value="sas_token">SAS token</option>
+              <option value="connection_string">Connection string</option>
             </select>
           </div>
-          {azureAuthMethod !== "azure_ad" && (
-            <div>
-              <label className="block text-xs font-medium mb-1">
-                {azureAuthMethod === "account_key"
-                  ? "Account Key"
-                  : azureAuthMethod === "sas_token"
-                    ? "SAS Token"
-                    : "Connection String"}
-              </label>
-              <input
-                type="password"
-                value={azureSecret}
-                onChange={(e) => setAzureSecret(e.target.value)}
-                placeholder={
-                  azureAuthMethod === "connection_string"
-                    ? "DefaultEndpointsProtocol=https;AccountName=..."
-                    : ""
-                }
-                className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-              />
-            </div>
-          )}
           <div>
-            <label className="block text-xs font-medium mb-1">
-              Custom Endpoint URL
+            <label className="block text-xs font-medium mb-1" htmlFor="azure-secret">
+              {azureAuthMethod === "account_key" ? "Account key" : azureAuthMethod === "sas_token" ? "SAS token" : "Connection string"}
+            </label>
+            <input
+              id="azure-secret"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder={initialData ? "(unchanged)" : azureAuthMethod === "connection_string" ? "DefaultEndpointsProtocol=https;AccountName=…" : azureAuthMethod === "sas_token" ? "sv=…&sig=…" : ""}
+              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1" htmlFor="azure-endpoint">
+              Endpoint
               <span className="text-gray-400 dark:text-gray-500 font-normal"> (optional)</span>
             </label>
             <input
+              id="azure-endpoint"
               type="text"
-              value={azureCustomEndpoint}
-              onChange={(e) => setAzureCustomEndpoint(e.target.value)}
-              placeholder="For Azure Gov, China, or Azurite"
+              value={host}
+              onChange={(e) => setHost(e.target.value)}
+              placeholder={AZURE_ENDPOINT_HINT[protocol]}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
             />
             <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">
-              Leave blank for standard Azure public cloud
+              Leave blank for the public Azure cloud. For Azure Government, Azure China or the Azurite emulator, enter the host or URL.
             </p>
           </div>
         </div>
       )}
       {/* OpenStack Swift fields */}
       {isSwift && (
-        <div className="space-y-2">
+        <div className="space-y-2" data-testid="swift-fields">
           <div>
-            <label className="block text-xs font-medium mb-1">Auth URL</label>
+            <label className="block text-xs font-medium mb-1" htmlFor="swift-auth-kind">Sign in with</label>
+            <select
+              id="swift-auth-kind"
+              value={swiftAuthKind}
+              onChange={(e) => setSwiftAuthKind(e.target.value as SwiftAuthKind)}
+              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+            >
+              <option value="password">Keystone user name and password</option>
+              <option value="application_credential">Keystone application credential</option>
+              <option value="temp_auth">TempAuth (v1)</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1" htmlFor="swift-auth-url">Auth URL</label>
             <input
+              id="swift-auth-url"
               type="text"
               value={swiftAuthUrl}
               onChange={(e) => setSwiftAuthUrl(e.target.value)}
-              placeholder="https://keystone.example.com:5000/v3"
+              placeholder={swiftAuthKind === "temp_auth" ? "https://swift.example.com/auth/v1.0" : "https://keystone.example.com:5000/v3"}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
             />
+            <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">
+              Leave blank to use the host and port above{swiftAuthKind === "temp_auth" ? " with /auth/v1.0" : " with /v3"}.
+            </p>
           </div>
-          <div>
-            <label className="block text-xs font-medium mb-1">Project Name</label>
-            <input
-              type="text"
-              value={swiftProjectName}
-              onChange={(e) => setSwiftProjectName(e.target.value)}
-              placeholder="my-project"
-              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium mb-1">Domain Name</label>
-            <input
-              type="text"
-              value={swiftDomainName}
-              onChange={(e) => setSwiftDomainName(e.target.value)}
-              placeholder="Default"
-              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium mb-1">
-              Region
-              <span className="text-gray-400 dark:text-gray-500 font-normal"> (optional)</span>
-            </label>
-            <input
-              type="text"
-              value={swiftRegion}
-              onChange={(e) => setSwiftRegion(e.target.value)}
-              placeholder="RegionOne"
-              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-            />
-          </div>
+          {swiftAuthKind === "application_credential" && (
+            <div>
+              <label className="block text-xs font-medium mb-1" htmlFor="swift-credential-id">Application credential ID</label>
+              <input
+                id="swift-credential-id"
+                type="text"
+                value={swiftCredentialId}
+                onChange={(e) => setSwiftCredentialId(e.target.value)}
+                className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+              />
+              <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">Enter the credential secret as the password; the credential's own project applies.</p>
+            </div>
+          )}
+          {swiftAuthKind === "password" && (
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-xs font-medium mb-1" htmlFor="swift-project">Project name</label>
+                <input
+                  id="swift-project"
+                  type="text"
+                  value={swiftProjectName}
+                  onChange={(e) => setSwiftProjectName(e.target.value)}
+                  placeholder="my-project"
+                  className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1" htmlFor="swift-domain">Domain</label>
+                <input
+                  id="swift-domain"
+                  type="text"
+                  value={swiftDomainName}
+                  onChange={(e) => setSwiftDomainName(e.target.value)}
+                  placeholder="Default"
+                  className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+                />
+              </div>
+            </div>
+          )}
+          {swiftAuthKind === "temp_auth" ? (
+            <p className="text-[10px] text-gray-400 dark:text-gray-500">Enter the user as account:user and the key as the password.</p>
+          ) : (
+            <div>
+              <label className="block text-xs font-medium mb-1" htmlFor="swift-region">
+                Region
+                <span className="text-gray-400 dark:text-gray-500 font-normal"> (optional)</span>
+              </label>
+              <input
+                id="swift-region"
+                type="text"
+                value={swiftRegion}
+                onChange={(e) => setSwiftRegion(e.target.value)}
+                placeholder="RegionOne"
+                className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+              />
+            </div>
+          )}
         </div>
       )}
       <div>
@@ -1483,6 +1660,8 @@ export function ConnectionPanel() {
     return conn?.name || connectedId;
   }, [connectedId, connections]);
 
+  const [sharingEntry, setSharing] = useState<RemoteFileEntry | null>(null);
+
   const joinRemote = (dir: string, name: string) => (dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`);
 
   const reloadRemote = useCallback(async () => {
@@ -2056,6 +2235,17 @@ export function ConnectionPanel() {
                   </div>
                 </button>
                 <div className="flex items-center gap-1 pr-2 flex-shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+                  {!entry.is_dir && connectedProtocol && SHAREABLE_PROTOCOLS.has(connectedProtocol) && (
+                    <button
+                      onClick={() => setSharing(entry)}
+                      className="text-xs px-1.5 py-0.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+                      type="button"
+                      aria-label={`Share ${entry.name}`}
+                      data-testid={`remote-share-${entry.name}`}
+                    >
+                      Share
+                    </button>
+                  )}
                   {!entry.is_dir && (
                     <button
                       onClick={() => handleDownload(entry)}
@@ -2081,6 +2271,9 @@ export function ConnectionPanel() {
               ))}
           </div>
         </div>
+      )}
+      {sharingEntry && connectedProtocol && (
+        <ShareLinkDialog protocol={connectedProtocol} connectionId={connectedId} path={sharingEntry.path} name={sharingEntry.name} onClose={() => setSharing(null)} />
       )}
     </div>
   );

@@ -241,7 +241,7 @@ impl SmbConnector {
 
     /// Get the mount point path for a given host and share.
     fn mount_point_path(host: &str, share: &str) -> PathBuf {
-        let base = std::env::temp_dir().join("ufop_smb_mounts");
+        let base = ufop_core::session::user_temp_subdir("smb-mounts");
         let sanitized_host = host.replace(['/', '\\', ':', ' '], "_");
         let sanitized_share = share.replace(['/', '\\', ':', ' '], "_");
         base.join(format!("{sanitized_host}_{sanitized_share}"))
@@ -1148,7 +1148,8 @@ mod tests {
     fn test_mount_point_path() {
         let mp = SmbConnector::mount_point_path("192.168.1.100", "SharedDocs");
         let mp_str = mp.to_string_lossy();
-        assert!(mp_str.contains("ufop_smb_mounts"));
+        // In this user's private temp folder, not a shared /tmp name.
+        assert!(mp.starts_with(ufop_core::session::user_temp_dir().unwrap().join("smb-mounts")), "{mp_str}");
         assert!(mp_str.contains("192.168.1.100_SharedDocs"));
     }
 

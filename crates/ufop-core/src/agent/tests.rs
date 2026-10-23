@@ -14,6 +14,11 @@ struct HostState {
     jobs: BTreeMap<String, Value>,
     rpc_calls: Vec<(String, Value)>,
     runs: Vec<String>,
+    /// Size of the diagnostics bundle the host builds (`None`: unsupported).
+    diag_size: Option<usize>,
+    /// Managed settings applied by the agent, in order (`None` = released).
+    settings: Vec<Option<ManagedSettings>>,
+    fail_settings: bool,
 }
 
 #[derive(Clone, Default)]
@@ -101,6 +106,23 @@ impl AgentHost for FakeHost {
     fn managed_policies(&self) -> BoxFuture<'_, Vec<String>> {
         Box::pin(async move { self.st().jobs.keys().filter_map(|k| policy_of_job(k).map(String::from)).collect() })
     }
+    fn apply_managed_settings(&self, settings: Option<ManagedSettings>) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async move {
+            if self.st().fail_settings {
+                return Err(AppError::validation("proxy unreachable"));
+            }
+            self.st().settings.push(settings);
+            Ok(())
+        })
+    }
+    fn diagnostics(&self) -> BoxFuture<'_, Result<DiagnosticsUpload, AppError>> {
+        Box::pin(async move {
+            match self.st().diag_size {
+                Some(n) => Ok(DiagnosticsUpload { file_name: "diag.zip".into(), summary: json!({ "os": "linux" }), bytes: vec![b'P'; n] }),
+                None => Err(AppError::state("Diagnostics are not available on this client", "")),
+            }
+        })
+    }
 }
 
 /// A small stateful console: one org, tokens, a command queue, policies.
@@ -116,6 +138,10 @@ struct Console {
     applied: Value,
     claim_polls: u32,
     rotations: u32,
+    diagnostics: Vec<Value>,
+    managed_settings: Value,
+    secret: Option<String>,
+    cred_version: u64,
 }
 
 fn console() -> (MockConsole, Arc<Mutex<Console>>) {
@@ -131,6 +157,12 @@ fn console() -> (MockConsole, Arc<Mutex<Console>>) {
                     return (401, json!({ "error": "The registration token is not valid" }));
                 }
                 (201, json!({ "machineId": "mch_1", "agentToken": c.token, "organization": "Acme", "heartbeatSeconds": 20 }))
+            }
+            "/api/agent/connect/token" => {
+                if r.body["code"] != "ufop_connect_ok" || r.body["codeVerifier"] != "verifier" || r.body["redirectUri"] != "http://127.0.0.1:5/callback" {
+                    return (401, json!({ "error": "The sign-in code is not valid or has expired; sign in again" }));
+                }
+                (201, json!({ "machineId": "mch_3", "agentToken": c.token, "organization": "Acme", "heartbeatSeconds": 45 }))
             }
             "/api/agent/claim" => (201, json!({ "claimId": "clm_1", "code": "ABCD-EFGH", "secret": "ufop_claim_s", "expiresAt": "2099-01-01T00:00:00Z" })),
             "/api/agent/claim/poll" => {
@@ -149,7 +181,7 @@ fn console() -> (MockConsole, Arc<Mutex<Console>>) {
             }
             "/api/agent/policies" => (
                 200,
-                json!({ "policySetVersion": c.version, "policies": c.policies, "credentials": [{ "credentialId": "central:crd_1", "name": "pw", "secret": "s3cret", "updatedAt": "" }] }),
+                json!({ "policySetVersion": c.version, "policies": c.policies, "credentials": [{ "credentialId": "central:crd_1", "name": "pw", "secret": c.secret.clone().unwrap_or_else(|| "s3cret".into()), "updatedAt": "", "version": c.cred_version }], "managedSettings": c.managed_settings }),
             ),
             "/api/agent/policies/applied" => {
                 c.applied = r.body.clone();
@@ -158,6 +190,10 @@ fn console() -> (MockConsole, Arc<Mutex<Console>>) {
             "/api/agent/report" => {
                 c.reports.push(r.body.clone());
                 (201, json!({ "id": "rpt_1" }))
+            }
+            "/api/agent/diagnostics" => {
+                c.diagnostics.push(r.body.clone());
+                (201, json!({ "id": format!("dgn_{}", c.diagnostics.len()) }))
             }
             "/api/agent/rotate" => {
                 c.rotations += 1;
@@ -287,6 +323,145 @@ async fn rotate_command_completes_with_new_token() {
     assert_eq!(host.st().token.as_deref(), Some("ufop_agent_rotated1"));
     a.cycle().await.unwrap();
     assert_eq!(m.hits("/api/agent/heartbeat").last().unwrap().bearer(), Some("ufop_agent_rotated1"));
+}
+
+#[tokio::test]
+async fn browser_sign_in_builds_the_url_and_redeems_the_code() {
+    let (m, _c) = console();
+    let host = FakeHost::default();
+    let a = agent(&host).await;
+    let url = reqwest::Url::parse(&a.connect_url(&m.url, "http://127.0.0.1:5/callback", "st", "ch").unwrap()).unwrap();
+    assert_eq!(url.path(), "/fleet/connect");
+    let q: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(q["redirect_uri"], "http://127.0.0.1:5/callback");
+    assert_eq!(q["state"], "st");
+    assert_eq!(q["code_challenge_method"], "S256");
+    assert_eq!(q["hostname"], "box1");
+
+    let err = a.register_with_code(&m.url, "ufop_connect_bad", "verifier", "http://127.0.0.1:5/callback", vec![]).await.unwrap_err();
+    assert!(err.user_message().contains("sign in again"), "{}", err.user_message());
+    let st = a.register_with_code(&m.url, "ufop_connect_ok", "verifier", "http://127.0.0.1:5/callback", vec!["dev".into()]).await.unwrap();
+    assert!(st.registered);
+    assert_eq!(st.machine_id, "mch_3");
+    assert_eq!(st.registered_via, "sso");
+    assert_eq!(host.st().token.as_deref(), Some("ufop_agent_first"));
+    // Already registered: no second sign-in.
+    assert!(a.connect_url(&m.url, "http://127.0.0.1:5/callback", "st", "ch").is_err());
+}
+
+#[tokio::test]
+async fn managed_settings_apply_on_change_report_errors_and_release() {
+    let (m, c) = console();
+    let host = FakeHost::default();
+    let a = agent(&host).await;
+    a.register(&m.url, "ufop_reg_good", vec![]).await.unwrap();
+    let set = |v: Value, version: &str| {
+        let mut g = c.lock().unwrap();
+        g.managed_settings = v;
+        g.version = version.into();
+    };
+    set(json!({ "version": 2, "updates": { "channel": "beta" }, "ai": { "enabled": false } }), "s2");
+    a.cycle().await.unwrap();
+    let applied = host.st().settings.clone();
+    assert_eq!(applied.len(), 1);
+    let s = applied[0].clone().unwrap();
+    assert_eq!(s.updates.unwrap().channel.as_deref(), Some("beta"));
+    assert_eq!(c.lock().unwrap().applied["applied"][MANAGED_SETTINGS_KEY], 2);
+    assert!(a.status().managed_policies.is_empty(), "settings are not listed as a policy");
+
+    // Same version again: not re-applied.
+    set(json!({ "version": 2, "updates": { "channel": "beta" } }), "s2b");
+    a.cycle().await.unwrap();
+    assert_eq!(host.st().settings.len(), 1);
+
+    // Invalid or failing settings are reported, the old version stays.
+    set(json!({ "version": 3, "proxy": { "mode": "manual" } }), "s3");
+    a.cycle().await.unwrap();
+    assert!(c.lock().unwrap().applied["errors"][MANAGED_SETTINGS_KEY].as_str().unwrap().contains("URL"));
+    assert_eq!(a.config().managed_settings_version, 2);
+    host.st().fail_settings = true;
+    set(json!({ "version": 4, "proxy": { "mode": "none" } }), "s4");
+    a.cycle().await.unwrap();
+    assert!(c.lock().unwrap().applied["errors"][MANAGED_SETTINGS_KEY].as_str().unwrap().contains("unreachable"));
+    host.st().fail_settings = false;
+    a.cycle().await.unwrap();
+    assert_eq!(a.config().managed_settings_version, 2, "no policy-set change, no retry until the next change");
+
+    // The console stops managing: settings are released.
+    set(Value::Null, "s5");
+    a.cycle().await.unwrap();
+    assert_eq!(host.st().settings.last().unwrap(), &None);
+    assert_eq!(a.config().managed_settings_version, 0);
+
+    set(json!({ "version": 6, "ai": { "allowCloud": false } }), "s6");
+    a.cycle().await.unwrap();
+    // A restarted agent applies the current settings again once.
+    let before = host.st().settings.len();
+    let restarted = agent(&host).await;
+    restarted.cycle().await.unwrap();
+    assert_eq!(host.st().settings.len(), before + 1);
+    restarted.cycle().await.unwrap();
+    assert_eq!(host.st().settings.len(), before + 1);
+    a.unregister(false).await.unwrap();
+    assert_eq!(host.st().settings.last().unwrap(), &None, "unregistering releases them");
+}
+
+#[tokio::test]
+async fn rotated_credentials_are_stored_and_their_version_reported() {
+    let (m, c) = console();
+    let host = FakeHost::default();
+    let a = agent(&host).await;
+    a.register(&m.url, "ufop_reg_good", vec![]).await.unwrap();
+    {
+        let mut g = c.lock().unwrap();
+        g.version = "cred:crd_1:1".into();
+        g.cred_version = 1;
+    }
+    a.cycle().await.unwrap();
+    assert_eq!(host.st().creds["central:crd_1"], "s3cret");
+    assert_eq!(c.lock().unwrap().applied["applied"]["credential:crd_1"], 1);
+    {
+        let mut g = c.lock().unwrap();
+        g.version = "cred:crd_1:2".into();
+        g.cred_version = 2;
+        g.secret = Some("rotated".into());
+    }
+    a.cycle().await.unwrap();
+    assert_eq!(host.st().creds["central:crd_1"], "rotated");
+    assert_eq!(c.lock().unwrap().applied["applied"]["credential:crd_1"], 2);
+    assert!(a.status().managed_policies.is_empty(), "credential versions are not listed as policies");
+}
+
+#[tokio::test]
+async fn diagnostics_upload_on_demand_and_by_command() {
+    let (m, c) = console();
+    let host = FakeHost::default();
+    let a = agent(&host).await;
+    assert!(a.send_diagnostics().await.unwrap_err().user_message().contains("not registered"));
+    a.register(&m.url, "ufop_reg_good", vec![]).await.unwrap();
+
+    // Hosts without a builder fail the command instead of crashing the cycle.
+    c.lock().unwrap().commands = vec![json!({ "id": "cmd_d0", "kind": "collect_diagnostics", "payload": {} })];
+    a.cycle().await.unwrap();
+    assert_eq!(c.lock().unwrap().completed[0]["body"]["ok"], false);
+
+    host.st().diag_size = Some(4);
+    assert_eq!(a.send_diagnostics().await.unwrap(), "dgn_1");
+    let sent = c.lock().unwrap().diagnostics[0].clone();
+    assert_eq!(sent["fileName"], "diag.zip");
+    assert_eq!(sent["bundleBase64"], "UFBQUA==");
+    assert_eq!(sent["summary"]["os"], "linux");
+
+    c.lock().unwrap().commands = vec![json!({ "id": "cmd_d1", "kind": "collect_diagnostics", "payload": {} })];
+    a.cycle().await.unwrap();
+    let done = c.lock().unwrap().completed.last().cloned().unwrap();
+    assert_eq!(done["body"]["ok"], true);
+    assert_eq!(done["body"]["result"]["diagnosticsId"], "dgn_2");
+
+    // Oversized bundles are refused locally, never uploaded.
+    host.st().diag_size = Some(MAX_DIAGNOSTICS_BYTES + 1);
+    assert!(a.send_diagnostics().await.is_err());
+    assert_eq!(c.lock().unwrap().diagnostics.len(), 2);
 }
 
 fn report(i: u64) -> RunReport {

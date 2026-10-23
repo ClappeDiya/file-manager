@@ -111,6 +111,9 @@ export interface UIState {
   // Application mode
   appMode: AppMode;
   setAppMode: (mode: AppMode) => void;
+  /** Text editor saves on its own a moment after the last edit. */
+  editorAutosave: boolean;
+  setEditorAutosave: (on: boolean) => void;
 
   // View
   viewMode: ViewMode;
@@ -252,6 +255,8 @@ export const useUIStore = create<UIState>()(
       // Application mode - Simple is default per architecture rules
       appMode: "simple",
       setAppMode: (mode: AppMode) => set({ appMode: mode }),
+      editorAutosave: false,
+      setEditorAutosave: (on: boolean) => set({ editorAutosave: on }),
 
       // View
       viewMode: "list",
@@ -386,6 +391,7 @@ export const useUIStore = create<UIState>()(
         userStyle: state.userStyle,
         activityFeed: state.activityFeed,
         toolbarItems: state.toolbarItems,
+        editorAutosave: state.editorAutosave,
       }),
       onRehydrateStorage: () => {
         return (state) => {

@@ -154,6 +154,8 @@ pub struct CentralCredential {
     pub credential_id: String,
     pub name: String,
     pub secret: String,
+    /// Increases with every rotation (0 from consoles without versions).
+    pub version: u64,
     pub updated_at: String,
 }
 
@@ -169,6 +171,8 @@ pub struct PolicyBundle {
     pub policy_set_version: String,
     pub policies: Vec<FleetPolicy>,
     pub credentials: Vec<CentralCredential>,
+    /// The organization's managed app settings (`None`: nothing managed).
+    pub managed_settings: Option<super::ManagedSettings>,
 }
 
 /// Size figures the console keeps per backup.
@@ -179,6 +183,18 @@ pub struct ReportStats {
     pub backend_size: u64,
     pub source_size: u64,
     pub schedule_interval_minutes: Option<u32>,
+}
+
+/// Largest diagnostics bundle the agent uploads (the console enforces the same).
+pub const MAX_DIAGNOSTICS_BYTES: usize = 8 * 1024 * 1024;
+
+/// A diagnostics bundle (zip) built by the host, as posted to `/api/agent/diagnostics`.
+#[derive(Debug, Clone, Default)]
+pub struct DiagnosticsUpload {
+    pub file_name: String,
+    /// Small JSON summary shown in the console without opening the zip.
+    pub summary: Value,
+    pub bytes: Vec<u8>,
 }
 
 /// One finished operation, as posted to `/api/agent/report`.
@@ -346,6 +362,17 @@ impl AgentClient {
         Ok(r)
     }
 
+    /// Redeem a browser sign-in code (loopback redirect + PKCE) for an agent token.
+    pub async fn connect_token(&self, code: &str, code_verifier: &str, redirect_uri: &str, info: &ClientInfo, tags: &[String]) -> Result<Registration, ConsoleError> {
+        let r: Registration = self
+            .call("/api/agent/connect/token", None, Some(json!({ "code": code, "codeVerifier": code_verifier, "redirectUri": redirect_uri, "info": info, "tags": tags })), false)
+            .await?;
+        if r.machine_id.is_empty() || !r.agent_token.starts_with("ufop_agent_") {
+            return Err(ConsoleError::Invalid("no machine id or agent token".into()));
+        }
+        Ok(r)
+    }
+
     pub async fn start_claim(&self, info: &ClientInfo) -> Result<ClaimStart, ConsoleError> {
         let c: ClaimStart = self.call("/api/agent/claim", None, Some(json!({ "info": info })), false).await?;
         if c.claim_id.is_empty() || c.secret.is_empty() || c.code.is_empty() {
@@ -378,6 +405,14 @@ impl AgentClient {
 
     pub async fn report(&self, token: &str, report: &Value) -> Result<(), ConsoleError> {
         self.call::<Value>("/api/agent/report", Some(token), Some(report.clone()), false).await.map(|_| ())
+    }
+
+    /// Upload a diagnostics bundle; returns the console's id for it.
+    pub async fn diagnostics(&self, token: &str, d: &DiagnosticsUpload) -> Result<String, ConsoleError> {
+        use base64::Engine as _;
+        let body = json!({ "fileName": d.file_name, "summary": d.summary, "bundleBase64": base64::engine::general_purpose::STANDARD.encode(&d.bytes) });
+        let v: Value = self.call("/api/agent/diagnostics", Some(token), Some(body), false).await?;
+        v.get("id").and_then(|i| i.as_str()).map(String::from).ok_or_else(|| ConsoleError::Invalid("no diagnostics id".into()))
     }
 
     pub async fn complete_command(&self, token: &str, id: &str, ok: bool, result: &Value) -> Result<(), ConsoleError> {

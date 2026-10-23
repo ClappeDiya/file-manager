@@ -174,3 +174,74 @@ async fn central_placeholder_needs_a_delivered_credential() {
     mgr.set_destination_secret("central:crd_missing", "pw").await.unwrap();
     assert_eq!(mgr.passphrase(&j.id).await.unwrap().as_deref(), Some("pw"));
 }
+
+#[tokio::test]
+async fn local_limits_confine_policies_and_remote_calls() {
+    let t = tempfile::tempdir().unwrap();
+    let allowed = t.path().join("allowed");
+    let (src, dst) = (allowed.join("src"), allowed.join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    let outside = t.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let repo = Repository::open_in_memory().await.unwrap();
+    let creds = Arc::new(CredentialStore::new());
+    let mgr = BackupManager::with_kdf(repo.pool().clone(), creds.clone(), None, None, t.path().join("dbs"), KdfParams::insecure_fast());
+    let settings = SettingsStore::plain(repo.pool().clone());
+    mgr.set_settings_store(settings.clone());
+    let agent = init(mgr.clone(), settings.clone(), creds.clone(), "desktop").await.unwrap();
+    let (m, c) = console();
+    agent.register(&m.url, "ufop_reg_x", vec![]).await.unwrap();
+    assert_eq!(agent.host().limits().await, AgentLimits::default());
+    agent
+        .host()
+        .set_limits(&AgentLimits { roots: vec![allowed.to_string_lossy().into()], allow_scripts: false, ..Default::default() })
+        .await
+        .unwrap();
+    assert!(agent.host().set_limits(&AgentLimits { roots: vec!["relative".into()], ..Default::default() }).await.is_err());
+
+    let policy = |id: &str, source: &std::path::Path, scripts: Value| {
+        json!({ "id": id, "name": id, "version": 1, "job": {
+            "name": id, "sources": [source.to_string_lossy()], "encrypted": false,
+            "destination": { "type": "local", "path": dst.to_string_lossy() }, "scripts": scripts
+        }})
+    };
+    {
+        let mut c = c.lock().unwrap();
+        c.version = "v1".into();
+        c.policies = vec![policy("fpl_in", &src, json!({})), policy("fpl_out", &outside, json!({})), policy("fpl_sh", &src, json!({ "run_before": "touch /tmp/pwned" }))];
+    }
+    agent.cycle().await.unwrap();
+    let st = agent.status();
+    let by_id = |id: &str| st.managed_policies.iter().find(|p| p.policy_id == id).cloned().unwrap();
+    assert!(by_id("fpl_in").error.is_none());
+    assert!(by_id("fpl_out").error.unwrap().contains("outside the folders"));
+    assert!(by_id("fpl_sh").error.unwrap().contains("scripts"));
+    assert!(mgr.get_job("policy-fpl_out").await.is_err() && mgr.get_job("policy-fpl_sh").await.is_err());
+
+    // Remote calls: a restore outside the roots is refused, inside is accepted.
+    let restore = |target: &std::path::Path| json!({ "command": "backup_start_operation", "args": { "id": "policy-fpl_in", "operation": { "type": "restore", "options": { "version": 0, "target": target.to_string_lossy() } } } });
+    c.lock().unwrap().commands = vec![json!({ "id": "cmd_out", "kind": "rpc", "payload": restore(&outside) })];
+    agent.cycle().await.unwrap();
+    let done = c.lock().unwrap().completed.last().cloned().unwrap();
+    assert_eq!(done["body"]["ok"], false);
+    assert!(done["body"]["result"].to_string().contains("outside the folders"), "{done}");
+
+    // Read-only: the console can no longer change jobs.
+    agent.host().set_limits(&AgentLimits { read_only: true, ..Default::default() }).await.unwrap();
+    c.lock().unwrap().commands = vec![
+        json!({ "id": "cmd_del", "kind": "rpc", "payload": { "command": "backup_delete_job", "args": { "id": "policy-fpl_in", "deleteLocalDb": false, "deleteRemote": false } } }),
+        json!({ "id": "cmd_get", "kind": "rpc", "payload": { "command": "backup_get_job", "args": { "id": "policy-fpl_in" } } }),
+    ];
+    agent.cycle().await.unwrap();
+    let done = c.lock().unwrap().completed.clone();
+    let n = done.len();
+    assert_eq!(done[n - 2]["body"]["ok"], false);
+    assert!(done[n - 2]["body"]["result"].to_string().contains("read-only"));
+    assert_eq!(done[n - 1]["body"]["ok"], true);
+    assert!(mgr.get_job("policy-fpl_in").await.is_ok());
+
+    // Unreadable limits fail closed.
+    settings.set(LIMITS_KEY, "{not json").await.unwrap();
+    let l = agent.host().limits().await;
+    assert!(l.read_only && !l.allow_scripts && l.check_path(&src.to_string_lossy()).is_err());
+}

@@ -24,6 +24,7 @@ import {
   Film,
   Music,
 } from "lucide-react";
+import { useThumbnail } from "@/lib/thumbnails";
 import type { ViewMode } from "@/stores/file-manager-store";
 
 // ──────────────────────────────────────────────
@@ -1170,6 +1171,22 @@ interface FileGridViewProps {
   onActivityDotClick?: (path: string) => void;
 }
 
+/** Grid cell icon: a thumbnail for images, else the folder/file glyph. */
+export function GridIcon({ entry }: { entry: FileEntryData }) {
+  const thumb = useThumbnail(entry.path, entry.name, !entry.is_dir, 96, entry.modified ?? "");
+  return (
+    <div className="flex items-center justify-center h-12 w-12">
+      {thumb ? (
+        <img src={thumb} alt="" className="max-h-12 max-w-12 object-contain rounded-sm" draggable={false} data-testid="grid-thumbnail" />
+      ) : entry.is_dir ? (
+        <Folder className="h-10 w-10 text-[color:var(--color-primary)]" aria-hidden="true" />
+      ) : (
+        <File className="h-10 w-10 text-[color:var(--color-text-secondary)]" aria-hidden="true" />
+      )}
+    </div>
+  );
+}
+
 function FileGridView({
   files,
   className,
@@ -1363,13 +1380,7 @@ function FileGridView({
                     }}
                     data-testid={`file-grid-item-${globalIndex}`}
                   >
-                    <div className="flex items-center justify-center h-12 w-12">
-                      {entry.is_dir ? (
-                        <Folder className="h-10 w-10 text-[color:var(--color-primary)]" aria-hidden="true" />
-                      ) : (
-                        <File className="h-10 w-10 text-[color:var(--color-text-secondary)]" aria-hidden="true" />
-                      )}
-                    </div>
+                    <GridIcon entry={entry} />
                     <div className="flex items-center justify-center gap-1 w-full px-1 mt-1">
                       {activityMap?.[entry.path] && (
                         <ActivityDot

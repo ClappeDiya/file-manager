@@ -288,6 +288,20 @@ Reports can be exported as CSV or JSON.
 | **Dropbox** | OAuth 2.0 login. Team/shared folders and session uploads. |
 | **OneDrive** | Personal and Business accounts. SharePoint support. Handles naming restrictions. |
 | **Backblaze B2** | Native API with large file uploads. S3 compatibility mode available. |
+| **Azure Blob Storage** | Containers and blobs; uploads in 4 MiB blocks; folders as `dir/` marker blobs; read-only SAS share links. |
+| **Azure Data Lake Storage Gen2** | Accounts with a hierarchical namespace (`dfs` endpoint): real folders, and uploads that appear only when complete (written under a hidden name, then renamed). |
+| **Azure Files** | File shares over the REST API (no SMB port needed); uploads in 4 MiB ranges under a hidden name, then renamed; read-only SAS share links. |
+| **OpenStack Swift** | Containers and objects; Keystone v3 (password or application credential) or TempAuth; files over 32 MiB upload as Static Large Objects; folders as `dir/` objects; TempURL share links. |
+
+For the Azure services, enter the **storage account** and sign in with an **account key**, a **SAS token** or a **connection string**. Leave **Endpoint** blank for the public cloud; enter a host or URL for Azure Government, Azure China or the Azurite emulator. A container, file system or share is never deleted from the app (that removes everything in it); folders are removed only when empty.
+
+For **OpenStack Swift**, choose how to sign in:
+
+- **Keystone user name and password**: enter the user, password, **project name** and **domain** (default `Default`). The domain applies to both the user and the project.
+- **Keystone application credential**: enter the **application credential ID**, and its secret as the password. The credential's own project applies.
+- **TempAuth (v1)**: enter the user as `account:user` and the key as the password.
+
+**Auth URL** is the Keystone (or TempAuth) URL; leave it blank to use `https://<host>:<port>/v3` (or `/auth/v1.0` for TempAuth). A URL without a version gets `/v3`. When the project has storage in several regions, enter the **region** to use. Large objects keep their segments in `<container>_segments`; replacing or deleting the object removes its old segments. Containers and folders are removed only when empty. Share links are TempURLs and need a `Temp-URL-Key` on the account or the container (for example `swift post -m Temp-URL-Key:<secret>`); changing that key revokes every link.
 
 ### Connection Management
 
@@ -308,28 +322,45 @@ Simple mode provides step-by-step wizards for:
 
 ---
 
+### Mounting Drives
+
+*Mount drive* turns a saved connection into a folder (SMB, NFS and SFTP through the OS; cloud storage through rclone + FUSE). Cloud drives have cache options:
+
+- **Cache mode** — *Off* (always from the server), *Minimal* (open files only), *Writes* (default: uploads finish in the background), *Full* (whole files are kept, so they stay readable offline).
+- **Largest cache** and **Keep cached files** limit the space and age of the local copies; **Read-only** refuses changes.
+- With the full cache, **Make available offline** downloads a folder (or the whole drive) into the cache; the cache size shows per drive, and **Clear cache** frees it once the drive is unmounted.
+- Your organization's **mount profile** (from the management console) may allow only some kinds of drives, require read-only mounts or a cache mode, cap the cache, or require mount points inside a folder; the dialog shows it and locks the options it forces.
+
 ## Peer-to-Peer Transfers
+
+Send files straight to another computer running UFOP on the same network, over an encrypted connection. Open **Nearby Computers** from the toolbar (add it in the toolbar customizer) or the command palette.
 
 ### Discovery
 
-UFOP discovers other UFOP instances on the local network using mDNS/Bonjour. Discovered peers appear in the sidebar with their hostname and display name.
+Click **Start Scanning**: UFOP advertises this computer over mDNS (Bonjour/Avahi) and lists the other UFOP computers it finds, with their name, operating system and status. While scanning, this computer also accepts incoming requests (it listens on port 43210, or another free port if that one is taken). Stop scanning to stop both. A computer that stops scanning disappears as offline.
+
+### Identity and security
+
+Each computer has its own certificate, created on first use; its fingerprint is shown at the bottom of the panel ("This device: AB12 CD34 …"). Connections use TLS with both computers presenting their certificates, so each side knows who it talks to. When you trust, block or save a computer, its certificate is remembered: if a saved computer later shows a different certificate (for example after a reinstall, or an impostor), the connection is refused until you remove it from saved devices. Compare fingerprints on both screens the first time if the network is not your own.
 
 ### Trust Levels
 
-- **Untrusted** - Requires approval for each transfer
-- **Trusted** - Automatically accept transfers
-- **Blocked** - Reject all requests
+- **Unknown / Untrusted** - you approve each transfer
+- **Trusted** - transfers are accepted automatically into your Downloads folder
+- **Blocked** - connections and requests are refused
 
 ### Transferring to Peers
 
-1. Select files
-2. Choose "Send to Another Computer" or drag to a peer in the sidebar
-3. The recipient approves (if not trusted)
-4. Transfer proceeds over a TLS-encrypted connection
+1. Select files or folders and choose **Send to Another Computer…** (right-click menu or command palette).
+2. Pick the computer in the panel and click its send button.
+3. The recipient sees the request with the sender, file count and size, and chooses **Accept** (into Downloads), **Save here** (the folder open in their file manager), **Deny**, or block the sender. Requests not answered within 5 minutes are declined.
+4. Files stream in 4 MiB pieces; each file is checked with SHA-256 and kept under a hidden name until it arrives intact, so a cancelled or failed transfer leaves no partial files. Existing files are never overwritten (copies are named `name (1).ext`), folders keep their structure, and modification times are kept. Symbolic links are skipped.
+
+Either side can cancel; progress, speed and the result show under **Transfers** on both computers.
 
 ### Manual Connection
 
-If peers are not auto-discovered, enter an IP address and port to connect manually.
+If discovery doesn't find a computer (different subnet, multicast blocked), click **+** and enter its IP address or host name and port. The other computer must be accepting transfers (scanning).
 
 ---
 
@@ -383,7 +414,8 @@ The preview pane (toggled from the toolbar or View menu) renders:
 - **Images** - Inline preview with EXIF metadata display
 - **Text Files** - Syntax-highlighted content preview
 - **Audio/Video** - Playback controls
-- **Documents** - Rendered preview where supported
+- **PDF** - Rendered in place
+- **Office documents** (Word, Excel, PowerPoint, OpenDocument, RTF; legacy `.doc`/`.xls`/`.ppt`) - The document's text appears at once (spreadsheets as rows of cells, presentations slide by slide); the page itself is rendered by Quick Look on macOS or by LibreOffice when it is installed (any platform; set `UFOP_SOFFICE` to point at a non-standard install), then shown as a PDF with *Page* / *Text* tabs. Renders are cached until the file changes. Without a renderer the text stays, with *Open in default app*.
 
 ---
 
@@ -411,6 +443,18 @@ Organize files with custom tags and color labels:
 - Set color labels on files
 - View file info including all tags and labels
 
+### Metadata and Metadata Schemas
+
+Files carry key-value metadata (client, invoice number, status …), edited under Tags & Labels and searchable with *Find by metadata*. It follows files that are moved or renamed in the app.
+
+**Metadata Schemas** (Integrity Tools → Metadata Schemas) define the fields a folder's files carry:
+
+- Field types: text (optional pattern and length), number, whole number (with ranges), date, yes/no, choice (fixed options), email and URL; each field can be required.
+- A schema applies to its folder and, with *Include subfolders*, everything below it; a subfolder can override it with its own schema (the nearest one wins).
+- Values are checked and normalized when they are set (e.g. `yes` → `true`, choices take the option's spelling); required fields cannot be removed; a *strict* schema accepts only its own fields.
+- The metadata editor shows the schema's fields first with matching inputs and highlights missing required ones.
+- *Check files* lists files that miss required fields or hold values that no longer fit (set before the schema existed or changed).
+
 ### Smart Folders
 
 Create virtual folders based on rules (file type, size, date, tags). Smart folders update dynamically as files change.
@@ -436,9 +480,17 @@ Connect to remote servers via SSH directly from UFOP. Uses saved connection prof
 
 ## AI Assistant
 
-### Chat
+### Chat and Help
 
-Ask questions about files, get help with operations, or troubleshoot errors. The AI provides contextual assistance based on what you're doing in the app.
+Ask questions about files, get help with operations, or troubleshoot errors. Answers come from this documentation, which is built into the app: with a local model running (Ollama, `UFOP_OLLAMA_URL` for another address) the assistant writes an answer from the best sections; without one it shows those sections. The **Help** tab lists the sources of every answer and works offline, even with AI turned off.
+
+### Activity report
+
+The **Report** tab summarizes the last 24 hours, 7 or 30 days: rule runs and failures per rule (failing rules first, with their latest error), file operations by kind and size, and what needs attention. With a local model, a short summary is added — written from the report's numbers only. Copy it or save it as a Markdown file.
+
+### Unattended AI tasks
+
+The automation action **Ask the local AI** (Advanced) applies an instruction — "summarize", "classify as invoice/receipt/other", "extract the total" — to each file's text (PDFs and office documents included) and saves the answer as `<file name>.ai.md` (or another suffix) next to the file or in a chosen folder. It only runs when AI and *content analysis* are allowed in the AI settings, uses the local model, and every task is recorded in the AI audit log.
 
 ### Error Explanation
 
@@ -491,6 +543,15 @@ Define organizational policies for encryption:
 
 ---
 
+## OpenPGP (GPG)
+
+With GnuPG installed, files can be encrypted (to keys or with a passphrase), decrypted, signed and verified from the context menu; outputs are written next to the originals under free names.
+
+- **Re-encrypt** (Advanced, on `.gpg`/`.pgp`/`.asc` files) changes who can open a file — other keys, or a new passphrase — in place. The file is decrypted in memory (up to 512 MB) and written again; no unencrypted copy is created, and a failure leaves the file unchanged.
+- **Legacy files** made without integrity protection (common before 2003) are refused, because changes to them can't be detected. *Decrypt anyway* opens them when you trust the source, and the result says it was unprotected. Re-encrypting such a file produces a protected one.
+- **Create a key pair** in Settings → OpenPGP Keys: Ed25519 (recommended) or RSA 4096, with an expiry and a passphrase; both can sign and encrypt.
+- Passphrases go to gpg on its input, never on the command line, and plaintext is never written to a temporary file.
+
 ## Cross-Platform Compatibility
 
 UFOP includes a compatibility engine that helps files work across macOS, Windows, Linux, and cloud services.
@@ -514,6 +575,61 @@ During transfers, UFOP can automatically fix problematic names while preserving 
 Files and folders display compatibility badges indicating their status across target platforms.
 
 ---
+
+## Schedules & holiday calendars
+
+In Advanced mode, **Schedules & holiday calendars** (toolbar or command palette) defines schedules and calendars once and shares them:
+
+- A **named schedule** is a cron expression (`sec min hour day month weekday`, UTC) plus the holiday calendars whose days it skips. Choose it in a sync pair (Trigger: Scheduled) or an automation rule (Trigger: Schedule) instead of typing cron. Editing the schedule changes every pair and rule that uses it at once. A schedule that is still in use cannot be deleted.
+- A **holiday calendar** lists days off: dates, dates that recur every year (`MM-DD`), and optionally weekends. Import an iCalendar (`.ics`) file to add its all-day events; yearly events recur. Backup jobs pick calendars on their Schedule step.
+- A scheduled run that falls on a day off (by local date) is skipped, not postponed: the next regular run happens as usual. The schedule editor previews the next runs and marks the ones a calendar skips.
+
+## Search: file contents
+
+Folders added to the search index with *include file contents* are searchable by the text inside their files: plain-text files, PDFs, and Word, Excel, PowerPoint, OpenDocument and RTF documents (up to 1 MB of text per file). PDF text comes from the document's fonts, so scanned pages (images) and password-protected PDFs have no text; legacy `.doc`/`.xls`/`.ppt` files are found by name only. Folders indexed before document text was supported read their documents again on the next index run.
+
+## Automation: workflows
+
+In Advanced mode, a rule's actions can be edited as a **workflow**: a graph instead of a list (rule editor → *Edit as a workflow*; a plain chain turns back into a list with *Use a list of actions instead*).
+
+- **Steps:** an action (any automation action), a **condition** (matching files continue on its *true* branch, the rest on *false*), a **delay**, a **join**, or a **nested rule** that runs another rule's actions on the files.
+- **Connections** fire on success (default), on failure, always, or on a condition's true/false branch. Branches run in parallel. A step waits until all its inputs have finished, then runs when at least one of them fired; a join set to *every* needs all of them. Otherwise it is skipped, and so is everything after it.
+- **Files flow along connections.** A step receives the files its inputs carry (several branches are merged), and an action runs once per file. Moving, renaming or downloading hands the new file on; other actions pass their input through.
+- **Run graph:** a workflow run in the run history has a *Run graph* button that shows which steps succeeded, failed or were skipped.
+- **History:** every edit keeps the previous version of the rule (up to 50). Open the rule's *History* to restore one. Command approvals must be given again after a restore.
+- Workflows are checked when saved: no loops, known steps only, delays up to 24 hours, nested rules at most 4 deep and never running themselves. Programs (`Run a program`) inside a workflow need the same approval as in a list.
+- **Organization workflows:** rules your organization pushes from the admin console show an *Org* badge. They run like your own but can only be viewed, not edited, switched off or deleted; *Clone* makes an editable copy. *Copy as JSON* (rule editor) copies any rule's definition — without its run statistics, command approval or webhook secret — to paste into the console.
+
+## Converting images and documents
+
+Right-click images (PNG, JPEG, WebP, GIF, BMP, TIFF) or documents (Word, Excel, PowerPoint, OpenDocument, RTF, text, HTML, CSV) → **Convert…**:
+
+- **Images:** choose a format (JPEG with a quality, PNG, WebP, GIF, BMP, TIFF, or keep the format) and a largest width/height. Images shrink to fit, keeping their proportions, and are never enlarged. JPEG output drops transparency.
+- **Documents:** convert to PDF, Word, OpenDocument, RTF, text, HTML, Excel, CSV or PowerPoint with LibreOffice, which must be installed (or set `UFOP_SOFFICE` to its `soffice` program). A private LibreOffice profile is used, so an open LibreOffice window isn't disturbed.
+- Converted files are new files next to the originals (or in the folder you choose) under free names; the originals are never changed.
+
+In automation rules, **Resize / convert an image** and **Convert a document** do the same for each file, into a folder template (empty = next to the file), following the rule's overwrite choice. Later steps work on the converted file, so *convert to PDF → upload* is two steps.
+
+## Automation: validating a batch
+
+In Advanced mode, **Validate a batch of files** checks a delivery — the files directly inside one folder (by default, the folder of the file that started the run; start the rule on a marker such as `*.done` so the batch is complete):
+
+- **Member rules:** files matching a name pattern (`orders_*.csv`, case-insensitive) must number at least / at most N and each be at least a size. *Other files make the batch invalid* rejects anything no rule names.
+- **Content checks** on matching files: not empty; valid JSON; CSV with required columns (case-insensitive), a minimum number of data rows and a delimiter; or a SHA-256 manifest (`sha256sum` format) whose listed files must exist in the batch and match.
+- **Report:** with a report folder (templates allowed), each run writes `<folder>-<time>.validation.json` and `.txt` listing every check. An invalid batch fails the step — the run history shows which checks failed, and a workflow's failure branch can move the batch to quarantine or send a message. Turn that off to only report.
+
+## Automation: scanning for malware
+
+**Scan for malware (ClamAV)** checks each file with ClamAV — `clamdscan` when the clamd daemon runs (fast), else `clamscan`; set `UFOP_CLAMSCAN` for another location. A clean file goes on to the rule's next steps. An infected one is moved to the quarantine folder (owner-only, with a `.quarantine.json` note naming the signature and where it came from), you get a notification, and the run stops with an error naming the signature. If ClamAV is missing or the scan fails, the run fails too — nothing is passed on unscanned. The template **Scan arrivals for malware** sets this up for a folder; keep the quarantine folder outside the watched folder.
+
+## Automation: downloading a URL
+
+In Advanced mode, an automation rule can **Download a URL** into a folder. The URL, folder, file name and expected SHA-256 accept the same templates as other actions (`{name}`, `{yyyy}`, webhook fields …).
+
+- The file name comes from the rule, else the server's `Content-Disposition`, else the URL. An existing file is kept and the new one gets a number, unless **Replace** is ticked.
+- The download goes to a hidden temporary file and is moved into place when complete. It stops at the size limit (default 1024 MB), and a wrong checksum discards it.
+- Up to 5 redirects are followed. Loopback, private, link-local (including cloud metadata) and other non-public addresses are blocked unless **Allow intranet addresses** is ticked. The check uses the address actually connected to, so it applies to every redirect too.
+- Network failures are retried with the rule's retry settings; blocked addresses, missing pages and checksum mismatches are not.
 
 ## Keyboard Shortcuts
 

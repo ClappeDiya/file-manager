@@ -33,6 +33,14 @@ import * as claim from '@/app/api/agent/claim/route';
 import * as claimPoll from '@/app/api/agent/claim/poll/route';
 import * as heartbeat from '@/app/api/agent/heartbeat/route';
 import * as agentReport from '@/app/api/agent/report/route';
+import * as agentDiagnostics from '@/app/api/agent/diagnostics/route';
+import * as fleetConnect from '@/app/api/fleet/connect/route';
+import * as managedSettings from '@/app/api/fleet/managed-settings/route';
+import * as connectToken from '@/app/api/agent/connect/token/route';
+import { middleware } from '@/middleware';
+import { createHash } from 'node:crypto';
+import * as machineDiagnostics from '@/app/api/fleet/machines/[id]/diagnostics/route';
+import { KEEP_PER_MACHINE, MAX_DIAGNOSTICS_BYTES } from '@/lib/db/repos/diagnostics';
 import * as rotate from '@/app/api/agent/rotate/route';
 import * as unregister from '@/app/api/agent/unregister/route';
 import * as agentCommand from '@/app/api/agent/commands/[id]/route';
@@ -394,13 +402,14 @@ describe('fleet policies and central credentials', () => {
 
     // The heartbeat announces the policy set; only the targeted agent receives the secret.
     const beat = await json<{ policySetVersion: string; policiesChanged: boolean }>(await hb(inScope.token));
-    expect(beat.body).toMatchObject({ policySetVersion: `${pol.id}:1`, policiesChanged: true });
-    expect((await json<{ policiesChanged: boolean }>(await hb(inScope.token, { policySetVersion: `${pol.id}:1` }))).body.policiesChanged).toBe(false);
+    const set1 = `cred:${credId}:1,${pol.id}:1`;
+    expect(beat.body).toMatchObject({ policySetVersion: set1, policiesChanged: true });
+    expect((await json<{ policiesChanged: boolean }>(await hb(inScope.token, { policySetVersion: set1 }))).body.policiesChanged).toBe(false);
     const got = await agentPolicies.GET(await req('GET', '/api/agent/policies', { headers: bearer(inScope.token) }));
     expect(got.headers.get('cache-control')).toBe('no-store');
     const body = (await got.json()) as { policies: { id: string; version: number; job: Record<string, unknown> }[]; credentials: { credentialId: string; secret: string }[] };
     expect(body.policies).toMatchObject([{ id: pol.id, version: 1, job: { name: 'Managed docs' } }]);
-    expect(body.credentials).toMatchObject([{ credentialId: `central:${credId}`, name: 'S3 key', secret: 'sup3r-s3cret-value' }]);
+    expect(body.credentials).toMatchObject([{ credentialId: `central:${credId}`, name: 'S3 key', secret: 'sup3r-s3cret-value', version: 1 }]);
     for (const t of [outOfScope.token, foreign.token]) {
       const r = await (await agentPolicies.GET(await req('GET', '/api/agent/policies', { headers: bearer(t) }))).text();
       expect(r).not.toContain('sup3r-s3cret-value');
@@ -410,18 +419,32 @@ describe('fleet policies and central credentials', () => {
     expect(listAudit({ eventType: 'credential.deliver' }).total).toBe(1);
 
     // The agent reports what it applied; compliance follows.
-    await applied.POST(await req('POST', '/api/agent/policies/applied', { headers: bearer(inScope.token), body: { applied: { [pol.id]: 1, bogus: 'x' }, errors: {} } }));
+    await applied.POST(await req('POST', '/api/agent/policies/applied', { headers: bearer(inScope.token), body: { applied: { [pol.id]: 1, [`credential:${credId}`]: 1, bogus: 'x' }, errors: {} } }));
     const comp = await json<{ policies: { id: string; targeted: number; upToDate: number }[] }>(await fleetPolicies.GET(await req('GET', '/api/fleet/policies', { as: admin })));
     expect(comp.body.policies.find((p) => p.id === pol.id)).toMatchObject({ targeted: 1, upToDate: 1 });
-    expect(getMachine(inScope.id)!.appliedPolicies).toEqual({ [pol.id]: 1 });
+    expect(getMachine(inScope.id)!.appliedPolicies).toEqual({ [pol.id]: 1, [`credential:${credId}`]: 1 });
+    type CredView = { id: string; version: number; propagation: { targeted: number; upToDate: number; pending: { id: string; version: number | null }[] } };
+    const credView = async () => (await json<{ credentials: CredView[] }>(await credentials.GET(await req('GET', '/api/fleet/credentials', { as: admin })))).body.credentials.find((c) => c.id === credId)!;
+    expect(await credView()).toMatchObject({ version: 1, propagation: { targeted: 1, upToDate: 1, pending: [] } });
 
-    // Rotation re-versions the policy so agents fetch the new secret.
-    expect((await credentialById.PUT(await req('PUT', `/api/fleet/credentials/${credId}`, { as: sec, body: { secret: 'rotated-value' } }), P(credId))).status).toBe(200);
-    expect((await json<{ policiesChanged: boolean; policySetVersion: string }>(await hb(inScope.token, { policySetVersion: `${pol.id}:1` }))).body).toMatchObject({ policiesChanged: true, policySetVersion: `${pol.id}:2` });
-    const after = (await (await agentPolicies.GET(await req('GET', '/api/agent/policies', { headers: bearer(inScope.token) }))).json()) as { credentials: { secret: string }[] };
-    expect(after.credentials[0].secret).toBe('rotated-value');
-    const comp2 = await json<{ policies: { id: string; upToDate: number; pending: { id: string; applied: number }[] }[] }>(await fleetPolicies.GET(await req('GET', '/api/fleet/policies', { as: admin })));
-    expect(comp2.body.policies.find((p) => p.id === pol.id)).toMatchObject({ upToDate: 0, pending: [{ id: inScope.id, applied: 1 }] });
+    // Rotation: a new credential version; the policy itself is unchanged, the
+    // policy set version moves so the agent fetches the new secret.
+    const rot = await json<{ credential: { version: number } }>(await credentialById.PUT(await req('PUT', `/api/fleet/credentials/${credId}`, { as: sec, body: { secret: 'rotated-value' } }), P(credId)));
+    expect(rot.status).toBe(200);
+    expect(rot.body.credential.version).toBe(2);
+    expect((await json<{ policiesChanged: boolean; policySetVersion: string }>(await hb(inScope.token, { policySetVersion: set1 }))).body).toMatchObject({ policiesChanged: true, policySetVersion: `cred:${credId}:2,${pol.id}:1` });
+    const after = (await (await agentPolicies.GET(await req('GET', '/api/agent/policies', { headers: bearer(inScope.token) }))).json()) as { policies: { version: number }[]; credentials: { secret: string; version: number }[] };
+    expect(after.credentials[0]).toMatchObject({ secret: 'rotated-value', version: 2 });
+    expect(after.policies[0].version).toBe(1);
+    const comp2 = await json<{ policies: { id: string; upToDate: number }[] }>(await fleetPolicies.GET(await req('GET', '/api/fleet/policies', { as: admin })));
+    expect(comp2.body.policies.find((p) => p.id === pol.id)).toMatchObject({ upToDate: 1 });
+    expect(await credView()).toMatchObject({ version: 2, propagation: { targeted: 1, upToDate: 0, pending: [{ id: inScope.id, version: 1 }] } });
+    await applied.POST(await req('POST', '/api/agent/policies/applied', { headers: bearer(inScope.token), body: { applied: { [pol.id]: 1, [`credential:${credId}`]: 2 } } }));
+    expect((await credView()).propagation).toMatchObject({ upToDate: 1, pending: [] });
+    const hist = await json<{ history: { version: number; createdBy: string }[] }>(await credentialById.GET(await req('GET', `/api/fleet/credentials/${credId}`, { as: admin }), P(credId)));
+    expect(hist.body.history.map((h) => [h.version, h.createdBy])).toEqual([[2, sec.email], [1, sec.email]]);
+    expect(JSON.stringify(hist.body)).not.toContain('rotated-value');
+    expect(listAudit({ eventType: 'credential.rotate' }).entries[0].description).toContain('version 2');
 
     // Failures to apply are audited.
     await applied.POST(await req('POST', '/api/agent/policies/applied', { headers: bearer(inScope.token), body: { applied: {}, errors: { [pol.id]: 'destination unreachable' } } }));
@@ -458,5 +481,178 @@ describe('audit trail of fleet actions', () => {
     const types = listAudit({}).entries.map((e) => e.eventType);
     expect(types).toEqual(expect.arrayContaining(['fleet.link_create', 'fleet.preload_download', 'machine.register', 'machine.update', 'fleet.tag_color', 'machine.token_rotate', 'machine.claim', 'fleet.link_revoke']));
     expect(verifyAudit()).toMatchObject({ ok: true });
+  });
+
+  it('stores diagnostics bundles from agents, on demand and by command', async () => {
+    const admin = makeUser('diag-admin@x.org', 'org_admin');
+    const viewer = makeUser('diag-auditor@x.org', 'read_only_auditor');
+    const owner = makeUser('diag-user@x.org', 'user');
+    const m = await enroll(admin, 'diag-box');
+    const zip = Buffer.concat([Buffer.from('PK\x03\x04'), Buffer.alloc(32, 1)]);
+    const upload = async (token: string, body: unknown) => agentDiagnostics.POST(await req('POST', '/api/agent/diagnostics', { body, headers: bearer(token) }));
+
+    expect((await upload('ufop_agent_nope', { bundleBase64: zip.toString('base64') })).status).toBe(401);
+    expect((await upload(m.token, {})).status).toBe(400);
+    expect((await upload(m.token, { bundleBase64: Buffer.from('not a zip').toString('base64') })).status).toBe(422);
+    expect((await upload(m.token, { bundleBase64: Buffer.alloc(MAX_DIAGNOSTICS_BYTES + 10, 0x50).toString('base64') })).status).toBe(413);
+    const ok = await json<{ id: string }>(await upload(m.token, { fileName: '../../evil name.zip', summary: { appVersion: '1.2.3', os: 'linux' }, bundleBase64: zip.toString('base64') }));
+    expect(ok.status).toBe(201);
+
+    const list = await json<{ diagnostics: { id: string; fileName: string; size: number; summary: Record<string, unknown> }[] }>(
+      await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics`, { as: viewer }), P(m.id)),
+    );
+    expect(list.body.diagnostics).toHaveLength(1);
+    expect(list.body.diagnostics[0]).toMatchObject({ id: ok.body.id, fileName: '.._.._evil_name.zip', size: zip.length, summary: { appVersion: '1.2.3' } });
+
+    const dl = await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics?download=${ok.body.id}`, { as: viewer }), P(m.id));
+    expect(dl.status).toBe(200);
+    expect(dl.headers.get('content-type')).toBe('application/zip');
+    expect(Buffer.from(await dl.arrayBuffer()).equals(zip)).toBe(true);
+    expect(listAudit({}).entries.some((e) => e.eventType === 'fleet.diagnostics_download')).toBe(true);
+
+    // Admins request a bundle through the command queue.
+    expect((await commands.POST(await req('POST', `/api/fleet/machines/${m.id}/commands`, { as: admin, body: { kind: 'collect_diagnostics' } }), P(m.id))).status).toBe(201);
+    const cmds = (await json<{ commands: { kind: string }[] }>(await hb(m.token))).body.commands;
+    expect(cmds.map((c) => c.kind)).toEqual(['collect_diagnostics']);
+
+    // Only the newest bundles are kept.
+    for (let i = 0; i < KEEP_PER_MACHINE + 2; i++) await upload(m.token, { fileName: `d${i}.zip`, bundleBase64: zip.toString('base64') });
+    const after = (await json<{ diagnostics: { fileName: string }[] }>(await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics`, { as: admin }), P(m.id)))).body.diagnostics;
+    expect(after).toHaveLength(KEEP_PER_MACHINE);
+    expect(after[0].fileName).toBe(`d${KEEP_PER_MACHINE + 1}.zip`);
+
+    // Deleting needs fleet.write.
+    expect((await machineDiagnostics.DELETE(await req('DELETE', `/api/fleet/machines/${m.id}/diagnostics?id=x`, { as: viewer }), P(m.id))).status).toBe(403);
+    const first = (await json<{ diagnostics: { id: string }[] }>(await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics`, { as: admin }), P(m.id)))).body.diagnostics[0].id;
+    expect((await machineDiagnostics.DELETE(await req('DELETE', `/api/fleet/machines/${m.id}/diagnostics?id=${first}`, { as: admin }), P(m.id))).status).toBe(200);
+    expect((await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics?download=${first}`, { as: admin }), P(m.id))).status).toBe(404);
+
+    // Machine owners without a grant and other organizations see nothing.
+    expect((await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics`, { as: owner }), P(m.id))).status).toBe(404);
+    const other = createOrg({ name: 'Diag Other' });
+    const outsider = makeUser('diag-out@y.org', 'org_admin', other.id);
+    expect((await machineDiagnostics.GET(await req('GET', `/api/fleet/machines/${m.id}/diagnostics`, { as: outsider }), P(m.id))).status).toBe(404);
+  });
+
+  it('enrolls a desktop by browser sign-in with a loopback redirect and PKCE', async () => {
+    const admin = makeUser('connect-admin@x.org', 'org_admin');
+    const viewer = makeUser('connect-viewer@x.org', 'read_only_auditor');
+    const verifier = 'v'.repeat(64);
+    const challenge = createHash('sha256').update(verifier).digest('base64url');
+    const redirectUri = 'http://127.0.0.1:49152/callback';
+    const approve = async (as: UserRecord, body: Record<string, unknown>) => fleetConnect.POST(await req('POST', '/api/fleet/connect', { as, body }));
+    const exchange = async (body: Record<string, unknown>) => connectToken.POST(await req('POST', '/api/agent/connect/token', { body }));
+
+    expect((await approve(viewer, { redirectUri, state: 's1', codeChallenge: challenge })).status).toBe(403);
+    for (const bad of ['https://127.0.0.1:1/cb', 'http://evil.example:80/cb', 'http://127.0.0.1/cb', 'http://user:pw@127.0.0.1:5/cb']) {
+      expect((await approve(admin, { redirectUri: bad, state: 's1', codeChallenge: challenge })).status).toBe(400);
+    }
+    expect((await approve(admin, { redirectUri, state: 's1', codeChallenge: 'short' })).status).toBe(400);
+
+    const ok = await json<{ redirect: string }>(await approve(admin, { redirectUri, state: 's1', codeChallenge: challenge, name: 'Ana laptop', tags: ['Laptop'] }));
+    expect(ok.status).toBe(200);
+    const back = new URL(ok.body.redirect);
+    expect(back.origin + back.pathname).toBe(redirectUri);
+    expect(back.searchParams.get('state')).toBe('s1');
+    const code = back.searchParams.get('code')!;
+    expect(code).toMatch(/^ufop_connect_/);
+
+    // Wrong verifier burns the code; it cannot be retried with the right one.
+    expect((await exchange({ code, codeVerifier: 'x'.repeat(64), redirectUri, info: { hostname: 'ana' } })).status).toBe(401);
+    expect((await exchange({ code, codeVerifier: verifier, redirectUri, info: { hostname: 'ana' } })).status).toBe(401);
+
+    const again = new URL((await json<{ redirect: string }>(await approve(admin, { redirectUri, state: 's2', codeChallenge: challenge, name: 'Ana laptop', tags: ['Laptop'] }))).body.redirect).searchParams.get('code')!;
+    expect((await exchange({ code: again, codeVerifier: verifier, redirectUri: 'http://127.0.0.1:1/other', info: {} })).status).toBe(401);
+    const third = new URL((await json<{ redirect: string }>(await approve(admin, { redirectUri, state: 's3', codeChallenge: challenge, name: 'Ana laptop', tags: ['Laptop'] }))).body.redirect).searchParams.get('code')!;
+    const reg = await json<{ machineId: string; agentToken: string }>(await exchange({ code: third, codeVerifier: verifier, redirectUri, info: { hostname: 'ana', os: 'macos', clientVersion: '1.0.0' }, tags: ['dev'] }));
+    expect(reg.status).toBe(201);
+    expect(reg.body.agentToken).toMatch(/^ufop_agent_/);
+    const m = getMachine(reg.body.machineId)!;
+    expect(m).toMatchObject({ name: 'Ana laptop', hostname: 'ana', registeredVia: 'sso:connect-admin@x.org' });
+    expect(m.tags).toEqual(['dev', 'laptop']);
+    expect((await hb(reg.body.agentToken)).status).toBe(200);
+    expect((await exchange({ code: third, codeVerifier: verifier, redirectUri, info: {} })).status).toBe(401);
+    expect(listAudit({}).entries.map((e) => e.eventType)).toEqual(expect.arrayContaining(['fleet.desktop_connect']));
+  });
+
+  it('sends signed-out page requests to sign-in and back to the same page', async () => {
+    const r = await middleware(new NextRequest(new URL('http://localhost:3001/fleet/connect?redirect_uri=http%3A%2F%2F127.0.0.1%3A5%2Fcb&state=s')));
+    const loc = new URL(r.headers.get('location')!);
+    expect(loc.pathname).toBe('/login');
+    expect(loc.searchParams.get('redirect')).toBe('/fleet/connect?redirect_uri=http%3A%2F%2F127.0.0.1%3A5%2Fcb&state=s');
+    const api = await middleware(new NextRequest(new URL('http://localhost:3001/api/fleet/machines')));
+    expect(api.status).toBe(401);
+  });
+
+  it('manages app settings for desktops and delivers them with the policies', async () => {
+    const RULE = { trigger: { type: 'file_created', path: '~/Downloads' }, action: { type: 'move', destination: '~/Sorted' } };
+    const admin = makeUser('ms-admin@x.org', 'org_admin');
+    const auditor = makeUser('ms-auditor@x.org', 'read_only_auditor');
+    const m = await enroll(admin, 'ms-desk');
+    const put = async (as: UserRecord, body: unknown) => managedSettings.PUT(await req('PUT', '/api/fleet/managed-settings', { as, body }));
+    const bundle = async () => (await json<{ policySetVersion: string; managedSettings: Record<string, unknown> | null }>(await agentPolicies.GET(await req('GET', '/api/agent/policies', { headers: bearer(m.token) })))).body;
+
+    expect((await bundle()).managedSettings).toBeNull();
+    const v0 = (await bundle()).policySetVersion;
+    expect((await put(auditor, { ai: { enabled: false } })).status).toBe(403);
+    for (const bad of [
+      { updates: { channel: 'nightly' } },
+      { updates: { blackout: { start: '8:00', end: '18:00', days: [] } } },
+      { updates: { blackout: { start: '08:00', end: '08:00', days: [] } } },
+      { updates: { blackout: { start: '08:00', end: '18:00', days: [7] } } },
+      { proxy: { mode: 'manual', url: 'proxy:3128' } },
+      { proxy: { mode: 'pac' } },
+      { proxy: { mode: 'magic' } },
+      { ai: { enabled: 'no' } },
+      { transfers: { maxConcurrentRuns: 9 } },
+      { transfers: { maxUploadKbps: -1 } },
+      { transfers: { maxDownloadKbps: 1.5 } },
+      { mounts: { cacheMode: 'everything' } },
+      { mounts: { allowedProtocols: ['gopher'] } },
+      { mounts: { maxCacheMb: 0 } },
+      { mounts: { readOnly: 'yes' } },
+      { workflows: { name: 'x' } },
+      { workflows: [{ name: '', rule: RULE }] },
+      { workflows: [{ name: 'Bad id', id: 'no spaces', rule: RULE }] },
+      { workflows: [{ name: 'Not a rule', rule: { hello: 1 } }] },
+      { workflows: [{ name: 'Broken', rule: '{not json' }] },
+      { workflows: [{ name: 'Runs', rule: { ...RULE, action: { type: 'run_command', command: 'rm' } } }] },
+      { workflows: [{ name: 'Nested', rule: { ...RULE, workflow: { nodes: [{ kind: { type: 'action', action: { type: 'execute_custom_command' } } }] } } }] },
+      { workflows: [{ name: 'Same', rule: RULE }, { name: 'same', rule: RULE }] },
+      { workflows: Array.from({ length: 51 }, (_, i) => ({ name: `w${i}`, rule: RULE })) },
+    ]) expect((await put(admin, bad)).status).toBe(400);
+
+    const ok = await json<{ settings: { version: number } }>(
+      await put(admin, { updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [5, 1, 1] } }, proxy: { mode: 'pac', pacUrl: 'https://wpad/p.pac', noProxy: [' intranet ', ''] }, ai: { allowCloud: false }, transfers: { maxUploadKbps: 512, maxConcurrentRuns: 2 }, mounts: { allowedProtocols: ['S3', 'rclone', 's3'], readOnly: true, cacheMode: 'full', maxCacheMb: 2048, mountRoot: ' ~/Drives ' }, workflows: [{ name: 'Tidy Downloads!', rule: JSON.stringify(RULE) }, { id: 'archive', name: 'Archive', enabled: false, rule: RULE }] }),
+    );
+    expect(ok.status).toBe(200);
+    expect(ok.body.settings.version).toBe(1);
+    const b = await bundle();
+    expect(b.managedSettings).toEqual({
+      version: 1,
+      updates: { channel: 'beta', autoCheck: null, blackout: { start: '08:00', end: '18:00', days: [1, 5] } },
+      proxy: { mode: 'pac', url: '', pacUrl: 'https://wpad/p.pac', noProxy: ['intranet'] },
+      ai: { enabled: null, allowCloud: false },
+      transfers: { maxUploadKbps: 512, maxDownloadKbps: null, maxConcurrentRuns: 2 },
+      mounts: { allowedProtocols: ['s3', 'rclone'], readOnly: true, cacheMode: 'full', maxCacheMb: 2048, maxCacheAgeHours: null, mountRoot: '~/Drives' },
+      workflows: [
+        { id: 'tidy-downloads', name: 'Tidy Downloads!', enabled: true, rule: RULE },
+        { id: 'archive', name: 'Archive', enabled: false, rule: RULE },
+      ],
+    });
+    expect(b.policySetVersion).not.toBe(v0);
+    const hbv = await json<{ policiesChanged: boolean }>(await hb(m.token, { policySetVersion: v0 }));
+    expect(hbv.body.policiesChanged).toBe(true);
+
+    // Compliance follows what agents report as applied.
+    await applied.POST(await req('POST', '/api/agent/policies/applied', { headers: bearer(m.token), body: { applied: { managed_settings: 1 } } }));
+    const view = await json<{ upToDate: number; desktops: number }>(await managedSettings.GET(await req('GET', '/api/fleet/managed-settings', { as: auditor })));
+    expect(view.body).toMatchObject({ upToDate: 1, desktops: 1 });
+
+    // Stopping: agents get null, and the next change is a newer version.
+    expect((await json<{ settings: null }>(await put(admin, { updates: null, proxy: null, ai: { enabled: null, allowCloud: null } }))).body.settings).toBeNull();
+    expect((await bundle()).managedSettings).toBeNull();
+    expect((await json<{ settings: { version: number } }>(await put(admin, { ai: { enabled: false } }))).body.settings.version).toBe(3);
+    expect(listAudit({}).entries.filter((e) => e.eventType === 'fleet.managed_settings')).toHaveLength(3);
   });
 });

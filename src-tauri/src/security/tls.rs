@@ -220,6 +220,8 @@ pub fn check_transport_security(
         | ConnectionProtocol::Dropbox
         | ConnectionProtocol::OneDrive
         | ConnectionProtocol::AzureBlob
+        | ConnectionProtocol::AdlsGen2
+        | ConnectionProtocol::AzureFiles
         | ConnectionProtocol::Swift => {
             // Cloud APIs always use HTTPS
             check.secure = true;
@@ -233,6 +235,11 @@ pub fn check_transport_security(
         ConnectionProtocol::Local => {
             // Local filesystem doesn't use network transport
             check.secure = true;
+        }
+        ConnectionProtocol::Rclone => {
+            // rclone negotiates transport per backend (HTTPS for cloud APIs).
+            check.secure = true;
+            check.recommendations.push("Transport security is set by the rclone remote's backend; check `rclone config`.".to_string());
         }
     }
 
@@ -275,7 +282,10 @@ pub fn recommended_security(protocol: ConnectionProtocol) -> TransportSecurity {
         | ConnectionProtocol::Dropbox
         | ConnectionProtocol::OneDrive
         | ConnectionProtocol::AzureBlob
+        | ConnectionProtocol::AdlsGen2
+        | ConnectionProtocol::AzureFiles
         | ConnectionProtocol::Swift => TransportSecurity::strict(),
+        ConnectionProtocol::Rclone => TransportSecurity::default(),
         ConnectionProtocol::Local => TransportSecurity {
             require_encryption: false,
             ..TransportSecurity::default()
@@ -407,6 +417,20 @@ impl rustls::client::danger::ServerCertVerifier for ExactOrWebPki {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.inner.supported_verify_schemes()
     }
+}
+
+/// A server-certificate verifier that accepts only the pinned SHA-256
+/// fingerprints, or (with no pins) any certificate whose handshake
+/// signature checks out: the caller then reads the presented certificate
+/// and decides (trust on first use).
+pub fn server_cert_verifier(pins: &[String]) -> Result<std::sync::Arc<dyn rustls::client::danger::ServerCertVerifier>, AppError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let pins: Vec<String> = pins
+        .iter()
+        .map(|p| normalize_fingerprint(p).ok_or_else(|| AppError::validation(format!("'{p}' is not a SHA-256 certificate fingerprint (64 hex digits)"))))
+        .collect::<Result<_, _>>()?;
+    let seen = pins.is_empty().then(Default::default);
+    Ok(std::sync::Arc::new(PinVerifier { pins, provider: provider(), seen }))
 }
 
 /// Build a rustls client configuration.

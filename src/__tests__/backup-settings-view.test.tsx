@@ -44,7 +44,9 @@ describe("backup settings", () => {
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_get_global_defaults", undefined));
     fireEvent.click(await screen.findByTestId("backup-defaults-save"));
     await waitFor(() =>
-      expect(mockInvoke).toHaveBeenCalledWith("backup_set_global_defaults", { defaults: { options: { upload_concurrency: 4 }, throttle: null, retry: null } }),
+      expect(mockInvoke).toHaveBeenCalledWith("backup_set_global_defaults", {
+        defaults: { options: { upload_concurrency: 4 }, throttle: null, retry: null, caps: { upload_bps: 0, download_bps: 0, max_concurrent_runs: 1 } },
+      }),
     );
 
     fireEvent.change(screen.getByTestId("library-name"), { target: { value: "NAS" } });
@@ -55,5 +57,26 @@ describe("backup settings", () => {
     expect(saved.destination.destination.path).toBe("/mnt/nas");
     fireEvent.click(screen.getByText("Remove"));
     await waitFor(() => expect(screen.getByText("No saved destinations yet.")).toBeInTheDocument());
+  });
+
+  it("keeps the retry defaults and saves machine-wide caps; shows the organization's caps", async () => {
+    const retry = { retries: 5, delay_ms: 10_000, exponential: true, max_delay_ms: 300_000 };
+    mockInvoke.mockImplementation(async (cmd: string, args: Record<string, unknown>) => {
+      if (cmd === "backup_get_global_defaults") return { options: {}, throttle: null, retry, caps: { upload_bps: 2048, download_bps: 0, max_concurrent_runs: 2 } };
+      if (cmd === "backup_effective_caps") return { upload_bps: 1024, download_bps: 0, max_concurrent_runs: 2 };
+      if (cmd === "backup_list_destinations") return [];
+      return args?.defaults ?? null;
+    });
+    render(<BackupSettingsView />);
+    await waitFor(() => expect((screen.getByLabelText("Total upload") as HTMLInputElement).value).toBe("2"));
+    expect(await screen.findByTestId("caps-managed")).toHaveTextContent("upload 1 KB/s");
+    fireEvent.change(screen.getByLabelText("Operations at the same time"), { target: { value: "12" } });
+    fireEvent.change(screen.getByLabelText("Total download"), { target: { value: "100" } });
+    fireEvent.click(screen.getByTestId("backup-defaults-save"));
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("backup_set_global_defaults", {
+        defaults: { options: {}, throttle: null, retry, caps: { upload_bps: 2048, download_bps: 102400, max_concurrent_runs: 8 } },
+      }),
+    );
   });
 });

@@ -8,6 +8,15 @@ export type AuditEventType =
   | 'auth.login'
   | 'auth.logout'
   | 'auth.login_failed'
+  | 'auth.reauth'
+  | 'auth.reauth_failed'
+  | 'user.retired_inactive'
+  | 'user.membership_expired'
+  | 'admin.user_restore'
+  | 'admin.user_purge'
+  | 'admin.user_expiry'
+  | 'fleet.policy_opt_out'
+  | 'api_token.retired_inactive'
   | 'connection.create'
   | 'connection.update'
   | 'connection.delete'
@@ -38,14 +47,14 @@ export type AuditEventType =
   | 'admin.settings_change';
 
 export const AUDIT_EVENT_CATEGORIES: Record<string, AuditEventType[]> = {
-  Authentication: ['auth.login', 'auth.logout', 'auth.login_failed'],
+  Authentication: ['auth.login', 'auth.logout', 'auth.login_failed', 'auth.reauth', 'auth.reauth_failed'],
   Connections: ['connection.create', 'connection.update', 'connection.delete', 'connection.test'],
   Transfers: ['transfer.start', 'transfer.complete', 'transfer.fail', 'transfer.cancel'],
   Sync: ['sync.start', 'sync.complete', 'sync.fail', 'sync.conflict'],
   Naming: ['naming.translation', 'naming.override'],
   Approvals: ['approval.request', 'approval.approve', 'approval.deny', 'approval.expire'],
   Policies: ['policy.create', 'policy.update', 'policy.delete', 'policy.violation'],
-  Admin: ['admin.user_invite', 'admin.user_deactivate', 'admin.user_remove', 'admin.role_change', 'admin.sso_configure', 'admin.settings_change'],
+  Admin: ['admin.user_invite', 'admin.user_deactivate', 'admin.user_remove', 'admin.role_change', 'admin.sso_configure', 'admin.settings_change', 'admin.user_restore', 'admin.user_purge', 'admin.user_expiry'],
 };
 
 export type AuditSeverity = 'info' | 'warning' | 'error' | 'critical';
@@ -98,18 +107,6 @@ export interface AuditFilter {
 
 /** Export formats */
 export type AuditExportFormat = 'csv' | 'json' | 'syslog';
-
-/** SIEM integration config (Enterprise) */
-export interface SIEMConfig {
-  type: 'webhook' | 'syslog';
-  endpoint: string;
-  format: 'json' | 'cef' | 'leef';
-  enabled: boolean;
-  authToken?: string;
-  tlsEnabled: boolean;
-  batchSize: number;
-  flushIntervalSeconds: number;
-}
 
 /** Device health types */
 export interface DeviceHealth {

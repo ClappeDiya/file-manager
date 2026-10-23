@@ -30,6 +30,23 @@ function getChallenge(id: string): Challenge | null {
 
 export type ChallengeResult = { ok: true; user: UserRecord; challenge: Challenge; usedRecoveryCode: boolean } | { ok: false; error: string; status: number };
 
+/**
+ * Check a TOTP code (not reusable: the step is recorded) or a recovery code
+ * (single use: it is removed). Null when neither matches.
+ */
+export function verifySecondFactor(user: UserRecord, code: string): { usedRecoveryCode: boolean } | null {
+  if (!user.totpSecretCiphertext) return null;
+  const step = verifyTotp(open(user.totpSecretCiphertext), code, user.lastTotpStep);
+  if (step !== null) {
+    updateUser(user.id, { lastTotpStep: step });
+    return { usedRecoveryCode: false };
+  }
+  const h = hashRecoveryCode(code);
+  if (!user.recoveryCodes.includes(h)) return null;
+  updateUser(user.id, { recoveryCodes: user.recoveryCodes.filter((x) => x !== h) });
+  return { usedRecoveryCode: true };
+}
+
 /** Complete a challenge with a TOTP code or a recovery code (single use). */
 export function completeChallenge(id: string, code: string): ChallengeResult {
   const ch = getChallenge(id);
@@ -37,17 +54,10 @@ export function completeChallenge(id: string, code: string): ChallengeResult {
   if (ch.attempts >= MAX_ATTEMPTS) return { ok: false, error: 'Too many wrong codes. Sign in again.', status: 429 };
   const user = getUser(ch.userId);
   if (!user?.isActive || !user.totpSecretCiphertext) return { ok: false, error: 'Two-factor authentication is not set up', status: 400 };
-  const step = verifyTotp(open(user.totpSecretCiphertext), code, user.lastTotpStep);
-  if (step !== null) {
-    updateUser(user.id, { lastTotpStep: step });
+  const v = verifySecondFactor(user, code);
+  if (v) {
     db().prepare('DELETE FROM mfa_challenges WHERE id = ?').run(id);
-    return { ok: true, user, challenge: ch, usedRecoveryCode: false };
-  }
-  const h = hashRecoveryCode(code);
-  if (user.recoveryCodes.includes(h)) {
-    updateUser(user.id, { recoveryCodes: user.recoveryCodes.filter((x) => x !== h) });
-    db().prepare('DELETE FROM mfa_challenges WHERE id = ?').run(id);
-    return { ok: true, user, challenge: ch, usedRecoveryCode: true };
+    return { ok: true, user, challenge: ch, usedRecoveryCode: v.usedRecoveryCode };
   }
   db().prepare('UPDATE mfa_challenges SET attempts = attempts + 1 WHERE id = ?').run(id);
   return { ok: false, error: 'The code is not valid', status: 401 };

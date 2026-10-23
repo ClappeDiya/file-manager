@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { jwtVerify } from 'jose';
+import { clientIp } from './lib/netacl';
 
 const PUBLIC_PATHS = [
   '/login',
   '/invite/',
   '/api/auth/login',
+  '/api/auth/password/',
+  '/api/auth/passkey/',
+  '/reset-password',
   '/api/auth/logout',
   '/api/auth/mfa/verify',
   '/api/auth/sso/',
@@ -14,16 +18,31 @@ const PUBLIC_PATHS = [
 
 /**
  * Endpoints that authenticate themselves and are called cross-site:
- * agents (bearer / report key) and SSO callbacks (signed state, SAML
- * signatures; the IdP posts the SAML response from its own origin).
+ * agents (bearer / report key), SCIM (bearer token), SSO callbacks (signed state, SAML
+ * signatures; the IdP posts the SAML response from its own origin) and billing
+ * webhooks (provider signature).
  */
-const AGENT_PATHS = ['/api/agent/', '/api/ingest/', '/api/auth/sso/'];
+const AGENT_PATHS = ['/api/agent/', '/api/ingest/', '/api/auth/sso/', '/api/scim/', '/api/billing/webhook'];
+
+/** Send a page request to sign-in, coming back to the same page afterwards. */
+function toLogin(request: NextRequest): NextResponse {
+  const login = new URL('/login', request.url);
+  const back = request.nextUrl.pathname + request.nextUrl.search;
+  if (back !== '/' && !back.startsWith('/login')) login.searchParams.set('redirect', back);
+  return NextResponse.redirect(login);
+}
 
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
   // Agent endpoints authenticate themselves (Authorization header / report key).
   if (AGENT_PATHS.some((p) => pathname.startsWith(p))) {
+    return NextResponse.next();
+  }
+
+  // Scripts with a console API token (and no session cookie): the route
+  // authenticates the token; no cookie means no cross-site request risk.
+  if (pathname.startsWith('/api/') && !request.cookies.get('ufop-admin-session') && request.headers.get('authorization')?.startsWith('Bearer ufop_cat_')) {
     return NextResponse.next();
   }
 
@@ -45,7 +64,7 @@ export async function middleware(request: NextRequest) {
     const host = request.headers.get('host');
 
     if (!origin) {
-      const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+      const ip = clientIp(request);
       console.error(JSON.stringify({ level: 'warn', event: 'security.csrf_blocked', timestamp: new Date().toISOString(), ip, pathname, reason: 'missing_origin' }));
       return NextResponse.json({ error: 'CSRF validation failed: Origin header required' }, { status: 403 });
     }
@@ -54,7 +73,7 @@ export async function middleware(request: NextRequest) {
       try {
         const originHost = new URL(origin).host;
         if (originHost !== host) {
-          const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+          const ip = clientIp(request);
           console.error(JSON.stringify({ level: 'warn', event: 'security.csrf_blocked', timestamp: new Date().toISOString(), ip, pathname, origin, host, reason: 'origin_mismatch' }));
           return NextResponse.json({ error: 'CSRF validation failed' }, { status: 403 });
         }
@@ -74,7 +93,7 @@ export async function middleware(request: NextRequest) {
     if (pathname.startsWith('/api/')) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
-    return NextResponse.redirect(new URL('/login', request.url));
+    return toLogin(request);
   }
 
   // Security: fail if NEXTAUTH_SECRET is not configured
@@ -100,7 +119,7 @@ export async function middleware(request: NextRequest) {
     if (pathname.startsWith('/api/')) {
       return NextResponse.json({ error: 'Session expired' }, { status: 401 });
     }
-    const response = NextResponse.redirect(new URL('/login', request.url));
+    const response = toLogin(request);
     response.cookies.delete('ufop-admin-session');
     return response;
   }

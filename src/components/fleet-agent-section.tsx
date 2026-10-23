@@ -17,9 +17,9 @@ function when(ts: string | null): string {
 }
 
 export function FleetAgentSection() {
-  const { status, busy, error, refresh, register, startClaim, pollClaim, cancelClaim, unregister, setEnabled, syncNow } =
+  const { status, busy, error, refresh, register, startClaim, pollClaim, cancelClaim, unregister, setEnabled, syncNow, connect, signInWithBrowser, cancelSignIn } =
     useFleetAgentStore();
-  const [mode, setMode] = useState<"link" | "claim">("link");
+  const [mode, setMode] = useState<"browser" | "link" | "claim">("browser");
   const [url, setUrl] = useState("");
   const [token, setToken] = useState("");
   const [tags, setTags] = useState("");
@@ -117,7 +117,17 @@ export function FleetAgentSection() {
       <p className="text-xs text-gray-500 dark:text-gray-400">
         Let an administrator manage this machine's backups centrally: policies, remote runs and reports.
       </p>
-      {status.claim ? (
+      {connect ? (
+        <div className="space-y-2" data-testid="fleet-agent-signing-in">
+          <p className="text-xs">
+            {connect.browser_opened ? "Approve the connection in your browser." : "Open this page in your browser and approve the connection:"}
+          </p>
+          <p className="font-mono text-xs break-all select-all">{connect.url}</p>
+          <button type="button" onClick={() => void cancelSignIn()} className={`${button} border border-gray-300 dark:border-gray-600`}>
+            Cancel
+          </button>
+        </div>
+      ) : status.claim ? (
         <div className="space-y-2">
           <p className="text-xs">Enter this code in the console under Machines → Claim:</p>
           <p className="font-mono text-2xl tracking-widest" data-testid="claim-code">
@@ -133,10 +143,13 @@ export function FleetAgentSection() {
           className="space-y-2"
           onSubmit={(e) => {
             e.preventDefault();
-            void (mode === "link" ? register(url, token, tags) : startClaim(url));
+            void (mode === "browser" ? signInWithBrowser(url, tags) : mode === "link" ? register(url, token, tags) : startClaim(url));
           }}
         >
           <div className="flex gap-3 text-xs">
+            <label className="flex items-center gap-1">
+              <input type="radio" checked={mode === "browser"} onChange={() => setMode("browser")} /> Sign in with browser
+            </label>
             <label className="flex items-center gap-1">
               <input type="radio" checked={mode === "link"} onChange={() => setMode("link")} /> Registration link
             </label>
@@ -146,13 +159,16 @@ export function FleetAgentSection() {
           </div>
           <input aria-label="Console URL" className={input} placeholder="https://console.example.com" value={url} onChange={(e) => setUrl(e.target.value)} />
           {mode === "link" && (
-            <>
-              <input aria-label="Registration token" className={input} type="password" placeholder="ufop_reg_…" value={token} onChange={(e) => setToken(e.target.value)} />
-              <input aria-label="Tags" className={input} placeholder="Tags (optional, comma separated)" value={tags} onChange={(e) => setTags(e.target.value)} />
-            </>
+            <input aria-label="Registration token" className={input} type="password" placeholder="ufop_reg_…" value={token} onChange={(e) => setToken(e.target.value)} />
+          )}
+          {mode !== "claim" && (
+            <input aria-label="Tags" className={input} placeholder="Tags (optional, comma separated)" value={tags} onChange={(e) => setTags(e.target.value)} />
+          )}
+          {mode === "browser" && (
+            <p className="text-xs text-gray-500 dark:text-gray-400">Opens the console in your browser; sign in (SSO works) and approve. Needs permission to enroll machines.</p>
           )}
           <button type="submit" disabled={busy || !url.trim() || (mode === "link" && !token.trim())} className={`${button} bg-blue-500 text-white hover:bg-blue-600`}>
-            {mode === "link" ? "Register" : "Get claim code"}
+            {mode === "browser" ? "Sign in with browser" : mode === "link" ? "Register" : "Get claim code"}
           </button>
         </form>
       )}

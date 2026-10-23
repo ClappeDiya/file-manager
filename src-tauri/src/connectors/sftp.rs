@@ -14,7 +14,6 @@ use crate::core::error::AppError;
 use crate::core::types::{ConnectionProfile, FileEntry};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -124,30 +123,7 @@ pub enum HostKeyVerification {
     AcceptAll,
 }
 
-/// Known host entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnownHostEntry {
-    pub hostname: String,
-    pub port: u16,
-    pub key_type: String,
-    pub fingerprint: String,
-    pub added_at: DateTime<Utc>,
-}
-
-/// Result of a host key check.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum HostKeyCheckResult {
-    /// Host key matches known_hosts.
-    Trusted,
-    /// Host key is new (first connection).
-    NewHost { fingerprint: String, key_type: String },
-    /// Host key changed (potential MITM).
-    Changed {
-        expected_fingerprint: String,
-        actual_fingerprint: String,
-        key_type: String,
-    },
-}
+pub use super::known_hosts::{HostKeyCheckResult, KnownHostEntry, KnownHostsStore};
 
 /// SFTP connector health status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,8 +162,8 @@ pub struct SftpConnector {
     connected: AtomicBool,
     /// SFTP-specific configuration.
     config: RwLock<SftpConfig>,
-    /// Known hosts database (in-memory, keyed by "host:port").
-    known_hosts: RwLock<HashMap<String, KnownHostEntry>>,
+    /// Trusted host keys, persisted across restarts.
+    known_hosts: Arc<KnownHostsStore>,
     /// Bytes transferred counters.
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
@@ -203,7 +179,7 @@ impl SftpConnector {
             channels: Arc::new(RwLock::new(Vec::new())),
             connected: AtomicBool::new(false),
             config: RwLock::new(SftpConfig::default()),
-            known_hosts: RwLock::new(HashMap::new()),
+            known_hosts: KnownHostsStore::for_connector(),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             last_keepalive: RwLock::new(None),
@@ -217,7 +193,7 @@ impl SftpConnector {
             channels: Arc::new(RwLock::new(Vec::new())),
             connected: AtomicBool::new(false),
             config: RwLock::new(config),
-            known_hosts: RwLock::new(HashMap::new()),
+            known_hosts: KnownHostsStore::for_connector(),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             last_keepalive: RwLock::new(None),
@@ -244,7 +220,13 @@ impl SftpConnector {
         }
     }
 
-    /// Verify the host key against our known_hosts database.
+    /// Use a specific host-key store (shared stores, tests).
+    pub fn with_known_hosts(mut self, store: Arc<KnownHostsStore>) -> Self {
+        self.known_hosts = store;
+        self
+    }
+
+    /// Verify the host key against the trusted-keys store.
     pub async fn verify_host_key(
         &self,
         host: &str,
@@ -252,28 +234,10 @@ impl SftpConnector {
         key_type: &str,
         fingerprint: &str,
     ) -> HostKeyCheckResult {
-        let key = format!("{host}:{port}");
-        let known = self.known_hosts.read().await;
-
-        if let Some(entry) = known.get(&key) {
-            if entry.fingerprint == fingerprint {
-                HostKeyCheckResult::Trusted
-            } else {
-                HostKeyCheckResult::Changed {
-                    expected_fingerprint: entry.fingerprint.clone(),
-                    actual_fingerprint: fingerprint.to_string(),
-                    key_type: key_type.to_string(),
-                }
-            }
-        } else {
-            HostKeyCheckResult::NewHost {
-                fingerprint: fingerprint.to_string(),
-                key_type: key_type.to_string(),
-            }
-        }
+        self.known_hosts.check(host, port, key_type, fingerprint).await
     }
 
-    /// Accept and store a host key in the known_hosts database.
+    /// Accept and persist a host key.
     pub async fn accept_host_key(
         &self,
         host: &str,
@@ -281,16 +245,22 @@ impl SftpConnector {
         key_type: &str,
         fingerprint: &str,
     ) {
-        let key = format!("{host}:{port}");
-        let entry = KnownHostEntry {
-            hostname: host.to_string(),
-            port,
-            key_type: key_type.to_string(),
-            fingerprint: fingerprint.to_string(),
-            added_at: Utc::now(),
-        };
-        let mut known = self.known_hosts.write().await;
-        known.insert(key, entry);
+        if let Err(e) = self.known_hosts.accept(host, port, key_type, fingerprint).await {
+            tracing::error!("Host key for {host}:{port} trusted for this session only (could not save: {e})");
+        }
+    }
+
+    /// Forget the app-trusted keys of a host (after a legitimate key change).
+    pub async fn forget_host_key(&self, host: &str, port: u16) -> Result<usize, AppError> {
+        self.known_hosts.forget(host, port).await.map_err(|e| AppError::Connection {
+            message: format!("Could not update the host-key store: {e}"),
+            advice: "Check that the app's data folder is writable.".to_string(),
+        })
+    }
+
+    /// Keys the app trusts (excluding the read-only system known_hosts).
+    pub async fn list_known_hosts(&self) -> Vec<KnownHostEntry> {
+        self.known_hosts.list().await
     }
 
     /// Resolve `host:port`, accepting both numeric addresses and DNS names.
@@ -1291,7 +1261,15 @@ impl super::Connector for SftpConnector {
         remote_path: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, AppError>> + Send + '_>> {
         let (l, r) = (local_path.to_string(), remote_path.to_string());
-        Box::pin(async move { self.upload_file(&l, &r, None).await })
+        Box::pin(async move {
+            super::staged_upload(
+                &r,
+                |temp| async move { self.upload_file(&l, &temp, None).await },
+                |from, to| async move { self.rename(&from, &to).await },
+                |p| async move { self.delete_file(&p).await },
+            )
+            .await
+        })
     }
 
     fn download(
@@ -2342,6 +2320,7 @@ mod tests {
             ftp_force_passive_ip: None,
             ftp_post_login_commands: None,
             symlink_policy: None,
+            extras: Default::default(),
         };
         let result = connector.disconnect().await;
         assert!(result.is_ok());

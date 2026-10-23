@@ -10,6 +10,10 @@ import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ComingSoon } from '@/components/ui/coming-soon';
+import { isEnabled } from '@/lib/features';
+import Link from 'next/link';
+import { formatDateTime } from '@/lib/utils/format';
 
 interface Connector {
   id: string;
@@ -66,6 +70,22 @@ export default function ConnectorsPage() {
     setConnectors(prev => prev.filter(c => c.id !== id));
   };
 
+  // The form below used to keep connectors in page state and fake a
+  // successful test; it stays off until connectors are stored and tested
+  // server-side.
+  if (!isEnabled('connectors')) {
+    return (
+      <div>
+        <PageHeader title="Connectors" description="Manage storage connectors and integrations" />
+        <ComingSoon
+          feature="connectors"
+          description="Organization-wide connector definitions that machines pick up automatically. Today, share storage credentials with your machines from Fleet → Credentials."
+          action={<Link href="/fleet/credentials" className="text-sm font-medium text-primary hover:underline">Open Fleet credentials →</Link>}
+        />
+      </div>
+    );
+  }
+
   return (
     <div>
       <PageHeader
@@ -105,7 +125,7 @@ export default function ConnectorsPage() {
                   </div>
                   <p className="text-xs text-foreground-tertiary mt-0.5">
                     {CONNECTOR_TYPES.find(t => t.value === connector.type)?.label || connector.type}
-                    {connector.lastTestedAt && ` - Last tested: ${new Date(connector.lastTestedAt).toLocaleString()}`}
+                    {connector.lastTestedAt && ` - Last tested: ${formatDateTime(connector.lastTestedAt)}`}
                   </p>
                 </div>
                 <div className="flex items-center gap-1">

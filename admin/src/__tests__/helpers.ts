@@ -17,11 +17,13 @@ export interface ReqOptions {
   org?: string;
   amr?: string[];
   headers?: Record<string, string>;
+  /** Reuse this server-side session instead of creating one. */
+  sid?: string;
 }
 
 export async function req(method: string, url: string, o: ReqOptions = {}): Promise<NextRequest> {
   const headers = new Headers({ 'content-type': 'application/json', origin: 'http://localhost:3001', host: 'localhost:3001', 'x-forwarded-for': '203.0.113.7', ...o.headers });
-  if (o.as) headers.set('cookie', `${SESSION_COOKIE}=${await signSession(o.as, o.org ?? o.as.organizationId, o.amr ?? ['pwd'])}`);
+  if (o.as) headers.set('cookie', `${SESSION_COOKIE}=${await signSession(o.as, o.org ?? o.as.organizationId, o.amr ?? ['pwd'], o.sid)}`);
   return new NextRequest(new URL(url, 'http://localhost:3001'), { method, headers, body: o.body === undefined ? undefined : JSON.stringify(o.body) });
 }
 

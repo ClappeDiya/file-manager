@@ -4,6 +4,7 @@ import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
+  FileCode2,
   LayoutDashboard,
   Users,
   Monitor,
@@ -26,13 +27,13 @@ import {
   Sparkles,
   Building2,
   UsersRound,
-  Fingerprint,
-} from 'lucide-react';
+  Fingerprint, SlidersHorizontal, Webhook, ShieldCheck, FileBarChart, Archive, Palette } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 import { useAdminStore } from '@/lib/stores/admin-store';
 import { useAuthStore } from '@/lib/stores/auth-store';
 import type { Permission } from '@/lib/types/auth';
 import { useTranslate } from '@/lib/i18n';
+import { useBrandingStore } from '@/lib/stores/branding-store';
 
 interface NavItem {
   id: string;
@@ -52,8 +53,11 @@ const navItems: NavItem[] = [
   { id: 'machines', i18nKey: 'nav.machines', href: '/fleet/machines', icon: HardDrive, requiredPermission: 'fleet.read' },
   { id: 'enrollment', i18nKey: 'nav.enrollment', href: '/fleet/enroll', icon: Link2, requiredPermission: 'fleet.enroll' },
   { id: 'fleet-policies', i18nKey: 'nav.fleetPolicies', href: '/fleet/policies', icon: ClipboardList, requiredPermission: 'fleet.read' },
+  { id: 'app-settings', i18nKey: 'nav.appSettings', href: '/fleet/app-settings', icon: SlidersHorizontal, requiredPermission: 'fleet.read' },
+  { id: 'policy-as-code', i18nKey: 'nav.policyAsCode', href: '/fleet/policy-as-code', icon: FileCode2, requiredPermission: 'fleet.read' },
   { id: 'credentials', i18nKey: 'nav.credentials', href: '/fleet/credentials', icon: KeyRound, requiredPermission: 'fleet.read' },
   { id: 'alerts', i18nKey: 'nav.alerts', href: '/alerts', icon: Bell, requiredPermission: 'alerts.read' },
+  { id: 'webhooks', i18nKey: 'nav.webhooks', href: '/integrations/webhooks', icon: Webhook, requiredPermission: 'alerts.read' },
   { id: 'ai-insights', i18nKey: 'nav.aiInsights', href: '/ai-insights', icon: Sparkles, requiredPermission: 'ai.read' },
   { id: 'organizations', i18nKey: 'nav.organizations', href: '/organizations', icon: Building2, requiredPermission: 'orgs.read' },
   { id: 'groups', i18nKey: 'nav.groups', href: '/groups', icon: UsersRound, requiredPermission: 'groups.read' },
@@ -61,16 +65,35 @@ const navItems: NavItem[] = [
   { id: 'devices', i18nKey: 'nav.devices', href: '/devices', icon: Monitor, requiredPermission: 'devices.read' },
   { id: 'policies', i18nKey: 'nav.policies', href: '/policies', icon: Shield, requiredPermission: 'policies.read' },
   { id: 'approvals', i18nKey: 'nav.approvals', href: '/approvals', icon: CheckSquare, requiredPermission: 'approvals.read' },
+  { id: 'reports', i18nKey: 'nav.reports', href: '/reports', icon: FileBarChart, requiredPermission: 'fleet.read' },
   { id: 'audit', i18nKey: 'nav.audit', href: '/audit', icon: ScrollText, requiredPermission: 'audit.read' },
   { id: 'connectors', i18nKey: 'nav.connectors', href: '/connectors', icon: Plug, requiredPermission: 'connectors.read' },
   { id: 'workspaces', i18nKey: 'nav.workspaces', href: '/workspaces', icon: FolderSync, requiredPermission: 'workspaces.read' },
   { id: 'ai-governance', i18nKey: 'nav.aiGovernance', href: '/ai-governance', icon: Brain, requiredPermission: 'ai_governance.read' },
   { id: 'billing', i18nKey: 'nav.billing', href: '/billing', icon: CreditCard, requiredPermission: 'billing.read' },
   { id: 'sso', i18nKey: 'nav.sso', href: '/settings/sso', icon: Fingerprint, requiredPermission: 'sso.configure' },
+  { id: 'security', i18nKey: 'nav.security', href: '/settings/security', icon: ShieldCheck, requiredPermission: 'users.read' },
+  { id: 'retention', i18nKey: 'nav.retention', href: '/settings/retention', icon: Archive, requiredPermission: 'audit.read' },
+  { id: 'branding', i18nKey: 'nav.branding', href: '/settings/branding', icon: Palette, requiredPermission: 'orgs.write' },
 ];
+
+/** The organization's logo, else its initial on the brand color. */
+function BrandMark() {
+  const b = useBrandingStore((s) => s.branding);
+  if (b?.logo) {
+    return <img src={b.logo} alt={b.displayName} className="h-8 max-w-[8rem] object-contain" />;
+  }
+  return (
+    <div className="w-8 h-8 shrink-0 rounded-lg bg-primary flex items-center justify-center">
+      <span className="text-primary-foreground font-bold text-sm">{(b?.displayName || 'U').slice(0, 1).toUpperCase()}</span>
+    </div>
+  );
+}
 
 export function Sidebar() {
   const pathname = usePathname();
+  const branding = useBrandingStore((s) => s.branding);
+  const brandName = branding && branding.displayName !== 'UFOP' ? branding.displayName : null;
   const { sidebarCollapsed, toggleSidebar, sidebarMobileOpen, toggleMobileSidebar } = useAdminStore();
   const checkPermission = useAuthStore((s) => s.checkPermission);
   const t = useTranslate();
@@ -107,18 +130,12 @@ export function Sidebar() {
           sidebarCollapsed ? 'justify-center' : 'justify-between'
         )}>
           {!sidebarCollapsed && (
-            <Link href="/dashboard" className="flex items-center gap-2">
-              <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
-                <span className="text-primary-foreground font-bold text-sm">U</span>
-              </div>
-              <span className="font-semibold text-sidebar-text-active text-sm">UFOP Admin</span>
+            <Link href="/dashboard" className="flex items-center gap-2 min-w-0">
+              <BrandMark />
+              <span className="font-semibold text-sidebar-text-active text-sm truncate">{brandName ? brandName : 'UFOP Admin'}</span>
             </Link>
           )}
-          {sidebarCollapsed && (
-            <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
-              <span className="text-primary-foreground font-bold text-sm">U</span>
-            </div>
-          )}
+          {sidebarCollapsed && <BrandMark />}
         </div>
 
         {/* Navigation */}

@@ -17,13 +17,15 @@ import { useApi } from '@/lib/use-api';
 import { api, errorText } from '@/lib/api-client';
 import { useAuthStore } from '@/lib/stores/auth-store';
 import { useToastStore } from '@/lib/stores/toast-store';
-import { formatRelativeTime } from '@/lib/utils/format';
+import { formatDateTime, formatRelativeTime } from '@/lib/utils/format';
 import type { Alert, AlertKind, AlertParams, AlertRule } from '@/lib/db/repos/alerts';
+import { OutboxView } from '@/components/alerts/outbox-view';
 import type { Channel, ChannelKind, EmailConfig, WebhookConfig } from '@/lib/db/repos/channels';
 
 const KIND_LABEL: Record<AlertKind, string> = {
   backup_failed: 'Backup failed',
   missed_backup: 'Missed backup',
+  expected_arrival: 'Backup not arrived by a set time',
   changed_files: 'Unusual number of changed files',
   duration_anomaly: 'Unusual duration',
 };
@@ -31,6 +33,7 @@ const KIND_LABEL: Record<AlertKind, string> = {
 const DEFAULT_PARAMS: Record<AlertKind, AlertParams> = {
   backup_failed: { includeWarnings: false, notifyOnResolve: true },
   missed_backup: { graceMinutes: 60, defaultIntervalHours: 24, notifyOnResolve: true },
+  expected_arrival: { expectedBy: '07:00', days: [1, 2, 3, 4, 5], timeZone: 'UTC', graceMinutes: 0, notifyOnResolve: true },
   changed_files: { maxChangedPercent: 30, maxDeletedFiles: 1000 },
   duration_anomaly: { minSamples: 5, factor: 2, stdDevs: 3, detectShort: false },
 };
@@ -41,6 +44,7 @@ const NUMERIC: Record<AlertKind, [keyof AlertParams, string][]> = {
     ['graceMinutes', 'Grace period (minutes)'],
     ['defaultIntervalHours', 'Assumed interval when the client reports none (hours, 0 = skip)'],
   ],
+  expected_arrival: [['graceMinutes', 'Grace period (minutes)']],
   changed_files: [
     ['maxChangedFiles', 'Changed files above'],
     ['maxChangedPercent', 'Changed share above (%)'],
@@ -139,7 +143,7 @@ export default function AlertsPage() {
     await channels.reload();
   };
 
-  const secretLabel = (k: ChannelKind) => (k === 'email' ? 'SMTP password' : k === 'slack' ? 'Slack incoming webhook URL' : 'Signing secret (HMAC-SHA256)');
+  const secretLabel = (k: ChannelKind) => (k === 'email' ? 'SMTP password' : k === 'slack' ? 'Slack incoming webhook URL' : k === 'teams' ? 'Teams workflow webhook URL' : 'Signing secret (HMAC-SHA256)');
 
   return (
     <div>
@@ -168,6 +172,7 @@ export default function AlertsPage() {
           { id: 'alerts', label: 'Alerts', count: state === 'open' ? alerts.data?.alerts.length : undefined },
           { id: 'rules', label: 'Rules', count: rules.data?.rules.length },
           { id: 'channels', label: 'Channels', count: channels.data?.channels.length },
+          { id: 'deliveries', label: 'Deliveries' },
         ]}
       />
 
@@ -209,6 +214,8 @@ export default function AlertsPage() {
                           </>
                         )}
                         {a.resolvedAt ? ` · resolved ${formatRelativeTime(a.resolvedAt)}` : ''}
+                        {!a.resolvedAt && a.acknowledgedAt && ` · acknowledged by ${a.acknowledgedBy}`}
+                        {!a.resolvedAt && a.snoozedUntil && new Date(a.snoozedUntil) > new Date() && ` · snoozed until ${formatDateTime(a.snoozedUntil)}`}
                       </p>
                     </TableCell>
                     <TableCell>
@@ -221,9 +228,28 @@ export default function AlertsPage() {
                     </TableCell>
                     <TableCell className="text-right">
                       {canWrite && !a.resolvedAt && (
-                        <Button size="sm" variant="ghost" onClick={() => void act(() => api(`/api/alerts/${a.id}`, { method: 'PATCH', body: {} }), alerts.reload)}>
-                          Resolve
-                        </Button>
+                        <div className="flex flex-wrap justify-end gap-1">
+                          {a.acknowledgedAt ? (
+                            <Button size="sm" variant="ghost" onClick={() => void act(() => api(`/api/alerts/${a.id}`, { method: 'PATCH', body: { action: 'unacknowledge' } }), alerts.reload)}>
+                              Unacknowledge
+                            </Button>
+                          ) : (
+                            <Button size="sm" variant="ghost" onClick={() => void act(() => api(`/api/alerts/${a.id}`, { method: 'PATCH', body: { action: 'acknowledge' } }), alerts.reload)}>
+                              Acknowledge
+                            </Button>
+                          )}
+                          <Select
+                            aria-label="Snooze"
+                            className="h-8 w-auto text-xs"
+                            value=""
+                            onChange={(e) => e.target.value && void act(() => api(`/api/alerts/${a.id}`, { method: 'PATCH', body: { action: 'snooze', minutes: Number(e.target.value) } }), alerts.reload)}
+                            options={[{ value: '60', label: '1 hour' }, { value: '480', label: '8 hours' }, { value: '1440', label: '1 day' }, { value: '10080', label: '1 week' }, { value: '0', label: 'Wake up' }]}
+                            placeholder="Snooze…"
+                          />
+                          <Button size="sm" variant="ghost" onClick={() => void act(() => api(`/api/alerts/${a.id}`, { method: 'PATCH', body: {} }), alerts.reload)}>
+                            Resolve
+                          </Button>
+                        </div>
                       )}
                     </TableCell>
                   </TableRow>
@@ -287,7 +313,7 @@ export default function AlertsPage() {
                       {c.name} <span className="text-xs text-foreground-tertiary">{c.kind}</span> {!c.enabled && <span className="text-xs text-warning">disabled</span>}
                     </p>
                     <p className="text-xs text-foreground-secondary">
-                      {c.kind === 'email' ? `${(c.config as EmailConfig).host} → ${(c.config as EmailConfig).to?.join(', ')}` : c.kind === 'webhook' ? (c.config as WebhookConfig).url : 'Slack incoming webhook'}
+                      {c.kind === 'email' ? `${(c.config as EmailConfig).host} → ${(c.config as EmailConfig).to?.join(', ')}` : c.kind === 'webhook' ? (c.config as WebhookConfig).url : c.kind === 'teams' ? 'Microsoft Teams workflow' : 'Slack incoming webhook'}
                     </p>
                     {c.lastError ? <p className="text-xs text-error">Last error: {c.lastError}</p> : c.lastSentAt ? <p className="text-xs text-foreground-tertiary">Last sent {formatRelativeTime(c.lastSentAt)}</p> : null}
                   </div>
@@ -317,6 +343,9 @@ export default function AlertsPage() {
           </div>
         )}
       </TabContent>
+      <TabContent tabId="deliveries" activeTab={tab}>
+        <OutboxView canWrite={canWrite} />
+      </TabContent>
 
       <Dialog open={!!rule} onClose={() => setRule(null)} className="max-w-2xl">
         <DialogHeader>
@@ -341,6 +370,30 @@ export default function AlertsPage() {
                 <Input key={k} label={label} type="number" min={0} value={(rule.params[k] as number | undefined) ?? ''} onChange={(e) => setRule({ ...rule, params: { ...rule.params, [k]: e.target.value === '' ? undefined : Number(e.target.value) } })} />
               ))}
             </div>
+            {rule.kind === 'expected_arrival' && (
+              <div className="space-y-2">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <Input label="Must arrive by (local time)" type="time" value={rule.params.expectedBy ?? ''} onChange={(e) => setRule({ ...rule, params: { ...rule.params, expectedBy: e.target.value } })} />
+                  <Input label="Time zone (IANA)" placeholder="Europe/Berlin" value={rule.params.timeZone ?? ''} onChange={(e) => setRule({ ...rule, params: { ...rule.params, timeZone: e.target.value } })} />
+                </div>
+                <div className="flex flex-wrap gap-1" role="group" aria-label="Days">
+                  {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d, i) => {
+                    const days = rule.params.days ?? [];
+                    const on = days.includes(i);
+                    return (
+                      <button key={d} type="button" aria-pressed={on} onClick={() => setRule({ ...rule, params: { ...rule.params, days: on ? days.filter((x) => x !== i) : [...days, i].sort() } })} className={`rounded border px-2 py-1 text-xs ${on ? 'border-primary bg-primary text-white' : 'border-border'}`}>
+                        {d}
+                      </button>
+                    );
+                  })}
+                </div>
+                <Input
+                  label="Only these backup ids (comma-separated; empty = all in scope)"
+                  value={(rule.params.backupIds ?? []).join(', ')}
+                  onChange={(e) => setRule({ ...rule, params: { ...rule.params, backupIds: e.target.value.split(',').map((x) => x.trim()).filter(Boolean) } })}
+                />
+              </div>
+            )}
             <div className="flex flex-wrap gap-4 text-sm">
               {rule.kind === 'backup_failed' && (
                 <label className="flex items-center gap-2">
@@ -395,7 +448,7 @@ export default function AlertsPage() {
             <ErrorBanner message={formErr} />
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Input label="Name" value={channel.name} onChange={(e) => setChannel({ ...channel, name: e.target.value })} />
-              <Select label="Type" value={channel.kind} disabled={!!channel.id} onChange={(e) => setChannel({ ...channel, kind: e.target.value as ChannelKind })} options={[{ value: 'email', label: 'Email (SMTP)' }, { value: 'slack', label: 'Slack' }, { value: 'webhook', label: 'Webhook' }]} />
+              <Select label="Type" value={channel.kind} disabled={!!channel.id} onChange={(e) => setChannel({ ...channel, kind: e.target.value as ChannelKind })} options={[{ value: 'email', label: 'Email (SMTP)' }, { value: 'slack', label: 'Slack' }, { value: 'teams', label: 'Microsoft Teams' }, { value: 'webhook', label: 'Webhook' }]} />
             </div>
             {channel.kind === 'email' && (
               <>

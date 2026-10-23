@@ -14,6 +14,7 @@ import { loadSmartDestinations, fileExtension, type SmartDestination } from "@/h
 import { assessBeforeExecute, measureSelection, FS_INTENT_KIND } from "@/lib/safety";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
 import { reportOperationFailure } from "@/lib/op-error-toast";
+import { OS_DROP_ATTR, useOsFileDrop } from "@/hooks/use-os-file-drop";
 import {
   computeListBytes,
   computeSelectionBytes,
@@ -55,6 +56,8 @@ import SettingsPanel from "./settings-panel";
 import { ConnectionPanel } from "./connection-panel";
 import { SyncPanel } from "./sync-panel";
 import { BackupPanel } from "./backup/backup-panel";
+import { PeerSidebar } from "./peer-sidebar";
+import { ScheduleLibraryPanel } from "./schedule-library-panel";
 import { PreviewPane } from "./preview-pane";
 import { TransferHistoryPanel } from "./transfer-history-panel";
 import { ArchiveBrowser, CreateArchiveDialog } from "./archive-browser";
@@ -71,6 +74,17 @@ import {
 import { useLedgerTailPoll } from "@/hooks/use-ledger-tail-poll";
 import { AiPanel } from "./ai-panel";
 import { AutomationPanel } from "./automation-panel";
+import { AutomationRuleEditor } from "./automation-rule-editor";
+import { CopyToManyDialog } from "./copy-to-many-dialog";
+import { IndexedSearchResults } from "./indexed-search-results";
+import { GpgDialog } from "./gpg-dialog";
+import { ConvertDialog } from "./convert-dialog";
+import { OperationsDrawer, OperationsIndicator } from "./operations-drawer";
+import { useOperationsStore } from "@/stores/operations-store";
+import { looksEncrypted, looksLikeSignature, useGpgDialog } from "@/stores/gpg-store";
+import { convertKind, useConvertDialog } from "@/stores/convert-store";
+import type { SearchScope } from "@/stores/search-store";
+import { openCopyToMany } from "@/stores/copy-to-many-store";
 import { VaultPanel } from "./vault-panel";
 import { TransferPanel } from "./transfer-panel";
 import {
@@ -125,9 +139,12 @@ import {
   Save,
   FolderDown,
   Zap,
+  Activity,
   Layers,
   X,
   DatabaseBackup,
+  CalendarClock,
+  MonitorSmartphone,
 } from "lucide-react";
 
 // Toolbar customization definition (#14)
@@ -143,7 +160,13 @@ const ALL_TOOLBAR_ITEMS = [
   { id: "smart-spaces", label: "Smart Spaces" },
   { id: "sync-browse", label: "Sync Browse" },
   { id: "backups", label: "Backups" },
+  { id: "schedules", label: "Schedules & holiday calendars" },
+  { id: "operations", label: "Operations" },
+  { id: "nearby", label: "Nearby Computers" },
 ];
+
+/** Peer transfers send local files only. */
+const localPaths = (paths: string[]) => paths.filter((p) => !p.includes("://"));
 
 // ──────────────────────────────────────────────
 // FileManager - main orchestrating component
@@ -229,6 +252,17 @@ const SMART_OPEN_PREVIEW_EXT = [
   ".mov",
   ".webm",
   ".avi",
+  // Office documents (text at once, rendered page via the OS or LibreOffice)
+  ".docx",
+  ".doc",
+  ".xlsx",
+  ".xls",
+  ".pptx",
+  ".ppt",
+  ".odt",
+  ".ods",
+  ".odp",
+  ".rtf",
 ] as const;
 
 function isArchivePath(path: string): boolean {
@@ -285,6 +319,7 @@ let migrationRun: MigrationRunState | null = null;
 let migrationRunDest: string | null = null;
 
 export function FileManager() {
+  useOsFileDrop();
   const appMode = useUIStore((s) => s.appMode);
   const sidebarOpen = useUIStore((s) => s.sidebarOpen);
   const sidebarWidth = useUIStore((s) => s.sidebarWidth);
@@ -693,6 +728,18 @@ export function FileManager() {
   const [syncOpen, setSyncOpen] = useState(false);
   // Versioned backups panel (jobs, restore, maintenance, history).
   const [backupOpen, setBackupOpen] = useState(false);
+  // Nearby computers: discovery, incoming requests, and the items to send (if any).
+  const [nearbyOpen, setNearbyOpen] = useState(false);
+  const [nearbySend, setNearbySend] = useState<string[]>([]);
+  const activeFolder = useFileManagerStore((s) => {
+    const pane = s.getActivePane();
+    return pane.tabs.find((t) => t.id === pane.activeTabId)?.path ?? "";
+  });
+  const openNearby = useCallback((send: string[] = []) => {
+    setNearbySend(localPaths(send));
+    setNearbyOpen(true);
+  }, []);
+  const [schedulesOpen, setSchedulesOpen] = useState(false);
   // The tray's "Backups…" item opens this panel.
   useEffect(() => {
     if (!isTauriAvailable()) return;
@@ -1939,6 +1986,7 @@ export function FileManager() {
           } catch {}
         },
         onToggleAutomations: toggleAutomationPanel,
+        onToggleOperations: () => useOperationsStore.getState().toggle(),
         onCreateAutomation: () => {
           if (!automationPanelOpen) toggleAutomationPanel();
           useAutomationStore.getState().openEditor();
@@ -2090,6 +2138,9 @@ export function FileManager() {
         onOpenBackups: () => {
           setBackupOpen(true);
         },
+        onOpenNearby: () => openNearby(),
+        onSendToComputer: () => openNearby(getAllSelectedPaths()),
+        onOpenSchedules: appMode === "advanced" ? () => setSchedulesOpen(true) : undefined,
         onOpenTransferHistory: () => {
           setTransferHistoryOpen(true);
         },
@@ -2228,7 +2279,7 @@ export function FileManager() {
         },
       }),
     ],
-    [quickflowCommands, toggleSidebar, handleUndo, handleRedo, handleSaveWorkspace, getFirstSelectedPath, getAllSelectedPaths, toggleAutomationPanel, automationPanelOpen, toggleActivityTimeline, favorites, handleJumpLastTouched],
+    [quickflowCommands, toggleSidebar, handleUndo, handleRedo, handleSaveWorkspace, getFirstSelectedPath, getAllSelectedPaths, toggleAutomationPanel, automationPanelOpen, toggleActivityTimeline, favorites, handleJumpLastTouched, appMode],
   );
 
   return (
@@ -2381,6 +2432,18 @@ export function FileManager() {
               <Zap className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
+          {toolbarItems.includes("operations") && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => useOperationsStore.getState().toggle()}
+              aria-label="Show operations"
+              title="Operations (transfers, syncs, backups…)"
+              data-testid="toggle-operations"
+            >
+              <Activity className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
           {toolbarItems.includes("backups") && (
             <Button
               variant={backupOpen ? "secondary" : "ghost"}
@@ -2391,6 +2454,30 @@ export function FileManager() {
               data-testid="toggle-backups"
             >
               <DatabaseBackup className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
+          {toolbarItems.includes("nearby") && (
+            <Button
+              variant={nearbyOpen ? "secondary" : "ghost"}
+              size="icon"
+              onClick={() => (nearbyOpen ? setNearbyOpen(false) : openNearby())}
+              aria-label="Nearby computers"
+              title="Nearby computers (send and receive files)"
+              data-testid="toggle-nearby"
+            >
+              <MonitorSmartphone className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
+          {appMode === "advanced" && toolbarItems.includes("schedules") && (
+            <Button
+              variant={schedulesOpen ? "secondary" : "ghost"}
+              size="icon"
+              onClick={() => setSchedulesOpen((open) => !open)}
+              aria-label="Schedules"
+              title="Schedules & holiday calendars"
+              data-testid="toggle-schedules"
+            >
+              <CalendarClock className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
           {toolbarItems.includes("smart-spaces") && (
@@ -2576,6 +2663,7 @@ export function FileManager() {
                   }
                   onCompress={(files) => setCreateArchiveSources(files)}
                   onShowTransfers={() => setTransfersOpen(true)}
+                  onSendToComputer={openNearby}
                 />
               )}
             />
@@ -2586,6 +2674,11 @@ export function FileManager() {
         {/* Lazy-mount: only render side panels when their toggle is on, so a fresh window
             ships with just the file canvas + sidebar instead of four hidden panels. */}
         {automationPanelOpen && <AutomationPanel />}
+        <AutomationRuleEditor />
+        <CopyToManyDialog />
+        <GpgDialog />
+        <ConvertDialog />
+        <OperationsDrawer />
         {activityTimelineOpen && (
           <ActivityTimelinePanel onDispatchPath={handleDispatchLedgerPath} />
         )}
@@ -2769,6 +2862,66 @@ export function FileManager() {
                 <X className="w-4 h-4" />
               </button>
               <BackupPanel />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Nearby computers: mDNS discovery, approval of incoming files and
+          sending the chosen items. Received files go to Downloads, or to
+          the active folder with "Save here". */}
+      {nearbyOpen && (
+        <div
+          className="fixed inset-0 z-50 flex justify-end bg-black/30"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Nearby computers"
+          data-testid="nearby-backdrop"
+          onClick={() => setNearbyOpen(false)}
+        >
+          <div
+            className="relative w-[min(380px,95vw)] h-full pt-9 shadow-2xl border-l border-[var(--color-border)] bg-[var(--color-surface)]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              className="absolute top-3 right-4 z-10 h-7 w-7 flex items-center justify-center rounded text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover)]"
+              onClick={() => setNearbyOpen(false)}
+              aria-label="Close Nearby computers"
+            >
+              <X className="w-4 h-4" />
+            </button>
+            <PeerSidebar
+              sendPaths={nearbySend}
+              receiveDir={localPaths([activeFolder])[0] || undefined}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Schedules & holiday calendars (Advanced): shared by sync pairs,
+          automation rules and backup jobs. */}
+      {schedulesOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Schedules"
+          data-testid="schedules-backdrop"
+          onClick={() => setSchedulesOpen(false)}
+        >
+          <div
+            className="w-[min(820px,95vw)] max-h-[min(760px,92vh)] overflow-auto rounded-lg shadow-2xl border border-[var(--color-border)] bg-[var(--color-surface)]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="relative pt-9">
+              <button
+                className="absolute top-3 right-4 z-10 h-7 w-7 flex items-center justify-center rounded text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover)]"
+                onClick={() => setSchedulesOpen(false)}
+                aria-label="Close Schedules"
+              >
+                <X className="w-4 h-4" />
+              </button>
+              <ScheduleLibraryPanel />
             </div>
           </div>
         </div>
@@ -3182,6 +3335,8 @@ interface FilePaneProps {
    *  and completion state are visible the moment jobs land — the dock
    *  lives at FileManager scope (same lift pattern as `onCompress`). */
   onShowTransfers: () => void;
+  /** Opens Nearby computers to send these local files. */
+  onSendToComputer: (files: string[]) => void;
 }
 
 function FilePane({
@@ -3192,6 +3347,7 @@ function FilePane({
   onVerifyIntegrity,
   onCompress,
   onShowTransfers,
+  onSendToComputer,
 }: FilePaneProps) {
   const pane = useFileManagerStore((s) => s.panes[paneIndex]);
   const navigateTab = useFileManagerStore((s) => s.navigateTab);
@@ -3999,8 +4155,9 @@ function FilePane({
         console.error("Get info failed:", err);
       }
       try {
-        const fileInfo = await tauriInvoke<{ label?: string }>("integrity_get_file_info", { path: filePath });
-        comment = fileInfo?.label || "";
+        // Comments are the file's "comment" metadata value.
+        const fileInfo = await tauriInvoke<{ metadata?: Record<string, string> }>("integrity_get_file_info", { path: filePath });
+        comment = fileInfo?.metadata?.comment ?? "";
       } catch { /* no comment yet */ }
     } else {
       metadata = { size: "4.2 KB", modified: new Date().toISOString(), type: "File" };
@@ -4013,7 +4170,7 @@ function FilePane({
   const handleSaveComment = useCallback(async (filePath: string, commentText: string) => {
     if (isTauriAvailable()) {
       try {
-        await tauriInvoke("integrity_set_label", { path: filePath, label: commentText });
+        await tauriInvoke("integrity_set_metadata", { path: filePath, key: "comment", value: commentText });
       } catch {
         try {
           await tauriInvoke("set_config", { key: `comment:${filePath}`, value: commentText });
@@ -4303,11 +4460,19 @@ function FilePane({
     }
   }, [selectedPaths]);
 
-  // Feature 4: Content search handler (#69)
-  const handleContentSearch = useCallback((query: string, path: string) => {
-    console.log(`Content search: "${query}" in ${path}`);
-    // Content search requires backend support - log for now
-  }, []);
+  // Indexed search (names in all subfolders / file contents) from the
+  // filter bar; "This folder" keeps the live listing filter.
+  const [searchScope, setSearchScope] = useState<SearchScope>("folder");
+  const indexedQuery = searchScope !== "folder" && pane.filterText.trim().length >= 2 ? pane.filterText.trim() : null;
+  const handleOpenSearchHit = useCallback(
+    (path: string, isDir: boolean) => {
+      const store = useFileManagerStore.getState();
+      store.setFilterText(paneIndex, "");
+      setSearchScope("folder");
+      store.revealPath(paneIndex, path, isDir);
+    },
+    [paneIndex],
+  );
 
   // Smart Send-To handler — moves the current selection to a
   // ledger-suggested destination directory in one click. Reuses the
@@ -4386,6 +4551,11 @@ function FilePane({
         onCut: handleCut,
         onPaste: handlePaste,
         onCopyToOtherPane: handleCopyToOtherPane,
+        onCopyToMany: () => openCopyToMany(selectedPaths, currentPath, otherPanePath()),
+        onGpg: (mode) => useGpgDialog.getState().open(mode, selectedPaths),
+        onConvert: convertKind(selectedPaths) ? () => useConvertDialog.getState().open(selectedPaths) : undefined,
+        gpgDecrypt: selectedPaths.length > 0 && selectedPaths.every((p) => looksEncrypted(p)),
+        gpgVerify: selectedPaths.length > 0 && selectedPaths.every((p) => looksLikeSignature(p)),
         onMoveToOtherPane: handleMoveToOtherPane,
         onDelete: handleDelete,
         onDeletePermanently: () => handleDeletePermanently(selectedPaths.length > 0 ? selectedPaths : [entry.path]),
@@ -4455,6 +4625,9 @@ function FilePane({
           const files = selectedPaths.length > 0 ? selectedPaths : [entry.path];
           onCompress(files);
         },
+        onSendToComputer: localPaths(selectedPaths.length > 0 ? selectedPaths : [entry.path]).length > 0
+          ? () => onSendToComputer(selectedPaths.length > 0 ? selectedPaths : [entry.path])
+          : undefined,
         // Iter 15: Extract Here. Only wired when the right-clicked
         // entry is an archive file — the gating happens here so the
         // context-menu doesn't need to inspect file types itself,
@@ -4511,7 +4684,7 @@ function FilePane({
       });
       onContextMenu({ position: { x: event.clientX, y: event.clientY }, items });
     },
-    [selectedPaths, currentPath, handleOpen, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleDelete, handleDeletePermanently, handleRename, handleDuplicate, handleNewFolder, handleNewFile, handleGetInfo, handleCalculateSize, handleEditRemote, handleCompareFiles, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, selectAll, invertSelection, onContextMenu, loadDirectory, isGitRepo, handleSendTo, onVerifyIntegrity, onCompress, handleExtractHere],
+    [selectedPaths, currentPath, handleOpen, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleDelete, handleDeletePermanently, handleRename, handleDuplicate, handleNewFolder, handleNewFile, handleGetInfo, handleCalculateSize, handleEditRemote, handleCompareFiles, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, selectAll, invertSelection, onContextMenu, loadDirectory, isGitRepo, handleSendTo, onVerifyIntegrity, onCompress, onSendToComputer, handleExtractHere],
   );
 
   // Keyboard shortcuts for compare (#47), quick select (#71), and the
@@ -4600,7 +4773,8 @@ function FilePane({
 
   return (
     <div
-      className="flex flex-col h-full relative"
+      className="flex flex-col h-full relative data-[os-drop-hover]:ring-2 data-[os-drop-hover]:ring-inset data-[os-drop-hover]:ring-[var(--color-primary)]"
+      {...{ [OS_DROP_ATTR]: currentPath }}
       onDragOver={handleDragOver}
       onDrop={(e) => {
         const droppedPaths = handleDrop(e);
@@ -4639,12 +4813,16 @@ function FilePane({
         paneIndex={paneIndex}
         totalCount={files.length}
         filteredCount={visibleFiles.length}
-        onContentSearch={handleContentSearch}
+        scope={searchScope}
+        onScopeChange={setSearchScope}
         staleCount={staleCount}
         staleActive={staleOnly}
         onToggleStale={() => setStaleOnly((v) => !v)}
         onArchiveStale={handleArchiveStale}
       />
+      {indexedQuery && (
+        <IndexedSearchResults text={indexedQuery} root={currentPath} content={searchScope === "contents"} onOpen={handleOpenSearchHit} />
+      )}
 
       {/* Feature 3: Grouping dropdown (#77) - advanced mode only */}
       {appModePane === "advanced" && (
@@ -5000,6 +5178,7 @@ function StatusBarContent() {
       </div>
 
       {/* Engine Pulse — ambient cross-engine activity heartbeat */}
+      <OperationsIndicator />
       <EnginePulseIndicator />
 
       <div className="flex items-center gap-2">

@@ -5,8 +5,17 @@
 //! The same `BackupManager` the desktop app uses runs here, so jobs,
 //! scheduling, history and maintenance behave identically.
 
+pub mod api_tokens;
 pub mod auth;
+pub mod dav;
+pub mod folders;
+pub mod gateway;
 pub mod oauth;
+pub mod mcp;
+pub mod mcp_oauth;
+pub mod openapi;
+pub mod sdk;
+pub mod shares;
 pub mod tls;
 /// Server settings live in `security::settings_store` (shared with the backup engine).
 pub use crate::security::settings_store as settings;
@@ -16,6 +25,8 @@ use crate::connectors::ConnectionManager;
 use crate::core::error::AppError;
 use auth::AuthService;
 use axum::extract::{Path as AxPath, Query, Request, State};
+use axum::Extension;
+use api_tokens::Principal;
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -55,6 +66,26 @@ pub struct ServerConfig {
     /// Tokens a trusted reverse proxy sends in `X-UFOP-PreAuth`.
     pub preauth_tokens: Vec<String>,
     pub tls: TlsMode,
+    /// Client addresses allowed to connect (TCP peer; empty = any).
+    pub allowed_clients: ufop_core::netacl::IpAllowlist,
+    /// Lowest TLS version accepted when HTTPS is on.
+    pub min_tls: tls::MinTls,
+    /// Strict-Transport-Security max-age in seconds when HTTPS is on (0 = no header).
+    pub hsts_max_age: u64,
+    /// Add `includeSubDomains` to the HSTS header.
+    pub hsts_include_subdomains: bool,
+    /// Folders whose contents may be shared by link (`/s/…`); empty = sharing off.
+    pub share_roots: Vec<PathBuf>,
+    /// Folders served read-only over WebDAV at `/dav/<name>/`; empty = off.
+    pub dav_roots: Vec<PathBuf>,
+    /// Client address ranges allowed to use WebDAV (on top of `allowed_clients`; empty = any).
+    pub dav_allowed_clients: ufop_core::netacl::IpAllowlist,
+    /// Folders the `/mcp` endpoint's file tools may use; empty = MCP off.
+    pub mcp_roots: Vec<PathBuf>,
+    /// Offer MCP tools that change files (to tokens with the write scope).
+    pub mcp_allow_write: bool,
+    /// Public origin (`https://files.example.com`) for OAuth metadata; default: from the request.
+    pub public_url: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -69,6 +100,16 @@ impl Default for ServerConfig {
             cors_origins: Vec::new(),
             preauth_tokens: Vec::new(),
             tls: TlsMode::None,
+            allowed_clients: Default::default(),
+            min_tls: tls::MinTls::Tls12,
+            hsts_max_age: 31_536_000,
+            hsts_include_subdomains: false,
+            share_roots: Vec::new(),
+            dav_roots: Vec::new(),
+            mcp_roots: Vec::new(),
+            mcp_allow_write: false,
+            public_url: None,
+            dav_allowed_clients: Default::default(),
         }
     }
 }
@@ -102,6 +143,8 @@ pub struct ServerState {
     pub oauth: Option<oauth::OAuthBroker>,
     /// Management console agent (`fleet_agent_*` RPC calls of the web UI).
     pub agent: Option<crate::fleet_agent::FleetAgent>,
+    /// File gateway relay (on-premises agents and their jobs).
+    pub gateways: gateway::Hub,
 }
 
 /// HTTP error wrapper: AppError → status + sanitized `{error_type, message, advice}`.
@@ -137,6 +180,36 @@ fn ok<T: serde::Serialize>(v: T) -> ApiResult {
 
 // ── Middleware ──
 
+/// Refuse clients outside `--allowed-cidrs` (by TCP peer address, so a
+/// forwarded header cannot fake it; list the reverse proxy behind one).
+async fn ip_check(State(st): State<ServerState>, req: Request, next: Next) -> Response {
+    if !st.cfg.allowed_clients.is_empty() {
+        let peer = req.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+        if !peer.is_some_and(|ip| st.cfg.allowed_clients.allows(ip)) {
+            let who = peer.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into());
+            tracing::warn!("Refused a connection from {who} (not in --allowed-cidrs)");
+            return (StatusCode::FORBIDDEN, Json(json!({"error_type":"permission_denied","message":format!("Connections from {who} are not allowed"),"advice":"Add the address range with --allowed-cidrs."}))).into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// Security headers on every response; HSTS only when served over HTTPS.
+async fn security_headers(State(st): State<ServerState>, req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    if !matches!(st.cfg.tls, TlsMode::None) && st.cfg.hsts_max_age > 0 {
+        let v = format!("max-age={}{}", st.cfg.hsts_max_age, if st.cfg.hsts_include_subdomains { "; includeSubDomains" } else { "" });
+        if let Ok(v) = HeaderValue::from_str(&v) {
+            h.insert(header::STRICT_TRANSPORT_SECURITY, v);
+        }
+    }
+    res
+}
+
 async fn host_check(State(st): State<ServerState>, req: Request, next: Next) -> Response {
     let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
     if !st.cfg.host_allowed(host) {
@@ -145,20 +218,40 @@ async fn host_check(State(st): State<ServerState>, req: Request, next: Next) -> 
     next.run(req).await
 }
 
-async fn require_auth(State(st): State<ServerState>, req: Request, next: Next) -> Response {
-    let h = req.headers();
+/// Who is calling: the pre-authentication header, an API token (with
+/// enough scope for `method path`), or a session/automation token.
+pub(crate) async fn authenticate(st: &ServerState, h: &HeaderMap, method: &Method, path: &str) -> Result<Principal, AppError> {
     if let Some(t) = h.get(PREAUTH_HEADER).and_then(|v| v.to_str().ok()) {
         if !t.is_empty() && st.cfg.preauth_tokens.iter().any(|p| constant_eq(p, t)) {
-            return next.run(req).await;
+            return Ok(Principal::Session);
         }
     }
-    let bearer = h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+    let bearer = h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::to_string);
     match bearer {
-        Some(t) => match st.auth.validate(t).await {
-            Ok(_) => next.run(req).await,
-            Err(e) => ApiError(e).into_response(),
-        },
-        None => ApiError(AppError::PermissionDenied { message: "Authentication required".into(), advice: "Sign in first.".into() }).into_response(),
+        Some(t) if t.starts_with(api_tokens::PREFIX) => {
+            let tok = st.auth.api_tokens().validate(&t).await?;
+            let need = api_tokens::required_scope(method, path);
+            if tok.scope < need {
+                return Err(AppError::PermissionDenied {
+                    message: format!("The API token \"{}\" has the {} scope; this needs {}", tok.name, tok.scope.as_str(), need.as_str()),
+                    advice: "Use a token with a wider scope.".into(),
+                });
+            }
+            Ok(Principal::ApiToken { id: tok.id, scope: tok.scope })
+        }
+        Some(t) => st.auth.validate(&t).await.map(|_| Principal::Session),
+        None => Err(AppError::PermissionDenied { message: "Authentication required".into(), advice: "Sign in first.".into() }),
+    }
+}
+
+async fn require_auth(State(st): State<ServerState>, mut req: Request, next: Next) -> Response {
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
+    match authenticate(&st, req.headers(), &method, &path).await {
+        Ok(principal) => {
+            req.extensions_mut().insert(principal);
+            next.run(req).await
+        }
+        Err(e) => ApiError(e).into_response(),
     }
 }
 
@@ -246,6 +339,40 @@ async fn signin_token(State(st): State<ServerState>) -> ApiResult {
 
 async fn automation_token(State(st): State<ServerState>) -> ApiResult {
     ok(st.auth.issue_automation().await?)
+}
+
+#[derive(Deserialize)]
+struct ApiTokenBody {
+    name: String,
+    scope: api_tokens::Scope,
+    #[serde(default = "default_token_days")]
+    expires_in_days: i64,
+}
+
+fn default_token_days() -> i64 {
+    90
+}
+
+async fn list_api_tokens(State(st): State<ServerState>) -> ApiResult {
+    ok(json!({"tokens": st.auth.api_tokens().list().await?}))
+}
+
+/// Minting needs an interactive sign-in: an API token cannot create more tokens.
+async fn create_api_token(State(st): State<ServerState>, Extension(who): Extension<Principal>, Json(b): Json<ApiTokenBody>) -> ApiResult {
+    if who != Principal::Session {
+        return Err(AppError::PermissionDenied { message: "API tokens cannot create API tokens".into(), advice: "Sign in with the server password.".into() }.into());
+    }
+    let (t, raw) = st.auth.api_tokens().create(&b.name, b.scope, b.expires_in_days).await?;
+    tracing::info!("Created API token {} ({}, {} scope)", t.id, t.name, t.scope.as_str());
+    ok(json!({"token": raw, "info": t}))
+}
+
+async fn revoke_api_token(State(st): State<ServerState>, AxPath(id): AxPath<String>) -> ApiResult {
+    if !st.auth.api_tokens().revoke(&id).await? {
+        return Err(AppError::FileOperation { message: format!("API token {id} not found"), advice: "List the tokens to see their ids.".into() }.into());
+    }
+    tracing::info!("Revoked API token {id}");
+    ok(json!({"ok": true}))
 }
 
 async fn reset_jwt(State(st): State<ServerState>) -> ApiResult {
@@ -566,18 +693,36 @@ fn mime_for(p: &std::path::Path) -> &'static str {
     }
 }
 
+/// `GET /api/v1/sdk/{language}`: the generated client library (public, like the OpenAPI document).
+async fn sdk_download(axum::extract::Path(language): axum::extract::Path<String>) -> Response {
+    let doc = openapi::document();
+    let (text, file) = match language.as_str() {
+        "typescript" | "ts" => (sdk::typescript(&doc), "ufop-client.ts"),
+        "python" | "py" => (sdk::python(&doc), "ufop_client.py"),
+        _ => return (StatusCode::NOT_FOUND, Json(json!({ "error_type": "not_found", "message": format!("No client for '{language}'"), "advice": "Use typescript or python." }))).into_response(),
+    };
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()), (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{file}\""))], text).into_response()
+}
+
 /// Build the full router.
 pub fn router(st: ServerState) -> Router {
     let public = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/openapi.json", get(|| async { Json(openapi::document()) }))
+        .route("/api/v1/sdk/{language}", get(sdk_download))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/refresh", post(refresh))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/signin", post(redeem_signin))
-        .merge(oauth::public_routes());
+        .merge(oauth::public_routes())
+        .merge(shares::public_routes())
+        .merge(mcp_oauth::routes())
+        .merge(mcp::routes());
     let protected = Router::new()
         .route("/api/v1/auth/signin-token", post(signin_token))
         .route("/api/v1/auth/automation-token", post(automation_token))
+        .route("/api/v1/auth/api-tokens", get(list_api_tokens).post(create_api_token))
+        .route("/api/v1/auth/api-tokens/{id}", axum::routing::delete(revoke_api_token))
         .route("/api/v1/auth/reset", post(reset_jwt))
         .route("/api/v1/auth/password", axum::routing::put(change_password))
         .route("/api/v1/status", get(status))
@@ -603,8 +748,11 @@ pub fn router(st: ServerState) -> Router {
         .route("/api/v1/scheduler/pause", post(pause))
         .route("/api/v1/scheduler/resume", post(resume))
         .merge(oauth::protected_routes())
+        .merge(shares::protected_routes())
+        .merge(folders::protected_routes())
+        .merge(gateway::protected_routes())
         .route_layer(middleware::from_fn_with_state(st.clone(), require_auth));
-    let mut app = public.merge(protected);
+    let mut app = public.merge(protected).merge(dav::routes());
     if !st.cfg.api_only && st.cfg.webroot.is_some() {
         app = app.fallback(static_files);
     }
@@ -618,7 +766,10 @@ pub fn router(st: ServerState) -> Router {
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static(PREAUTH_HEADER)]),
         );
     }
-    app.layer(middleware::from_fn_with_state(st.clone(), host_check)).with_state(st)
+    app.layer(middleware::from_fn_with_state(st.clone(), host_check))
+        .layer(middleware::from_fn_with_state(st.clone(), ip_check))
+        .layer(middleware::from_fn_with_state(st.clone(), security_headers))
+        .with_state(st)
 }
 
 /// Restrict the data directory to the current user (0700 on Unix).
@@ -642,6 +793,7 @@ pub async fn serve(st: ServerState) -> Result<(), AppError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let addr = st.cfg.bind_addr()?;
     let tls = st.cfg.tls.clone();
+    let min_tls = st.cfg.min_tls;
     let app = router(st).into_make_service_with_connect_info::<SocketAddr>();
     let io = |e: std::io::Error| AppError::Configuration { message: format!("Server failed: {e}"), advice: "Check the port and TLS settings.".into() };
     match tls {
@@ -650,15 +802,15 @@ pub async fn serve(st: ServerState) -> Result<(), AppError> {
             axum_server::bind(addr).serve(app).await.map_err(io)
         }
         TlsMode::Generated { dir, hostnames } => {
-            let pair = tls::GeneratedCerts::new(dir).load_or_create(&hostnames)?;
-            let cfg = axum_server::tls_rustls::RustlsConfig::from_pem(pair.cert_chain_pem.into_bytes(), pair.key_pem.into_bytes()).await.map_err(io)?;
-            tracing::info!("ufop-server listening on https://{addr}");
+            let (chain, key) = tls::pem_to_der(&tls::GeneratedCerts::new(dir).load_or_create(&hostnames)?)?;
+            let cfg = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls::server_config(chain, key, min_tls)?));
+            tracing::info!("ufop-server listening on https://{addr} (TLS {:?}+)", min_tls);
             axum_server::bind_rustls(addr, cfg).serve(app).await.map_err(io)
         }
         TlsMode::Pfx { path, password } => {
             let (chain, key) = tls::load_pfx(&path, &password)?;
-            let cfg = axum_server::tls_rustls::RustlsConfig::from_der(chain, key).await.map_err(io)?;
-            tracing::info!("ufop-server listening on https://{addr} (imported certificate)");
+            let cfg = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls::server_config(chain, key, min_tls)?));
+            tracing::info!("ufop-server listening on https://{addr} (imported certificate, TLS {:?}+)", min_tls);
             axum_server::bind_rustls(addr, cfg).serve(app).await.map_err(io)
         }
     }
