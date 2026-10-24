@@ -9,6 +9,10 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, reload, util::SubscriberInit
 
 pub const FILE_PREFIX: &str = "ufop";
 pub const FILE_SUFFIX: &str = "log";
+/// Suffix of the machine-readable twin of each day's log: one JSON object per
+/// line (`ufop.2026-10-24.jsonl`). The log viewer reads these; the
+/// human-readable `.log` files stay exactly as they were.
+pub const JSON_SUFFIX: &str = "jsonl";
 
 /// Default retention: two weeks, at most 200 MB of logs.
 pub const DEFAULT_MAX_AGE_DAYS: u64 = 14;
@@ -63,26 +67,36 @@ impl Retention {
 
 static RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 static GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
+static JSON_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
 /// `<local data dir>/logs`.
 pub fn log_dir() -> PathBuf {
     crate::paths::data_local_dir().join("logs")
 }
 
-/// Install the global subscriber (stdout + rolling file). Call once.
+/// Install the global subscriber (stdout + rolling file + a JSON-lines
+/// twin of the file for the log viewer). Call once.
 pub fn init(dir: &Path) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let (filter, handle) = reload::Layer::new(filter);
-    let file_layer = std::fs::create_dir_all(dir).ok().and_then(|_| {
-        tracing_appender::rolling::Builder::new()
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix(FILE_PREFIX)
-            .filename_suffix(FILE_SUFFIX)
-            .build(dir)
-            .ok()
-    });
+    let rolling = |suffix: &str| {
+        std::fs::create_dir_all(dir).ok().and_then(|_| {
+            tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix(FILE_PREFIX)
+                .filename_suffix(suffix)
+                .build(dir)
+                .ok()
+        })
+    };
     let registry = tracing_subscriber::registry().with(filter).with(fmt::layer());
-    let result = match file_layer {
+    let json_layer = rolling(JSON_SUFFIX).map(|appender| {
+        let (writer, guard) = tracing_appender::non_blocking(appender);
+        let _ = JSON_GUARD.set(guard);
+        json_lines::JsonLinesLayer::new(writer)
+    });
+    let registry = registry.with(json_layer);
+    let result = match rolling(FILE_SUFFIX) {
         Some(appender) => {
             let (writer, guard) = tracing_appender::non_blocking(appender);
             let _ = GUARD.set(guard);
@@ -106,15 +120,25 @@ pub fn set_level(directive: &str) -> Result<(), String> {
     }
 }
 
-/// Log files in `dir`, newest first: (path, size, modified).
+/// The human-readable log files in `dir`, newest first: (path, size, modified).
 pub fn log_files(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+    files_with_suffix(dir, FILE_SUFFIX)
+}
+
+/// The JSON-lines twins of the daily logs in `dir`, newest first.
+pub fn json_log_files(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+    files_with_suffix(dir, JSON_SUFFIX)
+}
+
+fn files_with_suffix(dir: &Path, suffix: &str) -> Vec<(PathBuf, u64, SystemTime)> {
     let mut v: Vec<_> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter(|e| {
             let n = e.file_name().to_string_lossy().to_string();
-            n.starts_with(FILE_PREFIX) && n.contains(&format!(".{FILE_SUFFIX}"))
+            // `ufop.<date>.log` (as before: anything containing `.log`) or `ufop.<date>.jsonl`.
+            n.starts_with(FILE_PREFIX) && if suffix == JSON_SUFFIX { n.ends_with(&format!(".{JSON_SUFFIX}")) } else { n.contains(&format!(".{suffix}")) }
         })
         .filter_map(|e| {
             let m = e.metadata().ok()?;
@@ -125,15 +149,21 @@ pub fn log_files(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
     v
 }
 
-/// Remove log files older than `max_age` and, oldest first, beyond
-/// `max_total` bytes. The newest file is always kept. Returns removed count.
+/// Remove log files (both kinds) older than `max_age` and, oldest first,
+/// beyond `max_total` bytes. The newest file of each kind is always kept.
+/// Returns the removed count.
 pub fn prune(dir: &Path, max_age: Duration, max_total: u64) -> usize {
     let now = SystemTime::now();
+    let mut all: Vec<(PathBuf, u64, SystemTime, bool)> = log_files(dir).into_iter().map(|(p, l, m)| (p, l, m, true)).collect();
+    all.extend(json_log_files(dir).into_iter().map(|(p, l, m)| (p, l, m, false)));
+    all.sort_by_key(|e| std::cmp::Reverse(e.2));
+    let (mut kept_human, mut kept_json) = (false, false);
     let mut total = 0u64;
     let mut removed = 0;
-    for (i, (p, len, modified)) in log_files(dir).into_iter().enumerate() {
+    for (p, len, modified, human) in all {
+        let newest_of_kind = if human { !std::mem::replace(&mut kept_human, true) } else { !std::mem::replace(&mut kept_json, true) };
         let too_old = now.duration_since(modified).is_ok_and(|age| age > max_age);
-        if i > 0 && (too_old || total + len > max_total) {
+        if !newest_of_kind && (too_old || total + len > max_total) {
             if std::fs::remove_file(&p).is_ok() {
                 removed += 1;
             }
@@ -142,6 +172,102 @@ pub fn prune(dir: &Path, max_age: Duration, max_total: u64) -> usize {
         total += len;
     }
     removed
+}
+
+/// One JSON object per event, written to its own rolling file.
+pub mod json_lines {
+    use serde_json::{json, Map, Value};
+    use std::io::Write;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::layer::Context;
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::Layer;
+
+    /// Writes every event as a line:
+    /// `{"ts":"2026-10-24T19:11:47.284071Z","level":"INFO","target":"…","message":"…","fields":{…},"spans":["a","b"]}`.
+    /// A line is one `write_all`, so lines from different threads never mix.
+    pub struct JsonLinesLayer<W> {
+        writer: W,
+    }
+
+    impl<W> JsonLinesLayer<W> {
+        pub fn new(writer: W) -> Self {
+            Self { writer }
+        }
+    }
+
+    #[derive(Default)]
+    struct Collect {
+        message: Option<String>,
+        fields: Map<String, Value>,
+    }
+
+    impl Collect {
+        fn put(&mut self, field: &Field, value: Value) {
+            if field.name() == "message" {
+                self.message = Some(match value {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                });
+            } else {
+                self.fields.insert(field.name().to_string(), value);
+            }
+        }
+    }
+
+    impl Visit for Collect {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.put(field, Value::String(value.to_string()));
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.put(field, json!(value));
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.put(field, json!(value));
+        }
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.put(field, json!(value));
+        }
+        fn record_f64(&mut self, field: &Field, value: f64) {
+            self.put(field, json!(value));
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.put(field, Value::String(format!("{value:?}")));
+        }
+    }
+
+    impl<S, W> Layer<S> for JsonLinesLayer<W>
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+        W: for<'a> MakeWriter<'a> + 'static,
+    {
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+            let meta = event.metadata();
+            let mut seen = Collect::default();
+            event.record(&mut seen);
+            let spans: Vec<&str> = ctx.event_scope(event).map(|scope| scope.from_root().map(|s| s.name()).collect()).unwrap_or_default();
+            let mut line = json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                "level": meta.level().as_str(),
+                "target": meta.target(),
+                "message": seen.message.unwrap_or_default(),
+            });
+            if let Some(o) = line.as_object_mut() {
+                if !seen.fields.is_empty() {
+                    o.insert("fields".into(), Value::Object(seen.fields));
+                }
+                if !spans.is_empty() {
+                    o.insert("spans".into(), json!(spans));
+                }
+            }
+            let mut bytes = line.to_string().into_bytes();
+            bytes.push(b'\n');
+            let mut out = self.writer.make_writer();
+            let _ = out.write_all(&bytes);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +319,69 @@ mod tests {
     #[test]
     fn level_directives_are_validated() {
         assert!(set_level("not a [valid directive").is_err());
+    }
+
+    /// A writer tests can read back.
+    #[derive(Clone, Default)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn the_json_sink_writes_one_parsable_line_per_event() {
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::registry().with(json_lines::JsonLinesLayer::new(sink.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            {
+                let span = tracing::info_span!("backup.operation", job = "Docs");
+                let _in = span.enter();
+                tracing::warn!(files = 3u64, ok = true, path = "C:\\Users\\me", "disk \"almost\" full\nsecond line");
+            }
+            tracing::error!("plain");
+        });
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2, "a multi-line message is still one line: {text}");
+        assert_eq!(lines[0]["level"], "WARN");
+        assert_eq!(lines[0]["message"], "disk \"almost\" full\nsecond line");
+        assert_eq!(lines[0]["fields"]["files"], 3);
+        assert_eq!(lines[0]["fields"]["ok"], true);
+        assert_eq!(lines[0]["fields"]["path"], "C:\\Users\\me");
+        assert_eq!(lines[0]["spans"], serde_json::json!(["backup.operation"]));
+        assert!(lines[0]["target"].as_str().unwrap().contains("logging"));
+        assert!(chrono::DateTime::parse_from_rfc3339(lines[0]["ts"].as_str().unwrap()).is_ok());
+        assert_eq!((lines[1]["level"].as_str(), lines[1]["message"].as_str()), (Some("ERROR"), Some("plain")));
+        assert!(lines[1].get("fields").is_none() && lines[1].get("spans").is_none());
+    }
+
+    #[test]
+    fn both_kinds_of_log_are_pruned_and_the_newest_of_each_kept() {
+        let d = tempfile::tempdir().unwrap();
+        file(d.path(), "ufop.2026-10-22.log", 100, 0);
+        file(d.path(), "ufop.2026-10-22.jsonl", 100, 0);
+        file(d.path(), "ufop.2026-10-01.log", 100, 21);
+        file(d.path(), "ufop.2026-10-01.jsonl", 100, 21);
+        file(d.path(), "ufop.2026-09-01.jsonl", 100, 50);
+        assert_eq!(log_files(d.path()).len(), 2, "the human list does not include the JSON files");
+        assert_eq!(json_log_files(d.path()).len(), 3);
+        // Two weeks: the three old files go; each kind keeps its newest.
+        assert_eq!(prune(d.path(), Duration::from_secs(14 * 86_400), u64::MAX), 3);
+        assert_eq!(log_files(d.path()).len(), 1);
+        assert_eq!(json_log_files(d.path()).len(), 1);
+        // Nothing allowed: still the newest of each kind.
+        assert_eq!(prune(d.path(), Duration::from_secs(0), 0), 0);
     }
 }

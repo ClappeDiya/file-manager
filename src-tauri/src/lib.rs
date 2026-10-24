@@ -14,6 +14,7 @@ pub mod governance;
 pub mod ledger;
 pub mod lineage;
 pub mod metadata_engine;
+pub mod log_query;
 pub mod logging;
 pub mod diagnostics;
 pub mod managed_settings;
@@ -1292,6 +1293,7 @@ pub fn run() {
             log_commands::diagnostics_send,
             log_commands::set_log_level,
             log_commands::get_log_directory,
+            log_commands::query_logs,
             log_commands::export_logs_json,
             log_commands::export_logs_to_file,
             // Trusted SSH Host CAs
