@@ -36,6 +36,7 @@ import {
   type CopyOptions,
   type RobocopyJob,
 } from "@/lib/copy-options";
+import { FolderField } from "@/components/remote-folder-picker";
 
 // ── Types ──
 
@@ -906,24 +907,32 @@ function CreatePairView({
 
       <label className="block text-xs text-zinc-600 dark:text-zinc-400">
         Source Path
-        <input
-          type="text"
-          value={form.sourcePath}
-          onChange={(e) => update("sourcePath", e.target.value)}
-          className="mt-1 block w-full px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
-          placeholder="/home/user/documents"
-        />
+        <div className="mt-1">
+          <FolderField
+            value={form.sourcePath}
+            onChange={(v) => update("sourcePath", v)}
+            inputClassName="flex-1 min-w-0 px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
+            placeholder="/home/user/documents"
+            pickerTitle="Sync source folder"
+            testId="sync-source-path"
+            allowConnections={false}
+          />
+        </div>
       </label>
 
       <label className="block text-xs text-zinc-600 dark:text-zinc-400">
         Destination Path
-        <input
-          type="text"
-          value={form.destPath}
-          onChange={(e) => update("destPath", e.target.value)}
-          className="mt-1 block w-full px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
-          placeholder="/backup/documents"
-        />
+        <div className="mt-1">
+          <FolderField
+            value={form.destPath}
+            onChange={(v) => update("destPath", v)}
+            inputClassName="flex-1 min-w-0 px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
+            placeholder="/backup/documents"
+            pickerTitle="Sync destination folder"
+            testId="sync-dest-path"
+            allowConnections={false}
+          />
+        </div>
       </label>
 
       <label className="block text-xs text-zinc-600 dark:text-zinc-400">

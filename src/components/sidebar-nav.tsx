@@ -1,5 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
-import { useFileManagerStore, type FavoriteItem } from "@/stores/file-manager-store";
+import { paneLabel, useFileManagerStore, type FavoriteItem } from "@/stores/file-manager-store";
+import { useConnectionsStore } from "@/stores/connections-store";
+import { isRemotePath } from "@/lib/location";
 import { cn } from "@ufop/ui-components";
 import { ScrollArea } from "@ufop/ui-components";
 import {
@@ -13,6 +15,7 @@ import {
   Trash2,
   TriangleAlert,
   Sparkles,
+  Cloud,
 } from "lucide-react";
 import type { FileEntryData } from "./file-list";
 import { SmartSpacesSection } from "./smart-spaces-section";
@@ -62,6 +65,9 @@ interface SidebarNavProps {
   onLoadChildren?: (path: string) => Promise<FileEntryData[]>;
   onEjectDrive?: (path: string) => void;
   onActivateSpace?: (space: SmartSpace) => void;
+  /** Open a saved connection in the active pane ("Open in pane"); the
+   *  Connections section is shown when given. */
+  onOpenConnection?: (connectionId: string) => void;
   className?: string;
 }
 
@@ -71,8 +77,14 @@ export function SidebarNav({
   onLoadChildren,
   onEjectDrive,
   onActivateSpace,
+  onOpenConnection,
   className,
 }: SidebarNavProps) {
+  const connections = useConnectionsStore((s) => s.connections);
+  const connectionStatuses = useConnectionsStore((s) => s.statuses);
+  useEffect(() => {
+    if (onOpenConnection) void useConnectionsStore.getState().ensureLoaded();
+  }, [onOpenConnection]);
   const favorites = useFileManagerStore((s) => s.favorites);
   const recentLocations = useFileManagerStore((s) => s.recentLocations);
   const addFavorite = useFileManagerStore((s) => s.addFavorite);
@@ -95,7 +107,7 @@ export function SidebarNav({
   }, []);
 
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
-    new Set(["smart-spaces", "smart-locations", "favorites", "devices"]),
+    new Set(["smart-spaces", "smart-locations", "favorites", "devices", "connections"]),
   );
 
   const toggleSection = useCallback((section: string) => {
@@ -229,6 +241,46 @@ export function SidebarNav({
           )}
         </SidebarSection>
 
+        {/* Saved connections: open one in the active pane */}
+        {onOpenConnection && (
+          <SidebarSection
+            title="Connections"
+            icon={<Cloud className="h-4 w-4" aria-hidden="true" />}
+            expanded={expandedSections.has("connections")}
+            onToggle={() => toggleSection("connections")}
+            testId="sidebar-connections"
+          >
+            {connections.length === 0 ? (
+              <p className="px-4 py-2 text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)] italic">
+                No saved connections
+              </p>
+            ) : (
+              connections.map((c) => {
+                const rejected = !!connectionStatuses[c.id]?.credentials_rejected_at;
+                return (
+                  <button
+                    key={c.id}
+                    className={cn(
+                      "flex items-center gap-2 w-full px-4 py-1.5 text-left",
+                      "text-[length:var(--font-size-xs)] text-[color:var(--color-text-secondary)]",
+                      "hover:bg-[var(--color-hover-bg)] transition-theme",
+                      "focus-visible:outline-2 focus-visible:outline-inset focus-visible:outline-[var(--color-focus-ring)]",
+                    )}
+                    onClick={() => onOpenConnection(c.id)}
+                    title={rejected ? `${c.name}: credentials rejected — open to reconnect` : `Open ${c.name} in the active pane`}
+                    aria-label={`Open ${c.name} in pane`}
+                    data-testid={`sidebar-connection-${c.id}`}
+                  >
+                    <Cloud className={cn("h-3.5 w-3.5 shrink-0", rejected ? "text-red-500" : "text-[color:var(--color-primary)]")} aria-hidden="true" />
+                    <span className="truncate flex-1">{c.name}</span>
+                    {rejected && <TriangleAlert className="h-3 w-3 text-red-500 shrink-0" aria-label="Credentials rejected" />}
+                  </button>
+                );
+              })
+            )}
+          </SidebarSection>
+        )}
+
         {/* Tree View Section */}
         <SidebarSection
           title="Folders"
@@ -275,9 +327,9 @@ export function SidebarNav({
                 onClick={() => onNavigate(loc.path)}
                 title={loc.path}
               >
-                <Folder className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                {isRemotePath(loc.path) ? <Cloud className="h-3.5 w-3.5 shrink-0" aria-hidden="true" /> : <Folder className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />}
                 <span className="truncate">
-                  {loc.path.split("/").filter(Boolean).pop() || loc.path}
+                  {isRemotePath(loc.path) ? paneLabel(loc.path) : loc.path.split("/").filter(Boolean).pop() || loc.path}
                 </span>
               </button>
             ))

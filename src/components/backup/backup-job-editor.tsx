@@ -37,6 +37,8 @@ import { BackupChangePassphrase } from "./backup-repository-format";
 import { ScheduleEditor } from "./backup-schedule-editor";
 import { EffectiveSettingsPanel, MaintenanceScheduleEditor, TemplatePicker } from "./backup-policies";
 import { changedPaths, setPath } from "@/stores/backup-policy";
+import { FolderField, RemoteFolderPicker } from "@/components/remote-folder-picker";
+import { parseLocation, remoteLocation } from "@/lib/location";
 
 interface ConnectionProfile {
   id: string;
@@ -55,6 +57,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
   const { saveJob, capabilities, loadCapabilities } = useBackupStore();
   const [job, setJob] = useState<BackupJob>(initial);
   const [step, setStep] = useState<Step>("General");
+  const [sourcePicker, setSourcePicker] = useState(false);
   const [passphrase, setPassphrase] = useState("");
   const [strength, setStrength] = useState<PassphraseStrength | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -221,6 +224,20 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 >
                   Add folder…
                 </Btn>
+                <Btn onClick={() => setSourcePicker(true)} testId="backup-source-pick" title="Pick a folder, or create one">
+                  Pick folder…
+                </Btn>
+                {sourcePicker && (
+                  <RemoteFolderPicker
+                    title="Add source folder"
+                    allowConnections={false}
+                    onCancel={() => setSourcePicker(false)}
+                    onPick={(p) => {
+                      setSourcePicker(false);
+                      patch({ sources: [...job.sources.filter((s) => s.trim()), p] });
+                    }}
+                  />
+                )}
                 <Btn
                   disabled={busy}
                   onClick={() =>
@@ -426,8 +443,21 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                     ))}
                   </select>
                 </Field>
-                <Field label="Remote folder" hint="For S3 use /bucket/prefix.">
-                  <input className={inputCls} value={dest.remote_path} onChange={(e) => setDest({ ...dest, remote_path: e.target.value })} />
+                <Field label="Remote folder" hint="For S3 use /bucket/prefix. Pick… browses the connection (and can create the folder).">
+                  {dest.connection_id ? (
+                    <FolderField
+                      value={dest.remote_path}
+                      onChange={(v) => setDest({ ...dest, remote_path: v })}
+                      inputClassName={inputCls}
+                      testId="backup-dest-remote-path"
+                      pickerTitle="Backup folder on the connection"
+                      lockRoot={remoteLocation(dest.connection_id, "/")}
+                      toValue={(p) => parseLocation(p).path}
+                      fromValue={(v) => remoteLocation(dest.connection_id, v || "/")}
+                    />
+                  ) : (
+                    <input className={inputCls} value={dest.remote_path} onChange={(e) => setDest({ ...dest, remote_path: e.target.value })} />
+                  )}
                 </Field>
               </>
             )}

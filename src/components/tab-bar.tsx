@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useFileManagerStore, type PaneTab } from "@/stores/file-manager-store";
+import { paneLabel, useFileManagerStore, type PaneTab } from "@/stores/file-manager-store";
 import { cn } from "@ufop/ui-components";
 import { Tooltip } from "@ufop/ui-components";
 import { X, Plus, Pin, PinOff } from "lucide-react";
+import { formatAddress } from "@/lib/location";
+import { useConnectionsStore } from "@/stores/connections-store";
 import { ContextMenu, getTabContextMenuItems } from "./context-menu";
 
 /**
@@ -59,7 +61,7 @@ export function TabBar({ paneIndex, className }: TabBarProps) {
         e.preventDefault();
         const currentTab = pane.tabs.find((t) => t.id === pane.activeTabId);
         const path = currentTab?.path || "/";
-        const label = path === "/" ? "Root" : path.split("/").filter(Boolean).pop() || "Root";
+        const label = paneLabel(path);
         addTab(paneIndex, path, label);
       }
 
@@ -122,7 +124,7 @@ export function TabBar({ paneIndex, className }: TabBarProps) {
   const handleNewTab = useCallback(() => {
     const currentTab = pane.tabs.find((t) => t.id === pane.activeTabId);
     const path = currentTab?.path || "/";
-    const label = path === "/" ? "Root" : path.split("/").filter(Boolean).pop() || "Root";
+    const label = paneLabel(path);
     addTab(paneIndex, path, label);
   }, [pane, paneIndex, addTab]);
 
@@ -291,7 +293,7 @@ function TabItem({
   onDragEnd,
 }: TabItemProps) {
   return (
-    <Tooltip content={tab.path}>
+    <Tooltip content={formatAddress(tab.path, (id) => useConnectionsStore.getState().nameOf(id))}>
       <div
         role="tab"
         aria-selected={isActive}
@@ -327,7 +329,7 @@ function TabItem({
         )}
 
         {/* Tab label */}
-        <span className="truncate" title={tab.path}>
+        <span className="truncate" title={formatAddress(tab.path, (id) => useConnectionsStore.getState().nameOf(id))}>
           {tab.label}
         </span>
 

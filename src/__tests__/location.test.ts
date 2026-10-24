@@ -1,0 +1,109 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import {
+  clearRemoteNames,
+  formatAddress,
+  isRemotePath,
+  joinLocation,
+  locationLabel,
+  locationRoot,
+  locationSegments,
+  parentLocation,
+  parseAddressInput,
+  parseLocation,
+  rememberRemoteNames,
+  remoteLocation,
+  sameLocationRoot,
+  splitAddressForCompletion,
+} from "@/lib/location";
+
+const ID = "6f1c2b0a-1111-4222-8333-944455556666";
+
+describe("pane locations", () => {
+  beforeEach(() => clearRemoteNames());
+
+  it("leaves every local path unchanged", () => {
+    for (const p of ["/", "/home/me", "C:\\Users\\me", "\\\\nas\\share"]) {
+      expect(parseLocation(p)).toEqual({ kind: "local", path: p });
+      expect(isRemotePath(p)).toBe(false);
+    }
+    expect(parentLocation("/home/me")).toBe("/home");
+    expect(parentLocation("/home")).toBe("/");
+    expect(joinLocation("/", "a")).toBe("/a");
+    expect(joinLocation("/home", "a")).toBe("/home/a");
+    expect(joinLocation("C:\\Users", "a")).toBe("C:\\Users\\a");
+    expect(locationRoot("/home/me")).toBe("/");
+  });
+
+  it("parses and builds conn:// locations", () => {
+    const p = remoteLocation(ID, "/drive/root:/Docs");
+    expect(p).toBe(`conn://${ID}/drive/root:/Docs`);
+    expect(parseLocation(p)).toEqual({ kind: "remote", connectionId: ID, path: "/drive/root:/Docs" });
+    expect(parseLocation(`conn://${ID}`)).toEqual({ kind: "remote", connectionId: ID, path: "/" });
+    expect(remoteLocation(ID, "bucket/x")).toBe(`conn://${ID}/bucket/x`);
+    expect(joinLocation(remoteLocation(ID, "/"), "a.txt")).toBe(`conn://${ID}/a.txt`);
+    expect(joinLocation(p, "a.txt")).toBe(`conn://${ID}/drive/root:/Docs/a.txt`);
+    expect(parentLocation(`conn://${ID}/a/b`)).toBe(`conn://${ID}/a`);
+    expect(parentLocation(`conn://${ID}/a`)).toBe(`conn://${ID}/`);
+    expect(parentLocation(`conn://${ID}/`)).toBe(`conn://${ID}/`);
+    expect(locationRoot(p)).toBe(`conn://${ID}/`);
+  });
+
+  it("knows which locations share a root", () => {
+    const other = "0b5d8c3e-aaaa-4bbb-8ccc-dddddddddddd";
+    expect(sameLocationRoot("/a", "/b")).toBe(true);
+    expect(sameLocationRoot(`conn://${ID}/a`, `conn://${ID}/b`)).toBe(true);
+    expect(sameLocationRoot(`conn://${ID}/a`, `conn://${other}/a`)).toBe(false);
+    expect(sameLocationRoot("/a", `conn://${ID}/a`)).toBe(false);
+  });
+
+  it("labels and breadcrumbs use listed names (Drive paths are ids)", () => {
+    rememberRemoteNames([
+      { path: `conn://${ID}/f1`, name: "Reports" },
+      { path: `conn://${ID}/f1/f2`, name: "2026" },
+    ]);
+    expect(locationLabel(`conn://${ID}/f1/f2`)).toBe("2026");
+    expect(locationLabel(`conn://${ID}/`, () => "My Drive")).toBe("My Drive");
+    expect(locationLabel("/")).toBe("Root");
+    expect(locationLabel("/home/me")).toBe("me");
+    expect(locationSegments(`conn://${ID}/f1/f2`)).toEqual([
+      { label: "Reports", path: `conn://${ID}/f1` },
+      { label: "2026", path: `conn://${ID}/f1/f2` },
+    ]);
+    // OneDrive's Graph prefix is not a folder of its own.
+    expect(locationSegments(`conn://${ID}/drive/root:/Docs`).map((s) => s.label)).toEqual(["Docs"]);
+    expect(locationSegments("/home/me")).toEqual([
+      { label: "home", path: "/home" },
+      { label: "me", path: "/home/me" },
+    ]);
+  });
+
+  it("parses typed addresses", () => {
+    const conns = [
+      { id: ID, name: "Work Drive" },
+      { id: "0b5d8c3e-aaaa-4bbb-8ccc-dddddddddddd", name: "D" },
+    ];
+    expect(parseAddressInput("/home/me/", conns)).toEqual({ ok: true, path: "/home/me" });
+    expect(parseAddressInput("/", conns)).toEqual({ ok: true, path: "/" });
+    expect(parseAddressInput("Work Drive:/Docs", conns)).toEqual({ ok: true, path: `conn://${ID}/Docs` });
+    expect(parseAddressInput("work drive:Docs", conns)).toEqual({ ok: true, path: `conn://${ID}/Docs` });
+    expect(parseAddressInput("Work Drive:", conns)).toEqual({ ok: true, path: `conn://${ID}/` });
+    expect(parseAddressInput(`conn://${ID}/x`, conns)).toEqual({ ok: true, path: `conn://${ID}/x` });
+    expect(parseAddressInput("conn://00000000-0000-4000-8000-000000000000/x", conns).ok).toBe(false);
+    // Windows drives stay local unless a connection is named exactly that.
+    expect(parseAddressInput("C:\\Users", conns)).toEqual({ ok: true, path: "C:\\Users" });
+    expect(parseAddressInput("C:", conns)).toEqual({ ok: true, path: "C:\\" });
+    expect(parseAddressInput("D:/x", conns)).toEqual({ ok: true, path: "conn://0b5d8c3e-aaaa-4bbb-8ccc-dddddddddddd/x" });
+    expect(parseAddressInput("Nope:/x", conns)).toEqual({ ok: false, error: 'No saved connection is named "Nope"' });
+    expect(parseAddressInput("relative/path", conns).ok).toBe(false);
+    expect(parseAddressInput("  ", conns).ok).toBe(false);
+  });
+
+  it("splits typed text for completion and formats addresses", () => {
+    expect(splitAddressForCompletion("/home/us")).toEqual({ parent: "/home", partial: "us" });
+    expect(splitAddressForCompletion("/ho")).toEqual({ parent: "/", partial: "ho" });
+    expect(splitAddressForCompletion("Drive:/Docs/Re")).toEqual({ parent: "Drive:/Docs", partial: "Re" });
+    expect(splitAddressForCompletion("Drive:/Re")).toEqual({ parent: "Drive:/", partial: "Re" });
+    expect(formatAddress(`conn://${ID}/Docs`, () => "Work Drive")).toBe("Work Drive:/Docs");
+    expect(formatAddress("/home")).toBe("/home");
+  });
+});

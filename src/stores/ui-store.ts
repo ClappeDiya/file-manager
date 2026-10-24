@@ -163,6 +163,15 @@ export interface UIState {
   /** Text editor saves on its own a moment after the last edit. */
   editorAutosave: boolean;
   setEditorAutosave: (on: boolean) => void;
+  /** Ask before a drag-and-drop copies or moves files (off = act at once, as always). */
+  confirmDragDrop: boolean;
+  setConfirmDragDrop: (on: boolean) => void;
+  /** Settings › General: where downloads from connections go first (null = ask / OS default). */
+  defaultDownloadDir: string | null;
+  setDefaultDownloadDir: (dir: string | null) => void;
+  /** Settings › General: where the upload file picker opens (null = OS default). */
+  defaultUploadDir: string | null;
+  setDefaultUploadDir: (dir: string | null) => void;
 
   // View
   viewMode: ViewMode;
@@ -403,6 +412,12 @@ export const useUIStore = create<UIState>()(
       setBackupAdvanced: (value: boolean | null) => set({ backupAdvanced: value }),
       editorAutosave: false,
       setEditorAutosave: (on: boolean) => set({ editorAutosave: on }),
+      confirmDragDrop: false,
+      setConfirmDragDrop: (on: boolean) => set({ confirmDragDrop: on }),
+      defaultDownloadDir: null,
+      setDefaultDownloadDir: (dir: string | null) => set({ defaultDownloadDir: dir?.trim() ? dir.trim() : null }),
+      defaultUploadDir: null,
+      setDefaultUploadDir: (dir: string | null) => set({ defaultUploadDir: dir?.trim() ? dir.trim() : null }),
 
       // View
       viewMode: "list",
@@ -545,6 +560,9 @@ export const useUIStore = create<UIState>()(
         activityFeed: state.activityFeed,
         toolbarItems: state.toolbarItems,
         editorAutosave: state.editorAutosave,
+        confirmDragDrop: state.confirmDragDrop,
+        defaultDownloadDir: state.defaultDownloadDir,
+        defaultUploadDir: state.defaultUploadDir,
       }),
       onRehydrateStorage: () => {
         return (state) => {

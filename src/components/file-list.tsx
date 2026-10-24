@@ -25,7 +25,8 @@ import {
   Film,
   Music,
 } from "lucide-react";
-import { useThumbnail } from "@/lib/thumbnails";
+import { hasThumbnail, useThumbnail } from "@/lib/thumbnails";
+import { isRemotePath } from "@/lib/location";
 import type { ViewMode } from "@/stores/file-manager-store";
 
 // ──────────────────────────────────────────────
@@ -1174,8 +1175,9 @@ interface FileGridViewProps {
 /** Grid cell icon: a thumbnail for images, else the folder/file glyph. */
 export function GridIcon({ entry }: { entry: FileEntryData }) {
   const thumb = useThumbnail(entry.path, entry.name, !entry.is_dir, 96, entry.modified ?? "");
+  const noRemoteThumb = !entry.is_dir && hasThumbnail(entry.name) && isRemotePath(entry.path);
   return (
-    <div className="flex items-center justify-center h-12 w-12">
+    <div className="flex items-center justify-center h-12 w-12" title={noRemoteThumb ? "No thumbnails for connection files: open the file to view it" : undefined}>
       {thumb ? (
         <img src={thumb} alt="" className="max-h-12 max-w-12 object-contain rounded-sm" draggable={false} data-testid="grid-thumbnail" />
       ) : entry.is_dir ? (

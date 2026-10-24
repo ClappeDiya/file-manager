@@ -31,6 +31,8 @@ import { usePortableStatus } from "@/hooks/use-portable-status";
 import { MetricsExporterSection } from "@/components/metrics-exporter-section";
 import { ChatControlSection } from "@/components/chat-control-section";
 import { AdvancedOnly } from "@/components/backup/advanced-only";
+import { FolderField } from "@/components/remote-folder-picker";
+import { useUIStore } from "@/stores/ui-store";
 
 // ── Types ──
 
@@ -103,6 +105,53 @@ function Section({
           {children}
         </div>
       )}
+    </div>
+  );
+}
+
+// ── General ──
+
+/** Drag-and-drop confirmation and the default download / upload folders. */
+export function GeneralSection() {
+  const confirmDragDrop = useUIStore((s) => s.confirmDragDrop);
+  const setConfirmDragDrop = useUIStore((s) => s.setConfirmDragDrop);
+  const downloadDir = useUIStore((s) => s.defaultDownloadDir);
+  const setDownloadDir = useUIStore((s) => s.setDefaultDownloadDir);
+  const uploadDir = useUIStore((s) => s.defaultUploadDir);
+  const setUploadDir = useUIStore((s) => s.setDefaultUploadDir);
+  return (
+    <div className="pt-3 space-y-3 text-xs">
+      <label className="flex items-start gap-2 cursor-pointer">
+        <input type="checkbox" checked={confirmDragDrop} onChange={(e) => setConfirmDragDrop(e.target.checked)} data-testid="setting-confirm-drag-drop" />
+        <span>
+          Ask before drag-and-drop copies or moves
+          <span className="block text-gray-500">Shows what will happen (and any Safety Interlock warning) before a drop runs. Off: drops act at once.</span>
+        </span>
+      </label>
+      <div>
+        <div className="font-medium mb-1">Default download folder</div>
+        <FolderField
+          value={downloadDir ?? ""}
+          onChange={(v) => setDownloadDir(v)}
+          placeholder="Ask each time"
+          testId="setting-download-dir"
+          pickerTitle="Default download folder"
+          allowConnections={false}
+        />
+        <p className="text-gray-500 mt-1">Where downloads from the Connections panel start, and where F5 / F6 from a connection folder go when the other pane cannot take them.</p>
+      </div>
+      <div>
+        <div className="font-medium mb-1">Default upload source folder</div>
+        <FolderField
+          value={uploadDir ?? ""}
+          onChange={(v) => setUploadDir(v)}
+          placeholder="The system default"
+          testId="setting-upload-dir"
+          pickerTitle="Default upload source folder"
+          allowConnections={false}
+        />
+        <p className="text-gray-500 mt-1">Where the file picker opens when you upload to a connection.</p>
+      </div>
     </div>
   );
 }
@@ -1317,6 +1366,10 @@ export default function SettingsPanel({
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
         <Section title="Appearance" defaultOpen>
           <AppearanceSettings />
+        </Section>
+
+        <Section title="General" id="general" focus={focusSection === "general"}>
+          <GeneralSection />
         </Section>
 
         {/* Export */}

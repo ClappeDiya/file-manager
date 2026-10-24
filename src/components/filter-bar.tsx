@@ -18,6 +18,9 @@ interface FilterBarProps {
    *  only when `onScopeChange` is given. */
   scope?: SearchScope;
   onScopeChange?: (scope: SearchScope) => void;
+  /** Set: only "This folder" works here (connection folders); the scope
+   *  menu is disabled with this reason. */
+  scopeDisabledReason?: string;
   className?: string;
   /** **Stale Files Filter** — number of files in the current directory
    *  that the unified ledger has NOT seen any activity on within the
@@ -50,6 +53,7 @@ export function FilterBar({
   filteredCount,
   scope = "folder",
   onScopeChange,
+  scopeDisabledReason,
   className,
   staleCount,
   staleActive,
@@ -126,6 +130,8 @@ export function FilterBar({
         <select
           value={scope}
           onChange={(e) => onScopeChange(e.target.value as SearchScope)}
+          disabled={!!scopeDisabledReason}
+          title={scopeDisabledReason}
           aria-label="Search in"
           className="h-5 shrink-0 rounded border border-[var(--color-border)] bg-transparent text-[length:var(--font-size-xs)] text-[color:var(--color-text-secondary)]"
         >

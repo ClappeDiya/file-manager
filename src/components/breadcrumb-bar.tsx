@@ -1,11 +1,16 @@
 import { useMemo } from "react";
 import { cn } from "@ufop/ui-components";
-import { ChevronLeft, ChevronRight, Home } from "lucide-react";
+import { ChevronLeft, ChevronRight, Cloud, Home } from "lucide-react";
+import { AddressBar, type AddressBarProps } from "./address-bar";
+import { isRemotePath, locationConnectionId, locationRoot, locationSegments } from "@/lib/location";
 
 /**
  * Breadcrumb bar with clickable path segments and back/forward navigation.
  * Shows the current directory path as breadcrumbs that can be clicked
- * to navigate to any parent directory.
+ * to navigate to any parent directory. Connection folders (`conn://…`)
+ * start at the connection (its name, a cloud icon) and name their folders
+ * from the listing. With `address` set, clicking the empty part of the bar
+ * (or `editing` from Ctrl/Cmd+L) turns it into the editable address bar.
  */
 interface BreadcrumbBarProps {
   path: string;
@@ -15,6 +20,13 @@ interface BreadcrumbBarProps {
   canGoBack?: boolean;
   canGoForward?: boolean;
   className?: string;
+  /** Name of a connection id (remote roots show it). */
+  connectionName?: (id: string) => string | undefined;
+  /** Makes the bar editable: what the address field needs. */
+  address?: Omit<AddressBarProps, "path" | "onNavigate" | "onCancel">;
+  /** Whether the address field is showing (controlled). */
+  editing?: boolean;
+  onEditingChange?: (editing: boolean) => void;
 }
 
 export function BreadcrumbBar({
@@ -25,14 +37,15 @@ export function BreadcrumbBar({
   canGoBack = false,
   canGoForward = false,
   className,
+  connectionName,
+  address,
+  editing = false,
+  onEditingChange,
 }: BreadcrumbBarProps) {
-  const segments = useMemo(() => {
-    const parts = path.split("/").filter(Boolean);
-    return parts.map((part, index) => ({
-      label: part,
-      path: "/" + parts.slice(0, index + 1).join("/"),
-    }));
-  }, [path]);
+  const segments = useMemo(() => locationSegments(path), [path]);
+  const remote = isRemotePath(path);
+  const rootLabel = remote ? connectionName?.(locationConnectionId(path) ?? "") ?? "Connection" : null;
+  const showAddress = !!address && editing;
 
   return (
     <nav
@@ -93,15 +106,35 @@ export function BreadcrumbBar({
           "transition-theme shrink-0",
           "focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]",
         )}
-        onClick={() => onNavigate("/")}
-        aria-label="Navigate to root"
+        onClick={() => onNavigate(locationRoot(path))}
+        aria-label={rootLabel ? `Navigate to the top of ${rootLabel}` : "Navigate to root"}
+        title={rootLabel ?? undefined}
         data-testid="breadcrumb-root"
         type="button"
       >
-        <Home className="h-3.5 w-3.5" aria-hidden="true" />
+        {rootLabel ? (
+          <>
+            <Cloud className="h-3.5 w-3.5" aria-hidden="true" />
+            <span className="truncate max-w-[140px]" data-testid="breadcrumb-connection">{rootLabel}</span>
+          </>
+        ) : (
+          <Home className="h-3.5 w-3.5" aria-hidden="true" />
+        )}
       </button>
 
-      {segments.map((segment, index) => (
+      {showAddress && address && (
+        <AddressBar
+          {...address}
+          path={path}
+          onNavigate={(p) => {
+            onEditingChange?.(false);
+            onNavigate(p);
+          }}
+          onCancel={() => onEditingChange?.(false)}
+        />
+      )}
+
+      {!showAddress && segments.map((segment, index) => (
         <div key={segment.path} className="flex items-center gap-0.5 min-w-0">
           <ChevronRight
             className="h-3 w-3 text-[color:var(--color-text-tertiary)] shrink-0"
@@ -127,6 +160,17 @@ export function BreadcrumbBar({
           </button>
         </div>
       ))}
+
+      {address && !showAddress && (
+        <button
+          type="button"
+          className="flex-1 self-stretch min-w-[24px] cursor-text"
+          onClick={() => onEditingChange?.(true)}
+          aria-label="Edit address"
+          title="Type a path (Ctrl+L)"
+          data-testid="breadcrumb-edit"
+        />
+      )}
     </nav>
   );
 }
