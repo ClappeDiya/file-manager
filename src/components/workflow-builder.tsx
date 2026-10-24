@@ -7,8 +7,10 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { applyNodeChanges, Background, Controls, Handle, Position, ReactFlow, type Connection, type Edge, type Node, type NodeChange, type NodeProps } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { addNode, autoLayout, connect, defaultKind, EDGE_LABELS, NODE_TYPES, nodeTitle, removeEdge, removeNode, setEdgeOn, updateNode, validateWorkflow, type NodeStatus, type NodeType } from "@/lib/workflow-model";
-import type { ConditionNode, EdgeOn, RuleAction, Workflow, WorkflowEdge, WorkflowNode } from "@/stores/automation-store";
+import { addNode, autoLayout, connect, defaultKind, earlierWorkflowResults, EDGE_LABELS, NODE_TYPES, nodeTitle, removeEdge, removeNode, setEdgeOn, updateNode, validateWorkflow, type NodeStatus, type NodeType } from "@/lib/workflow-model";
+import { RiskBadge } from "@/components/step-risk";
+import { RESULT_FIELDS } from "@/lib/automation-rule-model";
+import type { ConditionNode, EdgeOn, RuleAction, StepRisk, Workflow, WorkflowEdge, WorkflowNode } from "@/stores/automation-store";
 
 const field = "w-full min-w-0 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-xs";
 const btn = "px-2 py-1 text-xs rounded border border-[var(--color-border)] hover:bg-[var(--color-hover)] disabled:opacity-50";
@@ -20,6 +22,7 @@ interface StepData extends Record<string, unknown> {
   kind: NodeType;
   status?: NodeStatus;
   selected: boolean;
+  risk?: StepRisk;
 }
 
 function StepNode({ data }: NodeProps<Node<StepData>>) {
@@ -28,6 +31,7 @@ function StepNode({ data }: NodeProps<Node<StepData>>) {
       <Handle type="target" position={Position.Top} />
       <div className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)]">{KIND_TAG[data.kind]}</div>
       <div className="font-medium truncate max-w-[180px]">{data.title}</div>
+      <RiskBadge risk={data.risk} />
       {data.status && <div className="text-[10px]">{data.status}</div>}
       <Handle type="source" position={Position.Bottom} />
     </div>
@@ -47,10 +51,12 @@ export interface WorkflowBuilderProps {
   renderAction?: (a: RuleAction, onChange: (a: RuleAction) => void, idx: number) => ReactNode;
   renderCondition?: (c: ConditionNode, onChange: (c: ConditionNode) => void) => ReactNode;
   newAction?: () => RuleAction;
+  /** Risk of an action, shown as a badge on its step (Advanced). */
+  riskOf?: (a: RuleAction) => StepRisk | undefined;
   newCondition?: () => ConditionNode;
 }
 
-export function WorkflowBuilder({ workflow, onChange, status, rules = [], actionLabel, renderAction, renderCondition, newAction, newCondition }: WorkflowBuilderProps) {
+export function WorkflowBuilder({ workflow, onChange, status, rules = [], actionLabel, renderAction, renderCondition, newAction, newCondition, riskOf }: WorkflowBuilderProps) {
   const readOnly = !onChange;
   const [selected, setSelected] = useState<string | null>(null);
   const [selectedEdge, setSelectedEdge] = useState<string | null>(null);
@@ -60,8 +66,8 @@ export function WorkflowBuilder({ workflow, onChange, status, rules = [], action
   const errors = useMemo(() => (readOnly ? [] : validateWorkflow(workflow)), [workflow, readOnly]);
 
   const toNodes = useCallback(
-    (wf: Workflow): Node<StepData>[] => wf.nodes.map((n) => ({ id: n.id, type: "step", position: { x: n.x, y: n.y }, draggable: !readOnly, data: { title: nodeTitle(n, actionLabel), kind: n.kind, status: status?.[n.id], selected: n.id === selected } })),
-    [actionLabel, readOnly, selected, status],
+    (wf: Workflow): Node<StepData>[] => wf.nodes.map((n) => ({ id: n.id, type: "step", position: { x: n.x, y: n.y }, draggable: !readOnly, data: { title: nodeTitle(n, actionLabel), kind: n.kind, status: status?.[n.id], selected: n.id === selected, risk: n.kind === "action" ? riskOf?.(n.action) : undefined } })),
+    [actionLabel, readOnly, riskOf, selected, status],
   );
   const [rfNodes, setRfNodes] = useState<Node<StepData>[]>(() => toNodes(workflow));
   useEffect(() => setRfNodes(toNodes(workflow)), [workflow, toNodes]);
@@ -153,6 +159,7 @@ export function WorkflowBuilder({ workflow, onChange, status, rules = [], action
             <button type="button" className={`text-left hover:underline ${n.id === selected ? "font-semibold" : ""}`} onClick={() => setSelected(n.id)} aria-label={`Step ${n.id}: ${nodeTitle(n, actionLabel)}`}>
               {n.id}. {nodeTitle(n, actionLabel)}
             </button>
+            {n.kind === "action" && <RiskBadge risk={riskOf?.(n.action)} />}
             {status?.[n.id] && <span className="text-[10px] text-[var(--color-text-muted)]">{status[n.id]}</span>}
             <span className="text-[10px] text-[var(--color-text-muted)]">
               {workflow.edges
@@ -209,6 +216,19 @@ export function WorkflowBuilder({ workflow, onChange, status, rules = [], action
             </button>
           </div>
           {node.kind === "action" && renderAction?.(node.action, (action) => patchNode({ action } as Partial<WorkflowNode>), workflow.nodes.indexOf(node) + 100)}
+          {(node.kind === "action" || node.kind === "sub_rule") && (
+            <div className="space-y-1">
+              {node.kind === "action" && <RiskBadge risk={riskOf?.(node.action)} />}
+              <label className="text-xs block">
+                Save this step&apos;s result as (optional)
+                <input aria-label="Result name" className={`${field} font-mono`} placeholder="e.g. listing" value={node.output_as ?? ""} onChange={(e) => patchNode({ output_as: e.target.value || null })} />
+              </label>
+              <p className="text-[11px] text-[var(--color-text-muted)]">
+                Later steps can use {RESULT_FIELDS.map((f) => `{steps.${node.output_as?.trim() || "name"}.${f}}`).join(" ")}
+                {earlierWorkflowResults(workflow, node.id).length > 0 && <> · available here: {earlierWorkflowResults(workflow, node.id).join(", ")}</>}
+              </p>
+            </div>
+          )}
           {node.kind === "condition" && renderCondition?.(node.condition, (condition) => patchNode({ condition } as Partial<WorkflowNode>))}
           {node.kind === "delay" && (
             <label className="text-xs block">

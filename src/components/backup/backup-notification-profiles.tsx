@@ -162,13 +162,19 @@ export function NotificationProfilesManager() {
   );
 }
 
-/** Job editor: the profiles this job also sends to. */
-export function NotificationProfilePicker({ value, onChange }: { value: string[]; onChange: (ids: string[]) => void }) {
+/** The saved profiles and which of the `chosen` ids no longer exist (shared by every picker). */
+export function useProfileChoices(chosen: string[]) {
   const { profiles, loadProfiles } = useNotifyStore();
   useEffect(() => {
     void loadProfiles();
   }, [loadProfiles]);
-  const missing = value.filter((id) => !profiles.some((p) => p.id === id));
+  const missing = chosen.filter((id) => !profiles.some((p) => p.id === id));
+  return { profiles, missing };
+}
+
+/** Job editor: the profiles this job also sends to. */
+export function NotificationProfilePicker({ value, onChange }: { value: string[]; onChange: (ids: string[]) => void }) {
+  const { profiles, missing } = useProfileChoices(value);
   return (
     <Section title="Notification profiles" hint="Shared channels from Settings → Notification profiles.">
       {profiles.length === 0 && <p className="text-xs text-zinc-500">No profiles yet; create them in Backup settings.</p>}

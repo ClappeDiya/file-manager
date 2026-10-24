@@ -118,6 +118,22 @@ export function autoLayout(wf: Workflow): Workflow {
   };
 }
 
+/** Result names saved by the steps upstream of `id` (the ones its fields may use as {steps.<name>.…}). */
+export function earlierWorkflowResults(wf: Workflow, id: string): string[] {
+  const upstream = new Set<string>();
+  const stack = [id];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    for (const e of wf.edges) {
+      if (e.to === cur && !upstream.has(e.from)) {
+        upstream.add(e.from);
+        stack.push(e.from);
+      }
+    }
+  }
+  return wf.nodes.filter((n) => upstream.has(n.id)).map((n) => n.output_as?.trim() ?? "").filter(Boolean);
+}
+
 /** Problems that would make the engine refuse the workflow. */
 export function validateWorkflow(wf: Workflow): string[] {
   const errors: string[] = [];

@@ -14,6 +14,10 @@ import { refId, useScheduleStore } from "@/stores/schedule-store";
 import { useState, useCallback, useEffect } from "react";
 import { SyncRunOptionsSection } from "@/components/sync-run-options";
 import { DEFAULT_RUN_OPTIONS, type SyncRunOptions } from "@/stores/sync-store";
+import { RunNotifyPicker } from "@/components/run-notify-picker";
+import type { RunNotify } from "@/lib/run-notify";
+import { formatNextRun, useNextRuns } from "@/lib/upcoming-runs";
+import { useUIStore } from "@/stores/ui-store";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import { SyncProgressCard } from "@/components/sync-progress-card";
@@ -50,6 +54,8 @@ interface SyncPair {
   checksum_enabled: boolean;
   created_at: string;
   time_offset_secs: number | null;
+  /** Result notification, settle window, marker and version names. */
+  run_options?: SyncRunOptions;
   copy_options?: CopyOptions;
   dest_state?: "scan" | "trusted_inventory" | "blind_upload";
   checksum_algorithm?: "xxh3" | "sha256";
@@ -202,6 +208,7 @@ function triggerName(trigger: string | { scheduled: { cron_expr: string } }): st
 
 export function SyncPanel() {
   const [view, setView] = useState<SyncPanelView>("list");
+  const { nextRuns, refresh: refreshNextRuns } = useNextRuns("sync", true);
   const [pairs, setPairs] = useState<SyncPair[]>([]);
   const [healthMap, setHealthMap] = useState<Record<string, SyncHealth>>({});
   const [_selectedPair, _setSelectedPair] = useState<SyncPair | null>(null);
@@ -231,10 +238,11 @@ export function SyncPanel() {
         }
       }
       setHealthMap(healthResults);
+      void refreshNextRuns();
     } catch (e: any) {
       setError(e?.message || "Failed to load sync pairs");
     }
-  }, []);
+  }, [refreshNextRuns]);
 
   useEffect(() => {
     loadPairs();
@@ -388,6 +396,19 @@ export function SyncPanel() {
     }
   };
 
+  // ── Result notifications of an existing pair ──
+
+  const handleSaveNotify = async (pair: SyncPair, patch: RunNotify) => {
+    const updated: SyncPair = { ...pair, run_options: { ...DEFAULT_RUN_OPTIONS, ...pair.run_options, ...patch } };
+    setPairs((all) => all.map((p) => (p.id === pair.id ? updated : p)));
+    try {
+      await tauriInvoke("update_sync_pair", { pairJson: JSON.stringify(updated) });
+    } catch (e: any) {
+      setPairs((all) => all.map((p) => (p.id === pair.id ? pair : p)));
+      setError(e?.message || "Failed to save the notification settings");
+    }
+  };
+
   // ── Rollback ──
 
   const handleRollback = async (pairId: string) => {
@@ -535,6 +556,8 @@ export function SyncPanel() {
             onDelete={handleDeletePair}
             onRollback={handleRollback}
             onViewReports={handleViewReports}
+            onSaveNotify={handleSaveNotify}
+            nextRuns={nextRuns}
             syncRunning={syncRunning}
           />
         )}
@@ -597,6 +620,8 @@ function PairListView({
   onDelete,
   onRollback,
   onViewReports,
+  onSaveNotify,
+  nextRuns,
   syncRunning,
 }: {
   pairs: SyncPair[];
@@ -606,8 +631,13 @@ function PairListView({
   onDelete: (id: string) => void;
   onRollback: (id: string) => void;
   onViewReports: (id: string) => void;
+  onSaveNotify: (pair: SyncPair, notify: RunNotify) => Promise<void>;
+  /** Next scheduled run by pair id (RFC 3339). */
+  nextRuns: Record<string, string>;
   syncRunning: boolean;
 }) {
+  const advanced = useUIStore((s) => s.appMode === "advanced");
+  const [notifyOpen, setNotifyOpen] = useState<string | null>(null);
   if (pairs.length === 0) {
     return (
       <div className="text-center text-sm text-zinc-500 py-8">
@@ -656,6 +686,11 @@ function PairListView({
                   </span>
                 )}
               </div>
+              {nextRuns[pair.id] && pair.enabled && (
+                <div data-testid={`sync-next-run-${pair.id}`} title={new Date(nextRuns[pair.id]).toLocaleString()}>
+                  Next run: {formatNextRun(nextRuns[pair.id])}
+                </div>
+              )}
             </div>
 
             <div className="flex gap-1 mt-2 flex-wrap">
@@ -689,6 +724,14 @@ function PairListView({
                 Rollback
               </button>
               <button
+                onClick={() => setNotifyOpen(notifyOpen === pair.id ? null : pair.id)}
+                className="px-2 py-1 text-xs rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                aria-expanded={notifyOpen === pair.id}
+                aria-label={`Notifications for ${pair.name}`}
+              >
+                Notify
+              </button>
+              <button
                 onClick={() => {
                   if (confirm(`Delete sync pair "${pair.name}"?`)) {
                     onDelete(pair.id);
@@ -700,6 +743,11 @@ function PairListView({
                 Delete
               </button>
             </div>
+            {notifyOpen === pair.id && (
+              <div className="mt-2">
+                <RunNotifyPicker value={pair.run_options ?? {}} onChange={(patch) => void onSaveNotify(pair, patch)} advanced={advanced} />
+              </div>
+            )}
           </div>
         );
       })}

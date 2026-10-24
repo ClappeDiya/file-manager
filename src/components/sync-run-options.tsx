@@ -8,6 +8,8 @@ import { useEffect, useState } from "react";
 import { tauriInvoke, isTauriAvailable } from "@/hooks/use-tauri";
 import { errorText } from "@/lib/error-text";
 import type { CopyOptions } from "@/lib/copy-options";
+import { RunNotifyPicker } from "@/components/run-notify-picker";
+import { useUIStore } from "@/stores/ui-store";
 import { DEFAULT_VERSION_TEMPLATE, type SyncRunOptions } from "@/stores/sync-store";
 
 
@@ -50,7 +52,9 @@ export function SyncRunOptionsSection({
 }) {
   const set = (patch: Partial<SyncRunOptions>) => onChange({ ...runOptions, ...patch }, copyOptions);
   const twoWay = mode === "two_way";
+  const advanced = useUIStore((s) => s.appMode === "advanced");
   return (
+    <>
     <fieldset className="space-y-2 rounded border border-zinc-200 dark:border-zinc-700 p-2">
       <legend className="px-1 text-xs font-medium text-zinc-600 dark:text-zinc-400">After copying</legend>
       {!twoWay && (
@@ -100,5 +104,7 @@ export function SyncRunOptionsSection({
         </label>
       )}
     </fieldset>
+    <RunNotifyPicker value={runOptions} onChange={set} advanced={advanced} />
+    </>
   );
 }
