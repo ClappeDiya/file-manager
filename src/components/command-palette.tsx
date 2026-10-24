@@ -758,6 +758,8 @@ export function getDefaultCommands(actions: {
    *  SMB, FTP, Azure Blob, GCS, Dropbox, Box, OneDrive, iCloud
    *  Drive, Mega, pCloud, Nextcloud, OpenStack Swift, MinIO). */
   onOpenConnections?: () => void;
+  /** Open the Connection Manager on its rclone remote manager. */
+  onOpenRcloneRemotes?: () => void;
   /** Open the Sync Panel \u2014 sync-pair health indicators,
    *  create-pair wizard, dry-run preview, conflict resolution,
    *  reports, and rollback. Iter 28 surfaces the long-orphaned
@@ -1465,6 +1467,24 @@ export function getDefaultCommands(actions: {
         "manager",
         "new connection",
       ],
+    },
+    {
+      id: "open-rclone-remotes",
+      label: "rclone Remotes\u2026",
+      description: "Create, edit, test and delete rclone remotes (Box, pCloud, MEGA, S3, SFTP, 70+ providers)",
+      icon: <Globe className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onOpenRcloneRemotes || (() => {}),
+      keywords: ["rclone", "remote", "remotes", "rclone config", "box", "pcloud", "mega", "crypt", "provider", "cloud"],
+    },
+    {
+      id: "rclone-settings",
+      label: "rclone Program & Config\u2026",
+      description: "Choose the rclone binary and rclone.conf, check the version, install the managed copy (Settings \u2192 rclone)",
+      icon: <Globe className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onOpenSettings || (() => {}),
+      keywords: ["rclone", "binary", "version", "rclone.conf", "config", "update", "install"],
     },
     {
       id: "open-vault",

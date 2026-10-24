@@ -20,6 +20,7 @@ import { SearchIndexFolders } from "@/components/search-index-folders";
 import { GpgKeysSection } from "@/components/gpg-keys-section";
 import { SharingPolicySection } from "@/components/sharing-policy-section";
 import { ProxySection } from "@/components/proxy-section";
+import { RcloneSettingsSection } from "@/components/rclone/rclone-settings-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
 import { DiagnosticsSection } from "@/components/diagnostics-section";
 import { AppearanceSettings } from "@/components/appearance-settings";
@@ -1375,6 +1376,11 @@ export default function SettingsPanel({
         {/* Proxy for every outbound connection */}
         <Section title="Network Proxy">
           <ProxySection />
+        </Section>
+
+        {/* Which rclone binary and rclone.conf every rclone feature uses */}
+        <Section title="rclone">
+          <RcloneSettingsSection />
         </Section>
 
         {/* Which share links may be created from cloud connections */}

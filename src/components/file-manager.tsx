@@ -55,6 +55,9 @@ import { KeyboardCheatSheet } from "./keyboard-cheat-sheet";
 import { BatchRename } from "./batch-rename";
 import SettingsPanel from "./settings-panel";
 import { ConnectionPanel } from "./connection-panel";
+import { useRcloneUi } from "@/stores/rclone-ui-store";
+import { RcloneEngineInfo } from "@/components/rclone/rclone-settings-section";
+import { rcloneStatus, type RcloneStatus } from "@/lib/rclone";
 import { SyncPanel } from "./sync-panel";
 import { BackupPanel } from "./backup/backup-panel";
 import { PeerSidebar } from "./peer-sidebar";
@@ -721,6 +724,10 @@ export function FileManager() {
   // Cmd+Shift+U and a palette entry. Same TDZ-safe placement
   // as the iter 25/26 orphan dialogs.
   const [connectionsOpen, setConnectionsOpen] = useState(false);
+  // Closing the Connection Manager also leaves its rclone remote manager.
+  useEffect(() => {
+    if (!connectionsOpen) useRcloneUi.getState().closeManager();
+  }, [connectionsOpen]);
   // Iter 28: Sync panel modal state. SyncPanel is 1454 LOC of
   // sync-pair management UI \u2014 health indicators, create-pair
   // wizard (simple + advanced), dry-run preview with category
@@ -2141,6 +2148,10 @@ export function FileManager() {
           setSettingsOpen(true);
         },
         onOpenConnections: () => {
+          setConnectionsOpen(true);
+        },
+        onOpenRcloneRemotes: () => {
+          useRcloneUi.getState().openManager();
           setConnectionsOpen(true);
         },
         onOpenSync: () => {
@@ -5103,6 +5114,8 @@ function StatusBarContent() {
   const [configKey, setConfigKey] = useState("");
   const [configValue, setConfigValue] = useState("");
   const [configError, setConfigError] = useState<string | null>(null);
+  // About: the rclone engine in use (read when the popover opens).
+  const [rclone, setRclone] = useState<RcloneStatus | null>(null);
 
   useEffect(() => {
     if (isTauriAvailable()) {
@@ -5164,7 +5177,10 @@ function StatusBarContent() {
   const toggleSettings = async () => {
     const willOpen = !showSettings;
     setShowSettings(willOpen);
-    if (willOpen) { await loadConfig(); }
+    if (willOpen) {
+      if (isTauriAvailable()) rcloneStatus().then(setRclone, () => setRclone(null));
+      await loadConfig();
+    }
   };
 
   const platformTooltip = platformInfo
@@ -5236,11 +5252,16 @@ function StatusBarContent() {
             <span className="text-xs font-semibold">Settings</span>
             <button onClick={() => setShowSettings(false)} className="text-xs text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)]">Close</button>
           </div>
-          {platformInfo && (
+          {(platformInfo || rclone) && (
             <div className="px-3 py-2 border-b border-[var(--color-border)] text-xs text-[color:var(--color-text-secondary)]">
-              <div>OS: {platformInfo.os}</div>
-              <div>Arch: {platformInfo.arch}</div>
-              <div>Version: {platformInfo.version}</div>
+              {platformInfo && (
+                <>
+                  <div>OS: {platformInfo.os}</div>
+                  <div>Arch: {platformInfo.arch}</div>
+                  <div>Version: {platformInfo.version}</div>
+                </>
+              )}
+              <RcloneEngineInfo status={rclone} />
             </div>
           )}
           <div className="px-3 py-2 space-y-2 max-h-48 overflow-y-auto">
