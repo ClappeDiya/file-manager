@@ -9,11 +9,13 @@
  */
 import { useEffect, useState, type ReactNode } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
+import { useUIStore } from "@/stores/ui-store";
 
 import {
   ATTRIBUTE_LETTERS,
   COPY_PRESETS,
   isWindowsPlatform,
+  type CompareMode,
   type CopyOptions,
   type CopyPreset,
   type RobocopyJob,
@@ -120,11 +122,12 @@ export function CopyPresetPicker({
   activeId: string | null;
   onPick: (preset: CopyPreset) => void;
 }) {
+  const advanced = useUIStore((st) => st.appMode === "advanced");
   return (
     <div className="space-y-1">
       <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Start from</div>
       <div className="flex flex-wrap gap-1.5" role="group" aria-label="Copy presets">
-        {COPY_PRESETS.map((p) => (
+        {COPY_PRESETS.filter((p) => advanced || !p.advanced).map((p) => (
           <button
             key={p.id}
             type="button"
@@ -265,12 +268,14 @@ export function RobocopyOptionsSection({
 }: {
   options: CopyOptions;
   onChange: (o: CopyOptions) => void;
+  /** The pair's sync mode; "any" (global defaults) shows every mode's cleanup options. */
   mode: string;
   /** Show the NTFS-only options (defaults to the current platform). */
   windows?: boolean;
 }) {
   const set = <K extends keyof CopyOptions>(k: K, v: CopyOptions[K]) =>
     onChange({ ...options, [k]: v });
+  const advanced = useUIStore((st) => st.appMode === "advanced");
   const [excludeDirsText, setExcludeDirsText] = useState(options.exclude_dirs.join(", "));
   useEffect(() => setExcludeDirsText(options.exclude_dirs.join(", ")), [options.exclude_dirs]);
   const runHoursInvalid =
@@ -316,6 +321,21 @@ export function RobocopyOptionsSection({
       </Group>
 
       <Group title="When to overwrite">
+        {advanced && (
+          <label className="flex items-center justify-between gap-2 text-xs text-zinc-600 dark:text-zinc-400">
+            <span>Compare files by</span>
+            <select
+              aria-label="Compare files by"
+              value={options.compare_mode ?? "size_mtime"}
+              onChange={(e) => set("compare_mode", e.target.value as CompareMode)}
+              className={inputCls}
+            >
+              <option value="size_mtime">Size and date</option>
+              <option value="checksum">Checksum (reads every file)</option>
+              <option value="size_only">Size only</option>
+            </select>
+          </label>
+        )}
         <Check label="Never replace a newer destination file" flag="/XO" checked={options.exclude_older} onChange={(v) => set("exclude_older", v)} />
         <Check label="Never replace an older destination file" flag="/XN" checked={options.exclude_newer} onChange={(v) => set("exclude_newer", v)} />
         <Check label="Skip files whose size changed but date didn't" flag="/XC" checked={options.exclude_changed} onChange={(v) => set("exclude_changed", v)} />
@@ -326,13 +346,43 @@ export function RobocopyOptionsSection({
       </Group>
 
       <Group title="Cleanup & moving">
-        {mode === "mirror" ? (
+        {mode === "any" ? (
+          <>
+            <Check label="Mirror pairs: keep extra files at the destination (don't delete)" flag="/XX" checked={options.exclude_extra} onChange={(v) => set("exclude_extra", v)} />
+            <Check label="Other pairs: delete destination files the source no longer has" flag="/PURGE" checked={options.purge} onChange={(v) => set("purge", v)} />
+            <NumberField
+              label="Two-way pairs: stop if a run would delete more than (0 = no limit)"
+              flag="two-way"
+              value={options.two_way_max_delete_percent}
+              max={100}
+              unit="%"
+              onChange={(v) => set("two_way_max_delete_percent", v)}
+            />
+          </>
+        ) : mode === "mirror" ? (
           <Check label="Keep extra files at the destination (don't delete)" flag="/XX" checked={options.exclude_extra} onChange={(v) => set("exclude_extra", v)} />
         ) : mode !== "two_way" ? (
           <Check label="Delete destination files the source no longer has" flag="/PURGE" checked={options.purge} onChange={(v) => set("purge", v)} />
-        ) : null}
-        <Check label="Move files (delete from source after copying)" flag="/MOV" checked={options.move_files} onChange={(v) => onChange({ ...options, move_files: v, move_dirs: v && options.move_dirs })} />
-        {options.move_files && (
+        ) : (
+          <NumberField
+            label="Stop if a run would delete more than (0 = no limit)"
+            flag="two-way"
+            value={options.two_way_max_delete_percent}
+            max={100}
+            unit="%"
+            onChange={(v) => set("two_way_max_delete_percent", v)}
+          />
+        )}
+        {/* Two-way pairs cannot move: a moved file would be copied back on the next run. */}
+        {mode !== "two_way" && (
+          <Check
+            label={mode === "any" ? "Move files (delete from source after copying; not used by two-way pairs)" : "Move files (delete from source after copying)"}
+            flag="/MOV"
+            checked={options.move_files}
+            onChange={(v) => onChange({ ...options, move_files: v, move_dirs: v && options.move_dirs })}
+          />
+        )}
+        {mode !== "two_way" && options.move_files && (
           <Check label="…and remove emptied source folders" flag="/MOVE" checked={options.move_dirs} onChange={(v) => set("move_dirs", v)} />
         )}
         <Check label="Keep file dates" flag="/COPY:T" checked={options.copy_timestamps} onChange={(v) => set("copy_timestamps", v)} />

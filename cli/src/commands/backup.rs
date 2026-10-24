@@ -16,7 +16,7 @@ use ufop_core::backup::engine::Repo;
 use ufop_core::backup::restore::ConflictPolicy;
 use ufop_core::backup::versions::MetadataPatch;
 use ufop_core::backup::{
-    maintenance, run_backup, run_restore, Backend, BackupOptions, FilterAction, FilterKind, FilterRule, LocalBackend, OpContext,
+    maintenance, run_backup, run_restore, Backend, BackupOptions, LocalBackend, OpContext,
     ReadOnlyBackend, RestoreOptions, RetentionPolicy, SourceFilter,
 };
 
@@ -861,6 +861,10 @@ pub enum BackupCommands {
         /// Exclude filter: path, wildcard, [regex] or {group} (ordered, repeatable)
         #[arg(long)]
         exclude: Vec<String>,
+        /// rclone filter rule, "+ pattern" or "- pattern", matched inside each
+        /// source folder; applied after --include/--exclude, in order (repeatable)
+        #[arg(long = "filter")]
+        filter_rules: Vec<String>,
         #[arg(long)]
         exclude_hidden: bool,
         #[arg(long)]
@@ -931,6 +935,10 @@ pub enum BackupCommands {
         include: Vec<String>,
         #[arg(long)]
         exclude: Vec<String>,
+        /// rclone filter rule, "+ pattern" or "- pattern", matched inside each
+        /// source folder; applied after --include/--exclude, in order (repeatable)
+        #[arg(long = "filter")]
+        filter_rules: Vec<String>,
         #[arg(long)]
         exclude_hidden: bool,
         #[arg(long)]
@@ -1409,19 +1417,6 @@ pub enum BackupCommands {
     },
 }
 
-pub fn parse_filter(spec: &str, action: FilterAction) -> FilterRule {
-    let (kind, pattern) = if let Some(r) = spec.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-        (FilterKind::Regex, r.to_string())
-    } else if let Some(g) = spec.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-        (FilterKind::Group, g.to_string())
-    } else if spec.contains('*') || spec.contains('?') {
-        (FilterKind::Wildcard, spec.to_string())
-    } else {
-        (FilterKind::Exact, spec.to_string())
-    };
-    FilterRule { action, kind, pattern }
-}
-
 pub fn parse_retention(keep_versions: Option<u32>, keep_days: Option<u32>, policy: Option<String>) -> RetentionPolicy {
     match (keep_versions, keep_days, policy) {
         (Some(c), _, _) => RetentionPolicy::KeepCount { count: c },
@@ -1665,7 +1660,7 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
     let ok = |v: Result<(), Box<dyn std::error::Error>>| v.map_err(|e| ufop_core::error::AppError::internal(e.to_string()));
     match cmd {
         BackupCommands::Run {
-            repo, sources, include, exclude, exclude_hidden, skip_files_larger_than, ignore, block_size, volume_size, compression_level,
+            repo, sources, include, exclude, filter_rules, exclude_hidden, skip_files_larger_than, ignore, block_size, volume_size, compression_level,
             retention, note, tags, shared, shared_gc_delay_hours, verify_samples, upload_unchanged, no_auto_compact, engine,
         } => {
             let pass = repo.passphrase();
@@ -1675,10 +1670,8 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
                     repo.passphrase_env
                 )));
             }
-            let mut rules: Vec<FilterRule> = include.iter().map(|s| parse_filter(s, FilterAction::Include)).collect();
-            rules.extend(exclude.iter().map(|s| parse_filter(s, FilterAction::Exclude)));
             let mut filter = SourceFilter::default();
-            filter.rules = rules;
+            filter.rules = ufop_core::filter_rules::cli_rules(&include, &exclude, &filter_rules)?;
             filter.exclude_hidden = exclude_hidden;
             filter.max_file_size = skip_files_larger_than;
             ignore.apply(&mut filter);
@@ -1742,9 +1735,9 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
             ok(emit(format, &format!("Stored standard input as {}", ufop_core::backup::reader::stream_path(&name)), &r))?;
             Ok(if !r.errors.is_empty() || r.partial { 2 } else if !r.warnings.is_empty() { 1 } else { 0 })
         }
-        BackupCommands::Estimate { repo, sources, include, exclude, exclude_hidden, skip_files_larger_than, ignore, assumed_speed, largest, engine } => {
+        BackupCommands::Estimate { repo, sources, include, exclude, filter_rules, exclude_hidden, skip_files_larger_than, ignore, assumed_speed, largest, engine } => {
             let mut filter = SourceFilter::default();
-            filter.rules = include.iter().map(|s| parse_filter(s, FilterAction::Include)).chain(exclude.iter().map(|s| parse_filter(s, FilterAction::Exclude))).collect();
+            filter.rules = ufop_core::filter_rules::cli_rules(&include, &exclude, &filter_rules)?;
             filter.exclude_hidden = exclude_hidden;
             filter.max_file_size = skip_files_larger_than;
             ignore.apply(&mut filter);
@@ -2188,6 +2181,8 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ufop_core::backup::{FilterAction, FilterKind};
+    use ufop_core::filter_rules::parse_cli_filter as parse_filter;
 
     #[test]
     fn filter_specs() {
@@ -2263,6 +2258,36 @@ mod tests {
         assert_eq!(parse_retention(Some(3), None, None), RetentionPolicy::KeepCount { count: 3 });
         assert_eq!(parse_retention(None, None, Some("smart".into())), RetentionPolicy::Smart);
         assert_eq!(parse_retention(None, None, None), RetentionPolicy::KeepAll);
+    }
+
+    /// `--filter` takes rclone rules as the app stores them (and as the
+    /// app's "copy as CLI command" writes them): matched inside the source,
+    /// so an anchored `/Photos/**` keeps the source's own Photos folder.
+    #[test]
+    fn rclone_filter_rules_match_inside_the_source() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("src");
+        std::fs::create_dir_all(src.join("Photos/2024")).unwrap();
+        std::fs::write(src.join("Photos/2024/a.jpg"), b"jpg").unwrap();
+        std::fs::write(src.join("other.txt"), b"no").unwrap();
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(subcommand)]
+            c: BackupCommands,
+        }
+        let parse = |args: &[&str]| <T as clap::Parser>::try_parse_from(std::iter::once("t").chain(args.iter().copied())).unwrap().c;
+        let dest = t.path().join("dest").to_string_lossy().into_owned();
+        let db = t.path().join("db.sqlite").to_string_lossy().into_owned();
+        let src_s = src.to_string_lossy().into_owned();
+        let run_cmd = parse(&["run", "--dest", &dest, "--dbpath", &db, "--passphrase", "pw", "--source", &src_s, "--filter=+ /Photos/**", "--filter=- *", "--block-size", "4096", "--no-quota-warning"]);
+        assert_eq!(run(run_cmd, &OutputFormat::Json, false).unwrap(), 0);
+        let out = t.path().join("out");
+        let out_s = out.to_string_lossy().into_owned();
+        let restore_cmd = parse(&["restore", "--dest", &dest, "--dbpath", &db, "--passphrase", "pw", "--target", &out_s, "--conflict", "overwrite"]);
+        assert_eq!(run(restore_cmd, &OutputFormat::Json, false).unwrap(), 0);
+        assert_eq!(std::fs::read(out.join("src/Photos/2024/a.jpg")).unwrap(), b"jpg");
+        assert!(!out.join("src/other.txt").exists(), "- * keeps out everything else");
+        assert!(ufop_core::filter_rules::cli_rules(&[], &[], &["Photos".into()]).is_err(), "a --filter needs + or -");
     }
 
     #[test]

@@ -30,6 +30,8 @@ import { PortableModeBadge, PortableModeDetails } from "@/components/portable-mo
 import { usePortableStatus } from "@/hooks/use-portable-status";
 import { MetricsExporterSection } from "@/components/metrics-exporter-section";
 import { ChatControlSection } from "@/components/chat-control-section";
+import { SyncDefaultsSection } from "@/components/sync-defaults-section";
+import { BandwidthTimetableSection } from "@/components/bandwidth-timetable-section";
 import { AdvancedOnly } from "@/components/backup/advanced-only";
 
 // ── Types ──
@@ -1432,6 +1434,10 @@ export default function SettingsPanel({
             <MetricsExporterSection />
             <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Remote control from chat</h3>
             <ChatControlSection />
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Sync defaults</h3>
+            <SyncDefaultsSection />
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Bandwidth timetable</h3>
+            <BandwidthTimetableSection />
           </AdvancedOnly>
         </Section>
 

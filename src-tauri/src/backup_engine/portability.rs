@@ -265,17 +265,12 @@ pub fn cli_command(job: &BackupJob) -> String {
     for (k, v) in &o.default_tags {
         parts.push(format!("--tag={}", quote(&if v.is_empty() { k.clone() } else { format!("{k}={v}") })));
     }
+    // The CLI applies every --include, then every --exclude, then the
+    // --filter (rclone) lines, so the job's order survives as long as its
+    // rclone rules come after the others (as an imported rules file does).
     for r in &job.filter.rules {
-        let flag = match r.action {
-            ufop_core::backup::FilterAction::Include => "--include",
-            ufop_core::backup::FilterAction::Exclude => "--exclude",
-        };
-        let pat = match r.kind {
-            ufop_core::backup::FilterKind::Regex => format!("[{}]", r.pattern),
-            ufop_core::backup::FilterKind::Group => format!("{{{}}}", r.pattern),
-            _ => r.pattern.clone(),
-        };
-        parts.push(format!("{flag}={}", quote(&pat)));
+        let (flag, value) = ufop_core::filter_rules::cli_filter_arg(r);
+        parts.push(format!("{flag}={}", quote(&value)));
     }
     if let Some(m) = job.filter.max_file_size {
         parts.push(format!("--skip-files-larger-than={m}"));
@@ -353,6 +348,39 @@ mod tests {
         for f in ["--ignore-file=.backupignore", "--respect-gitignore", "--one-file-system", "--on-file-error=fail", "--on-unknown-entry=warn", "--fail-fast", "--max-errors=5", "--rehash-percent=10", "--max-upload=1073741824", "--parallel-file-threshold=0", "--snapshot-provider=btrfs"] {
             assert!(c.contains(f), "{f} in {c}");
         }
+    }
+
+    /// Regression: rclone rules were exported as `[regex]` filters, which
+    /// the CLI matches on absolute paths, while rclone rules (and the app)
+    /// match inside the source folder, so an anchored `/Photos/**` selected
+    /// nothing in the generated command.
+    #[test]
+    fn cli_command_selects_the_same_files_for_rclone_rules() {
+        use ufop_core::backup::{FilterAction, FilterKind, FilterRule, SourceFilter};
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("Docs");
+        let mut j = job();
+        j.sources = vec![src.to_string_lossy().to_string()];
+        let rclone = |action, p: &str| FilterRule { action, kind: FilterKind::Rclone, pattern: p.into() };
+        j.filter.rules = vec![
+            FilterRule { action: FilterAction::Exclude, kind: FilterKind::Regex, pattern: "\\.bak$".into() },
+            rclone(FilterAction::Include, "/Photos/**"),
+            rclone(FilterAction::Include, "*.md"),
+            rclone(FilterAction::Exclude, "*"),
+        ];
+        let cmd = cli_command(&j);
+        // What `ufop backup run` reads back from that command line.
+        let args = shlex::split(&cmd).unwrap();
+        let values = |flag: &str| -> Vec<String> { args.iter().filter_map(|a| a.strip_prefix(&format!("{flag}="))).map(String::from).collect() };
+        let mut cli = SourceFilter::default();
+        cli.rules = ufop_core::filter_rules::cli_rules(&values("--include"), &values("--exclude"), &values("--filter")).unwrap();
+        let cli = cli.compile().unwrap();
+        let app = j.filter.clone().compile().unwrap();
+        for (rel, is_dir) in [("Photos", true), ("Photos/a.jpg", false), ("Photos/2024/b.jpg", false), ("Photos/old.bak", false), ("notes.md", false), ("sub/readme.md", false), ("other.txt", false), ("sub", true), ("sub/Photos/c.jpg", false)] {
+            let path = src.join(rel);
+            assert_eq!(cli.evaluate_under(&path, Some(&src), is_dir), app.evaluate_under(&path, Some(&src), is_dir), "{rel}: CLI and app disagree\n{cmd}");
+        }
+        assert_eq!(app.evaluate_under(&src.join("Photos/a.jpg"), Some(&src), false), Some(FilterAction::Include));
     }
 
     #[test]

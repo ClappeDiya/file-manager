@@ -103,6 +103,23 @@ export function SyncRunOptionsSection({
           <VersionPreview template={runOptions.version_template ?? DEFAULT_VERSION_TEMPLATE} />
         </label>
       )}
+      {mode === "versioned_backup" && advanced && (
+        <label className={labelCls}>
+          Versions to keep of each file
+          <input
+            type="number"
+            min={1}
+            className={field}
+            placeholder="all"
+            value={runOptions.keep_versions ?? ""}
+            onChange={(e) => {
+              const n = parseInt(e.target.value, 10);
+              set({ keep_versions: Number.isNaN(n) || n < 1 ? null : n });
+            }}
+          />
+          <span className="text-[10px] text-zinc-400">After each run the oldest versions beyond this number are deleted. Empty = keep every version.</span>
+        </label>
+      )}
     </fieldset>
     <RunNotifyPicker value={runOptions} onChange={set} advanced={advanced} />
     </>

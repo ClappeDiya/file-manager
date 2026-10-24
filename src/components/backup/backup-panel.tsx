@@ -140,6 +140,20 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
         {!job.read_only && est.button}
         <Btn onClick={() => onView({ kind: "restore", job })} testId="backup-open-restore">Restore…</Btn>
         <Btn onClick={() => onView({ kind: "edit", job })}>Edit</Btn>
+        <Btn
+          testId="backup-duplicate"
+          title="Copy this job's settings into a new job (schedules off, no history)"
+          onClick={() =>
+            void useBackupStore
+              .getState()
+              .duplicateJob(job.id)
+              // Open the copy straight away: it should get its own destination.
+              .then((copy) => onView({ kind: "edit", job: copy }))
+              .catch((e) => setErr(errorText(e)))
+          }
+        >
+          Duplicate
+        </Btn>
         <Btn onClick={() => onView({ kind: "maintenance", job })}>Maintenance</Btn>
       </div>
       {est.panel}

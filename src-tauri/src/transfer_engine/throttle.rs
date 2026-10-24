@@ -1,107 +1,103 @@
 //! Bandwidth throttling for transfer operations.
 //!
-//! Provides a token-bucket based throttler that limits transfer speed
-//! to a configurable bytes-per-second rate.
+//! A handle on the one shared limiter (`ufop_core::throttle::SharedRate`,
+//! also used by backups and sync). The transfer queue's limit
+//! (`set_global_throttle`) is [`TRANSFER_RATE`]; every chunk is also paced
+//! by the bandwidth timetable's upload limit (shared with backups and sync).
+//! The backup machine-wide caps do not apply to transfers.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use ufop_core::throttle::{reserve_all, SharedRate, TIMETABLE_UPLOAD};
 
-/// Token-bucket bandwidth throttler.
-///
-/// When `limit_bps` is 0, throttling is disabled (unlimited speed).
-/// Otherwise, the throttler enforces the specified bytes-per-second rate.
-pub struct BandwidthThrottler {
-    /// Bytes per second limit (0 = unlimited).
-    limit_bps: AtomicU64,
-    /// Internal state for token bucket.
-    state: Mutex<ThrottleState>,
+/// The transfer queue's limit, shared by every transfer worker.
+pub static TRANSFER_RATE: SharedRate = SharedRate::new();
+
+enum Rate {
+    Owned(SharedRate),
+    Global(&'static SharedRate),
 }
 
-struct ThrottleState {
-    /// Available tokens (bytes that can be transferred immediately).
-    tokens: f64,
-    /// Last time tokens were refilled.
-    last_refill: Instant,
+/// Bandwidth throttler. When the limit is 0, throttling is disabled.
+pub struct BandwidthThrottler {
+    rate: Rate,
 }
 
 impl BandwidthThrottler {
-    /// Create a new throttler with the given bytes-per-second limit.
+    /// A throttler of its own with the given bytes-per-second limit.
     /// A limit of 0 means unlimited.
     pub fn new(limit_bps: u64) -> Self {
-        Self {
-            limit_bps: AtomicU64::new(limit_bps),
-            state: Mutex::new(ThrottleState {
-                tokens: limit_bps as f64,
-                last_refill: Instant::now(),
-            }),
+        let rate = SharedRate::new();
+        rate.set(limit_bps);
+        Self { rate: Rate::Owned(rate) }
+    }
+
+    /// The transfer queue's throttler ([`TRANSFER_RATE`]), which
+    /// [`pace_chunk`] applies to every transferred chunk.
+    pub fn global() -> Self {
+        Self { rate: Rate::Global(&TRANSFER_RATE) }
+    }
+
+    fn shared(&self) -> &SharedRate {
+        match &self.rate {
+            Rate::Owned(r) => r,
+            Rate::Global(r) => r,
         }
     }
 
     /// Update the bandwidth limit dynamically.
     pub fn set_limit(&self, limit_bps: u64) {
-        self.limit_bps.store(limit_bps, Ordering::Relaxed);
+        self.shared().set(limit_bps);
     }
 
     /// Get the current limit.
     pub fn limit(&self) -> u64 {
-        self.limit_bps.load(Ordering::Relaxed)
+        self.shared().base()
     }
 
-    /// Request permission to transfer `bytes` amount of data.
-    /// Returns the number of bytes actually allowed (may be less than requested)
-    /// and the duration to wait before the next request.
-    ///
-    /// If throttling is disabled (limit = 0), returns the full requested amount
-    /// with zero wait time.
+    /// Reserve `bytes` on the time line. Returns the bytes reserved (all of
+    /// them) and how long to wait before sending them.
     pub async fn acquire(&self, bytes: u64) -> (u64, Duration) {
-        let limit = self.limit_bps.load(Ordering::Relaxed);
-        if limit == 0 {
-            return (bytes, Duration::ZERO);
-        }
-
-        let mut state = self.state.lock().await;
-        let now = Instant::now();
-        let elapsed = now.duration_since(state.last_refill);
-
-        // Refill tokens based on elapsed time
-        let refill = (elapsed.as_secs_f64()) * (limit as f64);
-        state.tokens = (state.tokens + refill).min(limit as f64);
-        state.last_refill = now;
-
-        if state.tokens >= bytes as f64 {
-            // Enough tokens available
-            state.tokens -= bytes as f64;
-            (bytes, Duration::ZERO)
-        } else if state.tokens >= 1.0 {
-            // Partial tokens available
-            let allowed = state.tokens as u64;
-            state.tokens = 0.0;
-            let wait = Duration::from_secs_f64((bytes - allowed) as f64 / limit as f64);
-            (allowed, wait)
-        } else {
-            // No tokens available, calculate wait time
-            let wait = Duration::from_secs_f64(bytes as f64 / limit as f64);
-            (0, wait)
-        }
+        let wait = self.shared().reserve(bytes as usize, Instant::now());
+        (bytes, wait)
     }
 
-    /// Wait until the throttler allows at least `min_bytes` to be transferred.
-    /// Returns the number of bytes allowed.
+    /// Wait for the share of the time line `bytes` need. Returns `bytes`.
     pub async fn wait_for(&self, bytes: u64) -> u64 {
-        let limit = self.limit_bps.load(Ordering::Relaxed);
-        if limit == 0 {
-            return bytes;
+        let (allowed, wait) = self.acquire(bytes).await;
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
         }
-
-        loop {
-            let (allowed, wait) = self.acquire(bytes).await;
-            if allowed > 0 {
-                return allowed;
-            }
-            tokio::time::sleep(wait.min(Duration::from_millis(100))).await;
-        }
+        allowed
     }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Tests: the transfer-queue rate to pace by instead of [`TRANSFER_RATE`],
+    /// so a test's limit never slows other tests in the process.
+    pub static TEST_TRANSFER_RATE: std::sync::Arc<SharedRate>;
+}
+
+/// Pace one transferred chunk of `bytes` that started at `started`: by the
+/// transfer queue's limit and the bandwidth timetable.
+pub async fn pace_chunk(bytes: usize, started: Instant) {
+    #[cfg(test)]
+    let owned = TEST_TRANSFER_RATE.try_with(|r| r.clone()).ok();
+    #[cfg(test)]
+    let queue: &SharedRate = owned.as_deref().unwrap_or(&TRANSFER_RATE);
+    #[cfg(not(test))]
+    let queue: &SharedRate = &TRANSFER_RATE;
+    let wait = reserve_all(&[queue, &TIMETABLE_UPLOAD], bytes, started);
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Serializes tests that change the process-wide rates or the timetable.
+#[cfg(test)]
+pub async fn global_rates_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
 }
 
 #[cfg(test)]
@@ -155,6 +151,20 @@ mod tests {
         let (allowed, wait) = throttler.acquire(1_000_000).await;
         assert_eq!(allowed, 1_000_000);
         assert_eq!(wait, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn chunks_are_paced_by_the_transfer_limit() {
+        // Regression: the transfer throttle was configured but never
+        // applied to the chunks the pipeline copies.
+        let started = Instant::now();
+        let t = BandwidthThrottler::new(100_000);
+        let (_, first) = t.acquire(10_000).await;
+        let (_, second) = t.acquire(10_000).await;
+        assert!(second >= Duration::from_millis(150), "{first:?} {second:?}");
+        let waited = t.wait_for(1_000).await;
+        assert_eq!(waited, 1_000);
+        assert!(started.elapsed() >= Duration::from_millis(150));
     }
 
     #[tokio::test]

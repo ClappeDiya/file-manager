@@ -39,7 +39,7 @@ use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, oauth_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, oauth_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands, filter_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -168,6 +168,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
 
     // Initialize sync manager (T-039..T-042)
     let sync_mgr = SyncManager::new();
+    sync_mgr.attach_repository(repo.clone());
     // Restore saved pairs and re-arm their triggers. Non-fatal, matching the
     // automation-rule load below: a corrupt row must not stop the app booting.
     // The in-memory fallback path deliberately does not do this — its DB is
@@ -177,6 +178,12 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     }
     if let Err(e) = sync_mgr.load_reports_from_db(&repo, 50).await {
         tracing::warn!("Failed to load sync run history (non-fatal): {e}");
+    }
+    if let Err(e) = sync_mgr.load_default_options(&repo).await {
+        tracing::warn!("Failed to load the global sync defaults (non-fatal): {e}");
+    }
+    if let Err(e) = commands::transfer_commands::load_bandwidth_schedule(&repo).await {
+        tracing::warn!("Failed to load the bandwidth timetable (non-fatal): {e}");
     }
 
     // Initialize peer manager (T-031) and server transfer manager (T-033)
@@ -461,6 +468,7 @@ pub fn run() {
                 let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), None);
                 let ai_assistant = AiAssistant::with_audit(repo.pool().clone());
                 let fallback_schedules = schedule_library::ScheduleLibrary::new(repo.pool().clone());
+                let fallback_repo = repo.clone();
                 AppState {
                     metadata_store: metadata_engine::MetadataStore::new(repo.clone()),
                     search_manager: search_engine::SearchManager::new(
@@ -474,7 +482,11 @@ pub fn run() {
                     connection_mgr,
                     transfer_history,
                     connector_registry: ConnectorRegistry::with_cloud(fb_gdrive.clone(), fb_dropbox.clone(), fb_onedrive.clone()),
-                    sync_mgr: SyncManager::new(),
+                    sync_mgr: {
+                        let m = SyncManager::new();
+                        m.attach_repository(fallback_repo.clone());
+                        m
+                    },
                     peer_mgr: PeerManager::new(),
                     server_transfer_mgr: ServerTransferManager::new(),
                     ai_assistant,
@@ -674,6 +686,8 @@ pub fn run() {
             transfer_commands::set_transfer_priority,
             transfer_commands::reorder_transfer,
             transfer_commands::set_global_throttle,
+            transfer_commands::get_bandwidth_schedule,
+            transfer_commands::set_bandwidth_schedule,
             transfer_commands::set_connection_throttle,
             transfer_commands::get_throttle_config,
             transfer_commands::update_transfer_progress,
@@ -781,6 +795,7 @@ pub fn run() {
             backup_commands::backup_get_job,
             backup_commands::backup_save_job,
             backup_commands::backup_delete_job,
+            backup_commands::duplicate_backup_job,
             backup_commands::backup_test_destination,
             backup_commands::backup_test_destination_compat,
             backup_commands::backup_run,
@@ -913,6 +928,13 @@ pub fn run() {
             sync_commands::get_quarantine_entries,
             sync_commands::get_sync_reports,
             sync_commands::rollback_sync,
+            sync_commands::get_sync_baseline_info,
+            sync_commands::reset_sync_baseline,
+            sync_commands::duplicate_sync_pair,
+            sync_commands::export_sync_pair,
+            sync_commands::import_sync_pair,
+            sync_commands::get_sync_default_options,
+            sync_commands::set_sync_default_options,
             sync_commands::export_sync_report_csv,
             sync_commands::export_sync_report_json,
             sync_commands::start_sync_watcher,
@@ -922,6 +944,11 @@ pub fn run() {
             sync_commands::detect_time_offset,
             // Sync Filter Presets
             sync_commands::get_sync_filter_presets,
+            filter_commands::parse_filter_rules,
+            filter_commands::get_filter_groups,
+            filter_commands::list_user_filter_presets,
+            filter_commands::save_user_filter_preset,
+            filter_commands::delete_user_filter_preset,
             sync_commands::parse_robocopy_command,
             sync_commands::robocopy_command_preview,
             sync_commands::get_sync_progress,

@@ -33,6 +33,7 @@ import { NotificationProfilePicker } from "./backup-notification-profiles";
 import { JobSecretProviders } from "./backup-secret-providers";
 import { PhotosSourceSection } from "./backup-photos-source";
 import { AdvancedOnly } from "./advanced-only";
+import { appendRules, FilterPresetPicker, FilterRulesEditor, ImportRulesButton } from "@/components/filter-rules-editor";
 import { BackupChangePassphrase } from "./backup-repository-format";
 import { ScheduleEditor } from "./backup-schedule-editor";
 import { EffectiveSettingsPanel, MaintenanceScheduleEditor, TemplatePicker } from "./backup-policies";
@@ -282,38 +283,12 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                   placeholder={"-*.tmp\n-{cache_files}\n-[\\.bak\\d+$]\n+/home/me/Docs/keep.log"}
                 />
               ) : (
-                <div className="space-y-1">
-                  {rules.map((r, i) => (
-                    <div key={i} className="flex gap-1 items-center">
-                      <select className={`${inputCls} w-24`} value={r.action} onChange={(e) => setRules(rules.map((x, j) => (j === i ? { ...x, action: e.target.value as FilterRule["action"] } : x)))}>
-                        <option value="exclude">Exclude</option>
-                        <option value="include">Include</option>
-                      </select>
-                      <select className={`${inputCls} w-28`} value={r.kind} onChange={(e) => setRules(rules.map((x, j) => (j === i ? { ...x, kind: e.target.value as FilterRule["kind"] } : x)))}>
-                        <option value="wildcard">Wildcard</option>
-                        <option value="exact">Exact path</option>
-                        <option value="regex">Regex</option>
-                        <option value="group">Group</option>
-                      </select>
-                      {r.kind === "group" ? (
-                        <select className={inputCls} value={r.pattern} onChange={(e) => setRules(rules.map((x, j) => (j === i ? { ...x, pattern: e.target.value } : x)))}>
-                          <option value="">Choose group…</option>
-                          {capabilities?.filter_groups.map((g) => (
-                            <option key={g.name} value={g.name} title={g.patterns.join(" ")}>
-                              {g.name} — {g.description}
-                            </option>
-                          ))}
-                        </select>
-                      ) : (
-                        <input className={`${inputCls} font-mono`} value={r.pattern} onChange={(e) => setRules(rules.map((x, j) => (j === i ? { ...x, pattern: e.target.value } : x)))} />
-                      )}
-                      <Btn disabled={i === 0} onClick={() => setRules(rules.map((x, j) => (j === i - 1 ? rules[i] : j === i ? rules[i - 1] : x)))} title="Move up">↑</Btn>
-                      <Btn onClick={() => setRules(rules.filter((_, j) => j !== i))} title="Remove">✕</Btn>
-                    </div>
-                  ))}
-                  <Btn onClick={() => setRules([...rules, { action: "exclude", kind: "wildcard", pattern: "" }])}>Add rule</Btn>
-                </div>
+                <FilterRulesEditor rules={rules} onChange={setRules} groups={capabilities?.filter_groups} />
               )}
+              <div className="flex flex-wrap items-start gap-2">
+                <ImportRulesButton onImport={(extra) => setRules(appendRules(rules, extra))} />
+                <FilterPresetPicker rules={rules} onApply={(extra) => setRules(appendRules(rules, extra))} />
+              </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-1 pt-2">
                 <Check label="Exclude hidden files" checked={job.filter.exclude_hidden} onChange={(v) => patchFilter({ exclude_hidden: v })} />
                 <Check label="Exclude system files (Windows)" checked={job.filter.exclude_system} onChange={(v) => patchFilter({ exclude_system: v })} />

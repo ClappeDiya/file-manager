@@ -196,6 +196,39 @@ pub async fn set_global_throttle(
     Ok(())
 }
 
+/// Config-table key of the bandwidth timetable.
+pub const BANDWIDTH_SCHEDULE_KEY: &str = "bandwidth.schedule";
+
+/// The bandwidth timetable: windows (weekdays, start, end) with upload and
+/// download limits. While one is active, its upload limit is shared by
+/// backups, sync copies and file transfers, and both limits replace the
+/// backup machine-wide caps.
+#[tauri::command]
+pub async fn get_bandwidth_schedule() -> Result<Vec<ufop_core::throttle::BandwidthWindow>, AppError> {
+    Ok(ufop_core::throttle::schedule())
+}
+
+/// Validate, save and apply a new bandwidth timetable.
+#[tauri::command]
+pub async fn set_bandwidth_schedule(
+    windows: Vec<ufop_core::throttle::BandwidthWindow>,
+    repo: State<'_, crate::storage::Repository>,
+) -> Result<Vec<ufop_core::throttle::BandwidthWindow>, AppError> {
+    ufop_core::throttle::validate_schedule(&windows)?;
+    repo.set_config(BANDWIDTH_SCHEDULE_KEY, &serde_json::to_string(&windows)?).await?;
+    ufop_core::throttle::set_schedule(windows.clone())?;
+    Ok(windows)
+}
+
+/// Apply the saved bandwidth timetable (startup).
+pub async fn load_bandwidth_schedule(repo: &crate::storage::Repository) -> Result<usize, AppError> {
+    let Some(json) = repo.get_config(BANDWIDTH_SCHEDULE_KEY).await? else { return Ok(0) };
+    let windows: Vec<ufop_core::throttle::BandwidthWindow> = serde_json::from_str(&json)?;
+    let n = windows.len();
+    ufop_core::throttle::set_schedule(windows)?;
+    Ok(n)
+}
+
 /// Set per-connection bandwidth throttle.
 #[tauri::command]
 pub async fn set_connection_throttle(
@@ -630,4 +663,36 @@ fn parse_uuid(s: &str) -> Result<Uuid, AppError> {
         message: format!("Invalid transfer ID: {s}"),
         advice: "Provide a valid UUID.".to_string(),
     })
+}
+
+#[cfg(test)]
+mod bandwidth_schedule_tests {
+    use super::*;
+    use chrono::Datelike;
+
+    #[tokio::test]
+    async fn timetable_is_saved_and_restored() {
+        // Changes the process-wide timetable.
+        let _rates = crate::transfer_engine::throttle::global_rates_test_lock().await;
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        assert_eq!(load_bandwidth_schedule(&repo).await.unwrap(), 0);
+        // A day that is not today, so the shared limiter never applies it
+        // while other tests run.
+        let other_day = ((chrono::Local::now().weekday().num_days_from_monday() + 3) % 7) as u8;
+        let windows = vec![ufop_core::throttle::BandwidthWindow {
+            days: vec![other_day],
+            start: "09:00".into(),
+            end: "17:00".into(),
+            upload_bps: 512 * 1024,
+            download_bps: 0,
+        }];
+        ufop_core::throttle::validate_schedule(&windows).unwrap();
+        repo.set_config(BANDWIDTH_SCHEDULE_KEY, &serde_json::to_string(&windows).unwrap()).await.unwrap();
+        assert_eq!(load_bandwidth_schedule(&repo).await.unwrap(), 1);
+        assert_eq!(get_bandwidth_schedule().await.unwrap(), windows);
+        ufop_core::throttle::set_schedule(Vec::new()).unwrap();
+        // Invalid windows are refused before anything is stored.
+        let bad = vec![ufop_core::throttle::BandwidthWindow { days: vec![9], start: "09:00".into(), end: "10:00".into(), ..Default::default() }];
+        assert!(ufop_core::throttle::validate_schedule(&bad).is_err());
+    }
 }

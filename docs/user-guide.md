@@ -273,9 +273,58 @@ When files conflict during sync, they are quarantined. Resolve via:
 - **Keep Both** - Rename one copy
 - **Skip** - Leave unchanged
 
+### Two-way sync and deletions
+
+A two-way pair remembers what both folders looked like after its last successful run (its *sync history*). Each run compares both sides with it:
+
+- A file deleted on one side and unchanged on the other is **deleted on the other side too** (with a rollback copy). Renaming a file is a delete plus an add.
+- A file changed on one side is copied to the other, in either direction. A file edited while a run is copying it counts as changed on the next run, so the edit is copied then.
+- A folder deleted on one side is removed on the other once its files have been deleted there (a folder that still holds other files stays).
+- A file changed on **both** sides is a conflict and goes through the pair's conflict policy, unless both sides now hold the same bytes (checked by content hash), which counts as in sync. *Destination wins* and *Keep both* leave both folders identical (keep both: the destination's version under the name, the source's as `name (conflict DATE).ext`, on both sides).
+- The **first run** (no history yet) only combines both folders; it never deletes. The preview says so.
+- A run that fails, is cancelled or stops at the end of its run hours keeps the previous history, so nothing it left half done is mistaken for a deletion. Until a run finishes cleanly, deletions of files created since the last clean run are not tracked (such a file comes back from the other side); the preview says so after a run with errors.
+- **Move files** (/MOV, /MOVE) is not available for two-way pairs: a moved file would be copied back to the source on the next run. Two-way pairs do not take it from the global defaults either. A two-way pair saved with it by an older version keeps working safely (a moved file leaves the sync history, so it is copied back rather than deleted), and its preview says to turn it off.
+- **Names that differ only in letter case** (`Report.txt` on one side, `report.txt` on the other, e.g. after a rename that only changed the case) are skipped with a reason and a preview note, and their sync history is forgotten: on drives that ignore case (the macOS and Windows defaults) they are one file, so copying or deleting either name could remove it. Rename one side to match and the next run settles them. As a second safeguard, a delete only goes through when the folder lists the file under exactly the planned name.
+- **Safety stop**: a run that would delete more than 50% of the synced files on one side (more than two files), or everything because one folder is empty or missing, is refused — usually an unplugged drive or an unmounted share. Change the limit in *Cleanup & moving* (0 turns it off) or reset the history.
+
+With **Destination state: Blind upload** the destination is never read, so a two-way pair only copies source files to it and never deletes anything (no history is used or recorded). With **Trust the inventory** a two-way pair still scans the destination every run, because the saved inventory cannot show changes made there. Changing a pair's mode or folders forgets its history. In the Advanced view each two-way pair shows its history size and a **Reset history** button.
+
+### Edit, duplicate, export and import
+
+- **Edit** opens the pair in the same form used to create it.
+- **Duplicate** creates "*name* (copy)" with the same settings, no run history and its schedule (or watcher) off: a scheduled or watched pair's copy keeps its trigger (the cron expression included) but starts disabled; turn it on with **Enabled** in Edit once it points at its own folders. Backup jobs have **Duplicate** too: the copy's schedules (including replica timers, and a schedule or maintenance plan it would inherit from a policy template) are off, stored credentials are copied rather than shared, and it opens in the editor so you can give it its own destination.
+- **Export** / **Import** (Advanced view) save one pair as a `ufop-sync-pair` JSON file and load it on another computer. If a folder is missing there, or a folder is on a saved connection's mount that the computer does not have, the import says so and the pair stays disabled until you fix it. A pair that runs on a schedule or when files change also arrives turned off, so it cannot start syncing (or mirror-deleting) before you have checked its folders; turn it on in **Edit**.
+
+### Filters, rules and presets
+
+Besides the include/exclude lists, a pair (and a backup job) can have **ordered rules**: the first rule that matches decides, so `+ keep.log` above `- *.log` keeps that one log file. Rule kinds: wildcard, exact path, regex, a group (temporary files, caches, OS metadata, build output, images, video, audio, documents, archives) and **rclone glob** (`*` stays in one folder, `**` crosses folders, a leading `/` anchors at the top of the pair or of each backup source folder, a trailing `/` matches a folder and everything in it, `{jpg,png}` alternatives). As in rclone, an rclone pattern without a trailing `/` or `**` names files only: `- *` never hides a folder, so `+ *.jpg` followed by `- *` keeps JPEGs at any depth, and `+ /Photos/**` followed by `- *` keeps only the `Photos` folder of each source. The other rule kinds in a backup job match the full path on disk (`/home/me/cache/`, `*/cache/`). A folder rule covers everything inside that folder; in a sync pair, paths are matched from the pair's top folder (so `cache/` means the `cache` folder at the top of the pair, and `/proc/`-style anchored group entries refer to the pair's top as well).
+
+- **Import rules from file…** reads an rclone `--filter-from` file: one `+ pattern` or `- pattern` per line, `#` and `;` comments, `!` clears the rules read so far. On the command line, `ufop backup run` / `estimate` take rclone rules as `--filter "+ /Photos/**"` (repeatable, applied in order after `--include` / `--exclude`), which is also how a backup job's *CLI command* writes them.
+- **Saved presets**: *Save as preset…* stores the current rules under a name; *Apply saved preset* adds a preset's rules to a pair or job (both views). In the Standard view a sync pair lists its rules read-only under the picker, each with a remove button and *Clear all rules*, so an applied preset can be undone without switching views. Delete presets in the Advanced view.
+- The quick filter presets of the sync form now include images, video, audio, documents and archives.
+
+### Comparing files
+
+In the Advanced view, *When to overwrite › Compare files by* chooses **size and date** (default), **checksum** (xxHash3; reads every file whose size matches, finds changes even when the date did not change and ignores files that were only touched), or **size only**. When checksums are not available the preview notes that size and date were used. Checksums are computed by reading the files through their local or mounted path; hashes stored by a cloud provider are not used yet. The **Ignore existing** preset (Advanced) copies only files the destination does not have.
+
+### Versioned backup: versions to keep
+
+Versioned-backup pairs keep every stored version unless *Versions to keep of each file* (Advanced) is set; then the oldest versions beyond that number are deleted after each run. Unchanged files are no longer stored again on every run; if the newest stored version of a file is removed from the destination, the next run stores the file again. Versions stored by earlier app versions (numbered `name.v1.ext` files without a version list) are taken over on the first run, so they count towards that number and continue the numbering; this works for the default name and any template built only from `{name}`, `{ext}`, `{filename}` and `{num}`.
+
+### Interrupted runs
+
+Each finished step of a run is recorded as it happens. If the app quits, crashes or the run is cancelled, the next run skips the steps that were already done (for files that have not changed since, and whose copy is still in place at the other side) and its report says *Resumed from interruption*. Editing the pair's folders, mode, filter or options, or deleting the pair, discards that record; versions a versioned backup stored before a crash are added to its version list on the next run.
+
+### Global sync defaults and bandwidth timetable
+
+Settings › Advanced has:
+
+- **Sync defaults**: copy options new pairs start from. A pair created afterwards stores only the options it changes and follows the defaults for the rest; pairs created before keep all their own options.
+- **Bandwidth timetable**: windows (weekdays, from–to) with upload and download limits. While a window is active its upload limit is shared by file transfers, sync copies and backups together (transfers and sync copies count as uploads), its download limit applies to backup restores, and each replaces the backup machine-wide limit for its direction. A window's 0 sets no limit of its own: the machine-wide limit for that direction stays in force (a download-only window does not lift the upload cap). The backup machine-wide limits themselves still apply to backups and restores only. A window that ends before it starts runs past midnight; for each direction, the first active window that limits it wins (a download-only window listed first does not hide a later upload limit).
+
 ### Rollback
 
-If a sync produced unwanted results, use the Rollback feature to restore files from the pre-sync backup.
+If a sync produced unwanted results, use the Rollback feature to restore files from the pre-sync backup (not while the pair is syncing: wait for the run to finish or cancel it). Two-way runs keep rollback copies of source files they changed or deleted too, and Rollback puts each back on its own side, with its original modification time. Rolling back a two-way run also forgets the restored files' sync history: if a restored file now differs from the other side, the next run handles it as a conflict under the pair's conflict policy (with *Keep both*, both versions are kept) rather than copying either version over the other.
 
 ### Reports
 

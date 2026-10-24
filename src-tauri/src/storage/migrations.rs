@@ -178,6 +178,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "Starred connections and the credentials-rejected flag",
             sql: V32_SCHEMA,
         },
+        Migration {
+            version: 33,
+            description: "Two-way sync baselines and user-saved filter presets",
+            sql: V33_SCHEMA,
+        },
     ]
 }
 
@@ -193,6 +198,38 @@ fn rust_step(version: u32) -> Option<RustStep> {
         _ => None,
     }
 }
+
+/// Schema v33: two-way sync baselines — what both sides of a pair looked
+/// like after its last successful run (`sync_baseline_runs` per pair, one
+/// `sync_baseline` row per file, mtimes in nanoseconds) — and user-saved
+/// filter presets (ordered include/exclude rules as JSON), shared by sync
+/// pairs and backup jobs; and the copy options each sync pair sets itself
+/// over the global sync defaults (`option_overrides_json`, NULL = all).
+const V33_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_baseline_runs (
+    pair_id     TEXT PRIMARY KEY NOT NULL,
+    run_id      TEXT,
+    source_root TEXT NOT NULL,
+    dest_root   TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sync_baseline (
+    pair_id         TEXT NOT NULL REFERENCES sync_baseline_runs(pair_id) ON DELETE CASCADE,
+    rel_path        TEXT NOT NULL,
+    size            INTEGER NOT NULL,
+    source_mtime_ns INTEGER,
+    dest_mtime_ns   INTEGER,
+    hash            TEXT,
+    PRIMARY KEY (pair_id, rel_path)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS user_filter_presets (
+    id         TEXT PRIMARY KEY NOT NULL,
+    name       TEXT NOT NULL,
+    rules_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+ALTER TABLE sync_pairs ADD COLUMN option_overrides_json TEXT;
+"#;
 
 /// Schema v21: profile fields with no column (upload modes, FTP tuning,
 /// symlink policy, connector extras) as JSON; previously never saved.
@@ -1101,7 +1138,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 32);
+        assert_eq!(applied, 33);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -1129,6 +1166,9 @@ mod tests {
         for t in ["file_tag_defs", "file_tag_links", "file_labels", "file_metadata", "smart_folders"] {
             assert!(tables.contains(&t.to_string()), "missing {t}");
         }
+        for t in ["sync_baseline_runs", "sync_baseline", "user_filter_presets"] {
+            assert!(tables.contains(&t.to_string()), "missing {t}");
+        }
         assert!(tables.contains(&"_migrations".to_string()));
     }
 
@@ -1136,7 +1176,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 32);
+        assert_eq!(first, 33);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -1149,7 +1189,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 32);
+        assert_eq!(current_version(&conn).unwrap(), 33);
     }
 
     #[test]

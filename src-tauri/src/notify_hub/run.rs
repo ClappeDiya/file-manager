@@ -368,6 +368,7 @@ mod tests {
             error_messages: if errors > 0 { vec!["locked".into()] } else { vec![] },
             resumed: false,
             exit_code: 0,
+            versions_pruned: 0,
         }
     }
 

@@ -193,7 +193,7 @@ impl TransferManager {
             progress_rx,
             retry_policy: Arc::new(RwLock::new(RetryPolicy::default())),
             conflict_policy: Arc::new(RwLock::new(ConflictPolicy::default())),
-            throttler: Arc::new(BandwidthThrottler::new(0)),
+            throttler: Arc::new(BandwidthThrottler::global()),
             throttle_config: Arc::new(RwLock::new(ThrottleConfig::default())),
             connection_throttles: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(RwLock::new(config)),

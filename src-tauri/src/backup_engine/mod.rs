@@ -1109,6 +1109,102 @@ impl BackupManager {
         Ok(job)
     }
 
+    /// Copy a job's definition as a new job: "<name> (copy)", a new id, no
+    /// history or statistics, every schedule (backup, maintenance, replica
+    /// timers) off. Stored secrets (passphrase, notification and report
+    /// credentials, cloud destination credentials)
+    /// are copied under the new job's own ids, so editing one job's secret
+    /// never changes the other's. Point the copy at its own destination
+    /// before turning its schedule on.
+    pub async fn duplicate_job(&self, id: &str) -> Result<BackupJob, AppError> {
+        let original = self.get_job(id).await?;
+        let mut copy = original.clone();
+        copy.id = String::new();
+        copy.name = format!("{} (copy)", original.name);
+        copy.stats = JobStats::default();
+        copy.legal_hold = None;
+        // The schedules may come from policy templates: take the resolved
+        // ones as the copy's own settings, turned off, so no template turns
+        // them back on. Every other setting resolves as before.
+        let resolved = self.resolve_job(&original).await?.job;
+        let mut own = templates::explicit_paths(&original)?;
+        own.extend(["schedule".to_string(), "maintenance".to_string()]);
+        copy.overrides = Some(own.into_iter().collect());
+        copy.schedule = resolved.schedule;
+        copy.maintenance = resolved.maintenance;
+        copy.schedule.enabled = false;
+        if let Some(s) = copy.maintenance.compact.as_mut() {
+            s.enabled = false;
+        }
+        if let Some(v) = copy.maintenance.verify.as_mut() {
+            v.schedule.enabled = false;
+        }
+        if let Some(s) = copy.maintenance.retention.as_mut() {
+            s.enabled = false;
+        }
+        self.copy_destination_secret(&mut copy.destination).await?;
+        for r in copy.replicas.iter_mut() {
+            r.id.clear();
+            r.last_run = None;
+            r.last_result = None;
+            if matches!(r.schedule, ReplicaSchedule::Interval { .. }) {
+                r.schedule = ReplicaSchedule::Manual;
+            }
+            self.copy_destination_secret(&mut r.destination).await?;
+        }
+        for n in copy.notifications.iter_mut() {
+            self.copy_secret_ref(&mut n.credential_id).await?;
+            if let notify::Channel::Webhook { headers, .. } = &mut n.channel {
+                for h in headers.iter_mut().filter(|h| h.secret) {
+                    self.copy_secret_ref(&mut h.credential_id).await?;
+                }
+            }
+        }
+        for h in copy.reports.headers.iter_mut().filter(|h| h.secret) {
+            self.copy_secret_ref(&mut h.credential_id).await?;
+        }
+        let passphrase = self.store_get(&format!("{PASS_KEY_PREFIX}{id}")).await?;
+        self.save_job(copy, passphrase).await
+    }
+
+    /// A cloud destination's stored credential, copied under a new id (a
+    /// credential this machine does not store itself, such as a centrally
+    /// managed one, is left as it is).
+    async fn copy_destination_secret(&self, dest: &mut BackupDestination) -> Result<(), AppError> {
+        if let BackupDestination::Cloud { credential_id, .. } = dest {
+            self.copy_secret_ref(credential_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Point `credential_id` at a copy of its stored secret. A reference to
+    /// a secret this machine does not store (a centrally managed one) is
+    /// kept as it is rather than dropped.
+    async fn copy_secret_ref(&self, credential_id: &mut String) -> Result<(), AppError> {
+        let copied = self.copy_secret(credential_id).await?;
+        if !copied.is_empty() {
+            *credential_id = copied;
+        }
+        Ok(())
+    }
+
+    /// Store a copy of the secret kept under `credential_id` (as written,
+    /// provider references unresolved); returns the copy's id, or "" when
+    /// there is no secret.
+    async fn copy_secret(&self, credential_id: &str) -> Result<String, AppError> {
+        if credential_id.trim().is_empty() {
+            return Ok(String::new());
+        }
+        match self.store_get(&format!("{DEST_KEY_PREFIX}{credential_id}")).await? {
+            Some(secret) => {
+                let new_id = uuid::Uuid::new_v4().to_string();
+                self.set_destination_secret(&new_id, &secret).await?;
+                Ok(new_id)
+            }
+            None => Ok(String::new()),
+        }
+    }
+
     /// Passphrases go to the OS keychain when one is available, otherwise to
     /// the settings store in the database (encrypted with the settings key
     /// when there is one) so they survive restarts on headless machines.

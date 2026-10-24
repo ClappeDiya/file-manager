@@ -9,72 +9,12 @@
 //! never consulted.
 
 use crate::error::AppError;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs::Metadata;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FilterAction {
-    Include,
-    Exclude,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FilterKind {
-    /// Literal path.
-    Exact,
-    /// `*` (any run, including separators) and `?` (one char).
-    Wildcard,
-    Regex,
-    /// A predefined group name (see [`FILTER_GROUPS`]).
-    Group,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FilterRule {
-    pub action: FilterAction,
-    pub kind: FilterKind,
-    pub pattern: String,
-}
-
-/// Predefined exclusion groups: (name, description, wildcard patterns).
-pub const FILTER_GROUPS: &[(&str, &str, &[&str])] = &[
-    (
-        "temporary_files",
-        "Editor swap files, partial downloads and temp folders",
-        &["*.tmp", "*.temp", "*~", "*.swp", "*.swo", "*.part", "*.crdownload", "*/tmp/", "*/Temp/", "*/.Trash-*/"],
-    ),
-    (
-        "cache_files",
-        "Application and browser caches",
-        &["*/.cache/", "*/Cache/", "*/Caches/", "*/node_modules/.cache/", "*/__pycache__/", "*.pyc", "*/Library/Caches/"],
-    ),
-    (
-        "os_metadata",
-        "Desktop/Finder metadata files",
-        &["*/.DS_Store", "*/Thumbs.db", "*/desktop.ini", "*/.Spotlight-V100/", "*/.fseventsd/", "*/.TemporaryItems/", "*/$RECYCLE.BIN/", "*/.Trashes/"],
-    ),
-    (
-        "system_files",
-        "Operating-system files that cannot be restored meaningfully",
-        &["*/pagefile.sys", "*/hiberfil.sys", "*/swapfile.sys", "*/System Volume Information/", "/proc/", "/sys/", "/dev/", "/run/", "/private/var/vm/"],
-    ),
-    (
-        "build_artifacts",
-        "Rebuildable developer output",
-        &["*/node_modules/", "*/target/debug/", "*/target/release/", "*/.gradle/", "*/build/intermediates/"],
-    ),
-];
-
-#[derive(Debug, Clone)]
-enum Matcher {
-    Exact(String),
-    Glob(glob::Pattern),
-    Regex(Regex),
-}
+// The rule engine is shared with the sync planner (`crate::filter_rules`).
+pub use crate::filter_rules::{parse_filter_file, FilterAction, FilterKind, FilterRule, RuleSet, FILTER_GROUPS};
 
 /// Compiled source filter with every selection option.
 ///
@@ -104,7 +44,7 @@ pub struct SourceFilter {
     /// repositories inside the sources.
     pub respect_gitignore: bool,
     #[serde(skip)]
-    compiled: Vec<(FilterAction, Matcher)>,
+    compiled: RuleSet,
 }
 
 impl Default for SourceFilter {
@@ -120,76 +60,43 @@ impl Default for SourceFilter {
             exclude_cloud_placeholders: false,
             ignore_files: vec![super::ignore::DEFAULT_IGNORE_FILE.to_string()],
             respect_gitignore: false,
-            compiled: Vec::new(),
+            compiled: RuleSet::default(),
         }
     }
 }
 
 const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 
-fn normalize(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
 impl SourceFilter {
     /// Validate and compile the rules. Must be called before `evaluate`.
     pub fn compile(mut self) -> Result<Self, AppError> {
-        let mut compiled = Vec::new();
-        for r in &self.rules {
-            match r.kind {
-                FilterKind::Exact => compiled.push((r.action, Matcher::Exact(normalize(&r.pattern)))),
-                FilterKind::Wildcard => compiled.push((r.action, Matcher::Glob(compile_glob(&r.pattern)?))),
-                FilterKind::Regex => {
-                    let re = Regex::new(&r.pattern).map_err(|e| {
-                        AppError::validation(format!("Invalid regular expression '{}': {e}", r.pattern))
-                    })?;
-                    compiled.push((r.action, Matcher::Regex(re)));
-                }
-                FilterKind::Group => {
-                    let (_, _, pats) = FILTER_GROUPS
-                        .iter()
-                        .find(|(n, _, _)| *n == r.pattern)
-                        .ok_or_else(|| AppError::validation(format!("Unknown filter group '{}'", r.pattern)))?;
-                    for p in pats.iter() {
-                        compiled.push((r.action, Matcher::Glob(compile_glob(p)?)));
-                    }
-                }
-            }
-        }
-        self.compiled = compiled;
+        self.compiled = RuleSet::compile(&self.rules)?;
         Ok(self)
     }
 
     /// First matching rule's action; `None` when no rule matches.
     pub fn evaluate(&self, path: &str, is_dir: bool) -> Option<FilterAction> {
-        let mut p = normalize(path);
-        if is_dir && !p.ends_with('/') {
-            p.push('/');
-        }
-        let opts = glob::MatchOptions { case_sensitive: !cfg!(windows), require_literal_separator: false, require_literal_leading_dot: false };
-        for (action, m) in &self.compiled {
-            let hit = match m {
-                Matcher::Exact(e) => {
-                    if e.ends_with('/') {
-                        is_dir && p == *e
-                    } else {
-                        p == *e || (is_dir && p.trim_end_matches('/') == e)
-                    }
-                }
-                Matcher::Glob(g) => g.matches_with(&p, opts),
-                Matcher::Regex(r) => r.is_match(&p),
-            };
-            if hit {
-                return Some(*action);
-            }
-        }
-        None
+        self.compiled.evaluate(path, is_dir)
+    }
+
+    /// Like [`evaluate`](Self::evaluate) for `path` found under the source
+    /// folder `root`: rclone rules (imported `--filter-from` files) are
+    /// matched on the path inside `root`, so `/Photos/**` is the source's
+    /// own `Photos` folder; the other rule kinds keep matching the full path.
+    pub fn evaluate_under(&self, path: &Path, root: Option<&Path>, is_dir: bool) -> Option<FilterAction> {
+        let rel = root.and_then(|r| path.strip_prefix(r).ok()).map(|r| r.to_string_lossy());
+        self.compiled.evaluate_rooted(&path.to_string_lossy(), rel.as_deref(), is_dir)
     }
 
     /// Whether the entry is selected, applying rules and attribute checks.
     pub fn accepts(&self, path: &Path, md: &Metadata) -> bool {
-        let s = path.to_string_lossy();
-        if self.evaluate(&s, md.is_dir()) == Some(FilterAction::Exclude) {
+        self.accepts_under(path, None, md)
+    }
+
+    /// [`accepts`](Self::accepts) for an entry under the source folder
+    /// `root` (see [`evaluate_under`](Self::evaluate_under)).
+    pub fn accepts_under(&self, path: &Path, root: Option<&Path>, md: &Metadata) -> bool {
+        if self.evaluate_under(path, root, md.is_dir()) == Some(FilterAction::Exclude) {
             return false;
         }
         if self.exclude_hidden && is_hidden(path, md) {
@@ -231,10 +138,6 @@ impl SourceFilter {
             true
         })
     }
-}
-
-fn compile_glob(p: &str) -> Result<glob::Pattern, AppError> {
-    glob::Pattern::new(&normalize(p)).map_err(|e| AppError::validation(format!("Invalid wildcard '{p}': {e}")))
 }
 
 fn is_hidden(path: &Path, _md: &Metadata) -> bool {

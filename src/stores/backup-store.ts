@@ -15,7 +15,8 @@ export { errorText };
 // ── Types (mirror Rust) ──
 
 export type FilterAction = "include" | "exclude";
-export type FilterKind = "exact" | "wildcard" | "regex" | "group";
+/** Mirrors `FilterKind` in ufop-core filter_rules.rs (`rclone`: rclone-style glob). */
+export type FilterKind = "exact" | "wildcard" | "regex" | "group" | "rclone";
 
 export interface FilterRule {
   action: FilterAction;
@@ -1566,6 +1567,8 @@ interface BackupState {
   loadHistory: (jobId?: string | null, limit?: number) => Promise<void>;
   loadCapabilities: () => Promise<void>;
   saveJob: (job: BackupJob, passphrase?: string | null) => Promise<BackupJob>;
+  /** Copy a job as "<name> (copy)" with its schedules off (duplicate_backup_job). */
+  duplicateJob: (id: string) => Promise<BackupJob>;
   deleteJob: (id: string, deleteLocalDb: boolean, deleteRemote: boolean) => Promise<void>;
   runJob: (id: string, dryRun?: boolean) => Promise<string>;
   /** Queue a backup of every job (read-only and busy ones are skipped). */
@@ -1653,6 +1656,12 @@ export const useBackupStore = create<BackupState>((set, get) => ({
     });
     await get().loadJobs();
     return saved;
+  },
+
+  duplicateJob: async (id) => {
+    const copy = await tauriInvoke<BackupJob>("duplicate_backup_job", { id });
+    await get().loadJobs();
+    return copy;
   },
 
   deleteJob: async (id, deleteLocalDb, deleteRemote) => {
