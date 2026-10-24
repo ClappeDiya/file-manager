@@ -9,7 +9,7 @@
 //! file-type limits apply to every file.
 
 use crate::error::AppError;
-use crate::filter_rules::{FilterAction, FilterKind, FilterRule, RuleSet};
+use crate::filter_rules::{normalize, FilterAction, FilterKind, FilterRule, RuleSet};
 use crate::sync_types::SyncFilter;
 use std::path::Path;
 
@@ -65,7 +65,7 @@ impl CompiledSyncFilter {
 
     /// Whether the file at `relative_path` (of `size` bytes) is synced.
     pub fn accepts(&self, relative_path: &str, size: u64) -> bool {
-        let explicit = self.rules.evaluate(relative_path, false);
+        let explicit = self.rule_verdict(relative_path);
         if explicit == Some(FilterAction::Exclude) {
             return false;
         }
@@ -89,6 +89,30 @@ impl CompiledSyncFilter {
             return false;
         }
         true
+    }
+
+    /// The ordered rules' verdict, matched as backup matches them while it
+    /// walks: each folder above the file first (root first; an excluded
+    /// folder drops everything in it, an included one does not stop deeper
+    /// rules), then the file. Every path is tried both as written
+    /// (`cache/a.bin`) and from the pair root (`/cache/a.bin`), so relative
+    /// rules keep working and `*/Thumbs.db`-style group patterns also match
+    /// at the root.
+    fn rule_verdict(&self, relative_path: &str) -> Option<FilterAction> {
+        if self.rules.is_empty() {
+            return None;
+        }
+        let rel = normalize(relative_path);
+        let rel = rel.trim_start_matches('/');
+        let forms = |p: &str| [p.to_string(), format!("/{p}")];
+        for (i, _) in rel.match_indices('/') {
+            let [a, b] = forms(&rel[..i]);
+            if self.rules.evaluate_any(&[&a, &b], true) == Some(FilterAction::Exclude) {
+                return Some(FilterAction::Exclude);
+            }
+        }
+        let [a, b] = forms(rel);
+        self.rules.evaluate_any(&[&a, &b], false)
     }
 
     fn lists_accept(&self, relative_path: &str) -> bool {
@@ -134,6 +158,37 @@ mod tests {
         assert!(!c.accepts("logs/keep.log", 1000), "size limits still apply");
         let bad = SyncFilter { rules: vec![rule(FilterAction::Exclude, FilterKind::Regex, "(")], ..Default::default() };
         assert!(validate(&bad).is_err());
+    }
+
+    /// Regression: rules were matched against the file's own relative path
+    /// only, so folder rules and root-level `*/name` patterns never matched.
+    #[test]
+    fn folder_rules_and_groups_match_like_backup() {
+        let excl = |kind, p: &str| SyncFilter { rules: vec![rule(FilterAction::Exclude, kind, p)], ..Default::default() };
+        let drops = |f: &SyncFilter, path: &str| !CompiledSyncFilter::new(f).unwrap().accepts(path, 1);
+        let tmp = excl(FilterKind::Group, "temporary_files");
+        assert!(drops(&tmp, "proj/tmp/a.txt"));
+        assert!(drops(&tmp, "tmp/a.txt"), "a folder at the pair root");
+        assert!(!drops(&tmp, "proj/tmpfile.txt"));
+        assert!(drops(&excl(FilterKind::Group, "build_artifacts"), "app/node_modules/x/y.js"));
+        let os = excl(FilterKind::Group, "os_metadata");
+        assert!(drops(&os, "Thumbs.db"), "a file at the pair root");
+        assert!(drops(&os, "a/b/.DS_Store"));
+        assert!(drops(&os, "$RECYCLE.BIN/x"));
+        let cache = excl(FilterKind::Wildcard, "cache/");
+        assert!(drops(&cache, "cache/a.bin"));
+        assert!(drops(&cache, "cache/deep/a.bin"));
+        assert!(!drops(&cache, "cache"), "`cache/` is the folder only");
+        assert!(!drops(&cache, "x/cache/a.bin"), "an unanchored wildcard still names a path from the root");
+        assert!(drops(&excl(FilterKind::Exact, "cache"), "cache/a.bin"), "an exact folder rule");
+        assert!(drops(&excl(FilterKind::Rclone, "node_modules/"), "a/node_modules/b.js"));
+        // A deeper exclude still applies under an included folder, as in backup.
+        let f = SyncFilter {
+            rules: vec![rule(FilterAction::Include, FilterKind::Wildcard, "proj/"), rule(FilterAction::Exclude, FilterKind::Group, "temporary_files")],
+            ..Default::default()
+        };
+        assert!(drops(&f, "proj/tmp/a.txt"));
+        assert!(!drops(&f, "proj/a.txt"));
     }
 
     #[test]

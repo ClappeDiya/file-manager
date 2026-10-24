@@ -1366,6 +1366,38 @@ mod tests {
         crate::sync::copier::set_mtime(path, t);
     }
 
+    /// Regression: folder rules (the shared groups' `*/tmp/`-style entries
+    /// and folder wildcards like `cache/`) and `*/name` patterns for files at
+    /// the pair root used to match nothing in sync, so the files were copied.
+    #[test]
+    fn folder_and_group_rules_exclude_in_a_sync_plan() {
+        use crate::filter_rules::{FilterAction, FilterKind, FilterRule};
+        let (src, dst) = setup_dirs();
+        for f in ["proj/tmp/a.txt", "app/node_modules/x/y.js", "Thumbs.db", "cache/a.bin", "keep/notes.txt", "proj/tmpfile.txt"] {
+            let p = src.path().join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, "x").unwrap();
+        }
+        let rule = |kind, pattern: &str| FilterRule { action: FilterAction::Exclude, kind, pattern: pattern.into() };
+        let pair = SyncPair {
+            filter: SyncFilter {
+                rules: vec![
+                    rule(FilterKind::Group, "temporary_files"),
+                    rule(FilterKind::Group, "build_artifacts"),
+                    rule(FilterKind::Group, "os_metadata"),
+                    rule(FilterKind::Wildcard, "cache/"),
+                ],
+                ..Default::default()
+            },
+            ..pair_for(src.path(), dst.path())
+        };
+        let preview = compute_preview(&pair).unwrap();
+        let mut added: Vec<_> = preview.additions.iter().map(|e| e.relative_path.replace('\\', "/")).collect();
+        added.sort();
+        assert_eq!(added, vec!["keep/notes.txt".to_string(), "proj/tmpfile.txt".to_string()]);
+        assert_eq!(preview.total_skipped, 4);
+    }
+
     #[test]
     fn checksum_mode_compares_content() {
         let (src, dst) = setup_dirs();

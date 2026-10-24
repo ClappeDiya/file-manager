@@ -203,24 +203,36 @@ impl RuleSet {
 
     /// First matching rule's action; `None` when no rule matches.
     pub fn evaluate(&self, path: &str, is_dir: bool) -> Option<FilterAction> {
-        let mut p = normalize(path);
-        if is_dir && !p.ends_with('/') {
-            p.push('/');
-        }
+        self.evaluate_any(&[path], is_dir)
+    }
+
+    /// Like [`evaluate`](Self::evaluate) for a path that has several
+    /// spellings: the first rule that matches any of `paths` decides.
+    pub fn evaluate_any(&self, paths: &[&str], is_dir: bool) -> Option<FilterAction> {
+        let paths: Vec<String> = paths
+            .iter()
+            .map(|path| {
+                let mut p = normalize(path);
+                if is_dir && !p.ends_with('/') {
+                    p.push('/');
+                }
+                p
+            })
+            .collect();
         let opts = match_options(self.case_sensitive);
         for (action, m) in &self.compiled {
-            let hit = match m {
+            let hit = |p: &String| match m {
                 Matcher::Exact(e) => {
                     if e.ends_with('/') {
-                        is_dir && p == *e
+                        is_dir && p == e
                     } else {
-                        p == *e || (is_dir && p.trim_end_matches('/') == e)
+                        p == e || (is_dir && p.trim_end_matches('/') == e)
                     }
                 }
-                Matcher::Glob(g) => g.matches_with(&p, opts),
-                Matcher::Regex(r) => r.is_match(&p),
+                Matcher::Glob(g) => g.matches_with(p, opts),
+                Matcher::Regex(r) => r.is_match(p),
             };
-            if hit {
+            if paths.iter().any(hit) {
                 return Some(*action);
             }
         }

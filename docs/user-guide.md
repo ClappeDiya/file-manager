@@ -294,7 +294,7 @@ With **Destination state: Blind upload** the destination is never read, so a two
 
 ### Filters, rules and presets
 
-Besides the include/exclude lists, a pair (and a backup job) can have **ordered rules**: the first rule that matches decides, so `+ keep.log` above `- *.log` keeps that one log file. Rule kinds: wildcard, exact path, regex, a group (temporary files, caches, OS metadata, build output, images, video, audio, documents, archives) and **rclone glob** (`*` stays in one folder, `**` crosses folders, a leading `/` anchors at the top, a trailing `/` matches a folder and everything in it, `{jpg,png}` alternatives).
+Besides the include/exclude lists, a pair (and a backup job) can have **ordered rules**: the first rule that matches decides, so `+ keep.log` above `- *.log` keeps that one log file. Rule kinds: wildcard, exact path, regex, a group (temporary files, caches, OS metadata, build output, images, video, audio, documents, archives) and **rclone glob** (`*` stays in one folder, `**` crosses folders, a leading `/` anchors at the top, a trailing `/` matches a folder and everything in it, `{jpg,png}` alternatives). A folder rule covers everything inside that folder; in a sync pair, paths are matched from the pair's top folder (so `cache/` means the `cache` folder at the top of the pair, and `/proc/`-style anchored group entries refer to the pair's top as well).
 
 - **Import rules from file…** reads an rclone `--filter-from` file: one `+ pattern` or `- pattern` per line, `#` and `;` comments, `!` clears the rules read so far.
 - **Saved presets**: *Save as preset…* stores the current rules under a name; *Apply saved preset* adds a preset's rules to a pair or job (both views). Delete presets in the Advanced view.
