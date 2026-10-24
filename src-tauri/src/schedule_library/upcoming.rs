@@ -66,11 +66,13 @@ mod tests {
     #[tokio::test]
     async fn armed_schedules_are_listed_soonest_first_and_others_left_out() {
         let repo = crate::storage::Repository::open_in_memory().await.unwrap();
-        let sync = SyncManager::with_state_dir(std::env::temp_dir().join("ufop-upcoming-test"));
+        let state = tempfile::tempdir().unwrap();
+        let sync = SyncManager::with_state_dir(state.path().to_path_buf());
         let automation = AutomationManager::new();
 
-        // A pair every hour, a pair on watch, a disabled scheduled pair.
-        let hourly = SyncPair { name: "Hourly".into(), trigger: SyncTrigger::Scheduled { cron_expr: "0 0 * * * * *".into() }, ..Default::default() };
+        // A yearly pair (never due in the same minute as the minutely rule, so the
+        // order below cannot tie), a pair on watch, a disabled scheduled pair.
+        let hourly = SyncPair { name: "Hourly".into(), trigger: SyncTrigger::Scheduled { cron_expr: "0 0 0 1 1 * *".into() }, ..Default::default() };
         let watch = SyncPair { name: "Watch".into(), trigger: SyncTrigger::Watch, ..Default::default() };
         let off = SyncPair { name: "Off".into(), enabled: false, trigger: SyncTrigger::Scheduled { cron_expr: "0 0 * * * * *".into() }, ..Default::default() };
         for p in [&hourly, &watch, &off] {
@@ -86,7 +88,7 @@ mod tests {
         automation.rearm(&every_min).await.unwrap();
 
         let runs = upcoming(&sync, &automation).await;
-        assert_eq!(runs.iter().map(|r| (r.kind.as_str(), r.name.as_str())).collect::<Vec<_>>(), vec![("automation", "Minutely"), ("sync", "Hourly")]);
+        assert_eq!(runs.iter().map(|r| (r.kind.as_str(), r.name.as_str())).collect::<Vec<_>>(), vec![("automation", "Minutely"), ("sync", "Hourly")], "{runs:?}");
         assert!(runs[0].next_run_at <= runs[1].next_run_at);
         let t = DateTime::parse_from_rfc3339(&runs[0].next_run_at).unwrap();
         assert!(t > Utc::now() - chrono::Duration::seconds(1) && t < Utc::now() + chrono::Duration::seconds(61), "{t}");
