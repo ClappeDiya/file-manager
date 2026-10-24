@@ -282,11 +282,11 @@ pub async fn send_email(host: &str, port: Option<u16>, tls: TlsMode, username: &
 
 pub async fn send_telegram(api_base: &str, token: &str, chat_id: &str, text: &str, cert: &CertPolicy) -> Result<(), AppError> {
     let base = if api_base.is_empty() { "https://api.telegram.org" } else { api_base.trim_end_matches('/') };
-    let http = super::stores::http::client(&super::stores::http::TlsOptions { accept_invalid_certs: cert.accept_invalid_certs, ca_pem: cert.ca_pem.clone(), pinned_sha256: cert.pinned_sha256.clone() })?;
+    let http = crate::backup_engine::stores::http::client(&crate::backup_engine::stores::http::TlsOptions { accept_invalid_certs: cert.accept_invalid_certs, ca_pem: cert.ca_pem.clone(), pinned_sha256: cert.pinned_sha256.clone() })?;
     // Telegram limits messages to 4096 characters.
     let text: String = text.chars().take(4000).collect();
-    let r = http.post(format!("{base}/bot{token}/sendMessage")).json(&serde_json::json!({ "chat_id": chat_id, "text": text, "disable_web_page_preview": true })).send().await.map_err(|e| super::stores::http::net("Telegram", e))?;
-    let v: serde_json::Value = super::stores::http::check(r, "Telegram").await?.json().await.map_err(|e| super::stores::http::net("Telegram", e))?;
+    let r = http.post(format!("{base}/bot{token}/sendMessage")).json(&serde_json::json!({ "chat_id": chat_id, "text": text, "disable_web_page_preview": true })).send().await.map_err(|e| crate::backup_engine::stores::http::net("Telegram", e))?;
+    let v: serde_json::Value = crate::backup_engine::stores::http::check(r, "Telegram").await?.json().await.map_err(|e| crate::backup_engine::stores::http::net("Telegram", e))?;
     if v["ok"] != true {
         return Err(AppError::connection(format!("Telegram refused the message: {}", v["description"]), "Check the bot token and chat id."));
     }
@@ -296,7 +296,7 @@ pub async fn send_telegram(api_base: &str, token: &str, chat_id: &str, text: &st
 // ── Slack and Microsoft Teams webhooks ──
 
 fn webhook_client(cert: &CertPolicy) -> Result<reqwest::Client, AppError> {
-    super::stores::http::client(&super::stores::http::TlsOptions {
+    crate::backup_engine::stores::http::client(&crate::backup_engine::stores::http::TlsOptions {
         accept_invalid_certs: cert.accept_invalid_certs,
         ca_pem: cert.ca_pem.clone(),
         pinned_sha256: cert.pinned_sha256.clone(),
@@ -320,8 +320,8 @@ pub async fn send_slack(webhook_url: &str, title: &str, text: &str, cert: &CertP
         .json(&serde_json::json!({ "text": text, "mrkdwn": true }))
         .send()
         .await
-        .map_err(|e| super::stores::http::net("Slack", e))?;
-    super::stores::http::check(r, "Slack").await?;
+        .map_err(|e| crate::backup_engine::stores::http::net("Slack", e))?;
+    crate::backup_engine::stores::http::check(r, "Slack").await?;
     Ok(())
 }
 
@@ -354,8 +354,8 @@ pub async fn send_teams(webhook_url: &str, title: &str, text: &str, cert: &CertP
         .json(&teams_payload(title, text))
         .send()
         .await
-        .map_err(|e| super::stores::http::net("Teams", e))?;
-    super::stores::http::check(r, "Teams").await?;
+        .map_err(|e| crate::backup_engine::stores::http::net("Teams", e))?;
+    crate::backup_engine::stores::http::check(r, "Teams").await?;
     Ok(())
 }
 

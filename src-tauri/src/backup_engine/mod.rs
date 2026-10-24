@@ -20,7 +20,9 @@ pub mod drives;
 pub mod hardening;
 pub mod hooks;
 pub mod logs;
-pub mod notify;
+/// The channel dispatcher is shared with sync and automation (`crate::notify_hub`).
+pub use crate::notify_hub as notify;
+mod profile_store;
 pub mod policy;
 pub mod portability;
 pub mod runs;
@@ -1814,7 +1816,7 @@ impl BackupManager {
 
     // ── Shared settings: global defaults and destination library ──
 
-    async fn config_get(&self, key: &'static str) -> Result<Option<String>, AppError> {
+    pub(crate) async fn config_get(&self, key: &'static str) -> Result<Option<String>, AppError> {
         self.inner.pool.execute(move |c| Ok(c.query_row("SELECT value FROM config WHERE key = ?1", [key], |r| r.get(0)).ok())).await
     }
 

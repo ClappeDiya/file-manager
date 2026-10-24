@@ -17,6 +17,7 @@ pub mod logging;
 pub mod diagnostics;
 pub mod managed_settings;
 pub mod net;
+pub mod notify_hub;
 pub mod search_engine;
 pub mod thumbnail_engine;
 pub mod mount_engine;
