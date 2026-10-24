@@ -54,6 +54,15 @@ impl ActionServices for TauriActionServices {
             remote_dir.to_string(),
         );
         Box::pin(async move {
+            // A step that names only the connection (a download sent to a
+            // remote) takes the protocol from the saved connection.
+            let protocol = if protocol.trim().is_empty() {
+                let id = uuid::Uuid::parse_str(&connection_id).map_err(|_| format!("Invalid connection id '{connection_id}'"))?;
+                let profile = self.app.state::<ConnectionManager>().get_connection(id).await.map_err(|e| e.user_message())?.ok_or_else(|| format!("Saved connection {connection_id} not found"))?;
+                profile.protocol.as_str().to_string()
+            } else {
+                protocol
+            };
             let connector = crate::commands::connector_commands::ensure_connected(
                 &self.app.state::<ConnectorRegistry>(),
                 &self.app.state::<ConnectionManager>(),
@@ -126,6 +135,35 @@ impl ActionServices for TauriActionServices {
                 .send_message(n, &title, &body)
                 .await
                 .map_err(|e| e.user_message())
+        })
+    }
+
+    fn verify_pair<'a>(&'a self, pair_id: &'a str, full: bool) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async move {
+            use crate::core::traits::SyncOperations;
+            let id = uuid::Uuid::parse_str(pair_id).map_err(|_| format!("Invalid sync pair id '{pair_id}'"))?;
+            let pair = self.app.state::<SyncManager>().list_pairs().await.map_err(|e| e.user_message())?.into_iter().find(|p| p.id == id).ok_or_else(|| format!("Sync pair {pair_id} not found"))?;
+            tokio::task::spawn_blocking(move || crate::sync_engine::verify_outcome(&pair, full)).await.map_err(|e| format!("Verification failed: {e}"))?
+        })
+    }
+
+    fn assess_intent<'a>(&'a self, intent: &'a crate::safety::OperationIntent) -> BoxFuture<'a, crate::safety::RiskAssessment> {
+        Box::pin(async move { self.app.state::<crate::safety::SafetyInterlock>().assess(intent).await })
+    }
+
+    fn record_operation<'a>(&'a self, intent: &'a crate::safety::OperationIntent) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            use crate::ledger::{LedgerEngine, LedgerStatus, RecordEvent};
+            // `files` is what the safety baseline reads back as this operation's usual size.
+            let mut ev = RecordEvent::new(LedgerEngine::Automation, intent.kind.clone())
+                .status(LedgerStatus::Ok)
+                .summary(intent.summary.clone().unwrap_or_else(|| format!("automation {}", intent.kind)))
+                .bytes(intent.total_bytes as i64)
+                .details_json(serde_json::json!({ "files": intent.affected_files }).to_string());
+            if let Some(p) = &intent.subject_path {
+                ev = ev.subject(p.clone());
+            }
+            self.app.state::<OperationLedger>().record(ev).await;
         })
     }
 

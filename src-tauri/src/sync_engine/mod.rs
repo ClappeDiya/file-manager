@@ -145,6 +145,19 @@ pub struct SyncManager {
     run_listeners: Arc<std::sync::RwLock<Vec<RunListener>>>,
 }
 
+/// Compare a pair's two sides on demand (blocking): `Ok` with a one-line
+/// outcome when they agree, `Err` naming the first differences otherwise.
+/// What the automation step "Verify a sync pair" reports.
+pub fn verify_outcome(pair: &SyncPair, full: bool) -> Result<String, String> {
+    let diffs = executor::verify_now(pair, full).map_err(|e| e.user_message())?;
+    if diffs.is_empty() {
+        return Ok(format!("{} and {} agree", pair.source_path, pair.dest_path));
+    }
+    let shown: Vec<&str> = diffs.iter().take(5).map(String::as_str).collect();
+    let more = if diffs.len() > shown.len() { format!(" (and {} more)", diffs.len() - shown.len()) } else { String::new() };
+    Err(format!("{} difference(s) between {} and {}: {}{more}", diffs.len(), pair.source_path, pair.dest_path, shown.join("; ")))
+}
+
 /// How a sync run ended, for notifications.
 #[derive(Debug, Clone)]
 pub struct SyncRunEvent {
@@ -563,6 +576,11 @@ impl SyncManager {
     }
 
     /// Whether the cron loop is running.
+    /// Next scheduled run of a pair, if its schedule is armed.
+    pub fn next_scheduled_run(&self, pair_id: Uuid) -> Option<DateTime<Utc>> {
+        self.scheduler.next_run_time(pair_id)
+    }
+
     pub fn scheduler_running(&self) -> bool {
         self.scheduler.is_running()
     }

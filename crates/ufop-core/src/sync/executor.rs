@@ -930,6 +930,22 @@ fn write_completion_marker(pair: &SyncPair, report: &SyncReport) -> std::io::Res
 
 /// Verify sync results using checksum comparison (T-042).
 pub fn verify_sync(pair: &SyncPair, _report: &SyncReport) -> Result<Vec<String>, AppError> {
+    verify_pair(pair)
+}
+
+/// Compare a pair's source and destination on demand, whatever the pair's
+/// own verification settings are: sizes, or with `full` the contents too.
+/// Returns what differs (empty when the sides agree).
+pub fn verify_now(pair: &SyncPair, full: bool) -> Result<Vec<String>, AppError> {
+    let mut p = pair.clone();
+    p.verify_mode = if full { SyncVerifyMode::Full } else { SyncVerifyMode::Fast };
+    p.checksum_enabled = full;
+    verify_pair(&p)
+}
+
+/// The comparison behind [`verify_sync`] and [`verify_now`], following the
+/// pair's `verify_mode` and `checksum_enabled`.
+fn verify_pair(pair: &SyncPair) -> Result<Vec<String>, AppError> {
     if !pair.checksum_enabled && pair.verify_mode == SyncVerifyMode::None {
         return Ok(Vec::new());
     }
@@ -1403,6 +1419,32 @@ mod tests {
         assert!(validate_run_options(&notify(Some("p"), &["error"])).is_ok());
         assert!(validate_run_options(&notify(Some("p"), &["boom"])).is_err());
         assert!(validate_run_options(&notify(None, &["error"])).is_err());
+    }
+
+    #[test]
+    fn verify_now_compares_both_sides_whatever_the_pairs_own_settings() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "same-size-1").unwrap();
+        fs::write(src.path().join("b.txt"), "bbb").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.verify_mode = SyncVerifyMode::None;
+        pair.checksum_enabled = false;
+        run_with(pair.clone());
+        assert!(verify_now(&pair, true).unwrap().is_empty(), "identical sides agree");
+        // Same size, different content: only the full comparison sees it.
+        fs::write(dst.path().join("a.txt"), "same-size-2").unwrap();
+        assert!(verify_now(&pair, false).unwrap().is_empty());
+        let full = verify_now(&pair, true).unwrap();
+        assert_eq!(full, vec!["Checksum mismatch: a.txt".to_string()]);
+        // A missing file and a size change are both found by the fast comparison.
+        fs::remove_file(dst.path().join("b.txt")).unwrap();
+        fs::write(dst.path().join("a.txt"), "short").unwrap();
+        let fast = verify_now(&pair, false).unwrap();
+        assert!(fast.iter().any(|m| m.starts_with("Missing at destination: b.txt")) && fast.iter().any(|m| m.starts_with("Size mismatch: a.txt")), "{fast:?}");
+        // The pair's own settings are left alone: with verification off, a sync-time check finds nothing.
+        let report = run_with(pair.clone());
+        assert!(verify_sync(&pair, &report).unwrap().is_empty());
     }
 
     #[test]

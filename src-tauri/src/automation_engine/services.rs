@@ -62,6 +62,24 @@ pub trait ActionServices: Send + Sync {
         Box::pin(async {})
     }
 
+    /// Compare a sync pair's two sides (`full`: contents, not just sizes).
+    /// Ok with a one-line outcome when they agree; Err naming the differences.
+    fn verify_pair<'a>(&'a self, _pair_id: &'a str, _full: bool) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async { Err(SERVICES_UNAVAILABLE.to_string()) })
+    }
+
+    /// Judge a destructive step against the safety interlock. Without the
+    /// ledger only the absolute limits apply.
+    fn assess_intent<'a>(&'a self, intent: &'a crate::safety::OperationIntent) -> BoxFuture<'a, crate::safety::RiskAssessment> {
+        Box::pin(async move { crate::safety::assess_static(intent) })
+    }
+
+    /// Record a finished destructive step so later assessments know what is
+    /// usual for this user.
+    fn record_operation<'a>(&'a self, _intent: &'a crate::safety::OperationIntent) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
     /// Another rule by id (workflow steps that run a nested rule).
     fn rule<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Option<super::AutomationRule>> {
         Box::pin(async { None })
@@ -93,6 +111,14 @@ pub mod mock {
         pub rules: Mutex<Vec<crate::automation_engine::AutomationRule>>,
         /// `name:status` of every finished run reported to `run_finished`.
         pub finished: Mutex<Vec<String>>,
+        /// (path, content at the time of the call) of every upload.
+        pub uploaded: Mutex<Vec<(String, Vec<u8>)>>,
+        /// Sync pairs `verify_pair` can compare.
+        pub pairs: Mutex<Vec<ufop_core::sync_types::SyncPair>>,
+        /// Destructive steps reported to `record_operation` (`kind:files:bytes`).
+        pub operations: Mutex<Vec<String>>,
+        /// When set, `assess_intent` answers with this level instead of the static limits.
+        pub assess_level: Mutex<Option<crate::safety::RiskLevel>>,
     }
 
     impl RecordingServices {
@@ -127,6 +153,7 @@ pub mod mock {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             let remote = remote_join(remote_dir, &name);
+            self.uploaded.lock().unwrap().push((local_path.to_string(), std::fs::read(local_path).unwrap_or_default()));
             let r = self.record(format!("transfer:{protocol}:{connection_id}:{local_path}->{remote}"));
             Box::pin(async move { r.map(|_| remote) })
         }
@@ -154,6 +181,27 @@ pub mod mock {
             let kind = serde_json::to_value(&notification.channel).ok().and_then(|v| v["type"].as_str().map(str::to_string)).unwrap_or_default();
             let r = self.record(format!("message:{kind}:{title}:{body}"));
             Box::pin(async move { r })
+        }
+
+        fn verify_pair<'a>(&'a self, pair_id: &'a str, full: bool) -> BoxFuture<'a, Result<String, String>> {
+            let found = self.pairs.lock().unwrap().iter().find(|p| p.id.to_string() == pair_id).cloned();
+            let r = self.record(format!("verify:{pair_id}:{full}")).and_then(|_| found.ok_or_else(|| format!("Sync pair {pair_id} not found"))).and_then(|p| crate::sync_engine::verify_outcome(&p, full));
+            Box::pin(async move { r })
+        }
+
+        fn assess_intent<'a>(&'a self, intent: &'a crate::safety::OperationIntent) -> BoxFuture<'a, crate::safety::RiskAssessment> {
+            let mut a = crate::safety::assess_static(intent);
+            if let Some(level) = *self.assess_level.lock().unwrap() {
+                a.level = level;
+                a.requires_confirmation = level.requires_confirmation();
+                a.reasons = vec![format!("test says {level:?}")];
+            }
+            Box::pin(async move { a })
+        }
+
+        fn record_operation<'a>(&'a self, intent: &'a crate::safety::OperationIntent) -> BoxFuture<'a, ()> {
+            self.operations.lock().unwrap().push(format!("{}:{}:{}", intent.kind, intent.affected_files, intent.total_bytes));
+            Box::pin(async {})
         }
 
         fn run_finished<'a>(&'a self, rule: &'a crate::automation_engine::AutomationRule, log: &'a crate::automation_engine::AutomationLog) -> BoxFuture<'a, ()> {

@@ -379,3 +379,11 @@ pub async fn automation_restore_revision(rule_id: String, revision: i64, repo: S
 pub async fn automation_convert_to_workflow(rule: AutomationRule) -> Result<crate::automation_engine::workflow::Workflow, AppError> {
     Ok(rule.workflow.clone().unwrap_or_else(|| crate::automation_engine::workflow::Workflow::from_rule(&rule)))
 }
+
+/// How risky each action is (Low, Medium or High) and why, in the order
+/// given: the editor's per-step badges. Saving a rule with a High step asks
+/// the user to confirm first.
+#[tauri::command]
+pub async fn automation_action_risks(actions: Vec<crate::automation_engine::RuleAction>) -> Result<Vec<crate::automation_engine::risk::StepRisk>, AppError> {
+    Ok(actions.iter().map(crate::automation_engine::risk::action_risk).collect())
+}
