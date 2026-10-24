@@ -278,7 +278,8 @@ When files conflict during sync, they are quarantined. Resolve via:
 A two-way pair remembers what both folders looked like after its last successful run (its *sync history*). Each run compares both sides with it:
 
 - A file deleted on one side and unchanged on the other is **deleted on the other side too** (with a rollback copy). Renaming a file is a delete plus an add.
-- A file changed on one side is copied to the other, in either direction.
+- A file changed on one side is copied to the other, in either direction. A file edited while a run is copying it counts as changed on the next run, so the edit is copied then.
+- A folder deleted on one side is removed on the other once its files have been deleted there (a folder that still holds other files stays).
 - A file changed on **both** sides is a conflict and goes through the pair's conflict policy, unless both sides now hold the same bytes (checked by content hash), which counts as in sync. *Destination wins* and *Keep both* leave both folders identical (keep both: the destination's version under the name, the source's as `name (conflict DATE).ext`, on both sides).
 - The **first run** (no history yet) only combines both folders; it never deletes. The preview says so.
 - A run that fails, is cancelled or stops at the end of its run hours keeps the previous history, so nothing it left half done is mistaken for a deletion.
@@ -306,7 +307,7 @@ In the Advanced view, *When to overwrite › Compare files by* chooses **size an
 
 ### Versioned backup: versions to keep
 
-Versioned-backup pairs keep every stored version unless *Versions to keep of each file* (Advanced) is set; then the oldest versions beyond that number are deleted after each run. Unchanged files are no longer stored again on every run. Versions stored by earlier app versions (numbered `name.v1.ext` files without a version list) are taken over on the first run, so they count towards that number and continue the numbering; this works for the default name and any template built only from `{name}`, `{ext}`, `{filename}` and `{num}`.
+Versioned-backup pairs keep every stored version unless *Versions to keep of each file* (Advanced) is set; then the oldest versions beyond that number are deleted after each run. Unchanged files are no longer stored again on every run; if the newest stored version of a file is removed from the destination, the next run stores the file again. Versions stored by earlier app versions (numbered `name.v1.ext` files without a version list) are taken over on the first run, so they count towards that number and continue the numbering; this works for the default name and any template built only from `{name}`, `{ext}`, `{filename}` and `{num}`.
 
 ### Interrupted runs
 
@@ -321,7 +322,7 @@ Settings › Advanced has:
 
 ### Rollback
 
-If a sync produced unwanted results, use the Rollback feature to restore files from the pre-sync backup. Two-way runs keep rollback copies of source files they changed or deleted too, and Rollback puts each back on its own side.
+If a sync produced unwanted results, use the Rollback feature to restore files from the pre-sync backup. Two-way runs keep rollback copies of source files they changed or deleted too, and Rollback puts each back on its own side, with its original modification time. Rolling back a two-way run also forgets the restored files' sync history: if a restored file now differs from the other side, the next run handles it as a conflict under the pair's conflict policy (with *Keep both*, both versions are kept) rather than copying either version over the other.
 
 ### Reports
 

@@ -48,18 +48,6 @@ async fn record_sync(
     ledger.record(ev).await;
 }
 
-/// Option names a pair sets itself must be real copy options.
-fn validate_override_names(own: &[String]) -> Result<(), AppError> {
-    let known = CopyOptions::field_names();
-    match own.iter().find(|n| !known.contains(n)) {
-        Some(bad) => Err(AppError::Sync {
-            message: format!("\"{bad}\" is not a copy option."),
-            advice: "Save the pair again from the sync panel.".to_string(),
-        }),
-        None => Ok(()),
-    }
-}
-
 // ── T-039: Sync Pair CRUD ──
 
 /// Create a new sync pair.
@@ -123,7 +111,7 @@ pub async fn create_sync_pair(
         .map(|s| SyncConflictPolicy::from_str_lossy(&s))
         .unwrap_or_default();
     if let Some(own) = &option_overrides {
-        validate_override_names(own)?;
+        CopyOptions::validate_override_names(own)?;
     }
 
     let verify = verify_mode
@@ -269,7 +257,7 @@ pub async fn update_sync_pair(
     ufop_core::sync::executor::validate_run_options(&pair.run_options)?;
     ufop_core::sync::filter::validate(&pair.filter)?;
     if let Some(own) = &pair.option_overrides {
-        validate_override_names(own)?;
+        CopyOptions::validate_override_names(own)?;
     }
     let updated = manager.update_pair(pair).await?;
     manager.save_pair_to_db(&repo, &updated).await?;

@@ -497,6 +497,19 @@ impl CopyOptions {
         }
     }
 
+    /// Refuse option names a pair claims to set itself
+    /// (`SyncPair::option_overrides`) that are not copy options.
+    pub fn validate_override_names(own: &[String]) -> Result<(), crate::error::AppError> {
+        let known = Self::field_names();
+        match own.iter().find(|n| !known.contains(n)) {
+            Some(bad) => Err(crate::error::AppError::Sync {
+                message: format!("\"{bad}\" is not a copy option."),
+                advice: "Save the pair again from the sync panel.".to_string(),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// `defaults`, with this value for every option named in `own`.
     pub fn layered_on(&self, defaults: &CopyOptions, own: &[String]) -> CopyOptions {
         let (Ok(serde_json::Value::Object(mut out)), Ok(serde_json::Value::Object(mine))) =
@@ -663,9 +676,15 @@ pub struct SyncPreview {
     /// Directories to create at the destination (/E empty dirs, /CREATE).
     #[serde(default)]
     pub dirs_to_create: Vec<String>,
-    /// Extra destination directories to remove when purging (/PURGE, /MIR).
+    /// Destination directories to remove: extras when purging (/PURGE,
+    /// /MIR), and in two-way runs folders deleted in the source whose files
+    /// this run deletes.
     #[serde(default)]
     pub dirs_to_remove: Vec<String>,
+    /// Two-way: source directories to remove — folders deleted in the
+    /// destination whose files this run deletes from the source.
+    #[serde(default)]
+    pub source_dirs_to_remove: Vec<String>,
     /// Unchanged files whose timestamps or security get re-applied
     /// (/TIMFIX, /SECFIX).
     #[serde(default)]

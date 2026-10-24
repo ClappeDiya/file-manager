@@ -74,6 +74,8 @@ interface SyncPreview {
   total_bytes: number;
   dirs_to_create?: string[];
   dirs_to_remove?: string[];
+  /** Two-way: source folders removed (deleted in the destination). */
+  source_dirs_to_remove?: string[];
   /** How the plan was made (e.g. a first two-way run deletes nothing). */
   notes?: string[];
 }
@@ -1356,7 +1358,8 @@ export function PreviewView({
 }) {
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
   const [tab, setTab] = useState<"summary" | "compare">("summary");
-  const deleteCount = preview.total_deletions + (preview.dirs_to_remove?.length ?? 0);
+  const deleteCount =
+    preview.total_deletions + (preview.dirs_to_remove?.length ?? 0) + (preview.source_dirs_to_remove?.length ?? 0);
   const sourceDeletes = preview.deletions.filter((d) => d.direction === "to_source").length;
   const [deleteAck, setDeleteAck] = useState(false);
 

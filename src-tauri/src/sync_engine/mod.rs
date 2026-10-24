@@ -659,16 +659,11 @@ impl SyncManager {
             });
         }
 
-        let (source_path, dest_path) = {
-            let pairs = self.pairs.read().await;
-            pairs
-                .get(&pair_id)
-                .map(|p| (PathBuf::from(&p.source_path), PathBuf::from(&p.dest_path)))
-                .ok_or_else(|| AppError::Sync {
-                    message: format!("Sync pair {} not found", pair_id),
-                    advice: "Check the sync pair ID.".to_string(),
-                })?
-        };
+        let pair = self.pairs.read().await.get(&pair_id).cloned().ok_or_else(|| AppError::Sync {
+            message: format!("Sync pair {} not found", pair_id),
+            advice: "Check the sync pair ID.".to_string(),
+        })?;
+        let (source_path, dest_path) = (PathBuf::from(&pair.source_path), PathBuf::from(&pair.dest_path));
 
         let snapshots_clone = snapshots.clone();
         let restored = tokio::task::spawn_blocking(move || {
@@ -678,7 +673,16 @@ impl SyncManager {
         .map_err(|e| AppError::Sync {
             message: format!("Rollback task failed: {}", e),
             advice: "Try again.".to_string(),
-        })??;
+        })?;
+
+        // Two-way: the baseline the rolled-back run saved says the restored
+        // files are in sync with the other side, which they no longer are.
+        // Forget their history (also when only some could be restored): the
+        // next run sees two different files and handles them as a conflict
+        // under the pair's policy, instead of copying the restored file over
+        // the other side's newer version.
+        self.forget_baseline_paths(&pair, snapshots.iter().map(|s| s.relative_path.as_str())).await?;
+        let restored = restored?;
 
         // Clear snapshots after rollback
         {
@@ -687,6 +691,30 @@ impl SyncManager {
         }
 
         Ok(restored)
+    }
+
+    /// Drop `paths` from `pair`'s two-way baseline. When the shortened
+    /// baseline cannot be saved, the whole baseline is reset instead (the
+    /// next run then combines both sides and deletes nothing).
+    async fn forget_baseline_paths<'a>(&self, pair: &SyncPair, paths: impl Iterator<Item = &'a str>) -> Result<(), AppError> {
+        let Some(mut baseline) = self.load_baseline(pair).await? else {
+            return Ok(());
+        };
+        let before = baseline.entries.len();
+        for path in paths {
+            baseline.entries.remove(path);
+        }
+        if baseline.entries.len() == before {
+            return Ok(());
+        }
+        if let Err(e) = self.save_baseline(pair.id, baseline).await {
+            tracing::warn!("Could not update the two-way baseline of {} after a rollback: {e}", pair.id);
+            self.reset_baseline(pair.id).await.map_err(|_| AppError::Sync {
+                message: "The files were restored, but the pair's two-way sync history could not be updated.".to_string(),
+                advice: "Reset the pair's sync history before its next run, so the restored files are not copied over newer versions.".to_string(),
+            })?;
+        }
+        Ok(())
     }
 
     /// Get reports for a sync pair.
@@ -2126,6 +2154,45 @@ mod tests {
         // The deletion can be undone like any other destructive step.
         assert_eq!(mgr.rollback_last_run(pair.id).await.unwrap(), 1);
         assert!(dst.path().join("gone.txt").exists());
+    }
+
+    /// Regression (review): rolling back a two-way run restored the files
+    /// but kept the baseline that run saved, so the restored file read as a
+    /// fresh edit and the next run overwrote the other side's newer version
+    /// with the rolled-back content.
+    #[tokio::test]
+    async fn two_way_rollback_never_loses_the_other_sides_edit() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), "a").unwrap();
+        std::fs::write(src.path().join("b.txt"), "b").unwrap();
+        let pair = temp_pair(src.path(), dst.path(), SyncMode::TwoWay);
+        let (mgr, _state) = mgr_with(&pair).await;
+        mgr.execute_sync(pair.id).await.unwrap();
+
+        let edit = "b edited in the destination";
+        std::fs::write(dst.path().join("b.txt"), edit).unwrap();
+        let second = mgr.execute_sync(pair.id).await.unwrap();
+        assert_eq!(second.files_modified, 1);
+        assert_eq!(std::fs::read_to_string(src.path().join("b.txt")).unwrap(), edit);
+        assert_eq!(mgr.rollback_last_run(pair.id).await.unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(src.path().join("b.txt")).unwrap(), "b");
+
+        let preview = mgr.dry_run(pair.id).await.unwrap();
+        assert!(
+            !preview.modifications.iter().any(|m| m.relative_path == "b.txt" && m.direction == SyncDirection::ToDest),
+            "the rolled-back file must not be copied over the destination's edit: {:?}",
+            preview.modifications
+        );
+        let third = mgr.execute_sync(pair.id).await.unwrap();
+        assert_eq!(third.errors, 0, "{:?}", third.error_messages);
+        assert_eq!(std::fs::read_to_string(dst.path().join("b.txt")).unwrap(), edit, "the destination edit was overwritten after a rollback");
+        // The difference is a conflict under the pair's policy (keep both):
+        // the rolled-back content is kept too.
+        let kept = std::fs::read_dir(dst.path()).unwrap().flatten().any(|e| std::fs::read_to_string(e.path()).is_ok_and(|c| c == "b"));
+        assert!(kept, "the rolled-back version was lost");
+        // Untouched files keep their history.
+        assert!(mgr.load_baseline(&pair).await.unwrap().unwrap().entries.contains_key("a.txt"));
     }
 
     /// The baseline lives in SQLite: a restart in between does not turn the

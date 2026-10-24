@@ -162,6 +162,23 @@ impl VersionIndex {
         std::fs::rename(tmp, dest_root.join(VERSIONS_FILE))
     }
 
+    /// Drop each file's newest versions whose version file is no longer at
+    /// the destination (deleted by hand or by another tool), so the planner
+    /// never takes a file as stored when its copy is gone. Only the newest
+    /// are checked (one look per file); older missing ones are dropped when
+    /// pruning reaches them. Returns how many were dropped.
+    pub fn drop_missing_latest(&mut self, dest_root: &Path) -> usize {
+        let mut dropped = 0;
+        self.files.retain(|_, versions| {
+            while versions.last().is_some_and(|v| !dest_root.join(&v.path).is_file()) {
+                versions.pop();
+                dropped += 1;
+            }
+            !versions.is_empty()
+        });
+        dropped
+    }
+
     pub fn latest(&self, rel: &str) -> Option<&StoredVersion> {
         self.files.get(rel).and_then(|v| v.last())
     }

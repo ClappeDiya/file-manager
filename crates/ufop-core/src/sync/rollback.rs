@@ -151,6 +151,11 @@ pub fn rollback_pair_run(snapshots: &[SyncSnapshot], source_root: &Path, dest_ro
                 message: format!("Cannot restore {}: {}", snapshot.relative_path, e),
                 advice: "Check permissions and disk space.".to_string(),
             })?;
+            // Back as it was, time included: a restored file must not read
+            // as freshly edited to the next (two-way) run.
+            if let Some(modified) = snapshot.original_modified {
+                crate::sync::copier::set_mtime(&target, modified.into());
+            }
         }
 
         restored += 1;
@@ -255,6 +260,26 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), AppError> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Review: restored files got the time of the restore, so a two-way run
+    /// afterwards saw them as freshly edited.
+    #[test]
+    fn rollback_restores_the_original_modification_time() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let original = root.join("file.txt");
+        fs::write(&original, "original").unwrap();
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(5 * 86_400);
+        crate::sync::copier::set_mtime(&original, then);
+        let mut mgr = RollbackManager::new(Uuid::new_v4(), Uuid::new_v4(), &dir.path().join("rollback"));
+        mgr.snapshot_on(SyncSide::Source, "file.txt", &original).unwrap();
+        fs::write(&original, "overwritten").unwrap();
+        assert_eq!(rollback_pair_run(&mgr.snapshots, &root, &dir.path().join("other")).unwrap(), 1);
+        assert_eq!(fs::read_to_string(&original).unwrap(), "original");
+        let restored = chrono::DateTime::<Utc>::from(fs::metadata(&original).unwrap().modified().unwrap());
+        assert_eq!(Some(restored), mgr.snapshots[0].original_modified);
+    }
 
     #[test]
     fn test_snapshot_file() {

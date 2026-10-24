@@ -13,7 +13,7 @@
 //! pair silently failing on a folder that is not there.
 
 use crate::core::error::AppError;
-use crate::core::types::{ConnectionProfile, SyncPair};
+use crate::core::types::{ConnectionProfile, CopyOptions, SyncPair};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -106,6 +106,9 @@ pub fn parse(json: &str) -> Result<PairExport, AppError> {
     ufop_core::sync::copier::validate_options(&p.copy_options)?;
     ufop_core::sync::executor::validate_run_options(&p.run_options)?;
     ufop_core::sync::filter::validate(&p.filter)?;
+    if let Some(own) = &p.option_overrides {
+        CopyOptions::validate_override_names(own)?;
+    }
     Ok(doc)
 }
 
@@ -185,5 +188,23 @@ mod tests {
         v["pair"]["name"] = "x".into();
         v["pair"]["copy_options"]["threads"] = 0.into();
         assert!(parse(&v.to_string()).is_err(), "invalid options are refused");
+    }
+
+    /// Review: create and update refuse unknown `option_overrides` names, but
+    /// an imported file could store them (and they were silently ignored).
+    #[test]
+    fn rejects_unknown_option_override_names() {
+        let pair = SyncPair {
+            name: "x".into(),
+            source_path: "/a".into(),
+            dest_path: "/b".into(),
+            option_overrides: Some(vec!["threads".into()]),
+            ..Default::default()
+        };
+        let mut v: serde_json::Value = serde_json::from_str(&export(&pair, vec![]).unwrap()).unwrap();
+        assert!(parse(&v.to_string()).is_ok(), "real option names are accepted");
+        v["pair"]["option_overrides"] = serde_json::json!(["threads", "no_such_option"]);
+        let err = parse(&v.to_string()).unwrap_err().to_string();
+        assert!(err.contains("no_such_option"), "{err}");
     }
 }

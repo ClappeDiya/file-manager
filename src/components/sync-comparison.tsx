@@ -26,7 +26,7 @@ const CHANGE_STYLE: Record<RowChange, { label: string; cls: string }> = {
 
 function Cell({ side, row, which }: { side: CompareSide | null; row: CompareRow; which: "source" | "dest" }) {
   // The deleted copy is struck through on the side it is deleted from.
-  const deletedSide = row.change === "rmdir" || row.direction !== "to_source" ? "dest" : "source";
+  const deletedSide = row.direction === "to_source" ? "source" : "dest";
   const struck = which === deletedSide && (row.change === "delete" || row.change === "rmdir");
   if (!side) {
     return <span className="text-zinc-300 dark:text-zinc-600">—</span>;

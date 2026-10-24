@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Sync copies are paced block by block whenever the bandwidth timetable has an upload limit, so a window that opens during a long copy slows the rest of that file.
   - Standard view: a sync pair's filter rules (e.g. from an applied preset) are listed read-only with remove and *Clear all rules*, so a preset can be undone without the Advanced rule editor.
   - Importing a scheduled or watched pair leaves it turned off (with a note to turn it on in Edit), like a duplicate, so it cannot start running before it is reviewed.
+  - Two-way: each copied file's history entry comes from that step (the origin as planned, the copy read right after it was written) instead of a reading of both sides at the end of the run, so a file edited while the run was going is copied next time instead of being overwritten by the older copy or never sent. Links copied as links are recorded as the walk lists them, so they no longer read as changed every run.
+  - Two-way: Rollback also forgets the restored files' sync history and puts back their original modification time, so the next run treats a restored file that differs from the other side as a conflict (pair's policy) instead of copying it over the other side's newer version.
+  - Two-way: folders deleted on one side are removed on the other once the run has deleted their files there (folders that still hold other files, or that the first side still has, stay).
+  - Versioned backup: a newest stored version whose file was removed from the destination no longer counts as stored; the file is stored again.
+  - Importing a sync pair refuses unknown option names in `option_overrides`, as creating and editing do.
 
 - **Simple and Advanced mode in the backup screens**: in Simple mode (the default) the job editor, Restore, Maintenance, Settings and Recovery show the everyday flow; advanced options appear in Advanced mode or with *Show advanced backup options* (a per-area override in the UI store), behind one `AdvancedOnly` gate with a "Switch to Advanced" hint.
 - **`SECURITY.md`**: how to report a vulnerability privately (GitHub private vulnerability reporting), supported versions and response times.

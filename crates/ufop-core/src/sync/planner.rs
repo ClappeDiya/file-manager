@@ -177,7 +177,7 @@ fn walk_recursive(
         if link_meta.file_type().is_symlink() {
             match opts.symlinks {
                 SymlinkMode::Skip => continue,
-                SymlinkMode::CopyLink if cfg!(unix) => {
+                _ if lists_link_itself(&link_meta, opts) => {
                     entries.push(FileMeta {
                         relative_path: relative,
                         absolute_path: path,
@@ -234,6 +234,25 @@ fn walk_recursive(
     }
 
     Ok(())
+}
+
+/// Whether the walk lists this entry as the link itself (links copied as
+/// links, `SymlinkMode::CopyLink`, on Unix) rather than what it points to.
+fn lists_link_itself(link_meta: &std::fs::Metadata, opts: &CopyOptions) -> bool {
+    link_meta.file_type().is_symlink() && opts.symlinks == SymlinkMode::CopyLink && cfg!(unix)
+}
+
+/// Size and modification time of the file at `path` exactly as
+/// [`walk_directory_with`] lists it: a link copied as a link is the link
+/// itself (size 0, its own time); anything else is what it points to.
+/// `None` for a folder or an unreadable path.
+pub fn listed_file(path: &Path, opts: &CopyOptions) -> Option<(u64, Option<DateTime<Utc>>)> {
+    let link_meta = std::fs::symlink_metadata(path).ok()?;
+    if lists_link_itself(&link_meta, opts) {
+        return Some((0, link_meta.modified().ok().map(DateTime::<Utc>::from)));
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    (!meta.is_dir()).then(|| (meta.len(), meta.modified().ok().map(DateTime::<Utc>::from)))
 }
 
 /// Compare two timestamps with the /FFT (2 s) and /DST (1 h) tolerances.
@@ -496,6 +515,7 @@ pub fn plan(pair: &SyncPair, ctx: &PlanContext<'_>) -> Result<Plan, AppError> {
         if !super::versions::VersionIndex::exists(dest_root) {
             index.adopt_unindexed(pair, source_files.iter().filter(|f| !f.is_dir).map(|f| f.relative_path.as_str()));
         }
+        index.drop_missing_latest(dest_root);
         index
     });
     let ctx = PlanContext {
@@ -687,8 +707,21 @@ pub fn diff_trees(
     } else {
         Vec::new()
     };
+    // Two-way: a folder deleted on one side goes on the other too, once
+    // this run's deletes have emptied it there.
+    let mut source_dirs_to_remove = Vec::new();
+    if baseline.is_some() {
+        let deleted = |direction: SyncDirection| -> std::collections::HashSet<&str> {
+            deletions.iter().filter(|d| d.direction == direction).map(|d| d.relative_path.as_str()).collect()
+        };
+        dirs_to_remove.extend(emptied_dirs(&dest_dirs, &source_dirs, dest_files, &deleted(SyncDirection::ToDest)));
+        source_dirs_to_remove = emptied_dirs(&source_dirs, &dest_dirs, source_files, &deleted(SyncDirection::ToSource));
+    }
     // Deepest first so children go before parents.
-    dirs_to_remove.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| b.cmp(a)));
+    let deepest_first = |a: &String, b: &String| b.len().cmp(&a.len()).then_with(|| b.cmp(a));
+    dirs_to_remove.sort_by(deepest_first);
+    dirs_to_remove.dedup();
+    source_dirs_to_remove.sort_by(deepest_first);
 
     let duration = start.elapsed();
 
@@ -712,11 +745,44 @@ pub fn diff_trees(
             path_warnings,
             dirs_to_create,
             dirs_to_remove,
+            source_dirs_to_remove,
             fixups,
             notes,
         },
         settled,
     })
+}
+
+/// Two-way: the folders of one side (`dirs`, holding `files`) that the
+/// other side no longer has and that nothing but this run's deletes
+/// (`deleted`) is left in — a folder deleted on the other side. Folders
+/// below such a folder go too; a folder that only ever was empty, or still
+/// holds a file this run keeps, stays.
+fn emptied_dirs(
+    dirs: &std::collections::HashSet<&str>,
+    other_dirs: &std::collections::HashSet<&str>,
+    files: &[FileMeta],
+    deleted: &std::collections::HashSet<&str>,
+) -> Vec<String> {
+    if deleted.is_empty() {
+        return Vec::new();
+    }
+    // Per folder: holds a file being deleted / a file that stays.
+    let (mut emptied, mut kept) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+    for f in files.iter().filter(|f| !f.is_dir) {
+        let set = if deleted.contains(f.relative_path.as_str()) { &mut emptied } else { &mut kept };
+        for dir in Path::new(&f.relative_path).ancestors().skip(1) {
+            if !dir.as_os_str().is_empty() {
+                set.insert(dir.to_string_lossy().to_string());
+            }
+        }
+    }
+    let gone = |d: &str| !other_dirs.contains(d) && !kept.contains(d);
+    dirs.iter()
+        .filter(|d| gone(d))
+        .filter(|d| Path::new(*d).ancestors().any(|a| emptied.contains(a.to_string_lossy().as_ref()) && gone(&a.to_string_lossy())))
+        .map(|d| d.to_string())
+        .collect()
 }
 
 /// Mirror always purges; /PURGE adds it to one-way and backup modes; /XX
@@ -1366,6 +1432,7 @@ mod tests {
             path_warnings: Vec::new(),
             dirs_to_create: Vec::new(),
             dirs_to_remove: Vec::new(),
+            source_dirs_to_remove: Vec::new(),
             fixups: Vec::new(),
             notes: Vec::new(),
             total_additions: 1,
