@@ -317,9 +317,10 @@ pub struct PlanContext<'a> {
     pub baseline: Option<&'a SyncBaseline>,
     /// Checked between entries; when set, planning stops with an error.
     pub cancel: Option<&'a AtomicBool>,
-    /// Content hashes for [`CompareMode::Checksum`]. [`plan`] hashes local
-    /// files itself when this is `None`; [`diff_trees`] without one compares
-    /// by size and time and says so in the preview notes.
+    /// Content hashes for [`CompareMode::Checksum`], and in two-way mode to
+    /// tell a real edit-both conflict from the same bytes on both sides.
+    /// [`plan`] hashes local files itself when this is `None`; [`diff_trees`]
+    /// without one compares by size and time and says so in the preview notes.
     pub hasher: Option<&'a dyn ContentHasher>,
     /// Versioned-backup mode: the stored versions. [`plan`] reads the
     /// destination's index itself when this is `None`.
@@ -384,6 +385,12 @@ impl<'a> Comparer<'a> {
                 _ => times_equal(src.modified, dest_time, self.opts),
             },
         }
+    }
+
+    /// Whether both copies hold the same bytes by content hash, whatever the
+    /// compare mode; `false` when either cannot be hashed.
+    fn content_equal(&self, src: &FileMeta, dst: &FileMeta) -> bool {
+        src.size == dst.size && matches!((self.hash(SyncSide::Source, src), self.hash(SyncSide::Dest, dst)), (Some(a), Some(b)) if a == b)
     }
 
     /// Whether `file` changed since the baseline recorded its side.
@@ -484,7 +491,9 @@ pub fn plan(pair: &SyncPair, ctx: &PlanContext<'_>) -> Result<Plan, AppError> {
     let index = (pair.mode == SyncMode::VersionedBackup && ctx.versions.is_none() && dest_root.exists())
         .then(|| super::versions::VersionIndex::load(dest_root));
     let ctx = PlanContext {
-        hasher: ctx.hasher.or((opts.compare_mode == CompareMode::Checksum).then_some(&local as &dyn ContentHasher)),
+        hasher: ctx
+            .hasher
+            .or((opts.compare_mode == CompareMode::Checksum || pair.mode == SyncMode::TwoWay).then_some(&local as &dyn ContentHasher)),
         versions: ctx.versions.or(index.as_ref()),
         ..*ctx
     };
@@ -915,7 +924,7 @@ fn diff_legacy(
 /// |---|---|---|---|
 /// | changed | unchanged | yes | copy to destination |
 /// | unchanged | changed | yes | copy to source |
-/// | changed | changed | yes | conflict (unless both now match) |
+/// | changed | changed | yes | conflict (unless both now match, by the compare mode or by content hash) |
 /// | present | present | no | in sync if they match, else conflict |
 /// | unchanged | missing | yes | deleted at destination: delete in source |
 /// | changed | missing | yes | changed after the delete: copy back |
@@ -973,7 +982,11 @@ fn diff_two_way(
                 };
                 // Only compared when needed: in checksum mode this reads both files.
                 let same = || cmp.same(s, d, adjusted);
-                if (!s_changed && !d_changed) || (!opts.include_same && same()) {
+                // Changed on both sides to the same bytes — e.g. copied by a
+                // run that failed before its baseline was saved, without kept
+                // timestamps — is in sync, not a conflict.
+                let same_bytes = || s_changed && d_changed && cmp.content_equal(s, d);
+                if (!s_changed && !d_changed) || (!opts.include_same && same()) || same_bytes() {
                     acc.settled.push((rel_path.to_string(), Some(cmp.entry(s, d))));
                     if opts.fix_timestamps || opts.fix_security {
                         acc.fixups.push(rel_path.to_string());

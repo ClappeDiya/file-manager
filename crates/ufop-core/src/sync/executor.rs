@@ -2217,6 +2217,58 @@ mod tests {
         assert!(out.baseline.is_none());
     }
 
+    /// Regression: without kept timestamps, a file copied by a run that then
+    /// failed has a new time on both sides relative to the old baseline. It
+    /// was planned as a conflict, and "keep both" wrote conflict copies of
+    /// identical content. Same bytes on both sides now settle it.
+    #[test]
+    fn two_way_failed_run_without_timestamps_leaves_no_false_conflicts() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "v1").unwrap();
+        fs::write(src.path().join("b.txt"), "b1").unwrap();
+        set_age_days(&src.path().join("a.txt"), 3);
+        set_age_days(&src.path().join("b.txt"), 3);
+        let mut pair = two_way(src.path(), dst.path());
+        pair.copy_options.copy_timestamps = false;
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+        let before = base.clone();
+
+        // Edited in the source (same size), copied by a run that fails.
+        fs::write(src.path().join("a.txt"), "v2").unwrap();
+        fs::write(src.path().join("b.txt"), "b2").unwrap();
+        set_age_days(&src.path().join("a.txt"), 1);
+        set_age_days(&src.path().join("b.txt"), 1);
+        fs::write(src.path().join("blocked"), "x").unwrap();
+        fs::create_dir(dst.path().join("blocked")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let failed = run_two_way(&pair, &mut base);
+        assert!(failed.report.errors > 0);
+        assert_eq!(failed.report.files_modified, 2);
+        assert_eq!(base, before, "the failed run kept the old baseline");
+        assert_eq!(fs::read_to_string(dst.path().join("a.txt")).unwrap(), "v2");
+
+        fs::remove_dir(dst.path().join("blocked")).unwrap();
+        let preview = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
+        assert_eq!(preview.total_conflicts, 0, "{:?}", preview.conflicts);
+        let out = run_two_way(&pair, &mut base);
+        assert_eq!(out.report.conflicts_resolved, 0);
+        assert_eq!(out.report.status, SyncRunStatus::Success);
+        let conflict_copies = |dir: &Path| fs::read_dir(dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("(conflict")).count();
+        assert_eq!(conflict_copies(src.path()) + conflict_copies(dst.path()), 0);
+        // Settled: nothing left to do.
+        let after = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
+        assert_eq!(after.total_conflicts + after.total_additions + after.total_modifications + after.total_deletions, 0);
+
+        // A real edit on both sides with equal sizes is still a conflict.
+        fs::write(src.path().join("a.txt"), "s3").unwrap();
+        fs::write(dst.path().join("a.txt"), "d3").unwrap();
+        set_age_days(&dst.path().join("a.txt"), 2);
+        let both = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
+        assert_eq!(both.total_conflicts, 1);
+    }
+
     #[test]
     fn two_way_changed_after_delete_is_copied_back() {
         let src = TempDir::new().unwrap();
