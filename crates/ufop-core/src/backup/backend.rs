@@ -453,13 +453,10 @@ impl<B: Backend> RetryingBackend<B> {
     }
 }
 
+/// Validation, passphrase, local-filesystem and rejected-credential
+/// problems never get better by retrying; network failures often do.
 fn is_retryable(e: &AppError) -> bool {
-    // Validation, passphrase and local-filesystem problems never get better
-    // by retrying; network (connection/transfer) failures often do.
-    !matches!(
-        e,
-        AppError::Encryption { .. } | AppError::PermissionDenied { .. } | AppError::Configuration { .. } | AppError::FileOperation { .. }
-    )
+    crate::retry::is_retryable(e)
 }
 
 impl<B: Backend> Backend for RetryingBackend<B> {
@@ -780,6 +777,48 @@ mod tests {
         let t = Instant::now();
         assert!(b.list().is_err());
         assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Fails every call with the error `make` builds, counting attempts.
+    struct Failing {
+        calls: std::sync::atomic::AtomicU32,
+        make: fn() -> AppError,
+    }
+
+    impl Backend for Failing {
+        fn describe(&self) -> String {
+            "failing".into()
+        }
+        fn list(&self) -> Result<Vec<RemoteFile>, AppError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err((self.make)())
+        }
+        fn put(&self, _: &str, _: &[u8]) -> Result<(), AppError> {
+            self.list().map(|_| ())
+        }
+        fn get(&self, _: &str) -> Result<Vec<u8>, AppError> {
+            self.list().map(|_| Vec::new())
+        }
+        fn delete(&self, _: &str) -> Result<(), AppError> {
+            self.list().map(|_| ())
+        }
+        fn create_folder(&self) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// Regression: a 401/403 (rejected credentials) was retried with
+    /// backoff like a network error, hammering the account.
+    #[test]
+    fn rejected_credentials_are_not_retried() {
+        let policy = RetryPolicy { retries: 3, delay_ms: 1, exponential: false, max_delay_ms: 1 };
+        let b = RetryingBackend::new(Failing { calls: Default::default(), make: || AppError::auth("HTTP 401", "check the key") }, policy, Throttle::default());
+        assert!(b.list().unwrap_err().is_auth_failure());
+        assert_eq!(b.inner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Network failures still are.
+        let b = RetryingBackend::new(Failing { calls: Default::default(), make: || AppError::connection("reset", "retry") }, policy, Throttle::default());
+        assert!(b.list().is_err());
+        assert_eq!(b.inner.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
     #[test]

@@ -207,8 +207,9 @@ macro; if you add a new one here, register it there too.
 
 - `request_destructive_confirmation`
 
-## `connection_commands` (17 commands)
+## `connection_commands` (20 commands)
 
+- `clear_connection_credentials_rejected`
 - `create_connection_group`
 - `delete_connection`
 - `delete_connection_group`
@@ -218,25 +219,30 @@ macro; if you add a new one here, register it there too.
 - `import_connections`
 - `import_from_third_party`
 - `list_connection_groups`
+- `list_connection_status`
 - `list_connections`
 - `list_ssh_agents`
 - `list_ssh_config_hosts`
 - `resolve_ssh_config`
 - `save_connection`
 - `search_connections`
+- `set_connection_starred`
 - `set_global_proxy`
 - `test_connection`
 
-## `connector_commands` (11 commands)
+## `connector_commands` (14 commands)
 
 - `connection_presets`
 - `connector_connect`
 - `connector_disconnect`
 - `connector_download`
+- `connector_folder_size`
+- `connector_folder_size_cancel`
 - `connector_is_connected`
 - `connector_list_protocols`
 - `connector_list_remote`
 - `connector_make_directory`
+- `connector_quota`
 - `connector_remove`
 - `connector_upload`
 - `rclone_list_remotes`
@@ -480,6 +486,21 @@ macro; if you add a new one here, register it there too.
 - `get_notification_prefs`
 - `send_notification`
 - `set_notification_prefs`
+
+## `oauth_commands` (12 commands)
+
+- `dropbox_list_namespaces`
+- `gdrive_list_shared_drives`
+- `oauth_await`
+- `oauth_begin`
+- `oauth_cancel`
+- `oauth_complete`
+- `oauth_import_grant`
+- `oauth_provider_info`
+- `oauth_sign_out`
+- `oauth_status`
+- `onedrive_list_site_libraries`
+- `onedrive_search_sites`
 
 ## `operations_commands` (2 commands)
 
@@ -751,4 +772,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 583 commands across 51 modules.
+**Surface:** 601 commands across 52 modules.

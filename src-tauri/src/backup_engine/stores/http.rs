@@ -1,5 +1,6 @@
 //! Shared HTTP plumbing for cloud stores.
 
+use crate::connectors::google_errors::{classify_403, Forbidden};
 use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -50,7 +51,13 @@ pub async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Respo
     let body = resp.text().await.unwrap_or_default();
     let excerpt: String = body.chars().take(400).collect();
     Err(match status.as_u16() {
-        401 | 403 => AppError::connection(format!("{what} was refused ({status}): {excerpt}"), "Check the credentials and their permissions."),
+        // Google answers rate limits and quotas with 403 + a reason; those
+        // back off and retry like a 429.
+        403 if classify_403(&body).0 == Forbidden::Throttled => {
+            AppError::connection(format!("{what}: service is limiting requests ({status}): {excerpt}"), "The service is rate-limiting; retries will back off.")
+        }
+        // Rejected credentials: not retried (ufop_core::retry::is_retryable).
+        401 | 403 => AppError::auth(format!("{what} was refused ({status}): {excerpt}"), "Check the credentials and their permissions."),
         404 => AppError::not_found(format!("{what}: not found {NOT_FOUND_TAG} {excerpt}")),
         429 | 503 => AppError::connection(format!("{what}: service busy ({status})"), "The service is rate-limiting; retries will back off."),
         _ => AppError::connection(format!("{what} failed ({status}): {excerpt}"), "Check the destination settings."),
@@ -91,4 +98,55 @@ pub fn xml_one(xml: &str, tag: &str) -> Option<String> {
 /// Minimal XML entity decoding for keys returned by object stores.
 pub fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resp(code: u16) -> reqwest::Response {
+        resp_with(code, "nope")
+    }
+
+    fn resp_with(code: u16, body: &str) -> reqwest::Response {
+        reqwest::Response::from(axum::http::Response::builder().status(code).body(body.to_string()).unwrap())
+    }
+
+    fn google_403(reason: &str) -> String {
+        serde_json::json!({ "error": { "code": 403, "message": "m", "errors": [{ "domain": "usageLimits", "reason": reason, "message": "m" }] } }).to_string()
+    }
+
+    /// Regression: a 401/403 was a plain connection error, so the backup
+    /// retry policy retried rejected credentials with backoff.
+    #[tokio::test]
+    async fn rejected_credentials_are_auth_errors() {
+        for code in [401, 403] {
+            let e = check(resp(code), "Upload").await.unwrap_err();
+            assert!(e.is_auth_failure() && !ufop_core::retry::is_retryable(&e), "{code}: {e}");
+        }
+        let busy = check(resp(503), "Upload").await.unwrap_err();
+        assert!(!busy.is_auth_failure() && ufop_core::retry::is_retryable(&busy));
+    }
+
+    /// Regression: every 403 became a rejected sign-in, so a Google Drive
+    /// backup stopped on its first rate-limited request instead of backing
+    /// off. Google answers rate limits and quotas with 403 + a reason.
+    #[tokio::test]
+    async fn google_rate_limit_403s_are_retried() {
+        for reason in ["rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded", "quotaExceeded", "backendError"] {
+            let e = check(resp_with(403, &google_403(reason)), "Google Drive upload").await.unwrap_err();
+            assert!(!e.is_auth_failure() && ufop_core::retry::is_retryable(&e), "{reason}: {e}");
+        }
+        // The newer error format puts the reason in error.details[].
+        let details = serde_json::json!({ "error": { "code": 403, "status": "PERMISSION_DENIED", "details": [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "RATE_LIMIT_EXCEEDED" }] } }).to_string();
+        let e = check(resp_with(403, &details), "Google Drive upload").await.unwrap_err();
+        assert!(!e.is_auth_failure() && ufop_core::retry::is_retryable(&e), "{e}");
+        // Authorization reasons, and 403s without a throttling reason, stay rejected sign-ins.
+        for reason in ["insufficientPermissions", "authError", "accessNotConfigured", "somethingElse"] {
+            let e = check(resp_with(403, &google_403(reason)), "Google Drive upload").await.unwrap_err();
+            assert!(e.is_auth_failure() && !ufop_core::retry::is_retryable(&e), "{reason}: {e}");
+        }
+        let e = check(resp_with(401, &google_403("rateLimitExceeded")), "Google Drive upload").await.unwrap_err();
+        assert!(e.is_auth_failure(), "a 401 is always a rejected sign-in: {e}");
+    }
 }

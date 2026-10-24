@@ -21,6 +21,7 @@
 //!   connection string (`azure_rest`), file ops, read-only SAS links
 //! - OpenStack Swift: Keystone v3/TempAuth, container/object ops, SLO/DLO, TempURL
 
+pub mod folder_size;
 pub mod presets;
 pub mod rclone;
 pub mod connection_manager;
@@ -39,7 +40,9 @@ pub mod webdav;
 pub mod b2;
 pub mod dropbox;
 pub mod google_drive;
+pub mod google_errors;
 pub mod oauth;
+pub mod oauth_flow;
 pub mod onedrive;
 pub mod s3;
 // AWS credential chain, SSO, and STS federation
@@ -54,6 +57,10 @@ pub mod azure_adls;
 pub mod azure_files;
 #[cfg(test)]
 pub(crate) mod azure_tests;
+#[cfg(test)]
+pub(crate) mod mock_http;
+#[cfg(test)]
+mod oauth_tests;
 
 use crate::core::error::AppError;
 use crate::core::types::{ConnectionProfile, ConnectionProtocol, FileEntry};
@@ -122,8 +129,60 @@ pub struct ShareLink {
     pub note: Option<String>,
 }
 
+/// Everything secret a saved connection keeps in the credential store.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ConnectionSecrets {
+    /// Password, access secret, private-key path, bearer token or OAuth
+    /// grant, depending on the protocol.
+    pub secret: Option<String>,
+    /// SFTP: passphrase of the private key.
+    pub key_passphrase: Option<String>,
+}
+
+impl ConnectionSecrets {
+    pub fn new(secret: Option<String>) -> Self {
+        Self { secret, key_passphrase: None }
+    }
+}
+
+impl std::fmt::Debug for ConnectionSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionSecrets")
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("key_passphrase", &self.key_passphrase.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// A byte count that providers send as a number or a decimal string.
+pub(crate) fn json_u64(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
 pub(crate) fn share_unsupported(what: &str) -> AppError {
     AppError::validation(format!("This provider can't {what} on share links"))
+}
+
+/// Storage space of a remote account. Every figure is optional: providers
+/// report different subsets (an unlimited plan has no total).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemoteQuota {
+    pub total: Option<u64>,
+    pub used: Option<u64>,
+    pub free: Option<u64>,
+    /// In the provider's trash / recycle bin.
+    pub trashed: Option<u64>,
+}
+
+/// Size of a remote folder and everything below it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FolderSize {
+    pub bytes: u64,
+    pub files: u64,
+    /// `None` when the server-side figure does not count folders (rclone).
+    pub folders: Option<u64>,
+    /// `false` when the walk was cancelled (the figures are partial).
+    pub complete: bool,
 }
 
 /// Trait for remote filesystem connectors.
@@ -136,6 +195,24 @@ pub trait Connector: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<FileEntry>, AppError>> + Send + '_>>;
     fn is_connected(&self) -> bool;
 
+    /// The saved connection this instance is signed in as, for connectors
+    /// whose one shared instance can serve several accounts (Google Drive,
+    /// Dropbox, OneDrive, B2). `None`: not tracked (the default) or not
+    /// connected.
+    fn connected_profile_id(&self) -> Option<uuid::Uuid> {
+        None
+    }
+
+    /// A new, disconnected instance configured like this one (endpoints,
+    /// credential store), for connectors that track
+    /// [`Connector::connected_profile_id`]. An action for an account other
+    /// than the one this shared instance is signed in as runs on it, so the
+    /// instance the user is browsing is never re-signed behind their back.
+    /// `None` (the default): not tracked.
+    fn detached(&self) -> Option<Arc<dyn Connector>> {
+        None
+    }
+
     /// Connect using a secret held in the credential store (password, access
     /// secret, or private-key path, depending on the protocol). Connectors
     /// that need no secret fall back to [`Connector::connect`].
@@ -145,6 +222,16 @@ pub trait Connector: Send + Sync {
         _secret: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         self.connect(profile)
+    }
+
+    /// Connect with every stored secret of the connection. Only connectors
+    /// with more than one secret (SFTP key + passphrase) override this.
+    fn connect_with_secrets(
+        &self,
+        profile: &ConnectionProfile,
+        secrets: ConnectionSecrets,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        self.connect_with_secret(profile, secrets.secret)
     }
 
     /// Upload a local file to `remote_path`; returns bytes written.
@@ -182,6 +269,18 @@ pub trait Connector: Send + Sync {
         Box::pin(async { Err(unsupported_op("delete")) })
     }
 
+    /// Storage quota of the connected account; `None` when the protocol
+    /// has no notion of it (the default).
+    fn quota(&self) -> Pin<Box<dyn Future<Output = Result<Option<RemoteQuota>, AppError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// A server-side size of `remote_path` (rclone `size`), when the
+    /// protocol has one; `None` (the default) = walk the listing instead.
+    fn folder_size_fast(&self, _remote_path: &str) -> Pin<Box<dyn Future<Output = Result<Option<FolderSize>, AppError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Create a link others can open `remote_path` with.
     fn create_share_link(
         &self,
@@ -195,6 +294,18 @@ pub trait Connector: Send + Sync {
             })
         })
     }
+}
+
+/// Whether `connector` can serve saved connection `id` as it is: connected
+/// and, when it tracks who it is signed in as, signed in as that one (so an
+/// action for one account never runs against another of the same
+/// provider).
+pub fn connected_as<C: Connector + ?Sized>(connector: &C, id: Option<uuid::Uuid>) -> bool {
+    connector.is_connected()
+        && match (id, connector.connected_profile_id()) {
+            (Some(want), Some(have)) => want == have,
+            _ => true,
+        }
 }
 
 /// Suffix of a file still being uploaded (`.<name>.ufop-part`).
@@ -298,6 +409,17 @@ impl ConnectorRegistry {
         registry.register("swift", Arc::new(SwiftConnector::new()));
         registry.register("rclone", Arc::new(rclone::RcloneConnector::new()));
 
+        registry
+    }
+
+    /// The built-in connectors, with these OAuth connector instances (built
+    /// with the app's credential store, so rotated tokens are saved, and
+    /// shared with the commands that need their typed APIs).
+    pub fn with_cloud(gdrive: Arc<GoogleDriveConnector>, dropbox: Arc<DropboxConnector>, onedrive: Arc<OneDriveConnector>) -> Self {
+        let mut registry = Self::new();
+        registry.register("google_drive", gdrive);
+        registry.register("dropbox", dropbox);
+        registry.register("onedrive", onedrive);
         registry
     }
 

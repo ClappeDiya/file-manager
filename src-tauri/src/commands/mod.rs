@@ -8,6 +8,7 @@ pub mod aws_commands;
 pub mod batch_rename_commands;
 pub mod connection_commands;
 pub mod connector_commands;
+pub mod oauth_commands;
 pub mod custom_commands;
 pub mod drive_commands;
 pub mod editor_commands;

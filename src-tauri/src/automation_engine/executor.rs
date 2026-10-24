@@ -326,13 +326,15 @@ pub(crate) fn hands_on_path(action: &RuleAction) -> bool {
 }
 
 /// Whether retrying `action` after `error` could help. Validation and
-/// configuration problems never do; network, busy and locked conditions can.
+/// configuration problems never do, nor do rejected credentials
+/// (`AppError::Authentication`, shown as "Sign-in rejected: …"); network,
+/// busy and locked conditions can.
 pub fn is_transient(action: &RuleAction, error: &str) -> bool {
     let e = error.to_lowercase();
     let permanent = [
         "traversal", "outside", "no source", "unsupported", "invalid", "not approved", "does not exist", "not found",
         "cannot determine", "requires confirmation", "blocked", "already exists", "too many", "template", "destination '",
-        SERVICES_UNAVAILABLE,
+        "sign-in rejected:", SERVICES_UNAVAILABLE,
     ];
     if permanent.iter().any(|p| e.contains(&p.to_lowercase())) {
         return false;
@@ -1891,5 +1893,16 @@ mod tests {
         assert!(!is_transient(&mv, "Move failed: Permission denied"));
         assert!(is_transient(&mv, "Move failed: Resource busy"));
         assert!(!is_transient(&mv, "Path contains '..' traversal"));
+    }
+
+    /// Regression: an upload whose connection refused the credentials (or
+    /// was skipped because they were rejected earlier) was retried with
+    /// backoff like a network error.
+    #[test]
+    fn rejected_credentials_are_not_transient() {
+        let up = RuleAction::TransferToConnector { connector_protocol: "sftp".into(), connection_id: "c".into(), remote_path: "/".into() };
+        let refused = crate::core::error::AppError::auth("Cannot connect to NAS: HTTP 401", "Check the password.").user_message();
+        assert!(!is_transient(&up, &refused), "{refused}");
+        assert!(is_transient(&up, "Upload failed: Connection failed: reset by peer. Retry."));
     }
 }

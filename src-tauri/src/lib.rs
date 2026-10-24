@@ -36,12 +36,12 @@ use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, oauth_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
 use commands::terminal_commands::TerminalManager;
-use connectors::{ConnectionManager, ConnectorRegistry, GoogleDriveConnector, OneDriveConnector, PeerManager, S3Connector, ServerTransferManager};
+use connectors::{ConnectionManager, ConnectorRegistry, DropboxConnector, GoogleDriveConnector, OneDriveConnector, PeerManager, S3Connector, ServerTransferManager};
 use mount_engine::MountManager;
 use core::traits::StorageOperations;
 use security::confirmation::ConfirmationManager;
@@ -71,6 +71,9 @@ struct AppState {
     s3_connector: std::sync::Arc<S3Connector>,
     gdrive_connector: std::sync::Arc<GoogleDriveConnector>,
     onedrive_connector: std::sync::Arc<OneDriveConnector>,
+    dropbox_connector: std::sync::Arc<DropboxConnector>,
+    /// Google Drive / Dropbox / OneDrive sign-ins in progress.
+    oauth_flows: std::sync::Arc<connectors::oauth_flow::OAuthFlows>,
     editor_state: std::sync::Arc<commands::editor_commands::EditorState>,
     automation_mgr: AutomationManager,
     spaces_mgr: SpacesManager,
@@ -133,13 +136,15 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     let transfer_history = TransferHistory::new(repo.pool().clone());
     transfer_mgr.set_history(transfer_history.clone()).await;
 
-    // Initialize connector registry (SFTP, FTP, WebDAV, SMB, NFS, Local)
-    let connector_registry = ConnectorRegistry::new();
-
-    // Create shared connector instances for advanced cloud commands
+    // Shared OAuth connector instances: in the registry and managed for the
+    // typed cloud commands; rotated tokens are saved to the credential store.
     let s3_connector = std::sync::Arc::new(S3Connector::new());
-    let gdrive_connector = std::sync::Arc::new(GoogleDriveConnector::new());
-    let onedrive_connector = std::sync::Arc::new(OneDriveConnector::new());
+    let gdrive_connector = std::sync::Arc::new(GoogleDriveConnector::new().with_credentials(credential_store.clone()));
+    let onedrive_connector = std::sync::Arc::new(OneDriveConnector::new().with_credentials(credential_store.clone()));
+    let dropbox_connector = std::sync::Arc::new(DropboxConnector::new().with_credentials(credential_store.clone()));
+
+    // Initialize connector registry (SFTP, FTP, WebDAV, SMB, NFS, Local, cloud)
+    let connector_registry = ConnectorRegistry::with_cloud(gdrive_connector.clone(), dropbox_connector.clone(), onedrive_connector.clone());
 
     // Named schedules and holiday calendars, loaded before anything that is
     // scheduled by them (sync pairs, automation rules, backup jobs).
@@ -296,6 +301,8 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         s3_connector,
         gdrive_connector,
         onedrive_connector,
+        dropbox_connector,
+        oauth_flows: std::sync::Arc::new(connectors::oauth_flow::OAuthFlows::new()),
         editor_state,
         automation_mgr,
         spaces_mgr,
@@ -401,6 +408,9 @@ pub fn run() {
                     .expect("Failed to create in-memory database");
                 let credential_store = std::sync::Arc::new(CredentialStore::new());
                 let connection_mgr = ConnectionManager::new(repo.clone(), credential_store.clone());
+                let fb_gdrive = std::sync::Arc::new(GoogleDriveConnector::new().with_credentials(credential_store.clone()));
+                let fb_onedrive = std::sync::Arc::new(OneDriveConnector::new().with_credentials(credential_store.clone()));
+                let fb_dropbox = std::sync::Arc::new(DropboxConnector::new().with_credentials(credential_store.clone()));
                 let transfer_history = TransferHistory::new(repo.pool().clone());
                 let transfer_mgr = TransferManager::new();
                 let vault_mgr = VaultManager::new();
@@ -449,7 +459,7 @@ pub fn run() {
                     transfer_mgr,
                     connection_mgr,
                     transfer_history,
-                    connector_registry: ConnectorRegistry::new(),
+                    connector_registry: ConnectorRegistry::with_cloud(fb_gdrive.clone(), fb_dropbox.clone(), fb_onedrive.clone()),
                     sync_mgr: SyncManager::new(),
                     peer_mgr: PeerManager::new(),
                     server_transfer_mgr: ServerTransferManager::new(),
@@ -459,8 +469,10 @@ pub fn run() {
                     master_pw_mgr: MasterPasswordManager::new(),
                     mount_mgr: MountManager::new(),
                     s3_connector: std::sync::Arc::new(S3Connector::new()),
-                    gdrive_connector: std::sync::Arc::new(GoogleDriveConnector::new()),
-                    onedrive_connector: std::sync::Arc::new(OneDriveConnector::new()),
+                    gdrive_connector: fb_gdrive,
+                    onedrive_connector: fb_onedrive,
+                    dropbox_connector: fb_dropbox,
+                    oauth_flows: std::sync::Arc::new(connectors::oauth_flow::OAuthFlows::new()),
                     editor_state: std::sync::Arc::new(commands::editor_commands::EditorState::new()),
                     automation_mgr,
                     spaces_mgr: SpacesManager::new(),
@@ -570,6 +582,8 @@ pub fn run() {
         .manage(app_state.s3_connector)
         .manage(app_state.gdrive_connector)
         .manage(app_state.onedrive_connector)
+        .manage(app_state.dropbox_connector)
+        .manage(app_state.oauth_flows)
         .manage(app_state.editor_state)
         .manage(app_state.automation_mgr)
         .manage(app_state.spaces_mgr)
@@ -664,6 +678,9 @@ pub fn run() {
             connection_commands::delete_connection,
             connection_commands::test_connection,
             connection_commands::search_connections,
+            connection_commands::set_connection_starred,
+            connection_commands::list_connection_status,
+            connection_commands::clear_connection_credentials_rejected,
             connection_commands::create_connection_group,
             connection_commands::list_connection_groups,
             connection_commands::delete_connection_group,
@@ -685,6 +702,22 @@ pub fn run() {
             connector_commands::connector_make_directory,
             connector_commands::connector_remove,
             connector_commands::connector_list_protocols,
+            // OAuth sign-in (Google Drive, Dropbox, OneDrive)
+            oauth_commands::oauth_provider_info,
+            oauth_commands::oauth_begin,
+            oauth_commands::oauth_await,
+            oauth_commands::oauth_complete,
+            oauth_commands::oauth_cancel,
+            oauth_commands::oauth_import_grant,
+            oauth_commands::oauth_sign_out,
+            oauth_commands::oauth_status,
+            oauth_commands::gdrive_list_shared_drives,
+            oauth_commands::onedrive_search_sites,
+            oauth_commands::onedrive_list_site_libraries,
+            oauth_commands::dropbox_list_namespaces,
+            connector_commands::connector_quota,
+            connector_commands::connector_folder_size,
+            connector_commands::connector_folder_size_cancel,
             // SMB/CIFS (T-023)
             drive_commands::smb_discover_shares,
             drive_commands::smb_list_shares,

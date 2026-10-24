@@ -165,6 +165,15 @@ pub enum MountCapability {
     NotSupported { reason: String },
 }
 
+/// The error of a failed mount: an SMB share that refused the user name or
+/// password is a rejected sign-in (not retried, the connection is flagged).
+fn mount_failure(protocol: &str, message: String) -> AppError {
+    if matches!(protocol, "smb" | "cifs") && crate::connectors::smb::smb_credentials_rejected(&message) {
+        return AppError::auth(message, "Check the user name, password and domain of the connection.");
+    }
+    AppError::connection(message, "Check connection credentials and network access.")
+}
+
 /// Expand a leading `~` to the home directory.
 pub fn expand_home(p: &str) -> String {
     let home = || directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
@@ -517,10 +526,7 @@ impl MountManager {
         );
 
         if status == MountStatus::Error {
-            return Err(AppError::connection(
-                error_message.unwrap_or_default(),
-                "Check connection credentials and network access.",
-            ));
+            return Err(mount_failure(protocol_str, error_message.unwrap_or_default()));
         }
 
         Ok(MountResult {
@@ -762,9 +768,18 @@ impl MountManager {
             // `mount_remote` is idempotent enough for this: it rejects a
             // duplicate mount point that is already Mounted, so a race with a
             // manual mount degrades to a logged skip rather than a double mount.
+            // Rejected credentials: skip until the user fixes the connection.
+            if let Err(e) = connection_mgr.ensure_not_rejected(cid, &mount_point).await {
+                failed += 1;
+                tracing::warn!("Auto-mount of {mount_point} skipped: {}", e.user_message());
+                continue;
+            }
             let options: MountOptions = serde_json::from_str(&options_json).unwrap_or_default();
             let config_id = Uuid::parse_str(&config_id).ok();
-            match self.mount_remote_with(cid, mount_point.clone(), options, config_id, repo, connection_mgr).await {
+            let result = self.mount_remote_with(cid, mount_point.clone(), options, config_id, repo, connection_mgr).await;
+            // Refused credentials flag the connection (later starts skip it).
+            connection_mgr.record_connect_outcome(cid, &result).await;
+            match result {
                 Ok(_) => {
                     mounted += 1;
                     tracing::info!("Auto-mounted {mount_point}");
@@ -1115,6 +1130,31 @@ mod tests {
         );
     }
 
+    /// A connection whose credentials were rejected is not auto-mounted (no
+    /// mount attempt, so its saved row is left as it was).
+    #[tokio::test]
+    async fn auto_mount_skips_connections_with_rejected_credentials() {
+        let (repo, conns) = auto_mount_fixture().await;
+        let p = crate::connectors::live_tests::profile(crate::core::types::ConnectionProtocol::Sftp, "127.0.0.1", Some(1), "u", "/");
+        conns.save_connection(p.clone(), Some("pw".into())).await.unwrap();
+        conns.record_connect_outcome::<()>(p.id, &Err(AppError::auth("HTTP 401", "check"))).await;
+        let pid = p.id.to_string();
+        repo.pool()
+            .execute(move |c| {
+                c.execute("INSERT INTO mount_configs (id, connection_id, mount_point, auto_mount, status) VALUES ('cfg', ?1, '/mnt/flagged', 1, 'unmounted')", [pid])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(MountManager::new().auto_mount_saved(&repo, &conns).await, (0, 1));
+        let (status, err): (String, Option<String>) = repo
+            .pool()
+            .execute(|c| Ok(c.query_row("SELECT status, error_message FROM mount_configs WHERE id = 'cfg'", [], |r| Ok((r.get(0)?, r.get(1)?)))?))
+            .await
+            .unwrap();
+        assert_eq!((status.as_str(), err), ("unmounted", None), "no mount was attempted");
+    }
+
     /// One unreachable server must not stop the others being tried, and must
     /// never propagate an error into app startup.
     #[tokio::test]
@@ -1156,6 +1196,16 @@ mod tests {
         assert!(std::path::Path::new(&expand_home("~/x")).is_absolute());
         assert_eq!(expand_home("/abs/x"), "/abs/x");
         assert_eq!(expand_home("~other/x"), "~other/x");
+    }
+
+    /// Regression: a refused SMB password was a plain connection error, so
+    /// it was retried and never flagged the connection.
+    #[test]
+    fn a_refused_smb_password_is_a_rejected_sign_in() {
+        assert!(mount_failure("smb", "mount error(13): Permission denied".into()).is_auth_failure());
+        assert!(mount_failure("cifs", "Status: STATUS_LOGON_FAILURE".into()).is_auth_failure());
+        assert!(!mount_failure("smb", "mount error(112): Host is down".into()).is_auth_failure());
+        assert!(!mount_failure("nfs", "mount.nfs: access denied by server".into()).is_auth_failure());
     }
 
     #[tokio::test]
