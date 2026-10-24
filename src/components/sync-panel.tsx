@@ -18,6 +18,7 @@ import { useUIStore } from "@/stores/ui-store";
 import {
   appendRules,
   FilterPresetPicker,
+  FilterRulesSummary,
   FilterRulesEditor,
   ImportRulesButton,
   useFilterGroups,
@@ -1311,11 +1312,13 @@ function CreatePairView({
           {form.rules.length > 0 && <span className="ml-1 font-normal text-zinc-400">({form.rules.length}, first match wins)</span>}
         </div>
         <FilterPresetPicker rules={form.rules} onApply={(extra) => update("rules", appendRules(form.rules, extra))} />
-        {advancedView && (
+        {advancedView ? (
           <>
             <FilterRulesEditor rules={form.rules} onChange={(rules) => update("rules", rules)} groups={groups} />
             <ImportRulesButton onImport={(extra) => update("rules", appendRules(form.rules, extra))} />
           </>
+        ) : (
+          <FilterRulesSummary rules={form.rules} onChange={(rules) => update("rules", rules)} />
         )}
       </div>
 

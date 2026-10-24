@@ -203,6 +203,33 @@ describe("SyncPanel: filter rules and presets", () => {
     expect(args.optionOverrides).toEqual([]);
   });
 
+  // Regression: in the Standard view a preset's rules were added to the pair
+  // but only the Advanced-only editor showed them, so they could not be undone.
+  it("lists applied rules read-only in the Standard view, with remove and clear", async () => {
+    backend({ list_user_filter_presets: () => [{ ...PRESET, rules: [...PRESET.rules, { action: "include", kind: "rclone", pattern: "/Photos/**" }] }] });
+    render(<SyncPanel />);
+    fireEvent.click(await screen.findByLabelText("Create new sync pair"));
+    const rules = screen.getByTestId("sync-filter-rules");
+    const picker = await within(rules).findByLabelText("Apply a saved filter preset");
+    await within(rules).findByText("No archives (2 rules)");
+    fireEvent.change(picker, { target: { value: "u1" } });
+    const list = within(rules).getByTestId("filter-rules-summary");
+    expect(within(list).getByText("archives")).toBeInTheDocument();
+    expect(within(list).getByText("/Photos/**")).toBeInTheDocument();
+    expect(within(list).queryByRole("textbox")).toBeNull();
+    fireEvent.click(within(list).getByRole("button", { name: "Remove rule archives" }));
+    expect(within(list).queryByText("archives")).toBeNull();
+    expect(within(rules).getByText(/\(1, first match wins\)/)).toBeInTheDocument();
+    fireEvent.click(within(list).getByRole("button", { name: "Clear all rules" }));
+    expect(within(rules).queryByTestId("filter-rules-summary")).toBeNull();
+    fireEvent.change(screen.getByPlaceholderText("My Backup"), { target: { value: "New" } });
+    fireEvent.change(screen.getByPlaceholderText("/home/user/documents"), { target: { value: "/a" } });
+    fireEvent.change(screen.getByPlaceholderText("/backup/documents"), { target: { value: "/b" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Sync Pair" }));
+    await waitFor(() => expect(called("create_sync_pair").length).toBe(1));
+    expect(JSON.parse(called("create_sync_pair")[0].filterJson as string).rules).toEqual([]);
+  });
+
   it("edits ordered rules and imports rclone filter files in the Advanced view", async () => {
     backend();
     useUIStore.setState({ appMode: "advanced" });

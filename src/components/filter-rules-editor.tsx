@@ -3,6 +3,8 @@
  * and sync pairs — the UI of `ufop_core::filter_rules`:
  *
  * - `FilterRulesEditor`: the rule list (action, kind, pattern, reorder, remove).
+ * - `FilterRulesSummary`: the rules read-only, with remove and clear (the
+ *   Standard view, where presets can add rules but the editor is hidden).
  * - `ImportRulesButton`: read an rclone `--filter-from` file (`+ pattern` /
  *   `- pattern` / `# comment`) and append its rules.
  * - `FilterPresetPicker`: apply a user-saved preset, save the current rules
@@ -87,6 +89,36 @@ export function FilterRulesEditor({
         </div>
       ))}
       <Btn onClick={() => setRules([...rules, { action: "exclude", kind: "wildcard", pattern: "" }])}>Add rule</Btn>
+    </div>
+  );
+}
+
+/** The rules in order, read-only, each removable, plus "Clear all". */
+export function FilterRulesSummary({ rules, onChange }: { rules: FilterRule[]; onChange: (rules: FilterRule[]) => void }) {
+  if (rules.length === 0) return null;
+  const kindLabel = (k: FilterRule["kind"]) => KIND_LABELS.find(([x]) => x === k)?.[1] ?? k;
+  return (
+    <div className="space-y-1" data-testid="filter-rules-summary">
+      <ol className="space-y-0.5 text-[11px] text-zinc-600 dark:text-zinc-400">
+        {rules.map((r, i) => (
+          <li key={`${i}-${r.action}-${r.kind}-${r.pattern}`} className="flex items-center gap-1.5">
+            <span className={r.action === "include" ? "text-green-700 dark:text-green-400" : "text-red-700 dark:text-red-400"}>
+              {r.action === "include" ? "Include" : "Exclude"}
+            </span>
+            <span className="text-zinc-400">{kindLabel(r.kind)}</span>
+            <code className="font-mono truncate">{r.pattern}</code>
+            <button
+              type="button"
+              aria-label={`Remove rule ${r.pattern}`}
+              className="ml-auto text-red-600 hover:underline"
+              onClick={() => onChange(rules.filter((_, j) => j !== i))}
+            >
+              ✕
+            </button>
+          </li>
+        ))}
+      </ol>
+      <Btn onClick={() => onChange([])}>Clear all rules</Btn>
     </div>
   );
 }

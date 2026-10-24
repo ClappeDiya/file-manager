@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A backup job's generated CLI command writes rclone rules as `--filter "+ pattern"` (new `ufop backup run` / `estimate` flag, applied in order after `--include` / `--exclude`) instead of an absolute-path regex, so it selects the same files as the job (`/Photos/**` is the source's own Photos folder).
   - Settings › Sync defaults shows every mode's cleanup default, including the two-way delete limit (it was edited as a one-way pair, so that limit could not be set there).
   - Sync copies are paced block by block whenever the bandwidth timetable has an upload limit, so a window that opens during a long copy slows the rest of that file.
+  - Standard view: a sync pair's filter rules (e.g. from an applied preset) are listed read-only with remove and *Clear all rules*, so a preset can be undone without the Advanced rule editor.
   - Importing a scheduled or watched pair leaves it turned off (with a note to turn it on in Edit), like a duplicate, so it cannot start running before it is reviewed.
 
 - **Simple and Advanced mode in the backup screens**: in Simple mode (the default) the job editor, Restore, Maintenance, Settings and Recovery show the everyday flow; advanced options appear in Advanced mode or with *Show advanced backup options* (a per-area override in the UI store), behind one `AdvancedOnly` gate with a "Switch to Advanced" hint.
