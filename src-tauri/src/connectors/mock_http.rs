@@ -1,16 +1,15 @@
 //! In-process HTTP mock for connector tests: one handler closure sees every
-//! request (method, URI, headers, body) and keeps whatever state it needs.
+//! request (path, query, headers, body) and keeps whatever state it needs.
 //! Requests are logged so tests can assert on what the connector sent.
 
 use axum::body::Bytes;
-use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use std::sync::{Arc, Mutex};
 
 /// One request the mock received.
 #[derive(Debug, Clone)]
 pub struct Seen {
-    pub method: String,
     pub path: String,
     pub query: String,
     pub headers: HeaderMap,
@@ -54,10 +53,10 @@ where
 {
     let log: Arc<Mutex<Vec<Seen>>> = Arc::default();
     let (h, l2) = (Arc::new(handler), log.clone());
-    let app = axum::Router::new().fallback(move |m: Method, u: Uri, headers: HeaderMap, body: Bytes| {
+    let app = axum::Router::new().fallback(move |u: Uri, headers: HeaderMap, body: Bytes| {
         let (h, log) = (h.clone(), l2.clone());
         async move {
-            let seen = Seen { method: m.to_string(), path: u.path().to_string(), query: u.query().unwrap_or("").to_string(), headers, body };
+            let seen = Seen { path: u.path().to_string(), query: u.query().unwrap_or("").to_string(), headers, body };
             log.lock().unwrap().push(seen.clone());
             h(&seen)
         }

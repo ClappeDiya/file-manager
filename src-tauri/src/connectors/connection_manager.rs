@@ -173,6 +173,11 @@ impl ConnectionManager {
         self.credential_store.store(&CredentialStore::credential_key(&connection_id), secret).await
     }
 
+    /// Forget a connection's primary secret (e.g. an OAuth sign-in).
+    pub async fn delete_password(&self, connection_id: Uuid) -> Result<(), AppError> {
+        self.credential_store.delete(&CredentialStore::credential_key(&connection_id)).await
+    }
+
     /// The credential store (OAuth connectors persist rotated tokens through it).
     pub fn credential_store(&self) -> Arc<CredentialStore> {
         self.credential_store.clone()

@@ -7,10 +7,12 @@
 //! - File versioning: view history, restore
 //! - Auto token refresh
 
-use crate::connectors::oauth::{OAuthClient, OAuthConfig, OAuthToken};
+use crate::connectors::oauth::{OAuthClient, OAuthToken};
+use crate::connectors::oauth_flow::{self, OAuthProvider};
 use crate::connectors::Connector;
 use crate::core::error::AppError;
-use crate::core::types::{ConnectionProfile, FileEntry};
+use crate::core::types::{ConnectionProfile, FileEntry, GoogleDriveRoot, GoogleDriveSettings};
+use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -18,8 +20,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD_BASE: &str = "https://www.googleapis.com/upload/drive/v3";
 const DEFAULT_CALLBACK_PORT: u16 = 9876;
@@ -141,6 +141,17 @@ pub enum DriveScope {
 pub struct GoogleDriveConnector {
     oauth: Arc<RwLock<Option<OAuthClient>>>,
     http: reqwest::Client,
+    api_base: String,
+    upload_base: String,
+    /// Token endpoint override (tests); `None` = Google's.
+    token_url: Option<String>,
+    /// Rotated tokens are written back here (the app's credential store).
+    credentials: Option<Arc<crate::security::CredentialStore>>,
+    connected: AtomicBool,
+    /// The signed-in account (e-mail), from `about`.
+    account: std::sync::RwLock<Option<String>>,
+    /// Which part of Drive "/" opens, export formats.
+    settings: std::sync::RwLock<GoogleDriveSettings>,
 }
 
 impl GoogleDriveConnector {
@@ -148,7 +159,33 @@ impl GoogleDriveConnector {
         Self {
             oauth: Arc::new(RwLock::new(None)),
             http: crate::net::client(),
+            api_base: DRIVE_API_BASE.to_string(),
+            upload_base: DRIVE_UPLOAD_BASE.to_string(),
+            token_url: None,
+            credentials: None,
+            connected: AtomicBool::new(false),
+            account: std::sync::RwLock::new(None),
+            settings: std::sync::RwLock::new(GoogleDriveSettings::default()),
         }
+    }
+
+    /// Persist rotated tokens in `store` (under the connection's credential key).
+    pub fn with_credentials(mut self, store: Arc<crate::security::CredentialStore>) -> Self {
+        self.credentials = Some(store);
+        self
+    }
+
+    /// Talk to `api` / `upload` / `token_url` instead of Google (tests, proxies).
+    pub fn with_endpoints(mut self, api: &str, upload: &str, token_url: &str) -> Self {
+        self.api_base = api.trim_end_matches('/').to_string();
+        self.upload_base = upload.trim_end_matches('/').to_string();
+        self.token_url = Some(token_url.to_string());
+        self
+    }
+
+    /// The signed-in account, once connected.
+    pub fn account(&self) -> Option<String> {
+        self.account.read().ok().and_then(|a| a.clone())
     }
 
     /// Initialize the OAuth client with the given credentials.
@@ -159,25 +196,64 @@ impl GoogleDriveConnector {
         callback_port: Option<u16>,
     ) {
         let port = callback_port.unwrap_or(DEFAULT_CALLBACK_PORT);
-        let config = OAuthConfig {
-            client_id,
-            client_secret,
-            auth_url: GOOGLE_AUTH_URL.to_string(),
-            token_url: GOOGLE_TOKEN_URL.to_string(),
-            redirect_uri: format!("http://localhost:{port}/callback"),
-            scopes: vec![
-                "https://www.googleapis.com/auth/drive".to_string(),
-                "https://www.googleapis.com/auth/drive.file".to_string(),
-            ],
-            extra_params: vec![
-                ("access_type".to_string(), "offline".to_string()),
-                ("prompt".to_string(), "consent".to_string()),
-            ],
-        };
+        let provider = OAuthProvider::GoogleDrive;
+        let config = provider.oauth_config(client_id, client_secret, format!("http://localhost:{port}/callback"), provider.endpoints(Default::default()));
 
         let client = OAuthClient::new(config);
         let mut oauth = self.oauth.write().await;
         *oauth = Some(client);
+    }
+
+    /// Restore the stored grant, refresh it when expired and check it with
+    /// `about` (which also names the account and gives the quota).
+    async fn connect_oauth(&self, profile: &ConnectionProfile, secret: Option<String>) -> Result<(), AppError> {
+        self.connected.store(false, Ordering::SeqCst);
+        let client = oauth_flow::client_for_connect(OAuthProvider::GoogleDrive, profile, secret, self.token_url.as_deref(), self.credentials.clone()).await?;
+        *self.oauth.write().await = Some(client);
+        if let Ok(mut s) = self.settings.write() {
+            *s = profile.extras.google_drive.clone().unwrap_or_default();
+        }
+        let about = self.about().await?;
+        if let Ok(mut a) = self.account.write() {
+            *a = about["user"]["emailAddress"].as_str().or(about["user"]["displayName"].as_str()).map(String::from);
+        }
+        self.connected.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// `GET about` (user and storage quota). A 401 with a token that has not
+    /// expired (revoked, rotated elsewhere) refreshes once.
+    pub async fn about(&self) -> Result<serde_json::Value, AppError> {
+        let url = format!("{}/about?fields=user(displayName,emailAddress),storageQuota(limit,usage,usageInDrive,usageInDriveTrash)", self.api_base);
+        for attempt in 0..2 {
+            let token = self.get_token().await?;
+            let resp = self.http.get(&url).bearer_auth(&token).send().await.map_err(|e| AppError::connection(format!("Google Drive is unreachable: {e}"), "Check your network connection."))?;
+            let status = resp.status();
+            if status.as_u16() == 401 && attempt == 0 {
+                self.force_refresh().await?;
+                continue;
+            }
+            if matches!(status.as_u16(), 401 | 403) {
+                return Err(AppError::auth(format!("Google Drive refused the sign-in (HTTP {status})"), "Sign in again from Connections."));
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(AppError::connection(format!("Google Drive error (HTTP {status}): {}", body.chars().take(200).collect::<String>()), "Try again later."));
+            }
+            return resp.json().await.map_err(|e| AppError::connection(format!("Unexpected Google Drive reply: {e}"), "Try again."));
+        }
+        Err(AppError::auth("Google Drive refused the renewed sign-in", "Sign in again from Connections."))
+    }
+
+    /// The grant to store for the current tokens (after a sign-in or refresh).
+    pub async fn current_grant(&self) -> Option<crate::connectors::oauth::OAuthGrant> {
+        self.oauth.read().await.as_ref()?.grant().await
+    }
+
+    async fn force_refresh(&self) -> Result<(), AppError> {
+        let oauth = self.oauth.read().await;
+        let client = oauth.as_ref().ok_or_else(|| AppError::connection("Not connected to Google Drive", "Connect first."))?;
+        client.refresh_token().await.map(|_| ())
     }
 
     /// Get the authorization URL (user opens this in browser).
@@ -248,7 +324,7 @@ impl GoogleDriveConnector {
 
         let fields = "files(id,name,mimeType,size,modifiedTime,createdTime,parents,shared,trashed),nextPageToken";
 
-        let mut url = url::Url::parse(&format!("{DRIVE_API_BASE}/files")).unwrap();
+        let mut url = url::Url::parse(&format!("{}/files", self.api_base)).unwrap();
         {
             let mut params = url.query_pairs_mut();
             params.append_pair("q", &query);
@@ -296,6 +372,96 @@ impl GoogleDriveConnector {
         Ok((entries, list.next_page_token))
     }
 
+    /// Every entry at a virtual `path` (all pages). `/` opens the part of
+    /// Drive chosen on the connection (My Drive, Shared with me or one
+    /// shared drive).
+    pub async fn list_path(&self, path: &str) -> Result<Vec<FileEntry>, AppError> {
+        let loc = match drive_location(path) {
+            DriveLocation::Root => {
+                let s = self.settings.read().map(|s| s.clone()).unwrap_or_default();
+                match (s.root, s.shared_drive_id.filter(|d| !d.is_empty())) {
+                    (GoogleDriveRoot::SharedDrive, Some(d)) => DriveLocation::SharedDrive { drive_id: d, folder: None },
+                    (GoogleDriveRoot::SharedWithMe, _) => DriveLocation::SharedWithMe,
+                    _ => DriveLocation::MyDrive { folder: None },
+                }
+            }
+            other => other,
+        };
+        match loc {
+            DriveLocation::SharedDrives => self.all_shared_drives().await.map(|d| d.into_iter().map(|d| shared_drive_entry(&d.id, d.name)).collect()),
+            DriveLocation::MyDrive { folder } => {
+                let parent = folder.unwrap_or_else(|| "root".into());
+                // Top level of My Drive lists as "/<id>"; deeper paths keep their prefix.
+                let prefix = if parent == "root" { String::new() } else { path.trim_end_matches('/').to_string() };
+                self.list_query(&format!("'{}' in parents and trashed = false", q_escape(&parent)), None, &prefix).await
+            }
+            DriveLocation::SharedWithMe => {
+                let prefix = if drive_location(path) == DriveLocation::Root { "/shared-with-me".to_string() } else { path.trim_end_matches('/').to_string() };
+                self.list_query("sharedWithMe = true and trashed = false", None, &prefix).await
+            }
+            DriveLocation::SharedDrive { drive_id, folder } => {
+                let parent = folder.unwrap_or_else(|| drive_id.clone());
+                let prefix = if drive_location(path) == DriveLocation::Root { format!("/shared-drives/{drive_id}") } else { path.trim_end_matches('/').to_string() };
+                self.list_query(&format!("'{}' in parents and trashed = false", q_escape(&parent)), Some(&drive_id), &prefix).await
+            }
+            DriveLocation::Root => unreachable!("resolved above"),
+        }
+    }
+
+    /// `files.list` for `query`, following every page.
+    async fn list_query(&self, query: &str, drive_id: Option<&str>, prefix: &str) -> Result<Vec<FileEntry>, AppError> {
+        let fields = "files(id,name,mimeType,size,modifiedTime,createdTime,parents,shared,trashed),nextPageToken";
+        let mut out = Vec::new();
+        let mut page: Option<String> = None;
+        for _ in 0..10_000 {
+            let mut url = url::Url::parse(&format!("{}/files", self.api_base)).map_err(|e| AppError::internal(format!("Bad Drive API URL: {e}")))?;
+            {
+                let mut q = url.query_pairs_mut();
+                q.append_pair("q", query).append_pair("fields", fields).append_pair("pageSize", "1000").append_pair("orderBy", "folder,name");
+                q.append_pair("supportsAllDrives", "true").append_pair("includeItemsFromAllDrives", "true");
+                match drive_id {
+                    Some(d) => q.append_pair("corpora", "drive").append_pair("driveId", d),
+                    None => q.append_pair("corpora", "user"),
+                };
+                if let Some(p) = &page {
+                    q.append_pair("pageToken", p);
+                }
+            }
+            let resp = self.http.get(url.as_str()).bearer_auth(self.get_token().await?).send().await.map_err(|e| AppError::Connection {
+                message: format!("Google Drive API request failed: {e}"),
+                advice: "Check your network connection.".to_string(),
+            })?;
+            let list: FileListResponse = drive_json(resp, "Listing").await?;
+            out.extend(list.files.into_iter().map(|f| entry_at(f, prefix)));
+            page = list.next_page_token;
+            if page.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every shared drive the account can see (all pages).
+    pub async fn all_shared_drives(&self) -> Result<Vec<SharedDriveInfo>, AppError> {
+        let mut out = Vec::new();
+        let mut page: Option<String> = None;
+        for _ in 0..1_000 {
+            let mut url = url::Url::parse(&format!("{}/drives", self.api_base)).map_err(|e| AppError::internal(format!("Bad Drive API URL: {e}")))?;
+            url.query_pairs_mut().append_pair("pageSize", "100");
+            if let Some(p) = &page {
+                url.query_pairs_mut().append_pair("pageToken", p);
+            }
+            let resp = self.http.get(url.as_str()).bearer_auth(self.get_token().await?).send().await.map_err(|e| AppError::connection(format!("Drive API request failed: {e}"), "Check your network connection."))?;
+            let list: DriveListResponse = drive_json(resp, "Listing shared drives").await?;
+            out.extend(list.drives.into_iter().map(|d| SharedDriveInfo { id: d.id, name: d.name }));
+            page = list.next_page_token;
+            if page.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// List Shared Drives.
     async fn list_shared_drives(
         &self,
@@ -303,7 +469,7 @@ impl GoogleDriveConnector {
     ) -> Result<(Vec<FileEntry>, Option<String>), AppError> {
         let token = self.get_token().await?;
 
-        let mut url = url::Url::parse(&format!("{DRIVE_API_BASE}/drives")).unwrap();
+        let mut url = url::Url::parse(&format!("{}/drives", self.api_base)).unwrap();
         {
             let mut params = url.query_pairs_mut();
             params.append_pair("pageSize", "100");
@@ -407,7 +573,7 @@ impl GoogleDriveConnector {
         body.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
 
         let url = format!(
-            "{DRIVE_UPLOAD_BASE}/files?uploadType=multipart&supportsAllDrives=true"
+            "{}/files?uploadType=multipart&supportsAllDrives=true", self.upload_base
         );
 
         let resp = self.http
@@ -459,7 +625,7 @@ impl GoogleDriveConnector {
 
         // Step 1: Initiate resumable upload
         let url = format!(
-            "{DRIVE_UPLOAD_BASE}/files?uploadType=resumable&supportsAllDrives=true"
+            "{}/files?uploadType=resumable&supportsAllDrives=true", self.upload_base
         );
 
         let resp = self.http
@@ -556,7 +722,7 @@ impl GoogleDriveConnector {
         let token = self.get_token().await?;
 
         let url = format!(
-            "{DRIVE_API_BASE}/files/{file_id}?alt=media&supportsAllDrives=true"
+            "{}/files/{file_id}?alt=media&supportsAllDrives=true", self.api_base
         );
 
         let resp = self.http
@@ -593,7 +759,7 @@ impl GoogleDriveConnector {
         let token = self.get_token().await?;
 
         let url = format!(
-            "{DRIVE_API_BASE}/files/{file_id}/export?mimeType={}",
+            "{}/files/{file_id}/export?mimeType={}", self.api_base,
             percent_encoding::percent_encode(
                 format.mime_type().as_bytes(),
                 percent_encoding::NON_ALPHANUMERIC,
@@ -630,7 +796,7 @@ impl GoogleDriveConnector {
         let token = self.get_token().await?;
 
         let url = format!(
-            "{DRIVE_API_BASE}/files/{file_id}/revisions?fields=revisions(id,modifiedTime,originalFilename,size,keepForever)"
+            "{}/files/{file_id}/revisions?fields=revisions(id,modifiedTime,originalFilename,size,keepForever)", self.api_base
         );
 
         let resp = self.http
@@ -669,7 +835,7 @@ impl GoogleDriveConnector {
         let token = self.get_token().await?;
 
         let url = format!(
-            "{DRIVE_API_BASE}/files/{file_id}/revisions/{revision_id}?alt=media"
+            "{}/files/{file_id}/revisions/{revision_id}?alt=media", self.api_base
         );
 
         let resp = self.http
@@ -703,7 +869,7 @@ impl GoogleDriveConnector {
 
         if permanent {
             let url = format!(
-                "{DRIVE_API_BASE}/files/{file_id}?supportsAllDrives=true"
+                "{}/files/{file_id}?supportsAllDrives=true", self.api_base
             );
             let resp = self.http
                 .delete(&url)
@@ -726,7 +892,7 @@ impl GoogleDriveConnector {
         } else {
             // Move to trash
             let url = format!(
-                "{DRIVE_API_BASE}/files/{file_id}?supportsAllDrives=true"
+                "{}/files/{file_id}?supportsAllDrives=true", self.api_base
             );
             let resp = self.http
                 .patch(&url)
@@ -768,7 +934,7 @@ impl GoogleDriveConnector {
             metadata["parents"] = serde_json::json!([pid]);
         }
 
-        let url = format!("{DRIVE_API_BASE}/files?supportsAllDrives=true");
+        let url = format!("{}/files?supportsAllDrives=true", self.api_base);
 
         let resp = self.http
             .post(&url)
@@ -803,7 +969,7 @@ impl GoogleDriveConnector {
         let token = self.get_token().await?;
 
         let url = format!(
-            "{DRIVE_API_BASE}/files/{file_id}?supportsAllDrives=true"
+            "{}/files/{file_id}?supportsAllDrives=true", self.api_base
         );
 
         let resp = self.http
@@ -839,7 +1005,7 @@ impl GoogleDriveConnector {
         let token = self.get_token().await?;
 
         let mut url = format!(
-            "{DRIVE_API_BASE}/files/{file_id}?addParents={new_parent_id}&supportsAllDrives=true"
+            "{}/files/{file_id}?addParents={new_parent_id}&supportsAllDrives=true", self.api_base
         );
         if let Some(old) = old_parent_id {
             url.push_str(&format!("&removeParents={old}"));
@@ -878,20 +1044,19 @@ impl Default for GoogleDriveConnector {
 impl Connector for GoogleDriveConnector {
     fn connect(
         &self,
-        _profile: &ConnectionProfile,
+        profile: &ConnectionProfile,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
-        Box::pin(async move {
-            // For Google Drive, connection is established via OAuth flow
-            // The profile should have an OAuth token stored in credential_ref
-            let oauth = self.oauth.read().await;
-            if oauth.is_none() {
-                return Err(AppError::Connection {
-                    message: "Google Drive OAuth not initialized".to_string(),
-                    advice: "Initialize OAuth with your client ID before connecting.".to_string(),
-                });
-            }
-            Ok(())
-        })
+        self.connect_with_secret(profile, None)
+    }
+
+    /// The secret is the stored OAuth grant (see `oauth_flow`).
+    fn connect_with_secret(
+        &self,
+        profile: &ConnectionProfile,
+        secret: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let profile = profile.clone();
+        Box::pin(async move { self.connect_oauth(&profile, secret).await })
     }
 
     fn disconnect(&self) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
@@ -900,6 +1065,7 @@ impl Connector for GoogleDriveConnector {
             if let Some(client) = oauth.as_ref() {
                 client.clear_token().await;
             }
+            self.connected.store(false, Ordering::SeqCst);
             Ok(())
         })
     }
@@ -909,15 +1075,11 @@ impl Connector for GoogleDriveConnector {
         path: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<FileEntry>, AppError>> + Send + '_>> {
         let path = path.to_string();
-        Box::pin(async move {
-            let (scope, parent_id) = parse_drive_path(&path);
-            let (entries, _) = self.list_files(parent_id.as_deref(), scope, None).await?;
-            Ok(entries)
-        })
+        Box::pin(async move { self.list_path(&path).await })
     }
 
     fn is_connected(&self) -> bool {
-        false // Conservative; actual check needs async
+        self.connected.load(Ordering::SeqCst)
     }
 
     fn create_share_link(
@@ -932,7 +1094,7 @@ impl Connector for GoogleDriveConnector {
             let token = self.get_token().await?;
             let resp = self
                 .http
-                .post(format!("{DRIVE_API_BASE}/files/{file_id}/permissions?supportsAllDrives=true"))
+                .post(format!("{}/files/{file_id}/permissions?supportsAllDrives=true", self.api_base))
                 .bearer_auth(&token)
                 .json(&permission)
                 .send()
@@ -948,7 +1110,7 @@ impl Connector for GoogleDriveConnector {
             }
             let meta: serde_json::Value = self
                 .http
-                .get(format!("{DRIVE_API_BASE}/files/{file_id}?fields=webViewLink&supportsAllDrives=true"))
+                .get(format!("{}/files/{file_id}?fields=webViewLink&supportsAllDrives=true", self.api_base))
                 .bearer_auth(&token)
                 .send()
                 .await
@@ -986,6 +1148,12 @@ pub(crate) fn drive_permission_body(o: &super::ShareOptions) -> Result<serde_jso
 
 /// Convert a Drive API file object to our FileEntry.
 fn drive_file_to_entry(file: DriveFile, parent_path: &str) -> FileEntry {
+    entry_at(file, &format!("/{parent_path}"))
+}
+
+/// The entry for `file` listed at virtual path `prefix` (its path is
+/// `{prefix}/{id}`, so the folder chain and shared drive are kept).
+fn entry_at(file: DriveFile, prefix: &str) -> FileEntry {
     let is_folder = file.mime_type == "application/vnd.google-apps.folder";
     let is_google_doc = file.mime_type.starts_with("application/vnd.google-apps.");
 
@@ -1022,8 +1190,8 @@ fn drive_file_to_entry(file: DriveFile, parent_path: &str) -> FileEntry {
     };
 
     FileEntry {
+        path: format!("{}/{}", prefix.trim_end_matches('/'), file.id),
         name: file.name,
-        path: format!("/{}/{}", parent_path, file.id),
         is_dir: is_folder,
         is_symlink: false,
         size,
@@ -1039,36 +1207,85 @@ fn drive_file_to_entry(file: DriveFile, parent_path: &str) -> FileEntry {
     }
 }
 
+/// A shared drive (for the connection's drive picker).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedDriveInfo {
+    pub id: String,
+    pub name: String,
+}
+
+fn shared_drive_entry(id: &str, name: String) -> FileEntry {
+    FileEntry {
+        name,
+        path: format!("/shared-drives/{id}"),
+        is_dir: true,
+        is_symlink: false,
+        size: 0,
+        modified: None,
+        created: None,
+        is_hidden: false,
+        extension: None,
+        permissions: None,
+    }
+}
+
+/// Where a virtual Drive path points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DriveLocation {
+    /// `/`: what the connection is set to open.
+    Root,
+    MyDrive { folder: Option<String> },
+    SharedWithMe,
+    SharedDrives,
+    SharedDrive { drive_id: String, folder: Option<String> },
+}
+
+/// Paths are `/<folder id>/<folder id>…` (the last segment is the folder),
+/// optionally under `/my-drive`, `/shared-with-me` or
+/// `/shared-drives/<drive id>`.
+fn drive_location(path: &str) -> DriveLocation {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let last = |from: usize| segs.get(from..).and_then(|r| r.last()).map(|s| s.to_string());
+    match segs.as_slice() {
+        [] => DriveLocation::Root,
+        ["my-drive", ..] => DriveLocation::MyDrive { folder: last(1).filter(|s| s != "root") },
+        ["shared-with-me"] => DriveLocation::SharedWithMe,
+        ["shared-with-me", ..] => DriveLocation::MyDrive { folder: last(1) },
+        ["shared-drives"] => DriveLocation::SharedDrives,
+        ["shared-drives", d, ..] => DriveLocation::SharedDrive { drive_id: d.to_string(), folder: last(2) },
+        _ => DriveLocation::MyDrive { folder: last(0).filter(|s| s != "root") },
+    }
+}
+
+/// Escape a value inside a `files.list` query string literal.
+fn q_escape(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// The JSON body of a successful Drive reply; 401/403 are rejected sign-ins.
+async fn drive_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response, what: &str) -> Result<T, AppError> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let excerpt: String = body.chars().take(300).collect();
+        return Err(match status.as_u16() {
+            401 => AppError::auth(format!("{what}: Google Drive refused the sign-in (HTTP {status})"), "Sign in again from Connections."),
+            _ => AppError::Connection { message: format!("Google Drive API error (HTTP {status}): {excerpt}"), advice: "Check your permissions or re-authorize.".to_string() },
+        });
+    }
+    resp.json().await.map_err(|e| AppError::Connection { message: format!("Failed to parse Drive response: {e}"), advice: "Try again.".to_string() })
+}
+
 /// Parse a virtual path into drive scope and parent folder ID.
+#[cfg(test)]
 fn parse_drive_path(path: &str) -> (DriveScope, Option<String>) {
-    let path = path.trim_start_matches('/');
-
-    if path.is_empty() || path == "my-drive" {
-        return (DriveScope::MyDrive, None);
+    match drive_location(path) {
+        DriveLocation::Root => (DriveScope::MyDrive, None),
+        DriveLocation::MyDrive { folder } => (DriveScope::MyDrive, folder),
+        DriveLocation::SharedWithMe => (DriveScope::SharedWithMe, None),
+        DriveLocation::SharedDrives => (DriveScope::SharedDrives, None),
+        DriveLocation::SharedDrive { drive_id, folder } => (DriveScope::MyDrive, Some(folder.unwrap_or(drive_id))),
     }
-
-    if path == "shared-with-me" {
-        return (DriveScope::SharedWithMe, None);
-    }
-
-    if path == "shared-drives" {
-        return (DriveScope::SharedDrives, None);
-    }
-
-    if let Some(rest) = path.strip_prefix("shared-drives/") {
-        if rest.contains('/') {
-            let parts: Vec<&str> = rest.splitn(2, '/').collect();
-            return (DriveScope::MyDrive, Some(parts.last().unwrap_or(&"").to_string()));
-        }
-        return (DriveScope::MyDrive, Some(rest.to_string()));
-    }
-
-    if let Some(rest) = path.strip_prefix("my-drive/") {
-        return (DriveScope::MyDrive, Some(rest.to_string()));
-    }
-
-    // Default: treat as folder ID
-    (DriveScope::MyDrive, Some(path.to_string()))
 }
 
 #[cfg(test)]

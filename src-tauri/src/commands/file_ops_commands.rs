@@ -1200,10 +1200,15 @@ pub async fn get_file_metadata(path: String) -> Result<FileEntry, AppError> {
 /// - **onedrive**: DELETE `/me/drive/items/{id}` which moves to OneDrive Recycle Bin.
 /// - **dropbox**: `files/delete_v2` which soft-deletes (recoverable for retention period).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn cloud_delete_to_trash(
     protocol: String,
     file_id: String,
     connection_id: String,
+    connections: tauri::State<'_, crate::connectors::ConnectionManager>,
+    gdrive: tauri::State<'_, Arc<crate::connectors::GoogleDriveConnector>>,
+    onedrive: tauri::State<'_, Arc<crate::connectors::OneDriveConnector>>,
+    dropbox: tauri::State<'_, Arc<crate::connectors::DropboxConnector>>,
 ) -> Result<(), AppError> {
     tracing::info!(
         "cloud_delete_to_trash: protocol={}, file_id={}, connection_id={}",
@@ -1213,24 +1218,39 @@ pub async fn cloud_delete_to_trash(
     match protocol.as_str() {
         "google_drive" => {
             // Google Drive: move to trash (permanent=false)
-            let connector = crate::connectors::google_drive::GoogleDriveConnector::new();
-            connector.delete_file(&file_id, false).await
+            ensure_cloud_connected(gdrive.as_ref(), &connections, &connection_id).await?;
+            gdrive.delete_file(&file_id, false).await
         }
         "onedrive" => {
             // OneDrive: DELETE moves to recycle bin by default
-            let connector = crate::connectors::onedrive::OneDriveConnector::new();
-            connector.delete_item(&file_id).await
+            ensure_cloud_connected(onedrive.as_ref(), &connections, &connection_id).await?;
+            onedrive.delete_item(&file_id).await
         }
         "dropbox" => {
             // Dropbox: delete_v2 is a soft delete (recoverable)
-            let connector = crate::connectors::dropbox::DropboxConnector::new();
-            connector.delete(&file_id).await
+            ensure_cloud_connected(dropbox.as_ref(), &connections, &connection_id).await?;
+            dropbox.delete(&file_id).await
         }
         other => Err(AppError::FileOperation {
             message: format!("Unsupported cloud protocol for trash deletion: {other}"),
             advice: "Supported protocols: google_drive, onedrive, dropbox.".to_string(),
         }),
     }
+}
+
+/// Connect the shared cloud connector with the saved connection's sign-in
+/// when it is not connected yet. (These commands used to create a fresh,
+/// never-signed-in connector, so every call failed with "Not connected".)
+async fn ensure_cloud_connected(connector: &dyn crate::connectors::Connector, connections: &crate::connectors::ConnectionManager, connection_id: &str) -> Result<(), AppError> {
+    if connector.is_connected() {
+        return Ok(());
+    }
+    let id = uuid::Uuid::parse_str(connection_id).map_err(|_| AppError::validation(format!("Invalid connection id '{connection_id}'")))?;
+    let profile = connections.get_connection(id).await?.ok_or_else(|| AppError::not_found("The connection no longer exists"))?;
+    let secrets = connections.get_secrets(id).await?;
+    let r = connector.connect_with_secrets(&profile, secrets).await;
+    connections.record_connect_outcome(id, &r).await;
+    r
 }
 
 /// Permanently delete a cloud file/folder, bypassing the trash/recycle bin.
@@ -1240,10 +1260,15 @@ pub async fn cloud_delete_to_trash(
 /// - **onedrive**: DELETE + permanentDelete (removes from recycle bin too).
 /// - **dropbox**: `files/permanently_delete` endpoint (immediate permanent removal).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn cloud_delete_permanently(
     protocol: String,
     file_id: String,
     connection_id: String,
+    connections: tauri::State<'_, crate::connectors::ConnectionManager>,
+    gdrive: tauri::State<'_, Arc<crate::connectors::GoogleDriveConnector>>,
+    onedrive: tauri::State<'_, Arc<crate::connectors::OneDriveConnector>>,
+    dropbox: tauri::State<'_, Arc<crate::connectors::DropboxConnector>>,
 ) -> Result<(), AppError> {
     tracing::info!(
         "cloud_delete_permanently: protocol={}, file_id={}, connection_id={}",
@@ -1253,18 +1278,18 @@ pub async fn cloud_delete_permanently(
     match protocol.as_str() {
         "google_drive" => {
             // Google Drive: permanent delete (permanent=true)
-            let connector = crate::connectors::google_drive::GoogleDriveConnector::new();
-            connector.delete_file(&file_id, true).await
+            ensure_cloud_connected(gdrive.as_ref(), &connections, &connection_id).await?;
+            gdrive.delete_file(&file_id, true).await
         }
         "onedrive" => {
             // OneDrive: delete + purge from recycle bin
-            let connector = crate::connectors::onedrive::OneDriveConnector::new();
-            connector.delete_item_permanently(&file_id).await
+            ensure_cloud_connected(onedrive.as_ref(), &connections, &connection_id).await?;
+            onedrive.delete_item_permanently(&file_id).await
         }
         "dropbox" => {
             // Dropbox: permanent deletion endpoint
-            let connector = crate::connectors::dropbox::DropboxConnector::new();
-            connector.permanently_delete(&file_id).await
+            ensure_cloud_connected(dropbox.as_ref(), &connections, &connection_id).await?;
+            dropbox.permanently_delete(&file_id).await
         }
         other => Err(AppError::FileOperation {
             message: format!("Unsupported cloud protocol for permanent deletion: {other}"),

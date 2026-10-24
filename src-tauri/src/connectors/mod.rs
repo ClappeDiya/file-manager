@@ -40,6 +40,7 @@ pub mod b2;
 pub mod dropbox;
 pub mod google_drive;
 pub mod oauth;
+pub mod oauth_flow;
 pub mod onedrive;
 pub mod s3;
 // AWS credential chain, SSO, and STS federation
@@ -56,6 +57,8 @@ pub mod azure_files;
 pub(crate) mod azure_tests;
 #[cfg(test)]
 pub(crate) mod mock_http;
+#[cfg(test)]
+mod oauth_tests;
 
 use crate::core::error::AppError;
 use crate::core::types::{ConnectionProfile, ConnectionProtocol, FileEntry};
@@ -335,6 +338,17 @@ impl ConnectorRegistry {
         registry.register("swift", Arc::new(SwiftConnector::new()));
         registry.register("rclone", Arc::new(rclone::RcloneConnector::new()));
 
+        registry
+    }
+
+    /// The built-in connectors, with these OAuth connector instances (built
+    /// with the app's credential store, so rotated tokens are saved, and
+    /// shared with the commands that need their typed APIs).
+    pub fn with_cloud(gdrive: Arc<GoogleDriveConnector>, dropbox: Arc<DropboxConnector>, onedrive: Arc<OneDriveConnector>) -> Self {
+        let mut registry = Self::new();
+        registry.register("google_drive", gdrive);
+        registry.register("dropbox", dropbox);
+        registry.register("onedrive", onedrive);
         registry
     }
 
