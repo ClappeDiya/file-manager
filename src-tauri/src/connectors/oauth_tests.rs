@@ -269,7 +269,7 @@ async fn sign_in_cancel_and_manual_code() {
     assert!(w.await.unwrap().is_err());
     // A code pasted from another device (the whole redirect address).
     let start = flows.begin(OAuthProvider::GoogleDrive, &p, ("c".into(), None), Some(0), endpoints()).await.unwrap();
-    assert!(flows.complete(&start.state, &format!("http://localhost:1/callback?code=c1&state=other")).await.is_err());
+    assert!(flows.complete(&start.state, "http://localhost:1/callback?code=c1&state=other").await.is_err());
     let (id, grant) = flows.complete(&start.state, &format!("http://localhost:1/callback?code=c1&state={}", start.state)).await.unwrap();
     assert_eq!(id, p.id);
     assert!(matches!(grant, OAuthGrant::Token { token, .. } if token.access_token == "a1"));
