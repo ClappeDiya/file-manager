@@ -206,6 +206,29 @@ pub fn last_error_line(stderr: &str) -> String {
     msg.strip_prefix("NOTICE: ").unwrap_or(msg).trim().to_string()
 }
 
+/// Start `cmd`, retrying briefly while the binary is "text file busy"
+/// (ETXTBSY: it was just written, e.g. by a managed install, while another
+/// thread of this process was starting a program).
+pub async fn spawn(cmd: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
+    const ETXTBSY: i32 = 26;
+    let mut tries = 0;
+    loop {
+        match cmd.spawn() {
+            Err(e) if cfg!(unix) && e.raw_os_error() == Some(ETXTBSY) && tries < 20 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            r => return r,
+        }
+    }
+}
+
+/// `cmd` with stdout and stderr collected ([`spawn`] + wait).
+async fn output(mut cmd: tokio::process::Command) -> std::io::Result<std::process::Output> {
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    spawn(&mut cmd).await?.wait_with_output().await
+}
+
 /// An rclone binary plus the config file it uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rclone {
@@ -248,7 +271,7 @@ impl Rclone {
     pub async fn run(&self, args: &[String], timeout: Duration) -> Result<String, AppError> {
         let mut cmd = self.command();
         cmd.args(args);
-        let out = tokio::time::timeout(timeout, cmd.output())
+        let out = tokio::time::timeout(timeout, output(cmd))
             .await
             .map_err(|_| AppError::connection("rclone timed out", "Check the remote is reachable."))?
             .map_err(|e| not_started(&e))?;
@@ -263,7 +286,7 @@ impl Rclone {
     pub async fn version(&self) -> Result<RcloneVersion, AppError> {
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.arg("version").stdin(std::process::Stdio::null()).kill_on_drop(true);
-        let out = tokio::time::timeout(VERSION_TIMEOUT, cmd.output())
+        let out = tokio::time::timeout(VERSION_TIMEOUT, output(cmd))
             .await
             .map_err(|_| AppError::connection("rclone version timed out", "Check the rclone binary in Settings → rclone."))?
             .map_err(|e| not_started(&e))?;

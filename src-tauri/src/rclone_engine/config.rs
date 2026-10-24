@@ -520,7 +520,7 @@ pub fn authorize_token(stdout: &str) -> Option<String> {
 pub async fn authorize(rc: &Rclone, args: &[String], cancel: CancellationToken, timeout: Duration, on_url: &(dyn Fn(String) + Send + Sync)) -> Result<String, AppError> {
     let mut cmd = rc.command();
     cmd.arg("authorize").args(args).arg("--auth-no-open-browser").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| AppError::connection(format!("Could not start rclone: {e}"), "Check the rclone binary in Settings → rclone."))?;
+    let mut child = super::resolver::spawn(&mut cmd).await.map_err(|e| AppError::connection(format!("Could not start rclone: {e}"), "Check the rclone binary in Settings → rclone."))?;
     let (mut out, err) = (child.stdout.take(), child.stderr.take());
     let read_err = async {
         let mut tail = String::new();
@@ -605,6 +605,20 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let conf = d.path().join("rclone.conf");
         Some((d, Rclone::new("rclone", Some(conf.to_string_lossy().into_owned()))))
+    }
+
+    /// Remotes in the temp config (other tests define remotes through
+    /// `RCLONE_CONFIG_<NAME>_TYPE` in the shared process environment).
+    async fn configured(rc: &Rclone) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = list_remotes(rc)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| std::env::var(format!("RCLONE_CONFIG_{}_TYPE", r.name.trim_end_matches(':').to_ascii_uppercase())).is_err())
+            .map(|r| (r.name, r.backend))
+            .collect();
+        v.sort();
+        v
     }
 
     fn params(kv: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -791,9 +805,7 @@ esac
         // crypt over the alias, plain password obscured by rclone
         let s = create(&rc, "sec", "crypt", &params(&[("remote", "al:vault"), ("password", "hunter2")]), ObscureMode::Obscure).await.unwrap();
         assert!(s.done);
-        let mut names: Vec<(String, String)> = list_remotes(&rc).await.unwrap().into_iter().map(|r| (r.name, r.backend)).collect();
-        names.sort();
-        assert_eq!(names, vec![("al:".into(), "alias".into()), ("loc:".into(), "local".into()), ("sec:".into(), "crypt".into())]);
+        assert_eq!(configured(&rc).await, vec![("al:".into(), "alias".into()), ("loc:".into(), "local".into()), ("sec:".into(), "crypt".into())]);
         let conf = std::fs::read_to_string(rc.config.as_ref().unwrap()).unwrap();
         assert!(!conf.contains("hunter2"), "password stored obscured");
         let det = remote_details(&rc, "sec").await.unwrap();
@@ -820,8 +832,7 @@ esac
         // delete
         delete(&rc, "broken").await.unwrap();
         delete(&rc, "loc").await.unwrap();
-        let mut left: Vec<String> = list_remotes(&rc).await.unwrap().into_iter().map(|r| r.name).collect();
-        left.sort();
+        let left: Vec<String> = configured(&rc).await.into_iter().map(|r| r.0).collect();
         assert_eq!(left, vec!["al:", "sec:"]);
         assert!(delete(&rc, "loc").await.is_err());
 

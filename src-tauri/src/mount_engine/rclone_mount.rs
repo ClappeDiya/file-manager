@@ -138,7 +138,7 @@ impl RcloneProcesses {
         let rc = crate::rclone_engine::Rclone::current();
         let mut cmd = tokio::process::Command::new(&rc.program);
         cmd.args(rc.base_args()).args(mount_args(spec, mount_point, flags)).envs(spec.env.iter().cloned()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| format!("Could not start rclone: {e}"))?;
+        let mut child = crate::rclone_engine::resolver::spawn(&mut cmd).await.map_err(|e| format!("Could not start rclone: {e}"))?;
         let deadline = tokio::time::Instant::now() + MOUNT_WAIT;
         loop {
             if is_mounted(Path::new(mount_point)) {

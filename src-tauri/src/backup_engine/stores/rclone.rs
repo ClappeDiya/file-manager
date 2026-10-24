@@ -147,7 +147,7 @@ impl RcloneStore {
         if let Some(p) = &self.config_pass {
             cmd.env("RCLONE_CONFIG_PASS", p);
         }
-        let mut child = cmd.spawn().map_err(|e| AppError::connection(format!("Could not run {}: {e}", rc.program), "Install rclone (https://rclone.org), or choose its path in Settings → rclone."))?;
+        let mut child = crate::rclone_engine::resolver::spawn(&mut cmd).await.map_err(|e| AppError::connection(format!("Could not run {}: {e}", rc.program), "Install rclone (https://rclone.org), or choose its path in Settings → rclone."))?;
         let reaper = Reaper { pid: child.id() };
         let (mut out, mut err, input) = (child.stdout.take(), child.stderr.take(), child.stdin.take());
         let feed = async {
@@ -218,7 +218,11 @@ impl RcloneStore {
         };
         // rclone exited; anything it left behind in its group goes too.
         drop(reaper);
-        fed?;
+        // A failed rclone often stops before reading its input: its own error
+        // explains that better than the broken pipe the write then hit.
+        if status.success() {
+            fed?;
+        }
         if !status.success() {
             let err = String::from_utf8_lossy(&stderr);
             let last = err.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("").to_string();
@@ -319,6 +323,18 @@ esac
         let s = RcloneStore::new(RcloneConfig { binary: "/opt/rclone/rclone".into(), config_file: Some("/job/rclone.conf".into()), ..Default::default() }, None);
         assert_eq!(s.rclone(), crate::rclone_engine::Rclone::new("/opt/rclone/rclone", Some("/job/rclone.conf".into())));
         assert_eq!(s.rclone().base_args(), vec!["--config", "/job/rclone.conf"]);
+    }
+
+    /// Regression: rclone failing before it reads its input (quota, auth)
+    /// used to surface as "rclone input: Broken pipe" instead of rclone's
+    /// own error. A 4 MiB upload never fits the pipe buffer, so the write
+    /// always breaks.
+    #[tokio::test]
+    async fn early_failure_reports_rclone_error_not_broken_pipe() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = RcloneConfig { remote: "fake:".into(), binary: fake(d.path()), ..Default::default() };
+        let e = RcloneStore::new(cfg, None).put("big", vec![7u8; 4 * 1024 * 1024]).await.unwrap_err();
+        assert!(e.user_message().contains("quota exceeded"), "{}", e.user_message());
     }
 
     #[tokio::test]
