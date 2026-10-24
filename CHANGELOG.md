@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Editing a layered sync pair keeps its earlier option overrides, including ones whose value equals the current default; setting an overridden option to the default in the form resets it to follow the defaults.
   - Versioned backup: a newest stored version whose file was removed from the destination no longer counts as stored; the file is stored again.
   - Importing a sync pair refuses unknown option names in `option_overrides`, as creating and editing do.
+  - Two-way: names that differ only in letter case between the two sides (a case-only rename such as `A.txt` to `a.txt`) are skipped with a reason and a preview note, and their history is forgotten, instead of being planned as an add plus a delete, which on a case-insensitive drive (macOS, Windows) deleted the file on one side and, on the next run, on the other. Deletes also check that the folder lists the file under exactly the planned name.
+  - Rollback is refused while the pair is syncing (and holds the pair so no run starts during it); the Rollback button is disabled during a run.
+  - Bandwidth timetable: each direction takes the first active window that limits it, so a download-only window listed first no longer hides an overlapping window's upload limit.
+  - Two-way pairs refuse Move files (/MOV, /MOVE) on create, edit and import (moved files were copied back on the next run), do not inherit it from the global defaults, and no longer offer it in the options; older pairs saved with it get a preview note.
 
 - **Simple and Advanced mode in the backup screens**: in Simple mode (the default) the job editor, Restore, Maintenance, Settings and Recovery show the everyday flow; advanced options appear in Advanced mode or with *Show advanced backup options* (a per-area override in the UI store), behind one `AdvancedOnly` gate with a "Switch to Advanced" hint.
 - **`SECURITY.md`**: how to report a vulnerability privately (GitHub private vulnerability reporting), supported versions and response times.

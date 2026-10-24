@@ -356,6 +356,7 @@ pub fn execute_sync_with(
         parallel_adds > 0 && outcomes.len() < parallel_adds && !halted && !was_cancelled;
 
     // Phase 3: Execute operations
+    let mut listed = ListedNames::default();
     if !halted && !stopped_for_hours && !was_cancelled {
         for (idx, (entry, op_type)) in operations.iter().enumerate() {
             if idx < parallel_adds {
@@ -372,7 +373,7 @@ pub fn execute_sync_with(
 
             tracker.start_file(&entry.relative_path);
             let result = copier::with_retries(opts, || {
-                execute_single_operation(pair, entry, op_type, &mut rollback, &stored_versions)
+                execute_single_operation(pair, entry, op_type, &mut rollback, &stored_versions, &mut listed)
             });
             tracker.finish_file(match &result {
                 Ok(OperationResult::Added(b, _)) | Ok(OperationResult::Modified(b, _)) => *b,
@@ -904,6 +905,56 @@ fn store_version(pair: &SyncPair, entry: &SyncDiffEntry, versions: Option<&Store
     Ok(bytes)
 }
 
+/// The names each folder lists, read once per folder the run deletes from.
+/// Deletes run after every add and modify, so a listing read for the first
+/// delete in a folder holds every name a later delete there can mean.
+#[derive(Default)]
+struct ListedNames {
+    dirs: std::collections::HashMap<PathBuf, std::collections::HashSet<std::ffi::OsString>>,
+}
+
+impl ListedNames {
+    /// Whether `path` exists under exactly this name. A drive that ignores
+    /// letter case (the macOS and Windows defaults) also opens `a.txt` as
+    /// `A.txt`; a delete through a name the folder does not list would
+    /// remove a different file than the plan meant.
+    fn lists_exactly(&mut self, path: &Path) -> bool {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return false;
+        };
+        if fs::symlink_metadata(path).is_err() {
+            return false;
+        }
+        // Cheap answer first: when the name with every letter's case swapped
+        // does not open, this folder tells cases apart and the path is exact.
+        if let Some(text) = name.to_str() {
+            let swapped: String = text.chars().flat_map(|c| -> Vec<char> {
+                if c.is_lowercase() { c.to_uppercase().collect() } else { c.to_lowercase().collect() }
+            }).collect();
+            if swapped == text || fs::symlink_metadata(parent.join(&swapped)).is_err() {
+                return true;
+            }
+        }
+        let names = self.dirs.entry(parent.to_path_buf()).or_insert_with(|| {
+            fs::read_dir(parent)
+                .map(|it| it.filter_map(Result::ok).map(|e| e.file_name()).collect())
+                .unwrap_or_default()
+        });
+        names.contains(name)
+    }
+
+    /// Refuse a delete through a name its folder does not list exactly.
+    fn check_delete(&mut self, path: &Path, rel_path: &str) -> Result<(), AppError> {
+        if self.lists_exactly(path) {
+            return Ok(());
+        }
+        Err(AppError::Sync {
+            message: format!("Not deleted {rel_path}: its folder has the file under a name that differs in letter case."),
+            advice: "Rename the file so both sides use the same letter case, then sync again.".to_string(),
+        })
+    }
+}
+
 /// Execute a single file operation (add/modify/delete).
 fn execute_single_operation(
     pair: &SyncPair,
@@ -911,6 +962,7 @@ fn execute_single_operation(
     op_type: &str,
     rollback: &mut RollbackManager,
     versions: &StoredVersions,
+    listed: &mut ListedNames,
 ) -> Result<OperationResult, AppError> {
     let opts = &pair.copy_options;
     let source_root = Path::new(&pair.source_path);
@@ -931,6 +983,7 @@ fn execute_single_operation(
         "delete" if entry.direction == SyncDirection::ToSource => {
             // Two-way: deleted in the destination since the last sync.
             if source_file.exists() {
+                listed.check_delete(&source_file, &entry.relative_path)?;
                 rollback.snapshot_on(SyncSide::Source, &entry.relative_path, &source_file)?;
                 fs::remove_file(&source_file).map_err(|e| AppError::Sync {
                     message: format!("Delete failed {}: {}", entry.relative_path, e),
@@ -957,6 +1010,7 @@ fn execute_single_operation(
 
         "delete" => {
             if dest_file.exists() {
+                listed.check_delete(&dest_file, &entry.relative_path)?;
                 // Take pre-destructive snapshot
                 rollback.snapshot_file(&entry.relative_path, &dest_file)?;
 
@@ -2205,6 +2259,161 @@ mod tests {
         assert_eq!(fs::read_to_string(dst.path().join("new-name.txt")).unwrap(), "content");
     }
 
+    /// No step may delete a name on a side while the same run writes, or
+    /// that side already has, a name differing only in letter case: on a
+    /// drive that ignores case (the macOS and Windows defaults) the two
+    /// names are one file.
+    fn assert_no_case_collisions(preview: &SyncPreview, listed: &[(SyncDirection, &str)]) {
+        let fold = |p: &str| p.to_lowercase();
+        for del in &preview.deletions {
+            let writes = preview.additions.iter().chain(&preview.modifications).filter(|w| w.direction == del.direction);
+            for w in writes {
+                assert!(
+                    fold(&w.relative_path) != fold(&del.relative_path) || w.relative_path == del.relative_path,
+                    "delete {:?} and write {:?} are the same file on a case-insensitive drive",
+                    del.relative_path,
+                    w.relative_path
+                );
+            }
+            for (side, name) in listed.iter().filter(|(side, _)| *side == del.direction) {
+                assert!(
+                    fold(name) != fold(&del.relative_path) || *name == del.relative_path,
+                    "delete {:?} on {side:?} would remove {name:?} on a case-insensitive drive",
+                    del.relative_path
+                );
+            }
+        }
+    }
+
+    /// Regression (review): a case-only rename in the destination (`A.txt`
+    /// to `a.txt`) was planned as "add a.txt to the source" plus "delete
+    /// A.txt from the source". On a case-insensitive drive that is one file:
+    /// the add wrote over it and the delete removed it, and the next run
+    /// deleted the destination copy as "deleted in the source". Now both
+    /// names are skipped with a reason until they match again.
+    #[test]
+    fn two_way_case_only_rename_in_destination_deletes_nothing() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("A.txt"), "content").unwrap();
+        fs::write(src.path().join("other.txt"), "o").unwrap();
+        let pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+        assert!(base.as_ref().unwrap().entries.contains_key("A.txt"));
+
+        fs::rename(dst.path().join("A.txt"), dst.path().join("a.txt")).unwrap();
+        let preview = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
+        assert_no_case_collisions(&preview, &[(SyncDirection::ToSource, "A.txt"), (SyncDirection::ToDest, "a.txt")]);
+        assert_eq!(preview.total_deletions, 0, "a case-only rename must never plan a delete");
+        assert_eq!(preview.total_additions, 0);
+        let mut skipped: Vec<&str> = preview.skipped.iter().map(|e| e.relative_path.as_str()).collect();
+        skipped.sort_unstable();
+        assert_eq!(skipped, vec!["A.txt", "a.txt"]);
+        assert!(preview.skipped.iter().all(|e| e.reason.contains("letter case")), "{:?}", preview.skipped);
+        assert!(preview.notes.iter().any(|n| n.contains("letter case")));
+
+        for _ in 0..2 {
+            let out = run_two_way(&pair, &mut base);
+            assert_eq!((out.report.files_added, out.report.files_deleted), (0, 0));
+            assert_eq!(fs::read_to_string(src.path().join("A.txt")).unwrap(), "content");
+            assert_eq!(fs::read_to_string(dst.path().join("a.txt")).unwrap(), "content");
+            // The old-case history is dropped; nothing is recorded for the new name.
+            let entries = &base.as_ref().unwrap().entries;
+            assert!(!entries.contains_key("A.txt") && !entries.contains_key("a.txt"), "{:?}", entries.keys());
+        }
+
+        // Renaming the source to match settles the pair again.
+        fs::rename(src.path().join("A.txt"), src.path().join("a.txt")).unwrap();
+        let out = run_two_way(&pair, &mut base);
+        assert_eq!(out.report.files_added + out.report.files_deleted + out.report.files_modified, 0);
+        assert!(base.as_ref().unwrap().entries.contains_key("a.txt"));
+    }
+
+    /// The mirror image: the rename happened in the source, here through a
+    /// folder renamed only in case, which renames every path below it.
+    #[test]
+    fn two_way_case_only_rename_in_source_deletes_nothing() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::create_dir(src.path().join("Docs")).unwrap();
+        fs::write(src.path().join("Docs/Report.txt"), "r").unwrap();
+        fs::write(src.path().join("other.txt"), "o").unwrap();
+        let pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+
+        fs::rename(src.path().join("Docs"), src.path().join("docs")).unwrap();
+        let preview = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
+        assert_no_case_collisions(&preview, &[(SyncDirection::ToSource, "docs/Report.txt"), (SyncDirection::ToDest, "Docs/Report.txt")]);
+        assert_eq!(preview.total_deletions + preview.total_additions, 0);
+        assert!(preview.source_dirs_to_remove.is_empty() && preview.dirs_to_remove.is_empty());
+        for _ in 0..2 {
+            let out = run_two_way(&pair, &mut base);
+            assert_eq!((out.report.files_added, out.report.files_deleted), (0, 0));
+            assert_eq!(fs::read_to_string(src.path().join("docs/Report.txt")).unwrap(), "r");
+            assert_eq!(fs::read_to_string(dst.path().join("Docs/Report.txt")).unwrap(), "r");
+        }
+    }
+
+    /// First run (no baseline): the two names would be copied across each
+    /// other — on a case-insensitive drive, each over the other's file.
+    #[test]
+    fn two_way_first_run_skips_names_differing_only_in_case() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("Notes.md"), "from source").unwrap();
+        fs::write(dst.path().join("notes.md"), "from destination").unwrap();
+        let pair = two_way(src.path(), dst.path());
+        let preview = planner::plan(&pair, &planner::PlanContext::default()).unwrap().preview;
+        assert_eq!(preview.total_additions, 0, "{:?}", preview.additions);
+        assert_eq!(preview.total_skipped, 2);
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+        assert_eq!(fs::read_to_string(src.path().join("Notes.md")).unwrap(), "from source");
+        assert_eq!(fs::read_to_string(dst.path().join("notes.md")).unwrap(), "from destination");
+        assert!(!src.path().join("notes.md").exists() && !dst.path().join("Notes.md").exists());
+    }
+
+    /// Names present on both sides in every case (case-sensitive drives at
+    /// both ends) still sync normally.
+    #[test]
+    fn two_way_case_variants_present_on_both_sides_still_sync() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("A.txt"), "upper").unwrap();
+        fs::write(src.path().join("a.txt"), "lower").unwrap();
+        let pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+        assert!(dst.path().join("A.txt").exists() && dst.path().join("a.txt").exists());
+        fs::write(src.path().join("A.txt"), "upper, edited").unwrap();
+        let out = run_two_way(&pair, &mut base);
+        assert_eq!(out.report.files_modified, 1);
+        assert_eq!(fs::read_to_string(dst.path().join("A.txt")).unwrap(), "upper, edited");
+        assert_eq!(fs::read_to_string(dst.path().join("a.txt")).unwrap(), "lower");
+    }
+
+    /// Second safeguard: a delete goes through only when the folder lists
+    /// the file under exactly the planned name.
+    #[test]
+    fn delete_needs_the_exact_name_in_its_folder() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Exact.txt"), "x").unwrap();
+        fs::write(dir.path().join("123"), "x").unwrap();
+        fs::write(dir.path().join("ab"), "x").unwrap();
+        fs::write(dir.path().join("AB"), "y").unwrap();
+        let mut names = ListedNames::default();
+        assert!(names.lists_exactly(&dir.path().join("Exact.txt")));
+        assert!(names.lists_exactly(&dir.path().join("123")));
+        // Both cases exist: the folder listing decides.
+        assert!(names.lists_exactly(&dir.path().join("ab")));
+        assert!(names.lists_exactly(&dir.path().join("AB")));
+        // What a case-insensitive drive would open as Exact.txt.
+        assert!(!names.lists_exactly(&dir.path().join("exact.txt")));
+        assert!(!names.lists_exactly(&dir.path().join("EXACT.TXT")));
+    }
+
     #[test]
     fn two_way_first_run_never_deletes() {
         let src = TempDir::new().unwrap();
@@ -2247,6 +2456,7 @@ mod tests {
         fs::write(src.path().join("new2.txt"), "n2").unwrap();
         let preview = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
         assert_eq!(preview.total_deletions, 0, "must not plan to delete moved files");
+        assert!(preview.notes.iter().any(|n| n.contains("Move files (/MOV) is on for this two-way pair")), "{:?}", preview.notes);
         let second = run_two_way(&pair, &mut base);
         assert_eq!(second.report.files_deleted, 0);
         assert_eq!(fs::read_to_string(dst.path().join("moved.txt")).unwrap(), "moved", "DATA LOSS: moved file deleted from the destination");

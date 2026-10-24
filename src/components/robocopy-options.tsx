@@ -373,8 +373,16 @@ export function RobocopyOptionsSection({
             onChange={(v) => set("two_way_max_delete_percent", v)}
           />
         )}
-        <Check label="Move files (delete from source after copying)" flag="/MOV" checked={options.move_files} onChange={(v) => onChange({ ...options, move_files: v, move_dirs: v && options.move_dirs })} />
-        {options.move_files && (
+        {/* Two-way pairs cannot move: a moved file would be copied back on the next run. */}
+        {mode !== "two_way" && (
+          <Check
+            label={mode === "any" ? "Move files (delete from source after copying; not used by two-way pairs)" : "Move files (delete from source after copying)"}
+            flag="/MOV"
+            checked={options.move_files}
+            onChange={(v) => onChange({ ...options, move_files: v, move_dirs: v && options.move_dirs })}
+          />
+        )}
+        {mode !== "two_way" && options.move_files && (
           <Check label="…and remove emptied source folders" flag="/MOVE" checked={options.move_dirs} onChange={(v) => set("move_dirs", v)} />
         )}
         <Check label="Keep file dates" flag="/COPY:T" checked={options.copy_timestamps} onChange={(v) => set("copy_timestamps", v)} />

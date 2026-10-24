@@ -35,7 +35,9 @@ pub enum Direction {
 }
 
 /// One timetable entry: on `days`, between `start` and `end`, limit
-/// uploads and downloads to these rates (bytes/second, 0 = unlimited).
+/// uploads and downloads to these rates (bytes/second). A window's 0 for a
+/// direction sets no limit of its own: the base rate stays (or the first
+/// other active window that limits that direction applies).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct BandwidthWindow {
@@ -97,6 +99,13 @@ pub fn validate_schedule(windows: &[BandwidthWindow]) -> Result<(), AppError> {
 /// The first window active at `t`.
 pub fn window_at(windows: &[BandwidthWindow], t: NaiveDateTime) -> Option<&BandwidthWindow> {
     windows.iter().find(|w| w.active_at(t))
+}
+
+/// The limit for direction `d` at `t`: that of the first window active at
+/// `t` that limits `d` (a window's 0 for `d` sets no limit of its own, so a
+/// download-only window never hides a later window's upload limit).
+pub fn limit_at(windows: &[BandwidthWindow], t: NaiveDateTime, d: Direction) -> Option<u64> {
+    windows.iter().filter(|w| w.active_at(t)).map(|w| w.limit(d)).find(|&l| l > 0)
 }
 
 static SCHEDULE: RwLock<Vec<BandwidthWindow>> = RwLock::new(Vec::new());
@@ -168,11 +177,11 @@ impl SharedRate {
         self.rate_with(&SCHEDULE.read().unwrap_or_else(|e| e.into_inner()), t)
     }
 
-    /// The rate at `t` under `windows` (for tests and previews). A window's
-    /// 0 for this direction sets no limit of its own: the base rate stays
-    /// in force (so a download-only window leaves the upload cap alone).
+    /// The rate at `t` under `windows` (for tests and previews): the first
+    /// active window that limits this direction ([`limit_at`]); otherwise
+    /// the base rate (so a download-only window leaves the upload cap alone).
     pub fn rate_with(&self, windows: &[BandwidthWindow], t: NaiveDateTime) -> u64 {
-        match self.scheduled.and_then(|d| window_at(windows, t).map(|w| w.limit(d))).filter(|&l| l > 0) {
+        match self.scheduled.and_then(|d| limit_at(windows, t, d)) {
             Some(limit) => limit,
             None if self.window_only => 0,
             None => self.base(),
@@ -292,6 +301,29 @@ mod tests {
         assert_eq!(SharedRate::scheduled(Direction::Upload).rate_with(&windows, at(19, 9, 0)), 0);
         // The timetable-only rate has no cap outside its limits either.
         assert_eq!(SharedRate::window_only(Direction::Upload).rate_with(&windows, at(19, 9, 0)), 0);
+    }
+
+    /// Regression (review): only the first active window was read, for both
+    /// directions, so a download-only window listed before an overlapping
+    /// upload window hid that window's upload limit. Each direction takes
+    /// the first active window that limits it.
+    #[test]
+    fn overlapping_windows_are_read_per_direction() {
+        let windows = vec![
+            BandwidthWindow { days: vec![], start: "08:00".into(), end: "18:00".into(), upload_bps: 0, download_bps: 2_000 },
+            BandwidthWindow { days: vec![], start: "09:00".into(), end: "12:00".into(), upload_bps: 700, download_bps: 0 },
+            BandwidthWindow { days: vec![], start: "09:00".into(), end: "12:00".into(), upload_bps: 300, download_bps: 100 },
+        ];
+        let up = SharedRate::scheduled(Direction::Upload);
+        up.set(50_000);
+        let down = SharedRate::scheduled(Direction::Download);
+        down.set(90_000);
+        assert_eq!(up.rate_with(&windows, at(19, 10, 0)), 700, "the upload window behind the download-only one applies");
+        assert_eq!(down.rate_with(&windows, at(19, 10, 0)), 2_000, "the first window limiting downloads wins");
+        assert_eq!(up.rate_with(&windows, at(19, 13, 0)), 50_000, "only the download window is active: base upload rate");
+        assert_eq!(down.rate_with(&windows, at(19, 13, 0)), 2_000);
+        assert_eq!(SharedRate::window_only(Direction::Upload).rate_with(&windows, at(19, 10, 0)), 700);
+        assert_eq!(limit_at(&windows, at(19, 7, 0), Direction::Upload), None);
     }
 
     #[test]

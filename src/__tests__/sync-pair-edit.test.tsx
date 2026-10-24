@@ -7,7 +7,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke
 
 import { SyncPanel } from "@/components/sync-panel";
 import { DEFAULT_COPY_OPTIONS } from "@/lib/copy-options";
-import { changedOptionKeys, emptyPairForm, filterFromForm, formFromPair, layerOptions, pairFromForm } from "@/lib/sync-pair-form";
+import { changedOptionKeys, emptyPairForm, filterFromForm, formFromPair, layerOptions, optionsForMode, pairFromForm } from "@/lib/sync-pair-form";
 import { useUIStore } from "@/stores/ui-store";
 import type { SyncPair } from "@/stores/sync-store";
 
@@ -122,6 +122,52 @@ describe("sync pair form mapping", () => {
     // Setting an overridden option to the default in the form resets it: it follows the defaults again.
     const reset = pairFromForm({ ...form, copyOptions: { ...form.copyOptions, retries: 3 } }, pinned, { ...defaults, retries: 3 });
     expect(reset.option_overrides).toEqual(["threads"]);
+  });
+});
+
+// Review: /MOV has no meaning for two-way pairs (moved files are copied
+// back on the next run); the backend now refuses it, so the form never sends it.
+describe("two-way pairs never move", () => {
+  it("drops /MOV and /MOVE from a two-way pair's options", () => {
+    const moving = { ...DEFAULT_COPY_OPTIONS, move_files: true, move_dirs: true, threads: 4 };
+    expect(optionsForMode(moving, "two_way")).toMatchObject({ move_files: false, move_dirs: false, threads: 4 });
+    expect(optionsForMode(moving, "one_way")).toBe(moving);
+    const form = { ...formFromPair(pair), mode: "two_way", copyOptions: moving };
+    const saved = pairFromForm(form, pair, DEFAULT_COPY_OPTIONS);
+    expect(saved.copy_options).toMatchObject({ move_files: false, move_dirs: false });
+  });
+
+  it("creates a two-way pair without /MOV even when the defaults move", async () => {
+    backend({ list_sync_pairs: () => [], get_sync_default_options: () => ({ ...DEFAULT_COPY_OPTIONS, move_files: true }) });
+    render(<SyncPanel />);
+    fireEvent.click(await screen.findByLabelText("Create new sync pair"));
+    fireEvent.change(screen.getByPlaceholderText("My Backup"), { target: { value: "Both ways" } });
+    fireEvent.change(screen.getByPlaceholderText("/home/user/documents"), { target: { value: "/a" } });
+    fireEvent.change(screen.getByPlaceholderText("/backup/documents"), { target: { value: "/b" } });
+    fireEvent.change(screen.getByDisplayValue("One-Way (Source to Destination)"), { target: { value: "two_way" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Sync Pair" }));
+    await waitFor(() => expect(called("create_sync_pair").length).toBe(1));
+    const args = called("create_sync_pair")[0];
+    expect(JSON.parse(args.optionsJson as string)).toMatchObject({ move_files: false, move_dirs: false });
+  });
+});
+
+// Review: Rollback stayed enabled during a run of the same pair.
+describe("rollback during a run", () => {
+  it("disables Rollback while a sync is running", async () => {
+    let finish: (v: unknown) => void = () => {};
+    backend({ run_sync: () => new Promise((r) => (finish = r)) });
+    render(<SyncPanel />);
+    const rollback = await screen.findByLabelText("Rollback last sync for Photos");
+    expect(rollback).not.toBeDisabled();
+    fireEvent.click(screen.getByLabelText("Run sync for Photos"));
+    await waitFor(() => expect(screen.getByLabelText("Rollback last sync for Photos")).toBeDisabled());
+    finish({
+      id: "r", pair_id: "p1", pair_name: "Photos", started_at: "2026-10-01T00:00:00Z", ended_at: "2026-10-01T00:00:01Z",
+      duration_ms: 1000, files_added: 0, files_modified: 0, files_deleted: 0, files_skipped: 0, conflicts_resolved: 0,
+      errors: 0, bytes_transferred: 0, status: "completed", health: "green", error_messages: [], resumed: false,
+    });
+    await waitFor(() => expect(called("list_sync_pairs").length).toBeGreaterThan(1));
   });
 });
 

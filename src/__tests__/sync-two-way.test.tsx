@@ -113,6 +113,17 @@ describe("compare mode and presets", () => {
     expect(screen.getByText(/Stop if a run would delete more than/)).toBeInTheDocument();
   });
 
+  // Review: /MOV was offered for two-way pairs, which then moved files and
+  // copied them back on the next run.
+  it("does not offer moving for two-way pairs", () => {
+    const { rerender } = render(<RobocopyOptionsSection options={DEFAULT_COPY_OPTIONS} onChange={vi.fn()} mode="two_way" windows={false} />);
+    expect(screen.queryByText(/Move files/)).toBeNull();
+    rerender(<RobocopyOptionsSection options={DEFAULT_COPY_OPTIONS} onChange={vi.fn()} mode="one_way" windows={false} />);
+    expect(screen.getByText(/Move files/)).toBeInTheDocument();
+    rerender(<RobocopyOptionsSection options={DEFAULT_COPY_OPTIONS} onChange={vi.fn()} mode="any" windows={false} />);
+    expect(screen.getByText(/Move files.*not used by two-way pairs/)).toBeInTheDocument();
+  });
+
   it("keeps the Ignore existing preset for the Advanced view", () => {
     const onPick = vi.fn();
     const { rerender } = render(<CopyPresetPicker activeId={null} onPick={onPick} />);

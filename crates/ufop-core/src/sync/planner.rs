@@ -679,6 +679,10 @@ pub fn diff_trees(
     if pair.mode == SyncMode::TwoWay && pair.dest_state == DestStateMode::TrustedInventory {
         acc.notes.push("Two-way pairs scan the destination every run: a saved inventory cannot show changes made there.".to_string());
     }
+    // Saved before two-way pairs refused it (`copier::validate_for_mode`).
+    if pair.mode == SyncMode::TwoWay && (opts.move_files || opts.move_dirs) {
+        acc.notes.push("Move files (/MOV) is on for this two-way pair: a moved file is copied back to the source on the next run. Edit the pair to turn it off.".to_string());
+    }
     acc.notes.extend(cmp.notes());
     let Acc { additions, modifications, deletions, skipped, conflicts, path_warnings, total_bytes, fixups, settled, notes } = acc;
     let purge_extras = purges_extras(pair);
@@ -871,6 +875,10 @@ fn diff_legacy(
     let skip = |rel_path: &str, src: &FileMeta, reason: &str| {
         diff_entry(rel_path, SyncAction::Skip, Some(src), dest_map.get(rel_path).copied(), reason, SyncDirection::ToDest, None)
     };
+    // First two-way run: names differing only in case would be copied
+    // across each other, on a case-insensitive drive each over the other.
+    let cases = (pair.mode == SyncMode::TwoWay).then(|| CaseVariants::new(source_map, dest_map));
+    let mut case_skips = 0usize;
 
     // Process source files
     for (rel_path, src) in source_map {
@@ -956,6 +964,9 @@ fn diff_legacy(
             }
         } else if opts.exclude_lonely {
             acc.push(skip(rel_path, src, "Not present at destination (/XL)"));
+        } else if let Some(other) = cases.as_ref().and_then(|c| c.other_name(rel_path, true)) {
+            case_skips += 1;
+            acc.push(CaseVariants::skip(rel_path, Some(src), None, other));
         } else {
             // New file at source
             acc.push(diff_entry(rel_path, SyncAction::Add, Some(src), None, "New file in source", SyncDirection::ToDest, path_warning));
@@ -982,6 +993,11 @@ fn diff_legacy(
             for (rel_path, dest) in dest_map {
                 check_cancel(ctx)?;
                 if !source_map.contains_key(rel_path) && exclusion_reason(rel_path, dest, pair, filter, source_root, now).is_none() {
+                    if let Some(other) = cases.as_ref().and_then(|c| c.other_name(rel_path, false)) {
+                        case_skips += 1;
+                        acc.push(CaseVariants::skip(rel_path, None, Some(dest), other));
+                        continue;
+                    }
                     acc.push(diff_entry(
                         rel_path,
                         SyncAction::Add,
@@ -998,7 +1014,57 @@ fn diff_legacy(
             // OneWay, VersionedBackup, or /XX: no deletions from dest
         }
     }
+    if case_skips > 0 {
+        acc.notes.push(CaseVariants::note(case_skips));
+    }
     Ok(())
+}
+
+/// Names differing only in letter case, per side. On a drive that ignores
+/// case (the macOS and Windows defaults) `A.txt` and `a.txt` are one file,
+/// so two-way sync must not read a case-only rename as a delete plus an
+/// add: the add writes over the file, the delete then removes it through
+/// its old name, and the next run deletes the other side's copy as
+/// "deleted". A path on one side only whose other side has the same name
+/// in another case is skipped until the names match again.
+struct CaseVariants<'a> {
+    source: HashMap<String, Vec<&'a str>>,
+    dest: HashMap<String, Vec<&'a str>>,
+}
+
+impl<'a> CaseVariants<'a> {
+    fn new(source_map: &HashMap<&'a str, &FileMeta>, dest_map: &HashMap<&'a str, &FileMeta>) -> Self {
+        let group = |map: &HashMap<&'a str, &FileMeta>| {
+            let mut out: HashMap<String, Vec<&'a str>> = HashMap::new();
+            for p in map.keys() {
+                out.entry(p.to_lowercase()).or_default().push(*p);
+            }
+            out
+        };
+        Self { source: group(source_map), dest: group(dest_map) }
+    }
+
+    /// For `rel_path`, present on one side only (`in_source`): the name the
+    /// other side has for it in a different letter case, if any.
+    fn other_name(&self, rel_path: &str, in_source: bool) -> Option<&'a str> {
+        let other = if in_source { &self.dest } else { &self.source };
+        let mut names: Vec<&'a str> = other.get(&rel_path.to_lowercase())?.iter().copied().filter(|n| *n != rel_path).collect();
+        names.sort_unstable();
+        names.first().copied()
+    }
+
+    /// The skip entry for such a path (`other`: its name on the other side).
+    fn skip(rel_path: &str, src: Option<&FileMeta>, dst: Option<&FileMeta>, other: &str) -> SyncDiffEntry {
+        let (direction, side) = if src.is_some() { (SyncDirection::ToDest, "destination") } else { (SyncDirection::ToSource, "source") };
+        let reason = format!(
+            "The {side} has this file as \"{other}\": names that differ only in letter case are one file on drives that ignore case, so neither is synced. Rename one side to match"
+        );
+        diff_entry(rel_path, SyncAction::Skip, src, dst, reason, direction, None)
+    }
+
+    fn note(count: usize) -> String {
+        format!("{count} file(s) have names that differ only in letter case between the source and the destination and were skipped: on drives that ignore case they are one file, so copying or deleting either name could remove it. Rename one side to match.")
+    }
 }
 
 /// Two-way with a baseline: a three-way diff of source, destination and
@@ -1036,6 +1102,8 @@ fn diff_two_way(
     paths.sort_unstable();
     paths.dedup();
 
+    let cases = CaseVariants::new(source_map, dest_map);
+    let mut case_skips = 0usize;
     let (mut deletes_in_source, mut deletes_in_dest) = (0usize, 0usize);
     for rel_path in paths {
         check_cancel(ctx)?;
@@ -1052,6 +1120,19 @@ fn diff_two_way(
             if let Some(s) = src {
                 acc.push(diff_entry(rel_path, SyncAction::Skip, Some(s), dst, reason, SyncDirection::ToDest, None));
             }
+            continue;
+        }
+        // Renamed in letter case only, or never matched up: skip it, and
+        // forget its history so a later run never deletes by it.
+        let other_case = match (src, dst) {
+            (Some(_), None) => cases.other_name(rel_path, true),
+            (None, Some(_)) => cases.other_name(rel_path, false),
+            _ => None,
+        };
+        if let Some(other) = other_case {
+            case_skips += 1;
+            acc.push(CaseVariants::skip(rel_path, src, dst, other));
+            acc.settled.push((rel_path.to_string(), None));
             continue;
         }
         let to_dest_warning = || check_path_length(&pair.dest_path, rel_path);
@@ -1122,6 +1203,9 @@ fn diff_two_way(
         }
     }
 
+    if case_skips > 0 {
+        acc.notes.push(CaseVariants::note(case_skips));
+    }
     check_delete_safety(pair, baseline, dest_map.is_empty(), deletes_in_source, "source")?;
     check_delete_safety(pair, baseline, source_map.is_empty(), deletes_in_dest, "destination")?;
     Ok(())

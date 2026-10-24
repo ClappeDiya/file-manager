@@ -97,7 +97,7 @@ pub async fn create_sync_pair(
         })?,
         None => CopyOptions::default(),
     };
-    crate::sync_engine::copier::validate_options(&copy_options)?;
+    crate::sync_engine::copier::validate_for_mode(&copy_options, sync_mode)?;
     let run_options: ufop_core::sync_types::SyncRunOptions = match run_options_json {
         Some(j) => serde_json::from_str(&j).map_err(|e| AppError::Sync {
             message: format!("Invalid run options: {}", e),
@@ -253,7 +253,7 @@ pub async fn update_sync_pair(
         message: format!("Invalid sync pair data: {}", e),
         advice: "Check the sync pair configuration.".to_string(),
     })?;
-    crate::sync_engine::copier::validate_options(&pair.copy_options)?;
+    crate::sync_engine::copier::validate_for_mode(&pair.copy_options, pair.mode)?;
     ufop_core::sync::executor::validate_run_options(&pair.run_options)?;
     ufop_core::sync::filter::validate(&pair.filter)?;
     if let Some(own) = &pair.option_overrides {

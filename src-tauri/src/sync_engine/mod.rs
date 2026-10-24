@@ -642,7 +642,28 @@ impl SyncManager {
     }
 
     /// Rollback the last sync run for a pair.
+    ///
+    /// Never while the pair is syncing: the restore would race the run's
+    /// writes, and the run would then save a two-way baseline recording the
+    /// restored paths as in sync again. The rollback holds the pair's run
+    /// slot itself, so no run starts until it is done.
     pub async fn rollback_last_run(&self, pair_id: Uuid) -> Result<u64, AppError> {
+        {
+            let mut running = self.running.write().await;
+            if running.contains_key(&pair_id) {
+                return Err(AppError::Sync {
+                    message: "This pair is syncing; its last run cannot be rolled back now.".to_string(),
+                    advice: "Wait for the run to finish, or cancel it, then roll back.".to_string(),
+                });
+            }
+            running.insert(pair_id, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        }
+        let result = self.rollback_last_run_unlocked(pair_id).await;
+        self.running.write().await.remove(&pair_id);
+        result
+    }
+
+    async fn rollback_last_run_unlocked(&self, pair_id: Uuid) -> Result<u64, AppError> {
         let snapshots = {
             let snap_map = self.snapshots.read().await;
             snap_map.get(&pair_id).cloned().unwrap_or_default()
@@ -2062,6 +2083,33 @@ mod tests {
         let restored = mgr.rollback_last_run(pair.id).await.unwrap();
         assert_eq!(restored, 1);
         assert_eq!(std::fs::read_to_string(dst.path().join("extra.txt")).unwrap(), "precious");
+    }
+
+    /// Regression (review): a rollback during a run of the same pair raced
+    /// the run's file writes, and the run then saved a two-way baseline
+    /// recording the rolled-back paths as in sync again. Rollback waits for
+    /// the run, and a run cannot start during a rollback.
+    #[tokio::test]
+    async fn rollback_is_refused_while_the_pair_is_syncing() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        std::fs::write(dst.path().join("extra.txt"), "precious").unwrap();
+        let pair = temp_pair(src.path(), dst.path(), SyncMode::Mirror);
+        let (mgr, _state) = mgr_with(&pair).await;
+        mgr.execute_sync(pair.id).await.unwrap();
+        assert!(!dst.path().join("extra.txt").exists());
+
+        mgr.running.write().await.insert(pair.id, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let err = mgr.rollback_last_run(pair.id).await.unwrap_err();
+        assert!(matches!(&err, AppError::Sync { message, .. } if message.contains("syncing")), "{err:?}");
+        assert!(!dst.path().join("extra.txt").exists(), "nothing restored during the run");
+        mgr.running.write().await.remove(&pair.id);
+
+        // Once the run is over the rollback works, and frees the pair again.
+        assert_eq!(mgr.rollback_last_run(pair.id).await.unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(dst.path().join("extra.txt")).unwrap(), "precious");
+        assert!(mgr.running.read().await.get(&pair.id).is_none());
+        assert!(!mgr.cancel_sync(pair.id).await, "a finished rollback leaves no run behind");
     }
 
     #[tokio::test]

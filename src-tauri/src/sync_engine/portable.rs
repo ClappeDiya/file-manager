@@ -103,7 +103,7 @@ pub fn parse(json: &str) -> Result<PairExport, AppError> {
     if p.name.trim().is_empty() || p.source_path.trim().is_empty() || p.dest_path.trim().is_empty() {
         return Err(AppError::validation("The exported pair needs a name, a source and a destination"));
     }
-    ufop_core::sync::copier::validate_options(&p.copy_options)?;
+    ufop_core::sync::copier::validate_for_mode(&p.copy_options, p.mode)?;
     ufop_core::sync::executor::validate_run_options(&p.run_options)?;
     ufop_core::sync::filter::validate(&p.filter)?;
     if let Some(own) = &p.option_overrides {
@@ -188,6 +188,12 @@ mod tests {
         v["pair"]["name"] = "x".into();
         v["pair"]["copy_options"]["threads"] = 0.into();
         assert!(parse(&v.to_string()).is_err(), "invalid options are refused");
+        v["pair"]["copy_options"]["threads"] = 8.into();
+        v["pair"]["mode"] = "two_way".into();
+        v["pair"]["copy_options"]["move_files"] = true.into();
+        assert!(parse(&v.to_string()).unwrap_err().to_string().contains("two-way"), "two-way with /MOV is refused");
+        v["pair"]["mode"] = "one_way".into();
+        assert!(parse(&v.to_string()).is_ok());
     }
 
     /// Review: create and update refuse unknown `option_overrides` names, but

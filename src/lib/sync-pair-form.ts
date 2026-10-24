@@ -97,6 +97,16 @@ export function filterFromForm(form: SyncPairForm): SyncFilter {
   };
 }
 
+/**
+ * The options a pair in `mode` saves. Two-way pairs never move (/MOV,
+ * /MOVE): a moved file would be copied back on the next run, and the
+ * backend refuses the combination.
+ */
+export function optionsForMode(options: CopyOptions, mode: string): CopyOptions {
+  if (mode !== "two_way" || (!options.move_files && !options.move_dirs)) return options;
+  return { ...options, move_files: false, move_dirs: false };
+}
+
 /** Option names whose value differs from `defaults`. */
 export function changedOptionKeys(options: CopyOptions, defaults: CopyOptions): string[] {
   return (Object.keys(DEFAULT_COPY_OPTIONS) as (keyof CopyOptions)[]).filter(
@@ -171,10 +181,10 @@ export function pairFromForm(form: SyncPairForm, original: SyncPair, defaults: C
     dest_state: form.destState as SyncPair["dest_state"],
     checksum_algorithm: form.checksumAlgorithm as SyncPair["checksum_algorithm"],
     time_offset_secs: form.timeOffsetSecs,
-    copy_options: form.copyOptions,
+    copy_options: optionsForMode(form.copyOptions, form.mode),
     run_options: form.runOptions,
     // Pairs from before layering keep all their own options.
-    option_overrides: original.option_overrides ? editedOverrides(form.copyOptions, original, defaults) : null,
+    option_overrides: original.option_overrides ? editedOverrides(optionsForMode(form.copyOptions, form.mode), original, defaults) : null,
   };
 }
 

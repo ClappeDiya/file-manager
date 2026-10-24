@@ -118,6 +118,20 @@ pub fn validate_options(opts: &CopyOptions) -> Result<(), AppError> {
     Ok(())
 }
 
+/// [`validate_options`] for a pair in `mode`. Two-way pairs cannot move
+/// (/MOV, /MOVE): a moved file is gone from the source, so the next run
+/// finds it only in the destination and copies it back.
+pub fn validate_for_mode(opts: &CopyOptions, mode: SyncMode) -> Result<(), AppError> {
+    validate_options(opts)?;
+    if mode == SyncMode::TwoWay && (opts.move_files || opts.move_dirs) {
+        return Err(sync_err(
+            "Move files (/MOV, /MOVE) cannot be used with two-way sync: moved files would be copied back on the next run.".to_string(),
+            "Turn off Move files, or use a one-way or mirror pair to move files.",
+        ));
+    }
+    Ok(())
+}
+
 /// Whether files are copied block by block: for /Z, /IPG, or whenever the
 /// bandwidth timetable (shared with backups and transfers; the backup caps
 /// do not apply here) has an upload limit, so that a window opening during
@@ -557,5 +571,22 @@ mod validate_tests {
             ..Default::default()
         };
         assert!(validate_options(&bad_threads).is_err());
+    }
+
+    /// Review: /MOV on a two-way pair moved a file and the next run copied
+    /// it back as "new in the destination". Moving has no meaning in two-way.
+    #[test]
+    fn move_is_refused_for_two_way_pairs() {
+        for (move_files, move_dirs) in [(true, false), (true, true), (false, true)] {
+            let opts = CopyOptions { move_files, move_dirs, ..Default::default() };
+            let err = validate_for_mode(&opts, SyncMode::TwoWay).unwrap_err();
+            assert!(err.to_string().contains("two-way"), "{err}");
+            for mode in [SyncMode::OneWay, SyncMode::Mirror, SyncMode::VersionedBackup] {
+                assert!(validate_for_mode(&opts, mode).is_ok());
+            }
+        }
+        assert!(validate_for_mode(&CopyOptions::default(), SyncMode::TwoWay).is_ok());
+        let bad_threads = CopyOptions { threads: 0, ..Default::default() };
+        assert!(validate_for_mode(&bad_threads, SyncMode::OneWay).is_err(), "still checks every option");
     }
 }

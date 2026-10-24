@@ -480,9 +480,23 @@ pub struct SyncPair {
 
 impl SyncPair {
     /// The pair as it runs: its own options over the global `defaults`.
+    /// A two-way pair never inherits moving (/MOV, /MOVE) from the
+    /// defaults: it has no meaning there (see `copier::validate_for_mode`).
     pub fn effective(&self, defaults: &CopyOptions) -> SyncPair {
         match &self.option_overrides {
-            Some(own) => SyncPair { copy_options: self.copy_options.layered_on(defaults, own), ..self.clone() },
+            Some(own) => {
+                let mut copy_options = self.copy_options.layered_on(defaults, own);
+                if self.mode == SyncMode::TwoWay {
+                    let inherited = |name: &str| !own.iter().any(|n| n == name);
+                    if inherited("move_files") {
+                        copy_options.move_files = false;
+                    }
+                    if inherited("move_dirs") {
+                        copy_options.move_dirs = false;
+                    }
+                }
+                SyncPair { copy_options, ..self.clone() }
+            }
             None => self.clone(),
         }
     }
@@ -937,5 +951,19 @@ mod tests {
         obj.remove("option_overrides");
         let back: SyncPair = serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
         assert!(back.option_overrides.is_none());
+    }
+
+    /// Review: a two-way pair layered on global defaults with /MOV turned on
+    /// would move files and copy them back on the next run.
+    #[test]
+    fn two_way_pairs_never_inherit_move_from_the_defaults() {
+        let defaults = CopyOptions { move_files: true, move_dirs: true, retries: 7, ..CopyOptions::default() };
+        let two_way = SyncPair { mode: SyncMode::TwoWay, option_overrides: Some(vec!["threads".into()]), ..Default::default() };
+        let eff = two_way.effective(&defaults).copy_options;
+        assert!(!eff.move_files && !eff.move_dirs);
+        assert_eq!(eff.retries, 7, "other defaults still apply");
+        let one_way = SyncPair { mode: SyncMode::OneWay, ..two_way };
+        let eff = one_way.effective(&defaults).copy_options;
+        assert!(eff.move_files && eff.move_dirs);
     }
 }

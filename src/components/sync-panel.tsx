@@ -28,6 +28,7 @@ import {
   emptyPairForm,
   filterFromForm,
   formFromPair,
+  optionsForMode,
   pairFromForm,
   type SyncPairForm,
 } from "@/lib/sync-pair-form";
@@ -309,9 +310,9 @@ export function SyncPanel() {
           destState: createForm.destState,
           checksumAlgorithm: createForm.checksumAlgorithm,
           timeOffsetSecs: createForm.timeOffsetSecs,
-          optionsJson: JSON.stringify(createForm.copyOptions),
+          optionsJson: JSON.stringify(optionsForMode(createForm.copyOptions, createForm.mode)),
           runOptionsJson: JSON.stringify(createForm.runOptions),
-          optionOverrides: changedOptionKeys(createForm.copyOptions, syncDefaults),
+          optionOverrides: changedOptionKeys(optionsForMode(createForm.copyOptions, createForm.mode), syncDefaults),
         });
       }
 
@@ -782,7 +783,9 @@ function PairListView({
               )}
               <button
                 onClick={() => onRollback(pair.id)}
-                className="px-2 py-1 text-xs rounded bg-yellow-100 text-yellow-800 hover:bg-yellow-200"
+                disabled={syncRunning}
+                title={syncRunning ? "Wait for the running sync to finish" : undefined}
+                className="px-2 py-1 text-xs rounded bg-yellow-100 text-yellow-800 hover:bg-yellow-200 disabled:opacity-50"
                 aria-label={`Rollback last sync for ${pair.name}`}
               >
                 Rollback
