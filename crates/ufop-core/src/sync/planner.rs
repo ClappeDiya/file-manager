@@ -811,7 +811,7 @@ fn diff_legacy(
         let path_warning = check_path_length(&pair.dest_path, rel_path);
 
         // Versioned mode: compare with the newest stored version.
-        if let Some(latest) = ctx.versions.filter(|_| pair.mode == SyncMode::VersionedBackup).and_then(|v| v.latest(rel_path)) {
+        if let Some(latest) = ctx.versions.filter(|_| pair.mode == SyncMode::VersionedBackup).and_then(|v| v.latest(rel_path)).filter(|v| super::versions::is_safe_relative(&v.path)) {
             let stored = FileMeta {
                 relative_path: latest.path.clone(),
                 absolute_path: dest_root.join(&latest.path),

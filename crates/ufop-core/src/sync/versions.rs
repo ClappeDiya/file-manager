@@ -54,8 +54,42 @@ pub struct PruneResult {
 
 impl VersionIndex {
     /// The index of `dest_root`; empty when there is none (or it is unreadable).
+    /// Entries whose path could lead outside the destination are dropped
+    /// ([`VersionIndex::load_checked`] says which).
     pub fn load(dest_root: &Path) -> Self {
-        std::fs::read(dest_root.join(VERSIONS_FILE)).ok().and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default()
+        Self::load_checked(dest_root).0
+    }
+
+    /// [`VersionIndex::load`], plus a message for every entry dropped
+    /// because its path is not a plain relative path inside the destination.
+    /// The index lives in the destination, so whoever can write there (a
+    /// shared drive, a synced cloud folder) can write it: nothing in it is
+    /// trusted to name a file to read, replace or delete.
+    pub fn load_checked(dest_root: &Path) -> (Self, Vec<String>) {
+        let mut index: Self = std::fs::read(dest_root.join(VERSIONS_FILE)).ok().and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default();
+        let rejected = index.drop_unsafe_paths();
+        (index, rejected)
+    }
+
+    /// Remove entries (and whole files) whose paths are not plain relative
+    /// paths; returns a message per removed entry.
+    fn drop_unsafe_paths(&mut self) -> Vec<String> {
+        let mut rejected = Vec::new();
+        self.files.retain(|rel, versions| {
+            if !is_safe_relative(rel) {
+                rejected.push(format!("Version index entry \"{rel}\" ignored: not a path inside the destination"));
+                return false;
+            }
+            versions.retain(|v| {
+                let ok = is_safe_relative(&v.path);
+                if !ok {
+                    rejected.push(format!("Version index entry \"{}\" (a version of {rel}) ignored: not a path inside the destination", v.path));
+                }
+                ok
+            });
+            !versions.is_empty()
+        });
+        rejected
     }
 
     /// Whether `dest_root` has an index (a destination without one was
@@ -159,7 +193,17 @@ impl VersionIndex {
                     kept.push(v);
                     continue;
                 }
-                match std::fs::remove_file(dest_root.join(&v.path)) {
+                let target = match resolve_inside(dest_root, &v.path) {
+                    Ok(Some(target)) => target,
+                    // Already gone.
+                    Ok(None) => continue,
+                    Err(why) => {
+                        // Not ours to delete: dropped from the index, file left alone.
+                        out.errors.push(format!("{}: old version not removed: {why}", v.path));
+                        continue;
+                    }
+                };
+                match std::fs::remove_file(&target) {
                     Ok(()) => out.removed.push(v.path),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
@@ -172,6 +216,41 @@ impl VersionIndex {
         }
         Ok(out)
     }
+}
+
+/// Whether `path` is a plain relative path: not empty, not absolute, no
+/// drive or root, and nothing but ordinary names (no `.` or `..`), with `\`
+/// read as a separator too so a Windows-style `..\x` is caught everywhere.
+pub fn is_safe_relative(path: &str) -> bool {
+    use std::path::Component;
+    let plain = |p: &Path| p.components().all(|c| matches!(c, Component::Normal(_)));
+    !path.trim().is_empty() && plain(Path::new(path)) && plain(Path::new(&path.replace('\\', "/")))
+}
+
+/// The file `rel` under `dest_root`, with its folder resolved through any
+/// symlinks: `Ok(None)` when its folder no longer exists, `Err` when `rel`
+/// is not a plain relative path or its folder resolves outside `dest_root`.
+/// The returned path's folder is the resolved one, so a symlinked folder
+/// cannot redirect the caller elsewhere; the file name itself is left as is
+/// (removing a symlink removes the link, not its target).
+fn resolve_inside(dest_root: &Path, rel: &str) -> Result<Option<PathBuf>, String> {
+    if !is_safe_relative(rel) {
+        return Err("not a path inside the destination".into());
+    }
+    let joined = dest_root.join(rel);
+    let (Some(parent), Some(name)) = (joined.parent(), joined.file_name()) else {
+        return Err("not a file path".into());
+    };
+    let root = dest_root.canonicalize().map_err(|e| format!("destination unavailable: {e}"))?;
+    let parent = match parent.canonicalize() {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !parent.starts_with(&root) {
+        return Err("its folder leads outside the destination".into());
+    }
+    Ok(Some(parent.join(name)))
 }
 
 /// Names the versions of one file from a pair's template.
@@ -229,6 +308,27 @@ mod tests {
 
     fn version(path: &str, mins_ago: i64) -> StoredVersion {
         StoredVersion { path: path.into(), size: 1, source_modified: None, stored_at: Utc::now() - chrono::Duration::minutes(mins_ago), seq: 0 }
+    }
+
+    #[test]
+    fn only_plain_relative_paths_are_safe() {
+        for ok in ["doc.v1.txt", "sub/doc.v1.txt", "sub\\doc.v1.txt", "a//b.txt"] {
+            assert!(is_safe_relative(ok), "{ok}");
+        }
+        for bad in ["", " ", "/etc/passwd", "../x", "a/../../x", "..\\x", "a\\..\\..\\x", "./x", "\\\\server\\share\\x"] {
+            assert!(!is_safe_relative(bad), "{bad}");
+        }
+        // A crafted index loses its bad entries on load, and says so.
+        let d = tempfile::tempdir().unwrap();
+        let mut idx = VersionIndex::default();
+        idx.record("doc.txt", version("doc.v1.txt", 2));
+        idx.record("doc.txt", version("../../etc/passwd", 1));
+        idx.record("../escape.txt", version("escape.v1.txt", 1));
+        idx.save(d.path()).unwrap();
+        let (loaded, rejected) = VersionIndex::load_checked(d.path());
+        assert_eq!(rejected.len(), 2, "{rejected:?}");
+        assert_eq!(loaded.files.keys().collect::<Vec<_>>(), vec!["doc.txt"]);
+        assert_eq!(loaded.files["doc.txt"].len(), 1);
     }
 
     #[test]

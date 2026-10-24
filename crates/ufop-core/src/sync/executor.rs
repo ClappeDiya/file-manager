@@ -189,7 +189,10 @@ pub fn execute_sync_with(
     }
     // A checkpoint counts only for the folders and mode it was written for.
     let resume = config.resume_from.as_ref().filter(|c| c.matches(pair));
-    let mut index = if pair.mode == SyncMode::VersionedBackup { VersionIndex::load(Path::new(&pair.dest_path)) } else { VersionIndex::default() };
+    // Index entries naming paths outside the destination are dropped here
+    // and reported with the run's errors.
+    let (mut index, rejected_versions) =
+        if pair.mode == SyncMode::VersionedBackup { VersionIndex::load_checked(Path::new(&pair.dest_path)) } else { Default::default() };
     // First run on a destination without an index (stored by an older
     // version of the app): take over the version files already there.
     let adopted_versions = if pair.mode == SyncMode::VersionedBackup && !VersionIndex::exists(Path::new(&pair.dest_path)) {
@@ -242,9 +245,11 @@ pub fn execute_sync_with(
     // so the report agrees with the preview.
     let mut files_skipped: u64 = preview.total_skipped;
     let mut conflicts_resolved: u64 = 0;
-    let mut errors: u32 = 0;
     let mut bytes_transferred: u64 = 0;
-    let mut error_messages: Vec<String> = Vec::new();
+    // A rejected index entry is reported once; saving the index drops it.
+    let rejected_count = rejected_versions.len();
+    let mut errors: u32 = rejected_count as u32;
+    let mut error_messages: Vec<String> = rejected_versions;
     let mut log_lines: Vec<String> = Vec::new();
     let resumed = resume.is_some();
     // Steps the interrupted run already did, whose result is still in place,
@@ -554,7 +559,7 @@ pub fn execute_sync_with(
         let StoredVersions { mut index, stored } = stored_versions;
         let stored = stored.into_inner().unwrap_or_default();
         let keep = pair.run_options.keep_versions.filter(|k| *k > 0);
-        if !stored.is_empty() || keep.is_some() || recovered_versions > 0 || adopted_versions {
+        if !stored.is_empty() || keep.is_some() || recovered_versions > 0 || adopted_versions || rejected_count > 0 {
             for (rel, v) in stored {
                 index.record(&rel, v);
             }
@@ -812,7 +817,7 @@ fn recover_versions(index: &mut VersionIndex, dest_root: &Path, checkpoint: &Syn
         .completed
         .iter()
         .filter_map(|(rel, step)| step.version.as_ref().map(|v| (rel, v)))
-        .filter(|(_, v)| !known.contains(&v.path))
+        .filter(|(rel, v)| crate::sync::versions::is_safe_relative(rel) && crate::sync::versions::is_safe_relative(&v.path) && !known.contains(&v.path))
         .filter(|(_, v)| fs::metadata(dest_root.join(&v.path)).is_ok_and(|m| m.is_file() && m.len() == v.size))
         .collect();
     found.sort_by_key(|(_, v)| v.seq);
@@ -836,8 +841,8 @@ fn step_result_in_place(pair: &SyncPair, checkpoint: &SyncCheckpoint, entry: &Sy
     }
     let target = if pair.mode == SyncMode::VersionedBackup && entry.direction == SyncDirection::ToDest {
         match &step.version {
-            Some(v) => target_root.join(&v.path),
-            None => return false,
+            Some(v) if crate::sync::versions::is_safe_relative(&v.path) => target_root.join(&v.path),
+            _ => return false,
         }
     } else {
         target_root.join(&entry.relative_path)
@@ -2619,6 +2624,58 @@ mod tests {
         dated.run_options.version_template = Some("{name}~{num:3}.{ext}".into());
         fs::write(dst.path().join("doc~001.txt"), "x").unwrap();
         assert_eq!(VersionIndex::default().adopt_unindexed(&dated, ["doc.txt"]), 1);
+    }
+
+    /// Regression (security): pruning deleted `dest_root.join(path)` for
+    /// whatever paths the destination's version index listed, so an index
+    /// written by anyone with access to the destination (a shared NAS, a
+    /// mounted cloud folder) could make a run delete any file: an absolute
+    /// path replaces the root, `..` climbs out of it, a folder symlink
+    /// leads elsewhere. Such entries are now dropped and reported.
+    #[test]
+    fn pruning_never_deletes_outside_the_destination() {
+        let outside = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        let dst = root.path().join("dest");
+        fs::create_dir(&dst).unwrap();
+        let absolute = outside.path().join("absolute.txt");
+        fs::write(&absolute, "keep me").unwrap();
+        let sibling = root.path().join("sibling.txt");
+        fs::write(&sibling, "keep me too").unwrap();
+        fs::write(outside.path().join("linked.txt"), "and me").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), dst.join("link")).unwrap();
+        fs::write(dst.join("doc.v1.txt"), "old").unwrap();
+        let old = |path: &str, mins: i64| StoredVersion { path: path.into(), size: 1, source_modified: None, stored_at: Utc::now() - chrono::Duration::minutes(mins), seq: 0 };
+        let mut index = VersionIndex::default();
+        index.record("doc.txt", old(&absolute.to_string_lossy(), 50));
+        index.record("doc.txt", old("../sibling.txt", 40));
+        index.record("doc.txt", old("sub/../../sibling.txt", 35));
+        #[cfg(unix)]
+        index.record("doc.txt", old("link/linked.txt", 30));
+        index.record("doc.txt", StoredVersion { seq: 1, ..old("doc.v1.txt", 20) });
+        index.save(&dst).unwrap();
+
+        fs::write(src.path().join("doc.txt"), "new, longer").unwrap();
+        let mut pair = make_test_pair(src.path(), &dst);
+        pair.mode = SyncMode::VersionedBackup;
+        pair.run_options.keep_versions = Some(1);
+        let r = run_with(pair);
+
+        assert_eq!(fs::read_to_string(&absolute).unwrap(), "keep me", "absolute index path deleted");
+        assert_eq!(fs::read_to_string(&sibling).unwrap(), "keep me too", "../ index path deleted");
+        assert_eq!(fs::read_to_string(outside.path().join("linked.txt")).unwrap(), "and me", "path through a folder symlink deleted");
+        // The legitimate old version is still pruned.
+        assert!(!dst.join("doc.v1.txt").exists() && dst.join("doc.v2.txt").exists());
+        // Every bad entry is reported, and none stays in the index.
+        for bad in [absolute.to_string_lossy().to_string(), "../sibling.txt".into(), "sub/../../sibling.txt".into()] {
+            assert!(r.error_messages.iter().any(|m| m.contains(&bad)), "{bad} not reported: {:?}", r.error_messages);
+        }
+        #[cfg(unix)]
+        assert!(r.error_messages.iter().any(|m| m.contains("link/linked.txt")), "{:?}", r.error_messages);
+        let saved = VersionIndex::load(&dst);
+        assert_eq!(saved.files["doc.txt"].iter().map(|v| v.path.as_str()).collect::<Vec<_>>(), vec!["doc.v2.txt"]);
     }
 
     #[test]
