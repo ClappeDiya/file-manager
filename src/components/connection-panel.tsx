@@ -2551,6 +2551,7 @@ export function ConnectionPanel() {
       {rcloneUi.managerOpen && (
         <div className="border-b border-gray-200 dark:border-gray-700 max-h-[60%] overflow-y-auto">
           <RcloneRemoteManager
+            key={`${rcloneUi.startInCreate}:${rcloneUi.createType ?? ""}`}
             startInCreate={rcloneUi.startInCreate}
             initialType={rcloneUi.createType}
             onClose={rcloneUi.closeManager}
