@@ -13,8 +13,11 @@ pub fn parse_bound(label: &str, value: Option<&str>) -> Result<Option<DateTime<U
         .map_err(|_| AppError::validation(format!("\"{v}\" is not a valid {label} date; use a date and time like 2026-01-31T00:00:00Z")))
 }
 
+/// The start and end of a date range; either side may be open.
+pub type Bounds = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
 /// Both bounds of a range; a range that ends before it starts is refused.
-pub fn parse_range(from: Option<&str>, to: Option<&str>) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>), AppError> {
+pub fn parse_range(from: Option<&str>, to: Option<&str>) -> Result<Bounds, AppError> {
     let (f, t) = (parse_bound("start", from)?, parse_bound("end", to)?);
     if let (Some(f), Some(t)) = (f, t) {
         if t < f {

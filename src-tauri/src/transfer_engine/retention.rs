@@ -229,7 +229,7 @@ mod tests {
     async fn a_restored_failed_job_waits_for_the_user_to_retry_it() {
         let repo = Repository::open_in_memory().await.unwrap();
         let job = failed("report.bin", 2, "timed out");
-        StorageOperations::save_transfer_queue(&repo, &[job.clone()]).await.unwrap();
+        StorageOperations::save_transfer_queue(&repo, std::slice::from_ref(&job)).await.unwrap();
 
         // "Restart": a fresh manager restores the queue.
         let mgr = crate::transfer_engine::TransferManager::new();

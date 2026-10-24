@@ -489,6 +489,7 @@ pub async fn set_checksum_algorithm(
 
 /// Search transfer history. `date_from` / `date_to` (RFC 3339 instants)
 /// keep the transfers that started in that range.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn search_transfer_history(
     path_contains: Option<String>,
