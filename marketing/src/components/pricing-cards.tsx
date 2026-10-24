@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import { Check } from 'lucide-react';
+import { ANNUAL_SAVINGS_PERCENT, BUSINESS_ANNUAL_PRICE, BUSINESS_MONTHLY_PRICE, TRIAL_DAYS } from '@/lib/pricing';
 
 export type PricingVariant = 'teaser' | 'full';
 
@@ -23,8 +24,9 @@ const plans = [
   },
   {
     name: 'Business',
-    price: '$9.99',
+    price: BUSINESS_MONTHLY_PRICE,
     period: '/user/month',
+    note: `or ${BUSINESS_ANNUAL_PRICE}/user/year (save ${ANNUAL_SAVINGS_PERCENT}%). ${TRIAL_DAYS}-day free trial, no card to start.`,
     tagline: 'Shared workspaces + governance for teams.',
     cta: { label: 'Join waitlist', href: '/pricing#waitlist', primary: false },
     badge: 'Coming Q3 2026',
@@ -71,6 +73,7 @@ export function PricingCards({ variant = 'full' }: { variant?: PricingVariant })
           <div className="mb-6">
             <span className="text-3xl font-bold text-foreground">{plan.price}</span>
             <span className="text-sm text-foreground-secondary"> {plan.period}</span>
+            {plan.note && <p className="mt-1 text-xs text-foreground-secondary">{plan.note}</p>}
           </div>
 
           {variant === 'full' && (

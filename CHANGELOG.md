@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Admin console billing: free trial, annual plans and coupons**: an organization's first Business subscription starts with a free trial (`BILLING_TRIAL_DAYS`, default 14, no card needed; one trial per organization, never repeated after any earlier subscription), checkout supports monthly or annual billing (`STRIPE_PRICE_BUSINESS_ANNUAL`, Monthly/Annual toggle on the Billing page) and Stripe promotion codes (`BILLING_ALLOW_PROMOTION_CODES`, default on). The Billing page shows the trial banner with days left, the billing interval and any applied discount; `customer.subscription.trial_will_end` is audited and delivered to the organization's notification channels. The marketing pricing page now states exactly this (trial length, annual price). Admin schema version 34. See `docs/admin-console.md`.
+- **Searchable docs on the marketing site**: a build-time index of the published docs (title, headings, text) and a search box on `/docs` and every docs page (`/` focuses it) with highlighted snippets that link to the matching heading; no external service. The published docs list now contains the user guides.
 - **Simple and Advanced mode in the backup screens**: in Simple mode (the default) the job editor, Restore, Maintenance, Settings and Recovery show the everyday flow; advanced options appear in Advanced mode or with *Show advanced backup options* (a per-area override in the UI store), behind one `AdvancedOnly` gate with a "Switch to Advanced" hint.
 - **`SECURITY.md`**: how to report a vulnerability privately (GitHub private vulnerability reporting), supported versions and response times.
 - Interface polish:

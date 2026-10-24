@@ -62,6 +62,7 @@ export const EVENT_CATALOG: { group: string; events: string[] }[] = [
   { group: 'Fleet', events: ['fleet.policy_create', 'fleet.policy_update', 'fleet.policy_delete', 'policy.apply_failed', 'fleet.managed_settings', 'credential.create', 'credential.rotate', 'credential.delete', 'credential.deliver'] },
   { group: 'Users & access', events: ['user.create', 'user.update', 'user.deactivate', 'user.delete', 'auth.login', 'auth.login_failed', 'auth.mfa_enroll'] },
   { group: 'Remote', events: ['remote.command', 'remote.command_cancel'] },
+  { group: 'Billing', events: ['billing.subscription', 'billing.trial_will_end', 'billing.invoice_paid', 'billing.payment_failed'] },
   { group: 'Webhooks', events: ['webhook.test'] },
 ];
 

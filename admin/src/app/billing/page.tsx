@@ -16,7 +16,9 @@ import { api, errorText } from '@/lib/api-client';
 import { useAuthStore } from '@/lib/stores/auth-store';
 import { formatDate } from '@/lib/utils/format';
 import type { BillingAccount } from '@/lib/billing';
+import { ANNUAL_DISCOUNT_PERCENT, type BillingInterval } from '@/lib/billing/plans';
 import type { Invoice } from '@/lib/billing/provider';
+import { discountAmount, discountDuration, trialDaysLeft } from '@/lib/billing/trial';
 import type { License } from '@/lib/db/repos/orgs';
 
 interface PlanView {
@@ -25,8 +27,11 @@ interface PlanView {
   seats: number;
   price: string;
   period: string;
+  annualPrice: string | null;
+  annualPeriod: string | null;
   features: string[];
   purchasable: boolean;
+  annualPurchasable: boolean;
 }
 
 interface Data {
@@ -36,6 +41,8 @@ interface Data {
   license: License;
   account: BillingAccount | null;
   plans: PlanView[];
+  trial: { days: number; eligible: boolean };
+  promotionCodes: boolean;
   invoices: Invoice[];
   invoicesError: string | null;
 }
@@ -49,12 +56,16 @@ export default function BillingPage() {
   const [seats, setSeats] = useState<Record<string, string>>({});
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [interval, setInterval] = useState<BillingInterval>('month');
   if (loading && !data) return <Loading />;
   if (!data) return <ErrorBanner message={error ?? 'Could not load billing'} />;
 
   const lic = data.license;
   const acct = data.account;
   const subscribed = !!acct && ['active', 'trialing', 'past_due'].includes(acct.status);
+  const trialing = acct?.status === 'trialing';
+  const daysLeft = trialing ? trialDaysLeft(acct.trialEnd ?? acct.currentPeriodEnd) : null;
+  const annualOffered = data.plans.some((p) => p.annualPurchasable);
   const go = async (path: string, body?: unknown) => {
     setBusy(true);
     setErr(null);
@@ -75,6 +86,13 @@ export default function BillingPage() {
       {params.get('checkout') === 'success' && (
         <div className="mb-4 rounded-md border border-success bg-success-bg px-3 py-2 text-sm">Thank you — your subscription is being confirmed and the license updates in a moment.</div>
       )}
+      {trialing && (
+        <div className="mb-4 rounded-md border border-info bg-info-bg px-3 py-2 text-sm" role="status">
+          Free trial: {daysLeft === null ? 'ends soon' : daysLeft <= 0 ? 'ends today' : `${daysLeft} day${daysLeft === 1 ? '' : 's'} left`}
+          {acct.trialEnd || acct.currentPeriodEnd ? ` (until ${formatDate((acct.trialEnd ?? acct.currentPeriodEnd) as string)})` : ''}. Add a payment method in the billing portal before then to keep {planName(acct.plan)}; otherwise the subscription is cancelled and the
+          organization returns to the free plan.
+        </div>
+      )}
       {acct?.status === 'past_due' && (
         <div className="mb-4 rounded-md border border-warning bg-warning-bg px-3 py-2 text-sm">A payment is overdue. The license stays active for now; update the payment method in the billing portal.</div>
       )}
@@ -91,13 +109,20 @@ export default function BillingPage() {
         />
         <StatCard title="Seats" value={lic.seats != null ? `${lic.used} / ${lic.seats}` : `${lic.used} used`} icon={Users} variant="default" subtitle="Enrolled machines" />
         <StatCard
-          title="Renews"
+          title={trialing ? 'Trial ends' : 'Renews'}
           value={acct?.currentPeriodEnd ? formatDate(acct.currentPeriodEnd) : '—'}
           icon={CalendarClock}
           variant="default"
-          subtitle={acct?.cancelAtPeriodEnd ? 'Ends at the end of the period' : subscribed ? 'Renews automatically' : 'No subscription'}
+          subtitle={acct?.cancelAtPeriodEnd ? 'Ends at the end of the period' : trialing ? 'Converts only with a payment method' : subscribed ? `Renews automatically${acct?.interval === 'year' ? ' (annual)' : acct?.interval === 'month' ? ' (monthly)' : ''}` : 'No subscription'}
         />
       </div>
+
+      {acct?.discount && (
+        <div className="mb-4 rounded-md border border-success bg-success-bg px-3 py-2 text-sm" role="status">
+          Discount applied: <strong>{acct.discount.name}</strong> — {discountAmount(acct.discount)}
+          {discountDuration(acct.discount) ? `, ${discountDuration(acct.discount)}` : ''}.
+        </div>
+      )}
 
       {subscribed && canWrite && (
         <Button className="mb-6" disabled={busy} onClick={() => void go('/api/billing/portal')}>
@@ -105,10 +130,34 @@ export default function BillingPage() {
         </Button>
       )}
 
-      <h2 className="mb-4 text-lg font-semibold text-foreground">Plans</h2>
+      <div className="mb-4 flex items-center justify-between gap-4">
+        <h2 className="text-lg font-semibold text-foreground">Plans</h2>
+        {annualOffered && (
+          <div className="inline-flex rounded-md border border-border p-0.5 text-sm" role="group" aria-label="Billing interval">
+            {(['month', 'year'] as const).map((i) => (
+              <button
+                key={i}
+                type="button"
+                aria-pressed={interval === i}
+                onClick={() => setInterval(i)}
+                className={`rounded px-3 py-1 ${interval === i ? 'bg-primary text-primary-foreground' : 'text-foreground-secondary hover:text-foreground'}`}
+              >
+                {i === 'month' ? 'Monthly' : `Annual (save ${ANNUAL_DISCOUNT_PERCENT}%)`}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      {data.configured && data.trial.eligible && data.plans.some((p) => p.purchasable) && (
+        <p className="mb-4 text-sm text-foreground-secondary">Your first subscription starts with a {data.trial.days}-day free trial; no card is needed to start.</p>
+      )}
       <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-3">
         {data.plans.map((plan) => {
           const current = lic.plan === plan.id;
+          const yearly = interval === 'year' && plan.annualPurchasable;
+          const cost = yearly ? (plan.annualPrice ?? plan.price) : plan.price;
+          const per = yearly ? (plan.annualPeriod ?? plan.period) : plan.period;
+          const buyable = interval === 'year' ? plan.annualPurchasable : plan.purchasable;
           return (
             <Card key={plan.id} className={current ? 'border-primary ring-1 ring-primary' : ''}>
               <div className="mb-4 flex items-center justify-between">
@@ -116,8 +165,8 @@ export default function BillingPage() {
                 {current && <Badge variant="info">Current plan</Badge>}
               </div>
               <div className="mb-4">
-                <span className="text-3xl font-bold text-foreground">{plan.price}</span>
-                <span className="text-sm text-foreground-secondary"> {plan.period}</span>
+                <span className="text-3xl font-bold text-foreground">{cost}</span>
+                <span className="text-sm text-foreground-secondary"> {per}</span>
               </div>
               <ul className="mb-6 space-y-2">
                 {plan.features.map((f) => (
@@ -131,7 +180,7 @@ export default function BillingPage() {
                 <Button variant="primary" className="w-full" onClick={() => window.open('https://filemanager.clappe.com/pricing', '_blank', 'noopener')}>
                   Contact sales
                 </Button>
-              ) : plan.purchasable && canWrite && data.ownsLicense && !subscribed ? (
+              ) : buyable && canWrite && data.ownsLicense && !subscribed ? (
                 <div className="flex items-end gap-2">
                   <Input
                     label="Seats"
@@ -141,8 +190,8 @@ export default function BillingPage() {
                     value={seats[plan.id] ?? String(Math.max(plan.seats, lic.used, 1))}
                     onChange={(e) => setSeats({ ...seats, [plan.id]: e.target.value })}
                   />
-                  <Button className="flex-1" disabled={busy} onClick={() => void go('/api/billing/checkout', { plan: plan.id, seats: Number(seats[plan.id] ?? Math.max(plan.seats, lic.used, 1)) })}>
-                    Subscribe
+                  <Button className="flex-1" disabled={busy} onClick={() => void go('/api/billing/checkout', { plan: plan.id, seats: Number(seats[plan.id] ?? Math.max(plan.seats, lic.used, 1)), interval })}>
+                    {data.trial.eligible && data.trial.days > 0 ? `Start ${data.trial.days}-day free trial` : 'Subscribe'}
                   </Button>
                 </div>
               ) : (

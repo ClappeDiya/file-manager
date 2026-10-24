@@ -1,10 +1,11 @@
 import type { Metadata } from 'next';
 import { PricingCards } from '@/components/pricing-cards';
 import { WaitlistForm } from '@/components/waitlist-form';
+import { ANNUAL_SAVINGS_PERCENT, BUSINESS_ANNUAL_PRICE, BUSINESS_MONTHLY_PRICE, TRIAL_DAYS } from '@/lib/pricing';
 
 export const metadata: Metadata = {
   title: 'Pricing',
-  description: 'Free for individuals. Business $9.99/user/month (coming Q3). Enterprise custom.',
+  description: `Free for individuals. Business ${BUSINESS_MONTHLY_PRICE}/user/month or ${BUSINESS_ANNUAL_PRICE}/user/year, with a ${TRIAL_DAYS}-day free trial (coming Q3). Enterprise custom.`,
 };
 
 const faq = [
@@ -17,12 +18,12 @@ const faq = [
     a: 'Teams that need to share file-manager connections, enforce policies (e.g. "S3 buckets in eu-west-1 only"), require approval before risky operations, or keep a centralized audit log for compliance. None of that matters to a solo user; all of it matters once you have 5+ people moving files together.',
   },
   {
-    q: 'Why $9.99/user/month?',
-    a: 'It is the lowest sustainable price that lets us keep the desktop free, fund development, and run a managed SaaS without venture-scale unit economics. Annual billing saves 20%; non-profits get 50% off; students get it free.',
+    q: `Why ${BUSINESS_MONTHLY_PRICE}/user/month?`,
+    a: `It is the lowest sustainable price that lets us keep the desktop free, fund development, and run a managed SaaS without venture-scale unit economics. Annual billing is ${BUSINESS_ANNUAL_PRICE} per user per year, ${ANNUAL_SAVINGS_PERCENT}% less than twelve months at ${BUSINESS_MONTHLY_PRICE}. If you have a promotion code, enter it at checkout.`,
   },
   {
     q: 'How does Business billing work?',
-    a: 'Per-seat monthly or annual. You add seats in the admin console; we adjust your Stripe subscription automatically. Cancel anytime; cancellation takes effect at the end of the current period.',
+    a: 'Per-seat, monthly or annual: pick one on the Billing page of the admin console and pay through Stripe Checkout. Seats, the payment method and cancellation are managed in the Stripe billing portal linked from the same page. Cancellation takes effect at the end of the current period.',
   },
   {
     q: 'When does Business launch?',
@@ -34,7 +35,7 @@ const faq = [
   },
   {
     q: 'Do you offer a free trial of Business?',
-    a: 'Yes — 14 days, no credit card required at signup. We add the card before the trial converts.',
+    a: `Yes — ${TRIAL_DAYS} days, no credit card required to start. The admin console shows how many days are left and three days before the trial ends we notify your organization’s channels (email, Slack, Teams, webhooks). Add a payment method in the billing portal before then to keep Business; if you do not, the subscription is cancelled when the trial ends and your organization returns to the free plan. Each organization gets one trial.`,
   },
   {
     q: 'Is this open source?',

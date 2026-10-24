@@ -726,6 +726,20 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 34,
+    description: 'Billing: annual interval, free trial and applied discount',
+    up(d) {
+      d.exec(`
+        ALTER TABLE billing_accounts ADD COLUMN billing_interval TEXT;
+        ALTER TABLE billing_accounts ADD COLUMN trial_end TEXT;
+        ALTER TABLE billing_accounts ADD COLUMN trial_used INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE billing_accounts ADD COLUMN discount TEXT;
+        -- Organizations that already had a subscription never get a first-time trial.
+        UPDATE billing_accounts SET trial_used = 1 WHERE subscription_id IS NOT NULL OR plan IS NOT NULL OR status <> 'none';
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

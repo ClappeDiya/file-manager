@@ -4,15 +4,21 @@
  * verification (`Stripe-Signature: t=…,v1=HMAC-SHA256(secret, "t.payload")`,
  * 5-minute tolerance, constant-time compare).
  *
+ * A trial is started with `subscription_data[trial_period_days]` and no card up
+ * front (`payment_method_collection=if_required`); a trial that ends without a
+ * payment method is cancelled by Stripe, which returns the organization to the
+ * free plan through `customer.subscription.deleted`.
+ *
  * STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_API_BASE (tests/proxies).
  */
 import crypto from 'crypto';
-import { BillingError, type BillingEvent, type BillingProvider, type Invoice, type SubscriptionStatus } from './provider';
+import { BillingError, type BillingEvent, type BillingProvider, type Discount, type Invoice, type SubscriptionStatus } from './provider';
 
 const TOLERANCE_S = 300;
 
 type Obj = Record<string, unknown>;
 const str = (v: unknown) => (typeof v === 'string' ? v : null);
+const iso = (v: unknown) => (v ? new Date(Number(v) * 1000).toISOString() : null);
 const idOf = (v: unknown) => (typeof v === 'string' ? v : v && typeof v === 'object' ? (str((v as Obj).id) ?? '') : '');
 
 /** Stripe's form encoding for nested parameters. */
@@ -21,6 +27,23 @@ function form(params: Record<string, string | number | undefined>): string {
     .filter(([, v]) => v !== undefined && v !== '')
     .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
     .join('&');
+}
+
+/** The coupon of a Stripe discount object, or null. */
+function discountOf(v: unknown): Discount | null {
+  if (!v || typeof v !== 'object') return null;
+  const d = v as Obj;
+  const c = (d.coupon ?? {}) as Obj;
+  if (!c || typeof c !== 'object' || !Object.keys(c).length) return null;
+  const dur = str(c.duration);
+  return {
+    name: str(c.name) ?? str(c.id) ?? 'Discount',
+    percentOff: typeof c.percent_off === 'number' ? c.percent_off : null,
+    amountOff: typeof c.amount_off === 'number' ? c.amount_off : null,
+    currency: str(c.currency)?.toUpperCase() ?? null,
+    duration: dur === 'once' || dur === 'repeating' || dur === 'forever' ? dur : null,
+    endsAt: iso(d.end),
+  };
 }
 
 export class StripeProvider implements BillingProvider {
@@ -62,6 +85,14 @@ export class StripeProvider implements BillingProvider {
       customer_email: o.customerId ? undefined : o.email,
       'subscription_data[metadata][org_id]': o.orgId,
       'metadata[org_id]': o.orgId,
+      allow_promotion_codes: o.allowPromotionCodes ? 'true' : undefined,
+      ...(o.trialDays && o.trialDays > 0
+        ? {
+            'subscription_data[trial_period_days]': o.trialDays,
+            payment_method_collection: 'if_required',
+            'subscription_data[trial_settings][end_behavior][missing_payment_method]': 'cancel',
+          }
+        : {}),
     });
     const url = str(s.url);
     if (!url) throw new BillingError('Stripe did not return a checkout URL');
@@ -129,11 +160,15 @@ export class StripeProvider implements BillingProvider {
           status: (str(obj.status) ?? 'canceled') as SubscriptionStatus,
           priceId: idOf(item.price) || null,
           seats: Number(item.quantity ?? obj.quantity ?? 0),
-          periodEnd: obj.current_period_end ? new Date(Number(obj.current_period_end) * 1000).toISOString() : null,
+          periodEnd: iso(obj.current_period_end),
           cancelAtPeriodEnd: !!obj.cancel_at_period_end,
           deleted: type === 'customer.subscription.deleted',
+          trialEnd: iso(obj.trial_end),
+          discount: discountOf(obj.discount),
         };
       }
+      case 'customer.subscription.trial_will_end':
+        return { kind: 'trial_will_end', id, orgId: str(meta.org_id), customerId: idOf(obj.customer), subscriptionId: idOf(obj.id), trialEnd: iso(obj.trial_end) };
       case 'invoice.paid':
       case 'invoice.payment_failed':
         return {
