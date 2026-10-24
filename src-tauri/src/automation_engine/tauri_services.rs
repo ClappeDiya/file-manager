@@ -129,6 +129,19 @@ impl ActionServices for TauriActionServices {
         })
     }
 
+    fn run_finished<'a>(&'a self, rule: &'a super::AutomationRule, log: &'a super::AutomationLog) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if rule.options.notify.profile().is_none() {
+                return;
+            }
+            let Some(summary) = crate::notify_hub::run::automation_summary(rule, log) else { return };
+            let backup = self.app.state::<crate::backup_engine::BackupManager>();
+            for problem in crate::notify_hub::run::report(&backup, &rule.options.notify, &summary).await {
+                tracing::warn!("Automation notification for '{}' failed: {problem}", rule.name);
+            }
+        })
+    }
+
     fn rule<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Option<super::AutomationRule>> {
         Box::pin(async move { self.app.state::<super::AutomationManager>().get_rule(id).await })
     }

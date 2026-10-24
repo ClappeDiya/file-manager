@@ -171,6 +171,9 @@ pub struct RuleOptions {
     /// SHA-256 of the secret in this rule's webhook URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_secret_hash: Option<String>,
+    /// Where the result of a run is reported (a notification profile).
+    #[serde(flatten)]
+    pub notify: ufop_core::run_notify::RunNotify,
 }
 
 fn no_retry() -> ufop_core::retry::RetryPolicy {
@@ -188,6 +191,7 @@ impl Default for RuleOptions {
             source: None,
             command_approval: None,
             webhook_secret_hash: None,
+            notify: Default::default(),
         }
     }
 }
@@ -756,6 +760,10 @@ impl FireContext {
         // Fail-open: ledger errors are swallowed inside `record`.
         if let Some(ledger) = &self.ledger {
             record_automation_log(ledger, &log).await;
+        }
+        // Result notifications (profile channels) are fail-open too.
+        if let (Some(services), Some(rule)) = (&services, &updated) {
+            services.run_finished(rule, &log).await;
         }
         Ok(log)
     }
@@ -1677,6 +1685,30 @@ mod tests {
         mgr.sanitize_incoming(&mut spoof).await;
         assert!(spoof.managed_by.is_none());
         assert!(mgr.ensure_editable("org-p").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_is_reported_to_the_services_for_notifications() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = AutomationManager::new();
+        let svc = Arc::new(services::mock::RecordingServices::default());
+        mgr.set_services(svc.clone());
+        let mut ok = AutomationRule::new("tells".into(), RuleTrigger::Manual, RuleAction::Notify { title: "t".into(), body: "b".into() });
+        ok.options.notify = ufop_core::run_notify::RunNotify { notify_profile_id: Some("p".into()), notify_on: vec!["error".into()], min_bytes: Some(5) };
+        mgr.save_rule(&repo, &ok).await.unwrap();
+        let bad = AutomationRule::new("breaks".into(), RuleTrigger::Manual, RuleAction::RunSync { sync_pair_id: "p".into() });
+        mgr.save_rule(&repo, &bad).await.unwrap();
+        mgr.run_rule(&repo, &ok.id).await.unwrap();
+        assert_eq!(*svc.finished.lock().unwrap(), vec!["tells:Success".to_string()]);
+        let failing = Arc::new(services::mock::RecordingServices { fail_with: Some("boom".into()), ..Default::default() });
+        mgr.set_services(failing.clone());
+        let log = mgr.run_rule(&repo, &bad.id).await.unwrap();
+        assert_eq!(log.status, AutomationStatus::Failed);
+        assert_eq!(*failing.finished.lock().unwrap(), vec!["breaks:Failed".to_string()]);
+        // The notification settings are stored with the rule's options.
+        let reloaded = AutomationManager::new();
+        reloaded.load_rules_from_db(&repo).await.unwrap();
+        assert_eq!(reloaded.get_rule(&ok.id).await.unwrap().options.notify, ok.options.notify);
     }
 
     #[tokio::test]

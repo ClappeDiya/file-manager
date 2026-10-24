@@ -56,6 +56,12 @@ pub trait ActionServices: Send + Sync {
         Box::pin(async { Err(SERVICES_UNAVAILABLE.to_string()) })
     }
 
+    /// A rule finished a run (success or failure, not a dry run): report it
+    /// through the rule's notification profile. Never fails the run.
+    fn run_finished<'a>(&'a self, _rule: &'a super::AutomationRule, _log: &'a super::AutomationLog) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
     /// Another rule by id (workflow steps that run a nested rule).
     fn rule<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Option<super::AutomationRule>> {
         Box::pin(async { None })
@@ -85,6 +91,8 @@ pub mod mock {
         pub fail_with: Option<String>,
         /// Rules nested workflow steps can run.
         pub rules: Mutex<Vec<crate::automation_engine::AutomationRule>>,
+        /// `name:status` of every finished run reported to `run_finished`.
+        pub finished: Mutex<Vec<String>>,
     }
 
     impl RecordingServices {
@@ -146,6 +154,11 @@ pub mod mock {
             let kind = serde_json::to_value(&notification.channel).ok().and_then(|v| v["type"].as_str().map(str::to_string)).unwrap_or_default();
             let r = self.record(format!("message:{kind}:{title}:{body}"));
             Box::pin(async move { r })
+        }
+
+        fn run_finished<'a>(&'a self, rule: &'a crate::automation_engine::AutomationRule, log: &'a crate::automation_engine::AutomationLog) -> BoxFuture<'a, ()> {
+            self.finished.lock().unwrap().push(format!("{}:{:?}", rule.name, log.status));
+            Box::pin(async {})
         }
 
         fn rule<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Option<crate::automation_engine::AutomationRule>> {

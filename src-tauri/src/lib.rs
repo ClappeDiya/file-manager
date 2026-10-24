@@ -524,6 +524,16 @@ pub fn run() {
                     tracing::warn!("Backup notification failed: {e}");
                 }
             }));
+            // Transfers and sync runs → OS notifications, when Settings →
+            // Notifications asks for them; sync results → the pair's profile.
+            let desktop = app.handle().clone();
+            let sink: std::sync::Arc<dyn Fn(notify_hub::desktop::DesktopEvent) + Send + Sync> = std::sync::Arc::new(move |event| {
+                let app = desktop.clone();
+                tauri::async_runtime::spawn(async move { notify_hub::desktop::show(&app, event).await });
+            });
+            notify_hub::desktop::wire_transfers(&app.state::<TransferManager>(), sink.clone());
+            notify_hub::desktop::wire_sync(&app.state::<SyncManager>(), sink);
+            notify_hub::run::wire_sync_reports(app.handle());
             mgr.start_scheduler();
             // The Prometheus exporter, when the user turned it on.
             let metrics = setup_metrics.clone();

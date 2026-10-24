@@ -141,7 +141,23 @@ pub struct SyncManager {
     running: Arc<RwLock<HashMap<Uuid, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Latest progress of each run in progress, by pair.
     progress: Arc<std::sync::Mutex<HashMap<Uuid, executor::SyncProgress>>>,
+    /// Told about every finished run (desktop and profile notifications).
+    run_listeners: Arc<std::sync::RwLock<Vec<RunListener>>>,
 }
+
+/// How a sync run ended, for notifications.
+#[derive(Debug, Clone)]
+pub struct SyncRunEvent {
+    /// The pair as it was when the run started.
+    pub pair: SyncPair,
+    /// The report, or the reason the run could not finish.
+    pub outcome: Result<SyncReport, String>,
+    /// Files the post-run verification found different (0 when it did not run).
+    pub verify_mismatches: usize,
+}
+
+/// Listener for finished sync runs.
+pub type RunListener = Arc<dyn Fn(&SyncRunEvent) + Send + Sync>;
 
 /// Default location for sync state: the app data dir, else the temp dir.
 fn default_state_dir() -> PathBuf {
@@ -163,6 +179,7 @@ impl SyncManager {
             state_dir,
             running: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            run_listeners: Arc::new(std::sync::RwLock::new(Vec::new())),
             pairs: Arc::new(RwLock::new(HashMap::new())),
             reports: Arc::new(RwLock::new(HashMap::new())),
             snapshots: Arc::new(RwLock::new(HashMap::new())),
@@ -172,6 +189,11 @@ impl SyncManager {
             watcher_mgr: Arc::new(watcher::WatcherManager::default()),
             scheduler: Arc::new(scheduler::SyncScheduler::new()),
         }
+    }
+
+    /// Listen for finished runs, whoever started them.
+    pub fn add_run_listener(&self, listener: RunListener) {
+        self.run_listeners.write().unwrap_or_else(|e| e.into_inner()).push(listener);
     }
 
     /// Get a dry-run preview for a sync pair.
@@ -268,7 +290,13 @@ impl SyncManager {
         if let Ok(mut p) = self.progress.lock() {
             p.remove(&pair_id);
         }
-        let report = result?;
+        let report = match result {
+            Ok(report) => report,
+            Err(e) => {
+                self.announce(&pair, Err(e.user_message()), 0);
+                return Err(e);
+            }
+        };
 
         // Update pair last_run
         {
@@ -294,17 +322,26 @@ impl SyncManager {
         }
 
         // Run verification if enabled
+        let mut verify_mismatches = 0;
         if pair.checksum_enabled || pair.verify_mode != SyncVerifyMode::None {
             let pair_clone = pair.clone();
             let report_clone = report.clone();
-            let mismatches = tokio::task::spawn_blocking(move || {
+            let verified = tokio::task::spawn_blocking(move || {
                 executor::verify_sync(&pair_clone, &report_clone)
             })
             .await
             .map_err(|e| AppError::Sync {
                 message: format!("Verification task failed: {}", e),
                 advice: "The sync completed but verification could not run.".to_string(),
-            })??;
+            })
+            .and_then(|r| r);
+            let mismatches = match verified {
+                Ok(m) => m,
+                Err(e) => {
+                    self.announce(&pair, Ok(report.clone()), 0);
+                    return Err(e);
+                }
+            };
 
             if !mismatches.is_empty() {
                 tracing::warn!(
@@ -313,9 +350,23 @@ impl SyncManager {
                     pair_id
                 );
             }
+            verify_mismatches = mismatches.len();
         }
 
+        self.announce(&pair, Ok(report.clone()), verify_mismatches);
         Ok(report)
+    }
+
+    /// Tell the run listener (notifications) how a run ended.
+    fn announce(&self, pair: &SyncPair, outcome: Result<SyncReport, String>, verify_mismatches: usize) {
+        let listeners = self.run_listeners.read().unwrap_or_else(|e| e.into_inner());
+        if listeners.is_empty() {
+            return;
+        }
+        let event = SyncRunEvent { pair: pair.clone(), outcome, verify_mismatches };
+        for listener in listeners.iter() {
+            listener(&event);
+        }
     }
 
     /// Run the executor on a blocking thread and file away what it produced.
@@ -1156,6 +1207,8 @@ mod tests {
                 settle_secs: 30,
                 completion_marker: Some("_DONE".into()),
                 version_template: Some("{name}~{num}.{ext}".into()),
+                // Result notifications survive a restart with the pair.
+                notify: ufop_core::run_notify::RunNotify { notify_profile_id: Some("p1".into()), notify_on: vec!["error".into()], min_bytes: Some(10) },
             },
             ..SyncPair::default()
         };

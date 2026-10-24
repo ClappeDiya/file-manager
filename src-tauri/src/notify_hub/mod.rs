@@ -110,8 +110,10 @@ fn default_method() -> String {
     "POST".into()
 }
 
+pub mod desktop;
 pub mod mime;
 pub mod profiles;
+pub mod run;
 pub mod webhook;
 
 fn default_subject() -> String {

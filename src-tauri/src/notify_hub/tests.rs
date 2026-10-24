@@ -172,7 +172,7 @@ fn header_and_method_validation() {
 type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, BTreeMap<String, String>, String)>>>;
 
 /// A server recording every request: (method, path?query, headers, body).
-async fn recorder() -> (String, Seen) {
+pub(super) async fn recorder() -> (String, Seen) {
     use axum::{extract::Request, Router};
     let seen: Seen = Default::default();
     let s2 = seen.clone();
@@ -504,12 +504,12 @@ fn email_preview_renders_html() {
 
 // ── K101: notification profiles in the manager ──
 
-async fn manager(dir: &std::path::Path) -> crate::backup_engine::BackupManager {
+pub(super) async fn manager(dir: &std::path::Path) -> crate::backup_engine::BackupManager {
     let repo = crate::storage::Repository::open_in_memory().await.unwrap();
     crate::backup_engine::BackupManager::with_kdf(repo.pool().clone(), std::sync::Arc::new(crate::security::CredentialStore::new()), None, None, dir.join("dbs"), ufop_core::backup::crypto::KdfParams::insecure_fast())
 }
 
-fn webhook_profile(name: &str, url: &str) -> profiles::NotificationProfile {
+pub(super) fn webhook_profile(name: &str, url: &str) -> profiles::NotificationProfile {
     let mut n = webhook::preset(webhook::WebhookPreset::Generic, &webhook::PresetParams { server: url.into(), ..Default::default() }).unwrap();
     if let Channel::Webhook { headers, .. } = &mut n.channel {
         headers.push(webhook::WebhookHeader { name: "X-Token".into(), value: "hdr-s3cret".into(), secret: true, credential_id: String::new() });

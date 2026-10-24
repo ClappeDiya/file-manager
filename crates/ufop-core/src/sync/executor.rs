@@ -898,6 +898,7 @@ pub fn validate_run_options(o: &crate::sync_types::SyncRunOptions) -> Result<(),
             advice: "Use tokens like {name}, {ext}, {num} and {now:%Y-%m-%d}.".to_string(),
         })?;
     }
+    o.notify.validate().map_err(|message| AppError::Sync { message, advice: "Pick a notification profile and results of success, warning or error.".to_string() })?;
     if let Some(m) = o.completion_marker.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
         if m.contains(['/', '\\']) || m == "." || m == ".." || planner::is_internal_entry(m) {
             return Err(AppError::Sync {
@@ -1391,12 +1392,17 @@ mod tests {
     #[test]
     fn run_options_validation() {
         use crate::sync_types::SyncRunOptions;
-        let ok = SyncRunOptions { settle_secs: 5, completion_marker: Some("_DONE".into()), version_template: Some("{name}.{now:%Y}.{ext}".into()) };
+        let ok = SyncRunOptions { settle_secs: 5, completion_marker: Some("_DONE".into()), version_template: Some("{name}.{now:%Y}.{ext}".into()), ..Default::default() };
         assert!(validate_run_options(&ok).is_ok());
         assert!(validate_run_options(&SyncRunOptions { version_template: Some("{nope}".into()), ..Default::default() }).is_err());
         for bad in ["a/b", "..", ".ufop-sync-inventory.json"] {
             assert!(validate_run_options(&SyncRunOptions { completion_marker: Some(bad.into()), ..Default::default() }).is_err(), "{bad}");
         }
+        // Result notifications: a known result and a profile to send to.
+        let notify = |p: Option<&str>, on: &[&str]| SyncRunOptions { notify: crate::run_notify::RunNotify { notify_profile_id: p.map(Into::into), notify_on: on.iter().map(|s| s.to_string()).collect(), min_bytes: None }, ..Default::default() };
+        assert!(validate_run_options(&notify(Some("p"), &["error"])).is_ok());
+        assert!(validate_run_options(&notify(Some("p"), &["boom"])).is_err());
+        assert!(validate_run_options(&notify(None, &["error"])).is_err());
     }
 
     #[test]
