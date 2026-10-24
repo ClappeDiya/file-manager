@@ -10,6 +10,9 @@
  * - Live connection status polling
  * - Dynamic protocol list from backend
  * - Delete connection groups
+ * - Starred connections first; show/hide on password fields
+ * - Google Drive / Dropbox / OneDrive sign-in and where they open
+ * - "Credentials rejected" flag with Retry; remote quota; folder size
  */
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { ShareLinkDialog } from "@/components/share-link-dialog";
@@ -20,6 +23,11 @@ import { pickFiles, pickFolder } from "@/lib/folder-picker";
 import { promptText, confirmText } from "@/lib/prompt-dialog";
 import { errorText } from "@/lib/error-text";
 import { PRESET_FIELD_LABELS, fillPreset, type ProviderPreset } from "@/lib/provider-presets";
+import { PasswordInput } from "@/components/password-input";
+import { OAuthSignIn } from "@/components/oauth-sign-in";
+import { CloudScopeFields, type CloudExtras, type OAuthSettings } from "@/components/cloud-connection-fields";
+import { CONNECTIONS_CHANGED_EVENT, OAUTH_PROTOCOLS } from "@/lib/oauth";
+import { useUIStore } from "@/stores/ui-store";
 
 // ── Types (mirrors Rust types) ──
 
@@ -74,12 +82,54 @@ interface SwiftSettings {
   application_credential_id: string | null;
 }
 
-interface ConnectionExtras {
+type WebDavAuthMode = "basic" | "bearer" | "none";
+type WebDavVendor = "generic" | "nextcloud" | "owncloud";
+
+/** Mirrors `WebDavSettings`. */
+interface WebDavSettings {
+  auth: WebDavAuthMode;
+  vendor: WebDavVendor;
+}
+
+/** Mirrors `SmbSettings`. */
+interface SmbSettings {
+  domain: string | null;
+}
+
+interface ConnectionExtras extends CloudExtras {
   assume_role: AssumeRoleConfig | null;
   rclone_remote: string | null;
   preset: string | null;
   swift: SwiftSettings | null;
+  webdav?: WebDavSettings | null;
+  smb?: SmbSettings | null;
 }
+
+/** Mirrors `ConnectionStatus` (core/types.rs). */
+interface ConnectionStatus {
+  id: string;
+  starred: boolean;
+  credentials_rejected_at: string | null;
+  credentials_rejected_reason: string | null;
+}
+
+/** Mirrors `RemoteQuota`. */
+interface RemoteQuota {
+  total: number | null;
+  used: number | null;
+  free: number | null;
+  trashed: number | null;
+}
+
+/** Mirrors `FolderSize`. */
+interface FolderSize {
+  bytes: number;
+  files: number;
+  folders: number | null;
+  complete: boolean;
+}
+
+type SizeState = { jobId: string; running: true } | { running: false; result?: FolderSize; error?: string };
 
 interface ConnectionGroup {
   id: string;
@@ -147,6 +197,7 @@ const FALLBACK_PROTOCOLS: ProtocolOption[] = [
   { value: "google_drive", label: "Google Drive", port: 443 },
   { value: "dropbox", label: "Dropbox", port: 443 },
   { value: "onedrive", label: "OneDrive", port: 443 },
+  { value: "b2", label: "Backblaze B2", port: 443 },
   { value: "rclone", label: "rclone (GCS, Box, Mega, 70+ more)", port: 0 },
 ];
 
@@ -166,6 +217,7 @@ const DEFAULT_PORTS: Record<string, number> = {
   google_drive: 443,
   dropbox: 443,
   onedrive: 443,
+  b2: 443,
   https: 443,
   http: 80,
 };
@@ -175,6 +227,16 @@ const DEFAULT_PORTS: Record<string, number> = {
 
 /** Sizes follow Settings → Appearance → Size units. */
 const formatFileSize = (bytes: number): string => formatBytes(bytes);
+
+/** "4 GB of 15 GB used · 11 GB free" from whatever the provider reports. */
+function formatQuota(q: RemoteQuota): string {
+  const parts: string[] = [];
+  if (q.used != null) parts.push(q.total != null ? `${formatFileSize(q.used)} of ${formatFileSize(q.total)} used` : `${formatFileSize(q.used)} used`);
+  else if (q.total != null) parts.push(`${formatFileSize(q.total)} total`);
+  if (q.free != null) parts.push(`${formatFileSize(q.free)} free`);
+  if (q.trashed) parts.push(`${formatFileSize(q.trashed)} in trash`);
+  return parts.join(" · ");
+}
 
 function formatModified(dateStr: string): string {
   try {
@@ -281,7 +343,7 @@ const CHARSET_OPTIONS = [
 function SshKeyGenSection({
   onKeyGenerated,
 }: {
-  onKeyGenerated: (keyPath: string) => void;
+  onKeyGenerated: (keyPath: string, passphrase: string | null) => void;
 }) {
   const [showModal, setShowModal] = useState(false);
   const [algorithm, setAlgorithm] = useState("ed25519");
@@ -312,7 +374,7 @@ function SshKeyGenSection({
         comment: null,
       });
       setResult(res);
-      onKeyGenerated(res.private_key_path);
+      onKeyGenerated(res.private_key_path, showPassphrase && passphrase ? passphrase : null);
     } catch (e: any) {
       setGenError(e?.message || "Key generation failed");
     } finally {
@@ -371,8 +433,7 @@ function SshKeyGenSection({
               Add Passphrase
             </label>
             {showPassphrase && (
-              <input
-                type="password"
+              <PasswordInput
                 value={passphrase}
                 onChange={(e) => setPassphrase(e.target.value)}
                 placeholder="Optional passphrase"
@@ -547,6 +608,25 @@ function ConnectionForm({
   const [swiftRegion, setSwiftRegion] = useState(initialSwift?.region ?? "");
   const [swiftCredentialId, setSwiftCredentialId] = useState(initialSwift?.application_credential_id ?? "");
 
+  // SFTP private-key passphrase (stored in the credential store; blank = unchanged)
+  const [keyPassphrase, setKeyPassphrase] = useState("");
+
+  // WebDAV sign-in mode and server vendor
+  const [webdavAuth, setWebdavAuth] = useState<WebDavAuthMode>(initialData?.extras?.webdav?.auth ?? "basic");
+  const [webdavVendor, setWebdavVendor] = useState<WebDavVendor>(initialData?.extras?.webdav?.vendor ?? "generic");
+
+  // SMB Windows domain
+  const [smbDomain, setSmbDomain] = useState(initialData?.extras?.smb?.domain ?? "");
+
+  // Google Drive / OneDrive / Dropbox: app, account kind and where it opens
+  const [cloud, setCloud] = useState<CloudExtras>({
+    oauth: initialData?.extras?.oauth ?? null,
+    google_drive: initialData?.extras?.google_drive ?? null,
+    onedrive: initialData?.extras?.onedrive ?? null,
+    dropbox: initialData?.extras?.dropbox ?? null,
+  });
+  const advancedView = useUIStore((st) => st.appMode === "advanced");
+
   // Auto-expand Advanced section when editing a connection that has advanced fields set
   useEffect(() => {
     if (
@@ -629,6 +709,10 @@ function ConnectionForm({
   const isRclone = protocol === "rclone";
   const isSwift = protocol === "swift";
   const isS3 = protocol === "s3";
+  const isWebDav = protocol === "webdav";
+  const isSmb = protocol === "smb";
+  const isB2 = protocol === "b2";
+  const isOAuth = OAUTH_PROTOCOLS.has(protocol);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -658,7 +742,11 @@ function ConnectionForm({
       // Upload-time permission defaults (SFTP/FTP only)
       defaultFileMode: isSshProtocol || isFtpProtocol ? defaultFileMode || null : null,
       defaultDirMode: isSshProtocol || isFtpProtocol ? defaultDirMode || null : null,
+      // SFTP key passphrase: only sent when typed (null keeps the stored one)
+      keyPassphrase: isSshProtocol && keyPassphrase ? keyPassphrase : null,
       extras: {
+        // Keep settings this form does not show (other protocols, pickers).
+        ...(initialData?.extras ?? {}),
         rclone_remote: protocol === "rclone" ? host.trim() || null : initialData?.extras?.rclone_remote ?? null,
         preset: selectedPreset || null,
         assume_role:
@@ -675,6 +763,16 @@ function ConnectionForm({
               application_credential_id: swiftAuthKind === "application_credential" ? swiftCredentialId.trim() || null : null,
             }
           : null,
+        ...(isWebDav ? { webdav: { auth: webdavAuth, vendor: webdavVendor } } : {}),
+        ...(isSmb ? { smb: { domain: smbDomain.trim() || null } } : {}),
+        ...(isOAuth
+          ? {
+              oauth: cloud.oauth ? { ...cloud.oauth, client_id: cloud.oauth.client_id?.trim() || null } : null,
+              google_drive: protocol === "google_drive" ? cloud.google_drive ?? null : initialData?.extras?.google_drive,
+              onedrive: protocol === "onedrive" ? cloud.onedrive ?? null : initialData?.extras?.onedrive,
+              dropbox: protocol === "dropbox" ? cloud.dropbox ?? null : initialData?.extras?.dropbox,
+            }
+          : {}),
       } satisfies ConnectionExtras,
     });
   };
@@ -721,8 +819,14 @@ function ConnectionForm({
           />
         </div>
       </div>
-      {!isAzure && (
+      {isOAuth && (
+        <p className="text-xs text-gray-500 dark:text-gray-400" data-testid="oauth-form-hint">
+          {initialData ? "Use Sign in on the connection to change the account." : "After saving, sign in with your browser; no password is stored."}
+        </p>
+      )}
+      {!isAzure && !isOAuth && (
       <>
+      {!isB2 && (
       <div>
         <div className="flex items-center gap-1 mb-1">
           <label className="block text-xs font-medium">Host</label>
@@ -745,20 +849,46 @@ function ConnectionForm({
           className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
         />
       </div>
+      )}
+      {isWebDav && (
+        <div className="grid grid-cols-2 gap-2" data-testid="webdav-fields">
+          <div>
+            <label className="block text-xs font-medium mb-1" htmlFor="webdav-auth">Sign in with</label>
+            <select id="webdav-auth" value={webdavAuth} onChange={(e) => setWebdavAuth(e.target.value as WebDavAuthMode)} className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900">
+              <option value="basic">User name and password</option>
+              <option value="bearer">Bearer token</option>
+              <option value="none">No sign-in</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1" htmlFor="webdav-vendor">Server</label>
+            <select id="webdav-vendor" value={webdavVendor} onChange={(e) => setWebdavVendor(e.target.value as WebDavVendor)} className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900">
+              <option value="generic">Generic WebDAV</option>
+              <option value="nextcloud">Nextcloud</option>
+              <option value="owncloud">ownCloud</option>
+            </select>
+          </div>
+        </div>
+      )}
+      {!(isWebDav && webdavAuth === "none") && (
       <div className="grid grid-cols-2 gap-2">
+        {!(isWebDav && webdavAuth === "bearer") && (
         <div>
-          <label className="block text-xs font-medium mb-1">Username</label>
+          <label className="block text-xs font-medium mb-1" htmlFor="conn-username">{isB2 ? "Application key ID" : "Username"}</label>
           <input
+            id="conn-username"
             type="text"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
+            required={isB2}
             className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
           />
         </div>
+        )}
         <div>
-          <label className="block text-xs font-medium mb-1">Password</label>
-          <input
-            type="password"
+          <label className="block text-xs font-medium mb-1" htmlFor="conn-password">{isB2 ? "Application key" : isWebDav && webdavAuth === "bearer" ? "Bearer token" : "Password"}</label>
+          <PasswordInput
+            id="conn-password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             placeholder={initialData ? "(unchanged)" : ""}
@@ -766,16 +896,62 @@ function ConnectionForm({
           />
         </div>
       </div>
+      )}
+      {isSmb && (
+        <div>
+          <label className="block text-xs font-medium mb-1" htmlFor="smb-domain">
+            Domain
+            <span className="text-gray-400 dark:text-gray-500 font-normal"> (optional)</span>
+          </label>
+          <input id="smb-domain" type="text" value={smbDomain} onChange={(e) => setSmbDomain(e.target.value)} placeholder="CORP" className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900" />
+        </div>
+      )}
       </>
+      )}
+      {isOAuth && (
+        <>
+          <CloudScopeFields protocol={protocol} connectionId={initialData?.id ?? null} value={cloud} onChange={setCloud} />
+          {advancedView && (
+            <div>
+              <label className="block text-xs font-medium mb-1" htmlFor="oauth-app-client-id">
+                OAuth client ID
+                <span className="text-gray-400 dark:text-gray-500 font-normal"> (your own app; blank = built-in)</span>
+              </label>
+              <input
+                id="oauth-app-client-id"
+                value={cloud.oauth?.client_id ?? ""}
+                onChange={(e) => setCloud((c) => ({ ...c, oauth: { ...(c.oauth ?? ({ account_kind: "personal" } as OAuthSettings)), client_id: e.target.value } }))}
+                className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 font-mono"
+              />
+            </div>
+          )}
+        </>
       )}
       {/* SSH Key Generation (SFTP only) */}
       {isSshProtocol && (
         <SshKeyGenSection
-          onKeyGenerated={(keyPath) => {
+          onKeyGenerated={(keyPath, keyPass) => {
             setPassword(keyPath);
+            // The new key's passphrase unlocks it when connecting.
+            if (keyPass) setKeyPassphrase(keyPass);
             setSshConfigHint("key generated");
           }}
         />
+      )}
+      {isSshProtocol && (
+        <div>
+          <label className="block text-xs font-medium mb-1" htmlFor="sftp-key-passphrase">
+            Key passphrase
+            <span className="text-gray-400 dark:text-gray-500 font-normal"> (if the private key has one)</span>
+          </label>
+          <PasswordInput
+            id="sftp-key-passphrase"
+            value={keyPassphrase}
+            onChange={(e) => setKeyPassphrase(e.target.value)}
+            placeholder={initialData ? "(unchanged)" : ""}
+            className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+          />
+        </div>
       )}
       {/* AWS Profile selector (S3 only) */}
       {protocol === "s3" && awsProfiles.length > 0 && (
@@ -923,9 +1099,8 @@ function ConnectionForm({
             <label className="block text-xs font-medium mb-1" htmlFor="azure-secret">
               {azureAuthMethod === "account_key" ? "Account key" : azureAuthMethod === "sas_token" ? "SAS token" : "Connection string"}
             </label>
-            <input
+            <PasswordInput
               id="azure-secret"
-              type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder={initialData ? "(unchanged)" : azureAuthMethod === "connection_string" ? "DefaultEndpointsProtocol=https;AccountName=…" : azureAuthMethod === "sas_token" ? "sv=…&sig=…" : ""}
@@ -1148,8 +1323,7 @@ function ConnectionForm({
                       <label className="block text-xs font-medium mb-1">
                         Proxy Password
                       </label>
-                      <input
-                        type="password"
+                      <PasswordInput
                         value={proxyPassword}
                         onChange={(e) => setProxyPassword(e.target.value)}
                         placeholder="(optional)"
@@ -1313,6 +1487,10 @@ function ConnectionItem({
   testResult,
   testing,
   isConnected,
+  status,
+  onToggleStar,
+  onRetry,
+  onSignIn,
 }: {
   connection: ConnectionProfile;
   onConnect: (id: string) => void;
@@ -1322,9 +1500,28 @@ function ConnectionItem({
   testResult: ConnectionTestResult | null;
   testing: boolean;
   isConnected: boolean;
+  status?: ConnectionStatus;
+  onToggleStar?: (id: string, starred: boolean) => void;
+  onRetry?: (id: string) => void;
+  onSignIn?: (conn: ConnectionProfile) => void;
 }) {
+  const starred = !!status?.starred;
+  const rejected = !!status?.credentials_rejected_at;
   return (
     <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-gray-700 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-800/50">
+      {onToggleStar && (
+        <button
+          onClick={() => onToggleStar(connection.id, !starred)}
+          className={`mr-1 text-sm leading-none ${starred ? "text-amber-500" : "text-gray-300 dark:text-gray-600 hover:text-amber-400"}`}
+          type="button"
+          aria-label={starred ? `Unstar ${connection.name}` : `Star ${connection.name}`}
+          aria-pressed={starred}
+          title={starred ? "Unstar" : "Star (list first)"}
+          data-testid={`star-${connection.id}`}
+        >
+          {starred ? "\u2605" : "\u2606"}
+        </button>
+      )}
       <button
         onClick={() => onConnect(connection.id)}
         className="flex-1 min-w-0 text-left"
@@ -1334,9 +1531,9 @@ function ConnectionItem({
           {/* Connection status indicator */}
           <span
             className={`w-2 h-2 rounded-full flex-shrink-0 ${
-              isConnected ? "bg-green-500" : "bg-gray-300 dark:bg-gray-600"
+              rejected ? "bg-red-500" : isConnected ? "bg-green-500" : "bg-gray-300 dark:bg-gray-600"
             }`}
-            title={isConnected ? "Connected" : "Disconnected"}
+            title={rejected ? "Credentials rejected" : isConnected ? "Connected" : "Disconnected"}
           />
           <span className="text-sm font-medium truncate">
             {connection.name}
@@ -1359,8 +1556,33 @@ function ConnectionItem({
           {connection.port ? `:${connection.port}` : ""}{" "}
           {connection.username ? `(${connection.username})` : ""}
         </div>
+        {rejected && (
+          <div className="text-xs text-red-600 dark:text-red-400 truncate" data-testid={`rejected-${connection.id}`} title={status?.credentials_rejected_reason ?? undefined}>
+            Credentials rejected: automatic reconnects are paused. Edit the connection or click Retry.
+          </div>
+        )}
       </button>
       <div className="flex items-center gap-1 ml-2">
+        {rejected && onRetry && (
+          <button
+            onClick={() => onRetry(connection.id)}
+            className="text-xs px-2 py-1 rounded bg-red-500 text-white hover:bg-red-600"
+            type="button"
+            title="Retry"
+          >
+            Retry
+          </button>
+        )}
+        {onSignIn && OAUTH_PROTOCOLS.has(connection.protocol) && (
+          <button
+            onClick={() => onSignIn(connection)}
+            className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+            type="button"
+            title="Sign in"
+          >
+            Sign in
+          </button>
+        )}
         <button
           onClick={() => onTest(connection.id)}
           disabled={testing}
@@ -1418,6 +1640,23 @@ export function ConnectionPanel() {
   const [browseError, setBrowseError] = useState<string | null>(null);
   const [transferStatus, setTransferStatus] = useState<string | null>(null);
 
+  // Starred / credentials-rejected flags, by connection id
+  const [statuses, setStatuses] = useState<Record<string, ConnectionStatus>>({});
+  // Google Drive / Dropbox / OneDrive connection being signed in
+  const [signInFor, setSignInFor] = useState<ConnectionProfile | null>(null);
+  // Storage of the connected account
+  const [quota, setQuota] = useState<RemoteQuota | null>(null);
+  // "Calculate size" results, by remote path
+  const [sizes, setSizes] = useState<Record<string, SizeState>>({});
+  const [entryMenu, setEntryMenu] = useState<{ entry: RemoteFileEntry; x: number; y: number } | null>(null);
+  const setActiveGuidedFlow = useUIStore((st) => st.setActiveGuidedFlow);
+  const [showCloudMenu, setShowCloudMenu] = useState(false);
+
+  const refreshStatus = useCallback(async () => {
+    const list = await tauriInvoke<ConnectionStatus[]>("list_connection_status", undefined, []).catch(() => []);
+    setStatuses(Object.fromEntries((list ?? []).map((st) => [st.id, st])));
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       const [conns, grps] = await Promise.all([
@@ -1429,7 +1668,15 @@ export function ConnectionPanel() {
     } catch (err) {
       console.error("Failed to load connections:", err);
     }
-  }, []);
+    void refreshStatus();
+  }, [refreshStatus]);
+
+  // A guided cloud wizard saved a connection elsewhere: reload.
+  useEffect(() => {
+    const onChanged = () => void refresh();
+    window.addEventListener(CONNECTIONS_CHANGED_EVENT, onChanged);
+    return () => window.removeEventListener(CONNECTIONS_CHANGED_EVENT, onChanged);
+  }, [refresh]);
 
   // (2) connector_list_protocols - fetch available protocols on mount
   const fetchProtocols = useCallback(async () => {
@@ -1502,13 +1749,27 @@ export function ConnectionPanel() {
   const handleSave = useCallback(
     async (data: Record<string, unknown>) => {
       try {
-        await tauriInvoke("save_connection", data as Record<string, unknown>);
+        const saved = await tauriInvoke<ConnectionProfile | undefined>("save_connection", data as Record<string, unknown>);
         setShowForm(false);
         setEditingConnection(null);
         refresh();
+        // A new Google Drive / Dropbox / OneDrive connection signs in next.
+        if (saved && !data.connectionId && OAUTH_PROTOCOLS.has(saved.protocol)) setSignInFor(saved);
       } catch (err) {
         console.error("Failed to save connection:", err);
       }
+    },
+    [refresh]
+  );
+
+  const handleToggleStar = useCallback(
+    async (id: string, starred: boolean) => {
+      try {
+        await tauriInvoke("set_connection_starred", { connectionId: id, starred });
+      } catch (err) {
+        console.error("Failed to star connection:", err);
+      }
+      refresh();
     },
     [refresh]
   );
@@ -1589,8 +1850,14 @@ export function ConnectionPanel() {
         setConnectedProtocol(conn.protocol);
         setRemotePath(initialPath);
         setRemoteFiles(files);
+        setSizes({});
         // Mark as connected immediately
         setConnectedProtocols((prev) => new Set([...prev, conn.protocol]));
+        // 5. Storage quota, where the provider reports one
+        setQuota(null);
+        tauriInvoke<RemoteQuota | null>("connector_quota", { protocol: conn.protocol, connectionId: id }, null)
+          .then((q) => setQuota(q ?? null))
+          .catch(() => setQuota(null));
       } catch (err) {
         console.error("Failed to connect:", err);
         setBrowseError(
@@ -1598,10 +1865,59 @@ export function ConnectionPanel() {
         );
       } finally {
         setBrowsing(false);
+        // A rejected sign-in flags the connection (and a success clears it).
+        void refreshStatus();
       }
     },
-    []
+    [refreshStatus]
   );
+
+  // Retry: clear the credentials-rejected flag, then connect.
+  const handleRetry = useCallback(
+    async (id: string) => {
+      try {
+        await tauriInvoke("clear_connection_credentials_rejected", { connectionId: id });
+      } catch (err) {
+        console.error("Failed to clear the flag:", err);
+      }
+      await handleConnect(id);
+    },
+    [handleConnect]
+  );
+
+  const sizeJob = useRef(0);
+  const handleCalculateSize = useCallback(
+    async (entry: RemoteFileEntry) => {
+      if (!connectedProtocol) return;
+      const jobId = `size-${Date.now()}-${++sizeJob.current}`;
+      setSizes((prev) => ({ ...prev, [entry.path]: { jobId, running: true } }));
+      try {
+        const result = await tauriInvoke<FolderSize>("connector_folder_size", { protocol: connectedProtocol, path: entry.path, jobId });
+        setSizes((prev) => ({ ...prev, [entry.path]: { running: false, result } }));
+      } catch (err) {
+        setSizes((prev) => ({ ...prev, [entry.path]: { running: false, error: errorText(err) } }));
+      }
+    },
+    [connectedProtocol]
+  );
+
+  const handleCancelSize = useCallback(async (path: string) => {
+    const st = sizes[path];
+    if (st?.running) await tauriInvoke("connector_folder_size_cancel", { jobId: st.jobId }, false).catch(() => false);
+  }, [sizes]);
+
+  // Close the entry context menu on any outside click / Escape
+  useEffect(() => {
+    if (!entryMenu) return;
+    const close = () => setEntryMenu(null);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && close();
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [entryMenu]);
 
   const handleDisconnect = useCallback(async () => {
     if (connectedProtocol) {
@@ -1623,6 +1939,8 @@ export function ConnectionPanel() {
     setRemoteFiles([]);
     setRemotePath("/");
     setBrowseError(null);
+    setQuota(null);
+    setSizes({});
   }, [connectedProtocol]);
 
   const handleBrowse = useCallback(
@@ -1851,12 +2169,28 @@ export function ConnectionPanel() {
     [connectedProtocols]
   );
 
+  // Starred connections first, then by name (within each group too)
+  const sorted = useMemo(
+    () =>
+      connections
+        .slice()
+        .sort((a, b) => Number(!!statuses[b.id]?.starred) - Number(!!statuses[a.id]?.starred) || a.name.localeCompare(b.name)),
+    [connections, statuses]
+  );
+
   // Group connections by group_id
-  const ungrouped = connections.filter((c) => !c.group_id);
+  const ungrouped = sorted.filter((c) => !c.group_id);
   const grouped = groups.map((g) => ({
     group: g,
-    connections: connections.filter((c) => c.group_id === g.id),
+    connections: sorted.filter((c) => c.group_id === g.id),
   }));
+
+  const itemProps = (conn: ConnectionProfile) => ({
+    status: statuses[conn.id],
+    onToggleStar: (id: string, starred: boolean) => void handleToggleStar(id, starred),
+    onRetry: (id: string) => void handleRetry(id),
+    onSignIn: (c: ConnectionProfile) => setSignInFor(c),
+  });
 
   return (
     <div
@@ -1878,6 +2212,40 @@ export function ConnectionPanel() {
           >
             + New
           </button>
+          <div className="relative">
+            <button
+              onClick={() => setShowCloudMenu((v) => !v)}
+              className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded={showCloudMenu}
+            >
+              + Cloud
+            </button>
+            {showCloudMenu && (
+              <div className="absolute right-0 top-full mt-1 w-48 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg z-50" role="menu">
+                {([
+                  ["connect-gdrive", "Google Drive"],
+                  ["connect-dropbox", "Dropbox"],
+                  ["connect-onedrive", "OneDrive / SharePoint"],
+                  ["connect-gcs", "Google Cloud Storage"],
+                ] as const).map(([flow, label]) => (
+                  <button
+                    key={flow}
+                    role="menuitem"
+                    onClick={() => {
+                      setShowCloudMenu(false);
+                      setActiveGuidedFlow(flow);
+                    }}
+                    className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-700"
+                    type="button"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
           <button
             onClick={handleExport}
             className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
@@ -2015,6 +2383,7 @@ export function ConnectionPanel() {
                     testResult={testResults[conn.id] || null}
                     testing={testingIds.has(conn.id)}
                     isConnected={isProtocolConnected(conn.protocol)}
+                    {...itemProps(conn)}
                   />
                 ))}
               </div>
@@ -2041,6 +2410,7 @@ export function ConnectionPanel() {
             testResult={testResults[conn.id] || null}
             testing={testingIds.has(conn.id)}
             isConnected={isProtocolConnected(conn.protocol)}
+            {...itemProps(conn)}
           />
         ))}
 
@@ -2093,6 +2463,11 @@ export function ConnectionPanel() {
               Disconnect
             </button>
           </div>
+          {quota && formatQuota(quota) && (
+            <div className="px-3 py-1 text-xs text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-gray-700" data-testid="remote-quota">
+              Storage: {formatQuota(quota)}
+            </div>
+          )}
 
           {/* Breadcrumb path */}
           <div className="flex items-center gap-1 px-3 py-1.5 bg-gray-50 dark:bg-gray-800/50 border-b border-gray-200 dark:border-gray-700 overflow-x-auto">
@@ -2188,7 +2563,14 @@ export function ConnectionPanel() {
                 return a.name.localeCompare(b.name);
               })
               .map((entry) => (
-                <div key={entry.path} className="flex items-center border-b border-gray-100 dark:border-gray-800 last:border-b-0 group">
+                <div
+                  key={entry.path}
+                  className="flex items-center border-b border-gray-100 dark:border-gray-800 last:border-b-0 group"
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setEntryMenu({ entry, x: e.clientX, y: e.clientY });
+                  }}
+                >
                 <button
                   onClick={() => {
                     if (entry.is_dir) {
@@ -2223,6 +2605,18 @@ export function ConnectionPanel() {
                         {formatFileSize(entry.size)}
                       </span>
                     )}
+                    {entry.is_dir && sizes[entry.path] && (() => {
+                      const st = sizes[entry.path];
+                      if (st.running) return <span className="text-xs text-gray-400 dark:text-gray-500 animate-pulse" data-testid={`size-${entry.name}`}>Calculating…</span>;
+                      if (st.error) return <span className="text-xs text-red-500" data-testid={`size-${entry.name}`} title={st.error}>size failed</span>;
+                      const r = st.result!;
+                      return (
+                        <span className="text-xs text-gray-500 dark:text-gray-400" data-testid={`size-${entry.name}`}>
+                          {formatFileSize(r.bytes)} in {r.files} file{r.files === 1 ? "" : "s"}
+                          {r.complete ? "" : " (stopped)"}
+                        </span>
+                      );
+                    })()}
                     {entry.modified && (
                       <span className="text-xs text-gray-400 dark:text-gray-500">
                         {formatModified(entry.modified)}
@@ -2231,6 +2625,16 @@ export function ConnectionPanel() {
                   </div>
                 </button>
                 <div className="flex items-center gap-1 pr-2 flex-shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+                  {entry.is_dir && sizes[entry.path]?.running && (
+                    <button
+                      onClick={() => void handleCancelSize(entry.path)}
+                      className="text-xs px-1.5 py-0.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+                      type="button"
+                      aria-label={`Stop calculating the size of ${entry.name}`}
+                    >
+                      Stop
+                    </button>
+                  )}
                   {!entry.is_dir && connectedProtocol && SHAREABLE_PROTOCOLS.has(connectedProtocol) && (
                     <button
                       onClick={() => setSharing(entry)}
@@ -2270,6 +2674,66 @@ export function ConnectionPanel() {
       )}
       {sharingEntry && connectedProtocol && (
         <ShareLinkDialog protocol={connectedProtocol} connectionId={connectedId} path={sharingEntry.path} name={sharingEntry.name} onClose={() => setSharing(null)} />
+      )}
+      {entryMenu && (
+        <div
+          role="menu"
+          className="fixed z-50 min-w-40 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg py-1"
+          style={{ left: entryMenu.x, top: entryMenu.y }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          {entryMenu.entry.is_dir ? (
+            <button
+              role="menuitem"
+              type="button"
+              className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-700"
+              onClick={() => {
+                const entry = entryMenu.entry;
+                setEntryMenu(null);
+                void handleCalculateSize(entry);
+              }}
+            >
+              Calculate size
+            </button>
+          ) : (
+            <button
+              role="menuitem"
+              type="button"
+              className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-700"
+              onClick={() => {
+                const entry = entryMenu.entry;
+                setEntryMenu(null);
+                void handleDownload(entry);
+              }}
+            >
+              Download…
+            </button>
+          )}
+        </div>
+      )}
+      {signInFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" role="dialog" aria-modal="true" aria-label={`Sign in: ${signInFor.name}`}>
+          <div className="w-full max-w-md mx-4 rounded-lg bg-white dark:bg-gray-900 shadow-xl p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Sign in: {signInFor.name}</h3>
+              <button type="button" className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700" onClick={() => setSignInFor(null)}>
+                Close
+              </button>
+            </div>
+            <OAuthSignIn
+              connectionId={signInFor.id}
+              protocol={signInFor.protocol}
+              savedClientId={signInFor.extras?.oauth?.client_id ?? null}
+              onSignedIn={(r) => {
+                const id = signInFor.id;
+                setSignInFor(null);
+                setTransferStatus(r.account ? `Signed in as ${r.account}.` : "Signed in.");
+                refresh();
+                void handleConnect(id);
+              }}
+            />
+          </div>
+        </div>
       )}
     </div>
   );

@@ -305,7 +305,7 @@ Reports can be exported as CSV or JSON.
 | **Google Drive** | OAuth 2.0 login. Supports My Drive, Shared Drives, Docs export, and versioning. |
 | **Dropbox** | OAuth 2.0 login. Team/shared folders and session uploads. |
 | **OneDrive** | Personal and Business accounts. SharePoint support. Handles naming restrictions. |
-| **Backblaze B2** | Native API with large file uploads. S3 compatibility mode available. |
+| **Backblaze B2** | Native API (application key ID + key) with large file uploads. S3 compatibility mode available. |
 | **Azure Blob Storage** | Containers and blobs; uploads in 4 MiB blocks; folders as `dir/` marker blobs; read-only SAS share links. |
 | **Azure Data Lake Storage Gen2** | Accounts with a hierarchical namespace (`dfs` endpoint): real folders, and uploads that appear only when complete (written under a hidden name, then renamed). |
 | **Azure Files** | File shares over the REST API (no SMB port needed); uploads in 4 MiB ranges under a hidden name, then renamed; read-only SAS share links. |
@@ -321,19 +321,44 @@ For **OpenStack Swift**, choose how to sign in:
 
 **Auth URL** is the Keystone (or TempAuth) URL; leave it blank to use `https://<host>:<port>/v3` (or `/auth/v1.0` for TempAuth). A URL without a version gets `/v3`. When the project has storage in several regions, enter the **region** to use. Large objects keep their segments in `<container>_segments`; replacing or deleting the object removes its old segments. Containers and folders are removed only when empty. Share links are TempURLs and need a `Temp-URL-Key` on the account or the container (for example `swift post -m Temp-URL-Key:<secret>`); changing that key revokes every link.
 
+### Signing in to Google Drive, Dropbox and OneDrive
+
+Add the connection from **Connections → + Cloud** (a guided wizard) or with **+ New** and the provider as protocol. After it is saved, **Sign in with …** opens the provider's page in your browser; when you approve, the browser returns to UFOP (on `http://localhost:9876`, `9877` or `9878` for Google Drive, Dropbox and OneDrive) and the connection is signed in. No password is stored: the access the provider grants (OAuth tokens) is kept in the OS keychain and renewed automatically when it expires. Use **Sign in** on the connection later to switch accounts.
+
+- **Browser on another device**: open the sign-in page there and paste the code (or the whole address the browser was sent to) into *Paste the code*.
+- **Computer without a browser** (*Sign in on a computer without a browser*): paste tokens (an access token, or JSON with a refresh token and its client ID), or an **AuthID** from your self-hosted sign-in broker (`ufop-server --oauth-config`, open `/oauth/<provider>/start` there). The credential is checked by connecting before it is saved.
+- **Built-in app**: a build of UFOP can include its own OAuth app (`UFOP_GOOGLE_DRIVE_CLIENT_ID`, `UFOP_DROPBOX_CLIENT_ID`, `UFOP_ONEDRIVE_CLIENT_ID`, with `_CLIENT_SECRET` for Google; set when building or running). A build without one says so in the sign-in screen. In **Advanced** view you can then use **your own OAuth app**: enter its client ID (and, for Google, its client secret) and register the redirect URI shown (`http://localhost:<port>/callback`).
+
+**Where the connection opens** (saved on the connection):
+
+- **Google Drive**: My Drive, Shared with me, or one shared drive (choose it with *Load*). Google Docs, Sheets, Slides and Drawings are exported when downloaded, by default as docx, xlsx, pptx and pdf; Advanced view lets you pick other formats (for example pdf or csv).
+- **OneDrive**: a personal or a work/school account; for work accounts you can open a **SharePoint document library** instead of your OneDrive (search the site, then choose the library).
+- **Dropbox**: your own folder, the **team space** or a **team folder** (*Load team spaces*).
+
+### Connection settings
+
+- **SFTP**: the password, or the private key path (*Password*) and the key's **passphrase**. A key generated in the form with a passphrase fills it in.
+- **WebDAV**: sign in with a user name and password, a **bearer token** (app passwords and tokens), or none; choose **Nextcloud** or **ownCloud** for their chunked uploads.
+- **SMB**: the Windows **domain** (optional). The password is passed to the mount command through the environment, not the command line.
+- **Backblaze B2**: the **application key ID** and **application key**.
+
 ### Connection Management
 
 - **Save** - Store connection profiles with names and groups
 - **Test** - Verify connectivity before saving
 - **Groups** - Organize connections into named groups
+- **Star** - Starred connections (☆ next to the name) are listed first
+- **Show password** - The eye button in a password field shows what you typed
 - **Import/Export** - Share connection profiles between machines
 - **Credential Storage** - Passwords and keys stored in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service)
+- **Rejected credentials** - When a server refuses the sign-in (wrong password, expired or revoked access), the connection is marked *Credentials rejected* and automatic reconnects (backups, automation, auto-mount) skip it instead of retrying the same credentials, which could lock the account. Edit the connection with the current credentials, or click **Retry**. Network errors are still retried.
+- **Storage and folder size** - When connected, the panel shows the account's storage (Google Drive, OneDrive, Dropbox, rclone remotes). Right-click a remote folder → **Calculate size** to add up everything below it (rclone asks the server; other connections walk the folders, eight at a time); *Stop* ends it early with partial figures.
 
 ### Guided Wizards
 
 Simple mode provides step-by-step wizards for:
 
-- Connect OneDrive / Google Drive / Dropbox
+- Connect OneDrive / Google Drive / Dropbox (save, sign in, choose where it opens, check it by listing it) and Google Cloud Storage (HMAC keys, checked by listing the buckets)
 - Set up local sync
 - Connect to Windows Share (SMB)
 - Connect via SFTP

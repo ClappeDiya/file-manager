@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Google Drive, Dropbox and OneDrive sign-in** (see `docs/user-guide.md`): OAuth 2.0 with PKCE through the system browser and a loopback redirect (`oauth_begin` / `oauth_await`, `oauth_complete` for a code pasted from another device); tokens are stored in the OS keychain with the connection and each connector's connect restores them, renews expired ones and saves rotated ones. A build's own app comes from `UFOP_<GOOGLE_DRIVE|DROPBOX|ONEDRIVE>_CLIENT_ID`; without one the sign-in screen says so and Advanced view takes your own client ID/secret. Headless: paste tokens or an AuthID from the self-hosted broker (`oauth_import_grant`). The cloud wizards (Connections → + Cloud, Simple mode) now save, sign in, pick the location and list it for real.
+- **Business scopes**: Google Drive opens My Drive, Shared with me or a chosen shared drive, and exports Docs/Sheets/Slides/Drawings in chosen formats (Advanced); OneDrive work accounts can open a SharePoint document library (site search, library picker); Dropbox can open the team space or a team folder (`Dropbox-API-Path-Root`). Downloads, uploads, new folders and delete now work on these three connectors.
+- **Starred connections** (listed first) and a show/hide button on password fields; schema v32.
+- **Remote storage and folder size**: the Connections panel shows the account's quota (Google Drive, OneDrive, Dropbox, rclone `about`), and *Calculate size* on a remote folder adds it up (rclone `size`, else a cancellable walk) — `connector_quota`, `connector_folder_size`.
+- **Connection fields**: SFTP key passphrase (in the keychain), WebDAV bearer token and Nextcloud/ownCloud vendor, SMB domain, Backblaze B2 as a saved connection type.
 - **Simple and Advanced mode in the backup screens**: in Simple mode (the default) the job editor, Restore, Maintenance, Settings and Recovery show the everyday flow; advanced options appear in Advanced mode or with *Show advanced backup options* (a per-area override in the UI store), behind one `AdvancedOnly` gate with a "Switch to Advanced" hint.
 - **`SECURITY.md`**: how to report a vulnerability privately (GitHub private vulnerability reporting), supported versions and response times.
 - Interface polish:
@@ -84,6 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Rejected credentials are no longer retried**: 401/403 and refused sign-ins are `AppError::Authentication` (not retried by the shared retry policy, `ufop_core::retry::is_retryable`); the connection is flagged *Credentials rejected*, and backups, automation and auto-mount skip it until it is edited or *Retry* is clicked. Backup destinations used to retry a 401 with backoff.
+- Backblaze B2 connected with an empty application key (every connection failed) and could deadlock re-authorizing an expired token.
+- Connecting a saved connection ignored its connector settings; the SFTP key passphrase, WebDAV bearer/vendor settings and SMB domain (and password) never reached the connectors.
+- Google Drive listings stopped after 100 items and folder paths below the top level did not open; OneDrive paths below the root did not open; the cloud trash/permanent-delete commands used a connector that was never signed in.
 - ufop-server file gateway: a refused upload (no such gateway, read-only, larger than the agent accepts) was answered before its body was read, so a client still sending could get a broken pipe instead of the 404/403; the server now reads and discards up to 64 MiB of a refused upload (30 s at most) before answering, and closes the connection beyond that.
 - Automation rule editor: *Dry run* of an unsaved rule that watches a folder showed no files; it now tries the newest files already in that folder (`test_automation_rule`). `scripts/dump-ipc-commands.sh` no longer misses commands whose doc comment follows `#[tauri::command]`.
 - Mirror runs deleted the rollback snapshots they had just taken (stored inside the destination); snapshots and quarantine now live in the app data folder, and `.sync-rollback`, `.sync-quarantine` and `.ufop-partial` are never synced or purged.
