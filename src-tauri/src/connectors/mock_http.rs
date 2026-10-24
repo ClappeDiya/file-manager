@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 /// One request the mock received.
 #[derive(Debug, Clone)]
 pub struct Seen {
+    pub method: String,
     pub path: String,
     pub query: String,
     pub headers: HeaderMap,
@@ -53,14 +54,16 @@ where
 {
     let log: Arc<Mutex<Vec<Seen>>> = Arc::default();
     let (h, l2) = (Arc::new(handler), log.clone());
-    let app = axum::Router::new().fallback(move |u: Uri, headers: HeaderMap, body: Bytes| {
+    let app = axum::Router::new().fallback(move |m: axum::http::Method, u: Uri, headers: HeaderMap, body: Bytes| {
         let (h, log) = (h.clone(), l2.clone());
         async move {
-            let seen = Seen { path: u.path().to_string(), query: u.query().unwrap_or("").to_string(), headers, body };
+            let seen = Seen { method: m.to_string(), path: u.path().to_string(), query: u.query().unwrap_or("").to_string(), headers, body };
             log.lock().unwrap().push(seen.clone());
             h(&seen)
         }
-    });
+    })
+    // Uploads in tests may exceed axum's 2 MB default.
+    .layer(axum::extract::DefaultBodyLimit::disable());
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });

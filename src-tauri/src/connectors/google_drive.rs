@@ -23,6 +23,9 @@ use tokio::sync::RwLock;
 const DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD_BASE: &str = "https://www.googleapis.com/upload/drive/v3";
 const DEFAULT_CALLBACK_PORT: u16 = 9876;
+const GOOGLE_APPS_MIME: &str = "application/vnd.google-apps.";
+/// Smaller files go up in one multipart request; larger ones are streamed.
+const SIMPLE_UPLOAD_LIMIT: u64 = 5 * 1024 * 1024;
 
 /// Google Drive file MIME types for export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,8 +275,11 @@ impl GoogleDriveConnector {
                 self.force_refresh().await?;
                 continue;
             }
-            if matches!(status.as_u16(), 401 | 403) {
+            if status.as_u16() == 401 {
                 return Err(AppError::auth(format!("Google Drive refused the sign-in (HTTP {status})"), "Sign in again from Connections."));
+            }
+            if status.as_u16() == 403 {
+                return Err(about_forbidden(&resp.text().await.unwrap_or_default()));
             }
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
@@ -589,6 +595,66 @@ impl GoogleDriveConnector {
         Ok((entries, list.next_page_token))
     }
 
+    /// The shared drive new items under virtual folder `dir` belong to.
+    fn drive_id_for(&self, dir: &str) -> Option<String> {
+        match drive_location(dir) {
+            DriveLocation::Root => {
+                let s = self.settings.read().map(|s| s.clone()).unwrap_or_default();
+                s.shared_drive_id.filter(|d| !d.is_empty() && s.root == GoogleDriveRoot::SharedDrive)
+            }
+            DriveLocation::SharedDrive { drive_id, .. } => Some(drive_id),
+            _ => None,
+        }
+    }
+
+    /// The ID of a (non-folder) file called `name` directly in `parent`.
+    async fn find_file(&self, parent: &str, name: &str, drive_id: Option<&str>) -> Result<Option<String>, AppError> {
+        // Not folders, nor Google Docs (their content cannot be replaced by a file).
+        let q = format!("name = '{}' and '{}' in parents and trashed = false and not mimeType contains '{GOOGLE_APPS_MIME}'", q_escape(name), q_escape(parent));
+        let found = self.list_query(&q, drive_id, "").await?;
+        Ok(found.into_iter().find(|e| e.name == name && !e.is_dir).map(|e| e.path.trim_start_matches('/').to_string()))
+    }
+
+    /// Resumable upload streamed from `local` (`size` bytes): `POST` creates
+    /// a file with `metadata`, `PATCH` on `…/files/{id}` replaces its content.
+    async fn upload_streamed(&self, method: reqwest::Method, init_url: &str, metadata: serde_json::Value, local: &str, size: u64) -> Result<String, AppError> {
+        let unreachable = |e: reqwest::Error| AppError::transfer(format!("Google Drive upload failed: {e}"), "Check your network connection.");
+        let resp = self
+            .http
+            .request(method, init_url)
+            .bearer_auth(self.get_token().await?)
+            .header("Content-Type", "application/json; charset=UTF-8")
+            .header("X-Upload-Content-Length", size.to_string())
+            .body(metadata.to_string())
+            .send()
+            .await
+            .map_err(unreachable)?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body: String = resp.text().await.unwrap_or_default().chars().take(300).collect();
+            let message = format!("Google Drive upload failed (HTTP {status}): {body}");
+            return Err(if status.as_u16() == 401 { AppError::auth(message, "Sign in again from Connections.") } else { AppError::transfer(message, "Check your storage quota and permissions.") });
+        }
+        let session = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+            .ok_or_else(|| AppError::transfer("Google Drive gave no upload address", "Try again."))?;
+        let file = tokio::fs::File::open(local).await.map_err(|e| AppError::file_op(format!("Cannot read {local}: {e}"), "Check the file."))?;
+        let resp = self
+            .http
+            .put(&session)
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file)))
+            .send()
+            .await
+            .map_err(unreachable)?;
+        let done: DriveFile = drive_json(resp, "Uploading").await?;
+        tracing::info!("Uploaded to Google Drive: {} (ID: {})", local, done.id);
+        Ok(done.id)
+    }
+
     /// Upload a file to Google Drive.
     pub async fn upload_file(
         &self,
@@ -603,7 +669,7 @@ impl GoogleDriveConnector {
         let content_type = mime_type.unwrap_or("application/octet-stream");
 
         // Use simple upload for small files, resumable for large
-        if file_size < 5 * 1024 * 1024 {
+        if (file_size as u64) < SIMPLE_UPLOAD_LIMIT {
             self.simple_upload(&token, name, parent_id, &data, content_type).await
         } else {
             self.resumable_upload(&token, name, parent_id, &data, content_type).await
@@ -1159,10 +1225,25 @@ impl Connector for GoogleDriveConnector {
         Box::pin(async move {
             let (dir, name) = split_parent(&r)?;
             let parent = self.folder_for(&dir)?;
-            let data = tokio::fs::read(&l).await.map_err(|e| AppError::file_op(format!("Cannot read {l}: {e}"), "Check the file."))?;
-            let n = data.len() as u64;
-            self.upload_file(&name, Some(&parent), data, None).await?;
-            Ok(n)
+            let size = tokio::fs::metadata(&l).await.map_err(|e| AppError::file_op(format!("Cannot read {l}: {e}"), "Check the file."))?.len();
+            // Drive allows several files with one name: replace the one
+            // already there (as Dropbox and OneDrive do) instead of adding
+            // a duplicate on every re-run.
+            match self.find_file(&parent, &name, self.drive_id_for(&dir).as_deref()).await? {
+                Some(id) => {
+                    let url = format!("{}/files/{}?uploadType=resumable&supportsAllDrives=true", self.upload_base, percent_encoding::utf8_percent_encode(&id, percent_encoding::NON_ALPHANUMERIC));
+                    self.upload_streamed(reqwest::Method::PATCH, &url, serde_json::json!({}), &l, size).await?;
+                }
+                None if size < SIMPLE_UPLOAD_LIMIT => {
+                    let data = tokio::fs::read(&l).await.map_err(|e| AppError::file_op(format!("Cannot read {l}: {e}"), "Check the file."))?;
+                    self.upload_file(&name, Some(&parent), data, None).await?;
+                }
+                None => {
+                    let url = format!("{}/files?uploadType=resumable&supportsAllDrives=true", self.upload_base);
+                    self.upload_streamed(reqwest::Method::POST, &url, serde_json::json!({ "name": name, "parents": [parent] }), &l, size).await?;
+                }
+            }
+            Ok(size)
         })
     }
 
@@ -1415,7 +1496,31 @@ fn q_escape(v: &str) -> String {
     v.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
-/// The JSON body of a successful Drive reply; 401/403 are rejected sign-ins.
+/// A 403 from `about` (every connect). Google also answers 403 for rate
+/// limits, quotas and an API not enabled for the app, so only authorization
+/// reasons are a rejected sign-in; limits are retried later.
+fn about_forbidden(body: &str) -> AppError {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let err = &v["error"];
+    let reasons: Vec<&str> = err["errors"].as_array().into_iter().chain(err["details"].as_array()).flatten().filter_map(|e| e["reason"].as_str()).collect();
+    let has = |list: &[&str]| reasons.iter().any(|r| list.iter().any(|l| r.eq_ignore_ascii_case(l)));
+    let why = reasons.first().copied().unwrap_or("no reason given");
+    if has(&["rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded", "quotaExceeded", "RATE_LIMIT_EXCEEDED", "backendError"]) {
+        AppError::connection(format!("Google Drive is limiting requests (HTTP 403: {why})"), "UFOP tries again later; wait a few minutes.")
+    } else if has(&["accessNotConfigured", "SERVICE_DISABLED"]) {
+        AppError::Configuration {
+            message: format!("The Google Drive API is not enabled for this OAuth app (HTTP 403: {why})"),
+            advice: "Enable the Google Drive API in the Google Cloud project of your OAuth client, or sign in with the built-in app.".to_string(),
+        }
+    } else if has(&["authError", "insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT", "invalidCredentials"]) {
+        AppError::auth(format!("Google Drive refused the sign-in (HTTP 403: {why})"), "Sign in again from Connections.")
+    } else {
+        AppError::connection(format!("Google Drive refused the request (HTTP 403: {why})"), "Try again later; if it keeps failing, sign in again from Connections.")
+    }
+}
+
+/// The JSON body of a successful Drive reply; a 401 is a rejected sign-in
+/// (a 403 is about the item or a rate limit, not the sign-in).
 async fn drive_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response, what: &str) -> Result<T, AppError> {
     let status = resp.status();
     if !status.is_success() {
@@ -1552,6 +1657,89 @@ mod tests {
         assert_eq!(split_parent("/f1/a b.txt").unwrap(), ("/f1".to_string(), "a b.txt".to_string()));
         assert_eq!(split_parent("/a.txt").unwrap(), ("/".to_string(), "a.txt".to_string()));
         assert_eq!(q_escape("it's"), "it\\'s");
+    }
+
+    /// Regression: uploading a name that already exists in the folder made
+    /// a duplicate (Drive allows equal names; an automation re-run piled
+    /// them up), where Dropbox and OneDrive replace the file. The existing
+    /// file's content is now replaced, streamed from disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uploading_an_existing_name_replaces_that_file() {
+        use crate::connectors::mock_http::{json, serve, status};
+        use axum::response::IntoResponse;
+        let exists = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let e2 = exists.clone();
+        let mock = serve(move |r| {
+            let base = format!("http://{}", r.header("host").unwrap_or_default());
+            let file = |id: &str| json(serde_json::json!({ "id": id, "name": "it's.txt", "mimeType": "text/plain" }));
+            match r.path.as_str() {
+                "/api/about" => json(serde_json::json!({ "user": { "emailAddress": "t@example.com" } })),
+                "/api/files" if e2.load(std::sync::atomic::Ordering::SeqCst) => json(serde_json::json!({ "files": [{ "id": "old", "name": "it's.txt", "mimeType": "text/plain" }] })),
+                "/api/files" => json(serde_json::json!({ "files": [] })),
+                "/upload/files" if r.query_param("uploadType").as_deref() == Some("resumable") => ([("location", format!("{base}/session/big"))], "").into_response(),
+                "/upload/files" => file("new"),
+                "/upload/files/old" => ([("location", format!("{base}/session/old"))], "").into_response(),
+                "/session/old" => file("old"),
+                "/session/big" => file("big"),
+                _ => status(404, "no"),
+            }
+        })
+        .await;
+        let b = &mock.base;
+        let c = GoogleDriveConnector::new().with_endpoints(&format!("{b}/api"), &format!("{b}/upload"), &format!("{b}/token"));
+        let p = crate::connectors::live_tests::profile(crate::core::types::ConnectionProtocol::GoogleDrive, "", None, "", "/");
+        c.connect_with_secret(&p, Some(r#"{"access_token":"t"}"#.into())).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("it's.txt");
+        std::fs::write(&f, "v1").unwrap();
+        // New name: created.
+        assert_eq!(c.upload(f.to_str().unwrap(), "/it's.txt").await.unwrap(), 2);
+        assert_eq!(mock.requests("/upload/files").len(), 1);
+        let lookup = &mock.requests("/api/files")[0];
+        assert_eq!(lookup.query_param("q").as_deref(), Some("name = 'it\\'s.txt' and 'root' in parents and trashed = false and not mimeType contains 'application/vnd.google-apps.'"));
+        // Same name again: that file's content is replaced, no second file.
+        exists.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(&f, "version 2").unwrap();
+        assert_eq!(c.upload(f.to_str().unwrap(), "/it's.txt").await.unwrap(), 9);
+        assert_eq!(mock.requests("/upload/files").len(), 1, "no duplicate is created");
+        let init = &mock.requests("/upload/files/old")[0];
+        assert_eq!((init.method.as_str(), init.query_param("uploadType").as_deref()), ("PATCH", Some("resumable")));
+        let put = &mock.requests("/session/old")[0];
+        assert_eq!((put.method.as_str(), &put.body[..]), ("PUT", &b"version 2"[..]));
+        // A large new file is streamed through a resumable session.
+        exists.store(false, std::sync::atomic::Ordering::SeqCst);
+        let big = dir.path().join("big.bin");
+        std::fs::write(&big, vec![7u8; SIMPLE_UPLOAD_LIMIT as usize + 1]).unwrap();
+        assert_eq!(c.upload(big.to_str().unwrap(), "/big.bin").await.unwrap(), SIMPLE_UPLOAD_LIMIT + 1);
+        let init = mock.requests("/upload/files").into_iter().find(|r| r.query_param("uploadType").as_deref() == Some("resumable")).unwrap();
+        assert_eq!((init.method.as_str(), init.json()["name"].as_str(), init.header("x-upload-content-length")), ("POST", Some("big.bin"), Some((SIMPLE_UPLOAD_LIMIT + 1).to_string())));
+        assert_eq!(mock.requests("/session/big")[0].body.len() as u64, SIMPLE_UPLOAD_LIMIT + 1);
+    }
+
+    /// Regression: every 403 from `about` (run on each connect) was a
+    /// rejected sign-in, so a rate-limited background reconnect flagged the
+    /// connection and paused its automation. Only authorization reasons are.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rate_limited_connect_is_not_a_rejected_sign_in() {
+        use crate::connectors::mock_http::{serve, status};
+        let reason = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let r2 = reason.clone();
+        let mock = serve(move |_| {
+            let reason = r2.lock().unwrap().clone();
+            status(403, &serde_json::json!({ "error": { "code": 403, "message": "m", "errors": [{ "domain": "usageLimits", "reason": reason, "message": "m" }] } }).to_string())
+        })
+        .await;
+        let b = &mock.base;
+        let p = crate::connectors::live_tests::profile(crate::core::types::ConnectionProtocol::GoogleDrive, "", None, "", "/");
+        for (why, auth) in [("rateLimitExceeded", false), ("userRateLimitExceeded", false), ("dailyLimitExceeded", false), ("accessNotConfigured", false), ("insufficientPermissions", true), ("authError", true)] {
+            *reason.lock().unwrap() = why.to_string();
+            let c = GoogleDriveConnector::new().with_endpoints(&format!("{b}/api"), &format!("{b}/upload"), &format!("{b}/token"));
+            let err = c.connect_with_secret(&p, Some(r#"{"access_token":"t"}"#.into())).await.unwrap_err();
+            assert_eq!(err.is_auth_failure(), auth, "{why}: {err}");
+            if why.contains("RateLimit") || why.starts_with("rate") {
+                assert!(ufop_core::retry::is_retryable(&err), "{why} is retried: {err}");
+            }
+        }
     }
 
     /// Scopes (item 25): "/" opens the chosen shared drive; Docs export in
