@@ -58,6 +58,8 @@ import { ConnectionPanel } from "./connection-panel";
 import { useConnectionBrowse } from "@/stores/connection-browse-store";
 import { LogViewerDialog } from "./log-viewer-dialog";
 import { useLogViewer } from "@/stores/log-viewer-store";
+import { FeedbackDialog } from "./feedback-dialog";
+import { useFeedbackDialog } from "@/stores/feedback-store";
 import { useRcloneUi } from "@/stores/rclone-ui-store";
 import { RcloneEngineInfo } from "@/components/rclone/rclone-settings-section";
 import { rcloneStatus, type RcloneStatus } from "@/lib/rclone";
@@ -2184,6 +2186,7 @@ export function FileManager() {
         onSendToComputer: () => openNearby(getAllSelectedPaths()),
         onOpenSchedules: appMode === "advanced" ? () => setSchedulesOpen(true) : undefined,
         onOpenLogViewer: appMode === "advanced" ? () => useLogViewer.getState().setOpen(true) : undefined,
+        onSendFeedback: () => useFeedbackDialog.getState().setOpen(true),
         onOpenTransferHistory: () => {
           setTransferHistoryOpen(true);
         },
@@ -2971,6 +2974,9 @@ export function FileManager() {
 
       {/* In-app log viewer (Advanced) */}
       <LogViewerDialog />
+
+      {/* Help > Send feedback */}
+      <FeedbackDialog />
 
       {/* Schedules & holiday calendars (Advanced): shared by sync pairs,
           automation rules and backup jobs. */}
