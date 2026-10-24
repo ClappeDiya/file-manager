@@ -159,6 +159,7 @@ async fn run_once(pair: &SyncPair, format: &OutputFormat, cancel: Arc<AtomicBool
         })),
         cancel: Some(cancel),
         on_step: None,
+        on_file: None,
     };
 
     let result =

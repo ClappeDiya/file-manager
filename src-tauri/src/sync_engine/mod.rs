@@ -11,6 +11,7 @@
 //! - Partial failure continuation and resumable sync
 
 pub mod filter_presets;
+pub mod live_files;
 pub mod portable;
 pub mod report;
 pub mod scheduler;
@@ -162,6 +163,8 @@ pub struct SyncManager {
     running: Arc<RwLock<HashMap<Uuid, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Latest progress of each run in progress, by pair.
     progress: Arc<std::sync::Mutex<HashMap<Uuid, executor::SyncProgress>>>,
+    /// The files each run in progress is working on and has finished, by pair.
+    live: Arc<std::sync::Mutex<HashMap<Uuid, live_files::LiveRun>>>,
     /// Told about every finished run (desktop and profile notifications).
     run_listeners: Arc<std::sync::RwLock<Vec<RunListener>>>,
     /// Database for two-way baselines; without one (unit tests) they are
@@ -232,6 +235,7 @@ impl SyncManager {
             state_dir,
             running: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            live: Arc::new(std::sync::Mutex::new(HashMap::new())),
             run_listeners: Arc::new(std::sync::RwLock::new(Vec::new())),
             pairs: Arc::new(RwLock::new(HashMap::new())),
             reports: Arc::new(RwLock::new(HashMap::new())),
@@ -462,6 +466,12 @@ impl SyncManager {
     }
 
     /// Progress of every running sync.
+    /// The files a pair's running sync is working on and has finished (a
+    /// bounded list); `None` when the pair is not syncing.
+    pub fn live_files(&self, pair_id: Uuid, limit: usize) -> Option<live_files::LiveFiles> {
+        self.live.lock().ok()?.get(&pair_id).map(|run| run.snapshot(limit))
+    }
+
     pub fn all_progress(&self) -> Vec<executor::SyncProgress> {
         self.progress.lock().map(|m| m.values().cloned().collect()).unwrap_or_default()
     }
@@ -523,6 +533,9 @@ impl SyncManager {
         self.running.write().await.remove(&pair_id);
         if let Ok(mut p) = self.progress.lock() {
             p.remove(&pair_id);
+        }
+        if let Ok(mut l) = self.live.lock() {
+            l.remove(&pair_id);
         }
         let mut report = match result {
             Ok(report) => report,
@@ -641,6 +654,11 @@ impl SyncManager {
         }
 
         let progress_map = self.progress.clone();
+        let live_map = self.live.clone();
+        // A fresh list for this run.
+        if let Ok(mut m) = self.live.lock() {
+            m.insert(pair_id, live_files::LiveRun::default());
+        }
         let hooks = executor::RunHooks {
             progress: Some(Arc::new(move |p: &executor::SyncProgress| {
                 if let Ok(mut m) = progress_map.lock() {
@@ -649,6 +667,11 @@ impl SyncManager {
             })),
             cancel: Some(cancel),
             on_step: journal.as_ref().map(|j| j.recorder()),
+            on_file: Some(Arc::new(move |event: &executor::FileEvent| {
+                if let Ok(mut m) = live_map.lock() {
+                    m.entry(pair_id).or_default().apply(event);
+                }
+            })),
         };
 
         let result = tokio::task::spawn_blocking(move || executor::execute_sync_with(&config, &hooks))
@@ -1877,6 +1900,48 @@ mod tests {
         assert_eq!(names(window), vec!["run2"]);
     }
 
+    /// Row 72: a running sync exposes the files it is on, bounded; once it
+    /// ends the list is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_running_sync_lists_its_files_and_the_list_goes_with_the_run() {
+        let mgr = Arc::new(SyncManager::new());
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        for i in 0..600 {
+            std::fs::write(src.path().join(format!("f{i:03}.txt")), format!("file number {i}")).unwrap();
+        }
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.copy_options.threads = 1;
+        mgr.create_pair(pair.clone()).await.unwrap();
+        assert!(mgr.live_files(pair.id, 50).is_none(), "idle pairs have no live list");
+
+        let poller = {
+            let mgr = mgr.clone();
+            let id = pair.id;
+            tokio::spawn(async move {
+                let mut best: Option<live_files::LiveFiles> = None;
+                for _ in 0..20_000 {
+                    if let Some(snap) = mgr.live_files(id, 50) {
+                        if snap.finished_total > 0 && best.as_ref().map_or(true, |b| snap.finished_total > b.finished_total) {
+                            best = Some(snap);
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_micros(500)).await;
+                    if best.as_ref().is_some_and(|b| b.finished_total >= 300) {
+                        break;
+                    }
+                }
+                best
+            })
+        };
+        let report = mgr.execute_sync(pair.id).await.unwrap();
+        assert_eq!(report.files_added, 600);
+        let seen = poller.await.unwrap().expect("a snapshot taken while the run was going");
+        assert!(seen.files.len() <= 50, "bounded by the limit");
+        assert!(seen.files.iter().any(|f| f.state == "done" && f.action.as_deref() == Some("copied")));
+        assert!(mgr.live_files(pair.id, 50).is_none(), "the list goes with the run");
+    }
+
     #[tokio::test]
     async fn sync_pairs_survive_a_restart() {
         let repo = crate::storage::Repository::open_in_memory().await.unwrap();
@@ -2833,6 +2898,7 @@ mod tests {
             })),
             cancel: None,
             on_step: None,
+            on_file: None,
         };
         let outcome = executor::execute_sync_with(&config, &hooks).unwrap();
         assert_eq!(outcome.report.files_added, 5);

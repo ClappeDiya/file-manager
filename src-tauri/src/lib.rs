@@ -921,6 +921,7 @@ pub fn run() {
             sync_commands::run_sync,
             sync_commands::get_sync_run_history,
             sync_commands::get_sync_run_items,
+            sync_commands::get_sync_live_files,
             sync_commands::prune_sync_run_history,
             sync_commands::get_sync_health,
             sync_commands::sync_dry_run,

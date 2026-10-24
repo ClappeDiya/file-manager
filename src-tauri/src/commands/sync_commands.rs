@@ -281,6 +281,18 @@ pub async fn get_sync_run_history(
     manager.run_history_between(&repo, id, limit.unwrap_or(100), from, to).await
 }
 
+/// The files a running sync is working on and has finished, newest first
+/// (bounded; `limit` is capped). `null` when the pair is not syncing.
+#[tauri::command]
+pub async fn get_sync_live_files(
+    pair_id: String,
+    limit: Option<u32>,
+    manager: State<'_, SyncManager>,
+) -> Result<Option<crate::sync_engine::live_files::LiveFiles>, AppError> {
+    let id = parse_uuid(&pair_id)?;
+    Ok(manager.live_files(id, limit.unwrap_or(200) as usize))
+}
+
 /// The files a stored sync run changed (copied, updated, deleted, failed…),
 /// one page at a time.
 #[tauri::command]
