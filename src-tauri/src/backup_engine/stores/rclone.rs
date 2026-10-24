@@ -209,7 +209,8 @@ impl RcloneStore {
         };
         // rclone exited; anything it left behind in its group goes too.
         drop(reaper);
-        fed?;
+        // A failing rclone may exit before reading its input: its own error
+        // explains more than the broken pipe that leaves on our side.
         if !status.success() {
             let err = String::from_utf8_lossy(&stderr);
             let last = err.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("").to_string();
@@ -217,6 +218,7 @@ impl RcloneStore {
             let advice = if tail.is_empty() { "Check the rclone remote with `rclone lsd <remote>:`.".to_string() } else { format!("rclone said: {tail}. Check the remote with `rclone lsd <remote>:`.") };
             return Err(AppError::connection(format!("rclone {what} failed: {last}"), advice));
         }
+        fed?;
         Ok(stdout)
     }
 }

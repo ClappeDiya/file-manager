@@ -100,6 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Versioned backups stored a duplicate version of every file on every run** (copies were never seen as already stored).
 - **The transfer bandwidth limit was never applied**: `set_global_throttle` stored a limit no transfer obeyed; chunks are now paced.
 - **Sync resume was dead code**: the resume state was read but never written; replaced by real checkpoints.
+- **rclone backup destinations**: when rclone failed before reading the data sent to it (quota exceeded, permission denied), the error said "Broken pipe" instead of rclone's own message.
 
 - ufop-server file gateway: a refused upload (no such gateway, read-only, larger than the agent accepts) was answered before its body was read, so a client still sending could get a broken pipe instead of the 404/403; the server now reads and discards up to 64 MiB of a refused upload (30 s at most) before answering, and closes the connection beyond that.
 - Automation rule editor: *Dry run* of an unsaved rule that watches a folder showed no files; it now tries the newest files already in that folder (`test_automation_rule`). `scripts/dump-ipc-commands.sh` no longer misses commands whose doc comment follows `#[tauri::command]`.
