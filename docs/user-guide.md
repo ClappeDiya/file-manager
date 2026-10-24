@@ -232,6 +232,15 @@ A three-tier verification system is available:
 
 All completed transfers are logged and searchable. History can be exported as CSV.
 
+- **Date chips:** *Today*, *Yesterday*, *Last 7 days*, *Last 30 days* or *Custom* (two dates) narrow the list, the count and the CSV export alike. The same chips are on Sync history and Backup run history. Times are shown in your local time.
+- **Open source / Open destination:** a row's buttons reveal a local folder in the file manager, or open a remote location in the connection browser.
+- **Upload / Download / Sync chips** in the Transfers panel filter the queue by direction (a path like `s3://bucket/key` is the remote side). Each running sync shows an expandable list of its files (current, finished, and any that failed), capped so a huge sync stays light.
+- **Failed transfers survive a restart.** A failed transfer is saved at once, comes back after restart still marked *failed* (it is never retried by itself) and can be retried with the usual button. Failed entries are cleaned up after a time and size limit (default 30 days, 4096 KB; Transfer history → *Failed transfers stay available…*), which also run with *Clean up*.
+
+### Run history detail
+
+Sync, backup and Quickflow runs show **who started them**: *Manual*, *Scheduled*, *Watcher*, *API* or *Automation*. A sync run lists its **changed files** (copied, updated, deleted, moved, failed, conflict), up to 10,000 per run with a note when the list was cut short, and a backup job with several destinations keeps a **result row per destination** for every run, not just the last one.
+
 ---
 
 ## Sync
@@ -594,6 +603,10 @@ Open a terminal session in the current directory. Supports:
 
 Connect to remote servers via SSH directly from UFOP. Uses saved connection profiles for authentication.
 
+### Command help
+
+The *Command help* button in the terminal toolbar opens a drawer that lists the `ufop` command-line commands (and the `rclone` commands when rclone is found) with a one-line description. Search it, and click a command to type it at the prompt (it is not run until you press Enter).
+
 ---
 
 ## AI Assistant
@@ -773,6 +786,13 @@ Settings → Advanced → *Remote control from chat* lets you list, start and st
 - Switch on *Allow remote control from chat*, then a channel. **Telegram:** create a bot with @BotFather, paste its token, list the numeric user ids that may command it (message @userinfobot to find yours). **Slack:** create a Slack app with Socket Mode on, give the bot the `chat:write` scope (plus `app_mentions:read` for `app_mention` and `im:history` for `message.im`; `channels:history` if you use `message.channels`) and the app-level token the `connections:write` scope, subscribe to bot events (`app_mention` for channels, `message.im` for direct messages), then paste its bot token (`xoxb-…`) and app-level token (`xapp-…`) and list the member ids (`U…`) that may command it. One message that arrives as more than one event (for example both `app_mention` and `message.channels`) is run once. Tokens are kept in the credential store and never shown again.
 - The bot answers only the listed people; anyone else is ignored without a reply. Commands: `/jobs`, `/run <job>`, `/stop <job>`, `/status`, `/help`. Jobs are matched by their exact name or id (never a partial name); if a backup, a sync pair and a rule share a name, say which with `backup:Name`, `sync:Name` or `rule:Name`. Nothing else is understood — the bot cannot run a program or touch a path.
 - Every accepted command is written to the tamper-evident audit log before it runs; a command whose audit entry cannot be written is not run. Each person is limited to a number of commands per minute (default 10). Commands sent while the app was not listening are never run late: on start the Telegram bot first skips the waiting messages (and keeps retrying until it can, so an offline start never replays them).
+
+## Logs, feedback and the local web server
+
+- **Log viewer (Advanced):** toolbar *Log viewer*, Settings → Logging → *Open log viewer*, or the command palette. It reads the app's own log files and filters by level, source, time range and text. *Live* follows new lines, rows can be selected and copied, and *Open folder* shows where the files are (`ufop.<date>.log` for people, `ufop.<date>.jsonl` for tools; the log retention setting prunes both).
+- **Send feedback:** Help › *Send feedback* (command palette, or Settings → Logging). Write a message, pick a category and, if you want, tick *Include diagnostics* (off by default; secrets, e-mail addresses and folder names are scrubbed). On a computer registered with a management console it is sent there; otherwise it is saved as a zip you choose, and the dialog says so. Nothing is ever reported as sent when it was not.
+- **Local web server (Advanced):** Settings → Advanced → *Local web server* runs the web interface and API of `ufop-server` inside the app. It is off until you press *Start server*, listens on this computer only (port 8200 by default) and will not start until you set a password. *Allow other computers* listens on every interface and switches to HTTPS with a generated certificate. See `docs/server-operations.md`.
+- **Saved servers:** the same section lists the remote `ufop-server` addresses the `ufop` command line uses (`ufop/config.toml` in your user config folder, or the file named by `UFOP_CONFIG`). *Test connection* asks the server's `/api/v1/health` and shows its version and the delay. Tokens are never shown; sign in with `ufop server login`.
 
 ## Keyboard Shortcuts
 

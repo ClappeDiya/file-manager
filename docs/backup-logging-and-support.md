@@ -61,3 +61,14 @@ The CLI has `ufop backup db sanitize <db> <out>`, which writes only the sanitize
 ## Sync run history
 
 Every sync run is stored in the app database (`sync_runs`, migration v16), keeping the newest 500 per pair. **Sync → History** lists all pairs; **Reports** on a pair lists that pair's runs. CSV and JSON exports work for stored runs too. The commands are `get_sync_run_history` and `prune_sync_run_history`.
+
+Each sync run also stores its trigger (`run_trigger`: manual, scheduled, watcher, api) and, in `sync_run_items`, up to 10,000 changed files (copied, updated, deleted, moved, failed, conflict; failures first when the list is cut, `items_truncated` set). Commands: `get_sync_run_history` (optional `date_from`/`date_to`), `get_sync_run_items`, `get_sync_live_files` (running syncs). Backup runs store the trigger (`backup_runs.run_trigger`, migration v37) and one row per destination in `backup_replica_runs` (`backup_replica_history`; `backup_run_history` also takes dates).
+
+## Application log files
+
+The app writes `ufop.<date>.log` (human) and `ufop.<date>.jsonl` (one JSON object per line: time, level, source, message, fields) to the log folder. The in-app log viewer (`query_logs`) reads the JSON lines, falls back to the human file for days that have no `.jsonl`, and pages newest-first with a cursor. The retention setting prunes both kinds.
+
+## Feedback
+
+Help › Send feedback (`feedback_destination`, `feedback_submit`) sends a message, category and optional scrubbed diagnostics bundle to the registered management console as a bundle containing `feedback.json`; with no console it saves a zip to a folder. The result says which happened.
+

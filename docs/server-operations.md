@@ -300,6 +300,18 @@ form. Authenticate with `--pushgateway-basic-auth user:password` or `--pushgatew
 server stops, it waits for running backups to finish draining and pushes once more, so the last values
 (including `ufop_shutting_down 1`) are kept. Delete stale groups in the Pushgateway when you retire a server.
 
+## Inside the desktop app
+
+The desktop app can run the same server in-process (Settings → Advanced → *Local web server*; Advanced view). It shares the app's backup jobs and connections and has the same login, accounts and API, with these differences:
+
+- It never starts without a password; the password is the server's own account password (minimum 8 characters, stored hashed).
+- It listens on `127.0.0.1` only. *Allow other computers* listens on all interfaces and turns on HTTPS with a generated certificate; so does *HTTPS*.
+- Stopping it stops only the listener. The app's backups keep running (the in-process server installs no signal handlers and does not drain or cancel the app's backup manager).
+- The web interface files are taken from the folder chosen in Settings, else `UFOP_SERVER_WEBROOT`, else a `web` folder next to the app. If none has an `index.html` only the API answers, and Settings says so.
+- It is never started automatically when the app opens.
+
+The list below it is the CLI's profile file (`ufop` config, `UFOP_CONFIG` to move it). The desktop reads and writes only each profile's `server_url`; tokens are left untouched.
+
 ## Web UI branding
 
 Put your organization's name and colors on the server's web UI: a **title prefix** (`[ACME] ` before every page title), a **product name** (sign-in heading and titles, default *UFOP backup server*), a **logo** (sign-in screen, tab bar and favicon), an **accent color** (buttons and the selected tab; also the `--ufop-accent` CSS variable) and a little **custom CSS**.
