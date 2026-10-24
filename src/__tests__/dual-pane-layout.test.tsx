@@ -138,13 +138,9 @@ describe("T-006: DualPaneLayout", () => {
   });
 
   it("Compare (dual-pane toolbar) compares the two panes' folders", () => {
-    useFileManagerStore.setState({
-      singlePaneMode: false,
-      panes: useFileManagerStore.getState().panes.map((p, i) => ({
-        ...p,
-        tabs: p.tabs.map((t) => ({ ...t, path: i === 0 ? "/home/me/photos" : "/mnt/backup/photos" })),
-      })),
-    });
+    const [p0, p1] = useFileManagerStore.getState().panes;
+    const at = (p: typeof p0, path: string) => ({ ...p, tabs: p.tabs.map((t) => ({ ...t, path })) });
+    useFileManagerStore.setState({ singlePaneMode: false, panes: [at(p0, "/home/me/photos"), at(p1, "/mnt/backup/photos")] });
     useCompareStore.setState({ request: null });
     render(<DualPaneLayout renderPane={renderPane} />);
     fireEvent.click(screen.getByTestId("compare-panes"));

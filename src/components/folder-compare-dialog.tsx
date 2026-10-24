@@ -52,6 +52,8 @@ import {
   type TreeNode,
 } from "@/lib/folder-compare";
 import { useCompareStore, type CompareRequest } from "@/stores/compare-store";
+import type { FilterRule } from "@/stores/backup-store";
+import { FilterPresetPicker, FilterRulesEditor, FilterRulesSummary, ImportRulesButton, appendRules, useFilterGroups } from "./filter-rules-editor";
 import { useUIStore } from "@/stores/ui-store";
 
 const ROW_HEIGHT = 26;
@@ -153,6 +155,10 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
   const [permanent, setPermanent] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<{ action: CompareAction; planned: CompareActionPlan; paths: string[] } | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
+  const [showRules, setShowRules] = useState(false);
+  const groups = useFilterGroups();
+  const rules: FilterRule[] = options.filter.rules ?? [];
+  const setRules = (next: FilterRule[]) => setOptions((o) => ({ ...o, filter: { ...o.filter, rules: next } }));
   const taskRef = useRef<string | null>(null);
   const resultRef = useRef<CompareResult | null>(null);
   resultRef.current = result;
@@ -448,6 +454,9 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
             <span className="text-zinc-500">Exclude (e.g. *.tmp, node_modules/*)</span>
             <input value={exclude} onChange={(e) => setExclude(e.target.value)} className="w-40 rounded border border-[var(--color-border)] bg-transparent px-1 py-0.5" data-testid="compare-exclude" />
           </label>
+          <button type="button" onClick={() => setShowRules((v) => !v)} aria-expanded={showRules} className="pb-0.5 text-zinc-500 underline" data-testid="compare-rules-toggle">
+            Filter rules{rules.length > 0 ? ` (${rules.length})` : ""}
+          </button>
           <label className="flex items-center gap-1 pb-0.5">
             <input type="checkbox" checked={options.time_tolerance} onChange={(e) => setOptions((o) => ({ ...o, time_tolerance: e.target.checked }))} />
             Allow 2 s time difference
@@ -464,6 +473,21 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
             )}
           </div>
         </div>
+
+        {showRules && (
+          <div className="space-y-1.5 border-b border-[var(--color-border)] px-3 py-2 text-[11px]" data-testid="compare-rules">
+            <div className="text-zinc-500">Ordered include/exclude rules (first match wins), the same engine sync pairs and backups use. Compare again to apply.</div>
+            <FilterPresetPicker rules={rules} onApply={(extra) => setRules(appendRules(rules, extra))} />
+            {isAdvanced ? (
+              <>
+                <FilterRulesEditor rules={rules} onChange={setRules} groups={groups} />
+                <ImportRulesButton onImport={(extra) => setRules(appendRules(rules, extra))} />
+              </>
+            ) : (
+              <FilterRulesSummary rules={rules} onChange={setRules} />
+            )}
+          </div>
+        )}
 
         {/* Status chips (OR filters) + Advanced navigation */}
         <div className="flex flex-wrap items-center gap-1.5 border-b border-[var(--color-border)] px-3 py-1.5 text-[11px]" role="group" aria-label="Show only">

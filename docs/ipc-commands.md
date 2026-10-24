@@ -212,6 +212,14 @@ macro; if you add a new one here, register it there too.
 - `chat_control_save`
 - `chat_control_status`
 
+## `compare_commands` (5 commands)
+
+- `compare_apply`
+- `compare_cancel`
+- `compare_folders`
+- `compare_plan_action`
+- `compare_release`
+
 ## `confirmation_commands` (1 command)
 
 - `request_destructive_confirmation`
@@ -824,4 +832,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 644 commands across 55 modules.
+**Surface:** 649 commands across 56 modules.

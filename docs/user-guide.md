@@ -13,18 +13,19 @@ Version 0.1.0
 5. [File Operations](#file-operations)
 6. [Transfers](#transfers)
 7. [Sync](#sync)
-8. [Cloud & Server Connections](#cloud--server-connections)
-9. [Peer-to-Peer Transfers](#peer-to-peer-transfers)
-10. [Archive Operations](#archive-operations)
-11. [Batch Rename](#batch-rename)
-12. [File Preview](#file-preview)
-13. [Integrity Tools](#integrity-tools)
-14. [Terminal](#terminal)
-15. [AI Assistant](#ai-assistant)
-16. [Encrypted Vaults](#encrypted-vaults)
-17. [Cross-Platform Compatibility](#cross-platform-compatibility)
-18. [Keyboard Shortcuts](#keyboard-shortcuts)
-19. [Themes & Accessibility](#themes--accessibility)
+8. [Folder Compare](#folder-compare)
+9. [Cloud & Server Connections](#cloud--server-connections)
+10. [Peer-to-Peer Transfers](#peer-to-peer-transfers)
+11. [Archive Operations](#archive-operations)
+12. [Batch Rename](#batch-rename)
+13. [File Preview](#file-preview)
+14. [Integrity Tools](#integrity-tools)
+15. [Terminal](#terminal)
+16. [AI Assistant](#ai-assistant)
+17. [Encrypted Vaults](#encrypted-vaults)
+18. [Cross-Platform Compatibility](#cross-platform-compatibility)
+19. [Keyboard Shortcuts](#keyboard-shortcuts)
+20. [Themes & Accessibility](#themes--accessibility)
 
 ---
 
@@ -338,6 +339,29 @@ Every sync run generates a report with:
 Reports can be exported as CSV or JSON.
 
 ---
+
+## Folder Compare
+
+Compare two folders recursively and reconcile them by hand — without setting up a sync pair. Either side can be a folder on this computer or a folder on a saved connection (SFTP, S3, WebDAV, a cloud drive, an rclone remote…), so local ↔ local, local ↔ remote and remote ↔ remote all work.
+
+**Opening it**
+
+- **Compare** in the pane toolbar (dual-pane view) compares the left and right panes' folders. The same is in the command palette (*Compare Panes*), and as the optional *Compare Folders* toolbar button (Customize Toolbar).
+- *Compare Folder With…* (command palette) compares the active pane's folder with a folder you pick.
+- In **Connections**, while browsing a remote folder, **Compare with…** compares it with the left or right pane's folder, or with a local folder you choose.
+
+**Options**: *Compare by* size and modification time (default), size only, or checksum (xxHash3 of the content; files on a connection are compared by size and time and the window says so); *Folder depth* (0 = all levels; deeper folders show "contents not compared"); *Include* / *Exclude* patterns and **Filter rules** — the same filter engine, rule kinds and saved presets as sync pairs; *Allow 2 s time difference* for FAT drives and servers that store coarse times (on by default when a side is a connection). The comparison lists both sides at once (several folders at a time), shows progress, and **Cancel** stops it.
+
+**Results**: every file and folder with its size and date on each side and a status — **Left only**, **Right only**, **Same**, **Different** (hover for why: size, time or content) or **Error** (could not be read; the reason is shown). A folder's status comes from what is inside it, and its row counts the differences below it; folders that match start collapsed. The status chips at the top filter the list (several chips show any of them) and show how many entries each status has.
+
+*Advanced view* adds **Next difference**, **Largest by size** / **Largest by file count** (jumps to the folder with the most bytes or files that differ, opening the folders above it) and sorting by **size difference**.
+
+**Acting on differences**: tick rows (Shift-click ticks a range; a ticked folder stands for everything in it), then:
+
+- **Copy → right** / **Copy ← left** copies the ticked entries that are on that side and missing or different on the other, creating folders as needed. Entries that are already the same are never copied. Local copies run as verified transfer-queue jobs and keep the file's date; copies to or from a connection go through the connection and appear in the transfer queue too. A file that is replaced is moved to the Trash first.
+- **Delete on left** / **Delete on right** (asks first) deletes the ticked files on that side — to the Trash for a local folder — and then the ticked folders once they are empty (a folder that still holds files the comparison filtered out is kept, and the window says so). *Delete permanently* skips the Trash for deletes and replaced files.
+
+Every action is checked by the Safety Interlock (an unusually large delete or overwrite asks for confirmation), recorded in the Activity Timeline, and only the entries it touched are compared again. New local copies (and folders created for them) can be undone with **Undo copies** or from the timeline; replaced and deleted files are in the Trash. Uploads to some connections get the upload time as their date: if they still show as *Different*, compare by size only or checksum.
 
 ## Cloud & Server Connections
 

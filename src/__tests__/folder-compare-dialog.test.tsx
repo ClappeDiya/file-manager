@@ -119,6 +119,9 @@ function backend(cmd: string, args: Record<string, unknown>): unknown {
       return LOW;
     case "compare_apply":
       return outcome(args as { paths: string[]; action: string; taskId: string });
+    case "list_user_filter_presets":
+    case "get_filter_groups":
+      return [];
     case "undo_by_correlation":
       return { success: true, summary: "Undid copy", correlation_id: "undo-1", kind: "copy", item_count: 1 };
     default:
@@ -306,4 +309,31 @@ describe("FolderCompareDialog", () => {
     const order = screen.getAllByRole("row").map((r) => r.getAttribute("data-testid"));
     expect(order.indexOf("compare-row-media")).toBeLessThan(order.indexOf("compare-row-docs"));
   });
+
+  it("sends include/exclude patterns and ordered filter rules (the sync filter engine) when comparing again", async () => {
+    act(() => useUIStore.setState({ appMode: "advanced" }));
+    await openCompare();
+    fireEvent.change(screen.getByTestId("compare-include"), { target: { value: "*.jpg, docs/*" } });
+    fireEvent.change(screen.getByTestId("compare-exclude"), { target: { value: "*.tmp" } });
+    fireEvent.change(screen.getByTestId("compare-mode"), { target: { value: "checksum" } });
+    fireEvent.change(screen.getByTestId("compare-depth"), { target: { value: "2" } });
+    fireEvent.click(screen.getByTestId("compare-rules-toggle"));
+    const rules = screen.getByTestId("compare-rules");
+    fireEvent.click(within(rules).getByText("Add rule"));
+    fireEvent.change(within(rules).getByRole("textbox"), { target: { value: "*.bak" } });
+    fireEvent.click(screen.getByTestId("compare-run"));
+    await waitFor(() => expect(calls("compare_folders")).toHaveLength(2));
+    expect(calls("compare_folders")[1].options).toEqual(
+      expect.objectContaining({
+        compare_mode: "checksum",
+        max_depth: 2,
+        filter: expect.objectContaining({
+          include_patterns: ["*.jpg", "docs/*"],
+          exclude_patterns: ["*.tmp"],
+          rules: [{ action: "exclude", kind: "wildcard", pattern: "*.bak" }],
+        }),
+      }),
+    );
+  });
 });
+
