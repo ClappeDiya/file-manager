@@ -50,11 +50,13 @@ macro; if you add a new one here, register it there too.
 - `get_audit_log_status`
 - `verify_audit_log`
 
-## `automation_commands` (22 commands)
+## `automation_commands` (24 commands)
 
 - `approve_automation_command`
+- `automation_action_risks`
 - `automation_convert_to_workflow`
 - `automation_restore_revision`
+- `automation_rule_confirmations`
 - `automation_rule_revisions`
 - `clear_automation_logs`
 - `clone_automation_rule`
@@ -202,6 +204,12 @@ macro; if you add a new one here, register it there too.
 - `batch_rename_preview`
 - `batch_rename_undo`
 - `naming_preview`
+
+## `chat_control_commands` (3 commands)
+
+- `chat_control_get`
+- `chat_control_save`
+- `chat_control_status`
 
 ## `confirmation_commands` (1 command)
 
@@ -594,7 +602,7 @@ macro; if you add a new one here, register it there too.
 - `safety_assess_intent`
 - `safety_confirm_intent`
 
-## `schedule_commands` (8 commands)
+## `schedule_commands` (9 commands)
 
 - `calendar_delete`
 - `calendar_import_ics`
@@ -604,6 +612,7 @@ macro; if you add a new one here, register it there too.
 - `schedule_preview`
 - `schedule_save`
 - `schedules_list`
+- `upcoming_runs`
 
 ## `search_commands` (6 commands)
 
@@ -778,4 +787,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 607 commands across 52 modules.
+**Surface:** 613 commands across 53 modules.

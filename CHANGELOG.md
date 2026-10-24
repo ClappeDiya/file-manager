@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Starred connections** (listed first) and a show/hide button on password fields; schema v32.
 - **Remote storage and folder size**: the Connections panel shows the account's quota (Google Drive, OneDrive, Dropbox, rclone `about`), and *Calculate size* on a remote folder adds it up (rclone `size`, else a cancellable walk) — `connector_quota`, `connector_folder_size`.
 - **Connection fields**: SFTP key passphrase (in the keychain; *Remove saved passphrase* when editing), WebDAV bearer token and Nextcloud/ownCloud vendor, SMB domain, Backblaze B2 as a saved connection type.
+- **Automation, workflows and notifications** (see `docs/user-guide.md`):
+  - **Desktop notifications for transfers and sync**: Settings → Notifications now takes effect — transfer and sync completion/failure raise OS notifications (decision in a pure function, gated by the saved preferences).
+  - **Notification profiles for sync pairs and automation rules**: the channel dispatcher moved from the backup engine to a shared `notify_hub` module (backup behaviour unchanged); sync pairs (`run_options`) and rules (`options`) take optional `notify_profile_id`, `notify_on` and `min_bytes` (Advanced: mute successful runs below a size). Picker in the sync pair form/card and the rule editor.
+  - **Next run** in the Sync and Quickflows panels and the tray menu (`upcoming_runs`).
+  - **Step risk**: `automation_action_risks` classifies every action (Low/Medium/High, `safety::RiskLevel`); badges per step in the rule editor and workflow builder, and an inline confirmation before saving a rule with a High step (`automation_rule_confirmations`, Standard and Advanced; a failed check asks instead of passing).
+  - **New steps**: `verify_pair`, `remove_empty_dirs`, `list_files` and `purge` (guarded by the safety interlock).
+  - **Step results**: `output_as` on steps and workflow nodes, `{steps.<name>.files|count|bytes|path}` through the token engine, checked before a run.
+  - **Download straight to a remote**: `download_url` takes `destination_connection_id`, `destination_protocol` and `remote_path`; the temporary file is always removed.
+  - **Template search** replaces the template list in the rule editor (Advanced); three new templates.
+  - **Chat-bot remote control** (Settings → Advanced, off by default): Telegram long polling and Slack Socket Mode, allow-listed users only, fixed commands (`/jobs`, `/run`, `/stop`, `/status`, `/help`) mapped onto the existing managers, every accepted command in the audit log, tokens in the credential store; IPC `chat_control_get` / `chat_control_save` / `chat_control_status`.
 - **Simple and Advanced mode in the backup screens**: in Simple mode (the default) the job editor, Restore, Maintenance, Settings and Recovery show the everyday flow; advanced options appear in Advanced mode or with *Show advanced backup options* (a per-area override in the UI store), behind one `AdvancedOnly` gate with a "Switch to Advanced" hint.
 - **`SECURITY.md`**: how to report a vulnerability privately (GitHub private vulnerability reporting), supported versions and response times.
 - Interface polish:

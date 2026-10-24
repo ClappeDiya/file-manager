@@ -398,6 +398,9 @@ pub struct SyncRunOptions {
     /// `{name}.v{num}.{ext}`.
     #[serde(default)]
     pub version_template: Option<String>,
+    /// Where the result of a run is reported (a notification profile).
+    #[serde(flatten)]
+    pub notify: crate::run_notify::RunNotify,
 }
 
 /// Sync pair configuration (enhanced for T-039..T-042).

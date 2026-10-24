@@ -20,7 +20,9 @@ pub mod drives;
 pub mod hardening;
 pub mod hooks;
 pub mod logs;
-pub mod notify;
+/// The channel dispatcher is shared with sync and automation (`crate::notify_hub`).
+pub use crate::notify_hub as notify;
+mod profile_store;
 pub mod policy;
 pub mod portability;
 pub mod runs;
@@ -855,6 +857,8 @@ struct Inner {
     secrets: std::sync::OnceLock<SettingsStore>,
     notifier: std::sync::OnceLock<Notifier>,
     run_listener: std::sync::OnceLock<RunListener>,
+    /// Sync pairs and automation rules that name notification profiles (set by the desktop app).
+    profile_users: std::sync::OnceLock<std::sync::Arc<dyn crate::notify_hub::run::ProfileUsers>>,
     secret_cache: secrets::SecretCache,
     /// Console-delivered (`central:`) secrets when no secure store exists:
     /// kept in memory only and re-delivered by the agent after a restart.
@@ -945,6 +949,7 @@ impl BackupManager {
                 secrets: std::sync::OnceLock::new(),
                 notifier: std::sync::OnceLock::new(),
                 run_listener: std::sync::OnceLock::new(),
+                profile_users: std::sync::OnceLock::new(),
                 volatile_secrets: Mutex::new(HashMap::new()),
                 secret_cache: secrets::SecretCache::default(),
                 volume_cache: Mutex::new(None),
@@ -1516,6 +1521,12 @@ impl BackupManager {
         let _ = self.inner.notifier.set(n);
     }
 
+    /// Tell the profile store where sync pairs and automation rules keep
+    /// their notification profile (set by the desktop app).
+    pub fn set_profile_users(&self, u: std::sync::Arc<dyn crate::notify_hub::run::ProfileUsers>) {
+        let _ = self.inner.profile_users.set(u);
+    }
+
     /// Receive every finished operation (set once, by the fleet agent).
     pub fn set_run_listener(&self, l: RunListener) {
         let _ = self.inner.run_listener.set(l);
@@ -1818,7 +1829,7 @@ impl BackupManager {
 
     // ── Shared settings: global defaults and destination library ──
 
-    async fn config_get(&self, key: &'static str) -> Result<Option<String>, AppError> {
+    pub(crate) async fn config_get(&self, key: &'static str) -> Result<Option<String>, AppError> {
         self.inner.pool.execute(move |c| Ok(c.query_row("SELECT value FROM config WHERE key = ?1", [key], |r| r.get(0)).ok())).await
     }
 

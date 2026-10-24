@@ -1,4 +1,5 @@
-//! System tray: shows backup state in the tooltip and a status line, and
+//! System tray: shows backup state (and the next scheduled sync or
+//! automation) in the tooltip and a status line, and
 //! offers Open, Backups…, Pause for an hour, Resume and Quit. With
 //! "Keep running in the tray" enabled, closing the window hides it so
 //! scheduled backups keep running. A "Mounts" submenu lists the saved mounts
@@ -213,6 +214,8 @@ pub fn run_all_summary(r: &crate::backup_engine::runs::RunAllReport) -> String {
 
 pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
     let status_item = MenuItem::with_id(app, "status", "Loading…", false, None::<&str>)?;
+    // Shown only while a sync pair or automation rule has a schedule.
+    let next_item = MenuItem::with_id(app, "next_other", "", false, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "Open UFOP", true, None::<&str>)?;
     let backups = MenuItem::with_id(app, "backups", "Backups…", true, None::<&str>)?;
     let run_all = MenuItem::with_id(app, "run_all", "Back up all now", true, None::<&str>)?;
@@ -256,18 +259,36 @@ pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
     let tray = builder.build(app)?;
     spawn_mounts_menu(app.handle().clone(), mounts_menu);
 
-    // Refresh the status line and tooltip.
+    // Refresh the status lines and tooltip.
+    let handle = app.handle().clone();
     tauri::async_runtime::spawn(async move {
-        let mut last = String::new();
+        let mut last = (String::new(), None::<String>);
+        let mut next_shown = false;
         loop {
-            let s = describe(&mgr.status().await);
-            if s != last {
-                let _ = tray.set_tooltip(Some(format!("UFOP — {s}")));
+            let status = mgr.status().await;
+            let s = describe(&status);
+            let upcoming = crate::schedule_library::upcoming::upcoming(&handle.state::<crate::sync_engine::SyncManager>(), &handle.state::<crate::automation_engine::AutomationManager>()).await;
+            let other = crate::schedule_library::upcoming::describe(&upcoming);
+            if (s.clone(), other.clone()) != last {
+                let tip = match &other {
+                    Some(o) => format!("UFOP — {s}\n{o}"),
+                    None => format!("UFOP — {s}"),
+                };
+                let _ = tray.set_tooltip(Some(tip));
                 let _ = status_item.set_text(&s);
-                let paused = mgr.status().await.paused;
-                let _ = pause.set_enabled(!paused);
-                let _ = resume.set_enabled(paused);
-                last = s;
+                let _ = pause.set_enabled(!status.paused);
+                let _ = resume.set_enabled(status.paused);
+                match &other {
+                    Some(o) => {
+                        let _ = next_item.set_text(o);
+                        if !next_shown {
+                            next_shown = menu.insert(&next_item, 1).is_ok();
+                        }
+                    }
+                    None if next_shown => next_shown = menu.remove(&next_item).is_err(),
+                    None => {}
+                }
+                last = (s, other);
             }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }

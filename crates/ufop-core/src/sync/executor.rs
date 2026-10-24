@@ -898,6 +898,7 @@ pub fn validate_run_options(o: &crate::sync_types::SyncRunOptions) -> Result<(),
             advice: "Use tokens like {name}, {ext}, {num} and {now:%Y-%m-%d}.".to_string(),
         })?;
     }
+    o.notify.validate().map_err(|message| AppError::Sync { message, advice: "Pick a notification profile and results of success, warning or error.".to_string() })?;
     if let Some(m) = o.completion_marker.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
         if m.contains(['/', '\\']) || m == "." || m == ".." || planner::is_internal_entry(m) {
             return Err(AppError::Sync {
@@ -929,6 +930,22 @@ fn write_completion_marker(pair: &SyncPair, report: &SyncReport) -> std::io::Res
 
 /// Verify sync results using checksum comparison (T-042).
 pub fn verify_sync(pair: &SyncPair, _report: &SyncReport) -> Result<Vec<String>, AppError> {
+    verify_pair(pair)
+}
+
+/// Compare a pair's source and destination on demand, whatever the pair's
+/// own verification settings are: sizes, or with `full` the contents too.
+/// Returns what differs (empty when the sides agree).
+pub fn verify_now(pair: &SyncPair, full: bool) -> Result<Vec<String>, AppError> {
+    let mut p = pair.clone();
+    p.verify_mode = if full { SyncVerifyMode::Full } else { SyncVerifyMode::Fast };
+    p.checksum_enabled = full;
+    verify_pair(&p)
+}
+
+/// The comparison behind [`verify_sync`] and [`verify_now`], following the
+/// pair's `verify_mode` and `checksum_enabled`.
+fn verify_pair(pair: &SyncPair) -> Result<Vec<String>, AppError> {
     if !pair.checksum_enabled && pair.verify_mode == SyncVerifyMode::None {
         return Ok(Vec::new());
     }
@@ -1391,12 +1408,43 @@ mod tests {
     #[test]
     fn run_options_validation() {
         use crate::sync_types::SyncRunOptions;
-        let ok = SyncRunOptions { settle_secs: 5, completion_marker: Some("_DONE".into()), version_template: Some("{name}.{now:%Y}.{ext}".into()) };
+        let ok = SyncRunOptions { settle_secs: 5, completion_marker: Some("_DONE".into()), version_template: Some("{name}.{now:%Y}.{ext}".into()), ..Default::default() };
         assert!(validate_run_options(&ok).is_ok());
         assert!(validate_run_options(&SyncRunOptions { version_template: Some("{nope}".into()), ..Default::default() }).is_err());
         for bad in ["a/b", "..", ".ufop-sync-inventory.json"] {
             assert!(validate_run_options(&SyncRunOptions { completion_marker: Some(bad.into()), ..Default::default() }).is_err(), "{bad}");
         }
+        // Result notifications: a known result and a profile to send to.
+        let notify = |p: Option<&str>, on: &[&str]| SyncRunOptions { notify: crate::run_notify::RunNotify { notify_profile_id: p.map(Into::into), notify_on: on.iter().map(|s| s.to_string()).collect(), min_bytes: None }, ..Default::default() };
+        assert!(validate_run_options(&notify(Some("p"), &["error"])).is_ok());
+        assert!(validate_run_options(&notify(Some("p"), &["boom"])).is_err());
+        assert!(validate_run_options(&notify(None, &["error"])).is_err());
+    }
+
+    #[test]
+    fn verify_now_compares_both_sides_whatever_the_pairs_own_settings() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "same-size-1").unwrap();
+        fs::write(src.path().join("b.txt"), "bbb").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.verify_mode = SyncVerifyMode::None;
+        pair.checksum_enabled = false;
+        run_with(pair.clone());
+        assert!(verify_now(&pair, true).unwrap().is_empty(), "identical sides agree");
+        // Same size, different content: only the full comparison sees it.
+        fs::write(dst.path().join("a.txt"), "same-size-2").unwrap();
+        assert!(verify_now(&pair, false).unwrap().is_empty());
+        let full = verify_now(&pair, true).unwrap();
+        assert_eq!(full, vec!["Checksum mismatch: a.txt".to_string()]);
+        // A missing file and a size change are both found by the fast comparison.
+        fs::remove_file(dst.path().join("b.txt")).unwrap();
+        fs::write(dst.path().join("a.txt"), "short").unwrap();
+        let fast = verify_now(&pair, false).unwrap();
+        assert!(fast.iter().any(|m| m.starts_with("Missing at destination: b.txt")) && fast.iter().any(|m| m.starts_with("Size mismatch: a.txt")), "{fast:?}");
+        // The pair's own settings are left alone: with verification off, a sync-time check finds nothing.
+        let report = run_with(pair.clone());
+        assert!(verify_sync(&pair, &report).unwrap().is_empty());
     }
 
     #[test]

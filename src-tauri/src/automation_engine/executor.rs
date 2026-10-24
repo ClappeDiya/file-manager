@@ -8,11 +8,13 @@
 //! happens when a target exists is the rule's overwrite policy.
 
 use super::evaluator::evaluate_rule;
+use super::outputs::{Outputs, StepOutput};
 use super::services::{ActionServices, SERVICES_UNAVAILABLE};
-use super::{AutomationLog, AutomationRule, AutomationStatus, RuleAction, SourceSelection, StepResult};
+use super::{AutomationLog, AutomationRule, AutomationStatus, ListFormat, RuleAction, SourceSelection, StepResult};
 use crate::core::types::ConflictPolicy;
 use chrono::Utc;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use ufop_core::naming::{render, render_path, TokenContext, UnknownTokens};
 use uuid::Uuid;
 
@@ -32,6 +34,8 @@ pub struct ExecEnv<'a> {
     pub extra: std::collections::HashMap<String, String>,
     /// Rules that called this one through nested workflow steps.
     pub call_stack: Vec<String>,
+    /// Results of the steps that ran so far (`output_as`), for `{steps.…}`.
+    pub outputs: Arc<Outputs>,
 }
 
 impl<'a> ExecEnv<'a> {
@@ -44,6 +48,7 @@ impl<'a> ExecEnv<'a> {
             command_approval: None,
             extra: Default::default(),
             call_stack: Vec::new(),
+            outputs: Default::default(),
         }
     }
 
@@ -61,6 +66,8 @@ impl<'a> ExecEnv<'a> {
             command_approval: rule.options.command_approval.as_deref(),
             extra: self.extra.clone(),
             call_stack: self.call_stack.clone(),
+            // A nested rule has its own steps and their results.
+            outputs: Default::default(),
         }
     }
 
@@ -73,6 +80,7 @@ impl<'a> ExecEnv<'a> {
             command_approval: rule.options.command_approval.as_deref(),
             extra: Default::default(),
             call_stack: Vec::new(),
+            outputs: Default::default(),
         }
     }
 
@@ -80,6 +88,7 @@ impl<'a> ExecEnv<'a> {
         let mut ctx = file.map(|f| TokenContext::for_path(Path::new(f))).unwrap_or_default();
         ctx.captures = self.captures.clone();
         ctx.extra = self.extra.clone();
+        ctx.extra.extend(self.outputs.template_values());
         ctx.extra.entry("rule".into()).or_insert_with(|| self.rule_name.to_string());
         if let Some(f) = file {
             ctx.extra.entry("path".into()).or_insert_with(|| f.to_string());
@@ -197,6 +206,11 @@ pub async fn execute_rule(
         steps,
     };
 
+    // Step results that cannot resolve are caught before anything runs.
+    if let Err(e) = super::outputs::validate_rule(rule) {
+        return finish(AutomationStatus::Failed, vec![], Some(e), 1, vec![]);
+    }
+
     // Targets: the triggering file (conditions already checked by the
     // watcher, captures recomputed here), the source selection, or none.
     let targets: Vec<(Option<String>, Vec<String>)> = match (triggered_file, &rule.options.source) {
@@ -255,30 +269,37 @@ pub(crate) struct ActionsOutcome {
 /// in order (a step that moves, renames or downloads hands the new path on).
 pub(crate) async fn run_actions(rule: &AutomationRule, file: Option<String>, env: &ExecEnv<'_>) -> ActionsOutcome {
     if let Some(wf) = &rule.workflow {
+        env.outputs.clear();
         let (results, affected, error) = super::workflow::run(wf, rule, file, env).await;
         let attempts = results.iter().map(|r| r.attempts).max().unwrap_or(1).max(1);
         return ActionsOutcome { affected, error, results, attempts };
     }
     let (mut affected, mut results, mut error, mut attempts) = (Vec::new(), Vec::new(), None, 1);
     let mut current = file.clone();
+    // Each run on a file starts with no step results.
+    env.outputs.clear();
+    let names: Vec<Option<&str>> = std::iter::once(rule.output_as.as_deref()).chain(rule.steps.iter().map(|s| s.output_as.as_deref())).collect();
     for (i, (action, continue_on_error)) in rule.all_steps().into_iter().enumerate() {
         let retried = ufop_core::retry::retry_async(
             &rule.options.retry,
-            |_| dispatch(action, current.as_deref(), env),
+            |_| dispatch_step(action, current.as_deref(), env),
             |e: &String| is_transient(action, e),
             |attempt, e, d| tracing::warn!("Automation '{}' step {} failed (attempt {}), retrying in {d:?}: {e}", rule.name, i + 1, attempt + 1),
         )
         .await;
         attempts = attempts.max(retried.attempts);
         match retried.result {
-            Ok(paths) => {
+            Ok(step) => {
                 if hands_on_path(action) {
-                    if let Some(p) = paths.first() {
+                    if let Some(p) = step.paths.first() {
                         current = Some(p.clone());
                     }
                 }
                 results.push(StepResult { step: i, action: action_kind(action).into(), file: file.clone(), ok: true, attempts: retried.attempts, message: None, node: None });
-                affected.extend(paths);
+                affected.extend(step.paths.iter().cloned());
+                if let Some(name) = names.get(i).copied().flatten().map(str::trim).filter(|n| !n.is_empty()) {
+                    env.outputs.set(name, step.into_output());
+                }
             }
             Err(e) => {
                 results.push(StepResult { step: i, action: action_kind(action).into(), file: file.clone(), ok: false, attempts: retried.attempts, message: Some(e.clone()), node: None });
@@ -316,13 +337,21 @@ pub fn action_kind(action: &RuleAction) -> &'static str {
         RuleAction::ValidateBatch { .. } => "validate_batch",
         RuleAction::AiTask { .. } => "ai_task",
         RuleAction::ScanForMalware { .. } => "scan_for_malware",
+        RuleAction::VerifyPair { .. } => "verify_pair",
+        RuleAction::RemoveEmptyDirs { .. } => "remove_empty_dirs",
+        RuleAction::ListFiles { .. } => "list_files",
+        RuleAction::Purge { .. } => "purge",
     }
 }
 
 /// Actions whose result is the file later steps work on: the file moved,
 /// renamed, downloaded or converted.
 pub(crate) fn hands_on_path(action: &RuleAction) -> bool {
-    matches!(action, RuleAction::MoveFile { .. } | RuleAction::RenameFile { .. } | RuleAction::DownloadUrl { .. } | RuleAction::ConvertImage { .. } | RuleAction::ConvertDocument { .. })
+    match action {
+        // A download sent straight to a remote leaves no local file to hand on.
+        RuleAction::DownloadUrl { destination_connection_id, .. } => destination_connection_id.as_deref().map_or(true, |c| c.trim().is_empty()),
+        _ => matches!(action, RuleAction::MoveFile { .. } | RuleAction::RenameFile { .. } | RuleAction::ConvertImage { .. } | RuleAction::ConvertDocument { .. }),
+    }
 }
 
 /// Whether retrying `action` after `error` could help. Validation and
@@ -527,6 +556,241 @@ fn require_services(services: Option<&dyn ActionServices>) -> Result<&dyn Action
     services.ok_or_else(|| SERVICES_UNAVAILABLE.to_string())
 }
 
+// ── Folder steps: list, tidy, purge ──
+
+/// Most entries a listing holds.
+const MAX_LISTED: usize = 1_000_000;
+
+/// The folder a step works on: `path` (a template), or, when empty, the
+/// triggering folder (the parent of a triggering file).
+fn tree_dir(path: &str, triggered_file: Option<&str>, env: &ExecEnv<'_>, what: &str) -> Result<PathBuf, String> {
+    let dir = if path.trim().is_empty() {
+        let f = Path::new(triggered_file.ok_or_else(|| format!("Choose {what} (no file started this run)"))?);
+        if f.is_dir() { f.to_path_buf() } else { f.parent().ok_or("Cannot determine parent directory")?.to_path_buf() }
+    } else {
+        PathBuf::from(env.path(path, triggered_file)?)
+    };
+    validate_automation_path(&dir, None)?;
+    if !dir.is_dir() {
+        return Err(format!("{} does not exist or is not a folder", dir.display()));
+    }
+    Ok(dir)
+}
+
+/// One row of a listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedEntry {
+    path: String,
+    name: String,
+    size: u64,
+    modified: String,
+    is_dir: bool,
+}
+
+/// Entries under `root` (never following links), sorted by path.
+fn walk_tree(root: &Path, recursive: bool, include_dirs: bool) -> Result<Vec<ListedEntry>, String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| format!("Cannot read {}: {e}", dir.display()))?.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            let p = entry.path();
+            if ft.is_dir() && recursive {
+                stack.push(p.clone());
+            }
+            if ft.is_dir() && !include_dirs {
+                continue;
+            }
+            let meta = entry.metadata().ok();
+            out.push(ListedEntry {
+                path: p.to_string_lossy().into_owned(),
+                name: entry.file_name().to_string_lossy().into_owned(),
+                size: if ft.is_dir() { 0 } else { meta.as_ref().map(|m| m.len()).unwrap_or(0) },
+                modified: meta.and_then(|m| m.modified().ok()).map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339()).unwrap_or_default(),
+                is_dir: ft.is_dir(),
+            });
+            if out.len() > MAX_LISTED {
+                return Err(format!("More than {MAX_LISTED} entries; list a smaller folder"));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// The text of a listing in `format`: CSV with a header row, or a JSON array.
+fn render_listing(entries: &[ListedEntry], format: ListFormat) -> Result<String, String> {
+    match format {
+        ListFormat::Csv => {
+            let mut w = csv::Writer::from_writer(Vec::new());
+            w.write_record(["path", "name", "size", "modified", "is_dir"]).map_err(|e| e.to_string())?;
+            for e in entries {
+                w.write_record([e.path.as_str(), e.name.as_str(), &e.size.to_string(), e.modified.as_str(), if e.is_dir { "true" } else { "false" }]).map_err(|e| e.to_string())?;
+            }
+            String::from_utf8(w.into_inner().map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        }
+        ListFormat::Json => {
+            let rows: Vec<serde_json::Value> = entries.iter().map(|e| serde_json::json!({ "path": e.path, "name": e.name, "size": e.size, "modified": e.modified, "is_dir": e.is_dir })).collect();
+            serde_json::to_string_pretty(&rows).map(|mut t| {
+                t.push('\n');
+                t
+            }).map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// `ListFiles`: write the listing of a folder to `output`.
+#[allow(clippy::too_many_arguments)]
+async fn list_files(path: &str, output: &str, format: ListFormat, recursive: bool, include_dirs: bool, overwrite: bool, triggered_file: Option<&str>, env: &ExecEnv<'_>) -> Result<Produced, String> {
+    if output.trim().is_empty() {
+        return Err("Choose where to save the listing".into());
+    }
+    let dir = tree_dir(path, triggered_file, env, "the folder to list")?;
+    let out_path = PathBuf::from(env.path(output, triggered_file)?);
+    validate_automation_path(&out_path, None)?;
+    if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
+    }
+    let target = if overwrite || !out_path.exists() { out_path } else { find_unique_name(&out_path) };
+    if target.is_dir() {
+        return Err(format!("{} is a folder", target.display()));
+    }
+    let mut entries = tokio::task::spawn_blocking(move || walk_tree(&dir, recursive, include_dirs)).await.map_err(|e| format!("Listing failed: {e}"))??;
+    // A listing saved inside the folder it lists must not list itself.
+    let own = target.to_string_lossy().into_owned();
+    entries.retain(|e| e.path != own && e.path != format!("{own}.ufop-part"));
+    let text = render_listing(&entries, format)?;
+    let tmp = PathBuf::from(format!("{own}.ufop-part"));
+    std::fs::write(&tmp, text).map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &target).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Cannot write {}: {e}", target.display())
+    })?;
+    let files: Vec<String> = entries.iter().filter(|e| !e.is_dir).map(|e| e.path.clone()).collect();
+    let bytes = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+    Ok(Produced { paths: vec![own.clone()], output: Some(StepOutput { files, count: entries.len() as u64, bytes, path: own }) })
+}
+
+/// Remove folders under `root` that hold nothing, deepest first (and `root`
+/// itself when asked and it ends up empty). Links, files and anything
+/// unreadable keep their folder. Returns the removed folders.
+fn remove_empty_dirs(root: &Path, remove_root: bool) -> Result<Vec<String>, String> {
+    let meta = std::fs::symlink_metadata(root).map_err(|e| format!("Cannot read {}: {e}", root.display()))?;
+    if !meta.is_dir() {
+        return Err(format!("{} is not a folder", root.display()));
+    }
+    // Never a drive root: that is nobody's intent.
+    if root.components().filter(|c| matches!(c, std::path::Component::Normal(_))).count() == 0 {
+        return Err(format!("{} is a drive root; choose a folder inside it", root.display()));
+    }
+    fn visit(dir: &Path, removed: &mut Vec<String>) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else { return false };
+        let mut empty = true;
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => {
+                    let p = entry.path();
+                    if visit(&p, removed) && std::fs::remove_dir(&p).is_ok() {
+                        removed.push(p.to_string_lossy().into_owned());
+                    } else {
+                        empty = false;
+                    }
+                }
+                _ => empty = false,
+            }
+        }
+        empty
+    }
+    let mut removed = Vec::new();
+    let empty = visit(root, &mut removed);
+    if remove_root && empty && std::fs::remove_dir(root).is_ok() {
+        removed.push(root.to_string_lossy().into_owned());
+    }
+    Ok(removed)
+}
+
+/// Fewest folder levels a purge target must have (`/mnt/backup/old` yes,
+/// `/mnt` or `C:\Users` no).
+const PURGE_MIN_DEPTH: usize = 3;
+
+/// Whether `path` may be purged at all: a full path, no `..`, deep enough,
+/// not the user's home folder or one of its parents, and not a link.
+fn purge_guard(path: &Path, home: Option<&Path>) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("Purge needs a full path, not '{}'", path.display()));
+    }
+    validate_automation_path(path, None)?;
+    let depth = path.components().filter(|c| matches!(c, std::path::Component::Normal(_))).count();
+    if depth < PURGE_MIN_DEPTH {
+        return Err(format!("Purge refuses {}: it is too close to a drive root (at least {PURGE_MIN_DEPTH} folder levels are needed)", path.display()));
+    }
+    if home.is_some_and(|h| h.starts_with(path)) {
+        return Err(format!("Purge refuses {}: it is your home folder or contains it", path.display()));
+    }
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("Purge refuses {}: it is a link", path.display()));
+    }
+    if !meta.is_dir() {
+        return Err(format!("{} is a file; use the Delete action for files", path.display()));
+    }
+    Ok(())
+}
+
+/// (files, bytes) under `root`, links not followed; stops counting once
+/// `stop_after` files are seen (the volume is then "at least" that).
+fn tree_size(root: &Path, stop_after: u64) -> (u64, u64) {
+    let (mut files, mut bytes) = (0u64, 0u64);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(entry.path()),
+                Ok(t) if t.is_file() => {
+                    files += 1;
+                    bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    if files > stop_after {
+                        return (files, bytes);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (files, bytes)
+}
+
+/// `Purge`: remove a folder tree after the guard, the size limit and the
+/// safety interlock agree. Returns the purged path.
+async fn purge(path: &Path, max_files: Option<u64>, services: Option<&dyn ActionServices>) -> Result<String, String> {
+    let home = dirs::home_dir();
+    purge_guard(path, home.as_deref())?;
+    let display = path.to_string_lossy().into_owned();
+    let (counted, stop) = (path.to_path_buf(), crate::safety::DESTRUCTIVE_VOLUME_HARD_CAP.max(max_files.unwrap_or(0)).saturating_add(1));
+    let (files, bytes) = tokio::task::spawn_blocking(move || tree_size(&counted, stop)).await.map_err(|e| format!("Purge failed: {e}"))?;
+    if let Some(max) = max_files.filter(|m| files > *m) {
+        return Err(format!("Purge refused: {display} holds more than the {max} files this step allows"));
+    }
+    let intent = crate::safety::OperationIntent { engine: "automation".into(), kind: "purge".into(), affected_files: files, total_bytes: bytes, subject_path: Some(display.clone()), summary: Some(format!("Purge {display}")) };
+    let assessment = match services {
+        Some(s) => s.assess_intent(&intent).await,
+        None => crate::safety::assess_static(&intent),
+    };
+    if assessment.level == crate::safety::RiskLevel::High {
+        return Err(format!("Safety check refused the purge of {display}: {} Delete it by hand in the file manager, which asks you to confirm.", assessment.reasons.join(" ")));
+    }
+    let target = path.to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&target)).await.map_err(|e| format!("Purge failed: {e}"))?.map_err(|e| format!("Purge of {display} failed: {e}"))?;
+    if let Some(s) = services {
+        s.record_operation(&intent).await;
+    }
+    Ok(display)
+}
+
 /// Dispatch an action without engine services (see [`dispatch_action_with`]).
 #[cfg(test)]
 async fn dispatch_action(
@@ -545,8 +809,35 @@ pub async fn dispatch_action_with(
     dispatch(action, triggered_file, &ExecEnv::new(services)).await
 }
 
+/// What a step produced: the paths it hands on and, for steps that know
+/// more (a listing), their whole result.
+#[derive(Debug, Clone, Default)]
+pub struct Produced {
+    pub paths: Vec<String>,
+    pub output: Option<StepOutput>,
+}
+
+impl Produced {
+    /// The result later steps see as `{steps.<name>.…}`.
+    pub fn into_output(self) -> StepOutput {
+        self.output.unwrap_or_else(|| StepOutput::from_paths(&self.paths))
+    }
+}
+
 /// Run one action for one file (or none). Returns the paths it produced.
 pub async fn dispatch(action: &RuleAction, triggered_file: Option<&str>, env: &ExecEnv<'_>) -> Result<Vec<String>, String> {
+    dispatch_step(action, triggered_file, env).await.map(|p| p.paths)
+}
+
+/// [`dispatch`], keeping what the step knows about its own result.
+pub async fn dispatch_step(action: &RuleAction, triggered_file: Option<&str>, env: &ExecEnv<'_>) -> Result<Produced, String> {
+    if let RuleAction::ListFiles { path, output, format, recursive, include_dirs, overwrite } = action {
+        return list_files(path, output, *format, *recursive, *include_dirs, *overwrite, triggered_file, env).await;
+    }
+    dispatch_paths(action, triggered_file, env).await.map(|paths| Produced { paths, output: None })
+}
+
+async fn dispatch_paths(action: &RuleAction, triggered_file: Option<&str>, env: &ExecEnv<'_>) -> Result<Vec<String>, String> {
     let services = env.services;
     match action {
         RuleAction::MoveFile { dest_path } | RuleAction::CopyFile { dest_path } => {
@@ -763,10 +1054,14 @@ pub async fn dispatch(action: &RuleAction, triggered_file: Option<&str>, env: &E
             run_command(program, args, working_dir.as_deref(), *timeout_secs, triggered_file, env).await
         }
 
-        RuleAction::DownloadUrl { url, dest_path, file_name, overwrite, max_mb, sha256, allow_private } => {
-            let dest = env.path(dest_path, triggered_file)?;
-            validate_automation_path(Path::new(&dest), None)?;
-            std::fs::create_dir_all(&dest).map_err(|e| format!("Cannot create folder: {e}"))?;
+        RuleAction::DownloadUrl { url, dest_path, file_name, overwrite, max_mb, sha256, allow_private, destination_connection_id, destination_protocol, remote_path } => {
+            let remote = destination_connection_id.as_deref().map(str::trim).filter(|c| !c.is_empty());
+            // Everything that can fail on the rule's own settings is checked
+            // before anything is created.
+            let remote_dir = match remote {
+                Some(_) => Some(env.text(remote_path.as_deref().filter(|r| !r.trim().is_empty()).unwrap_or("/"), triggered_file)?),
+                None => None,
+            };
             let file_name = match file_name.as_deref().filter(|n| !n.trim().is_empty()) {
                 Some(n) => {
                     let n = env.text(n, triggered_file)?;
@@ -775,18 +1070,75 @@ pub async fn dispatch(action: &RuleAction, triggered_file: Option<&str>, env: &E
                 }
                 None => None,
             };
+            let url = env.text(url, triggered_file)?;
+            let sha256 = sha256.as_deref().map(|s| env.text(s, triggered_file)).transpose()?;
+            // To a folder, or to a private temporary one for the upload.
+            let (dest, temp) = match remote {
+                Some(_) => {
+                    let t = std::env::temp_dir().join(format!("ufop-download-{}", Uuid::new_v4().simple()));
+                    std::fs::create_dir_all(&t).map_err(|e| format!("Cannot create a temporary folder: {e}"))?;
+                    (t.to_string_lossy().into_owned(), Some(t))
+                }
+                None => {
+                    let dest = env.path(dest_path, triggered_file)?;
+                    validate_automation_path(Path::new(&dest), None)?;
+                    std::fs::create_dir_all(&dest).map_err(|e| format!("Cannot create folder: {e}"))?;
+                    (dest, None)
+                }
+            };
             let spec = super::download::Download {
-                url: env.text(url, triggered_file)?,
+                url,
                 dest_dir: PathBuf::from(&dest),
                 file_name,
                 overwrite: *overwrite,
                 max_bytes: max_mb.saturating_mul(1 << 20),
-                sha256: sha256.as_deref().map(|s| env.text(s, triggered_file)).transpose()?,
+                sha256,
                 allow_private: *allow_private,
                 timeout: std::time::Duration::from_secs(3600),
             };
-            let saved = super::download::run(&spec).await?;
-            Ok(vec![saved.to_string_lossy().into_owned()])
+            let outcome = async {
+                let saved = super::download::run(&spec).await?;
+                let saved = saved.to_string_lossy().into_owned();
+                match (remote, remote_dir) {
+                    (Some(connection), Some(dir)) => {
+                        let protocol = destination_protocol.as_deref().map(str::trim).unwrap_or_default();
+                        let uploaded = require_services(services)?.transfer_to_connector(protocol, connection, &saved, &dir).await?;
+                        Ok(vec![uploaded])
+                    }
+                    _ => Ok(vec![saved]),
+                }
+            }
+            .await;
+            // The temporary copy never outlives the step, whatever happened.
+            if let Some(t) = temp {
+                let _ = std::fs::remove_dir_all(t);
+            }
+            outcome
+        }
+
+        RuleAction::VerifyPair { sync_pair_id, full } => {
+            let outcome = require_services(services)?.verify_pair(sync_pair_id, *full).await?;
+            // A check produces no file: nothing for `files_affected`, `{path}` or a size.
+            tracing::info!("Automation verify_pair {sync_pair_id}: {outcome}");
+            Ok(Vec::new())
+        }
+
+        RuleAction::RemoveEmptyDirs { path, remove_root } => {
+            let root = tree_dir(path, triggered_file, env, "the folders to tidy")?;
+            let root2 = root.clone();
+            let remove_root = *remove_root;
+            tokio::task::spawn_blocking(move || remove_empty_dirs(&root2, remove_root)).await.map_err(|e| format!("Removing empty folders failed: {e}"))?
+        }
+
+        RuleAction::ListFiles { path, output, format, recursive, include_dirs, overwrite } => list_files(path, output, *format, *recursive, *include_dirs, *overwrite, triggered_file, env).await.map(|p| p.paths),
+
+        RuleAction::Purge { path, max_files } => {
+            let target = if path.trim().is_empty() {
+                triggered_file.ok_or("Choose the folder to purge (no file started this run)")?.to_string()
+            } else {
+                env.path(path, triggered_file)?
+            };
+            purge(Path::new(&target), *max_files, services).await.map(|p| vec![p])
         }
 
         RuleAction::ConvertImage { format, max_width, max_height, quality, dest_path } => {
@@ -1171,6 +1523,7 @@ mod tests {
             trigger: super::super::RuleTrigger::Manual,
             conditions: vec![],
             action: RuleAction::DeleteFile { to_trash: false },
+            output_as: None,
             created_at: Utc::now().to_rfc3339(),
             updated_at: Utc::now().to_rfc3339(),
             last_triggered: None,
@@ -1440,6 +1793,9 @@ mod tests {
             max_mb: 1,
             sha256: None,
             allow_private,
+            destination_connection_id: None,
+            destination_protocol: None,
+            remote_path: None,
         };
         let action = make("{name}-copy.pdf", true);
         let out = dispatch_action(&action, trigger.to_str()).await.unwrap();
@@ -1470,7 +1826,7 @@ mod tests {
         let out = dir.path().join("shared");
         let convert = |dest: &str| RuleAction::ConvertImage { format: Some("jpeg".into()), max_width: Some(120), max_height: None, quality: Some(80), dest_path: dest.into() };
         // Convert into a templated folder, then copy what was produced.
-        let rule = rule_steps(convert(&format!("{}/small/{{ext}}", dir.path().display())), vec![ActionStep { action: RuleAction::CopyFile { dest_path: out.to_string_lossy().into() }, continue_on_error: false }], RuleOptions::default());
+        let rule = rule_steps(convert(&format!("{}/small/{{ext}}", dir.path().display())), vec![ActionStep { action: RuleAction::CopyFile { dest_path: out.to_string_lossy().into() }, continue_on_error: false, output_as: None }], RuleOptions::default());
         let log = execute_rule_action(&rule, src.to_str(), false).await;
         assert_eq!(log.status, AutomationStatus::Success, "{:?}", log.error_message);
         let small = dir.path().join("small/png/photo.jpg");
@@ -1561,7 +1917,7 @@ mod tests {
         let quarantine = dir.path().join("quarantine");
         let rule = rule_steps(
             RuleAction::ScanForMalware { quarantine_path: format!("{}/{{yyyy}}", quarantine.display()), notify: true },
-            vec![ActionStep { action: RuleAction::CopyFile { dest_path: dir.path().join("safe").to_string_lossy().into() }, continue_on_error: false }],
+            vec![ActionStep { action: RuleAction::CopyFile { dest_path: dir.path().join("safe").to_string_lossy().into() }, continue_on_error: false, output_as: None }],
             RuleOptions::default(),
         );
         let ok = execute_rule_action_with(&rule, clean.to_str(), false, Some(&svc)).await;
@@ -1625,7 +1981,7 @@ mod tests {
         write(&f, "x");
         let rule = rule_steps(
             RuleAction::RenameFile { pattern: "{name|slug}.{ext|lower}".into() },
-            vec![ActionStep { action: RuleAction::MoveFile { dest_path: format!("{}/filed", dir.path().display()) }, continue_on_error: false }],
+            vec![ActionStep { action: RuleAction::MoveFile { dest_path: format!("{}/filed", dir.path().display()) }, continue_on_error: false, output_as: None }],
             RuleOptions::default(),
         );
         let log = execute_rule_action(&rule, f.to_str(), false).await;
@@ -1645,8 +2001,8 @@ mod tests {
         let keep_going = rule_steps(
             copy_to("a"),
             vec![
-                ActionStep { action: failing.clone(), continue_on_error: true },
-                ActionStep { action: copy_to("b"), continue_on_error: false },
+                ActionStep { action: failing.clone(), continue_on_error: true, output_as: None },
+                ActionStep { action: copy_to("b"), continue_on_error: false, output_as: None },
             ],
             RuleOptions::default(),
         );
@@ -1656,7 +2012,7 @@ mod tests {
 
         let stop = rule_steps(
             copy_to("c"),
-            vec![ActionStep { action: failing, continue_on_error: false }, ActionStep { action: copy_to("d"), continue_on_error: false }],
+            vec![ActionStep { action: failing, continue_on_error: false, output_as: None }, ActionStep { action: copy_to("d"), continue_on_error: false, output_as: None }],
             RuleOptions::default(),
         );
         execute_rule_action(&stop, f.to_str(), false).await;
@@ -1872,7 +2228,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "type": "teams", "credential_id": "teams-1" })).unwrap();
         let rule = rule_steps(
             RuleAction::SendMessage { notification: n, title: "New {ext} in {parent}".into(), body: "{filename} ({size} bytes)".into() },
-            vec![ActionStep { action: RuleAction::Notify { title: "{rule}".into(), body: "{name}".into() }, continue_on_error: false }],
+            vec![ActionStep { action: RuleAction::Notify { title: "{rule}".into(), body: "{name}".into() }, continue_on_error: false, output_as: None }],
             RuleOptions::default(),
         );
         let log = execute_rule_action_with(&rule, f.to_str(), false, Some(&svc)).await;
@@ -1904,5 +2260,437 @@ mod tests {
         let refused = crate::core::error::AppError::auth("Cannot connect to NAS: HTTP 401", "Check the password.").user_message();
         assert!(!is_transient(&up, &refused), "{refused}");
         assert!(is_transient(&up, "Upload failed: Connection failed: reset by peer. Retry."));
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    //! Verify, tidy, list and purge steps; step results; downloads to a remote.
+    use super::*;
+    use crate::automation_engine::services::mock::RecordingServices;
+    use crate::automation_engine::workflow::{EdgeOn, NodeKind, Workflow, WorkflowEdge, WorkflowNode};
+    use crate::automation_engine::{ActionStep, RuleOptions, RuleTrigger};
+
+    fn write(p: &Path, data: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, data).unwrap();
+    }
+
+    fn s(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    async fn run(action: RuleAction, file: Option<&str>, svc: Option<&RecordingServices>) -> Result<Vec<String>, String> {
+        dispatch_action_with(&action, file, svc.map(|s| s as &dyn ActionServices)).await
+    }
+
+    // ── list_files ──
+
+    #[tokio::test]
+    async fn list_files_writes_csv_and_json_listings_without_listing_itself() {
+        let t = tempfile::tempdir().unwrap();
+        write(&t.path().join("in/a.txt"), "aaa");
+        write(&t.path().join("in/sub/b, \"quoted\".txt"), "bb");
+        let out = t.path().join("in/listing.csv");
+        let action = |recursive, include_dirs, overwrite, format| RuleAction::ListFiles { path: s(&t.path().join("in")), output: s(&out), format, recursive, include_dirs, overwrite };
+
+        // Flat: only a.txt (and the folder when asked).
+        assert_eq!(run(action(false, false, true, ListFormat::Csv), None, None).await.unwrap(), vec![s(&out)]);
+        let csv = std::fs::read_to_string(&out).unwrap();
+        assert!(csv.starts_with("path,name,size,modified,is_dir\n"), "{csv}");
+        assert_eq!(csv.lines().count(), 2, "{csv}");
+        assert!(csv.contains(",a.txt,3,") && csv.trim_end().ends_with(",false"));
+
+        // Recursive with folders; the listing, saved inside, does not list itself; values with commas and quotes survive.
+        run(action(true, true, true, ListFormat::Csv), None, None).await.unwrap();
+        let mut rd = csv::Reader::from_path(&out).unwrap();
+        let rows: Vec<csv::StringRecord> = rd.records().map(|r| r.unwrap()).collect();
+        let names: Vec<&str> = rows.iter().map(|r| &r[1]).collect();
+        assert_eq!(names, vec!["a.txt", "sub", "b, \"quoted\".txt"], "sorted by path: the folder, then what is in it");
+        assert_eq!(rows[1][4].to_string(), "true");
+
+        // JSON.
+        let json_out = t.path().join("lists/out.json");
+        let json = RuleAction::ListFiles { path: s(&t.path().join("in")), output: s(&json_out), format: ListFormat::Json, recursive: true, include_dirs: false, overwrite: true };
+        run(json, None, None).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json_out).unwrap()).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 3, "a.txt, b.txt and the earlier listing.csv");
+        assert!(v.as_array().unwrap().iter().any(|r| r["name"] == "a.txt" && r["size"] == 3 && r["is_dir"] == false));
+
+        // overwrite = false keeps the old listing and writes a numbered one.
+        let again = run(action(false, false, false, ListFormat::Csv), None, None).await.unwrap();
+        assert_eq!(again, vec![s(&t.path().join("in/listing (2).csv"))]);
+        assert!(out.exists());
+    }
+
+    #[tokio::test]
+    async fn list_files_uses_the_triggering_folder_and_reports_its_result() {
+        let t = tempfile::tempdir().unwrap();
+        write(&t.path().join("box/one.log"), "1234");
+        write(&t.path().join("box/two.log"), "12");
+        let trigger = t.path().join("box/one.log");
+        let out = t.path().join("report.json");
+        let a = RuleAction::ListFiles { path: String::new(), output: s(&out), format: ListFormat::Json, recursive: false, include_dirs: false, overwrite: true };
+        let env = ExecEnv::new(None);
+        let step = dispatch_step(&a, trigger.to_str(), &env).await.unwrap();
+        let o = step.into_output();
+        assert_eq!((o.count, o.bytes, o.path.as_str()), (2, 6, out.to_str().unwrap()));
+        assert_eq!(o.files.len(), 2);
+        // Errors: no output, missing folder, nothing to list from.
+        assert!(run(RuleAction::ListFiles { path: s(t.path()), output: " ".into(), format: ListFormat::Csv, recursive: false, include_dirs: false, overwrite: true }, None, None).await.unwrap_err().contains("where to save"));
+        assert!(run(RuleAction::ListFiles { path: s(&t.path().join("nope")), output: s(&out), format: ListFormat::Csv, recursive: false, include_dirs: false, overwrite: true }, None, None).await.unwrap_err().contains("not a folder"));
+        assert!(run(RuleAction::ListFiles { path: String::new(), output: s(&out), format: ListFormat::Csv, recursive: false, include_dirs: false, overwrite: true }, None, None).await.is_err());
+    }
+
+    // ── remove_empty_dirs ──
+
+    #[tokio::test]
+    async fn remove_empty_dirs_removes_nested_empties_and_keeps_everything_else() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("tree");
+        for d in ["a/b/c", "a/b/d", "keep/inner", "only-empty/x/y"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        write(&root.join("keep/file.txt"), "x");
+        write(&root.join("a/b/e.txt"), "x");
+        let action = |remove_root| RuleAction::RemoveEmptyDirs { path: s(&root), remove_root };
+        let mut removed = run(action(false), None, None).await.unwrap();
+        removed.sort();
+        let rel: Vec<String> = removed.iter().map(|p| Path::new(p).strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/")).collect();
+        assert_eq!(rel, vec!["a/b/c", "a/b/d", "keep/inner", "only-empty", "only-empty/x", "only-empty/x/y"]);
+        assert!(root.join("a/b/e.txt").exists() && root.join("keep/file.txt").exists(), "folders holding files stay");
+        assert!(!root.join("only-empty").exists());
+        // Nothing left to remove; the root is only removed on request, and only if empty.
+        assert!(run(action(false), None, None).await.unwrap().is_empty());
+        let empty_root = t.path().join("gone");
+        std::fs::create_dir_all(empty_root.join("x")).unwrap();
+        assert!(run(RuleAction::RemoveEmptyDirs { path: s(&empty_root), remove_root: false }, None, None).await.unwrap().len() == 1 && empty_root.exists());
+        assert!(run(RuleAction::RemoveEmptyDirs { path: s(&empty_root), remove_root: true }, None, None).await.unwrap().contains(&s(&empty_root)));
+        assert!(!empty_root.exists());
+        assert!(run(action(true), None, None).await.unwrap().is_empty() && root.exists(), "a root with files stays");
+        // The triggering file's folder is the default; a file is not a folder.
+        let trigger = root.join("keep/file.txt");
+        std::fs::create_dir_all(root.join("keep/later")).unwrap();
+        let r = run(RuleAction::RemoveEmptyDirs { path: String::new(), remove_root: false }, trigger.to_str(), None).await.unwrap();
+        assert_eq!(r, vec![s(&root.join("keep/later"))]);
+        assert!(run(RuleAction::RemoveEmptyDirs { path: s(&trigger), remove_root: false }, None, None).await.unwrap_err().contains("not a folder"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_dirs_never_follows_links() {
+        let t = tempfile::tempdir().unwrap();
+        let outside = t.path().join("outside/empty");
+        std::fs::create_dir_all(&outside).unwrap();
+        let root = t.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(t.path().join("outside"), root.join("link")).unwrap();
+        assert!(remove_empty_dirs(&root, false).unwrap().is_empty());
+        assert!(outside.exists(), "the link's target is untouched");
+        assert!(remove_empty_dirs(&root.join("link"), false).is_err(), "a link is not a folder to tidy");
+    }
+
+    // ── purge ──
+
+    #[test]
+    fn purge_guard_refuses_dangerous_targets() {
+        let t = tempfile::tempdir().unwrap();
+        let deep = t.path().join("a/b");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert!(purge_guard(&deep, None).is_ok());
+        assert!(purge_guard(Path::new("relative/dir/x"), None).unwrap_err().contains("full path"));
+        assert!(purge_guard(&deep.join("../b"), None).unwrap_err().contains("traversal"));
+        for shallow in ["/", "/home", "/home/user"] {
+            let e = purge_guard(Path::new(shallow), None).unwrap_err();
+            assert!(e.contains("drive root") || e.contains("full path"), "{shallow}: {e}");
+        }
+        // The home folder, or a folder that contains it.
+        assert!(purge_guard(&deep, Some(&deep.join("me"))).unwrap_err().contains("home folder"));
+        assert!(purge_guard(&deep, Some(&deep)).unwrap_err().contains("home folder"));
+        assert!(purge_guard(&deep, Some(&t.path().join("other/home"))).is_ok());
+        assert!(purge_guard(&t.path().join("a/missing"), None).is_err());
+        let f = deep.join("f.txt");
+        std::fs::write(&f, "x").unwrap();
+        assert!(purge_guard(&f, None).unwrap_err().contains("is a file"));
+        #[cfg(unix)]
+        {
+            let link = t.path().join("a/link");
+            std::os::unix::fs::symlink(&deep, &link).unwrap();
+            assert!(purge_guard(&link, None).unwrap_err().contains("is a link"));
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_removes_the_tree_after_the_interlock_and_records_it() {
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("old/cache");
+        for i in 0..5 {
+            write(&victim.join(format!("d{i}/f.bin")), "0123456789");
+        }
+        let svc = RecordingServices::default();
+        let out = run(RuleAction::Purge { path: s(&victim), max_files: None }, None, Some(&svc)).await.unwrap();
+        assert_eq!(out, vec![s(&victim)]);
+        assert!(!victim.exists());
+        assert_eq!(*svc.operations.lock().unwrap(), vec!["purge:5:50".to_string()], "the ledger learns what is usual");
+        // A path template from the triggering file.
+        write(&t.path().join("old/job-7/x.txt"), "x");
+        let trigger = t.path().join("old/job-7.done");
+        write(&trigger, "");
+        let out = run(RuleAction::Purge { path: format!("{}/old/{{name}}", t.path().display()), max_files: None }, trigger.to_str(), Some(&svc)).await.unwrap();
+        assert_eq!(out, vec![s(&t.path().join("old/job-7"))]);
+        assert!(!t.path().join("old/job-7").exists() && trigger.exists());
+    }
+
+    #[tokio::test]
+    async fn purge_is_refused_by_the_interlock_the_size_limit_and_the_guard() {
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("old/big");
+        for i in 0..4 {
+            write(&victim.join(format!("f{i}")), "x");
+        }
+        // Interlock says High: nothing is removed, the reason is shown.
+        let svc = RecordingServices::default();
+        *svc.assess_level.lock().unwrap() = Some(crate::safety::RiskLevel::High);
+        let e = run(RuleAction::Purge { path: s(&victim), max_files: None }, None, Some(&svc)).await.unwrap_err();
+        assert!(e.contains("Safety check refused") && e.contains("test says High") && e.contains("by hand"), "{e}");
+        assert!(victim.join("f0").exists());
+        assert!(svc.operations.lock().unwrap().is_empty(), "a refused purge is not recorded as done");
+        assert!(!is_transient(&RuleAction::Purge { path: s(&victim), max_files: None }, &e), "never retried");
+        // Medium and Low go ahead (the user confirmed the step when saving the rule).
+        *svc.assess_level.lock().unwrap() = Some(crate::safety::RiskLevel::Medium);
+        write(&victim.join("f0"), "x");
+        // The step's own limit.
+        let e = run(RuleAction::Purge { path: s(&victim), max_files: Some(3) }, None, Some(&svc)).await.unwrap_err();
+        assert!(e.contains("more than the 3 files"), "{e}");
+        assert!(victim.exists());
+        run(RuleAction::Purge { path: s(&victim), max_files: Some(4) }, None, Some(&svc)).await.unwrap();
+        assert!(!victim.exists());
+        // Guard errors surface unchanged; without services the absolute limits still apply.
+        assert!(run(RuleAction::Purge { path: "/".into(), max_files: None }, None, None).await.is_err());
+        assert!(run(RuleAction::Purge { path: String::new(), max_files: None }, None, None).await.unwrap_err().contains("no file started this run"));
+        let bare = t.path().join("bare/dir");
+        write(&bare.join("x"), "x");
+        run(RuleAction::Purge { path: s(&bare), max_files: None }, None, None).await.unwrap();
+        assert!(!bare.exists());
+    }
+
+    // ── verify_pair ──
+
+    #[tokio::test]
+    async fn verify_pair_passes_when_sides_agree_and_names_the_differences_when_not() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(&src.path().join("a.txt"), "hello");
+        write(&dst.path().join("a.txt"), "hello");
+        let pair = ufop_core::sync_types::SyncPair { name: "P".into(), source_path: s(src.path()), dest_path: s(dst.path()), ..Default::default() };
+        let svc = RecordingServices::default();
+        svc.pairs.lock().unwrap().push(pair.clone());
+        let id = pair.id.to_string();
+        let ok = run(RuleAction::VerifyPair { sync_pair_id: id.clone(), full: true }, None, Some(&svc)).await.unwrap();
+        assert!(ok.is_empty(), "{ok:?}: a check produces no file, so no pseudo-path reaches the log or the size");
+        write(&dst.path().join("a.txt"), "HELLO");
+        let e = run(RuleAction::VerifyPair { sync_pair_id: id.clone(), full: true }, None, Some(&svc)).await.unwrap_err();
+        assert!(e.contains("1 difference(s)") && e.contains("Checksum mismatch: a.txt"), "{e}");
+        // The quick comparison compares sizes only.
+        assert!(run(RuleAction::VerifyPair { sync_pair_id: id, full: false }, None, Some(&svc)).await.is_ok());
+        assert!(run(RuleAction::VerifyPair { sync_pair_id: "nope".into(), full: false }, None, Some(&svc)).await.unwrap_err().contains("not found"));
+        // Not a pretend success without the engines.
+        assert!(run(RuleAction::VerifyPair { sync_pair_id: "x".into(), full: false }, None, None).await.unwrap_err().contains(SERVICES_UNAVAILABLE));
+    }
+
+    // ── step results ──
+
+    fn two_steps(first: RuleAction, name: Option<&str>, second: RuleAction) -> AutomationRule {
+        let mut r = AutomationRule::new("steps".into(), RuleTrigger::Manual, first);
+        r.output_as = name.map(Into::into);
+        r.steps = vec![ActionStep { action: second, continue_on_error: false, output_as: None }];
+        r.options = RuleOptions::default();
+        r
+    }
+
+    #[tokio::test]
+    async fn later_steps_use_the_results_of_earlier_ones() {
+        let t = tempfile::tempdir().unwrap();
+        write(&t.path().join("box/a.dat"), "12345");
+        write(&t.path().join("box/b.dat"), "123");
+        let listing = t.path().join("out/list.csv");
+        let first = RuleAction::ListFiles { path: s(&t.path().join("box")), output: s(&listing), format: ListFormat::Csv, recursive: false, include_dirs: false, overwrite: true };
+        let tell = RuleAction::Notify { title: "{steps.l.count} files".into(), body: "{steps.l.bytes} bytes in {steps.l.path|upper}".into() };
+        let svc = RecordingServices::default();
+        let log = execute_rule_action_with(&two_steps(first, Some("l"), tell), None, false, Some(&svc)).await;
+        assert_eq!(log.status, AutomationStatus::Success, "{:?}", log.error_message);
+        assert_eq!(svc.calls(), vec![format!("notify:2 files:8 bytes in {}", s(&listing).to_uppercase())]);
+    }
+
+    #[tokio::test]
+    async fn step_results_cover_produced_files_and_start_fresh_for_each_file() {
+        let t = tempfile::tempdir().unwrap();
+        write(&t.path().join("in/x.txt"), "xx");
+        write(&t.path().join("in/y.txt"), "yyyy");
+        let mut rule = two_steps(
+            RuleAction::CopyFile { dest_path: s(&t.path().join("copies")) },
+            Some("cp"),
+            RuleAction::Notify { title: "copied".into(), body: "{steps.cp.path} {steps.cp.bytes} {steps.cp.count}".into() },
+        );
+        rule.options.source = Some(SourceSelection { path: s(&t.path().join("in")), recursive: false, newest: None, include_dirs: false });
+        let svc = RecordingServices::default();
+        let log = execute_rule_action_with(&rule, None, false, Some(&svc)).await;
+        assert_eq!(log.status, AutomationStatus::Success, "{:?}", log.error_message);
+        let mut calls = svc.calls();
+        calls.sort();
+        assert_eq!(calls, vec![format!("notify:copied:{} 2 1", s(&t.path().join("copies/x.txt"))), format!("notify:copied:{} 4 1", s(&t.path().join("copies/y.txt")))]);
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_reference_fails_the_rule_before_any_step_runs() {
+        let t = tempfile::tempdir().unwrap();
+        let made = t.path().join("made");
+        let rule = two_steps(RuleAction::CreateFolder { path: s(&made) }, None, RuleAction::Notify { title: "t".into(), body: "{steps.ghost.path}".into() });
+        let svc = RecordingServices::default();
+        let log = execute_rule_action_with(&rule, None, false, Some(&svc)).await;
+        assert_eq!(log.status, AutomationStatus::Failed);
+        assert!(log.error_message.as_deref().unwrap().contains("no earlier step is named \"ghost\""), "{:?}", log.error_message);
+        assert!(!made.exists() && svc.calls().is_empty(), "nothing ran");
+        // Saving is refused with the same message.
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = crate::automation_engine::AutomationManager::new();
+        let e = mgr.save_rule(&repo, &rule).await.unwrap_err();
+        assert!(e.user_message().contains("ghost"), "{}", e.user_message());
+        assert!(mgr.get_rule(&rule.id).await.is_none());
+    }
+
+    fn node(id: &str, action: RuleAction, out: Option<&str>) -> WorkflowNode {
+        WorkflowNode { id: id.into(), kind: NodeKind::Action { action: Box::new(action) }, label: String::new(), output_as: out.map(Into::into), x: 0.0, y: 0.0 }
+    }
+
+    #[tokio::test]
+    async fn graph_results_flow_along_the_connections() {
+        let t = tempfile::tempdir().unwrap();
+        write(&t.path().join("box/one.dat"), "1");
+        write(&t.path().join("box/two.dat"), "22");
+        let listing = t.path().join("l.json");
+        let wf = Workflow {
+            nodes: vec![
+                node("list", RuleAction::ListFiles { path: s(&t.path().join("box")), output: s(&listing), format: ListFormat::Json, recursive: false, include_dirs: false, overwrite: true }, Some("l")),
+                node("tell", RuleAction::Notify { title: "n".into(), body: "{steps.l.count}/{steps.l.bytes}".into() }, None),
+            ],
+            edges: vec![WorkflowEdge { from: "list".into(), to: "tell".into(), on: EdgeOn::Success }],
+        };
+        let mut rule = AutomationRule::new("g".into(), RuleTrigger::Manual, RuleAction::Notify { title: "x".into(), body: "y".into() });
+        rule.workflow = Some(wf.clone());
+        let svc = RecordingServices::default();
+        let log = execute_rule_action_with(&rule, None, false, Some(&svc)).await;
+        assert_eq!(log.status, AutomationStatus::Success, "{:?}", log.error_message);
+        assert_eq!(svc.calls(), vec!["notify:n:2/3".to_string()]);
+        // A step that is not downstream of the producer cannot use its result.
+        let mut sibling = wf;
+        sibling.edges.clear();
+        rule.workflow = Some(sibling);
+        let log = execute_rule_action_with(&rule, None, false, Some(&RecordingServices::default())).await;
+        assert_eq!(log.status, AutomationStatus::Failed);
+        assert!(log.error_message.unwrap().contains("Step tell"));
+    }
+
+    #[tokio::test]
+    async fn results_survive_storage_and_conversion_to_a_graph() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = crate::automation_engine::AutomationManager::new();
+        let rule = two_steps(RuleAction::CreateFolder { path: "/x/y".into() }, Some("mk"), RuleAction::Notify { title: "t".into(), body: "{steps.mk.path}".into() });
+        mgr.save_rule(&repo, &rule).await.unwrap();
+        let reloaded = crate::automation_engine::AutomationManager::new();
+        reloaded.load_rules_from_db(&repo).await.unwrap();
+        assert_eq!(reloaded.get_rule(&rule.id).await.unwrap().output_as.as_deref(), Some("mk"));
+        let wf = Workflow::from_rule(&rule);
+        assert_eq!(wf.nodes[0].output_as.as_deref(), Some("mk"));
+        let mut as_graph = rule.clone();
+        as_graph.workflow = Some(wf);
+        assert!(as_graph.validate().is_ok());
+    }
+
+    // ── download straight to a remote ──
+
+    async fn serve() -> u16 {
+        let app = axum::Router::new().route("/report.pdf", axum::routing::get(|| async { "remote bytes" }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        port
+    }
+
+    fn to_remote(port: u16, path: &str) -> RuleAction {
+        RuleAction::DownloadUrl {
+            url: format!("http://127.0.0.1:{port}{path}"),
+            dest_path: String::new(),
+            file_name: None,
+            overwrite: false,
+            max_mb: 1,
+            sha256: None,
+            allow_private: true,
+            destination_connection_id: Some("conn-1".into()),
+            destination_protocol: Some("sftp".into()),
+            remote_path: Some("/inbox/{name}".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_download_goes_straight_to_the_remote_and_leaves_no_local_copy() {
+        let port = serve().await;
+        let t = tempfile::tempdir().unwrap();
+        let trigger = t.path().join("job-9.trigger");
+        write(&trigger, "");
+        let svc = RecordingServices::default();
+        let out = run(to_remote(port, "/report.pdf"), trigger.to_str(), Some(&svc)).await.unwrap();
+        assert_eq!(out, vec!["/inbox/job-9/report.pdf".to_string()], "the remote path is the result");
+        let uploads = svc.uploaded.lock().unwrap().clone();
+        assert_eq!(uploads.len(), 1);
+        let (local, content) = &uploads[0];
+        assert_eq!(content, b"remote bytes", "the file was complete when it was uploaded");
+        assert!(local.contains("ufop-download-") && local.ends_with("report.pdf"));
+        assert!(!Path::new(local).exists() && !Path::new(local).parent().unwrap().exists(), "the temporary file and its folder are gone");
+        assert_eq!(svc.calls(), vec![format!("transfer:sftp:conn-1:{local}->/inbox/job-9/report.pdf")]);
+        // A remote result is not a local file to hand on to later steps.
+        assert!(!hands_on_path(&to_remote(port, "/report.pdf")));
+    }
+
+    #[tokio::test]
+    async fn a_failed_upload_or_download_still_cleans_up_and_reports() {
+        let port = serve().await;
+        let failing = RecordingServices { fail_with: Some("remote refused the file".into()), ..Default::default() };
+        let e = run(to_remote(port, "/report.pdf"), None, Some(&failing)).await.unwrap_err();
+        assert!(e.contains("remote refused the file"), "{e}");
+        let local = failing.uploaded.lock().unwrap()[0].0.clone();
+        assert!(!Path::new(&local).parent().unwrap().exists(), "temp folder removed after a failed upload");
+        // The download itself fails (404): nothing is uploaded.
+        let ok = RecordingServices::default();
+        let e = run(to_remote(port, "/missing.pdf"), None, Some(&ok)).await.unwrap_err();
+        assert!(e.contains("404"), "{e}");
+        assert!(ok.uploaded.lock().unwrap().is_empty());
+        // Without the engines the step says so instead of pretending.
+        let e = run(to_remote(port, "/report.pdf"), None, None).await.unwrap_err();
+        assert!(e.contains(SERVICES_UNAVAILABLE), "{e}");
+        // A template that cannot render fails before anything is downloaded.
+        let mut bad = to_remote(port, "/report.pdf");
+        if let RuleAction::DownloadUrl { remote_path, .. } = &mut bad {
+            *remote_path = Some("/{nope}".into());
+        }
+        assert!(run(bad, None, Some(&ok)).await.is_err());
+    }
+
+    #[test]
+    fn new_steps_are_named_and_retried_sensibly() {
+        let verify = RuleAction::VerifyPair { sync_pair_id: "p".into(), full: false };
+        assert_eq!(action_kind(&verify), "verify_pair");
+        assert_eq!(action_kind(&RuleAction::Purge { path: "x".into(), max_files: None }), "purge");
+        assert_eq!(action_kind(&RuleAction::RemoveEmptyDirs { path: String::new(), remove_root: false }), "remove_empty_dirs");
+        assert!(!is_transient(&verify, "1 difference(s) between a and b"), "differences are not a transient failure");
+        // The wire format the editor uses.
+        let j = serde_json::to_value(RuleAction::ListFiles { path: "/a".into(), output: "/o.csv".into(), format: ListFormat::Json, recursive: true, include_dirs: false, overwrite: true }).unwrap();
+        assert_eq!(j["type"], "list_files");
+        assert_eq!(j["format"], "json");
+        let parsed: RuleAction = serde_json::from_str(r#"{"type":"list_files","output":"/o.csv"}"#).unwrap();
+        assert!(matches!(parsed, RuleAction::ListFiles { format: ListFormat::Csv, overwrite: true, recursive: false, .. }), "defaults: csv, overwrite, flat");
+        // Stored downloads from before the remote option still load.
+        let old: RuleAction = serde_json::from_str(r#"{"type":"download_url","url":"https://h/f","dest_path":"/d"}"#).unwrap();
+        assert!(matches!(old, RuleAction::DownloadUrl { destination_connection_id: None, .. }));
     }
 }

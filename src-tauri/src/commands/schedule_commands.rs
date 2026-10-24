@@ -51,6 +51,13 @@ pub async fn schedule_delete(id: String, lib: State<'_, ScheduleLibrary>, sync: 
     lib.delete_schedule(&id, &users).await
 }
 
+/// When each enabled, scheduled sync pair and automation rule runs next,
+/// soonest first (days off of their calendars skipped).
+#[tauri::command]
+pub async fn upcoming_runs(sync: State<'_, SyncManager>, automation: State<'_, AutomationManager>) -> Result<Vec<schedule_library::upcoming::UpcomingRun>, AppError> {
+    Ok(schedule_library::upcoming::upcoming(&sync, &automation).await)
+}
+
 #[tauri::command]
 pub async fn calendars_list(lib: State<'_, ScheduleLibrary>) -> Result<Vec<HolidayCalendar>, AppError> {
     Ok(lib.list_calendars().await)

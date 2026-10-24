@@ -1,6 +1,7 @@
 pub mod ai_engine;
 pub mod automation_engine;
 pub mod backup_engine;
+pub mod chat_control;
 pub mod commands;
 pub mod paths;
 pub mod compat_engine;
@@ -17,6 +18,7 @@ pub mod logging;
 pub mod diagnostics;
 pub mod managed_settings;
 pub mod net;
+pub mod notify_hub;
 pub mod search_engine;
 pub mod thumbnail_engine;
 pub mod mount_engine;
@@ -36,7 +38,7 @@ use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, oauth_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, oauth_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -535,6 +537,25 @@ pub fn run() {
                     tracing::warn!("Backup notification failed: {e}");
                 }
             }));
+            // Transfers and sync runs → OS notifications, when Settings →
+            // Notifications asks for them; sync results → the pair's profile.
+            let desktop = app.handle().clone();
+            let sink: std::sync::Arc<dyn Fn(notify_hub::desktop::DesktopEvent) + Send + Sync> = std::sync::Arc::new(move |event| {
+                let app = desktop.clone();
+                tauri::async_runtime::spawn(async move { notify_hub::desktop::show(&app, event).await });
+            });
+            notify_hub::desktop::wire_transfers(&app.state::<TransferManager>(), sink.clone());
+            notify_hub::desktop::wire_sync(&app.state::<SyncManager>(), sink);
+            notify_hub::run::wire_sync_reports(app.handle());
+            notify_hub::run::wire_profile_users(app.handle());
+            // Chat-bot remote control: nothing starts unless the user turned it on.
+            app.manage(chat_control::service::ChatControlService::new(app.handle().clone()));
+            let chat = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = chat.state::<chat_control::service::ChatControlService>().apply(false).await {
+                    tracing::warn!("Remote control did not start: {}", e.user_message());
+                }
+            });
             mgr.start_scheduler();
             // The Prometheus exporter, when the user turned it on.
             let metrics = setup_metrics.clone();
@@ -754,7 +775,11 @@ pub fn run() {
             backup_commands::backup_execute,
             backup_commands::backup_cancel,
             backup_commands::backup_change_passphrase,
+            chat_control_commands::chat_control_get,
+            chat_control_commands::chat_control_save,
+            chat_control_commands::chat_control_status,
             schedule_commands::schedules_list,
+            schedule_commands::upcoming_runs,
             schedule_commands::schedule_save,
             schedule_commands::schedule_delete,
             schedule_commands::calendars_list,
@@ -1220,6 +1245,8 @@ pub fn run() {
             automation_commands::automation_rule_revisions,
             automation_commands::automation_restore_revision,
             automation_commands::automation_convert_to_workflow,
+            automation_commands::automation_action_risks,
+            automation_commands::automation_rule_confirmations,
             automation_commands::create_automation_rule,
             automation_commands::update_automation_rule,
             automation_commands::delete_automation_rule,

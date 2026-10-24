@@ -6,6 +6,7 @@
  */
 import { WorkflowBuilder } from "@/components/workflow-builder";
 import { runStatus } from "@/lib/workflow-model";
+import { formatNextRun } from "@/lib/upcoming-runs";
 import { useCallback, useEffect, useState } from "react";
 import {
   useAutomationStore,
@@ -141,7 +142,15 @@ function actionLabel(action: RuleAction): string {
     case "create_folder":
       return `Create folder ${shortenPath(action.path)}`;
     case "download_url":
-      return `Download to ${shortenPath(action.dest_path)}`;
+      return action.destination_connection_id ? `Download to ${action.destination_protocol ?? "remote"} ${shortenPath(action.remote_path ?? "")}`.trim() : `Download to ${shortenPath(action.dest_path)}`;
+    case "verify_pair":
+      return `Verify sync pair${action.full ? " (contents)" : ""}`;
+    case "remove_empty_dirs":
+      return `Remove empty folders${action.path ? ` in ${shortenPath(action.path)}` : ""}`;
+    case "list_files":
+      return `List files to ${shortenPath(action.output)}`;
+    case "purge":
+      return `Purge ${shortenPath(action.path)}`;
     case "convert_image":
       return [action.format ? `Convert to ${action.format.toUpperCase()}` : "Resize", action.max_width || action.max_height ? `≤ ${action.max_width ?? "∞"}×${action.max_height ?? "∞"}` : ""].filter(Boolean).join(" ");
     case "convert_document":
@@ -190,9 +199,11 @@ function shortenPath(path: string): string {
 
 interface RuleCardProps {
   rule: AutomationRule;
+  /** Next scheduled run (RFC 3339), when the rule is armed with a schedule. */
+  nextRun?: string;
 }
 
-function RuleCard({ rule }: RuleCardProps) {
+function RuleCard({ rule, nextRun }: RuleCardProps) {
   const toggleRule = useAutomationStore((s) => s.toggleRule);
   const runRule = useAutomationStore((s) => s.runRule);
   const deleteRule = useAutomationStore((s) => s.deleteRule);
@@ -269,6 +280,12 @@ function RuleCard({ rule }: RuleCardProps) {
             <span className="text-[var(--color-text-muted)]">→</span>
             <span>{rule.workflow ? `Workflow (${rule.workflow.nodes.length} steps)` : actionLabel(rule.action)}</span>
           </div>
+          {nextRun && rule.enabled && (
+            <div className="mt-0.5 flex items-center gap-1 text-[10px] text-[var(--color-text-muted)]" data-testid={`next-run-${rule.id}`} title={new Date(nextRun).toLocaleString()}>
+              <Clock className="h-3 w-3" aria-hidden="true" />
+              Next run: {formatNextRun(nextRun)}
+            </div>
+          )}
         </div>
 
         {/* Enabled toggle — `role="switch"` so screen readers announce state. */}
@@ -564,6 +581,8 @@ export function AutomationPanel() {
   const logs = useAutomationStore((s) => s.logs);
   const loading = useAutomationStore((s) => s.loading);
   const loadRules = useAutomationStore((s) => s.loadRules);
+  const nextRuns = useAutomationStore((s) => s.nextRuns);
+  const loadNextRuns = useAutomationStore((s) => s.loadNextRuns);
   const loadLogs = useAutomationStore((s) => s.loadLogs);
   const loadSuggestions = useAutomationStore((s) => s.loadSuggestions);
   const openEditor = useAutomationStore((s) => s.openEditor);
@@ -576,8 +595,16 @@ export function AutomationPanel() {
       loadRules();
       loadLogs();
       loadSuggestions();
+      // A schedule moves on after each run; keep "Next run" current while the panel is open.
+      const t = setInterval(() => void loadNextRuns(), 60_000);
+      return () => clearInterval(t);
     }
-  }, [panelOpen, loadRules, loadLogs, loadSuggestions]);
+  }, [panelOpen, loadRules, loadLogs, loadSuggestions, loadNextRuns]);
+
+  // Enabling, editing or running a rule changes when it runs next.
+  useEffect(() => {
+    if (panelOpen) void loadNextRuns();
+  }, [panelOpen, rules, loadNextRuns]);
 
   if (!panelOpen) return null;
 
@@ -685,7 +712,7 @@ export function AutomationPanel() {
                 </div>
               )}
               {!loading &&
-                rules.map((rule) => <RuleCard key={rule.id} rule={rule} />)}
+                rules.map((rule) => <RuleCard key={rule.id} rule={rule} nextRun={nextRuns[rule.id]} />)}
             </>
           )}
 

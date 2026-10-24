@@ -172,7 +172,14 @@ pub struct TransferManager {
     /// Transfer History panel reflects real executions — without this the
     /// panel could only ever render "No transfer history".
     history: Arc<RwLock<Option<TransferHistory>>>,
+
+    /// Called for every job that completes or fails (desktop notifications);
+    /// added at start-up.
+    terminal_hooks: Arc<std::sync::RwLock<Vec<TerminalHook>>>,
 }
+
+/// Listener for jobs reaching a final Completed or Failed status.
+pub type TerminalHook = Arc<dyn Fn(&crate::core::types::TransferJob) + Send + Sync>;
 
 impl TransferManager {
     pub fn new() -> Self {
@@ -195,7 +202,13 @@ impl TransferManager {
             controls: Arc::new(RwLock::new(HashMap::new())),
             executors: Arc::new(Mutex::new(HashSet::new())),
             history: Arc::new(RwLock::new(None)),
+            terminal_hooks: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
+    }
+
+    /// Listen for jobs that complete or fail.
+    pub fn add_terminal_hook(&self, hook: TerminalHook) {
+        self.terminal_hooks.write().unwrap_or_else(|e| e.into_inner()).push(hook);
     }
 
     /// Attach the history sink. Called once from app init, right after the
@@ -540,7 +553,17 @@ impl TransferManager {
             error_message: None,
         };
         let _ = self.progress_tx.send(Some(progress));
+        let done = job.clone();
+        drop(map);
+        self.announce(&done);
         Ok(())
+    }
+
+    /// Tell the terminal hooks (desktop notifications) a job ended.
+    fn announce(&self, job: &TransferJob) {
+        for hook in self.terminal_hooks.read().unwrap_or_else(|e| e.into_inner()).iter() {
+            hook(job);
+        }
     }
 
     /// Mark a job as failed.
@@ -566,6 +589,9 @@ impl TransferManager {
             error_message: Some(error.to_string()),
         };
         let _ = self.progress_tx.send(Some(progress));
+        let done = job.clone();
+        drop(map);
+        self.announce(&done);
         Ok(())
     }
 

@@ -7,6 +7,7 @@
  */
 import { create } from "zustand";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import type { RunNotify } from "@/lib/run-notify";
 
 // ── Types ──
 
@@ -31,7 +32,7 @@ export interface SyncPair {
   run_options?: SyncRunOptions;
 }
 
-export interface SyncRunOptions {
+export interface SyncRunOptions extends RunNotify {
   settle_secs: number;
   completion_marker: string | null;
   version_template: string | null;
