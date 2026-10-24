@@ -285,9 +285,14 @@ impl SyncManager {
         let doc = portable::parse(json)?;
         let (_, profiles) = Self::mounts_and_profiles(repo).await?;
         let mut warnings = portable::warnings(&doc, &profiles, |p| std::path::Path::new(p).exists());
-        let enabled = warnings.is_empty() && doc.pair.enabled;
+        // As with a duplicate, a pair that would run on its own (and could
+        // mirror-delete at once) is never armed by the import itself.
+        let automatic = matches!(doc.pair.trigger, SyncTrigger::Scheduled { .. } | SyncTrigger::Watch);
+        let enabled = warnings.is_empty() && doc.pair.enabled && !automatic;
         if !warnings.is_empty() {
             warnings.push("The pair is disabled until you fix this; enable it from Edit.".to_string());
+        } else if doc.pair.enabled && automatic {
+            warnings.push("It runs on a schedule or when files change, so it starts turned off: check its folders, then turn it on in Edit.".to_string());
         }
         let pair = SyncPair { id: Uuid::new_v4(), last_run: None, created_at: Utc::now(), enabled, ..doc.pair };
         let pair = self.create_pair(pair).await?;
@@ -2354,6 +2359,21 @@ mod tests {
         assert!(!flagged.pair.enabled);
         assert!(flagged.warnings.iter().any(|w| w.contains("/nonexistent/ufop/dest")));
         assert!(mgr.import_pair(&repo, "{}").await.is_err());
+
+        // Regression: an enabled scheduled (or watched) pair from another
+        // computer was armed on import, so a mirror could start purging a
+        // destination before anyone looked at it. It now arrives off.
+        let armed = mgr.scheduler.list_schedules().len();
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["pair"]["trigger"] = serde_json::to_value(SyncTrigger::Scheduled { cron_expr: "0 0 * * * * *".into() }).unwrap();
+        let scheduled = mgr.import_pair(&repo, &v.to_string()).await.unwrap();
+        assert!(!scheduled.pair.enabled, "an imported scheduled pair starts disabled");
+        assert!(matches!(scheduled.pair.trigger, SyncTrigger::Scheduled { .. }), "the trigger itself is kept");
+        assert_eq!(mgr.scheduler.list_schedules().len(), armed, "an imported schedule is not armed");
+        assert!(scheduled.warnings.iter().any(|w| w.contains("Edit")), "{:?}", scheduled.warnings);
+        v["pair"]["trigger"] = serde_json::to_value(SyncTrigger::Watch).unwrap();
+        let watched = mgr.import_pair(&repo, &v.to_string()).await.unwrap();
+        assert!(!watched.pair.enabled, "an imported watched pair starts disabled");
     }
 
     #[tokio::test]

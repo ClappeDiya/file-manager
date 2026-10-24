@@ -290,7 +290,7 @@ With **Destination state: Blind upload** the destination is never read, so a two
 
 - **Edit** opens the pair in the same form used to create it.
 - **Duplicate** creates "*name* (copy)" with the same settings, no run history and its schedule (or watcher) off: a scheduled or watched pair's copy keeps its trigger (the cron expression included) but starts disabled; turn it on with **Enabled** in Edit once it points at its own folders. Backup jobs have **Duplicate** too: the copy's schedules (including replica timers, and a schedule or maintenance plan it would inherit from a policy template) are off, stored credentials are copied rather than shared, and it opens in the editor so you can give it its own destination.
-- **Export** / **Import** (Advanced view) save one pair as a `ufop-sync-pair` JSON file and load it on another computer. If a folder is missing there, or a folder is on a saved connection's mount that the computer does not have, the import says so and the pair stays disabled until you fix it.
+- **Export** / **Import** (Advanced view) save one pair as a `ufop-sync-pair` JSON file and load it on another computer. If a folder is missing there, or a folder is on a saved connection's mount that the computer does not have, the import says so and the pair stays disabled until you fix it. A pair that runs on a schedule or when files change also arrives turned off, so it cannot start syncing (or mirror-deleting) before you have checked its folders; turn it on in **Edit**.
 
 ### Filters, rules and presets
 
