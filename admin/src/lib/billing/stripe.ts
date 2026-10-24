@@ -21,6 +21,9 @@ const str = (v: unknown) => (typeof v === 'string' ? v : null);
 const iso = (v: unknown) => (v ? new Date(Number(v) * 1000).toISOString() : null);
 const idOf = (v: unknown) => (typeof v === 'string' ? v : v && typeof v === 'object' ? (str((v as Obj).id) ?? '') : '');
 
+/** Whether a subscription or customer object has a default payment method (an id or an expanded object). */
+const hasDefaultPaymentMethod = (v: Obj) => !!(idOf(v.default_payment_method) || idOf(v.default_source));
+
 /** Stripe's form encoding for nested parameters. */
 function form(params: Record<string, string | number | undefined>): string {
   return Object.entries(params)
@@ -103,6 +106,13 @@ export class StripeProvider implements BillingProvider {
     await this.call('POST', `/v1/checkout/sessions/${encodeURIComponent(sessionId)}/expire`);
   }
 
+  async retrieveCheckout(sessionId: string): Promise<{ status: 'open' | 'complete' | 'expired' }> {
+    const s = await this.call('GET', `/v1/checkout/sessions/${encodeURIComponent(sessionId)}`);
+    const status = str(s.status);
+    if (status !== 'open' && status !== 'complete' && status !== 'expired') throw new BillingError('Stripe returned an unknown checkout session state');
+    return { status };
+  }
+
   async hasSubscriptions(customerId: string): Promise<boolean> {
     const r = await this.call('GET', '/v1/subscriptions', { customer: customerId, status: 'all', limit: 1 });
     return ((r.data as Obj[] | undefined) ?? []).length > 0;
@@ -175,13 +185,13 @@ export class StripeProvider implements BillingProvider {
           deleted: type === 'customer.subscription.deleted',
           trialEnd: iso(obj.trial_end),
           discount: discountOf(obj.discount ?? ((obj.discounts as unknown[] | undefined) ?? []).find((d) => d && typeof d === 'object')),
-          hasPaymentMethod: !!(idOf(obj.default_payment_method) || idOf(obj.default_source)),
+          hasPaymentMethod: hasDefaultPaymentMethod(obj),
         };
       }
       case 'customer.subscription.trial_will_end':
-        return { kind: 'trial_will_end', id, orgId: str(meta.org_id), customerId: idOf(obj.customer), subscriptionId: idOf(obj.id), trialEnd: iso(obj.trial_end), hasPaymentMethod: !!(idOf(obj.default_payment_method) || idOf(obj.default_source)) };
+        return { kind: 'trial_will_end', id, orgId: str(meta.org_id), customerId: idOf(obj.customer), subscriptionId: idOf(obj.id), trialEnd: iso(obj.trial_end), hasPaymentMethod: hasDefaultPaymentMethod(obj) };
       case 'customer.updated':
-        return { kind: 'customer', id, customerId: idOf(obj.id), hasPaymentMethod: !!(idOf((obj.invoice_settings as Obj | undefined)?.default_payment_method) || idOf(obj.default_source)) };
+        return { kind: 'customer', id, customerId: idOf(obj.id), hasPaymentMethod: hasDefaultPaymentMethod({ default_payment_method: (obj.invoice_settings as Obj | undefined)?.default_payment_method, default_source: obj.default_source }) };
       case 'invoice.paid':
       case 'invoice.payment_failed':
         return {

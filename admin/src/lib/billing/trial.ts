@@ -36,6 +36,13 @@ export function trialOutcome(pm: boolean | null): string {
   return `Check in the billing portal that a payment method is on file; without one the subscription is cancelled when the trial ends and the organization returns to the free plan.`;
 }
 
+/** The trial outcome in one clause for the audit trail (same three cases as `trialOutcome`). */
+export function trialOutcomeShort(pm: boolean | null): string {
+  if (pm === true) return 'a payment method is on file, so it converts to a paid subscription';
+  if (pm === false) return 'add a payment method in the billing portal to keep the subscription';
+  return 'check in the billing portal that a payment method is on file to keep the subscription';
+}
+
 /** "20% off" / "$5.00 off", for the billing page. */
 export function discountAmount(d: Discount): string {
   if (d.percentOff != null) return `${Number(d.percentOff.toFixed(2))}% off`;

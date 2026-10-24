@@ -23,7 +23,7 @@ import { deliverTo } from '../mailer';
 import { promotionCodesEnabled, trialDays } from './config';
 import { BILLING_INTERVALS, FREE_PLAN, planById, priceFor, priceMatch, type BillingInterval } from './plans';
 import { BillingError, type BillingEvent, type BillingProvider, type Discount, type Invoice, type SubscriptionStatus } from './provider';
-import { hasPaymentMethod, trialDaysLeft, trialEndsPhrase, trialOutcome } from './trial';
+import { hasPaymentMethod, trialDaysLeft, trialEndsPhrase, trialOutcome, trialOutcomeShort } from './trial';
 import { stripeFromEnv } from './stripe';
 
 export { BillingError };
@@ -164,7 +164,27 @@ export async function startCheckout(
   // other's id, so every earlier session gets expired and only the last one stays open.
   const earlier = billingAccount(orgId)?.checkoutSessionId;
   upsert(orgId, p.id, { checkoutSessionId: session.id });
-  if (earlier && earlier !== session.id) await p.expireCheckout(earlier).catch(() => undefined); // already completed or expired
+  if (earlier && earlier !== session.id) {
+    try {
+      await p.expireCheckout(earlier);
+    } catch (e) {
+      // The earlier session could not be expired: it is already expired (nothing to do), or it has just been
+      // completed (its webhook is still on the way, so the console does not know the subscription yet and this
+      // session may carry a second trial), or its state is unknown. Only the first lets the new one stand.
+      const state = await p.retrieveCheckout(earlier).then((r) => r.status, () => null);
+      if (state !== 'expired') {
+        if (session.id) await p.expireCheckout(session.id).catch(() => undefined);
+        // Give the earlier id back so its webhook closes it (unless another start has taken over meanwhile).
+        const patch = billingAccount(orgId)?.checkoutSessionId === session.id ? { checkoutSessionId: earlier } : {};
+        if (state === 'complete') {
+          upsert(orgId, p.id, { ...patch, trialUsed: true });
+          throw new OrgError('A subscription was just started; it will appear in a moment', 409);
+        }
+        upsert(orgId, p.id, patch);
+        throw new BillingError(`Your earlier checkout could not be closed (${e instanceof Error ? e.message : 'unknown error'}); try again in a moment`);
+      }
+    }
+  }
   return { url: session.url };
 }
 
@@ -242,7 +262,7 @@ export function applyBillingEvent(provider: string, ev: BillingEvent): 'duplicat
     upsert(orgId, provider, { subPaymentMethod: ev.hasPaymentMethod });
     const pm = hasPaymentMethod(billingAccount(orgId)!);
     const left = trialDaysLeft(ev.trialEnd);
-    audit(orgId, 'billing.trial_will_end', `The free trial ends ${trialEndsPhrase(left)}${ev.trialEnd ? ` (${ev.trialEnd.slice(0, 10)})` : ''}; ${pm === true ? 'a payment method is on file, so it converts to a paid subscription' : pm === false ? 'add a payment method in the billing portal to keep the subscription' : 'check in the billing portal that a payment method is on file to keep the subscription'}`, pm === true ? 'info' : 'warning', { subscriptionId: ev.subscriptionId, trialEnd: ev.trialEnd, paymentMethod: pm });
+    audit(orgId, 'billing.trial_will_end', `The free trial ends ${trialEndsPhrase(left)}${ev.trialEnd ? ` (${ev.trialEnd.slice(0, 10)})` : ''}; ${trialOutcomeShort(pm)}`, pm === true ? 'info' : 'warning', { subscriptionId: ev.subscriptionId, trialEnd: ev.trialEnd, paymentMethod: pm });
     return 'applied';
   }
   if (!orgId) {
@@ -310,7 +330,9 @@ export async function handleBillingWebhook(rawBody: string, headers: Headers): P
   const result = applyBillingEvent(p.id, ev);
   if (result === 'applied' && ev.kind === 'trial_will_end') {
     const orgId = resolveOrg(p.id, ev.orgId, ev.customerId);
-    if (orgId) await notifyTrialEnding(orgId, ev.trialEnd);
+    // Not awaited: a slow channel (SMTP, a webhook) must not hold up the answer to the provider. The event is
+    // recorded already; failed sends are retried from the outbox.
+    if (orgId) void notifyTrialEnding(orgId, ev.trialEnd).catch((e) => console.error('trial notice failed', e));
   }
   return result;
 }

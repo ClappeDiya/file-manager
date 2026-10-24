@@ -2,7 +2,7 @@
  * Billing: Stripe checkout/portal/invoices against a mock API, signed webhooks → license seats, idempotency, step-up;
  * free trial (first subscription only), annual interval, trial-ending notices and applied coupons.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import crypto from 'crypto';
 import http from 'http';
 import net from 'net';
@@ -32,8 +32,14 @@ let server: http.Server;
 let base = '';
 /** Customers that have a subscription at the mock provider (answers GET /v1/subscriptions). */
 const customersWithSubscriptions = new Set<string>();
-/** Checkout sessions that can no longer be expired (already completed). */
+/** Checkout sessions that can no longer be expired because they completed. */
 const finishedSessions = new Set<string>();
+/** Checkout sessions that expired by themselves (they cannot be expired again). */
+const lapsedSessions = new Set<string>();
+/** Sessions the console expired. */
+const expiredByConsole = new Set<string>();
+/** Make the checkout lookup fail (the state of an earlier session cannot be read). */
+let sessionLookupDown = false;
 let sessionCount = 0;
 const calls: { method: string; url: string; body: string; auth: string }[] = [];
 
@@ -51,7 +57,17 @@ beforeAll(async () => {
         return send(200, { id, url: `https://checkout.stripe.test/${id}` });
       }
       const expire = /^\/v1\/checkout\/sessions\/(cs_\d+)\/expire$/.exec(rq.url ?? '');
-      if (expire) return finishedSessions.has(expire[1]) ? send(400, { error: { message: 'Only open sessions can be expired' } }) : send(200, { id: expire[1], status: 'expired' });
+      if (expire) {
+        if (finishedSessions.has(expire[1]) || lapsedSessions.has(expire[1])) return send(400, { error: { message: 'Only open sessions can be expired' } });
+        expiredByConsole.add(expire[1]);
+        return send(200, { id: expire[1], status: 'expired' });
+      }
+      const lookup = /^\/v1\/checkout\/sessions\/(cs_\d+)$/.exec(rq.url ?? '');
+      if (lookup) {
+        if (sessionLookupDown) return send(500, { error: { message: 'boom' } });
+        const id = lookup[1];
+        return send(200, { id, status: finishedSessions.has(id) ? 'complete' : lapsedSessions.has(id) || expiredByConsole.has(id) ? 'expired' : 'open' });
+      }
       if (rq.url?.startsWith('/v1/subscriptions?')) {
         const customer = new URLSearchParams(rq.url.split('?')[1]).get('customer') ?? '';
         if (customer === 'cus_lookup_down') return send(500, { error: { message: 'boom' } });
@@ -469,9 +485,10 @@ describe('billing: trial ending notice', () => {
     const audited = listAudit({ eventType: 'billing.trial_will_end' }).entries.find((e) => e.orgId === org.id)!;
     expect(audited).toMatchObject({ severity: 'warning', resourceType: 'billing' });
     expect(audited.description).toContain('ends in 3 days');
-    expect(hookBodies).toHaveLength(1);
+    // The first send is not awaited (a slow channel must not hold up the answer to Stripe), so wait for it.
+    await vi.waitFor(() => expect(hookBodies).toHaveLength(1));
     expect(JSON.parse(hookBodies[0])).toMatchObject({ event: 'billing.trial_will_end', subject: expect.stringContaining('Your free trial ends in 3 days') });
-    expect(listOutbox(org.id, { status: 'sent' }).map((e) => e.channelId)).toEqual([ch.id]);
+    await vi.waitFor(() => expect(listOutbox(org.id, { status: 'sent' }).map((e) => e.channelId)).toEqual([ch.id]));
     // A redelivered event is not notified again.
     expect((await deliver(ev)).body.result).toBe('duplicate');
     expect(hookBodies).toHaveLength(1);
@@ -613,13 +630,52 @@ describe('billing: one trial even with concurrent checkouts', () => {
     expect(expired.has(kept)).toBe(false);
   });
 
-  it('still opens the new checkout when the earlier session cannot be expired (it was already completed)', async () => {
+  it('refuses a new checkout when the earlier one has just completed (its webhook is still on the way), and expires the new session', async () => {
     const t = await startCheckoutFor('Finished earlier');
     await t.post();
-    finishedSessions.add(billingAccount(t.org.id)!.checkoutSessionId!);
+    const first = billingAccount(t.org.id)!.checkoutSessionId!;
+    finishedSessions.add(first);
+    const r = await t.post();
+    expect(r.status).toBe(409);
+    expect(r.body.error).toContain('A subscription was just started');
+    expect(r.body.url).toBeUndefined();
+    const second = `cs_${sessionCount}`; // the session that was just created
+    expect(second).not.toBe(first);
+    expect(calls.some((c) => c.method === 'POST' && c.url === `/v1/checkout/sessions/${second}/expire`)).toBe(true);
+    // No second trial for this organization, and the finished session stays the one the webhook closes.
+    const acct = billingAccount(t.org.id)!;
+    expect(acct.trialUsed).toBe(true);
+    expect(acct.checkoutSessionId).toBe(first);
+    expect(trialEligible(t.org.id)).toBe(false);
+    await deliver({ id: `evt_fin_${++n}`, type: 'checkout.session.completed', data: { object: { id: first, client_reference_id: t.org.id, customer: 'cus_fin', subscription: 'sub_fin' } } });
+    expect(billingAccount(t.org.id)).toMatchObject({ subscriptionId: 'sub_fin', checkoutSessionId: null, trialUsed: true });
+  });
+
+  it('still opens the new checkout when the earlier session has expired', async () => {
+    const t = await startCheckoutFor('Lapsed earlier');
+    await t.post();
+    lapsedSessions.add(billingAccount(t.org.id)!.checkoutSessionId!);
     const r = await t.post();
     expect(r.status).toBe(200);
     expect(r.body.url).toMatch(/^https:\/\/checkout\.stripe\.test\/cs_\d+$/);
+    expect(billingAccount(t.org.id)!.checkoutSessionId).toBe(/(cs_\d+)$/.exec(r.body.url!)![1]);
+  });
+
+  it('fails safe when the state of the earlier session cannot be read: the new session is expired and nothing is opened', async () => {
+    const t = await startCheckoutFor('Unknown earlier');
+    await t.post();
+    const first = billingAccount(t.org.id)!.checkoutSessionId!;
+    finishedSessions.add(first);
+    sessionLookupDown = true;
+    try {
+      const r = await t.post();
+      expect(r.status).toBe(502);
+      expect(r.body.url).toBeUndefined();
+    } finally {
+      sessionLookupDown = false;
+    }
+    expect(billingAccount(t.org.id)!.checkoutSessionId).toBe(first);
+    expect(calls.some((c) => c.method === 'POST' && c.url === `/v1/checkout/sessions/cs_${sessionCount}/expire`)).toBe(true);
   });
 
   it('forgets the open session once it completes', async () => {
@@ -703,7 +759,7 @@ describe('billing: payment method on file', () => {
     expect(missing.description).toContain('add a payment method');
   });
 
-  it('does not claim there is no card when the console never received customer.updated (neutral notice, info severity)', async () => {
+  it('does not claim there is no card when the console never received customer.updated (neutral notice, warning severity)', async () => {
     const org = createOrg({ name: 'Card unknown' });
     await deliver(withCard(trialSub(org.id, { customer: `cus_${org.id}` }), null));
     await deliver({ id: `evt_tw_${++n}`, type: 'customer.subscription.trial_will_end', data: { object: { id: 'sub_t', customer: `cus_${org.id}`, metadata: { org_id: org.id }, trial_end: unix(Date.now() + 3 * DAY), default_payment_method: null } } });

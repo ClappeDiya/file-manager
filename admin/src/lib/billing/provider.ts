@@ -85,6 +85,8 @@ export interface BillingProvider {
   }): Promise<{ url: string; id: string | null }>;
   /** Close an unfinished checkout session so it can no longer be completed (a newer one replaced it). */
   expireCheckout(sessionId: string): Promise<void>;
+  /** The state of a checkout session: still open, completed (a subscription was started) or expired. */
+  retrieveCheckout(sessionId: string): Promise<{ status: 'open' | 'complete' | 'expired' }>;
   /** Whether the customer has (or ever had) any subscription at the provider. */
   hasSubscriptions(customerId: string): Promise<boolean>;
   createPortal(o: { customerId: string; returnUrl: string }): Promise<{ url: string }>;
