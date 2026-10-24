@@ -20,6 +20,7 @@ pub mod net;
 pub mod search_engine;
 pub mod thumbnail_engine;
 pub mod mount_engine;
+pub mod rclone_engine;
 pub mod narrator;
 pub mod safety;
 pub mod security;
@@ -354,6 +355,8 @@ fn start_background_engines(app: tauri::AppHandle) {
         // or connects around the proxy.
         commands::policy_commands::activate_stored(&app.state::<Repository>()).await;
         commands::proxy_commands::activate_stored(&app.state::<Repository>(), &app.state::<std::sync::Arc<CredentialStore>>()).await;
+        // The rclone binary / rclone.conf chosen in Settings, before anything runs rclone.
+        commands::rclone_commands::activate_stored(&app.state::<Repository>()).await;
         managed_settings::activate_stored(&app.state::<Repository>(), &app.state::<AiAssistant>(), &app.state::<BackupManager>(), &app.state::<MountManager>()).await;
         let automation = app.state::<AutomationManager>();
         if let Err(e) = automation.start_all_watchers().await {
@@ -1028,6 +1031,22 @@ pub fn run() {
             commands::proxy_commands::proxy_set,
             commands::proxy_commands::proxy_test,
             commands::connector_commands::rclone_list_remotes,
+            commands::rclone_commands::rclone_status,
+            commands::rclone_commands::rclone_settings_get,
+            commands::rclone_commands::rclone_settings_set,
+            commands::rclone_commands::rclone_detect,
+            commands::rclone_commands::rclone_install_managed,
+            commands::rclone_commands::rclone_providers,
+            commands::rclone_commands::rclone_remote_get,
+            commands::rclone_commands::rclone_remote_create,
+            commands::rclone_commands::rclone_remote_update,
+            commands::rclone_commands::rclone_config_continue,
+            commands::rclone_commands::rclone_config_oauth,
+            commands::rclone_commands::rclone_config_cancel,
+            commands::rclone_commands::rclone_remote_delete,
+            commands::rclone_commands::rclone_remote_test,
+            commands::rclone_commands::rclone_crypt_info,
+            commands::rclone_commands::rclone_cryptdecode,
             commands::connector_commands::connection_presets,
             file_ops_commands::move_files,
             file_ops_commands::rename_file,

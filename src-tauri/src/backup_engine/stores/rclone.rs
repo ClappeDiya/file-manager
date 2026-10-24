@@ -25,9 +25,10 @@ pub struct RcloneConfig {
     pub remote: String,
     /// Folder on the remote.
     pub path: String,
-    /// rclone executable.
+    /// rclone executable; `rclone` (the default) or empty = the binary
+    /// chosen in Settings → rclone / `UFOP_RCLONE` / `PATH`.
     pub binary: String,
-    /// Alternative rclone config file.
+    /// Alternative rclone config file; `None` = the one in Settings → rclone.
     pub config_file: Option<String>,
     /// Extra flags passed to every call (e.g. `--tpslimit 4`).
     pub extra_args: Vec<String>,
@@ -114,12 +115,20 @@ impl RcloneStore {
         }
     }
 
+    /// The binary and config file for this store: the job's own when set,
+    /// else the app's resolved ones.
+    pub fn rclone(&self) -> crate::rclone_engine::Rclone {
+        let app = crate::rclone_engine::Rclone::current();
+        let bin = self.cfg.binary.trim();
+        let program = if bin.is_empty() || bin == "rclone" { app.program } else { bin.to_string() };
+        crate::rclone_engine::Rclone::new(program, self.cfg.config_file.clone().filter(|c| !c.trim().is_empty()).or(app.config))
+    }
+
     async fn run(&self, args: &[&str], stdin: Option<Vec<u8>>) -> Result<Vec<u8>, AppError> {
         let what = args.first().copied().unwrap_or("");
-        let mut cmd = tokio::process::Command::new(&self.cfg.binary);
-        if let Some(c) = &self.cfg.config_file {
-            cmd.arg("--config").arg(c);
-        }
+        let rc = self.rclone();
+        let mut cmd = tokio::process::Command::new(&rc.program);
+        cmd.args(rc.base_args());
         cmd.args(&self.cfg.extra_args).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
         // Killed when the operation is dropped; the group kill (below) also
         // reaches anything rclone started.
@@ -138,7 +147,7 @@ impl RcloneStore {
         if let Some(p) = &self.config_pass {
             cmd.env("RCLONE_CONFIG_PASS", p);
         }
-        let mut child = cmd.spawn().map_err(|e| AppError::connection(format!("Could not run {}: {e}", self.cfg.binary), "Install rclone (https://rclone.org) or set its path."))?;
+        let mut child = cmd.spawn().map_err(|e| AppError::connection(format!("Could not run {}: {e}", rc.program), "Install rclone (https://rclone.org), or choose its path in Settings → rclone."))?;
         let reaper = Reaper { pid: child.id() };
         let (mut out, mut err, input) = (child.stdout.take(), child.stderr.take(), child.stdin.take());
         let feed = async {
@@ -297,6 +306,19 @@ esac
 
     fn alive(pid: i32) -> bool {
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// The job's own binary/config win; the defaults follow the app's resolver.
+    #[test]
+    fn binary_and_config_come_from_the_job_or_the_resolver() {
+        let app = crate::rclone_engine::Rclone::current();
+        let s = RcloneStore::new(RcloneConfig::default(), None);
+        assert_eq!(s.rclone(), app);
+        let s = RcloneStore::new(RcloneConfig { binary: " ".into(), ..Default::default() }, None);
+        assert_eq!(s.rclone().program, app.program);
+        let s = RcloneStore::new(RcloneConfig { binary: "/opt/rclone/rclone".into(), config_file: Some("/job/rclone.conf".into()), ..Default::default() }, None);
+        assert_eq!(s.rclone(), crate::rclone_engine::Rclone::new("/opt/rclone/rclone", Some("/job/rclone.conf".into())));
+        assert_eq!(s.rclone().base_args(), vec!["--config", "/job/rclone.conf"]);
     }
 
     #[tokio::test]

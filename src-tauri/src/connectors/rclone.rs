@@ -1,6 +1,7 @@
 //! Connector for anything rclone can reach (Google Cloud Storage, Box,
-//! pCloud, Mega, Backblaze, Jottacloud… 70+ backends) through the user's
-//! `rclone` binary and its configured remotes.
+//! pCloud, Mega, Backblaze, Jottacloud… 70+ backends) through the rclone
+//! binary and rclone.conf chosen by `rclone_engine::resolver` (Settings →
+//! rclone, then `UFOP_RCLONE`, then `PATH`) and its configured remotes.
 //!
 //! A connection names a remote (`gcs:` from `rclone config`, or an
 //! on-the-fly `:backend,opt=value:`). Listing uses `rclone lsjson`; files
@@ -9,6 +10,7 @@
 use super::{Connector, ShareLink, ShareOptions, ShareScope};
 use crate::core::error::AppError;
 use crate::core::types::{ConnectionProfile, FileEntry};
+use crate::rclone_engine::Rclone;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -38,10 +40,6 @@ struct LsJsonEntry {
     is_dir: bool,
 }
 
-fn exe() -> String {
-    std::env::var("UFOP_RCLONE").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "rclone".into())
-}
-
 /// `gdrive` → `gdrive:`; `:s3,provider=AWS:` and `gdrive:bucket` stay.
 pub fn normalize_remote(remote: &str) -> Result<String, AppError> {
     let r = remote.trim();
@@ -66,31 +64,15 @@ pub fn target(remote: &str, path: &str) -> String {
     }
 }
 
-/// Run rclone with `args`; stdout on success, the last stderr line otherwise.
+/// Run rclone with `args` (the resolved binary and config file); stdout on
+/// success, the last stderr line otherwise.
 async fn run(args: &[String], timeout: Duration) -> Result<String, AppError> {
-    run_exe(&exe(), args, timeout).await
-}
-
-async fn run_exe(program: &str, args: &[String], timeout: Duration) -> Result<String, AppError> {
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args).stdin(std::process::Stdio::null()).kill_on_drop(true);
-    let out = tokio::time::timeout(timeout, cmd.output())
-        .await
-        .map_err(|_| AppError::connection("rclone timed out", "Check the remote is reachable."))?
-        .map_err(|e| AppError::connection(format!("Could not start rclone: {e}"), "Install rclone (https://rclone.org/install/) or set UFOP_RCLONE to its path."))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let line = err.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("unknown error");
-        let msg = line.split_once(" : ").map(|(_, m)| m).unwrap_or(line).trim();
-        return Err(AppError::connection(format!("rclone: {msg}"), "Check the remote with `rclone config` and try again."));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Rclone::current().run(args, timeout).await
 }
 
 /// Configured remotes, for the connection form.
 pub async fn list_remotes() -> Result<Vec<RcloneRemote>, AppError> {
-    let out = run(&["listremotes".into(), "--long".into()], LIST_TIMEOUT).await?;
-    Ok(parse_listremotes(&out))
+    crate::rclone_engine::config::list_remotes(&Rclone::current()).await
 }
 
 pub fn parse_listremotes(out: &str) -> Vec<RcloneRemote> {
@@ -128,7 +110,7 @@ pub fn parse_lsjson(out: &str, dir: &str) -> Result<Vec<FileEntry>, AppError> {
 
 pub struct RcloneConnector {
     remote: RwLock<Option<String>>,
-    /// rclone binary for `about` / `size` (tests); `None` = [`exe`].
+    /// rclone binary for `about` / `size` (tests); `None` = the resolved one.
     program: Option<String>,
 }
 
@@ -161,7 +143,11 @@ impl RcloneConnector {
     }
 
     async fn run_mine(&self, args: &[String], timeout: Duration) -> Result<String, AppError> {
-        run_exe(self.program.as_deref().unwrap_or(&exe()), args, timeout).await
+        let rc = Rclone::current();
+        match &self.program {
+            Some(p) => rc.with_program(p).run(args, timeout).await,
+            None => rc.run(args, timeout).await,
+        }
     }
 
     async fn remote(&self) -> Result<String, AppError> {
@@ -338,7 +324,7 @@ mod tests {
     }
 
     fn rclone_available() -> bool {
-        std::process::Command::new(exe()).arg("version").output().is_ok_and(|o| o.status.success())
+        std::process::Command::new(Rclone::current().program).arg("version").output().is_ok_and(|o| o.status.success())
     }
 
     /// Real rclone against its local backend (`:local:`).
