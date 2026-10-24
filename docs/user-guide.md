@@ -289,7 +289,7 @@ Changing a pair's mode or folders forgets its history. In the Advanced view each
 ### Edit, duplicate, export and import
 
 - **Edit** opens the pair in the same form used to create it.
-- **Duplicate** creates "*name* (copy)" with the same settings, no run history and its schedule (or watcher) off. Backup jobs have **Duplicate** too: the copy's schedules are off and it opens in the editor so you can give it its own destination.
+- **Duplicate** creates "*name* (copy)" with the same settings, no run history and its schedule (or watcher) off. Backup jobs have **Duplicate** too: the copy's schedules (including replica timers) are off, stored credentials are copied rather than shared, and it opens in the editor so you can give it its own destination.
 - **Export** / **Import** (Advanced view) save one pair as a `ufop-sync-pair` JSON file and load it on another computer. If a folder is missing there, or a folder is on a saved connection's mount that the computer does not have, the import says so and the pair stays disabled until you fix it.
 
 ### Filters, rules and presets
