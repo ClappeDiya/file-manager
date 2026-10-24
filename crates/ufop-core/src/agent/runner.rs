@@ -544,10 +544,25 @@ impl<H: AgentHost> Agent<H> {
 
     async fn upload_diagnostics(&self, client: &AgentClient, token: &str) -> Result<String, AppError> {
         let d = self.host.diagnostics().await?;
+        Self::upload_bundle(client, token, &d).await
+    }
+
+    async fn upload_bundle(client: &AgentClient, token: &str, d: &DiagnosticsUpload) -> Result<String, AppError> {
         if d.bytes.len() > MAX_DIAGNOSTICS_BYTES {
-            return Err(AppError::validation(format!("The diagnostics bundle is {} bytes; the limit is {MAX_DIAGNOSTICS_BYTES}", d.bytes.len())));
+            return Err(AppError::validation(format!("The bundle is {} bytes; the limit is {MAX_DIAGNOSTICS_BYTES}", d.bytes.len())));
         }
-        Ok(client.diagnostics(token, &d).await?)
+        Ok(client.diagnostics(token, d).await?)
+    }
+
+    /// Send a bundle the caller built (feedback with its optional diagnostics)
+    /// to the console the way diagnostics go. Returns the console's id for it
+    /// and the console's address; nothing is reported as sent unless the
+    /// console accepted it.
+    pub async fn send_bundle(&self, d: &DiagnosticsUpload) -> Result<(String, String), AppError> {
+        let c = self.config();
+        let t = self.token().filter(|_| c.is_registered()).ok_or_else(|| AppError::state("This machine is not registered", "Register it with a console first."))?;
+        let id = Self::upload_bundle(&self.client(&c.console_url)?, &t, d).await?;
+        Ok((id, c.console_url))
     }
 
     /// Build a diagnostics bundle and send it to the console ("Send diagnostics").

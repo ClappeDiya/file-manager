@@ -108,6 +108,12 @@ fn read_tail(path: &Path, limit: u64) -> std::io::Result<(String, bool)> {
 /// Build a bundle from the log files in `log_dir` (newest first, up to
 /// `max_log_bytes`) plus `system.json`.
 pub fn build(log_dir: &Path, system: &Value, max_log_bytes: u64) -> Result<Bundle, AppError> {
+    build_with(log_dir, system, max_log_bytes, &[])
+}
+
+/// [`build`] with extra top-level files (name, text) in the zip, such as the
+/// `feedback.json` of a feedback report.
+pub fn build_with(log_dir: &Path, system: &Value, max_log_bytes: u64, extra: &[(String, String)]) -> Result<Bundle, AppError> {
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut b = Bundle { file_name: format!("ufop-diagnostics-{}.zip", chrono::Utc::now().format("%Y%m%d-%H%M%S")), ..Default::default() };
@@ -118,6 +124,9 @@ pub fn build(log_dir: &Path, system: &Value, max_log_bytes: u64) -> Result<Bundl
         Ok(())
     };
 
+    for (name, text) in extra {
+        add(&mut zip, name.clone(), text)?;
+    }
     add(&mut zip, "system.json".into(), &serde_json::to_string_pretty(system)?)?;
     let mut budget = max_log_bytes;
     for (path, size, _) in crate::logging::log_files(log_dir) {
