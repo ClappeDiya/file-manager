@@ -40,6 +40,7 @@ pub mod webdav;
 pub mod b2;
 pub mod dropbox;
 pub mod google_drive;
+pub mod google_errors;
 pub mod oauth;
 pub mod oauth_flow;
 pub mod onedrive;

@@ -1517,22 +1517,17 @@ fn q_escape(v: &str) -> String {
 /// limits, quotas and an API not enabled for the app, so only authorization
 /// reasons are a rejected sign-in; limits are retried later.
 fn about_forbidden(body: &str) -> AppError {
-    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-    let err = &v["error"];
-    let reasons: Vec<&str> = err["errors"].as_array().into_iter().chain(err["details"].as_array()).flatten().filter_map(|e| e["reason"].as_str()).collect();
-    let has = |list: &[&str]| reasons.iter().any(|r| list.iter().any(|l| r.eq_ignore_ascii_case(l)));
-    let why = reasons.first().copied().unwrap_or("no reason given");
-    if has(&["rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded", "quotaExceeded", "RATE_LIMIT_EXCEEDED", "backendError"]) {
-        AppError::connection(format!("Google Drive is limiting requests (HTTP 403: {why})"), "UFOP tries again later; wait a few minutes.")
-    } else if has(&["accessNotConfigured", "SERVICE_DISABLED"]) {
-        AppError::Configuration {
+    use crate::connectors::google_errors::{classify_403, Forbidden};
+    let (kind, reason) = classify_403(body);
+    let why = reason.as_deref().unwrap_or("no reason given");
+    match kind {
+        Forbidden::Throttled => AppError::connection(format!("Google Drive is limiting requests (HTTP 403: {why})"), "UFOP tries again later; wait a few minutes."),
+        Forbidden::ApiDisabled => AppError::Configuration {
             message: format!("The Google Drive API is not enabled for this OAuth app (HTTP 403: {why})"),
             advice: "Enable the Google Drive API in the Google Cloud project of your OAuth client, or sign in with the built-in app.".to_string(),
-        }
-    } else if has(&["authError", "insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT", "invalidCredentials"]) {
-        AppError::auth(format!("Google Drive refused the sign-in (HTTP 403: {why})"), "Sign in again from Connections.")
-    } else {
-        AppError::connection(format!("Google Drive refused the request (HTTP 403: {why})"), "Try again later; if it keeps failing, sign in again from Connections.")
+        },
+        Forbidden::Authorization => AppError::auth(format!("Google Drive refused the sign-in (HTTP 403: {why})"), "Sign in again from Connections."),
+        Forbidden::Unknown => AppError::connection(format!("Google Drive refused the request (HTTP 403: {why})"), "Try again later; if it keeps failing, sign in again from Connections."),
     }
 }
 

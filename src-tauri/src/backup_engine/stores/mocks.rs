@@ -318,6 +318,57 @@ async fn google_drive_mock() {
     exercise(&store, 300_000).await;
 }
 
+/// Regression: a Google Drive rate-limit 403 was a rejected sign-in, so
+/// `RetryingBackend` gave up after one request. It now backs off and
+/// retries; an authorization 403 is still tried once.
+#[tokio::test(flavor = "multi_thread")]
+async fn google_drive_rate_limit_403_is_retried_by_the_backend() {
+    use ufop_core::backup::backend::Throttle;
+    use ufop_core::backup::RetryingBackend;
+    use ufop_core::retry::RetryPolicy;
+    let (base, st) = serve(|st: St, _m: Method, u: Uri, _h: HeaderMap, _b: Bytes| async move {
+        if u.path() != "/drive/v3/files" {
+            return not_found();
+        }
+        let mut x = st.extra.lock().unwrap();
+        let n: u32 = x.get("calls").and_then(|c| c.parse().ok()).unwrap_or(0) + 1;
+        x.insert("calls".into(), n.to_string());
+        let reason = x.get("reason").cloned().unwrap_or_default();
+        let throttled = x.get("throttled").and_then(|c| c.parse().ok()).unwrap_or(0u32);
+        if n <= throttled {
+            let body = json!({ "error": { "code": 403, "message": "m", "errors": [{ "domain": "usageLimits", "reason": reason, "message": "m" }] } });
+            return (StatusCode::FORBIDDEN, body.to_string()).into_response();
+        }
+        jsonr(json!({ "files": [{ "id": "f1", "name": "ufop-a.dblock", "mimeType": "application/octet-stream", "size": "3" }] }))
+    })
+    .await;
+    let policy = RetryPolicy { retries: 3, delay_ms: 1, exponential: false, max_delay_ms: 1 };
+    let open = |base: &str| {
+        let cfg = oauth_drive::DriveConfig { folder: String::new(), api_base: base.to_string(), content_base: base.to_string(), ..Default::default() };
+        let store = oauth_drive::DriveStore::new(oauth_drive::Kind::GoogleDrive, cfg, "fresh".into()).unwrap();
+        RetryingBackend::new(StoreBackend::new(Box::new(store), None), policy, Throttle::default())
+    };
+    let set = |reason: &str, throttled: u32| {
+        let mut x = st.extra.lock().unwrap();
+        x.insert("calls".into(), "0".into());
+        x.insert("reason".into(), reason.into());
+        x.insert("throttled".into(), throttled.to_string());
+    };
+    let calls = || st.extra.lock().unwrap().get("calls").and_then(|c| c.parse::<u32>().ok()).unwrap_or(0);
+    // Two throttled replies, then success: three requests, the listing arrives.
+    set("rateLimitExceeded", 2);
+    let b = open(&base);
+    let listed = tokio::task::spawn_blocking(move || b.list()).await.unwrap().unwrap();
+    assert_eq!(listed.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["ufop-a.dblock"]);
+    assert_eq!(calls(), 3);
+    // A rejected sign-in is not retried.
+    set("insufficientPermissions", 10);
+    let b = open(&base);
+    let err = tokio::task::spawn_blocking(move || b.list()).await.unwrap().unwrap_err();
+    assert!(err.is_auth_failure(), "{err}");
+    assert_eq!(calls(), 1);
+}
+
 fn find(h: &[u8], n: &[u8]) -> Option<usize> {
     h.windows(n.len()).position(|w| w == n)
 }
