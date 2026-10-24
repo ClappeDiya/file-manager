@@ -44,6 +44,12 @@ pub async fn backup_save_job(job: BackupJob, passphrase: Option<String>, mgr: St
     mgr.save_job(job, passphrase).await
 }
 
+/// Copy a job as "<name> (copy)": new id, no history, schedules off.
+#[tauri::command]
+pub async fn duplicate_backup_job(id: String, mgr: State<'_, BackupManager>) -> Result<BackupJob, AppError> {
+    mgr.duplicate_job(&id).await
+}
+
 #[tauri::command]
 pub async fn backup_delete_job(id: String, delete_local_db: bool, delete_remote: bool, mgr: State<'_, BackupManager>) -> Result<(), AppError> {
     mgr.delete_job(&id, delete_local_db, delete_remote).await

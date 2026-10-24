@@ -128,6 +128,8 @@ pub async fn transfer_chunk(
 
     // Step 2: Write chunk to destination at offset
     write_chunk_at_offset(dest_path, chunk.offset, &data).await?;
+    // Bandwidth limits: the transfer queue's and the machine-wide one.
+    super::throttle::pace_chunk(data.len(), start).await;
     let write_time_ms = write_start.elapsed().as_millis() as u32;
 
     // Step 3: fsync if required by tier
@@ -803,6 +805,44 @@ mod tests {
         assert!(result.verified);
         assert_eq!(result.bytes_transferred, data.len() as u64);
         assert_ne!(result.source_xxhash, 0);
+    }
+
+    /// Regression: `set_global_throttle` stored a limit no transfer ever
+    /// obeyed — chunks were copied at full speed.
+    #[tokio::test]
+    async fn chunks_obey_the_transfer_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.dat");
+        let temp = dir.path().join(".dest.dat.ufop-partial");
+        let data = vec![7u8; 64 * 1024];
+        tokio::fs::write(&src, &data).await.unwrap();
+        verification::preallocate_file(temp.to_str().unwrap(), data.len() as u64 * 2).await.unwrap();
+        let semaphore = Arc::new(Semaphore::new(100));
+        let config = TransferConfig::default();
+        let chunk = |index: u32| ChunkSpec {
+            chunk_index: index,
+            offset: index as u64 * data.len() as u64,
+            length: data.len() as u64,
+            source_hash: None,
+            dest_hash: None,
+            sha256: None,
+            status: ChunkStatus::Pending,
+            write_time_ms: 0,
+            verify_time_ms: 0,
+        };
+        let one = ChunkSpec { offset: 0, ..chunk(0) };
+        let throttler = crate::transfer_engine::throttle::BandwidthThrottler::global();
+        // 256 KiB/s: two 64 KiB chunks need at least ~0.25 s.
+        throttler.set_limit(256 * 1024);
+        let started = std::time::Instant::now();
+        for c in [&one, &ChunkSpec { offset: 0, ..chunk(1) }] {
+            transfer_chunk(src.to_str().unwrap(), temp.to_str().unwrap(), c, VerifyTier::Fast, &config, None, None, &semaphore, None)
+                .await
+                .unwrap();
+        }
+        let elapsed = started.elapsed();
+        throttler.set_limit(0);
+        assert!(elapsed >= std::time::Duration::from_millis(240), "copied too fast: {elapsed:?}");
     }
 
     #[tokio::test]

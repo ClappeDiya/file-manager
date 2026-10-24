@@ -48,6 +48,18 @@ async fn record_sync(
     ledger.record(ev).await;
 }
 
+/// Option names a pair sets itself must be real copy options.
+fn validate_override_names(own: &[String]) -> Result<(), AppError> {
+    let known = CopyOptions::field_names();
+    match own.iter().find(|n| !known.contains(n)) {
+        Some(bad) => Err(AppError::Sync {
+            message: format!("\"{bad}\" is not a copy option."),
+            advice: "Save the pair again from the sync panel.".to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
 // ── T-039: Sync Pair CRUD ──
 
 /// Create a new sync pair.
@@ -69,6 +81,7 @@ pub async fn create_sync_pair(
     dest_state: Option<String>,
     checksum_algorithm: Option<String>,
     run_options_json: Option<String>,
+    option_overrides: Option<Vec<String>>,
     manager: State<'_, SyncManager>,
     ledger: State<'_, OperationLedger>,
     repo: State<'_, Repository>,
@@ -87,6 +100,7 @@ pub async fn create_sync_pair(
     let filter: SyncFilter = filter_json
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
+    ufop_core::sync::filter::validate(&filter)?;
 
     let copy_options: CopyOptions = match options_json {
         Some(j) => serde_json::from_str(&j).map_err(|e| AppError::Sync {
@@ -108,6 +122,9 @@ pub async fn create_sync_pair(
     let policy = conflict_policy
         .map(|s| SyncConflictPolicy::from_str_lossy(&s))
         .unwrap_or_default();
+    if let Some(own) = &option_overrides {
+        validate_override_names(own)?;
+    }
 
     let verify = verify_mode
         .map(|s| SyncVerifyMode::from_str_lossy(&s))
@@ -132,6 +149,7 @@ pub async fn create_sync_pair(
         dest_state: dest_state.and_then(|v| serde_json::from_value(serde_json::Value::String(v)).ok()).unwrap_or_default(),
         checksum_algorithm: checksum_algorithm.and_then(|v| serde_json::from_value(serde_json::Value::String(v)).ok()).unwrap_or_default(),
         run_options,
+        option_overrides,
     };
 
     use crate::core::traits::SyncOperations;
@@ -249,6 +267,10 @@ pub async fn update_sync_pair(
     })?;
     crate::sync_engine::copier::validate_options(&pair.copy_options)?;
     ufop_core::sync::executor::validate_run_options(&pair.run_options)?;
+    ufop_core::sync::filter::validate(&pair.filter)?;
+    if let Some(own) = &pair.option_overrides {
+        validate_override_names(own)?;
+    }
     let updated = manager.update_pair(pair).await?;
     manager.save_pair_to_db(&repo, &updated).await?;
     Ok(updated)
@@ -371,6 +393,62 @@ pub async fn get_sync_health(
 ) -> Result<SyncHealth, AppError> {
     let id = parse_uuid(&pair_id)?;
     Ok(manager.get_health(id).await)
+}
+
+// ── Duplicate, export / import, global defaults ──
+
+/// Copy a pair's definition: "<name> (copy)", a new id, no run history,
+/// and its schedule (or watcher) off until the user turns it on.
+#[tauri::command]
+pub async fn duplicate_sync_pair(
+    pair_id: String,
+    manager: State<'_, SyncManager>,
+    ledger: State<'_, OperationLedger>,
+    repo: State<'_, Repository>,
+) -> Result<SyncPair, AppError> {
+    let id = parse_uuid(&pair_id)?;
+    let copy = manager.duplicate_pair(id).await?;
+    manager.save_pair_to_db(&repo, &copy).await?;
+    record_sync(&ledger, "duplicate_pair", LedgerStatus::Ok, &copy.id.to_string(), format!("duplicate_pair: {pair_id} → {}", copy.name), None, None, None).await;
+    Ok(copy)
+}
+
+/// One pair as versioned JSON (`{"format":"ufop-sync-pair","version":1,…}`).
+#[tauri::command]
+pub async fn export_sync_pair(pair_id: String, manager: State<'_, SyncManager>, repo: State<'_, Repository>) -> Result<String, AppError> {
+    let id = parse_uuid(&pair_id)?;
+    manager.export_pair(&repo, id).await
+}
+
+/// Create a pair from an export. `warnings` lists connections and folders
+/// this computer lacks; such a pair is created disabled.
+#[tauri::command]
+pub async fn import_sync_pair(
+    json: String,
+    manager: State<'_, SyncManager>,
+    ledger: State<'_, OperationLedger>,
+    repo: State<'_, Repository>,
+) -> Result<crate::sync_engine::portable::ImportResult, AppError> {
+    let result = manager.import_pair(&repo, &json).await?;
+    record_sync(&ledger, "import_pair", LedgerStatus::Ok, &result.pair.id.to_string(), format!("import_pair: {}", result.pair.name), None, None, None).await;
+    Ok(result)
+}
+
+/// The global default copy options new pairs follow.
+#[tauri::command]
+pub async fn get_sync_default_options(manager: State<'_, SyncManager>) -> Result<CopyOptions, AppError> {
+    Ok(manager.default_options())
+}
+
+/// Save the global default copy options. Pairs that store only their own
+/// changes pick them up on their next run; older pairs are unaffected.
+#[tauri::command]
+pub async fn set_sync_default_options(
+    options: CopyOptions,
+    manager: State<'_, SyncManager>,
+    repo: State<'_, Repository>,
+) -> Result<CopyOptions, AppError> {
+    manager.set_default_options(&repo, options).await
 }
 
 // ── Two-way baseline ──

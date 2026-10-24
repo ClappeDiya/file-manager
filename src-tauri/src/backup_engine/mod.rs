@@ -1104,6 +1104,64 @@ impl BackupManager {
         Ok(job)
     }
 
+    /// Copy a job's definition as a new job: "<name> (copy)", a new id, no
+    /// history or statistics, every schedule (backup and maintenance) off.
+    /// Stored secrets (passphrase, notification and report credentials)
+    /// are copied under the new job's own ids, so editing one job's secret
+    /// never changes the other's. Point the copy at its own destination
+    /// before turning its schedule on.
+    pub async fn duplicate_job(&self, id: &str) -> Result<BackupJob, AppError> {
+        let original = self.get_job(id).await?;
+        let mut copy = original.clone();
+        copy.id = String::new();
+        copy.name = format!("{} (copy)", original.name);
+        copy.stats = JobStats::default();
+        copy.legal_hold = None;
+        copy.schedule.enabled = false;
+        if let Some(s) = copy.maintenance.compact.as_mut() {
+            s.enabled = false;
+        }
+        if let Some(v) = copy.maintenance.verify.as_mut() {
+            v.schedule.enabled = false;
+        }
+        if let Some(s) = copy.maintenance.retention.as_mut() {
+            s.enabled = false;
+        }
+        for r in copy.replicas.iter_mut() {
+            r.id.clear();
+        }
+        for n in copy.notifications.iter_mut() {
+            n.credential_id = self.copy_secret(&n.credential_id).await?;
+            if let notify::Channel::Webhook { headers, .. } = &mut n.channel {
+                for h in headers.iter_mut().filter(|h| h.secret) {
+                    h.credential_id = self.copy_secret(&h.credential_id).await?;
+                }
+            }
+        }
+        for h in copy.reports.headers.iter_mut().filter(|h| h.secret) {
+            h.credential_id = self.copy_secret(&h.credential_id).await?;
+        }
+        let passphrase = self.store_get(&format!("{PASS_KEY_PREFIX}{id}")).await?;
+        self.save_job(copy, passphrase).await
+    }
+
+    /// Store a copy of the secret kept under `credential_id` (as written,
+    /// provider references unresolved); returns the copy's id, or "" when
+    /// there is no secret.
+    async fn copy_secret(&self, credential_id: &str) -> Result<String, AppError> {
+        if credential_id.trim().is_empty() {
+            return Ok(String::new());
+        }
+        match self.store_get(&format!("{DEST_KEY_PREFIX}{credential_id}")).await? {
+            Some(secret) => {
+                let new_id = uuid::Uuid::new_v4().to_string();
+                self.set_destination_secret(&new_id, &secret).await?;
+                Ok(new_id)
+            }
+            None => Ok(String::new()),
+        }
+    }
+
     /// Passphrases go to the OS keychain when one is available, otherwise to
     /// the settings store in the database (encrypted with the settings key
     /// when there is one) so they survive restarts on headless machines.

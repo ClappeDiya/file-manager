@@ -457,6 +457,7 @@ pub fn execute_sync_with(
                 break;
             }
             tracker.start_file(&entry.relative_path);
+            let mut copies = Vec::new();
             let result = execute_conflict_resolution(
                 pair,
                 entry,
@@ -464,7 +465,13 @@ pub fn execute_sync_with(
                 config.quarantine_dir.as_deref(),
                 &mut quarantined,
                 &mut pending_conflicts,
+                &mut copies,
             );
+            // Two-way "keep both": the conflict copy is on both sides now.
+            for rel in copies.into_iter().filter(|_| pair.mode == SyncMode::TwoWay) {
+                let entry = observed_entry(pair, &rel);
+                baseline_updates.push((rel, entry));
+            }
             tracker.finish_file(match &result {
                 Ok(OperationResult::ConflictResolved(b)) => *b,
                 _ => 0,
@@ -880,6 +887,7 @@ fn execute_conflict_resolution(
     quarantine_dir: Option<&Path>,
     quarantined: &mut Vec<QuarantineEntry>,
     pending: &mut Vec<SyncConflictItem>,
+    copies: &mut Vec<String>,
 ) -> Result<OperationResult, AppError> {
     let opts = &pair.copy_options;
     let source_root = Path::new(&pair.source_path);
@@ -925,6 +933,9 @@ fn execute_conflict_resolution(
             bytes += copier::copy_file(&source_file, &conflict_source, opts)?;
             rollback.snapshot_on(SyncSide::Source, &entry.relative_path, &source_file)?;
             bytes += copier::copy_file(&dest_file, &source_file, opts)?;
+            if let Ok(rel) = conflict_dest.strip_prefix(dest_root) {
+                copies.push(rel.to_string_lossy().to_string());
+            }
             Ok(OperationResult::ConflictResolved(bytes))
         }
         ConflictAction::CopyToConflictPath => {
@@ -1013,6 +1024,7 @@ pub fn apply_manual_resolution(
         Some(quarantine_dir),
         &mut quarantined,
         &mut pending,
+        &mut Vec::new(),
     )?;
     Ok((rollback.snapshots, quarantined))
 }
@@ -1039,6 +1051,7 @@ pub const DEFAULT_VERSION_TEMPLATE: &str = "{name}.v{num}.{ext}";
 
 /// Name for the next kept version of `path` from the pair's template; the
 /// first free one. A template without `{num}` gets ` (n)` added on clashes.
+#[cfg(test)]
 fn versioned_path(path: &Path, template: Option<&str>) -> Result<PathBuf, AppError> {
     versioned_path_from(path, template, 1).map(|(p, _)| p)
 }
@@ -2067,6 +2080,7 @@ mod tests {
         };
         assert_eq!(copies(src.path()), vec!["edited in source".to_string()]);
         assert_eq!(copies(dst.path()), vec!["edited in source".to_string()]);
+        assert!(base.as_ref().unwrap().entries.keys().any(|k| k.contains("(conflict")), "the conflict copy is tracked too");
         // Converged: the next run has nothing to do.
         let after = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
         assert_eq!(after.total_conflicts + after.total_additions + after.total_modifications + after.total_deletions, 0);

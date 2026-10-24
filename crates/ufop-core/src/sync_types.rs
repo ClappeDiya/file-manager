@@ -471,6 +471,54 @@ pub struct SyncPair {
     pub checksum_algorithm: SyncHashAlgorithm,
     #[serde(default)]
     pub run_options: SyncRunOptions,
+    /// Copy options the pair sets itself; every other option follows the
+    /// global sync defaults. `None` (pairs from before global defaults, the
+    /// CLI): all of `copy_options` is the pair's own.
+    #[serde(default)]
+    pub option_overrides: Option<Vec<String>>,
+}
+
+impl SyncPair {
+    /// The pair as it runs: its own options over the global `defaults`.
+    pub fn effective(&self, defaults: &CopyOptions) -> SyncPair {
+        match &self.option_overrides {
+            Some(own) => SyncPair { copy_options: self.copy_options.layered_on(defaults, own), ..self.clone() },
+            None => self.clone(),
+        }
+    }
+}
+
+impl CopyOptions {
+    /// Names of every option (the serialized field names).
+    pub fn field_names() -> Vec<String> {
+        match serde_json::to_value(CopyOptions::default()) {
+            Ok(serde_json::Value::Object(m)) => m.keys().cloned().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `defaults`, with this value for every option named in `own`.
+    pub fn layered_on(&self, defaults: &CopyOptions, own: &[String]) -> CopyOptions {
+        let (Ok(serde_json::Value::Object(mut out)), Ok(serde_json::Value::Object(mine))) =
+            (serde_json::to_value(defaults), serde_json::to_value(self))
+        else {
+            return self.clone();
+        };
+        for name in own {
+            if let Some(v) = mine.get(name) {
+                out.insert(name.clone(), v.clone());
+            }
+        }
+        serde_json::from_value(serde_json::Value::Object(out)).unwrap_or_else(|_| self.clone())
+    }
+
+    /// The options of `self` that differ from `defaults`.
+    pub fn differences_from(&self, defaults: &CopyOptions) -> Vec<String> {
+        let (Ok(serde_json::Value::Object(a)), Ok(serde_json::Value::Object(b))) = (serde_json::to_value(self), serde_json::to_value(defaults)) else {
+            return Vec::new();
+        };
+        a.iter().filter(|(k, v)| b.get(*k) != Some(*v)).map(|(k, _)| k.clone()).collect()
+    }
 }
 
 impl Default for SyncPair {
@@ -494,6 +542,7 @@ impl Default for SyncPair {
             dest_state: DestStateMode::Scan,
             checksum_algorithm: SyncHashAlgorithm::Xxh3,
             run_options: SyncRunOptions::default(),
+            option_overrides: None,
         }
     }
 }
@@ -805,5 +854,34 @@ impl SyncBaseline {
     /// Whether this baseline describes `pair`'s current folders.
     pub fn matches(&self, pair: &SyncPair) -> bool {
         self.source_root == pair.source_path && self.dest_root == pair.dest_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn options_layer_over_global_defaults() {
+        let defaults = CopyOptions { retries: 5, threads: 4, ..CopyOptions::default() };
+        let own = CopyOptions { threads: 16, exclude_hidden: true, ..CopyOptions::default() };
+        let layered = own.layered_on(&defaults, &["threads".to_string()]);
+        assert_eq!((layered.threads, layered.retries, layered.exclude_hidden), (16, 5, false));
+        // Pairs from before defaults keep everything they have.
+        let legacy = SyncPair { copy_options: own.clone(), ..Default::default() };
+        assert_eq!(legacy.effective(&defaults).copy_options, own);
+        let layered_pair = SyncPair { copy_options: own.clone(), option_overrides: Some(vec!["exclude_hidden".into()]), ..Default::default() };
+        let eff = layered_pair.effective(&defaults).copy_options;
+        assert_eq!((eff.threads, eff.retries, eff.exclude_hidden), (4, 5, true));
+        let mut diff = own.differences_from(&CopyOptions::default());
+        diff.sort();
+        assert_eq!(diff, vec!["exclude_hidden".to_string(), "threads".to_string()]);
+        assert!(CopyOptions::field_names().contains(&"compare_mode".to_string()));
+        // Old JSON without the field reads as "all its own".
+        let json = serde_json::to_value(SyncPair::default()).unwrap();
+        let mut obj = json.as_object().unwrap().clone();
+        obj.remove("option_overrides");
+        let back: SyncPair = serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+        assert!(back.option_overrides.is_none());
     }
 }

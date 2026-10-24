@@ -22,6 +22,7 @@ pub mod share_commands;
 pub mod thumbnail_commands;
 pub mod encryption_commands;
 pub mod file_ops_commands;
+pub mod filter_commands;
 pub mod fleet_agent_commands;
 pub mod fs_commands;
 pub mod integrity_commands;

@@ -84,7 +84,7 @@ macro; if you add a new one here, register it there too.
 - `resolve_aws_profile`
 - `start_sso_auth`
 
-## `backup_commands` (109 commands)
+## `backup_commands` (110 commands)
 
 - `backup_adopt_repository`
 - `backup_apply_template`
@@ -194,6 +194,7 @@ macro; if you add a new one here, register it there too.
 - `backup_webhook_preset`
 - `desktop_metrics_configure`
 - `desktop_metrics_status`
+- `duplicate_backup_job`
 - `ediscovery_export`
 
 ## `batch_rename_commands` (4 commands)
@@ -337,6 +338,14 @@ macro; if you add a new one here, register it there too.
 - `set_owner`
 - `set_permissions`
 - `undo_file_operation`
+
+## `filter_commands` (5 commands)
+
+- `delete_user_filter_preset`
+- `get_filter_groups`
+- `list_user_filter_presets`
+- `parse_filter_rules`
+- `save_user_filter_preset`
 
 ## `fleet_agent_commands` (13 commands)
 
@@ -635,29 +644,36 @@ macro; if you add a new one here, register it there too.
 - `save_workspace_state`
 - `set_config`
 
-## `sync_commands` (26 commands)
+## `sync_commands` (33 commands)
 
 - `cancel_sync`
 - `create_sync_pair`
 - `delete_sync_pair`
 - `detect_time_offset`
+- `duplicate_sync_pair`
+- `export_sync_pair`
 - `export_sync_preview_csv`
 - `export_sync_report_csv`
 - `export_sync_report_json`
 - `get_quarantine_entries`
+- `get_sync_baseline_info`
 - `get_sync_conflicts`
+- `get_sync_default_options`
 - `get_sync_filter_presets`
 - `get_sync_health`
 - `get_sync_progress`
 - `get_sync_reports`
 - `get_sync_run_history`
+- `import_sync_pair`
 - `list_sync_pairs`
 - `parse_robocopy_command`
 - `prune_sync_run_history`
+- `reset_sync_baseline`
 - `resolve_sync_conflict`
 - `robocopy_command_preview`
 - `rollback_sync`
 - `run_sync`
+- `set_sync_default_options`
 - `start_sync_watcher`
 - `stop_sync_watcher`
 - `sync_dry_run`
@@ -690,7 +706,7 @@ macro; if you add a new one here, register it there too.
 - `thumbnail_cache_clear`
 - `thumbnail_get`
 
-## `transfer_commands` (35 commands)
+## `transfer_commands` (37 commands)
 
 - `cancel_transfer`
 - `check_conflict`
@@ -700,6 +716,7 @@ macro; if you add a new one here, register it there too.
 - `enqueue_transfer`
 - `export_transfer_history`
 - `fail_transfer`
+- `get_bandwidth_schedule`
 - `get_completion_hooks`
 - `get_throttle_config`
 - `get_transfer`
@@ -714,6 +731,7 @@ macro; if you add a new one here, register it there too.
 - `retry_all_failed`
 - `retry_transfer`
 - `search_transfer_history`
+- `set_bandwidth_schedule`
 - `set_checksum_algorithm`
 - `set_completion_hooks`
 - `set_conflict_policy`
@@ -751,4 +769,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 583 commands across 51 modules.
+**Surface:** 598 commands across 52 modules.

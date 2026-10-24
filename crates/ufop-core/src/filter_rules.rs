@@ -274,10 +274,21 @@ pub fn rclone_to_regex(pattern: &str) -> Result<String, AppError> {
                 i = end;
             }
             '{' if chars.get(i + 1) == Some(&'{') => {
-                let rest: String = chars[i + 2..].iter().collect();
-                let end = rest.find("}}").ok_or_else(|| bad("unclosed {{"))?;
-                re.push_str(&format!("(?:{})", &rest[..end]));
-                i += 2 + end + 1;
+                // Raw regex up to the closing `}}`; in `{{\d{4}}}` the
+                // regex's own `}` comes first, so take the last of a run.
+                let mut j = i + 2;
+                let close = loop {
+                    if j + 1 >= chars.len() {
+                        return Err(bad("unclosed {{"));
+                    }
+                    if chars[j] == '}' && chars[j + 1] == '}' && chars.get(j + 2) != Some(&'}') {
+                        break j;
+                    }
+                    j += 1;
+                };
+                let raw: String = chars[i + 2..close].iter().collect();
+                re.push_str(&format!("(?:{raw})"));
+                i = close + 1;
             }
             '{' => {
                 braces += 1;

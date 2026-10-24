@@ -198,7 +198,8 @@ fn rust_step(version: u32) -> Option<RustStep> {
 /// like after its last successful run (`sync_baseline_runs` per pair, one
 /// `sync_baseline` row per file, mtimes in nanoseconds) — and user-saved
 /// filter presets (ordered include/exclude rules as JSON), shared by sync
-/// pairs and backup jobs.
+/// pairs and backup jobs; and the copy options each sync pair sets itself
+/// over the global sync defaults (`option_overrides_json`, NULL = all).
 const V33_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sync_baseline_runs (
     pair_id     TEXT PRIMARY KEY NOT NULL,
@@ -222,6 +223,7 @@ CREATE TABLE IF NOT EXISTS user_filter_presets (
     rules_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+ALTER TABLE sync_pairs ADD COLUMN option_overrides_json TEXT;
 "#;
 
 /// Schema v21: profile fields with no column (upload modes, FTP tuning,
@@ -1121,7 +1123,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 31);
+        assert_eq!(applied, 32); // 32 migrations (versions 1-31 and 33)
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -1149,6 +1151,9 @@ mod tests {
         for t in ["file_tag_defs", "file_tag_links", "file_labels", "file_metadata", "smart_folders"] {
             assert!(tables.contains(&t.to_string()), "missing {t}");
         }
+        for t in ["sync_baseline_runs", "sync_baseline", "user_filter_presets"] {
+            assert!(tables.contains(&t.to_string()), "missing {t}");
+        }
         assert!(tables.contains(&"_migrations".to_string()));
     }
 
@@ -1156,7 +1161,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 31);
+        assert_eq!(first, 32);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);

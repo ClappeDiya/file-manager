@@ -28,6 +28,8 @@ import { FleetAgentLimits } from "@/components/fleet-agent-limits";
 import { PortableModeBadge, PortableModeDetails } from "@/components/portable-mode-status";
 import { usePortableStatus } from "@/hooks/use-portable-status";
 import { MetricsExporterSection } from "@/components/metrics-exporter-section";
+import { SyncDefaultsSection } from "@/components/sync-defaults-section";
+import { BandwidthTimetableSection } from "@/components/bandwidth-timetable-section";
 import { AdvancedOnly } from "@/components/backup/advanced-only";
 
 // ── Types ──
@@ -1408,6 +1410,10 @@ export default function SettingsPanel({
           <AdvancedOnly hint>
             <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Prometheus metrics</h3>
             <MetricsExporterSection />
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Sync defaults</h3>
+            <SyncDefaultsSection />
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Bandwidth timetable</h3>
+            <BandwidthTimetableSection />
           </AdvancedOnly>
         </Section>
 

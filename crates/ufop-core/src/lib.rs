@@ -30,4 +30,5 @@ pub mod session;
 pub mod stability;
 pub mod webdav;
 pub mod sync;
+pub mod throttle;
 pub mod sync_types;

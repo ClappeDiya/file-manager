@@ -1,7 +1,8 @@
 //! Robocopy-equivalent file copy primitives used by the sync executor.
 //!
 //! - Restartable copy through a `.ufop-partial` file (/Z)
-//! - Bandwidth throttling with an inter-packet gap (/IPG)
+//! - Bandwidth throttling with an inter-packet gap (/IPG) and the shared
+//!   machine-wide limit / timetable (`crate::throttle`)
 //! - Timestamp preservation (/COPY:T, /DCOPY:T)
 //! - Symbolic links copied as links (/SL)
 //! - Zero-length "tree only" copies (/CREATE)
@@ -68,7 +69,9 @@ pub fn copy_file(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<u64, AppE
             )
         })?;
         0
-    } else if opts.restartable || opts.inter_packet_gap_ms > 0 {
+    } else if opts.restartable || opts.inter_packet_gap_ms > 0 || crate::throttle::GLOBAL_UPLOAD.get() > 0 {
+        // Block by block: /Z, /IPG, or the machine-wide bandwidth limit
+        // (and timetable) shared with backups and transfers.
         copy_blockwise(src, dst, opts)?
     } else {
         fs::copy(src, dst).map_err(|e| {
@@ -164,12 +167,14 @@ fn copy_blockwise(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<u64, App
     let mut buffer = vec![0u8; BLOCK_SIZE];
     let mut written = 0u64;
     loop {
+        let block_started = std::time::Instant::now();
         let n = reader.read(&mut buffer)?;
         if n == 0 {
             break;
         }
         writer.write_all(&buffer[..n])?;
         written += n as u64;
+        crate::throttle::GLOBAL_UPLOAD.wait(n, block_started);
         if !gap.is_zero() {
             std::thread::sleep(gap);
         }

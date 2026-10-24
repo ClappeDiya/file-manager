@@ -10,6 +10,8 @@
 //! - Checksum verification (fast and full modes)
 //! - Partial failure continuation and resumable sync
 
+pub mod filter_presets;
+pub mod portable;
 pub mod report;
 pub mod scheduler;
 pub mod watcher;
@@ -122,7 +124,25 @@ pub fn get_filter_presets() -> Vec<FilterPreset> {
             built_in: true,
         },
     ]
+    .into_iter()
+    // File-type groups come from the shared rule engine's groups, so sync
+    // and backup offer the same lists.
+    .chain(MEDIA_GROUPS.iter().filter_map(|(id, name)| {
+        let (_, description, patterns) = ufop_core::filter_rules::FILTER_GROUPS.iter().find(|(n, _, _)| n == id)?;
+        Some(FilterPreset {
+            id: (*id).to_string(),
+            name: (*name).to_string(),
+            description: format!("{description} ({})", patterns.iter().step_by(2).take(6).cloned().collect::<Vec<_>>().join(", ")),
+            patterns: patterns.iter().map(|p| p.to_string()).collect(),
+            built_in: true,
+        })
+    }))
+    .collect()
 }
+
+/// Shared groups offered as sync presets: (group name, label).
+const MEDIA_GROUPS: [(&str, &str); 5] =
+    [("images", "Images"), ("video", "Video"), ("audio", "Audio"), ("documents", "Documents"), ("archives", "Archives")];
 
 /// Manages sync pairs and executes sync runs with full feature set.
 pub struct SyncManager {
@@ -144,7 +164,13 @@ pub struct SyncManager {
     /// kept in memory for the manager's lifetime.
     repo: Arc<std::sync::RwLock<Option<crate::storage::Repository>>>,
     baselines: Arc<RwLock<HashMap<Uuid, SyncBaseline>>>,
+    /// Global default copy options: a pair with `option_overrides` takes
+    /// every option it does not set from here.
+    default_options: Arc<std::sync::RwLock<CopyOptions>>,
 }
+
+/// Config-table key of the global default copy options.
+pub const DEFAULT_OPTIONS_KEY: &str = "sync.default_copy_options";
 
 /// What the UI shows about a two-way pair's baseline.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -184,7 +210,101 @@ impl SyncManager {
             scheduler: Arc::new(scheduler::SyncScheduler::new()),
             repo: Arc::new(std::sync::RwLock::new(None)),
             baselines: Arc::new(RwLock::new(HashMap::new())),
+            default_options: Arc::new(std::sync::RwLock::new(CopyOptions::default())),
         }
+    }
+
+    /// The global default copy options.
+    pub fn default_options(&self) -> CopyOptions {
+        self.default_options.read().map(|d| d.clone()).unwrap_or_default()
+    }
+
+    /// Read the saved global defaults (startup).
+    pub async fn load_default_options(&self, repo: &crate::storage::Repository) -> Result<(), AppError> {
+        if let Some(json) = repo.get_config(DEFAULT_OPTIONS_KEY).await? {
+            let d: CopyOptions = serde_json::from_str(&json)?;
+            if let Ok(mut cur) = self.default_options.write() {
+                *cur = d;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate, save and apply new global defaults.
+    pub async fn set_default_options(&self, repo: &crate::storage::Repository, options: CopyOptions) -> Result<CopyOptions, AppError> {
+        copier::validate_options(&options)?;
+        repo.set_config(DEFAULT_OPTIONS_KEY, &serde_json::to_string(&options)?).await?;
+        if let Ok(mut cur) = self.default_options.write() {
+            *cur = options.clone();
+        }
+        Ok(options)
+    }
+
+    /// The pair as it runs: its own options over the global defaults.
+    pub fn effective(&self, pair: &SyncPair) -> SyncPair {
+        pair.effective(&self.default_options())
+    }
+
+    /// Copy a pair's definition under a new id: "<name> (copy)", no run
+    /// history or two-way baseline, and never on a schedule or watcher
+    /// until the user turns one on.
+    pub async fn duplicate_pair(&self, pair_id: Uuid) -> Result<SyncPair, AppError> {
+        let original = self.pairs.read().await.get(&pair_id).cloned().ok_or_else(|| AppError::Sync {
+            message: format!("Sync pair {} not found", pair_id),
+            advice: "Check the sync pair ID.".to_string(),
+        })?;
+        let copy = SyncPair {
+            id: Uuid::new_v4(),
+            name: format!("{} (copy)", original.name),
+            last_run: None,
+            created_at: Utc::now(),
+            trigger: match original.trigger {
+                SyncTrigger::Scheduled { .. } | SyncTrigger::Watch => SyncTrigger::Manual,
+                other => other,
+            },
+            ..original
+        };
+        self.create_pair(copy).await
+    }
+
+    /// One pair as a `ufop-sync-pair` JSON export, naming the saved
+    /// connections either folder is mounted from.
+    pub async fn export_pair(&self, repo: &crate::storage::Repository, pair_id: Uuid) -> Result<String, AppError> {
+        let pair = self.pairs.read().await.get(&pair_id).cloned().ok_or_else(|| AppError::Sync {
+            message: format!("Sync pair {} not found", pair_id),
+            advice: "Check the sync pair ID.".to_string(),
+        })?;
+        let (mounts, profiles) = Self::mounts_and_profiles(repo).await?;
+        portable::export(&pair, portable::connection_refs(&pair, &mounts, &profiles))
+    }
+
+    /// Create a pair from an export. Anything this computer lacks (a saved
+    /// connection, a folder) is listed, and such a pair stays disabled.
+    pub async fn import_pair(&self, repo: &crate::storage::Repository, json: &str) -> Result<portable::ImportResult, AppError> {
+        let doc = portable::parse(json)?;
+        let (_, profiles) = Self::mounts_and_profiles(repo).await?;
+        let mut warnings = portable::warnings(&doc, &profiles, |p| std::path::Path::new(p).exists());
+        let enabled = warnings.is_empty() && doc.pair.enabled;
+        if !warnings.is_empty() {
+            warnings.push("The pair is disabled until you fix this; enable it from Edit.".to_string());
+        }
+        let pair = SyncPair { id: Uuid::new_v4(), last_run: None, created_at: Utc::now(), enabled, ..doc.pair };
+        let pair = self.create_pair(pair).await?;
+        self.save_pair_to_db(repo, &pair).await?;
+        Ok(portable::ImportResult { pair, warnings })
+    }
+
+    /// Saved mounts (connection id, mount point) and connection profiles.
+    async fn mounts_and_profiles(repo: &crate::storage::Repository) -> Result<(Vec<(String, String)>, Vec<ConnectionProfile>), AppError> {
+        let mounts = repo
+            .pool()
+            .execute(|conn| {
+                let mut st = conn.prepare("SELECT connection_id, mount_point FROM mount_configs")?;
+                let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+            })
+            .await?;
+        Ok((mounts, repo.list_connections().await?))
     }
 
     /// Keep two-way baselines in this database (both app init paths call it).
@@ -255,7 +375,7 @@ impl SyncManager {
         })?;
 
         // Run planner on blocking thread
-        let pair_clone = pair.clone();
+        let pair_clone = self.effective(pair);
         drop(pairs);
         let baseline = self.load_baseline(&pair_clone).await?;
         tokio::task::spawn_blocking(move || {
@@ -343,6 +463,7 @@ impl SyncManager {
             running.insert(pair_id, cancel.clone());
         }
 
+        let pair = self.effective(&pair);
         let result = self.run_pair(pair.clone(), cancel).await;
 
         self.running.write().await.remove(&pair_id);
@@ -712,13 +833,14 @@ impl SyncManager {
     /// Update sync pair configuration. Changing the mode or either folder
     /// forgets the two-way baseline: it describes other files.
     pub async fn update_pair(&self, pair: SyncPair) -> Result<SyncPair, AppError> {
-        let reset = {
+        let (reset, rearm) = {
             let mut pairs = self.pairs.write().await;
             if let std::collections::hash_map::Entry::Occupied(mut e) = pairs.entry(pair.id) {
                 let old = e.get();
                 let reset = old.mode != pair.mode || old.source_path != pair.source_path || old.dest_path != pair.dest_path;
+                let rearm = old.trigger != pair.trigger || old.enabled != pair.enabled || old.source_path != pair.source_path;
                 e.insert(pair.clone());
-                reset
+                (reset, rearm)
             } else {
                 return Err(AppError::Sync {
                     message: "Sync pair not found.".to_string(),
@@ -728,6 +850,20 @@ impl SyncManager {
         };
         if reset {
             self.reset_baseline(pair.id).await?;
+        }
+        // An edited trigger takes effect now, not after a restart.
+        if rearm {
+            let _ = self.stop_watcher(pair.id).await;
+            let _ = self.scheduler.remove_schedule(pair.id);
+            if pair.enabled {
+                match &pair.trigger {
+                    SyncTrigger::Watch => self.start_watcher(pair.id).await?,
+                    SyncTrigger::Scheduled { cron_expr } => {
+                        self.scheduler.add_schedule(pair.id, cron_expr)?;
+                    }
+                    _ => {}
+                }
+            }
         }
         Ok(pair)
     }
@@ -894,8 +1030,8 @@ impl SyncManager {
                     "INSERT INTO sync_pairs (id, name, source_path, dest_path, mode, enabled, \
                      last_run, trigger_mode, cron_expr, filter_json, conflict_policy, \
                      verify_mode, checksum_enabled, created_at, time_offset_secs, options_json, \
-                     dest_state, checksum_algorithm, run_options_json) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) \
+                     dest_state, checksum_algorithm, run_options_json, option_overrides_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20) \
                      ON CONFLICT(id) DO UPDATE SET \
                      name = excluded.name, source_path = excluded.source_path, \
                      dest_path = excluded.dest_path, mode = excluded.mode, \
@@ -909,7 +1045,8 @@ impl SyncManager {
                      options_json = excluded.options_json, \
                      dest_state = excluded.dest_state, \
                      checksum_algorithm = excluded.checksum_algorithm, \
-                     run_options_json = excluded.run_options_json",
+                     run_options_json = excluded.run_options_json, \
+                     option_overrides_json = excluded.option_overrides_json",
                     rusqlite::params![
                         p.id.to_string(),
                         p.name,
@@ -930,6 +1067,7 @@ impl SyncManager {
                         serde_json::to_value(p.dest_state).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "scan".into()),
                         serde_json::to_value(p.checksum_algorithm).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "xxh3".into()),
                         serde_json::to_string(&p.run_options).unwrap_or_else(|_| "{}".into()),
+                        p.option_overrides.as_ref().and_then(|o| serde_json::to_string(o).ok()),
                     ],
                 )?;
                 Ok(())
@@ -968,7 +1106,7 @@ impl SyncManager {
                     "SELECT id, name, source_path, dest_path, mode, enabled, last_run, \
                      trigger_mode, cron_expr, filter_json, conflict_policy, verify_mode, \
                      checksum_enabled, created_at, time_offset_secs, options_json, \
-                     dest_state, checksum_algorithm, run_options_json \
+                     dest_state, checksum_algorithm, run_options_json, option_overrides_json \
                      FROM sync_pairs ORDER BY created_at ASC",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -985,6 +1123,7 @@ impl SyncManager {
                     let dest_state: String = row.get(16)?;
                     let checksum_algorithm: String = row.get(17)?;
                     let run_options_json: String = row.get(18)?;
+                    let option_overrides_json: Option<String> = row.get(19)?;
 
                     Ok(SyncPair {
                         // A row we cannot parse is a row we cannot honour, but
@@ -1017,6 +1156,7 @@ impl SyncManager {
                         dest_state: serde_json::from_value(serde_json::Value::String(dest_state)).unwrap_or_default(),
                         checksum_algorithm: serde_json::from_value(serde_json::Value::String(checksum_algorithm)).unwrap_or_default(),
                         run_options: serde_json::from_str(&run_options_json).unwrap_or_default(),
+                        option_overrides: option_overrides_json.and_then(|j| serde_json::from_str(&j).ok()),
                     })
                 })?;
                 let mut out = Vec::new();
@@ -1509,6 +1649,16 @@ mod tests {
         assert_eq!(restarted.load_pairs_from_db(&repo).await.unwrap(), 0);
     }
 
+    #[test]
+    fn filter_presets_include_the_shared_file_type_groups() {
+        let presets = get_filter_presets();
+        for id in ["macos_metadata", "images", "video", "audio", "documents", "archives"] {
+            assert!(presets.iter().any(|p| p.id == id), "{id}");
+        }
+        let images = presets.iter().find(|p| p.id == "images").unwrap();
+        assert!(images.patterns.contains(&"*.jpg".to_string()) && images.patterns.contains(&"*.JPG".to_string()));
+    }
+
     fn make_test_pair(src: &std::path::Path, dst: &std::path::Path) -> SyncPair {
         SyncPair {
             id: Uuid::new_v4(),
@@ -1972,6 +2122,102 @@ mod tests {
         assert!(mgr.checkpoint_path(pair.id).exists());
         assert!(mgr.execute_sync(pair.id).await.unwrap().resumed);
         assert!(!mgr.checkpoint_path(pair.id).exists());
+    }
+
+    #[tokio::test]
+    async fn duplicate_copies_the_definition_without_history_or_schedule() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), "a").unwrap();
+        let mut pair = temp_pair(src.path(), dst.path(), SyncMode::TwoWay);
+        pair.trigger = SyncTrigger::Scheduled { cron_expr: "0 0 * * * * *".into() };
+        pair.copy_options.threads = 4;
+        let (mgr, _state) = mgr_with(&pair).await;
+        mgr.attach_repository(repo.clone());
+        mgr.execute_sync(pair.id).await.unwrap();
+        let copy = mgr.duplicate_pair(pair.id).await.unwrap();
+        assert_ne!(copy.id, pair.id);
+        assert_eq!(copy.name, "Regression (copy)");
+        assert_eq!(copy.trigger, SyncTrigger::Manual, "the copy is never scheduled");
+        assert_eq!(copy.copy_options.threads, 4);
+        assert!(copy.last_run.is_none());
+        assert!(mgr.get_reports(copy.id).await.is_empty());
+        assert!(mgr.baseline_info(copy.id).await.unwrap().is_none(), "no two-way history");
+        assert!(mgr.baseline_info(pair.id).await.unwrap().is_some());
+        assert_eq!(mgr.list_pairs().await.unwrap().len(), 2);
+        assert!(mgr.duplicate_pair(Uuid::new_v4()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn global_defaults_apply_to_layered_pairs_only() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = SyncManager::new();
+        let defaults = CopyOptions { exclude_hidden: true, ..CopyOptions::default() };
+        mgr.set_default_options(&repo, defaults.clone()).await.unwrap();
+        assert!(mgr.set_default_options(&repo, CopyOptions { threads: 0, ..CopyOptions::default() }).await.is_err());
+        let restarted = SyncManager::new();
+        restarted.load_default_options(&repo).await.unwrap();
+        assert_eq!(restarted.default_options(), defaults);
+
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join(".hidden"), "h").unwrap();
+        std::fs::write(src.path().join("seen.txt"), "s").unwrap();
+        // A pair from before defaults existed keeps its own options …
+        let legacy = temp_pair(src.path(), dst.path(), SyncMode::OneWay);
+        restarted.create_pair(legacy.clone()).await.unwrap();
+        assert_eq!(restarted.dry_run(legacy.id).await.unwrap().total_additions, 2);
+        // … a layered pair follows the defaults for what it does not set.
+        let layered = SyncPair { id: Uuid::new_v4(), option_overrides: Some(vec!["threads".into()]), ..legacy.clone() };
+        restarted.create_pair(layered.clone()).await.unwrap();
+        assert_eq!(restarted.dry_run(layered.id).await.unwrap().total_additions, 1);
+        let own = SyncPair { id: Uuid::new_v4(), option_overrides: Some(vec!["exclude_hidden".into()]), ..legacy };
+        restarted.create_pair(own.clone()).await.unwrap();
+        assert_eq!(restarted.dry_run(own.id).await.unwrap().total_additions, 2, "the pair's own value wins");
+        // Overrides survive a restart.
+        restarted.save_pair_to_db(&repo, &own).await.unwrap();
+        let again = SyncManager::new();
+        again.load_pairs_from_db(&repo).await.unwrap();
+        assert_eq!(again.pairs.read().await.get(&own.id).unwrap().option_overrides, Some(vec!["exclude_hidden".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn export_and_import_a_pair() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        let mut pair = temp_pair(src.path(), dst.path(), SyncMode::Mirror);
+        pair.filter.exclude_patterns = vec!["*.tmp".into()];
+        let (mgr, _state) = mgr_with(&pair).await;
+        let json = mgr.export_pair(&repo, pair.id).await.unwrap();
+        assert!(json.contains("\"format\": \"ufop-sync-pair\""));
+        let imported = mgr.import_pair(&repo, &json).await.unwrap();
+        assert!(imported.warnings.is_empty(), "{:?}", imported.warnings);
+        assert_ne!(imported.pair.id, pair.id);
+        assert!(imported.pair.enabled);
+        assert_eq!(imported.pair.filter.exclude_patterns, vec!["*.tmp".to_string()]);
+        // On a computer without the folders it is flagged and left disabled.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["pair"]["dest_path"] = "/nonexistent/ufop/dest".into();
+        let flagged = mgr.import_pair(&repo, &v.to_string()).await.unwrap();
+        assert!(!flagged.pair.enabled);
+        assert!(flagged.warnings.iter().any(|w| w.contains("/nonexistent/ufop/dest")));
+        assert!(mgr.import_pair(&repo, "{}").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn editing_the_trigger_rearms_it() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        let pair = temp_pair(src.path(), dst.path(), SyncMode::OneWay);
+        let (mgr, _state) = mgr_with(&pair).await;
+        assert!(mgr.scheduler.list_schedules().is_empty());
+        let scheduled = SyncPair { trigger: SyncTrigger::Scheduled { cron_expr: "0 0 * * * * *".into() }, ..pair.clone() };
+        mgr.update_pair(scheduled).await.unwrap();
+        assert_eq!(mgr.scheduler.list_schedules().len(), 1);
+        mgr.update_pair(pair).await.unwrap();
+        assert!(mgr.scheduler.list_schedules().is_empty());
     }
 
     #[tokio::test]

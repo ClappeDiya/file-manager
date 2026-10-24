@@ -48,6 +48,40 @@ async fn job_crud_validation_and_persistence() {
 }
 
 #[tokio::test]
+async fn duplicate_job_copies_definition_with_schedules_off() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    let m = manager(t.path()).await;
+    let mut j = job(&src, &dst);
+    j.schedule.enabled = true;
+    j.schedule.start_time = "02:00".into();
+    j.schedule.interval_minutes = 1440;
+    j.maintenance.compact = Some(BackupSchedule { enabled: true, start_time: "03:00".into(), interval_minutes: 1440, ..Default::default() });
+    j.reports.headers = vec![notify::webhook::WebhookHeader { name: "Authorization".into(), value: "Bearer s3cret".into(), secret: true, credential_id: String::new() }];
+    let original = m.save_job(j, Some("pw".into())).await.unwrap();
+    m.execute(&original.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    let original = m.get_job(&original.id).await.unwrap();
+    assert!(original.stats.version_count > 0);
+
+    let copy = m.duplicate_job(&original.id).await.unwrap();
+    assert_ne!(copy.id, original.id);
+    assert_eq!(copy.name, "Docs (copy)");
+    assert_eq!(copy.sources, original.sources);
+    assert!(!copy.schedule.enabled, "the copy never runs on its own");
+    assert!(!copy.maintenance.compact.as_ref().unwrap().enabled);
+    assert_eq!(copy.stats.version_count, 0, "no history");
+    assert_eq!(m.passphrase(&copy.id).await.unwrap().as_deref(), Some("pw"));
+    // Secrets are copied, not shared.
+    let (oh, ch) = (&original.reports.headers[0], &copy.reports.headers[0]);
+    assert!(!ch.credential_id.is_empty() && ch.credential_id != oh.credential_id);
+    assert_eq!(m.prepare_reports(&copy.reports).await.headers[0].value, "Bearer s3cret");
+    assert_eq!(m.list_jobs().await.len(), 2);
+    assert!(m.duplicate_job("missing").await.is_err());
+}
+
+#[tokio::test]
 async fn backup_restore_history_and_queries() {
     let t = tempfile::tempdir().unwrap();
     let (src, dst, out) = (t.path().join("src"), t.path().join("dst"), t.path().join("out"));

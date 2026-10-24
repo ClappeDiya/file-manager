@@ -92,7 +92,10 @@ impl CompiledSyncFilter {
     }
 
     fn lists_accept(&self, relative_path: &str) -> bool {
-        let included = |set: &Option<RuleSet>| set.as_ref().map_or(true, |s| s.evaluate(relative_path, false).is_some());
+        let included = |set: &Option<RuleSet>| match set {
+            Some(s) => s.evaluate(relative_path, false).is_some(),
+            None => true,
+        };
         included(&self.include_globs)
             && self.excludes.evaluate(relative_path, false).is_none()
             && included(&self.include_regex)

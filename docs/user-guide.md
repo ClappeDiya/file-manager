@@ -273,9 +273,55 @@ When files conflict during sync, they are quarantined. Resolve via:
 - **Keep Both** - Rename one copy
 - **Skip** - Leave unchanged
 
+### Two-way sync and deletions
+
+A two-way pair remembers what both folders looked like after its last successful run (its *sync history*). Each run compares both sides with it:
+
+- A file deleted on one side and unchanged on the other is **deleted on the other side too** (with a rollback copy). Renaming a file is a delete plus an add.
+- A file changed on one side is copied to the other, in either direction.
+- A file changed on **both** sides is a conflict and goes through the pair's conflict policy. *Destination wins* and *Keep both* leave both folders identical (keep both: the destination's version under the name, the source's as `name (conflict DATE).ext`, on both sides).
+- The **first run** (no history yet) only combines both folders; it never deletes. The preview says so.
+- A run that fails, is cancelled or stops at the end of its run hours keeps the previous history, so nothing it left half done is mistaken for a deletion.
+- **Safety stop**: a run that would delete more than 50% of the synced files on one side (more than two files), or everything because one folder is empty or missing, is refused — usually an unplugged drive or an unmounted share. Change the limit in *Cleanup & moving* (0 turns it off) or reset the history.
+
+Changing a pair's mode or folders forgets its history. In the Advanced view each two-way pair shows its history size and a **Reset history** button.
+
+### Edit, duplicate, export and import
+
+- **Edit** opens the pair in the same form used to create it.
+- **Duplicate** creates "*name* (copy)" with the same settings, no run history and its schedule (or watcher) off. Backup jobs have **Duplicate** too: the copy's schedules are off and it opens in the editor so you can give it its own destination.
+- **Export** / **Import** (Advanced view) save one pair as a `ufop-sync-pair` JSON file and load it on another computer. If a folder is missing there, or a folder is on a saved connection's mount that the computer does not have, the import says so and the pair stays disabled until you fix it.
+
+### Filters, rules and presets
+
+Besides the include/exclude lists, a pair (and a backup job) can have **ordered rules**: the first rule that matches decides, so `+ keep.log` above `- *.log` keeps that one log file. Rule kinds: wildcard, exact path, regex, a group (temporary files, caches, OS metadata, build output, images, video, audio, documents, archives) and **rclone glob** (`*` stays in one folder, `**` crosses folders, a leading `/` anchors at the top, a trailing `/` matches a folder and everything in it, `{jpg,png}` alternatives).
+
+- **Import rules from file…** reads an rclone `--filter-from` file: one `+ pattern` or `- pattern` per line, `#` and `;` comments, `!` clears the rules read so far.
+- **Saved presets**: *Save as preset…* stores the current rules under a name; *Apply saved preset* adds a preset's rules to a pair or job (both views). Delete presets in the Advanced view.
+- The quick filter presets of the sync form now include images, video, audio, documents and archives.
+
+### Comparing files
+
+In the Advanced view, *When to overwrite › Compare files by* chooses **size and date** (default), **checksum** (xxHash3; reads every file whose size matches, finds changes even when the date did not change and ignores files that were only touched), or **size only**. When checksums are not available the preview notes that size and date were used. The **Ignore existing** preset (Advanced) copies only files the destination does not have.
+
+### Versioned backup: versions to keep
+
+Versioned-backup pairs keep every stored version unless *Versions to keep of each file* (Advanced) is set; then the oldest versions beyond that number are deleted after each run. Unchanged files are no longer stored again on every run.
+
+### Interrupted runs
+
+Each finished step of a run is recorded as it happens. If the app quits, crashes or the run is cancelled, the next run skips the steps that were already done (for files that have not changed since) and its report says *Resumed from interruption*.
+
+### Global sync defaults and bandwidth timetable
+
+Settings › Advanced has:
+
+- **Sync defaults**: copy options new pairs start from. A pair created afterwards stores only the options it changes and follows the defaults for the rest; pairs created before keep all their own options.
+- **Bandwidth timetable**: windows (weekdays, from–to) with upload and download limits that replace the machine-wide limits while active, for file transfers, sync and backups alike. A window that ends before it starts runs past midnight; the first matching window wins.
+
 ### Rollback
 
-If a sync produced unwanted results, use the Rollback feature to restore files from the pre-sync backup.
+If a sync produced unwanted results, use the Rollback feature to restore files from the pre-sync backup. Two-way runs keep rollback copies of source files they changed or deleted too, and Rollback puts each back on its own side.
 
 ### Reports
 

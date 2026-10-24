@@ -29,6 +29,11 @@ export interface SyncPair {
   copy_options?: import("@/lib/copy-options").CopyOptions;
   /** Mirrors `SyncRunOptions` (ufop-core sync_types.rs). */
   run_options?: SyncRunOptions;
+  dest_state?: "scan" | "trusted_inventory" | "blind_upload";
+  checksum_algorithm?: "xxh3" | "sha256";
+  /** Copy options the pair sets itself; the rest follow the global sync
+   *  defaults. `null`: pair from before defaults existed (all its own). */
+  option_overrides?: string[] | null;
 }
 
 export interface SyncRunOptions {

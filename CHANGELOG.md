@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sync (WS-C)** — see `docs/user-guide.md` › Sync:
+  - **Two-way sync with a baseline**: two-way pairs record both sides after each clean run (schema v33 `sync_baseline_runs` / `sync_baseline`) and the planner does a three-way diff, so deletions propagate (rollback copies on either side) instead of coming back, changes flow both ways, edits on both sides are conflicts, and the first run still never deletes. Failed, cancelled or paused runs keep the old baseline. Safety stop (`copy_options.two_way_max_delete_percent`, default 50%) when a side lost most of its files or is empty/missing. IPC `get_sync_baseline_info`, `reset_sync_baseline`; Advanced *Reset history*.
+  - **Compare files by** size and date, checksum (xxHash3, with a preview note when no hash is available) or size only (`copy_options.compare_mode`); Advanced **Ignore existing** preset (/XO /XN /XC).
+  - **Versioned backup**: a version index at the destination (`.ufop-sync-versions.json`) and `run_options.keep_versions` pruning (retention keep-count), shown as *versions removed* in the report.
+  - **Crash recovery**: finished steps are checkpointed per run; a rerun after a crash or cancel skips them (`report.resumed`).
+  - **One filter engine** (`ufop_core::filter_rules`) for sync and backup: ordered rules with rclone globs, `--filter-from` import (`parse_filter_rules`), new groups images/video/audio/documents/archives (`get_filter_groups`, also as sync quick presets), and user-saved presets (schema v33 `user_filter_presets`; `list_user_filter_presets`, `save_user_filter_preset`, `delete_user_filter_preset`) in both editors.
+  - **Edit and duplicate**: pairs open in the create form for editing (trigger changes apply at once); `duplicate_sync_pair` and `duplicate_backup_job` copy a definition as "*name* (copy)" with no history and schedules off.
+  - **Export / import one pair** (`export_sync_pair`, `import_sync_pair`; `{"format":"ufop-sync-pair","version":1}`), flagging missing folders and saved connections.
+  - **Global sync defaults** (`get_sync_default_options`, `set_sync_default_options`; Settings › Advanced): new pairs store only their own options (`option_overrides`); older pairs are unchanged.
+  - **Bandwidth timetable** (`get_bandwidth_schedule`, `set_bandwidth_schedule`; Settings › Advanced) on the one shared limiter (`ufop_core::throttle`), now also used by file transfers and sync copies.
+  - `planner::diff_trees`: the planner's decisions on two listings, pure and cancellable, for folder comparisons.
+
 - **Simple and Advanced mode in the backup screens**: in Simple mode (the default) the job editor, Restore, Maintenance, Settings and Recovery show the everyday flow; advanced options appear in Advanced mode or with *Show advanced backup options* (a per-area override in the UI store), behind one `AdvancedOnly` gate with a "Switch to Advanced" hint.
 - **`SECURITY.md`**: how to report a vulnerability privately (GitHub private vulnerability reporting), supported versions and response times.
 - Interface polish:
@@ -83,6 +95,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sizes are shown in decimal units by default (1 KB = 1,000 bytes; before, 1,024 bytes were labelled KB). Choose *Binary* in Settings → Appearance for KiB/MiB/GiB.
 
 ### Fixed
+
+- **Two-way sync deletions never stuck**: a file deleted on one side was copied back from the other on the next run.
+- **Versioned backups stored a duplicate version of every file on every run** (copies were never seen as already stored).
+- **The transfer bandwidth limit was never applied**: `set_global_throttle` stored a limit no transfer obeyed; chunks are now paced.
+- **Sync resume was dead code**: the resume state was read but never written; replaced by real checkpoints.
 
 - ufop-server file gateway: a refused upload (no such gateway, read-only, larger than the agent accepts) was answered before its body was read, so a client still sending could get a broken pipe instead of the 404/403; the server now reads and discards up to 64 MiB of a refused upload (30 s at most) before answering, and closes the connection beyond that.
 - Automation rule editor: *Dry run* of an unsaved rule that watches a folder showed no files; it now tries the newest files already in that folder (`test_automation_rule`). `scripts/dump-ipc-commands.sh` no longer misses commands whose doc comment follows `#[tauri::command]`.
