@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { DualPaneLayout } from "@/components/dual-pane-layout";
 import { useFileManagerStore } from "@/stores/file-manager-store";
+import { useCompareStore } from "@/stores/compare-store";
 
 describe("T-006: DualPaneLayout", () => {
   beforeEach(() => {
@@ -134,5 +135,26 @@ describe("T-006: DualPaneLayout", () => {
     render(<DualPaneLayout renderPane={renderPane} />);
     expect(screen.getByRole("region", { name: /left file pane/i })).toBeInTheDocument();
     expect(screen.getByRole("region", { name: /right file pane/i })).toBeInTheDocument();
+  });
+
+  it("Compare (dual-pane toolbar) compares the two panes' folders", () => {
+    useFileManagerStore.setState({
+      singlePaneMode: false,
+      panes: useFileManagerStore.getState().panes.map((p, i) => ({
+        ...p,
+        tabs: p.tabs.map((t) => ({ ...t, path: i === 0 ? "/home/me/photos" : "/mnt/backup/photos" })),
+      })),
+    });
+    useCompareStore.setState({ request: null });
+    render(<DualPaneLayout renderPane={renderPane} />);
+    fireEvent.click(screen.getByTestId("compare-panes"));
+    const req = useCompareStore.getState().request;
+    expect(req?.left).toEqual({ type: "local", path: "/home/me/photos" });
+    expect(req?.right).toEqual({ type: "local", path: "/mnt/backup/photos" });
+  });
+
+  it("Compare is not offered in single-pane mode", () => {
+    render(<DualPaneLayout renderPane={renderPane} />);
+    expect(screen.queryByTestId("compare-panes")).not.toBeInTheDocument();
   });
 });
