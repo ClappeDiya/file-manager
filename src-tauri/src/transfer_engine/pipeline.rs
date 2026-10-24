@@ -831,17 +831,21 @@ mod tests {
             verify_time_ms: 0,
         };
         let one = ChunkSpec { offset: 0, ..chunk(0) };
-        let throttler = crate::transfer_engine::throttle::BandwidthThrottler::global();
-        // 256 KiB/s: two 64 KiB chunks need at least ~0.25 s.
-        throttler.set_limit(256 * 1024);
+        // 256 KiB/s: two 64 KiB chunks need at least ~0.25 s. The test paces
+        // by a rate of its own: the process-wide one would slow other tests.
+        let rate = Arc::new(ufop_core::throttle::SharedRate::new());
+        rate.set(256 * 1024);
         let started = std::time::Instant::now();
-        for c in [&one, &ChunkSpec { offset: 0, ..chunk(1) }] {
-            transfer_chunk(src.to_str().unwrap(), temp.to_str().unwrap(), c, VerifyTier::Fast, &config, None, None, &semaphore, None)
-                .await
-                .unwrap();
-        }
+        crate::transfer_engine::throttle::TEST_TRANSFER_RATE
+            .scope(rate, async {
+                for c in [&one, &ChunkSpec { offset: 0, ..chunk(1) }] {
+                    transfer_chunk(src.to_str().unwrap(), temp.to_str().unwrap(), c, VerifyTier::Fast, &config, None, None, &semaphore, None)
+                        .await
+                        .unwrap();
+                }
+            })
+            .await;
         let elapsed = started.elapsed();
-        throttler.set_limit(0);
         assert!(elapsed >= std::time::Duration::from_millis(240), "copied too fast: {elapsed:?}");
     }
 

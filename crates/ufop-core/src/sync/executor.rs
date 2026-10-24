@@ -51,9 +51,9 @@ pub struct RunHooks {
 }
 
 impl RunHooks {
-    fn step_done(&self, entry: &SyncDiffEntry) {
+    fn step_done(&self, entry: &SyncDiffEntry, version: Option<StoredVersion>) {
         if let Some(f) = &self.on_step {
-            f(&entry.relative_path, &CompletedStep::of(entry));
+            f(&entry.relative_path, &CompletedStep { version, ..CompletedStep::of(entry) });
         }
     }
 
@@ -187,10 +187,12 @@ pub fn execute_sync_with(
     if let Some(cb) = &hooks.progress {
         cb(&planning);
     }
-    let stored_versions = StoredVersions {
-        index: if pair.mode == SyncMode::VersionedBackup { VersionIndex::load(Path::new(&pair.dest_path)) } else { VersionIndex::default() },
-        stored: Mutex::new(Vec::new()),
-    };
+    // A checkpoint counts only for the folders and mode it was written for.
+    let resume = config.resume_from.as_ref().filter(|c| c.matches(pair));
+    let mut index = if pair.mode == SyncMode::VersionedBackup { VersionIndex::load(Path::new(&pair.dest_path)) } else { VersionIndex::default() };
+    // Versions the interrupted run stored before it could write the index.
+    let recovered_versions = resume.map_or(0, |c| recover_versions(&mut index, Path::new(&pair.dest_path), c));
+    let stored_versions = StoredVersions { index, stored: Mutex::new(Vec::new()) };
     let plan = planner::plan(
         pair,
         &planner::PlanContext {
@@ -235,10 +237,10 @@ pub fn execute_sync_with(
     let mut bytes_transferred: u64 = 0;
     let mut error_messages: Vec<String> = Vec::new();
     let mut log_lines: Vec<String> = Vec::new();
-    let resumed = config.resume_from.is_some();
-    // Steps the interrupted run already did are not repeated (a versioned
-    // backup would otherwise keep a second copy of each).
-    let already_done = |e: &SyncDiffEntry| config.resume_from.as_ref().is_some_and(|c| c.covers(e));
+    let resumed = resume.is_some();
+    // Steps the interrupted run already did, whose result is still in place,
+    // are not repeated.
+    let already_done = |e: &SyncDiffEntry| resume.is_some_and(|c| c.covers(e) && step_result_in_place(pair, c, e));
     let mut resumed_skips: u64 = 0;
 
     // /E and /CREATE: build the directory tree first.
@@ -311,7 +313,7 @@ pub fn execute_sync_with(
                     tracker.start_file(&entry.relative_path);
                     let r = copier::with_retries(opts, || add_file(pair, entry, None));
                     if r.is_ok() {
-                        hooks.step_done(entry);
+                        hooks.step_done(entry, None);
                     }
                     tracker.finish_file(match &r {
                         Ok(OperationResult::Added(b)) => *b,
@@ -361,7 +363,7 @@ pub fn execute_sync_with(
             });
             let failed = result.is_err();
             if !failed {
-                hooks.step_done(entry);
+                hooks.step_done(entry, stored_versions.last_for(&entry.relative_path));
             }
             outcomes.push((idx, result));
             if failed && !config.continue_on_error {
@@ -543,7 +545,7 @@ pub fn execute_sync_with(
         let StoredVersions { mut index, stored } = stored_versions;
         let stored = stored.into_inner().unwrap_or_default();
         let keep = pair.run_options.keep_versions.filter(|k| *k > 0);
-        if !stored.is_empty() || keep.is_some() {
+        if !stored.is_empty() || keep.is_some() || recovered_versions > 0 {
             for (rel, v) in stored {
                 index.record(&rel, v);
             }
@@ -664,7 +666,10 @@ pub fn execute_sync_with(
     // Two-way: record the new baseline only when every planned step ran
     // cleanly. A failed, cancelled or paused run keeps the old one, so the
     // next run re-derives anything this one left half done.
+    // Blind upload never looked at the destination, so this run says nothing
+    // about it: keep the previous baseline.
     let baseline = (pair.mode == SyncMode::TwoWay
+        && pair.dest_state != DestStateMode::BlindUpload
         && report.status == SyncRunStatus::Success
         && report.errors == 0
         && !stopped_for_hours
@@ -779,6 +784,70 @@ fn add_file(pair: &SyncPair, entry: &SyncDiffEntry, versions: Option<&StoredVers
 struct StoredVersions {
     index: VersionIndex,
     stored: Mutex<Vec<(String, StoredVersion)>>,
+}
+
+impl StoredVersions {
+    /// The version this run last stored for `rel`, if any.
+    fn last_for(&self, rel: &str) -> Option<StoredVersion> {
+        let stored = self.stored.lock().ok()?;
+        stored.iter().rev().find(|(r, _)| r == rel).map(|(_, v)| v.clone())
+    }
+}
+
+/// Add to `index` the versions an interrupted run stored (per its
+/// checkpoint) that never reached the index, when the version file is still
+/// there with its recorded size. Returns how many were added.
+fn recover_versions(index: &mut VersionIndex, dest_root: &Path, checkpoint: &SyncCheckpoint) -> usize {
+    let known: std::collections::HashSet<String> = index.version_paths().into_iter().map(str::to_string).collect();
+    let mut found: Vec<(&String, &StoredVersion)> = checkpoint
+        .completed
+        .iter()
+        .filter_map(|(rel, step)| step.version.as_ref().map(|v| (rel, v)))
+        .filter(|(_, v)| !known.contains(&v.path))
+        .filter(|(_, v)| fs::metadata(dest_root.join(&v.path)).is_ok_and(|m| m.is_file() && m.len() == v.size))
+        .collect();
+    found.sort_by_key(|(_, v)| v.seq);
+    for (rel, v) in &found {
+        index.record(rel, (*v).clone());
+    }
+    found.len()
+}
+
+/// Whether what the checkpointed step for `entry` produced is still there:
+/// a deleted file still gone, a copy still the file the step wrote (same
+/// size, and the origin's time when timestamps are kept, otherwise a time
+/// from while the interrupted run was going).
+fn step_result_in_place(pair: &SyncPair, checkpoint: &SyncCheckpoint, entry: &SyncDiffEntry) -> bool {
+    let Some(step) = checkpoint.completed.get(&entry.relative_path) else {
+        return false;
+    };
+    let target_root = Path::new(if entry.direction == SyncDirection::ToSource { &pair.source_path } else { &pair.dest_path });
+    if entry.action == SyncAction::Delete {
+        return fs::symlink_metadata(target_root.join(&entry.relative_path)).is_err();
+    }
+    let target = if pair.mode == SyncMode::VersionedBackup && entry.direction == SyncDirection::ToDest {
+        match &step.version {
+            Some(v) => target_root.join(&v.path),
+            None => return false,
+        }
+    } else {
+        target_root.join(&entry.relative_path)
+    };
+    let Ok(meta) = fs::metadata(&target) else {
+        return false;
+    };
+    if !meta.is_file() || Some(meta.len()) != step.size {
+        return false;
+    }
+    let mtime = meta.modified().ok().map(chrono::DateTime::<Utc>::from);
+    if pair.copy_options.copy_timestamps {
+        return planner::times_equal(mtime, step.modified, &pair.copy_options);
+    }
+    let slack = chrono::Duration::seconds(2);
+    match (mtime, step.done_at) {
+        (Some(m), Some(done)) => m <= done + slack && checkpoint.started_at.map_or(true, |s| m >= s - slack),
+        _ => false,
+    }
 }
 
 /// Versioned backup: copy the source file to its next version name and
@@ -2191,6 +2260,36 @@ mod tests {
         assert_eq!(out.report.files_deleted, 6);
     }
 
+    /// Blind upload never reads the destination, so a baseline cannot tell
+    /// "deleted there" from "not looked at": nothing may be deleted, and no
+    /// run may stop on the safety limit.
+    #[test]
+    fn two_way_blind_upload_never_deletes_from_the_source() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        for i in 0..4 {
+            fs::write(src.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let mut pair = two_way(src.path(), dst.path());
+        pair.dest_state = DestStateMode::BlindUpload;
+        let mut base = None;
+        assert_eq!(run_two_way(&pair, &mut base).report.files_added, 4);
+        // Also with the baseline of an earlier run that did scan the destination.
+        let mut scanned = None;
+        run_two_way(&SyncPair { dest_state: DestStateMode::Scan, ..pair.clone() }, &mut scanned);
+        assert_eq!(scanned.as_ref().unwrap().entries.len(), 4);
+        for (limit, mut base) in [(50, base.clone()), (0, base), (50, scanned.clone()), (0, scanned)] {
+            pair.copy_options.two_way_max_delete_percent = limit;
+            let preview = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
+            assert_eq!(preview.total_deletions, 0, "limit {limit}");
+            let out = run_two_way(&pair, &mut base);
+            assert_eq!(out.report.status, SyncRunStatus::Success, "limit {limit}");
+            assert_eq!(out.report.files_deleted, 0, "limit {limit}");
+            assert!(out.baseline.is_none(), "an unobserved destination must not become the baseline");
+            assert_eq!(fs::read_dir(src.path()).unwrap().count(), 4, "limit {limit}: source emptied");
+        }
+    }
+
     #[test]
     fn two_way_baseline_for_other_folders_is_ignored() {
         let src = TempDir::new().unwrap();
@@ -2237,7 +2336,7 @@ mod tests {
         let mut pair = make_test_pair(src.path(), dst.path());
         // Without kept timestamps every rerun would copy everything again.
         pair.copy_options.copy_timestamps = false;
-        let steps = Arc::new(Mutex::new(SyncCheckpoint { pair_id: pair.id, ..Default::default() }));
+        let steps = Arc::new(Mutex::new(SyncCheckpoint::for_pair(&pair, Uuid::new_v4())));
         let rec = steps.clone();
         let hooks = RunHooks {
             on_step: Some(Arc::new(move |path: &str, step: &CompletedStep| {
@@ -2267,6 +2366,94 @@ mod tests {
         let p = planner::compute_preview(&pair).unwrap();
         let a = p.modifications.iter().find(|e| e.relative_path == "a.txt").unwrap();
         assert!(!checkpoint.covers(a));
+    }
+
+    /// Runs `pair` while recording a checkpoint, as if the run then died
+    /// before it could clear it.
+    fn run_recording(pair: &SyncPair) -> (SyncReport, SyncCheckpoint) {
+        let steps = Arc::new(Mutex::new(SyncCheckpoint::for_pair(pair, Uuid::new_v4())));
+        let rec = steps.clone();
+        let hooks = RunHooks {
+            on_step: Some(Arc::new(move |path: &str, step: &CompletedStep| {
+                rec.lock().unwrap().completed.insert(path.to_string(), step.clone());
+            })),
+            ..Default::default()
+        };
+        let report = execute_sync_with(&cfg(pair.clone()), &hooks).unwrap().report;
+        let cp = steps.lock().unwrap().clone();
+        (report, cp)
+    }
+
+    /// Regression: a checkpoint recorded against one destination made a run
+    /// to another destination skip its copies and still report Success.
+    #[test]
+    fn resume_ignores_a_checkpoint_for_other_folders() {
+        let src = TempDir::new().unwrap();
+        let d1 = TempDir::new().unwrap();
+        let d2 = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "alpha").unwrap();
+        let mut pair = make_test_pair(src.path(), d1.path());
+        pair.copy_options.copy_timestamps = false;
+        let (_, cp) = run_recording(&pair);
+        assert_eq!(cp.completed.len(), 1);
+        let moved = SyncPair { dest_path: d2.path().to_string_lossy().to_string(), ..pair.clone() };
+        let r = execute_sync_with(&ExecutorConfig { resume_from: Some(cp.clone()), ..cfg(moved.clone()) }, &RunHooks::default()).unwrap().report;
+        assert_eq!(r.status, SyncRunStatus::Success);
+        assert_eq!(r.files_added, 1);
+        assert!(!r.resumed, "a checkpoint for other folders is not a resume");
+        assert!(d2.path().join("a.txt").exists(), "a.txt missing at the new destination");
+        // Nor does it carry over to another mode.
+        assert!(!cp.matches(&SyncPair { mode: SyncMode::Mirror, ..pair.clone() }));
+        assert!(cp.matches(&pair));
+    }
+
+    /// Regression: a checkpoint only proved the origin was unchanged, so a
+    /// copy whose result was later deleted or replaced was skipped.
+    #[test]
+    fn resume_copies_again_when_the_copied_file_is_gone_or_changed() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "alpha").unwrap();
+        fs::write(src.path().join("b.txt"), "bravo").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.copy_options.copy_timestamps = false;
+        let (_, cp) = run_recording(&pair);
+        assert_eq!(cp.completed.len(), 2);
+        // a.txt deleted from the destination; b.txt rewritten there later.
+        fs::remove_file(dst.path().join("a.txt")).unwrap();
+        fs::write(dst.path().join("b.txt"), "BRAVO").unwrap();
+        copier::set_mtime(&dst.path().join("b.txt"), std::time::SystemTime::now() + std::time::Duration::from_secs(3_600));
+        let r = execute_sync_with(&ExecutorConfig { resume_from: Some(cp), ..cfg(pair.clone()) }, &RunHooks::default()).unwrap().report;
+        assert!(r.resumed);
+        assert_eq!((r.files_added, r.files_modified), (1, 1));
+        assert_eq!(fs::read_to_string(dst.path().join("a.txt")).unwrap(), "alpha");
+        assert_eq!(fs::read_to_string(dst.path().join("b.txt")).unwrap(), "bravo");
+    }
+
+    /// Regression: versions stored by a run that crashed before writing the
+    /// index were skipped on resume but never indexed — orphan files, and a
+    /// duplicate version on the next run.
+    #[test]
+    fn versioned_crash_and_resume_leaves_no_orphan_or_duplicate_version() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("doc.txt"), "v1").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::VersionedBackup;
+        let (r, cp) = run_recording(&pair);
+        assert_eq!(r.files_added, 1);
+        // The crash came before the index was saved.
+        fs::remove_file(dst.path().join(crate::sync::versions::VERSIONS_FILE)).unwrap();
+        let resumed = execute_sync_with(&ExecutorConfig { resume_from: Some(cp), ..cfg(pair.clone()) }, &RunHooks::default()).unwrap().report;
+        assert_eq!(resumed.status, SyncRunStatus::Success);
+        assert_eq!(resumed.files_added + resumed.files_modified, 0, "the version was already stored");
+        let index = VersionIndex::load(dst.path());
+        assert_eq!(index.files.get("doc.txt").map(|v| v.len()), Some(1), "the stored version is indexed");
+        // The next normal run stores nothing more.
+        let next = run_with(pair);
+        assert_eq!(next.files_added + next.files_modified, 0, "duplicate version");
+        let stored = fs::read_dir(dst.path()).unwrap().flatten().filter(|e| !planner::is_internal_entry(&e.file_name().to_string_lossy())).count();
+        assert_eq!(stored, 1);
     }
 
     // ── Versioned backup ──

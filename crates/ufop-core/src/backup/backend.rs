@@ -430,7 +430,8 @@ impl<B: Backend> Backend for RetryingBackend<B> {
         let t = Instant::now();
         self.retry("put", || self.inner.put(name, data))?;
         Self::pace(self.throttle.upload_bps, data.len(), t);
-        GLOBAL_UPLOAD.wait(data.len(), t);
+        // The machine-wide cap, and the timetable's share with sync and transfers.
+        crate::throttle::wait_all(&[&GLOBAL_UPLOAD, &crate::throttle::TIMETABLE_UPLOAD], data.len(), t);
         Ok(())
     }
     fn get(&self, name: &str) -> Result<Vec<u8>, AppError> {

@@ -1118,6 +1118,15 @@ impl BackupManager {
         copy.name = format!("{} (copy)", original.name);
         copy.stats = JobStats::default();
         copy.legal_hold = None;
+        // The schedules may come from policy templates: take the resolved
+        // ones as the copy's own settings, turned off, so no template turns
+        // them back on. Every other setting resolves as before.
+        let resolved = self.resolve_job(&original).await?.job;
+        let mut own = templates::explicit_paths(&original)?;
+        own.extend(["schedule".to_string(), "maintenance".to_string()]);
+        copy.overrides = Some(own.into_iter().collect());
+        copy.schedule = resolved.schedule;
+        copy.maintenance = resolved.maintenance;
         copy.schedule.enabled = false;
         if let Some(s) = copy.maintenance.compact.as_mut() {
             s.enabled = false;
@@ -1139,15 +1148,15 @@ impl BackupManager {
             self.copy_destination_secret(&mut r.destination).await?;
         }
         for n in copy.notifications.iter_mut() {
-            n.credential_id = self.copy_secret(&n.credential_id).await?;
+            self.copy_secret_ref(&mut n.credential_id).await?;
             if let notify::Channel::Webhook { headers, .. } = &mut n.channel {
                 for h in headers.iter_mut().filter(|h| h.secret) {
-                    h.credential_id = self.copy_secret(&h.credential_id).await?;
+                    self.copy_secret_ref(&mut h.credential_id).await?;
                 }
             }
         }
         for h in copy.reports.headers.iter_mut().filter(|h| h.secret) {
-            h.credential_id = self.copy_secret(&h.credential_id).await?;
+            self.copy_secret_ref(&mut h.credential_id).await?;
         }
         let passphrase = self.store_get(&format!("{PASS_KEY_PREFIX}{id}")).await?;
         self.save_job(copy, passphrase).await
@@ -1158,10 +1167,18 @@ impl BackupManager {
     /// managed one, is left as it is).
     async fn copy_destination_secret(&self, dest: &mut BackupDestination) -> Result<(), AppError> {
         if let BackupDestination::Cloud { credential_id, .. } = dest {
-            let copied = self.copy_secret(credential_id).await?;
-            if !copied.is_empty() {
-                *credential_id = copied;
-            }
+            self.copy_secret_ref(credential_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Point `credential_id` at a copy of its stored secret. A reference to
+    /// a secret this machine does not store (a centrally managed one) is
+    /// kept as it is rather than dropped.
+    async fn copy_secret_ref(&self, credential_id: &mut String) -> Result<(), AppError> {
+        let copied = self.copy_secret(credential_id).await?;
+        if !copied.is_empty() {
+            *credential_id = copied;
         }
         Ok(())
     }

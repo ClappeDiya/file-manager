@@ -199,9 +199,10 @@ pub async fn set_global_throttle(
 /// Config-table key of the bandwidth timetable.
 pub const BANDWIDTH_SCHEDULE_KEY: &str = "bandwidth.schedule";
 
-/// The bandwidth timetable: windows (weekdays, start, end) whose upload and
-/// download limits replace the machine-wide limits while they are active.
-/// Shared by transfers, sync and backup.
+/// The bandwidth timetable: windows (weekdays, start, end) with upload and
+/// download limits. While one is active, its upload limit is shared by
+/// backups, sync copies and file transfers, and both limits replace the
+/// backup machine-wide caps.
 #[tauri::command]
 pub async fn get_bandwidth_schedule() -> Result<Vec<ufop_core::throttle::BandwidthWindow>, AppError> {
     Ok(ufop_core::throttle::schedule())
@@ -671,6 +672,8 @@ mod bandwidth_schedule_tests {
 
     #[tokio::test]
     async fn timetable_is_saved_and_restored() {
+        // Changes the process-wide timetable.
+        let _rates = crate::transfer_engine::throttle::global_rates_test_lock().await;
         let repo = crate::storage::Repository::open_in_memory().await.unwrap();
         assert_eq!(load_bandwidth_schedule(&repo).await.unwrap(), 0);
         // A day that is not today, so the shared limiter never applies it

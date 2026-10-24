@@ -69,9 +69,9 @@ pub fn copy_file(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<u64, AppE
             )
         })?;
         0
-    } else if opts.restartable || opts.inter_packet_gap_ms > 0 || crate::throttle::GLOBAL_UPLOAD.get() > 0 {
-        // Block by block: /Z, /IPG, or the machine-wide bandwidth limit
-        // (and timetable) shared with backups and transfers.
+    } else if opts.restartable || opts.inter_packet_gap_ms > 0 || crate::throttle::TIMETABLE_UPLOAD.get() > 0 {
+        // Block by block: /Z, /IPG, or a bandwidth timetable window (shared
+        // with backups and transfers; the backup caps do not apply here).
         copy_blockwise(src, dst, opts)?
     } else {
         fs::copy(src, dst).map_err(|e| {
@@ -174,7 +174,7 @@ fn copy_blockwise(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<u64, App
         }
         writer.write_all(&buffer[..n])?;
         written += n as u64;
-        crate::throttle::GLOBAL_UPLOAD.wait(n, block_started);
+        crate::throttle::TIMETABLE_UPLOAD.wait(n, block_started);
         if !gap.is_zero() {
             std::thread::sleep(gap);
         }
@@ -367,6 +367,24 @@ pub fn write_log(pair: &SyncPair, report: &SyncReport, lines: &[String]) -> Resu
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Regression: the backup machine-wide upload cap (and the console's
+    /// managed cap) also paced every sync copy, a change for anyone who had
+    /// set one for backups. Sync follows only the bandwidth timetable.
+    #[test]
+    fn backup_machine_caps_do_not_slow_sync_copies() {
+        let _g = crate::throttle::test_lock();
+        let dir = TempDir::new().unwrap();
+        let (src, dst) = (dir.path().join("a.bin"), dir.path().join("b.bin"));
+        fs::write(&src, vec![1u8; 256 * 1024]).unwrap();
+        crate::throttle::GLOBAL_UPLOAD.set(64 * 1024);
+        let started = std::time::Instant::now();
+        let r = copy_file(&src, &dst, &CopyOptions::default());
+        crate::throttle::GLOBAL_UPLOAD.set(0);
+        r.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2), "paced by the backup cap: {:?}", started.elapsed());
+        assert_eq!(fs::read(&dst).unwrap().len(), 256 * 1024);
+    }
 
     #[test]
     fn restartable_copy_resumes_partial_file() {

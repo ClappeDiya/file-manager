@@ -1,8 +1,9 @@
 /**
  * Settings › Advanced › Bandwidth timetable: windows (weekdays, from, to)
- * whose upload and download limits replace the machine-wide limits while
- * they are active. One limiter is shared by file transfers, sync and
- * backups, so the timetable applies to all of them.
+ * with upload and download limits. While a window is active its upload
+ * limit is shared by file transfers, sync copies and backups together, and
+ * both limits replace the backup machine-wide limits. Outside every window
+ * transfers and sync are not limited by the backup caps.
  */
 import { useEffect, useState } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
@@ -49,7 +50,8 @@ export function BandwidthTimetableSection() {
   return (
     <div className="space-y-2" data-testid="bandwidth-timetable">
       <p className="text-xs text-gray-500 dark:text-gray-400">
-        While a window is active its limits (KiB/s, 0 = unlimited) replace the machine-wide limits for transfers, sync and backups.
+        While a window is active, its upload limit (KiB/s, 0 = unlimited) is shared by file transfers, sync copies and backups
+        together; its download limit applies to backup restores. Both replace the backup machine-wide limits during the window.
         The first matching window wins; a window that ends before it starts runs past midnight.
       </p>
       {windows.map((w, i) => (

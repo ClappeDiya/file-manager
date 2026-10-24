@@ -330,7 +330,11 @@ export function SyncPanel() {
     setError(null);
     try {
       const copy = await tauriInvoke<SyncPair>("duplicate_sync_pair", { pairId });
-      setNotice(`Created "${copy.name}". Its schedule is off until you turn it on.`);
+      setNotice(
+        copy.enabled
+          ? `Created "${copy.name}".`
+          : `Created "${copy.name}". It is disabled, so its schedule is off: point it at its own folders, then turn it on in Edit.`,
+      );
       await loadPairs();
     } catch (e: any) {
       setError(e?.message || "Failed to duplicate sync pair");
@@ -707,6 +711,11 @@ function PairListView({
               <div className="truncate" title={pair.dest_path}>
                 Dest: {pair.dest_path}
               </div>
+              {!pair.enabled && (
+                <div className="text-amber-600 dark:text-amber-400" data-testid="sync-pair-disabled">
+                  Disabled: it does not run until you turn it on in Edit.
+                </div>
+              )}
               <div>
                 Trigger: {triggerName(pair.trigger)}
                 {pair.last_run && (
@@ -998,6 +1007,13 @@ function CreatePairView({
         </select>
       </label>
 
+      {editing && (
+        <label className="flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
+          <input type="checkbox" checked={form.enabled} onChange={(e) => update("enabled", e.target.checked)} />
+          Enabled (runs on its trigger and from Sync Now)
+        </label>
+      )}
+
       {form.trigger === "scheduled" && (
         <div className="space-y-1">
           <NamedSchedulePicker
@@ -1122,6 +1138,12 @@ function CreatePairView({
               <option value="blind_upload">Blind upload (copy everything, never delete)</option>
             </select>
           </label>
+          {form.mode === "two_way" && form.destState === "blind_upload" && (
+            <p className="text-[10px] text-amber-600 dark:text-amber-400" data-testid="sync-blind-two-way-hint">
+              Blind upload never reads the destination, so a two-way pair only copies source files to it: nothing is
+              deleted and destination changes are not brought back.
+            </p>
+          )}
 
           <label className="block text-xs text-zinc-600 dark:text-zinc-400">
             Exclude Patterns (comma-separated globs)

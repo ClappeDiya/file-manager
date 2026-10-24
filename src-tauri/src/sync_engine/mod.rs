@@ -253,15 +253,16 @@ impl SyncManager {
             message: format!("Sync pair {} not found", pair_id),
             advice: "Check the sync pair ID.".to_string(),
         })?;
+        // The trigger (cron expression included) is copied, but a copy that
+        // would run on its own starts disabled: nothing arms it until the
+        // user turns it on in Edit, after pointing it at its own folders.
+        let automatic = matches!(original.trigger, SyncTrigger::Scheduled { .. } | SyncTrigger::Watch);
         let copy = SyncPair {
             id: Uuid::new_v4(),
             name: format!("{} (copy)", original.name),
             last_run: None,
             created_at: Utc::now(),
-            trigger: match original.trigger {
-                SyncTrigger::Scheduled { .. } | SyncTrigger::Watch => SyncTrigger::Manual,
-                other => other,
-            },
+            enabled: original.enabled && !automatic,
             ..original
         };
         self.create_pair(copy).await
@@ -524,10 +525,19 @@ impl SyncManager {
         let run_id = Uuid::new_v4();
 
         // A checkpoint left by a run that never finished (crash, power
-        // loss, cancel): this run skips the steps it had completed.
-        let resume_from = checkpoint::load(&self.checkpoint_path(pair_id));
+        // loss, cancel): this run skips the steps it had completed. One
+        // written for other folders or another mode says nothing about this
+        // run: drop it.
+        let cp_path = self.checkpoint_path(pair_id);
+        let resume_from = checkpoint::load(&cp_path).filter(|c| {
+            let ok = c.matches(&pair);
+            if !ok {
+                checkpoint::clear(&cp_path);
+            }
+            ok
+        });
         let resuming = resume_from.is_some();
-        let journal = checkpoint::Journal::open(&self.checkpoint_path(pair_id), pair_id, run_id, resuming);
+        let journal = checkpoint::Journal::open(&cp_path, &pair, run_id, resuming);
 
         let config = executor::ExecutorConfig {
             pair: pair.clone(),
@@ -831,16 +841,25 @@ impl SyncManager {
     }
 
     /// Update sync pair configuration. Changing the mode or either folder
-    /// forgets the two-way baseline: it describes other files.
+    /// forgets the two-way baseline: it describes other files. Changing
+    /// what a run copies (folders, mode, filter, options) also drops a
+    /// pending crash-recovery checkpoint: its steps were planned for the old
+    /// definition.
     pub async fn update_pair(&self, pair: SyncPair) -> Result<SyncPair, AppError> {
-        let (reset, rearm) = {
+        let (reset, rearm, stale_checkpoint) = {
             let mut pairs = self.pairs.write().await;
             if let std::collections::hash_map::Entry::Occupied(mut e) = pairs.entry(pair.id) {
                 let old = e.get();
                 let reset = old.mode != pair.mode || old.source_path != pair.source_path || old.dest_path != pair.dest_path;
                 let rearm = old.trigger != pair.trigger || old.enabled != pair.enabled || old.source_path != pair.source_path;
+                let stale_checkpoint = reset
+                    || old.dest_state != pair.dest_state
+                    || old.copy_options != pair.copy_options
+                    || old.option_overrides != pair.option_overrides
+                    || old.run_options != pair.run_options
+                    || serde_json::to_value(&old.filter).ok() != serde_json::to_value(&pair.filter).ok();
                 e.insert(pair.clone());
-                (reset, rearm)
+                (reset, rearm, stale_checkpoint)
             } else {
                 return Err(AppError::Sync {
                     message: "Sync pair not found.".to_string(),
@@ -850,6 +869,9 @@ impl SyncManager {
         };
         if reset {
             self.reset_baseline(pair.id).await?;
+        }
+        if stale_checkpoint {
+            checkpoint::clear(&self.checkpoint_path(pair.id));
         }
         // An edited trigger takes effect now, not after a restart.
         if rearm {
@@ -1214,6 +1236,14 @@ mod checkpoint {
         pair_id: Uuid,
         run_id: Uuid,
         started_at: DateTime<Utc>,
+        /// The folders and mode the run worked on; a checkpoint without them
+        /// matches no pair.
+        #[serde(default)]
+        source_root: String,
+        #[serde(default)]
+        dest_root: String,
+        #[serde(default)]
+        mode: Option<SyncMode>,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -1228,7 +1258,15 @@ mod checkpoint {
         let text = std::fs::read_to_string(path).ok()?;
         let mut lines = text.lines();
         let header: Header = serde_json::from_str(lines.next()?).ok()?;
-        let mut cp = SyncCheckpoint { pair_id: header.pair_id, run_id: header.run_id, started_at: Some(header.started_at), ..Default::default() };
+        let mut cp = SyncCheckpoint {
+            pair_id: header.pair_id,
+            run_id: header.run_id,
+            started_at: Some(header.started_at),
+            source_root: header.source_root,
+            dest_root: header.dest_root,
+            mode: header.mode,
+            completed: Default::default(),
+        };
         for l in lines {
             if let Ok(line) = serde_json::from_str::<Line>(l) {
                 cp.completed.insert(line.path, line.step);
@@ -1251,7 +1289,7 @@ mod checkpoint {
     impl Journal {
         /// Start (or, when resuming, continue) the checkpoint at `path`.
         /// `None` when it cannot be written: the run goes ahead without one.
-        pub fn open(path: &std::path::Path, pair_id: Uuid, run_id: Uuid, resume: bool) -> Option<Self> {
+        pub fn open(path: &std::path::Path, pair: &SyncPair, run_id: Uuid, resume: bool) -> Option<Self> {
             let open = || -> std::io::Result<std::fs::File> {
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir)?;
@@ -1260,7 +1298,14 @@ mod checkpoint {
                     return std::fs::OpenOptions::new().append(true).open(path);
                 }
                 let mut f = std::fs::File::create(path)?;
-                let header = Header { pair_id, run_id, started_at: Utc::now() };
+                let header = Header {
+                    pair_id: pair.id,
+                    run_id,
+                    started_at: Utc::now(),
+                    source_root: pair.source_path.clone(),
+                    dest_root: pair.dest_path.clone(),
+                    mode: Some(pair.mode),
+                };
                 writeln!(f, "{}", serde_json::to_string(&header).map_err(std::io::Error::other)?)?;
                 Ok(f)
             };
@@ -1387,8 +1432,11 @@ impl SyncOperations for SyncManager {
             map.insert(pair.id, pair.clone());
             tracing::info!("Sync pair created: {} ({})", pair.name, pair.id);
 
-            // Set up trigger if needed
+            // Set up trigger if needed. A disabled pair (a duplicate, an
+            // import missing its folders) is not armed: its runs would
+            // only be refused.
             match &pair.trigger {
+                _ if !pair.enabled => {}
                 SyncTrigger::Watch => {
                     drop(map); // Release lock before starting watcher
                     if let Err(e) = self.start_watcher(pair.id).await {
@@ -1421,6 +1469,7 @@ impl SyncOperations for SyncManager {
 
             // Clean up associated data
             self.reset_baseline(pair_id).await?;
+            checkpoint::clear(&self.checkpoint_path(pair_id));
             {
                 let mut reports = self.reports.write().await;
                 reports.remove(&pair_id);
@@ -2105,7 +2154,7 @@ mod tests {
         // A run that died after copying a.txt left this behind.
         let preview = mgr.dry_run(pair.id).await.unwrap();
         let a = preview.modifications.iter().find(|e| e.relative_path == "a.txt").unwrap();
-        let journal = checkpoint::Journal::open(&mgr.checkpoint_path(pair.id), pair.id, Uuid::new_v4(), false).unwrap();
+        let journal = checkpoint::Journal::open(&mgr.checkpoint_path(pair.id), &pair, Uuid::new_v4(), false).unwrap();
         (journal.recorder())("a.txt", &CompletedStep::of(a));
         drop(journal);
         assert_eq!(checkpoint::load(&mgr.checkpoint_path(pair.id)).unwrap().completed.len(), 1);
@@ -2124,6 +2173,47 @@ mod tests {
         assert!(!mgr.checkpoint_path(pair.id).exists());
     }
 
+    /// Regression: the checkpoint of a cancelled run made the next run skip
+    /// its copies after the pair's destination was changed, reporting Success.
+    #[tokio::test]
+    async fn checkpoint_does_not_survive_a_change_of_folders() {
+        let src = tempfile::TempDir::new().unwrap();
+        let d1 = tempfile::TempDir::new().unwrap();
+        let d2 = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), "alpha").unwrap();
+        let mut pair = temp_pair(src.path(), d1.path(), SyncMode::OneWay);
+        pair.copy_options.copy_timestamps = false;
+        let (mgr, _state) = mgr_with(&pair).await;
+        mgr.execute_sync(pair.id).await.unwrap();
+        let record = |mgr: &SyncManager, pair: &SyncPair| {
+            let preview = planner::compute_preview(pair).unwrap();
+            let a = preview.modifications.iter().chain(&preview.additions).find(|e| e.relative_path == "a.txt").unwrap().clone();
+            let journal = checkpoint::Journal::open(&mgr.checkpoint_path(pair.id), pair, Uuid::new_v4(), false).unwrap();
+            (journal.recorder())("a.txt", &CompletedStep::of(&a));
+        };
+
+        // Editing the folders forgets the checkpoint.
+        record(&mgr, &pair);
+        let moved = SyncPair { dest_path: d2.path().to_string_lossy().to_string(), ..pair.clone() };
+        mgr.update_pair(moved.clone()).await.unwrap();
+        assert!(!mgr.checkpoint_path(pair.id).exists(), "update_pair keeps a stale checkpoint");
+        let r = mgr.execute_sync(pair.id).await.unwrap();
+        assert_eq!((r.status, r.files_added, r.resumed), (SyncRunStatus::Success, 1, false));
+        assert!(d2.path().join("a.txt").exists(), "a.txt missing at the new destination");
+
+        // A checkpoint written for other folders is ignored and removed.
+        record(&mgr, &pair);
+        let r = mgr.execute_sync(pair.id).await.unwrap();
+        assert!(!r.resumed);
+        assert_eq!(r.files_modified, 1);
+        assert!(!mgr.checkpoint_path(pair.id).exists());
+
+        // Deleting the pair removes its checkpoint too.
+        record(&mgr, &moved);
+        mgr.delete_pair(pair.id).await.unwrap();
+        assert!(!mgr.checkpoint_path(pair.id).exists());
+    }
+
     #[tokio::test]
     async fn duplicate_copies_the_definition_without_history_or_schedule() {
         let repo = crate::storage::Repository::open_in_memory().await.unwrap();
@@ -2139,7 +2229,11 @@ mod tests {
         let copy = mgr.duplicate_pair(pair.id).await.unwrap();
         assert_ne!(copy.id, pair.id);
         assert_eq!(copy.name, "Regression (copy)");
-        assert_eq!(copy.trigger, SyncTrigger::Manual, "the copy is never scheduled");
+        // The schedule is copied (cron included) but off: the copy is disabled and not armed.
+        assert_eq!(copy.trigger, pair.trigger, "the cron expression is kept");
+        assert!(!copy.enabled, "the copy is never scheduled");
+        assert!(mgr.scheduler.next_run_time(copy.id).is_none(), "the copy's schedule is armed");
+        assert!(mgr.scheduler.next_run_time(pair.id).is_some());
         assert_eq!(copy.copy_options.threads, 4);
         assert!(copy.last_run.is_none());
         assert!(mgr.get_reports(copy.id).await.is_empty());

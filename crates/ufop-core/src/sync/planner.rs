@@ -493,9 +493,12 @@ pub fn plan(pair: &SyncPair, ctx: &PlanContext<'_>) -> Result<Plan, AppError> {
     Ok(plan)
 }
 
-/// The baseline in `ctx`, when it applies to this pair (two-way, same folders).
+/// The baseline in `ctx`, when it applies to this pair (two-way, same folders,
+/// destination observed). Blind upload never lists the destination, so every
+/// tracked file would read as "deleted there": deletions may only come from
+/// a side that was actually looked at.
 fn usable_baseline<'a>(pair: &SyncPair, baseline: Option<&'a SyncBaseline>) -> Option<&'a SyncBaseline> {
-    baseline.filter(|b| pair.mode == SyncMode::TwoWay && b.matches(pair))
+    baseline.filter(|b| pair.mode == SyncMode::TwoWay && pair.dest_state != DestStateMode::BlindUpload && b.matches(pair))
 }
 
 fn check_cancel(ctx: &PlanContext<'_>) -> Result<(), AppError> {
@@ -623,7 +626,9 @@ pub fn diff_trees(
         diff_two_way(pair, &filter, &cmp, &source_map, &dest_map, b, ctx, now, &mut acc)?;
     } else {
         diff_legacy(pair, &filter, &cmp, &source_map, &dest_map, ctx, now, &mut acc)?;
-        if pair.mode == SyncMode::TwoWay {
+        if pair.mode == SyncMode::TwoWay && pair.dest_state == DestStateMode::BlindUpload {
+            acc.notes.push("Blind upload: the destination is not read, so two-way runs only copy source files to it and never delete.".to_string());
+        } else if pair.mode == SyncMode::TwoWay {
             acc.notes.push("First two-way run: files are combined in both directions and nothing is deleted. Later runs propagate deletions.".to_string());
         }
     }

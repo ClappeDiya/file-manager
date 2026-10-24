@@ -766,6 +766,14 @@ pub struct CompletedStep {
     /// Size and time of the file the step copied from (or deleted).
     pub size: Option<u64>,
     pub modified: Option<DateTime<Utc>>,
+    /// When the step finished: a copy made without kept timestamps got its
+    /// time while the interrupted run wrote it, never later.
+    #[serde(default)]
+    pub done_at: Option<DateTime<Utc>>,
+    /// Versioned backup: the version the step stored. The index is written
+    /// at the end of a run, so a resumed run records it from here.
+    #[serde(default)]
+    pub version: Option<crate::sync::versions::StoredVersion>,
 }
 
 /// The steps an interrupted run of a pair had finished (T-042 crash recovery).
@@ -775,10 +783,37 @@ pub struct SyncCheckpoint {
     /// The run that started the checkpoint.
     pub run_id: Uuid,
     pub started_at: Option<DateTime<Utc>>,
+    /// The folders and mode the steps were done against: a checkpoint says
+    /// nothing about a pair that has since been pointed elsewhere.
+    #[serde(default)]
+    pub source_root: String,
+    #[serde(default)]
+    pub dest_root: String,
+    #[serde(default)]
+    pub mode: Option<SyncMode>,
     pub completed: std::collections::BTreeMap<String, CompletedStep>,
 }
 
 impl SyncCheckpoint {
+    /// An empty checkpoint for a run of `pair` starting now.
+    pub fn for_pair(pair: &SyncPair, run_id: Uuid) -> Self {
+        Self {
+            pair_id: pair.id,
+            run_id,
+            started_at: Some(Utc::now()),
+            source_root: pair.source_path.clone(),
+            dest_root: pair.dest_path.clone(),
+            mode: Some(pair.mode),
+            completed: Default::default(),
+        }
+    }
+
+    /// Whether the checkpoint was written by a run of this pair against the
+    /// same folders in the same mode.
+    pub fn matches(&self, pair: &SyncPair) -> bool {
+        self.pair_id == pair.id && self.source_root == pair.source_path && self.dest_root == pair.dest_path && self.mode == Some(pair.mode)
+    }
+
     /// Whether `entry` was already done by the interrupted run, against
     /// files that have not changed since.
     pub fn covers(&self, entry: &SyncDiffEntry) -> bool {
@@ -800,7 +835,7 @@ impl CompletedStep {
     /// The step that finishing `entry` records.
     pub fn of(entry: &SyncDiffEntry) -> Self {
         let (size, modified) = Self::origin(entry);
-        Self { action: entry.action.clone(), direction: entry.direction, size, modified }
+        Self { action: entry.action.clone(), direction: entry.direction, size, modified, done_at: Some(Utc::now()), version: None }
     }
 
     /// Size and time of the side `entry` copies from (or deletes).

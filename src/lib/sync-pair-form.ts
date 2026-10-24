@@ -18,6 +18,8 @@ export interface SyncPairForm {
   mode: string;
   trigger: string;
   cronExpr: string;
+  /** Whether the pair runs (on its trigger, and from "Sync Now"). */
+  enabled: boolean;
   conflictPolicy: string;
   verifyMode: string;
   checksumEnabled: boolean;
@@ -51,6 +53,7 @@ export function emptyPairForm(defaults: CopyOptions = DEFAULT_COPY_OPTIONS): Syn
     mode: "one_way",
     trigger: "manual",
     cronExpr: DEFAULT_CRON,
+    enabled: true,
     conflictPolicy: "create_conflict_copy",
     verifyMode: "fast",
     checksumEnabled: false,
@@ -127,6 +130,7 @@ export function formFromPair(pair: SyncPair, defaults: CopyOptions = DEFAULT_COP
     destPath: pair.dest_path,
     mode: pair.mode,
     ...triggerParts(pair.trigger),
+    enabled: pair.enabled,
     conflictPolicy: pair.conflict_policy,
     verifyMode: pair.verify_mode,
     checksumEnabled: pair.checksum_enabled,
@@ -159,6 +163,7 @@ export function pairFromForm(form: SyncPairForm, original: SyncPair, defaults: C
     dest_path: form.destPath,
     mode: form.mode,
     trigger,
+    enabled: form.enabled,
     filter: filterFromForm(form),
     conflict_policy: form.conflictPolicy,
     verify_mode: form.verifyMode,

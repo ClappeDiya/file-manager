@@ -2,11 +2,17 @@
 //! and the bandwidth timetable.
 //!
 //! A [`SharedRate`] spreads transfers over a time line so that everything
-//! going through it together stays at or below its rate. The machine-wide
-//! [`GLOBAL_UPLOAD`] and [`GLOBAL_DOWNLOAD`] rates (backup "machine-wide
-//! limits", the console's managed caps) also follow the timetable: while a
-//! [`BandwidthWindow`] is active its limits replace the base rate, outside
-//! every window the base rate applies.
+//! going through it together stays at or below its rate.
+//!
+//! - [`GLOBAL_UPLOAD`] / [`GLOBAL_DOWNLOAD`]: the backup "machine-wide
+//!   limits" (and the console's managed caps). They pace backups and
+//!   restores only, as they always have. While a [`BandwidthWindow`] is
+//!   active its limits replace these base rates.
+//! - [`TIMETABLE_UPLOAD`]: the timetable alone (no base rate), shared by
+//!   backups, sync copies and file transfers, so while a window is active
+//!   all of them together stay within its upload limit. Sync copies and
+//!   transfers have no direction of their own and count as uploads; a
+//!   window's download limit applies to backup downloads (restores).
 //!
 //! Window times reuse the sync run-hours format (`HH:MM` or `HHMM`, a window
 //! may wrap midnight) and weekdays the backup-schedule convention
@@ -115,16 +121,24 @@ pub struct SharedRate {
     next: std::sync::Mutex<Option<Instant>>,
     /// Follows the timetable for this direction.
     scheduled: Option<Direction>,
+    /// Outside every window: unlimited (the base rate is never used).
+    window_only: bool,
 }
 
 impl SharedRate {
     pub const fn new() -> Self {
-        Self { bps: AtomicU64::new(0), next: std::sync::Mutex::new(None), scheduled: None }
+        Self { bps: AtomicU64::new(0), next: std::sync::Mutex::new(None), scheduled: None, window_only: false }
     }
 
     /// A rate whose limit the bandwidth timetable replaces while a window is active.
     pub const fn scheduled(direction: Direction) -> Self {
-        Self { bps: AtomicU64::new(0), next: std::sync::Mutex::new(None), scheduled: Some(direction) }
+        Self { bps: AtomicU64::new(0), next: std::sync::Mutex::new(None), scheduled: Some(direction), window_only: false }
+    }
+
+    /// A rate that only the timetable sets: a window's limit while one is
+    /// active, unlimited otherwise.
+    pub const fn window_only(direction: Direction) -> Self {
+        Self { bps: AtomicU64::new(0), next: std::sync::Mutex::new(None), scheduled: Some(direction), window_only: true }
     }
 
     /// Base rate in bytes per second; 0 = unlimited.
@@ -149,7 +163,11 @@ impl SharedRate {
 
     /// The rate at `t` under `windows` (for tests and previews).
     pub fn rate_with(&self, windows: &[BandwidthWindow], t: NaiveDateTime) -> u64 {
-        self.scheduled.and_then(|d| window_at(windows, t).map(|w| w.limit(d))).unwrap_or_else(|| self.base())
+        match self.scheduled.and_then(|d| window_at(windows, t).map(|w| w.limit(d))) {
+            Some(limit) => limit,
+            None if self.window_only => 0,
+            None => self.base(),
+        }
     }
 
     /// How long a transfer of `bytes` that started at `started` must still
@@ -183,9 +201,34 @@ impl Default for SharedRate {
     }
 }
 
-/// Machine-wide upload and download caps (on top of each job's own throttle).
+/// Backup machine-wide upload and download caps (on top of each job's own
+/// throttle); timetable windows replace them while active.
 pub static GLOBAL_UPLOAD: SharedRate = SharedRate::scheduled(Direction::Upload);
 pub static GLOBAL_DOWNLOAD: SharedRate = SharedRate::scheduled(Direction::Download);
+
+/// The timetable's upload limit, shared by backups, sync and transfers
+/// (unlimited outside every window).
+pub static TIMETABLE_UPLOAD: SharedRate = SharedRate::window_only(Direction::Upload);
+
+/// Reserve `bytes` on every rate in `rates`; the wait is the longest.
+pub fn reserve_all(rates: &[&SharedRate], bytes: usize, started: Instant) -> Duration {
+    rates.iter().map(|r| r.reserve(bytes, started)).max().unwrap_or(Duration::ZERO)
+}
+
+/// Block the thread until `bytes` fit every rate in `rates`.
+pub fn wait_all(rates: &[&SharedRate], bytes: usize, started: Instant) {
+    let d = reserve_all(rates, bytes, started);
+    if !d.is_zero() {
+        std::thread::sleep(d);
+    }
+}
+
+/// Serializes tests that change the process-wide rates or timetable.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[cfg(test)]
 mod tests {
@@ -222,6 +265,22 @@ mod tests {
         let plain = SharedRate::new();
         plain.set(42);
         assert_eq!(plain.rate_with(&windows, at(19, 9, 30)), 42);
+    }
+
+    #[test]
+    fn timetable_rate_has_no_base() {
+        let windows = vec![window(&[], "08:00", "18:00", 1_000)];
+        let tt = SharedRate::window_only(Direction::Upload);
+        tt.set(5); // never used
+        assert_eq!(tt.rate_with(&windows, at(19, 7, 0)), 0, "outside every window: unlimited");
+        assert_eq!(tt.rate_with(&windows, at(19, 9, 0)), 1_000);
+        assert_eq!(tt.rate_with(&[], at(19, 9, 0)), 0);
+        // The longest wait of several rates wins.
+        let (a, b) = (SharedRate::new(), SharedRate::new());
+        b.set(1_000);
+        let t = Instant::now();
+        b.reserve(1_000, t);
+        assert!(reserve_all(&[&a, &b], 1_000, t) >= Duration::from_millis(900));
     }
 
     #[test]

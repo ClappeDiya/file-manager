@@ -3,10 +3,11 @@
 //! A handle on the one shared limiter (`ufop_core::throttle::SharedRate`,
 //! also used by backups and sync). The transfer queue's limit
 //! (`set_global_throttle`) is [`TRANSFER_RATE`]; every chunk is also paced
-//! by the machine-wide upload limit, which follows the bandwidth timetable.
+//! by the bandwidth timetable's upload limit (shared with backups and sync).
+//! The backup machine-wide caps do not apply to transfers.
 
 use std::time::{Duration, Instant};
-use ufop_core::throttle::{SharedRate, GLOBAL_UPLOAD};
+use ufop_core::throttle::{reserve_all, SharedRate, TIMETABLE_UPLOAD};
 
 /// The transfer queue's limit, shared by every transfer worker.
 pub static TRANSFER_RATE: SharedRate = SharedRate::new();
@@ -70,13 +71,33 @@ impl BandwidthThrottler {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Tests: the transfer-queue rate to pace by instead of [`TRANSFER_RATE`],
+    /// so a test's limit never slows other tests in the process.
+    pub static TEST_TRANSFER_RATE: std::sync::Arc<SharedRate>;
+}
+
 /// Pace one transferred chunk of `bytes` that started at `started`: by the
-/// transfer queue's limit and the machine-wide upload limit (timetable).
+/// transfer queue's limit and the bandwidth timetable.
 pub async fn pace_chunk(bytes: usize, started: Instant) {
-    let wait = TRANSFER_RATE.reserve(bytes, started).max(GLOBAL_UPLOAD.reserve(bytes, started));
+    #[cfg(test)]
+    let owned = TEST_TRANSFER_RATE.try_with(|r| r.clone()).ok();
+    #[cfg(test)]
+    let queue: &SharedRate = owned.as_deref().unwrap_or(&TRANSFER_RATE);
+    #[cfg(not(test))]
+    let queue: &SharedRate = &TRANSFER_RATE;
+    let wait = reserve_all(&[queue, &TIMETABLE_UPLOAD], bytes, started);
     if !wait.is_zero() {
         tokio::time::sleep(wait).await;
     }
+}
+
+/// Serializes tests that change the process-wide rates or the timetable.
+#[cfg(test)]
+pub async fn global_rates_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
 }
 
 #[cfg(test)]

@@ -52,9 +52,12 @@ function backend(extra: Record<string, (a: Record<string, unknown>) => unknown> 
     get_filter_groups: () => [{ name: "video", description: "Video files", patterns: ["*.mp4"] }],
     update_sync_pair: (a) => JSON.parse(a.pairJson as string),
     create_sync_pair: () => ({ ...pair, id: "p2" }),
-    duplicate_sync_pair: () => ({ ...pair, id: "p3", name: "Photos (copy)", trigger: "manual" }),
+    // A scheduled pair's copy keeps its cron expression and starts disabled.
+    duplicate_sync_pair: () => ({ ...pair, id: "p3", name: "Photos (copy)", enabled: false }),
     export_sync_pair: () => '{"format":"ufop-sync-pair","version":1}',
     import_sync_pair: () => ({ pair: { ...pair, id: "p4", enabled: false }, warnings: ["The source folder /home/me/Pictures does not exist on this computer."] }),
+    schedules_list: () => [],
+    calendars_list: () => [],
     parse_filter_rules: () => [{ action: "include", kind: "rclone", pattern: "/Photos/**" }],
     ...extra,
   };
@@ -94,6 +97,8 @@ describe("sync pair form mapping", () => {
     expect(saved.filter.include_regex).toEqual(["^keep/"]);
     expect(saved.filter.rules).toEqual(pair.filter.rules);
     expect(saved.option_overrides).toEqual(["threads"]);
+    expect(saved.enabled).toBe(true);
+    expect(pairFromForm({ ...form, enabled: false }, pair, defaults).enabled).toBe(false);
     expect(pairFromForm(form, { ...pair, option_overrides: null }, defaults).option_overrides).toBeNull();
     expect(filterFromForm(emptyPairForm()).rules).toEqual([]);
   });
@@ -120,7 +125,30 @@ describe("SyncPanel: edit, duplicate, export, import", () => {
     render(<SyncPanel />);
     fireEvent.click(await screen.findByLabelText("Duplicate Photos"));
     await waitFor(() => expect(called("duplicate_sync_pair")).toEqual([{ pairId: "p1" }]));
-    expect(await screen.findByText(/Created "Photos \(copy\)"/)).toBeInTheDocument();
+    expect(await screen.findByText(/Created "Photos \(copy\)". It is disabled/)).toBeInTheDocument();
+  });
+
+  it("keeps a disabled copy's schedule and turns it on from Edit", async () => {
+    const copy = { ...pair, id: "p3", name: "Photos (copy)", enabled: false };
+    backend({ list_sync_pairs: () => [copy] });
+    render(<SyncPanel />);
+    expect(await screen.findByTestId("sync-pair-disabled")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Edit Photos (copy)"));
+    expect(screen.getByDisplayValue("0 0 2 * * * *")).toBeInTheDocument();
+    const toggle = screen.getByLabelText(/Enabled \(runs on its trigger/);
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(called("update_sync_pair").length).toBe(1));
+    const saved = JSON.parse(called("update_sync_pair")[0].pairJson as string);
+    expect(saved).toMatchObject({ id: "p3", enabled: true, trigger: { scheduled: { cron_expr: "0 0 2 * * * *" } } });
+  });
+
+  it("warns that a two-way pair with blind upload never deletes", async () => {
+    backend({ list_sync_pairs: () => [{ ...pair, mode: "two_way", dest_state: "blind_upload" }] });
+    render(<SyncPanel />);
+    fireEvent.click(await screen.findByLabelText("Edit Photos"));
+    expect(screen.getByTestId("sync-blind-two-way-hint")).toHaveTextContent(/nothing is\s+deleted/);
   });
 
   it("exports and imports pairs in the Advanced view only", async () => {

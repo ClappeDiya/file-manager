@@ -284,12 +284,12 @@ A two-way pair remembers what both folders looked like after its last successful
 - A run that fails, is cancelled or stops at the end of its run hours keeps the previous history, so nothing it left half done is mistaken for a deletion.
 - **Safety stop**: a run that would delete more than 50% of the synced files on one side (more than two files), or everything because one folder is empty or missing, is refused — usually an unplugged drive or an unmounted share. Change the limit in *Cleanup & moving* (0 turns it off) or reset the history.
 
-Changing a pair's mode or folders forgets its history. In the Advanced view each two-way pair shows its history size and a **Reset history** button.
+With **Destination state: Blind upload** the destination is never read, so a two-way pair only copies source files to it and never deletes anything (no history is used or recorded). Changing a pair's mode or folders forgets its history. In the Advanced view each two-way pair shows its history size and a **Reset history** button.
 
 ### Edit, duplicate, export and import
 
 - **Edit** opens the pair in the same form used to create it.
-- **Duplicate** creates "*name* (copy)" with the same settings, no run history and its schedule (or watcher) off. Backup jobs have **Duplicate** too: the copy's schedules (including replica timers) are off, stored credentials are copied rather than shared, and it opens in the editor so you can give it its own destination.
+- **Duplicate** creates "*name* (copy)" with the same settings, no run history and its schedule (or watcher) off: a scheduled or watched pair's copy keeps its trigger (the cron expression included) but starts disabled; turn it on with **Enabled** in Edit once it points at its own folders. Backup jobs have **Duplicate** too: the copy's schedules (including replica timers, and a schedule or maintenance plan it would inherit from a policy template) are off, stored credentials are copied rather than shared, and it opens in the editor so you can give it its own destination.
 - **Export** / **Import** (Advanced view) save one pair as a `ufop-sync-pair` JSON file and load it on another computer. If a folder is missing there, or a folder is on a saved connection's mount that the computer does not have, the import says so and the pair stays disabled until you fix it.
 
 ### Filters, rules and presets
@@ -310,14 +310,14 @@ Versioned-backup pairs keep every stored version unless *Versions to keep of eac
 
 ### Interrupted runs
 
-Each finished step of a run is recorded as it happens. If the app quits, crashes or the run is cancelled, the next run skips the steps that were already done (for files that have not changed since) and its report says *Resumed from interruption*.
+Each finished step of a run is recorded as it happens. If the app quits, crashes or the run is cancelled, the next run skips the steps that were already done (for files that have not changed since, and whose copy is still in place at the other side) and its report says *Resumed from interruption*. Editing the pair's folders, mode, filter or options, or deleting the pair, discards that record; versions a versioned backup stored before a crash are added to its version list on the next run.
 
 ### Global sync defaults and bandwidth timetable
 
 Settings › Advanced has:
 
 - **Sync defaults**: copy options new pairs start from. A pair created afterwards stores only the options it changes and follows the defaults for the rest; pairs created before keep all their own options.
-- **Bandwidth timetable**: windows (weekdays, from–to) with upload and download limits that replace the machine-wide limits while active, for file transfers, sync and backups alike. A window that ends before it starts runs past midnight; the first matching window wins.
+- **Bandwidth timetable**: windows (weekdays, from–to) with upload and download limits. While a window is active its upload limit is shared by file transfers, sync copies and backups together (transfers and sync copies count as uploads), its download limit applies to backup restores, and both replace the backup machine-wide limits. The backup machine-wide limits themselves still apply to backups and restores only. A window that ends before it starts runs past midnight; the first matching window wins.
 
 ### Rollback
 
