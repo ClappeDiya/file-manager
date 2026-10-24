@@ -61,9 +61,8 @@ export function RunNotifyPicker({ value, onChange, advanced }: { value: RunNotif
             <label className={labelCls}>
               Don’t report successful runs below (MB)
               <input
-                type="number"
-                min={0}
-                step="any"
+                type="text"
+                inputMode="decimal"
                 className={field}
                 placeholder="no limit"
                 value={mbText}

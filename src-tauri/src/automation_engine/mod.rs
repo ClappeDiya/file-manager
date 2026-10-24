@@ -1846,7 +1846,18 @@ mod tests {
         let last = &rules[rules.len() - 2];
         assert_eq!(last.trigger, RuleTrigger::Webhook);
         assert!(matches!(last.condition_tree, Some(ConditionNode::Any { ref nodes }) if nodes.len() == 2));
-        assert_eq!(last.steps.len(), 7);
+        assert_eq!(last.steps.len(), 13);
+        // Steps, result names and notification settings added with the Quickflows parity work.
+        assert!(matches!(&last.steps[7].action, RuleAction::ListFiles { format: ListFormat::Json, recursive: true, include_dirs: true, overwrite: false, .. }));
+        assert_eq!(last.steps[7].output_as.as_deref(), Some("listing"));
+        assert!(matches!(&last.steps[8].action, RuleAction::VerifyPair { sync_pair_id, full: true } if sync_pair_id == "pair-1"));
+        assert!(matches!(&last.steps[9].action, RuleAction::RemoveEmptyDirs { remove_root: true, .. }));
+        assert!(matches!(&last.steps[10].action, RuleAction::Purge { path, max_files: Some(500) } if path == "/in/tmp"));
+        assert!(matches!(&last.steps[11].action, RuleAction::DownloadUrl { destination_connection_id: Some(c), destination_protocol: Some(p), remote_path: Some(r), .. } if c == "conn-1" && p == "sftp" && r == "/in/{yyyy}"));
+        assert!(outputs::validate_rule(last).is_ok(), "{{steps.listing.*}} resolves to the earlier step");
+        assert_eq!(last.options.notify.notify_profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(last.options.notify.notify_on, vec!["warning".to_string(), "error".to_string()]);
+        assert_eq!(last.options.notify.min_bytes, Some(1_048_576));
         assert!(matches!(&last.steps[6].action, RuleAction::ScanForMalware { quarantine_path, notify: false } if quarantine_path == "/quarantine/{yyyy}"));
         assert!(matches!(&last.steps[5].action, RuleAction::AiTask { instruction, suffix, max_chars: 5000, .. } if instruction == "Classify {filename}" && suffix == "class.txt"));
         assert!(matches!(&last.steps[2].action, RuleAction::ConvertImage { format: Some(f), max_width: Some(800), max_height: None, quality: None, dest_path } if f == "webp" && dest_path == "/in/small"));

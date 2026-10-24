@@ -479,12 +479,33 @@ export interface RulePreset {
   id: string;
   label: string;
   description: string;
+  /** Extra words the template search matches (topics, step names). */
+  tags: string[];
   build: (folder: string) => RuleForm;
+}
+
+/**
+ * Templates matching `query`: every word must appear in the name,
+ * description or a tag (case-insensitive); name matches rank first.
+ * An empty query lists them all, in their own order.
+ */
+export function searchPresets(presets: RulePreset[], query: string): RulePreset[] {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return presets;
+  const scored: { p: RulePreset; rank: number; i: number }[] = [];
+  presets.forEach((p, i) => {
+    const name = p.label.toLowerCase();
+    const rest = `${p.description} ${p.tags.join(" ")}`.toLowerCase();
+    if (!words.every((w) => name.includes(w) || rest.includes(w))) return;
+    scored.push({ p, i, rank: words.every((w) => name.includes(w)) ? 0 : 1 });
+  });
+  return scored.sort((a, b) => a.rank - b.rank || a.i - b.i).map((x) => x.p);
 }
 
 export const PRESETS: RulePreset[] = [
   {
     id: "notify-arrivals",
+    tags: ["notification","alert","watch","folder","new files"],
     label: "Tell me when files arrive",
     description: "A notification for every new file in a folder.",
     build: (folder) => ({
@@ -495,6 +516,7 @@ export const PRESETS: RulePreset[] = [
   },
   {
     id: "file-by-date",
+    tags: ["organise","organize","sort","move","year","month","folders"],
     label: "File arrivals by date",
     description: "Move each new file into Year/Month folders.",
     build: (folder) => ({
@@ -505,6 +527,7 @@ export const PRESETS: RulePreset[] = [
   },
   {
     id: "expire-old",
+    tags: ["delete","retention","trash","schedule","nightly","cleanup","age"],
     label: "Clean up old files",
     description: "Every night, move files untouched for 30 days to the folder's trash.",
     build: (folder) => ({
@@ -518,6 +541,7 @@ export const PRESETS: RulePreset[] = [
   },
   {
     id: "malware-scan",
+    tags: ["antivirus","clamav","virus","security","quarantine"],
     label: "Scan arrivals for malware",
     description: "Scan each new file with ClamAV; infected files go to a quarantine folder and you are notified.",
     build: (folder) => ({
@@ -528,6 +552,7 @@ export const PRESETS: RulePreset[] = [
   },
   {
     id: "unzip-arrivals",
+    tags: ["extract","archive","zip","decompress"],
     label: "Unzip arriving archives",
     description: "Extract new .zip files next to them and keep the archive.",
     build: (folder) => ({
@@ -535,6 +560,30 @@ export const PRESETS: RulePreset[] = [
       name: "Extract arriving zips",
       conditions: [{ key: rowKey(), negate: false, condition: { type: "extension_is", extensions: ["zip"] } }],
       steps: [{ action: { type: "extract_archive", dest_path: `${folder}/{name}`, max_entries: 10_000, delete_archive: false }, continue_on_error: false }],
+    }),
+  },
+  {
+    id: "weekly-listing",
+    tags: ["inventory", "csv", "json", "report", "list files", "schedule", "weekly"],
+    label: "Weekly file listing",
+    description: "Every Sunday write a CSV listing of everything in a folder.",
+    build: (folder) => ({
+      ...newRuleForm(folder),
+      name: "Weekly file listing",
+      trigger: { type: "schedule", cron_expr: "0 0 3 * * Sun *", cron_human: "Every Sunday at 03:00" },
+      steps: [{ action: { type: "list_files", path: folder, output: `${folder || "~"}/listing-{yyyy}-{mm}-{dd}.csv`, format: "csv", recursive: true, include_dirs: false, overwrite: true }, continue_on_error: false }],
+    }),
+  },
+  {
+    id: "remove-empty-folders",
+    tags: ["cleanup", "empty", "directories", "tidy", "schedule", "weekly"],
+    label: "Tidy up empty folders",
+    description: "Every Sunday remove folders that have nothing in them.",
+    build: (folder) => ({
+      ...newRuleForm(folder),
+      name: "Remove empty folders",
+      trigger: { type: "schedule", cron_expr: "0 0 3 * * Sun *", cron_human: "Every Sunday at 03:00" },
+      steps: [{ action: { type: "remove_empty_dirs", path: folder, remove_root: false }, continue_on_error: false }],
     }),
   },
 ];

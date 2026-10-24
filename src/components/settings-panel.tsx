@@ -28,6 +28,7 @@ import { FleetAgentLimits } from "@/components/fleet-agent-limits";
 import { PortableModeBadge, PortableModeDetails } from "@/components/portable-mode-status";
 import { usePortableStatus } from "@/hooks/use-portable-status";
 import { MetricsExporterSection } from "@/components/metrics-exporter-section";
+import { ChatControlSection } from "@/components/chat-control-section";
 import { AdvancedOnly } from "@/components/backup/advanced-only";
 
 // ── Types ──
@@ -1408,6 +1409,8 @@ export default function SettingsPanel({
           <AdvancedOnly hint>
             <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Prometheus metrics</h3>
             <MetricsExporterSection />
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Remote control from chat</h3>
+            <ChatControlSection />
           </AdvancedOnly>
         </Section>
 
