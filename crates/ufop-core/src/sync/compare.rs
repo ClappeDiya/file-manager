@@ -74,7 +74,7 @@ pub struct SideListing {
     pub entries: Vec<FileMeta>,
     /// Entries (or whole folders) that could not be read.
     pub errors: Vec<ListingError>,
-    /// Folders listed but not looked inside (depth limit).
+    /// Folders listed but not looked inside (depth limit, linked folders).
     pub truncated: HashSet<String>,
 }
 
@@ -305,15 +305,16 @@ pub fn compare_entries(
 
     // A folder whose every entry the filter left out is not part of the
     // comparison either (a folder that is really empty stays).
+    let stands_alone = |e: &CompareEntry| !e.is_dir || e.status == CompareStatus::Error || e.children_skipped || !had_children.contains(&e.path);
     let mut kept_dirs: HashSet<String> = HashSet::new();
-    for e in &entries {
+    for e in entries.iter().filter(|e| stands_alone(e)) {
         for a in ancestors(&e.path) {
             if !kept_dirs.insert(a.to_string()) {
                 break;
             }
         }
     }
-    entries.retain(|e| !e.is_dir || e.status == CompareStatus::Error || kept_dirs.contains(&e.path) || !had_children.contains(&e.path) || e.children_skipped);
+    entries.retain(|e| stands_alone(e) || kept_dirs.contains(&e.path));
     Ok((entries, cmp.notes()))
 }
 
@@ -367,7 +368,7 @@ pub fn finalize(entries: &mut [CompareEntry]) -> CompareSummary {
                 (true, false) => (CompareStatus::LeftOnly, None),
                 (false, true) => (CompareStatus::RightOnly, None),
                 _ if dirty.contains(&e.path) => (CompareStatus::Different, Some("Contents differ".to_string())),
-                _ if e.children_skipped => (CompareStatus::Same, Some("Contents not compared (below the depth limit)".to_string())),
+                _ if e.children_skipped => (CompareStatus::Same, Some("Contents not compared (below the depth limit, or a linked folder)".to_string())),
                 _ => (CompareStatus::Same, None),
             };
         }
@@ -788,12 +789,12 @@ mod tests {
 
     #[test]
     fn filter_engine_applies_and_prunes_emptied_folders() {
-        let l = listing(vec![dir("logs"), file("logs/a.log", 1, 1), dir("empty"), file("keep.txt", 1, 1), file("drop.log", 1, 1)]);
+        let l = listing(vec![dir("logs"), dir("logs/old"), file("logs/old/a.log", 1, 1), dir("empty"), file("keep.txt", 1, 1), file("drop.log", 1, 1)]);
         let r = listing(vec![file("keep.txt", 1, 1)]);
         let opts = CompareOptions { filter: SyncFilter { exclude_patterns: vec!["*.log".into()], ..Default::default() }, ..Default::default() };
         let out = compare_listings(&l, &r, &opts, None, None).unwrap();
         let paths: Vec<&str> = out.entries.iter().map(|e| e.path.as_str()).collect();
-        // `logs` only held excluded files; `empty` really is empty and stays.
+        // `logs` (and `logs/old`) only held excluded files; `empty` really is empty and stays.
         assert_eq!(paths, ["empty", "keep.txt"]);
     }
 

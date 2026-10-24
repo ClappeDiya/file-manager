@@ -396,6 +396,38 @@ impl TransferManager {
         self.complete_job(job_id).await.map_err(|e| e.to_string())
     }
 
+    /// Show work another engine runs — a connector upload or download for a
+    /// folder comparison — as an active job in the queue, so it has the same
+    /// progress row and history entry as engine copies. The queue runner
+    /// never executes it (remote endpoints are labelled `protocol://…`, which
+    /// it refuses); the caller ends it with [`TransferManager::finish_external`].
+    pub async fn track_external(&self, source: &str, dest: &str, total_bytes: u64, connection_id: Option<Uuid>) -> Result<TransferJob, AppError> {
+        let job = self.enqueue(source, dest, total_bytes).await?;
+        let mut map = self.jobs.write().await;
+        let job = map.get_mut(&job.id).ok_or_else(|| AppError::internal("Tracked transfer vanished"))?;
+        job.status = TransferStatus::Active;
+        job.connection_id = connection_id;
+        // Connectors verify their own uploads; the engine computed no checksums.
+        job.verify_checksum = false;
+        job.updated_at = Utc::now();
+        Ok(job.clone())
+    }
+
+    /// End a job started with [`TransferManager::track_external`]: completed
+    /// with the bytes moved, or failed with the error. Recorded in history.
+    pub async fn finish_external(&self, job_id: Uuid, outcome: Result<u64, String>, started_at: chrono::DateTime<Utc>, elapsed: std::time::Duration) {
+        let _ = match outcome {
+            Ok(bytes) => {
+                if let Some(job) = self.jobs.write().await.get_mut(&job_id) {
+                    job.total_bytes = bytes.max(job.total_bytes);
+                }
+                self.complete_job(job_id).await
+            }
+            Err(e) => self.fail_job(job_id, &e).await,
+        };
+        self.record_history(job_id, started_at, elapsed).await;
+    }
+
     /// Initialize the journal backend. Must be called after DB is available.
     pub async fn init_journal(&self, pool: DbPool) {
         let journal = TransferJournal::new(pool);

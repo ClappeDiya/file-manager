@@ -3,6 +3,7 @@ pub mod automation_engine;
 pub mod backup_engine;
 pub mod chat_control;
 pub mod commands;
+pub mod compare_engine;
 pub mod paths;
 pub mod compat_engine;
 pub mod convert_engine;
@@ -83,6 +84,8 @@ struct AppState {
     confirmation_mgr: ConfirmationManager,
     ledger: OperationLedger,
     safety_interlock: SafetyInterlock,
+    /// Folder comparisons: running tasks and results to act on.
+    compare_mgr: compare_engine::CompareManager,
     narrator: OperationNarrator,
     quickflow_suggester: LedgerSuggester,
     backup_mgr: BackupManager,
@@ -330,6 +333,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         ledger,
         schedule_library,
         safety_interlock,
+        compare_mgr: compare_engine::CompareManager::new(),
         narrator,
         quickflow_suggester,
         desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics::new(backup_mgr.clone()),
@@ -506,6 +510,7 @@ pub fn run() {
                     ledger,
                     schedule_library: fallback_schedules,
                     safety_interlock,
+                    compare_mgr: compare_engine::CompareManager::new(),
                     narrator,
                     quickflow_suggester,
                     desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics::new(backup_mgr.clone()),
@@ -637,6 +642,7 @@ pub fn run() {
         .manage(app_state.ledger)
         .manage(app_state.schedule_library)
         .manage(app_state.safety_interlock)
+        .manage(app_state.compare_mgr)
         .manage(app_state.narrator)
         .manage(app_state.quickflow_suggester)
         .manage(app_state.backup_mgr)
@@ -766,6 +772,12 @@ pub fn run() {
             connector_commands::connector_quota,
             connector_commands::connector_folder_size,
             connector_commands::connector_folder_size_cancel,
+            // Folder compare and reconcile
+            commands::compare_commands::compare_folders,
+            commands::compare_commands::compare_cancel,
+            commands::compare_commands::compare_release,
+            commands::compare_commands::compare_plan_action,
+            commands::compare_commands::compare_apply,
             // SMB/CIFS (T-023)
             drive_commands::smb_discover_shares,
             drive_commands::smb_list_shares,

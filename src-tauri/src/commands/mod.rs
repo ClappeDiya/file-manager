@@ -6,6 +6,7 @@ pub mod archive_commands;
 pub mod confirmation_commands;
 pub mod aws_commands;
 pub mod batch_rename_commands;
+pub mod compare_commands;
 pub mod connection_commands;
 pub mod connector_commands;
 pub mod oauth_commands;

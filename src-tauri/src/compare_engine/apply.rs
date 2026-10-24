@@ -1,0 +1,570 @@
+//! Copy or delete selected differences of a comparison, then re-compare
+//! just the entries that changed.
+//!
+//! - Local → local copies are transfer-engine jobs (the queue's verified,
+//!   journalled, pausable copy) into a hidden sibling, moved into place
+//!   once complete; the copy keeps the source's modification time.
+//! - Copies to or from a connection go through its connector (upload,
+//!   download, or download-then-upload between two connections) and show
+//!   in the transfer queue as tracked jobs.
+//! - A copy that replaces a different file first moves the old one to the
+//!   Trash (or deletes it, when the user chose permanent).
+//! - Local deletes go through the file manager's own delete (Trash unless
+//!   permanent); connection deletes through the connector. A folder is
+//!   removed only once nothing is left in it.
+//!
+//! Everything is recorded in the operation ledger. Local copies of new files
+//! and local folders created are recorded as `fs` copy / create-folder
+//! operations, so Undo removes them; replacements and deletes are recorded
+//! as such (the Trash holds what they removed).
+
+use super::{ComparePhase, CompareProgress, ProgressFn, ResolvedSide};
+use crate::commands::file_ops_commands::{delete_files_impl, move_to_trash, record_fs_ok};
+use crate::core::error::AppError;
+use crate::core::traits::TransferOperations;
+use crate::core::types::TransferStatus;
+use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
+use crate::sync_engine::compare::{self, ActionPlan, ActionStep, CompareAction, CompareEntry, CompareOptions, CompareSideId, CompareSummary, ListingError, LocalSidesHasher, SideListing, SkippedEntry};
+use crate::sync_engine::planner::FileMeta;
+use crate::transfer_engine::TransferManager;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use tokio_util::sync::CancellationToken;
+
+/// What running an action needs besides the two sides.
+pub struct ApplyEnv<'a> {
+    pub transfer: &'a TransferManager,
+    pub ledger: &'a OperationLedger,
+    /// Delete for good (and replace without keeping the old file) instead
+    /// of moving to the Trash.
+    pub permanent: bool,
+    pub cancel: &'a CancellationToken,
+    pub progress: &'a ProgressFn,
+    pub task_id: &'a str,
+}
+
+/// A step that did not work.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailedStep {
+    pub path: String,
+    pub error: String,
+}
+
+/// How an action went, and the comparison entries it changed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyOutcome {
+    pub task_id: String,
+    pub action: CompareAction,
+    /// Paths copied, created or deleted.
+    pub done: Vec<String>,
+    pub failed: Vec<FailedStep>,
+    pub skipped: Vec<SkippedEntry>,
+    /// Folders left in place because they still hold something.
+    pub kept: Vec<String>,
+    pub notes: Vec<String>,
+    pub cancelled: bool,
+    /// Ledger id of the copies Undo can remove, when there are any.
+    pub undo_id: Option<String>,
+    /// Re-compared entries (folders above them included) …
+    pub changed: Vec<CompareEntry>,
+    /// … and paths now on neither side.
+    pub removed: Vec<String>,
+    pub summary: CompareSummary,
+}
+
+/// What [`execute`] did.
+#[derive(Debug, Default)]
+pub struct ExecReport {
+    pub done: Vec<String>,
+    pub failed: Vec<FailedStep>,
+    pub kept: Vec<String>,
+    pub notes: Vec<String>,
+    pub cancelled: bool,
+    pub undo_id: Option<String>,
+    /// Paths to re-compare.
+    pub touched: HashSet<String>,
+}
+
+/// Ledger records, gathered while the steps run.
+#[derive(Default)]
+struct Records {
+    /// Local copies of files that were not there (undoable).
+    copied: (Vec<String>, Vec<String>),
+    /// Local files replaced.
+    replaced: (Vec<String>, Vec<String>),
+    /// Local folders created (undoable).
+    created: Vec<String>,
+    uploads_with_new_time: u64,
+}
+
+fn side<'a>(id: CompareSideId, left: &'a ResolvedSide, right: &'a ResolvedSide) -> &'a ResolvedSide {
+    match id {
+        CompareSideId::Left => left,
+        CompareSideId::Right => right,
+    }
+}
+
+/// Run `plan` over the two sides, step by step (stopping between steps when
+/// cancelled). Never fails as a whole: each step's error is reported.
+pub async fn execute(plan: &ActionPlan, left: &ResolvedSide, right: &ResolvedSide, env: &ApplyEnv<'_>) -> ExecReport {
+    let mut report = ExecReport::default();
+    let mut rec = Records::default();
+    let total = plan.steps.len() as u64;
+    let mut pending_deletes: Vec<(String, String)> = Vec::new();
+    let mut created_recorded = false;
+
+    for (i, step) in plan.steps.iter().enumerate() {
+        if env.cancel.is_cancelled() {
+            report.cancelled = true;
+            break;
+        }
+        let mut p = CompareProgress::new(env.task_id, ComparePhase::Applying);
+        (p.done, p.total, p.current) = (i as u64, total, Some(step.path().to_string()));
+        (env.progress)(p);
+        report.touched.insert(step.path().to_string());
+
+        // Local file deletes run as one batch (one ledger operation), flushed
+        // before anything else (the folders they empty) runs.
+        if let ActionStep::Delete { side: s, path, is_dir: false, .. } = step {
+            if let Some(local) = side(*s, left, right).local_path(path) {
+                pending_deletes.push((path.clone(), local.to_string_lossy().to_string()));
+                continue;
+            }
+        }
+        flush_deletes(&mut pending_deletes, env, &mut report).await;
+        // Folders are created before any copy: record them first, so Undo
+        // removes the copies, then the (then empty) folders.
+        if !created_recorded && matches!(step, ActionStep::Copy { .. }) {
+            created_recorded = true;
+            record_created(&mut rec, env.ledger).await;
+        }
+
+        let result = match step {
+            ActionStep::MakeDir { side: s, path } => make_dir(side(*s, left, right), path, env.ledger, &mut rec).await,
+            ActionStep::Copy { from, to, path, size, modified, replace } => {
+                copy_file(side(*from, left, right), side(*to, left, right), path, *size, *modified, *replace, env, &mut rec).await
+            }
+            ActionStep::Delete { side: s, path, is_dir, .. } => {
+                let target = side(*s, left, right);
+                if *is_dir {
+                    match delete_dir(target, path, env).await {
+                        Ok(true) => Ok(()),
+                        Ok(false) => {
+                            report.kept.push(path.clone());
+                            continue;
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    delete_remote_file(target, path, env.ledger).await
+                }
+            }
+        };
+        match result {
+            Ok(()) => report.done.push(step.path().to_string()),
+            Err(error) => report.failed.push(FailedStep { path: step.path().to_string(), error }),
+        }
+    }
+    flush_deletes(&mut pending_deletes, env, &mut report).await;
+    if !created_recorded {
+        record_created(&mut rec, env.ledger).await;
+    }
+
+    if !rec.copied.1.is_empty() {
+        let id = uuid::Uuid::new_v4().to_string();
+        record_fs_ok(env.ledger, "copy", &rec.copied.0, &rec.copied.1, &id).await;
+        report.undo_id = Some(id);
+    }
+    if !rec.replaced.1.is_empty() {
+        let id = uuid::Uuid::new_v4().to_string();
+        record_fs_ok(env.ledger, "overwrite", &rec.replaced.0, &rec.replaced.1, &id).await;
+        let kept = if env.permanent { "deleted" } else { "moved to the Trash" };
+        report.notes.push(format!("{} replaced file(s): the previous versions were {kept}.", rec.replaced.1.len()));
+    }
+    if rec.uploads_with_new_time > 0 {
+        report.notes.push(format!(
+            "{} file(s) uploaded to a connection may carry the upload time as their modification time; compare by size only (or checksum) if they still show as different.",
+            rec.uploads_with_new_time
+        ));
+    }
+    if !report.kept.is_empty() {
+        report.notes.push(format!("{} folder(s) were kept because they still hold files that are not part of this comparison.", report.kept.len()));
+    }
+    let mut p = CompareProgress::new(env.task_id, ComparePhase::Applying);
+    (p.done, p.total) = (report.done.len() as u64 + report.failed.len() as u64, total);
+    (env.progress)(p);
+    report
+}
+
+async fn record_created(rec: &mut Records, ledger: &OperationLedger) {
+    if !rec.created.is_empty() {
+        record_fs_ok(ledger, "create_folder", &[], &std::mem::take(&mut rec.created), &uuid::Uuid::new_v4().to_string()).await;
+    }
+}
+
+/// Delete local files in one batch through the file manager's delete; a
+/// failure stops that batch at the file that failed, so the rest are
+/// retried after it.
+async fn flush_deletes(pending: &mut Vec<(String, String)>, env: &ApplyEnv<'_>, report: &mut ExecReport) {
+    let mut remaining = std::mem::take(pending);
+    while !remaining.is_empty() {
+        let paths: Vec<String> = remaining.iter().map(|(_, abs)| abs.clone()).collect();
+        match delete_files_impl(paths, env.permanent, env.ledger).await {
+            Ok(_) => {
+                report.done.extend(remaining.drain(..).map(|(rel, _)| rel));
+            }
+            Err(e) => {
+                // The batch runs in order and skips what is already gone:
+                // the first file still there is the one that failed.
+                match remaining.iter().position(|(_, abs)| std::fs::symlink_metadata(abs).is_ok()) {
+                    Some(i) => {
+                        report.done.extend(remaining.drain(..i).map(|(rel, _)| rel));
+                        let (rel, _) = remaining.remove(0);
+                        report.failed.push(FailedStep { path: rel, error: e.to_string() });
+                    }
+                    None => report.done.extend(remaining.drain(..).map(|(rel, _)| rel)),
+                }
+            }
+        }
+    }
+}
+
+fn connector_event(kind: &str, status: LedgerStatus, subject: &str, target: Option<&str>, bytes: Option<u64>) -> RecordEvent {
+    let summary = match target {
+        Some(t) => format!("{kind}: {subject} → {t}"),
+        None => format!("{kind}: {subject}"),
+    };
+    let mut ev = RecordEvent::new(LedgerEngine::Connector, kind).status(status).subject(subject).summary(summary);
+    if let Some(t) = target {
+        ev = ev.target(t);
+    }
+    if let Some(b) = bytes {
+        ev = ev.bytes(b as i64);
+    }
+    ev
+}
+
+async fn make_dir(target: &ResolvedSide, rel: &str, ledger: &OperationLedger, rec: &mut Records) -> Result<(), String> {
+    match target {
+        ResolvedSide::Local { .. } => {
+            let path = target.local_path(rel).ok_or("not a local folder")?;
+            if path.is_dir() {
+                return Ok(());
+            }
+            crate::commands::policy_commands::enforce_path(&path).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(&path).map_err(|e| format!("Cannot create folder {}: {e}", path.display()))?;
+            rec.created.push(path.to_string_lossy().to_string());
+            Ok(())
+        }
+        ResolvedSide::Remote { connector, .. } => {
+            let abs = target.abs(rel);
+            match connector.make_directory(&abs).await {
+                Ok(()) => {
+                    ledger.record(connector_event("create_folder", LedgerStatus::Ok, &target.label(rel), None, None)).await;
+                    Ok(())
+                }
+                // Some servers refuse to create a folder that exists.
+                Err(e) if remote_kind(target, rel).await == Some(true) => {
+                    tracing::debug!("{abs} already exists: {e}");
+                    Ok(())
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
+    }
+}
+
+/// Whether `rel` exists on a remote side, and is a folder (`Some(true)`).
+async fn remote_kind(target: &ResolvedSide, rel: &str) -> Option<bool> {
+    let ResolvedSide::Remote { connector, .. } = target else { return None };
+    let (parent, name) = match rel.rsplit_once('/') {
+        Some((p, n)) => (p, n),
+        None => ("", rel),
+    };
+    let listing = connector.list_remote(&target.abs(parent)).await.ok()?;
+    listing.iter().find(|e| e.name.trim_end_matches('/') == name).map(|e| e.is_dir)
+}
+
+/// Hidden sibling a local copy is written to before it is moved into place.
+fn staging_for(dest: &Path) -> PathBuf {
+    let name = dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    dest.with_file_name(format!(".{name}.ufop-compare-{tag}"))
+}
+
+/// Move a finished local copy at `staging` to `dest`, keeping `modified`.
+/// A file already at `dest` is replaced only when the plan said so (moved
+/// to the Trash first unless `permanent`); otherwise the copy is dropped.
+fn settle_local(staging: &Path, dest: &Path, modified: Option<DateTime<Utc>>, replace: bool, permanent: bool) -> Result<(), String> {
+    let discard = |e: String| {
+        let _ = std::fs::remove_file(staging);
+        e
+    };
+    if let Some(t) = modified {
+        let _ = std::fs::File::options().write(true).open(staging).and_then(|f| f.set_modified(t.into()));
+    }
+    if std::fs::symlink_metadata(dest).is_ok() {
+        if !replace {
+            return Err(discard(format!("{} appeared after the comparison; it was not overwritten. Compare again.", dest.display())));
+        }
+        let gone = if permanent { std::fs::remove_file(dest).map_err(|e| e.to_string()) } else { move_to_trash(dest).map_err(|e| e.to_string()) };
+        gone.map_err(|e| discard(format!("Could not move the old {} out of the way: {e}", dest.display())))?;
+    }
+    std::fs::rename(staging, dest).map_err(|e| discard(format!("Copied, but could not move the copy into place as {}: {e}", dest.display())))
+}
+
+/// Wait for transfer-engine job `id` to end; cancelling stops the job.
+async fn wait_for_job(transfer: &TransferManager, id: uuid::Uuid, cancel: &CancellationToken) -> Result<(), String> {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                let _ = transfer.cancel(id).await;
+                return Err("Cancelled.".to_string());
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+        match transfer.get_job(id).await {
+            Ok(Some(job)) => match job.status {
+                TransferStatus::Completed => return Ok(()),
+                TransferStatus::Failed => return Err(job.error_message.unwrap_or_else(|| "The transfer failed.".to_string())),
+                TransferStatus::Cancelled => return Err("The transfer was cancelled.".to_string()),
+                _ => {}
+            },
+            Ok(None) => return Err("The transfer job disappeared from the queue.".to_string()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// Run a connector transfer as a tracked queue job.
+async fn tracked<F>(transfer: &TransferManager, source: &str, dest: &str, size: u64, connection: Option<uuid::Uuid>, work: F) -> Result<u64, String>
+where
+    F: std::future::Future<Output = Result<u64, AppError>>,
+{
+    let (started_at, started) = (Utc::now(), std::time::Instant::now());
+    let job = transfer.track_external(source, dest, size, connection).await.ok();
+    let result = work.await.map_err(|e| e.to_string());
+    if let Some(job) = job {
+        transfer.finish_external(job.id, result.clone(), started_at, started.elapsed()).await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn copy_file(
+    from: &ResolvedSide,
+    to: &ResolvedSide,
+    rel: &str,
+    size: u64,
+    modified: Option<DateTime<Utc>>,
+    replace: bool,
+    env: &ApplyEnv<'_>,
+    rec: &mut Records,
+) -> Result<(), String> {
+    let (src_label, dest_label) = (from.label(rel), to.label(rel));
+    match to {
+        ResolvedSide::Local { .. } => {
+            let dest = to.local_path(rel).ok_or("not a local folder")?;
+            crate::commands::policy_commands::enforce_path(&dest).map_err(|e| e.to_string())?;
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create folder {}: {e}", parent.display()))?;
+            }
+            let staging = staging_for(&dest);
+            let staging_str = staging.to_string_lossy().to_string();
+            match from {
+                ResolvedSide::Local { .. } => {
+                    let src = from.abs(rel);
+                    let job = env.transfer.enqueue(&src, &staging_str, size).await.map_err(|e| e.to_string())?;
+                    env.transfer.spawn_runner(job.id).await;
+                    if let Err(e) = wait_for_job(env.transfer, job.id, env.cancel).await {
+                        let _ = std::fs::remove_file(&staging);
+                        return Err(e);
+                    }
+                }
+                ResolvedSide::Remote { connector, .. } => {
+                    let remote = from.abs(rel);
+                    let got = tracked(env.transfer, &src_label, &dest.to_string_lossy(), size, from.connection_id(), connector.download(&remote, &staging_str)).await;
+                    if let Err(e) = got {
+                        let _ = std::fs::remove_file(&staging);
+                        return Err(e);
+                    }
+                }
+            }
+            settle_local(&staging, &dest, modified, replace, env.permanent)?;
+            let list = if replace { &mut rec.replaced } else { &mut rec.copied };
+            list.0.push(src_label);
+            list.1.push(dest.to_string_lossy().to_string());
+            Ok(())
+        }
+        ResolvedSide::Remote { connector, .. } => {
+            let remote = to.abs(rel);
+            let (local, temp) = match from {
+                ResolvedSide::Local { .. } => (from.abs(rel), None),
+                ResolvedSide::Remote { connector: source, .. } => {
+                    // Between two connections the bytes pass through a temp file.
+                    let temp = ufop_core::session::user_temp_subdir("compare").join(uuid::Uuid::new_v4().simple().to_string());
+                    let temp_str = temp.to_string_lossy().to_string();
+                    let got = source.download(&from.abs(rel), &temp_str).await;
+                    if let Err(e) = got {
+                        let _ = std::fs::remove_file(&temp);
+                        return Err(e.to_string());
+                    }
+                    (temp_str, Some(temp))
+                }
+            };
+            let sent = tracked(env.transfer, &src_label, &dest_label, size, to.connection_id(), connector.upload(&local, &remote)).await;
+            if let Some(t) = temp {
+                let _ = std::fs::remove_file(t);
+            }
+            let kind = if replace { "overwrite" } else { "copy" };
+            match sent {
+                Ok(bytes) => {
+                    env.ledger.record(connector_event(kind, LedgerStatus::Ok, &src_label, Some(&dest_label), Some(bytes))).await;
+                    rec.uploads_with_new_time += 1;
+                    Ok(())
+                }
+                Err(e) => {
+                    env.ledger.record(connector_event(kind, LedgerStatus::Failed, &src_label, Some(&dest_label), None)).await;
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+async fn delete_remote_file(target: &ResolvedSide, rel: &str, ledger: &OperationLedger) -> Result<(), String> {
+    let ResolvedSide::Remote { connector, .. } = target else { return Err("not a connection".to_string()) };
+    let result = connector.remove(&target.abs(rel), false).await;
+    let status = if result.is_ok() { LedgerStatus::Ok } else { LedgerStatus::Failed };
+    ledger.record(connector_event("delete", status, &target.label(rel), None, None)).await;
+    result.map_err(|e| e.to_string())
+}
+
+/// Remove a folder once it is empty: `Ok(false)` when something is still in it.
+async fn delete_dir(target: &ResolvedSide, rel: &str, env: &ApplyEnv<'_>) -> Result<bool, String> {
+    match target {
+        ResolvedSide::Local { .. } => {
+            let path = target.local_path(rel).ok_or("not a local folder")?;
+            if !path.exists() {
+                return Ok(true);
+            }
+            let empty = std::fs::read_dir(&path).map(|mut d| d.next().is_none()).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+            if !empty {
+                return Ok(false);
+            }
+            delete_files_impl(vec![path.to_string_lossy().to_string()], env.permanent, env.ledger).await.map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        ResolvedSide::Remote { connector, .. } => {
+            let abs = target.abs(rel);
+            match connector.list_remote(&abs).await {
+                Ok(list) if !list.is_empty() => return Ok(false),
+                Ok(_) => {}
+                // Already gone.
+                Err(_) if remote_kind(target, rel).await.is_none() => return Ok(true),
+                Err(e) => return Err(e.to_string()),
+            }
+            let result = connector.remove(&abs, true).await;
+            let status = if result.is_ok() { LedgerStatus::Ok } else { LedgerStatus::Failed };
+            env.ledger.record(connector_event("delete", status, &target.label(rel), None, None)).await;
+            result.map(|_| true).map_err(|e| e.to_string())
+        }
+    }
+}
+
+// ── Re-comparing what an action touched ──
+
+/// What `rel` is on a side right now: `Ok(None)` when it is not there.
+fn local_meta(side: &ResolvedSide, rel: &str) -> Result<Option<FileMeta>, String> {
+    let path = side.local_path(rel).ok_or("not a local folder")?;
+    let meta = match std::fs::metadata(&path).or_else(|_| std::fs::symlink_metadata(&path)) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
+    };
+    Ok(Some(FileMeta {
+        relative_path: rel.to_string(),
+        absolute_path: path,
+        size: if meta.is_dir() { 0 } else { meta.len() },
+        modified: meta.modified().ok().map(DateTime::<Utc>::from),
+        is_dir: meta.is_dir(),
+        is_symlink: false,
+        hidden: rel.rsplit('/').next().is_some_and(|n| n.starts_with('.')),
+        readonly: false,
+        attributes: 0,
+    }))
+}
+
+/// The current state of `paths` on one side, as a listing.
+async fn stat_side(side: &ResolvedSide, paths: &[String]) -> SideListing {
+    let mut listing = SideListing::default();
+    let add = |rel: &str, r: Result<Option<FileMeta>, String>, listing: &mut SideListing| match r {
+        Ok(Some(m)) => listing.entries.push(m),
+        Ok(None) => {}
+        Err(message) => listing.errors.push(ListingError { path: rel.to_string(), is_dir: false, message }),
+    };
+    match side {
+        ResolvedSide::Local { .. } => {
+            for rel in paths {
+                add(rel, local_meta(side, rel), &mut listing);
+            }
+        }
+        ResolvedSide::Remote { connector, .. } => {
+            // One listing per parent folder; below a folder that is gone,
+            // everything is gone.
+            let mut sorted: Vec<&String> = paths.iter().collect();
+            sorted.sort_by_key(|p| p.matches('/').count());
+            let mut listings: HashMap<String, Result<Vec<crate::core::types::FileEntry>, String>> = HashMap::new();
+            let mut absent: HashSet<String> = HashSet::new();
+            for rel in sorted {
+                let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel.as_str()));
+                if absent.contains(parent) {
+                    absent.insert(rel.clone());
+                    continue;
+                }
+                if !listings.contains_key(parent) {
+                    let got = connector.list_remote(&side.abs(parent)).await.map_err(|e| e.to_string());
+                    listings.insert(parent.to_string(), got);
+                }
+                let found = match &listings[parent] {
+                    Ok(list) => Ok(list.iter().find(|e| e.name.trim_end_matches('/') == name).map(|e| FileMeta {
+                        relative_path: rel.clone(),
+                        absolute_path: PathBuf::from(side.abs(rel)),
+                        size: if e.is_dir { 0 } else { e.size },
+                        modified: e.modified,
+                        is_dir: e.is_dir,
+                        is_symlink: false,
+                        hidden: name.starts_with('.'),
+                        readonly: false,
+                        attributes: 0,
+                    })),
+                    Err(e) => Err(e.clone()),
+                };
+                if matches!(found, Ok(None)) {
+                    absent.insert(rel.clone());
+                }
+                add(rel, found, &mut listing);
+            }
+        }
+    }
+    listing
+}
+
+/// Re-compare `touched` paths on both sides: their entries now (paths on
+/// neither side are left out).
+pub async fn refresh(left: &ResolvedSide, right: &ResolvedSide, opts: &CompareOptions, touched: &HashSet<String>) -> Result<Vec<CompareEntry>, AppError> {
+    let paths: Vec<String> = touched.iter().cloned().collect();
+    let (l, r) = tokio::join!(stat_side(left, &paths), stat_side(right, &paths));
+    let hasher = LocalSidesHasher { left_local: left.is_local(), right_local: right.is_local() };
+    let opts = opts.clone();
+    tokio::task::spawn_blocking(move || compare::compare_entries(&l, &r, &opts, Some(&hasher), None).map(|(entries, _)| entries))
+        .await
+        .map_err(|e| AppError::internal(format!("Comparison task failed: {e}")))?
+}
+
+/// Every path an action covers (for re-comparing): the steps' paths.
+pub fn touched_by(plan: &ActionPlan) -> HashSet<String> {
+    plan.steps.iter().map(|s| s.path().to_string()).collect()
+}

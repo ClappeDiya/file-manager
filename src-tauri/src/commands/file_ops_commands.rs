@@ -1538,7 +1538,31 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), AppError> {
 }
 
 /// Move a file/directory to the OS trash.
-fn move_to_trash(path: &Path) -> Result<(), AppError> {
+/// Move `path` into the trash folder `trash_dir`; returns where it went.
+/// A name already in the trash gets a number (`notes 2.txt`), so trashing
+/// two files of the same name never overwrites the first.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn trash_into(trash_dir: &Path, path: &Path) -> Result<PathBuf, AppError> {
+    let file_name = path.file_name().unwrap_or_default();
+    let mut target = trash_dir.join(file_name);
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut n = 2;
+    while std::fs::symlink_metadata(&target).is_ok() {
+        target = trash_dir.join(format!("{stem} {n}{ext}"));
+        n += 1;
+    }
+    std::fs::rename(path, &target).map_err(|e| {
+        AppError::file_op(
+            format!("Failed to move to Trash: {e}"),
+            "Try permanent delete instead.",
+        )
+    })?;
+    Ok(target)
+}
+
+/// Move `path` to the OS trash (permanently deleted on Windows for now).
+pub(crate) fn move_to_trash(path: &Path) -> Result<(), AppError> {
     // Cross-platform trash implementation
     // On macOS: move to ~/.Trash/
     // On Linux: use ~/.local/share/Trash/ (freedesktop spec)
@@ -1604,15 +1628,7 @@ fn move_to_trash(path: &Path) -> Result<(), AppError> {
             })?;
         }
 
-        let file_name = path.file_name().unwrap_or_default();
-        let target = trash_dir.join(file_name);
-
-        std::fs::rename(path, &target).map_err(|e| {
-            AppError::file_op(
-                format!("Failed to move to Trash: {e}"),
-                "Try permanent delete instead.",
-            )
-        })?;
+        trash_into(&trash_dir, path)?;
     }
 
     #[cfg(target_os = "windows")]
@@ -1740,6 +1756,27 @@ fn is_default_port(protocol: &str, port: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: trashing a second file with the same name as one already
+    /// in the trash renamed it over the first, destroying it.
+    #[test]
+    fn trash_keeps_files_that_share_a_name() {
+        let base = tempfile::tempdir().unwrap();
+        let trash = base.path().join("Trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        for (dir, body) in [("one", "first"), ("two", "second")] {
+            let d = base.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("notes.txt"), body).unwrap();
+            super::trash_into(&trash, &d.join("notes.txt")).unwrap();
+        }
+        let mut kept: Vec<String> = std::fs::read_dir(&trash)
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["first", "second"]);
+    }
+
     #[test]
     fn cross_device_fallback_moves_file_and_dir() {
         let tmp = tempfile::tempdir().unwrap();
