@@ -344,6 +344,10 @@ pub struct PlanContext<'a> {
     /// Versioned-backup mode: the stored versions. [`plan`] reads the
     /// destination's index itself when this is `None`.
     pub versions: Option<&'a super::versions::VersionIndex>,
+    /// Two-way only: the id of the pair's most recent run. When it is not the
+    /// run that recorded `baseline` (a run with errors keeps the old one),
+    /// the preview says the history is held back.
+    pub last_run_id: Option<uuid::Uuid>,
 }
 
 /// Content hashes for checksum comparison: a storage provider's own hashes,
@@ -661,6 +665,9 @@ pub fn diff_trees(
     let mut acc = Acc::default();
     if let Some(b) = baseline {
         diff_two_way(pair, &filter, &cmp, &source_map, &dest_map, b, ctx, now, &mut acc)?;
+        if ctx.last_run_id.is_some_and(|id| b.run_id != Some(id)) {
+            acc.notes.push("The last run did not finish cleanly, so the sync history is still the one from the last clean run: a file created since then and deleted on one side is copied back from the other side instead of deleted. Fix the errors and run again to bring the history up to date.".to_string());
+        }
     } else {
         diff_legacy(pair, &filter, &cmp, &source_map, &dest_map, ctx, now, &mut acc)?;
         if pair.mode == SyncMode::TwoWay && pair.dest_state == DestStateMode::BlindUpload {

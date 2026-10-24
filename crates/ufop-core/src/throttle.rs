@@ -168,9 +168,11 @@ impl SharedRate {
         self.rate_with(&SCHEDULE.read().unwrap_or_else(|e| e.into_inner()), t)
     }
 
-    /// The rate at `t` under `windows` (for tests and previews).
+    /// The rate at `t` under `windows` (for tests and previews). A window's
+    /// 0 for this direction sets no limit of its own: the base rate stays
+    /// in force (so a download-only window leaves the upload cap alone).
     pub fn rate_with(&self, windows: &[BandwidthWindow], t: NaiveDateTime) -> u64 {
-        match self.scheduled.and_then(|d| window_at(windows, t).map(|w| w.limit(d))) {
+        match self.scheduled.and_then(|d| window_at(windows, t).map(|w| w.limit(d))).filter(|&l| l > 0) {
             Some(limit) => limit,
             None if self.window_only => 0,
             None => self.base(),
@@ -209,7 +211,7 @@ impl Default for SharedRate {
 }
 
 /// Backup machine-wide upload and download caps (on top of each job's own
-/// throttle); timetable windows replace them while active.
+/// throttle); a timetable window's non-zero limits replace them while active.
 pub static GLOBAL_UPLOAD: SharedRate = SharedRate::scheduled(Direction::Upload);
 pub static GLOBAL_DOWNLOAD: SharedRate = SharedRate::scheduled(Direction::Download);
 
@@ -266,12 +268,30 @@ mod tests {
         assert_eq!(up.rate_with(&windows, at(25, 2, 0)), 10_000_000, "Sunday 02:00 does not");
         let down = SharedRate::scheduled(Direction::Download);
         assert_eq!(down.rate_with(&windows, at(19, 9, 30)), 2_000_000);
-        // A window of 0 lifts the limit; an unscheduled rate ignores the timetable.
+        // A window's 0 leaves that direction's normal limit in force (it does
+        // not lift it); an unscheduled rate ignores the timetable.
         let open = vec![window(&[], "00:00", "00:00", 0)];
-        assert_eq!(up.rate_with(&open, at(19, 12, 0)), 0);
+        assert_eq!(up.rate_with(&open, at(19, 12, 0)), 10_000_000);
         let plain = SharedRate::new();
         plain.set(42);
         assert_eq!(plain.rate_with(&windows, at(19, 9, 30)), 42);
+    }
+
+    /// Regression (review): a window that limits only downloads (upload 0)
+    /// lifted the backup machine-wide upload cap to unlimited while active.
+    #[test]
+    fn download_only_window_keeps_the_upload_cap() {
+        let windows = vec![BandwidthWindow { days: vec![], start: "08:00".into(), end: "18:00".into(), upload_bps: 0, download_bps: 2_000 }];
+        let up = SharedRate::scheduled(Direction::Upload);
+        up.set(500_000);
+        assert_eq!(up.rate_with(&windows, at(19, 9, 0)), 500_000, "the upload cap stays");
+        let down = SharedRate::scheduled(Direction::Download);
+        down.set(9_000);
+        assert_eq!(down.rate_with(&windows, at(19, 9, 0)), 2_000, "the window's download limit applies");
+        // Without a base cap the direction stays unlimited.
+        assert_eq!(SharedRate::scheduled(Direction::Upload).rate_with(&windows, at(19, 9, 0)), 0);
+        // The timetable-only rate has no cap outside its limits either.
+        assert_eq!(SharedRate::window_only(Direction::Upload).rate_with(&windows, at(19, 9, 0)), 0);
     }
 
     #[test]

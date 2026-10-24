@@ -404,6 +404,8 @@ pub fn rclone_to_regex(pattern: &str) -> Result<String, AppError> {
 /// read so far. Patterns are rclone globs ([`FilterKind::Rclone`]).
 pub fn parse_filter_file(text: &str) -> Result<Vec<FilterRule>, AppError> {
     let mut rules = Vec::new();
+    // A file saved with a UTF-8 byte order mark (as some Windows editors do).
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -413,9 +415,9 @@ pub fn parse_filter_file(text: &str) -> Result<Vec<FilterRule>, AppError> {
             rules.clear();
             continue;
         }
-        let (action, rest) = match line.split_at(1) {
-            ("+", rest) => (FilterAction::Include, rest),
-            ("-", rest) => (FilterAction::Exclude, rest),
+        let (action, rest) = match (line.strip_prefix('+'), line.strip_prefix('-')) {
+            (Some(rest), _) => (FilterAction::Include, rest),
+            (_, Some(rest)) => (FilterAction::Exclude, rest),
             _ => {
                 return Err(AppError::validation(format!(
                     "Line {}: \"{line}\" must start with \"+ \" (include) or \"- \" (exclude)",
@@ -588,6 +590,24 @@ mod tests {
         let err = parse_filter_file("- ok\nnope").unwrap_err();
         assert!(err.to_string().contains("Line 2"), "{err}");
         assert!(parse_filter_file("+ a{b").is_err());
+    }
+
+    /// Regression (review): `split_at(1)` panicked when a line started with
+    /// a multi-byte character (a dash pasted from a web page, a BOM), so the
+    /// IPC command never answered and the CLI crashed.
+    #[test]
+    fn filter_file_with_non_ascii_first_character_is_an_error_not_a_panic() {
+        for text in ["\u{2013} *.tmp", "- ok\n\u{2014} *.log", "\u{e9}t\u{e9}", "+ a\n\u{feff}- b"] {
+            let got = std::panic::catch_unwind(|| parse_filter_file(text));
+            let err = got.expect("must not panic").unwrap_err();
+            assert!(err.to_string().contains("must start with"), "{text:?}: {err}");
+        }
+        // A file saved with a UTF-8 byte order mark reads like one without.
+        assert_eq!(
+            parse_filter_file("\u{feff}- *.tmp\n+ *").unwrap(),
+            vec![rule(FilterAction::Exclude, FilterKind::Rclone, "*.tmp"), rule(FilterAction::Include, FilterKind::Rclone, "*")]
+        );
+        assert_eq!(parse_filter_file("\u{feff}# comment\n- a").unwrap().len(), 1);
     }
 
     #[test]

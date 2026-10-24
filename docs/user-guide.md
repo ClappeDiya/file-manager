@@ -282,7 +282,8 @@ A two-way pair remembers what both folders looked like after its last successful
 - A folder deleted on one side is removed on the other once its files have been deleted there (a folder that still holds other files stays).
 - A file changed on **both** sides is a conflict and goes through the pair's conflict policy, unless both sides now hold the same bytes (checked by content hash), which counts as in sync. *Destination wins* and *Keep both* leave both folders identical (keep both: the destination's version under the name, the source's as `name (conflict DATE).ext`, on both sides).
 - The **first run** (no history yet) only combines both folders; it never deletes. The preview says so.
-- A run that fails, is cancelled or stops at the end of its run hours keeps the previous history, so nothing it left half done is mistaken for a deletion.
+- A run that fails, is cancelled or stops at the end of its run hours keeps the previous history, so nothing it left half done is mistaken for a deletion. Until a run finishes cleanly, deletions of files created since the last clean run are not tracked (such a file comes back from the other side); the preview says so after a run with errors.
+- With **Move files** (/MOV) on, a file moved to the destination leaves the sync history, so the next run copies it back to the source rather than deleting the only copy left.
 - **Safety stop**: a run that would delete more than 50% of the synced files on one side (more than two files), or everything because one folder is empty or missing, is refused — usually an unplugged drive or an unmounted share. Change the limit in *Cleanup & moving* (0 turns it off) or reset the history.
 
 With **Destination state: Blind upload** the destination is never read, so a two-way pair only copies source files to it and never deletes anything (no history is used or recorded). With **Trust the inventory** a two-way pair still scans the destination every run, because the saved inventory cannot show changes made there. Changing a pair's mode or folders forgets its history. In the Advanced view each two-way pair shows its history size and a **Reset history** button.
@@ -318,7 +319,7 @@ Each finished step of a run is recorded as it happens. If the app quits, crashes
 Settings › Advanced has:
 
 - **Sync defaults**: copy options new pairs start from. A pair created afterwards stores only the options it changes and follows the defaults for the rest; pairs created before keep all their own options.
-- **Bandwidth timetable**: windows (weekdays, from–to) with upload and download limits. While a window is active its upload limit is shared by file transfers, sync copies and backups together (transfers and sync copies count as uploads), its download limit applies to backup restores, and both replace the backup machine-wide limits. The backup machine-wide limits themselves still apply to backups and restores only. A window that ends before it starts runs past midnight; the first matching window wins.
+- **Bandwidth timetable**: windows (weekdays, from–to) with upload and download limits. While a window is active its upload limit is shared by file transfers, sync copies and backups together (transfers and sync copies count as uploads), its download limit applies to backup restores, and each replaces the backup machine-wide limit for its direction. A window's 0 sets no limit of its own: the machine-wide limit for that direction stays in force (a download-only window does not lift the upload cap). The backup machine-wide limits themselves still apply to backups and restores only. A window that ends before it starts runs past midnight; the first matching window wins.
 
 ### Rollback
 

@@ -102,6 +102,27 @@ describe("sync pair form mapping", () => {
     expect(pairFromForm(form, { ...pair, option_overrides: null }, defaults).option_overrides).toBeNull();
     expect(filterFromForm(emptyPairForm()).rules).toEqual([]);
   });
+
+  // Regression (review): an edit recomputed the overrides from the form, so
+  // an override whose value equals the current default was dropped on any
+  // edit and the pair then followed future default changes.
+  it("keeps an override that equals the current default when editing other fields", () => {
+    const defaults = { ...DEFAULT_COPY_OPTIONS, threads: 4 };
+    const pinned: SyncPair = { ...pair, option_overrides: ["threads", "retries"], copy_options: { ...DEFAULT_COPY_OPTIONS, threads: 4, retries: 0 } };
+    const form = formFromPair(pinned, { ...defaults, retries: 3 });
+    expect(form.copyOptions).toMatchObject({ threads: 4, retries: 0 });
+    const saved = pairFromForm({ ...form, name: "Renamed" }, pinned, { ...defaults, retries: 3 });
+    expect(saved.option_overrides).toEqual(expect.arrayContaining(["threads", "retries"]));
+    expect(saved.option_overrides).toHaveLength(2);
+    // A later default change does not reach the pinned option.
+    expect(layerOptions({ ...defaults, threads: 16 }, saved.copy_options!, saved.option_overrides)).toMatchObject({ threads: 4 });
+    // Options the user changes in the form become overrides too.
+    const more = pairFromForm({ ...form, copyOptions: { ...form.copyOptions, exclude_hidden: true } }, pinned, defaults);
+    expect(more.option_overrides).toEqual(expect.arrayContaining(["threads", "retries", "exclude_hidden"]));
+    // Setting an overridden option to the default in the form resets it: it follows the defaults again.
+    const reset = pairFromForm({ ...form, copyOptions: { ...form.copyOptions, retries: 3 } }, pinned, { ...defaults, retries: 3 });
+    expect(reset.option_overrides).toEqual(["threads"]);
+  });
 });
 
 describe("SyncPanel: edit, duplicate, export, import", () => {

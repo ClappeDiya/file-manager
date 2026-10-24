@@ -435,12 +435,22 @@ pub fn execute_sync_with(
                     && entry.source_size.is_some()
                 {
                     let src = Path::new(&pair.source_path).join(&entry.relative_path);
-                    if let Err(e) = fs::remove_file(&src) {
-                        errors += 1;
-                        error_messages.push(format!(
-                            "{}: copied but source not removed: {}",
-                            entry.relative_path, e
-                        ));
+                    match fs::remove_file(&src) {
+                        // Two-way: the file is no longer synced on both sides,
+                        // so it leaves the baseline. Otherwise the next run
+                        // reads the missing source copy as a deletion and
+                        // deletes the destination copy, the only one left.
+                        Ok(()) if pair.mode == SyncMode::TwoWay => {
+                            baseline_updates.push((entry.relative_path.clone(), None))
+                        }
+                        Ok(()) => {}
+                        Err(e) => {
+                            errors += 1;
+                            error_messages.push(format!(
+                                "{}: copied but source not removed: {}",
+                                entry.relative_path, e
+                            ));
+                        }
                     }
                 }
             }
@@ -2215,6 +2225,35 @@ mod tests {
         assert_eq!(base.unwrap().entries.len(), 2);
     }
 
+    /// Regression (review): with /MOV on a two-way pair, a moved file stayed
+    /// in the baseline after its source copy was removed. The next run read
+    /// it as "deleted in the source, unchanged in the destination" and
+    /// deleted the destination copy — the only one left.
+    #[test]
+    fn two_way_move_keeps_the_only_copy_left() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("moved.txt"), "moved").unwrap();
+        fs::write(src.path().join("other1.txt"), "other").unwrap();
+        let mut pair = two_way(src.path(), dst.path());
+        pair.copy_options.move_files = true;
+        let mut base = None;
+        let first = run_two_way(&pair, &mut base);
+        assert_eq!(first.report.files_added, 2);
+        assert!(!src.path().join("moved.txt").exists(), "/MOV removes the source copy");
+        assert!(!base.as_ref().unwrap().entries.contains_key("moved.txt"), "a moved file leaves the baseline");
+
+        fs::write(src.path().join("new1.txt"), "n1").unwrap();
+        fs::write(src.path().join("new2.txt"), "n2").unwrap();
+        let preview = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
+        assert_eq!(preview.total_deletions, 0, "must not plan to delete moved files");
+        let second = run_two_way(&pair, &mut base);
+        assert_eq!(second.report.files_deleted, 0);
+        assert_eq!(fs::read_to_string(dst.path().join("moved.txt")).unwrap(), "moved", "DATA LOSS: moved file deleted from the destination");
+        assert_eq!(fs::read_to_string(dst.path().join("other1.txt")).unwrap(), "other");
+        assert_eq!(fs::read_to_string(dst.path().join("new1.txt")).unwrap(), "n1");
+    }
+
     #[test]
     fn two_way_failed_run_does_not_advance_the_baseline() {
         let src = TempDir::new().unwrap();
@@ -2238,6 +2277,31 @@ mod tests {
         let out = execute_sync_with(&ExecutorConfig { baseline: base.clone(), ..cfg(pair.clone()) }, &RunHooks { cancel: Some(cancel), ..Default::default() }).unwrap();
         assert_eq!(out.report.status, SyncRunStatus::Cancelled);
         assert!(out.baseline.is_none());
+    }
+
+    /// Review: the baseline only advances on a clean run, so after a run with
+    /// errors the preview says that deletions since the last clean run are
+    /// not tracked yet.
+    #[test]
+    fn two_way_preview_notes_a_baseline_held_back_by_a_failed_run() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "a").unwrap();
+        let pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        let clean = run_two_way(&pair, &mut base);
+        let held_back = |base: &Option<SyncBaseline>, last_run_id| {
+            let ctx = planner::PlanContext { baseline: base.as_ref(), last_run_id, ..Default::default() };
+            planner::plan(&pair, &ctx).unwrap().preview.notes.iter().any(|n| n.contains("did not finish cleanly"))
+        };
+        assert!(!held_back(&base, Some(clean.report.id)), "the last run recorded the baseline");
+        assert!(!held_back(&base, None), "no run history: nothing to say");
+
+        fs::write(src.path().join("blocked"), "b").unwrap();
+        fs::create_dir(dst.path().join("blocked")).unwrap();
+        let failed = run_two_way(&pair, &mut base);
+        assert!(failed.report.errors > 0 && failed.baseline.is_none());
+        assert!(held_back(&base, Some(failed.report.id)));
     }
 
     /// Regression: without kept timestamps, a file copied by a run that then

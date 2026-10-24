@@ -174,6 +174,26 @@ export function pairFromForm(form: SyncPairForm, original: SyncPair, defaults: C
     copy_options: form.copyOptions,
     run_options: form.runOptions,
     // Pairs from before layering keep all their own options.
-    option_overrides: original.option_overrides ? changedOptionKeys(form.copyOptions, defaults) : null,
+    option_overrides: original.option_overrides ? editedOverrides(form.copyOptions, original, defaults) : null,
   };
+}
+
+/**
+ * A layered pair's overrides after an edit: every option that now differs
+ * from the defaults, plus each earlier override the form left as it was
+ * (even when its value equals the current default, so it stays pinned).
+ * An override the user sets to the default value in the form is reset and
+ * follows the defaults again.
+ */
+function editedOverrides(options: CopyOptions, original: SyncPair, defaults: CopyOptions): string[] {
+  const before = layerOptions(defaults, original.copy_options ?? DEFAULT_COPY_OPTIONS, original.option_overrides);
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  const kept = new Set(
+    (original.option_overrides ?? []).filter(
+      (k) => k in options && same(options[k as keyof CopyOptions], before[k as keyof CopyOptions]),
+    ),
+  );
+  return (Object.keys(DEFAULT_COPY_OPTIONS) as (keyof CopyOptions)[]).filter(
+    (k) => kept.has(k) || !same(options[k], defaults[k]),
+  );
 }

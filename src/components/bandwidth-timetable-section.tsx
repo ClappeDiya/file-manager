@@ -50,8 +50,9 @@ export function BandwidthTimetableSection() {
   return (
     <div className="space-y-2" data-testid="bandwidth-timetable">
       <p className="text-xs text-gray-500 dark:text-gray-400">
-        While a window is active, its upload limit (KiB/s, 0 = unlimited) is shared by file transfers, sync copies and backups
-        together; its download limit applies to backup restores. Both replace the backup machine-wide limits during the window.
+        While a window is active, its upload limit (KiB/s) is shared by file transfers, sync copies and backups together; its
+        download limit applies to backup restores. Each replaces the backup machine-wide limit for its direction during the
+        window; 0 sets no limit of its own, so the machine-wide limit for that direction stays in force.
         The first matching window wins; a window that ends before it starts runs past midnight.
       </p>
       {windows.map((w, i) => (

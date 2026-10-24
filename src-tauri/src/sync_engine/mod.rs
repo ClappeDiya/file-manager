@@ -384,8 +384,11 @@ impl SyncManager {
         let pair_clone = self.effective(pair);
         drop(pairs);
         let baseline = self.load_baseline(&pair_clone).await?;
+        // Newest first: the preview notes when that run kept the old baseline.
+        let last_run_id = self.reports.read().await.get(&pair_id).and_then(|r| r.first()).map(|r| r.id);
         tokio::task::spawn_blocking(move || {
-            planner::plan(&pair_clone, &planner::PlanContext { baseline: baseline.as_ref(), ..Default::default() }).map(|p| p.preview)
+            let ctx = planner::PlanContext { baseline: baseline.as_ref(), last_run_id, ..Default::default() };
+            planner::plan(&pair_clone, &ctx).map(|p| p.preview)
         })
             .await
             .map_err(|e| AppError::Sync {
@@ -2193,6 +2196,24 @@ mod tests {
         assert!(kept, "the rolled-back version was lost");
         // Untouched files keep their history.
         assert!(mgr.load_baseline(&pair).await.unwrap().unwrap().entries.contains_key("a.txt"));
+    }
+
+    /// Review: a run with errors keeps the old baseline; the dry run says so.
+    #[tokio::test]
+    async fn two_way_dry_run_notes_a_baseline_held_back_by_a_failed_run() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), "a").unwrap();
+        let pair = temp_pair(src.path(), dst.path(), SyncMode::TwoWay);
+        let (mgr, _state) = mgr_with(&pair).await;
+        let held_back = |p: &SyncPreview| p.notes.iter().any(|n| n.contains("did not finish cleanly"));
+        mgr.execute_sync(pair.id).await.unwrap();
+        assert!(!held_back(&mgr.dry_run(pair.id).await.unwrap()));
+
+        std::fs::write(src.path().join("blocked"), "b").unwrap();
+        std::fs::create_dir(dst.path().join("blocked")).unwrap();
+        assert!(mgr.execute_sync(pair.id).await.unwrap().errors > 0);
+        assert!(held_back(&mgr.dry_run(pair.id).await.unwrap()));
     }
 
     /// The baseline lives in SQLite: a restart in between does not turn the
