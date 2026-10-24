@@ -16,7 +16,7 @@ import { createLink, registerWithToken } from '@/lib/db/repos/machines';
 import { listOutbox } from '@/lib/db/repos/outbox';
 import { createSession } from '@/lib/db/repos/sessions';
 import { billingAccount, setBillingProvider, trialEligible } from '@/lib/billing';
-import { trialDaysLeft, discountAmount, discountDuration, hasPaymentMethod, trialOutcome } from '@/lib/billing/trial';
+import { trialDaysLeft, discountAmount, discountDuration, hasPaymentMethod, trialEndsPhrase, trialOutcome } from '@/lib/billing/trial';
 import { DEFAULT_TRIAL_DAYS } from '@/lib/billing/config';
 import { StripeProvider } from '@/lib/billing/stripe';
 import { json, makeUser, req } from './helpers';
@@ -388,10 +388,11 @@ describe('billing: trialing subscriptions', () => {
     const { token } = createLink(org.id, {}, 'tester');
     for (let i = 0; i < 2; i++) registerWithToken(token, { name: `m${i}` });
     expect(() => registerWithToken(token, { name: 'm3' })).toThrow(/license allows 2 machine/);
-    // Converting to a paid subscription keeps the plan; the trial end is cleared when it is no longer trialing.
+    // Converting to a paid subscription keeps the plan; the status follows the provider (and trialEnd stays the past timestamp it reports).
     await deliver(trialSub(org.id, { seats: 4, status: 'active', trialEnd: unix(Date.now() - DAY) }));
     expect(license(org.id).seats).toBe(4);
     expect(billingAccount(org.id)!.status).toBe('active');
+    expect(billingAccount(org.id)!.trialEnd).toBe(new Date(unix(Date.now() - DAY) * 1000).toISOString());
   });
 
   it('drops back to the free plan when a trial ends without a payment method (subscription deleted)', async () => {
@@ -467,7 +468,7 @@ describe('billing: trial ending notice', () => {
     expect((await deliver(ev)).body.result).toBe('applied');
     const audited = listAudit({ eventType: 'billing.trial_will_end' }).entries.find((e) => e.orgId === org.id)!;
     expect(audited).toMatchObject({ severity: 'warning', resourceType: 'billing' });
-    expect(audited.description).toContain('in 3 day(s)');
+    expect(audited.description).toContain('ends in 3 days');
     expect(hookBodies).toHaveLength(1);
     expect(JSON.parse(hookBodies[0])).toMatchObject({ event: 'billing.trial_will_end', subject: expect.stringContaining('Your free trial ends in 3 days') });
     expect(listOutbox(org.id, { status: 'sent' }).map((e) => e.channelId)).toEqual([ch.id]);
@@ -510,6 +511,19 @@ describe('billing: coupons', () => {
     expect(billingAccount(org.id)!.discount).toMatchObject({ percentOff: 10, duration: 'forever' });
     await deliver(trialSub(org.id, { type: 'customer.subscription.deleted', status: 'canceled', discount: coupon({ percent_off: 10, duration: 'forever' }) }));
     expect(billingAccount(org.id)!.discount).toBeNull();
+  });
+
+  it('reads the discount and period end the way newer API versions send them (discounts[], period on the item)', async () => {
+    // Webhook payloads use the endpoint's API version, not the 2024-06-20 the console sends on its own calls.
+    const org = createOrg({ name: 'Newer API' });
+    const ev = trialSub(org.id, { status: 'active' });
+    const obj = ev.data.object as Record<string, unknown>;
+    delete obj.discount;
+    delete obj.current_period_end;
+    obj.discounts = ['di_unexpanded', coupon({ percent_off: 15, duration: 'forever' })];
+    ((obj.items as { data: Record<string, unknown>[] }).data[0]).current_period_end = 1_900_000_000;
+    await deliver(ev);
+    expect(billingAccount(org.id)).toMatchObject({ discount: { percentOff: 15, duration: 'forever' }, currentPeriodEnd: new Date(1_900_000_000 * 1000).toISOString() });
   });
 });
 
@@ -581,6 +595,24 @@ describe('billing: one trial even with concurrent checkouts', () => {
     expect(calls.some((c) => c.url === `/v1/checkout/sessions/${second}/expire`)).toBe(false);
   });
 
+  it('leaves exactly one open session when two checkouts start at the same moment (no session is orphaned)', async () => {
+    const t = await startCheckoutFor('Interleaved starts');
+    await t.post();
+    const s0 = billingAccount(t.org.id)!.checkoutSessionId!;
+    const before = sessionIds();
+    const [a, b] = await Promise.all([t.post(), t.post()]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+    const created = calls.filter((c) => c.url === '/v1/checkout/sessions').length - before;
+    expect(created).toBe(2);
+    const kept = billingAccount(t.org.id)!.checkoutSessionId!;
+    const expired = new Set(calls.filter((c) => c.method === 'POST' && /^\/v1\/checkout\/sessions\/cs_\d+\/expire$/.test(c.url)).map((c) => c.url.split('/')[4]));
+    // Every session ever opened for the organization except the one that is stored has been expired.
+    const opened = [s0, ...[a, b].map((r) => /(cs_\d+)$/.exec(r.body.url ?? '')![1])];
+    expect(opened).toContain(kept);
+    for (const id of opened.filter((i) => i !== kept)) expect(expired.has(id), `${id} should be expired`).toBe(true);
+    expect(expired.has(kept)).toBe(false);
+  });
+
   it('still opens the new checkout when the earlier session cannot be expired (it was already completed)', async () => {
     const t = await startCheckoutFor('Finished earlier');
     await t.post();
@@ -611,7 +643,8 @@ describe('billing: payment method on file', () => {
     const org = createOrg({ name: 'Cards' });
     await deliver(trialSub(org.id, { customer: 'cus_cards' }));
     expect(billingAccount(org.id)).toMatchObject({ subPaymentMethod: false, customerPaymentMethod: null });
-    expect(hasPaymentMethod(billingAccount(org.id)!)).toBe(false);
+    // Without a customer.updated event (an endpoint not subscribed to it) a missing subscription default proves nothing.
+    expect(hasPaymentMethod(billingAccount(org.id)!)).toBeNull();
     // A card added in the portal becomes the customer's default.
     const update = (id: string, def: unknown) => ({ id, type: 'customer.updated', data: { object: { id: 'cus_cards', invoice_settings: { default_payment_method: def } } } });
     expect((await deliver(update(`evt_cu_${++n}`, 'pm_1'))).body.result).toBe('applied');
@@ -619,7 +652,7 @@ describe('billing: payment method on file', () => {
     // A later subscription event without its own default does not wipe the customer's card.
     await deliver(trialSub(org.id, { customer: 'cus_cards' }));
     expect(hasPaymentMethod(billingAccount(org.id)!)).toBe(true);
-    // Removing it again.
+    // Removing it again: now both are known to have none.
     await deliver(update(`evt_cu_${++n}`, null));
     expect(hasPaymentMethod(billingAccount(org.id)!)).toBe(false);
     // The subscription's own default (a string id or an expanded object) counts.
@@ -632,6 +665,16 @@ describe('billing: payment method on file', () => {
   it('reports unknown for accounts that predate the flags', () => {
     expect(hasPaymentMethod({ subPaymentMethod: null, customerPaymentMethod: null })).toBeNull();
     expect(hasPaymentMethod({ subPaymentMethod: null, customerPaymentMethod: true })).toBe(true);
+    expect(hasPaymentMethod({ subPaymentMethod: false, customerPaymentMethod: null })).toBeNull();
+    expect(hasPaymentMethod({ subPaymentMethod: null, customerPaymentMethod: false })).toBeNull();
+    expect(hasPaymentMethod({ subPaymentMethod: false, customerPaymentMethod: false })).toBe(false);
+  });
+
+  it('words the days left the same way everywhere', () => {
+    expect(trialEndsPhrase(null)).toBe('soon');
+    expect(trialEndsPhrase(0)).toBe('today');
+    expect(trialEndsPhrase(1)).toBe('in 1 day');
+    expect(trialEndsPhrase(3)).toBe('in 3 days');
   });
 
   it('words the trial outcome after the card state (no add-a-card warning once one is on file)', () => {
@@ -644,8 +687,10 @@ describe('billing: payment method on file', () => {
   it('keeps the cancellation warning out of the trial-ending notice when a card is on file', async () => {
     const withCardOrg = createOrg({ name: 'Has card' });
     const noCardOrg = createOrg({ name: 'No card' });
-    const warn = async (org: { id: string }, card: unknown) => {
+    const warn = async (org: { id: string }, card: unknown, customerEvent = false) => {
       await deliver(withCard(trialSub(org.id, { customer: `cus_${org.id}` }), card));
+      // customer.updated tells the console the customer has no default card either.
+      if (customerEvent) await deliver({ id: `evt_cu_${++n}`, type: 'customer.updated', data: { object: { id: `cus_${org.id}`, invoice_settings: { default_payment_method: null } } } });
       const ev = { id: `evt_tw_${++n}`, type: 'customer.subscription.trial_will_end', data: { object: { id: 'sub_t', customer: `cus_${org.id}`, metadata: { org_id: org.id }, trial_end: unix(Date.now() + 3 * DAY), default_payment_method: card } } };
       await deliver(ev);
       return listAudit({ eventType: 'billing.trial_will_end' }).entries.find((e) => e.orgId === org.id)!;
@@ -653,9 +698,19 @@ describe('billing: payment method on file', () => {
     const ok = await warn(withCardOrg, 'pm_ok');
     expect(ok.severity).toBe('info');
     expect(ok.description).toContain('converts to a paid subscription');
-    const missing = await warn(noCardOrg, null);
+    const missing = await warn(noCardOrg, null, true);
     expect(missing.severity).toBe('warning');
     expect(missing.description).toContain('add a payment method');
+  });
+
+  it('does not claim there is no card when the console never received customer.updated (neutral notice, info severity)', async () => {
+    const org = createOrg({ name: 'Card unknown' });
+    await deliver(withCard(trialSub(org.id, { customer: `cus_${org.id}` }), null));
+    await deliver({ id: `evt_tw_${++n}`, type: 'customer.subscription.trial_will_end', data: { object: { id: 'sub_t', customer: `cus_${org.id}`, metadata: { org_id: org.id }, trial_end: unix(Date.now() + 3 * DAY), default_payment_method: null } } });
+    const e = listAudit({ eventType: 'billing.trial_will_end' }).entries.find((x) => x.orgId === org.id)!;
+    expect(e.severity).toBe('warning');
+    expect(e.description).not.toContain('add a payment method');
+    expect(e.description).toContain('check in the billing portal');
   });
 });
 

@@ -11,13 +11,22 @@ export function trialDaysLeft(trialEnd: string | null | undefined, at: Date = ne
   return Math.max(0, Math.ceil((end - at.getTime()) / DAY_MS));
 }
 
+/** "soon" / "today" / "in 1 day" / "in 3 days", for the audit entry, the notice and the billing page banner. */
+export function trialEndsPhrase(left: number | null): string {
+  if (left === null) return 'soon';
+  if (left <= 0) return 'today';
+  return `in ${left} day${left === 1 ? '' : 's'}`;
+}
+
 /**
- * Whether a payment method is on file for the subscription: true when the subscription or the customer has a
- * default, false when the subscription is known to have none, null when no event has said yet.
+ * Whether a payment method is on file: true when the subscription or the customer has a default; false only when
+ * both are known to have none; null otherwise. A subscription without a default says nothing about the customer
+ * (a card added in the billing portal becomes the customer's default and arrives as `customer.updated`), so
+ * until that event has been received the answer stays unknown rather than claiming there is no card.
  */
 export function hasPaymentMethod(a: { subPaymentMethod: boolean | null; customerPaymentMethod: boolean | null }): boolean | null {
   if (a.subPaymentMethod || a.customerPaymentMethod) return true;
-  return a.subPaymentMethod === false ? false : null;
+  return a.subPaymentMethod === false && a.customerPaymentMethod === false ? false : null;
 }
 
 /** What happens when the trial ends, in words (billing page banner, notices). */

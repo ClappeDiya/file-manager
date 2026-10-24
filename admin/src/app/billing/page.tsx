@@ -18,7 +18,7 @@ import { formatDate } from '@/lib/utils/format';
 import type { BillingAccount } from '@/lib/billing';
 import { ANNUAL_DISCOUNT_PERCENT, type BillingInterval } from '@/lib/billing/plans';
 import type { Invoice } from '@/lib/billing/provider';
-import { discountAmount, discountDuration, hasPaymentMethod, trialDaysLeft, trialOutcome } from '@/lib/billing/trial';
+import { discountAmount, discountDuration, hasPaymentMethod, trialDaysLeft, trialEndsPhrase, trialOutcome } from '@/lib/billing/trial';
 import type { License } from '@/lib/db/repos/orgs';
 
 interface PlanView {
@@ -56,7 +56,7 @@ export default function BillingPage() {
   const [seats, setSeats] = useState<Record<string, string>>({});
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [interval, setInterval] = useState<BillingInterval>('month');
+  const [billingInterval, setBillingInterval] = useState<BillingInterval>('month');
   if (loading && !data) return <Loading />;
   if (!data) return <ErrorBanner message={error ?? 'Could not load billing'} />;
 
@@ -89,7 +89,7 @@ export default function BillingPage() {
       )}
       {trialing && (
         <div className="mb-4 rounded-md border border-info bg-info-bg px-3 py-2 text-sm" role="status">
-          Free trial: {daysLeft === null ? 'ends soon' : daysLeft <= 0 ? 'ends today' : `${daysLeft} day${daysLeft === 1 ? '' : 's'} left`}
+          Free trial ends {trialEndsPhrase(daysLeft)}
           {acct.trialEnd || acct.currentPeriodEnd ? ` (until ${formatDate((acct.trialEnd ?? acct.currentPeriodEnd) as string)})` : ''}. {trialOutcome(paymentMethod)}
         </div>
       )}
@@ -138,9 +138,9 @@ export default function BillingPage() {
               <button
                 key={i}
                 type="button"
-                aria-pressed={interval === i}
-                onClick={() => setInterval(i)}
-                className={`rounded px-3 py-1 ${interval === i ? 'bg-primary text-primary-foreground' : 'text-foreground-secondary hover:text-foreground'}`}
+                aria-pressed={billingInterval === i}
+                onClick={() => setBillingInterval(i)}
+                className={`rounded px-3 py-1 ${billingInterval === i ? 'bg-primary text-primary-foreground' : 'text-foreground-secondary hover:text-foreground'}`}
               >
                 {i === 'month' ? 'Monthly' : `Annual (save ${ANNUAL_DISCOUNT_PERCENT}%)`}
               </button>
@@ -154,10 +154,10 @@ export default function BillingPage() {
       <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-3">
         {data.plans.map((plan) => {
           const current = lic.plan === plan.id;
-          const yearly = interval === 'year' && plan.annualPurchasable;
+          const yearly = billingInterval === 'year' && plan.annualPurchasable;
           const cost = yearly ? (plan.annualPrice ?? plan.price) : plan.price;
           const per = yearly ? (plan.annualPeriod ?? plan.period) : plan.period;
-          const buyable = interval === 'year' ? plan.annualPurchasable : plan.purchasable;
+          const buyable = billingInterval === 'year' ? plan.annualPurchasable : plan.purchasable;
           return (
             <Card key={plan.id} className={current ? 'border-primary ring-1 ring-primary' : ''}>
               <div className="mb-4 flex items-center justify-between">
@@ -190,7 +190,7 @@ export default function BillingPage() {
                     value={seats[plan.id] ?? String(Math.max(plan.seats, lic.used, 1))}
                     onChange={(e) => setSeats({ ...seats, [plan.id]: e.target.value })}
                   />
-                  <Button className="flex-1" disabled={busy} onClick={() => void go('/api/billing/checkout', { plan: plan.id, seats: Number(seats[plan.id] ?? Math.max(plan.seats, lic.used, 1)), interval })}>
+                  <Button className="flex-1" disabled={busy} onClick={() => void go('/api/billing/checkout', { plan: plan.id, seats: Number(seats[plan.id] ?? Math.max(plan.seats, lic.used, 1)), interval: billingInterval })}>
                     {data.trial.eligible && data.trial.days > 0 ? `Start ${data.trial.days}-day free trial` : 'Subscribe'}
                   </Button>
                 </div>

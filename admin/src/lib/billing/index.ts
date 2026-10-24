@@ -23,7 +23,7 @@ import { deliverTo } from '../mailer';
 import { promotionCodesEnabled, trialDays } from './config';
 import { BILLING_INTERVALS, FREE_PLAN, planById, priceFor, priceMatch, type BillingInterval } from './plans';
 import { BillingError, type BillingEvent, type BillingProvider, type Discount, type Invoice, type SubscriptionStatus } from './provider';
-import { hasPaymentMethod, trialDaysLeft, trialOutcome } from './trial';
+import { hasPaymentMethod, trialDaysLeft, trialEndsPhrase, trialOutcome } from './trial';
 import { stripeFromEnv } from './stripe';
 
 export { BillingError };
@@ -160,9 +160,11 @@ export async function startCheckout(
   });
   // Only one checkout session stays open per organization: a session opened earlier (another tab, another
   // owner) was priced before this one and could still start a second, trialing subscription.
+  // The stored id is swapped before anything is awaited: two starts that overlap each take over from the
+  // other's id, so every earlier session gets expired and only the last one stays open.
   const earlier = billingAccount(orgId)?.checkoutSessionId;
-  if (earlier && earlier !== session.id) await p.expireCheckout(earlier).catch(() => undefined); // already completed or expired
   upsert(orgId, p.id, { checkoutSessionId: session.id });
+  if (earlier && earlier !== session.id) await p.expireCheckout(earlier).catch(() => undefined); // already completed or expired
   return { url: session.url };
 }
 
@@ -240,7 +242,7 @@ export function applyBillingEvent(provider: string, ev: BillingEvent): 'duplicat
     upsert(orgId, provider, { subPaymentMethod: ev.hasPaymentMethod });
     const pm = hasPaymentMethod(billingAccount(orgId)!);
     const left = trialDaysLeft(ev.trialEnd);
-    audit(orgId, 'billing.trial_will_end', `The free trial ends ${left === null ? 'soon' : left <= 0 ? 'today' : `in ${left} day(s)`}${ev.trialEnd ? ` (${ev.trialEnd.slice(0, 10)})` : ''}; ${pm ? 'a payment method is on file, so it converts to a paid subscription' : 'add a payment method in the billing portal to keep the subscription'}`, pm ? 'info' : 'warning', { subscriptionId: ev.subscriptionId, trialEnd: ev.trialEnd, paymentMethod: pm });
+    audit(orgId, 'billing.trial_will_end', `The free trial ends ${trialEndsPhrase(left)}${ev.trialEnd ? ` (${ev.trialEnd.slice(0, 10)})` : ''}; ${pm === true ? 'a payment method is on file, so it converts to a paid subscription' : pm === false ? 'add a payment method in the billing portal to keep the subscription' : 'check in the billing portal that a payment method is on file to keep the subscription'}`, pm === true ? 'info' : 'warning', { subscriptionId: ev.subscriptionId, trialEnd: ev.trialEnd, paymentMethod: pm });
     return 'applied';
   }
   if (!orgId) {
@@ -286,7 +288,7 @@ async function notifyTrialEnding(orgId: string, trialEnd: string | null): Promis
   const acct = billingAccount(orgId);
   const pm = acct ? hasPaymentMethod(acct) : null;
   const left = trialDaysLeft(trialEnd);
-  const when = left === null ? 'soon' : left <= 0 ? 'today' : `in ${left} day${left === 1 ? '' : 's'}`;
+  const when = trialEndsPhrase(left);
   const org = getOrg(orgId);
   await deliverTo(
     orgId,

@@ -169,11 +169,12 @@ export class StripeProvider implements BillingProvider {
           status: (str(obj.status) ?? 'canceled') as SubscriptionStatus,
           priceId: idOf(item.price) || null,
           seats: Number(item.quantity ?? obj.quantity ?? 0),
-          periodEnd: iso(obj.current_period_end),
+          // Newer API versions (a webhook endpoint follows the account's, not the 2024-06-20 of our own calls) move the period to the item and the single discount to discounts[].
+          periodEnd: iso(obj.current_period_end ?? item.current_period_end),
           cancelAtPeriodEnd: !!obj.cancel_at_period_end,
           deleted: type === 'customer.subscription.deleted',
           trialEnd: iso(obj.trial_end),
-          discount: discountOf(obj.discount),
+          discount: discountOf(obj.discount ?? ((obj.discounts as unknown[] | undefined) ?? []).find((d) => d && typeof d === 'object')),
           hasPaymentMethod: !!(idOf(obj.default_payment_method) || idOf(obj.default_source)),
         };
       }
