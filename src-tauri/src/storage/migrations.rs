@@ -202,16 +202,6 @@ fn rust_step(version: u32) -> Option<RustStep> {
 /// Schema v31: `ufop-server` accounts (Argon2 PHC hashes, role, disabled,
 /// console-managed flag), per-job access rules, and the account that owns
 /// each session and API token (existing ones: `admin`).
-/// Schema v32: `starred` connections (listed first) and the
-/// credentials-rejected flag: set when a service refuses the sign-in, so
-/// background reconnects stop retrying until the user edits the connection
-/// or clicks Retry.
-const V32_SCHEMA: &str = r#"
-ALTER TABLE connections ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE connections ADD COLUMN credentials_rejected_at TEXT;
-ALTER TABLE connections ADD COLUMN credentials_rejected_reason TEXT;
-"#;
-
 const V31_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS server_users (
     username      TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
@@ -232,6 +222,16 @@ CREATE TABLE IF NOT EXISTS server_acl (
 );
 ALTER TABLE server_tokens ADD COLUMN subject TEXT NOT NULL DEFAULT 'admin';
 ALTER TABLE server_api_tokens ADD COLUMN owner TEXT NOT NULL DEFAULT 'admin';
+"#;
+
+/// Schema v32: `starred` connections (listed first) and the
+/// credentials-rejected flag: set when a service refuses the sign-in, so
+/// background reconnects stop retrying until the user edits the connection
+/// or clicks Retry.
+const V32_SCHEMA: &str = r#"
+ALTER TABLE connections ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE connections ADD COLUMN credentials_rejected_at TEXT;
+ALTER TABLE connections ADD COLUMN credentials_rejected_reason TEXT;
 "#;
 
 /// Schema v30: `ufop-server` API tokens limited to some jobs (`job_ids`,
