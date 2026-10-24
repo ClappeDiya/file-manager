@@ -202,6 +202,16 @@ pub trait Connector: Send + Sync {
         None
     }
 
+    /// A new, disconnected instance configured like this one (endpoints,
+    /// credential store), for connectors that track
+    /// [`Connector::connected_profile_id`]. An action for an account other
+    /// than the one this shared instance is signed in as runs on it, so the
+    /// instance the user is browsing is never re-signed behind their back.
+    /// `None` (the default): not tracked.
+    fn detached(&self) -> Option<Arc<dyn Connector>> {
+        None
+    }
+
     /// Connect using a secret held in the credential store (password, access
     /// secret, or private-key path, depending on the protocol). Connectors
     /// that need no secret fall back to [`Connector::connect`].
@@ -289,7 +299,7 @@ pub trait Connector: Send + Sync {
 /// and, when it tracks who it is signed in as, signed in as that one (so an
 /// action for one account never runs against another of the same
 /// provider).
-pub fn connected_as(connector: &dyn Connector, id: Option<uuid::Uuid>) -> bool {
+pub fn connected_as<C: Connector + ?Sized>(connector: &C, id: Option<uuid::Uuid>) -> bool {
     connector.is_connected()
         && match (id, connector.connected_profile_id()) {
             (Some(want), Some(have)) => want == have,

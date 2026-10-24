@@ -78,6 +78,8 @@ async fn env() -> Env {
                 { "id": "f2", "name": "notes.txt", "mimeType": "text/plain", "size": "12" }
             ] })),
             "/dbx/users/get_current_account" => json(j!({ "email": "bob@example.com", "root_info": { ".tag": "user", "root_namespace_id": "1", "home_namespace_id": "1" } })),
+            "/dbx/files/delete_v2" => json(j!({ "metadata": { ".tag": "file", "name": "x.docx" } })),
+            "/content/files/upload" => json(j!({ "name": "x.txt", "path_display": "/in/x.txt", "size": 3 })),
             "/dbx/files/list_folder" => json(j!({ "entries": [{ ".tag": "file", "name": "a.txt", "path_display": "/a.txt", "size": 3 }], "cursor": "c", "has_more": false })),
             "/graph/me/drive" => json(j!({ "id": "d1", "owner": { "user": { "email": "cy@example.com" } }, "quota": { "total": 1000, "used": 10 } })),
             "/graph/me/drive/root/children" => json(j!({ "value": [{ "id": "i1", "name": "Docs", "folder": { "childCount": 0 }, "parentReference": { "path": "/drive/root:" } }] })),
@@ -284,12 +286,63 @@ async fn sign_in_cancel_and_manual_code() {
     assert!(!flows.is_pending(&start.state).await);
 }
 
+/// Regression: one shared Dropbox instance serves the Connections panel.
+/// An automation upload for connection B re-signed it as B, so the user,
+/// still browsing A, had their next delete / upload / listing run against
+/// account B.
+#[tokio::test(flavor = "multi_thread")]
+async fn background_work_for_another_account_leaves_the_browsed_one_alone() {
+    use crate::commands::connector_commands::{ensure_connected, user_instance};
+    let e = env().await;
+    let (pa, pb) = (e.saved(ConnectionProtocol::Dropbox).await, e.saved(ConnectionProtocol::Dropbox).await);
+    e.mgr.set_password(pa.id, r#"{"access_token":"a1"}"#).await.unwrap();
+    e.mgr.set_password(pb.id, r#"{"access_token":"pasted"}"#).await.unwrap();
+    let db = Arc::new(e.dropbox());
+    let registry = super::ConnectorRegistry::with_cloud(Arc::new(e.gdrive()), db.clone(), Arc::new(e.onedrive()));
+    let bearer = |path: &str| e.mock.requests(path).last().and_then(|r| r.header("authorization"));
+
+    // The user browses A (connector_connect).
+    db.connect_with_secrets(&pa, e.mgr.get_secrets(pa.id).await.unwrap()).await.unwrap();
+    // An automation rule uploads for B.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("x.txt");
+    std::fs::write(&file, b"abc").unwrap();
+    let c = ensure_connected(&registry, &e.mgr, "dropbox", Some(&pb.id.to_string())).await.unwrap();
+    c.upload(&file.to_string_lossy(), "/in/x.txt").await.unwrap();
+    assert_eq!(bearer("/content/files/upload").as_deref(), Some("Bearer pasted"), "B's upload uses B's token");
+
+    // The instance the panel browses is still signed in as A: its listing
+    // and delete go to A's account.
+    assert_eq!(db.connected_profile_id(), Some(pa.id), "background work must not re-sign the shared instance");
+    let shared = registry.get("dropbox").unwrap();
+    shared.list_remote("/").await.unwrap();
+    assert_eq!(bearer("/dbx/files/list_folder").as_deref(), Some("Bearer a1"));
+    shared.remove("/Reports/x.docx", false).await.unwrap();
+    assert_eq!(bearer("/dbx/files/delete_v2").as_deref(), Some("Bearer a1"), "the panel's delete must hit A");
+
+    // A sign-in for B (the wizard) does re-sign the shared instance. The
+    // panel's file commands name the connection they browse, so they still
+    // run as A, on a dedicated instance, leaving the shared one as B.
+    db.connect_with_secrets(&pb, e.mgr.get_secrets(pb.id).await.unwrap()).await.unwrap();
+    let panel = user_instance(&registry, &e.mgr, "dropbox", Some(&pa.id.to_string())).await.unwrap();
+    panel.remove("/Reports/y.docx", false).await.unwrap();
+    assert_eq!(bearer("/dbx/files/delete_v2").as_deref(), Some("Bearer a1"));
+    panel.list_remote("/").await.unwrap();
+    assert_eq!(bearer("/dbx/files/list_folder").as_deref(), Some("Bearer a1"));
+    assert_eq!(db.connected_profile_id(), Some(pb.id));
+    // Commands that name no connection keep using the shared instance.
+    let unnamed = user_instance(&registry, &e.mgr, "dropbox", None).await.unwrap();
+    assert_eq!(unnamed.connected_profile_id(), Some(pb.id));
+}
+
 /// Regression: the one shared Dropbox instance stayed signed in as the
 /// last-connected account, so an action for connection B (automation
 /// upload, share link, quota, permanent delete) ran against account A.
+/// Each action now runs signed in as the connection it names, without
+/// re-signing the shared instance.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_shared_connector_reconnects_as_the_requested_connection() {
-    use crate::commands::connector_commands::{connect_if_needed, ensure_connected};
+async fn an_action_runs_signed_in_as_the_connection_it_names() {
+    use crate::commands::connector_commands::{ensure_connected, user_instance};
     let e = env().await;
     let (pa, pb) = (e.saved(ConnectionProtocol::Dropbox).await, e.saved(ConnectionProtocol::Dropbox).await);
     e.mgr.set_password(pa.id, r#"{"access_token":"a1"}"#).await.unwrap();
@@ -300,31 +353,30 @@ async fn a_shared_connector_reconnects_as_the_requested_connection() {
     let (a, b) = (pa.id.to_string(), pb.id.to_string());
 
     // The panel connects A.
-    connect_if_needed(db.as_ref(), &e.mgr, Some(&a)).await.unwrap();
+    db.connect_with_secrets(&pa, e.mgr.get_secrets(pa.id).await.unwrap()).await.unwrap();
     db.list_remote("/").await.unwrap();
     assert_eq!(last_bearer().as_deref(), Some("Bearer a1"));
-    // An interactive action for B (quota, share link) signs in as B.
-    connect_if_needed(db.as_ref(), &e.mgr, Some(&b)).await.unwrap();
-    db.list_remote("/").await.unwrap();
+    // An interactive action for B (quota, share link) runs as B.
+    user_instance(&registry, &e.mgr, "dropbox", Some(&b)).await.unwrap().list_remote("/").await.unwrap();
     assert_eq!(last_bearer().as_deref(), Some("Bearer pasted"), "B's action must use B's token");
-    // A background action for A (automation upload) switches back to A.
-    let c = ensure_connected(&registry, &e.mgr, "dropbox", Some(&a)).await.unwrap();
-    c.list_remote("/").await.unwrap();
-    assert_eq!(last_bearer().as_deref(), Some("Bearer a1"), "A's automation must use A's token");
-    // Already signed in as A: no new sign-in check.
+    // A background action for B (automation upload) runs as B too.
+    ensure_connected(&registry, &e.mgr, "dropbox", Some(&b)).await.unwrap().list_remote("/").await.unwrap();
+    assert_eq!(last_bearer().as_deref(), Some("Bearer pasted"), "B's automation must use B's token");
+    assert_eq!(db.connected_profile_id(), Some(pa.id), "neither re-signs the shared instance");
+    // Already signed in as A: the shared instance, no new sign-in check.
     let checks = e.mock.requests("/dbx/users/get_current_account").len();
-    ensure_connected(&registry, &e.mgr, "dropbox", Some(&a)).await.unwrap();
-    connect_if_needed(db.as_ref(), &e.mgr, Some(&a)).await.unwrap();
+    let c = ensure_connected(&registry, &e.mgr, "dropbox", Some(&a)).await.unwrap();
+    assert_eq!(c.connected_profile_id(), Some(pa.id));
+    user_instance(&registry, &e.mgr, "dropbox", Some(&a)).await.unwrap();
     assert_eq!(e.mock.requests("/dbx/users/get_current_account").len(), checks);
-    assert_eq!(db.connected_profile_id(), Some(pa.id));
 
     // B flagged as credentials-rejected: background work for B is refused,
     // a user action for B (share link, quota) still tries — and succeeds.
     e.mgr.record_connect_outcome(pb.id, &Err::<(), _>(crate::core::error::AppError::auth("refused", "sign in"))).await;
     assert!(ensure_connected(&registry, &e.mgr, "dropbox", Some(&b)).await.err().is_some_and(|e| e.is_auth_failure()));
-    assert_eq!(db.connected_profile_id(), Some(pa.id), "a refused background reconnect leaves A in place");
-    connect_if_needed(db.as_ref(), &e.mgr, Some(&b)).await.unwrap();
-    assert_eq!(db.connected_profile_id(), Some(pb.id));
+    let ub = user_instance(&registry, &e.mgr, "dropbox", Some(&b)).await.unwrap();
+    assert_eq!(ub.connected_profile_id(), Some(pb.id));
+    assert_eq!(db.connected_profile_id(), Some(pa.id), "A stays in place");
     db.disconnect().await.unwrap();
     assert_eq!(db.connected_profile_id(), None);
 }

@@ -1843,7 +1843,7 @@ export function ConnectionPanel() {
         const initialPath = conn.remote_path || "/";
         const files = await tauriInvoke<RemoteFileEntry[]>(
           "connector_list_remote",
-          { protocol: conn.protocol, path: initialPath },
+          { protocol: conn.protocol, path: initialPath, connectionId: id },
           []
         );
 
@@ -1894,13 +1894,13 @@ export function ConnectionPanel() {
       const jobId = `size-${Date.now()}-${++sizeJob.current}`;
       setSizes((prev) => ({ ...prev, [entry.path]: { jobId, running: true } }));
       try {
-        const result = await tauriInvoke<FolderSize>("connector_folder_size", { protocol: connectedProtocol, path: entry.path, jobId });
+        const result = await tauriInvoke<FolderSize>("connector_folder_size", { protocol: connectedProtocol, path: entry.path, jobId, connectionId: connectedId });
         setSizes((prev) => ({ ...prev, [entry.path]: { running: false, result } }));
       } catch (err) {
         setSizes((prev) => ({ ...prev, [entry.path]: { running: false, error: errorText(err) } }));
       }
     },
-    [connectedProtocol]
+    [connectedProtocol, connectedId]
   );
 
   const handleCancelSize = useCallback(async (path: string) => {
@@ -1953,7 +1953,7 @@ export function ConnectionPanel() {
       try {
         const files = await tauriInvoke<RemoteFileEntry[]>(
           "connector_list_remote",
-          { protocol: connectedProtocol, path },
+          { protocol: connectedProtocol, path, connectionId: connectedId },
           []
         );
         setRemoteFiles(files);
@@ -1966,7 +1966,7 @@ export function ConnectionPanel() {
         setBrowsing(false);
       }
     },
-    [connectedProtocol]
+    [connectedProtocol, connectedId]
   );
 
   // Derive the connected connection name for the header
@@ -1984,11 +1984,11 @@ export function ConnectionPanel() {
     if (!connectedProtocol) return;
     const files = await tauriInvoke<RemoteFileEntry[]>(
       "connector_list_remote",
-      { protocol: connectedProtocol, path: remotePath },
+      { protocol: connectedProtocol, path: remotePath, connectionId: connectedId },
       [],
     );
     setRemoteFiles(files);
-  }, [connectedProtocol, remotePath]);
+  }, [connectedProtocol, connectedId, remotePath]);
 
   const handleUpload = useCallback(async () => {
     if (!connectedProtocol) return;
@@ -2004,6 +2004,7 @@ export function ConnectionPanel() {
           protocol: connectedProtocol,
           localPath: local,
           remotePath: joinRemote(remotePath, name),
+          connectionId: connectedId,
         });
         done++;
       }
@@ -2013,7 +2014,7 @@ export function ConnectionPanel() {
       setTransferStatus(null);
       setBrowseError(`Upload failed after ${done}/${files.length}: ${errorText(err)}`);
     }
-  }, [connectedProtocol, remotePath, reloadRemote]);
+  }, [connectedProtocol, connectedId, remotePath, reloadRemote]);
 
   const handleDownload = useCallback(async (entry: RemoteFileEntry) => {
     if (!connectedProtocol) return;
@@ -2026,13 +2027,14 @@ export function ConnectionPanel() {
         protocol: connectedProtocol,
         remotePath: entry.path,
         localPath: `${dir.replace(/\/$/, "")}/${entry.name}`,
+        connectionId: connectedId,
       });
       setTransferStatus(`Downloaded ${entry.name} (${formatFileSize(bytes)}) to ${dir}.`);
     } catch (err) {
       setTransferStatus(null);
       setBrowseError(`Download failed: ${errorText(err)}`);
     }
-  }, [connectedProtocol]);
+  }, [connectedProtocol, connectedId]);
 
   const handleRemoteMkdir = useCallback(async () => {
     if (!connectedProtocol) return;
@@ -2043,13 +2045,14 @@ export function ConnectionPanel() {
       await tauriInvoke("connector_make_directory", {
         protocol: connectedProtocol,
         remotePath: joinRemote(remotePath, name),
+        connectionId: connectedId,
       });
       setTransferStatus(`Created folder ${name}.`);
       await reloadRemote();
     } catch (err) {
       setBrowseError(`Create folder failed: ${errorText(err)}`);
     }
-  }, [connectedProtocol, remotePath, reloadRemote]);
+  }, [connectedProtocol, connectedId, remotePath, reloadRemote]);
 
   const handleRemoteDelete = useCallback(async (entry: RemoteFileEntry) => {
     if (!connectedProtocol) return;
@@ -2065,13 +2068,14 @@ export function ConnectionPanel() {
         protocol: connectedProtocol,
         remotePath: entry.path,
         isDir: entry.is_dir,
+        connectionId: connectedId,
       });
       setTransferStatus(`Deleted ${entry.name}.`);
       await reloadRemote();
     } catch (err) {
       setBrowseError(`Delete failed: ${errorText(err)}`);
     }
-  }, [connectedProtocol, reloadRemote]);
+  }, [connectedProtocol, connectedId, reloadRemote]);
 
   const handleExport = useCallback(async () => {
     try {

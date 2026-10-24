@@ -133,6 +133,19 @@ impl DropboxConnector {
         }
     }
 
+    /// A new, disconnected instance with this one's endpoints and credential
+    /// store (an action for another account runs on it).
+    pub fn fresh(&self) -> Self {
+        Self {
+            http: self.http.clone(),
+            api_base: self.api_base.clone(),
+            content_base: self.content_base.clone(),
+            token_url: self.token_url.clone(),
+            credentials: self.credentials.clone(),
+            ..Self::new()
+        }
+    }
+
     /// Persist rotated tokens in `store` (under the connection's credential key).
     pub fn with_credentials(mut self, store: Arc<crate::security::CredentialStore>) -> Self {
         self.credentials = Some(store);
@@ -952,6 +965,10 @@ impl Connector for DropboxConnector {
 
     fn connected_profile_id(&self) -> Option<uuid::Uuid> {
         self.profile_id.read().ok().and_then(|p| *p).filter(|_| self.is_connected())
+    }
+
+    fn detached(&self) -> Option<Arc<dyn Connector>> {
+        Some(Arc::new(self.fresh()))
     }
 
     fn upload(&self, local_path: &str, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<u64, AppError>> + Send + '_>> {

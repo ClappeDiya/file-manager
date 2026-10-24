@@ -1,7 +1,7 @@
 //! Share links for files on cloud connections, under a sharing policy
 //! (stored in config; enforced before any provider is asked).
 
-use super::connector_commands::connect_if_needed;
+use super::connector_commands::user_instance;
 use crate::connectors::{ConnectionManager, ConnectorRegistry, ShareLink, ShareOptions, ShareScope};
 use crate::core::error::AppError;
 use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
@@ -91,8 +91,7 @@ pub async fn connector_create_share_link(
     load_policy(&repo).await?.check(&options)?;
     // A user action: tried even when the connection is flagged as
     // credentials-rejected (only background reconnects skip those).
-    let connector = registry.get(&protocol).ok_or_else(|| AppError::validation(format!("Unsupported protocol '{protocol}'")))?;
-    connect_if_needed(connector.as_ref(), &connections, connection_id.as_deref()).await?;
+    let connector = user_instance(&registry, &connections, &protocol, connection_id.as_deref()).await?;
     let result = connector.create_share_link(&path, &options).await;
     let summary = match &result {
         Ok(l) => format!(

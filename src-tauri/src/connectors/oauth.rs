@@ -131,6 +131,24 @@ enum RefreshVia {
 
 /// A refused token request: `invalid_grant` / 400 / 401 mean the sign-in is
 /// no longer valid (revoked, expired, changed password).
+/// A sign-in broker URL the AuthID (a bearer secret) may be sent to:
+/// https, or plain http only to this machine (a broker on localhost).
+pub fn check_broker_url(url: &str) -> Result<(), AppError> {
+    let refuse = || AppError::validation("The broker URL must start with https:// (plain http:// only for a broker on this computer: localhost, 127.0.0.1 or [::1])");
+    let parsed = url::Url::parse(url).map_err(|_| refuse())?;
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    match parsed.scheme() {
+        "https" if parsed.host().is_some() => Ok(()),
+        "http" if loopback => Ok(()),
+        _ => Err(refuse()),
+    }
+}
+
 fn token_error(what: &str, status: reqwest::StatusCode, body: &str) -> AppError {
     let code = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| v["error"].as_str().map(String::from)).unwrap_or_default();
     if matches!(status.as_u16(), 400 | 401 | 403) || code == "invalid_grant" || code == "invalid_client" {
@@ -455,6 +473,7 @@ impl OAuthClient {
     /// A fresh access token from the AuthID broker (`server/oauth.rs`):
     /// `{"access_token": "…", "expires_at": <unix seconds>}`.
     async fn refresh_from_broker(&self, broker_url: &str, authid: &str) -> Result<OAuthToken, AppError> {
+        check_broker_url(broker_url)?;
         let resp = self
             .http
             .get(format!("{broker_url}/oauth/token"))

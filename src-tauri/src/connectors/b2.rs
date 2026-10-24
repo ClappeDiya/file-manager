@@ -160,6 +160,12 @@ impl B2Connector {
         }
     }
 
+    /// A new, unauthorized instance against the same authorize URL (an
+    /// action for another key runs on it).
+    pub fn fresh(&self) -> Self {
+        Self::with_authorize_url(&self.authorize_url)
+    }
+
     /// Connect with application key credentials.
     pub async fn connect_with_credentials(
         &self,
@@ -971,6 +977,10 @@ impl Connector for B2Connector {
 
     fn connected_profile_id(&self) -> Option<uuid::Uuid> {
         self.profile_id.read().ok().and_then(|p| *p).filter(|_| self.is_connected())
+    }
+
+    fn detached(&self) -> Option<Arc<dyn Connector>> {
+        Some(Arc::new(self.fresh()))
     }
 }
 

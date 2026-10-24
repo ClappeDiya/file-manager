@@ -199,9 +199,7 @@ pub fn grant_from_input(token: Option<String>, broker_url: Option<String>, authi
     let nonempty = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     match (nonempty(token), nonempty(broker_url), nonempty(authid)) {
         (_, Some(url), Some(authid)) => {
-            if !(url.starts_with("https://") || url.starts_with("http://")) {
-                return Err(AppError::validation("The broker URL must start with https://"));
-            }
+            crate::connectors::oauth::check_broker_url(&url)?;
             Ok(OAuthGrant::Broker { broker_url: url.trim_end_matches('/').to_string(), authid })
         }
         (_, None, Some(_)) => Err(AppError::validation("Enter the broker URL the AuthID came from")),
@@ -285,5 +283,20 @@ mod tests {
         assert!(grant_from_input(None, Some("ftp://b".into()), Some("x".into())).is_err());
         assert!(matches!(grant_from_input(Some("tok".into()), None, None).unwrap(), OAuthGrant::Token { .. }));
         assert!(grant_from_input(Some(" ".into()), None, None).is_err());
+    }
+
+    /// Regression: an http:// broker URL was accepted (though the message
+    /// said https://), so the AuthID, a bearer secret, went out in clear
+    /// text on every refresh. Plain http is only allowed to this machine.
+    #[test]
+    fn a_broker_url_must_be_https_unless_it_is_this_machine() {
+        let broker = |url: &str| grant_from_input(None, Some(url.into()), Some("google:x".into()));
+        for bad in ["http://broker.example", "http://10.0.0.5:8080", "http://localhost.evil.example", "http://127.0.0.1.nip.io"] {
+            let err = broker(bad).err().unwrap_or_else(|| panic!("{bad} accepted"));
+            assert!(err.user_message().contains("https://"), "{bad}: {}", err.user_message());
+        }
+        for ok in ["https://broker.example", "http://localhost:8080", "http://127.0.0.1:9000/", "http://[::1]:9000"] {
+            assert!(broker(ok).is_ok(), "{ok} refused");
+        }
     }
 }

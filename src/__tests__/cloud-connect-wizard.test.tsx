@@ -86,6 +86,28 @@ describe("Google Drive wizard", () => {
     window.removeEventListener("ufop:connections-changed", changed);
   });
 
+  // Regression: a sign-in with your own OAuth app stores its client id on
+  // the connection; the wizard's later saves sent client_id: null and
+  // wiped it, so the next sign-in fell back to the built-in app.
+  it("keeps the custom OAuth app the sign-in saved on the connection", async () => {
+    backend({
+      get_connection: () => ({ id: "c1", name: "Google Drive", protocol: "google_drive", extras: { oauth: { client_id: "my-app.apps", account_kind: "personal" } } }),
+    });
+    render(<ConnectGDriveWizard />);
+    next();
+    fireEvent.click(await screen.findByRole("button", { name: "Sign in with Google Drive" }));
+    await screen.findByTestId("cloud-signed-in");
+    next();
+    fireEvent.click(await screen.findByRole("button", { name: "List it" }));
+    await screen.findByTestId("cloud-listing");
+    expect(calls("connector_list_remote").at(-1)).toMatchObject({ protocol: "google_drive", connectionId: "c1" });
+    next();
+    await waitFor(() => expect(useUIStore.getState().activeGuidedFlow).toBeNull());
+    const saves = calls("save_connection") as { extras: { oauth: { client_id: string | null } } }[];
+    expect(saves.length).toBeGreaterThan(1);
+    for (const s of saves.slice(1)) expect(s.extras.oauth.client_id).toBe("my-app.apps");
+  });
+
   it("does not continue when the sign-in has not happened", async () => {
     render(<ConnectGDriveWizard />);
     next();

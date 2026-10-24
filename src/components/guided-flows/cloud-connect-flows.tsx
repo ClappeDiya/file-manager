@@ -19,7 +19,7 @@ import { tauriInvoke } from "@/hooks/use-tauri";
 import { errorText } from "@/lib/error-text";
 import { announceConnectionsChanged, type OAuthSignedIn } from "@/lib/oauth";
 import { OAuthSignIn } from "@/components/oauth-sign-in";
-import { CloudScopeFields, type CloudExtras } from "@/components/cloud-connection-fields";
+import { CloudScopeFields, type CloudExtras, type OAuthSettings } from "@/components/cloud-connection-fields";
 import { PasswordInput } from "@/components/password-input";
 import { WizardShell, type WizardStepDef } from "./wizard-shell";
 import { cn } from "@ufop/ui-components";
@@ -74,7 +74,7 @@ async function saveProfile(args: Record<string, unknown>): Promise<SavedProfile>
 /** Connect a saved connection and list its root: the real test. */
 async function connectAndList(protocol: string, connectionId: string, host = ""): Promise<RemoteEntry[]> {
   await tauriInvoke("connector_connect", { protocol, host, port: null, username: null, remotePath: "/", connectionId });
-  return tauriInvoke<RemoteEntry[]>("connector_list_remote", { protocol, path: "/" });
+  return tauriInvoke<RemoteEntry[]>("connector_list_remote", { protocol, path: "/", connectionId });
 }
 
 function CloudConnectWizard({ provider }: { provider: CloudProvider }) {
@@ -91,6 +91,8 @@ function CloudConnectWizard({ provider }: { provider: CloudProvider }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [listing, setListing] = useState<RemoteEntry[] | null>(null);
+  // The OAuth app the sign-in saved on the connection (your own, Advanced).
+  const [clientId, setClientId] = useState<string | null>(null);
 
   const extras = useCallback(
     (): Record<string, unknown> => ({
@@ -98,12 +100,14 @@ function CloudConnectWizard({ provider }: { provider: CloudProvider }) {
       rclone_remote: null,
       preset: null,
       swift: null,
-      oauth: { client_id: null, ...(scope.oauth ?? {}), account_kind: provider === "onedrive" ? scope.oauth?.account_kind ?? accountKind : "personal" },
+      // Every save replaces the extras: carry the sign-in's OAuth app over,
+      // or the next sign-in would fall back to the built-in one.
+      oauth: { ...(scope.oauth ?? {}), client_id: clientId, account_kind: provider === "onedrive" ? scope.oauth?.account_kind ?? accountKind : "personal" },
       google_drive: provider === "gdrive" ? scope.google_drive ?? null : null,
       onedrive: provider === "onedrive" ? scope.onedrive ?? null : null,
       dropbox: provider === "dropbox" ? scope.dropbox ?? null : null,
     }),
-    [scope, provider, accountKind],
+    [scope, provider, accountKind, clientId],
   );
 
   const save = useCallback(async (): Promise<SavedProfile> => {
@@ -122,6 +126,17 @@ function CloudConnectWizard({ provider }: { provider: CloudProvider }) {
     setSaved(p);
     return p;
   }, [saved, name, info, extras]);
+
+  /** Signed in: read back the OAuth app the sign-in saved on the connection. */
+  const handleSignedIn = useCallback(async (s: OAuthSignedIn) => {
+    try {
+      const p = await tauriInvoke<{ extras?: { oauth?: OAuthSettings | null } | null } | null>("get_connection", { connectionId: s.connection_id });
+      setClientId(p?.extras?.oauth?.client_id ?? null);
+    } catch (e) {
+      console.error("Cannot read the connection back:", e);
+    }
+    setSignedIn(s);
+  }, []);
 
   /** Save the chosen location, then connect and list it. */
   const preview = useCallback(async () => {
@@ -247,7 +262,7 @@ function CloudConnectWizard({ provider }: { provider: CloudProvider }) {
               Signed in{signedIn.account ? ` as ${signedIn.account}` : ""}.
             </p>
           ) : (
-            <OAuthSignIn connectionId={saved.id} protocol={info.protocol} onSignedIn={setSignedIn} />
+            <OAuthSignIn connectionId={saved.id} protocol={info.protocol} onSignedIn={(s) => void handleSignedIn(s)} />
           )}
           <p className="text-xs text-[color:var(--color-text-tertiary)]">
             <Shield className="h-3 w-3 inline mr-1" aria-hidden="true" />

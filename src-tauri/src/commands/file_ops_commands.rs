@@ -1218,18 +1218,18 @@ pub async fn cloud_delete_to_trash(
     match protocol.as_str() {
         "google_drive" => {
             // Google Drive: move to trash (permanent=false)
-            ensure_cloud_connected(gdrive.as_ref(), &connections, &connection_id).await?;
-            gdrive.delete_file(&file_id, false).await
+            cloud_instance(&gdrive, &connections, &connection_id, crate::connectors::GoogleDriveConnector::fresh).await?
+                .delete_file(&file_id, false).await
         }
         "onedrive" => {
             // OneDrive: DELETE moves to recycle bin by default
-            ensure_cloud_connected(onedrive.as_ref(), &connections, &connection_id).await?;
-            onedrive.delete_item(&file_id).await
+            cloud_instance(&onedrive, &connections, &connection_id, crate::connectors::OneDriveConnector::fresh).await?
+                .delete_item(&file_id).await
         }
         "dropbox" => {
             // Dropbox: delete_v2 is a soft delete (recoverable)
-            ensure_cloud_connected(dropbox.as_ref(), &connections, &connection_id).await?;
-            dropbox.delete(&file_id).await
+            cloud_instance(&dropbox, &connections, &connection_id, crate::connectors::DropboxConnector::fresh).await?
+                .delete(&file_id).await
         }
         other => Err(AppError::FileOperation {
             message: format!("Unsupported cloud protocol for trash deletion: {other}"),
@@ -1238,12 +1238,19 @@ pub async fn cloud_delete_to_trash(
     }
 }
 
-/// Connect the shared cloud connector with the saved connection's sign-in
-/// unless it is already signed in as that connection. (These commands used
-/// to create a fresh, never-signed-in connector, so every call failed with
-/// "Not connected".)
-async fn ensure_cloud_connected(connector: &dyn crate::connectors::Connector, connections: &crate::connectors::ConnectionManager, connection_id: &str) -> Result<(), AppError> {
-    super::connector_commands::connect_if_needed(connector, connections, Some(connection_id)).await
+/// The cloud connector signed in as the saved connection: the shared one
+/// when it already is, else a fresh instance (the shared one, which the
+/// Connections panel browses, is not re-signed as another account). These
+/// commands used to create a never-signed-in connector, so every call
+/// failed with "Not connected".
+async fn cloud_instance<C: crate::connectors::Connector + 'static>(
+    connector: &Arc<C>,
+    connections: &crate::connectors::ConnectionManager,
+    connection_id: &str,
+    fresh: fn(&C) -> C,
+) -> Result<Arc<C>, AppError> {
+    use super::connector_commands::{instance_for, Caller};
+    instance_for(connector.clone(), |c| Some(Arc::new(fresh(c))), connections, connection_id, Caller::User).await
 }
 
 /// Permanently delete a cloud file/folder, bypassing the trash/recycle bin.
@@ -1271,18 +1278,18 @@ pub async fn cloud_delete_permanently(
     match protocol.as_str() {
         "google_drive" => {
             // Google Drive: permanent delete (permanent=true)
-            ensure_cloud_connected(gdrive.as_ref(), &connections, &connection_id).await?;
-            gdrive.delete_file(&file_id, true).await
+            cloud_instance(&gdrive, &connections, &connection_id, crate::connectors::GoogleDriveConnector::fresh).await?
+                .delete_file(&file_id, true).await
         }
         "onedrive" => {
             // OneDrive: delete + purge from recycle bin
-            ensure_cloud_connected(onedrive.as_ref(), &connections, &connection_id).await?;
-            onedrive.delete_item_permanently(&file_id).await
+            cloud_instance(&onedrive, &connections, &connection_id, crate::connectors::OneDriveConnector::fresh).await?
+                .delete_item_permanently(&file_id).await
         }
         "dropbox" => {
             // Dropbox: permanent deletion endpoint
-            ensure_cloud_connected(dropbox.as_ref(), &connections, &connection_id).await?;
-            dropbox.permanently_delete(&file_id).await
+            cloud_instance(&dropbox, &connections, &connection_id, crate::connectors::DropboxConnector::fresh).await?
+                .permanently_delete(&file_id).await
         }
         other => Err(AppError::FileOperation {
             message: format!("Unsupported cloud protocol for permanent deletion: {other}"),

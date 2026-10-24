@@ -124,53 +124,73 @@ fn require_connected(connector: &dyn Connector) -> Result<(), AppError> {
 }
 
 /// Upload a local file to the connected server; returns bytes written.
+///
+/// `connection_id` names the saved connection the caller is browsing: the
+/// action then runs signed in as that account even if the shared instance
+/// holds another one (see [`instance_for`]).
 #[tauri::command]
 pub async fn connector_upload(
     protocol: String,
     local_path: String,
     remote_path: String,
+    connection_id: Option<String>,
     registry: State<'_, ConnectorRegistry>,
+    manager: State<'_, ConnectionManager>,
 ) -> Result<u64, AppError> {
-    let connector = require_connector(&registry, &protocol)?;
-    require_connected(connector.as_ref())?;
+    let connector = user_instance(&registry, &manager, &protocol, connection_id.as_deref()).await?;
     connector.upload(&local_path, &remote_path).await
 }
 
 /// Download a remote file from the connected server; returns bytes written.
+///
+/// `connection_id` names the saved connection the caller is browsing: the
+/// action then runs signed in as that account even if the shared instance
+/// holds another one (see [`instance_for`]).
 #[tauri::command]
 pub async fn connector_download(
     protocol: String,
     remote_path: String,
     local_path: String,
+    connection_id: Option<String>,
     registry: State<'_, ConnectorRegistry>,
+    manager: State<'_, ConnectionManager>,
 ) -> Result<u64, AppError> {
-    let connector = require_connector(&registry, &protocol)?;
-    require_connected(connector.as_ref())?;
+    let connector = user_instance(&registry, &manager, &protocol, connection_id.as_deref()).await?;
     connector.download(&remote_path, &local_path).await
 }
 
 /// Create a directory on the connected server.
+///
+/// `connection_id` names the saved connection the caller is browsing: the
+/// action then runs signed in as that account even if the shared instance
+/// holds another one (see [`instance_for`]).
 #[tauri::command]
 pub async fn connector_make_directory(
     protocol: String,
     remote_path: String,
+    connection_id: Option<String>,
     registry: State<'_, ConnectorRegistry>,
+    manager: State<'_, ConnectionManager>,
 ) -> Result<(), AppError> {
-    let connector = require_connector(&registry, &protocol)?;
-    require_connected(connector.as_ref())?;
+    let connector = user_instance(&registry, &manager, &protocol, connection_id.as_deref()).await?;
     connector.make_directory(&remote_path).await
 }
 
 /// Delete a file or empty directory on the connected server.
+///
+/// `connection_id` names the saved connection the caller is browsing: the
+/// action then runs signed in as that account even if the shared instance
+/// holds another one (see [`instance_for`]).
 #[tauri::command]
 pub async fn connector_remove(
     protocol: String,
     remote_path: String,
     is_dir: bool,
+    connection_id: Option<String>,
     registry: State<'_, ConnectorRegistry>,
+    manager: State<'_, ConnectionManager>,
 ) -> Result<(), AppError> {
-    let connector = require_connector(&registry, &protocol)?;
-    require_connected(connector.as_ref())?;
+    let connector = user_instance(&registry, &manager, &protocol, connection_id.as_deref()).await?;
     connector.remove(&remote_path, is_dir).await
 }
 
@@ -191,19 +211,26 @@ pub async fn connector_disconnect(
 }
 
 /// List remote directory contents.
+///
+/// `connection_id` names the saved connection the caller is browsing: the
+/// action then runs signed in as that account even if the shared instance
+/// holds another one (see [`instance_for`]).
 #[tauri::command]
 pub async fn connector_list_remote(
     protocol: String,
     path: String,
+    connection_id: Option<String>,
     registry: State<'_, ConnectorRegistry>,
+    manager: State<'_, ConnectionManager>,
     search: State<'_, crate::search_engine::SearchManager>,
 ) -> Result<Vec<FileEntry>, AppError> {
-    let connector = registry
-        .get(&protocol)
-        .ok_or_else(|| AppError::Connection {
+    let connector = match connection_id.as_deref().filter(|c| !c.is_empty()) {
+        Some(_) => user_instance(&registry, &manager, &protocol, connection_id.as_deref()).await?,
+        None => registry.get(&protocol).ok_or_else(|| AppError::Connection {
             message: format!("Unsupported protocol: {protocol}"),
             advice: "Use one of: sftp, ftp, ftps, webdav, smb, nfs, local.".to_string(),
-        })?;
+        })?,
+    };
 
     let entries = connector.list_remote(&path).await?;
     // Remember what was seen, so global search can find it later. Local
@@ -253,10 +280,11 @@ pub async fn connector_list_protocols(
     Ok(registry.protocols())
 }
 
-/// The connector for `protocol`, connected with the saved connection's
-/// secret unless it already is connected as that connection (one shared
-/// instance serves every account of a provider, so it is re-signed-in
-/// when it holds another one).
+/// The connector to run background work (an automation rule) for saved
+/// connection `connection_id` on. A connection whose credentials were
+/// rejected is skipped until the user fixes them. See [`instance_for`]: the
+/// shared instance the user is browsing is never re-signed as another
+/// account.
 pub async fn ensure_connected(
     registry: &ConnectorRegistry,
     connections: &crate::connectors::ConnectionManager,
@@ -266,47 +294,82 @@ pub async fn ensure_connected(
     let connector = registry
         .get(protocol)
         .ok_or_else(|| AppError::validation(format!("Unsupported protocol '{protocol}'")))?;
-    if let Some(cid) = connection_id.filter(|c| !c.is_empty()) {
-        let id = parse_connection_id(cid)?;
-        if !crate::connectors::connected_as(connector.as_ref(), Some(id)) {
-            let profile = connections
-                .get_connection(id)
-                .await?
-                .ok_or_else(|| AppError::validation(format!("Saved connection {cid} not found")))?;
-            // An automatic reconnect: skip a connection whose credentials
-            // were rejected until the user fixes them.
-            let secrets = connections.background_secrets(id, &profile.name).await?;
-            let result = connector.connect_with_secrets(&profile, secrets).await;
-            connections.record_connect_outcome(id, &result).await;
-            result.map_err(|e| match e {
-                AppError::Authentication { message, advice } => AppError::Authentication { message: format!("Cannot connect to {}: {message}", profile.name), advice },
-                e => AppError::connection(format!("Cannot connect to {}: {e}", profile.name), "Check the connection's settings."),
-            })?;
-        }
+    match connection_id.filter(|c| !c.is_empty()) {
+        Some(cid) => instance_for(connector, |c| c.detached(), connections, cid, Caller::Background).await,
+        None => Ok(connector),
     }
-    Ok(connector)
 }
 
 fn parse_connection_id(cid: &str) -> Result<uuid::Uuid, AppError> {
     uuid::Uuid::parse_str(cid).map_err(|_| AppError::validation(format!("Invalid connection id '{cid}'")))
 }
 
-/// Connect `connector` with the saved connection's secrets unless it is
-/// already connected as that connection (an interactive request: tried
-/// even when the connection is flagged, and the outcome recorded).
-pub(crate) async fn connect_if_needed(connector: &dyn Connector, manager: &ConnectionManager, connection_id: Option<&str>) -> Result<(), AppError> {
-    let Some(cid) = connection_id.filter(|c| !c.is_empty()) else {
-        return require_connected(connector);
-    };
+/// Who wants a connection: the user (tried even when it is flagged as
+/// credentials-rejected) or background work (a flagged one is skipped).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Caller {
+    User,
+    Background,
+}
+
+/// The instance to run an action for saved connection `cid` on:
+/// - the shared `connector` when it already serves that connection;
+/// - for connectors that track which account they are signed in as
+///   (`detach` gives a fresh instance), a dedicated instance signed in as
+///   it, leaving the shared one alone: one shared instance serves the
+///   Connections panel, so re-signing it would make the user's next
+///   delete or upload hit another account;
+/// - otherwise the shared one, connected.
+///
+/// Only an explicit connect (`connector_connect`, a sign-in) changes the
+/// account the shared instance holds. The outcome is recorded on the
+/// connection (rejected-credentials flag).
+pub(crate) async fn instance_for<C: Connector + ?Sized>(
+    connector: std::sync::Arc<C>,
+    detach: impl FnOnce(&C) -> Option<std::sync::Arc<C>>,
+    manager: &ConnectionManager,
+    cid: &str,
+    caller: Caller,
+) -> Result<std::sync::Arc<C>, AppError> {
     let id = parse_connection_id(cid)?;
-    if crate::connectors::connected_as(connector, Some(id)) {
-        return Ok(());
+    if crate::connectors::connected_as(connector.as_ref(), Some(id)) {
+        return Ok(connector);
     }
     let profile = manager.get_connection(id).await?.ok_or_else(|| AppError::not_found(format!("Saved connection {cid} not found")))?;
-    let secrets = manager.get_secrets(id).await?;
-    let r = connector.connect_with_secrets(&profile, secrets).await;
-    manager.record_connect_outcome(id, &r).await;
-    r
+    let secrets = match caller {
+        Caller::User => manager.get_secrets(id).await?,
+        Caller::Background => manager.background_secrets(id, &profile.name).await?,
+    };
+    let target = detach(connector.as_ref()).unwrap_or(connector);
+    let result = target.connect_with_secrets(&profile, secrets).await;
+    manager.record_connect_outcome(id, &result).await;
+    match (caller, result) {
+        (_, Ok(())) => Ok(target),
+        (Caller::User, Err(e)) => Err(e),
+        (Caller::Background, Err(AppError::Authentication { message, advice })) => {
+            Err(AppError::Authentication { message: format!("Cannot connect to {}: {message}", profile.name), advice })
+        }
+        (Caller::Background, Err(e)) => Err(AppError::connection(format!("Cannot connect to {}: {e}", profile.name), "Check the connection's settings.")),
+    }
+}
+
+/// The registry connector for `protocol`, serving saved connection
+/// `connection_id` for a user action ([`instance_for`]); with no
+/// connection named, the shared instance as it is (must be connected).
+pub(crate) async fn user_instance(
+    registry: &ConnectorRegistry,
+    manager: &ConnectionManager,
+    protocol: &str,
+    connection_id: Option<&str>,
+) -> Result<std::sync::Arc<dyn Connector>, AppError> {
+    let connector = require_connector(registry, protocol)?;
+    match connection_id.filter(|c| !c.is_empty()) {
+        Some(cid) => instance_for(connector, |c| c.detached(), manager, cid, Caller::User).await,
+        None => {
+            require_connected(connector.as_ref())?;
+            Ok(connector)
+        }
+    }
 }
 
 /// Storage quota (total / used / free / trash) of the account behind a
@@ -318,9 +381,7 @@ pub async fn connector_quota(
     registry: State<'_, ConnectorRegistry>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<Option<crate::connectors::RemoteQuota>, AppError> {
-    let connector = require_connector(&registry, &protocol)?;
-    connect_if_needed(connector.as_ref(), &manager, connection_id.as_deref()).await?;
-    connector.quota().await
+    user_instance(&registry, &manager, &protocol, connection_id.as_deref()).await?.quota().await
 }
 
 fn size_jobs() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, tokio_util::sync::CancellationToken>> {
@@ -331,16 +392,17 @@ fn size_jobs() -> std::sync::MutexGuard<'static, std::collections::HashMap<Strin
 /// Total size of a remote folder and everything below it: rclone's
 /// server-side `size`, else a walk of the listing (8 folders at a time).
 /// `job_id` lets `connector_folder_size_cancel` stop it (partial figures,
-/// `complete: false`).
+/// `complete: false`). `connection_id`: as for `connector_list_remote`.
 #[tauri::command]
 pub async fn connector_folder_size(
     protocol: String,
     path: String,
     job_id: Option<String>,
+    connection_id: Option<String>,
     registry: State<'_, ConnectorRegistry>,
+    manager: State<'_, ConnectionManager>,
 ) -> Result<crate::connectors::FolderSize, AppError> {
-    let connector = require_connector(&registry, &protocol)?;
-    require_connected(connector.as_ref())?;
+    let connector = user_instance(&registry, &manager, &protocol, connection_id.as_deref()).await?;
     let cancel = tokio_util::sync::CancellationToken::new();
     if let Some(id) = &job_id {
         size_jobs().insert(id.clone(), cancel.clone());
