@@ -286,6 +286,33 @@ async fn sign_in_cancel_and_manual_code() {
     assert!(!flows.is_pending(&start.state).await);
 }
 
+/// Regression: restarting a sign-in (a new one for the connection, or
+/// cancel then sign in again) bound the fixed callback port while the old
+/// waiter, not yet scheduled, still held it: "Cannot listen for the
+/// sign-in on port 9876". (Single-threaded, so the waiter cannot run first
+/// by luck.)
+#[tokio::test]
+async fn restarting_a_sign_in_reuses_the_callback_port() {
+    let p = super::live_tests::profile(ConnectionProtocol::GoogleDrive, "", None, "", "/");
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let flows = Arc::new(OAuthFlows::new());
+    let ep = || Some(AuthEndpoints { auth_url: "http://127.0.0.1:1/auth".into(), token_url: "http://127.0.0.1:1/token".into() });
+    let waiter = |state: String| {
+        let f = flows.clone();
+        tokio::spawn(async move { f.wait(&state, Duration::from_secs(30)).await })
+    };
+    let s1 = flows.begin(OAuthProvider::GoogleDrive, &p, ("c".into(), None), Some(port), ep()).await.unwrap();
+    let w1 = waiter(s1.state.clone());
+    tokio::task::yield_now().await; // the waiter now holds the listener
+    let s2 = flows.begin(OAuthProvider::GoogleDrive, &p, ("c".into(), None), Some(port), ep()).await.expect("a new sign-in replaces the waiting one");
+    assert!(w1.await.unwrap().is_err());
+    let w2 = waiter(s2.state.clone());
+    tokio::task::yield_now().await;
+    flows.cancel(&s2.state).await;
+    flows.begin(OAuthProvider::GoogleDrive, &p, ("c".into(), None), Some(port), ep()).await.expect("signing in again after Cancel");
+    assert!(w2.await.unwrap().is_err());
+}
+
 /// Regression: one shared Dropbox instance serves the Connections panel.
 /// An automation upload for connection B re-signed it as B, so the user,
 /// still browsing A, had their next delete / upload / listing run against

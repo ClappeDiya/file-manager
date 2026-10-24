@@ -127,6 +127,33 @@ export const GOOGLE_EXPORT_CHOICES = {
   drawing: ["pdf"],
 } as const;
 
+/** Listing `extension` of a native Google file → its export kind. */
+const GOOGLE_NATIVE_KIND: Record<string, keyof typeof GOOGLE_EXPORT_CHOICES> = {
+  gdoc: "document",
+  gsheet: "spreadsheet",
+  gslides: "presentation",
+  gdraw: "drawing",
+};
+
+/**
+ * The local file name a Google Drive entry downloads as. A native Google
+ * file is exported (the connection's format, else the default), and the
+ * connector writes exactly the path it is given, so the name gets the
+ * format's extension here.
+ */
+export function googleDownloadName(
+  name: string,
+  extension: string | null | undefined,
+  formats?: Partial<Record<keyof typeof GOOGLE_EXPORT_CHOICES, string | null>> | null,
+): string {
+  const kind = extension ? GOOGLE_NATIVE_KIND[extension] : undefined;
+  if (!kind) return name;
+  const choices: readonly string[] = GOOGLE_EXPORT_CHOICES[kind];
+  const wanted = formats?.[kind];
+  const ext = wanted && choices.includes(wanted) ? wanted : choices[0];
+  return name.toLowerCase().endsWith(`.${ext}`) ? name : `${name}.${ext}`;
+}
+
 /** Tell open connection lists to reload (a wizard saved one). */
 export const CONNECTIONS_CHANGED_EVENT = "ufop:connections-changed";
 

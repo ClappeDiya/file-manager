@@ -339,7 +339,7 @@ Add the connection from **Connections → + Cloud** (a guided wizard) or with **
 
 - **SFTP**: the password, or the private key path (*Password*) and the key's **passphrase**. A key generated in the form with a passphrase fills it in.
 - **WebDAV**: sign in with a user name and password, a **bearer token** (app passwords and tokens), or none; choose **Nextcloud** or **ownCloud** for their chunked uploads.
-- **SMB**: the Windows **domain** (optional). The password is passed to the mount command through the environment, not the command line.
+- **SMB**: the Windows **domain** (optional). On Linux the password reaches `mount.cifs` through the environment, not the command line. On macOS (`mount_smbfs`) and Windows (`net use`) those tools only take it as a command argument, so while the mount command runs (a moment) other programs of the same user can see it in the process list; avoid mounting with a password on a shared machine, or use a Kerberos / saved Windows credential (leave the password empty).
 - **Backblaze B2**: the **application key ID** and **application key**.
 
 ### Connection Management

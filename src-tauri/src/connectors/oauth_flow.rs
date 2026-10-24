@@ -297,6 +297,8 @@ struct PendingFlow {
     connection_id: Uuid,
     client: Arc<OAuthClient>,
     loopback: Option<Loopback>,
+    /// Resolves once the waiter that took `loopback` has closed it.
+    released: Option<tokio::sync::oneshot::Receiver<()>>,
     /// A code is being exchanged (the flow stays open until one succeeds).
     exchanging: bool,
     done: Arc<tokio::sync::Notify>,
@@ -328,12 +330,11 @@ impl OAuthFlows {
         pending.retain(|_, f| f.started.elapsed() < SIGN_IN_TIMEOUT * 2);
         // One sign-in per connection: a new one replaces an abandoned one.
         let stale: Vec<String> = pending.iter().filter(|(_, f)| f.connection_id == profile.id).map(|(k, _)| k.clone()).collect();
-        for k in stale {
-            if let Some(f) = pending.remove(&k) {
-                f.done.notify_one();
-            }
-        }
+        let ended: Vec<PendingFlow> = stale.iter().filter_map(|k| pending.remove(k)).collect();
         drop(pending);
+        for f in ended {
+            end_flow(f).await;
+        }
         let loopback = Loopback::bind_on(port.unwrap_or(provider.callback_port()), "localhost").await?;
         let endpoints = endpoints.unwrap_or_else(|| provider.endpoints(account_kind(profile)));
         let oauth = OAuthClient::new(provider.oauth_config(client.0, client.1, loopback.redirect_uri.clone(), endpoints));
@@ -341,21 +342,32 @@ impl OAuthFlows {
         let redirect_uri = loopback.redirect_uri.clone();
         self.pending.lock().await.insert(
             state.clone(),
-            PendingFlow { connection_id: profile.id, client: Arc::new(oauth), loopback: Some(loopback), exchanging: false, done: Arc::new(tokio::sync::Notify::new()), started: Instant::now() },
+            PendingFlow { connection_id: profile.id, client: Arc::new(oauth), loopback: Some(loopback), released: None, exchanging: false, done: Arc::new(tokio::sync::Notify::new()), started: Instant::now() },
         );
         Ok(OAuthStart { state, provider, auth_url, redirect_uri, browser_opened: false })
     }
 
     /// Wait for the browser to come back with the code, then exchange it.
     pub async fn wait(&self, state: &str, timeout: Duration) -> Result<(Uuid, OAuthGrant), AppError> {
+        let released;
         let (loopback, done) = {
             let mut pending = self.pending.lock().await;
             let f = pending.get_mut(state).ok_or_else(not_pending)?;
-            (f.loopback.take().ok_or_else(|| AppError::state("This sign-in is already being waited for", "Wait for it to finish."))?, f.done.clone())
+            let loopback = f.loopback.take().ok_or_else(|| AppError::state("This sign-in is already being waited for", "Wait for it to finish."))?;
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            released = tx;
+            f.released = Some(rx);
+            (loopback, f.done.clone())
         };
         let code = tokio::select! {
-            r = loopback.wait_for_code(state, timeout) => r,
-            _ = done.notified() => return Err(AppError::state("The sign-in was cancelled or finished another way", "Start it again if you still need it.")),
+            r = loopback.wait_for_code(state, timeout) => Some(r),
+            _ = done.notified() => None,
+        };
+        // The listener (owned by the finished select) is closed: whoever
+        // ended this flow may bind the port again.
+        drop(released);
+        let Some(code) = code else {
+            return Err(AppError::state("The sign-in was cancelled or finished another way", "Start it again if you still need it."));
         };
         match code {
             Ok(code) => self.exchange(state, &code, false).await,
@@ -430,15 +442,27 @@ impl OAuthFlows {
         }
     }
 
-    /// Abandon a sign-in.
+    /// Abandon a sign-in; returns once its callback port is free again.
     pub async fn cancel(&self, state: &str) {
-        if let Some(f) = self.pending.lock().await.remove(state) {
-            f.done.notify_one();
+        let ended = self.pending.lock().await.remove(state);
+        if let Some(f) = ended {
+            end_flow(f).await;
         }
     }
 
     pub async fn is_pending(&self, state: &str) -> bool {
         self.pending.lock().await.contains_key(state)
+    }
+}
+
+/// End a flow taken out of the pending map: wake its waiter and wait (up
+/// to 2 s) until the waiter has closed the callback listener, so the port
+/// can be bound again right away. A flow nobody waits for still owns its
+/// listener, which closes as `f` is dropped here.
+async fn end_flow(mut f: PendingFlow) {
+    f.done.notify_one();
+    if let Some(rx) = f.released.take() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
     }
 }
 

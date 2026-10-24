@@ -26,7 +26,7 @@ import { PRESET_FIELD_LABELS, fillPreset, type ProviderPreset } from "@/lib/prov
 import { PasswordInput } from "@/components/password-input";
 import { OAuthSignIn } from "@/components/oauth-sign-in";
 import { CloudScopeFields, type CloudExtras, type OAuthSettings } from "@/components/cloud-connection-fields";
-import { CONNECTIONS_CHANGED_EVENT, OAUTH_PROTOCOLS } from "@/lib/oauth";
+import { CONNECTIONS_CHANGED_EVENT, OAUTH_PROTOCOLS, googleDownloadName } from "@/lib/oauth";
 import { useUIStore } from "@/stores/ui-store";
 
 // ── Types (mirrors Rust types) ──
@@ -151,6 +151,7 @@ interface RemoteFileEntry {
   is_dir: boolean;
   size: number;
   modified: string | null;
+  extension?: string | null;
 }
 
 interface ProtocolOption {
@@ -2021,20 +2022,24 @@ export function ConnectionPanel() {
     const dir = await pickFolder(`Choose where to save ${entry.name}`);
     if (!dir) return;
     setBrowseError(null);
+    // A native Google file downloads as an export: give it the format's extension.
+    const fileName = connectedProtocol === "google_drive"
+      ? googleDownloadName(entry.name, entry.extension, connections.find((c) => c.id === connectedId)?.extras?.google_drive?.export_formats)
+      : entry.name;
     setTransferStatus(`Downloading ${entry.name}...`);
     try {
       const bytes = await tauriInvoke<number>("connector_download", {
         protocol: connectedProtocol,
         remotePath: entry.path,
-        localPath: `${dir.replace(/\/$/, "")}/${entry.name}`,
+        localPath: `${dir.replace(/\/$/, "")}/${fileName}`,
         connectionId: connectedId,
       });
-      setTransferStatus(`Downloaded ${entry.name} (${formatFileSize(bytes)}) to ${dir}.`);
+      setTransferStatus(`Downloaded ${fileName} (${formatFileSize(bytes)}) to ${dir}.`);
     } catch (err) {
       setTransferStatus(null);
       setBrowseError(`Download failed: ${errorText(err)}`);
     }
-  }, [connectedProtocol, connectedId]);
+  }, [connectedProtocol, connectedId, connections]);
 
   const handleRemoteMkdir = useCallback(async () => {
     if (!connectedProtocol) return;

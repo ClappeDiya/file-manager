@@ -279,7 +279,12 @@ impl DropboxConnector {
                 out.push(DropboxNamespace { namespace_id: Some(ns.into()), label: "Team space".into(), kind: "team_space".into() });
             }
         }
-        for f in self.list_shared_folders().await.unwrap_or_default() {
+        // A failure is reported, not shown as "no team folders".
+        let folders = self.list_shared_folders().await.map_err(|e| match e {
+            AppError::Authentication { message, advice } => AppError::Authentication { message: format!("Cannot list the team folders: {message}"), advice },
+            e => AppError::connection(format!("Cannot list the team folders: {}", e.user_message()), "Try again; if it keeps failing, check the account's sharing permissions."),
+        })?;
+        for f in folders {
             if f.is_team_folder {
                 out.push(DropboxNamespace { namespace_id: Some(f.shared_folder_id), label: f.name, kind: "team_folder".into() });
             }
@@ -1150,6 +1155,24 @@ mod namespace_tests {
         let header = mock.requests("/2/files/list_folder")[1].header("dropbox-api-path-root").unwrap();
         assert_eq!(serde_json::from_str::<serde_json::Value>(&header).unwrap(), serde_json::json!({ ".tag": "namespace_id", "namespace_id": "300" }));
         assert_eq!(c.quota().await.unwrap().unwrap(), crate::connectors::RemoteQuota { total: Some(1000), used: Some(10), free: Some(400), trashed: None });
+    }
+
+    /// Regression: a failure listing the team folders was swallowed, so the
+    /// picker showed no team folders instead of saying why.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_team_folder_listing_failure_is_reported() {
+        let mock = serve(|r| match r.path.as_str() {
+            "/2/users/get_current_account" => json(serde_json::json!({ "email": "m@corp.example", "root_info": { ".tag": "team", "root_namespace_id": "100", "home_namespace_id": "200" } })),
+            "/2/sharing/list_folders" => status(500, "boom"),
+            _ => status(404, "no"),
+        })
+        .await;
+        let b = &mock.base;
+        let c = DropboxConnector::new().with_endpoints(&format!("{b}/2"), &format!("{b}/c"), &format!("{b}/token"));
+        let p = crate::connectors::live_tests::profile(ConnectionProtocol::Dropbox, "", None, "", "/");
+        c.connect_with_secret(&p, Some("tok".into())).await.unwrap();
+        let err = c.namespaces().await.expect_err("the failure must reach the picker");
+        assert!(err.user_message().contains("team folders"), "{}", err.user_message());
     }
 }
 

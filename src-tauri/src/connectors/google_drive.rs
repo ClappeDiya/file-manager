@@ -1276,18 +1276,17 @@ impl Connector for GoogleDriveConnector {
                 "Reading the file",
             )
             .await?;
-            let (data, local) = match self.export_format_for(&meta.mime_type) {
-                Some(format) => {
-                    let ext = format!(".{}", format.extension());
-                    let local = if l.to_ascii_lowercase().ends_with(&ext) { l.clone() } else { format!("{l}{ext}") };
-                    (self.export_file(&id, format).await?, local)
-                }
+            // A native Google file is exported (the connection's format);
+            // it is written to `local_path` as given: the caller picks the
+            // name (the panel adds the format's extension).
+            let data = match self.export_format_for(&meta.mime_type) {
+                Some(format) => self.export_file(&id, format).await?,
                 None if meta.mime_type.starts_with("application/vnd.google-apps.") => {
                     return Err(AppError::validation(format!("'{}' is a Google {} and cannot be downloaded", meta.name, meta.mime_type.trim_start_matches("application/vnd.google-apps."))));
                 }
-                None => (self.download_file(&id).await?, l.clone()),
+                None => self.download_file(&id).await?,
             };
-            tokio::fs::write(&local, &data).await.map_err(|e| AppError::file_op(format!("Cannot write {local}: {e}"), "Check the destination folder."))?;
+            tokio::fs::write(&l, &data).await.map_err(|e| AppError::file_op(format!("Cannot write {l}: {e}"), "Check the destination folder."))?;
             Ok(data.len() as u64)
         })
     }
@@ -1409,6 +1408,7 @@ fn entry_at(file: DriveFile, prefix: &str) -> FileEntry {
             "application/vnd.google-apps.document" => Some("gdoc".to_string()),
             "application/vnd.google-apps.spreadsheet" => Some("gsheet".to_string()),
             "application/vnd.google-apps.presentation" => Some("gslides".to_string()),
+            "application/vnd.google-apps.drawing" => Some("gdraw".to_string()),
             _ => None,
         }
     } else {
@@ -1792,11 +1792,14 @@ mod tests {
         let q = &mock.requests("/api/files")[0];
         assert_eq!((q.query_param("corpora").as_deref(), q.query_param("driveId").as_deref()), (Some("drive"), Some("D1")));
         assert_eq!(q.query_param("q").as_deref(), Some("'D1' in parents and trashed = false"));
-        // Export as PDF (chosen), saved with the extension.
+        // Export as PDF (chosen), written exactly where the caller asked
+        // (regression: it went to `{local}.pdf`, and callers that used the
+        // path they passed found no file). The caller picks the name.
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("Plan");
         assert_eq!(c.download(&list[0].path, local.to_str().unwrap()).await.unwrap(), 8);
-        assert_eq!(std::fs::read_to_string(dir.path().join("Plan.pdf")).unwrap(), "exported");
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), "exported");
+        assert!(!dir.path().join("Plan.pdf").exists());
         assert_eq!(mock.requests("/api/files/x1/export")[0].query_param("mimeType").as_deref(), Some("application/pdf"));
         // An unsupported choice falls back to the default (docx).
         assert_eq!(c.export_format_for("application/vnd.google-apps.spreadsheet"), Some(GoogleDocExportFormat::Xlsx));
