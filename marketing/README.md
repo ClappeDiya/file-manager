@@ -37,8 +37,20 @@ Built and pushed to GHCR via the `ghcr-dokploy-pipeline` workflow, then deployed
 | `/download` | OS-detected download CTAs + Homebrew/winget commands + checksums |
 | `/pricing` | Free / Business / Enterprise; waitlist form for Business |
 | `/security` | Privacy stance, local-AI explanation, security disclosures |
+| `/docs`, `/docs/<slug>` | The published user docs (allow-list in `src/lib/docs.ts`, Markdown from repo-root `docs/`) with a search box (`/` focuses it) |
+| `/docs/search-index.json` | Search index built at `next build` from the same Markdown (title, headings, text); no external service |
 | `/changelog` | Built from repo-root `CHANGELOG.md` |
 | `/contact` | Contact form + support email |
 | `/legal/{privacy,terms,refund}` | Required legal pages |
 
-To add `/docs/*` (Nextra) see the open Phase 1 task.
+### Docs and search
+
+A doc is published by adding it to `PUBLISHED_DOCS` in `src/lib/docs.ts`; the page, its heading anchors and the
+search index all come from that one list, so a published doc is searchable and a search hit always links to an
+existing heading (`src/lib/docs-index.test.tsx` checks this against the real docs). The indexer and scorer are
+in `src/lib/docs-search.ts`. Run the tests with `pnpm --filter marketing test`.
+
+### Pricing copy
+
+`src/lib/pricing.ts` holds the trial length and prices quoted on `/pricing`; the admin console's billing tests
+(`admin/src/__tests__/billing.test.ts`) fail if they differ from what checkout does.
