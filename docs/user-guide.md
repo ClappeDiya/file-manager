@@ -671,7 +671,7 @@ In Advanced mode, an automation rule can **Download a URL** into a folder. The U
 Settings → Advanced → *Remote control from chat* lets you list, start and stop your backup, sync and automation jobs from Telegram or Slack.
 
 - Switch on *Allow remote control from chat*, then a channel. **Telegram:** create a bot with @BotFather, paste its token, list the numeric user ids that may command it (message @userinfobot to find yours). **Slack:** create a Slack app with Socket Mode, paste its bot token (`xoxb-…`) and app-level token (`xapp-…`), and list the member ids (`U…`) that may command it. Tokens are kept in the credential store and never shown again.
-- The bot answers only the listed people; anyone else is ignored without a reply. Commands: `/jobs`, `/run <job>`, `/stop <job>`, `/status`, `/help`. Jobs are named as in the app; a name that is ambiguous or unknown is refused with the matching names. Nothing else is understood — the bot cannot run a program or touch a path.
+- The bot answers only the listed people; anyone else is ignored without a reply. Commands: `/jobs`, `/run <job>`, `/stop <job>`, `/status`, `/help`. Jobs are matched by their exact name or id (never a partial name); if a backup, a sync pair and a rule share a name, say which with `backup:Name`, `sync:Name` or `rule:Name`. Nothing else is understood — the bot cannot run a program or touch a path.
 - Every accepted command is written to the tamper-evident audit log before it runs; a command whose audit entry cannot be written is not run. Each person is limited to a number of commands per minute (default 10).
 
 ## Keyboard Shortcuts
