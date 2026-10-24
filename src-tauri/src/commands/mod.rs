@@ -12,6 +12,7 @@ pub mod oauth_commands;
 pub mod custom_commands;
 pub mod drive_commands;
 pub mod editor_commands;
+pub mod embedded_server_commands;
 pub mod editor_draft_commands;
 pub mod convert_commands;
 pub mod gpg_commands;

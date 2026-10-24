@@ -14,6 +14,7 @@ pub mod governance;
 pub mod ledger;
 pub mod lineage;
 pub mod metadata_engine;
+pub mod embedded_server;
 pub mod feedback;
 pub mod log_query;
 pub mod logging;
@@ -41,7 +42,7 @@ use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, oauth_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, feedback_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands, filter_commands};
+use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, oauth_commands, drive_commands, editor_commands, embedded_server_commands, encryption_commands, file_ops_commands, feedback_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands, filter_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -90,6 +91,8 @@ struct AppState {
     backup_mgr: BackupManager,
     schedule_library: schedule_library::ScheduleLibrary,
     fleet_agent: fleet_agent::FleetAgent,
+    /// The web server inside the app (Settings > Local web server; off until started).
+    embedded_server: embedded_server::EmbeddedServer,
     /// Optional loopback Prometheus exporter (Settings → Advanced; off by default).
     desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics,
     background_mode: tray::BackgroundMode,
@@ -304,6 +307,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     }
     // Management console agent (registration, heartbeats, policies, reports);
     // its loop starts in `setup`, like the scheduler.
+    let embedded_server = embedded_server::EmbeddedServer::new(repo.clone(), backup_mgr.clone(), connection_mgr.clone(), agent_store.clone());
     let fleet_agent = fleet_agent::init_or_default(backup_mgr.clone(), agent_store, credential_store.clone(), "desktop").await;
     // The scheduler starts in Tauri's `setup` hook: this function runs on a
     // throwaway runtime whose spawned tasks die when it is dropped.
@@ -340,6 +344,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics::new(backup_mgr.clone()),
         backup_mgr,
         fleet_agent,
+        embedded_server,
         background_mode,
         audit_trail,
         metadata_store: metadata_engine::MetadataStore::new(repo_for_metadata),
@@ -471,6 +476,12 @@ pub fn run() {
                     credential_store.clone(),
                     "desktop",
                 ));
+                let embedded_server = embedded_server::EmbeddedServer::new(
+                    repo.clone(),
+                    backup_mgr.clone(),
+                    connection_mgr.clone(),
+                    crate::security::settings_store::SettingsStore::plain(repo.pool().clone()),
+                );
                 let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), None);
                 let ai_assistant = AiAssistant::with_audit(repo.pool().clone());
                 let fallback_schedules = schedule_library::ScheduleLibrary::new(repo.pool().clone());
@@ -517,6 +528,7 @@ pub fn run() {
                     desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics::new(backup_mgr.clone()),
                     backup_mgr,
                     fleet_agent,
+                    embedded_server,
                     background_mode: tray::BackgroundMode::default(),
                     audit_trail,
                 }
@@ -647,6 +659,7 @@ pub fn run() {
         .manage(app_state.quickflow_suggester)
         .manage(app_state.backup_mgr)
         .manage(app_state.fleet_agent)
+        .manage(app_state.embedded_server)
         .manage(app_state.desktop_metrics)
         .manage(app_state.background_mode)
         .manage(app_state.audit_trail)
@@ -1296,6 +1309,16 @@ pub fn run() {
             log_commands::set_log_level,
             log_commands::get_log_directory,
             log_commands::query_logs,
+            embedded_server_commands::embedded_server_status,
+            embedded_server_commands::embedded_server_save_settings,
+            embedded_server_commands::embedded_server_start,
+            embedded_server_commands::embedded_server_stop,
+            embedded_server_commands::embedded_server_set_password,
+            embedded_server_commands::open_server_in_browser,
+            embedded_server_commands::server_profiles_list,
+            embedded_server_commands::server_profile_save,
+            embedded_server_commands::server_profile_remove,
+            embedded_server_commands::server_profile_test,
             feedback_commands::feedback_destination,
             feedback_commands::feedback_submit,
             log_commands::export_logs_json,
