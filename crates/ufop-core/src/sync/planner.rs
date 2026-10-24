@@ -366,8 +366,9 @@ impl ContentHasher for LocalHasher {
 }
 
 /// Decides whether files match, per the pair's [`CompareMode`]; caches
-/// hashes so each file is read at most once per plan.
-struct Comparer<'a> {
+/// hashes so each file is read at most once per plan. Shared with the
+/// standalone folder comparison (`super::compare`).
+pub(crate) struct Comparer<'a> {
     opts: &'a CopyOptions,
     hasher: Option<&'a dyn ContentHasher>,
     hashes: std::cell::RefCell<HashMap<(bool, String), Option<String>>>,
@@ -376,11 +377,11 @@ struct Comparer<'a> {
 }
 
 impl<'a> Comparer<'a> {
-    fn new(opts: &'a CopyOptions, hasher: Option<&'a dyn ContentHasher>) -> Self {
+    pub(crate) fn new(opts: &'a CopyOptions, hasher: Option<&'a dyn ContentHasher>) -> Self {
         Self { opts, hasher, hashes: Default::default(), unhashed: Default::default() }
     }
 
-    fn hash(&self, side: SyncSide, file: &FileMeta) -> Option<String> {
+    pub(crate) fn hash(&self, side: SyncSide, file: &FileMeta) -> Option<String> {
         let hasher = self.hasher?;
         let key = (side == SyncSide::Source, file.relative_path.clone());
         if let Some(h) = self.hashes.borrow().get(&key) {
@@ -396,7 +397,7 @@ impl<'a> Comparer<'a> {
 
     /// Whether the source and destination copies hold the same data
     /// (`dest_time`: the destination time adjusted for clock skew).
-    fn same(&self, src: &FileMeta, dst: &FileMeta, dest_time: Option<DateTime<Utc>>) -> bool {
+    pub(crate) fn same(&self, src: &FileMeta, dst: &FileMeta, dest_time: Option<DateTime<Utc>>) -> bool {
         if src.size != dst.size {
             return false;
         }
@@ -441,7 +442,7 @@ impl<'a> Comparer<'a> {
         BaselineEntry { size: src.size, source_modified: src.modified, dest_modified: dst.modified, hash }
     }
 
-    fn notes(&self) -> Vec<String> {
+    pub(crate) fn notes(&self) -> Vec<String> {
         if self.opts.compare_mode != CompareMode::Checksum {
             return Vec::new();
         }
