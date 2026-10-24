@@ -32,7 +32,7 @@ pub const TELEGRAM_TOKEN_KEY: &str = "chat_control.telegram.bot_token";
 pub const SLACK_BOT_TOKEN_KEY: &str = "chat_control.slack.bot_token";
 pub const SLACK_APP_TOKEN_KEY: &str = "chat_control.slack.app_token";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelegramSettings {
     pub enabled: bool,
@@ -42,13 +42,7 @@ pub struct TelegramSettings {
     pub api_base: String,
 }
 
-impl Default for TelegramSettings {
-    fn default() -> Self {
-        Self { enabled: false, allowed_user_ids: Vec::new(), api_base: String::new() }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SlackSettings {
     pub enabled: bool,
@@ -56,12 +50,6 @@ pub struct SlackSettings {
     pub allowed_user_ids: Vec<String>,
     /// Web API base; empty = `https://slack.com/api`.
     pub api_base: String,
-}
-
-impl Default for SlackSettings {
-    fn default() -> Self {
-        Self { enabled: false, allowed_user_ids: Vec::new(), api_base: String::new() }
-    }
 }
 
 /// Settings → Advanced → Remote control.
