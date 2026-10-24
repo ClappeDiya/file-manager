@@ -740,6 +740,19 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 35,
+    description: 'Billing: payment-method flags and the open checkout session',
+    up(d) {
+      d.exec(`
+        -- NULL = not known yet (no event seen); 0/1 from the subscription and customer events.
+        ALTER TABLE billing_accounts ADD COLUMN sub_payment_method INTEGER;
+        ALTER TABLE billing_accounts ADD COLUMN customer_payment_method INTEGER;
+        -- The unfinished checkout session, closed when a newer one is started.
+        ALTER TABLE billing_accounts ADD COLUMN checkout_session_id TEXT;
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

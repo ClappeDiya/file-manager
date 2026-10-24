@@ -47,6 +47,28 @@ const PUBLISHED_DOCS: DocEntry[] = [
   { slug: 'server-operations', title: 'Operating ufop-server', description: 'Accounts, roles, API tokens, sessions, tracing and logs of the headless server.', filename: 'server-operations.md' },
 ];
 
+/** Where unpublished repo documents are linked from published ones. */
+export const DOCS_REPO_BLOB_URL = 'https://github.com/ClappeDiya/file-manager/blob/master';
+
+/**
+ * Rewrites a link found in a published document's Markdown for the website. Docs link to each other with
+ * repo-relative paths (`backup-safety.md#fragment`, `./user-guide.md`); on the site those would 404.
+ * A relative `.md` link to a published document becomes `/docs/<slug>[#fragment]`; one to a document that
+ * is not published goes to its page in the GitHub repository. Anything else (external, `#fragment`,
+ * absolute path, non-Markdown) is returned unchanged.
+ */
+export function resolveDocHref(href: string): string {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('#') || href.startsWith('/')) return href;
+  const hash = href.indexOf('#');
+  const fragment = hash === -1 ? '' : href.slice(hash);
+  const target = (hash === -1 ? href : href.slice(0, hash)).replace(/\?.*$/, '');
+  if (!/\.md$/i.test(target)) return href;
+  const repoPath = path.posix.normalize(path.posix.join('docs', target));
+  if (repoPath.startsWith('../')) return href;
+  const published = PUBLISHED_DOCS.find((d) => repoPath === `docs/${d.filename}`);
+  return published ? `/docs/${published.slug}${fragment}` : `${DOCS_REPO_BLOB_URL}/${repoPath}${fragment}`;
+}
+
 async function findDocsRoot(): Promise<string | null> {
   for (const candidate of DOCS_ROOT_CANDIDATES) {
     try {

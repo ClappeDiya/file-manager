@@ -7,7 +7,7 @@
 
 /** A provider event reduced to what the console acts on. */
 export type BillingEvent =
-  | { kind: 'checkout_completed'; id: string; orgId: string | null; customerId: string; subscriptionId: string | null }
+  | { kind: 'checkout_completed'; id: string; orgId: string | null; customerId: string; subscriptionId: string | null; sessionId: string | null }
   | {
       kind: 'subscription';
       id: string;
@@ -24,8 +24,12 @@ export type BillingEvent =
       trialEnd: string | null;
       /** The coupon applied to the subscription, if any. */
       discount: Discount | null;
+      /** The subscription has its own default payment method. */
+      hasPaymentMethod: boolean;
     }
-  | { kind: 'trial_will_end'; id: string; orgId: string | null; customerId: string; subscriptionId: string; trialEnd: string | null }
+  | { kind: 'trial_will_end'; id: string; orgId: string | null; customerId: string; subscriptionId: string; trialEnd: string | null; hasPaymentMethod: boolean }
+  /** The customer's default payment method changed (a card added or removed in the portal). */
+  | { kind: 'customer'; id: string; customerId: string; hasPaymentMethod: boolean }
   | { kind: 'invoice'; id: string; customerId: string; paid: boolean; amount: number; currency: string; number: string | null; url: string | null }
   | { kind: 'ignored'; id: string; type: string };
 
@@ -78,7 +82,11 @@ export interface BillingProvider {
     trialDays?: number;
     /** Show the promotion-code field at checkout. */
     allowPromotionCodes?: boolean;
-  }): Promise<{ url: string }>;
+  }): Promise<{ url: string; id: string | null }>;
+  /** Close an unfinished checkout session so it can no longer be completed (a newer one replaced it). */
+  expireCheckout(sessionId: string): Promise<void>;
+  /** Whether the customer has (or ever had) any subscription at the provider. */
+  hasSubscriptions(customerId: string): Promise<boolean>;
   createPortal(o: { customerId: string; returnUrl: string }): Promise<{ url: string }>;
   /** Verify the signature and read the event; throws BillingError(400) on a bad signature. */
   parseWebhook(rawBody: string, headers: Headers, now?: Date): BillingEvent;

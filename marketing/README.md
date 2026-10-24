@@ -50,7 +50,12 @@ search index all come from that one list, so a published doc is searchable and a
 existing heading (`src/lib/docs-index.test.tsx` checks this against the real docs). The indexer and scorer are
 in `src/lib/docs-search.ts`. Run the tests with `pnpm --filter marketing test`.
 
+The docs link to each other with repo-relative paths (`backup-safety.md#fragment`); `DocMarkdown` rewrites them
+through `resolveDocHref` in `src/lib/docs.ts`: a link to a published doc becomes `/docs/<slug>#fragment`, a link to a
+doc that is not published goes to its page on GitHub. The same test file renders every published page and fails on a
+link that ends in `.md`, names an unpublished slug or points at a heading that does not exist.
+
 ### Pricing copy
 
-`src/lib/pricing.ts` holds the trial length and prices quoted on `/pricing`; the admin console's billing tests
+`src/lib/pricing.ts` holds the trial length, prices and unit (per enrolled machine, as the admin console sells seats) quoted on `/pricing`; the admin console's billing tests
 (`admin/src/__tests__/billing.test.ts`) fail if they differ from what checkout does.

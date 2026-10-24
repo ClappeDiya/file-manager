@@ -1,6 +1,7 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { createSlugger } from '@/lib/docs-search';
+import { resolveDocHref } from '@/lib/docs';
 
 type HastNode = { type: string; tagName?: string; value?: string; properties?: Record<string, unknown>; children?: HastNode[] };
 
@@ -23,10 +24,16 @@ export function rehypeHeadingIds() {
   };
 }
 
-/** A published document's Markdown, rendered with heading anchors. */
+/** A published document's Markdown, rendered with heading anchors and links rewritten for the site. */
 export function DocMarkdown({ content }: { content: string }) {
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHeadingIds]}>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeHeadingIds]}
+      components={{
+        a: ({ node: _node, href, ...rest }) => <a {...rest} href={href === undefined ? undefined : resolveDocHref(href)} />,
+      }}
+    >
       {content}
     </ReactMarkdown>
   );

@@ -16,7 +16,7 @@ import { createLink, registerWithToken } from '@/lib/db/repos/machines';
 import { listOutbox } from '@/lib/db/repos/outbox';
 import { createSession } from '@/lib/db/repos/sessions';
 import { billingAccount, setBillingProvider, trialEligible } from '@/lib/billing';
-import { trialDaysLeft, discountAmount, discountDuration } from '@/lib/billing/trial';
+import { trialDaysLeft, discountAmount, discountDuration, hasPaymentMethod, trialOutcome } from '@/lib/billing/trial';
 import { DEFAULT_TRIAL_DAYS } from '@/lib/billing/config';
 import { StripeProvider } from '@/lib/billing/stripe';
 import { json, makeUser, req } from './helpers';
@@ -30,6 +30,11 @@ const PRICE = 'price_business_test';
 const ANNUAL = 'price_business_annual_test';
 let server: http.Server;
 let base = '';
+/** Customers that have a subscription at the mock provider (answers GET /v1/subscriptions). */
+const customersWithSubscriptions = new Set<string>();
+/** Checkout sessions that can no longer be expired (already completed). */
+const finishedSessions = new Set<string>();
+let sessionCount = 0;
 const calls: { method: string; url: string; body: string; auth: string }[] = [];
 
 beforeAll(async () => {
@@ -41,7 +46,17 @@ beforeAll(async () => {
     rq.on('end', () => {
       calls.push({ method: rq.method ?? '', url: rq.url ?? '', body, auth: String(rq.headers.authorization) });
       const send = (status: number, v: unknown) => rs.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(v));
-      if (rq.url === '/v1/checkout/sessions') return send(200, { id: 'cs_1', url: 'https://checkout.stripe.test/cs_1' });
+      if (rq.url === '/v1/checkout/sessions') {
+        const id = `cs_${++sessionCount}`;
+        return send(200, { id, url: `https://checkout.stripe.test/${id}` });
+      }
+      const expire = /^\/v1\/checkout\/sessions\/(cs_\d+)\/expire$/.exec(rq.url ?? '');
+      if (expire) return finishedSessions.has(expire[1]) ? send(400, { error: { message: 'Only open sessions can be expired' } }) : send(200, { id: expire[1], status: 'expired' });
+      if (rq.url?.startsWith('/v1/subscriptions?')) {
+        const customer = new URLSearchParams(rq.url.split('?')[1]).get('customer') ?? '';
+        if (customer === 'cus_lookup_down') return send(500, { error: { message: 'boom' } });
+        return send(200, { data: customersWithSubscriptions.has(customer) ? [{ id: 'sub_x', status: 'canceled' }] : [] });
+      }
       if (rq.url === '/v1/billing_portal/sessions') return send(200, { id: 'bps_1', url: 'https://billing.stripe.test/p/1' });
       if (rq.url?.startsWith('/v1/invoices')) {
         if (rq.url.includes('cus_broken')) return send(500, { error: { message: 'boom' } });
@@ -270,7 +285,7 @@ async function startCheckoutFor(orgName: string, body: Record<string, unknown> =
   const org = createOrg({ name: orgName });
   const owner = makeUser(`owner@${orgName.toLowerCase().replace(/\W+/g, '')}.test`, 'org_owner', org.id);
   const post = async (b: Record<string, unknown> = body) => json<{ url?: string; error?: string }>(await checkout.POST(await req('POST', '/api/billing/checkout', { as: owner, body: b })));
-  return { org, owner, post, params: () => new URLSearchParams(calls.at(-1)!.body) };
+  return { org, owner, post, params: () => new URLSearchParams(calls.findLast((c) => c.url === '/v1/checkout/sessions')!.body) };
 }
 
 describe('billing: free trial', () => {
@@ -504,16 +519,154 @@ describe('billing: schema upgrade', () => {
     migrate(d);
     // Roll the billing table back to its version-33 shape, as a console upgraded from before trials would have it.
     for (const c of ['billing_interval', 'trial_end', 'trial_used', 'discount']) d.exec(`ALTER TABLE billing_accounts DROP COLUMN ${c}`);
+    for (const c of ['sub_payment_method', 'customer_payment_method', 'checkout_session_id']) d.exec(`ALTER TABLE billing_accounts DROP COLUMN ${c}`);
     d.pragma('user_version = 33');
     const org = (id: string) => d.prepare("INSERT INTO organizations (id, name, created_at, updated_at) VALUES (?, ?, 'now', 'now')").run(id, id);
     for (const id of ['org_old_sub', 'org_old_customer_only']) org(id);
     d.prepare("INSERT INTO billing_accounts (org_id, provider, customer_id, subscription_id, plan, seats, status, updated_at) VALUES ('org_old_sub', 'stripe', 'cus_1', 'sub_1', 'business', 5, 'active', 'now')").run();
     d.prepare("INSERT INTO billing_accounts (org_id, provider, customer_id, status, updated_at) VALUES ('org_old_customer_only', 'stripe', 'cus_2', 'none', 'now')").run();
-    expect(migrate(d)).toBe(1);
+    expect(migrate(d)).toBe(2);
     expect(d.prepare('SELECT org_id, trial_used FROM billing_accounts ORDER BY org_id').all()).toEqual([
       { org_id: 'org_old_customer_only', trial_used: 0 },
       { org_id: 'org_old_sub', trial_used: 1 },
     ]);
+  });
+});
+
+describe('billing: one trial even with concurrent checkouts', () => {
+  const sessionIds = () => calls.filter((c) => c.url === '/v1/checkout/sessions').length;
+
+  it('asks the provider whether the customer already subscribed and drops the trial if so', async () => {
+    const t = await startCheckoutFor('Lagging webhooks');
+    // The console knows the customer (checkout completed without a subscription event yet) but not the subscription.
+    await deliver({ id: `evt_lag_${++n}`, type: 'checkout.session.completed', data: { object: { client_reference_id: t.org.id, customer: 'cus_lag', subscription: null } } });
+    expect(billingAccount(t.org.id)).toMatchObject({ customerId: 'cus_lag', trialUsed: false });
+    expect(trialEligible(t.org.id)).toBe(true);
+    customersWithSubscriptions.add('cus_lag');
+    expect((await t.post()).status).toBe(200);
+    expect(calls.some((c) => c.method === 'GET' && c.url.startsWith('/v1/subscriptions?') && c.url.includes('customer=cus_lag') && c.url.includes('status=all'))).toBe(true);
+    expect([...t.params().keys()].filter((k) => k.includes('trial') || k === 'payment_method_collection')).toEqual([]);
+    expect(trialEligible(t.org.id)).toBe(false);
+  });
+
+  it('keeps the trial for a known customer who never subscribed, and does not ask the provider for a new one', async () => {
+    const t = await startCheckoutFor('Known customer');
+    await deliver({ id: `evt_kc_${++n}`, type: 'checkout.session.completed', data: { object: { client_reference_id: t.org.id, customer: 'cus_known', subscription: null } } });
+    expect((await t.post()).status).toBe(200);
+    expect(t.params().get('subscription_data[trial_period_days]')).toBe('14');
+    const first = calls.filter((c) => c.url.startsWith('/v1/subscriptions?')).length;
+    const fresh = await startCheckoutFor('Brand new customer');
+    await fresh.post();
+    expect(calls.filter((c) => c.url.startsWith('/v1/subscriptions?')).length).toBe(first);
+  });
+
+  it('does not start a checkout when the subscription lookup fails (no surprise charge, no trial)', async () => {
+    const t = await startCheckoutFor('Lookup down');
+    await deliver({ id: `evt_ld_${++n}`, type: 'checkout.session.completed', data: { object: { client_reference_id: t.org.id, customer: 'cus_lookup_down', subscription: null } } });
+    const before = sessionIds();
+    const r = await t.post();
+    expect(r.status).toBe(502);
+    expect(sessionIds()).toBe(before);
+  });
+
+  it('expires the earlier open checkout session when a newer one is started, so two tabs cannot both start a trial', async () => {
+    const t = await startCheckoutFor('Two tabs');
+    await t.post();
+    const first = billingAccount(t.org.id)!.checkoutSessionId!;
+    expect(first).toMatch(/^cs_\d+$/);
+    await t.post();
+    const second = billingAccount(t.org.id)!.checkoutSessionId!;
+    expect(second).not.toBe(first);
+    expect(calls.some((c) => c.method === 'POST' && c.url === `/v1/checkout/sessions/${first}/expire`)).toBe(true);
+    expect(calls.some((c) => c.url === `/v1/checkout/sessions/${second}/expire`)).toBe(false);
+  });
+
+  it('still opens the new checkout when the earlier session cannot be expired (it was already completed)', async () => {
+    const t = await startCheckoutFor('Finished earlier');
+    await t.post();
+    finishedSessions.add(billingAccount(t.org.id)!.checkoutSessionId!);
+    const r = await t.post();
+    expect(r.status).toBe(200);
+    expect(r.body.url).toMatch(/^https:\/\/checkout\.stripe\.test\/cs_\d+$/);
+  });
+
+  it('forgets the open session once it completes', async () => {
+    const t = await startCheckoutFor('Completes');
+    await t.post();
+    const open = billingAccount(t.org.id)!.checkoutSessionId!;
+    await deliver({ id: `evt_done_${++n}`, type: 'checkout.session.completed', data: { object: { id: 'cs_other', client_reference_id: t.org.id, customer: 'cus_done', subscription: 'sub_done' } } });
+    expect(billingAccount(t.org.id)!.checkoutSessionId).toBe(open);
+    await deliver({ id: `evt_done_${++n}`, type: 'checkout.session.completed', data: { object: { id: open, client_reference_id: t.org.id, customer: 'cus_done', subscription: 'sub_done' } } });
+    expect(billingAccount(t.org.id)!.checkoutSessionId).toBeNull();
+  });
+});
+
+describe('billing: payment method on file', () => {
+  const withCard = (ev: ReturnType<typeof trialSub>, card: unknown) => {
+    (ev.data.object as Record<string, unknown>).default_payment_method = card;
+    return ev;
+  };
+
+  it('is unknown until an event says so, then follows the subscription and the customer', async () => {
+    const org = createOrg({ name: 'Cards' });
+    await deliver(trialSub(org.id, { customer: 'cus_cards' }));
+    expect(billingAccount(org.id)).toMatchObject({ subPaymentMethod: false, customerPaymentMethod: null });
+    expect(hasPaymentMethod(billingAccount(org.id)!)).toBe(false);
+    // A card added in the portal becomes the customer's default.
+    const update = (id: string, def: unknown) => ({ id, type: 'customer.updated', data: { object: { id: 'cus_cards', invoice_settings: { default_payment_method: def } } } });
+    expect((await deliver(update(`evt_cu_${++n}`, 'pm_1'))).body.result).toBe('applied');
+    expect(hasPaymentMethod(billingAccount(org.id)!)).toBe(true);
+    // A later subscription event without its own default does not wipe the customer's card.
+    await deliver(trialSub(org.id, { customer: 'cus_cards' }));
+    expect(hasPaymentMethod(billingAccount(org.id)!)).toBe(true);
+    // Removing it again.
+    await deliver(update(`evt_cu_${++n}`, null));
+    expect(hasPaymentMethod(billingAccount(org.id)!)).toBe(false);
+    // The subscription's own default (a string id or an expanded object) counts.
+    await deliver(withCard(trialSub(org.id, { customer: 'cus_cards' }), { id: 'pm_2' }));
+    expect(hasPaymentMethod(billingAccount(org.id)!)).toBe(true);
+    // Unknown customers are recorded, not applied.
+    expect((await deliver({ id: `evt_cu_${++n}`, type: 'customer.updated', data: { object: { id: 'cus_nobody' } } })).body.result).toBe('unmatched');
+  });
+
+  it('reports unknown for accounts that predate the flags', () => {
+    expect(hasPaymentMethod({ subPaymentMethod: null, customerPaymentMethod: null })).toBeNull();
+    expect(hasPaymentMethod({ subPaymentMethod: null, customerPaymentMethod: true })).toBe(true);
+  });
+
+  it('words the trial outcome after the card state (no add-a-card warning once one is on file)', () => {
+    expect(trialOutcome(true)).toContain('converts to a paid subscription');
+    expect(trialOutcome(true)).not.toMatch(/add one|cancelled/);
+    expect(trialOutcome(false)).toMatch(/No payment method is on file: add one/);
+    expect(trialOutcome(null)).toMatch(/Check in the billing portal/);
+  });
+
+  it('keeps the cancellation warning out of the trial-ending notice when a card is on file', async () => {
+    const withCardOrg = createOrg({ name: 'Has card' });
+    const noCardOrg = createOrg({ name: 'No card' });
+    const warn = async (org: { id: string }, card: unknown) => {
+      await deliver(withCard(trialSub(org.id, { customer: `cus_${org.id}` }), card));
+      const ev = { id: `evt_tw_${++n}`, type: 'customer.subscription.trial_will_end', data: { object: { id: 'sub_t', customer: `cus_${org.id}`, metadata: { org_id: org.id }, trial_end: unix(Date.now() + 3 * DAY), default_payment_method: card } } };
+      await deliver(ev);
+      return listAudit({ eventType: 'billing.trial_will_end' }).entries.find((e) => e.orgId === org.id)!;
+    };
+    const ok = await warn(withCardOrg, 'pm_ok');
+    expect(ok.severity).toBe('info');
+    expect(ok.description).toContain('converts to a paid subscription');
+    const missing = await warn(noCardOrg, null);
+    expect(missing.severity).toBe('warning');
+    expect(missing.description).toContain('add a payment method');
+  });
+});
+
+describe('billing: marketing copy units', () => {
+  it('says "per machine", never "per user", on the pricing page and cards', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    for (const f of ['src/app/pricing/page.tsx', 'src/components/pricing-cards.tsx']) {
+      const text = fs.readFileSync(path.resolve(process.cwd(), '..', 'marketing', f), 'utf8');
+      expect(text, f).not.toMatch(/per user|per-user|\/user\//i);
+    }
   });
 });
 
@@ -527,6 +680,9 @@ describe('billing: marketing copy', () => {
     expect(copy.BUSINESS_MONTHLY_PRICE).toBe(business.price);
     expect(copy.BUSINESS_ANNUAL_PRICE).toBe(business.annualPrice);
     expect(copy.ANNUAL_SAVINGS_PERCENT).toBe(ANNUAL_DISCOUNT_PERCENT);
+    // The unit too: seats are enrolled machines, so the copy must not say "per user".
+    expect(copy.BUSINESS_MONTHLY_PERIOD).toBe(business.period);
+    expect(copy.BUSINESS_ANNUAL_PERIOD).toBe(business.annualPeriod);
     const monthly = Number(business.price.slice(1));
     const yearly = Number(business.annualPrice!.slice(1));
     expect(yearly).toBeCloseTo(monthly * 12 * (1 - ANNUAL_DISCOUNT_PERCENT / 100), 2);

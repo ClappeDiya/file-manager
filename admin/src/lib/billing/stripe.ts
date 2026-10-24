@@ -96,7 +96,16 @@ export class StripeProvider implements BillingProvider {
     });
     const url = str(s.url);
     if (!url) throw new BillingError('Stripe did not return a checkout URL');
-    return { url };
+    return { url, id: str(s.id) };
+  }
+
+  async expireCheckout(sessionId: string): Promise<void> {
+    await this.call('POST', `/v1/checkout/sessions/${encodeURIComponent(sessionId)}/expire`);
+  }
+
+  async hasSubscriptions(customerId: string): Promise<boolean> {
+    const r = await this.call('GET', '/v1/subscriptions', { customer: customerId, status: 'all', limit: 1 });
+    return ((r.data as Obj[] | undefined) ?? []).length > 0;
   }
 
   async createPortal(o: { customerId: string; returnUrl: string }) {
@@ -146,7 +155,7 @@ export class StripeProvider implements BillingProvider {
     const meta = (obj.metadata ?? {}) as Obj;
     switch (type) {
       case 'checkout.session.completed':
-        return { kind: 'checkout_completed', id, orgId: str(obj.client_reference_id) ?? str(meta.org_id), customerId: idOf(obj.customer), subscriptionId: idOf(obj.subscription) || null };
+        return { kind: 'checkout_completed', id, orgId: str(obj.client_reference_id) ?? str(meta.org_id), customerId: idOf(obj.customer), subscriptionId: idOf(obj.subscription) || null, sessionId: str(obj.id) };
       case 'customer.subscription.created':
       case 'customer.subscription.updated':
       case 'customer.subscription.deleted': {
@@ -165,10 +174,13 @@ export class StripeProvider implements BillingProvider {
           deleted: type === 'customer.subscription.deleted',
           trialEnd: iso(obj.trial_end),
           discount: discountOf(obj.discount),
+          hasPaymentMethod: !!(idOf(obj.default_payment_method) || idOf(obj.default_source)),
         };
       }
       case 'customer.subscription.trial_will_end':
-        return { kind: 'trial_will_end', id, orgId: str(meta.org_id), customerId: idOf(obj.customer), subscriptionId: idOf(obj.id), trialEnd: iso(obj.trial_end) };
+        return { kind: 'trial_will_end', id, orgId: str(meta.org_id), customerId: idOf(obj.customer), subscriptionId: idOf(obj.id), trialEnd: iso(obj.trial_end), hasPaymentMethod: !!(idOf(obj.default_payment_method) || idOf(obj.default_source)) };
+      case 'customer.updated':
+        return { kind: 'customer', id, customerId: idOf(obj.id), hasPaymentMethod: !!(idOf((obj.invoice_settings as Obj | undefined)?.default_payment_method) || idOf(obj.default_source)) };
       case 'invoice.paid':
       case 'invoice.payment_failed':
         return {

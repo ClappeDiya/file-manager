@@ -3,7 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { DocMarkdown } from '@/components/doc-markdown';
-import { listDocs, loadAllDocs } from '@/lib/docs';
+import { DOCS_REPO_BLOB_URL, listDocs, loadAllDocs, resolveDocHref } from '@/lib/docs';
 import { buildSearchIndex, searchDocs, splitSections } from '@/lib/docs-search';
 import { GET } from '@/app/docs/search-index.json/route';
 
@@ -15,6 +15,28 @@ describe('DocMarkdown', () => {
     const html = renderToStaticMarkup(<DocMarkdown content={md} />);
     expect(idsOf(html)).toEqual(['title', 'install', 'ufop-sync--more', 'install-1', 'install-2']);
     expect(splitSections('d', 'D', md).map((s) => s.anchor)).toEqual(idsOf(html));
+  });
+});
+
+const hrefsOf = (html: string) => [...html.matchAll(/<a\s[^>]*?href="([^"]*)"/g)].map((m) => m[1].replace(/&amp;/g, '&'));
+
+describe('resolveDocHref', () => {
+  it('maps relative links to published docs onto their site pages, keeping the fragment', () => {
+    expect(resolveDocHref('backup-safety.md')).toBe('/docs/backup-safety');
+    expect(resolveDocHref('./user-guide.md')).toBe('/docs/user-guide');
+    expect(resolveDocHref('backup-policies-and-schedules.md#time-zone')).toBe('/docs/backup-policies-and-schedules#time-zone');
+  });
+
+  it('sends links to unpublished repo documents to GitHub', () => {
+    expect(resolveDocHref('api-reference.md#ufop-server-rest-api-apiv1')).toBe(`${DOCS_REPO_BLOB_URL}/docs/api-reference.md#ufop-server-rest-api-apiv1`);
+    expect(resolveDocHref('./release-checklist.md')).toBe(`${DOCS_REPO_BLOB_URL}/docs/release-checklist.md`);
+    expect(resolveDocHref('../README.md#build')).toBe(`${DOCS_REPO_BLOB_URL}/README.md#build`);
+    expect(resolveDocHref('duplicati-parity/notes.md')).toBe(`${DOCS_REPO_BLOB_URL}/docs/duplicati-parity/notes.md`);
+  });
+
+  it('leaves external, fragment-only, absolute and non-Markdown links alone', () => {
+    for (const h of ['https://example.com/a.md', 'mailto:a@b.test', '#install', '/docs/user-guide', 'diagram.png', '../../outside.md'])
+      expect(resolveDocHref(h)).toBe(h);
   });
 });
 
@@ -50,5 +72,35 @@ describe('published docs index', () => {
     const cli = searchDocs(index, 'completions');
     expect(cli.length).toBeGreaterThan(0);
     expect(cli[0].snippet.some((s) => s.hit)).toBe(true);
+  });
+
+  it('has no link left pointing at a repo .md file, and every internal link lands on a published page and heading', async () => {
+    const docs = await loadAllDocs();
+    const idsBySlug = new Map<string, Set<string>>();
+    const htmlBySlug = new Map<string, string>();
+    for (const d of docs) {
+      const html = renderToStaticMarkup(<DocMarkdown content={d.content} />);
+      htmlBySlug.set(d.entry.slug, html);
+      idsBySlug.set(d.entry.slug, new Set(idsOf(html)));
+    }
+    let internal = 0;
+    for (const [slug, html] of htmlBySlug) {
+      for (const href of hrefsOf(html)) {
+        const where = `${slug} -> ${href}`;
+        // Only absolute GitHub URLs may name a .md file; nothing on the site itself may.
+        if (!/^https:\/\/github\.com\//.test(href)) expect(href.split('#')[0], where).not.toMatch(/\.md$/i);
+        const m = /^\/docs\/([^#/]+)(?:#(.+))?$/.exec(href);
+        if (m) {
+          internal++;
+          expect(idsBySlug.has(m[1]), `${where}: unpublished slug`).toBe(true);
+          if (m[2]) expect(idsBySlug.get(m[1])!.has(m[2]), `${where}: missing heading`).toBe(true);
+        } else if (href.startsWith('#')) {
+          expect(idsBySlug.get(slug)!.has(href.slice(1)), `${where}: missing heading`).toBe(true);
+        } else {
+          expect(href, where).toMatch(/^(https?:|mailto:)/);
+        }
+      }
+    }
+    expect(internal).toBeGreaterThan(20);
   });
 });

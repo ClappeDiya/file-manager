@@ -1,11 +1,11 @@
 import type { Metadata } from 'next';
 import { PricingCards } from '@/components/pricing-cards';
 import { WaitlistForm } from '@/components/waitlist-form';
-import { ANNUAL_SAVINGS_PERCENT, BUSINESS_ANNUAL_PRICE, BUSINESS_MONTHLY_PRICE, TRIAL_DAYS } from '@/lib/pricing';
+import { ANNUAL_SAVINGS_PERCENT, BUSINESS_ANNUAL_PERIOD, BUSINESS_ANNUAL_PRICE, BUSINESS_MONTHLY_PERIOD, BUSINESS_MONTHLY_PRICE, BUSINESS_UNIT, TRIAL_DAYS } from '@/lib/pricing';
 
 export const metadata: Metadata = {
   title: 'Pricing',
-  description: `Free for individuals. Business ${BUSINESS_MONTHLY_PRICE}/user/month or ${BUSINESS_ANNUAL_PRICE}/user/year, with a ${TRIAL_DAYS}-day free trial (coming Q3). Enterprise custom.`,
+  description: `Free for individuals. Business ${BUSINESS_MONTHLY_PRICE}${BUSINESS_MONTHLY_PERIOD} or ${BUSINESS_ANNUAL_PRICE}${BUSINESS_ANNUAL_PERIOD}, with a ${TRIAL_DAYS}-day free trial (coming Q3). Enterprise custom.`,
 };
 
 const faq = [
@@ -18,12 +18,12 @@ const faq = [
     a: 'Teams that need to share file-manager connections, enforce policies (e.g. "S3 buckets in eu-west-1 only"), require approval before risky operations, or keep a centralized audit log for compliance. None of that matters to a solo user; all of it matters once you have 5+ people moving files together.',
   },
   {
-    q: `Why ${BUSINESS_MONTHLY_PRICE}/user/month?`,
-    a: `It is the lowest sustainable price that lets us keep the desktop free, fund development, and run a managed SaaS without venture-scale unit economics. Annual billing is ${BUSINESS_ANNUAL_PRICE} per user per year, ${ANNUAL_SAVINGS_PERCENT}% less than twelve months at ${BUSINESS_MONTHLY_PRICE}. If you have a promotion code, enter it at checkout.`,
+    q: `Why ${BUSINESS_MONTHLY_PRICE}${BUSINESS_MONTHLY_PERIOD}?`,
+    a: `It is the lowest sustainable price that lets us keep the desktop free, fund development, and run a managed SaaS without venture-scale unit economics. Annual billing is ${BUSINESS_ANNUAL_PRICE} per ${BUSINESS_UNIT} per year, ${ANNUAL_SAVINGS_PERCENT}% less than twelve months at ${BUSINESS_MONTHLY_PRICE}. If you have a promotion code, enter it at checkout.`,
   },
   {
     q: 'How does Business billing work?',
-    a: 'Per-seat, monthly or annual: pick one on the Billing page of the admin console and pay through Stripe Checkout. Seats, the payment method and cancellation are managed in the Stripe billing portal linked from the same page. Cancellation takes effect at the end of the current period.',
+    a: `Per seat, where a seat is one enrolled ${BUSINESS_UNIT} (not a person), monthly or annual: pick one on the Billing page of the admin console and pay through Stripe Checkout. Seats, the payment method and cancellation are managed in the Stripe billing portal linked from the same page. Cancellation takes effect at the end of the current period.`,
   },
   {
     q: 'When does Business launch?',

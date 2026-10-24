@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { Check } from 'lucide-react';
-import { ANNUAL_SAVINGS_PERCENT, BUSINESS_ANNUAL_PRICE, BUSINESS_MONTHLY_PRICE, TRIAL_DAYS } from '@/lib/pricing';
+import { ANNUAL_SAVINGS_PERCENT, BUSINESS_ANNUAL_PERIOD, BUSINESS_ANNUAL_PRICE, BUSINESS_MONTHLY_PERIOD, BUSINESS_MONTHLY_PRICE, TRIAL_DAYS } from '@/lib/pricing';
 
 export type PricingVariant = 'teaser' | 'full';
 
@@ -25,8 +25,8 @@ const plans = [
   {
     name: 'Business',
     price: BUSINESS_MONTHLY_PRICE,
-    period: '/user/month',
-    note: `or ${BUSINESS_ANNUAL_PRICE}/user/year (save ${ANNUAL_SAVINGS_PERCENT}%). ${TRIAL_DAYS}-day free trial, no card to start.`,
+    period: BUSINESS_MONTHLY_PERIOD,
+    note: `or ${BUSINESS_ANNUAL_PRICE}${BUSINESS_ANNUAL_PERIOD} (save ${ANNUAL_SAVINGS_PERCENT}%). ${TRIAL_DAYS}-day free trial, no card to start.`,
     tagline: 'Shared workspaces + governance for teams.',
     cta: { label: 'Join waitlist', href: '/pricing#waitlist', primary: false },
     badge: 'Coming Q3 2026',

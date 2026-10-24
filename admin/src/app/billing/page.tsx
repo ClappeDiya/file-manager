@@ -18,7 +18,7 @@ import { formatDate } from '@/lib/utils/format';
 import type { BillingAccount } from '@/lib/billing';
 import { ANNUAL_DISCOUNT_PERCENT, type BillingInterval } from '@/lib/billing/plans';
 import type { Invoice } from '@/lib/billing/provider';
-import { discountAmount, discountDuration, trialDaysLeft } from '@/lib/billing/trial';
+import { discountAmount, discountDuration, hasPaymentMethod, trialDaysLeft, trialOutcome } from '@/lib/billing/trial';
 import type { License } from '@/lib/db/repos/orgs';
 
 interface PlanView {
@@ -64,6 +64,7 @@ export default function BillingPage() {
   const acct = data.account;
   const subscribed = !!acct && ['active', 'trialing', 'past_due'].includes(acct.status);
   const trialing = acct?.status === 'trialing';
+  const paymentMethod = acct ? hasPaymentMethod(acct) : null;
   const daysLeft = trialing ? trialDaysLeft(acct.trialEnd ?? acct.currentPeriodEnd) : null;
   const annualOffered = data.plans.some((p) => p.annualPurchasable);
   const go = async (path: string, body?: unknown) => {
@@ -89,8 +90,7 @@ export default function BillingPage() {
       {trialing && (
         <div className="mb-4 rounded-md border border-info bg-info-bg px-3 py-2 text-sm" role="status">
           Free trial: {daysLeft === null ? 'ends soon' : daysLeft <= 0 ? 'ends today' : `${daysLeft} day${daysLeft === 1 ? '' : 's'} left`}
-          {acct.trialEnd || acct.currentPeriodEnd ? ` (until ${formatDate((acct.trialEnd ?? acct.currentPeriodEnd) as string)})` : ''}. Add a payment method in the billing portal before then to keep {planName(acct.plan)}; otherwise the subscription is cancelled and the
-          organization returns to the free plan.
+          {acct.trialEnd || acct.currentPeriodEnd ? ` (until ${formatDate((acct.trialEnd ?? acct.currentPeriodEnd) as string)})` : ''}. {trialOutcome(paymentMethod)}
         </div>
       )}
       {acct?.status === 'past_due' && (
@@ -113,7 +113,7 @@ export default function BillingPage() {
           value={acct?.currentPeriodEnd ? formatDate(acct.currentPeriodEnd) : '—'}
           icon={CalendarClock}
           variant="default"
-          subtitle={acct?.cancelAtPeriodEnd ? 'Ends at the end of the period' : trialing ? 'Converts only with a payment method' : subscribed ? `Renews automatically${acct?.interval === 'year' ? ' (annual)' : acct?.interval === 'month' ? ' (monthly)' : ''}` : 'No subscription'}
+          subtitle={acct?.cancelAtPeriodEnd ? 'Ends at the end of the period' : trialing ? (paymentMethod ? 'Converts to a paid subscription' : 'Converts only with a payment method') : subscribed ? `Renews automatically${acct?.interval === 'year' ? ' (annual)' : acct?.interval === 'month' ? ' (monthly)' : ''}` : 'No subscription'}
         />
       </div>
 
