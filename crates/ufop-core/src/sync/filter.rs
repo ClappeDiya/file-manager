@@ -191,6 +191,26 @@ mod tests {
         assert!(!drops(&f, "proj/a.txt"));
     }
 
+    /// Regression: a file pattern such as `- *` also excluded every folder,
+    /// so the rclone "only JPEGs" file (`+ *.jpg` / `- *`) dropped all
+    /// files below the pair root.
+    #[test]
+    fn rclone_file_rules_do_not_prune_folders() {
+        let f = SyncFilter { rules: crate::filter_rules::parse_filter_file("+ *.jpg\n- *").unwrap(), ..Default::default() };
+        let c = CompiledSyncFilter::new(&f).unwrap();
+        assert!(c.accepts("a.jpg", 1));
+        assert!(c.accepts("sub/deep/a.jpg", 1));
+        assert!(!c.accepts("sub/a.txt", 1));
+        let f = SyncFilter { rules: crate::filter_rules::parse_filter_file("+ /Photos/**\n- *").unwrap(), ..Default::default() };
+        let c = CompiledSyncFilter::new(&f).unwrap();
+        assert!(c.accepts("Photos/2024/a.jpg", 1));
+        assert!(!c.accepts("Music/b.mp3", 1));
+        // Folder rules (`dir/`, `**`) still prune.
+        let f = SyncFilter { rules: crate::filter_rules::parse_filter_file("- /cache/\n- tmp/**\n+ *").unwrap(), ..Default::default() };
+        let c = CompiledSyncFilter::new(&f).unwrap();
+        assert!(!c.accepts("cache/a.jpg", 1) && !c.accepts("x/tmp/a", 1) && c.accepts("x/cache/a", 1));
+    }
+
     #[test]
     fn legacy_lists_keep_their_meaning() {
         // Both include lists must match; an invalid pattern matches nothing.

@@ -79,10 +79,24 @@ impl SourceFilter {
         self.compiled.evaluate(path, is_dir)
     }
 
+    /// Like [`evaluate`](Self::evaluate) for `path` found under the source
+    /// folder `root`: rclone rules (imported `--filter-from` files) are
+    /// matched on the path inside `root`, so `/Photos/**` is the source's
+    /// own `Photos` folder; the other rule kinds keep matching the full path.
+    pub fn evaluate_under(&self, path: &Path, root: Option<&Path>, is_dir: bool) -> Option<FilterAction> {
+        let rel = root.and_then(|r| path.strip_prefix(r).ok()).map(|r| r.to_string_lossy());
+        self.compiled.evaluate_rooted(&path.to_string_lossy(), rel.as_deref(), is_dir)
+    }
+
     /// Whether the entry is selected, applying rules and attribute checks.
     pub fn accepts(&self, path: &Path, md: &Metadata) -> bool {
-        let s = path.to_string_lossy();
-        if self.evaluate(&s, md.is_dir()) == Some(FilterAction::Exclude) {
+        self.accepts_under(path, None, md)
+    }
+
+    /// [`accepts`](Self::accepts) for an entry under the source folder
+    /// `root` (see [`evaluate_under`](Self::evaluate_under)).
+    pub fn accepts_under(&self, path: &Path, root: Option<&Path>, md: &Metadata) -> bool {
+        if self.evaluate_under(path, root, md.is_dir()) == Some(FilterAction::Exclude) {
             return false;
         }
         if self.exclude_hidden && is_hidden(path, md) {

@@ -747,9 +747,20 @@ impl<'f> Scanner<'f> {
         matches!((root_dev, dev), (Some(a), Some(b)) if a != b)
     }
 
+    /// The source folder `path` was found under (the deepest one).
+    fn root_of(&self, path: &Path) -> Option<&Path> {
+        self.roots.iter().find(|r| path.starts_with(r)).map(PathBuf::as_path)
+    }
+
+    /// The filter rules' verdict on `path`, rclone rules relative to its
+    /// source folder.
+    fn rule(&self, path: &Path, is_dir: bool) -> Option<super::FilterAction> {
+        self.filter.evaluate_under(path, self.root_of(path), is_dir)
+    }
+
     /// Excluded by an ignore file (explicit filter rules win over them).
     fn ignored(&mut self, path: &Path, is_dir: bool) -> bool {
-        self.ignores.is_active() && self.filter.evaluate(&path.to_string_lossy(), is_dir).is_none() && self.ignores.is_ignored(path, is_dir)
+        self.ignores.is_active() && self.rule(path, is_dir).is_none() && self.ignores.is_ignored(path, is_dir)
     }
 
     fn real(&self, path: &Path) -> PathBuf {
@@ -813,7 +824,7 @@ impl<'f> Scanner<'f> {
             match self.opts.symlink_policy {
                 SymlinkPolicy::Ignore => return None,
                 SymlinkPolicy::Store => {
-                    if self.filter.evaluate(&path.to_string_lossy(), false) == Some(super::FilterAction::Exclude) || self.ignored(path, false) {
+                    if self.rule(path, false) == Some(super::FilterAction::Exclude) || self.ignored(path, false) {
                         return None;
                     }
                     let mut e = self.entry(path, EntryKind::Symlink, &lmd);
@@ -835,7 +846,7 @@ impl<'f> Scanner<'f> {
         } else {
             lmd
         };
-        if self.ignored(path, md.is_dir()) || !self.filter.accepts(path, &md) {
+        if self.ignored(path, md.is_dir()) || !self.filter.accepts_under(path, self.root_of(path), &md) {
             return None;
         }
         if md.is_dir() {
@@ -913,7 +924,7 @@ impl<'f> Scanner<'f> {
                 .ancestors()
                 .skip(1)
                 .take_while(|a| a.starts_with(&root))
-                .any(|d| !*dir_ok.entry(d.to_path_buf()).or_insert_with(|| self.filter.accepts(d, &library_md)));
+                .any(|d| !*dir_ok.entry(d.to_path_buf()).or_insert_with(|| self.filter.accepts_under(d, Some(&root), &library_md)));
             if blocked {
                 continue;
             }
@@ -924,7 +935,7 @@ impl<'f> Scanner<'f> {
                     continue;
                 }
             };
-            if !self.filter.accepts(&item.logical, &md) {
+            if !self.filter.accepts_under(&item.logical, Some(&root), &md) {
                 continue;
             }
             files.push((item.original.clone(), file_entry(&item.logical, EntryKind::File, md.len(), Some(&md))));
@@ -2498,6 +2509,40 @@ mod tests {
         let (e, _) = scan_sources(&[source_uri(&lib).into()], &f, &o).unwrap();
         assert!(!e.iter().any(|(_, e)| e.path.contains("2024")), "{:?}", e.iter().map(|x| &x.1.path).collect::<Vec<_>>());
         assert!(e.iter().any(|(_, e)| e.path.contains("2023")));
+    }
+
+    /// Regression: rclone `--filter-from` rules were matched against the
+    /// absolute path, so `/Photos/**` meant the filesystem root and an
+    /// imported "only Photos" file selected nothing.
+    #[test]
+    fn rclone_rules_are_relative_to_the_source_folder() {
+        let src = tempfile::tempdir().unwrap();
+        write(src.path(), "Photos/a.jpg", b"p");
+        write(src.path(), "Photos/2024/b.jpg", b"p");
+        write(src.path(), "Music/b.mp3", b"m");
+        write(src.path(), "sub/deep/c.jpg", b"j");
+        write(src.path(), "sub/notes.txt", b"t");
+        let picked = |text: &str| {
+            let mut f = SourceFilter::default();
+            f.rules = crate::filter_rules::parse_filter_file(text).unwrap();
+            let f = f.compile().unwrap();
+            let (e, _) = scan_sources(&[src.path().into()], &f, &opts()).unwrap();
+            let mut files: Vec<String> = e
+                .iter()
+                .filter(|(_, e)| e.kind == EntryKind::File)
+                .map(|(p, _)| p.strip_prefix(src.path()).unwrap().to_string_lossy().replace('\\', "/"))
+                .collect();
+            files.sort();
+            files
+        };
+        assert_eq!(picked("+ /Photos/**\n- *"), vec!["Photos/2024/b.jpg", "Photos/a.jpg"]);
+        // A file rule such as `- *` does not prune folders (as in rclone), so
+        // "only JPEGs" finds them at any depth.
+        assert_eq!(picked("+ *.jpg\n- *"), vec!["Photos/2024/b.jpg", "Photos/a.jpg", "sub/deep/c.jpg"]);
+        // An anchored pattern names a folder of the source, not one higher up.
+        let parent = src.path().file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(picked(&format!("- /{parent}/**")).len(), 5);
+        assert_eq!(picked("- /sub/\n- /Music/**"), vec!["Photos/2024/b.jpg", "Photos/a.jpg"]);
     }
 
     /// Fails every block upload after the first `ok` ones (a dropped

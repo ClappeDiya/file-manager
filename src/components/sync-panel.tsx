@@ -1144,6 +1144,11 @@ function CreatePairView({
               deleted and destination changes are not brought back.
             </p>
           )}
+          {form.mode === "two_way" && form.destState === "trusted_inventory" && (
+            <p className="text-[10px] text-amber-600 dark:text-amber-400" data-testid="sync-inventory-two-way-hint">
+              Two-way pairs scan the destination every run anyway: a saved inventory cannot show changes made there.
+            </p>
+          )}
 
           <label className="block text-xs text-zinc-600 dark:text-zinc-400">
             Exclude Patterns (comma-separated globs)

@@ -284,7 +284,7 @@ A two-way pair remembers what both folders looked like after its last successful
 - A run that fails, is cancelled or stops at the end of its run hours keeps the previous history, so nothing it left half done is mistaken for a deletion.
 - **Safety stop**: a run that would delete more than 50% of the synced files on one side (more than two files), or everything because one folder is empty or missing, is refused — usually an unplugged drive or an unmounted share. Change the limit in *Cleanup & moving* (0 turns it off) or reset the history.
 
-With **Destination state: Blind upload** the destination is never read, so a two-way pair only copies source files to it and never deletes anything (no history is used or recorded). Changing a pair's mode or folders forgets its history. In the Advanced view each two-way pair shows its history size and a **Reset history** button.
+With **Destination state: Blind upload** the destination is never read, so a two-way pair only copies source files to it and never deletes anything (no history is used or recorded). With **Trust the inventory** a two-way pair still scans the destination every run, because the saved inventory cannot show changes made there. Changing a pair's mode or folders forgets its history. In the Advanced view each two-way pair shows its history size and a **Reset history** button.
 
 ### Edit, duplicate, export and import
 
@@ -294,7 +294,7 @@ With **Destination state: Blind upload** the destination is never read, so a two
 
 ### Filters, rules and presets
 
-Besides the include/exclude lists, a pair (and a backup job) can have **ordered rules**: the first rule that matches decides, so `+ keep.log` above `- *.log` keeps that one log file. Rule kinds: wildcard, exact path, regex, a group (temporary files, caches, OS metadata, build output, images, video, audio, documents, archives) and **rclone glob** (`*` stays in one folder, `**` crosses folders, a leading `/` anchors at the top, a trailing `/` matches a folder and everything in it, `{jpg,png}` alternatives). A folder rule covers everything inside that folder; in a sync pair, paths are matched from the pair's top folder (so `cache/` means the `cache` folder at the top of the pair, and `/proc/`-style anchored group entries refer to the pair's top as well).
+Besides the include/exclude lists, a pair (and a backup job) can have **ordered rules**: the first rule that matches decides, so `+ keep.log` above `- *.log` keeps that one log file. Rule kinds: wildcard, exact path, regex, a group (temporary files, caches, OS metadata, build output, images, video, audio, documents, archives) and **rclone glob** (`*` stays in one folder, `**` crosses folders, a leading `/` anchors at the top of the pair or of each backup source folder, a trailing `/` matches a folder and everything in it, `{jpg,png}` alternatives). As in rclone, an rclone pattern without a trailing `/` or `**` names files only: `- *` never hides a folder, so `+ *.jpg` followed by `- *` keeps JPEGs at any depth, and `+ /Photos/**` followed by `- *` keeps only the `Photos` folder of each source. The other rule kinds in a backup job match the full path on disk (`/home/me/cache/`, `*/cache/`). A folder rule covers everything inside that folder; in a sync pair, paths are matched from the pair's top folder (so `cache/` means the `cache` folder at the top of the pair, and `/proc/`-style anchored group entries refer to the pair's top as well).
 
 - **Import rules from file…** reads an rclone `--filter-from` file: one `+ pattern` or `- pattern` per line, `#` and `;` comments, `!` clears the rules read so far.
 - **Saved presets**: *Save as preset…* stores the current rules under a name; *Apply saved preset* adds a preset's rules to a pair or job (both views). Delete presets in the Advanced view.
@@ -306,7 +306,7 @@ In the Advanced view, *When to overwrite › Compare files by* chooses **size an
 
 ### Versioned backup: versions to keep
 
-Versioned-backup pairs keep every stored version unless *Versions to keep of each file* (Advanced) is set; then the oldest versions beyond that number are deleted after each run. Unchanged files are no longer stored again on every run.
+Versioned-backup pairs keep every stored version unless *Versions to keep of each file* (Advanced) is set; then the oldest versions beyond that number are deleted after each run. Unchanged files are no longer stored again on every run. Versions stored by earlier app versions (numbered `name.v1.ext` files without a version list) are taken over on the first run, so they count towards that number and continue the numbering; this works for the default name and any template built only from `{name}`, `{ext}`, `{filename}` and `{num}`.
 
 ### Interrupted runs
 

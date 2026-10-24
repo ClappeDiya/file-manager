@@ -151,6 +151,14 @@ describe("SyncPanel: edit, duplicate, export, import", () => {
     expect(screen.getByTestId("sync-blind-two-way-hint")).toHaveTextContent(/nothing is\s+deleted/);
   });
 
+  it("notes that a two-way pair scans the destination despite a trusted inventory", async () => {
+    backend({ list_sync_pairs: () => [{ ...pair, mode: "two_way", dest_state: "trusted_inventory" }] });
+    render(<SyncPanel />);
+    fireEvent.click(await screen.findByLabelText("Edit Photos"));
+    expect(screen.getByTestId("sync-inventory-two-way-hint")).toHaveTextContent(/scan the destination every run/);
+    expect(screen.queryByTestId("sync-blind-two-way-hint")).toBeNull();
+  });
+
   it("exports and imports pairs in the Advanced view only", async () => {
     backend();
     const { unmount } = render(<SyncPanel />);

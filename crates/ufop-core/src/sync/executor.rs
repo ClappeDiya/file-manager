@@ -190,6 +190,15 @@ pub fn execute_sync_with(
     // A checkpoint counts only for the folders and mode it was written for.
     let resume = config.resume_from.as_ref().filter(|c| c.matches(pair));
     let mut index = if pair.mode == SyncMode::VersionedBackup { VersionIndex::load(Path::new(&pair.dest_path)) } else { VersionIndex::default() };
+    // First run on a destination without an index (stored by an older
+    // version of the app): take over the version files already there.
+    let adopted_versions = if pair.mode == SyncMode::VersionedBackup && !VersionIndex::exists(Path::new(&pair.dest_path)) {
+        let source = planner::walk_directory_with(Path::new(&pair.source_path), &pair.copy_options).unwrap_or_default();
+        index.adopt_unindexed(pair, source.iter().filter(|f| !f.is_dir).map(|f| f.relative_path.as_str()));
+        true
+    } else {
+        false
+    };
     // Versions the interrupted run stored before it could write the index.
     let recovered_versions = resume.map_or(0, |c| recover_versions(&mut index, Path::new(&pair.dest_path), c));
     let stored_versions = StoredVersions { index, stored: Mutex::new(Vec::new()) };
@@ -545,7 +554,7 @@ pub fn execute_sync_with(
         let StoredVersions { mut index, stored } = stored_versions;
         let stored = stored.into_inner().unwrap_or_default();
         let keep = pair.run_options.keep_versions.filter(|k| *k > 0);
-        if !stored.is_empty() || keep.is_some() || recovered_versions > 0 {
+        if !stored.is_empty() || keep.is_some() || recovered_versions > 0 || adopted_versions {
             for (rel, v) in stored {
                 index.record(&rel, v);
             }
@@ -1128,32 +1137,9 @@ fn versioned_path(path: &Path, template: Option<&str>) -> Result<PathBuf, AppErr
 /// [`versioned_path`] trying version numbers from `start` (numbers freed by
 /// pruning are not reused); also returns the number used.
 fn versioned_path_from(path: &Path, template: Option<&str>, start: u64) -> Result<(PathBuf, u64), AppError> {
-    use crate::naming::{render, sanitize_segment, TokenContext, UnknownTokens};
-    let template = template.map(str::trim).filter(|t| !t.is_empty()).unwrap_or(DEFAULT_VERSION_TEMPLATE);
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let has_ext = path.extension().is_some();
-    let mut base = TokenContext::for_path(path);
-    // A first version has no file yet: date tokens use the run time.
-    if base.modified.is_none() {
-        base.modified = Some(Utc::now());
-    }
-    let numbered = template.contains("{num") || template.contains("{counter");
+    let namer = crate::sync::versions::VersionNamer::new(path, template);
     for n in start.max(1)..start.max(1) + 100_000u64 {
-        let mut name = render(template, &base.clone().with_counter(n, 0), UnknownTokens::Error).map_err(|e| AppError::Sync {
-            message: format!("Version name template \"{template}\" is invalid: {e}"),
-            advice: "Fix the version naming template in the pair's options.".to_string(),
-        })?;
-        // "{name}.{ext}" on a file without an extension would end in a dot.
-        if !has_ext {
-            name = name.trim_end_matches('.').to_string();
-        }
-        if !numbered && n > 1 {
-            name = match name.rsplit_once('.') {
-                Some((stem, ext)) if has_ext => format!("{stem} ({n}).{ext}"),
-                _ => format!("{name} ({n})"),
-            };
-        }
-        let candidate = parent.join(sanitize_segment(name));
+        let candidate = namer.name(n)?;
         if candidate != path && !candidate.exists() {
             return Ok((candidate, n));
         }
@@ -2342,6 +2328,32 @@ mod tests {
         }
     }
 
+    /// Regression: with *Trust the inventory* the destination "listing" was
+    /// the inventory saved by the last run, so a destination edit was never
+    /// seen: deleting the same file in the source then deleted the edited
+    /// destination copy. Two-way pairs now always scan the destination.
+    #[test]
+    fn two_way_with_trusted_inventory_sees_destination_edits() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "a").unwrap();
+        fs::write(src.path().join("b.txt"), "b").unwrap();
+        let pair = SyncPair { dest_state: DestStateMode::TrustedInventory, ..two_way(src.path(), dst.path()) };
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+        assert!(base.is_some());
+
+        fs::write(dst.path().join("a.txt"), "a edited in the destination").unwrap();
+        fs::remove_file(src.path().join("a.txt")).unwrap();
+        fs::write(dst.path().join("b.txt"), "b edited in the destination").unwrap();
+        let preview = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
+        assert!(preview.deletions.iter().all(|d| d.relative_path != "a.txt"), "would delete the edited destination copy");
+        assert!(preview.notes.iter().any(|n| n.contains("inventory")), "{:?}", preview.notes);
+        run_two_way(&pair, &mut base);
+        assert_eq!(fs::read_to_string(dst.path().join("a.txt")).unwrap(), "a edited in the destination");
+        assert_eq!(fs::read_to_string(src.path().join("b.txt")).unwrap(), "b edited in the destination");
+    }
+
     #[test]
     fn two_way_baseline_for_other_folders_is_ignored() {
         let src = TempDir::new().unwrap();
@@ -2557,6 +2569,56 @@ mod tests {
         // Unlimited (the default) never removes anything; the index is never synced.
         assert!(planner::is_internal_entry(crate::sync::versions::VERSIONS_FILE));
         assert!(validate_run_options(&SyncRunOptions { keep_versions: Some(0), ..Default::default() }).is_err());
+    }
+
+    /// Regression (upgrade): versions stored before the version index
+    /// existed were never indexed, so `keep_versions` never pruned them,
+    /// /PURGE deleted them as extras and the first run stored another copy
+    /// of every unchanged file. They are now adopted on first use.
+    #[test]
+    fn versions_stored_before_the_index_are_adopted() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+        fs::write(src.path().join("doc.txt"), "second").unwrap();
+        copier::set_mtime(&src.path().join("doc.txt"), t);
+        fs::create_dir(dst.path().join("sub")).unwrap();
+        fs::create_dir(src.path().join("sub")).unwrap();
+        fs::write(src.path().join("sub/notes.md"), "n").unwrap();
+        // What the old engine left: numbered copies, no index.
+        fs::write(dst.path().join("doc.v1.txt"), "first").unwrap();
+        fs::write(dst.path().join("doc.v2.txt"), "second").unwrap();
+        copier::set_mtime(&dst.path().join("doc.v2.txt"), t);
+        fs::write(dst.path().join("sub/notes.v1.md"), "n").unwrap();
+        copier::set_mtime(&dst.path().join("sub/notes.v1.md"), t);
+        copier::set_mtime(&src.path().join("sub/notes.md"), t);
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::VersionedBackup;
+        pair.copy_options.purge = true;
+        pair.run_options.keep_versions = Some(1);
+
+        let preview = planner::compute_preview(&pair).unwrap();
+        assert_eq!(preview.total_deletions, 0, "old versions are not extras: {:?}", preview.deletions);
+        assert_eq!(preview.total_additions + preview.total_modifications, 0, "unchanged files are not stored again");
+        let r = run_with(pair.clone());
+        assert_eq!(r.errors, 0, "{:?}", r.error_messages);
+        assert_eq!(r.files_added + r.files_modified + r.files_deleted, 0);
+        assert_eq!(r.versions_pruned, 1);
+        assert!(!dst.path().join("doc.v1.txt").exists() && dst.path().join("doc.v2.txt").exists());
+        let index = VersionIndex::load(dst.path());
+        assert_eq!(index.latest("doc.txt").map(|v| (v.path.as_str(), v.seq)), Some(("doc.v2.txt", 2)));
+        assert_eq!(index.latest("sub/notes.md").map(|v| v.path.as_str()), Some("sub/notes.v1.md"));
+        // The next version continues the numbering.
+        fs::write(src.path().join("doc.txt"), "third, longer").unwrap();
+        run_with(pair.clone());
+        assert!(dst.path().join("doc.v3.txt").exists());
+        // Names that depend on dates cannot be recognised: nothing is adopted.
+        let mut dated = pair;
+        dated.run_options.version_template = Some("{name}.{now:%Y}.{ext}".into());
+        assert_eq!(VersionIndex::default().adopt_unindexed(&dated, ["doc.txt"]), 0);
+        dated.run_options.version_template = Some("{name}~{num:3}.{ext}".into());
+        fs::write(dst.path().join("doc~001.txt"), "x").unwrap();
+        assert_eq!(VersionIndex::default().adopt_unindexed(&dated, ["doc.txt"]), 1);
     }
 
     #[test]

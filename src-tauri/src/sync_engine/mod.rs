@@ -853,29 +853,31 @@ impl SyncManager {
                 scheduler::SyncScheduler::validate_cron(cron_expr)?;
             }
         }
-        let (reset, rearm, stale_checkpoint) = {
-            let mut pairs = self.pairs.write().await;
-            if let std::collections::hash_map::Entry::Occupied(mut e) = pairs.entry(pair.id) {
-                let old = e.get();
-                let reset = old.mode != pair.mode || old.source_path != pair.source_path || old.dest_path != pair.dest_path;
-                let rearm = old.trigger != pair.trigger || old.enabled != pair.enabled || old.source_path != pair.source_path;
-                let stale_checkpoint = reset
-                    || old.dest_state != pair.dest_state
-                    || old.copy_options != pair.copy_options
-                    || old.option_overrides != pair.option_overrides
-                    || old.run_options != pair.run_options
-                    || serde_json::to_value(&old.filter).ok() != serde_json::to_value(&pair.filter).ok();
-                e.insert(pair.clone());
-                (reset, rearm, stale_checkpoint)
-            } else {
-                return Err(AppError::Sync {
-                    message: "Sync pair not found.".to_string(),
-                    advice: "Create the sync pair first.".to_string(),
-                });
-            }
+        let not_found = || AppError::Sync {
+            message: "Sync pair not found.".to_string(),
+            advice: "Create the sync pair first.".to_string(),
         };
+        let (reset, rearm, stale_checkpoint) = {
+            let pairs = self.pairs.read().await;
+            let old = pairs.get(&pair.id).ok_or_else(not_found)?;
+            let reset = old.mode != pair.mode || old.source_path != pair.source_path || old.dest_path != pair.dest_path;
+            let rearm = old.trigger != pair.trigger || old.enabled != pair.enabled || old.source_path != pair.source_path;
+            let stale_checkpoint = reset
+                || old.dest_state != pair.dest_state
+                || old.copy_options != pair.copy_options
+                || old.option_overrides != pair.option_overrides
+                || old.run_options != pair.run_options
+                || serde_json::to_value(&old.filter).ok() != serde_json::to_value(&pair.filter).ok();
+            (reset, rearm, stale_checkpoint)
+        };
+        // The fallible baseline reset comes before the pair is replaced, so
+        // a failure leaves the old pair in place everywhere.
         if reset {
             self.reset_baseline(pair.id).await?;
+        }
+        match self.pairs.write().await.get_mut(&pair.id) {
+            Some(slot) => *slot = pair.clone(),
+            None => return Err(not_found()),
         }
         if stale_checkpoint {
             checkpoint::clear(&self.checkpoint_path(pair.id));
@@ -886,7 +888,13 @@ impl SyncManager {
             let _ = self.scheduler.remove_schedule(pair.id);
             if pair.enabled {
                 match &pair.trigger {
-                    SyncTrigger::Watch => self.start_watcher(pair.id).await?,
+                    // As in `create_pair`: the edit stands (the command saves
+                    // it) and the watcher is retried at the next start.
+                    SyncTrigger::Watch => {
+                        if let Err(e) = self.start_watcher(pair.id).await {
+                            tracing::warn!("Failed to start watcher for {}: {}", pair.id, e);
+                        }
+                    }
                     SyncTrigger::Scheduled { cron_expr } => {
                         self.scheduler.add_schedule(pair.id, cron_expr)?;
                     }
@@ -1290,6 +1298,17 @@ mod checkpoint {
         }
     }
 
+    fn ends_without_newline(f: &mut std::fs::File) -> std::io::Result<bool> {
+        use std::io::{Read, Seek, SeekFrom};
+        if f.metadata()?.len() == 0 {
+            return Ok(false);
+        }
+        f.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        f.read_exact(&mut last)?;
+        Ok(last[0] != b'\n')
+    }
+
     /// The open checkpoint of a run.
     pub struct Journal(Arc<std::sync::Mutex<std::fs::File>>);
 
@@ -1302,7 +1321,13 @@ mod checkpoint {
                     std::fs::create_dir_all(dir)?;
                 }
                 if resume {
-                    return std::fs::OpenOptions::new().append(true).open(path);
+                    let mut f = std::fs::OpenOptions::new().read(true).append(true).open(path)?;
+                    // A crash mid-write leaves a torn last line; end it so the
+                    // next step is not glued onto it (`load` skips the fragment).
+                    if ends_without_newline(&mut f)? {
+                        writeln!(f)?;
+                    }
+                    return Ok(f);
                 }
                 let mut f = std::fs::File::create(path)?;
                 let header = Header {
@@ -2180,6 +2205,30 @@ mod tests {
         assert!(!mgr.checkpoint_path(pair.id).exists());
     }
 
+    /// Regression: a resumed run appended its first step to the torn last
+    /// line a crash left behind, so that step was lost as well.
+    #[test]
+    fn resumed_checkpoint_does_not_glue_onto_a_torn_line() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pair = temp_pair(dir.path(), dir.path(), SyncMode::OneWay);
+        let path = dir.path().join("cp.jsonl");
+        let step = CompletedStep { action: SyncAction::Add, direction: Default::default(), size: Some(1), modified: None, done_at: None, version: None };
+        let journal = checkpoint::Journal::open(&path, &pair, Uuid::new_v4(), false).unwrap();
+        (journal.recorder())("a.txt", &step);
+        drop(journal);
+        // The crash cut the second line short.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut f, br#"{"path":"b.tx"#).unwrap();
+        drop(f);
+        assert_eq!(checkpoint::load(&path).unwrap().completed.len(), 1);
+
+        let journal = checkpoint::Journal::open(&path, &pair, Uuid::new_v4(), true).unwrap();
+        (journal.recorder())("c.txt", &step);
+        drop(journal);
+        let cp = checkpoint::load(&path).unwrap();
+        assert!(cp.completed.contains_key("a.txt") && cp.completed.contains_key("c.txt"), "{:?}", cp.completed.keys().collect::<Vec<_>>());
+    }
+
     /// Regression: the checkpoint of a cancelled run made the next run skip
     /// its copies after the pair's destination was changed, reporting Success.
     #[tokio::test]
@@ -2319,6 +2368,29 @@ mod tests {
         assert_eq!(mgr.scheduler.list_schedules().len(), 1);
         mgr.update_pair(pair).await.unwrap();
         assert!(mgr.scheduler.list_schedules().is_empty());
+    }
+
+    /// Regression: an edit to a watched pair whose folder cannot be watched
+    /// failed after the pair was replaced in memory (the command then never
+    /// saved it), so memory, database and triggers disagreed. A watcher
+    /// failure is now logged, as when a pair is created.
+    #[tokio::test]
+    async fn unwatchable_edit_is_still_applied() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        let pair = temp_pair(src.path(), dst.path(), SyncMode::OneWay);
+        let (mgr, _state) = mgr_with(&pair).await;
+        let gone = src.path().join("missing");
+        let watched = SyncPair {
+            name: "Watched".into(),
+            trigger: SyncTrigger::Watch,
+            source_path: gone.to_string_lossy().to_string(),
+            ..pair.clone()
+        };
+        let saved = mgr.update_pair(watched.clone()).await.expect("the edit is applied");
+        assert_eq!(saved.name, "Watched");
+        let kept = mgr.pairs.read().await.get(&pair.id).cloned().unwrap();
+        assert_eq!((kept.name.as_str(), &kept.trigger), ("Watched", &SyncTrigger::Watch));
     }
 
     /// Regression: an edit with an invalid cron expression replaced the pair

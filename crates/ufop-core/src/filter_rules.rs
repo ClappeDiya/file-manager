@@ -131,10 +131,32 @@ enum Matcher {
     Regex(Regex),
 }
 
+/// Which entries a compiled rule is tried on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Applies {
+    Any,
+    /// An rclone file pattern: as in rclone it never excludes a folder, so
+    /// `+ *.jpg` / `- *` still finds JPEGs in subfolders.
+    Files,
+    /// A folder an rclone include pattern needs to look into (`Photos/`
+    /// for `+ /Photos/*.jpg`).
+    Dirs,
+}
+
+#[derive(Debug, Clone)]
+struct Compiled {
+    action: FilterAction,
+    matcher: Matcher,
+    applies: Applies,
+    /// rclone patterns name paths from the top of what is being walked
+    /// (see [`RuleSet::evaluate_rooted`]).
+    relative: bool,
+}
+
 /// Compiled, ordered rules.
 #[derive(Debug, Clone)]
 pub struct RuleSet {
-    compiled: Vec<(FilterAction, Matcher)>,
+    compiled: Vec<Compiled>,
     /// Wildcards are case-sensitive except on Windows unless overridden.
     case_sensitive: bool,
 }
@@ -167,23 +189,40 @@ impl RuleSet {
     /// Validate and compile `rules` (in order).
     pub fn compile(rules: &[FilterRule]) -> Result<Self, AppError> {
         let mut compiled = Vec::new();
+        let any = |action, matcher| Compiled { action, matcher, applies: Applies::Any, relative: false };
         for r in rules {
             match r.kind {
-                FilterKind::Exact => compiled.push((r.action, Matcher::Exact(normalize(&r.pattern)))),
-                FilterKind::Wildcard => compiled.push((r.action, Matcher::Glob(compile_glob(&r.pattern)?))),
+                FilterKind::Exact => compiled.push(any(r.action, Matcher::Exact(normalize(&r.pattern)))),
+                FilterKind::Wildcard => compiled.push(any(r.action, Matcher::Glob(compile_glob(&r.pattern)?))),
                 FilterKind::Regex => {
                     let re = Regex::new(&r.pattern).map_err(|e| AppError::validation(format!("Invalid regular expression '{}': {e}", r.pattern)))?;
-                    compiled.push((r.action, Matcher::Regex(re)));
+                    compiled.push(any(r.action, Matcher::Regex(re)));
                 }
                 FilterKind::Rclone => {
-                    let re = Regex::new(&rclone_to_regex(&r.pattern)?)
-                        .map_err(|e| AppError::validation(format!("Invalid pattern '{}': {e}", r.pattern)))?;
-                    compiled.push((r.action, Matcher::Regex(re)));
+                    let bad = |e: regex::Error| AppError::validation(format!("Invalid pattern '{}': {e}", r.pattern));
+                    let re = Regex::new(&rclone_to_regex(&r.pattern)?).map_err(bad)?;
+                    // As in rclone: a pattern ending in `/` or using `**`
+                    // also names folders; any other pattern names files
+                    // only, and an include one opens the folders above it.
+                    let p = r.pattern.trim();
+                    let file_rule = !p.ends_with('/') && !p.contains("**");
+                    let applies = if file_rule { Applies::Files } else { Applies::Any };
+                    compiled.push(Compiled { action: r.action, matcher: Matcher::Regex(re), applies, relative: true });
+                    if file_rule && r.action == FilterAction::Include {
+                        for dir in rclone_parent_dirs(p) {
+                            // Exactly that folder: the file-pattern regex
+                            // with the folder's trailing `/` before `$`.
+                            let Some(re) = rclone_to_regex(&dir).ok().and_then(|re| Regex::new(&format!("{}/$", re.strip_suffix('$')?)).ok()) else {
+                                continue;
+                            };
+                            compiled.push(Compiled { action: r.action, matcher: Matcher::Regex(re), applies: Applies::Dirs, relative: true });
+                        }
+                    }
                 }
                 FilterKind::Group => {
                     let pats = group_patterns(&r.pattern).ok_or_else(|| AppError::validation(format!("Unknown filter group '{}'", r.pattern)))?;
                     for p in pats.iter() {
-                        compiled.push((r.action, Matcher::Glob(compile_glob(p)?)));
+                        compiled.push(any(r.action, Matcher::Glob(compile_glob(p)?)));
                     }
                 }
             }
@@ -209,18 +248,39 @@ impl RuleSet {
     /// Like [`evaluate`](Self::evaluate) for a path that has several
     /// spellings: the first rule that matches any of `paths` decides.
     pub fn evaluate_any(&self, paths: &[&str], is_dir: bool) -> Option<FilterAction> {
-        let paths: Vec<String> = paths
-            .iter()
-            .map(|path| {
-                let mut p = normalize(path);
-                if is_dir && !p.ends_with('/') {
-                    p.push('/');
-                }
-                p
-            })
-            .collect();
+        self.evaluate_in(paths, None, is_dir)
+    }
+
+    /// Like [`evaluate`](Self::evaluate) for an entry at absolute `path`
+    /// found under the folder being walked, `rel` being its path inside that
+    /// folder. rclone rules are matched on `rel` (so `/Photos/**` means the
+    /// folder's own `Photos`, and they never filter the folder itself);
+    /// every other rule on `path`. With `rel` `None` all rules see `path`.
+    pub fn evaluate_rooted(&self, path: &str, rel: Option<&str>, is_dir: bool) -> Option<FilterAction> {
+        let rel = rel.map(|r| format!("/{}", normalize(r).trim_start_matches('/')));
+        self.evaluate_in(&[path], rel.as_deref(), is_dir)
+    }
+
+    fn evaluate_in(&self, paths: &[&str], rel: Option<&str>, is_dir: bool) -> Option<FilterAction> {
+        let spell = |path: &str| {
+            let mut p = normalize(path);
+            if is_dir && !p.ends_with('/') {
+                p.push('/');
+            }
+            p
+        };
+        let paths: Vec<String> = paths.iter().map(|p| spell(p)).collect();
+        let rel: Option<Vec<String>> = rel.map(|r| if r == "/" { Vec::new() } else { vec![spell(r)] });
         let opts = match_options(self.case_sensitive);
-        for (action, m) in &self.compiled {
+        for c in &self.compiled {
+            if (c.applies == Applies::Files && is_dir) || (c.applies == Applies::Dirs && !is_dir) {
+                continue;
+            }
+            let paths = match &rel {
+                Some(rel) if c.relative => rel,
+                _ => &paths,
+            };
+            let (action, m) = (&c.action, &c.matcher);
             let hit = |p: &String| match m {
                 Matcher::Exact(e) => {
                     if e.ends_with('/') {
@@ -238,6 +298,21 @@ impl RuleSet {
         }
         None
     }
+}
+
+/// The folders above an rclone pattern's last segment, deepest first:
+/// `/Photos/2024/*.jpg` gives `/Photos/2024` and `/Photos`.
+fn rclone_parent_dirs(pattern: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut g = pattern;
+    while let Some(i) = g.rfind('/') {
+        if i == 0 {
+            break;
+        }
+        g = &g[..i];
+        out.push(g.to_string());
+    }
+    out
 }
 
 /// Translate an rclone filter glob into a regular expression over
@@ -395,6 +470,26 @@ mod tests {
         let s = set("weird\\*name");
         assert!(hit(&s, "weird*name", false) && !hit(&s, "weirdXname", false));
         assert!(rclone_to_regex("a{b").is_err() && rclone_to_regex("[ab").is_err());
+    }
+
+    #[test]
+    fn rclone_rules_match_inside_the_walked_folder() {
+        let set = RuleSet::compile(&parse_filter_file("+ /Photos/2024/*.jpg\n- *").unwrap()).unwrap();
+        let at = |abs: &str, rel: &str, dir| set.evaluate_rooted(abs, Some(rel), dir);
+        assert_eq!(at("/home/u/src/Photos/2024/a.jpg", "Photos/2024/a.jpg", false), Some(FilterAction::Include));
+        // The folders on the way are opened; others are left to the walk.
+        assert_eq!(at("/home/u/src/Photos", "Photos", true), Some(FilterAction::Include));
+        assert_eq!(at("/home/u/src/Photos/2024", "Photos/2024", true), Some(FilterAction::Include));
+        assert_eq!(at("/home/u/src/Music", "Music", true), None);
+        assert_eq!(at("/home/u/src/Music/b.mp3", "Music/b.mp3", false), Some(FilterAction::Exclude));
+        // The walked folder itself is never filtered by rclone rules.
+        assert_eq!(at("/home/u/src", "", true), None);
+        // Other kinds keep matching the full path.
+        let set = RuleSet::compile(&[rule(FilterAction::Exclude, FilterKind::Exact, "/home/u/src/a")]).unwrap();
+        assert_eq!(set.evaluate_rooted("/home/u/src/a", Some("a"), false), Some(FilterAction::Exclude));
+        assert_eq!(rclone_parent_dirs("/Photos/2024/*.jpg"), vec!["/Photos/2024", "/Photos"]);
+        assert_eq!(rclone_parent_dirs("docs/*.txt"), vec!["docs"]);
+        assert!(rclone_parent_dirs("*.jpg").is_empty());
     }
 
     #[test]

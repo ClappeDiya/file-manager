@@ -480,6 +480,9 @@ pub fn plan(pair: &SyncPair, ctx: &PlanContext<'_>) -> Result<Plan, AppError> {
     let dest_files = match pair.dest_state {
         _ if !dest_root.exists() => Vec::new(),
         DestStateMode::BlindUpload => Vec::new(),
+        // Two-way needs the destination's own changes, which a saved
+        // inventory cannot show: such pairs scan it (see `diff_trees`' note).
+        DestStateMode::TrustedInventory if pair.mode == SyncMode::TwoWay => walk_directory_with(dest_root, opts)?,
         DestStateMode::TrustedInventory => match load_inventory(dest_root) {
             Some(inv) => inv,
             None => walk_directory_with(dest_root, opts)?,
@@ -488,8 +491,13 @@ pub fn plan(pair: &SyncPair, ctx: &PlanContext<'_>) -> Result<Plan, AppError> {
     };
 
     let local = LocalHasher;
-    let index = (pair.mode == SyncMode::VersionedBackup && ctx.versions.is_none() && dest_root.exists())
-        .then(|| super::versions::VersionIndex::load(dest_root));
+    let index = (pair.mode == SyncMode::VersionedBackup && ctx.versions.is_none() && dest_root.exists()).then(|| {
+        let mut index = super::versions::VersionIndex::load(dest_root);
+        if !super::versions::VersionIndex::exists(dest_root) {
+            index.adopt_unindexed(pair, source_files.iter().filter(|f| !f.is_dir).map(|f| f.relative_path.as_str()));
+        }
+        index
+    });
     let ctx = PlanContext {
         hasher: ctx
             .hasher
@@ -640,6 +648,9 @@ pub fn diff_trees(
         } else if pair.mode == SyncMode::TwoWay {
             acc.notes.push("First two-way run: files are combined in both directions and nothing is deleted. Later runs propagate deletions.".to_string());
         }
+    }
+    if pair.mode == SyncMode::TwoWay && pair.dest_state == DestStateMode::TrustedInventory {
+        acc.notes.push("Two-way pairs scan the destination every run: a saved inventory cannot show changes made there.".to_string());
     }
     acc.notes.extend(cmp.notes());
     let Acc { additions, modifications, deletions, skipped, conflicts, path_warnings, total_bytes, fixups, settled, notes } = acc;

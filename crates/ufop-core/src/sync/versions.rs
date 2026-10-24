@@ -9,13 +9,17 @@
 //! file is not stored again), purging leaves versions alone, and
 //! `keep_versions` prunes the oldest ones with the retention engine's
 //! keep-count rule.
+//!
+//! Destinations written before the index existed have numbered version
+//! files and no index; the first run adopts them
+//! ([`VersionIndex::adopt_unindexed`]).
 
 use crate::error::AppError;
 use crate::retention::RetentionPolicy;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Index file at the destination root (never synced, never purged).
 pub const VERSIONS_FILE: &str = ".ufop-sync-versions.json";
@@ -52,6 +56,69 @@ impl VersionIndex {
     /// The index of `dest_root`; empty when there is none (or it is unreadable).
     pub fn load(dest_root: &Path) -> Self {
         std::fs::read(dest_root.join(VERSIONS_FILE)).ok().and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default()
+    }
+
+    /// Whether `dest_root` has an index (a destination without one was
+    /// never versioned, or by an app version without the index).
+    pub fn exists(dest_root: &Path) -> bool {
+        dest_root.join(VERSIONS_FILE).is_file()
+    }
+
+    /// Index the version files an older app version stored for the source
+    /// files `source_rels` under `pair`'s name template: `doc.v1.txt`,
+    /// `doc.v2.txt`, ... (numbers in order, one missing number tolerated).
+    /// Only templates whose names depend on nothing but the file name and the
+    /// number (the default does) can be recognised. When timestamps are kept
+    /// a version's time is the source's when it was stored, so an unchanged
+    /// file is not stored again. Returns the number of versions adopted.
+    pub fn adopt_unindexed<'a>(&mut self, pair: &crate::sync_types::SyncPair, source_rels: impl IntoIterator<Item = &'a str>) -> usize {
+        let template = pair.run_options.version_template.as_deref().map(str::trim).filter(|t| !t.is_empty()).unwrap_or(super::executor::DEFAULT_VERSION_TEMPLATE);
+        let tokens = crate::naming::tokens::tokens_in(template);
+        let numbered = tokens.iter().any(|t| t == "num" || t == "counter");
+        if !numbered || !tokens.iter().all(|t| matches!(t.as_str(), "name" | "ext" | "filename" | "num" | "counter")) {
+            return 0;
+        }
+        let dest_root = Path::new(&pair.dest_path);
+        let keep_times = pair.copy_options.copy_timestamps;
+        let mut adopted = 0;
+        for rel in source_rels {
+            if self.files.contains_key(rel) {
+                continue;
+            }
+            let namer = VersionNamer::new(&dest_root.join(rel), Some(template));
+            let (mut n, mut misses) = (1u64, 0);
+            // Kept in number order: pruning goes by `stored_at`.
+            let mut prev: Option<DateTime<Utc>> = None;
+            while misses < 2 {
+                let Ok(path) = namer.name(n) else { break };
+                match std::fs::metadata(&path) {
+                    Ok(md) if md.is_file() => {
+                        misses = 0;
+                        let modified: Option<DateTime<Utc>> = md.modified().ok().map(Into::into);
+                        let Ok(stored) = path.strip_prefix(dest_root) else { break };
+                        self.record(
+                            rel,
+                            StoredVersion {
+                                path: stored.to_string_lossy().replace('\\', "/"),
+                                size: md.len(),
+                                source_modified: modified.filter(|_| keep_times),
+                                stored_at: {
+                                    let at = modified.unwrap_or_else(Utc::now);
+                                    let at = prev.map_or(at, |p| at.max(p + chrono::Duration::nanoseconds(1)));
+                                    prev = Some(at);
+                                    at
+                                },
+                                seq: n,
+                            },
+                        );
+                        adopted += 1;
+                    }
+                    _ => misses += 1,
+                }
+                n += 1;
+            }
+        }
+        adopted
     }
 
     /// Write the index atomically.
@@ -104,6 +171,55 @@ impl VersionIndex {
             *versions = kept;
         }
         Ok(out)
+    }
+}
+
+/// Names the versions of one file from a pair's template.
+pub(crate) struct VersionNamer {
+    template: String,
+    base: crate::naming::TokenContext,
+    parent: PathBuf,
+    has_ext: bool,
+    numbered: bool,
+}
+
+impl VersionNamer {
+    pub(crate) fn new(path: &Path, template: Option<&str>) -> Self {
+        let template = template.map(str::trim).filter(|t| !t.is_empty()).unwrap_or(super::executor::DEFAULT_VERSION_TEMPLATE);
+        let mut base = crate::naming::TokenContext::for_path(path);
+        // A first version has no file yet: date tokens use the run time.
+        if base.modified.is_none() {
+            base.modified = Some(Utc::now());
+        }
+        Self {
+            template: template.to_string(),
+            base,
+            parent: path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf(),
+            has_ext: path.extension().is_some(),
+            numbered: template.contains("{num") || template.contains("{counter"),
+        }
+    }
+
+    /// Version `n`'s path. A template without `{num}` gets ` (n)` added
+    /// from the second one on.
+    pub(crate) fn name(&self, n: u64) -> Result<PathBuf, AppError> {
+        use crate::naming::{render, sanitize_segment, UnknownTokens};
+        let template = &self.template;
+        let mut name = render(template, &self.base.clone().with_counter(n, 0), UnknownTokens::Error).map_err(|e| AppError::Sync {
+            message: format!("Version name template \"{template}\" is invalid: {e}"),
+            advice: "Fix the version naming template in the pair's options.".to_string(),
+        })?;
+        // "{name}.{ext}" on a file without an extension would end in a dot.
+        if !self.has_ext {
+            name = name.trim_end_matches('.').to_string();
+        }
+        if !self.numbered && n > 1 {
+            name = match name.rsplit_once('.') {
+                Some((stem, ext)) if self.has_ext => format!("{stem} ({n}).{ext}"),
+                _ => format!("{name} ({n})"),
+            };
+        }
+        Ok(self.parent.join(sanitize_segment(name)))
     }
 }
 
