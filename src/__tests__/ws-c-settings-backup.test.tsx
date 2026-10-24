@@ -112,6 +112,21 @@ describe("Settings: sync defaults and bandwidth timetable", () => {
     expect(await screen.findByText(/Saved\./)).toBeInTheDocument();
   });
 
+  // Regression: the defaults were edited as a one-way pair, so the two-way
+  // delete limit (a default every two-way pair follows) could not be set here.
+  it("edits the two-way delete limit and the mode-specific cleanup defaults", async () => {
+    backend();
+    render(<SyncDefaultsSection />);
+    expect(await screen.findByTestId("sync-defaults")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Cleanup & moving"));
+    fireEvent.change(screen.getByLabelText(/Two-way pairs: stop if a run would delete more than/), { target: { value: "20" } });
+    expect(screen.getByLabelText(/Mirror pairs: keep extra files/)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Other pairs: delete destination files/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save sync defaults" }));
+    await waitFor(() => expect(called("set_sync_default_options")).toHaveLength(1));
+    expect((called("set_sync_default_options")[0].options as { two_way_max_delete_percent: number }).two_way_max_delete_percent).toBe(20);
+  });
+
   it("adds a window and saves the timetable", async () => {
     backend();
     render(<BandwidthTimetableSection />);

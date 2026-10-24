@@ -268,6 +268,7 @@ export function RobocopyOptionsSection({
 }: {
   options: CopyOptions;
   onChange: (o: CopyOptions) => void;
+  /** The pair's sync mode; "any" (global defaults) shows every mode's cleanup options. */
   mode: string;
   /** Show the NTFS-only options (defaults to the current platform). */
   windows?: boolean;
@@ -345,7 +346,20 @@ export function RobocopyOptionsSection({
       </Group>
 
       <Group title="Cleanup & moving">
-        {mode === "mirror" ? (
+        {mode === "any" ? (
+          <>
+            <Check label="Mirror pairs: keep extra files at the destination (don't delete)" flag="/XX" checked={options.exclude_extra} onChange={(v) => set("exclude_extra", v)} />
+            <Check label="Other pairs: delete destination files the source no longer has" flag="/PURGE" checked={options.purge} onChange={(v) => set("purge", v)} />
+            <NumberField
+              label="Two-way pairs: stop if a run would delete more than (0 = no limit)"
+              flag="two-way"
+              value={options.two_way_max_delete_percent}
+              max={100}
+              unit="%"
+              onChange={(v) => set("two_way_max_delete_percent", v)}
+            />
+          </>
+        ) : mode === "mirror" ? (
           <Check label="Keep extra files at the destination (don't delete)" flag="/XX" checked={options.exclude_extra} onChange={(v) => set("exclude_extra", v)} />
         ) : mode !== "two_way" ? (
           <Check label="Delete destination files the source no longer has" flag="/PURGE" checked={options.purge} onChange={(v) => set("purge", v)} />

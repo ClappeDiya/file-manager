@@ -43,7 +43,7 @@ export function SyncDefaultsSection() {
         New sync pairs start from these copy options and keep following them for every option they don't change.
         {countChangedOptions(options) > 0 && ` ${countChangedOptions(options)} changed from the built-in defaults.`}
       </p>
-      <RobocopyOptionsSection options={options} onChange={setOptions} mode="one_way" />
+      <RobocopyOptionsSection options={options} onChange={setOptions} mode="any" />
       <div className="flex items-center gap-2">
         <button type="button" onClick={() => void save()} className="text-xs px-3 py-1 rounded bg-blue-500 text-white hover:bg-blue-600">
           Save sync defaults

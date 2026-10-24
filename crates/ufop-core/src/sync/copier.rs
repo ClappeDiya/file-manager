@@ -69,9 +69,7 @@ pub fn copy_file(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<u64, AppE
             )
         })?;
         0
-    } else if opts.restartable || opts.inter_packet_gap_ms > 0 || crate::throttle::TIMETABLE_UPLOAD.get() > 0 {
-        // Block by block: /Z, /IPG, or a bandwidth timetable window (shared
-        // with backups and transfers; the backup caps do not apply here).
+    } else if copies_blockwise(opts) {
         copy_blockwise(src, dst, opts)?
     } else {
         fs::copy(src, dst).map_err(|e| {
@@ -118,6 +116,15 @@ pub fn validate_options(opts: &CopyOptions) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+/// Whether files are copied block by block: for /Z, /IPG, or whenever the
+/// bandwidth timetable (shared with backups and transfers; the backup caps
+/// do not apply here) has an upload limit, so that a window opening during
+/// a copy paces the rest of that file too; each block asks for the rate in
+/// force at that moment.
+fn copies_blockwise(opts: &CopyOptions) -> bool {
+    opts.restartable || opts.inter_packet_gap_ms > 0 || crate::throttle::limits_uploads()
 }
 
 /// Block copy with optional resume (/Z) and inter-packet gap (/IPG).
@@ -384,6 +391,26 @@ mod tests {
         r.unwrap();
         assert!(started.elapsed() < Duration::from_secs(2), "paced by the backup cap: {:?}", started.elapsed());
         assert_eq!(fs::read(&dst).unwrap().len(), 256 * 1024);
+    }
+
+    /// Regression: block-by-block copying (where the timetable is applied)
+    /// was chosen only when a window was active as a file started, so a
+    /// window opening during a long copy did not slow that file. Any
+    /// configured timetable now copies block by block, and each block asks
+    /// the timetable for the rate in force at that moment.
+    #[test]
+    fn a_configured_timetable_copies_block_by_block() {
+        let _g = crate::throttle::test_lock();
+        let opts = CopyOptions::default();
+        crate::throttle::set_schedule(vec![]).unwrap();
+        assert!(!copies_blockwise(&opts), "no timetable: plain copy");
+        // A window that is not active now (on another weekday).
+        let today = chrono::Datelike::weekday(&chrono::Local::now()).num_days_from_monday() as u8;
+        let later = crate::throttle::BandwidthWindow { days: vec![(today + 3) % 7], start: "00:00".into(), end: "23:59".into(), upload_bps: 1_000, download_bps: 0 };
+        crate::throttle::set_schedule(vec![later]).unwrap();
+        let blockwise = copies_blockwise(&opts);
+        crate::throttle::set_schedule(vec![]).unwrap();
+        assert!(blockwise, "a window can open mid-file");
     }
 
     #[test]

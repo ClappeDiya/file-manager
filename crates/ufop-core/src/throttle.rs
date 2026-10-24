@@ -113,6 +113,13 @@ pub fn schedule() -> Vec<BandwidthWindow> {
     SCHEDULE.read().map(|s| s.clone()).unwrap_or_default()
 }
 
+/// Whether the timetable can ever limit uploads (some window has an upload
+/// limit), active now or not: a long copy that should slow down when such a
+/// window opens has to be paced block by block from the start.
+pub fn limits_uploads() -> bool {
+    SCHEDULE.read().map(|s| s.iter().any(|w| w.upload_bps > 0)).unwrap_or(false)
+}
+
 /// A rate shared by every transfer that goes through it: each transfer
 /// reserves its share of the time line, so the sum of concurrent
 /// transfers stays at or below the rate.
