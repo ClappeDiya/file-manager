@@ -35,6 +35,7 @@ import { ChatControlSection } from "@/components/chat-control-section";
 import { SyncDefaultsSection } from "@/components/sync-defaults-section";
 import { BandwidthTimetableSection } from "@/components/bandwidth-timetable-section";
 import { AdvancedOnly } from "@/components/backup/advanced-only";
+import { LocalServerSection } from "@/components/local-server-section";
 
 // ── Types ──
 
@@ -1449,6 +1450,8 @@ export default function SettingsPanel({
             <MetricsExporterSection />
             <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Remote control from chat</h3>
             <ChatControlSection />
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Local web server</h3>
+            <LocalServerSection />
             <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Sync defaults</h3>
             <SyncDefaultsSection />
             <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Bandwidth timetable</h3>
