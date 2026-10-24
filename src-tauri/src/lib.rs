@@ -97,10 +97,20 @@ struct AppState {
     credential_store: std::sync::Arc<CredentialStore>,
 }
 
+/// Settings that must be in force before any engine starts: the rclone
+/// binary and rclone.conf chosen in Settings → rclone. Applied right after
+/// the database opens, in both init paths, so saved auto-mounts, the backup
+/// scheduler and every other rclone caller use them from the first call.
+async fn apply_startup_settings(repo: &Repository) {
+    commands::rclone_commands::activate_stored(repo).await;
+}
+
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
 async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError> {
     // Open database (creates if needed, runs migrations)
     let repo = Repository::open_default().await?;
+    // Before anything below can run rclone (auto-mounts, backups, connectors).
+    apply_startup_settings(&repo).await;
 
     // Restore transfer queue from database
     let transfer_mgr = TransferManager::new();
@@ -355,8 +365,6 @@ fn start_background_engines(app: tauri::AppHandle) {
         // or connects around the proxy.
         commands::policy_commands::activate_stored(&app.state::<Repository>()).await;
         commands::proxy_commands::activate_stored(&app.state::<Repository>(), &app.state::<std::sync::Arc<CredentialStore>>()).await;
-        // The rclone binary / rclone.conf chosen in Settings, before anything runs rclone.
-        commands::rclone_commands::activate_stored(&app.state::<Repository>()).await;
         managed_settings::activate_stored(&app.state::<Repository>(), &app.state::<AiAssistant>(), &app.state::<BackupManager>(), &app.state::<MountManager>()).await;
         let automation = app.state::<AutomationManager>();
         if let Err(e) = automation.start_all_watchers().await {
@@ -409,6 +417,7 @@ pub fn run() {
                 let repo = rt2
                     .block_on(Repository::open_in_memory())
                     .expect("Failed to create in-memory database");
+                rt2.block_on(apply_startup_settings(&repo));
                 let credential_store = std::sync::Arc::new(CredentialStore::new());
                 let connection_mgr = ConnectionManager::new(repo.clone(), credential_store.clone());
                 let fb_gdrive = std::sync::Arc::new(GoogleDriveConnector::new().with_credentials(credential_store.clone()));
@@ -1343,6 +1352,67 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stored rclone settings become the ones every rclone call uses.
+    #[tokio::test]
+    async fn startup_settings_make_the_stored_rclone_current() {
+        use crate::rclone_engine::resolver::{self, BinarySource, RcloneSettings};
+        let prior = resolver::current_settings();
+        let repo = Repository::open_in_memory().await.unwrap();
+        // The binary the default lookup already finds (rclone tests running in
+        // parallel see the same program); without one, a stand-in that fails
+        // like a missing rclone.
+        let d = tempfile::tempdir().unwrap();
+        let found = resolver::resolve();
+        let bin = if found.found && std::path::Path::new(&found.path).is_absolute() {
+            found.path.clone()
+        } else {
+            let p = d.path().join("rclone");
+            std::fs::write(&p, "#!/bin/sh\nexit 1\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            p.to_string_lossy().into_owned()
+        };
+        let stored = commands::rclone_commands::persist(&repo, RcloneSettings { binary_path: Some(bin.clone()), config_path: None }).await.unwrap();
+        apply_startup_settings(&repo).await;
+        let (applied, now) = (resolver::current_settings(), resolver::resolve());
+        resolver::apply(prior);
+        assert_eq!(applied, stored);
+        assert_eq!((now.path.as_str(), now.source), (bin.as_str(), BinarySource::Settings));
+    }
+
+    /// Regression: saved auto-mounts were started in `initialize_app_state`
+    /// while the rclone settings were only applied later (in
+    /// `start_background_engines`), so startup mounts ignored the binary and
+    /// rclone.conf chosen in Settings. Both init paths must apply them as
+    /// soon as the database is open, before anything can run rclone.
+    #[test]
+    fn startup_settings_are_applied_before_any_engine_starts() {
+        let src = include_str!("lib.rs");
+        let body = |start: &str, end: &str| {
+            let a = src.find(start).unwrap_or_else(|| panic!("{start} not found"));
+            let b = a + src[a..].find(end).unwrap_or_else(|| panic!("{end} not found after {start}"));
+            &src[a..b]
+        };
+        let pos = |hay: &str, needle: &str| hay.find(needle).unwrap_or_else(|| panic!("{needle} not found"));
+        let apply = "apply_startup_settings(&repo).await";
+        // Normal path: right after the database opens, before auto-mounts and managers.
+        let init = body("async fn initialize_app_state()", "\n}\n");
+        let opened = pos(init, "Repository::open_default()");
+        let applied = pos(init, apply);
+        assert!(opened < applied, "settings applied before the database opens");
+        for later in ["auto_mount_saved", "TransferManager::new()", "BackupManager::"] {
+            assert!(applied < pos(init, later), "{later} runs before the rclone settings are applied");
+        }
+        // Fallback path: the same, before its managers are built.
+        let fallback = body("Starting with in-memory database as fallback", "AppState {");
+        let mem = pos(fallback, "Repository::open_in_memory()");
+        let applied = pos(fallback, "apply_startup_settings(&repo)");
+        assert!(mem < applied && applied < pos(fallback, "TransferManager::new()"), "fallback path does not apply the rclone settings first");
+    }
 
     #[tokio::test]
     async fn test_initialize_with_in_memory() {

@@ -3,6 +3,11 @@
 //! release's `SHA256SUMS` before anything is unpacked, and installed into
 //! the app data folder (`<data>/rclone/rclone[.exe]`).
 //!
+//! Trust: `SHA256SUMS` comes from the same host as the zip and its PGP
+//! clear-signature is not checked (no release-signing key is pinned here),
+//! so the check catches corrupted downloads and a mirror or proxy altering
+//! the zip, not a compromised downloads.rclone.org.
+//!
 //! Only that folder is ever written: a binary the user chose elsewhere is
 //! never replaced. After installing, Settings points at the managed copy;
 //! the user's own binary stays where it is and can be chosen again.

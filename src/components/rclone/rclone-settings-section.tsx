@@ -178,7 +178,14 @@ export function RcloneSettingsSection() {
             <p>
               Installed: <span className="font-mono">{view.managed_version}</span>
               {view.update_available && <span className="text-amber-600"> — update to {view.pinned_version} available</span>}
+              {s.managed && <span className="text-gray-500"> (in use)</span>}
             </p>
+          )}
+          {/* Installed but another binary chosen: one click back to it. */}
+          {view.managed_binary && !s.managed && (
+            <button type="button" className={`${btn} mr-1`} disabled={busy !== null} onClick={() => void save(view.managed_binary ?? "", config)}>
+              Use managed copy
+            </button>
           )}
           <button
             type="button"

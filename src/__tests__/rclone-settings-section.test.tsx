@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach, beforeAll } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { RcloneEngineInfo, RcloneSettingsSection } from "@/components/rclone/rclone-settings-section";
 import { useUIStore } from "@/stores/ui-store";
-import type { RcloneSettingsView, RcloneStatus } from "@/lib/rclone";
+import { rcloneStatus, type RcloneSettingsView, type RcloneStatus } from "@/lib/rclone";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -19,6 +19,7 @@ function view(patch: Partial<RcloneSettingsView> = {}, status: Partial<RcloneSta
     managed_dir: "/data/ufop/rclone",
     pinned_version: "1.69.1",
     managed_version: null,
+    managed_binary: null,
     update_available: false,
     platform_supported: true,
     ...patch,
@@ -50,7 +51,7 @@ beforeEach(() => {
           { path: "/opt/old/rclone", origin: "common", version: "v1.50.0", meets_minimum: false, error: null },
         ]);
       case "rclone_install_managed":
-        return Promise.resolve({ result: { path: "/data/ufop/rclone/rclone", version: "v1.69.1", archive: "rclone-v1.69.1-linux-amd64.zip", sha256: "ab" }, view: view({ managed_version: "v1.69.1" }, { path: "/data/ufop/rclone/rclone", source: "settings", managed: true, version: "v1.69.1" }) });
+        return Promise.resolve({ result: { path: "/data/ufop/rclone/rclone", version: "v1.69.1", archive: "rclone-v1.69.1-linux-amd64.zip", sha256: "ab" }, view: view({ managed_version: "v1.69.1", managed_binary: "/data/ufop/rclone/rclone" }, { path: "/data/ufop/rclone/rclone", source: "settings", managed: true, version: "v1.69.1" }) });
       default:
         return Promise.resolve(undefined);
     }
@@ -103,6 +104,38 @@ describe("Settings → rclone", () => {
     expect(await screen.findByText(/Installed rclone v1.69.1 \(SHA-256 verified\)/)).toBeTruthy();
     expect(screen.getByTestId("rclone-status")).toHaveTextContent("managed copy");
     expect(screen.getByText("Up to date")).toBeDisabled();
+  });
+
+  // Regression: with a managed copy installed but another binary chosen,
+  // the panel only showed a disabled "Up to date" and no way back to it.
+  it("offers to switch back to an installed managed copy", async () => {
+    useUIStore.setState({ appMode: "advanced" });
+    current = view({ managed_version: "v1.69.1", managed_binary: "/data/ufop/rclone/rclone", settings: { binary_path: "/usr/bin/rclone", config_path: "/etc/rclone.conf" } }, { source: "settings", managed: false });
+    render(<RcloneSettingsSection />);
+    fireEvent.click(await screen.findByText("Use managed copy"));
+    await waitFor(() => expect(calls("rclone_settings_set")).toEqual([{ settings: { binary_path: "/data/ufop/rclone/rclone", config_path: "/etc/rclone.conf" } }]));
+  });
+
+  it("does not offer the managed copy when it is already in use or missing", async () => {
+    useUIStore.setState({ appMode: "advanced" });
+    current = view({ managed_version: "v1.69.1", managed_binary: "/data/ufop/rclone/rclone" }, { path: "/data/ufop/rclone/rclone", source: "settings", managed: true, version: "v1.69.1" });
+    const { unmount } = render(<RcloneSettingsSection />);
+    await screen.findByTestId("rclone-managed");
+    expect(screen.queryByText("Use managed copy")).toBeNull();
+    unmount();
+    current = view();
+    render(<RcloneSettingsSection />);
+    await screen.findByTestId("rclone-managed");
+    expect(screen.queryByText("Use managed copy")).toBeNull();
+  });
+
+  // The read-only status call has a fallback (CLAUDE.md): a failing call
+  // reads "status unavailable", never "not installed".
+  it("About says the status is unavailable when it cannot be read", async () => {
+    mockInvoke.mockImplementation(() => Promise.reject(new Error("ipc broke")));
+    const s = await rcloneStatus();
+    render(<RcloneEngineInfo status={s} />);
+    expect(screen.getByTestId("about-rclone")).toHaveTextContent("rclone: status unavailable");
   });
 
   it("About shows the engine or 'not installed'", () => {

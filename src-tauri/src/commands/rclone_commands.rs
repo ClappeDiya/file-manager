@@ -63,6 +63,8 @@ pub struct RcloneSettingsView {
     pub pinned_version: String,
     /// Version of the managed copy, when installed.
     pub managed_version: Option<String>,
+    /// The managed copy's path, when installed (Settings → "Use managed copy").
+    pub managed_binary: Option<String>,
     /// The managed copy is older than the pinned release.
     pub update_available: bool,
     /// A release exists for this OS/CPU.
@@ -93,6 +95,7 @@ async fn view() -> RcloneSettingsView {
         managed_dir: dir.to_string_lossy().into_owned(),
         pinned_version: install::PINNED_VERSION.to_string(),
         update_available: managed_version.as_ref().zip(pinned).is_some_and(|(v, p)| v.semver < p),
+        managed_binary: managed_version.is_some().then(|| managed.to_string_lossy().into_owned()),
         managed_version: managed_version.map(|v| v.raw),
         platform_supported: install::platform().is_some(),
     }

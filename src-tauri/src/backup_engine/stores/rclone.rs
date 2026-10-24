@@ -118,10 +118,24 @@ impl RcloneStore {
     /// The binary and config file for this store: the job's own when set,
     /// else the app's resolved ones.
     pub fn rclone(&self) -> crate::rclone_engine::Rclone {
-        let app = crate::rclone_engine::Rclone::current();
+        self.rclone_with(crate::rclone_engine::Rclone::current())
+    }
+
+    /// [`Self::rclone`] against the app's rclone `app`. A job that names its
+    /// config through `RCLONE_CONFIG` (its env, or passed into an isolated
+    /// environment) keeps it: the Settings file would arrive as `--config`,
+    /// which beats the variable.
+    fn rclone_with(&self, app: crate::rclone_engine::Rclone) -> crate::rclone_engine::Rclone {
         let bin = self.cfg.binary.trim();
         let program = if bin.is_empty() || bin == "rclone" { app.program } else { bin.to_string() };
-        crate::rclone_engine::Rclone::new(program, self.cfg.config_file.clone().filter(|c| !c.trim().is_empty()).or(app.config))
+        let fallback = if self.job_sets_config_env() { None } else { app.config };
+        crate::rclone_engine::Rclone::new(program, self.cfg.config_file.clone().filter(|c| !c.trim().is_empty()).or(fallback))
+    }
+
+    fn job_sets_config_env(&self) -> bool {
+        // Variable names are case-insensitive on Windows only.
+        let is_var = |k: &String| if cfg!(windows) { k.trim().eq_ignore_ascii_case("RCLONE_CONFIG") } else { k.trim() == "RCLONE_CONFIG" };
+        self.cfg.env.keys().any(is_var) || (self.cfg.isolate_env && self.cfg.env_passthrough.iter().any(is_var))
     }
 
     async fn run(&self, args: &[&str], stdin: Option<Vec<u8>>) -> Result<Vec<u8>, AppError> {
@@ -323,6 +337,37 @@ esac
         let s = RcloneStore::new(RcloneConfig { binary: "/opt/rclone/rclone".into(), config_file: Some("/job/rclone.conf".into()), ..Default::default() }, None);
         assert_eq!(s.rclone(), crate::rclone_engine::Rclone::new("/opt/rclone/rclone", Some("/job/rclone.conf".into())));
         assert_eq!(s.rclone().base_args(), vec!["--config", "/job/rclone.conf"]);
+    }
+
+    /// Regression: a job that names its config through `RCLONE_CONFIG` (its
+    /// own env, or passed through into an isolated environment) kept it only
+    /// until a config file was chosen in Settings: that one then arrived as
+    /// `--config`, which beats the variable.
+    #[test]
+    fn job_rclone_config_env_is_not_overridden_by_the_settings_config() {
+        let app = crate::rclone_engine::Rclone::new("/usr/bin/rclone", Some("/settings/rclone.conf".into()));
+        // No job config: the Settings file.
+        let s = RcloneStore::new(RcloneConfig::default(), None);
+        assert_eq!(s.rclone_with(app.clone()).config.as_deref(), Some("/settings/rclone.conf"));
+        // RCLONE_CONFIG in the job's env: no `--config`, the variable decides.
+        let mut c = RcloneConfig::default();
+        c.env.insert("RCLONE_CONFIG".into(), "/job/env.conf".into());
+        let rc = RcloneStore::new(c.clone(), None).rclone_with(app.clone());
+        assert_eq!((rc.program.as_str(), rc.config.as_deref()), ("/usr/bin/rclone", None));
+        assert!(rc.base_args().is_empty());
+        // Passed through into an isolated environment: the same.
+        let iso = RcloneConfig { isolate_env: true, env_passthrough: vec!["RCLONE_CONFIG".into()], ..Default::default() };
+        assert_eq!(RcloneStore::new(iso.clone(), None).rclone_with(app.clone()).config, None);
+        // A passthrough list only applies to an isolated environment.
+        let not_iso = RcloneConfig { isolate_env: false, ..iso };
+        assert_eq!(RcloneStore::new(not_iso, None).rclone_with(app.clone()).config.as_deref(), Some("/settings/rclone.conf"));
+        // Other RCLONE_* variables change nothing.
+        let mut other = RcloneConfig::default();
+        other.env.insert("RCLONE_CONFIG_PASS".into(), "x".into());
+        assert_eq!(RcloneStore::new(other, None).rclone_with(app.clone()).config.as_deref(), Some("/settings/rclone.conf"));
+        // The job's own config file still wins over everything.
+        c.config_file = Some("/job/rclone.conf".into());
+        assert_eq!(RcloneStore::new(c, None).rclone_with(app).config.as_deref(), Some("/job/rclone.conf"));
     }
 
     /// Regression: rclone failing before it reads its input (quota, auth)

@@ -3,7 +3,7 @@
  * Types mirror `src-tauri/src/rclone_engine/*` and
  * `commands/rclone_commands.rs` (serde output: snake_case, `T | null`).
  */
-import { tauriInvoke } from "@/hooks/use-tauri";
+import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 
 // ── Binary and config (Settings → rclone) ──
 
@@ -37,6 +37,8 @@ export interface RcloneSettingsView {
   managed_dir: string;
   pinned_version: string;
   managed_version: string | null;
+  /** Path of the managed copy, when installed. */
+  managed_binary: string | null;
   update_available: boolean;
   platform_supported: boolean;
 }
@@ -65,11 +67,33 @@ export const SOURCE_LABEL: Record<RcloneBinarySource, string> = {
 
 /** One line for About / Settings: "v1.69.1 (/usr/bin/rclone)" or "not installed". */
 export function describeStatus(s: RcloneStatus): string {
+  if (!s.path) return "status unavailable";
   if (!s.version) return s.source === "none" || !s.found ? "not installed" : `not working (${s.error ?? "no version"})`;
   return `${s.version} (${s.path})`;
 }
 
-export const rcloneStatus = () => tauriInvoke<RcloneStatus>("rclone_status");
+/**
+ * What `rcloneStatus` returns when the status cannot be read (outside the
+ * desktop app, or the call failed). The backend always reports a path, so
+ * an empty one marks this; it reads "status unavailable", not "not installed".
+ */
+export const RCLONE_STATUS_UNAVAILABLE: RcloneStatus = {
+  path: "",
+  source: "none",
+  found: false,
+  version: null,
+  meets_minimum: null,
+  min_version: "",
+  config_path: null,
+  managed: false,
+  error: "rclone status unavailable",
+};
+
+export const rcloneStatus = () => tauriInvokeSafe<RcloneStatus>("rclone_status", undefined, RCLONE_STATUS_UNAVAILABLE);
+// Exception to "always pass a fallback" (CLAUDE.md), here and for the
+// remote manager below: Settings shows the failure itself, and a made-up
+// view (managed folder, pinned release) would show values that are not real.
+// Calls that change anything reject too, so a failure is never shown as done.
 export const getRcloneSettings = () => tauriInvoke<RcloneSettingsView>("rclone_settings_get");
 export const setRcloneSettings = (settings: RcloneSettings) => tauriInvoke<RcloneSettingsView>("rclone_settings_set", { settings });
 /** Rejects on failure, so Settings shows the error rather than "No rclone found". */
@@ -156,8 +180,10 @@ export const RCLONE_AUTH_URL_EVENT = "rclone-auth-url";
 /** Fired on `window` after a remote is created, changed or deleted. */
 export const RCLONE_REMOTES_CHANGED_EVENT = "ufop:rclone-remotes-changed";
 
-// No `[]` fallback: a missing or failing rclone must reach the caller as an
-// error, not look like "no remotes" / "no storage types".
+// No `[]` fallback (a deliberate exception to CLAUDE.md's "always pass a
+// fallback"): a missing or failing rclone must reach the caller as an error,
+// not look like "no remotes" / "no storage types". Callers check
+// `isTauriAvailable()` or show the error.
 export const listRcloneRemotes = () => tauriInvoke<RcloneRemote[]>("rclone_list_remotes");
 export const rcloneProviders = () => tauriInvoke<RcloneProvider[]>("rclone_providers");
 export const getRcloneRemote = (name: string) => tauriInvoke<RcloneRemoteDetails>("rclone_remote_get", { name });
