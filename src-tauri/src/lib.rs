@@ -1,6 +1,7 @@
 pub mod ai_engine;
 pub mod automation_engine;
 pub mod backup_engine;
+pub mod chat_control;
 pub mod commands;
 pub mod paths;
 pub mod compat_engine;
@@ -37,7 +38,7 @@ use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -534,6 +535,14 @@ pub fn run() {
             notify_hub::desktop::wire_transfers(&app.state::<TransferManager>(), sink.clone());
             notify_hub::desktop::wire_sync(&app.state::<SyncManager>(), sink);
             notify_hub::run::wire_sync_reports(app.handle());
+            // Chat-bot remote control: nothing starts unless the user turned it on.
+            app.manage(chat_control::service::ChatControlService::new(app.handle().clone()));
+            let chat = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = chat.state::<chat_control::service::ChatControlService>().apply(false).await {
+                    tracing::warn!("Remote control did not start: {}", e.user_message());
+                }
+            });
             mgr.start_scheduler();
             // The Prometheus exporter, when the user turned it on.
             let metrics = setup_metrics.clone();
@@ -731,6 +740,9 @@ pub fn run() {
             backup_commands::backup_execute,
             backup_commands::backup_cancel,
             backup_commands::backup_change_passphrase,
+            chat_control_commands::chat_control_get,
+            chat_control_commands::chat_control_save,
+            chat_control_commands::chat_control_status,
             schedule_commands::schedules_list,
             schedule_commands::upcoming_runs,
             schedule_commands::schedule_save,

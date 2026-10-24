@@ -37,6 +37,7 @@ pub mod peer_commands;
 pub mod preview_commands;
 pub mod s3_commands;
 pub mod safety_commands;
+pub mod chat_control_commands;
 pub mod schedule_commands;
 pub mod space_commands;
 pub mod settings_commands;
