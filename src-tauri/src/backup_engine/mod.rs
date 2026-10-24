@@ -1105,8 +1105,9 @@ impl BackupManager {
     }
 
     /// Copy a job's definition as a new job: "<name> (copy)", a new id, no
-    /// history or statistics, every schedule (backup and maintenance) off.
-    /// Stored secrets (passphrase, notification and report credentials)
+    /// history or statistics, every schedule (backup, maintenance, replica
+    /// timers) off. Stored secrets (passphrase, notification and report
+    /// credentials, cloud destination credentials)
     /// are copied under the new job's own ids, so editing one job's secret
     /// never changes the other's. Point the copy at its own destination
     /// before turning its schedule on.
@@ -1127,8 +1128,15 @@ impl BackupManager {
         if let Some(s) = copy.maintenance.retention.as_mut() {
             s.enabled = false;
         }
+        self.copy_destination_secret(&mut copy.destination).await?;
         for r in copy.replicas.iter_mut() {
             r.id.clear();
+            r.last_run = None;
+            r.last_result = None;
+            if matches!(r.schedule, ReplicaSchedule::Interval { .. }) {
+                r.schedule = ReplicaSchedule::Manual;
+            }
+            self.copy_destination_secret(&mut r.destination).await?;
         }
         for n in copy.notifications.iter_mut() {
             n.credential_id = self.copy_secret(&n.credential_id).await?;
@@ -1143,6 +1151,19 @@ impl BackupManager {
         }
         let passphrase = self.store_get(&format!("{PASS_KEY_PREFIX}{id}")).await?;
         self.save_job(copy, passphrase).await
+    }
+
+    /// A cloud destination's stored credential, copied under a new id (a
+    /// credential this machine does not store itself, such as a centrally
+    /// managed one, is left as it is).
+    async fn copy_destination_secret(&self, dest: &mut BackupDestination) -> Result<(), AppError> {
+        if let BackupDestination::Cloud { credential_id, .. } = dest {
+            let copied = self.copy_secret(credential_id).await?;
+            if !copied.is_empty() {
+                *credential_id = copied;
+            }
+        }
+        Ok(())
     }
 
     /// Store a copy of the secret kept under `credential_id` (as written,

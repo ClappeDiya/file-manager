@@ -60,6 +60,17 @@ async fn duplicate_job_copies_definition_with_schedules_off() {
     j.schedule.interval_minutes = 1440;
     j.maintenance.compact = Some(BackupSchedule { enabled: true, start_time: "03:00".into(), interval_minutes: 1440, ..Default::default() });
     j.reports.headers = vec![notify::webhook::WebhookHeader { name: "Authorization".into(), value: "Bearer s3cret".into(), secret: true, credential_id: String::new() }];
+    // A replica on its own timer, with a stored cloud credential.
+    m.set_destination_secret("replica-cred", "replica-key").await.unwrap();
+    let cloud = stores::CloudConfig::S3(stores::s3::S3Config { bucket: "b".into(), ..Default::default() });
+    j.replicas = vec![Replica {
+        name: "Offsite".into(),
+        destination: BackupDestination::Cloud { config: cloud, credential_id: "replica-cred".into() },
+        schedule: ReplicaSchedule::Interval { minutes: 60 },
+        last_run: Some("2026-01-01T00:00:00Z".into()),
+        last_result: Some("ok".into()),
+        ..Default::default()
+    }];
     let original = m.save_job(j, Some("pw".into())).await.unwrap();
     m.execute(&original.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
     let original = m.get_job(&original.id).await.unwrap();
@@ -77,6 +88,14 @@ async fn duplicate_job_copies_definition_with_schedules_off() {
     let (oh, ch) = (&original.reports.headers[0], &copy.reports.headers[0]);
     assert!(!ch.credential_id.is_empty() && ch.credential_id != oh.credential_id);
     assert_eq!(m.prepare_reports(&copy.reports).await.headers[0].value, "Bearer s3cret");
+    // Replicas: no timer, no history, their own copy of the credential.
+    let r = &copy.replicas[0];
+    assert_ne!(r.id, original.replicas[0].id);
+    assert_eq!(r.schedule, ReplicaSchedule::Manual, "the copy's replica never runs on a timer");
+    assert!(r.last_run.is_none() && r.last_result.is_none());
+    let BackupDestination::Cloud { credential_id, .. } = &r.destination else { panic!("cloud replica") };
+    assert!(credential_id != "replica-cred" && !credential_id.is_empty());
+    assert_eq!(m.destination_secret(credential_id).await.unwrap().as_deref(), Some("replica-key"));
     assert_eq!(m.list_jobs().await.len(), 2);
     assert!(m.duplicate_job("missing").await.is_err());
 }
