@@ -14,6 +14,7 @@ pub mod calendar;
 pub mod cli_gen;
 pub mod confine;
 pub mod error;
+pub mod filter_rules;
 pub mod fsutil;
 pub mod gateway;
 pub mod gpg;

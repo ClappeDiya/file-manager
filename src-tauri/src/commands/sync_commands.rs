@@ -373,6 +373,33 @@ pub async fn get_sync_health(
     Ok(manager.get_health(id).await)
 }
 
+// ── Two-way baseline ──
+
+/// Size and age of a two-way pair's sync history (its baseline), or `null`
+/// before its first successful run.
+#[tauri::command]
+pub async fn get_sync_baseline_info(
+    pair_id: String,
+    manager: State<'_, SyncManager>,
+) -> Result<Option<crate::sync_engine::BaselineInfo>, AppError> {
+    let id = parse_uuid(&pair_id)?;
+    manager.baseline_info(id).await
+}
+
+/// Forget a two-way pair's sync history: the next run combines both sides
+/// again and deletes nothing.
+#[tauri::command]
+pub async fn reset_sync_baseline(
+    pair_id: String,
+    manager: State<'_, SyncManager>,
+    ledger: State<'_, OperationLedger>,
+) -> Result<(), AppError> {
+    let id = parse_uuid(&pair_id)?;
+    manager.reset_baseline(id).await?;
+    record_sync(&ledger, "reset_baseline", LedgerStatus::Ok, &pair_id, format!("reset_baseline: {pair_id}"), None, None, None).await;
+    Ok(())
+}
+
 // ── T-040: Dry-Run Preview ──
 
 /// Perform a dry-run preview for a sync pair.

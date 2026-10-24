@@ -11,7 +11,11 @@ export interface PreviewEntry {
   source_modified: string | null;
   dest_modified: string | null;
   reason: string;
+  /** Side the action writes to; two-way sync also writes to the source. */
+  direction?: SyncDirection;
 }
+
+export type SyncDirection = "to_dest" | "to_source";
 
 export interface PreviewLike {
   additions: PreviewEntry[];
@@ -40,6 +44,8 @@ export interface CompareRow {
   source: CompareSide | null;
   dest: CompareSide | null;
   reason: string;
+  /** Side the change is applied to (folders: always the destination). */
+  direction: SyncDirection;
 }
 
 const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -66,6 +72,7 @@ export function buildComparisonRows(preview: PreviewLike, includeSkipped = false
       source: side(e.source_size, e.source_modified),
       dest: change === "add" && e.source_size !== null ? null : side(e.dest_size, e.dest_modified),
       reason: e.reason,
+      direction: e.direction ?? "to_dest",
     });
   };
   preview.additions.forEach((e) => add(e, "add"));
@@ -86,6 +93,7 @@ export function buildComparisonRows(preview: PreviewLike, includeSkipped = false
       source: change === "rmdir" ? null : { size: null, modified: null },
       dest: change === "mkdir" ? null : { size: null, modified: null },
       reason: change === "mkdir" ? "New folder" : change === "rmdir" ? "Folder removed" : "",
+      direction: "to_dest",
     });
   };
   (preview.dirs_to_create ?? []).forEach((d) => addDir(d, "mkdir"));

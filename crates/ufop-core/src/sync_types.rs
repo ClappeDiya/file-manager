@@ -81,9 +81,14 @@ impl SyncTrigger {
     }
 }
 
-/// Selective sync filter configuration.
+/// Selective sync filter configuration. Ordered `rules` decide first; files
+/// no rule matches go through the lists below (see `sync::filter`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncFilter {
+    /// Ordered include/exclude rules, first match wins (the engine backup
+    /// jobs use: wildcard, regex, groups, rclone globs).
+    #[serde(default)]
+    pub rules: Vec<crate::filter_rules::FilterRule>,
     /// Glob patterns to include (empty = include all)
     pub include_patterns: Vec<String>,
     /// Glob patterns to exclude
@@ -114,6 +119,21 @@ pub enum SymlinkMode {
     /// Recreate the link itself at the destination (/SL). Unix only; falls
     /// back to `Follow` elsewhere.
     CopyLink,
+}
+
+/// How a file present on both sides is judged unchanged.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompareMode {
+    /// Same size and modification time (with the /FFT, /DST tolerances).
+    #[default]
+    SizeMtime,
+    /// Same size and the same content hash (xxHash3, or the hash the
+    /// storage provides). Falls back to size and time, with a note in the
+    /// preview, when no hash is available.
+    Checksum,
+    /// Same size; times are ignored.
+    SizeOnly,
 }
 
 /// Robocopy-equivalent copy options for a sync pair.
@@ -158,6 +178,9 @@ pub struct CopyOptions {
     pub fat_time_tolerance: bool,
     /// Treat an exact 1-hour timestamp difference as equal (/DST).
     pub dst_tolerance: bool,
+    /// How files on both sides are compared (size and time, checksum,
+    /// size only).
+    pub compare_mode: CompareMode,
 
     // ── Destination cleanup ──
     /// Delete destination files that no longer exist in the source (/PURGE).
@@ -165,6 +188,10 @@ pub struct CopyOptions {
     pub purge: bool,
     /// Never delete extra destination files, even in mirror mode (/XX).
     pub exclude_extra: bool,
+    /// Two-way safety stop: refuse a run that would propagate deletions of
+    /// more than this percentage of the files tracked on one side (and of
+    /// everything, when one side looks empty). 0 = no limit.
+    pub two_way_max_delete_percent: u32,
 
     // ── Copy behaviour ──
     /// Preserve file modification times (/COPY:T). On by default.
@@ -243,8 +270,10 @@ impl Default for CopyOptions {
             include_same: false,
             fat_time_tolerance: false,
             dst_tolerance: false,
+            compare_mode: CompareMode::SizeMtime,
             purge: false,
             exclude_extra: false,
+            two_way_max_delete_percent: 50,
             copy_timestamps: true,
             copy_dir_timestamps: false,
             move_files: false,
@@ -500,6 +529,28 @@ pub enum SyncHealth {
     Gray,
 }
 
+/// Which side of a pair a planned action writes to. One-way, mirror and
+/// versioned modes only ever write to the destination; two-way sync also
+/// copies to, and deletes from, the source.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncDirection {
+    /// Copy from the source into the destination / delete at the destination.
+    #[default]
+    ToDest,
+    /// Copy from the destination into the source / delete at the source.
+    ToSource,
+}
+
+/// The side of a pair a rollback snapshot was taken from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncSide {
+    Source,
+    #[default]
+    Dest,
+}
+
 /// A single file action in a sync plan.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -524,6 +575,9 @@ pub struct SyncDiffEntry {
     pub reason: String,
     /// Path length warning if applicable
     pub path_length_warning: Option<String>,
+    /// Side the action writes to (two-way sync can write to the source).
+    #[serde(default)]
+    pub direction: SyncDirection,
 }
 
 /// Dry-run preview result (T-040).
@@ -563,6 +617,10 @@ pub struct SyncPreview {
     /// (/TIMFIX, /SECFIX).
     #[serde(default)]
     pub fixups: Vec<String>,
+    /// Plain-language notes about how the plan was made (e.g. "first
+    /// two-way run: nothing is deleted").
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// A conflict item for the ask-mode resolution UI (T-041).
@@ -608,6 +666,9 @@ pub struct SyncSnapshot {
     pub original_size: u64,
     pub original_modified: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Side of the pair the file was on (two-way sync also writes to the source).
+    #[serde(default)]
+    pub side: SyncSide,
 }
 
 /// Per-run sync report (T-042).
@@ -638,17 +699,104 @@ pub struct SyncReport {
     pub exit_code: u8,
 }
 
-/// Resumable sync state for crash recovery (T-042).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncResumeState {
-    pub run_id: Uuid,
+/// A step of a run that finished, recorded as it happens so a run that
+/// was interrupted (crash, power loss, cancel) can be resumed: the next run
+/// skips steps whose file is still exactly as it was when the step ran.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletedStep {
+    pub action: SyncAction,
+    #[serde(default)]
+    pub direction: SyncDirection,
+    /// Size and time of the file the step copied from (or deleted).
+    pub size: Option<u64>,
+    pub modified: Option<DateTime<Utc>>,
+}
+
+/// The steps an interrupted run of a pair had finished (T-042 crash recovery).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncCheckpoint {
     pub pair_id: Uuid,
-    /// Index of last successfully synced file
-    pub last_completed_index: u64,
-    /// Total files in plan
-    pub total_files: u64,
-    /// Serialized plan state
-    pub plan_json: String,
-    pub started_at: DateTime<Utc>,
-    pub interrupted_at: DateTime<Utc>,
+    /// The run that started the checkpoint.
+    pub run_id: Uuid,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed: std::collections::BTreeMap<String, CompletedStep>,
+}
+
+impl SyncCheckpoint {
+    /// Whether `entry` was already done by the interrupted run, against
+    /// files that have not changed since.
+    pub fn covers(&self, entry: &SyncDiffEntry) -> bool {
+        let Some(step) = self.completed.get(&entry.relative_path) else {
+            return false;
+        };
+        let (size, modified) = CompletedStep::origin(entry);
+        // A copy that finished before the crash is planned again as an
+        // overwrite ("modify"), so add and modify count as the same step.
+        let deletes = |a: &SyncAction| *a == SyncAction::Delete;
+        deletes(&step.action) == deletes(&entry.action)
+            && step.direction == entry.direction
+            && step.size == size
+            && step.modified == modified
+    }
+}
+
+impl CompletedStep {
+    /// The step that finishing `entry` records.
+    pub fn of(entry: &SyncDiffEntry) -> Self {
+        let (size, modified) = Self::origin(entry);
+        Self { action: entry.action.clone(), direction: entry.direction, size, modified }
+    }
+
+    /// Size and time of the side `entry` copies from (or deletes).
+    fn origin(entry: &SyncDiffEntry) -> (Option<u64>, Option<DateTime<Utc>>) {
+        let from_source = match entry.action {
+            SyncAction::Delete => entry.direction == SyncDirection::ToSource,
+            _ => entry.direction == SyncDirection::ToDest,
+        };
+        if from_source {
+            (entry.source_size, entry.source_modified)
+        } else {
+            (entry.dest_size, entry.dest_modified)
+        }
+    }
+}
+
+/// One file both sides of a two-way pair agreed on at the end of the last
+/// successful run, and what each side looked like then.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BaselineEntry {
+    pub size: u64,
+    pub source_modified: Option<DateTime<Utc>>,
+    pub dest_modified: Option<DateTime<Utc>>,
+    /// Content hash (checksum comparison), when one was computed.
+    #[serde(default)]
+    pub hash: Option<String>,
+}
+
+/// What a two-way pair looked like after its last successful run. The
+/// planner compares each side against it: a file missing on one side but
+/// unchanged on the other was deleted (so the deletion is propagated), a
+/// file changed on both sides is a conflict. No baseline (first run) means
+/// a plain union that never deletes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncBaseline {
+    /// Roots the baseline was recorded for; one recorded for other folders
+    /// is never used.
+    pub source_root: String,
+    pub dest_root: String,
+    pub run_id: Option<Uuid>,
+    pub recorded_at: Option<DateTime<Utc>>,
+    pub entries: std::collections::BTreeMap<String, BaselineEntry>,
+}
+
+impl SyncBaseline {
+    /// An empty baseline for `pair`'s folders.
+    pub fn for_pair(pair: &SyncPair) -> Self {
+        Self { source_root: pair.source_path.clone(), dest_root: pair.dest_path.clone(), ..Default::default() }
+    }
+
+    /// Whether this baseline describes `pair`'s current folders.
+    pub fn matches(&self, pair: &SyncPair) -> bool {
+        self.source_root == pair.source_path && self.dest_root == pair.dest_path
+    }
 }

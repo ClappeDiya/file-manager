@@ -15,7 +15,8 @@ export { errorText };
 // ── Types (mirror Rust) ──
 
 export type FilterAction = "include" | "exclude";
-export type FilterKind = "exact" | "wildcard" | "regex" | "group";
+/** Mirrors `FilterKind` in ufop-core filter_rules.rs (`rclone`: rclone-style glob). */
+export type FilterKind = "exact" | "wildcard" | "regex" | "group" | "rclone";
 
 export interface FilterRule {
   action: FilterAction;

@@ -273,6 +273,10 @@ pub fn cli_command(job: &BackupJob) -> String {
         let pat = match r.kind {
             ufop_core::backup::FilterKind::Regex => format!("[{}]", r.pattern),
             ufop_core::backup::FilterKind::Group => format!("{{{}}}", r.pattern),
+            // The CLI has no rclone-glob syntax: pass the equivalent regex.
+            ufop_core::backup::FilterKind::Rclone => {
+                format!("[{}]", ufop_core::filter_rules::rclone_to_regex(&r.pattern).unwrap_or_else(|_| regex::escape(&r.pattern)))
+            }
             _ => r.pattern.clone(),
         };
         parts.push(format!("{flag}={}", quote(&pat)));

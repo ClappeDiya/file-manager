@@ -25,7 +25,9 @@ const CHANGE_STYLE: Record<RowChange, { label: string; cls: string }> = {
 };
 
 function Cell({ side, row, which }: { side: CompareSide | null; row: CompareRow; which: "source" | "dest" }) {
-  const struck = which === "dest" && (row.change === "delete" || row.change === "rmdir");
+  // The deleted copy is struck through on the side it is deleted from.
+  const deletedSide = row.change === "rmdir" || row.direction !== "to_source" ? "dest" : "source";
+  const struck = which === deletedSide && (row.change === "delete" || row.change === "rmdir");
   if (!side) {
     return <span className="text-zinc-300 dark:text-zinc-600">—</span>;
   }
@@ -82,7 +84,10 @@ export function SyncComparison({ preview }: { preview: PreviewLike }) {
                     <td className="px-2 py-0.5 text-zinc-700 dark:text-zinc-300">
                       <Cell side={row.source} row={row} which="source" />
                     </td>
-                    <td className={`px-1 py-0.5 text-center ${style.cls}`}>{style.label}</td>
+                    <td className={`px-1 py-0.5 text-center ${style.cls}`}>
+                      {/* Two-way: an arrow shows which way the change flows. */}
+                      {row.direction === "to_source" && row.change !== "skip" ? `← ${style.label}` : style.label}
+                    </td>
                     <td className="px-2 py-0.5 text-zinc-700 dark:text-zinc-300">
                       <Cell side={row.dest} row={row} which="dest" />
                     </td>

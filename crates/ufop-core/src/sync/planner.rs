@@ -5,10 +5,12 @@
 //! and produces a `SyncPreview` without touching the filesystem.
 
 use crate::error::AppError;
+use crate::sync::filter::CompiledSyncFilter;
 use crate::sync_types::*;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 /// Metadata for a single file entry during planning.
@@ -273,95 +275,16 @@ fn option_exclusion(
     None
 }
 
-/// Check if a file path matches the sync filter criteria.
+/// Check if a file path matches the sync filter criteria. Compiles the
+/// filter on every call; loops use [`CompiledSyncFilter`] once instead. A
+/// filter with an invalid ordered rule matches nothing.
 pub fn matches_filter(relative_path: &str, size: u64, filter: &SyncFilter) -> bool {
-    // Check include patterns (if any specified, must match at least one)
-    if !filter.include_patterns.is_empty() {
-        let matches_any = filter
-            .include_patterns
-            .iter()
-            .any(|pat| glob_match(pat, relative_path));
-        if !matches_any {
-            return false;
-        }
-    }
-
-    // Check exclude patterns
-    if filter
-        .exclude_patterns
-        .iter()
-        .any(|pat| glob_match(pat, relative_path))
-    {
-        return false;
-    }
-
-    // Check include regex
-    if !filter.include_regex.is_empty() {
-        let matches_any = filter.include_regex.iter().any(|pat| {
-            regex::Regex::new(pat)
-                .map(|re| re.is_match(relative_path))
-                .unwrap_or(false)
-        });
-        if !matches_any {
-            return false;
-        }
-    }
-
-    // Check exclude regex
-    if filter.exclude_regex.iter().any(|pat| {
-        regex::Regex::new(pat)
-            .map(|re| re.is_match(relative_path))
-            .unwrap_or(false)
-    }) {
-        return false;
-    }
-
-    // Size filters
-    if filter.min_size > 0 && size < filter.min_size {
-        return false;
-    }
-    if filter.max_size > 0 && size > filter.max_size {
-        return false;
-    }
-
-    // File type filters
-    if !filter.file_types.is_empty() {
-        let ext = Path::new(relative_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        if !filter
-            .file_types
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(ext))
-        {
-            return false;
-        }
-    }
-
-    // Exclude file types
-    if !filter.exclude_file_types.is_empty() {
-        let ext = Path::new(relative_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        if filter
-            .exclude_file_types
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(ext))
-        {
-            return false;
-        }
-    }
-
-    true
+    CompiledSyncFilter::new(filter).map(|f| f.accepts(relative_path, size)).unwrap_or(false)
 }
 
-/// Simple glob matching using the `glob` crate pattern logic.
+/// Wildcard match on the shared rule engine (case-sensitive, `*` crosses `/`).
 fn glob_match(pattern: &str, path: &str) -> bool {
-    glob::Pattern::new(pattern)
-        .map(|p| p.matches(path))
-        .unwrap_or(false)
+    crate::filter_rules::wildcard_matches(pattern, path, true)
 }
 
 /// Check path length for Windows compatibility (260 char limit).
@@ -382,8 +305,137 @@ fn check_path_length(dest_root: &str, relative_path: &str) -> Option<String> {
     }
 }
 
+/// Inputs beyond the pair that shape a plan.
+#[derive(Default, Clone, Copy)]
+pub struct PlanContext<'a> {
+    /// Two-way only: what both sides looked like after the last successful
+    /// run, for a three-way diff. `None` = first run (union, never delete).
+    /// A baseline recorded for other folders is ignored.
+    pub baseline: Option<&'a SyncBaseline>,
+    /// Checked between entries; when set, planning stops with an error.
+    pub cancel: Option<&'a AtomicBool>,
+    /// Content hashes for [`CompareMode::Checksum`]. [`plan`] hashes local
+    /// files itself when this is `None`; [`diff_trees`] without one compares
+    /// by size and time and says so in the preview notes.
+    pub hasher: Option<&'a dyn ContentHasher>,
+}
+
+/// Content hashes for checksum comparison: a storage provider's own hashes,
+/// or local files read and hashed. `None` = no hash for that file.
+pub trait ContentHasher {
+    fn hash(&self, side: SyncSide, file: &FileMeta) -> Option<String>;
+}
+
+/// Hashes local files with xxHash3.
+pub struct LocalHasher;
+
+impl ContentHasher for LocalHasher {
+    fn hash(&self, _side: SyncSide, file: &FileMeta) -> Option<String> {
+        super::executor::compute_file_hash(&file.absolute_path, SyncHashAlgorithm::Xxh3).ok()
+    }
+}
+
+/// Decides whether files match, per the pair's [`CompareMode`]; caches
+/// hashes so each file is read at most once per plan.
+struct Comparer<'a> {
+    opts: &'a CopyOptions,
+    hasher: Option<&'a dyn ContentHasher>,
+    hashes: std::cell::RefCell<HashMap<(bool, String), Option<String>>>,
+    /// Paths with a side that could not be hashed.
+    unhashed: std::cell::RefCell<std::collections::HashSet<String>>,
+}
+
+impl<'a> Comparer<'a> {
+    fn new(opts: &'a CopyOptions, hasher: Option<&'a dyn ContentHasher>) -> Self {
+        Self { opts, hasher, hashes: Default::default(), unhashed: Default::default() }
+    }
+
+    fn hash(&self, side: SyncSide, file: &FileMeta) -> Option<String> {
+        let hasher = self.hasher?;
+        let key = (side == SyncSide::Source, file.relative_path.clone());
+        if let Some(h) = self.hashes.borrow().get(&key) {
+            return h.clone();
+        }
+        let h = hasher.hash(side, file);
+        if h.is_none() {
+            self.unhashed.borrow_mut().insert(file.relative_path.clone());
+        }
+        self.hashes.borrow_mut().insert(key, h.clone());
+        h
+    }
+
+    /// Whether the source and destination copies hold the same data
+    /// (`dest_time`: the destination time adjusted for clock skew).
+    fn same(&self, src: &FileMeta, dst: &FileMeta, dest_time: Option<DateTime<Utc>>) -> bool {
+        if src.size != dst.size {
+            return false;
+        }
+        match self.opts.compare_mode {
+            CompareMode::SizeOnly => true,
+            CompareMode::SizeMtime => times_equal(src.modified, dest_time, self.opts),
+            CompareMode::Checksum => match (self.hash(SyncSide::Source, src), self.hash(SyncSide::Dest, dst)) {
+                (Some(a), Some(b)) => a == b,
+                _ => times_equal(src.modified, dest_time, self.opts),
+            },
+        }
+    }
+
+    /// Whether `file` changed since the baseline recorded its side.
+    fn changed_since(&self, side: SyncSide, file: &FileMeta, b: &BaselineEntry) -> bool {
+        if file.size != b.size {
+            return true;
+        }
+        let recorded = if side == SyncSide::Source { b.source_modified } else { b.dest_modified };
+        let same_time = times_equal(file.modified, recorded, self.opts);
+        match self.opts.compare_mode {
+            CompareMode::SizeOnly => false,
+            CompareMode::SizeMtime => !same_time,
+            // Touched but maybe not edited: the hash decides.
+            CompareMode::Checksum if !same_time => match (&b.hash, self.hash(side, file)) {
+                (Some(then), Some(now)) => *then != now,
+                _ => true,
+            },
+            CompareMode::Checksum => false,
+        }
+    }
+
+    /// The baseline entry for a file that matches on both sides.
+    fn entry(&self, src: &FileMeta, dst: &FileMeta) -> BaselineEntry {
+        let hash = (self.opts.compare_mode == CompareMode::Checksum).then(|| self.hash(SyncSide::Source, src)).flatten();
+        BaselineEntry { size: src.size, source_modified: src.modified, dest_modified: dst.modified, hash }
+    }
+
+    fn notes(&self) -> Vec<String> {
+        if self.opts.compare_mode != CompareMode::Checksum {
+            return Vec::new();
+        }
+        match (self.hasher, self.unhashed.borrow().len()) {
+            (None, _) => vec!["Checksums are not available here; files were compared by size and modification time.".to_string()],
+            (Some(_), 0) => Vec::new(),
+            (Some(_), n) => vec![format!("{n} file(s) could not be hashed and were compared by size and modification time.")],
+        }
+    }
+}
+
+/// A plan: the preview, plus the two-way baseline decisions that do not
+/// depend on how the run goes.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub preview: SyncPreview,
+    /// Two-way: paths whose baseline entry the plan alone settles — `Some`
+    /// for files that already match on both sides, `None` for files gone
+    /// from both. Paths not listed keep their previous entry unless the run
+    /// changes them.
+    pub settled: Vec<(String, Option<BaselineEntry>)>,
+}
+
 /// Compute a dry-run preview for a sync pair.
 pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
+    plan(pair, &PlanContext::default()).map(|p| p.preview)
+}
+
+/// Walk both sides of `pair` and plan the run.
+pub fn plan(pair: &SyncPair, ctx: &PlanContext<'_>) -> Result<Plan, AppError> {
     let start = Instant::now();
 
     let source_root = Path::new(&pair.source_path);
@@ -398,7 +450,17 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
     }
 
     let opts = &pair.copy_options;
-    let now = Utc::now();
+    let baseline = usable_baseline(pair, ctx.baseline);
+    // A two-way pair with a baseline whose destination vanished would read
+    // as "everything deleted there": refuse instead of emptying the source.
+    if let Some(b) = baseline {
+        if !b.entries.is_empty() && !dest_root.exists() {
+            return Err(AppError::Sync {
+                message: format!("Destination folder is missing: {}", pair.dest_path),
+                advice: "Reconnect or mount the destination, then run again. Nothing was deleted.".to_string(),
+            });
+        }
+    }
 
     // Walk the source; learn the destination per the pair's state mode.
     let source_files = walk_directory_with(source_root, opts)?;
@@ -411,6 +473,118 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
         },
         DestStateMode::Scan => walk_directory_with(dest_root, opts)?,
     };
+
+    let local = LocalHasher;
+    let ctx = PlanContext {
+        hasher: ctx.hasher.or((opts.compare_mode == CompareMode::Checksum).then_some(&local as &dyn ContentHasher)),
+        ..*ctx
+    };
+    let mut plan = diff_trees(pair, &source_files, &dest_files, &ctx)?;
+    plan.preview.duration_ms = start.elapsed().as_millis() as u64;
+    Ok(plan)
+}
+
+/// The baseline in `ctx`, when it applies to this pair (two-way, same folders).
+fn usable_baseline<'a>(pair: &SyncPair, baseline: Option<&'a SyncBaseline>) -> Option<&'a SyncBaseline> {
+    baseline.filter(|b| pair.mode == SyncMode::TwoWay && b.matches(pair))
+}
+
+fn check_cancel(ctx: &PlanContext<'_>) -> Result<(), AppError> {
+    if ctx.cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(AppError::Sync {
+            message: "Comparison cancelled.".to_string(),
+            advice: "Start it again when you are ready.".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Accumulates the entries of a preview.
+#[derive(Default)]
+struct Acc {
+    additions: Vec<SyncDiffEntry>,
+    modifications: Vec<SyncDiffEntry>,
+    deletions: Vec<SyncDiffEntry>,
+    skipped: Vec<SyncDiffEntry>,
+    conflicts: Vec<SyncDiffEntry>,
+    path_warnings: Vec<SyncDiffEntry>,
+    total_bytes: u64,
+    fixups: Vec<String>,
+    settled: Vec<(String, Option<BaselineEntry>)>,
+    notes: Vec<String>,
+}
+
+impl Acc {
+    fn push(&mut self, entry: SyncDiffEntry) {
+        if entry.path_length_warning.is_some() {
+            self.path_warnings.push(entry.clone());
+        }
+        match entry.action {
+            SyncAction::Add => {
+                self.total_bytes += entry_bytes(&entry);
+                self.additions.push(entry)
+            }
+            SyncAction::Modify => {
+                self.total_bytes += entry_bytes(&entry);
+                self.modifications.push(entry)
+            }
+            SyncAction::Delete => self.deletions.push(entry),
+            SyncAction::Conflict => self.conflicts.push(entry),
+            SyncAction::Skip => self.skipped.push(entry),
+        }
+    }
+}
+
+/// Bytes an add/modify moves: the size of the side it copies from.
+fn entry_bytes(e: &SyncDiffEntry) -> u64 {
+    match e.direction {
+        SyncDirection::ToDest => e.source_size.unwrap_or(0),
+        SyncDirection::ToSource => e.dest_size.unwrap_or(0),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_entry(
+    rel_path: &str,
+    action: SyncAction,
+    src: Option<&FileMeta>,
+    dst: Option<&FileMeta>,
+    reason: impl Into<String>,
+    direction: SyncDirection,
+    path_length_warning: Option<String>,
+) -> SyncDiffEntry {
+    SyncDiffEntry {
+        relative_path: rel_path.to_string(),
+        action,
+        source_size: src.map(|s| s.size),
+        dest_size: dst.map(|d| d.size),
+        source_modified: src.and_then(|s| s.modified),
+        dest_modified: dst.and_then(|d| d.modified),
+        reason: reason.into(),
+        path_length_warning,
+        direction,
+    }
+}
+
+/// Diff two listings of the same pair without touching the filesystem.
+///
+/// `source` and `dest` are the files of each side, as [`walk_directory_with`]
+/// lists them (relative paths, sizes, modification times). Applies the
+/// pair's filters, Robocopy-style options and mode; for a two-way pair with
+/// a baseline in `ctx`, runs the three-way comparison. `ctx.cancel` is
+/// checked between entries. This is the planner's whole decision logic, so
+/// any caller with two listings (a folder comparison, a remote listing) gets
+/// exactly the answers a sync would.
+pub fn diff_trees(
+    pair: &SyncPair,
+    source_files: &[FileMeta],
+    dest_files: &[FileMeta],
+    ctx: &PlanContext<'_>,
+) -> Result<Plan, AppError> {
+    let start = Instant::now();
+    let opts = &pair.copy_options;
+    let now = Utc::now();
+    let baseline = usable_baseline(pair, ctx.baseline);
 
     // Build lookup maps by relative path. The completion marker is the
     // engine's own output: never copied, never purged.
@@ -426,219 +600,21 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
         .filter(|f| !f.is_dir && Some(f.relative_path.as_str()) != marker)
         .map(|f| (f.relative_path.as_str(), f))
         .collect();
-    let settle = pair.run_options.settle_secs;
-    let policy = crate::policy::active();
 
-    let mut additions = Vec::new();
-    let mut modifications = Vec::new();
-    let mut deletions = Vec::new();
-    let mut skipped = Vec::new();
-    let mut conflicts = Vec::new();
-    let mut path_warnings = Vec::new();
-    let mut total_bytes: u64 = 0;
-    let mut fixups: Vec<String> = Vec::new();
-
-    let skip_entry = |rel_path: &str, src: &FileMeta, reason: &str| SyncDiffEntry {
-        relative_path: rel_path.to_string(),
-        action: SyncAction::Skip,
-        source_size: Some(src.size),
-        dest_size: dest_map.get(rel_path).map(|d| d.size),
-        source_modified: src.modified,
-        dest_modified: dest_map.get(rel_path).and_then(|d| d.modified),
-        reason: reason.to_string(),
-        path_length_warning: None,
-    };
-
-    // Process source files
-    for (rel_path, src) in &source_map {
-        // Apply filter
-        if !matches_filter(rel_path, src.size, &pair.filter) {
-            skipped.push(skip_entry(rel_path, src, "Excluded by filter"));
-            continue;
-        }
-        if let Some(reason) = option_exclusion(src, opts, now) {
-            skipped.push(skip_entry(rel_path, src, reason));
-            continue;
-        }
-        if still_changing(src, settle, now) {
-            skipped.push(skip_entry(rel_path, src, "Still changing (modified moments ago); the next run copies it"));
-            continue;
-        }
-        if let Err(v) = policy.check(&dest_root.join(rel_path)) {
-            skipped.push(skip_entry(rel_path, src, &format!("Blocked by filename policy: {}", v.reason)));
-            continue;
-        }
-
-        // Check path length
-        let path_warning = check_path_length(&pair.dest_path, rel_path);
-
-        if let Some(dest) = dest_map.get(rel_path) {
-            // File exists at destination - check if changed
-            // Apply time offset compensation for clock skew
-            let adjusted_dest_modified = match (dest.modified, pair.time_offset_secs) {
-                (Some(mtime), Some(offset)) => Some(mtime + chrono::Duration::seconds(offset)),
-                (mtime, _) => mtime,
-            };
-
-            let same_time = times_equal(src.modified, adjusted_dest_modified, opts);
-            let differs = match pair.verify_mode {
-                SyncVerifyMode::None => false,
-                // Full mode previews with size+mtime; checksums run at execution.
-                SyncVerifyMode::Fast | SyncVerifyMode::Full => src.size != dest.size || !same_time,
-            };
-            let changed = differs || opts.include_same;
-
-            if changed && differs {
-                // Robocopy-style comparison exclusions (/XC, /XO, /XN).
-                let reason = if same_time && opts.exclude_changed {
-                    Some("Changed file excluded (/XC)")
-                } else if !same_time && src.modified < adjusted_dest_modified && opts.exclude_older
-                {
-                    Some("Source is older than destination (/XO)")
-                } else if !same_time && src.modified > adjusted_dest_modified && opts.exclude_newer
-                {
-                    Some("Source is newer than destination (/XN)")
-                } else {
-                    None
-                };
-                if let Some(reason) = reason {
-                    skipped.push(skip_entry(rel_path, src, reason));
-                    continue;
-                }
-            }
-
-            if changed {
-                // Check for conflict in two-way mode
-                if pair.mode == SyncMode::TwoWay && differs {
-                    // Both sides changed = conflict
-                    let is_conflict = dest.modified.is_some()
-                        && src.modified.is_some()
-                        && dest.modified != src.modified
-                        && dest.size != src.size;
-
-                    if is_conflict {
-                        let entry = SyncDiffEntry {
-                            relative_path: rel_path.to_string(),
-                            action: SyncAction::Conflict,
-                            source_size: Some(src.size),
-                            dest_size: Some(dest.size),
-                            source_modified: src.modified,
-                            dest_modified: dest.modified,
-                            reason: "Both source and destination modified".to_string(),
-                            path_length_warning: path_warning.clone(),
-                        };
-                        conflicts.push(entry.clone());
-                        if path_warning.is_some() {
-                            path_warnings.push(entry);
-                        }
-                        continue;
-                    }
-                }
-
-                let entry = SyncDiffEntry {
-                    relative_path: rel_path.to_string(),
-                    action: SyncAction::Modify,
-                    source_size: Some(src.size),
-                    dest_size: Some(dest.size),
-                    source_modified: src.modified,
-                    dest_modified: dest.modified,
-                    reason: if differs {
-                        "File changed (size or modification time differs)".to_string()
-                    } else {
-                        "Identical file re-copied (/IS)".to_string()
-                    },
-                    path_length_warning: path_warning.clone(),
-                };
-                total_bytes += src.size;
-                modifications.push(entry.clone());
-                if path_warning.is_some() {
-                    path_warnings.push(entry);
-                }
-            } else if opts.fix_timestamps || opts.fix_security {
-                fixups.push(rel_path.to_string());
-            }
-        } else if opts.exclude_lonely {
-            skipped.push(skip_entry(
-                rel_path,
-                src,
-                "Not present at destination (/XL)",
-            ));
-        } else {
-            // New file at source
-            let entry = SyncDiffEntry {
-                relative_path: rel_path.to_string(),
-                action: SyncAction::Add,
-                source_size: Some(src.size),
-                dest_size: None,
-                source_modified: src.modified,
-                dest_modified: None,
-                reason: "New file in source".to_string(),
-                path_length_warning: path_warning.clone(),
-            };
-            total_bytes += src.size;
-            additions.push(entry.clone());
-            if path_warning.is_some() {
-                path_warnings.push(entry);
-            }
+    let filter = CompiledSyncFilter::new(&pair.filter)?;
+    let cmp = Comparer::new(opts, ctx.hasher);
+    let mut acc = Acc::default();
+    if let Some(b) = baseline {
+        diff_two_way(pair, &filter, &cmp, &source_map, &dest_map, b, ctx, now, &mut acc)?;
+    } else {
+        diff_legacy(pair, &filter, &cmp, &source_map, &dest_map, ctx, now, &mut acc)?;
+        if pair.mode == SyncMode::TwoWay {
+            acc.notes.push("First two-way run: files are combined in both directions and nothing is deleted. Later runs propagate deletions.".to_string());
         }
     }
-
-    // Mirror always purges; /PURGE adds it to one-way and backup modes; /XX
-    // turns it off everywhere. Two-way never purges — extras flow back instead.
-    let purge_extras = pair.mode != SyncMode::TwoWay
-        && (pair.mode == SyncMode::Mirror || opts.purge)
-        && !opts.exclude_extra;
-
-    // Process deletions (files in dest not in source)
-    match pair.mode {
-        _ if purge_extras => {
-            // Delete files in dest that are not in source
-            for (rel_path, dest) in &dest_map {
-                if !source_map.contains_key(rel_path) {
-                    deletions.push(SyncDiffEntry {
-                        relative_path: rel_path.to_string(),
-                        action: SyncAction::Delete,
-                        source_size: None,
-                        dest_size: Some(dest.size),
-                        source_modified: None,
-                        dest_modified: dest.modified,
-                        reason: if pair.mode == SyncMode::Mirror {
-                            "Not present in source (mirror mode)".to_string()
-                        } else {
-                            "Not present in source (/PURGE)".to_string()
-                        },
-                        path_length_warning: None,
-                    });
-                }
-            }
-        }
-        SyncMode::TwoWay => {
-            // Two-way: files only in dest should be copied to source (treated as additions in reverse)
-            for (rel_path, dest) in &dest_map {
-                if !source_map.contains_key(rel_path)
-                    && matches_filter(rel_path, dest.size, &pair.filter)
-                    && option_exclusion(dest, opts, now).is_none()
-                    && !still_changing(dest, settle, now)
-                    && policy.check(&source_root.join(rel_path)).is_ok()
-                {
-                    additions.push(SyncDiffEntry {
-                        relative_path: rel_path.to_string(),
-                        action: SyncAction::Add,
-                        source_size: None,
-                        dest_size: Some(dest.size),
-                        source_modified: None,
-                        dest_modified: dest.modified,
-                        reason: "New file in destination (two-way sync)".to_string(),
-                        path_length_warning: check_path_length(&pair.source_path, rel_path),
-                    });
-                    total_bytes += dest.size;
-                }
-            }
-        }
-        _ => {
-            // OneWay, VersionedBackup, or /XX: no deletions from dest
-        }
-    }
+    acc.notes.extend(cmp.notes());
+    let Acc { additions, modifications, deletions, skipped, conflicts, path_warnings, total_bytes, fixups, settled, notes } = acc;
+    let purge_extras = purges_extras(pair);
 
     // Directory tree: /E creates empty source directories at the destination;
     // purging removes destination directories the source no longer has.
@@ -676,27 +652,374 @@ pub fn compute_preview(pair: &SyncPair) -> Result<SyncPreview, AppError> {
 
     let duration = start.elapsed();
 
-    Ok(SyncPreview {
-        pair_id: pair.id,
-        pair_name: pair.name.clone(),
-        computed_at: Utc::now(),
-        duration_ms: duration.as_millis() as u64,
-        total_additions: additions.len() as u64,
-        total_modifications: modifications.len() as u64,
-        total_deletions: deletions.len() as u64,
-        total_skipped: skipped.len() as u64,
-        total_conflicts: conflicts.len() as u64,
-        total_bytes,
-        additions,
-        modifications,
-        deletions,
-        skipped,
-        conflicts,
-        path_warnings,
-        dirs_to_create,
-        dirs_to_remove,
-        fixups,
+    Ok(Plan {
+        preview: SyncPreview {
+            pair_id: pair.id,
+            pair_name: pair.name.clone(),
+            computed_at: Utc::now(),
+            duration_ms: duration.as_millis() as u64,
+            total_additions: additions.len() as u64,
+            total_modifications: modifications.len() as u64,
+            total_deletions: deletions.len() as u64,
+            total_skipped: skipped.len() as u64,
+            total_conflicts: conflicts.len() as u64,
+            total_bytes,
+            additions,
+            modifications,
+            deletions,
+            skipped,
+            conflicts,
+            path_warnings,
+            dirs_to_create,
+            dirs_to_remove,
+            fixups,
+            notes,
+        },
+        settled,
     })
+}
+
+/// Mirror always purges; /PURGE adds it to one-way and backup modes; /XX
+/// turns it off everywhere. Two-way never purges — extras flow back instead.
+fn purges_extras(pair: &SyncPair) -> bool {
+    pair.mode != SyncMode::TwoWay
+        && (pair.mode == SyncMode::Mirror || pair.copy_options.purge)
+        && !pair.copy_options.exclude_extra
+}
+
+/// Why a file on one side is left out of the plan entirely, if it is:
+/// filters, attribute/age options, the settle window or the filename policy
+/// (checked against the path the file would be written to).
+fn exclusion_reason(
+    rel_path: &str,
+    file: &FileMeta,
+    pair: &SyncPair,
+    filter: &CompiledSyncFilter,
+    target_root: &Path,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    if !filter.accepts(rel_path, file.size) {
+        return Some("Excluded by filter".to_string());
+    }
+    if let Some(reason) = option_exclusion(file, &pair.copy_options, now) {
+        return Some(reason.to_string());
+    }
+    if still_changing(file, pair.run_options.settle_secs, now) {
+        return Some("Still changing (modified moments ago); the next run copies it".to_string());
+    }
+    if let Err(v) = crate::policy::active().check(&target_root.join(rel_path)) {
+        return Some(format!("Blocked by filename policy: {}", v.reason));
+    }
+    None
+}
+
+/// The Robocopy comparison exclusions (/XC, /XO, /XN) for copying `from`
+/// over `to` (the `to` time already adjusted for clock skew).
+fn comparison_exclusion(
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    same_time: bool,
+    opts: &CopyOptions,
+) -> Option<&'static str> {
+    if same_time && opts.exclude_changed {
+        Some("Changed file excluded (/XC)")
+    } else if !same_time && from < to && opts.exclude_older {
+        Some("Source is older than destination (/XO)")
+    } else if !same_time && from > to && opts.exclude_newer {
+        Some("Source is newer than destination (/XN)")
+    } else {
+        None
+    }
+}
+
+/// Destination time adjusted for the pair's clock-skew offset.
+fn adjusted_dest_time(dest: &FileMeta, pair: &SyncPair) -> Option<DateTime<Utc>> {
+    match (dest.modified, pair.time_offset_secs) {
+        (Some(mtime), Some(offset)) => Some(mtime + chrono::Duration::seconds(offset)),
+        (mtime, _) => mtime,
+    }
+}
+
+/// The one-way / mirror / versioned plan, and two-way without a baseline.
+#[allow(clippy::too_many_arguments)]
+fn diff_legacy(
+    pair: &SyncPair,
+    filter: &CompiledSyncFilter,
+    cmp: &Comparer<'_>,
+    source_map: &HashMap<&str, &FileMeta>,
+    dest_map: &HashMap<&str, &FileMeta>,
+    ctx: &PlanContext<'_>,
+    now: DateTime<Utc>,
+    acc: &mut Acc,
+) -> Result<(), AppError> {
+    let opts = &pair.copy_options;
+    let source_root = Path::new(&pair.source_path);
+    let dest_root = Path::new(&pair.dest_path);
+    let skip = |rel_path: &str, src: &FileMeta, reason: &str| {
+        diff_entry(rel_path, SyncAction::Skip, Some(src), dest_map.get(rel_path).copied(), reason, SyncDirection::ToDest, None)
+    };
+
+    // Process source files
+    for (rel_path, src) in source_map {
+        check_cancel(ctx)?;
+        if let Some(reason) = exclusion_reason(rel_path, src, pair, filter, dest_root, now) {
+            acc.push(skip(rel_path, src, &reason));
+            continue;
+        }
+
+        // Check path length
+        let path_warning = check_path_length(&pair.dest_path, rel_path);
+
+        if let Some(dest) = dest_map.get(rel_path) {
+            // File exists at destination - check if changed
+            // Apply time offset compensation for clock skew
+            let adjusted_dest_modified = adjusted_dest_time(dest, pair);
+
+            let same_time = times_equal(src.modified, adjusted_dest_modified, opts);
+            let differs = match pair.verify_mode {
+                SyncVerifyMode::None => false,
+                // Compared per the pair's compare mode (size and time by
+                // default); Full verification also checksums after the run.
+                SyncVerifyMode::Fast | SyncVerifyMode::Full => !cmp.same(src, dest, adjusted_dest_modified),
+            };
+            let changed = differs || opts.include_same;
+
+            if changed && differs {
+                // Robocopy-style comparison exclusions (/XC, /XO, /XN).
+                if let Some(reason) = comparison_exclusion(src.modified, adjusted_dest_modified, same_time, opts) {
+                    acc.push(skip(rel_path, src, reason));
+                    continue;
+                }
+            }
+
+            if changed {
+                // Check for conflict in two-way mode
+                if pair.mode == SyncMode::TwoWay && differs {
+                    // Both sides changed = conflict
+                    let is_conflict = dest.modified.is_some()
+                        && src.modified.is_some()
+                        && dest.modified != src.modified
+                        && dest.size != src.size;
+
+                    if is_conflict {
+                        acc.push(diff_entry(rel_path, SyncAction::Conflict, Some(src), Some(dest), "Both source and destination modified", SyncDirection::ToDest, path_warning));
+                        continue;
+                    }
+                }
+
+                let reason = if differs {
+                    "File changed (size or modification time differs)"
+                } else {
+                    "Identical file re-copied (/IS)"
+                };
+                acc.push(diff_entry(rel_path, SyncAction::Modify, Some(src), Some(dest), reason, SyncDirection::ToDest, path_warning));
+            } else {
+                if pair.mode == SyncMode::TwoWay {
+                    acc.settled.push((rel_path.to_string(), Some(cmp.entry(src, dest))));
+                }
+                if opts.fix_timestamps || opts.fix_security {
+                    acc.fixups.push(rel_path.to_string());
+                }
+            }
+        } else if opts.exclude_lonely {
+            acc.push(skip(rel_path, src, "Not present at destination (/XL)"));
+        } else {
+            // New file at source
+            acc.push(diff_entry(rel_path, SyncAction::Add, Some(src), None, "New file in source", SyncDirection::ToDest, path_warning));
+        }
+    }
+
+    // Process deletions (files in dest not in source)
+    match pair.mode {
+        _ if purges_extras(pair) => {
+            // Delete files in dest that are not in source
+            for (rel_path, dest) in dest_map {
+                if !source_map.contains_key(rel_path) {
+                    let reason = if pair.mode == SyncMode::Mirror {
+                        "Not present in source (mirror mode)"
+                    } else {
+                        "Not present in source (/PURGE)"
+                    };
+                    acc.push(diff_entry(rel_path, SyncAction::Delete, None, Some(dest), reason, SyncDirection::ToDest, None));
+                }
+            }
+        }
+        SyncMode::TwoWay => {
+            // Two-way: files only in dest are copied to the source.
+            for (rel_path, dest) in dest_map {
+                check_cancel(ctx)?;
+                if !source_map.contains_key(rel_path) && exclusion_reason(rel_path, dest, pair, filter, source_root, now).is_none() {
+                    acc.push(diff_entry(
+                        rel_path,
+                        SyncAction::Add,
+                        None,
+                        Some(dest),
+                        "New file in destination (two-way sync)",
+                        SyncDirection::ToSource,
+                        check_path_length(&pair.source_path, rel_path),
+                    ));
+                }
+            }
+        }
+        _ => {
+            // OneWay, VersionedBackup, or /XX: no deletions from dest
+        }
+    }
+    Ok(())
+}
+
+/// Two-way with a baseline: a three-way diff of source, destination and
+/// the state both had after the last successful run.
+///
+/// | source | dest | baseline | action |
+/// |---|---|---|---|
+/// | changed | unchanged | yes | copy to destination |
+/// | unchanged | changed | yes | copy to source |
+/// | changed | changed | yes | conflict (unless both now match) |
+/// | present | present | no | in sync if they match, else conflict |
+/// | unchanged | missing | yes | deleted at destination: delete in source |
+/// | changed | missing | yes | changed after the delete: copy back |
+/// | present | missing | no | new: copy to destination |
+///
+/// and the mirror image for files missing in the source.
+#[allow(clippy::too_many_arguments)]
+fn diff_two_way(
+    pair: &SyncPair,
+    filter: &CompiledSyncFilter,
+    cmp: &Comparer<'_>,
+    source_map: &HashMap<&str, &FileMeta>,
+    dest_map: &HashMap<&str, &FileMeta>,
+    baseline: &SyncBaseline,
+    ctx: &PlanContext<'_>,
+    now: DateTime<Utc>,
+    acc: &mut Acc,
+) -> Result<(), AppError> {
+    let opts = &pair.copy_options;
+    let source_root = Path::new(&pair.source_path);
+    let dest_root = Path::new(&pair.dest_path);
+
+    let mut paths: Vec<&str> = source_map.keys().chain(dest_map.keys()).copied().collect();
+    paths.extend(baseline.entries.keys().map(String::as_str));
+    paths.sort_unstable();
+    paths.dedup();
+
+    let (mut deletes_in_source, mut deletes_in_dest) = (0usize, 0usize);
+    for rel_path in paths {
+        check_cancel(ctx)?;
+        let src = source_map.get(rel_path).copied();
+        let dst = dest_map.get(rel_path).copied();
+        let base = baseline.entries.get(rel_path);
+
+        // Excluded on a side it exists on: leave the path alone entirely, and
+        // keep its baseline entry for when it is included again.
+        let excluded = src
+            .and_then(|s| exclusion_reason(rel_path, s, pair, filter, dest_root, now))
+            .or_else(|| dst.and_then(|d| exclusion_reason(rel_path, d, pair, filter, source_root, now)));
+        if let Some(reason) = excluded {
+            if let Some(s) = src {
+                acc.push(diff_entry(rel_path, SyncAction::Skip, Some(s), dst, reason, SyncDirection::ToDest, None));
+            }
+            continue;
+        }
+        let to_dest_warning = || check_path_length(&pair.dest_path, rel_path);
+        let to_source_warning = || check_path_length(&pair.source_path, rel_path);
+
+        match (src, dst) {
+            (Some(s), Some(d)) => {
+                let adjusted = adjusted_dest_time(d, pair);
+                let (s_changed, d_changed) = match base {
+                    Some(b) => (cmp.changed_since(SyncSide::Source, s, b), cmp.changed_since(SyncSide::Dest, d, b)),
+                    None => (true, true),
+                };
+                // Only compared when needed: in checksum mode this reads both files.
+                let same = || cmp.same(s, d, adjusted);
+                if (!s_changed && !d_changed) || (!opts.include_same && same()) {
+                    acc.settled.push((rel_path.to_string(), Some(cmp.entry(s, d))));
+                    if opts.fix_timestamps || opts.fix_security {
+                        acc.fixups.push(rel_path.to_string());
+                    }
+                    continue;
+                }
+                if s_changed && d_changed {
+                    let reason = if base.is_some() {
+                        "Changed in both source and destination since the last sync"
+                    } else {
+                        "Different files in source and destination, not seen by an earlier sync"
+                    };
+                    acc.push(diff_entry(rel_path, SyncAction::Conflict, Some(s), Some(d), reason, SyncDirection::ToDest, to_dest_warning()));
+                    continue;
+                }
+                let (direction, from, to, reason, warning) = if s_changed {
+                    (SyncDirection::ToDest, s.modified, adjusted, "Changed in source since the last sync", to_dest_warning())
+                } else {
+                    (SyncDirection::ToSource, adjusted, s.modified, "Changed in destination since the last sync", to_source_warning())
+                };
+                let same_time = times_equal(from, to, opts);
+                if let Some(reason) = comparison_exclusion(from, to, same_time, opts) {
+                    acc.push(diff_entry(rel_path, SyncAction::Skip, Some(s), Some(d), reason, direction, None));
+                    continue;
+                }
+                acc.push(diff_entry(rel_path, SyncAction::Modify, Some(s), Some(d), reason, direction, warning));
+            }
+            (Some(s), None) => match base {
+                Some(b) if !cmp.changed_since(SyncSide::Source, s, b) => {
+                    deletes_in_source += 1;
+                    acc.push(diff_entry(rel_path, SyncAction::Delete, Some(s), None, "Deleted in destination since the last sync", SyncDirection::ToSource, None));
+                }
+                Some(_) => acc.push(diff_entry(rel_path, SyncAction::Add, Some(s), None, "Changed in source after it was deleted in destination; copied back", SyncDirection::ToDest, to_dest_warning())),
+                None if opts.exclude_lonely => {
+                    acc.push(diff_entry(rel_path, SyncAction::Skip, Some(s), None, "Not present at destination (/XL)", SyncDirection::ToDest, None))
+                }
+                None => acc.push(diff_entry(rel_path, SyncAction::Add, Some(s), None, "New file in source", SyncDirection::ToDest, to_dest_warning())),
+            },
+            (None, Some(d)) => match base {
+                Some(b) if !cmp.changed_since(SyncSide::Dest, d, b) => {
+                    deletes_in_dest += 1;
+                    acc.push(diff_entry(rel_path, SyncAction::Delete, None, Some(d), "Deleted in source since the last sync", SyncDirection::ToDest, None));
+                }
+                Some(_) => acc.push(diff_entry(rel_path, SyncAction::Add, None, Some(d), "Changed in destination after it was deleted in source; copied back", SyncDirection::ToSource, to_source_warning())),
+                None => acc.push(diff_entry(rel_path, SyncAction::Add, None, Some(d), "New file in destination (two-way sync)", SyncDirection::ToSource, to_source_warning())),
+            },
+            // Gone from both sides: nothing to do, and nothing to remember.
+            (None, None) => acc.settled.push((rel_path.to_string(), None)),
+        }
+    }
+
+    check_delete_safety(pair, baseline, dest_map.is_empty(), deletes_in_source, "source")?;
+    check_delete_safety(pair, baseline, source_map.is_empty(), deletes_in_dest, "destination")?;
+    Ok(())
+}
+
+/// The two-way safety stop: a side that suddenly lost most (or all) of its
+/// files is far more likely unmounted or emptied by mistake than cleaned up
+/// on purpose, and propagating that would empty the other side too.
+/// `missing_side_empty`: the side the files vanished from has no files left.
+fn check_delete_safety(
+    pair: &SyncPair,
+    baseline: &SyncBaseline,
+    missing_side_empty: bool,
+    deletes: usize,
+    side_deleting: &str,
+) -> Result<(), AppError> {
+    let pct = pair.copy_options.two_way_max_delete_percent;
+    let tracked = baseline.entries.len();
+    if pct == 0 || deletes == 0 || tracked == 0 {
+        return Ok(());
+    }
+    let other = if side_deleting == "source" { "destination" } else { "source" };
+    let too_many = deletes > 2 && deletes * 100 > pct as usize * tracked;
+    if missing_side_empty || too_many {
+        let what = if missing_side_empty { format!("the {other} is empty") } else { format!("they are missing in the {other}") };
+        return Err(AppError::Sync {
+            message: format!(
+                "Safety stop: this run would delete {deletes} of {tracked} synced files in the {side_deleting} because {what}. Nothing was changed."
+            ),
+            advice: format!(
+                "Check that the {other} folder is connected and complete. If the deletions are intended, raise or turn off the two-way delete limit ({pct}%) in the pair's options, or reset the pair's sync history."
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Export a preview as CSV.
@@ -970,6 +1293,7 @@ mod tests {
                 dest_modified: None,
                 reason: "New file".to_string(),
                 path_length_warning: None,
+                direction: SyncDirection::ToDest,
             }],
             modifications: Vec::new(),
             deletions: Vec::new(),
@@ -979,6 +1303,7 @@ mod tests {
             dirs_to_create: Vec::new(),
             dirs_to_remove: Vec::new(),
             fixups: Vec::new(),
+            notes: Vec::new(),
             total_additions: 1,
             total_modifications: 0,
             total_deletions: 0,
@@ -990,5 +1315,108 @@ mod tests {
         let csv = export_preview_csv(&preview).unwrap();
         assert!(csv.contains("new.txt"));
         assert!(csv.contains("Add"));
+    }
+
+    fn pair_for(src: &Path, dst: &Path) -> SyncPair {
+        SyncPair { source_path: src.to_string_lossy().to_string(), dest_path: dst.to_string_lossy().to_string(), ..Default::default() }
+    }
+
+    fn set_time(path: &Path, secs_ago: u64) {
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        crate::sync::copier::set_mtime(path, t);
+    }
+
+    #[test]
+    fn checksum_mode_compares_content() {
+        let (src, dst) = setup_dirs();
+        // Same bytes, different times: only touched.
+        fs::write(src.path().join("touched.txt"), "same").unwrap();
+        fs::write(dst.path().join("touched.txt"), "same").unwrap();
+        set_time(&src.path().join("touched.txt"), 10);
+        set_time(&dst.path().join("touched.txt"), 5000);
+        // Same size and time, different bytes.
+        fs::write(src.path().join("sneaky.txt"), "abcd").unwrap();
+        fs::write(dst.path().join("sneaky.txt"), "wxyz").unwrap();
+        set_time(&src.path().join("sneaky.txt"), 100);
+        set_time(&dst.path().join("sneaky.txt"), 100);
+
+        let mut pair = pair_for(src.path(), dst.path());
+        let p = compute_preview(&pair).unwrap();
+        assert_eq!(p.modifications.iter().map(|m| m.relative_path.as_str()).collect::<Vec<_>>(), vec!["touched.txt"]);
+
+        pair.copy_options.compare_mode = CompareMode::Checksum;
+        let p = compute_preview(&pair).unwrap();
+        assert_eq!(p.modifications.iter().map(|m| m.relative_path.as_str()).collect::<Vec<_>>(), vec!["sneaky.txt"]);
+        assert!(p.notes.is_empty(), "local files can always be hashed");
+    }
+
+    #[test]
+    fn checksum_without_hashes_falls_back_with_a_note() {
+        let file = |p: &str, size: u64, secs: i64| FileMeta {
+            relative_path: p.into(),
+            absolute_path: PathBuf::from(p),
+            size,
+            modified: Some(Utc::now() - chrono::Duration::seconds(secs)),
+            is_dir: false,
+            is_symlink: false,
+            hidden: false,
+            readonly: false,
+            attributes: 0,
+        };
+        let mut pair = SyncPair::default();
+        pair.copy_options.compare_mode = CompareMode::Checksum;
+        let plan = diff_trees(&pair, &[file("a", 4, 10)], &[file("a", 4, 9000)], &PlanContext::default()).unwrap();
+        assert_eq!(plan.preview.total_modifications, 1, "size and time decide without hashes");
+        assert!(plan.preview.notes.iter().any(|n| n.contains("Checksums are not available")));
+
+        struct Fixed;
+        impl ContentHasher for Fixed {
+            fn hash(&self, _: SyncSide, f: &FileMeta) -> Option<String> {
+                (f.relative_path != "unhashable").then(|| "same".to_string())
+            }
+        }
+        let ctx = PlanContext { hasher: Some(&Fixed), ..Default::default() };
+        let plan = diff_trees(&pair, &[file("a", 4, 10), file("unhashable", 4, 10)], &[file("a", 4, 9000), file("unhashable", 4, 9000)], &ctx).unwrap();
+        assert_eq!(plan.preview.modifications.iter().map(|m| m.relative_path.as_str()).collect::<Vec<_>>(), vec!["unhashable"]);
+        assert!(plan.preview.notes.iter().any(|n| n.starts_with("1 file(s) could not be hashed")), "{:?}", plan.preview.notes);
+    }
+
+    #[test]
+    fn size_only_ignores_times() {
+        let (src, dst) = setup_dirs();
+        fs::write(src.path().join("a.txt"), "1234").unwrap();
+        fs::write(dst.path().join("a.txt"), "abcd").unwrap();
+        set_time(&dst.path().join("a.txt"), 7200);
+        fs::write(src.path().join("b.txt"), "longer").unwrap();
+        fs::write(dst.path().join("b.txt"), "short").unwrap();
+        let mut pair = pair_for(src.path(), dst.path());
+        pair.copy_options.compare_mode = CompareMode::SizeOnly;
+        let p = compute_preview(&pair).unwrap();
+        assert_eq!(p.modifications.iter().map(|m| m.relative_path.as_str()).collect::<Vec<_>>(), vec!["b.txt"]);
+    }
+
+    #[test]
+    fn ignore_existing_copies_only_new_files() {
+        // The "Ignore existing" preset: /XO + /XN + /XC.
+        let (src, dst) = setup_dirs();
+        fs::write(src.path().join("new.txt"), "n").unwrap();
+        fs::write(src.path().join("older.txt"), "source, older").unwrap();
+        fs::write(dst.path().join("older.txt"), "dest").unwrap();
+        set_time(&src.path().join("older.txt"), 9000);
+        fs::write(src.path().join("newer.txt"), "source, newer").unwrap();
+        fs::write(dst.path().join("newer.txt"), "dest").unwrap();
+        set_time(&dst.path().join("newer.txt"), 9000);
+        fs::write(src.path().join("same-time.txt"), "different size").unwrap();
+        fs::write(dst.path().join("same-time.txt"), "x").unwrap();
+        set_time(&src.path().join("same-time.txt"), 300);
+        set_time(&dst.path().join("same-time.txt"), 300);
+        let mut pair = pair_for(src.path(), dst.path());
+        pair.copy_options.exclude_older = true;
+        pair.copy_options.exclude_newer = true;
+        pair.copy_options.exclude_changed = true;
+        let p = compute_preview(&pair).unwrap();
+        assert_eq!(p.additions.iter().map(|a| a.relative_path.as_str()).collect::<Vec<_>>(), vec!["new.txt"]);
+        assert_eq!(p.total_modifications, 0);
+        assert_eq!(p.total_skipped, 3);
     }
 }

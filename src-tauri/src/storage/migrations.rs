@@ -173,6 +173,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "ufop-server accounts, per-job access rules, token owners",
             sql: V31_SCHEMA,
         },
+        Migration {
+            version: 33,
+            description: "Two-way sync baselines and user-saved filter presets",
+            sql: V33_SCHEMA,
+        },
     ]
 }
 
@@ -188,6 +193,36 @@ fn rust_step(version: u32) -> Option<RustStep> {
         _ => None,
     }
 }
+
+/// Schema v33: two-way sync baselines — what both sides of a pair looked
+/// like after its last successful run (`sync_baseline_runs` per pair, one
+/// `sync_baseline` row per file, mtimes in nanoseconds) — and user-saved
+/// filter presets (ordered include/exclude rules as JSON), shared by sync
+/// pairs and backup jobs.
+const V33_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_baseline_runs (
+    pair_id     TEXT PRIMARY KEY NOT NULL,
+    run_id      TEXT,
+    source_root TEXT NOT NULL,
+    dest_root   TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sync_baseline (
+    pair_id         TEXT NOT NULL REFERENCES sync_baseline_runs(pair_id) ON DELETE CASCADE,
+    rel_path        TEXT NOT NULL,
+    size            INTEGER NOT NULL,
+    source_mtime_ns INTEGER,
+    dest_mtime_ns   INTEGER,
+    hash            TEXT,
+    PRIMARY KEY (pair_id, rel_path)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS user_filter_presets (
+    id         TEXT PRIMARY KEY NOT NULL,
+    name       TEXT NOT NULL,
+    rules_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"#;
 
 /// Schema v21: profile fields with no column (upload modes, FTP tuning,
 /// symlink policy, connector extras) as JSON; previously never saved.
@@ -1134,7 +1169,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 31);
+        assert_eq!(current_version(&conn).unwrap(), 33);
     }
 
     #[test]

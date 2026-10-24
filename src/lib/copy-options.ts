@@ -6,6 +6,9 @@
 
 export type SymlinkMode = "follow" | "skip" | "copy_link";
 
+/** How files on both sides are compared (mirrors `CompareMode` in ufop-core sync_types.rs). */
+export type CompareMode = "size_mtime" | "checksum" | "size_only";
+
 export interface CopyOptions {
   copy_subdirs: boolean;
   include_empty_dirs: boolean;
@@ -23,8 +26,11 @@ export interface CopyOptions {
   include_same: boolean;
   fat_time_tolerance: boolean;
   dst_tolerance: boolean;
+  compare_mode: CompareMode;
   purge: boolean;
   exclude_extra: boolean;
+  /** Two-way safety stop: max % of synced files one run may delete on a side (0 = no limit). */
+  two_way_max_delete_percent: number;
   copy_timestamps: boolean;
   copy_dir_timestamps: boolean;
   move_files: boolean;
@@ -69,8 +75,10 @@ export const DEFAULT_COPY_OPTIONS: CopyOptions = {
   include_same: false,
   fat_time_tolerance: false,
   dst_tolerance: false,
+  compare_mode: "size_mtime",
   purge: false,
   exclude_extra: false,
+  two_way_max_delete_percent: 50,
   copy_timestamps: true,
   copy_dir_timestamps: false,
   move_files: false,
@@ -127,6 +135,8 @@ export interface CopyPreset {
   hint: string;
   mode: string;
   options: Partial<CopyOptions>;
+  /** Only offered in the Advanced view. */
+  advanced?: boolean;
 }
 
 const RELIABLE = { retries: 3, retry_wait_secs: 5, restartable: true };
@@ -166,6 +176,14 @@ export const COPY_PRESETS: CopyPreset[] = [
     hint: "8 parallel threads, no per-file waits (robocopy /E /MT:8 /R:1 /W:1)",
     mode: "one_way",
     options: { include_empty_dirs: true, threads: 8, retries: 1, retry_wait_secs: 1 },
+  },
+  {
+    id: "ignore_existing",
+    label: "Ignore existing",
+    hint: "Copy only files the destination doesn't have yet; never touch existing ones (robocopy /XO /XN /XC)",
+    mode: "one_way",
+    options: { exclude_older: true, exclude_newer: true, exclude_changed: true },
+    advanced: true,
   },
 ];
 

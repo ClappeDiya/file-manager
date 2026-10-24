@@ -131,7 +131,6 @@ pub struct SyncManager {
     snapshots: Arc<RwLock<HashMap<Uuid, Vec<SyncSnapshot>>>>,
     quarantine: Arc<RwLock<HashMap<Uuid, Vec<QuarantineEntry>>>>,
     conflicts: Arc<RwLock<Vec<SyncConflictItem>>>,
-    resume_states: Arc<RwLock<HashMap<Uuid, SyncResumeState>>>,
     watcher_mgr: Arc<watcher::WatcherManager>,
     scheduler: Arc<scheduler::SyncScheduler>,
     /// Where rollback snapshots and quarantined files live. Always outside
@@ -141,6 +140,19 @@ pub struct SyncManager {
     running: Arc<RwLock<HashMap<Uuid, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Latest progress of each run in progress, by pair.
     progress: Arc<std::sync::Mutex<HashMap<Uuid, executor::SyncProgress>>>,
+    /// Database for two-way baselines; without one (unit tests) they are
+    /// kept in memory for the manager's lifetime.
+    repo: Arc<std::sync::RwLock<Option<crate::storage::Repository>>>,
+    baselines: Arc<RwLock<HashMap<Uuid, SyncBaseline>>>,
+}
+
+/// What the UI shows about a two-way pair's baseline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BaselineInfo {
+    /// Files both sides agreed on after the last successful run.
+    pub files: u64,
+    pub recorded_at: Option<DateTime<Utc>>,
+    pub run_id: Option<Uuid>,
 }
 
 /// Default location for sync state: the app data dir, else the temp dir.
@@ -168,10 +180,70 @@ impl SyncManager {
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             quarantine: Arc::new(RwLock::new(HashMap::new())),
             conflicts: Arc::new(RwLock::new(Vec::new())),
-            resume_states: Arc::new(RwLock::new(HashMap::new())),
             watcher_mgr: Arc::new(watcher::WatcherManager::default()),
             scheduler: Arc::new(scheduler::SyncScheduler::new()),
+            repo: Arc::new(std::sync::RwLock::new(None)),
+            baselines: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Keep two-way baselines in this database (both app init paths call it).
+    pub fn attach_repository(&self, repo: crate::storage::Repository) {
+        if let Ok(mut r) = self.repo.write() {
+            *r = Some(repo);
+        }
+    }
+
+    fn repository(&self) -> Option<crate::storage::Repository> {
+        self.repo.read().ok().and_then(|r| r.clone())
+    }
+
+    /// The baseline a two-way run of `pair` compares against: the one
+    /// recorded after its last successful run, for these same folders.
+    pub async fn load_baseline(&self, pair: &SyncPair) -> Result<Option<SyncBaseline>, AppError> {
+        if pair.mode != SyncMode::TwoWay {
+            return Ok(None);
+        }
+        let found = match self.repository() {
+            Some(repo) => baseline_db::load(&repo, pair.id).await?,
+            None => self.baselines.read().await.get(&pair.id).cloned(),
+        };
+        Ok(found.filter(|b| b.matches(pair)))
+    }
+
+    /// Record `baseline` for `pair_id`, replacing the previous one in one
+    /// transaction.
+    pub async fn save_baseline(&self, pair_id: Uuid, baseline: SyncBaseline) -> Result<(), AppError> {
+        match self.repository() {
+            Some(repo) => baseline_db::save(&repo, pair_id, &baseline).await,
+            None => {
+                self.baselines.write().await.insert(pair_id, baseline);
+                Ok(())
+            }
+        }
+    }
+
+    /// Forget a pair's baseline: its next two-way run combines both sides
+    /// again and deletes nothing.
+    pub async fn reset_baseline(&self, pair_id: Uuid) -> Result<(), AppError> {
+        self.baselines.write().await.remove(&pair_id);
+        match self.repository() {
+            Some(repo) => baseline_db::delete(&repo, pair_id).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Size and age of a pair's baseline, `None` when it has none.
+    pub async fn baseline_info(&self, pair_id: Uuid) -> Result<Option<BaselineInfo>, AppError> {
+        let pair = self.pairs.read().await.get(&pair_id).cloned().ok_or_else(|| AppError::Sync {
+            message: format!("Sync pair {} not found", pair_id),
+            advice: "Check the sync pair ID.".to_string(),
+        })?;
+        Ok(self.load_baseline(&pair).await?.map(|b| BaselineInfo {
+            files: b.entries.len() as u64,
+            recorded_at: b.recorded_at,
+            run_id: b.run_id,
+        }))
     }
 
     /// Get a dry-run preview for a sync pair.
@@ -184,7 +256,11 @@ impl SyncManager {
 
         // Run planner on blocking thread
         let pair_clone = pair.clone();
-        tokio::task::spawn_blocking(move || planner::compute_preview(&pair_clone))
+        drop(pairs);
+        let baseline = self.load_baseline(&pair_clone).await?;
+        tokio::task::spawn_blocking(move || {
+            planner::plan(&pair_clone, &planner::PlanContext { baseline: baseline.as_ref(), ..Default::default() }).map(|p| p.preview)
+        })
             .await
             .map_err(|e| AppError::Sync {
                 message: format!("Dry-run task failed: {}", e),
@@ -207,6 +283,11 @@ impl SyncManager {
 
     fn quarantine_root(&self, pair_id: Uuid) -> PathBuf {
         self.state_dir.join("quarantine").join(pair_id.to_string())
+    }
+
+    /// Steps of the pair's current run, written as they finish.
+    fn checkpoint_path(&self, pair_id: Uuid) -> PathBuf {
+        self.state_dir.join("checkpoints").join(format!("{pair_id}.jsonl"))
     }
 
     /// Latest progress of a running sync, or `None` when it isn't running.
@@ -287,12 +368,6 @@ impl SyncManager {
                 .insert(0, report.clone());
         }
 
-        // Clear resume state on success
-        if report.status == SyncRunStatus::Success {
-            let mut resume_states = self.resume_states.write().await;
-            resume_states.remove(&pair_id);
-        }
-
         // Run verification if enabled
         if pair.checksum_enabled || pair.verify_mode != SyncVerifyMode::None {
             let pair_clone = pair.clone();
@@ -327,13 +402,11 @@ impl SyncManager {
         let pair_id = pair.id;
         let run_id = Uuid::new_v4();
 
-        // Check for resume state
-        let resume_from = {
-            let resume_states = self.resume_states.read().await;
-            resume_states
-                .get(&pair_id)
-                .map(|s| s.last_completed_index)
-        };
+        // A checkpoint left by a run that never finished (crash, power
+        // loss, cancel): this run skips the steps it had completed.
+        let resume_from = checkpoint::load(&self.checkpoint_path(pair_id));
+        let resuming = resume_from.is_some();
+        let journal = checkpoint::Journal::open(&self.checkpoint_path(pair_id), pair_id, run_id, resuming);
 
         let config = executor::ExecutorConfig {
             pair: pair.clone(),
@@ -342,6 +415,7 @@ impl SyncManager {
             resume_from,
             quarantine_dir: Some(self.quarantine_root(pair_id)),
             rollback_dir: Some(self.rollback_root(pair_id).join(run_id.to_string())),
+            baseline: self.load_baseline(&pair).await?,
         };
 
         // Rollback is only offered for 7 days; don't keep data past that.
@@ -357,14 +431,26 @@ impl SyncManager {
                 }
             })),
             cancel: Some(cancel),
+            on_step: journal.as_ref().map(|j| j.recorder()),
         };
 
-        let outcome = tokio::task::spawn_blocking(move || executor::execute_sync_with(&config, &hooks))
+        let result = tokio::task::spawn_blocking(move || executor::execute_sync_with(&config, &hooks))
             .await
             .map_err(|e| AppError::Sync {
                 message: format!("Sync execution task failed: {}", e),
                 advice: "Try again.".to_string(),
-            })??;
+            })?;
+        // The checkpoint outlives only runs that stopped part-way: a
+        // cancelled run (resumed next time) or one that never got going
+        // while an older checkpoint was waiting.
+        let keep = match &result {
+            Ok(o) => o.report.status == SyncRunStatus::Cancelled,
+            Err(_) => resuming,
+        };
+        if !keep {
+            checkpoint::clear(&self.checkpoint_path(pair_id));
+        }
+        let outcome = result?;
 
         // Keep the newest run's snapshots so "Rollback" undoes exactly that
         // run; older runs' snapshot folders can never be restored, so drop them.
@@ -390,6 +476,14 @@ impl SyncManager {
                 .entry(pair_id)
                 .or_default()
                 .extend(outcome.quarantined.clone());
+        }
+        // Two-way: the executor only hands back a baseline when every step
+        // ran cleanly. Failing to record it is not a failed sync — the next
+        // run compares against the previous baseline and redoes the work.
+        if let Some(baseline) = outcome.baseline.clone() {
+            if let Err(e) = self.save_baseline(pair_id, baseline).await {
+                tracing::warn!("Could not record the two-way baseline of {pair_id}: {e}");
+            }
         }
         if !outcome.pending_conflicts.is_empty() {
             let mut conflicts = self.conflicts.write().await;
@@ -429,11 +523,11 @@ impl SyncManager {
             });
         }
 
-        let dest_path = {
+        let (source_path, dest_path) = {
             let pairs = self.pairs.read().await;
             pairs
                 .get(&pair_id)
-                .map(|p| PathBuf::from(&p.dest_path))
+                .map(|p| (PathBuf::from(&p.source_path), PathBuf::from(&p.dest_path)))
                 .ok_or_else(|| AppError::Sync {
                     message: format!("Sync pair {} not found", pair_id),
                     advice: "Check the sync pair ID.".to_string(),
@@ -442,7 +536,7 @@ impl SyncManager {
 
         let snapshots_clone = snapshots.clone();
         let restored = tokio::task::spawn_blocking(move || {
-            rollback::rollback_sync_run(&snapshots_clone, &dest_path)
+            rollback::rollback_pair_run(&snapshots_clone, &source_path, &dest_path)
         })
         .await
         .map_err(|e| AppError::Sync {
@@ -615,18 +709,27 @@ impl SyncManager {
         Ok(())
     }
 
-    /// Update sync pair configuration.
+    /// Update sync pair configuration. Changing the mode or either folder
+    /// forgets the two-way baseline: it describes other files.
     pub async fn update_pair(&self, pair: SyncPair) -> Result<SyncPair, AppError> {
-        let mut pairs = self.pairs.write().await;
-        if let std::collections::hash_map::Entry::Occupied(mut e) = pairs.entry(pair.id) {
-            e.insert(pair.clone());
-            Ok(pair)
-        } else {
-            Err(AppError::Sync {
-                message: "Sync pair not found.".to_string(),
-                advice: "Create the sync pair first.".to_string(),
-            })
+        let reset = {
+            let mut pairs = self.pairs.write().await;
+            if let std::collections::hash_map::Entry::Occupied(mut e) = pairs.entry(pair.id) {
+                let old = e.get();
+                let reset = old.mode != pair.mode || old.source_path != pair.source_path || old.dest_path != pair.dest_path;
+                e.insert(pair.clone());
+                reset
+            } else {
+                return Err(AppError::Sync {
+                    message: "Sync pair not found.".to_string(),
+                    advice: "Create the sync pair first.".to_string(),
+                });
+            }
+        };
+        if reset {
+            self.reset_baseline(pair.id).await?;
         }
+        Ok(pair)
     }
 
     /// Export a report as CSV.
@@ -847,7 +950,8 @@ impl SyncManager {
                 conn.execute("DELETE FROM sync_pairs WHERE id = ?1", rusqlite::params![id])?;
                 Ok(())
             })
-            .await
+            .await?;
+        baseline_db::delete(repo, pair_id).await
     }
 
     /// Restore every saved pair into memory at startup and re-arm its trigger,
@@ -956,6 +1060,186 @@ impl SyncManager {
     }
 }
 
+/// Crash-recovery checkpoints: one JSON-lines file per pair in the state
+/// dir. The first line names the run; every finished step appends a line
+/// (written straight through, so a crash loses at most the step in flight).
+/// The file is removed when a run ends normally, so one that exists at the
+/// start of a run belongs to a run that never finished.
+mod checkpoint {
+    use super::*;
+    use std::io::Write;
+
+    #[derive(Serialize, Deserialize)]
+    struct Header {
+        pair_id: Uuid,
+        run_id: Uuid,
+        started_at: DateTime<Utc>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Line {
+        path: String,
+        step: CompletedStep,
+    }
+
+    /// The checkpoint at `path`, if a run left one. A torn last line (the
+    /// crash happened mid-write) is ignored.
+    pub fn load(path: &std::path::Path) -> Option<SyncCheckpoint> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let mut lines = text.lines();
+        let header: Header = serde_json::from_str(lines.next()?).ok()?;
+        let mut cp = SyncCheckpoint { pair_id: header.pair_id, run_id: header.run_id, started_at: Some(header.started_at), ..Default::default() };
+        for l in lines {
+            if let Ok(line) = serde_json::from_str::<Line>(l) {
+                cp.completed.insert(line.path, line.step);
+            }
+        }
+        Some(cp)
+    }
+
+    pub fn clear(path: &std::path::Path) {
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("Could not remove sync checkpoint {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// The open checkpoint of a run.
+    pub struct Journal(Arc<std::sync::Mutex<std::fs::File>>);
+
+    impl Journal {
+        /// Start (or, when resuming, continue) the checkpoint at `path`.
+        /// `None` when it cannot be written: the run goes ahead without one.
+        pub fn open(path: &std::path::Path, pair_id: Uuid, run_id: Uuid, resume: bool) -> Option<Self> {
+            let open = || -> std::io::Result<std::fs::File> {
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                if resume {
+                    return std::fs::OpenOptions::new().append(true).open(path);
+                }
+                let mut f = std::fs::File::create(path)?;
+                let header = Header { pair_id, run_id, started_at: Utc::now() };
+                writeln!(f, "{}", serde_json::to_string(&header).map_err(std::io::Error::other)?)?;
+                Ok(f)
+            };
+            match open() {
+                Ok(f) => Some(Self(Arc::new(std::sync::Mutex::new(f)))),
+                Err(e) => {
+                    tracing::warn!("Could not start a sync checkpoint at {}: {e}", path.display());
+                    None
+                }
+            }
+        }
+
+        /// The executor's finished-step callback.
+        pub fn recorder(&self) -> executor::StepFn {
+            let file = self.0.clone();
+            Arc::new(move |path: &str, step: &CompletedStep| {
+                let Ok(line) = serde_json::to_string(&Line { path: path.to_string(), step: step.clone() }) else { return };
+                if let Ok(mut f) = file.lock() {
+                    let _ = writeln!(f, "{line}");
+                }
+            })
+        }
+    }
+}
+
+/// Two-way baselines in SQLite (schema v33): a header row per pair and one
+/// row per file. Saving replaces the whole baseline in one transaction, so
+/// a crash mid-save leaves the previous one intact.
+mod baseline_db {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn ns(t: Option<DateTime<Utc>>) -> Option<i64> {
+        t.and_then(|t| t.timestamp_nanos_opt())
+    }
+
+    fn from_ns(n: Option<i64>) -> Option<DateTime<Utc>> {
+        n.map(DateTime::<Utc>::from_timestamp_nanos)
+    }
+
+    pub async fn load(repo: &crate::storage::Repository, pair_id: Uuid) -> Result<Option<SyncBaseline>, AppError> {
+        let id = pair_id.to_string();
+        repo.pool()
+            .execute(move |conn| {
+                use rusqlite::OptionalExtension;
+                let head: Option<(Option<String>, String, String, String)> = conn
+                    .query_row(
+                        "SELECT run_id, source_root, dest_root, recorded_at FROM sync_baseline_runs WHERE pair_id = ?1",
+                        [&id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .optional()?;
+                let Some((run_id, source_root, dest_root, recorded_at)) = head else {
+                    return Ok(None);
+                };
+                let mut st = conn.prepare("SELECT rel_path, size, source_mtime_ns, dest_mtime_ns, hash FROM sync_baseline WHERE pair_id = ?1")?;
+                let rows = st.query_map([&id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        BaselineEntry {
+                            size: r.get::<_, i64>(1)?.max(0) as u64,
+                            source_modified: from_ns(r.get(2)?),
+                            dest_modified: from_ns(r.get(3)?),
+                            hash: r.get(4)?,
+                        },
+                    ))
+                })?;
+                let mut entries = BTreeMap::new();
+                for row in rows {
+                    let (path, entry) = row?;
+                    entries.insert(path, entry);
+                }
+                Ok(Some(SyncBaseline {
+                    source_root,
+                    dest_root,
+                    run_id: run_id.and_then(|r| Uuid::parse_str(&r).ok()),
+                    recorded_at: DateTime::parse_from_rfc3339(&recorded_at).ok().map(|t| t.with_timezone(&Utc)),
+                    entries,
+                }))
+            })
+            .await
+    }
+
+    pub async fn save(repo: &crate::storage::Repository, pair_id: Uuid, b: &SyncBaseline) -> Result<(), AppError> {
+        let id = pair_id.to_string();
+        let b = b.clone();
+        repo.pool()
+            .execute(move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute("DELETE FROM sync_baseline_runs WHERE pair_id = ?1", [&id])?;
+                tx.execute(
+                    "INSERT INTO sync_baseline_runs (pair_id, run_id, source_root, dest_root, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![id, b.run_id.map(|r| r.to_string()), b.source_root, b.dest_root, b.recorded_at.unwrap_or_else(Utc::now).to_rfc3339()],
+                )?;
+                {
+                    let mut st = tx.prepare(
+                        "INSERT INTO sync_baseline (pair_id, rel_path, size, source_mtime_ns, dest_mtime_ns, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    )?;
+                    for (path, e) in &b.entries {
+                        st.execute(rusqlite::params![id, path, e.size as i64, ns(e.source_modified), ns(e.dest_modified), e.hash])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn delete(repo: &crate::storage::Repository, pair_id: Uuid) -> Result<(), AppError> {
+        let id = pair_id.to_string();
+        repo.pool()
+            .execute(move |conn| {
+                conn.execute("DELETE FROM sync_baseline_runs WHERE pair_id = ?1", [&id])?;
+                Ok(())
+            })
+            .await
+    }
+}
+
 impl SyncOperations for SyncManager {
     fn create_pair(&self, pair: SyncPair) -> BoxFuture<'_, Result<SyncPair, AppError>> {
         Box::pin(async move {
@@ -996,6 +1280,7 @@ impl SyncOperations for SyncManager {
             })?;
 
             // Clean up associated data
+            self.reset_baseline(pair_id).await?;
             {
                 let mut reports = self.reports.write().await;
                 reports.remove(&pair_id);
@@ -1577,6 +1862,117 @@ mod tests {
         assert!(!dst.path().join(".sync-quarantine").exists());
     }
 
+    // ── Two-way baseline (item 47) ──
+
+    /// Regression: two-way sync had no memory of the last run, so a file
+    /// deleted on one side was seen as "new on the other side" and copied
+    /// straight back — deletions never stuck.
+    #[tokio::test]
+    async fn two_way_deletion_sticks_and_propagates() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("keep.txt"), "keep").unwrap();
+        std::fs::write(src.path().join("gone.txt"), "delete me").unwrap();
+        let pair = temp_pair(src.path(), dst.path(), SyncMode::TwoWay);
+        let (mgr, _state) = mgr_with(&pair).await;
+
+        let first = mgr.execute_sync(pair.id).await.unwrap();
+        assert_eq!(first.files_added, 2);
+        assert!(dst.path().join("gone.txt").exists());
+
+        std::fs::remove_file(src.path().join("gone.txt")).unwrap();
+        let second = mgr.execute_sync(pair.id).await.unwrap();
+        assert!(!src.path().join("gone.txt").exists(), "the deleted file came back");
+        assert!(!dst.path().join("gone.txt").exists(), "the deletion was not propagated");
+        assert_eq!(second.files_deleted, 1);
+        assert!(dst.path().join("keep.txt").exists() && src.path().join("keep.txt").exists());
+        // The deletion can be undone like any other destructive step.
+        assert_eq!(mgr.rollback_last_run(pair.id).await.unwrap(), 1);
+        assert!(dst.path().join("gone.txt").exists());
+    }
+
+    /// The baseline lives in SQLite: a restart in between does not turn the
+    /// deletion back into an addition.
+    #[tokio::test]
+    async fn two_way_baseline_survives_a_restart() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), "a").unwrap();
+        std::fs::write(src.path().join("b.txt"), "b").unwrap();
+        let pair = temp_pair(src.path(), dst.path(), SyncMode::TwoWay);
+        let (mgr, _state) = mgr_with(&pair).await;
+        mgr.attach_repository(repo.clone());
+        mgr.save_pair_to_db(&repo, &pair).await.unwrap();
+        mgr.execute_sync(pair.id).await.unwrap();
+        let info = mgr.baseline_info(pair.id).await.unwrap().unwrap();
+        assert_eq!(info.files, 2);
+        assert!(info.recorded_at.is_some());
+
+        let state = tempfile::TempDir::new().unwrap();
+        let restarted = SyncManager::with_state_dir(state.path().to_path_buf());
+        restarted.attach_repository(repo.clone());
+        restarted.load_pairs_from_db(&repo).await.unwrap();
+        std::fs::remove_file(dst.path().join("a.txt")).unwrap();
+        let preview = restarted.dry_run(pair.id).await.unwrap();
+        assert_eq!(preview.total_deletions, 1, "dry run uses the stored baseline");
+        assert_eq!(preview.deletions[0].direction, SyncDirection::ToSource);
+        restarted.execute_sync(pair.id).await.unwrap();
+        assert!(!src.path().join("a.txt").exists());
+
+        // Changing the mode or folders forgets it; so does an explicit reset.
+        let mut moved = restarted.pairs.read().await.get(&pair.id).cloned().unwrap();
+        assert!(restarted.baseline_info(pair.id).await.unwrap().is_some());
+        moved.mode = SyncMode::OneWay;
+        restarted.update_pair(moved.clone()).await.unwrap();
+        moved.mode = SyncMode::TwoWay;
+        restarted.update_pair(moved).await.unwrap();
+        assert!(restarted.baseline_info(pair.id).await.unwrap().is_none());
+        restarted.execute_sync(pair.id).await.unwrap();
+        assert!(restarted.baseline_info(pair.id).await.unwrap().is_some());
+        restarted.reset_baseline(pair.id).await.unwrap();
+        assert!(restarted.baseline_info(pair.id).await.unwrap().is_none());
+    }
+
+    /// Regression (dead resume path): `resume_states` was read on every run
+    /// but never written, so an interrupted run always started over. Steps
+    /// are now checkpointed as they finish and a rerun skips them.
+    #[tokio::test]
+    async fn interrupted_run_resumes_from_its_checkpoint() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), "alpha").unwrap();
+        std::fs::write(src.path().join("b.txt"), "bravo").unwrap();
+        let mut pair = temp_pair(src.path(), dst.path(), SyncMode::OneWay);
+        pair.copy_options.copy_timestamps = false;
+        let (mgr, _state) = mgr_with(&pair).await;
+        let first = mgr.execute_sync(pair.id).await.unwrap();
+        assert_eq!(first.files_added, 2);
+        assert!(!first.resumed);
+        assert!(!mgr.checkpoint_path(pair.id).exists(), "a finished run leaves no checkpoint");
+
+        // A run that died after copying a.txt left this behind.
+        let preview = mgr.dry_run(pair.id).await.unwrap();
+        let a = preview.modifications.iter().find(|e| e.relative_path == "a.txt").unwrap();
+        let journal = checkpoint::Journal::open(&mgr.checkpoint_path(pair.id), pair.id, Uuid::new_v4(), false).unwrap();
+        (journal.recorder())("a.txt", &CompletedStep::of(a));
+        drop(journal);
+        assert_eq!(checkpoint::load(&mgr.checkpoint_path(pair.id)).unwrap().completed.len(), 1);
+
+        let resumed = mgr.execute_sync(pair.id).await.unwrap();
+        assert!(resumed.resumed);
+        assert_eq!(resumed.files_modified, 1, "a.txt was already done");
+        assert!(!mgr.checkpoint_path(pair.id).exists());
+
+        // A cancelled run keeps its checkpoint for the next one.
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancelled = mgr.run_pair(pair.clone(), flag).await.unwrap();
+        assert_eq!(cancelled.status, SyncRunStatus::Cancelled);
+        assert!(mgr.checkpoint_path(pair.id).exists());
+        assert!(mgr.execute_sync(pair.id).await.unwrap().resumed);
+        assert!(!mgr.checkpoint_path(pair.id).exists());
+    }
+
     #[tokio::test]
     async fn cancel_and_progress_and_single_run() {
         let src = tempfile::TempDir::new().unwrap();
@@ -1608,12 +2004,14 @@ mod tests {
             resume_from: None,
             quarantine_dir: None,
             rollback_dir: None,
+            baseline: None,
         };
         let hooks = executor::RunHooks {
             progress: Some(Arc::new(move |p: &executor::SyncProgress| {
                 seen2.lock().unwrap().push(p.clone());
             })),
             cancel: None,
+            on_step: None,
         };
         let outcome = executor::execute_sync_with(&config, &hooks).unwrap();
         assert_eq!(outcome.report.files_added, 5);

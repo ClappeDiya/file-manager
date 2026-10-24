@@ -36,14 +36,26 @@ pub struct SyncProgress {
 /// Callback receiving progress snapshots (called from worker threads).
 pub type ProgressFn = Arc<dyn Fn(&SyncProgress) + Send + Sync>;
 
-/// Optional observers for a run: a progress callback and a cancel flag.
+/// Callback told about every step as soon as it finished (called from
+/// worker threads), for crash-recovery checkpoints.
+pub type StepFn = Arc<dyn Fn(&str, &CompletedStep) + Send + Sync>;
+
+/// Optional observers for a run: a progress callback, a cancel flag and a
+/// finished-step callback.
 #[derive(Default, Clone)]
 pub struct RunHooks {
     pub progress: Option<ProgressFn>,
     pub cancel: Option<Arc<AtomicBool>>,
+    pub on_step: Option<StepFn>,
 }
 
 impl RunHooks {
+    fn step_done(&self, entry: &SyncDiffEntry) {
+        if let Some(f) = &self.on_step {
+            f(&entry.relative_path, &CompletedStep::of(entry));
+        }
+    }
+
     fn cancelled(&self) -> bool {
         self.cancel
             .as_ref()
@@ -60,6 +72,10 @@ pub struct RunOutcome {
     pub snapshots: Vec<SyncSnapshot>,
     pub quarantined: Vec<QuarantineEntry>,
     pub pending_conflicts: Vec<SyncConflictItem>,
+    /// Two-way: the baseline to record for the next run. Only set when the
+    /// run finished every planned step without errors; otherwise the
+    /// previous baseline stays.
+    pub baseline: Option<SyncBaseline>,
 }
 
 /// Thread-safe progress counters shared by parallel copy workers.
@@ -116,12 +132,16 @@ pub struct ExecutorConfig {
     pub run_id: Uuid,
     /// Whether to continue on partial failure
     pub continue_on_error: bool,
-    /// Optional resume state (last completed index)
-    pub resume_from: Option<u64>,
+    /// Steps an interrupted earlier run finished: planned steps it covers
+    /// (same file, unchanged since) are skipped and the report says "resumed".
+    pub resume_from: Option<SyncCheckpoint>,
     /// Quarantine directory for quarantine policy
     pub quarantine_dir: Option<PathBuf>,
     /// Rollback directory for snapshots
     pub rollback_dir: Option<PathBuf>,
+    /// Two-way: the state after the last successful run (see
+    /// [`SyncBaseline`]). `None` = first run: combine both sides, delete nothing.
+    pub baseline: Option<SyncBaseline>,
 }
 
 /// Execute a sync run and return a report.
@@ -166,7 +186,8 @@ pub fn execute_sync_with(
     if let Some(cb) = &hooks.progress {
         cb(&planning);
     }
-    let preview = planner::compute_preview(pair)?;
+    let plan = planner::plan(pair, &planner::PlanContext { baseline: config.baseline.as_ref(), ..Default::default() })?;
+    let preview = &plan.preview;
 
     // Phase 2: Ensure destination exists
     let dest_root = Path::new(&pair.dest_path);
@@ -203,6 +224,10 @@ pub fn execute_sync_with(
     let mut error_messages: Vec<String> = Vec::new();
     let mut log_lines: Vec<String> = Vec::new();
     let resumed = config.resume_from.is_some();
+    // Steps the interrupted run already did are not repeated (a versioned
+    // backup would otherwise keep a second copy of each).
+    let already_done = |e: &SyncDiffEntry| config.resume_from.as_ref().is_some_and(|c| c.covers(e));
+    let mut resumed_skips: u64 = 0;
 
     // /E and /CREATE: build the directory tree first.
     for dir in &preview.dirs_to_create {
@@ -216,17 +241,17 @@ pub fn execute_sync_with(
 
     // Collect all planned operations into a flat list
     let mut operations: Vec<(&SyncDiffEntry, &str)> = Vec::new();
-    for entry in &preview.additions {
-        operations.push((entry, "add"));
+    for (entries, op) in [(&preview.additions, "add"), (&preview.modifications, "modify"), (&preview.deletions, "delete")] {
+        for entry in entries.iter() {
+            if already_done(entry) {
+                resumed_skips += 1;
+            } else {
+                operations.push((entry, op));
+            }
+        }
     }
-    for entry in &preview.modifications {
-        operations.push((entry, "modify"));
-    }
-    for entry in &preview.deletions {
-        operations.push((entry, "delete"));
-    }
-
-    let start_index = config.resume_from.unwrap_or(0) as usize;
+    files_skipped += resumed_skips;
+    let additions: Vec<&SyncDiffEntry> = operations.iter().filter(|(_, op)| *op == "add").map(|(e, _)| *e).collect();
     let tracker = Tracker {
         hooks,
         base: SyncProgress {
@@ -245,13 +270,11 @@ pub fn execute_sync_with(
     let mut outcomes: Vec<(usize, Result<OperationResult, AppError>)> = Vec::new();
 
     // /MT: new files need no rollback snapshot, so they copy in parallel.
-    // Resumed runs stay sequential to keep the resume index meaningful.
-    let parallel_adds =
-        if opts.threads > 1 && start_index == 0 && pair.mode != SyncMode::VersionedBackup {
-            preview.additions.len()
-        } else {
-            0
-        };
+    let parallel_adds = if opts.threads > 1 && pair.mode != SyncMode::VersionedBackup {
+        additions.len()
+    } else {
+        0
+    };
     if parallel_adds > 0 {
         use std::sync::atomic::AtomicUsize;
         let next = AtomicUsize::new(0);
@@ -272,9 +295,12 @@ pub fn execute_sync_with(
                         stop.store(true, Ordering::Relaxed);
                         break;
                     }
-                    let entry = &preview.additions[idx];
+                    let entry = additions[idx];
                     tracker.start_file(&entry.relative_path);
                     let r = copier::with_retries(opts, || add_file(pair, entry));
+                    if r.is_ok() {
+                        hooks.step_done(entry);
+                    }
                     tracker.finish_file(match &r {
                         Ok(OperationResult::Added(b)) => *b,
                         _ => 0,
@@ -301,7 +327,7 @@ pub fn execute_sync_with(
     // Phase 3: Execute operations
     if !halted && !stopped_for_hours && !was_cancelled {
         for (idx, (entry, op_type)) in operations.iter().enumerate() {
-            if idx < start_index.max(parallel_adds) {
+            if idx < parallel_adds {
                 continue;
             }
             if hooks.cancelled() {
@@ -328,6 +354,9 @@ pub fn execute_sync_with(
                 _ => 0,
             });
             let failed = result.is_err();
+            if !failed {
+                hooks.step_done(entry);
+            }
             outcomes.push((idx, result));
             if failed && !config.continue_on_error {
                 halted = true;
@@ -336,8 +365,19 @@ pub fn execute_sync_with(
         }
     }
 
+    // Two-way: what each finished step means for the next baseline.
+    let mut baseline_updates: Vec<(String, Option<BaselineEntry>)> = Vec::new();
     for (idx, result) in outcomes {
         let (entry, op_type) = operations[idx];
+        if pair.mode == SyncMode::TwoWay {
+            match &result {
+                Ok(OperationResult::Deleted) => baseline_updates.push((entry.relative_path.clone(), None)),
+                Ok(OperationResult::Added(_)) | Ok(OperationResult::Modified(_)) => {
+                    baseline_updates.push((entry.relative_path.clone(), observed_entry(pair, &entry.relative_path)))
+                }
+                _ => {}
+            }
+        }
         match result {
             Ok(op_result) => {
                 match op_result {
@@ -366,6 +406,7 @@ pub fn execute_sync_with(
                 // /MOV, /MOVE: the source copy goes once the destination has it.
                 if (opts.move_files || opts.move_dirs)
                     && (op_type == "add" || op_type == "modify")
+                    && entry.direction == SyncDirection::ToDest
                     && entry.source_size.is_some()
                 {
                     let src = Path::new(&pair.source_path).join(&entry.relative_path);
@@ -402,6 +443,7 @@ pub fn execute_sync_with(
     }
 
     // Handle conflicts from preview
+    let mut conflicts_halted = false;
     if !halted && !stopped_for_hours && !was_cancelled {
         for entry in &preview.conflicts {
             if hooks.cancelled() {
@@ -427,6 +469,9 @@ pub fn execute_sync_with(
                     OperationResult::ConflictResolved(bytes) => {
                         conflicts_resolved += 1;
                         bytes_transferred += bytes;
+                        if pair.mode == SyncMode::TwoWay {
+                            baseline_updates.push((entry.relative_path.clone(), observed_entry(pair, &entry.relative_path)));
+                        }
                     }
                     OperationResult::Skipped => {
                         files_skipped += 1;
@@ -437,6 +482,7 @@ pub fn execute_sync_with(
                     errors += 1;
                     error_messages.push(format!("Conflict {}: {}", entry.relative_path, e));
                     if !config.continue_on_error {
+                        conflicts_halted = true;
                         break;
                     }
                 }
@@ -554,8 +600,10 @@ pub fn execute_sync_with(
             planner::walk_directory_with(dest_root, opts)
         } else {
             // One-way / mirror: the destination now holds the selected source files.
-            planner::walk_directory_with(Path::new(&pair.source_path), opts).map(|v| {
-                v.into_iter().filter(|f| !f.is_dir && planner::matches_filter(&f.relative_path, f.size, &pair.filter)).collect()
+            let filter = crate::sync::filter::CompiledSyncFilter::new(&pair.filter);
+            planner::walk_directory_with(Path::new(&pair.source_path), opts).and_then(|v| {
+                let filter = filter?;
+                Ok(v.into_iter().filter(|f| !f.is_dir && filter.accepts(&f.relative_path, f.size)).collect())
             })
         };
         if let Err(e) = state.map_err(|e| std::io::Error::other(e.to_string())).and_then(|s| planner::save_inventory(dest_root, &s)) {
@@ -567,11 +615,38 @@ pub fn execute_sync_with(
         tracing::warn!("Could not write sync log for {}: {}", pair.name, e);
     }
 
+    // Two-way: record the new baseline only when every planned step ran
+    // cleanly. A failed, cancelled or paused run keeps the old one, so the
+    // next run re-derives anything this one left half done.
+    let baseline = (pair.mode == SyncMode::TwoWay
+        && report.status == SyncRunStatus::Success
+        && report.errors == 0
+        && !stopped_for_hours
+        && !was_cancelled
+        && !halted
+        && !conflicts_halted)
+        .then(|| {
+            let mut next = match &config.baseline {
+                Some(b) if b.matches(pair) => b.clone(),
+                _ => SyncBaseline::for_pair(pair),
+            };
+            for (path, entry) in plan.settled.iter().cloned().chain(baseline_updates) {
+                match entry {
+                    Some(e) => next.entries.insert(path, e),
+                    None => next.entries.remove(&path),
+                };
+            }
+            next.run_id = Some(config.run_id);
+            next.recorded_at = Some(Utc::now());
+            next
+        });
+
     Ok(RunOutcome {
         report,
         snapshots: rollback.snapshots,
         quarantined,
         pending_conflicts,
+        baseline,
     })
 }
 
@@ -639,8 +714,8 @@ fn add_file(pair: &SyncPair, entry: &SyncDiffEntry) -> Result<OperationResult, A
     let source_file = source_root.join(&entry.relative_path);
     let dest_file = dest_root.join(&entry.relative_path);
 
-    // For two-way sync, new files in dest get copied to source
-    if entry.reason.contains("two-way") && entry.source_size.is_none() {
+    // Two-way: files new in the destination are copied to the source.
+    if entry.direction == SyncDirection::ToSource {
         let bytes = copier::copy_file(&dest_file, &source_file, opts)?;
         return Ok(OperationResult::Added(bytes));
     }
@@ -671,6 +746,25 @@ fn execute_single_operation(
 
     match op_type {
         "add" => add_file(pair, entry),
+
+        "modify" if entry.direction == SyncDirection::ToSource => {
+            // Two-way: the destination changed; bring the source up to date.
+            rollback.snapshot_on(SyncSide::Source, &entry.relative_path, &source_file)?;
+            let bytes = copier::copy_file(&dest_file, &source_file, opts)?;
+            Ok(OperationResult::Modified(bytes))
+        }
+
+        "delete" if entry.direction == SyncDirection::ToSource => {
+            // Two-way: deleted in the destination since the last sync.
+            if source_file.exists() {
+                rollback.snapshot_on(SyncSide::Source, &entry.relative_path, &source_file)?;
+                fs::remove_file(&source_file).map_err(|e| AppError::Sync {
+                    message: format!("Delete failed {}: {}", entry.relative_path, e),
+                    advice: "Check permissions.".to_string(),
+                })?;
+            }
+            Ok(OperationResult::Deleted)
+        }
 
         "modify" => {
             // Take pre-destructive snapshot if destination exists
@@ -741,6 +835,7 @@ fn execute_conflict_resolution(
         quarantine_dir,
     )?;
 
+    let two_way = pair.mode == SyncMode::TwoWay;
     match result.action {
         ConflictAction::CopySource => {
             if dest_file.exists() {
@@ -749,7 +844,25 @@ fn execute_conflict_resolution(
             let bytes = copier::copy_file(&source_file, &dest_file, opts)?;
             Ok(OperationResult::ConflictResolved(bytes))
         }
+        // Two-way: the destination's version wins on both sides.
+        ConflictAction::KeepDest if two_way => {
+            rollback.snapshot_on(SyncSide::Source, &entry.relative_path, &source_file)?;
+            let bytes = copier::copy_file(&dest_file, &source_file, opts)?;
+            Ok(OperationResult::ConflictResolved(bytes))
+        }
         ConflictAction::KeepDest => Ok(OperationResult::Skipped),
+        // Two-way: keep both versions on both sides — the destination's at
+        // the original name, the source's as the conflict copy.
+        ConflictAction::CopyToConflictPath if two_way => {
+            let source_twin = |p: &Path| p.strip_prefix(dest_root).map(|rel| source_root.join(rel)).unwrap_or_else(|_| p.to_path_buf());
+            let conflict_dest = conflict::generate_conflict_path_with(&dest_file, |p| p.exists() || source_twin(p).exists());
+            let conflict_source = source_twin(&conflict_dest);
+            let mut bytes = copier::copy_file(&source_file, &conflict_dest, opts)?;
+            bytes += copier::copy_file(&source_file, &conflict_source, opts)?;
+            rollback.snapshot_on(SyncSide::Source, &entry.relative_path, &source_file)?;
+            bytes += copier::copy_file(&dest_file, &source_file, opts)?;
+            Ok(OperationResult::ConflictResolved(bytes))
+        }
         ConflictAction::CopyToConflictPath => {
             let bytes = copier::copy_file(&source_file, &result.resolved_path, opts)?;
             Ok(OperationResult::ConflictResolved(bytes))
@@ -823,6 +936,7 @@ pub fn apply_manual_resolution(
         dest_modified: item.dest_modified,
         reason: "Manual resolution".to_string(),
         path_length_warning: None,
+        direction: SyncDirection::ToDest,
     };
     let mut rollback =
         RollbackManager::new(run_id, pair.id, &rollback_dir.join(run_id.to_string()));
@@ -837,6 +951,23 @@ pub fn apply_manual_resolution(
         &mut pending,
     )?;
     Ok((rollback.snapshots, quarantined))
+}
+
+/// What both sides of `rel` look like now, as a baseline entry. `None` when
+/// either side cannot be read (the path is then left out of the baseline,
+/// so the next run compares it afresh).
+fn observed_entry(pair: &SyncPair, rel: &str) -> Option<BaselineEntry> {
+    let s = fs::metadata(Path::new(&pair.source_path).join(rel)).ok()?;
+    let d = fs::metadata(Path::new(&pair.dest_path).join(rel)).ok()?;
+    if !s.is_file() || !d.is_file() {
+        return None;
+    }
+    Some(BaselineEntry {
+        size: s.len(),
+        source_modified: s.modified().ok().map(chrono::DateTime::<Utc>::from),
+        dest_modified: d.modified().ok().map(chrono::DateTime::<Utc>::from),
+        hash: None,
+    })
 }
 
 /// Default name for kept versions: `file.txt` -> `file.v2.txt`.
@@ -939,9 +1070,10 @@ pub fn verify_sync(pair: &SyncPair, _report: &SyncReport) -> Result<Vec<String>,
 
     // Walk source and verify each file exists and matches at destination
     let source_files = planner::walk_directory(source_root)?;
+    let filter = crate::sync::filter::CompiledSyncFilter::new(&pair.filter)?;
 
     for file in source_files.iter().filter(|f| !f.is_dir) {
-        if !planner::matches_filter(&file.relative_path, file.size, &pair.filter) {
+        if !filter.accepts(&file.relative_path, file.size) {
             continue;
         }
 
@@ -1032,6 +1164,7 @@ pub fn compute_file_hash(path: &Path, alg: SyncHashAlgorithm) -> Result<String, 
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use crate::sync::rollback;
 
     fn make_test_pair(src: &Path, dst: &Path) -> SyncPair {
         SyncPair {
@@ -1070,6 +1203,7 @@ mod tests {
             resume_from: None,
             quarantine_dir: None,
             rollback_dir: None,
+            baseline: None,
         };
 
         let report = execute_sync(&config).unwrap();
@@ -1103,6 +1237,7 @@ mod tests {
             resume_from: None,
             quarantine_dir: None,
             rollback_dir: None,
+            baseline: None,
         };
 
         let report = execute_sync(&config).unwrap();
@@ -1131,6 +1266,7 @@ mod tests {
             resume_from: None,
             quarantine_dir: None,
             rollback_dir: None,
+            baseline: None,
         };
 
         let report = execute_sync(&config).unwrap();
@@ -1158,6 +1294,7 @@ mod tests {
             resume_from: None,
             quarantine_dir: None,
             rollback_dir: None,
+            baseline: None,
         };
 
         let report = execute_sync(&config).unwrap();
@@ -1186,6 +1323,7 @@ mod tests {
             resume_from: None,
             quarantine_dir: None,
             rollback_dir: None,
+            baseline: None,
         };
 
         let report = execute_sync(&config).unwrap();
@@ -1211,6 +1349,7 @@ mod tests {
             resume_from: None,
             quarantine_dir: None,
             rollback_dir: None,
+            baseline: None,
         };
 
         let report = execute_sync(&config).unwrap();
@@ -1233,6 +1372,7 @@ mod tests {
             resume_from: None,
             quarantine_dir: None,
             rollback_dir: None,
+            baseline: None,
         };
 
         let report = execute_sync(&config).unwrap();
@@ -1317,6 +1457,7 @@ mod tests {
             resume_from: None,
             quarantine_dir: None,
             rollback_dir: None,
+            baseline: None,
         })
         .unwrap()
     }
@@ -1631,6 +1772,7 @@ mod tests {
             resume_from: None,
             quarantine_dir: None,
             rollback_dir: None,
+            baseline: None,
         });
         assert!(err.is_err());
     }
@@ -1679,7 +1821,7 @@ mod tests {
     }
 
     fn cfg(pair: SyncPair) -> ExecutorConfig {
-        ExecutorConfig { pair, run_id: Uuid::new_v4(), continue_on_error: true, resume_from: None, quarantine_dir: None, rollback_dir: None }
+        ExecutorConfig { pair, run_id: Uuid::new_v4(), continue_on_error: true, resume_from: None, quarantine_dir: None, rollback_dir: None, baseline: None }
     }
 
     #[test]
@@ -1737,5 +1879,302 @@ mod tests {
         assert!(verify_sync(&pair, &r).unwrap().is_empty());
         fs::write(dst.path().join("a"), "dat4").unwrap();
         assert_eq!(verify_sync(&pair, &r).unwrap().len(), 1);
+    }
+
+    // ── Two-way baseline (three-way diff) ──
+
+    fn two_way(src: &Path, dst: &Path) -> SyncPair {
+        let mut pair = make_test_pair(src, dst);
+        pair.mode = SyncMode::TwoWay;
+        pair
+    }
+
+    /// One two-way run with `baseline`; returns the outcome. The caller keeps
+    /// the new baseline only when the run produced one — as the app does.
+    fn run_two_way(pair: &SyncPair, baseline: &mut Option<SyncBaseline>) -> RunOutcome {
+        let rollback = TempDir::new().unwrap().keep();
+        let outcome = execute_sync_with(
+            &ExecutorConfig { baseline: baseline.clone(), rollback_dir: Some(rollback), ..cfg(pair.clone()) },
+            &RunHooks::default(),
+        )
+        .unwrap();
+        if let Some(b) = &outcome.baseline {
+            *baseline = Some(b.clone());
+        }
+        outcome
+    }
+
+    #[test]
+    fn two_way_delete_on_source_is_propagated_not_resurrected() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("gone.txt"), "x").unwrap();
+        fs::write(src.path().join("keep.txt"), "k").unwrap();
+        let pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        assert_eq!(run_two_way(&pair, &mut base).report.files_added, 2);
+        assert_eq!(base.as_ref().unwrap().entries.len(), 2);
+
+        fs::remove_file(src.path().join("gone.txt")).unwrap();
+        let preview = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
+        assert_eq!(preview.total_deletions, 1);
+        assert_eq!(preview.deletions[0].direction, SyncDirection::ToDest);
+        assert_eq!(preview.total_additions, 0, "must not plan to copy it back");
+
+        let out = run_two_way(&pair, &mut base);
+        assert_eq!(out.report.files_deleted, 1);
+        assert!(!src.path().join("gone.txt").exists(), "deleted file came back to the source");
+        assert!(!dst.path().join("gone.txt").exists(), "deletion not propagated to the destination");
+        assert!(!base.as_ref().unwrap().entries.contains_key("gone.txt"));
+        // A third run is a no-op.
+        let again = run_two_way(&pair, &mut base);
+        assert_eq!(again.report.files_added + again.report.files_deleted + again.report.files_modified, 0);
+    }
+
+    #[test]
+    fn two_way_delete_and_edit_on_destination_flow_back_to_source() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "a").unwrap();
+        fs::write(src.path().join("b.txt"), "b").unwrap();
+        fs::write(src.path().join("c.txt"), "c").unwrap();
+        let pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+
+        fs::remove_file(dst.path().join("a.txt")).unwrap();
+        fs::write(dst.path().join("b.txt"), "b edited in the destination").unwrap();
+        let out = run_two_way(&pair, &mut base);
+        assert_eq!(out.report.files_deleted, 1);
+        assert_eq!(out.report.files_modified, 1);
+        assert!(!src.path().join("a.txt").exists());
+        assert_eq!(fs::read_to_string(src.path().join("b.txt")).unwrap(), "b edited in the destination");
+        // Source-side changes are snapshotted and can be rolled back.
+        assert!(out.snapshots.iter().all(|s| s.side == SyncSide::Source));
+        let restored = rollback::rollback_pair_run(&out.snapshots, src.path(), dst.path()).unwrap();
+        assert_eq!(restored, 2);
+        assert_eq!(fs::read_to_string(src.path().join("a.txt")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(src.path().join("b.txt")).unwrap(), "b");
+    }
+
+    #[test]
+    fn two_way_edit_on_both_sides_is_a_conflict() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("doc.txt"), "v1").unwrap();
+        let mut pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+
+        fs::write(src.path().join("doc.txt"), "edited in source").unwrap();
+        fs::write(dst.path().join("doc.txt"), "edited in destination!").unwrap();
+        let preview = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
+        assert_eq!(preview.total_conflicts, 1);
+        assert!(preview.conflicts[0].reason.contains("both"));
+        assert_eq!(preview.total_modifications, 0);
+
+        // Skip leaves it unresolved: no baseline entry advance, still a conflict next time.
+        pair.conflict_policy = SyncConflictPolicy::Skip;
+        run_two_way(&pair, &mut base);
+        let again = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
+        assert_eq!(again.total_conflicts, 1);
+
+        // Keep both: both sides end up with both versions.
+        pair.conflict_policy = SyncConflictPolicy::CreateConflictCopy;
+        let out = run_two_way(&pair, &mut base);
+        assert_eq!(out.report.conflicts_resolved, 1);
+        assert_eq!(fs::read_to_string(src.path().join("doc.txt")).unwrap(), "edited in destination!");
+        assert_eq!(fs::read_to_string(dst.path().join("doc.txt")).unwrap(), "edited in destination!");
+        let copies = |dir: &Path| {
+            fs::read_dir(dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("(conflict")).map(|e| fs::read_to_string(e.path()).unwrap()).collect::<Vec<_>>()
+        };
+        assert_eq!(copies(src.path()), vec!["edited in source".to_string()]);
+        assert_eq!(copies(dst.path()), vec!["edited in source".to_string()]);
+        // Converged: the next run has nothing to do.
+        let after = planner::plan(&pair, &planner::PlanContext { baseline: base.as_ref(), ..Default::default() }).unwrap().preview;
+        assert_eq!(after.total_conflicts + after.total_additions + after.total_modifications + after.total_deletions, 0);
+    }
+
+    #[test]
+    fn two_way_rename_is_a_delete_plus_add() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("old-name.txt"), "content").unwrap();
+        let pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+
+        fs::rename(src.path().join("old-name.txt"), src.path().join("new-name.txt")).unwrap();
+        let out = run_two_way(&pair, &mut base);
+        assert_eq!((out.report.files_added, out.report.files_deleted), (1, 1));
+        assert!(!dst.path().join("old-name.txt").exists());
+        assert!(!src.path().join("old-name.txt").exists());
+        assert_eq!(fs::read_to_string(dst.path().join("new-name.txt")).unwrap(), "content");
+    }
+
+    #[test]
+    fn two_way_first_run_never_deletes() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("only-in-source.txt"), "s").unwrap();
+        fs::write(dst.path().join("only-in-dest.txt"), "d").unwrap();
+        let pair = two_way(src.path(), dst.path());
+        let preview = planner::plan(&pair, &planner::PlanContext::default()).unwrap().preview;
+        assert_eq!(preview.total_deletions, 0);
+        assert_eq!(preview.total_additions, 2);
+        assert!(preview.notes.iter().any(|n| n.contains("First two-way run")));
+        let mut base = None;
+        let out = run_two_way(&pair, &mut base);
+        assert_eq!((out.report.files_added, out.report.files_deleted), (2, 0));
+        for dir in [src.path(), dst.path()] {
+            assert!(dir.join("only-in-source.txt").exists() && dir.join("only-in-dest.txt").exists());
+        }
+        assert_eq!(base.unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn two_way_failed_run_does_not_advance_the_baseline() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "a").unwrap();
+        let pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+        let before = base.clone();
+
+        // A new source file whose copy fails (a folder of that name is in the way).
+        fs::write(src.path().join("blocked"), "b").unwrap();
+        fs::create_dir(dst.path().join("blocked")).unwrap();
+        fs::write(src.path().join("new.txt"), "n").unwrap();
+        let out = run_two_way(&pair, &mut base);
+        assert!(out.report.errors > 0);
+        assert!(out.baseline.is_none(), "a run with errors must not record a baseline");
+        assert_eq!(base, before);
+        // Cancelled runs keep the old baseline too.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let out = execute_sync_with(&ExecutorConfig { baseline: base.clone(), ..cfg(pair.clone()) }, &RunHooks { cancel: Some(cancel), ..Default::default() }).unwrap();
+        assert_eq!(out.report.status, SyncRunStatus::Cancelled);
+        assert!(out.baseline.is_none());
+    }
+
+    #[test]
+    fn two_way_changed_after_delete_is_copied_back() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("f.txt"), "v1").unwrap();
+        let pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+        fs::remove_file(dst.path().join("f.txt")).unwrap();
+        fs::write(src.path().join("f.txt"), "v2, edited after the delete").unwrap();
+        let out = run_two_way(&pair, &mut base);
+        assert_eq!((out.report.files_added, out.report.files_deleted), (1, 0));
+        assert_eq!(fs::read_to_string(dst.path().join("f.txt")).unwrap(), "v2, edited after the delete");
+    }
+
+    #[test]
+    fn two_way_safety_stop_when_a_side_is_emptied() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        for i in 0..6 {
+            fs::write(src.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let mut pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+        // The destination is emptied (an unmounted share looks the same).
+        for i in 0..6 {
+            fs::remove_file(dst.path().join(format!("f{i}.txt"))).unwrap();
+        }
+        let err = execute_sync_with(&ExecutorConfig { baseline: base.clone(), ..cfg(pair.clone()) }, &RunHooks::default()).unwrap_err();
+        assert!(err.to_string().contains("Safety stop"), "{err}");
+        assert_eq!(fs::read_dir(src.path()).unwrap().count(), 6, "nothing deleted");
+        // A missing destination folder is refused as well.
+        let gone = TempDir::new().unwrap().path().join("not-mounted");
+        let moved = SyncPair { dest_path: gone.to_string_lossy().to_string(), ..pair.clone() };
+        let b = SyncBaseline { dest_root: moved.dest_path.clone(), ..base.clone().unwrap() };
+        assert!(planner::plan(&moved, &planner::PlanContext { baseline: Some(&b), ..Default::default() }).is_err());
+        // Deliberate: turning the limit off lets the deletions through.
+        pair.copy_options.two_way_max_delete_percent = 0;
+        let out = run_two_way(&pair, &mut base);
+        assert_eq!(out.report.files_deleted, 6);
+    }
+
+    #[test]
+    fn two_way_baseline_for_other_folders_is_ignored() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(dst.path().join("d.txt"), "d").unwrap();
+        let pair = two_way(src.path(), dst.path());
+        let mut stale = SyncBaseline { source_root: "/elsewhere".into(), dest_root: "/other".into(), ..Default::default() };
+        stale.entries.insert("d.txt".into(), BaselineEntry { size: 1, source_modified: None, dest_modified: None, hash: None });
+        let preview = planner::plan(&pair, &planner::PlanContext { baseline: Some(&stale), ..Default::default() }).unwrap().preview;
+        assert_eq!(preview.total_deletions, 0);
+        assert_eq!(preview.total_additions, 1);
+    }
+
+    #[test]
+    fn diff_trees_is_pure_and_cancellable() {
+        let file = |p: &str, size: u64| planner::FileMeta {
+            relative_path: p.into(),
+            absolute_path: PathBuf::from(p),
+            size,
+            modified: Some(Utc::now() - chrono::Duration::days(1)),
+            is_dir: false,
+            is_symlink: false,
+            hidden: false,
+            readonly: false,
+            attributes: 0,
+        };
+        let pair = SyncPair { source_path: "/nowhere/src".into(), dest_path: "/nowhere/dst".into(), ..SyncPair::default() };
+        let plan = planner::diff_trees(&pair, &[file("a", 1), file("b", 2)], &[file("b", 3)], &planner::PlanContext::default()).unwrap();
+        assert_eq!((plan.preview.total_additions, plan.preview.total_modifications), (1, 1));
+        let stop = AtomicBool::new(true);
+        assert!(planner::diff_trees(&pair, &[file("a", 1)], &[], &planner::PlanContext { cancel: Some(&stop), ..Default::default() }).is_err());
+    }
+
+    // ── Crash-recovery checkpoints ──
+
+    #[test]
+    fn resume_skips_steps_an_interrupted_run_finished() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "alpha").unwrap();
+        fs::write(src.path().join("b.txt"), "bravo").unwrap();
+        set_age_days(&src.path().join("a.txt"), 1);
+        set_age_days(&src.path().join("b.txt"), 1);
+        let mut pair = make_test_pair(src.path(), dst.path());
+        // Without kept timestamps every rerun would copy everything again.
+        pair.copy_options.copy_timestamps = false;
+        let steps = Arc::new(Mutex::new(SyncCheckpoint { pair_id: pair.id, ..Default::default() }));
+        let rec = steps.clone();
+        let hooks = RunHooks {
+            on_step: Some(Arc::new(move |path: &str, step: &CompletedStep| {
+                rec.lock().unwrap().completed.insert(path.to_string(), step.clone());
+            })),
+            ..Default::default()
+        };
+        let first = execute_sync_with(&cfg(pair.clone()), &hooks).unwrap();
+        assert_eq!(first.report.files_added, 2);
+        let mut checkpoint = steps.lock().unwrap().clone();
+        assert_eq!(checkpoint.completed.len(), 2);
+
+        // Pretend the run died after both copies; b.txt then changed.
+        fs::write(src.path().join("b.txt"), "bravo, edited after the crash").unwrap();
+        set_age_days(&src.path().join("b.txt"), 1);
+        let resumed = execute_sync_with(&ExecutorConfig { resume_from: Some(checkpoint.clone()), ..cfg(pair.clone()) }, &RunHooks::default()).unwrap().report;
+        assert!(resumed.resumed);
+        assert_eq!(resumed.files_modified, 1, "only the changed file is copied again");
+        assert_eq!(fs::read_to_string(dst.path().join("b.txt")).unwrap(), "bravo, edited after the crash");
+
+        // Without the checkpoint both files would be copied again.
+        let plain = run_with(pair.clone());
+        assert_eq!(plain.files_modified, 2);
+        assert!(!plain.resumed);
+        // Steps of another kind (a delete recorded for a file now to be copied) never match.
+        checkpoint.completed.get_mut("a.txt").unwrap().action = SyncAction::Delete;
+        let p = planner::compute_preview(&pair).unwrap();
+        let a = p.modifications.iter().find(|e| e.relative_path == "a.txt").unwrap();
+        assert!(!checkpoint.covers(a));
     }
 }

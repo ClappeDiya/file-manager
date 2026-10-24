@@ -50,6 +50,8 @@ export interface SyncFilter {
   max_size: number;
   file_types: string[];
   exclude_file_types: string[];
+  /** Ordered include/exclude rules, first match wins (decided before the lists above). */
+  rules?: import("@/stores/backup-store").FilterRule[];
 }
 
 export interface SyncPreview {

@@ -150,6 +150,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
 
     // Initialize sync manager (T-039..T-042)
     let sync_mgr = SyncManager::new();
+    sync_mgr.attach_repository(repo.clone());
     // Restore saved pairs and re-arm their triggers. Non-fatal, matching the
     // automation-rule load below: a corrupt row must not stop the app booting.
     // The in-memory fallback path deliberately does not do this — its DB is
@@ -437,6 +438,7 @@ pub fn run() {
                 let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), None);
                 let ai_assistant = AiAssistant::with_audit(repo.pool().clone());
                 let fallback_schedules = schedule_library::ScheduleLibrary::new(repo.pool().clone());
+                let fallback_repo = repo.clone();
                 AppState {
                     metadata_store: metadata_engine::MetadataStore::new(repo.clone()),
                     search_manager: search_engine::SearchManager::new(
@@ -450,7 +452,11 @@ pub fn run() {
                     connection_mgr,
                     transfer_history,
                     connector_registry: ConnectorRegistry::new(),
-                    sync_mgr: SyncManager::new(),
+                    sync_mgr: {
+                        let m = SyncManager::new();
+                        m.attach_repository(fallback_repo.clone());
+                        m
+                    },
                     peer_mgr: PeerManager::new(),
                     server_transfer_mgr: ServerTransferManager::new(),
                     ai_assistant,
@@ -842,6 +848,8 @@ pub fn run() {
             sync_commands::get_quarantine_entries,
             sync_commands::get_sync_reports,
             sync_commands::rollback_sync,
+            sync_commands::get_sync_baseline_info,
+            sync_commands::reset_sync_baseline,
             sync_commands::export_sync_report_csv,
             sync_commands::export_sync_report_json,
             sync_commands::start_sync_watcher,

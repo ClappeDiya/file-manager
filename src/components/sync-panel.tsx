@@ -18,6 +18,7 @@ import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import { SyncProgressCard } from "@/components/sync-progress-card";
 import { SyncComparison } from "@/components/sync-comparison";
+import { TwoWayHistory } from "@/components/sync-two-way-history";
 import {
   CopyPresetPicker,
   RobocopyCommandPreview,
@@ -64,6 +65,8 @@ interface SyncFilter {
   max_size: number;
   file_types: string[];
   exclude_file_types: string[];
+  /** Ordered include/exclude rules, first match wins (decided before the lists above). */
+  rules?: import("@/stores/backup-store").FilterRule[];
 }
 
 interface SyncPreview {
@@ -85,6 +88,8 @@ interface SyncPreview {
   total_bytes: number;
   dirs_to_create?: string[];
   dirs_to_remove?: string[];
+  /** How the plan was made (e.g. a first two-way run deletes nothing). */
+  notes?: string[];
 }
 
 interface SyncDiffEntry {
@@ -96,6 +101,8 @@ interface SyncDiffEntry {
   dest_modified: string | null;
   reason: string;
   path_length_warning: string | null;
+  /** Side the action writes to; two-way sync also writes to the source. */
+  direction?: "to_dest" | "to_source";
 }
 
 interface SyncReport {
@@ -657,6 +664,7 @@ function PairListView({
                 )}
               </div>
             </div>
+            {pair.mode === "two_way" && <TwoWayHistory pairId={pair.id} refreshKey={pair.last_run} />}
 
             <div className="flex gap-1 mt-2 flex-wrap">
               <button
@@ -1212,6 +1220,7 @@ export function PreviewView({
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
   const [tab, setTab] = useState<"summary" | "compare">("summary");
   const deleteCount = preview.total_deletions + (preview.dirs_to_remove?.length ?? 0);
+  const sourceDeletes = preview.deletions.filter((d) => d.direction === "to_source").length;
   const [deleteAck, setDeleteAck] = useState(false);
 
   const categories = [
@@ -1266,6 +1275,12 @@ export function PreviewView({
       <div className="text-xs text-zinc-500">
         Total: {formatBytes(preview.total_bytes)} to transfer
       </div>
+
+      {(preview.notes ?? []).map((note) => (
+        <p key={note} className="text-[11px] text-blue-700 dark:text-blue-300" data-testid="sync-preview-note">
+          {note}
+        </p>
+      ))}
 
       <div className="flex gap-1 text-xs" role="tablist" aria-label="Preview view">
         {(["summary", "compare"] as const).map((t) => (
@@ -1357,8 +1372,11 @@ export function PreviewView({
             className="mt-0.5"
           />
           <span>
-            I understand {deleteCount} item{deleteCount === 1 ? "" : "s"} will be deleted from the
-            destination. You can undo this with Rollback for 7 days.
+            I understand {deleteCount} item{deleteCount === 1 ? "" : "s"} will be deleted
+            {sourceDeletes > 0
+              ? ` (${sourceDeletes} from the source, ${deleteCount - sourceDeletes} from the destination)`
+              : " from the destination"}
+            . You can undo this with Rollback for 7 days.
           </span>
         </label>
       )}
