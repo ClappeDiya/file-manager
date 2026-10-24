@@ -396,4 +396,35 @@ describe("editing a saved mount", () => {
       "/home/u/Drives/bucket",
     );
   });
+
+  it("in Standard mode a saved drive letter shows and can be switched back to a folder", async () => {
+    const lettered: MountInfo = {
+      ...saved,
+      mount_point: "E:",
+      options: {
+        ...DEFAULT_MOUNT_OPTIONS,
+        ...saved.options,
+        drive_letter: "E",
+      },
+    };
+    await openForm("bucket", { editing: lettered });
+    // No folder field and no Advanced section: the letter is shown, with a way out.
+    expect(screen.queryByLabelText("Mount Point")).not.toBeInTheDocument();
+    expect(screen.getByTestId("mount-drive-letter-note")).toHaveTextContent(
+      "Drive E:",
+    );
+    fireEvent.click(screen.getByText("Use a folder instead"));
+    expect(screen.getByLabelText("Mount Point")).toHaveValue("");
+    fireEvent.change(screen.getByLabelText("Mount Point"), {
+      target: { value: "/home/u/Drives/bucket" },
+    });
+    fireEvent.click(screen.getByText("Save changes"));
+    await waitFor(() => expect(calls("update_mount_config")).toHaveLength(1));
+    const sent = calls("update_mount_config")[0] as {
+      mountPoint: string;
+      options: Record<string, unknown>;
+    };
+    expect(sent.mountPoint).toBe("/home/u/Drives/bucket");
+    expect(sent.options).not.toHaveProperty("drive_letter");
+  });
 });

@@ -198,6 +198,17 @@ fn rclone_only_set(o: &MountOptions) -> Vec<&'static str> {
     v
 }
 
+/// Stored options for a connection of `protocol`, without what that protocol cannot
+/// use. Rows saved before options were checked per protocol (the organization's cache
+/// limits were stored for native SMB/SFTP/WebDAV drives too) would otherwise be refused
+/// by `validate_on` and never mount again. Cloud (rclone) drives keep all their options.
+pub fn sanitize_for_protocol(o: &MountOptions, protocol: &str) -> MountOptions {
+    if matches!(protocol.to_ascii_lowercase().as_str(), "rclone" | "s3") {
+        return o.clone();
+    }
+    MountOptions { subfolder: o.subfolder.clone(), open_after_mount: o.open_after_mount, ..MountOptions::default() }
+}
+
 /// `"x"`, `"X:"` → `'X'`; `None` unless it is one letter from D to Z.
 pub fn parse_drive_letter(s: &str) -> Option<char> {
     let mut cs = s.trim().trim_end_matches(':').chars();
@@ -704,6 +715,28 @@ mod tests {
         let err = effective_on(&w, "rclone", Path::new("X:"), Some(&p), Os::Windows).unwrap_err();
         assert!(err.to_string().contains("drive letter can't be used"), "{err}");
         assert!(effective_on(&w, "rclone", Path::new("X:"), None, Os::Windows).is_ok());
+    }
+
+    #[test]
+    fn stored_options_lose_what_a_native_protocol_cannot_use() {
+        let old = MountOptions {
+            cache_mode: CacheMode::Full,
+            max_cache_mb: Some(2048),
+            max_cache_age_hours: Some(12),
+            read_only: true,
+            subfolder: Some("docs".into()),
+            open_after_mount: true,
+            extra_flags: vec!["--no-seek".into()],
+            ..Default::default()
+        };
+        for protocol in ["sftp", "smb", "webdav", "nfs"] {
+            let clean = sanitize_for_protocol(&old, protocol);
+            assert_eq!(clean, MountOptions { subfolder: Some("docs".into()), open_after_mount: true, ..Default::default() }, "{protocol}");
+            assert!(validate_on(&clean, protocol, Path::new("/mnt/x"), Os::Linux).is_ok(), "{protocol}");
+        }
+        // Cloud drives keep every option.
+        assert_eq!(sanitize_for_protocol(&old, "rclone"), old);
+        assert_eq!(sanitize_for_protocol(&old, "S3"), old);
     }
 
     #[test]

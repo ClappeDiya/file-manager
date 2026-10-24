@@ -239,6 +239,11 @@ export function MountsPanel() {
   const refreshTick = useMountsUi((s) => s.refreshTick);
   const openDialog = useMountsUi((s) => s.openDialog);
   const bump = useMountsUi((s) => s.bump);
+  // Inside the app the backend announces every change (MOUNTS_CHANGED_EVENT) and the
+  // listener below reloads; reloading here as well would fetch the list twice.
+  const reloadAfterAction = () => {
+    if (!isTauriAvailable()) bump();
+  };
 
   const load = useCallback(async () => {
     setMounts(await tauriInvokeSafe<MountInfo[]>("list_mounts", undefined, []));
@@ -277,8 +282,7 @@ export function MountsPanel() {
       setRowErrors((e) => ({ ...e, [m.id]: errorText(err) }));
     } finally {
       setBusyId(null);
-      // Reloads this list and any other open one.
-      bump();
+      reloadAfterAction();
     }
   };
 
@@ -319,8 +323,7 @@ export function MountsPanel() {
       setNote(errorText(err));
     } finally {
       setAllBusy(false);
-      // Reloads this list and any other open one.
-      bump();
+      reloadAfterAction();
     }
   };
 

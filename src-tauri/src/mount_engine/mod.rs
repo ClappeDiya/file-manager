@@ -455,6 +455,10 @@ impl MountManager {
         }
 
         let protocol_str = profile.protocol.as_str();
+        // A saved mount's options may predate the per-protocol checks (the organization's
+        // cache limits used to be stored for native drives too): drop what its protocol
+        // cannot use. New input (no `config_id`) is still refused by the checks below.
+        let options = if config_id.is_some() { policy::sanitize_for_protocol(&options, protocol_str) } else { options };
 
         // Check capability before attempting mount
         let capability = check_mount_capability(protocol_str);
@@ -906,8 +910,12 @@ impl MountManager {
     }
 
     /// The options saved for mount `id`.
-    pub async fn saved_options(&self, id: Uuid, repo: &Repository) -> Result<MountOptions, AppError> {
-        Ok(load_saved(repo, id).await?.options)
+    pub async fn saved_options(&self, id: Uuid, repo: &Repository, connection_mgr: &ConnectionManager) -> Result<MountOptions, AppError> {
+        let saved = load_saved(repo, id).await?;
+        Ok(match connection_mgr.get_connection(saved.connection_id).await? {
+            Some(profile) => policy::sanitize_for_protocol(&saved.options, profile.protocol.as_str()),
+            None => saved.options,
+        })
     }
 
     /// Change a saved mount (connection, mount point, auto-mount, options).
@@ -979,35 +987,37 @@ impl MountManager {
     }
 
     /// Mounts that were Mounted but are gone (rclone stopped, unmounted outside
-    /// the app) become errors instead of staying "mounted".
+    /// the app) become errors instead of staying "mounted". On Windows a drive
+    /// letter is checked at its root; a folder mount point cannot be told apart from
+    /// an ordinary folder there, so it is not noticed when it vanishes.
     async fn reconcile(&self, repo: &Repository) {
-        #[cfg(unix)]
-        {
-            let mounted: Vec<(Uuid, String)> =
-                self.mounts.read().await.values().filter(|m| m.status == MountStatus::Mounted).map(|m| (m.id, m.mount_point.clone())).collect();
-            if mounted.is_empty() {
-                return;
-            }
-            let gone: Vec<(Uuid, String)> = tokio::task::spawn_blocking(move || {
-                mounted.into_iter().filter(|(_, p)| !rclone_mount::is_mounted(std::path::Path::new(p))).collect()
-            })
+        let mounted: Vec<(Uuid, String, DateTime<Utc>)> = self
+            .mounts
+            .read()
             .await
-            .unwrap_or_default();
-            self.mark_gone(gone, repo).await;
+            .values()
+            .filter(|m| m.status == MountStatus::Mounted)
+            .map(|m| (m.id, m.mount_point.clone(), m.created_at))
+            .collect();
+        if mounted.is_empty() {
+            return;
         }
-        #[cfg(not(unix))]
-        let _ = repo;
+        let gone: Vec<(Uuid, String, DateTime<Utc>)> =
+            tokio::task::spawn_blocking(move || mounted.into_iter().filter(|(_, p, _)| !rclone_mount::is_mounted(std::path::Path::new(p))).collect())
+                .await
+                .unwrap_or_default();
+        self.mark_gone(gone, repo).await;
     }
 
-    /// Record that these mounts (id, mount point) stopped. Only an entry that is still
-    /// there and still Mounted is touched: one the user unmounted meanwhile stays
-    /// 'unmounted' instead of turning into an error.
-    #[cfg_attr(not(unix), allow(dead_code))]
-    async fn mark_gone(&self, gone: Vec<(Uuid, String)>, repo: &Repository) {
-        for (id, mount_point) in gone {
+    /// Record that these mounts (id, mount point, when that mount started) stopped. Only
+    /// the very mount that was looked at is touched: an entry the user unmounted
+    /// meanwhile stays 'unmounted', and one they unmounted and mounted again (same id,
+    /// newer start time) is left running instead of being killed.
+    async fn mark_gone(&self, gone: Vec<(Uuid, String, DateTime<Utc>)>, repo: &Repository) {
+        for (id, mount_point, started) in gone {
             let message = "The drive is no longer mounted (it was disconnected or unmounted outside UFOP)".to_string();
             let still_mounted = match self.mounts.write().await.get_mut(&id) {
-                Some(m) if m.status == MountStatus::Mounted => {
+                Some(m) if m.status == MountStatus::Mounted && m.created_at == started => {
                     m.status = MountStatus::Error;
                     m.error_message = Some(message.clone());
                     true
@@ -1535,7 +1545,7 @@ mod tests {
         assert!(mgr.mount_remote_with(profile.id, mp, asked.clone(), None, &repo, &conns).await.is_err());
         let info = mgr.list_mounts(&repo, &conns).await.unwrap().into_iter().next().unwrap();
         assert!(info.options.read_only && info.options.max_cache_mb == Some(32), "what is applied: {:?}", info.options);
-        assert_eq!(mgr.saved_options(info.id, &repo).await.unwrap(), asked, "what is saved");
+        assert_eq!(mgr.saved_options(info.id, &repo, &conns).await.unwrap(), asked, "what is saved");
     }
 
     /// Regression: a row left as 'mounted' by an app that exited (or crashed)
@@ -1599,7 +1609,7 @@ mod tests {
         let mgr = MountManager::new();
         let id = inject_mounted(&mgr, &repo, "Raced", "/mnt/raced").await;
         // reconcile's snapshot says the drive is gone ...
-        let stale = vec![(id, "/mnt/raced".to_string())];
+        let stale = vec![(id, "/mnt/raced".to_string(), started_at(&mgr, id).await)];
         // ... but the user unmounts it first (unmount_remote removes the entry and writes 'unmounted').
         mgr.unmount_remote(id, &repo).await.unwrap();
         let changes = mgr.subscribe();
@@ -1608,6 +1618,84 @@ mod tests {
         let info = mgr.list_mounts(&repo, &conns).await.unwrap().into_iter().find(|m| m.id == id).unwrap();
         assert_eq!(info.status, MountStatus::Unmounted, "{info:?}");
         assert!(info.error_message.is_none());
+    }
+
+    async fn started_at(mgr: &MountManager, id: Uuid) -> DateTime<Utc> {
+        mgr.mounts.read().await.get(&id).unwrap().created_at
+    }
+
+    /// Regression: reconcile looked at a mount, the user unmounted it and mounted the same
+    /// saved drive again; the late "no longer mounted" write killed the fresh mount.
+    #[tokio::test]
+    async fn a_drive_mounted_again_while_reconcile_looked_is_left_running() {
+        let (repo, _conns) = auto_mount_fixture().await;
+        let mgr = MountManager::new();
+        let id = inject_mounted(&mgr, &repo, "Raced", "/mnt/raced").await;
+        // reconcile's snapshot of the first mount says it is gone ...
+        let stale = vec![(id, "/mnt/raced".to_string(), started_at(&mgr, id).await)];
+        // ... but the user unmounted it and mounted it again (same id, a newer start).
+        mgr.mounts.write().await.get_mut(&id).unwrap().created_at = Utc::now() + chrono::Duration::seconds(5);
+        let changes = mgr.subscribe();
+        mgr.mark_gone(stale, &repo).await;
+        assert!(!changes.has_changed().unwrap(), "nothing changed, so nobody is told");
+        assert_eq!(mgr.get_mount_status(id).await, MountStatus::Mounted);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn insert_saved_native_row(repo: &crate::storage::Repository, connection_id: Uuid, mount_point: &str, options_json: &str, auto: bool) -> Uuid {
+        let id = Uuid::new_v4();
+        let (sid, cid, mp, json) = (id.to_string(), connection_id.to_string(), mount_point.to_string(), options_json.to_string());
+        repo.pool()
+            .execute(move |c| {
+                c.execute(INSERT_MOUNT_SQL, rusqlite::params![sid, cid, mp, "unmounted", Option::<String>::None, "2026-01-01T00:00:00Z", json])?;
+                c.execute("UPDATE mount_configs SET auto_mount = ?2 WHERE id = ?1", rusqlite::params![sid, auto])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Regression: before options were checked per protocol, the organization's cache limits
+    /// were stored with native SMB/SFTP/WebDAV mounts. The per-protocol check then refused
+    /// those saved rows ("applies to cloud (rclone) drives only"), so they never mounted again
+    /// (Mount in the list, the tray and auto-mount on startup).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn saved_native_mounts_with_old_cache_options_still_load_and_mount() {
+        use std::os::unix::fs::PermissionsExt;
+        let (repo, conns) = auto_mount_fixture().await;
+        let mut profile = rclone_profile("nas", "/share");
+        profile.protocol = crate::core::types::ConnectionProtocol::Sftp;
+        let profile = conns.save_connection(profile, None).await.unwrap();
+        let mgr = MountManager::new();
+        let old = r#"{"cache_mode":"full","max_cache_mb":2048,"max_cache_age_hours":12,"read_only":false}"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let mp = |n: &str| tmp.path().join(n).to_string_lossy().to_string();
+        let (listed, auto) = (mp("listed"), mp("auto"));
+        let id = insert_saved_native_row(&repo, profile.id, &listed, old, false).await;
+        let auto_id = insert_saved_native_row(&repo, profile.id, &auto, old, true).await;
+
+        // The stored options themselves are what the strict check refuses ...
+        let stored: MountOptions = serde_json::from_str(old).unwrap();
+        let strict = policy::validate_on(&stored, "sftp", std::path::Path::new(&listed), policy::Os::Linux).unwrap_err();
+        assert!(strict.to_string().contains("applies to cloud (rclone) drives only"), "{strict}");
+        // ... so the Edit dialog is given the row without them ...
+        assert_eq!(mgr.saved_options(id, &repo, &conns).await.unwrap(), MountOptions::default());
+
+        // ... and mounting works. A stand-in `sshfs` that succeeds takes the place of a server.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sshfs = bin.join("sshfs");
+        std::fs::write(&sshfs, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&sshfs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::set_var("PATH", std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path))).unwrap());
+
+        let r = mgr.mount_saved(id, &repo, &conns).await.expect("a saved native mount with old cache options mounts");
+        assert_eq!(r.status, MountStatus::Mounted);
+        assert_eq!(mgr.auto_mount_saved(&repo, &conns).await, (1, 0), "auto-mount mounts the other row");
+        assert_eq!(mgr.get_mount_status(auto_id).await, MountStatus::Mounted);
     }
 
     #[tokio::test]

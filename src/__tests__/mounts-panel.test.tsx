@@ -12,8 +12,15 @@ const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...a: unknown[]) => mockInvoke(...a),
 }));
+// The backend emits this after every change; the mock lets a test play the backend.
+let onMountsChanged: (() => void) | null = null;
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: async () => () => {},
+  listen: async (_event: string, handler: () => void) => {
+    onMountsChanged = handler;
+    return () => {
+      onMountsChanged = null;
+    };
+  },
   emit: async () => {},
 }));
 
@@ -49,6 +56,12 @@ const mk = (
   ...extra,
 });
 
+const MUTATING = [
+  "mount_saved_config",
+  "unmount_remote",
+  "delete_mount_config",
+  "unmount_all_mounts",
+];
 let mounts: ReturnType<typeof mk>[];
 
 beforeEach(() => {
@@ -71,7 +84,10 @@ beforeEach(() => {
       error_message: "rclone mount exited (exit status: 1)",
     }),
   ];
+  onMountsChanged = null;
   mockInvoke.mockReset().mockImplementation(async (cmd: string) => {
+    // Like the backend, announce a change once a mounting command has done its work.
+    if (MUTATING.includes(cmd)) queueMicrotask(() => onMountsChanged?.());
     if (cmd === "list_mounts") return mounts;
     if (cmd === "mount_cache_usage") return 0;
     if (cmd === "list_connections") return [];
@@ -203,6 +219,8 @@ describe("Mounts list", () => {
     await waitFor(() => expect(calls("list_mounts")).toHaveLength(2));
     await new Promise((r) => setTimeout(r, 50));
     expect(calls("list_mounts")).toHaveLength(2);
+    // The one reload came from the backend's event, not from the panel's own refresh.
+    expect(useMountsUi.getState().refreshTick).toBe(0);
   });
 
   it("unmounts and opens a mounted drive", async () => {

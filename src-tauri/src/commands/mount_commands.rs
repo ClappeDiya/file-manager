@@ -44,7 +44,7 @@ async fn open_mounted(mount_mgr: &MountManager, mount_id: Uuid) -> Result<(), Ap
 /// Mount a saved configuration; opens it afterwards when its options say so.
 /// Shared by the Mounts list and the tray.
 pub async fn mount_saved_and_open(mount_mgr: &MountManager, mount_id: Uuid, repo: &Repository, connection_mgr: &ConnectionManager) -> Result<MountResult, AppError> {
-    let wants_open = mount_mgr.saved_options(mount_id, repo).await.map(|o| o.open_after_mount).unwrap_or(false);
+    let wants_open = mount_mgr.saved_options(mount_id, repo, connection_mgr).await.map(|o| o.open_after_mount).unwrap_or(false);
     let result = mount_mgr.mount_saved(mount_id, repo, connection_mgr).await?;
     Ok(if wants_open { open_after_mount(mount_mgr, result).await } else { result })
 }
@@ -211,8 +211,13 @@ pub async fn update_mount_config(
 /// The options a saved mount was saved with (what the user chose, before the organization's
 /// limits). The Edit dialog starts from these, so saving does not turn forced values into choices.
 #[tauri::command]
-pub async fn saved_mount_options(mount_id: String, mount_mgr: State<'_, MountManager>, repo: State<'_, Repository>) -> Result<MountOptions, AppError> {
-    mount_mgr.saved_options(mount_uuid(&mount_id)?, &repo).await
+pub async fn saved_mount_options(
+    mount_id: String,
+    mount_mgr: State<'_, MountManager>,
+    repo: State<'_, Repository>,
+    connection_mgr: State<'_, ConnectionManager>,
+) -> Result<MountOptions, AppError> {
+    mount_mgr.saved_options(mount_uuid(&mount_id)?, &repo, &connection_mgr).await
 }
 
 /// Mount a saved mount again with its own settings.

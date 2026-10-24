@@ -1367,14 +1367,14 @@ pub async fn resolve_path(
 #[tauri::command]
 pub async fn open_file_with_default(path: String) -> Result<(), AppError> {
     // tokio's process, so waiting for the opener never blocks the async runtime.
-    let status = {
+    let status: std::io::Result<std::process::ExitStatus> = {
         #[cfg(target_os = "macos")]
         { tokio::process::Command::new("open").arg(&path).status().await }
         // Explorer opens the path itself: unlike `cmd /C start`, nothing in the name
         // (`&`, `^`, `%`) is interpreted by a shell. It reports exit code 1 even when
         // it worked, so only a failure to start it counts.
         #[cfg(target_os = "windows")]
-        { tokio::process::Command::new("explorer.exe").arg(&path).status().await.map(|_| std::os::windows::process::ExitStatusExt::from_raw(0)) }
+        { tokio::process::Command::new("explorer.exe").arg(&path).status().await.map(|_| <std::process::ExitStatus as std::os::windows::process::ExitStatusExt>::from_raw(0)) }
         #[cfg(target_os = "linux")]
         { tokio::process::Command::new("xdg-open").arg(&path).status().await }
     };

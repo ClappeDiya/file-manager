@@ -215,6 +215,27 @@ function MountForm({
 
       {capability && <CapabilityBadge capability={capability} />}
 
+      {usesDriveLetter && !advanced && (
+        // The drive-letter picker is an Advanced option; without it a saved drive letter
+        // could not be changed back to a folder.
+        <div data-testid="mount-drive-letter-note">
+          <span className="block text-xs font-medium mb-1">Mount Point</span>
+          <div className="flex items-center gap-2 text-sm">
+            <span>Drive {options.drive_letter?.toUpperCase()}:</span>
+            <button
+              type="button"
+              onClick={() => {
+                setOptions({ ...options, drive_letter: null });
+                setMountPoint("");
+              }}
+              className="text-xs px-2 py-1 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800"
+            >
+              Use a folder instead
+            </button>
+          </div>
+        </div>
+      )}
+
       {!usesDriveLetter && (
         <div>
           <label className="block text-xs font-medium mb-1" htmlFor="mount-point">Mount Point</label>
