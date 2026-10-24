@@ -145,7 +145,7 @@ describe("RcloneRemoteManager", () => {
     act(() => authListener?.({ payload: { name: "box", url: "http://127.0.0.1:53682/auth?state=x", opened: true } }));
     expect(await screen.findByText("Open the sign-in page")).toHaveAttribute("href", "http://127.0.0.1:53682/auth?state=x");
     const done = await screen.findByTestId("rclone-done");
-    expect(calls("rclone_config_oauth")).toEqual([{ name: "box", state: "*oauth-islocal,choose,,", params: {}, openBrowser: true }]);
+    expect(calls("rclone_config_oauth")).toEqual([{ name: "box", state: "*oauth-islocal,choose,,", params: {}, openBrowser: true, obscure: "obscure" }]);
     // The remote was created through a question: the done screen still says so and offers Add as connection.
     expect(done).toHaveTextContent("was created");
     fireEvent.click(within(done).getByText("Add as connection"));
@@ -162,7 +162,7 @@ describe("RcloneRemoteManager", () => {
     fireEvent.change(screen.getByLabelText("config_is_local"), { target: { value: "false" } });
     fireEvent.click(screen.getByText("Continue"));
     const done = await screen.findByTestId("rclone-done");
-    expect(calls("rclone_config_continue")).toEqual([{ name: "box", state: "*oauth-islocal,choose,,", result: "false", params: {} }]);
+    expect(calls("rclone_config_continue")).toEqual([{ name: "box", state: "*oauth-islocal,choose,,", result: "false", params: {}, obscure: "obscure" }]);
     expect(done).toHaveTextContent("was created");
     fireEvent.click(within(done).getByText("Add as connection"));
     expect(onAdd).toHaveBeenCalledWith("box:", "box");
@@ -198,6 +198,45 @@ describe("RcloneRemoteManager", () => {
     expect(done).toHaveTextContent("was created");
     fireEvent.click(within(done).getByText("Add as connection"));
     expect(onAdd).toHaveBeenCalledWith("box:", "box");
+  });
+
+  it("carries the create call's obscure mode through follow-up questions", async () => {
+    // A follow-up step re-sends the plain password: without the flag rclone
+    // may store a base64-looking one raw over the obscured value.
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "rclone_remote_create" && args?.remoteType === "crypt")
+        return Promise.resolve({ state: "*2fa", option: opt("config_2fa", { help: "Two-factor code", required: true }), error: "", result: "", done: false });
+      return Promise.resolve(backend(cmd, args));
+    });
+    render(<RcloneRemoteManager startInCreate initialType="crypt" />);
+    fireEvent.change(await screen.findByLabelText(/^Remote name/), { target: { value: "vault" } });
+    fireEvent.change(screen.getByLabelText(/^remote/), { target: { value: "al:vault" } });
+    fireEvent.change(screen.getByLabelText(/^password/), { target: { value: "abcdefghijklmnopqrstuvwxyz012345" } });
+    fireEvent.click(screen.getByText("Create remote"));
+    fireEvent.change(await screen.findByLabelText(/^config_2fa/), { target: { value: "123456" } });
+    fireEvent.click(screen.getByText("Continue"));
+    await screen.findByTestId("rclone-done");
+    expect(calls("rclone_config_continue")).toEqual([
+      { name: "vault", state: "*2fa", result: "123456", params: { remote: "al:vault", password: "abcdefghijklmnopqrstuvwxyz012345" }, obscure: "obscure" },
+    ]);
+  });
+
+  it("keeps an edit's already-obscured mode for the sign-in that follows", async () => {
+    useUIStore.setState({ appMode: "advanced" });
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "rclone_remote_update")
+        return Promise.resolve({ state: "*oauth-islocal,,", option: opt("config_is_local", { type: "bool", default: "true", exclusive: true }), error: "", result: "", done: false });
+      return Promise.resolve(backend(cmd, args));
+    });
+    render(<RcloneRemoteManager />);
+    fireEvent.click(within(await screen.findByTestId("rclone-remote-sec")).getByText("Edit"));
+    fireEvent.change(await screen.findByLabelText(/^password/), { target: { value: "x6xLnMK3obscured" } });
+    fireEvent.click(screen.getByText("New passwords are already obscured"));
+    fireEvent.click(screen.getByText("Save"));
+    fireEvent.click(await screen.findByText("Sign in with browser"));
+    await screen.findByTestId("rclone-done");
+    expect(calls("rclone_remote_update")).toEqual([{ name: "sec", params: { password: "x6xLnMK3obscured" }, obscure: "already_obscured" }]);
+    expect(calls("rclone_config_oauth")).toEqual([{ name: "sec", state: "*oauth-islocal,,", params: { password: "x6xLnMK3obscured" }, openBrowser: true, obscure: "already_obscured" }]);
   });
 
   it("does not offer Add as connection after editing a remote", async () => {

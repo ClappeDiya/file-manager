@@ -167,10 +167,11 @@ pub async fn rclone_remote_update(name: String, params: Option<BTreeMap<String, 
     config::update(&Rclone::current(), &name, &params.unwrap_or_default(), obscure.unwrap_or_default()).await
 }
 
-/// Answer the question of a configuration step.
+/// Answer the question of a configuration step. `params` and `obscure` are
+/// those of the create/update call that started the flow.
 #[tauri::command]
-pub async fn rclone_config_continue(name: String, state: String, result: String, params: Option<BTreeMap<String, String>>) -> Result<ConfigStep, AppError> {
-    config::continue_with(&Rclone::current(), &name, &state, &result, &params.unwrap_or_default()).await
+pub async fn rclone_config_continue(name: String, state: String, result: String, params: Option<BTreeMap<String, String>>, obscure: Option<ObscureMode>) -> Result<ConfigStep, AppError> {
+    config::continue_with(&Rclone::current(), &name, &state, &result, &params.unwrap_or_default(), obscure.unwrap_or_default()).await
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,7 +187,7 @@ pub struct AuthUrlEvent {
 /// also sent as an `rclone-auth-url` event; returns the next step once the
 /// browser returns (up to ten minutes; `rclone_config_cancel` stops it).
 #[tauri::command]
-pub async fn rclone_config_oauth(app: tauri::AppHandle, name: String, state: String, params: Option<BTreeMap<String, String>>, open_browser: Option<bool>) -> Result<ConfigStep, AppError> {
+pub async fn rclone_config_oauth(app: tauri::AppHandle, name: String, state: String, params: Option<BTreeMap<String, String>>, open_browser: Option<bool>, obscure: Option<ObscureMode>) -> Result<ConfigStep, AppError> {
     let open = open_browser.unwrap_or(true);
     let n = name.trim().trim_end_matches(':').to_string();
     let on_url = move |url: String| {
@@ -200,7 +201,7 @@ pub async fn rclone_config_oauth(app: tauri::AppHandle, name: String, state: Str
         };
         let _ = app.emit(AUTH_URL_EVENT, AuthUrlEvent { name: n.clone(), url, opened });
     };
-    config::oauth_sign_in(&Rclone::current(), &name, &state, &params.unwrap_or_default(), &on_url).await
+    config::oauth_sign_in(&Rclone::current(), &name, &state, &params.unwrap_or_default(), obscure.unwrap_or_default(), &on_url).await
 }
 
 /// Stop a browser sign-in started by `rclone_config_oauth`.

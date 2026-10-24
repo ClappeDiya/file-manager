@@ -205,9 +205,9 @@ async fn fetch(client: &reqwest::Client, url: &str, limit: usize) -> Result<Vec<
 /// release's `SHA256SUMS`, and install it into `dir`. A missing entry or a
 /// mismatching checksum installs nothing.
 pub async fn install_from(client: &reqwest::Client, base: &str, version: &str, os: &str, arch: &str, dir: &Path) -> Result<InstallResult, AppError> {
-    if super::resolver::Semver::parse(version).is_none() {
+    let Some(wanted) = super::resolver::Semver::parse(version) else {
         return Err(AppError::validation(format!("Invalid rclone version {version}")));
-    }
+    };
     let base = base.trim_end_matches('/');
     let archive = archive_name(version, os, arch);
     let sums_text = fetch(client, &format!("{base}/v{version}/SHA256SUMS"), 1024 * 1024).await?;
@@ -219,8 +219,24 @@ pub async fn install_from(client: &reqwest::Client, base: &str, version: &str, o
     verify_checksum(&archive, &zip, expected)?;
     let exe = if os == "windows" { "rclone.exe" } else { "rclone" };
     let bytes = extract_binary(&zip, exe)?;
+    // Run the new binary from a staging folder first: a mislabelled archive
+    // (another release inside) installs nothing and keeps the current copy.
+    let staging = dir.join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
+    let checked = async {
+        let staged = place_binary(&staging, &bytes)?;
+        let reported = super::resolver::Rclone::new(staged.to_string_lossy(), None).version().await?;
+        if reported.semver != wanted {
+            return Err(AppError::connection(
+                format!("The rclone {version} download reports {}; it was not installed", reported.raw),
+                "Install rclone yourself from https://rclone.org/downloads/ and set its path in Settings → rclone.",
+            ));
+        }
+        Ok(reported)
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&staging);
+    let reported = checked?;
     let path = place_binary(dir, &bytes)?;
-    let reported = super::resolver::Rclone::new(path.to_string_lossy(), None).version().await?;
     Ok(InstallResult { path: path.to_string_lossy().into_owned(), version: reported.raw, archive, sha256: expected.clone() })
 }
 
@@ -348,6 +364,19 @@ mod tests {
         assert_eq!((r.version.as_str(), r.archive.as_str()), ("v1.69.1", "rclone-v1.69.1-linux-amd64.zip"));
         assert_eq!(r.path, managed_binary(&dir).to_string_lossy());
         assert_eq!(r.sha256, sha256_hex(&zip));
+
+        // A mislabelled archive (its binary is another release) is refused
+        // and the installed copy stays as it was.
+        let wrong = release_zip(top, "rclone", b"#!/bin/sh\necho 'rclone v1.60.0'\n");
+        let sums = format!("{}  {top}.zip\n", sha256_hex(&wrong));
+        let base2 = mirror(vec![("/v1.69.1/SHA256SUMS".into(), sums.into_bytes()), (format!("/v1.69.1/{top}.zip"), wrong)]).await;
+        let e = install_from(&client, &base2, "1.69.1", "linux", "amd64", &dir).await.unwrap_err().user_message();
+        assert!(e.contains("reports v1.60.0") && e.contains("1.69.1"), "{e}");
+        assert_eq!(std::fs::read(managed_binary(&dir)).unwrap(), b"#!/bin/sh\necho 'rclone v1.69.1'\n");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no staging files left behind");
+        let fresh = d.path().join("fresh");
+        assert!(install_from(&client, &base2, "1.69.1", "linux", "amd64", &fresh).await.is_err());
+        assert!(!managed_binary(&fresh).exists(), "nothing installed on a version mismatch");
 
         // Tampered archive: refused, the installed copy is untouched.
         let mut bad = zip.clone();

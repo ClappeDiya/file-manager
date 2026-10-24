@@ -50,7 +50,17 @@ type Mode =
   | { kind: "list" }
   | { kind: "create"; type: string | null }
   | { kind: "edit"; name: string }
-  | { kind: "question"; name: string; type: string; step: RcloneConfigStep; params: Record<string, string>; created: boolean; manual: boolean }
+  | {
+      kind: "question";
+      name: string;
+      type: string;
+      step: RcloneConfigStep;
+      /** The create/update call's params and obscure mode, re-sent with every answer. */
+      params: Record<string, string>;
+      obscure: RcloneObscureMode;
+      created: boolean;
+      manual: boolean;
+    }
   | { kind: "signing-in"; name: string; type: string; url: string | null }
   | { kind: "done"; name: string; type: string; created: boolean };
 
@@ -129,15 +139,17 @@ export function RcloneRemoteManager({
    * is carried through every follow-up question, so the done screen still
    * says "created" and offers Add as connection); `first` = this is the
    * reply to the create call itself, the moment the remote appears in
-   * rclone.conf.
+   * rclone.conf. `params`/`obscure` are the create/update call's: follow-up
+   * steps re-send the params, so they must keep its obscure mode (rclone
+   * would otherwise guess, storing a base64-looking password raw).
    */
   const handleStep = useCallback(
-    (name: string, type: string, step: RcloneConfigStep, params: Record<string, string>, created: boolean, first = false) => {
+    (name: string, type: string, step: RcloneConfigStep, params: Record<string, string>, obscure: RcloneObscureMode, created: boolean, first = false) => {
       if (step.done) {
         setMode({ kind: "done", name, type, created });
         changed();
       } else {
-        setMode({ kind: "question", name, type, step, params, created, manual: false });
+        setMode({ kind: "question", name, type, step, params, obscure, created, manual: false });
         if (first) changed();
       }
     },
@@ -239,7 +251,7 @@ export function RcloneRemoteManager({
           onCreate={(name, provider, params, obscure) =>
             run(async () => {
               const step = await createRcloneRemote(name, provider.name, params, obscure);
-              handleStep(name, provider.name, step, params, true, true);
+              handleStep(name, provider.name, step, params, obscure, true, true);
             })
           }
         />
@@ -255,7 +267,7 @@ export function RcloneRemoteManager({
           onSave={(params, obscure) =>
             run(async () => {
               const step = await updateRcloneRemote(mode.name, params, obscure);
-              handleStep(mode.name, typeOf(mode.name), step, params, false);
+              handleStep(mode.name, typeOf(mode.name), step, params, obscure, false);
             })
           }
         />
@@ -268,8 +280,8 @@ export function RcloneRemoteManager({
           onManual={() => setMode({ ...mode, manual: true })}
           onAnswer={(answer) =>
             run(async () => {
-              const step = await continueRcloneConfig(mode.name, mode.step.state, answer, mode.params);
-              handleStep(mode.name, mode.type, step, mode.params, mode.created);
+              const step = await continueRcloneConfig(mode.name, mode.step.state, answer, mode.params, mode.obscure);
+              handleStep(mode.name, mode.type, step, mode.params, mode.obscure, mode.created);
             })
           }
           onSignIn={() =>
@@ -277,8 +289,8 @@ export function RcloneRemoteManager({
               setError(null);
               setMode({ kind: "signing-in", name: mode.name, type: mode.type, url: null });
               try {
-                const step = await signInRcloneRemote(mode.name, mode.step.state, mode.params);
-                handleStep(mode.name, mode.type, step, mode.params, mode.created);
+                const step = await signInRcloneRemote(mode.name, mode.step.state, mode.params, mode.obscure);
+                handleStep(mode.name, mode.type, step, mode.params, mode.obscure, mode.created);
               } catch (e) {
                 setError(errorText(e));
                 setMode(mode);

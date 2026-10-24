@@ -21,6 +21,7 @@ use super::resolver::Rclone;
 use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
@@ -158,10 +159,16 @@ const SENSITIVE_NAMES: &[&str] = &[
     "key_pem",
     "link_password",
     "authorization",
+    // Obscured passwords: `rclone reveal` turns them back into plain text.
+    "pass",
+    "user_pass",
+    "key_file_pass",
+    "secret",
+    "library_key",
 ];
 
 pub fn is_sensitive_name(name: &str) -> bool {
-    SENSITIVE_NAMES.contains(&name) || name.ends_with("_secret") || name.ends_with("_token") || name.contains("password")
+    SENSITIVE_NAMES.contains(&name) || name.ends_with("_secret") || name.ends_with("_token") || name.ends_with("_pass") || name.contains("password")
 }
 
 const HIDE_CONFIGURATOR: u32 = 4;
@@ -360,7 +367,10 @@ pub async fn update(rc: &Rclone, name: &str, params: &BTreeMap<String, String>, 
     parse_step(&rc.run(&args, QUICK).await?)
 }
 
-fn continue_args(name: &str, state: &str, result: &str, params: &BTreeMap<String, String>) -> Result<Vec<String>, AppError> {
+/// `obscure` must be the create/update call's mode: the params (plain
+/// secrets included) are written again, and without the flag rclone
+/// guesses, storing a base64-looking password raw.
+fn continue_args(name: &str, state: &str, result: &str, params: &BTreeMap<String, String>, obscure: ObscureMode) -> Result<Vec<String>, AppError> {
     if result.contains(['\n', '\r']) && !result.trim_start().starts_with('{') {
         return Err(AppError::validation("The answer must be on one line"));
     }
@@ -368,13 +378,15 @@ fn continue_args(name: &str, state: &str, result: &str, params: &BTreeMap<String
     args.extend(param_args(params)?);
     // `--flag=value` so an answer starting with "-" is never read as a flag.
     args.extend(["--continue".into(), "--non-interactive".into(), format!("--state={state}"), format!("--result={result}")]);
+    args.extend(obscure.flag().map(String::from));
     Ok(args)
 }
 
-/// Answer the question of a step (`result`) and get the next one.
-pub async fn continue_with(rc: &Rclone, name: &str, state: &str, result: &str, params: &BTreeMap<String, String>) -> Result<ConfigStep, AppError> {
+/// Answer the question of a step (`result`) and get the next one; `params`
+/// and `obscure` are those of the create/update call that started it.
+pub async fn continue_with(rc: &Rclone, name: &str, state: &str, result: &str, params: &BTreeMap<String, String>, obscure: ObscureMode) -> Result<ConfigStep, AppError> {
     let name = existing(rc, name).await?;
-    parse_step(&rc.run(&continue_args(&name, state, result, params)?, QUICK).await?)
+    parse_step(&rc.run(&continue_args(&name, state, result, params, obscure)?, QUICK).await?)
 }
 
 /// The remote's name if it is configured.
@@ -472,16 +484,38 @@ pub async fn test_remote(rc: &Rclone, name: &str) -> Result<RemoteTest, AppError
 
 // ── OAuth sign-in ──
 
-/// Sign-ins in progress, by remote name (for cancelling).
-fn flows() -> &'static Mutex<HashMap<String, CancellationToken>> {
-    static F: OnceLock<Mutex<HashMap<String, CancellationToken>>> = OnceLock::new();
+/// Sign-ins in progress, by remote name (for cancelling): the flow's id
+/// and its cancel token.
+fn flows() -> &'static Mutex<HashMap<String, (u64, CancellationToken)>> {
+    static F: OnceLock<Mutex<HashMap<String, (u64, CancellationToken)>>> = OnceLock::new();
     F.get_or_init(Default::default)
+}
+
+/// Track a new sign-in for `name`, stopping one already running for it (a
+/// single remote has one sign-in; the old one also holds rclone's callback
+/// port). Untracked when the returned guard drops, unless superseded.
+fn track_sign_in(name: &str, token: CancellationToken) -> impl Drop {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    if let Some((_, old)) = flows().lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), (id, token)) {
+        old.cancel();
+    }
+    struct Tracked(String, u64);
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            let mut f = flows().lock().unwrap_or_else(|e| e.into_inner());
+            if f.get(&self.0).is_some_and(|(id, _)| *id == self.1) {
+                f.remove(&self.0);
+            }
+        }
+    }
+    Tracked(name.to_string(), id)
 }
 
 /// Stop the sign-in of `name`; true if one was running.
 pub fn cancel_sign_in(name: &str) -> bool {
     let name = name.trim().trim_end_matches(':');
-    flows().lock().unwrap_or_else(|e| e.into_inner()).remove(name).map(|t| t.cancel()).is_some()
+    flows().lock().unwrap_or_else(|e| e.into_inner()).remove(name).map(|(_, t)| t.cancel()).is_some()
 }
 
 /// Whether a step asks rclone's "Use auto config?" OAuth question.
@@ -567,24 +601,17 @@ pub async fn authorize(rc: &Rclone, args: &[String], cancel: CancellationToken, 
 /// through the browser: answer "headless", run the `rclone authorize`
 /// command rclone asks for, then hand rclone the token. Returns the next
 /// step (usually done, or the backend's next question).
-pub async fn oauth_sign_in(rc: &Rclone, name: &str, state: &str, params: &BTreeMap<String, String>, on_url: &(dyn Fn(String) + Send + Sync)) -> Result<ConfigStep, AppError> {
+pub async fn oauth_sign_in(rc: &Rclone, name: &str, state: &str, params: &BTreeMap<String, String>, obscure: ObscureMode, on_url: &(dyn Fn(String) + Send + Sync)) -> Result<ConfigStep, AppError> {
     let name = existing(rc, name).await?;
     let token = CancellationToken::new();
-    flows().lock().unwrap_or_else(|e| e.into_inner()).insert(name.clone(), token.clone());
-    struct Done(String);
-    impl Drop for Done {
-        fn drop(&mut self) {
-            flows().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
-        }
-    }
-    let _done = Done(name.clone());
-    let headless = parse_step(&rc.run(&continue_args(&name, state, "false", params)?, QUICK).await?)?;
+    let _tracked = track_sign_in(&name, token.clone());
+    let headless = parse_step(&rc.run(&continue_args(&name, state, "false", params, obscure)?, QUICK).await?)?;
     let help = headless.option.as_ref().filter(|o| o.name == "config_token").map(|o| o.help.clone()).ok_or_else(|| {
         AppError::connection("rclone did not ask for a sign-in token", "Answer the questions manually (choose \"No\" for auto config and paste a token from `rclone authorize`).")
     })?;
     let args = authorize_args(&help).ok_or_else(|| AppError::connection("rclone did not name the authorize command", "Update rclone."))?;
     let tok = authorize(rc, &args, token, SIGN_IN_TIMEOUT, on_url).await?;
-    parse_step(&rc.run(&continue_args(&name, &headless.state, &tok, params)?, QUICK).await?)
+    parse_step(&rc.run(&continue_args(&name, &headless.state, &tok, params, obscure)?, QUICK).await?)
 }
 
 #[cfg(test)]
@@ -673,8 +700,13 @@ mod tests {
         assert_eq!(param_args(&params(&[("remote", "/a=b"), ("password", "-p w")])).unwrap(), vec!["password=-p w", "remote=/a=b"]);
         assert!(param_args(&params(&[("--config", "x")])).is_err());
         assert!(param_args(&params(&[("a", "line\nbreak")])).is_err());
-        let a = continue_args("gd", "*oauth,x", "-weird", &params(&[("scope", "drive")])).unwrap();
+        let a = continue_args("gd", "*oauth,x", "-weird", &params(&[("scope", "drive")]), ObscureMode::Auto).unwrap();
         assert_eq!(a, vec!["config", "update", "gd", "scope=drive", "--continue", "--non-interactive", "--state=*oauth,x", "--result=-weird"]);
+        // Follow-up steps carry the create/update call's obscure mode.
+        let a = continue_args("sec", "st", "", &params(&[("password", "pw")]), ObscureMode::Obscure).unwrap();
+        assert_eq!(a, vec!["config", "update", "sec", "password=pw", "--continue", "--non-interactive", "--state=st", "--result=", "--obscure"]);
+        let a = continue_args("sec", "st", "", &params(&[("password", "x6xL")]), ObscureMode::AlreadyObscured).unwrap();
+        assert_eq!(a.last().map(String::as_str), Some("--no-obscure"));
         assert_eq!(ObscureMode::Obscure.flag(), Some("--obscure"));
         assert_eq!(ObscureMode::AlreadyObscured.flag(), Some("--no-obscure"));
     }
@@ -692,6 +724,11 @@ mod tests {
         let s: BTreeMap<String, String> = [("type", "drive"), ("token", "{\"access_token\":\"x\"}"), ("client_id", "id")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
         let d = redact("gd", &s, None);
         assert_eq!((d.secrets_set.clone(), d.values.keys().cloned().collect::<Vec<_>>()), (vec!["token".to_string()], vec!["client_id".to_string()]));
+        // …including the obscured `pass` of sftp/ftp/webdav/smb (reversible with `rclone reveal`).
+        let s: BTreeMap<String, String> = [("type", "sftp"), ("host", "h"), ("user", "u"), ("pass", "x6xLnMK3"), ("key_file_pass", "abc")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        let d = redact("box", &s, None);
+        assert_eq!(d.secrets_set, vec!["key_file_pass", "pass"]);
+        assert_eq!(d.values.keys().cloned().collect::<Vec<_>>(), vec!["host", "user"]);
     }
 
     #[test]
@@ -739,7 +776,7 @@ esac
         let rc = Rclone::new(fake.to_string_lossy(), Some("/tmp/x.conf".into()));
         let urls = Arc::new(Mutex::new(Vec::new()));
         let u2 = urls.clone();
-        let step = oauth_sign_in(&rc, "gd", "*oauth-islocal,teamdrive,,", &params(&[("scope", "drive")]), &move |u| u2.lock().unwrap().push(u)).await.unwrap();
+        let step = oauth_sign_in(&rc, "gd", "*oauth-islocal,teamdrive,,", &params(&[("scope", "drive")]), ObscureMode::Auto, &move |u| u2.lock().unwrap().push(u)).await.unwrap();
         assert!(step.done, "{step:?}");
         assert_eq!(*urls.lock().unwrap(), vec!["http://127.0.0.1:53682/auth?state=XYZ".to_string()]);
         let calls = std::fs::read_to_string(&log).unwrap();
@@ -749,7 +786,7 @@ esac
 
         // A cancelled sign-in stops authorize and reports it.
         let rc2 = rc.clone();
-        let task = tokio::spawn(async move { oauth_sign_in(&rc2, "gd", "*oauth-islocal,teamdrive,,", &BTreeMap::new(), &|_| {}).await });
+        let task = tokio::spawn(async move { oauth_sign_in(&rc2, "gd", "*oauth-islocal,teamdrive,,", &BTreeMap::new(), ObscureMode::Auto, &|_| {}).await });
         for _ in 0..100 {
             if cancel_sign_in("gd") {
                 break;
@@ -758,6 +795,46 @@ esac
         }
         let e = task.await.unwrap().unwrap_err().user_message();
         assert!(e.contains("cancelled"), "{e}");
+    }
+
+    /// A second sign-in for the same remote supersedes the first (which
+    /// stops, freeing rclone's callback port); the first one finishing must
+    /// not forget the second, so Cancel still reaches it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn second_sign_in_for_a_name_stays_cancellable() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let fake = d.path().join("rclone");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+case "$*" in
+  *listremotes*) echo "gd2: drive" ;;
+  *"--result=false"*) printf '%s\n' '{"State":"*oauth-authorize,,,","Option":{"Name":"config_token","Help":"\trclone authorize \"drive\"","Required":true,"Type":"string"},"Error":"","Result":""}' ;;
+  *" authorize "*) echo "NOTICE: Please go to the following link: http://127.0.0.1:53682/auth?state=S" >&2; exec sleep 30 ;;
+  *) exit 2 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rc = Rclone::new(fake.to_string_lossy(), Some("/tmp/x.conf".into()));
+        let start = |seen: Arc<tokio::sync::Notify>| {
+            let rc = rc.clone();
+            tokio::spawn(async move { oauth_sign_in(&rc, "gd2", "*oauth-islocal,,,", &BTreeMap::new(), ObscureMode::Auto, &move |_| seen.notify_one()).await })
+        };
+        let (seen_a, seen_b) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        let a = start(seen_a.clone());
+        tokio::time::timeout(Duration::from_secs(10), seen_a.notified()).await.unwrap();
+        let b = start(seen_b.clone());
+        tokio::time::timeout(Duration::from_secs(10), seen_b.notified()).await.unwrap();
+        let ea = tokio::time::timeout(Duration::from_secs(5), a).await.expect("the first sign-in is superseded").unwrap().unwrap_err().user_message();
+        assert!(ea.contains("cancelled"), "{ea}");
+        assert!(cancel_sign_in("gd2"), "the second sign-in is still tracked");
+        let eb = tokio::time::timeout(Duration::from_secs(5), b).await.unwrap().unwrap().unwrap_err().user_message();
+        assert!(eb.contains("cancelled"), "{eb}");
+        assert!(!cancel_sign_in("gd2"));
     }
 
     /// Real rclone `authorize`: the link is captured from its output and the
@@ -783,6 +860,28 @@ esac
             // The local callback port is busy on this machine: rclone fails fast instead.
             None => assert!(r.is_err()),
         }
+    }
+
+    /// Follow-up steps re-send the original params (plain secrets included):
+    /// they must keep the create call's obscure mode, or rclone stores a
+    /// base64-looking password (≥ 22 chars) raw over the obscured value.
+    #[tokio::test]
+    async fn follow_up_steps_keep_passwords_obscured_with_real_rclone() {
+        let Some((d, rc)) = temp_rclone() else { return };
+        let pw = "abcdefghijklmnopqrstuvwxyz012345";
+        let p = params(&[("remote", d.path().join("x").to_str().unwrap()), ("password", pw)]);
+        assert!(create(&rc, "sec", "crypt", &p, ObscureMode::Obscure).await.unwrap().done);
+        let stored = || {
+            let conf = std::fs::read_to_string(rc.config.as_ref().unwrap()).unwrap();
+            conf.lines().find_map(|l| l.strip_prefix("password = ")).unwrap().to_string()
+        };
+        assert_ne!(stored(), pw);
+        let s = continue_with(&rc, "sec", "", "", &p, ObscureMode::Obscure).await.unwrap();
+        assert!(s.done, "{s:?}");
+        let v = stored();
+        assert_ne!(v, pw, "password stored in plain text by the follow-up step");
+        let revealed = rc.run(&["reveal".into(), v], QUICK).await.unwrap();
+        assert_eq!(revealed.trim(), pw);
     }
 
     /// Create / update / list / details / test / delete with the real rclone
@@ -840,7 +939,7 @@ esac
         let s = create(&rc, "gp", "google photos", &BTreeMap::new(), ObscureMode::Auto).await.unwrap();
         assert!(is_oauth_question(&s), "{s:?}");
         // Answering "headless" gets the token question naming `rclone authorize`.
-        let s = continue_with(&rc, "gp", &s.state, "false", &BTreeMap::new()).await.unwrap();
+        let s = continue_with(&rc, "gp", &s.state, "false", &BTreeMap::new(), ObscureMode::Auto).await.unwrap();
         assert_eq!(s.option.as_ref().map(|o| o.name.as_str()), Some("config_token"));
         assert_eq!(authorize_args(&s.option.unwrap().help).unwrap(), vec!["google photos"]);
     }

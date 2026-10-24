@@ -165,10 +165,11 @@ export const createRcloneRemote = (name: string, remoteType: string, params: Rec
   tauriInvoke<RcloneConfigStep>("rclone_remote_create", { name, remoteType, params, obscure });
 export const updateRcloneRemote = (name: string, params: Record<string, string>, obscure: RcloneObscureMode) =>
   tauriInvoke<RcloneConfigStep>("rclone_remote_update", { name, params, obscure });
-export const continueRcloneConfig = (name: string, state: string, result: string, params: Record<string, string>) =>
-  tauriInvoke<RcloneConfigStep>("rclone_config_continue", { name, state, result, params });
-export const signInRcloneRemote = (name: string, state: string, params: Record<string, string>) =>
-  tauriInvoke<RcloneConfigStep>("rclone_config_oauth", { name, state, params, openBrowser: true });
+/** `params` and `obscure` are those of the create/update call that started the flow. */
+export const continueRcloneConfig = (name: string, state: string, result: string, params: Record<string, string>, obscure: RcloneObscureMode) =>
+  tauriInvoke<RcloneConfigStep>("rclone_config_continue", { name, state, result, params, obscure });
+export const signInRcloneRemote = (name: string, state: string, params: Record<string, string>, obscure: RcloneObscureMode) =>
+  tauriInvoke<RcloneConfigStep>("rclone_config_oauth", { name, state, params, openBrowser: true, obscure });
 export const cancelRcloneSignIn = (name: string) => tauriInvoke<boolean>("rclone_config_cancel", { name }, false);
 export const deleteRcloneRemote = (name: string) => tauriInvoke<void>("rclone_remote_delete", { name });
 export const testRcloneRemote = (name: string) => tauriInvoke<RcloneRemoteTest>("rclone_remote_test", { name });

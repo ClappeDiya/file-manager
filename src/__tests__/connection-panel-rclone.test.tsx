@@ -104,6 +104,25 @@ describe("ConnectionPanel × rclone", () => {
     expect(screen.getByText(":local:/data/vault")).toBeTruthy();
   });
 
+  it("Advanced: sharing a file on the underlying remote sends no connection id", async () => {
+    useUIStore.setState({ appMode: "advanced" });
+    const policy = { enabled: true, allow_anyone: true, require_expiry: false, max_expiry_days: null, require_password: false, allow_edit: false };
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "connector_list_remote" && !args?.connectionId) return Promise.resolve([{ name: "c1pher", path: "/c1pher", is_dir: false, size: 9, modified: null }]);
+      if (cmd === "sharing_policy_get") return Promise.resolve(policy);
+      if (cmd === "connector_create_share_link") return Promise.resolve({ url: "https://example.test/s/1", expires_at: null, scope: "anyone", allow_edit: false, password_protected: false });
+      return Promise.resolve(backend(cmd, args));
+    });
+    render(<ConnectionPanel />);
+    fireEvent.click(await screen.findByText("Secret vault"));
+    await screen.findByTestId("crypt-banner");
+    fireEvent.click(screen.getByText("Open underlying remote"));
+    fireEvent.click(await screen.findByTestId("remote-share-c1pher"));
+    fireEvent.click(await screen.findByText("Create link"));
+    await waitFor(() => expect(calls("connector_create_share_link")).toHaveLength(1));
+    expect(calls("connector_create_share_link")[0]).toEqual(expect.objectContaining({ protocol: "rclone", connectionId: null, path: "/c1pher" }));
+  });
+
   it("Standard: no crypt lookups or banner", async () => {
     render(<ConnectionPanel />);
     fireEvent.click(await screen.findByText("Secret vault"));

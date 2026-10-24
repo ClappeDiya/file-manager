@@ -2919,7 +2919,7 @@ export function ConnectionPanel() {
         </div>
       )}
       {sharingEntry && connectedProtocol && (
-        <ShareLinkDialog protocol={connectedProtocol} connectionId={connectedId} path={sharingEntry.path} name={sharingEntry.name} onClose={() => setSharing(null)} />
+        <ShareLinkDialog protocol={connectedProtocol} connectionId={connArg} path={sharingEntry.path} name={sharingEntry.name} onClose={() => setSharing(null)} />
       )}
       {entryMenu && (
         <div
