@@ -543,6 +543,7 @@ pub fn run() {
             fleet_agent::spawn(setup_agent.clone(), "unified-file-ops");
             // Signed audit checkpoints: once at start-up, then hourly.
             tauri::async_runtime::spawn(setup_audit.clone().run_anchor_loop(security::audit::ANCHOR_INTERVAL));
+            commands::mount_commands::forward_mount_changes(app.handle().clone(), &app.state::<MountManager>());
             if let Err(e) = tray::setup(app, mgr) {
                 tracing::warn!("System tray unavailable (non-fatal): {e}");
             }
@@ -1065,6 +1066,11 @@ pub fn run() {
             mount_commands::mount_cache_usage,
             mount_commands::mount_clear_cache,
             mount_commands::delete_mount_config,
+            mount_commands::update_mount_config,
+            mount_commands::mount_saved_config,
+            mount_commands::unmount_all_mounts,
+            mount_commands::free_drive_letters,
+            mount_commands::open_mount_point,
             // Settings Export/Import & Sync
             settings_commands::export_all_settings,
             settings_commands::import_all_settings,

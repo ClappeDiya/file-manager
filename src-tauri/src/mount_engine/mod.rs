@@ -360,7 +360,8 @@ impl MountManager {
         self.changed.subscribe()
     }
 
-    fn notify(&self) {
+    /// Tell subscribers something changed (also used to redraw views after a failed action).
+    pub fn notify(&self) {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
@@ -891,7 +892,15 @@ impl MountManager {
         self.mount_remote_with(c.connection_id, c.mount_point, c.options, Some(id), repo, connection_mgr).await
     }
 
-    /// The saved configuration `id` as the Mounts list shows it (and the options to mount it with).
+    /// Where a mounted drive is mounted (for opening it).
+    pub async fn mounted_path(&self, id: Uuid) -> Result<String, AppError> {
+        match self.mounts.read().await.get(&id) {
+            Some(m) if m.status == MountStatus::Mounted => Ok(m.mount_point.clone()),
+            _ => Err(AppError::validation("That drive is not mounted")),
+        }
+    }
+
+    /// The options saved for mount `id`.
     pub async fn saved_options(&self, id: Uuid, repo: &Repository) -> Result<MountOptions, AppError> {
         Ok(load_saved(repo, id).await?.options)
     }
