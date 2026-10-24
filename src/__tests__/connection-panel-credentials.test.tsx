@@ -233,7 +233,7 @@ describe("quota and folder size", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Calculate size" }));
     expect(await screen.findByTestId("size-Photos")).toHaveTextContent("Calculating");
     const { jobId } = calls("connector_folder_size")[0] as { jobId: string };
-    expect(calls("connector_folder_size")[0]).toEqual({ protocol: "google_drive", path: "/Photos", jobId });
+    expect(calls("connector_folder_size")[0]).toEqual({ protocol: "google_drive", path: "/Photos", jobId, connectionId: "g" });
     fireEvent.click(screen.getByRole("button", { name: "Stop calculating the size of Photos" }));
     await waitFor(() => expect(calls("connector_folder_size_cancel")).toEqual([{ jobId }]));
     resolveSize({ bytes: 2048, files: 3, folders: 1, complete: false });
