@@ -1388,16 +1388,20 @@ pub async fn resolve_path(
     sftp.realpath(&path).await
 }
 
-/// Open a file with the OS default application.
+/// Open a file or folder with the OS default application.
 #[tauri::command]
 pub async fn open_file_with_default(path: String) -> Result<(), AppError> {
-    let status = {
+    // tokio's process, so waiting for the opener never blocks the async runtime.
+    let status: std::io::Result<std::process::ExitStatus> = {
         #[cfg(target_os = "macos")]
-        { std::process::Command::new("open").arg(&path).status() }
+        { tokio::process::Command::new("open").arg(&path).status().await }
+        // Explorer opens the path itself: unlike `cmd /C start`, nothing in the name
+        // (`&`, `^`, `%`) is interpreted by a shell. It reports exit code 1 even when
+        // it worked, so only a failure to start it counts.
         #[cfg(target_os = "windows")]
-        { std::process::Command::new("cmd").args(["/C", "start", "", &path]).status() }
+        { tokio::process::Command::new("explorer.exe").arg(&path).status().await.map(|_| <std::process::ExitStatus as std::os::windows::process::ExitStatusExt>::from_raw(0)) }
         #[cfg(target_os = "linux")]
-        { std::process::Command::new("xdg-open").arg(&path).status() }
+        { tokio::process::Command::new("xdg-open").arg(&path).status().await }
     };
     match status {
         Ok(s) if s.success() => Ok(()),

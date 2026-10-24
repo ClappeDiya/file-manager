@@ -58,6 +58,8 @@ import { ConnectionPanel } from "./connection-panel";
 import { SyncPanel } from "./sync-panel";
 import { BackupPanel } from "./backup/backup-panel";
 import { PeerSidebar } from "./peer-sidebar";
+import { MountsHost } from "./mounts-host";
+import { useMountsUi } from "@/stores/mounts-ui-store";
 import { ScheduleLibraryPanel } from "./schedule-library-panel";
 import { PreviewPane } from "./preview-pane";
 import { TransferHistoryPanel } from "./transfer-history-panel";
@@ -146,6 +148,7 @@ import {
   DatabaseBackup,
   CalendarClock,
   MonitorSmartphone,
+  HardDrive,
 } from "lucide-react";
 
 // Toolbar customization definition (#14)
@@ -164,6 +167,7 @@ const ALL_TOOLBAR_ITEMS = [
   { id: "schedules", label: "Schedules & holiday calendars" },
   { id: "operations", label: "Operations" },
   { id: "nearby", label: "Nearby Computers" },
+  { id: "mounts", label: "Mounts" },
 ];
 
 /** Peer transfers send local files only. */
@@ -734,6 +738,8 @@ export function FileManager() {
   const [backupOpen, setBackupOpen] = useState(false);
   // Nearby computers: discovery, incoming requests, and the items to send (if any).
   const [nearbyOpen, setNearbyOpen] = useState(false);
+  // Mounted drives: the Mounts list and the mount dialog (see MountsHost).
+  const mountsOpen = useMountsUi((s) => s.panelOpen);
   const [nearbySend, setNearbySend] = useState<string[]>([]);
   const activeFolder = useFileManagerStore((s) => {
     const pane = s.getActivePane();
@@ -2144,6 +2150,8 @@ export function FileManager() {
           setBackupOpen(true);
         },
         onOpenNearby: () => openNearby(),
+        onOpenMounts: () => useMountsUi.getState().openPanel(),
+        onMountDrive: () => useMountsUi.getState().openDialog(),
         onSendToComputer: () => openNearby(getAllSelectedPaths()),
         onOpenSchedules: appMode === "advanced" ? () => setSchedulesOpen(true) : undefined,
         onOpenTransferHistory: () => {
@@ -2471,6 +2479,18 @@ export function FileManager() {
               data-testid="toggle-nearby"
             >
               <MonitorSmartphone className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
+          {toolbarItems.includes("mounts") && (
+            <Button
+              variant={mountsOpen ? "secondary" : "ghost"}
+              size="icon"
+              onClick={() => useMountsUi.getState().togglePanel()}
+              aria-label="Mounts"
+              title="Mounts (mounted drives)"
+              data-testid="toggle-mounts"
+            >
+              <HardDrive className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
           {appMode === "advanced" && toolbarItems.includes("schedules") && (
@@ -2871,6 +2891,10 @@ export function FileManager() {
           </div>
         </div>
       )}
+
+      {/* Mounts: the list of saved and mounted drives, and the mount dialog
+          (also opened from the Connection Manager and the command palette). */}
+      <MountsHost />
 
       {/* Nearby computers: mDNS discovery, approval of incoming files and
           sending the chosen items. Received files go to Downloads, or to

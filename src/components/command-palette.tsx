@@ -46,6 +46,7 @@ import {
   Filter,
   FolderSync,
   DatabaseBackup,
+  HardDrive,
   CalendarClock,
   MonitorSmartphone,
   Upload,
@@ -769,6 +770,10 @@ export function getDefaultCommands(actions: {
   onOpenSchedules?: () => void;
   /** Open Nearby computers (peer discovery and transfers). */
   onOpenNearby?: () => void;
+  /** Open the Mounts list (saved and running mounts, with mount/unmount/edit/remove). */
+  onOpenMounts?: () => void;
+  /** Open the mount dialog to mount a connection as a drive or folder. */
+  onMountDrive?: () => void;
   /** Send the selection to another computer (undefined hides the entry). */
   onSendToComputer?: () => void;
   /** Open the Transfer History (Journal) panel \u2014 searchable
@@ -1221,6 +1226,24 @@ export function getDefaultCommands(actions: {
       category: "Navigation",
       action: actions.onOpenNearby || (() => {}),
       keywords: ["peer", "peers", "nearby", "airdrop", "lan", "local network", "computer", "device", "mdns", "bonjour", "receive"],
+    },
+    {
+      id: "mount-drive",
+      label: "Mount Drive\u2026",
+      description: "Mount a saved connection (cloud, SFTP, SMB, WebDAV, NFS) as a folder or drive on this computer",
+      icon: <HardDrive className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onMountDrive || (() => {}),
+      keywords: ["mount", "drive", "disk", "volume", "fuse", "rclone", "remote drive", "network drive", "map drive", "sshfs"],
+    },
+    {
+      id: "open-mounts",
+      label: "Show Mounts",
+      description: "See saved and mounted drives; mount, unmount, edit or remove them",
+      icon: <HardDrive className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onOpenMounts || (() => {}),
+      keywords: ["mounts", "mounted", "drives", "unmount", "eject", "remote drives", "network drives"],
     },
     ...(actions.onSendToComputer
       ? [
