@@ -21,6 +21,7 @@
 //!   connection string (`azure_rest`), file ops, read-only SAS links
 //! - OpenStack Swift: Keystone v3/TempAuth, container/object ops, SLO/DLO, TempURL
 
+pub mod folder_size;
 pub mod presets;
 pub mod rclone;
 pub mod connection_manager;
@@ -152,8 +153,35 @@ impl std::fmt::Debug for ConnectionSecrets {
     }
 }
 
+/// A byte count that providers send as a number or a decimal string.
+pub(crate) fn json_u64(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
 pub(crate) fn share_unsupported(what: &str) -> AppError {
     AppError::validation(format!("This provider can't {what} on share links"))
+}
+
+/// Storage space of a remote account. Every figure is optional: providers
+/// report different subsets (an unlimited plan has no total).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemoteQuota {
+    pub total: Option<u64>,
+    pub used: Option<u64>,
+    pub free: Option<u64>,
+    /// In the provider's trash / recycle bin.
+    pub trashed: Option<u64>,
+}
+
+/// Size of a remote folder and everything below it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FolderSize {
+    pub bytes: u64,
+    pub files: u64,
+    /// `None` when the server-side figure does not count folders (rclone).
+    pub folders: Option<u64>,
+    /// `false` when the walk was cancelled (the figures are partial).
+    pub complete: bool,
 }
 
 /// Trait for remote filesystem connectors.
@@ -220,6 +248,18 @@ pub trait Connector: Send + Sync {
         _is_dir: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         Box::pin(async { Err(unsupported_op("delete")) })
+    }
+
+    /// Storage quota of the connected account; `None` when the protocol
+    /// has no notion of it (the default).
+    fn quota(&self) -> Pin<Box<dyn Future<Output = Result<Option<RemoteQuota>, AppError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// A server-side size of `remote_path` (rclone `size`), when the
+    /// protocol has one; `None` (the default) = walk the listing instead.
+    fn folder_size_fast(&self, _remote_path: &str) -> Pin<Box<dyn Future<Output = Result<Option<FolderSize>, AppError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
     }
 
     /// Create a link others can open `remote_path` with.

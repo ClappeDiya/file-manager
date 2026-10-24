@@ -135,6 +135,13 @@ struct GraphDriveItemList {
     next_link: Option<String>,
 }
 
+/// A SharePoint document library (a Graph drive).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharePointLibrary {
+    pub id: String,
+    pub name: String,
+}
+
 /// SharePoint site information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharePointSite {
@@ -405,9 +412,14 @@ impl OneDriveConnector {
 
     /// List SharePoint sites.
     pub async fn list_sharepoint_sites(&self) -> Result<Vec<SharePointSite>, AppError> {
-        let token = self.get_token().await?;
+        self.search_sharepoint_sites("*").await
+    }
 
-        let url = format!("{}/sites?search=*&$top=100", self.api_base);
+    /// SharePoint sites matching `query` (`*` = all the user can see).
+    pub async fn search_sharepoint_sites(&self, query: &str) -> Result<Vec<SharePointSite>, AppError> {
+        let token = self.get_token().await?;
+        let q = if query.trim().is_empty() { "*" } else { query.trim() };
+        let url = format!("{}/sites?search={}&$top=100", self.api_base, percent_encoding::utf8_percent_encode(q, percent_encoding::NON_ALPHANUMERIC));
 
         let resp = self.http
             .get(&url)
@@ -441,6 +453,16 @@ impl OneDriveConnector {
                 display_name: s.display_name.unwrap_or_else(|| "Untitled".to_string()),
                 web_url: s.web_url.unwrap_or_default(),
             })
+            .collect())
+    }
+
+    /// Document libraries of a SharePoint site (for the library picker).
+    pub async fn site_libraries(&self, site_id: &str) -> Result<Vec<SharePointLibrary>, AppError> {
+        Ok(self
+            .list_site_drives(site_id)
+            .await?
+            .into_iter()
+            .map(|e| SharePointLibrary { id: e.path.trim_start_matches("/drives/").to_string(), name: e.name })
             .collect())
     }
 
@@ -511,8 +533,9 @@ impl OneDriveConnector {
         path: &str,
         data: Vec<u8>,
     ) -> Result<String, AppError> {
-        // Check naming restrictions before upload
-        let check = check_onedrive_naming(path);
+        // Check naming restrictions before upload (each name; `/` separates folders)
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let check = check_onedrive_naming(name);
         if !check.is_valid {
             let issues_desc: Vec<String> = check.issues.iter().map(|i| i.description.clone()).collect();
             return Err(AppError::Transfer {
@@ -532,10 +555,7 @@ impl OneDriveConnector {
     async fn simple_upload(&self, path: &str, data: &[u8]) -> Result<String, AppError> {
         let token = self.get_token().await?;
 
-        let encoded_path = percent_encoding::percent_encode(
-            path.as_bytes(),
-            percent_encoding::NON_ALPHANUMERIC,
-        );
+        let encoded_path = encode_path(path);
         let url = format!("{}/root:/{encoded_path}:/content", self.drive_base());
 
         let resp = self.http
@@ -573,10 +593,7 @@ impl OneDriveConnector {
         let token = self.get_token().await?;
 
         // Step 1: Create upload session
-        let encoded_path = percent_encoding::percent_encode(
-            path.as_bytes(),
-            percent_encoding::NON_ALPHANUMERIC,
-        );
+        let encoded_path = encode_path(path);
         let url = format!("{}/root:/{encoded_path}:/createUploadSession", self.drive_base());
 
         let resp = self.http
@@ -836,11 +853,8 @@ impl OneDriveConnector {
 
         let token = self.get_token().await?;
 
-        let encoded_parent = percent_encoding::percent_encode(
-            parent_path.as_bytes(),
-            percent_encoding::NON_ALPHANUMERIC,
-        );
-        let url = if parent_path.is_empty() || parent_path == "/" {
+        let encoded_parent = encode_path(parent_path);
+        let url = if encoded_parent.is_empty() {
             format!("{}/root/children", self.drive_base())
         } else {
             format!("{}/root:/{encoded_parent}:/children", self.drive_base())
@@ -1005,6 +1019,61 @@ impl Connector for OneDriveConnector {
         self.connected.load(Ordering::SeqCst)
     }
 
+    fn upload(&self, local_path: &str, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (l, r) = (local_path.to_string(), remote_path.to_string());
+        Box::pin(async move {
+            let data = tokio::fs::read(&l).await.map_err(|e| AppError::file_op(format!("Cannot read {l}: {e}"), "Check the file."))?;
+            let n = data.len() as u64;
+            self.upload_file(r.trim_start_matches('/'), data).await?;
+            Ok(n)
+        })
+    }
+
+    fn download(&self, remote_path: &str, local_path: &str) -> Pin<Box<dyn Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (r, l) = (remote_path.to_string(), local_path.to_string());
+        Box::pin(async move {
+            let url = format!("{}/root:/{}:/content", self.drive_base(), encode_path(&r));
+            let resp = self.http.get(&url).bearer_auth(self.get_token().await?).send().await.map_err(|e| AppError::transfer(format!("OneDrive download failed: {e}"), "Check your network connection."))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                return Err(AppError::transfer(format!("OneDrive download failed (HTTP {status}): {}", graph_error_message(&resp.text().await.unwrap_or_default())), "Check the file still exists."));
+            }
+            let bytes = resp.bytes().await.map_err(|e| AppError::transfer(format!("OneDrive download failed: {e}"), "Try again."))?;
+            tokio::fs::write(&l, &bytes).await.map_err(|e| AppError::file_op(format!("Cannot write {l}: {e}"), "Check the destination folder."))?;
+            Ok(bytes.len() as u64)
+        })
+    }
+
+    fn make_directory(&self, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.trim_matches('/').to_string();
+        Box::pin(async move {
+            let (parent, name) = r.rsplit_once('/').unwrap_or(("", r.as_str()));
+            self.create_folder(parent, name).await.map(|_| ())
+        })
+    }
+
+    /// Moves the item to the OneDrive recycle bin.
+    fn remove(&self, remote_path: &str, _is_dir: bool) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
+        Box::pin(async move {
+            let url = format!("{}/root:/{}", self.drive_base(), encode_path(&r));
+            let resp = self.http.delete(&url).bearer_auth(self.get_token().await?).send().await.map_err(|e| AppError::transfer(format!("OneDrive delete failed: {e}"), "Check your network connection."))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                return Err(AppError::transfer(format!("OneDrive delete failed (HTTP {status}): {}", graph_error_message(&resp.text().await.unwrap_or_default())), "Check your permissions."));
+            }
+            Ok(())
+        })
+    }
+
+    /// `drive.quota` (total, used, remaining, deleted).
+    fn quota(&self) -> Pin<Box<dyn Future<Output = Result<Option<super::RemoteQuota>, AppError>> + Send + '_>> {
+        Box::pin(async move {
+            let q = &self.drive_info().await?["quota"];
+            Ok(Some(super::RemoteQuota { total: super::json_u64(&q["total"]), used: super::json_u64(&q["used"]), free: super::json_u64(&q["remaining"]), trashed: super::json_u64(&q["deleted"]) }))
+        })
+    }
+
     fn create_share_link(
         &self,
         remote_path: &str,
@@ -1017,7 +1086,7 @@ impl Connector for OneDriveConnector {
             if path.is_empty() {
                 return Err(AppError::validation("Choose a file or folder to share"));
             }
-            let encoded = percent_encoding::percent_encode(path.as_bytes(), percent_encoding::NON_ALPHANUMERIC);
+            let encoded = encode_path(path);
             let url = format!("{}/root:/{encoded}:/createLink", self.drive_base());
             let resp = self
                 .http
@@ -1264,6 +1333,42 @@ fn graph_error_message(body: &str) -> String {
         .ok()
         .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
         .unwrap_or_else(|| body.chars().take(200).collect())
+}
+
+#[cfg(test)]
+mod library_tests {
+    use super::*;
+    use crate::connectors::mock_http::{json, serve, status};
+    use crate::core::types::{ConnectionProtocol, OneDriveSettings};
+
+    /// Scopes (item 25): a SharePoint library chosen on the profile is the
+    /// root; sites are searched; quota and file operations use the library.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sharepoint_library_root_search_and_quota() {
+        let mock = serve(|r| match r.path.as_str() {
+            "/g/drives/LIB1" => json(serde_json::json!({ "id": "LIB1", "owner": { "group": { "displayName": "Sales" } }, "quota": { "total": 100, "used": 30, "remaining": 70, "deleted": 2 } })),
+            "/g/drives/LIB1/root/children" => json(serde_json::json!({ "value": [{ "id": "i", "name": "Q3", "folder": {}, "parentReference": { "path": "/drives/LIB1/root:" } }] })),
+            "/g/drives/LIB1/root:/Q3/a%20b%2Etxt:/content" => status(200, "data"),
+            "/g/sites" => json(serde_json::json!({ "value": [{ "id": "site1", "displayName": "Sales", "webUrl": "https://x.sharepoint.com/sites/sales" }] })),
+            "/g/sites/site1/drives" => json(serde_json::json!({ "value": [{ "id": "LIB1", "name": "Documents", "driveType": "documentLibrary" }] })),
+            _ => status(404, "no"),
+        })
+        .await;
+        let c = OneDriveConnector::new().with_endpoints(&format!("{}/g", mock.base), &format!("{}/token", mock.base));
+        let mut p = crate::connectors::live_tests::profile(ConnectionProtocol::OneDrive, "", None, "", "/");
+        p.extras.onedrive = Some(OneDriveSettings { site_id: Some("site1".into()), site_name: Some("Sales".into()), drive_id: Some("LIB1".into()), drive_name: Some("Documents".into()) });
+        c.connect_with_secret(&p, Some("tok".into())).await.unwrap();
+        assert_eq!(c.quota().await.unwrap().unwrap(), crate::connectors::RemoteQuota { total: Some(100), used: Some(30), free: Some(70), trashed: Some(2) });
+        let list = c.list_remote("/").await.unwrap();
+        assert_eq!((list[0].name.as_str(), list[0].path.as_str()), ("Q3", "/Q3"));
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("a b.txt");
+        assert_eq!(c.download("/Q3/a b.txt", out.to_str().unwrap()).await.unwrap(), 4);
+        let sites = c.search_sharepoint_sites("sales team").await.unwrap();
+        assert_eq!(sites[0].id, "site1");
+        assert_eq!(mock.requests("/g/sites")[0].query_param("search").as_deref(), Some("sales team"));
+        assert_eq!(c.site_libraries("site1").await.unwrap(), vec![SharePointLibrary { id: "LIB1".into(), name: "Documents".into() }]);
+    }
 }
 
 #[cfg(test)]

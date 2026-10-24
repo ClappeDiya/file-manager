@@ -285,6 +285,78 @@ pub async fn ensure_connected(
     Ok(connector)
 }
 
+/// Connect `connector` with the saved connection's secrets when it is not
+/// connected (an interactive request: tried even when flagged).
+async fn connect_if_needed(connector: &dyn Connector, manager: &ConnectionManager, connection_id: Option<&str>) -> Result<(), AppError> {
+    if connector.is_connected() {
+        return Ok(());
+    }
+    let Some(cid) = connection_id.filter(|c| !c.is_empty()) else {
+        return require_connected(connector);
+    };
+    let id = uuid::Uuid::parse_str(cid).map_err(|_| AppError::validation(format!("Invalid connection id '{cid}'")))?;
+    let profile = manager.get_connection(id).await?.ok_or_else(|| AppError::not_found(format!("Saved connection {cid} not found")))?;
+    let secrets = manager.get_secrets(id).await?;
+    let r = connector.connect_with_secrets(&profile, secrets).await;
+    manager.record_connect_outcome(id, &r).await;
+    r
+}
+
+/// Storage quota (total / used / free / trash) of the account behind a
+/// connection; `None` when the protocol has none (SFTP, FTP…).
+#[tauri::command]
+pub async fn connector_quota(
+    protocol: String,
+    connection_id: Option<String>,
+    registry: State<'_, ConnectorRegistry>,
+    manager: State<'_, ConnectionManager>,
+) -> Result<Option<crate::connectors::RemoteQuota>, AppError> {
+    let connector = require_connector(&registry, &protocol)?;
+    connect_if_needed(connector.as_ref(), &manager, connection_id.as_deref()).await?;
+    connector.quota().await
+}
+
+fn size_jobs() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, tokio_util::sync::CancellationToken>> {
+    static JOBS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>> = std::sync::OnceLock::new();
+    JOBS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Total size of a remote folder and everything below it: rclone's
+/// server-side `size`, else a walk of the listing (8 folders at a time).
+/// `job_id` lets `connector_folder_size_cancel` stop it (partial figures,
+/// `complete: false`).
+#[tauri::command]
+pub async fn connector_folder_size(
+    protocol: String,
+    path: String,
+    job_id: Option<String>,
+    registry: State<'_, ConnectorRegistry>,
+) -> Result<crate::connectors::FolderSize, AppError> {
+    let connector = require_connector(&registry, &protocol)?;
+    require_connected(connector.as_ref())?;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    if let Some(id) = &job_id {
+        size_jobs().insert(id.clone(), cancel.clone());
+    }
+    let result = crate::connectors::folder_size::folder_size(connector, &path, crate::connectors::folder_size::DEFAULT_CONCURRENCY, cancel).await;
+    if let Some(id) = &job_id {
+        size_jobs().remove(id);
+    }
+    result
+}
+
+/// Stop a running `connector_folder_size`; `false` when it already ended.
+#[tauri::command]
+pub async fn connector_folder_size_cancel(job_id: String) -> Result<bool, AppError> {
+    Ok(match size_jobs().remove(&job_id) {
+        Some(t) => {
+            t.cancel();
+            true
+        }
+        None => false,
+    })
+}
+
 /// rclone remotes from the user's rclone config (`rclone listremotes`).
 #[tauri::command]
 pub async fn rclone_list_remotes() -> Result<Vec<crate::connectors::rclone::RcloneRemote>, AppError> {
@@ -296,4 +368,31 @@ pub async fn rclone_list_remotes() -> Result<Vec<crate::connectors::rclone::Rclo
 #[tauri::command]
 pub async fn connection_presets() -> Result<Vec<crate::connectors::presets::ProviderPreset>, AppError> {
     Ok(crate::connectors::presets::PRESETS.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::{WebDavAuthMode, WebDavSettings};
+    use crate::security::CredentialStore;
+
+    /// Regression: `connector_connect` rebuilt the profile from host/port/
+    /// user, dropping the saved connector settings (WebDAV mode, SMB domain,
+    /// OAuth app, scopes) and the SFTP key passphrase.
+    #[tokio::test]
+    async fn connecting_a_saved_connection_uses_its_settings_and_secrets() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = ConnectionManager::new(repo, std::sync::Arc::new(CredentialStore { cache: Default::default(), keychain_available: false, file_vault: None }));
+        let mut p = crate::connectors::live_tests::profile(ConnectionProtocol::WebDav, "dav.example", None, "u", "/");
+        p.extras.webdav = Some(WebDavSettings { auth: WebDavAuthMode::Bearer, ..Default::default() });
+        mgr.save_connection_with_secrets(p.clone(), Some("token".into()), Some("pp".into())).await.unwrap();
+        let req = || ConnectRequest { protocol: "webdav".into(), host: "dav.example".into(), port: None, username: Some("u".into()), remote_path: None };
+        let (profile, secrets) = resolve_connect(&mgr, req(), Some(&p.id.to_string())).await.unwrap();
+        assert_eq!(profile.extras, p.extras);
+        assert_eq!((secrets.secret.as_deref(), secrets.key_passphrase.as_deref()), (Some("token"), Some("pp")));
+        // Quick connect without a saved connection: an ad-hoc profile, no secrets.
+        let (adhoc, none) = resolve_connect(&mgr, req(), None).await.unwrap();
+        assert_eq!((adhoc.protocol, adhoc.extras.webdav), (ConnectionProtocol::WebDav, None));
+        assert_eq!(none, crate::connectors::ConnectionSecrets::default());
+    }
 }

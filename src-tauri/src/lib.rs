@@ -711,6 +711,13 @@ pub fn run() {
             oauth_commands::oauth_import_grant,
             oauth_commands::oauth_sign_out,
             oauth_commands::oauth_status,
+            oauth_commands::gdrive_list_shared_drives,
+            oauth_commands::onedrive_search_sites,
+            oauth_commands::onedrive_list_site_libraries,
+            oauth_commands::dropbox_list_namespaces,
+            connector_commands::connector_quota,
+            connector_commands::connector_folder_size,
+            connector_commands::connector_folder_size_cancel,
             // SMB/CIFS (T-023)
             drive_commands::smb_discover_shares,
             drive_commands::smb_list_shares,

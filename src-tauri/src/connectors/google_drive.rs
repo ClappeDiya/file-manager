@@ -38,6 +38,34 @@ pub enum GoogleDocExportFormat {
 }
 
 impl GoogleDocExportFormat {
+    /// `pdf`, `docx`… (the extension).
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "pdf" => Self::Pdf,
+            "docx" => Self::Docx,
+            "xlsx" => Self::Xlsx,
+            "pptx" => Self::Pptx,
+            "csv" => Self::Csv,
+            "txt" => Self::Txt,
+            "html" => Self::Html,
+            "epub" => Self::Epub,
+            _ => return None,
+        })
+    }
+
+    /// Formats Google can export a native file of `mime_type` to, the
+    /// default first; `None` for files that are not Google Docs editors files.
+    pub fn choices(mime_type: &str) -> Option<&'static [GoogleDocExportFormat]> {
+        use GoogleDocExportFormat::*;
+        Some(match mime_type {
+            "application/vnd.google-apps.document" => &[Docx, Pdf, Txt, Html, Epub],
+            "application/vnd.google-apps.spreadsheet" => &[Xlsx, Pdf, Csv, Html],
+            "application/vnd.google-apps.presentation" => &[Pptx, Pdf, Txt],
+            "application/vnd.google-apps.drawing" => &[Pdf],
+            _ => return None,
+        })
+    }
+
     pub fn mime_type(&self) -> &'static str {
         match self {
             Self::Pdf => "application/pdf",
@@ -370,6 +398,34 @@ impl GoogleDriveConnector {
             .collect();
 
         Ok((entries, list.next_page_token))
+    }
+
+    /// The folder ID new items under virtual folder `dir` go into.
+    fn folder_for(&self, dir: &str) -> Result<String, AppError> {
+        let settings = self.settings.read().map(|s| s.clone()).unwrap_or_default();
+        match drive_location(dir) {
+            DriveLocation::Root => match (settings.root, settings.shared_drive_id.filter(|d| !d.is_empty())) {
+                (GoogleDriveRoot::SharedDrive, Some(d)) => Ok(d),
+                (GoogleDriveRoot::SharedWithMe, _) => Err(AppError::validation("Open a folder inside Shared with me to add files there")),
+                _ => Ok("root".into()),
+            },
+            DriveLocation::MyDrive { folder } => Ok(folder.unwrap_or_else(|| "root".into())),
+            DriveLocation::SharedDrive { drive_id, folder } => Ok(folder.unwrap_or(drive_id)),
+            DriveLocation::SharedWithMe | DriveLocation::SharedDrives => Err(AppError::validation("Open a folder to add files there")),
+        }
+    }
+
+    /// The export format for a native Google file (`None` = not exportable).
+    fn export_format_for(&self, mime_type: &str) -> Option<GoogleDocExportFormat> {
+        let choices = GoogleDocExportFormat::choices(mime_type)?;
+        let f = self.settings.read().map(|s| s.export_formats.clone()).unwrap_or_default();
+        let wanted = match mime_type {
+            "application/vnd.google-apps.document" => f.document,
+            "application/vnd.google-apps.spreadsheet" => f.spreadsheet,
+            "application/vnd.google-apps.presentation" => f.presentation,
+            _ => f.drawing,
+        };
+        Some(wanted.as_deref().and_then(GoogleDocExportFormat::parse).filter(|w| choices.contains(w)).unwrap_or(choices[0]))
     }
 
     /// Every entry at a virtual `path` (all pages). `/` opens the part of
@@ -1082,6 +1138,66 @@ impl Connector for GoogleDriveConnector {
         self.connected.load(Ordering::SeqCst)
     }
 
+    fn upload(&self, local_path: &str, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (l, r) = (local_path.to_string(), remote_path.to_string());
+        Box::pin(async move {
+            let (dir, name) = split_parent(&r)?;
+            let parent = self.folder_for(&dir)?;
+            let data = tokio::fs::read(&l).await.map_err(|e| AppError::file_op(format!("Cannot read {l}: {e}"), "Check the file."))?;
+            let n = data.len() as u64;
+            self.upload_file(&name, Some(&parent), data, None).await?;
+            Ok(n)
+        })
+    }
+
+    /// Downloads the file; Google Docs, Sheets, Slides and Drawings are
+    /// exported in the connection's format (docx/xlsx/pptx/pdf by default),
+    /// and the local name gets that extension.
+    fn download(&self, remote_path: &str, local_path: &str) -> Pin<Box<dyn Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (r, l) = (remote_path.to_string(), local_path.to_string());
+        Box::pin(async move {
+            let id = last_segment(&r)?;
+            let meta: DriveFile = drive_json(
+                self.http.get(format!("{}/files/{id}?fields=id,name,mimeType&supportsAllDrives=true", self.api_base)).bearer_auth(self.get_token().await?).send().await.map_err(|e| AppError::transfer(format!("Google Drive is unreachable: {e}"), "Check your network connection."))?,
+                "Reading the file",
+            )
+            .await?;
+            let (data, local) = match self.export_format_for(&meta.mime_type) {
+                Some(format) => {
+                    let ext = format!(".{}", format.extension());
+                    let local = if l.to_ascii_lowercase().ends_with(&ext) { l.clone() } else { format!("{l}{ext}") };
+                    (self.export_file(&id, format).await?, local)
+                }
+                None if meta.mime_type.starts_with("application/vnd.google-apps.") => {
+                    return Err(AppError::validation(format!("'{}' is a Google {} and cannot be downloaded", meta.name, meta.mime_type.trim_start_matches("application/vnd.google-apps."))));
+                }
+                None => (self.download_file(&id).await?, l.clone()),
+            };
+            tokio::fs::write(&local, &data).await.map_err(|e| AppError::file_op(format!("Cannot write {local}: {e}"), "Check the destination folder."))?;
+            Ok(data.len() as u64)
+        })
+    }
+
+    fn make_directory(&self, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
+        Box::pin(async move {
+            let (dir, name) = split_parent(&r)?;
+            let parent = self.folder_for(&dir)?;
+            self.create_folder(&name, Some(&parent)).await.map(|_| ())
+        })
+    }
+
+    /// Moves the file or folder to the Drive trash (recoverable).
+    fn remove(&self, remote_path: &str, _is_dir: bool) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
+        Box::pin(async move { self.delete_file(&last_segment(&r)?, false).await })
+    }
+
+    /// `about.storageQuota`; no `limit` means unlimited.
+    fn quota(&self) -> Pin<Box<dyn Future<Output = Result<Option<super::RemoteQuota>, AppError>> + Send + '_>> {
+        Box::pin(async move { Ok(Some(drive_quota(&self.about().await?["storageQuota"]))) })
+    }
+
     fn create_share_link(
         &self,
         remote_path: &str,
@@ -1207,6 +1323,12 @@ fn entry_at(file: DriveFile, prefix: &str) -> FileEntry {
     }
 }
 
+/// `storageQuota` → quota (`limit` absent = unlimited).
+fn drive_quota(q: &serde_json::Value) -> super::RemoteQuota {
+    let (total, used) = (super::json_u64(&q["limit"]), super::json_u64(&q["usage"]));
+    super::RemoteQuota { total, used, free: total.zip(used).map(|(t, u)| t.saturating_sub(u)), trashed: super::json_u64(&q["usageInDriveTrash"]) }
+}
+
 /// A shared drive (for the connection's drive picker).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SharedDriveInfo {
@@ -1255,6 +1377,21 @@ fn drive_location(path: &str) -> DriveLocation {
         ["shared-drives", d, ..] => DriveLocation::SharedDrive { drive_id: d.to_string(), folder: last(2) },
         _ => DriveLocation::MyDrive { folder: last(0).filter(|s| s != "root") },
     }
+}
+
+/// The last segment of a virtual path (the file or folder ID).
+fn last_segment(path: &str) -> Result<String, AppError> {
+    path.trim_end_matches('/').rsplit('/').next().filter(|s| !s.is_empty()).map(String::from).ok_or_else(|| AppError::validation("Choose a file or folder"))
+}
+
+/// `"/a/b/name"` → (`"/a/b"`, `"name"`).
+fn split_parent(path: &str) -> Result<(String, String), AppError> {
+    let p = path.trim_end_matches('/');
+    let (dir, name) = p.rsplit_once('/').unwrap_or(("", p));
+    if name.is_empty() {
+        return Err(AppError::validation("Enter a name"));
+    }
+    Ok((if dir.is_empty() { "/".into() } else { dir.to_string() }, name.to_string()))
 }
 
 /// Escape a value inside a `files.list` query string literal.
@@ -1387,6 +1524,68 @@ mod tests {
         assert_eq!(entry.extension.as_deref(), Some("pdf"));
         assert!(entry.modified.is_some());
         assert!(entry.created.is_some());
+    }
+
+    #[test]
+    fn locations_keep_folders_and_shared_drives() {
+        assert_eq!(drive_location("/"), DriveLocation::Root);
+        assert_eq!(drive_location("/root/f1/f2"), DriveLocation::MyDrive { folder: Some("f2".into()) });
+        assert_eq!(drive_location("/shared-drives/D/f1"), DriveLocation::SharedDrive { drive_id: "D".into(), folder: Some("f1".into()) });
+        assert_eq!(drive_location("/shared-drives/D"), DriveLocation::SharedDrive { drive_id: "D".into(), folder: None });
+        assert_eq!(drive_location("/shared-with-me/x"), DriveLocation::MyDrive { folder: Some("x".into()) });
+        assert_eq!(split_parent("/f1/a b.txt").unwrap(), ("/f1".to_string(), "a b.txt".to_string()));
+        assert_eq!(split_parent("/a.txt").unwrap(), ("/".to_string(), "a.txt".to_string()));
+        assert_eq!(q_escape("it's"), "it\\'s");
+    }
+
+    /// Scopes (item 25): "/" opens the chosen shared drive; Docs export in
+    /// the chosen format; uploads go to the right folder.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_drive_root_and_export_formats() {
+        use crate::connectors::mock_http::{json, serve, status};
+        use crate::core::types::{GoogleDriveSettings, GoogleExportFormats};
+        let mock = serve(|r| match r.path.as_str() {
+            "/api/about" => json(serde_json::json!({ "user": { "emailAddress": "t@example.com" }, "storageQuota": { "usage": "7" } })),
+            "/api/files" => json(serde_json::json!({ "files": [{ "id": "x1", "name": "Plan", "mimeType": "application/vnd.google-apps.document" }] })),
+            "/api/drives" => json(serde_json::json!({ "drives": [{ "id": "D1", "name": "Team" }] })),
+            "/api/files/x1" => json(serde_json::json!({ "id": "x1", "name": "Plan", "mimeType": "application/vnd.google-apps.document" })),
+            "/api/files/x1/export" => status(200, "exported"),
+            "/upload/files" => json(serde_json::json!({ "id": "new", "name": "n.txt", "mimeType": "text/plain" })),
+            _ => status(404, "no"),
+        })
+        .await;
+        let b = &mock.base;
+        let c = GoogleDriveConnector::new().with_endpoints(&format!("{b}/api"), &format!("{b}/upload"), &format!("{b}/token"));
+        let mut p = crate::connectors::live_tests::profile(crate::core::types::ConnectionProtocol::GoogleDrive, "", None, "", "/");
+        p.extras.google_drive = Some(GoogleDriveSettings {
+            root: GoogleDriveRoot::SharedDrive,
+            shared_drive_id: Some("D1".into()),
+            shared_drive_name: Some("Team".into()),
+            export_formats: GoogleExportFormats { document: Some("pdf".into()), ..Default::default() },
+        });
+        c.connect_with_secret(&p, Some(r#"{"access_token":"t"}"#.into())).await.unwrap();
+        assert_eq!(c.quota().await.unwrap().unwrap().used, Some(7));
+        assert_eq!(c.all_shared_drives().await.unwrap(), vec![SharedDriveInfo { id: "D1".into(), name: "Team".into() }]);
+        let list = c.list_remote("/").await.unwrap();
+        assert_eq!(list[0].path, "/shared-drives/D1/x1");
+        let q = &mock.requests("/api/files")[0];
+        assert_eq!((q.query_param("corpora").as_deref(), q.query_param("driveId").as_deref()), (Some("drive"), Some("D1")));
+        assert_eq!(q.query_param("q").as_deref(), Some("'D1' in parents and trashed = false"));
+        // Export as PDF (chosen), saved with the extension.
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("Plan");
+        assert_eq!(c.download(&list[0].path, local.to_str().unwrap()).await.unwrap(), 8);
+        assert_eq!(std::fs::read_to_string(dir.path().join("Plan.pdf")).unwrap(), "exported");
+        assert_eq!(mock.requests("/api/files/x1/export")[0].query_param("mimeType").as_deref(), Some("application/pdf"));
+        // An unsupported choice falls back to the default (docx).
+        assert_eq!(c.export_format_for("application/vnd.google-apps.spreadsheet"), Some(GoogleDocExportFormat::Xlsx));
+        assert_eq!(c.export_format_for("text/plain"), None);
+        // Uploading to "/" goes into the shared drive.
+        let f = dir.path().join("n.txt");
+        std::fs::write(&f, "hi").unwrap();
+        c.upload(f.to_str().unwrap(), "/n.txt").await.unwrap();
+        let body = String::from_utf8_lossy(&mock.requests("/upload/files")[0].body).to_string();
+        assert!(body.contains(r#""parents":["D1"]"#), "{body}");
     }
 
     #[test]

@@ -858,6 +858,16 @@ impl Default for DropboxConnector {
     }
 }
 
+/// `get_space_usage` → quota. A team allocation is shared: free space is
+/// what the team has left.
+fn dropbox_quota(v: &serde_json::Value) -> super::RemoteQuota {
+    let used = super::json_u64(&v["used"]);
+    let a = &v["allocation"];
+    let total = super::json_u64(&a["allocated"]);
+    let pool_used = if a[".tag"].as_str() == Some("team") { super::json_u64(&a["used"]).or(used) } else { used };
+    super::RemoteQuota { total, used, free: total.zip(pool_used).map(|(t, u)| t.saturating_sub(u)), trashed: None }
+}
+
 /// A root a Dropbox connection can open (for the namespace picker).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DropboxNamespace {
@@ -926,6 +936,42 @@ impl Connector for DropboxConnector {
 
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    fn upload(&self, local_path: &str, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (l, r) = (local_path.to_string(), remote_path.to_string());
+        Box::pin(async move {
+            let data = tokio::fs::read(&l).await.map_err(|e| AppError::file_op(format!("Cannot read {l}: {e}"), "Check the file."))?;
+            let n = data.len() as u64;
+            self.upload_file(&r, data, "overwrite").await?;
+            Ok(n)
+        })
+    }
+
+    fn download(&self, remote_path: &str, local_path: &str) -> Pin<Box<dyn Future<Output = Result<u64, AppError>> + Send + '_>> {
+        let (r, l) = (remote_path.to_string(), local_path.to_string());
+        Box::pin(async move {
+            let data = self.download_file(&r).await?;
+            tokio::fs::write(&l, &data).await.map_err(|e| AppError::file_op(format!("Cannot write {l}: {e}"), "Check the destination folder."))?;
+            Ok(data.len() as u64)
+        })
+    }
+
+    fn make_directory(&self, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
+        Box::pin(async move { self.create_folder(&r).await.map(|_| ()) })
+    }
+
+    /// Soft delete (recoverable from Dropbox's deleted files).
+    fn remove(&self, remote_path: &str, _is_dir: bool) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
+        Box::pin(async move { self.delete(&r).await })
+    }
+
+    /// `users/get_space_usage`: the member's use against the individual or
+    /// team allocation.
+    fn quota(&self) -> Pin<Box<dyn Future<Output = Result<Option<super::RemoteQuota>, AppError>> + Send + '_>> {
+        Box::pin(async move { Ok(Some(dropbox_quota(&self.space_usage().await?))) })
     }
 
     fn create_share_link(
@@ -1034,6 +1080,44 @@ pub(crate) fn parse_dropbox_link(status: u16, body: &str, scope: super::ShareSco
         message: format!("Dropbox refused the share link: {summary}"),
         advice: "Expiry dates, passwords and team-only links need a Dropbox plan that allows them.".into(),
     })
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    use crate::connectors::mock_http::{json, serve, status};
+    use crate::core::types::ConnectionProtocol;
+
+    /// Scopes (item 25): a team space / team folder chosen on the profile
+    /// is sent as `Dropbox-API-Path-Root`; the picker lists both; quota.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn team_namespace_root_and_quota() {
+        let mock = serve(|r| match r.path.as_str() {
+            "/2/users/get_current_account" => json(serde_json::json!({ "email": "m@corp.example", "root_info": { ".tag": "team", "root_namespace_id": "100", "home_namespace_id": "200" } })),
+            "/2/sharing/list_folders" => json(serde_json::json!({ "entries": [
+                { "shared_folder_id": "300", "name": "Marketing", "is_team_folder": true },
+                { "shared_folder_id": "400", "name": "Shared with Bob", "is_team_folder": false }
+            ] })),
+            "/2/users/get_space_usage" => json(serde_json::json!({ "used": 10, "allocation": { ".tag": "team", "used": 600, "allocated": 1000 } })),
+            "/2/files/list_folder" => json(serde_json::json!({ "entries": [], "cursor": "c", "has_more": false })),
+            _ => status(404, "no"),
+        })
+        .await;
+        let b = &mock.base;
+        let c = DropboxConnector::new().with_endpoints(&format!("{b}/2"), &format!("{b}/c"), &format!("{b}/token"));
+        let mut p = crate::connectors::live_tests::profile(ConnectionProtocol::Dropbox, "", None, "", "/");
+        c.connect_with_secret(&p, Some("tok".into())).await.unwrap();
+        let ns = c.namespaces().await.unwrap();
+        assert_eq!(ns.iter().map(|n| (n.namespace_id.as_deref(), n.kind.as_str())).collect::<Vec<_>>(), vec![(None, "home"), (Some("100"), "team_space"), (Some("300"), "team_folder")]);
+        c.list_remote("/").await.unwrap();
+        assert!(mock.requests("/2/files/list_folder")[0].header("dropbox-api-path-root").is_none());
+        p.extras.dropbox = Some(DropboxSettings { root_namespace_id: Some("300".into()), root_label: Some("Marketing".into()) });
+        c.connect_with_secret(&p, Some("tok".into())).await.unwrap();
+        c.list_remote("/").await.unwrap();
+        let header = mock.requests("/2/files/list_folder")[1].header("dropbox-api-path-root").unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&header).unwrap(), serde_json::json!({ ".tag": "namespace_id", "namespace_id": "300" }));
+        assert_eq!(c.quota().await.unwrap().unwrap(), crate::connectors::RemoteQuota { total: Some(1000), used: Some(10), free: Some(400), trashed: None });
+    }
 }
 
 #[cfg(test)]

@@ -231,6 +231,48 @@ pub async fn oauth_status(connection_id: String, manager: State<'_, ConnectionMa
     Ok(manager.get_password(profile.id).await?.is_some_and(|s| OAuthGrant::parse(&s).is_ok()))
 }
 
+/// A fresh connector signed in as the saved connection (pickers must not
+/// disturb the connection being browsed).
+async fn signed_in<C: Connector>(manager: &ConnectionManager, connection_id: &str, want: OAuthProvider, make: impl FnOnce(Arc<crate::security::CredentialStore>) -> C) -> Result<C, AppError> {
+    let (profile, provider) = oauth_profile(manager, connection_id).await?;
+    if provider != want {
+        return Err(AppError::validation(format!("This is not a {} connection", want.label())));
+    }
+    let c = make(manager.credential_store());
+    let secrets = manager.get_secrets(profile.id).await?;
+    let r = c.connect_with_secret(&profile, secrets.secret).await;
+    manager.record_connect_outcome(profile.id, &r).await;
+    r.map(|_| c)
+}
+
+/// Shared drives the signed-in Google account can open (drive picker).
+#[tauri::command]
+pub async fn gdrive_list_shared_drives(connection_id: String, manager: State<'_, ConnectionManager>) -> Result<Vec<crate::connectors::google_drive::SharedDriveInfo>, AppError> {
+    let c = signed_in(&manager, &connection_id, OAuthProvider::GoogleDrive, |s| GoogleDriveConnector::new().with_credentials(s)).await?;
+    c.all_shared_drives().await
+}
+
+/// SharePoint sites matching `query` (site picker).
+#[tauri::command]
+pub async fn onedrive_search_sites(connection_id: String, query: String, manager: State<'_, ConnectionManager>) -> Result<Vec<crate::connectors::onedrive::SharePointSite>, AppError> {
+    let c = signed_in(&manager, &connection_id, OAuthProvider::OneDrive, |s| OneDriveConnector::new().with_credentials(s)).await?;
+    c.search_sharepoint_sites(&query).await
+}
+
+/// Document libraries of a SharePoint site (library picker).
+#[tauri::command]
+pub async fn onedrive_list_site_libraries(connection_id: String, site_id: String, manager: State<'_, ConnectionManager>) -> Result<Vec<crate::connectors::onedrive::SharePointLibrary>, AppError> {
+    let c = signed_in(&manager, &connection_id, OAuthProvider::OneDrive, |s| OneDriveConnector::new().with_credentials(s)).await?;
+    c.site_libraries(&site_id).await
+}
+
+/// Roots a Dropbox connection can open: own folder, team space, team folders.
+#[tauri::command]
+pub async fn dropbox_list_namespaces(connection_id: String, manager: State<'_, ConnectionManager>) -> Result<Vec<crate::connectors::dropbox::DropboxNamespace>, AppError> {
+    let c = signed_in(&manager, &connection_id, OAuthProvider::Dropbox, |s| DropboxConnector::new().with_credentials(s)).await?;
+    c.namespaces().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
