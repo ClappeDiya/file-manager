@@ -254,7 +254,9 @@ pub async fn connector_list_protocols(
 }
 
 /// The connector for `protocol`, connected with the saved connection's
-/// secret when it isn't already.
+/// secret unless it already is connected as that connection (one shared
+/// instance serves every account of a provider, so it is re-signed-in
+/// when it holds another one).
 pub async fn ensure_connected(
     registry: &ConnectorRegistry,
     connections: &crate::connectors::ConnectionManager,
@@ -264,9 +266,9 @@ pub async fn ensure_connected(
     let connector = registry
         .get(protocol)
         .ok_or_else(|| AppError::validation(format!("Unsupported protocol '{protocol}'")))?;
-    if !connector.is_connected() {
-        if let Some(cid) = connection_id.filter(|c| !c.is_empty()) {
-            let id = uuid::Uuid::parse_str(cid).map_err(|_| AppError::validation(format!("Invalid connection id '{cid}'")))?;
+    if let Some(cid) = connection_id.filter(|c| !c.is_empty()) {
+        let id = parse_connection_id(cid)?;
+        if !crate::connectors::connected_as(connector.as_ref(), Some(id)) {
             let profile = connections
                 .get_connection(id)
                 .await?
@@ -285,16 +287,21 @@ pub async fn ensure_connected(
     Ok(connector)
 }
 
-/// Connect `connector` with the saved connection's secrets when it is not
-/// connected (an interactive request: tried even when flagged).
-async fn connect_if_needed(connector: &dyn Connector, manager: &ConnectionManager, connection_id: Option<&str>) -> Result<(), AppError> {
-    if connector.is_connected() {
-        return Ok(());
-    }
+fn parse_connection_id(cid: &str) -> Result<uuid::Uuid, AppError> {
+    uuid::Uuid::parse_str(cid).map_err(|_| AppError::validation(format!("Invalid connection id '{cid}'")))
+}
+
+/// Connect `connector` with the saved connection's secrets unless it is
+/// already connected as that connection (an interactive request: tried
+/// even when the connection is flagged, and the outcome recorded).
+pub(crate) async fn connect_if_needed(connector: &dyn Connector, manager: &ConnectionManager, connection_id: Option<&str>) -> Result<(), AppError> {
     let Some(cid) = connection_id.filter(|c| !c.is_empty()) else {
         return require_connected(connector);
     };
-    let id = uuid::Uuid::parse_str(cid).map_err(|_| AppError::validation(format!("Invalid connection id '{cid}'")))?;
+    let id = parse_connection_id(cid)?;
+    if crate::connectors::connected_as(connector, Some(id)) {
+        return Ok(());
+    }
     let profile = manager.get_connection(id).await?.ok_or_else(|| AppError::not_found(format!("Saved connection {cid} not found")))?;
     let secrets = manager.get_secrets(id).await?;
     let r = connector.connect_with_secrets(&profile, secrets).await;

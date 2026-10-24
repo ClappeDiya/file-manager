@@ -176,6 +176,8 @@ pub struct GoogleDriveConnector {
     /// Rotated tokens are written back here (the app's credential store).
     credentials: Option<Arc<crate::security::CredentialStore>>,
     connected: AtomicBool,
+    /// The saved connection the current sign-in belongs to.
+    profile_id: std::sync::RwLock<Option<uuid::Uuid>>,
     /// The signed-in account (e-mail), from `about`.
     account: std::sync::RwLock<Option<String>>,
     /// Which part of Drive "/" opens, export formats.
@@ -192,6 +194,7 @@ impl GoogleDriveConnector {
             token_url: None,
             credentials: None,
             connected: AtomicBool::new(false),
+            profile_id: std::sync::RwLock::new(None),
             account: std::sync::RwLock::new(None),
             settings: std::sync::RwLock::new(GoogleDriveSettings::default()),
         }
@@ -236,6 +239,7 @@ impl GoogleDriveConnector {
     /// `about` (which also names the account and gives the quota).
     async fn connect_oauth(&self, profile: &ConnectionProfile, secret: Option<String>) -> Result<(), AppError> {
         self.connected.store(false, Ordering::SeqCst);
+        self.set_profile_id(None);
         let client = oauth_flow::client_for_connect(OAuthProvider::GoogleDrive, profile, secret, self.token_url.as_deref(), self.credentials.clone()).await?;
         *self.oauth.write().await = Some(client);
         if let Ok(mut s) = self.settings.write() {
@@ -245,8 +249,15 @@ impl GoogleDriveConnector {
         if let Ok(mut a) = self.account.write() {
             *a = about["user"]["emailAddress"].as_str().or(about["user"]["displayName"].as_str()).map(String::from);
         }
+        self.set_profile_id(Some(profile.id));
         self.connected.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn set_profile_id(&self, id: Option<uuid::Uuid>) {
+        if let Ok(mut p) = self.profile_id.write() {
+            *p = id;
+        }
     }
 
     /// `GET about` (user and storage quota). A 401 with a token that has not
@@ -1122,6 +1133,7 @@ impl Connector for GoogleDriveConnector {
                 client.clear_token().await;
             }
             self.connected.store(false, Ordering::SeqCst);
+            self.set_profile_id(None);
             Ok(())
         })
     }
@@ -1136,6 +1148,10 @@ impl Connector for GoogleDriveConnector {
 
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    fn connected_profile_id(&self) -> Option<uuid::Uuid> {
+        self.profile_id.read().ok().and_then(|p| *p).filter(|_| self.is_connected())
     }
 
     fn upload(&self, local_path: &str, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<u64, AppError>> + Send + '_>> {

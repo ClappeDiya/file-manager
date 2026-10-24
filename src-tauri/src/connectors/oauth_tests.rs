@@ -277,3 +277,67 @@ async fn sign_in_cancel_and_manual_code() {
     let start = flows.begin(OAuthProvider::GoogleDrive, &p, ("c".into(), None), Some(0), endpoints()).await.unwrap();
     assert!(flows.complete(&start.state, "wrong-code").await.unwrap_err().is_auth_failure());
 }
+
+/// Regression: the one shared Dropbox instance stayed signed in as the
+/// last-connected account, so an action for connection B (automation
+/// upload, share link, quota, permanent delete) ran against account A.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_connector_reconnects_as_the_requested_connection() {
+    use crate::commands::connector_commands::{connect_if_needed, ensure_connected};
+    let e = env().await;
+    let (pa, pb) = (e.saved(ConnectionProtocol::Dropbox).await, e.saved(ConnectionProtocol::Dropbox).await);
+    e.mgr.set_password(pa.id, r#"{"access_token":"a1"}"#).await.unwrap();
+    e.mgr.set_password(pb.id, r#"{"access_token":"pasted"}"#).await.unwrap();
+    let db = Arc::new(e.dropbox());
+    let registry = super::ConnectorRegistry::with_cloud(Arc::new(e.gdrive()), db.clone(), Arc::new(e.onedrive()));
+    let last_bearer = || e.mock.requests("/dbx/files/list_folder").last().and_then(|r| r.header("authorization"));
+    let (a, b) = (pa.id.to_string(), pb.id.to_string());
+
+    // The panel connects A.
+    connect_if_needed(db.as_ref(), &e.mgr, Some(&a)).await.unwrap();
+    db.list_remote("/").await.unwrap();
+    assert_eq!(last_bearer().as_deref(), Some("Bearer a1"));
+    // An interactive action for B (quota, share link) signs in as B.
+    connect_if_needed(db.as_ref(), &e.mgr, Some(&b)).await.unwrap();
+    db.list_remote("/").await.unwrap();
+    assert_eq!(last_bearer().as_deref(), Some("Bearer pasted"), "B's action must use B's token");
+    // A background action for A (automation upload) switches back to A.
+    let c = ensure_connected(&registry, &e.mgr, "dropbox", Some(&a)).await.unwrap();
+    c.list_remote("/").await.unwrap();
+    assert_eq!(last_bearer().as_deref(), Some("Bearer a1"), "A's automation must use A's token");
+    // Already signed in as A: no new sign-in check.
+    let checks = e.mock.requests("/dbx/users/get_current_account").len();
+    ensure_connected(&registry, &e.mgr, "dropbox", Some(&a)).await.unwrap();
+    connect_if_needed(db.as_ref(), &e.mgr, Some(&a)).await.unwrap();
+    assert_eq!(e.mock.requests("/dbx/users/get_current_account").len(), checks);
+    assert_eq!(db.connected_profile_id(), Some(pa.id));
+
+    // B flagged as credentials-rejected: background work for B is refused,
+    // a user action for B (share link, quota) still tries — and succeeds.
+    e.mgr.record_connect_outcome(pb.id, &Err::<(), _>(crate::core::error::AppError::auth("refused", "sign in"))).await;
+    assert!(ensure_connected(&registry, &e.mgr, "dropbox", Some(&b)).await.err().is_some_and(|e| e.is_auth_failure()));
+    assert_eq!(db.connected_profile_id(), Some(pa.id), "a refused background reconnect leaves A in place");
+    connect_if_needed(db.as_ref(), &e.mgr, Some(&b)).await.unwrap();
+    assert_eq!(db.connected_profile_id(), Some(pb.id));
+    db.disconnect().await.unwrap();
+    assert_eq!(db.connected_profile_id(), None);
+}
+
+/// B2 remembers whose application key it authorized with.
+#[tokio::test(flavor = "multi_thread")]
+async fn b2_tracks_the_connection_it_is_authorized_as() {
+    let mock = serve(move |r| {
+        let base = format!("http://{}", r.header("host").unwrap_or_default());
+        json(j!({ "accountId": "acc", "authorizationToken": "tok", "apiUrl": base, "downloadUrl": base, "recommendedPartSize": 100u64, "absoluteMinimumPartSize": 5u64, "allowed": { "capabilities": [] } }))
+    })
+    .await;
+    let c = super::B2Connector::with_authorize_url(&format!("{}/b2api/v2/b2_authorize_account", mock.base));
+    let (pa, pb) = (super::live_tests::profile(ConnectionProtocol::B2, "", None, "kid", "/"), super::live_tests::profile(ConnectionProtocol::B2, "", None, "kid2", "/"));
+    c.connect_with_secret(&pa, Some("k".into())).await.unwrap();
+    assert!(super::connected_as(&c, Some(pa.id)) && !super::connected_as(&c, Some(pb.id)));
+    // A failed attempt for B (no key) keeps the A authorization and owner.
+    assert!(c.connect_with_secret(&pb, None).await.is_err());
+    assert_eq!(c.connected_profile_id(), Some(pa.id));
+    c.connect_with_secret(&pb, Some("k2".into())).await.unwrap();
+    assert_eq!(c.connected_profile_id(), Some(pb.id));
+}

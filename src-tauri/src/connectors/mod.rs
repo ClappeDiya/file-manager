@@ -194,6 +194,14 @@ pub trait Connector: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<FileEntry>, AppError>> + Send + '_>>;
     fn is_connected(&self) -> bool;
 
+    /// The saved connection this instance is signed in as, for connectors
+    /// whose one shared instance can serve several accounts (Google Drive,
+    /// Dropbox, OneDrive, B2). `None`: not tracked (the default) or not
+    /// connected.
+    fn connected_profile_id(&self) -> Option<uuid::Uuid> {
+        None
+    }
+
     /// Connect using a secret held in the credential store (password, access
     /// secret, or private-key path, depending on the protocol). Connectors
     /// that need no secret fall back to [`Connector::connect`].
@@ -275,6 +283,18 @@ pub trait Connector: Send + Sync {
             })
         })
     }
+}
+
+/// Whether `connector` can serve saved connection `id` as it is: connected
+/// and, when it tracks who it is signed in as, signed in as that one (so an
+/// action for one account never runs against another of the same
+/// provider).
+pub fn connected_as(connector: &dyn Connector, id: Option<uuid::Uuid>) -> bool {
+    connector.is_connected()
+        && match (id, connector.connected_profile_id()) {
+            (Some(want), Some(have)) => want == have,
+            _ => true,
+        }
 }
 
 /// Suffix of a file still being uploaded (`.<name>.ufop-part`).

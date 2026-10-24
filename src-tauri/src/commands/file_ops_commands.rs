@@ -1239,18 +1239,11 @@ pub async fn cloud_delete_to_trash(
 }
 
 /// Connect the shared cloud connector with the saved connection's sign-in
-/// when it is not connected yet. (These commands used to create a fresh,
-/// never-signed-in connector, so every call failed with "Not connected".)
+/// unless it is already signed in as that connection. (These commands used
+/// to create a fresh, never-signed-in connector, so every call failed with
+/// "Not connected".)
 async fn ensure_cloud_connected(connector: &dyn crate::connectors::Connector, connections: &crate::connectors::ConnectionManager, connection_id: &str) -> Result<(), AppError> {
-    if connector.is_connected() {
-        return Ok(());
-    }
-    let id = uuid::Uuid::parse_str(connection_id).map_err(|_| AppError::validation(format!("Invalid connection id '{connection_id}'")))?;
-    let profile = connections.get_connection(id).await?.ok_or_else(|| AppError::not_found("The connection no longer exists"))?;
-    let secrets = connections.get_secrets(id).await?;
-    let r = connector.connect_with_secrets(&profile, secrets).await;
-    connections.record_connect_outcome(id, &r).await;
-    r
+    super::connector_commands::connect_if_needed(connector, connections, Some(connection_id)).await
 }
 
 /// Permanently delete a cloud file/folder, bypassing the trash/recycle bin.

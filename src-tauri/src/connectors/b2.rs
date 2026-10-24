@@ -142,6 +142,8 @@ pub struct B2Connector {
     state: Arc<RwLock<Option<B2State>>>,
     /// `b2_authorize_account` URL (overridable for tests).
     authorize_url: String,
+    /// The saved connection whose key the current authorization used.
+    profile_id: std::sync::RwLock<Option<uuid::Uuid>>,
 }
 
 impl B2Connector {
@@ -154,6 +156,7 @@ impl B2Connector {
         Self {
             state: Arc::new(RwLock::new(None)),
             authorize_url: url.to_string(),
+            profile_id: std::sync::RwLock::new(None),
         }
     }
 
@@ -911,6 +914,7 @@ impl Connector for B2Connector {
         secret: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         let key_id = profile.username.clone().unwrap_or_default();
+        let id = profile.id;
         Box::pin(async move {
             let key = secret.filter(|k| !k.trim().is_empty()).ok_or_else(|| {
                 AppError::validation("Enter the B2 application key (as the connection's password)")
@@ -918,7 +922,13 @@ impl Connector for B2Connector {
             if key_id.trim().is_empty() {
                 return Err(AppError::validation("Enter the B2 application key ID (as the user name)"));
             }
-            self.connect_with_credentials(key_id.trim(), key.trim()).await
+            self.connect_with_credentials(key_id.trim(), key.trim()).await?;
+            // A failed attempt leaves the previous authorization (and its
+            // owner) in place.
+            if let Ok(mut p) = self.profile_id.write() {
+                *p = Some(id);
+            }
+            Ok(())
         })
     }
 
@@ -926,6 +936,9 @@ impl Connector for B2Connector {
         Box::pin(async move {
             let mut state = self.state.write().await;
             *state = None;
+            if let Ok(mut p) = self.profile_id.write() {
+                *p = None;
+            }
             Ok(())
         })
     }
@@ -954,6 +967,10 @@ impl Connector for B2Connector {
 
     fn is_connected(&self) -> bool {
         self.state.try_read().map(|s| s.is_some()).unwrap_or(false)
+    }
+
+    fn connected_profile_id(&self) -> Option<uuid::Uuid> {
+        self.profile_id.read().ok().and_then(|p| *p).filter(|_| self.is_connected())
     }
 }
 
