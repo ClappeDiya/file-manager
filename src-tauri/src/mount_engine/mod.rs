@@ -152,6 +152,9 @@ fn dir_size(p: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// A `mount_configs` row: id, connection, mount point, auto-mount, status, created, options JSON, error.
+type SavedRow = (String, String, String, bool, String, String, String, Option<String>);
+
 /// A saved mount configuration as stored.
 #[derive(Debug, Clone)]
 struct SavedConfig {
@@ -1024,7 +1027,7 @@ impl MountManager {
         // Also load saved configs from DB that aren't currently active
         let active_ids: Vec<String> = active.iter().map(|m| m.id.to_string()).collect();
 
-        let saved_configs: Vec<(String, String, String, bool, String, String, String, Option<String>)> = repo
+        let saved_configs: Vec<SavedRow> = repo
             .pool()
             .execute(move |conn| {
                 let mut stmt = conn.prepare(
@@ -1555,7 +1558,7 @@ mod tests {
         let mgr = MountManager::new();
         let a = inject_mounted(&mgr, &repo, "A", "/mnt/a").await;
         let b = inject_mounted(&mgr, &repo, "B", "/mnt/b").await;
-        let mut changes = mgr.subscribe();
+        let changes = mgr.subscribe();
         let report = mgr.unmount_all(&repo).await;
         assert_eq!(report, UnmountAllReport { unmounted: 2, failed: vec![] });
         assert!(changes.has_changed().unwrap(), "the tray and the UI are told");
@@ -1610,7 +1613,7 @@ mod tests {
         let mgr = MountManager::new();
         let cfg = mgr.save_mount_config(profile.id, "/mnt/one".into(), false, Some(MountOptions::default()), &repo, &conns).await.unwrap();
         let second = mgr.save_mount_config(profile.id, "/mnt/two".into(), false, None, &repo, &conns).await.unwrap();
-        let mut rx = mgr.subscribe();
+        let rx = mgr.subscribe();
 
         let opts = MountOptions { cache_mode: CacheMode::Full, subfolder: Some("/photos/2024/".into()), extra_flags: vec!["--no-modtime".into()], ..Default::default() };
         let out = mgr.update_mount_config(cfg.id, Some(other.id), "/mnt/renamed".into(), true, opts, &repo, &conns).await.unwrap();
@@ -1679,7 +1682,7 @@ mod tests {
         let (repo, conns) = auto_mount_fixture().await;
         let mgr = MountManager::new();
         let id = inject_mounted(&mgr, &repo, "A", "/mnt/a").await;
-        let mut rx = mgr.subscribe();
+        let rx = mgr.subscribe();
         mgr.delete_mount_config(id, &repo).await.unwrap();
         assert!(rx.has_changed().unwrap());
         assert!(mgr.list_mounts(&repo, &conns).await.unwrap().is_empty());

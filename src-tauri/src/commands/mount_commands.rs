@@ -189,6 +189,7 @@ pub async fn mount_policy(mount_mgr: State<'_, MountManager>) -> Result<Option<u
 
 /// Change a saved mount (the drive must be unmounted). `connection_id` is optional: omitted keeps it.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn update_mount_config(
     mount_id: String,
     connection_id: Option<String>,
