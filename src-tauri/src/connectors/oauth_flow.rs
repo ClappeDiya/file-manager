@@ -220,6 +220,14 @@ pub(crate) async fn client_for_connect(
     token_url: Option<&str>,
     credentials: Option<Arc<crate::security::CredentialStore>>,
 ) -> Result<OAuthClient, AppError> {
+    // `connect()` without a secret loads the stored sign-in itself.
+    let secret = match secret.filter(|s| !s.trim().is_empty()) {
+        Some(s) => Some(s),
+        None => match &credentials {
+            Some(store) => store.retrieve(&crate::security::CredentialStore::credential_key(&profile.id)).await?,
+            None => None,
+        },
+    };
     let secret = secret.filter(|s| !s.trim().is_empty()).ok_or_else(|| AppError::State {
         message: format!("Not signed in to {} yet", provider.label()),
         advice: "Click Sign in on the connection in Connections.".into(),

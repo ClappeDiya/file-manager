@@ -399,10 +399,7 @@ impl S3Connector {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(AppError::Connection {
-                message: format!("S3 list buckets failed (HTTP {status}): {body}"),
-                advice: "Check your access key and permissions.".to_string(),
-            });
+            return Err(s3_status_error(format!("S3 list buckets failed (HTTP {status}): {body}"), status.as_u16(), &body, "Check your access key and permissions."));
         }
 
         let body = resp.text().await.map_err(|e| AppError::Connection {
@@ -513,10 +510,7 @@ impl S3Connector {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(AppError::Connection {
-                message: format!("S3 list objects failed (HTTP {status}): {body}"),
-                advice: "Check your bucket name and permissions.".to_string(),
-            });
+            return Err(s3_status_error(format!("S3 list objects failed (HTTP {status}): {body}"), status.as_u16(), &body, "Check your bucket name and permissions."));
         }
 
         let body = resp.text().await.map_err(|e| AppError::Connection {
@@ -3526,6 +3520,30 @@ fn parse_object_versions_xml(xml: &str, key_filter: &str) -> Vec<S3ObjectVersion
     // Sort by last_modified descending (latest first)
     versions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
     versions
+}
+
+/// An S3 error reply: rejected keys (401, or 403 with `InvalidAccessKeyId`,
+/// `SignatureDoesNotMatch`, `ExpiredToken`…) are authentication failures,
+/// which are not retried; a plain 403 (bucket policy) is not.
+pub(crate) fn s3_status_error(message: String, status: u16, body: &str, advice: &str) -> AppError {
+    const REJECTED: &[&str] = &["InvalidAccessKeyId", "SignatureDoesNotMatch", "ExpiredToken", "InvalidToken", "TokenRefreshRequired", "InvalidClientTokenId"];
+    if status == 401 || (status == 403 && REJECTED.iter().any(|c| body.contains(&format!("<Code>{c}</Code>")))) {
+        AppError::auth(message, "Check the access key ID and secret (they were refused).")
+    } else {
+        AppError::connection(message, advice)
+    }
+}
+
+#[cfg(test)]
+mod auth_error_tests {
+    #[test]
+    fn rejected_keys_are_auth_failures_but_policy_denials_are_not() {
+        let e = super::s3_status_error("x".into(), 403, "<Error><Code>SignatureDoesNotMatch</Code></Error>", "a");
+        assert!(e.is_auth_failure());
+        assert!(super::s3_status_error("x".into(), 403, "<Error><Code>InvalidAccessKeyId</Code></Error>", "a").is_auth_failure());
+        assert!(!super::s3_status_error("x".into(), 403, "<Error><Code>AccessDenied</Code></Error>", "a").is_auth_failure());
+        assert!(!super::s3_status_error("x".into(), 500, "", "a").is_auth_failure());
+    }
 }
 
 #[cfg(test)]

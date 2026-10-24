@@ -184,6 +184,10 @@ async fn sign_in_connect_list_and_refresh_on_expiry() {
     assert_eq!((token.access_token.as_str(), token.refresh_token.as_deref()), ("a2", Some("r2")), "rotated tokens are persisted");
     assert!(!token.is_expired());
     assert_eq!(fresh.list_remote("/").await.unwrap().len(), 2);
+    // Plain connect() (no secret passed) loads the stored sign-in itself.
+    let plain = e.gdrive();
+    plain.connect(&saved_profile(&e, &p).await).await.unwrap();
+    assert!(plain.is_connected());
 }
 
 async fn saved_profile(e: &Env, p: &ConnectionProfile) -> ConnectionProfile {
