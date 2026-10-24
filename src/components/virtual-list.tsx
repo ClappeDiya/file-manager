@@ -1,6 +1,6 @@
-import { useRef, useCallback } from "react";
+import { useRef, useCallback, useEffect, useState, type ReactNode } from "react";
 import { formatBytes } from "@/lib/format-bytes";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { observeElementRect, useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@ufop/ui-components";
 import type { FileEntry } from "./data-grid";
 
@@ -171,6 +171,201 @@ export function VirtualList({
             );
           })}
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Generic virtualised rows ──
+
+export interface VirtualRowsProps<T> {
+  items: T[];
+  /** Draws one row's content; the row box (height, selection colour) is ours. */
+  renderRow: (item: T, index: number) => ReactNode;
+  ariaLabel: string;
+  rowHeight?: number;
+  /** Height of the scroll area in px. */
+  height?: number;
+  /** Rows can be selected (click, Ctrl/Cmd-click, Shift-click, Shift+arrows, Ctrl/Cmd+A). */
+  selectable?: boolean;
+  /** Told the selected row indexes, ascending, whenever the selection changes. */
+  onSelectionChange?: (indexes: number[]) => void;
+  /** Ctrl/Cmd+C on the list: told the selected row indexes. */
+  onCopy?: (indexes: number[]) => void;
+  /** Stay on the newest (last) row while rows are added, until the reader scrolls up. */
+  followTail?: boolean;
+  /** Row `id` attribute; defaults to the index. */
+  rowKey?: (item: T, index: number) => string | number;
+  className?: string;
+}
+
+/**
+ * A scrolling list that only renders the rows in view (TanStack Virtual), so
+ * tens of thousands of rows stay quick: the log viewer and the changed-items
+ * list of a sync run. Keyboard and screen-reader behaviour follows
+ * [`VirtualList`].
+ */
+export function VirtualRows<T>({
+  items,
+  renderRow,
+  ariaLabel,
+  rowHeight = 22,
+  height = 360,
+  selectable = false,
+  onSelectionChange,
+  onCopy,
+  followTail = false,
+  rowKey,
+  className,
+}: VirtualRowsProps<T>) {
+  const parentRef = useRef<HTMLDivElement>(null);
+  const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
+  const [active, setActive] = useState(0);
+  const anchor = useRef(0);
+  const atTail = useRef(true);
+
+  const virtualizer = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => rowHeight,
+    overscan: 12,
+    initialRect: { width: 800, height },
+    // An element that reports no size (hidden, or a test DOM) still gets its rows drawn.
+    observeElementRect: (instance, cb) => observeElementRect(instance, (rect) => cb(rect.height > 0 ? rect : { width: rect.width || 800, height })),
+  });
+
+  const commit = useCallback(
+    (next: Set<number>) => {
+      setSelected(next);
+      onSelectionChange?.([...next].sort((a, b) => a - b));
+    },
+    [onSelectionChange],
+  );
+
+  // A new list (filters changed, rows cleared) starts without a selection.
+  const length = items.length;
+  useEffect(() => {
+    setSelected((prev) => {
+      if (prev.size === 0) return prev;
+      const kept = new Set([...prev].filter((i) => i < length));
+      if (kept.size === prev.size) return prev;
+      onSelectionChange?.([...kept].sort((a, b) => a - b));
+      return kept;
+    });
+    setActive((a) => Math.min(a, Math.max(0, length - 1)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [length]);
+
+  // Follow the tail while the reader has not scrolled away from it.
+  useEffect(() => {
+    if (followTail && atTail.current && length > 0) virtualizer.scrollToIndex(length - 1, { align: "end" });
+  }, [followTail, length, virtualizer]);
+
+  const onScroll = useCallback(() => {
+    const el = parentRef.current;
+    if (el) atTail.current = el.scrollTop + el.clientHeight >= el.scrollHeight - rowHeight * 2;
+  }, [rowHeight]);
+
+  const pick = useCallback(
+    (index: number, mods: { shift: boolean; toggle: boolean }) => {
+      if (!selectable) return;
+      if (mods.shift) {
+        const [a, b] = [Math.min(anchor.current, index), Math.max(anchor.current, index)];
+        const range = new Set<number>(mods.toggle ? selected : []);
+        for (let i = a; i <= b; i++) range.add(i);
+        commit(range);
+      } else if (mods.toggle) {
+        const next = new Set(selected);
+        if (!next.delete(index)) next.add(index);
+        anchor.current = index;
+        commit(next);
+      } else {
+        anchor.current = index;
+        commit(new Set([index]));
+      }
+      setActive(index);
+    },
+    [selectable, selected, commit],
+  );
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (length === 0) return;
+    const mod = e.ctrlKey || e.metaKey;
+    const move = (to: number) => {
+      const i = Math.max(0, Math.min(length - 1, to));
+      e.preventDefault();
+      virtualizer.scrollToIndex(i, { align: "auto" });
+      if (selectable) pick(i, { shift: e.shiftKey, toggle: false });
+      else setActive(i);
+    };
+    const page = Math.max(1, Math.floor((parentRef.current?.clientHeight || height) / rowHeight));
+    switch (e.key) {
+      case "ArrowDown": return move(active + 1);
+      case "ArrowUp": return move(active - 1);
+      case "PageDown": return move(active + page);
+      case "PageUp": return move(active - page);
+      case "Home": return move(0);
+      case "End": return move(length - 1);
+      case "a":
+      case "A":
+        if (mod && selectable) {
+          e.preventDefault();
+          commit(new Set(Array.from({ length }, (_, i) => i)));
+        }
+        return;
+      case "c":
+      case "C":
+        if (mod && onCopy && selected.size > 0) {
+          e.preventDefault();
+          onCopy([...selected].sort((a, b) => a - b));
+        }
+        return;
+    }
+  };
+
+  return (
+    <div
+      ref={parentRef}
+      className={cn(
+        "overflow-auto rounded-[var(--radius-md)] border border-[var(--color-border)]",
+        "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]",
+        className,
+      )}
+      style={{ height }}
+      role="listbox"
+      aria-label={ariaLabel}
+      aria-multiselectable={selectable || undefined}
+      aria-rowcount={length}
+      aria-activedescendant={length > 0 ? `vrow-${ariaLabel}-${active}` : undefined}
+      tabIndex={0}
+      onKeyDown={onKeyDown}
+      onScroll={onScroll}
+    >
+      <div style={{ height: `${virtualizer.getTotalSize()}px`, width: "100%", position: "relative" }}>
+        {virtualizer.getVirtualItems().map((v) => {
+          const item = items[v.index];
+          if (item === undefined) return null;
+          const isSel = selected.has(v.index);
+          return (
+            <div
+              key={rowKey ? rowKey(item, v.index) : v.key}
+              id={`vrow-${ariaLabel}-${v.index}`}
+              role="option"
+              aria-selected={selectable ? isSel : undefined}
+              aria-posinset={v.index + 1}
+              aria-setsize={length}
+              className={cn(
+                "absolute left-0 top-0 w-full flex items-center px-2 gap-2",
+                isSel ? "bg-[var(--color-selection-bg)] text-[color:var(--color-selection-text)]" : "hover:bg-[var(--color-hover-bg)]",
+                v.index === active && "outline outline-1 -outline-offset-1 outline-[var(--color-focus-ring)]",
+              )}
+              style={{ height: `${v.size}px`, transform: `translateY(${v.start}px)` }}
+              onClick={(e) => pick(v.index, { shift: e.shiftKey, toggle: e.ctrlKey || e.metaKey })}
+            >
+              {renderRow(item, v.index)}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

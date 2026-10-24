@@ -13,7 +13,7 @@ import { NamedSchedulePicker } from "@/components/schedule-pickers";
 import { refId, useScheduleStore } from "@/stores/schedule-store";
 import { useState, useCallback, useEffect, useRef } from "react";
 import { SyncRunOptionsSection } from "@/components/sync-run-options";
-import { DEFAULT_RUN_OPTIONS, type SyncPair as StoreSyncPair } from "@/stores/sync-store";
+import { DEFAULT_RUN_OPTIONS, type SyncPair as StoreSyncPair, type SyncReport } from "@/stores/sync-store";
 import { RunNotifyPicker } from "@/components/run-notify-picker";
 import type { RunNotify } from "@/lib/run-notify";
 import { formatNextRun, useNextRuns } from "@/lib/upcoming-runs";
@@ -40,6 +40,11 @@ import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import { SyncProgressCard } from "@/components/sync-progress-card";
 import { SyncComparison } from "@/components/sync-comparison";
+import { SyncRunItems } from "@/components/sync-run-items";
+import { HistoryRangeChips } from "@/components/history-range-chips";
+import { ALL_TIME, formatLocalTime, rangeArgs, type HistoryRange } from "@/lib/history-range";
+import { triggerLabel } from "@/lib/run-trigger";
+import { canOpen, localTarget, openTarget } from "@/lib/open-location";
 import { TwoWayHistory } from "@/components/sync-two-way-history";
 import {
   CopyPresetPicker,
@@ -95,28 +100,6 @@ interface SyncDiffEntry {
   path_length_warning: string | null;
   /** Side the action writes to; two-way sync also writes to the source. */
   direction?: "to_dest" | "to_source";
-}
-
-interface SyncReport {
-  id: string;
-  pair_id: string;
-  pair_name: string;
-  started_at: string;
-  ended_at: string;
-  duration_ms: number;
-  files_added: number;
-  files_modified: number;
-  files_deleted: number;
-  files_skipped: number;
-  conflicts_resolved: number;
-  errors: number;
-  bytes_transferred: number;
-  status: string;
-  health: string;
-  error_messages: string[];
-  resumed: boolean;
-  exit_code?: number;
-  versions_pruned?: number;
 }
 
 interface SyncConflictItem {
@@ -215,6 +198,9 @@ export function SyncPanel() {
   const [_selectedPair, _setSelectedPair] = useState<SyncPair | null>(null);
   const [preview, setPreview] = useState<SyncPreview | null>(null);
   const [reports, setReports] = useState<SyncReport[]>([]);
+  // Which pair (all when null) and dates the History view shows.
+  const [reportsPairId, setReportsPairId] = useState<string | null>(null);
+  const [reportsRange, setReportsRange] = useState<HistoryRange>(ALL_TIME);
   const [conflicts, setConflicts] = useState<SyncConflictItem[]>([]);
   const [quarantine, _setQuarantine] = useState<QuarantineEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -463,12 +449,14 @@ export function SyncPanel() {
   // ── Load Reports ──
 
   // Stored history (survives restarts); falls back to this session's runs.
-  const handleViewReports = async (pairId: string | null) => {
+  const handleViewReports = async (pairId: string | null, range: HistoryRange = ALL_TIME) => {
     try {
-      const result = await tauriInvoke<SyncReport[]>("get_sync_run_history", { pairId, limit: 200 }).catch(() =>
+      const result = await tauriInvoke<SyncReport[]>("get_sync_run_history", { pairId, limit: 200, ...rangeArgs(range) }).catch(() =>
         pairId ? tauriInvoke<SyncReport[]>("get_sync_reports", { pairId }) : Promise.resolve([] as SyncReport[]),
       );
       setReports(result);
+      setReportsPairId(pairId);
+      setReportsRange(range);
       setView("reports");
     } catch (e: any) {
       setError(e?.message || "Failed to load reports");
@@ -655,6 +643,9 @@ export function SyncPanel() {
         {view === "reports" && (
           <ReportsView
             reports={reports}
+            pairs={pairs}
+            range={reportsRange}
+            onRangeChange={(r) => void handleViewReports(reportsPairId, r)}
             onBack={() => setView("list")}
           />
         )}
@@ -1645,12 +1636,30 @@ export function PreviewView({
 
 function ReportsView({
   reports,
+  pairs,
+  range,
+  onRangeChange,
   onBack,
 }: {
   reports: SyncReport[];
+  pairs: SyncPair[];
+  range: HistoryRange;
+  onRangeChange: (range: HistoryRange) => void;
   onBack: () => void;
 }) {
   const [exportError, setExportError] = useState<string | null>(null);
+  // Runs whose changed-files list is open.
+  const [openItems, setOpenItems] = useState<Set<string>>(new Set());
+  const toggleItems = (id: string) =>
+    setOpenItems((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+  const open = async (path: string | undefined) => {
+    const err = await openTarget(localTarget(path));
+    if (err) setExportError(err);
+  };
 
   const handleExportReportCsv = async (pairId: string, reportId: string, pairName: string) => {
     setExportError(null);
@@ -1692,8 +1701,9 @@ function ReportsView({
         >
           Back to list
         </button>
+        <HistoryRangeChips value={range} onChange={onRangeChange} />
         <div className="text-center text-sm text-zinc-500 py-4">
-          No sync reports available.
+          {range.preset === "all" ? "No sync reports available." : "No sync runs in this date range."}
         </div>
       </div>
     );
@@ -1712,6 +1722,7 @@ function ReportsView({
           Back
         </button>
       </div>
+      <HistoryRangeChips value={range} onChange={onRangeChange} />
 
       {reports.map((report) => (
         <div
@@ -1743,6 +1754,7 @@ function ReportsView({
               Transferred: {formatBytes(report.bytes_transferred)}
             </div>
             <div>Status: {report.status}</div>
+            <div data-testid="run-trigger">Started: {triggerLabel(report.trigger)}</div>
             {report.resumed && <div>Resumed from interruption</div>}
             {!!report.versions_pruned && <div>Old versions removed: {report.versions_pruned}</div>}
             {report.exit_code !== undefined && (
@@ -1761,9 +1773,50 @@ function ReportsView({
           )}
 
           <div className="text-[10px] text-zinc-400 mt-2">
-            {new Date(report.started_at).toLocaleString()} -{" "}
-            {new Date(report.ended_at).toLocaleString()}
+            {formatLocalTime(report.started_at)} - {formatLocalTime(report.ended_at)}
           </div>
+
+          {/* Open the folders, and see which files the run changed */}
+          {(() => {
+            const pair = pairs.find((p) => p.id === report.pair_id);
+            const changed = report.files_added + report.files_modified + report.files_deleted + report.conflicts_resolved + report.errors;
+            return (
+              <div className="flex gap-1 mt-2 flex-wrap">
+                <button
+                  onClick={() => void open(pair?.source_path)}
+                  disabled={!pair || !canOpen(localTarget(pair.source_path))}
+                  title={pair ? pair.source_path : "This pair no longer exists"}
+                  className="px-2 py-1 text-[11px] rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-50"
+                  aria-label={`Open source of report ${report.id}`}
+                >
+                  Open source
+                </button>
+                <button
+                  onClick={() => void open(pair?.dest_path)}
+                  disabled={!pair || !canOpen(localTarget(pair.dest_path))}
+                  title={pair ? pair.dest_path : "This pair no longer exists"}
+                  className="px-2 py-1 text-[11px] rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-50"
+                  aria-label={`Open destination of report ${report.id}`}
+                >
+                  Open destination
+                </button>
+                <button
+                  onClick={() => toggleItems(report.id)}
+                  disabled={changed === 0}
+                  aria-expanded={openItems.has(report.id)}
+                  className="px-2 py-1 text-[11px] rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-50"
+                  aria-label={`Changed files of report ${report.id}`}
+                >
+                  {openItems.has(report.id) ? "Hide changed files" : "Changed files"}
+                </button>
+              </div>
+            );
+          })()}
+          {openItems.has(report.id) && (
+            <div className="mt-2">
+              <SyncRunItems runId={report.id} />
+            </div>
+          )}
 
           {/* Export buttons */}
           <div className="flex gap-1 mt-2">

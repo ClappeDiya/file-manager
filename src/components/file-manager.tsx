@@ -55,6 +55,7 @@ import { KeyboardCheatSheet } from "./keyboard-cheat-sheet";
 import { BatchRename } from "./batch-rename";
 import SettingsPanel from "./settings-panel";
 import { ConnectionPanel } from "./connection-panel";
+import { useConnectionBrowse } from "@/stores/connection-browse-store";
 import { useRcloneUi } from "@/stores/rclone-ui-store";
 import { RcloneEngineInfo } from "@/components/rclone/rclone-settings-section";
 import { rcloneStatus, type RcloneStatus } from "@/lib/rclone";
@@ -726,6 +727,11 @@ export function FileManager() {
   // Cmd+Shift+U and a palette entry. Same TDZ-safe placement
   // as the iter 25/26 orphan dialogs.
   const [connectionsOpen, setConnectionsOpen] = useState(false);
+  // A history row asked to open a folder of a saved connection: show the manager.
+  const browseRequested = useConnectionBrowse((s) => s.request !== null);
+  useEffect(() => {
+    if (browseRequested) setConnectionsOpen(true);
+  }, [browseRequested]);
   // Closing the Connection Manager also leaves its rclone remote manager.
   useEffect(() => {
     if (!connectionsOpen) useRcloneUi.getState().closeManager();
