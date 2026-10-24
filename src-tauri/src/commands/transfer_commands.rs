@@ -7,7 +7,9 @@ use crate::core::types::{
 };
 use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
 use crate::transfer_engine::conflict::{self, ConflictAction, ConflictCheck};
+use crate::storage::Repository;
 use crate::transfer_engine::history::TransferHistory;
+use crate::transfer_engine::retention::{self, FailedRetention};
 use crate::transfer_engine::verification::{self, VerificationResult};
 use crate::transfer_engine::TransferManager;
 use tauri::State;
@@ -485,7 +487,8 @@ pub async fn set_checksum_algorithm(
     Ok(())
 }
 
-/// Search transfer history.
+/// Search transfer history. `date_from` / `date_to` (RFC 3339 instants)
+/// keep the transfers that started in that range.
 #[tauri::command]
 pub async fn search_transfer_history(
     path_contains: Option<String>,
@@ -493,26 +496,31 @@ pub async fn search_transfer_history(
     connection_id: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
+    date_from: Option<String>,
+    date_to: Option<String>,
     history: State<'_, TransferHistory>,
 ) -> Result<Vec<TransferHistoryRecord>, AppError> {
+    let (date_from, date_to) = crate::core::date_range::parse_range(date_from.as_deref(), date_to.as_deref())?;
     let filter = TransferHistoryFilter {
         path_contains,
         status: status.map(|s| TransferStatus::from_str_lossy(&s)),
         connection_id: connection_id.and_then(|s| Uuid::parse_str(&s).ok()),
-        date_from: None,
-        date_to: None,
+        date_from,
+        date_to,
         limit,
         offset,
     };
     history.search(filter).await
 }
 
-/// Export transfer history.
+/// Export transfer history (with the same filters as the search).
 #[tauri::command]
 pub async fn export_transfer_history(
     format: String,
     path_contains: Option<String>,
     status: Option<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
     history: State<'_, TransferHistory>,
 ) -> Result<String, AppError> {
     let fmt = match format.as_str() {
@@ -520,25 +528,63 @@ pub async fn export_transfer_history(
         "json" => ExportFormat::Json,
         _ => ExportFormat::Json,
     };
+    let (date_from, date_to) = crate::core::date_range::parse_range(date_from.as_deref(), date_to.as_deref())?;
     let filter = TransferHistoryFilter {
         path_contains,
         status: status.map(|s| TransferStatus::from_str_lossy(&s)),
+        date_from,
+        date_to,
         ..Default::default()
     };
     history.export(filter, fmt).await
 }
 
-/// Clean up old transfer history records.
+/// Clean up old transfer history records, and the failed transfers kept for
+/// retry that are past the retention limits (age and total size). Returns
+/// how many records were removed in all.
 #[tauri::command]
 pub async fn cleanup_transfer_history(
     older_than_days: Option<u32>,
     history: State<'_, TransferHistory>,
+    manager: State<'_, TransferManager>,
+    repo: State<'_, Repository>,
 ) -> Result<u32, AppError> {
-    match older_than_days {
+    let history_removed = match older_than_days {
         // The user's "older than N days" choice; without one, the default retention.
-        Some(days) => history.cleanup_older_than(days.max(1)).await,
-        None => history.cleanup_old_records().await,
-    }
+        Some(days) => history.cleanup_older_than(days.max(1)).await?,
+        None => history.cleanup_old_records().await?,
+    };
+    let retry_removed = prune_failed_transfers_now(&manager, &repo).await?;
+    Ok(history_removed + retry_removed)
+}
+
+/// Drop the stored failed transfers beyond the saved retention limits, and
+/// from memory too. Returns how many were dropped.
+async fn prune_failed_transfers_now(manager: &TransferManager, repo: &Repository) -> Result<u32, AppError> {
+    let limits = FailedRetention::load(repo).await;
+    let removed = retention::prune_failed(repo, limits).await?;
+    manager.forget_failed(&removed).await;
+    Ok(removed.len() as u32)
+}
+
+/// How long, and how much, failed transfers are kept for retry.
+#[tauri::command]
+pub async fn get_failed_transfer_retention(repo: State<'_, Repository>) -> Result<FailedRetention, AppError> {
+    Ok(FailedRetention::load(&repo).await)
+}
+
+/// Change the retention of failed transfers (values are clamped to sane
+/// bounds) and apply it now. Returns the limits in force.
+#[tauri::command]
+pub async fn set_failed_transfer_retention(
+    max_age_days: u32,
+    max_total_kb: u32,
+    manager: State<'_, TransferManager>,
+    repo: State<'_, Repository>,
+) -> Result<FailedRetention, AppError> {
+    let saved = FailedRetention { max_age_days, max_total_kb }.save(&repo).await?;
+    prune_failed_transfers_now(&manager, &repo).await?;
+    Ok(saved)
 }
 
 // ── Three-Layer Architecture Commands ──

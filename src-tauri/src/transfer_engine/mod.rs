@@ -17,6 +17,7 @@ pub mod history;
 pub mod journal;
 pub mod pipeline;
 pub mod resume;
+pub mod retention;
 pub mod throttle;
 pub mod verification;
 
@@ -479,6 +480,17 @@ impl TransferManager {
         let mut map = self.jobs.write().await;
         for job in jobs {
             map.insert(job.id, job);
+        }
+    }
+
+    /// Drop failed jobs from memory (their stored rows were pruned).
+    /// Anything that is not failed any more is left alone.
+    pub async fn forget_failed(&self, ids: &[Uuid]) {
+        let mut map = self.jobs.write().await;
+        for id in ids {
+            if map.get(id).is_some_and(|j| j.status == TransferStatus::Failed) {
+                map.remove(id);
+            }
         }
     }
 

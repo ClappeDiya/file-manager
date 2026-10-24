@@ -794,7 +794,7 @@ impl StorageOperations for Repository {
                                 checksum_algorithm, source_checksum, dest_checksum,
                                 speed_bps, eta_seconds
                          FROM transfer_history
-                         WHERE status IN ('queued', 'active', 'paused')
+                         WHERE status IN ('queued', 'active', 'paused', 'failed')
                          ORDER BY
                             CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 ELSE 1 END,
                             sort_order ASC,
@@ -804,7 +804,9 @@ impl StorageOperations for Repository {
                         .query_map([], Self::row_to_transfer_job)?
                         .filter_map(|r| r.ok())
                         .map(|mut job| {
-                            // Active transfers that were interrupted should be re-queued
+                            // Active transfers that were interrupted should be re-queued.
+                            // Failed ones stay failed: listed with their error, retried
+                            // only when the user says so.
                             if job.status == TransferStatus::Active {
                                 job.status = TransferStatus::Queued;
                             }
@@ -1005,6 +1007,49 @@ mod tests {
         let paused_job = loaded.iter().find(|j| j.id == jobs[0].id).unwrap();
         assert_eq!(paused_job.status, TransferStatus::Paused);
         assert_eq!(paused_job.transferred_bytes, 500);
+    }
+
+    /// Row 93: a failed job used to vanish on restart (the restore query
+    /// skipped it), taking its error and its retry with it.
+    #[tokio::test]
+    async fn failed_transfers_come_back_after_a_restart_and_stay_failed() {
+        let repo = Repository::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        let job = |status: TransferStatus, name: &str, error: Option<&str>| TransferJob {
+            id: Uuid::new_v4(),
+            source_path: format!("/src/{name}"),
+            dest_path: format!("/dst/{name}"),
+            total_bytes: 1000,
+            transferred_bytes: 400,
+            status,
+            priority: TransferPriority::Normal,
+            sort_order: 0,
+            created_at: now,
+            updated_at: now,
+            error_message: error.map(String::from),
+            retry_count: 2,
+            partial_checksum: None,
+            conflict_policy: None,
+            connection_id: None,
+            verify_checksum: false,
+            checksum_algorithm: None,
+            source_checksum: None,
+            dest_checksum: None,
+            speed_bps: 0,
+            eta_seconds: None,
+        };
+        let failed = job(TransferStatus::Failed, "failed.bin", Some("disk full"));
+        let done = job(TransferStatus::Completed, "done.bin", None);
+        let gone = job(TransferStatus::Cancelled, "gone.bin", None);
+        StorageOperations::save_transfer_queue(&repo, &[failed.clone(), done, gone]).await.unwrap();
+
+        let loaded = StorageOperations::load_transfer_queue(&repo).await.unwrap();
+
+        let back = loaded.iter().find(|j| j.id == failed.id).expect("the failed job is restored");
+        assert_eq!(back.status, TransferStatus::Failed, "restored as failed, not queued for an automatic retry");
+        assert_eq!(back.error_message.as_deref(), Some("disk full"));
+        assert_eq!((back.retry_count, back.transferred_bytes), (2, 400));
+        assert_eq!(loaded.len(), 1, "finished and cancelled jobs are not restored");
     }
 
     #[tokio::test]

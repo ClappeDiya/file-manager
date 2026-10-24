@@ -132,6 +132,9 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         }
     }
 
+    // Failed jobs are restored too (still failed); keep only what the saved limits allow.
+    transfer_engine::retention::enforce_at_startup(&repo).await;
+    transfer_engine::retention::persist_failures(&transfer_mgr, repo.clone());
     let queued_jobs = StorageOperations::load_transfer_queue(&repo).await?;
     if !queued_jobs.is_empty() {
         tracing::info!(
@@ -438,6 +441,7 @@ pub fn run() {
                 rt2.block_on(async {
                     transfer_mgr.init_journal(repo.pool().clone()).await;
                     transfer_mgr.set_history(transfer_history.clone()).await;
+                    transfer_engine::retention::persist_failures(&transfer_mgr, repo.clone());
                     vault_mgr.set_pool(repo.pool().clone()).await;
                 });
                 let ledger = OperationLedger::new(repo.pool().clone());
@@ -711,6 +715,8 @@ pub fn run() {
             transfer_commands::search_transfer_history,
             transfer_commands::export_transfer_history,
             transfer_commands::cleanup_transfer_history,
+            transfer_commands::get_failed_transfer_retention,
+            transfer_commands::set_failed_transfer_retention,
             // Three-layer architecture
             transfer_commands::set_verify_tier,
             transfer_commands::get_verify_tier,
