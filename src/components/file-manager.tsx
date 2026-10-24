@@ -353,14 +353,19 @@ interface MigrationRunState {
 /** Asks a pane to open its address field (`detail.paneIndex`). */
 const EDIT_ADDRESS_EVENT = "ufop:edit-address";
 
+/** An action that works on this computer's files only, asked for a connection item. */
+function refuseRemote(what: string, userAction = "Copy the item to this computer first") {
+  useUIStore.getState().addStructuredError({
+    what: `${what} is not available in connection folders`,
+    why: LOCAL_ONLY_REASON,
+    appDid: `Did not run ${what}`,
+    userAction,
+  });
+}
+
 /** Batch Rename works on this computer's files: say so for connection items. */
 function refuseRemoteBatchRename() {
-  useUIStore.getState().addStructuredError({
-    what: "Batch Rename is not available in connection folders",
-    why: LOCAL_ONLY_REASON,
-    appDid: "Did not open Batch Rename",
-    userAction: "Rename connection items one at a time (F2), or copy them to this computer first",
-  });
+  refuseRemote("Batch Rename", "Rename connection items one at a time (F2), or copy them to this computer first");
 }
 
 let migrationRun: MigrationRunState | null = null;
@@ -1586,13 +1591,18 @@ export function FileManager() {
       // default base path. Toggle closes on second press.
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "i") {
         e.preventDefault();
-        setIntegrityToolsOpen((prev) => {
-          if (prev !== null) return null;
-          const fmStore = useFileManagerStore.getState();
-          const pane = fmStore.panes[fmStore.activePaneIndex];
-          const tab = pane.tabs.find((t) => t.id === pane.activeTabId);
-          return { dir: tab?.path ?? "/", files: [] };
-        });
+        const fmNow = useFileManagerStore.getState();
+        if (isRemotePath(fmNow.getActivePath(fmNow.activePaneIndex))) {
+          refuseRemote("Integrity Tools");
+        } else {
+          setIntegrityToolsOpen((prev) => {
+            if (prev !== null) return null;
+            const fmStore = useFileManagerStore.getState();
+            const pane = fmStore.panes[fmStore.activePaneIndex];
+            const tab = pane.tabs.find((t) => t.id === pane.activeTabId);
+            return { dir: tab?.path ?? "/", files: [] };
+          });
+        }
       }
       // Cmd+Shift+P \u2014 toggle the Preview panel on the first
       // selected file. Routes through the ui-store's pre-
@@ -1613,7 +1623,12 @@ export function FileManager() {
           const fmStore = useFileManagerStore.getState();
           const pane = fmStore.getActivePane();
           const sel = fmStore.selectedPaths[pane.id];
-          if (sel && sel.length > 0) {
+          if (sel && sel.length > 0 && isRemotePath(sel[0])) {
+            // A connection file previews from a downloaded copy.
+            void resolveItems([sel[0]])
+              .then(([en]) => localCopyOf(en))
+              .then((local) => useUIStore.getState().openPreviewFor(local), (err) => reportOperationFailure("Preview", err));
+          } else if (sel && sel.length > 0) {
             uiStore.openPreviewFor(sel[0]);
           }
         }
@@ -1996,11 +2011,12 @@ export function FileManager() {
         onCopyPath: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
-          await copyToClipboardWithToast(path, "Copy Path");
+          await copyToClipboardWithToast(formatAddress(path, useConnectionsStore.getState().nameOf), "Copy Path");
         },
         onCopyRemotePath: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
+          if (isRemotePath(path)) return refuseRemote("Copy Remote Path");
           let resolved: string;
           try {
             const result = await tauriInvoke<{ path: string }>("copy_remote_path", { path, remoteBase: null });
@@ -2019,6 +2035,7 @@ export function FileManager() {
         onCopyUrl: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
+          if (isRemotePath(path)) return refuseRemote("Copy URL");
           let resolved: string;
           try {
             const result = await tauriInvoke<{ path: string }>("copy_url", { path, protocol: "local", host: "localhost", port: null, username: null });
@@ -2037,6 +2054,7 @@ export function FileManager() {
         onCopyRelativePath: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
+          if (isRemotePath(path)) return refuseRemote("Copy Relative Path");
           const store = useFileManagerStore.getState();
           const basePath = store.getActivePath(store.activePaneIndex);
           let resolved: string;
@@ -2057,6 +2075,7 @@ export function FileManager() {
         onOpenInEditor: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
+          if (isRemotePath(path)) return refuseRemote("Open in Editor");
           const ext = path.split('.').pop() || "";
           try {
             const mapping = await tauriInvoke<{ app_path: string; args: string[] } | null>("resolve_editor", { extension: ext });
@@ -2257,6 +2276,7 @@ export function FileManager() {
           const fmStore = useFileManagerStore.getState();
           const pane = fmStore.panes[fmStore.activePaneIndex];
           const tab = pane.tabs.find((t) => t.id === pane.activeTabId);
+          if (isRemotePath(tab?.path)) return refuseRemote("Integrity Tools");
           setIntegrityToolsOpen({ dir: tab?.path ?? "/", files: [] });
         },
         onJumpLastTouched: () => {
@@ -2264,7 +2284,12 @@ export function FileManager() {
         },
         onOpenPreview: () => {
           const path = getFirstSelectedPath();
-          if (path) {
+          if (path && isRemotePath(path)) {
+            // A connection file previews from a downloaded copy.
+            void resolveItems([path])
+              .then(([e]) => localCopyOf(e))
+              .then((local) => useUIStore.getState().openPreviewFor(local), (err) => reportOperationFailure("Preview", err));
+          } else if (path) {
             useUIStore.getState().openPreviewFor(path);
           } else {
             useUIStore.getState().addStructuredError({
@@ -2308,9 +2333,7 @@ export function FileManager() {
             // One directory listing yields is_dir + size for the whole
             // selection (the pane's `files` array isn't in the store).
             const listing = tab
-              ? await tauriInvoke<FileEntryData[]>("list_directory", {
-                  path: tab.path,
-                }).catch(() => [] as FileEntryData[])
+              ? await listDirectory(tab.path).catch(() => [] as FileEntryData[])
               : [];
             const selected = listing.filter(
               (f) => paths.includes(f.path) && !f.is_dir,
@@ -2326,8 +2349,19 @@ export function FileManager() {
               });
               return;
             }
-            const dest = await pickFolder("Choose destination for queued copy");
+            const fromConnection = selected.some((f) => isRemotePath(f.path));
+            const dest = await pickFolder("Choose destination for queued copy", fromConnection ? useUIStore.getState().defaultDownloadDir : null);
             if (!dest) return;
+            if (fromConnection) {
+              // Downloads from a connection: the location route names each file.
+              try {
+                const outcome = await transferItems(selected, dest, "copy");
+                if (outcome.jobs.length > 0) setTransfersOpen(true);
+              } catch (err) {
+                reportOperationFailure("Queue copy", err);
+              }
+              return;
+            }
             let queued = 0;
             for (const f of selected) {
               try {
@@ -5469,10 +5503,12 @@ function FilePane({
                   value={infoDialog.comment}
                   onChange={(e) => setInfoDialog((prev) => prev ? { ...prev, comment: e.target.value } : null)}
                   onBlur={() => {
-                    if (infoDialog) {
+                    if (infoDialog && !isRemotePath(infoDialog.path)) {
                       handleSaveComment(infoDialog.path, infoDialog.comment);
                     }
                   }}
+                  disabled={isRemotePath(infoDialog.path)}
+                  title={isRemotePath(infoDialog.path) ? LOCAL_ONLY_REASON : undefined}
                   className="w-full h-20 mt-1 p-2 text-xs border border-[var(--color-border)] rounded resize-none bg-[var(--color-bg)] text-[color:var(--color-text)]"
                   placeholder="Add a comment..."
                 />
