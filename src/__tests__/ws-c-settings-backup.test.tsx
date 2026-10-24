@@ -84,13 +84,14 @@ describe("backup: duplicate and shared filter tools", () => {
         return true;
       },
     });
-    vi.spyOn(window, "prompt").mockReturnValue("Mine");
     vi.spyOn(window, "confirm").mockReturnValue(true);
     useUIStore.setState({ appMode: "advanced" });
     const rules: FilterRule[] = [{ action: "exclude", kind: "wildcard", pattern: "*.tmp" }];
     const onApply = vi.fn();
     render(<FilterPresetPicker rules={rules} onApply={onApply} />);
     fireEvent.click(screen.getByRole("button", { name: "Save as preset…" }));
+    fireEvent.change(screen.getByLabelText("Preset name"), { target: { value: "Mine" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(called("save_user_filter_preset")).toEqual([{ id: null, name: "Mine", rules }]));
     fireEvent.change(await screen.findByLabelText("Apply a saved filter preset"), { target: { value: "u9" } });
     await waitFor(() => expect(onApply).toHaveBeenCalledWith(rules));

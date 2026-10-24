@@ -146,6 +146,8 @@ export function FilterPresetPicker({ rules, onApply }: { rules: FilterRule[]; on
   const advanced = useUIStore((s) => s.appMode === "advanced");
   const [presets, setPresets] = useState<UserFilterPreset[]>([]);
   const [error, setError] = useState<string | null>(null);
+  /** The name being typed for a new preset; `null` = not saving. */
+  const [naming, setNaming] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const list = await tauriInvokeSafe<UserFilterPreset[]>("list_user_filter_presets", undefined, []);
@@ -156,11 +158,12 @@ export function FilterPresetPicker({ rules, onApply }: { rules: FilterRule[]; on
   }, [load]);
 
   const save = async () => {
-    const name = prompt("Name for this filter preset");
-    if (!name?.trim()) return;
+    const name = naming?.trim();
+    if (!name) return;
     setError(null);
     try {
       await tauriInvoke<UserFilterPreset>("save_user_filter_preset", { id: null, name, rules });
+      setNaming(null);
       await load();
     } catch (e) {
       setError(errorText(e));
@@ -197,9 +200,33 @@ export function FilterPresetPicker({ rules, onApply }: { rules: FilterRule[]; on
             </option>
           ))}
         </select>
-        <Btn disabled={rules.length === 0} onClick={() => void save()} title="Save the current rules as a reusable preset">
-          Save as preset…
-        </Btn>
+        {naming === null ? (
+          <Btn disabled={rules.length === 0} onClick={() => setNaming("")} title="Save the current rules as a reusable preset">
+            Save as preset…
+          </Btn>
+        ) : (
+          <span className="inline-flex items-center gap-1">
+            <input
+              autoFocus
+              aria-label="Preset name"
+              placeholder="Preset name"
+              className={`${inputCls} w-40`}
+              value={naming}
+              onChange={(e) => setNaming(e.target.value)}
+              onKeyDown={(e) => {
+                // Not a <form>: the picker sits inside other editors' forms.
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void save();
+                } else if (e.key === "Escape") setNaming(null);
+              }}
+            />
+            <Btn disabled={!naming.trim()} onClick={() => void save()}>
+              Save
+            </Btn>
+            <Btn onClick={() => setNaming(null)}>Cancel</Btn>
+          </span>
+        )}
       </div>
       {advanced && presets.length > 0 && (
         <div className="flex flex-wrap gap-1 text-[11px] text-zinc-500">
