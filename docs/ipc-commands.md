@@ -568,6 +568,25 @@ macro; if you add a new one here, register it there too.
 - `proxy_set`
 - `proxy_test`
 
+## `rclone_commands` (16 commands)
+
+- `rclone_config_cancel`
+- `rclone_config_continue`
+- `rclone_config_oauth`
+- `rclone_crypt_info`
+- `rclone_cryptdecode`
+- `rclone_detect`
+- `rclone_install_managed`
+- `rclone_providers`
+- `rclone_remote_create`
+- `rclone_remote_delete`
+- `rclone_remote_get`
+- `rclone_remote_test`
+- `rclone_remote_update`
+- `rclone_settings_get`
+- `rclone_settings_set`
+- `rclone_status`
+
 ## `s3_commands` (18 commands)
 
 - `s3_create_invalidation`
@@ -778,4 +797,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 607 commands across 52 modules.
+**Surface:** 623 commands across 53 modules.
