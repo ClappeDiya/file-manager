@@ -72,6 +72,24 @@ describe("drag-and-drop confirmation", () => {
     expect(onCancel).toHaveBeenCalled();
   });
 
+  it("cannot be confirmed before the Safety Interlock has assessed the drop", async () => {
+    // Regression: the autofocused button confirmed with no assessment (a
+    // quick Enter), and the drop then skipped the interlock altogether.
+    let answer: (a: unknown) => void = () => undefined;
+    mockInvoke.mockImplementation((cmd: string) => (cmd === "safety_assess_intent" ? new Promise((r) => (answer = r)) : Promise.resolve(undefined)));
+    const onConfirm = vi.fn();
+    render(<DragDropConfirm request={request} onConfirm={onConfirm} onCancel={vi.fn()} />);
+    const ok = screen.getByTestId("drag-drop-ok");
+    expect(ok).toBeDisabled();
+    fireEvent.click(ok);
+    expect(onConfirm).not.toHaveBeenCalled();
+    answer({ level: "high", reasons: ["Moves 40× more files than usual"], baseline_sample_size: 5, baseline_median_files: 2, baseline_median_bytes: 0, intent_hash: "h1", requires_confirmation: true });
+    await waitFor(() => expect(ok).toBeEnabled());
+    expect(ok).toHaveFocus();
+    fireEvent.click(ok);
+    expect(onConfirm).toHaveBeenCalledWith(expect.objectContaining({ requires_confirmation: true }));
+  });
+
   it("shows the Safety Interlock's risk when it would ask", async () => {
     risk = true;
     render(<DragDropConfirm request={request} onConfirm={vi.fn()} onCancel={vi.fn()} />);

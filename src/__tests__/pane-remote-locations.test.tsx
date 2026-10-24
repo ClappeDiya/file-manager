@@ -77,6 +77,7 @@ beforeEach(() => {
       case "list_directory":
         return args?.path === "/home" ? [entry("/home/local.txt", "local.txt", false, 5)] : [];
       case "connector_stat":
+        if (args?.path === "/Docs/Q1") return entry("/d1/q1", "Q1", true, 0); // an id-path provider resolves names
         return args?.path === "/Reports" ? entry("/Reports", "Reports", true, 0) : null;
       case "enqueue_location_transfer":
         return { jobs: [], moved: [], folders_created: 0 };
@@ -242,6 +243,19 @@ describe("connections in the panes", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(useFileManagerStore.getState().getActivePath(0)).toBe(`conn://${ID}/Reports`));
     expect(screen.queryByTestId("address-bar-input")).not.toBeInTheDocument();
+  });
+
+  it("a typed name path opens the folder at the path the connection resolved (Google Drive ids)", async () => {
+    setPanes("/home", "/home", true);
+    render(<FileManager />);
+    await settled("local.txt");
+    fireEvent.keyDown(window, { key: "l", ctrlKey: true });
+    const input = (await screen.findByTestId("address-bar-input")) as HTMLInputElement;
+    await waitFor(() => expect(useConnectionsStore.getState().loaded).toBe(true));
+    fireEvent.change(input, { target: { value: "Work Drive:/Docs/Q1" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(useFileManagerStore.getState().getActivePath(0)).toBe(`conn://${ID}/d1/q1`));
+    expect(calls("connector_stat")).toContainEqual({ protocol: "dropbox", path: "/Docs/Q1", connectionId: ID });
   });
 });
 

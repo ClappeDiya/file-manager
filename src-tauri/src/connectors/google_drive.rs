@@ -462,7 +462,27 @@ impl GoogleDriveConnector {
     /// Drive chosen on the connection (My Drive, Shared with me or one
     /// shared drive).
     pub async fn list_path(&self, path: &str) -> Result<Vec<FileEntry>, AppError> {
-        let loc = match drive_location(path) {
+        let loc = self.resolved_location(path);
+        let prefix = listing_prefix(path, &loc);
+        match loc {
+            DriveLocation::SharedDrives => self.all_shared_drives().await.map(|d| d.into_iter().map(|d| shared_drive_entry(&d.id, d.name)).collect()),
+            DriveLocation::MyDrive { folder } => {
+                let parent = folder.unwrap_or_else(|| "root".into());
+                self.list_query(&format!("'{}' in parents and trashed = false", q_escape(&parent)), None, &prefix).await
+            }
+            DriveLocation::SharedWithMe => self.list_query("sharedWithMe = true and trashed = false", None, &prefix).await,
+            DriveLocation::SharedDrive { drive_id, folder } => {
+                let parent = folder.unwrap_or_else(|| drive_id.clone());
+                self.list_query(&format!("'{}' in parents and trashed = false", q_escape(&parent)), Some(&drive_id), &prefix).await
+            }
+            DriveLocation::Root => unreachable!("resolved above"),
+        }
+    }
+
+    /// Where virtual `path` points, with `/` resolved to the part of Drive
+    /// chosen on the connection.
+    fn resolved_location(&self, path: &str) -> DriveLocation {
+        match drive_location(path) {
             DriveLocation::Root => {
                 let s = self.settings.read().map(|s| s.clone()).unwrap_or_default();
                 match (s.root, s.shared_drive_id.filter(|d| !d.is_empty())) {
@@ -472,26 +492,13 @@ impl GoogleDriveConnector {
                 }
             }
             other => other,
-        };
-        match loc {
-            DriveLocation::SharedDrives => self.all_shared_drives().await.map(|d| d.into_iter().map(|d| shared_drive_entry(&d.id, d.name)).collect()),
-            DriveLocation::MyDrive { folder } => {
-                let parent = folder.unwrap_or_else(|| "root".into());
-                // Top level of My Drive lists as "/<id>"; deeper paths keep their prefix.
-                let prefix = if parent == "root" { String::new() } else { path.trim_end_matches('/').to_string() };
-                self.list_query(&format!("'{}' in parents and trashed = false", q_escape(&parent)), None, &prefix).await
-            }
-            DriveLocation::SharedWithMe => {
-                let prefix = if drive_location(path) == DriveLocation::Root { "/shared-with-me".to_string() } else { path.trim_end_matches('/').to_string() };
-                self.list_query("sharedWithMe = true and trashed = false", None, &prefix).await
-            }
-            DriveLocation::SharedDrive { drive_id, folder } => {
-                let parent = folder.unwrap_or_else(|| drive_id.clone());
-                let prefix = if drive_location(path) == DriveLocation::Root { format!("/shared-drives/{drive_id}") } else { path.trim_end_matches('/').to_string() };
-                self.list_query(&format!("'{}' in parents and trashed = false", q_escape(&parent)), Some(&drive_id), &prefix).await
-            }
-            DriveLocation::Root => unreachable!("resolved above"),
         }
+    }
+
+    /// The virtual path of item `id` directly in folder `dir`, as
+    /// [`Self::list_path`] lists it.
+    fn child_path(&self, dir: &str, id: &str) -> String {
+        format!("{}/{id}", listing_prefix(dir, &self.resolved_location(dir)))
     }
 
     /// `files.list` for `query`, following every page.
@@ -1205,6 +1212,14 @@ impl Connector for GoogleDriveConnector {
         })
     }
 
+    /// The item keeps its id: it is listed under `to`'s folder by that id.
+    fn renamed_path(&self, from: &str, to: &str) -> String {
+        match (last_segment(from), split_parent(to)) {
+            (Ok(id), Ok((dir, _))) => self.child_path(&dir, &id),
+            _ => to.to_string(),
+        }
+    }
+
     /// A native Google document downloads as an export: the connection's
     /// format's extension is added to its name.
     fn download_name(&self, entry: &FileEntry) -> String {
@@ -1326,10 +1341,18 @@ impl Connector for GoogleDriveConnector {
 
     fn make_directory(&self, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         let r = remote_path.to_string();
+        Box::pin(async move { self.make_directory_path(&r).await.map(|_| ()) })
+    }
+
+    /// `remote_path` is the parent folder's path plus the new name; the
+    /// folder is listed (and its contents go) under its new id.
+    fn make_directory_path(&self, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + '_>> {
+        let r = remote_path.to_string();
         Box::pin(async move {
             let (dir, name) = split_parent(&r)?;
             let parent = self.folder_for(&dir)?;
-            self.create_folder(&name, Some(&parent)).await.map(|_| ())
+            let id = self.create_folder(&name, Some(&parent)).await?;
+            Ok(self.child_path(&dir, &id))
         })
     }
 
@@ -1523,6 +1546,19 @@ fn drive_location(path: &str) -> DriveLocation {
         ["shared-drives"] => DriveLocation::SharedDrives,
         ["shared-drives", d, ..] => DriveLocation::SharedDrive { drive_id: d.to_string(), folder: last(2) },
         _ => DriveLocation::MyDrive { folder: last(0).filter(|s| s != "root") },
+    }
+}
+
+/// What [`GoogleDriveConnector::list_path`] puts before each listed id in
+/// `path` (`resolved` is where it points): nothing at the top of My Drive,
+/// the scope at "/" of Shared with me or a shared drive, else `path`.
+fn listing_prefix(path: &str, resolved: &DriveLocation) -> String {
+    let at_root = drive_location(path) == DriveLocation::Root;
+    match resolved {
+        DriveLocation::MyDrive { folder: None } => String::new(),
+        DriveLocation::SharedWithMe if at_root => "/shared-with-me".to_string(),
+        DriveLocation::SharedDrive { drive_id, .. } if at_root => format!("/shared-drives/{drive_id}"),
+        _ => path.trim_end_matches('/').to_string(),
     }
 }
 
@@ -1840,6 +1876,23 @@ mod tests {
         assert!(body.contains(r#""parents":["D1"]"#), "{body}");
     }
 
+    /// New folders and renamed items are reported at the path the folder
+    /// listing gives them (ids, not names), so callers can put things in
+    /// them and find them again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn created_and_renamed_items_are_addressed_by_their_listed_id_path() {
+        let drive = super::fake_drive::start(&[("f1", "Folder 1", "root", true), ("x9", "a.txt", "f1", false)]).await;
+        let c = drive.connector.as_ref();
+        let sub = c.make_directory_path("/f1/new").await.unwrap();
+        let top = c.make_directory_path("/top").await.unwrap();
+        assert!(c.list_remote("/f1").await.unwrap().iter().any(|e| e.path == sub && e.name == "new"), "{sub}");
+        assert!(c.list_remote("/").await.unwrap().iter().any(|e| e.path == top && e.name == "top"), "{top}");
+        assert_eq!(c.renamed_path("/f1/x9", "/f1/b.txt"), "/f1/x9", "a rename keeps the id path");
+        assert_eq!(c.renamed_path("/f1/x9", &format!("{sub}/a.txt")), format!("{sub}/x9"));
+        assert_eq!(crate::commands::connector_commands::rename_at(c, "/f1/x9", &format!("{sub}/b.txt")).await.unwrap(), format!("{sub}/x9"));
+        assert!(c.list_remote(&sub).await.unwrap().iter().any(|e| e.path == format!("{sub}/x9") && e.name == "b.txt"));
+    }
+
     #[test]
     fn test_export_format_mime_types() {
         assert_eq!(GoogleDocExportFormat::Pdf.mime_type(), "application/pdf");
@@ -1859,5 +1912,122 @@ mod tests {
         assert!(url.contains("accounts.google.com"));
         assert!(url.contains("test_client"));
         assert!(!state.is_empty());
+    }
+}
+
+/// A small in-process Google Drive for tests of callers that address Drive
+/// by folder-id paths (pane transfers, typed addresses): folders and files
+/// live under parent ids, and every request naming an unknown parent id
+/// answers 404 exactly as Drive does.
+#[cfg(test)]
+pub(crate) mod fake_drive {
+    use super::GoogleDriveConnector;
+    use crate::connectors::mock_http::{json, serve, status, Mock, Seen};
+    use crate::connectors::Connector;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    /// One Drive item: (name, parent id, is folder).
+    pub type Item = (String, String, bool);
+
+    pub struct FakeDrive {
+        pub mock: Mock,
+        pub items: Arc<Mutex<BTreeMap<String, Item>>>,
+        pub connector: Arc<GoogleDriveConnector>,
+    }
+
+    impl FakeDrive {
+        /// The id of the item called `name` in folder `parent`.
+        pub fn id_of(&self, name: &str, parent: &str) -> Option<String> {
+            self.items.lock().unwrap().iter().find(|(_, (n, p, _))| n == name && p == parent).map(|(id, _)| id.clone())
+        }
+    }
+
+    const FOLDER: &str = "application/vnd.google-apps.folder";
+
+    fn file_json(id: &str, (name, _, folder): &Item) -> serde_json::Value {
+        serde_json::json!({ "id": id, "name": name, "mimeType": if *folder { FOLDER } else { "text/plain" } })
+    }
+
+    /// The parent id of a `files.list` query (`'<id>' in parents`).
+    fn query_parent(r: &Seen) -> Option<String> {
+        let q = r.query_param("q")?;
+        let end = q.find("' in parents")?;
+        let start = q[..end].rfind('\'')? + 1;
+        Some(q[start..end].to_string())
+    }
+
+    /// The metadata JSON of a multipart upload body.
+    fn multipart_metadata(body: &[u8]) -> serde_json::Value {
+        let text = String::from_utf8_lossy(body);
+        let json = text.split("\r\n\r\n").nth(1).and_then(|p| p.split("\r\n").next()).unwrap_or("{}");
+        serde_json::from_str(json).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Serve a Drive holding `seed` (id → item; `root` is always there) and
+    /// sign a connector in to it.
+    pub async fn start(seed: &[(&str, &str, &str, bool)]) -> FakeDrive {
+        let items: Arc<Mutex<BTreeMap<String, Item>>> = Arc::default();
+        for (id, name, parent, folder) in seed {
+            items.lock().unwrap().insert(id.to_string(), (name.to_string(), parent.to_string(), *folder));
+        }
+        let state = items.clone();
+        let mock = serve(move |r| {
+            let mut items = state.lock().unwrap();
+            let is_folder = |items: &BTreeMap<String, Item>, id: &str| id == "root" || items.get(id).is_some_and(|i| i.2);
+            let not_found = || status(404, r#"{"error":{"code":404,"message":"File not found"}}"#);
+            let create = |items: &mut BTreeMap<String, Item>, name: String, parent: String, folder: bool| {
+                if !is_folder(items, &parent) {
+                    return not_found();
+                }
+                let id = format!("id{}", items.len() + 1);
+                let item = (name, parent, folder);
+                let body = file_json(&id, &item);
+                items.insert(id, item);
+                json(body)
+            };
+            match (r.method.as_str(), r.path.as_str()) {
+                (_, "/api/about") => json(serde_json::json!({ "user": { "emailAddress": "t@example.com" } })),
+                ("GET", "/api/files") => match query_parent(r) {
+                    Some(p) if is_folder(&items, &p) => json(serde_json::json!({ "files": items.iter().filter(|(_, i)| i.1 == p).map(|(id, i)| file_json(id, i)).collect::<Vec<_>>() })),
+                    _ => not_found(),
+                },
+                ("POST", "/api/files") => {
+                    let m = r.json();
+                    create(&mut items, m["name"].as_str().unwrap_or_default().to_string(), m["parents"][0].as_str().unwrap_or("root").to_string(), m["mimeType"] == FOLDER)
+                }
+                ("POST", "/upload/files") => {
+                    let m = multipart_metadata(&r.body);
+                    create(&mut items, m["name"].as_str().unwrap_or_default().to_string(), m["parents"][0].as_str().unwrap_or("root").to_string(), false)
+                }
+                ("PATCH", p) if p.starts_with("/api/files/") => {
+                    let id = p.trim_start_matches("/api/files/").to_string();
+                    let new_parent = r.query_param("addParents");
+                    if new_parent.as_deref().is_some_and(|np| !is_folder(&items, np)) {
+                        return not_found();
+                    }
+                    let name = r.json()["name"].as_str().map(String::from);
+                    match items.get_mut(&id) {
+                        Some(item) => {
+                            if let Some(np) = new_parent {
+                                item.1 = np;
+                            }
+                            if let Some(n) = name {
+                                item.0 = n;
+                            }
+                            json(file_json(&id, item))
+                        }
+                        None => not_found(),
+                    }
+                }
+                _ => not_found(),
+            }
+        })
+        .await;
+        let b = &mock.base;
+        let connector = GoogleDriveConnector::new().with_endpoints(&format!("{b}/api"), &format!("{b}/upload"), &format!("{b}/token"));
+        let p = crate::connectors::live_tests::profile(crate::core::types::ConnectionProtocol::GoogleDrive, "", None, "", "/");
+        connector.connect_with_secret(&p, Some(r#"{"access_token":"t"}"#.into())).await.unwrap();
+        FakeDrive { mock, items, connector: Arc::new(connector) }
     }
 }

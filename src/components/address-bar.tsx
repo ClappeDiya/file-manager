@@ -26,8 +26,12 @@ export interface AddressBarProps {
   connections: ReadonlyArray<AddressConnection>;
   /** Folders of a pane path (the location provider's listDirectory). */
   listFolders: (path: string) => Promise<ReadonlyArray<{ path: string; name: string; is_dir: boolean }>>;
-  /** Whether a pane path is an existing folder: null = yes, else the error to show. */
-  validate: (path: string) => Promise<string | null>;
+  /**
+   * Whether a pane path is an existing folder: null = yes, a string = the
+   * error to show, `{ path }` = yes, and it really is at `path` (a
+   * connection resolved a name path to its own, e.g. Google Drive ids).
+   */
+  validate: (path: string) => Promise<string | null | { path: string }>;
   /** Recently visited pane paths (path-jump history), newest first. */
   history: ReadonlyArray<string>;
   onNavigate: (path: string) => void;
@@ -104,12 +108,12 @@ export function AddressBar({ path, connections, listFolders, validate, history, 
       }
       setBusy(true);
       try {
-        const problem = await validate(parsed.path);
-        if (problem) {
-          setError(problem);
+        const checked = await validate(parsed.path);
+        if (typeof checked === "string") {
+          setError(checked);
           return;
         }
-        onNavigate(parsed.path);
+        onNavigate(checked?.path ?? parsed.path);
       } finally {
         setBusy(false);
       }

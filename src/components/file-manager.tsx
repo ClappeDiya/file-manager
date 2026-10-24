@@ -4267,9 +4267,9 @@ function FilePane({
 
   /** Run a (confirmed) drop: the location route when a connection is
    *  involved, else copy_files / move_files exactly as before. */
-  const performDrop = useCallback(async (sources: string[], mode: "copy" | "move") => {
+  const performDrop = useCallback(async (sources: string[], mode: "copy" | "move", preconfirmed = true) => {
     if (needsLocationTransfer(sources, currentPath)) {
-      await transferAcrossLocations(sources, currentPath, mode, true);
+      await transferAcrossLocations(sources, currentPath, mode, preconfirmed);
       return;
     }
     const command = mode === "copy" ? "copy_files" : "move_files";
@@ -4311,12 +4311,15 @@ function FilePane({
     () => ({
       connections: connectionsList,
       listFolders: (p: string) => listDirectory(p),
-      validate: async (p: string): Promise<string | null> => {
+      validate: async (p: string): Promise<string | null | { path: string }> => {
         if (!isTauriAvailable()) return null;
         try {
           const entry = await statLocation(p);
           if (!entry) return "That folder does not exist";
-          return entry.is_dir ? null : "That is a file, not a folder";
+          if (!entry.is_dir) return "That is a file, not a folder";
+          // A connection may know the folder by another path (Google Drive: ids, not names).
+          const trim = (x: string) => x.replace(/\/+$/, "");
+          return isRemotePath(p) && trim(entry.path) !== trim(p) ? { path: entry.path } : null;
         } catch (err) {
           return errorText(err);
         }
@@ -5307,8 +5310,10 @@ function FilePane({
             const req = dropRequest;
             setDropRequest(null);
             // Confirmed here: the interlock's audit entry, without asking twice.
+            // (The button waits for the assessment; without one the
+            // interlock still runs before a move.)
             if (assessment?.requires_confirmation) void confirmIntent(dropIntent(req), assessment);
-            void performDrop(req.sources, req.mode);
+            void performDrop(req.sources, req.mode, assessment !== null);
           }}
         />
       )}

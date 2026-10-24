@@ -245,7 +245,7 @@ pub async fn plan_transfer(items: &[LocationItem], dest_dir: &Location, resolver
 }
 
 /// Whether `inner` is `outer` or below it.
-fn is_within(outer: &Location, inner: &Location) -> bool {
+pub fn is_within(outer: &Location, inner: &Location) -> bool {
     match (outer, inner) {
         (Location::Local(o), Location::Local(i)) => std::path::Path::new(i).starts_with(o),
         (Location::Remote { path: o, .. }, Location::Remote { path: i, .. }) => {
@@ -283,12 +283,58 @@ async fn expand_dir(source: &Location, dest: &Location, resolver: &dyn RemoteRes
     Ok(())
 }
 
-/// Create a planned destination folder.
-pub async fn make_dir(loc: &Location, resolver: &dyn RemoteResolver) -> Result<(), AppError> {
+/// Create a planned destination folder; returns where it is (a connector
+/// may address it differently: Google Drive by the new folder's id).
+pub async fn make_dir(loc: &Location, resolver: &dyn RemoteResolver) -> Result<Location, AppError> {
     match loc {
-        Location::Local(p) => tokio::fs::create_dir_all(p).await.map_err(|e| AppError::file_op(format!("Cannot create {p}: {e}"), "Check you may write to the destination.")),
-        Location::Remote { connection_id, path } => resolver.connector(*connection_id).await?.make_directory(path).await,
+        Location::Local(p) => {
+            tokio::fs::create_dir_all(p).await.map_err(|e| AppError::file_op(format!("Cannot create {p}: {e}"), "Check you may write to the destination."))?;
+            Ok(loc.clone())
+        }
+        Location::Remote { connection_id, path } => {
+            let made = resolver.connector(*connection_id).await?.make_directory_path(path).await?;
+            Ok(Location::Remote { connection_id: *connection_id, path: made })
+        }
     }
+}
+
+/// Create the plan's destination folders, parents first, and move what is
+/// planned below each one under the path its connector gave it. The plan
+/// names folders by name; Google Drive addresses them by id, so a folder's
+/// children (folders and files) must go under its new id, not its name.
+pub async fn create_dirs(plan: &mut TransferPlan, resolver: &dyn RemoteResolver) -> Result<(), AppError> {
+    // Planned folder (pane path) → created folder, where they differ.
+    let mut created: HashMap<String, Location> = HashMap::new();
+    for i in 0..plan.dirs.len() {
+        let planned = plan.dirs[i].clone();
+        let made = make_dir(&rebase(&planned, &created)?, resolver).await?;
+        let made_str = made.to_location_string();
+        if made_str != planned {
+            created.insert(planned, made);
+        }
+        plan.dirs[i] = made_str;
+    }
+    if !created.is_empty() {
+        for f in &mut plan.files {
+            f.dest = rebase(&f.dest, &created)?.to_location_string();
+        }
+    }
+    Ok(())
+}
+
+/// Planned pane path `path`, under its parent's created folder when that
+/// was created somewhere other than planned.
+fn rebase(path: &str, created: &HashMap<String, Location>) -> Result<Location, AppError> {
+    let loc = Location::parse(path)?;
+    let Location::Remote { connection_id, path: p } = &loc else {
+        return Ok(loc);
+    };
+    let parent = Location::Remote { connection_id: *connection_id, path: remote_parent(p) }.to_location_string();
+    let name = p.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+    Ok(match created.get(&parent) {
+        Some(made) => made.join(name),
+        None => loc,
+    })
 }
 
 /// Whether a remote `path` exists: its parent lists an entry with that path
@@ -362,11 +408,19 @@ async fn download_into_place(conn: &dyn Connector, remote: &str, local: &str) ->
     Ok(bytes)
 }
 
+/// Where relayed files are held: this user's private temporary folder
+/// (mode 0700 on Unix, never one another user planted).
+pub fn relay_dir() -> std::path::PathBuf {
+    ufop_core::session::user_temp_subdir("relay")
+}
+
 /// Download to a temporary file on this computer, upload it, delete it.
 async fn relay(job_id: Uuid, src: &dyn Connector, from: &str, dst: &dyn Connector, to: &str) -> Result<u64, AppError> {
-    let dir = std::env::temp_dir().join("ufop-relay");
+    let dir = relay_dir();
     tokio::fs::create_dir_all(&dir).await.map_err(|e| AppError::file_op(format!("Cannot create a temporary folder: {e}"), "Free some disk space and retry."))?;
     let temp = dir.join(job_id.to_string()).to_string_lossy().to_string();
+    // Never write through something already there (a planted link).
+    let _ = tokio::fs::remove_file(&temp).await;
     let result = async {
         src.download(from, &temp).await?;
         dst.upload(&temp, to).await
@@ -439,6 +493,8 @@ pub(crate) mod tests {
         pub files: std::sync::Mutex<HashMap<String, Vec<u8>>>,
         pub dirs: std::sync::Mutex<HashSet<String>>,
         pub server_copies: std::sync::Mutex<Vec<(String, String)>>,
+        /// Server-side renames done (folders move with what is below them).
+        pub renames: std::sync::Mutex<Vec<(String, String)>>,
         pub can_server_copy: bool,
         pub fail_upload: bool,
     }
@@ -530,8 +586,27 @@ pub(crate) mod tests {
         fn rename_entry(&self, from: &str, to: &str) -> Fut<'_, ()> {
             let (f, t) = (from.to_string(), to.to_string());
             Box::pin(async move {
-                let data = self.files.lock().unwrap().remove(&f).ok_or_else(|| AppError::not_found(format!("{f} not found")))?;
-                self.files.lock().unwrap().insert(t, data);
+                if self.dirs.lock().unwrap().remove(&f) {
+                    // A folder: everything below it moves along.
+                    let under = |p: &str| p.strip_prefix(&format!("{f}/")).map(|rest| format!("{t}/{rest}"));
+                    let mut files = self.files.lock().unwrap();
+                    let moved: Vec<_> = files.keys().filter_map(|p| under(p).map(|n| (p.clone(), n))).collect();
+                    for (old, new) in moved {
+                        let data = files.remove(&old).unwrap_or_default();
+                        files.insert(new, data);
+                    }
+                    let mut dirs = self.dirs.lock().unwrap();
+                    let moved: Vec<_> = dirs.iter().filter_map(|p| under(p).map(|n| (p.clone(), n))).collect();
+                    for (old, new) in moved {
+                        dirs.remove(&old);
+                        dirs.insert(new);
+                    }
+                    dirs.insert(t.clone());
+                } else {
+                    let data = self.files.lock().unwrap().remove(&f).ok_or_else(|| AppError::not_found(format!("{f} not found")))?;
+                    self.files.lock().unwrap().insert(t.clone(), data);
+                }
+                self.renames.lock().unwrap().push((f, t));
                 Ok(())
             })
         }
@@ -614,7 +689,8 @@ pub(crate) mod tests {
         // Across connections: relayed through a temporary file, removed after.
         transfer_file(job, &ra("/r/one.txt"), &rb("/in/relayed.txt"), &resolver).await.unwrap();
         assert_eq!(cb.file("/in/relayed.txt").as_deref(), Some("one"));
-        assert!(!std::env::temp_dir().join("ufop-relay").join(job.to_string()).exists());
+        assert!(!relay_dir().join(job.to_string()).exists());
+        assert!(relay_dir().starts_with(ufop_core::session::user_temp_dir().unwrap()), "a private folder of this user");
         // A failed download leaves no staging file behind.
         assert!(transfer_file(job, &ra("/r/missing.txt"), &Location::Local(l("m.txt")), &resolver).await.is_err());
         assert!(!std::path::Path::new(&local_staging_path(&l("m.txt"))).exists());

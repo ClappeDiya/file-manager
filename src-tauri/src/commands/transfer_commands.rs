@@ -161,12 +161,17 @@ pub(crate) async fn location_transfer(
         if loc::remote_parent(from).trim_end_matches('/') == dest_path.trim_end_matches('/') {
             continue; // already there
         }
+        // Never ask the server to move a folder into itself.
+        if loc::is_within(&source, &dest) {
+            return Err(AppError::validation(format!("Cannot put {} inside itself", item.name)));
+        }
         let conn = resolver.connector(*connection_id).await?;
         let taken: std::collections::HashSet<String> = conn.list_remote(dest_path).await?.into_iter().map(|e| e.name).collect();
         let name = if taken.contains(&item.name) { super::file_ops_commands::next_copy_name(&item.name, |n| taken.contains(n))? } else { item.name.clone() };
         let to = loc::join_remote(dest_path, &name);
         match conn.rename_entry(from, &to).await {
-            Ok(()) => moved.push(MovedItem { from: item.path.clone(), to: Location::Remote { connection_id: *connection_id, path: to }.to_location_string() }),
+            // Where it is listed now (Google Drive: its id under the new folder).
+            Ok(()) => moved.push(MovedItem { from: item.path.clone(), to: Location::Remote { connection_id: *connection_id, path: conn.renamed_path(from, &to) }.to_location_string() }),
             // No server-side move here: copy, then delete.
             Err(e) => {
                 tracing::info!("Server-side move of {from} unavailable ({e}); copying instead");
@@ -175,10 +180,8 @@ pub(crate) async fn location_transfer(
         }
     }
 
-    let plan = loc::plan_transfer(&rest, &dest, resolver).await?;
-    for dir in &plan.dirs {
-        loc::make_dir(&Location::parse(dir)?, resolver).await?;
-    }
+    let mut plan = loc::plan_transfer(&rest, &dest, resolver).await?;
+    loc::create_dirs(&mut plan, resolver).await?;
     let mut jobs = Vec::with_capacity(plan.files.len());
     for f in &plan.files {
         jobs.push(manager.enqueue_location_job(&f.source, &f.dest, f.size).await?);
@@ -776,6 +779,86 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("jobs did not settle");
+    }
+
+    /// Resolves connection ids to any connector (a fake Google Drive here).
+    struct DynResolver(HashMap<Uuid, Arc<dyn crate::connectors::Connector>>);
+
+    impl crate::transfer_engine::location::RemoteResolver for DynResolver {
+        fn connector(&self, id: Uuid) -> crate::core::traits::BoxFuture<'_, Result<Arc<dyn crate::connectors::Connector>, AppError>> {
+            let c = self.0.get(&id).cloned();
+            Box::pin(async move { c.ok_or_else(|| AppError::not_found("no such connection")) })
+        }
+    }
+
+    fn drive_resolver(id: Uuid, drive: &crate::connectors::google_drive::fake_drive::FakeDrive) -> Arc<DynResolver> {
+        Arc::new(DynResolver(HashMap::from([(id, drive.connector.clone() as Arc<dyn crate::connectors::Connector>)])))
+    }
+
+    /// Regression: Google Drive paths are folder-id chains, but a folder
+    /// copy planned its subfolders and files by name, so copying any folder
+    /// into Drive created the top folder and then failed (Drive: 404 for
+    /// parent id "up"), leaving the copy half done. Everything below a new
+    /// folder now goes under the id Drive gave it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copying_a_folder_into_google_drive_uses_the_new_folder_ids() {
+        let drive = crate::connectors::google_drive::fake_drive::start(&[("f1", "Folder 1", "root", true)]).await;
+        let id = Uuid::new_v4();
+        let resolver = drive_resolver(id, &drive);
+        let mgr = TransferManager::new();
+        mgr.set_remote_resolver(resolver.clone());
+        let local = tempfile::tempdir().unwrap();
+        let folder = local.path().join("up");
+        std::fs::create_dir_all(folder.join("inner")).unwrap();
+        std::fs::write(folder.join("inner/f.txt"), "f").unwrap();
+        std::fs::write(folder.join("top.txt"), "t").unwrap();
+
+        let out = location_transfer(&mgr, resolver.as_ref(), vec![item(folder.to_string_lossy().into(), "up", true, 0)], &format!("conn://{id}/f1"), TransferMode::Copy).await.unwrap();
+        assert_eq!((out.folders_created, out.jobs.len()), (2, 2));
+        settle(&mgr, &out.jobs).await;
+        let all = mgr.list_jobs().await.unwrap();
+        assert!(all.iter().filter(|j| out.jobs.iter().any(|o| o.id == j.id)).all(|j| matches!(j.status, TransferStatus::Completed)), "{all:?}");
+        let up = drive.id_of("up", "f1").expect("the folder is created in f1");
+        let inner = drive.id_of("inner", &up).expect("its subfolder is created inside it, by its id");
+        assert!(drive.id_of("top.txt", &up).is_some(), "top.txt lands in the new folder");
+        assert!(drive.id_of("f.txt", &inner).is_some(), "f.txt lands in the new subfolder");
+        // Every folder create named a real parent id.
+        let parents: Vec<String> = drive.mock.requests("/api/files").into_iter().filter(|r| r.method == "POST").map(|r| r.json()["parents"][0].as_str().unwrap_or_default().to_string()).collect();
+        assert_eq!(parents, vec!["f1".to_string(), up]);
+    }
+
+    /// A move inside one Google Drive reports where the item is now: its id
+    /// under the new parent (the name is not part of a Drive path).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_side_move_in_google_drive_reports_the_id_path() {
+        let drive = crate::connectors::google_drive::fake_drive::start(&[("f1", "Folder 1", "root", true), ("r1", "Reports", "root", true), ("x9", "a.txt", "f1", false)]).await;
+        let id = Uuid::new_v4();
+        let resolver = drive_resolver(id, &drive);
+        let mgr = TransferManager::new();
+        let out = location_transfer(&mgr, resolver.as_ref(), vec![item(format!("conn://{id}/f1/x9"), "a.txt", false, 1)], &format!("conn://{id}/r1"), TransferMode::Move).await.unwrap();
+        assert!(out.jobs.is_empty());
+        assert_eq!(out.moved, vec![MovedItem { from: format!("conn://{id}/f1/x9"), to: format!("conn://{id}/r1/x9") }]);
+        assert_eq!(drive.items.lock().unwrap()["x9"].1, "r1");
+    }
+
+    /// A move of a folder into itself (or below it) inside one connection is
+    /// refused before the server is asked to rename it there.
+    #[tokio::test]
+    async fn moving_a_folder_into_itself_is_refused_before_any_server_rename() {
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector::with(&[("/a/x.txt", "x")], &["/a", "/a/b"]));
+        let resolver = Arc::new(MemResolver(HashMap::from([(id, conn.clone())])));
+        let mgr = TransferManager::new();
+        for dest in ["/a/b", "/a", "/a/b/"] {
+            let err = location_transfer(&mgr, resolver.as_ref(), vec![item(format!("conn://{id}/a"), "a", true, 0)], &format!("conn://{id}{dest}"), TransferMode::Move).await.unwrap_err();
+            assert!(err.to_string().contains("inside itself"), "{dest}: {err}");
+        }
+        assert!(conn.renames.lock().unwrap().is_empty(), "the server was never asked");
+        assert_eq!(conn.file("/a/x.txt").as_deref(), Some("x"));
+        // A sibling folder is fine.
+        conn.dirs.lock().unwrap().insert("/c".into());
+        location_transfer(&mgr, resolver.as_ref(), vec![item(format!("conn://{id}/a"), "a", true, 0)], &format!("conn://{id}/c"), TransferMode::Move).await.unwrap();
+        assert_eq!(conn.file("/c/a/x.txt").as_deref(), Some("x"));
     }
 
     #[tokio::test]

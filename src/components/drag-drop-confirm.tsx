@@ -6,7 +6,7 @@
  * interlock would ask (large or unusual moves). Confirming here also counts
  * as the interlock's confirmation, so the user is asked once.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, Copy, MoveRight } from "lucide-react";
 import { cn } from "@ufop/ui-components";
 import { assessIntent, type RiskAssessment } from "@/lib/safety";
@@ -19,18 +19,26 @@ export function DragDropConfirm({
   onCancel,
 }: {
   request: DropRequest;
-  /** Called with the assessment shown (null while it was still loading). */
+  /** Called with the assessment shown (confirming waits for it). */
   onConfirm: (assessment: RiskAssessment | null) => void;
   onCancel: () => void;
 }) {
   const [assessment, setAssessment] = useState<RiskAssessment | null>(null);
+  const okRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     let live = true;
+    setAssessment(null);
     void assessIntent(dropIntent(request)).then((a) => live && setAssessment(a));
     return () => {
       live = false;
     };
   }, [request]);
+  // Confirm only once the risk is known (a quick Enter must not skip the
+  // interlock); then the button takes the focus.
+  const ready = assessment !== null;
+  useEffect(() => {
+    if (ready) okRef.current?.focus();
+  }, [ready]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -78,10 +86,13 @@ export function DragDropConfirm({
           Cancel
         </button>
         <button
+          ref={okRef}
           type="button"
-          autoFocus
-          onClick={() => onConfirm(assessment)}
-          className={cn("px-2 py-0.5 rounded text-white", risky ? "bg-amber-600 hover:bg-amber-700" : "bg-[var(--color-primary)] hover:opacity-90")}
+          disabled={!ready}
+          aria-busy={!ready}
+          title={ready ? undefined : "Checking the operation with the Safety Interlock…"}
+          onClick={() => ready && onConfirm(assessment)}
+          className={cn("px-2 py-0.5 rounded text-white disabled:opacity-50", risky ? "bg-amber-600 hover:bg-amber-700" : "bg-[var(--color-primary)] hover:opacity-90")}
           data-testid="drag-drop-ok"
         >
           {request.mode === "move" ? "Move" : "Copy"}

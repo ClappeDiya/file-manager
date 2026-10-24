@@ -68,8 +68,13 @@ describe("location provider routing", () => {
 
     expect(await renameEntry("/home/a.txt", "b.txt")).toBe("/home/b.txt");
     expect(invoke).toHaveBeenLastCalledWith("rename_file", { path: "/home/a.txt", newName: "b.txt" });
-    expect(await renameEntry(`conn://${ID}/f1/x9`, "b.txt")).toBe(`conn://${ID}/f1/b.txt`);
+    // Google Drive keeps the item's id: the backend says where it is now.
+    invoke.mockResolvedValueOnce("/f1/x9");
+    expect(await renameEntry(`conn://${ID}/f1/x9`, "b.txt")).toBe(`conn://${ID}/f1/x9`);
     expect(invoke).toHaveBeenLastCalledWith("connector_rename", { protocol: "google_drive", fromPath: "/f1/x9", toPath: "/f1/b.txt", connectionId: ID });
+    // Path-based connections: the new name's path.
+    invoke.mockResolvedValueOnce("/f1/b.txt");
+    expect(await renameEntry(`conn://${ID}/f1/a.txt`, "b.txt")).toBe(`conn://${ID}/f1/b.txt`);
 
     invoke.mockResolvedValue(entry("/f1/x9", "a.txt"));
     expect((await statLocation(`conn://${ID}/f1/x9`))?.path).toBe(`conn://${ID}/f1/x9`);

@@ -427,7 +427,9 @@ pub async fn connector_folder_size_cancel(job_id: String) -> Result<bool, AppErr
 }
 
 /// Rename or move `from_path` to `to_path` within one connection, on the
-/// server (panes: rename, and moves inside one connection).
+/// server (panes: rename, and moves inside one connection). Returns the
+/// item's path afterwards: `to_path`, except where the connector addresses
+/// items by id (Google Drive: the new folder's path plus the item's id).
 #[tauri::command]
 pub async fn connector_rename(
     protocol: String,
@@ -436,12 +438,17 @@ pub async fn connector_rename(
     connection_id: Option<String>,
     registry: State<'_, ConnectorRegistry>,
     manager: State<'_, ConnectionManager>,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     if from_path.trim_end_matches('/') == to_path.trim_end_matches('/') {
-        return Ok(());
+        return Ok(from_path);
     }
     let connector = user_instance(&registry, &manager, &protocol, connection_id.as_deref()).await?;
-    connector.rename_entry(&from_path, &to_path).await
+    rename_at(connector.as_ref(), &from_path, &to_path).await
+}
+
+pub(crate) async fn rename_at(connector: &dyn Connector, from: &str, to: &str) -> Result<String, AppError> {
+    connector.rename_entry(from, to).await?;
+    Ok(connector.renamed_path(from, to))
 }
 
 /// The entry at `path` (from its folder's listing); `None` when there is
@@ -458,25 +465,68 @@ pub async fn connector_stat(
     stat_entry(connector.as_ref(), &path).await
 }
 
+/// The entry at `path` as its folder lists it: its `path` is where a pane
+/// opens it. A typed path may name folders by name where the connector
+/// addresses them otherwise (Google Drive: `/Reports/Q1` is `/<id>/<id>`),
+/// so when the parent cannot be listed as typed, or does not hold the
+/// item, the path is resolved folder by folder from the top.
 pub(crate) async fn stat_entry(connector: &dyn Connector, path: &str) -> Result<Option<FileEntry>, AppError> {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         // The root always exists once connected.
         return Ok(Some(FileEntry { name: "/".into(), path: "/".into(), is_dir: true, is_symlink: false, size: 0, modified: None, created: None, is_hidden: false, extension: None, permissions: None }));
     }
-    let name = trimmed.rsplit('/').next().unwrap_or_default();
-    let listing = connector.list_remote(&crate::transfer_engine::location::remote_parent(trimmed)).await?;
-    // Same path, else same name: listings may spell paths their own way
-    // (OneDrive `/drive/root:/Docs` for a typed `/Docs`).
-    let by_path = listing.iter().position(|e| e.path.trim_end_matches('/') == trimmed);
+    let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+    let direct_err = match connector.list_remote(&crate::transfer_engine::location::remote_parent(trimmed)).await {
+        Ok(listing) => match find_listed(listing, trimmed, segments.last().copied().unwrap_or_default()) {
+            Some(entry) => return Ok(Some(entry)),
+            None => None,
+        },
+        Err(e) => Some(e),
+    };
+    if segments.len() < 2 {
+        // A top-level item: its folder (the root) was listed as typed.
+        return direct_err.map_or(Ok(None), Err);
+    }
+    match resolve_by_names(connector, &segments).await {
+        Ok(found) => Ok(found),
+        // The typed parent was listed fine: the item is simply not there.
+        Err(e) => direct_err.map_or(Ok(None), |_| Err(e)),
+    }
+}
+
+/// Walk `segments` from the root, each one matched by path or by name in
+/// its folder's listing.
+async fn resolve_by_names(connector: &dyn Connector, segments: &[&str]) -> Result<Option<FileEntry>, AppError> {
+    let mut dir = "/".to_string();
+    let mut found = None;
+    for (i, seg) in segments.iter().enumerate() {
+        let typed = format!("/{}", segments[..=i].join("/"));
+        let Some(entry) = find_listed(connector.list_remote(&dir).await?, &typed, seg) else {
+            return Ok(None);
+        };
+        if i + 1 < segments.len() && !entry.is_dir {
+            return Ok(None);
+        }
+        dir = entry.path.clone();
+        found = Some(entry);
+    }
+    Ok(found)
+}
+
+/// The entry of `listing` at `path`, else the one called `name`: listings
+/// may spell paths their own way (OneDrive `/drive/root:/Docs` for a typed
+/// `/Docs`, Google Drive ids).
+fn find_listed(listing: Vec<FileEntry>, path: &str, name: &str) -> Option<FileEntry> {
+    let by_path = listing.iter().position(|e| e.path.trim_end_matches('/') == path);
     let at = by_path.or_else(|| listing.iter().position(|e| e.name == name));
-    Ok(at.map(|i| listing[i].clone()))
+    at.map(|i| listing[i].clone())
 }
 
 /// Largest remote file `connector_fetch_preview` downloads.
 pub const PREVIEW_MAX_BYTES: u64 = 25 * 1024 * 1024;
 
-/// Download a remote file into the preview cache (a temporary folder) so
+/// Download a remote file into the preview cache (the app cache folder) so
 /// the local previewers and the default app can open it; returns the local
 /// copy's path. `size` is the listed size: larger than `max_bytes`
 /// (default [`PREVIEW_MAX_BYTES`]) is refused before anything downloads.
@@ -502,12 +552,14 @@ pub async fn connector_fetch_preview(
 
 /// The preview-cache file for `remote_path` of `scope` (a connection id):
 /// one folder per remote path, so two files with one name never collide.
+/// The cache is in this user's app cache folder (never the shared
+/// temporary folder, where another user could plant links).
 pub(crate) fn preview_cache_path(scope: &str, remote_path: &str, name: &str) -> std::path::PathBuf {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (scope, remote_path).hash(&mut h);
     let safe: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '\0') { '_' } else { c }).collect();
-    std::env::temp_dir().join("ufop-remote-preview").join(format!("{:016x}", h.finish())).join(if safe.is_empty() { "file".into() } else { safe })
+    crate::paths::cache_dir().join("remote-previews").join(format!("{:016x}", h.finish())).join(if safe.is_empty() { "file".into() } else { safe })
 }
 
 pub(crate) async fn fetch_preview(connector: &dyn Connector, remote_path: &str, name: &str, scope: &str) -> Result<String, AppError> {
@@ -517,6 +569,8 @@ pub(crate) async fn fetch_preview(connector: &dyn Connector, remote_path: &str, 
     }
     let local_str = local.to_string_lossy().to_string();
     let staging = crate::transfer_engine::location::local_staging_path(&local_str);
+    // Never write through something already there (a leftover or a link).
+    let _ = tokio::fs::remove_file(&staging).await;
     if let Err(e) = connector.download(remote_path, &staging).await {
         let _ = tokio::fs::remove_file(&staging).await;
         return Err(e);
@@ -591,6 +645,24 @@ mod tests {
         assert_eq!(none, crate::connectors::ConnectionSecrets::default());
     }
 
+    /// Regression: a Google Drive address typed by names
+    /// (`Work Drive:/Reports/Q1`) failed (Drive paths are folder ids, so
+    /// listing "/Reports" is a 404) or, one level deep, validated and then
+    /// opened "Reports" as a folder id. It now resolves folder by folder to
+    /// the id path the pane opens.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stat_resolves_names_to_google_drive_id_paths() {
+        let drive = crate::connectors::google_drive::fake_drive::start(&[("r1", "Reports", "root", true), ("q1", "Q1", "r1", true), ("n1", "notes.txt", "q1", false)]).await;
+        let c = drive.connector.as_ref();
+        assert_eq!(stat_entry(c, "/Reports").await.unwrap().unwrap().path, "/r1");
+        let q1 = stat_entry(c, "/Reports/Q1/").await.unwrap().unwrap();
+        assert_eq!((q1.path.as_str(), q1.is_dir), ("/r1/q1", true));
+        assert_eq!(stat_entry(c, "/Reports/Q1/notes.txt").await.unwrap().unwrap().path, "/r1/q1/n1");
+        assert_eq!(stat_entry(c, "/r1/q1").await.unwrap().unwrap().path, "/r1/q1", "id paths resolve as they are");
+        assert!(stat_entry(c, "/Reports/Nope").await.unwrap().is_none());
+        assert!(stat_entry(c, "/Nope/Q1").await.unwrap().is_none());
+    }
+
     /// `connector_stat` and `connector_fetch_preview` against an in-memory
     /// connection: entries by path (or by name), the root, missing paths;
     /// previews land under the final name only when complete.
@@ -608,6 +680,9 @@ mod tests {
         let local = fetch_preview(&c, "/docs/a.txt", "a.txt", &scope).await.unwrap();
         assert_eq!(std::fs::read_to_string(&local).unwrap(), "hello");
         assert!(local.ends_with("a.txt"));
+        // In this user's app cache, not the shared temporary folder.
+        assert!(std::path::Path::new(&local).starts_with(crate::paths::cache_dir()), "{local}");
+        assert!(!std::path::Path::new(&local).starts_with(std::env::temp_dir()), "{local}");
         assert_ne!(preview_cache_path(&scope, "/docs/a.txt", "a.txt"), preview_cache_path(&scope, "/other/a.txt", "a.txt"));
         assert!(preview_cache_path(&scope, "/x", "../../etc").file_name().unwrap() == ".._.._etc", "names cannot leave the cache folder");
         assert!(fetch_preview(&c, "/docs/missing.txt", "m.txt", &scope).await.is_err());

@@ -58,6 +58,15 @@ describe("AddressBar", () => {
     expect(props.onNavigate).not.toHaveBeenCalled();
   });
 
+  it("goes to the path validation resolved a typed address to (Google Drive names → ids)", async () => {
+    const validate = vi.fn(async () => ({ path: `conn://${ID}/r1` }));
+    const { props, input } = setup({ validate });
+    fireEvent.change(input, { target: { value: "Work Drive:/Reports" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(props.onNavigate).toHaveBeenCalledWith(`conn://${ID}/r1`));
+    expect(validate).toHaveBeenCalledWith(`conn://${ID}/Reports`);
+  });
+
   it("suggests the typed parent's folders (debounced) and recent places", async () => {
     vi.useFakeTimers();
     try {

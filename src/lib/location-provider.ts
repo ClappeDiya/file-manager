@@ -71,7 +71,12 @@ export async function listDirectory(path: string): Promise<FileEntryData[]> {
   return out;
 }
 
-/** The entry at `path`, or null when there is nothing there. */
+/**
+ * The entry at `path`, or null when there is nothing there. A connection
+ * entry's `path` is where the item really is: a path typed by names
+ * (`/Reports/Q1`) comes back as the connection's own path for it (Google
+ * Drive: folder ids), which is what a pane must open.
+ */
 export async function statLocation(path: string): Promise<FileEntryData | null> {
   if (!isRemotePath(path)) {
     try {
@@ -95,7 +100,11 @@ export async function makeDirectory(path: string): Promise<void> {
   await tauriInvoke("connector_make_directory", { protocol, remotePath, connectionId });
 }
 
-/** Rename an item in place; returns its new pane path. */
+/**
+ * Rename an item in place; returns its new pane path. For a connection the
+ * backend says where the item is now: the new name's path, or (Google
+ * Drive, which addresses items by id) its unchanged id path.
+ */
 export async function renameEntry(path: string, newName: string): Promise<string> {
   if (!isRemotePath(path)) {
     await tauriInvoke("rename_file", { path, newName });
@@ -104,8 +113,8 @@ export async function renameEntry(path: string, newName: string): Promise<string
   const { protocol, connectionId, remotePath } = await remoteArgs(path);
   const parent = parseLocation(parentLocation(path)).path;
   const toPath = parent.endsWith("/") ? `${parent}${newName}` : `${parent}/${newName}`;
-  await tauriInvoke("connector_rename", { protocol, fromPath: remotePath, toPath, connectionId });
-  return remoteLocation(connectionId, toPath);
+  const now = await tauriInvoke<string | null>("connector_rename", { protocol, fromPath: remotePath, toPath, connectionId });
+  return remoteLocation(connectionId, typeof now === "string" && now ? now : toPath);
 }
 
 /**

@@ -260,6 +260,18 @@ pub trait Connector: Send + Sync {
         Box::pin(async { Err(unsupported_op("create folder")) })
     }
 
+    /// Create a remote directory and return its path as this connector
+    /// lists it, which is where its contents go. Path-based connectors
+    /// return `remote_path` (the default); Google Drive addresses folders
+    /// by id, so it returns the parent's path plus the new folder's id.
+    fn make_directory_path(&self, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + '_>> {
+        let path = remote_path.to_string();
+        Box::pin(async move {
+            self.make_directory(&path).await?;
+            Ok(path)
+        })
+    }
+
     /// Delete a remote file or (empty) directory.
     fn remove(
         &self,
@@ -283,6 +295,13 @@ pub trait Connector: Send + Sync {
                 advice: "Copy the item under the new name, then delete the original.".to_string(),
             })
         })
+    }
+
+    /// Where the item at `from` is listed after `rename_entry(from, to)`:
+    /// `to` for path-based connectors (the default). Google Drive keeps the
+    /// item's id, so it is the new parent's path plus that id.
+    fn renamed_path(&self, _from: &str, to: &str) -> String {
+        to.to_string()
     }
 
     /// Copy the file `from` to `to` on the server without the bytes passing
