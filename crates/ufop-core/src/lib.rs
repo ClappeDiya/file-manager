@@ -24,6 +24,8 @@ pub mod naming;
 pub mod netacl;
 pub mod policy;
 pub mod preload;
+#[cfg(feature = "profiles")]
+pub mod profiles;
 pub mod retention;
 pub mod retry;
 pub mod run_notify;
