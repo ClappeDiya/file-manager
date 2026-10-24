@@ -11,7 +11,7 @@ import { NamedSchedulePicker } from "@/components/schedule-pickers";
 import { WorkflowBuilder } from "@/components/workflow-builder";
 import { PresetCombobox } from "@/components/preset-combobox";
 import { RunNotifyPicker } from "@/components/run-notify-picker";
-import { RiskBadge, RiskConfirm, fetchRisks, highRiskSteps, useRiskLookup } from "@/components/step-risk";
+import { RiskBadge, RiskConfirm, fetchHighRiskSteps, useRiskLookup, type HighRiskStep } from "@/components/step-risk";
 import { autoLayout, workflowActions } from "@/lib/workflow-model";
 import { refId } from "@/stores/schedule-store";
 import { useCallback, useEffect, useState } from "react";
@@ -462,7 +462,7 @@ function ActionFields({
             </select>
           </div>
           <label className="flex items-center gap-2 text-xs">
-            <input type="checkbox" checked={a.full} onChange={(e) => onChange({ ...a, full: e.target.checked })} /> Compare file contents, not only sizes and times (slower)
+            <input type="checkbox" checked={a.full} onChange={(e) => onChange({ ...a, full: e.target.checked })} /> Compare file contents, not only sizes (slower)
           </label>
           <p className="text-[11px] text-[var(--color-text-muted)]">Reads both sides and changes nothing. The step fails when files differ or are missing, so later steps (or a workflow&apos;s failure branch) can react.</p>
         </div>
@@ -719,7 +719,7 @@ export function AutomationRuleEditor() {
   const [customCommands, setCustomCommands] = useState<Named[]>([]);
   const [revisions, setRevisions] = useState<RuleRevision[]>([]);
   const [copied, setCopied] = useState(false);
-  const [riskPrompt, setRiskPrompt] = useState<ReturnType<typeof highRiskSteps> | null>(null);
+  const [riskPrompt, setRiskPrompt] = useState<HighRiskStep[] | null>(null);
   const loadRules = useAutomationStore((s) => s.loadRules);
 
   useEffect(() => {
@@ -758,9 +758,9 @@ export function AutomationRuleEditor() {
     if (problems.length) return null;
     setBusy(true);
     try {
-      // A High-risk step needs an explicit yes (Advanced); the answer comes from Rust.
-      if (advanced && !confirmedRisk) {
-        const high = highRiskSteps(allActions, await fetchRisks(allActions));
+      // A High-risk step needs an explicit yes, in Standard and Advanced alike; the answer comes from Rust.
+      if (!confirmedRisk) {
+        const high = await fetchHighRiskSteps(ruleFromForm(form));
         if (high.length > 0) {
           setRiskPrompt(high);
           return null;

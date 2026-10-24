@@ -111,8 +111,9 @@ impl super::BackupManager {
         Ok(p)
     }
 
-    /// Delete a local profile. Referenced by jobs or templates: refused
-    /// unless `force`, which removes those references (with warnings).
+    /// Delete a local profile. Referenced by jobs, templates, sync pairs or
+    /// automation rules: refused unless `force`, which removes those
+    /// references (with warnings).
     pub async fn delete_notification_profile(&self, id: &str, force: bool) -> Result<ProfileDeleteOutcome, AppError> {
         if id.starts_with(MANAGED_PREFIX) {
             return Err(AppError::PermissionDenied { message: "Deleting organization notification profiles is not allowed here; the console manages them".into(), advice: "Ask your administrator to remove it.".into() });
@@ -126,6 +127,10 @@ impl super::BackupManager {
         let templates: Vec<_> = self.list_templates().await?.into_iter().filter(|t| !t.managed && t.settings.notification_profile_ids.as_deref().is_some_and(refers)).collect();
         let mut users: Vec<String> = jobs.iter().map(|j| format!("job '{}'", j.name)).collect();
         users.extend(templates.iter().map(|t| format!("template '{}'", t.name)));
+        let run_users = self.inner.profile_users.get().cloned();
+        if let Some(r) = &run_users {
+            users.extend(r.users(id).await);
+        }
         if !users.is_empty() && !force {
             return Err(AppError::state(format!("The notification profile is used by {}", users.join(", ")), "Remove it there first, or delete with force to remove those references."));
         }
@@ -144,6 +149,12 @@ impl super::BackupManager {
             out.warnings.push(format!("Template '{}' no longer sends to '{}'", t.name, profile.name));
             out.removed_from.push(format!("template '{}'", t.name));
             self.save_template(t).await?;
+        }
+        if let Some(r) = &run_users {
+            for label in r.remove(id).await? {
+                out.warnings.push(format!("The {label} no longer sends to '{}'", profile.name));
+                out.removed_from.push(label);
+            }
         }
         for w in &out.warnings {
             tracing::warn!("{w}");

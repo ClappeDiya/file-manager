@@ -1116,7 +1116,9 @@ async fn dispatch_paths(action: &RuleAction, triggered_file: Option<&str>, env: 
 
         RuleAction::VerifyPair { sync_pair_id, full } => {
             let outcome = require_services(services)?.verify_pair(sync_pair_id, *full).await?;
-            Ok(vec![format!("sync_pair:{sync_pair_id} ({outcome})")])
+            // A check produces no file: nothing for `files_affected`, `{path}` or a size.
+            tracing::info!("Automation verify_pair {sync_pair_id}: {outcome}");
+            Ok(Vec::new())
         }
 
         RuleAction::RemoveEmptyDirs { path, remove_root } => {
@@ -2472,7 +2474,7 @@ mod step_tests {
         svc.pairs.lock().unwrap().push(pair.clone());
         let id = pair.id.to_string();
         let ok = run(RuleAction::VerifyPair { sync_pair_id: id.clone(), full: true }, None, Some(&svc)).await.unwrap();
-        assert!(ok[0].starts_with(&format!("sync_pair:{id} (")) && ok[0].contains("agree"), "{ok:?}");
+        assert!(ok.is_empty(), "{ok:?}: a check produces no file, so no pseudo-path reaches the log or the size");
         write(&dst.path().join("a.txt"), "HELLO");
         let e = run(RuleAction::VerifyPair { sync_pair_id: id.clone(), full: true }, None, Some(&svc)).await.unwrap_err();
         assert!(e.contains("1 difference(s)") && e.contains("Checksum mismatch: a.txt"), "{e}");

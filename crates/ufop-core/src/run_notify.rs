@@ -127,6 +127,8 @@ mod tests {
         assert!(n(None, &["error"], None).validate().is_err());
         assert!(n(None, &[], Some(5)).validate().is_err());
         assert!(RunNotify::default().validate().is_ok());
+        // "Nobody" in the editor: the profile cleared together with what depended on it.
+        assert!(n(None, &[], None).validate().is_ok());
         // Absent fields read as "no notification"; none are written when unset.
         let back: RunNotify = serde_json::from_str("{}").unwrap();
         assert_eq!(back, RunNotify::default());

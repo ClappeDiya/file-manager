@@ -104,7 +104,55 @@ describe("sync panel", () => {
     await act(async () => {
       fireEvent.change(screen.getByTestId("run-notify-profile"), { target: { value: "prof-1" } });
     });
-    await waitFor(() => expect(updates).toHaveLength(1));
+    await waitFor(() => expect(updates).toHaveLength(1), { timeout: 3000 });
     expect((updates[0] as { run_options: unknown }).run_options).toEqual({ settle_secs: 0, completion_marker: null, version_template: null, notify_profile_id: "prof-1" });
+  });
+  const notifyHarness = (initialNotify: Record<string, unknown> = {}) => {
+    const pair = { id: "pair-1", name: "Photos", source_path: "/a", dest_path: "/b", mode: "one_way", enabled: true, last_run: null, trigger: "manual", run_options: { settle_secs: 0, completion_marker: null, version_template: null, ...initialNotify } };
+    const updates: { run_options: Record<string, unknown> }[] = [];
+    mockInvoke.mockImplementation(async (cmd: string, args?: { pairJson?: string }) => {
+      if (cmd === "list_sync_pairs") return [pair];
+      if (cmd === "get_sync_health") return "green";
+      if (cmd === "update_sync_pair") {
+        const sent = JSON.parse(args!.pairJson!);
+        // What the backend's RunNotify::validate enforces.
+        const o = sent.run_options;
+        if (!o.notify_profile_id && ((o.notify_on ?? []).length > 0 || o.min_bytes != null)) throw new Error("Choose a notification profile to send to");
+        updates.push(sent);
+        return pair;
+      }
+      if (cmd === "backup_list_notification_profiles") return [{ id: "prof-1", name: "Ops Slack", description: "", notification: { type: "slack", credential_id: "c", send_on: [], template: "", cert: {} }, min_severity: null, managed: false, created_at: "", updated_at: "" }];
+      return [];
+    });
+    return updates;
+  };
+
+  it("turning notifications off after choosing results saves a valid pair", async () => {
+    const updates = notifyHarness({ notify_profile_id: "prof-1", notify_on: ["error"] });
+    render(<SyncPanel />);
+    fireEvent.click(await screen.findByLabelText("Notifications for Photos"));
+    await screen.findByText(/Ops Slack/);
+    await act(async () => {
+      fireEvent.change(screen.getByTestId("run-notify-profile"), { target: { value: "" } });
+    });
+    await waitFor(() => expect(updates).toHaveLength(1), { timeout: 3000 });
+    expect(screen.queryByText(/Choose a notification profile/)).toBeNull();
+    const o = updates[0].run_options;
+    expect(o.notify_profile_id ?? null).toBeNull();
+    expect(o.notify_on).toEqual([]);
+    expect(o.min_bytes ?? null).toBeNull();
+  });
+
+  it("typing a threshold saves once, after typing pauses", async () => {
+    useUIStore.setState({ appMode: "advanced" });
+    const updates = notifyHarness({ notify_profile_id: "prof-1" });
+    render(<SyncPanel />);
+    fireEvent.click(await screen.findByLabelText("Notifications for Photos"));
+    await screen.findByText(/Ops Slack/);
+    const input = screen.getByLabelText(/Don’t report successful runs below/);
+    for (const v of ["1", "10", "100"]) fireEvent.change(input, { target: { value: v } });
+    expect(updates).toHaveLength(0);
+    await waitFor(() => expect(updates).toHaveLength(1), { timeout: 3000 });
+    expect(updates[0].run_options.min_bytes).toBe(100 * 1024 * 1024);
   });
 });

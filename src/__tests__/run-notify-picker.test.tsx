@@ -65,7 +65,19 @@ describe("RunNotifyPicker", () => {
     expect(seen).toHaveBeenLastCalledWith({ notify_profile_id: "p1", notify_on: ["warning"] });
     // Back to nobody.
     fireEvent.change(select, { target: { value: "" } });
-    expect(seen).toHaveBeenLastCalledWith({ notify_profile_id: null, notify_on: ["warning"] });
+    // The cleared shape is one the backend accepts: no filter or threshold without a profile.
+    expect(seen).toHaveBeenLastCalledWith({ notify_profile_id: null, notify_on: [], min_bytes: null });
+  });
+
+  it("choosing Nobody after a threshold was typed clears the threshold too", async () => {
+    const seen = vi.fn();
+    render(<Harness initial={{ notify_profile_id: "p1", notify_on: ["error"], min_bytes: 2_097_152 }} advanced seen={seen} />);
+    await screen.findByText("Mail (Email)");
+    fireEvent.change(screen.getByTestId("run-notify-profile"), { target: { value: "" } });
+    expect(seen).toHaveBeenLastCalledWith({ notify_profile_id: null, notify_on: [], min_bytes: null });
+    // Choosing a profile again starts from an empty threshold field.
+    fireEvent.change(screen.getByTestId("run-notify-profile"), { target: { value: "p2" } });
+    expect((screen.getByLabelText(/Don’t report successful runs below/) as HTMLInputElement).value).toBe("");
   });
 
   it("shows the size threshold only in Advanced, in MB, keeping partial typing", async () => {

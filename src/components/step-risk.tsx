@@ -6,8 +6,8 @@
  * explicit answer in an inline dialog.
  */
 import { useEffect, useMemo, useState } from "react";
-import { tauriInvokeSafe } from "@/hooks/use-tauri";
-import type { RiskLevel, RuleAction, StepRisk } from "@/stores/automation-store";
+import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
+import type { AutomationRule, RiskLevel, RuleAction, StepRisk } from "@/stores/automation-store";
 
 const TONE: Record<RiskLevel, string> = {
   low: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
@@ -50,13 +50,33 @@ export function useRiskLookup(actions: RuleAction[]): (a: RuleAction) => StepRis
   return useMemo(() => (a: RuleAction) => table.get(JSON.stringify(a)), [table]);
 }
 
-/** The High steps among `actions`, numbered from 1 as the editor shows them. */
-export function highRiskSteps(actions: RuleAction[], risks: StepRisk[]): { step: number; risk: StepRisk }[] {
-  return risks.flatMap((risk, i) => (risk.level === "high" && actions[i] ? [{ step: i + 1, risk }] : []));
+/** A High-risk step of a rule, as `automation_rule_confirmations` names it (`Action 2`, `Step Wipe`). */
+export interface HighRiskStep {
+  step: string;
+  level: RiskLevel;
+  reason: string;
+}
+
+/**
+ * The steps of `rule` that need an explicit yes before saving, from Rust
+ * (the same labels the workflow graph uses). Outside the app there is no
+ * backend to ask and the save fails later anyway. Inside it, a failed or
+ * malformed answer is never read as "all clear": the user is asked to
+ * confirm the whole rule instead.
+ */
+export async function fetchHighRiskSteps(rule: AutomationRule): Promise<HighRiskStep[]> {
+  if (!isTauriAvailable()) return [];
+  try {
+    const steps = await tauriInvoke<HighRiskStep[]>("automation_rule_confirmations", { rule });
+    if (Array.isArray(steps) && steps.every((x) => x && typeof x.step === "string" && typeof x.reason === "string")) return steps;
+  } catch {
+    // Falls through to the unchecked answer below.
+  }
+  return [{ step: "This rule", level: "high", reason: "Its steps could not be checked for risk, so it may remove data or run programs" }];
 }
 
 /** Inline confirmation shown before saving a rule with High-risk steps (not `window.confirm`). */
-export function RiskConfirm({ steps, onConfirm, onCancel }: { steps: { step: number; risk: StepRisk }[]; onConfirm: () => void; onCancel: () => void }) {
+export function RiskConfirm({ steps, onConfirm, onCancel }: { steps: HighRiskStep[]; onConfirm: () => void; onCancel: () => void }) {
   return (
     <section role="alertdialog" aria-labelledby="risk-confirm-title" className="rounded border border-red-500/60 bg-red-500/5 p-3 text-xs space-y-2" data-testid="risk-confirm">
       <p id="risk-confirm-title" className="font-semibold text-red-700 dark:text-red-300">
@@ -65,7 +85,7 @@ export function RiskConfirm({ steps, onConfirm, onCancel }: { steps: { step: num
       <ul className="list-disc pl-5">
         {steps.map((s) => (
           <li key={s.step}>
-            Action {s.step}: {s.risk.reason}
+            {s.step}: {s.reason}
           </li>
         ))}
       </ul>

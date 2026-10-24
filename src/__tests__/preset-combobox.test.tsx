@@ -48,6 +48,28 @@ describe("PresetCombobox", () => {
     expect(screen.queryByRole("listbox")).toBeNull();
   });
 
+  it("closes when focus leaves it (Tab away), but not when focus stays inside", () => {
+    render(
+      <div>
+        <PresetCombobox presets={PRESETS} onPick={vi.fn()} />
+        <button type="button">next field</button>
+      </div>,
+    );
+    const box = screen.getByRole("combobox");
+    fireEvent.focus(box);
+    expect(screen.getByRole("listbox")).toBeTruthy();
+    // Focus moving to something inside the combobox keeps it open.
+    fireEvent.blur(box, { relatedTarget: screen.getByRole("listbox") });
+    expect(screen.queryByRole("listbox")).not.toBeNull();
+    // Tabbing to the next field closes it.
+    fireEvent.blur(box, { relatedTarget: screen.getByText("next field") });
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(box.getAttribute("aria-expanded")).toBe("false");
+    // Focusing again reopens it.
+    fireEvent.focus(box);
+    expect(screen.getByRole("listbox")).toBeTruthy();
+  });
+
   it("moves with the arrow keys, stops at the ends, and closes on Escape", () => {
     const onPick = vi.fn();
     render(<PresetCombobox presets={PRESETS} onPick={onPick} />);

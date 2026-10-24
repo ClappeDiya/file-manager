@@ -11,7 +11,7 @@
  */
 import { NamedSchedulePicker } from "@/components/schedule-pickers";
 import { refId, useScheduleStore } from "@/stores/schedule-store";
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { SyncRunOptionsSection } from "@/components/sync-run-options";
 import { DEFAULT_RUN_OPTIONS, type SyncRunOptions } from "@/stores/sync-store";
 import { RunNotifyPicker } from "@/components/run-notify-picker";
@@ -209,7 +209,13 @@ function triggerName(trigger: string | { scheduled: { cron_expr: string } }): st
 export function SyncPanel() {
   const [view, setView] = useState<SyncPanelView>("list");
   const { nextRuns, refresh: refreshNextRuns } = useNextRuns("sync", true);
-  const [pairs, setPairs] = useState<SyncPair[]>([]);
+  const [pairs, setPairsState] = useState<SyncPair[]>([]);
+  // The latest list, for saves that run after a debounce.
+  const pairsRef = useRef<SyncPair[]>([]);
+  const setPairs = useCallback((next: SyncPair[] | ((prev: SyncPair[]) => SyncPair[])) => {
+    pairsRef.current = typeof next === "function" ? next(pairsRef.current) : next;
+    setPairsState(pairsRef.current);
+  }, []);
   const [healthMap, setHealthMap] = useState<Record<string, SyncHealth>>({});
   const [_selectedPair, _setSelectedPair] = useState<SyncPair | null>(null);
   const [preview, setPreview] = useState<SyncPreview | null>(null);
@@ -398,13 +404,18 @@ export function SyncPanel() {
 
   // ── Result notifications of an existing pair ──
 
-  const handleSaveNotify = async (pair: SyncPair, patch: RunNotify) => {
+  const handleSaveNotify = async (pairId: string, patch: RunNotify) => {
+    // Build from the latest state, not from the pair a stale closure captured.
+    const pair = pairsRef.current.find((p) => p.id === pairId);
+    if (!pair) return;
     const updated: SyncPair = { ...pair, run_options: { ...DEFAULT_RUN_OPTIONS, ...pair.run_options, ...patch } };
-    setPairs((all) => all.map((p) => (p.id === pair.id ? updated : p)));
+    pairsRef.current = pairsRef.current.map((p) => (p.id === pairId ? updated : p));
+    setPairs(pairsRef.current);
     try {
       await tauriInvoke("update_sync_pair", { pairJson: JSON.stringify(updated) });
     } catch (e: any) {
-      setPairs((all) => all.map((p) => (p.id === pair.id ? pair : p)));
+      pairsRef.current = pairsRef.current.map((p) => (p.id === pairId ? pair : p));
+      setPairs(pairsRef.current);
       setError(e?.message || "Failed to save the notification settings");
     }
   };
@@ -612,6 +623,43 @@ export function SyncPanel() {
 
 // ── Sub-Components ──
 
+/** How long typing pauses before a pair's notification settings are saved. */
+export const NOTIFY_SAVE_DELAY_MS = 500;
+
+/**
+ * The notify picker of one pair card. Edits show at once; the save runs once
+ * typing pauses (not per keystroke) and is flushed when the card closes.
+ */
+function PairNotify({ pair, onSave, advanced }: { pair: SyncPair; onSave: (pairId: string, notify: RunNotify) => Promise<void>; advanced: boolean }) {
+  const [draft, setDraft] = useState<RunNotify>(pair.run_options ?? {});
+  const pending = useRef<RunNotify | null>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const save = useRef(onSave);
+  useEffect(() => {
+    save.current = onSave;
+  });
+  const flush = useCallback(() => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = null;
+    const patch = pending.current;
+    pending.current = null;
+    if (patch) void save.current(pair.id, patch);
+  }, [pair.id]);
+  useEffect(() => flush, [flush]);
+  return (
+    <RunNotifyPicker
+      value={draft}
+      advanced={advanced}
+      onChange={(patch) => {
+        setDraft((d) => ({ ...d, ...patch }));
+        pending.current = { ...pending.current, ...patch };
+        if (timer.current) clearTimeout(timer.current);
+        timer.current = setTimeout(flush, NOTIFY_SAVE_DELAY_MS);
+      }}
+    />
+  );
+}
+
 function PairListView({
   pairs,
   healthMap,
@@ -631,7 +679,7 @@ function PairListView({
   onDelete: (id: string) => void;
   onRollback: (id: string) => void;
   onViewReports: (id: string) => void;
-  onSaveNotify: (pair: SyncPair, notify: RunNotify) => Promise<void>;
+  onSaveNotify: (pairId: string, notify: RunNotify) => Promise<void>;
   /** Next scheduled run by pair id (RFC 3339). */
   nextRuns: Record<string, string>;
   syncRunning: boolean;
@@ -745,7 +793,7 @@ function PairListView({
             </div>
             {notifyOpen === pair.id && (
               <div className="mt-2">
-                <RunNotifyPicker value={pair.run_options ?? {}} onChange={(patch) => void onSaveNotify(pair, patch)} advanced={advanced} />
+                <PairNotify pair={pair} onSave={onSaveNotify} advanced={advanced} />
               </div>
             )}
           </div>

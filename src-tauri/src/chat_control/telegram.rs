@@ -101,14 +101,38 @@ pub async fn sleep_or_stop(d: Duration, stop: &mut Stop) -> bool {
     }
 }
 
+/// The offset past everything already waiting, retrying with a growing pause
+/// until Telegram answers. `None` when stopped first.
+async fn skip_backlog(cfg: &TelegramConfig, stop: &mut Stop, status: &ChannelStatus) -> Option<i64> {
+    let mut pause = Duration::from_millis(500);
+    loop {
+        if *stop.borrow() {
+            return None;
+        }
+        match call(cfg, "getUpdates", json!({ "offset": -1, "timeout": 0 })).await {
+            Ok(v) => return Some(parse_updates(&v).iter().map(|u| u.id + 1).max().unwrap_or(0)),
+            Err(e) => {
+                tracing::warn!("Remote control: {e}");
+                status.set_error(e);
+                if sleep_or_stop(pause, stop).await {
+                    return None;
+                }
+                pause = (pause * 2).min(Duration::from_secs(60));
+            }
+        }
+    }
+}
+
 /// Run until `stop` fires.
 pub async fn run(cfg: TelegramConfig, handler: Arc<Handler>, mut stop: Stop, status: Arc<ChannelStatus>) {
-    // Skip whatever was said while nobody listened.
-    let mut offset = match call(&cfg, "getUpdates", json!({ "offset": -1, "timeout": 0 })).await {
-        Ok(v) => parse_updates(&v).iter().map(|u| u.id + 1).max().unwrap_or(0),
-        Err(e) => {
-            status.set_error(e);
-            0
+    // Skip whatever was said while nobody listened. Until that has worked
+    // (the app may have started offline) nothing is processed: starting from
+    // offset 0 would run up to a day of old commands.
+    let mut offset = match skip_backlog(&cfg, &mut stop, &status).await {
+        Some(o) => o,
+        None => {
+            status.connected.store(false, Ordering::SeqCst);
+            return;
         }
     };
     let mut backoff = 1u64;
@@ -286,6 +310,47 @@ mod tests {
         tx.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
         assert!(!status.snapshot().connected);
+    }
+
+    #[tokio::test]
+    async fn a_failed_backlog_skip_is_retried_and_old_commands_never_run() {
+        let mock = Arc::new(Mock::default());
+        // Said while the app was off, and the first skip call fails (offline start).
+        mock.queue.lock().unwrap().extend([update(1, 42, "/run Tidy"), update(2, 42, "/stop Tidy")]);
+        *mock.fail_updates.lock().unwrap() = 1;
+        let base = serve(mock.clone()).await;
+        let backend = Arc::new(MockBackend::with(vec![job(JobKind::Rule, "r1", "Tidy")]));
+        let handler = Arc::new(Handler::new(Dialect::Telegram, None, &["42".to_string()], 10, backend.clone(), Arc::new(MockAudit::default())));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let status = Arc::new(ChannelStatus::default());
+        let task = tokio::spawn(run(config(base), handler, rx, status.clone()));
+        // The skip is retried (offset -1 again), then polling starts past the backlog.
+        eventually("a normal poll", || mock.polls.lock().unwrap().iter().any(|p| p["offset"].as_i64().is_some_and(|o| o >= 0))).await;
+        let polls = mock.polls.lock().unwrap().clone();
+        assert!(polls.len() >= 3 && polls[0]["offset"] == -1 && polls[1]["offset"] == -1, "{polls:?}");
+        assert_eq!(polls.iter().find(|p| p["offset"] != -1).unwrap()["offset"], 3, "polling starts after the last old update");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(backend.calls().is_empty(), "{:?}: old commands were not run", backend.calls());
+        assert!(mock.sent.lock().unwrap().is_empty());
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_while_the_skip_keeps_failing_ends_the_loop_without_running_anything() {
+        let mock = Arc::new(Mock::default());
+        mock.queue.lock().unwrap().push(update(1, 42, "/run Tidy"));
+        *mock.fail_updates.lock().unwrap() = 1000;
+        let base = serve(mock.clone()).await;
+        let backend = Arc::new(MockBackend::with(vec![job(JobKind::Rule, "r1", "Tidy")]));
+        let handler = Arc::new(Handler::new(Dialect::Telegram, None, &["42".to_string()], 10, backend.clone(), Arc::new(MockAudit::default())));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run(config(base), handler, rx, Arc::new(ChannelStatus::default())));
+        eventually("a failing skip", || !mock.polls.lock().unwrap().is_empty()).await;
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert!(backend.calls().is_empty());
+        assert!(mock.polls.lock().unwrap().iter().all(|p| p["offset"] == -1), "never moved on to normal polling");
     }
 
     #[tokio::test]

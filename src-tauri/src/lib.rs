@@ -535,6 +535,7 @@ pub fn run() {
             notify_hub::desktop::wire_transfers(&app.state::<TransferManager>(), sink.clone());
             notify_hub::desktop::wire_sync(&app.state::<SyncManager>(), sink);
             notify_hub::run::wire_sync_reports(app.handle());
+            notify_hub::run::wire_profile_users(app.handle());
             // Chat-bot remote control: nothing starts unless the user turned it on.
             app.manage(chat_control::service::ChatControlService::new(app.handle().clone()));
             let chat = app.handle().clone();
@@ -1205,6 +1206,7 @@ pub fn run() {
             automation_commands::automation_restore_revision,
             automation_commands::automation_convert_to_workflow,
             automation_commands::automation_action_risks,
+            automation_commands::automation_rule_confirmations,
             automation_commands::create_automation_rule,
             automation_commands::update_automation_rule,
             automation_commands::delete_automation_rule,

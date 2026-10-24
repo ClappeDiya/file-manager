@@ -11,7 +11,7 @@ const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
 import { AutomationRuleEditor } from "@/components/automation-rule-editor";
-import { RiskBadge, RiskConfirm, highRiskSteps, fetchRisks } from "@/components/step-risk";
+import { RiskBadge, RiskConfirm, fetchHighRiskSteps, fetchRisks } from "@/components/step-risk";
 import { useAutomationStore, type AutomationRule, type RuleAction, type StepRisk } from "@/stores/automation-store";
 import { useUIStore } from "@/stores/ui-store";
 
@@ -41,6 +41,12 @@ beforeEach(() => {
         return lastSaved;
       case "automation_action_risks":
         return (args?.actions as RuleAction[]).map((a) => RISKS[a.type] ?? { level: "low", reason: "" });
+      case "automation_rule_confirmations": {
+        // What Rust answers: the High steps, named "Action n".
+        const rule = args?.rule as AutomationRule;
+        const actions = [rule.action, ...(rule.steps ?? []).map((st) => st.action)];
+        return actions.flatMap((a, i) => (RISKS[a.type]?.level === "high" ? [{ step: `Action ${i + 1}`, ...RISKS[a.type] }] : []));
+      }
       case "list_sync_pairs":
         return [{ id: "pair-1", name: "Photos" }];
       case "list_connections":
@@ -58,12 +64,11 @@ const manual = () => fireEvent.change(screen.getByLabelText("Trigger"), { target
 const watch = () => fireEvent.change(screen.getByLabelText("Folder to watch", { selector: "input" }), { target: { value: "/in" } });
 
 describe("step risk helpers", () => {
-  it("draws a badge with the reason and picks out the High steps", () => {
+  it("draws a badge with the reason", () => {
     render(<RiskBadge risk={RISKS.delete_file} />);
     const badge = screen.getByTestId("risk-badge");
     expect(badge.textContent).toBe("High risk");
     expect(badge.getAttribute("title")).toBe("Deletes files permanently");
-    expect(highRiskSteps([{ type: "delete_file", to_trash: false }, { type: "create_folder", path: "/x" }, { type: "purge", path: "/y", max_files: null }], [RISKS.delete_file, RISKS.copy_file, RISKS.purge]).map((s) => s.step)).toEqual([1, 3]);
   });
 
   it("asks Rust for risks only when there are actions, and ignores a mismatched answer", async () => {
@@ -73,10 +78,27 @@ describe("step risk helpers", () => {
     expect(await fetchRisks([{ type: "delete_file", to_trash: true }, { type: "delete_file", to_trash: true }])).toEqual([]);
   });
 
+  it("a failed or malformed risk check asks for confirmation instead of passing", async () => {
+    const rule = { id: "r", name: "n", action: { type: "copy_file", dest_path: "/d" } } as unknown as AutomationRule;
+    mockInvoke.mockRejectedValueOnce(new Error("deserialisation error"));
+    const afterError = await fetchHighRiskSteps(rule);
+    expect(afterError).toHaveLength(1);
+    expect(afterError[0].level).toBe("high");
+    expect(afterError[0].reason).toMatch(/could not be checked/);
+    mockInvoke.mockResolvedValueOnce("not a list");
+    expect(await fetchHighRiskSteps(rule)).toHaveLength(1);
+    mockInvoke.mockResolvedValueOnce([]);
+    expect(await fetchHighRiskSteps(rule)).toEqual([]);
+    // Outside the app there is nothing to ask.
+    delete (window as unknown as Record<string, unknown>).__TAURI__;
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    expect(await fetchHighRiskSteps(rule)).toEqual([]);
+  });
+
   it("the confirmation names every step and answers both ways", () => {
     const yes = vi.fn();
     const no = vi.fn();
-    render(<RiskConfirm steps={[{ step: 2, risk: RISKS.purge }]} onConfirm={yes} onCancel={no} />);
+    render(<RiskConfirm steps={[{ step: "Action 2", ...RISKS.purge }]} onConfirm={yes} onCancel={no} />);
     expect(screen.getByRole("alertdialog").textContent).toContain("Action 2: Removes a folder and everything in it");
     fireEvent.click(screen.getByText("Go back"));
     fireEvent.click(screen.getByText("Save with high-risk steps"));
@@ -128,7 +150,7 @@ describe("rule editor in Advanced mode", () => {
     expect(screen.queryByRole("alertdialog")).toBeNull();
   });
 
-  it("asks nothing and shows no badges in Standard mode", async () => {
+  it("shows no badges in Standard mode and asks nothing for a Low risk rule", async () => {
     useUIStore.setState({ appMode: "simple" });
     render(<AutomationRuleEditor />);
     open();
@@ -137,7 +159,41 @@ describe("rule editor in Advanced mode", () => {
     expect(screen.queryByTestId("risk-badge")).toBeNull();
     fireEvent.click(screen.getByText("Create rule"));
     await waitFor(() => expect(calls("create_automation_rule")).toHaveLength(1));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(calls("automation_action_risks")).toHaveLength(0);
+  });
+
+  it("Standard mode also confirms a permanent delete before saving", async () => {
+    useUIStore.setState({ appMode: "simple" });
+    render(<AutomationRuleEditor />);
+    open();
+    watch();
+    fireEvent.change(screen.getByLabelText("Action 1"), { target: { value: "delete_file" } });
+    fireEvent.click(screen.getByLabelText(/Move to the folder's .ufop_trash/)); // permanent delete
+    fireEvent.click(screen.getByText("Create rule"));
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain("Action 1: Deletes files permanently");
+    expect(calls("create_automation_rule")).toHaveLength(0);
+    fireEvent.click(screen.getByText("Save with high-risk steps"));
+    await waitFor(() => expect(calls("create_automation_rule")).toHaveLength(1));
+  });
+
+  it("asks for confirmation when the risk check itself fails inside the app", async () => {
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "automation_rule_confirmations") throw new Error("invalid args");
+      if (cmd === "create_automation_rule") {
+        lastSaved = args?.rule as AutomationRule;
+        return lastSaved;
+      }
+      return [];
+    });
+    render(<AutomationRuleEditor />);
+    open();
+    watch();
+    fireEvent.change(screen.getByLabelText("Destination folder", { selector: "input" }), { target: { value: "/out" } });
+    fireEvent.click(screen.getByText("Create rule"));
+    expect((await screen.findByRole("alertdialog")).textContent).toContain("could not be checked");
+    expect(calls("create_automation_rule")).toHaveLength(0);
   });
 
   it("starts from a searched template (Advanced) and keeps the plain list in Standard", async () => {

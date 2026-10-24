@@ -18,7 +18,7 @@ export function PresetCombobox({ presets, onPick, className = "" }: { presets: R
   const optionId = (i: number) => `${listId}-opt-${i}`;
 
   useEffect(() => setActive(0), [query]);
-  // Close when focus or a click lands elsewhere.
+  // Close when a click lands elsewhere (focus moving away is handled by onBlur).
   useEffect(() => {
     if (!open) return;
     const away = (e: MouseEvent) => !root.current?.contains(e.target as Node) && setOpen(false);
@@ -71,7 +71,14 @@ export function PresetCombobox({ presets, onPick, className = "" }: { presets: R
   };
 
   return (
-    <div ref={root} className={`relative ${className}`}>
+    <div
+      ref={root}
+      className={`relative ${className}`}
+      // Tabbing (or any focus move) out of the combobox closes the list, like a click elsewhere.
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+      }}
+    >
       <input
         role="combobox"
         aria-label="Start from a template"

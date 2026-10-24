@@ -857,6 +857,8 @@ struct Inner {
     secrets: std::sync::OnceLock<SettingsStore>,
     notifier: std::sync::OnceLock<Notifier>,
     run_listener: std::sync::OnceLock<RunListener>,
+    /// Sync pairs and automation rules that name notification profiles (set by the desktop app).
+    profile_users: std::sync::OnceLock<std::sync::Arc<dyn crate::notify_hub::run::ProfileUsers>>,
     secret_cache: secrets::SecretCache,
     /// Console-delivered (`central:`) secrets when no secure store exists:
     /// kept in memory only and re-delivered by the agent after a restart.
@@ -947,6 +949,7 @@ impl BackupManager {
                 secrets: std::sync::OnceLock::new(),
                 notifier: std::sync::OnceLock::new(),
                 run_listener: std::sync::OnceLock::new(),
+                profile_users: std::sync::OnceLock::new(),
                 volatile_secrets: Mutex::new(HashMap::new()),
                 secret_cache: secrets::SecretCache::default(),
                 volume_cache: Mutex::new(None),
@@ -1516,6 +1519,12 @@ impl BackupManager {
     /// Route run results to OS notifications (set by the desktop app).
     pub fn set_notifier(&self, n: Notifier) {
         let _ = self.inner.notifier.set(n);
+    }
+
+    /// Tell the profile store where sync pairs and automation rules keep
+    /// their notification profile (set by the desktop app).
+    pub fn set_profile_users(&self, u: std::sync::Arc<dyn crate::notify_hub::run::ProfileUsers>) {
+        let _ = self.inner.profile_users.set(u);
     }
 
     /// Receive every finished operation (set once, by the fleet agent).

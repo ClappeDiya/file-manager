@@ -3,7 +3,8 @@
 //!
 //! Every event envelope is acknowledged first, as Slack requires; a repeated
 //! delivery of the same event is not run twice. The bot ignores its own and
-//! other bots' messages.
+//! other bots' messages. One post that Slack reports twice (as `message` and
+//! as `app_mention`, with different event ids) is run once.
 
 use super::core::{slack_escape, Dialect};
 use super::handler::{Handler, Incoming};
@@ -39,7 +40,14 @@ pub enum Envelope {
     /// Slack asks for a new connection.
     Disconnect(String),
     /// An event to acknowledge, maybe a message for the bot.
-    Event { envelope_id: String, event_id: Option<String>, incoming: Option<Incoming> },
+    Event {
+        envelope_id: String,
+        event_id: Option<String>,
+        /// `channel:ts` of the post: the same for the `message` and the
+        /// `app_mention` event of one message.
+        message_key: Option<String>,
+        incoming: Option<Incoming>,
+    },
     Other,
 }
 
@@ -51,6 +59,7 @@ pub fn parse_envelope(text: &str) -> Envelope {
         Some(kind) => {
             let Some(envelope_id) = v["envelope_id"].as_str().map(str::to_string) else { return Envelope::Other };
             let mut event_id = None;
+            let mut message_key = None;
             let mut incoming = None;
             if kind == "events_api" {
                 event_id = v["payload"]["event_id"].as_str().map(str::to_string);
@@ -60,11 +69,12 @@ pub fn parse_envelope(text: &str) -> Envelope {
                 // Not our own or another bot's messages: that is how reply loops start.
                 if (is_message || is_mention) && e.get("bot_id").map_or(true, Value::is_null) {
                     if let (Some(user), Some(channel), Some(text)) = (e["user"].as_str(), e["channel"].as_str(), e["text"].as_str()) {
+                        message_key = e["ts"].as_str().map(|ts| format!("{channel}:{ts}"));
                         incoming = Some(Incoming { dialect: Dialect::Slack, sender: user.to_string(), chat: channel.to_string(), text: text.to_string() });
                     }
                 }
             }
-            Envelope::Event { envelope_id, event_id, incoming }
+            Envelope::Event { envelope_id, event_id, message_key, incoming }
         }
         None => Envelope::Other,
     }
@@ -124,6 +134,21 @@ impl Seen {
     }
 }
 
+/// Whether this event repeats one already seen: a redelivery (same event id)
+/// or the other event type of the same post (same channel and timestamp).
+/// Both are remembered either way.
+fn is_repeat(seen: &mut Seen, event_id: Option<&str>, message_key: Option<&str>) -> bool {
+    let new_event = event_id.map_or(true, |id| seen.first_time(id));
+    let new_message = message_key.map_or(true, |key| seen.first_time(&format!("msg:{key}")));
+    !(new_event && new_message)
+}
+
+fn seen_event(seen: &mut Seen, event_id: Option<&str>) {
+    if let Some(id) = event_id {
+        seen.first_time(id);
+    }
+}
+
 /// One connection's life. `Ok(true)` = Slack asked for a fresh connection.
 async fn session(cfg: &SlackConfig, handler: &Handler, stop: &mut Stop, status: &ChannelStatus, seen: &mut Seen) -> Result<bool, String> {
     let url = open_connection(cfg).await?;
@@ -144,12 +169,16 @@ async fn session(cfg: &SlackConfig, handler: &Handler, stop: &mut Stop, status: 
                 tracing::info!("Remote control: Slack asked for a new connection ({reason})");
                 return Ok(true);
             }
-            Envelope::Event { envelope_id, event_id, incoming } => {
+            Envelope::Event { envelope_id, event_id, message_key, incoming } => {
                 ws.send_text(&json!({ "envelope_id": envelope_id }).to_string()).await?;
-                if event_id.as_deref().is_some_and(|id| !seen.first_time(id)) {
+                // Nothing to obey; still remember the id so a redelivery stays a repeat.
+                let Some(incoming) = incoming else {
+                    seen_event(seen, event_id.as_deref());
+                    continue;
+                };
+                if is_repeat(seen, event_id.as_deref(), message_key.as_deref()) {
                     continue;
                 }
-                let Some(incoming) = incoming else { continue };
                 if let Some(reply) = handler.handle(&incoming).await {
                     status.handled.fetch_add(1, Ordering::SeqCst);
                     if let Err(e) = post_message(cfg, &incoming.chat, &reply).await {
@@ -209,7 +238,7 @@ mod tests {
         assert_eq!(parse_envelope(r#"{"foo":1}"#), Envelope::Other);
         assert_eq!(parse_envelope(r#"{"type":"events_api"}"#), Envelope::Other, "no envelope id, nothing to acknowledge");
         match parse_envelope(&event("e1", "Ev1", "U1", "run Tidy", json!({}))) {
-            Envelope::Event { envelope_id, event_id, incoming: Some(i) } => {
+            Envelope::Event { envelope_id, event_id, incoming: Some(i), .. } => {
                 assert_eq!((envelope_id.as_str(), event_id.as_deref()), ("e1", Some("Ev1")));
                 assert_eq!((i.sender.as_str(), i.chat.as_str(), i.text.as_str(), i.dialect), ("U1", "D1", "run Tidy", Dialect::Slack));
             }
@@ -226,6 +255,29 @@ mod tests {
         let no_user = json!({ "envelope_id": "e4", "type": "events_api", "payload": { "event": { "type": "message", "channel": "D1", "text": "run" } } }).to_string();
         assert!(matches!(parse_envelope(&no_user), Envelope::Event { incoming: None, .. }));
         assert_eq!(base_of(""), "https://slack.com/api");
+    }
+
+    #[test]
+    fn one_post_reported_as_message_and_as_mention_is_a_repeat() {
+        let post = |kind: &str, event_id: &str, ts: &str| {
+            json!({ "envelope_id": "e", "type": "events_api", "payload": { "event_id": event_id, "event": { "type": kind, "user": "U1", "channel": "C1", "ts": ts, "text": "<@U0BOT> run Tidy" } } }).to_string()
+        };
+        let keys: Vec<Option<String>> = [post("message", "Ev1", "1700.1"), post("app_mention", "Ev2", "1700.1"), post("app_mention", "Ev3", "1700.2")]
+            .iter()
+            .map(|t| match parse_envelope(t) {
+                Envelope::Event { message_key, .. } => message_key,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(keys[0], Some("C1:1700.1".into()));
+        assert_eq!(keys[0], keys[1], "the same post has the same key whichever event reports it");
+        assert_ne!(keys[0], keys[2]);
+        let mut seen = Seen::default();
+        assert!(!is_repeat(&mut seen, Some("Ev1"), keys[0].as_deref()));
+        assert!(is_repeat(&mut seen, Some("Ev2"), keys[1].as_deref()), "second event of the same post");
+        assert!(is_repeat(&mut seen, Some("Ev1"), None), "redelivery by event id");
+        assert!(!is_repeat(&mut seen, Some("Ev3"), keys[2].as_deref()), "a new post is new");
+        assert!(!is_repeat(&mut seen, None, None), "no ids at all: nothing to compare, obey");
     }
 
     #[test]
@@ -291,11 +343,14 @@ mod tests {
         assert_eq!(serde_json::from_slice::<Value>(&ack.payload).unwrap(), json!({ "envelope_id": "env-1" }));
         server.send(&event("env-2", "Ev2", "U0STRANGER", "run Tidy <up> & co", json!({}))).await;
         assert_eq!(serde_json::from_slice::<Value>(&server.next().await.payload).unwrap(), json!({ "envelope_id": "env-2" }));
-        server.send(&event("env-3", "Ev3", "U0ADMIN", "run Tidy <up> & co", json!({}))).await;
+        server.send(&event("env-3", "Ev3", "U0ADMIN", "run Tidy <up> & co", json!({ "ts": "100.1" }))).await;
         assert_eq!(serde_json::from_slice::<Value>(&server.next().await.payload).unwrap(), json!({ "envelope_id": "env-3" }));
         // Slack redelivers the same event: acknowledged again, not run again.
         server.send(&event("env-3b", "Ev3", "U0ADMIN", "run Tidy <up> & co", json!({}))).await;
         assert_eq!(serde_json::from_slice::<Value>(&server.next().await.payload).unwrap(), json!({ "envelope_id": "env-3b" }));
+        // The same post arriving again as an app_mention (new event id) is not run again either.
+        server.send(&event("env-3c", "Ev3c", "U0ADMIN", "run Tidy <up> & co", json!({ "type": "app_mention", "ts": "100.1" }))).await;
+        assert_eq!(serde_json::from_slice::<Value>(&server.next().await.payload).unwrap(), json!({ "envelope_id": "env-3c" }));
         // The bot's own reply arriving as an event is ignored.
         server.send(&event("env-4", "Ev4", "U0ADMIN", "Started Tidy", json!({ "bot_id": "B1" }))).await;
         assert_eq!(serde_json::from_slice::<Value>(&server.next().await.payload).unwrap(), json!({ "envelope_id": "env-4" }));

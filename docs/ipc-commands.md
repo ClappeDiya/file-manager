@@ -50,12 +50,13 @@ macro; if you add a new one here, register it there too.
 - `get_audit_log_status`
 - `verify_audit_log`
 
-## `automation_commands` (23 commands)
+## `automation_commands` (24 commands)
 
 - `approve_automation_command`
 - `automation_action_risks`
 - `automation_convert_to_workflow`
 - `automation_restore_revision`
+- `automation_rule_confirmations`
 - `automation_rule_revisions`
 - `clear_automation_logs`
 - `clone_automation_rule`
@@ -759,4 +760,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 588 commands across 52 modules.
+**Surface:** 589 commands across 52 modules.

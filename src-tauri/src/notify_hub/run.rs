@@ -9,7 +9,12 @@
 
 use super::profiles::NotificationProfile;
 use super::Notification;
+use crate::automation_engine::AutomationManager;
 use crate::backup_engine::{human_bytes, BackupManager};
+use crate::core::error::AppError;
+use crate::core::traits::{BoxFuture, SyncOperations};
+use crate::storage::Repository;
+use crate::sync_engine::SyncManager;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use ufop_core::run_notify::{RunNotify, RunResult};
@@ -126,6 +131,19 @@ pub fn sync_summary(run: &crate::sync_engine::SyncRunEvent) -> Option<RunSummary
     }
 }
 
+/// Bytes of the files a run produced or touched that still exist. `None`
+/// when none of them does (deleted or purged paths, remote results, runs that
+/// only notify or verify): the run's size is unknown and a size threshold
+/// must not mute it.
+pub fn affected_bytes(paths: &[String]) -> Option<u64> {
+    let sizes: Vec<u64> = paths.iter().filter_map(|f| std::fs::metadata(f).ok()).filter(|m| m.is_file()).map(|m| m.len()).collect();
+    if sizes.is_empty() {
+        None
+    } else {
+        Some(sizes.iter().sum())
+    }
+}
+
 /// What a finished automation run reports; `None` for a run that did nothing
 /// (skipped: no file matched) or is still going.
 pub fn automation_summary(rule: &crate::automation_engine::AutomationRule, log: &crate::automation_engine::AutomationLog) -> Option<RunSummary> {
@@ -139,8 +157,7 @@ pub fn automation_summary(rule: &crate::automation_engine::AutomationRule, log: 
         (Ok(a), Some(Ok(b))) => (b - a).num_seconds().max(0) as u64,
         _ => 0,
     };
-    // Bytes of the files the run produced or touched that still exist.
-    let bytes: u64 = log.files_affected.iter().filter_map(|f| std::fs::metadata(f).ok()).filter(|m| m.is_file()).map(|m| m.len()).sum();
+    let bytes = affected_bytes(&log.files_affected);
     let summary = match (&log.error_message, log.files_affected.len()) {
         (Some(e), _) if result == RunResult::Error => format!("Automation \"{}\" failed: {e}", rule.name),
         (_, 0) => format!("Automation \"{}\" ran", rule.name),
@@ -148,7 +165,79 @@ pub fn automation_summary(rule: &crate::automation_engine::AutomationRule, log: 
     };
     let errors: Vec<String> = log.steps.iter().filter(|s| !s.ok).map(|s| s.message.clone().unwrap_or_else(|| format!("{} failed", s.action))).collect();
     let errors = if errors.is_empty() { log.error_message.clone().into_iter().collect() } else { errors };
-    Some(RunSummary { kind: "automation", id: rule.id.clone(), name: rule.name.clone(), result, summary, errors, files: log.files_affected.len() as u64, bytes: Some(bytes), duration_secs })
+    Some(RunSummary { kind: "automation", id: rule.id.clone(), name: rule.name.clone(), result, summary, errors, files: log.files_affected.len() as u64, bytes, duration_secs })
+}
+
+/// Who else names a notification profile: sync pairs and automation rules
+/// (backup jobs and templates are the profile store's own). Lets deleting a
+/// profile see, and with force clean up, those references.
+pub trait ProfileUsers: Send + Sync {
+    /// Labels of the pairs and rules that send to `profile_id`.
+    fn users<'a>(&'a self, profile_id: &'a str) -> BoxFuture<'a, Vec<String>>;
+    /// Stop them sending to it; the labels of what changed.
+    fn remove<'a>(&'a self, profile_id: &'a str) -> BoxFuture<'a, Result<Vec<String>, AppError>>;
+}
+
+/// `sync pair 'Photos'`, `automation rule 'Nightly'` for everything naming `profile_id`.
+pub async fn run_users(profile_id: &str, sync: &SyncManager, automation: &AutomationManager) -> Vec<String> {
+    let names = |cfg: &RunNotify| cfg.profile() == Some(profile_id);
+    let mut out: Vec<String> = sync.list_pairs().await.unwrap_or_default().iter().filter(|p| names(&p.run_options.notify)).map(|p| format!("sync pair '{}'", p.name)).collect();
+    out.extend(automation.list_rules().await.iter().filter(|r| names(&r.options.notify)).map(|r| format!("automation rule '{}'", r.name)));
+    out
+}
+
+/// Clear the notification settings of every pair and rule that names `profile_id`.
+pub async fn remove_run_users(profile_id: &str, sync: &SyncManager, automation: &AutomationManager, repo: &Repository) -> Result<Vec<String>, AppError> {
+    let mut changed = Vec::new();
+    for mut pair in sync.list_pairs().await.unwrap_or_default() {
+        if pair.run_options.notify.profile() != Some(profile_id) {
+            continue;
+        }
+        pair.run_options.notify = RunNotify::default();
+        let label = format!("sync pair '{}'", pair.name);
+        let saved = sync.update_pair(pair).await?;
+        sync.save_pair_to_db(repo, &saved).await?;
+        changed.push(label);
+    }
+    for mut rule in automation.list_rules().await {
+        if rule.options.notify.profile() != Some(profile_id) {
+            continue;
+        }
+        // A rule an organization manages is theirs to change.
+        if rule.managed_by.is_some() {
+            continue;
+        }
+        automation.record_revision(repo, &rule.id).await?;
+        rule.options.notify = RunNotify::default();
+        automation.save_rule(repo, &rule).await?;
+        changed.push(format!("automation rule '{}'", rule.name));
+    }
+    Ok(changed)
+}
+
+/// The desktop app's view of [`ProfileUsers`]: the managers live in Tauri's state.
+struct AppProfileUsers(tauri::AppHandle);
+
+impl ProfileUsers for AppProfileUsers {
+    fn users<'a>(&'a self, profile_id: &'a str) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(async move {
+            use tauri::Manager;
+            run_users(profile_id, &self.0.state::<SyncManager>(), &self.0.state::<AutomationManager>()).await
+        })
+    }
+
+    fn remove<'a>(&'a self, profile_id: &'a str) -> BoxFuture<'a, Result<Vec<String>, AppError>> {
+        Box::pin(async move {
+            use tauri::Manager;
+            remove_run_users(profile_id, &self.0.state::<SyncManager>(), &self.0.state::<AutomationManager>(), &self.0.state::<Repository>()).await
+        })
+    }
+}
+
+/// Let deleting a notification profile see the sync pairs and rules using it.
+pub fn wire_profile_users(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    app.state::<BackupManager>().set_profile_users(std::sync::Arc::new(AppProfileUsers(app.clone())));
 }
 
 /// Report finished sync runs of pairs that name a notification profile.
@@ -327,6 +416,76 @@ mod tests {
         assert!(bad.summary.contains("failed: a.bin: disk full"));
         assert!(automation_summary(&rule, &log(AutomationStatus::Skipped, Some("No files matched"), vec![])).is_none());
         assert!(automation_summary(&rule, &log(AutomationStatus::Running, None, vec![])).is_none());
+
+        // Results that are not local files (deleted, purged, a sync pair, a remote path): the size is
+        // unknown, so a size threshold must not mute the run.
+        let mut gone = log(AutomationStatus::Success, None, vec![]);
+        gone.files_affected = vec!["/gone".into(), "sync_pair:abc (ok)".into(), t.path().to_string_lossy().into_owned()];
+        let unknown = automation_summary(&rule, &gone).unwrap();
+        assert_eq!(unknown.bytes, None, "no existing local file");
+        assert!(cfg("p", &[], Some(1_000_000)).wants(unknown.result, unknown.bytes), "a threshold does not mute a run whose size is unknown");
+        assert_eq!(affected_bytes(&[]), None);
+        // Known sizes still count against the threshold.
+        assert!(!cfg("p", &[], Some(1_000_000)).wants(ok.result, ok.bytes));
+    }
+
+    /// Reaches the managers the way the desktop app does, without a window.
+    struct Direct {
+        sync: std::sync::Arc<SyncManager>,
+        automation: std::sync::Arc<AutomationManager>,
+        repo: Repository,
+    }
+
+    impl ProfileUsers for Direct {
+        fn users<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Vec<String>> {
+            Box::pin(run_users(id, &self.sync, &self.automation))
+        }
+        fn remove<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Vec<String>, AppError>> {
+            Box::pin(remove_run_users(id, &self.sync, &self.automation, &self.repo))
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_profile_sees_and_cleans_the_sync_pairs_and_rules_using_it() {
+        use crate::automation_engine::{AutomationRule, RuleAction, RuleTrigger};
+        use ufop_core::sync_types::SyncPair;
+        let t = tempfile::tempdir().unwrap();
+        let m = manager(t.path()).await;
+        let profile = m.save_notification_profile(super::super::tests::webhook_profile("Ops", "https://h.example/x")).await.unwrap();
+        let repo = Repository::open_in_memory().await.unwrap();
+        let sync = std::sync::Arc::new(SyncManager::with_state_dir(t.path().join("sync")));
+        let automation = std::sync::Arc::new(AutomationManager::new());
+        m.set_profile_users(std::sync::Arc::new(Direct { sync: sync.clone(), automation: automation.clone(), repo: repo.clone() }));
+
+        let mut notifying = SyncPair { name: "Photos".into(), ..Default::default() };
+        notifying.run_options.notify = cfg(&profile.id, &["error"], Some(10));
+        let quiet = SyncPair { name: "Quiet".into(), ..Default::default() };
+        for p in [&notifying, &quiet] {
+            sync.create_pair(p.clone()).await.unwrap();
+        }
+        let mut rule = AutomationRule::new("Nightly".into(), RuleTrigger::Manual, RuleAction::CreateFolder { path: "/x".into() });
+        rule.options.notify = cfg(&profile.id, &[], None);
+        let other = AutomationRule::new("Other".into(), RuleTrigger::Manual, RuleAction::CreateFolder { path: "/y".into() });
+        for r in [&rule, &other] {
+            automation.save_rule(&repo, r).await.unwrap();
+        }
+
+        // Refused while in use, naming them.
+        let e = m.delete_notification_profile(&profile.id, false).await.unwrap_err().user_message();
+        assert!(e.contains("sync pair 'Photos'") && e.contains("automation rule 'Nightly'"), "{e}");
+        assert!(!e.contains("Quiet") && !e.contains("Other"), "{e}");
+        assert!(m.get_notification_profile(&profile.id).await.is_ok(), "still there");
+
+        // Forced: the settings are cleared (not left dangling) and reported.
+        let out = m.delete_notification_profile(&profile.id, true).await.unwrap();
+        assert_eq!(out.removed_from, vec!["sync pair 'Photos'", "automation rule 'Nightly'"]);
+        assert_eq!(out.warnings.len(), 2);
+        let pair = sync.list_pairs().await.unwrap().into_iter().find(|p| p.id == notifying.id).unwrap();
+        assert_eq!(pair.run_options.notify, RunNotify::default());
+        assert_eq!(automation.get_rule(&rule.id).await.unwrap().options.notify, RunNotify::default());
+        assert!(pair.run_options.notify.validate().is_ok(), "what is left can be saved again");
+        assert!(m.get_notification_profile(&profile.id).await.is_err(), "deleted");
+        assert!(run_users(&profile.id, &sync, &automation).await.is_empty());
     }
 
     #[tokio::test]

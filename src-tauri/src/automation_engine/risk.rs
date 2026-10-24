@@ -58,22 +58,17 @@ pub fn action_risk(action: &RuleAction) -> StepRisk {
     }
 }
 
-/// The highest of two levels.
-pub fn worse(a: RiskLevel, b: RiskLevel) -> RiskLevel {
-    let rank = |l: RiskLevel| match l {
-        RiskLevel::Low => 0,
-        RiskLevel::Medium => 1,
-        RiskLevel::High => 2,
-    };
-    if rank(b) > rank(a) {
-        b
-    } else {
-        a
-    }
+/// A High-risk step of a rule, named as the editor names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HighRiskStep {
+    /// `Action n` in the list editor, `Step <label>` in a workflow graph.
+    pub step: String,
+    #[serde(flatten)]
+    pub risk: StepRisk,
 }
 
-/// The step ids (or `Action n`) of a rule that need confirming, with why.
-pub fn needs_confirmation(rule: &AutomationRule) -> Vec<(String, StepRisk)> {
+/// The steps of a rule that need an explicit yes before it is saved, with why.
+pub fn needs_confirmation(rule: &AutomationRule) -> Vec<HighRiskStep> {
     let mut out = Vec::new();
     match &rule.workflow {
         Some(wf) => workflow_risks(wf, &mut out),
@@ -81,7 +76,7 @@ pub fn needs_confirmation(rule: &AutomationRule) -> Vec<(String, StepRisk)> {
             for (i, (action, _)) in rule.all_steps().into_iter().enumerate() {
                 let r = action_risk(action);
                 if r.level == RiskLevel::High {
-                    out.push((format!("Action {}", i + 1), r));
+                    out.push(HighRiskStep { step: format!("Action {}", i + 1), risk: r });
                 }
             }
         }
@@ -89,12 +84,12 @@ pub fn needs_confirmation(rule: &AutomationRule) -> Vec<(String, StepRisk)> {
     out
 }
 
-fn workflow_risks(wf: &Workflow, out: &mut Vec<(String, StepRisk)>) {
+fn workflow_risks(wf: &Workflow, out: &mut Vec<HighRiskStep>) {
     for n in &wf.nodes {
         if let NodeKind::Action { action } = &n.kind {
             let r = action_risk(action);
             if r.level == RiskLevel::High {
-                out.push((format!("Step {}", if n.label.is_empty() { &n.id } else { &n.label }), r));
+                out.push(HighRiskStep { step: format!("Step {}", if n.label.is_empty() { &n.id } else { &n.label }), risk: r });
             }
         }
     }
@@ -186,26 +181,21 @@ mod tests {
     }
 
     #[test]
-    fn worse_picks_the_higher_level() {
-        assert_eq!(worse(Low, Medium), Medium);
-        assert_eq!(worse(High, Medium), High);
-        assert_eq!(worse(Low, Low), Low);
-    }
-
-    #[test]
     fn rules_list_their_high_risk_steps() {
         let mut r = AutomationRule::new("r".into(), RuleTrigger::Manual, RuleAction::DeleteFile { to_trash: true });
         assert!(needs_confirmation(&r).is_empty());
         r.steps.push(crate::automation_engine::ActionStep { action: RuleAction::Purge { path: "/a/b".into(), max_files: None }, continue_on_error: false, output_as: None });
         let n = needs_confirmation(&r);
         assert_eq!(n.len(), 1);
-        assert_eq!(n[0].0, "Action 2");
-        assert_eq!(n[0].1.level, High);
+        assert_eq!(n[0].step, "Action 2");
+        assert_eq!(n[0].risk.level, High);
+        // The answer the editor reads: the step, the level and the reason side by side.
+        assert_eq!(serde_json::to_value(&n[0]).unwrap(), serde_json::json!({ "step": "Action 2", "level": "high", "reason": "Removes a folder and everything in it" }));
         // The same in a graph.
         let mut wf = Workflow::from_rule(&r);
         wf.nodes[0].label = "Trash".into();
         wf.nodes[1].label = "Wipe".into();
         r.workflow = Some(wf);
-        assert_eq!(needs_confirmation(&r).iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(), vec!["Step Wipe"]);
+        assert_eq!(needs_confirmation(&r).iter().map(|h| h.step.as_str()).collect::<Vec<_>>(), vec!["Step Wipe"]);
     }
 }

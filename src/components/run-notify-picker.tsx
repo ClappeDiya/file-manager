@@ -28,7 +28,16 @@ export function RunNotifyPicker({ value, onChange, advanced }: { value: RunNotif
         <select
           className={field}
           value={chosen}
-          onChange={(e) => onChange({ notify_profile_id: e.target.value || null })}
+          onChange={(e) => {
+            if (e.target.value) {
+              onChange({ notify_profile_id: e.target.value });
+            } else {
+              // "Nobody" also drops what only makes sense with a profile; the
+              // backend refuses a filter or threshold without one.
+              setMbText("");
+              onChange({ notify_profile_id: null, notify_on: [], min_bytes: null });
+            }
+          }}
           data-testid="run-notify-profile"
         >
           <option value="">Nobody</option>
