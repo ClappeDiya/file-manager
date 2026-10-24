@@ -983,12 +983,37 @@ impl Connector for SmbConnector {
 // Helper Functions
 // ──────────────────────────────────────────────
 
-/// A failed mount: refused credentials are told apart from other failures.
+/// A failed mount: refused credentials (a rejected sign-in, not retried)
+/// are told apart from other failures.
 fn smb_mount_error(stderr: &str) -> AppError {
-    AppError::Connection {
-        message: format!("SMB mount failed: {stderr}"),
-        advice: "Check the hostname, share name, and credentials.".to_string(),
+    let message = format!("SMB mount failed: {}", stderr.trim());
+    if smb_credentials_rejected(stderr) {
+        AppError::auth(message, "Check the user name, password and domain of the connection.")
+    } else {
+        AppError::connection(message, "Check the hostname, share name, and credentials.")
     }
+}
+
+/// Whether mount.cifs / mount_smbfs / `net use` output says the server
+/// refused the user name or password.
+pub(crate) fn smb_credentials_rejected(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    [
+        "mount error(13)",          // mount.cifs: EACCES = logon failure
+        "status_logon_failure",     // kernel / smbclient
+        "status_account_disabled",
+        "status_account_locked_out",
+        "status_password_expired",
+        "status_wrong_password",
+        "authentication error",     // mount_smbfs
+        "authentication failed",
+        "system error 1326",        // net use: user name or password incorrect
+        "system error 86",          // net use: network password not correct
+        "user name or password is incorrect",
+        "logon failure",
+    ]
+    .iter()
+    .any(|k| s.contains(k))
 }
 
 /// URL-encode a string for SMB URLs.
@@ -1148,6 +1173,24 @@ mod profile_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: every mount failure was a connection error, so a
+    /// refused password was retried and never flagged the connection.
+    #[test]
+    fn refused_smb_credentials_are_rejected_sign_ins() {
+        for stderr in [
+            "mount error(13): Permission denied\nRefer to the mount.cifs(8) manual page",
+            "CIFS: VFS: \\\\nas Send error in SessSetup = -13 STATUS_LOGON_FAILURE",
+            "mount_smbfs: server rejected the connection: Authentication error",
+            "System error 1326 has occurred.\r\nThe user name or password is incorrect.",
+        ] {
+            assert!(smb_mount_error(stderr).is_auth_failure(), "{stderr}");
+        }
+        for stderr in ["mount error(112): Host is down", "mount error(2): No such file or directory", "mount_smbfs: server connection failed: No route to host"] {
+            let e = smb_mount_error(stderr);
+            assert!(!e.is_auth_failure() && ufop_core::retry::is_retryable(&e), "{stderr}");
+        }
+    }
+
     use super::*;
 
     #[test]

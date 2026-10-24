@@ -165,6 +165,15 @@ pub enum MountCapability {
     NotSupported { reason: String },
 }
 
+/// The error of a failed mount: an SMB share that refused the user name or
+/// password is a rejected sign-in (not retried, the connection is flagged).
+fn mount_failure(protocol: &str, message: String) -> AppError {
+    if matches!(protocol, "smb" | "cifs") && crate::connectors::smb::smb_credentials_rejected(&message) {
+        return AppError::auth(message, "Check the user name, password and domain of the connection.");
+    }
+    AppError::connection(message, "Check connection credentials and network access.")
+}
+
 /// Expand a leading `~` to the home directory.
 pub fn expand_home(p: &str) -> String {
     let home = || directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
@@ -517,10 +526,7 @@ impl MountManager {
         );
 
         if status == MountStatus::Error {
-            return Err(AppError::connection(
-                error_message.unwrap_or_default(),
-                "Check connection credentials and network access.",
-            ));
+            return Err(mount_failure(protocol_str, error_message.unwrap_or_default()));
         }
 
         Ok(MountResult {
@@ -770,7 +776,10 @@ impl MountManager {
             }
             let options: MountOptions = serde_json::from_str(&options_json).unwrap_or_default();
             let config_id = Uuid::parse_str(&config_id).ok();
-            match self.mount_remote_with(cid, mount_point.clone(), options, config_id, repo, connection_mgr).await {
+            let result = self.mount_remote_with(cid, mount_point.clone(), options, config_id, repo, connection_mgr).await;
+            // Refused credentials flag the connection (later starts skip it).
+            connection_mgr.record_connect_outcome(cid, &result).await;
+            match result {
                 Ok(_) => {
                     mounted += 1;
                     tracing::info!("Auto-mounted {mount_point}");
@@ -1187,6 +1196,16 @@ mod tests {
         assert!(std::path::Path::new(&expand_home("~/x")).is_absolute());
         assert_eq!(expand_home("/abs/x"), "/abs/x");
         assert_eq!(expand_home("~other/x"), "~other/x");
+    }
+
+    /// Regression: a refused SMB password was a plain connection error, so
+    /// it was retried and never flagged the connection.
+    #[test]
+    fn a_refused_smb_password_is_a_rejected_sign_in() {
+        assert!(mount_failure("smb", "mount error(13): Permission denied".into()).is_auth_failure());
+        assert!(mount_failure("cifs", "Status: STATUS_LOGON_FAILURE".into()).is_auth_failure());
+        assert!(!mount_failure("smb", "mount error(112): Host is down".into()).is_auth_failure());
+        assert!(!mount_failure("nfs", "mount.nfs: access denied by server".into()).is_auth_failure());
     }
 
     #[tokio::test]
