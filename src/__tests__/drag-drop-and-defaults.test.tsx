@@ -90,6 +90,22 @@ describe("drag-and-drop confirmation", () => {
     expect(onConfirm).toHaveBeenCalledWith(expect.objectContaining({ requires_confirmation: true }));
   });
 
+  it("assesses a drop once measured, with the files it really affects", async () => {
+    // Regression: the drop was assessed as its top-level item count with
+    // 0 bytes, so a large folder move looked low risk.
+    const measuring = { ...request, sources: ["/big"], measuring: true };
+    const { rerender } = render(<DragDropConfirm request={measuring} onConfirm={vi.fn()} onCancel={vi.fn()} />);
+    expect(screen.getByTestId("drag-drop-ok")).toBeDisabled();
+    expect(screen.getByTestId("drag-drop-ok")).toHaveAttribute("title", "Measuring what the drop affects…");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls("safety_assess_intent")).toHaveLength(0);
+    rerender(<DragDropConfirm request={{ ...measuring, measuring: false, affectedFiles: 4000, totalBytes: 8_000_000_000 }} onConfirm={vi.fn()} onCancel={vi.fn()} />);
+    await waitFor(() => expect(calls("safety_assess_intent")).toHaveLength(1));
+    expect(calls("safety_assess_intent")[0]).toMatchObject({ intent: { affected_files: 4000, total_bytes: 8_000_000_000, kind: "move" } });
+    await waitFor(() => expect(screen.getByTestId("drag-drop-ok")).toBeEnabled());
+    expect(screen.getByTestId("drag-drop-summary")).toHaveTextContent("(8.0 GB)");
+  });
+
   it("shows the Safety Interlock's risk when it would ask", async () => {
     risk = true;
     render(<DragDropConfirm request={request} onConfirm={vi.fn()} onCancel={vi.fn()} />);

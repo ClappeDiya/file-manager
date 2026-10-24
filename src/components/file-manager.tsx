@@ -23,6 +23,7 @@ import {
   makeDirectory,
   needsLocationTransfer,
   remoteFolderSize,
+  measureLocations,
   removeEntries,
   renameEntry,
   resolveItems,
@@ -3674,14 +3675,20 @@ function FilePane({
     // Bump the recall token before any async work so any earlier
     // in-flight lineage fetch becomes a no-op when it resolves.
     const token = ++pathRecallTokenRef.current;
+    // Stale-result guard for the listing itself: a slow listing of a
+    // folder the user already left (likely for connection folders) must
+    // not replace the newer folder's files, error or loading state.
+    const isCurrent = () => token === pathRecallTokenRef.current;
     try {
       if (isTauriAvailable()) {
         const entries = await listDirectory(path);
+        if (!isCurrent()) return;
         setFiles(entries);
       } else {
         setFiles(isRemotePath(path) ? [] : generateDemoFiles(path));
       }
     } catch (err) {
+      if (!isCurrent()) return;
       if (isRemotePath(path)) {
         // A connection folder that cannot be listed (signed out, offline,
         // credentials rejected) says why and offers Reconnect — never
@@ -3719,8 +3726,10 @@ function FilePane({
         }
       }
     } finally {
-      setLoading(false);
-      setFocusedIndex(0);
+      if (isCurrent()) {
+        setLoading(false);
+        setFocusedIndex(0);
+      }
     }
   }, []);
 
@@ -4138,24 +4147,34 @@ function FilePane({
     const label = mode === "copy" ? "Copy" : "Move";
     try {
       const items = await resolveItems(paths, files);
-      const bytes = items.reduce((n, i) => n + (i.is_dir ? 0 : i.size || 0), 0);
       const destLabel = formatAddress(destDir, useConnectionsStore.getState().nameOf);
       const run = () => transferItems(items, destDir, mode);
-      const outcome: LocationTransferOutcome | null =
-        mode === "move" && !preconfirmed
-          ? await assessBeforeExecute(
-              {
-                engine: "fs",
-                kind: FS_INTENT_KIND.move,
-                affected_files: items.length,
-                total_bytes: bytes,
-                subject_path: currentPath,
-                summary: `Move ${items.length} item${items.length === 1 ? "" : "s"} → ${destLabel}`,
-              },
-              run,
-            )
-          : await run();
+      // The interlock assesses what the move really affects (folders
+      // counted through), not the number of top-level items.
+      const measured = mode === "move" && !preconfirmed ? await measureLocations(paths, files) : null;
+      const outcome: LocationTransferOutcome | null = measured
+        ? await assessBeforeExecute(
+            {
+              engine: "fs",
+              kind: FS_INTENT_KIND.move,
+              affected_files: measured.files,
+              total_bytes: measured.bytes,
+              subject_path: currentPath,
+              summary: `Move ${items.length} item${items.length === 1 ? "" : "s"} → ${destLabel}`,
+            },
+            run,
+          )
+        : await run();
       if (outcome === null) return false;
+      const kept = outcome.kept ?? [];
+      if (kept.length > 0) {
+        useUIStore.getState().addStructuredError({
+          what: `${kept.length} Google document${kept.length === 1 ? " was" : "s were"} copied, not moved`,
+          why: "Outside Google Drive a document is an export (for example .docx), not the document itself",
+          appDid: "Copied the export and kept the original document in Drive",
+          userAction: "Delete the original in Drive yourself if you no longer need it",
+        });
+      }
       const touched = [currentPath, destDir, ...paths.map(parentLocation)];
       const jobIds = outcome.jobs.map((j) => j.id);
       if (jobIds.length > 0) {
@@ -5262,7 +5281,15 @@ function FilePane({
             // between this computer and a connection ⇒ copy.
             const mode = dragDropMode(droppedPaths, currentPath, e.altKey);
             if (useUIStore.getState().confirmDragDrop) {
-              setDropRequest({ sources: droppedPaths, destDir: currentPath, mode, destLabel: formatAddress(currentPath, nameOfConnection), totalBytes: 0 });
+              // Shown at once; assessed once the drop is measured (folders
+              // counted through), so a large folder is not a "low risk" item.
+              const req: DropRequest = { sources: droppedPaths, destDir: currentPath, mode, destLabel: formatAddress(currentPath, nameOfConnection), totalBytes: 0, measuring: true };
+              setDropRequest(req);
+              const measuredReq = (m: { files: number; bytes: number } | null): DropRequest =>
+                m ? { ...req, measuring: false, affectedFiles: m.files, totalBytes: m.bytes } : { ...req, measuring: false };
+              void measureLocations(droppedPaths, files)
+                .catch(() => null)
+                .then((m) => setDropRequest((cur) => (cur === req ? measuredReq(m) : cur)));
               return;
             }
             if (needsLocationTransfer(droppedPaths, currentPath)) {

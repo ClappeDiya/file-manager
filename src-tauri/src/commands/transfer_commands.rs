@@ -92,6 +92,9 @@ pub struct LocationTransferOutcome {
     pub moved: Vec<MovedItem>,
     /// Destination folders created for the copied folders.
     pub folders_created: usize,
+    /// Items a move converted on the way (Google documents exported to
+    /// files) and so kept at the source: pane paths of the originals.
+    pub kept: Vec<String>,
 }
 
 /// Copy or move pane items into `dest_dir` when either end is a saved
@@ -187,19 +190,22 @@ pub(crate) async fn location_transfer(
         jobs.push(manager.enqueue_location_job(&f.source, &f.dest, f.size).await?);
     }
     if mode == TransferMode::Move {
-        if jobs.is_empty() {
+        // A converted copy is not the original: keep that one (its folder
+        // then stays too, as it is not empty).
+        let pairs: Vec<_> = jobs.iter().zip(&plan.files).filter(|(_, f)| !f.converted).map(|(j, f)| (j.id, f.source.clone())).collect();
+        if pairs.is_empty() {
             for dir in &plan.source_dirs {
                 let _ = loc::remove_empty_dir(&Location::parse(dir)?, resolver).await;
             }
         } else {
-            let pairs = jobs.iter().zip(&plan.files).map(|(j, f)| (j.id, f.source.clone())).collect();
             manager.register_move(pairs, plan.source_dirs.clone()).await;
         }
     }
+    let kept = if mode == TransferMode::Move { plan.files.iter().filter(|f| f.converted).map(|f| f.source.clone()).collect() } else { Vec::new() };
     for job in &jobs {
         manager.spawn_runner(job.id).await;
     }
-    Ok(LocationTransferOutcome { jobs, moved, folders_created: plan.dirs.len() })
+    Ok(LocationTransferOutcome { jobs, moved, folders_created: plan.dirs.len(), kept })
 }
 
 /// Pause a transfer job.
@@ -902,5 +908,34 @@ mod tests {
         // Two folders of this computer: not this command's job.
         let err = location_transfer(&mgr, resolver.as_ref(), vec![item(folder.to_string_lossy().into(), "up", true, 0)], local.path().to_str().unwrap(), TransferMode::Copy).await.unwrap_err();
         assert!(err.to_string().contains("Both ends"));
+    }
+
+    /// Moving a Google document out of its connection exports it (a lossy
+    /// conversion): the copy is made, the original is kept and reported,
+    /// while the other files of the move are moved.
+    #[tokio::test]
+    async fn moving_a_document_out_of_its_connection_keeps_the_original() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let ca = Arc::new(MemConnector::with(&[("/r/Plan", "doc"), ("/r/n.txt", "n")], &["/r"]));
+        ca.native.lock().unwrap().insert("/r/Plan".into());
+        let cb = Arc::new(MemConnector::with(&[], &["/in"]));
+        let resolver = Arc::new(MemResolver(HashMap::from([(a, ca.clone()), (b, cb.clone())])));
+        let mgr = TransferManager::new();
+        mgr.set_remote_resolver(resolver.clone());
+        let mut doc = item(format!("conn://{a}/r/Plan"), "Plan", false, 3);
+        doc.extension = Some("gdoc".into());
+        let out = location_transfer(&mgr, resolver.as_ref(), vec![doc, item(format!("conn://{a}/r/n.txt"), "n.txt", false, 1)], &format!("conn://{b}/in"), TransferMode::Move).await.unwrap();
+        assert_eq!(out.kept, vec![format!("conn://{a}/r/Plan")]);
+        settle(&mgr, &out.jobs).await;
+        for _ in 0..200 {
+            if ca.file("/r/n.txt").is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ca.file("/r/n.txt").is_none(), "an ordinary file is moved");
+        assert_eq!(cb.file("/in/Plan.docx").as_deref(), Some("doc"), "the export has the format's extension");
+        assert_eq!(ca.file("/r/Plan").as_deref(), Some("doc"), "the document itself is kept");
+        assert!(ca.dirs.lock().unwrap().contains("/r"));
     }
 }

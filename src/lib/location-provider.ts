@@ -12,6 +12,7 @@
 import { tauriInvoke } from "@/hooks/use-tauri";
 import type { FileEntryData } from "@/components/file-list";
 import { useConnectionsStore, type PaneConnection } from "@/stores/connections-store";
+import { measureSelection } from "@/lib/safety";
 import {
   isRemotePath,
   joinLocation,
@@ -162,6 +163,9 @@ export interface LocationTransferOutcome {
   jobs: { id: string; source_path: string; dest_path: string; total_bytes: number; status: string }[];
   moved: { from: string; to: string }[];
   folders_created: number;
+  /** Google documents a move exported and so kept at the source (always
+   *  sent by the backend). */
+  kept?: string[];
 }
 
 export type TransferMode = "copy" | "move";
@@ -245,6 +249,42 @@ export interface RemoteFolderSize {
 export async function remoteFolderSize(path: string, jobId: string): Promise<RemoteFolderSize> {
   const { protocol, connectionId, remotePath } = await remoteArgs(path);
   return tauriInvoke<RemoteFolderSize>("connector_folder_size", { protocol, path: remotePath, jobId, connectionId });
+}
+
+/**
+ * Files and bytes a copy or move of `paths` affects, folders counted
+ * through, on this computer (`count_affected_files`) or a connection (the
+ * listed size of files, the folder size of folders). Feeds the Safety
+ * Interlock, so a large folder is not assessed as one small item.
+ */
+export async function measureLocations(paths: ReadonlyArray<string>, known: ReadonlyArray<FileEntryData> = []): Promise<{ files: number; bytes: number }> {
+  const local = paths.filter((p) => !isRemotePath(p));
+  const remote = paths.filter(isRemotePath);
+  let files = 0;
+  let bytes = 0;
+  if (local.length > 0) {
+    const m = await measureSelection(local);
+    files += m.files;
+    bytes += m.bytes;
+  }
+  if (remote.length > 0) {
+    const items = await resolveItems(remote, known);
+    for (const [i, item] of items.entries()) {
+      if (!item.is_dir) {
+        files += 1;
+        bytes += item.size || 0;
+        continue;
+      }
+      try {
+        const size = await remoteFolderSize(item.path, `measure-${Date.now()}-${i}`);
+        files += size.files;
+        bytes += size.bytes;
+      } catch {
+        files += 1; // Unmeasured: at least the folder itself.
+      }
+    }
+  }
+  return { files, bytes };
 }
 
 /** Mirrors `RemoteQuota`. */

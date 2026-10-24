@@ -176,6 +176,8 @@ describe("connections in the panes", () => {
     const confirm = await screen.findByTestId("drag-drop-confirm");
     expect(within(confirm).getByTestId("drag-drop-summary")).toHaveTextContent("Copy 1 item to Work Drive:/?");
     expect(calls("enqueue_location_transfer")).toHaveLength(0);
+    // Confirmable once measured and assessed.
+    await waitFor(() => expect(within(confirm).getByTestId("drag-drop-ok")).toBeEnabled());
     fireEvent.click(within(confirm).getByTestId("drag-drop-ok"));
     await waitFor(() => expect(calls("enqueue_location_transfer")).toHaveLength(1));
     expect(calls("enqueue_location_transfer")[0]).toMatchObject({ destDir: ROOT, mode: "copy" });
@@ -256,6 +258,74 @@ describe("connections in the panes", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(useFileManagerStore.getState().getActivePath(0)).toBe(`conn://${ID}/d1/q1`));
     expect(calls("connector_stat")).toContainEqual({ protocol: "dropbox", path: "/Docs/Q1", connectionId: ID });
+  });
+
+  it("never shows a slow listing of a folder already left under the newer folder", async () => {
+    // Regression: the listing of a remote folder the user had left could
+    // land after the newer folder's and replace its files.
+    let releaseSlow: () => void = () => undefined;
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "connector_list_remote" && args?.path === "/Slow") {
+        await new Promise<void>((r) => (releaseSlow = r));
+        return [entry("/Slow/old.txt", "old.txt")];
+      }
+      if (cmd === "connector_list_remote" && args?.path === "/Fast") return [entry("/Fast/new.txt", "new.txt")];
+      return base(cmd, args);
+    });
+    setPanes(ROOT, "/home", true);
+    render(<FileManager />);
+    await settled("Reports");
+    const fm = useFileManagerStore.getState();
+    act(() => fm.navigateTab(0, "tab-0", `conn://${ID}/Slow`, "Slow"));
+    await waitFor(() => expect(calls("connector_list_remote")).toContainEqual(expect.objectContaining({ path: "/Slow" })));
+    act(() => useFileManagerStore.getState().navigateTab(0, "tab-0", `conn://${ID}/Fast`, "Fast"));
+    await screen.findByText("new.txt");
+    await act(async () => {
+      releaseSlow();
+      await new Promise((r) => setTimeout(r, 100));
+    });
+    expect(screen.getByText("new.txt")).toBeInTheDocument();
+    expect(screen.queryByText("old.txt")).not.toBeInTheDocument();
+  });
+
+  it("assesses a confirmed drop with what it really affects", async () => {
+    useUIStore.setState({ confirmDragDrop: true });
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "count_affected_files" ? { files: 2500, bytes: 7_000_000_000, capped: false } : base(cmd, args),
+    );
+    setPanes(ROOT, "/home", true);
+    render(<FileManager />);
+    await screen.findByText("Reports");
+    const target = screen.getByTestId("pane-0").firstElementChild as HTMLElement;
+    const data = new Map<string, string>([["application/x-ufop-files", JSON.stringify(["/home/big"])]]);
+    fireEvent.drop(target, { dataTransfer: { getData: (t: string) => data.get(t) ?? "", types: [...data.keys()] } });
+    const confirm = await screen.findByTestId("drag-drop-confirm");
+    await waitFor(() => expect(calls("safety_assess_intent")).toHaveLength(1));
+    expect(calls("count_affected_files")).toContainEqual({ paths: ["/home/big"] });
+    expect(calls("safety_assess_intent")[0]).toMatchObject({ intent: { affected_files: 2500, total_bytes: 7_000_000_000 } });
+    expect(within(confirm).getByTestId("drag-drop-summary")).toHaveTextContent("(7.0 GB)");
+  });
+
+  it("says when a move kept Google documents (exported, not moved)", async () => {
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "enqueue_location_transfer"
+        ? { jobs: [], moved: [], folders_created: 0, kept: [`conn://${ID}/a.txt`] }
+        : cmd === "count_affected_files"
+          ? { files: 1, bytes: 3, capped: false }
+          : base(cmd, args),
+    );
+    useUIStore.setState({ structuredErrors: [] });
+    setPanes(ROOT, "/home", false);
+    render(<FileManager />);
+    fireEvent.click(await settled("a.txt", screen.getByTestId("pane-0")));
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "F6" });
+    });
+    await waitFor(() => expect(calls("enqueue_location_transfer")).toContainEqual(expect.objectContaining({ mode: "move" })));
+    await waitFor(() => expect(useUIStore.getState().structuredErrors.map((e) => e.what)).toContain("1 Google document was copied, not moved"));
   });
 });
 

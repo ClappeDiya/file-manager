@@ -403,6 +403,14 @@ pub struct TransferConfig {
     pub journal_retention_days: u32,
     /// Minimum file size for chunking (bytes).
     pub chunk_threshold: u64,
+    /// Files transferred at once per saved connection by pane copies and
+    /// moves to or from it (the others wait in the queue).
+    #[serde(default = "default_location_jobs_per_connection")]
+    pub max_location_jobs_per_connection: u32,
+}
+
+fn default_location_jobs_per_connection() -> u32 {
+    4
 }
 
 impl Default for TransferConfig {
@@ -421,6 +429,7 @@ impl Default for TransferConfig {
             merkle_sidecar: true,
             journal_retention_days: 30,
             chunk_threshold: 10 * 1024 * 1024, // 10 MB
+            max_location_jobs_per_connection: default_location_jobs_per_connection(),
         }
     }
 }

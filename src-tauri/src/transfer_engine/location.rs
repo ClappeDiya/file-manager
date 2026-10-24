@@ -9,8 +9,15 @@
 //! - connection → this computer: it downloads to a hidden sibling, renamed
 //!   into place when complete;
 //! - connection → connection: a server-side copy when both ends are the same
-//!   connection and the connector has one, else download + upload through a
+//!   connection and the connector has one, else (or when that copy fails,
+//!   e.g. an S3 object over CopyObject's 5 GB) download + upload through a
 //!   temporary file on this computer.
+//!
+//! A write that fails, is cancelled or paused removes what it left at the
+//! destination (which the job checked was free before it started), so a
+//! retry is not refused by a half-written file. Google documents are
+//! exported when they leave their Drive (the name gets the format's
+//! extension); a move then keeps the original document.
 //!
 //! Folders are expanded here into one job per file (folders are created
 //! first). A move is copy jobs plus a [`MoveGroup`]: each source file is
@@ -19,6 +26,7 @@
 //! top-level names get the keep-both `(copy)` naming, and a job fails rather
 //! than replace a file that appeared meanwhile.
 
+use super::JobControl;
 use crate::connectors::Connector;
 use crate::core::error::AppError;
 use crate::core::traits::BoxFuture;
@@ -143,6 +151,9 @@ pub struct PlannedFile {
     pub source: String,
     pub dest: String,
     pub size: u64,
+    /// The copy is a conversion (a Google document exported to a file):
+    /// a move keeps the original.
+    pub converted: bool,
 }
 
 /// Everything a pane transfer does.
@@ -194,13 +205,18 @@ async fn list(loc: &Location, resolver: &dyn RemoteResolver) -> Result<Vec<FileE
     }
 }
 
-/// The name an item gets at the destination: downloads from a connection
-/// use the connector's download name (Google Drive exports get the format's
-/// extension).
-async fn dest_name(entry: &FileEntry, source: &Location, dest: &Location, resolver: &dyn RemoteResolver) -> Result<String, AppError> {
-    match (source, dest) {
-        (Location::Remote { connection_id, .. }, Location::Local(_)) if !entry.is_dir => Ok(resolver.connector(*connection_id).await?.download_name(entry)),
-        _ => Ok(entry.name.clone()),
+/// The name a file gets at the destination, and whether copying it there
+/// converts it. A file leaving its connection (to this computer or another
+/// connection) is what the connector downloads: Google documents are
+/// exported and get the format's extension. Within one connection it is
+/// copied as it is (Google Drive copies a document as a document).
+async fn dest_name(entry: &FileEntry, source: &Location, dest: &Location, resolver: &dyn RemoteResolver) -> Result<(String, bool), AppError> {
+    match source {
+        Location::Remote { connection_id, .. } if !entry.is_dir && dest.connection_id() != Some(*connection_id) => {
+            let conn = resolver.connector(*connection_id).await?;
+            Ok((conn.download_name(entry), conn.converts_on_download(entry)))
+        }
+        _ => Ok((entry.name.clone(), false)),
     }
 }
 
@@ -224,7 +240,7 @@ pub async fn plan_transfer(items: &[LocationItem], dest_dir: &Location, resolver
             extension: item.extension.clone(),
             permissions: None,
         };
-        let wanted = dest_name(&entry, &source, dest_dir, resolver).await?;
+        let (wanted, converted) = dest_name(&entry, &source, dest_dir, resolver).await?;
         let name = if taken.contains(&wanted) { crate::commands::file_ops_commands::next_copy_name(&wanted, |n| taken.contains(n))? } else { wanted };
         taken.insert(name.clone());
         let dest = dest_dir.join(&name);
@@ -234,7 +250,7 @@ pub async fn plan_transfer(items: &[LocationItem], dest_dir: &Location, resolver
             }
             expand_dir(&source, &dest, resolver, &mut plan).await?;
         } else {
-            plan.files.push(PlannedFile { source: item.path.clone(), dest: dest.to_location_string(), size: item.size });
+            plan.files.push(PlannedFile { source: item.path.clone(), dest: dest.to_location_string(), size: item.size, converted });
         }
         if plan.files.len() > MAX_PLANNED_FILES {
             return Err(AppError::validation(format!("More than {MAX_PLANNED_FILES} files: transfer fewer folders at a time")));
@@ -268,12 +284,12 @@ async fn expand_dir(source: &Location, dest: &Location, resolver: &dyn RemoteRes
                 Location::Local(_) => Location::Local(entry.path.clone()),
                 Location::Remote { connection_id, .. } => Location::Remote { connection_id: *connection_id, path: entry.path.clone() },
             };
-            let name = dest_name(&entry, &src, &dst, resolver).await?;
+            let (name, converted) = dest_name(&entry, &src, &dst, resolver).await?;
             let child_dst = dst.join(&name);
             if entry.is_dir {
                 stack.push((child_src, child_dst));
             } else {
-                plan.files.push(PlannedFile { source: child_src.to_location_string(), dest: child_dst.to_location_string(), size: entry.size });
+                plan.files.push(PlannedFile { source: child_src.to_location_string(), dest: child_dst.to_location_string(), size: entry.size, converted });
                 if plan.files.len() > MAX_PLANNED_FILES {
                     return Err(AppError::validation(format!("More than {MAX_PLANNED_FILES} files: transfer fewer folders at a time")));
                 }
@@ -356,25 +372,93 @@ pub fn local_staging_path(dest: &str) -> String {
 /// Run one file job between two locations (at least one remote); returns the
 /// bytes written. Never replaces an existing destination.
 pub async fn transfer_file(job_id: Uuid, source: &Location, dest: &Location, resolver: &dyn RemoteResolver) -> Result<u64, AppError> {
+    transfer_file_until(job_id, source, dest, resolver, &JobControl::default())
+        .await?
+        .ok_or_else(|| AppError::internal("The transfer stopped"))
+}
+
+/// [`transfer_file`], stopped as soon as `control` is cancelled or paused:
+/// `Ok(None)`, with what it had written removed.
+pub async fn transfer_file_until(job_id: Uuid, source: &Location, dest: &Location, resolver: &dyn RemoteResolver, control: &JobControl) -> Result<Option<u64>, AppError> {
     match (source, dest) {
         (Location::Local(l), Location::Remote { connection_id, path }) => {
             let conn = resolver.connector(*connection_id).await?;
             refuse_existing_remote(conn.as_ref(), path).await?;
-            conn.upload(l, path).await
+            write_remote(control, conn.as_ref(), path, conn.upload(l, path)).await
         }
         (Location::Remote { connection_id, path }, Location::Local(l)) => {
             let conn = resolver.connector(*connection_id).await?;
-            download_into_place(conn.as_ref(), path, l).await
+            download_into_place(control, conn.as_ref(), path, l).await
         }
         (Location::Remote { connection_id: a, path: from }, Location::Remote { connection_id: b, path: to }) => {
             let (src, dst) = (resolver.connector(*a).await?, resolver.connector(*b).await?);
             refuse_existing_remote(dst.as_ref(), to).await?;
-            if a == b && src.server_copy(from, to).await? {
-                return Ok(0);
+            if a == b {
+                match write_remote(control, dst.as_ref(), to, src.server_copy(from, to)).await {
+                    Ok(Some(true)) => return Ok(Some(0)),
+                    Ok(Some(false)) => {}
+                    Ok(None) => return Ok(None),
+                    // Not possible for this file (S3 CopyObject stops at
+                    // 5 GB; some WebDAV servers refuse COPY): relay it.
+                    Err(e) => {
+                        tracing::info!("Server-side copy of {from} failed ({e}); copying it through this computer");
+                        refuse_conversion(src.as_ref(), from).await?;
+                    }
+                }
             }
-            relay(job_id, src.as_ref(), from, dst.as_ref(), to).await
+            relay(job_id, control, src.as_ref(), from, dst.as_ref(), to).await
         }
         (Location::Local(_), Location::Local(_)) => Err(AppError::validation("Both ends are on this computer: the local queue runs this job")),
+    }
+}
+
+/// `op`, unless `control` is cancelled or paused first (`None`: `op` was
+/// dropped, mid-way or before it started).
+async fn unless_stopped<T>(control: &JobControl, op: impl std::future::Future<Output = Result<T, AppError>>) -> Result<Option<T>, AppError> {
+    tokio::select! {
+        biased;
+        _ = control.stopped() => Ok(None),
+        r = op => r.map(Some),
+    }
+}
+
+/// Run `op`, which writes remote `path`: if it fails or is stopped, remove
+/// what it left there (the caller checked `path` was free beforehand).
+async fn write_remote<T>(control: &JobControl, conn: &dyn Connector, path: &str, op: impl std::future::Future<Output = Result<T, AppError>>) -> Result<Option<T>, AppError> {
+    let result = unless_stopped(control, op).await;
+    if !matches!(result, Ok(Some(_))) {
+        remove_partial(conn, path).await;
+    }
+    result
+}
+
+/// Best-effort removal of a file a failed or stopped write left at `path`
+/// (found by path or name: Google Drive lists it under its new id).
+async fn remove_partial(conn: &dyn Connector, path: &str) {
+    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+    match conn.list_remote(&remote_parent(path)).await {
+        Ok(listing) => {
+            if let Some(entry) = listing.into_iter().find(|e| !e.is_dir && (e.path == path || e.name == name)) {
+                if let Err(e) = conn.remove(&entry.path, false).await {
+                    tracing::warn!("Could not remove the incomplete {path}: {e}");
+                }
+            }
+        }
+        Err(e) => tracing::warn!("Could not check for an incomplete {path}: {e}"),
+    }
+}
+
+/// Relaying `from` within its connection would convert it (a Google
+/// document whose server-side copy failed would come back as an exported
+/// file): refuse instead.
+async fn refuse_conversion(conn: &dyn Connector, from: &str) -> Result<(), AppError> {
+    let listing = conn.list_remote(&remote_parent(from)).await?;
+    match listing.iter().find(|e| e.path == from) {
+        Some(entry) if conn.converts_on_download(entry) => Err(AppError::file_op(
+            format!("{} could not be copied on the server, and copying it through this computer would convert it.", entry.name),
+            "Retry later, or copy it in the provider's web app.",
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -385,7 +469,7 @@ async fn refuse_existing_remote(conn: &dyn Connector, path: &str) -> Result<(), 
     Ok(())
 }
 
-async fn download_into_place(conn: &dyn Connector, remote: &str, local: &str) -> Result<u64, AppError> {
+async fn download_into_place(control: &JobControl, conn: &dyn Connector, remote: &str, local: &str) -> Result<Option<u64>, AppError> {
     if tokio::fs::metadata(local).await.is_ok() {
         return Err(AppError::file_op(format!("{local} already exists; it was not overwritten."), "Rename or remove it, then retry the transfer."));
     }
@@ -393,19 +477,18 @@ async fn download_into_place(conn: &dyn Connector, remote: &str, local: &str) ->
         tokio::fs::create_dir_all(parent).await.map_err(|e| AppError::file_op(format!("Cannot create the destination folder: {e}"), "Check you may write there."))?;
     }
     let staging = local_staging_path(local);
-    let result = conn.download(remote, &staging).await;
-    let bytes = match result {
-        Ok(b) => b,
-        Err(e) => {
+    let bytes = match unless_stopped(control, conn.download(remote, &staging)).await {
+        Ok(Some(b)) => b,
+        other => {
             let _ = tokio::fs::remove_file(&staging).await;
-            return Err(e);
+            return other;
         }
     };
     if let Err(e) = tokio::fs::rename(&staging, local).await {
         let _ = tokio::fs::remove_file(&staging).await;
         return Err(AppError::file_op(format!("Downloaded, but could not move it into place as {local}: {e}"), "Check you may write to the destination folder."));
     }
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 /// Where relayed files are held: this user's private temporary folder
@@ -415,15 +498,17 @@ pub fn relay_dir() -> std::path::PathBuf {
 }
 
 /// Download to a temporary file on this computer, upload it, delete it.
-async fn relay(job_id: Uuid, src: &dyn Connector, from: &str, dst: &dyn Connector, to: &str) -> Result<u64, AppError> {
+async fn relay(job_id: Uuid, control: &JobControl, src: &dyn Connector, from: &str, dst: &dyn Connector, to: &str) -> Result<Option<u64>, AppError> {
     let dir = relay_dir();
     tokio::fs::create_dir_all(&dir).await.map_err(|e| AppError::file_op(format!("Cannot create a temporary folder: {e}"), "Free some disk space and retry."))?;
     let temp = dir.join(job_id.to_string()).to_string_lossy().to_string();
     // Never write through something already there (a planted link).
     let _ = tokio::fs::remove_file(&temp).await;
     let result = async {
-        src.download(from, &temp).await?;
-        dst.upload(&temp, to).await
+        if unless_stopped(control, src.download(from, &temp)).await?.is_none() {
+            return Ok(None);
+        }
+        write_remote(control, dst, to, dst.upload(&temp, to)).await
     }
     .await;
     let _ = tokio::fs::remove_file(&temp).await;
@@ -497,6 +582,27 @@ pub(crate) mod tests {
         pub renames: std::sync::Mutex<Vec<(String, String)>>,
         pub can_server_copy: bool,
         pub fail_upload: bool,
+        /// Server-side copies write a partial destination, then fail.
+        pub fail_server_copy: bool,
+        /// Uploads still to fail (each writes a partial file first).
+        pub fail_next_uploads: std::sync::atomic::AtomicUsize,
+        /// Uploads write a partial file, wait this long, then complete.
+        pub upload_delay_ms: std::sync::atomic::AtomicU64,
+        /// Uploads running now, and the most ever at once.
+        pub active_uploads: std::sync::atomic::AtomicUsize,
+        pub peak_uploads: std::sync::atomic::AtomicUsize,
+        /// Paths listed as Google-style native documents (`gdoc`): they
+        /// download as `<name>.docx` exports.
+        pub native: std::sync::Mutex<HashSet<String>>,
+    }
+
+    /// Counts an upload as running until dropped (also when cancelled).
+    struct Running<'a>(&'a std::sync::atomic::AtomicUsize);
+
+    impl Drop for Running<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     impl MemConnector {
@@ -543,7 +649,15 @@ pub(crate) mod tests {
                     permissions: None,
                 };
                 let child = |p: &str| remote_parent(p).trim_end_matches('/') == dir;
-                let mut out: Vec<FileEntry> = self.files.lock().unwrap().iter().filter(|(p, _)| child(p)).map(|(p, d)| entry(p, false, d.len() as u64)).collect();
+                let native = self.native.lock().unwrap().clone();
+                let mut out: Vec<FileEntry> = self
+                    .files
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(p, _)| child(p))
+                    .map(|(p, d)| FileEntry { extension: native.contains(p.as_str()).then(|| "gdoc".to_string()), ..entry(p, false, d.len() as u64) })
+                    .collect();
                 out.extend(self.dirs.lock().unwrap().iter().filter(|p| child(p)).map(|p| entry(p, true, 0)));
                 out.sort_by(|a, b| a.path.cmp(&b.path));
                 Ok(out)
@@ -552,8 +666,23 @@ pub(crate) mod tests {
         fn upload(&self, local: &str, remote: &str) -> Fut<'_, u64> {
             let (l, r) = (local.to_string(), remote.to_string());
             Box::pin(async move {
+                use std::sync::atomic::Ordering::SeqCst;
                 if self.fail_upload {
                     return Err(AppError::connection("upload refused", "test"));
+                }
+                let now = self.active_uploads.fetch_add(1, SeqCst) + 1;
+                let _running = Running(&self.active_uploads);
+                self.peak_uploads.fetch_max(now, SeqCst);
+                let delay = self.upload_delay_ms.load(SeqCst);
+                let failing = self.fail_next_uploads.fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1)).is_ok();
+                if delay > 0 || failing {
+                    self.files.lock().unwrap().insert(r.clone(), b"part".to_vec());
+                }
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                if failing {
+                    return Err(AppError::connection("connection lost mid-upload", "test"));
                 }
                 let data = std::fs::read(&l).map_err(|e| AppError::file_op(e.to_string(), ""))?;
                 let n = data.len() as u64;
@@ -616,11 +745,21 @@ pub(crate) mod tests {
                 if !self.can_server_copy {
                     return Ok(false);
                 }
+                if self.fail_server_copy {
+                    self.files.lock().unwrap().insert(t.clone(), b"part".to_vec());
+                    return Err(AppError::transfer("copy too large for the server", "test"));
+                }
                 let data = self.files.lock().unwrap().get(&f).cloned().ok_or_else(|| AppError::not_found(format!("{f} not found")))?;
                 self.files.lock().unwrap().insert(t.clone(), data);
                 self.server_copies.lock().unwrap().push((f, t));
                 Ok(true)
             })
+        }
+        fn download_name(&self, entry: &FileEntry) -> String {
+            if self.converts_on_download(entry) { format!("{}.docx", entry.name) } else { entry.name.clone() }
+        }
+        fn converts_on_download(&self, entry: &FileEntry) -> bool {
+            entry.extension.as_deref() == Some("gdoc")
         }
     }
 
@@ -650,7 +789,7 @@ pub(crate) mod tests {
         let dest = Location::Remote { connection_id: id, path: "/dst".into() };
         let items = [item(a.to_string_lossy().into(), "a.txt", false, 3), item(format!("conn://{id}/src"), "src", true, 0)];
         let plan = plan_transfer(&items, &dest, &resolver).await.unwrap();
-        assert_eq!(plan.files[0], PlannedFile { source: a.to_string_lossy().into(), dest: format!("conn://{id}/dst/a (copy).txt"), size: 3 });
+        assert_eq!(plan.files[0], PlannedFile { source: a.to_string_lossy().into(), dest: format!("conn://{id}/dst/a (copy).txt"), size: 3, converted: false });
         assert_eq!(plan.dirs, vec![format!("conn://{id}/dst/src"), format!("conn://{id}/dst/src/sub")]);
         let dests: HashSet<_> = plan.files.iter().map(|f| f.dest.clone()).collect();
         assert!(dests.contains(&format!("conn://{id}/dst/src/top.txt")) && dests.contains(&format!("conn://{id}/dst/src/sub/deep.txt")));
@@ -708,5 +847,72 @@ pub(crate) mod tests {
         assert!(!conn.dirs.lock().unwrap().contains("/s"));
         assert!(remote_exists(conn.as_ref(), "/e").await.unwrap());
         assert!(!remote_exists(conn.as_ref(), "/s").await.unwrap());
+    }
+
+    /// Regression: a server-side copy that failed (an S3 object over
+    /// CopyObject's 5 GB, a WebDAV server refusing COPY) failed the job
+    /// instead of copying through this computer.
+    #[tokio::test]
+    async fn a_failed_server_copy_is_relayed_and_leaves_nothing_behind() {
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector { can_server_copy: true, fail_server_copy: true, ..MemConnector::with(&[("/r/big.bin", "big"), ("/r/Plan", "exported")], &["/r", "/o"]) });
+        let resolver = MemResolver(HashMap::from([(id, conn.clone())]));
+        let r = |p: &str| Location::Remote { connection_id: id, path: p.into() };
+        assert_eq!(transfer_file(Uuid::new_v4(), &r("/r/big.bin"), &r("/o/big.bin"), &resolver).await.unwrap(), 3);
+        assert_eq!(conn.file("/o/big.bin").as_deref(), Some("big"), "relayed, over the failed copy's partial file");
+        // A Google-style document would come back converted: refused, and
+        // the failed copy's partial file is removed.
+        conn.native.lock().unwrap().insert("/r/Plan".into());
+        let err = transfer_file(Uuid::new_v4(), &r("/r/Plan"), &r("/o/Plan"), &resolver).await.unwrap_err();
+        assert!(err.to_string().contains("convert"), "{err}");
+        assert!(conn.file("/o/Plan").is_none());
+    }
+
+    /// Regression: an upload that failed half-way left a partial file under
+    /// the final name; the retry then refused it as "already exists".
+    #[tokio::test]
+    async fn a_failed_upload_leaves_no_partial_file_and_a_retry_works() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let ca = Arc::new(MemConnector::with(&[("/r/one.txt", "one")], &["/r"]));
+        let cb = Arc::new(MemConnector::with(&[], &["/in"]));
+        cb.fail_next_uploads.store(2, std::sync::atomic::Ordering::SeqCst);
+        let resolver = MemResolver(HashMap::from([(a, ca), (b, cb.clone())]));
+        let local = tempfile::tempdir().unwrap();
+        let f = local.path().join("f.txt");
+        std::fs::write(&f, "full").unwrap();
+        let dest = Location::Remote { connection_id: b, path: "/in/f.txt".into() };
+        let up = Location::Local(f.to_string_lossy().into());
+        assert!(transfer_file(Uuid::new_v4(), &up, &dest, &resolver).await.is_err());
+        assert!(cb.file("/in/f.txt").is_none(), "no partial upload under the real name");
+        // Relayed between connections: the same.
+        let relayed = Location::Remote { connection_id: b, path: "/in/one.txt".into() };
+        let from = Location::Remote { connection_id: a, path: "/r/one.txt".into() };
+        assert!(transfer_file(Uuid::new_v4(), &from, &relayed, &resolver).await.is_err());
+        assert!(cb.file("/in/one.txt").is_none());
+        // The retries go through.
+        transfer_file(Uuid::new_v4(), &up, &dest, &resolver).await.unwrap();
+        transfer_file(Uuid::new_v4(), &from, &relayed, &resolver).await.unwrap();
+        assert_eq!((cb.file("/in/f.txt").as_deref(), cb.file("/in/one.txt").as_deref()), (Some("full"), Some("one")));
+    }
+
+    /// Regression: a Google document relayed to another connection was
+    /// uploaded under its bare name ("Plan", no extension) although its
+    /// bytes are an export. A file leaving its connection gets the download
+    /// name and is marked converted; within the connection it keeps its own.
+    #[tokio::test]
+    async fn documents_leaving_their_connection_get_the_export_name() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let ca = Arc::new(MemConnector::with(&[("/r/Plan", "doc"), ("/r/n.txt", "n")], &["/r"]));
+        ca.native.lock().unwrap().insert("/r/Plan".into());
+        let resolver = MemResolver(HashMap::from([(a, ca), (b, Arc::new(MemConnector::with(&[], &["/in"])))]));
+        let mut plan_item = item(format!("conn://{a}/r/Plan"), "Plan", false, 3);
+        plan_item.extension = Some("gdoc".into());
+        let to_b = plan_transfer(&[plan_item.clone(), item(format!("conn://{a}/r/n.txt"), "n.txt", false, 1)], &Location::Remote { connection_id: b, path: "/in".into() }, &resolver).await.unwrap();
+        assert_eq!((to_b.files[0].dest.as_str(), to_b.files[0].converted), (format!("conn://{b}/in/Plan.docx").as_str(), true));
+        assert!(!to_b.files[1].converted);
+        let folder = plan_transfer(&[item(format!("conn://{a}/r"), "r", true, 0)], &Location::Remote { connection_id: b, path: "/in".into() }, &resolver).await.unwrap();
+        assert!(folder.files.iter().any(|f| f.dest == format!("conn://{b}/in/r/Plan.docx") && f.converted), "{folder:?}");
+        let within = plan_transfer(&[plan_item], &Location::Remote { connection_id: a, path: "/".into() }, &resolver).await.unwrap();
+        assert_eq!((within.files[0].dest.as_str(), within.files[0].converted), (format!("conn://{a}/Plan").as_str(), false));
     }
 }

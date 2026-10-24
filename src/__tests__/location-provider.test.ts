@@ -14,6 +14,7 @@ import {
   listDirectory,
   localCopyOf,
   makeDirectory,
+  measureLocations,
   needsLocationTransfer,
   removeEntries,
   renameEntry,
@@ -128,5 +129,20 @@ describe("location provider routing", () => {
     invoke.mockResolvedValue({ total: 100, used: 40, free: 60, trashed: null });
     expect(await connectionQuota(`conn://${ID}/f1`)).toEqual({ total: 100, used: 40, free: 60, trashed: null });
     expect(invoke).toHaveBeenCalledWith("connector_quota", { protocol: "google_drive", connectionId: ID }, null);
+  });
+
+  it("measures what a transfer affects, folders counted through, on either side", async () => {
+    const safe = tauriInvokeSafe as unknown as ReturnType<typeof vi.fn>;
+    safe.mockReset().mockResolvedValue({ files: 120, bytes: 5000, capped: false });
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "connector_list_remote") return [entry("/f1", "Reports", true), entry("/a.txt", "a.txt")];
+      if (cmd === "connector_folder_size") return { bytes: 9000, files: 300, folders: 4, complete: true };
+      return null;
+    });
+    const out = await measureLocations(["/home/big", `conn://${ID}/f1`, `conn://${ID}/a.txt`]);
+    expect(safe).toHaveBeenCalledWith("count_affected_files", { paths: ["/home/big"] }, expect.anything());
+    expect(invoke).toHaveBeenCalledWith("connector_folder_size", expect.objectContaining({ protocol: "google_drive", path: "/f1", connectionId: ID }));
+    // 120 local + 300 in the remote folder + 1 remote file (3 bytes).
+    expect(out).toEqual({ files: 421, bytes: 14003 });
   });
 });

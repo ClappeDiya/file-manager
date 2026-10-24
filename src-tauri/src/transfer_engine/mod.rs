@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{watch, Mutex, Notify, RwLock};
+use tokio::sync::{watch, Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use uuid::Uuid;
 
 /// Cooperative pause/cancel signal for a running transfer job.
@@ -57,9 +57,12 @@ impl JobControl {
         self.notify.notify_waiters();
     }
 
-    /// Hold the transfer at the next chunk boundary.
+    /// Hold the transfer at the next chunk boundary. Wakes [`Self::stopped`]
+    /// waiters (a connection transfer stops its file; workers parked in
+    /// [`Self::wait_if_paused`] re-check and keep waiting).
     pub fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 
     /// Resume a paused transfer.
@@ -78,6 +81,26 @@ impl JobControl {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    /// Resolve once the job is cancelled or paused (at once if it already
+    /// is). Raced against work that cannot stop at chunk boundaries, such as
+    /// a connector's upload or download, which is then dropped.
+    pub async fn stopped(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register before checking, so a signal in between is not missed.
+            notified.as_mut().enable();
+            if self.is_cancelled() || self.is_paused() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Park until unpaused. Callers must check `is_cancelled` after this
@@ -185,6 +208,11 @@ pub struct TransferManager {
     /// Pane moves in flight (in memory: after a restart the restored jobs
     /// are plain copies and the originals are kept).
     moves: Arc<Mutex<MoveBook>>,
+
+    /// Transfer slots per saved connection for location jobs (see
+    /// [`TransferConfig::max_location_jobs_per_connection`]), with the limit
+    /// each semaphore was made for.
+    location_slots: Arc<std::sync::Mutex<HashMap<Uuid, (u32, Arc<Semaphore>)>>>,
 }
 
 /// Move groups by id, and the group of each job.
@@ -221,6 +249,7 @@ impl TransferManager {
             terminal_hooks: Arc::new(std::sync::RwLock::new(Vec::new())),
             resolver: Arc::new(std::sync::RwLock::new(None)),
             moves: Arc::new(Mutex::new(MoveBook::default())),
+            location_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -381,42 +410,88 @@ impl TransferManager {
         }
     }
 
+    /// Run a location job: it stays Queued until it has a transfer slot on
+    /// every connection it uses, then transfers its file. Pausing or
+    /// cancelling stops the file at once (what it had written is removed);
+    /// a paused job waits here and starts its file over when resumed.
     async fn run_location_job_inner(&self, job_id: Uuid) -> Result<(), String> {
         let control = self.control(job_id).await;
-        control.wait_if_paused().await;
-        let (source, dest, total) = {
-            let mut map = self.jobs.write().await;
-            let job = map.get_mut(&job_id).ok_or_else(|| "Transfer job not found".to_string())?;
-            if job.status != TransferStatus::Queued {
+        loop {
+            control.wait_if_paused().await;
+            let (source, dest, total) = {
+                let map = self.jobs.read().await;
+                let job = map.get(&job_id).ok_or_else(|| "Transfer job not found".to_string())?;
+                if job.status != TransferStatus::Queued {
+                    return Ok(());
+                }
+                (job.source_path.clone(), job.dest_path.clone(), job.total_bytes)
+            };
+            if control.is_cancelled() {
                 return Ok(());
             }
-            job.status = TransferStatus::Active;
-            job.updated_at = Utc::now();
-            (job.source_path.clone(), job.dest_path.clone(), job.total_bytes)
-        };
-        if control.is_cancelled() {
-            return Ok(());
-        }
-        let resolver = self.remote_resolver().ok_or_else(|| "Connections are not available yet; try again in a moment.".to_string())?;
-        let src = location::Location::parse(&source).map_err(|e| e.to_string())?;
-        let dst = location::Location::parse(&dest).map_err(|e| e.to_string())?;
-        let started = std::time::Instant::now();
-        let bytes = location::transfer_file(job_id, &src, &dst, resolver.as_ref()).await.map_err(|e| e.to_string())?;
-        if control.is_cancelled() {
-            return Ok(());
-        }
-        // A server-side copy reports no byte count: the listed size moved.
-        let bytes = if bytes == 0 { total } else { bytes };
-        {
-            let mut map = self.jobs.write().await;
-            if let Some(job) = map.get_mut(&job_id) {
-                job.total_bytes = bytes;
+            let src = location::Location::parse(&source).map_err(|e| e.to_string())?;
+            let dst = location::Location::parse(&dest).map_err(|e| e.to_string())?;
+            let connections: Vec<Uuid> = [src.connection_id(), dst.connection_id()].into_iter().flatten().collect();
+            let _slots = tokio::select! {
+                biased;
+                _ = control.stopped() => continue,
+                slots = self.location_slots(&connections) => slots?,
+            };
+            {
+                let mut map = self.jobs.write().await;
+                let job = map.get_mut(&job_id).ok_or_else(|| "Transfer job not found".to_string())?;
+                if job.status != TransferStatus::Queued {
+                    continue;
+                }
+                job.status = TransferStatus::Active;
+                job.updated_at = Utc::now();
             }
+            let resolver = self.remote_resolver().ok_or_else(|| "Connections are not available yet; try again in a moment.".to_string())?;
+            let started = std::time::Instant::now();
+            let Some(bytes) = location::transfer_file_until(job_id, &src, &dst, resolver.as_ref(), &control).await.map_err(|e| e.to_string())? else {
+                // Paused (wait, then start over) or cancelled (status set).
+                continue;
+            };
+            if control.is_cancelled() {
+                return Ok(());
+            }
+            // A server-side copy reports no byte count: the listed size moved.
+            let bytes = if bytes == 0 { total } else { bytes };
+            {
+                let mut map = self.jobs.write().await;
+                if let Some(job) = map.get_mut(&job_id) {
+                    job.total_bytes = bytes;
+                }
+            }
+            let secs = started.elapsed().as_secs_f64();
+            let speed = if secs > 0.0 { (bytes as f64 / secs) as u64 } else { 0 };
+            let _ = self.update_progress(job_id, bytes, speed).await;
+            return self.complete_job(job_id).await.map_err(|e| e.to_string());
         }
-        let secs = started.elapsed().as_secs_f64();
-        let speed = if secs > 0.0 { (bytes as f64 / secs) as u64 } else { 0 };
-        let _ = self.update_progress(job_id, bytes, speed).await;
-        self.complete_job(job_id).await.map_err(|e| e.to_string())
+    }
+
+    /// One transfer slot on each of `connections`, waiting (in queue order)
+    /// for any that are all taken. Taken in id order, so two jobs relaying
+    /// between the same connections never each hold one the other needs.
+    async fn location_slots(&self, connections: &[Uuid]) -> Result<Vec<OwnedSemaphorePermit>, String> {
+        let limit = self.config().await.max_location_jobs_per_connection.max(1);
+        let mut ids = connections.to_vec();
+        ids.sort();
+        ids.dedup();
+        let mut permits = Vec::with_capacity(ids.len());
+        for id in ids {
+            let semaphore = {
+                let mut slots = self.location_slots.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = slots.entry(id).or_insert_with(|| (limit, Arc::new(Semaphore::new(limit as usize))));
+                // A changed limit applies to jobs that start from now on.
+                if entry.0 != limit {
+                    *entry = (limit, Arc::new(Semaphore::new(limit as usize)));
+                }
+                entry.1.clone()
+            };
+            permits.push(semaphore.acquire_owned().await.map_err(|e| format!("Transfer slots unavailable: {e}"))?);
+        }
+        Ok(permits)
     }
 
     /// Execute a queued local-file job through the three-layer pipeline
@@ -1781,5 +1856,77 @@ mod tests {
         mgr.run_location_job(job.id).await;
         let j = mgr.get_job(job.id).await.unwrap().unwrap();
         assert_eq!(j.status, TransferStatus::Failed);
+    }
+
+    fn status_of(mgr: &TransferManager, id: Uuid) -> Option<TransferStatus> {
+        mgr.jobs.try_read().ok().and_then(|m| m.get(&id).map(|j| j.status))
+    }
+
+    /// Regression: every file of a pane transfer started at once (thousands
+    /// of uploads for a big folder: rate limits, sockets, relay temp files).
+    /// Jobs on one connection now take one of its slots; the rest wait
+    /// Queued.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn location_jobs_run_a_few_at_a_time_per_connection() {
+        use location::tests::{MemConnector, MemResolver};
+        use std::sync::atomic::Ordering::SeqCst;
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector::with(&[], &["/dst"]));
+        conn.upload_delay_ms.store(40, SeqCst);
+        let mgr = TransferManager::new();
+        mgr.set_config(TransferConfig { max_location_jobs_per_connection: 3, ..TransferConfig::default() }).await;
+        mgr.set_remote_resolver(Arc::new(MemResolver(HashMap::from([(id, conn.clone())]))));
+        let local = tempfile::tempdir().unwrap();
+        let mut jobs = Vec::new();
+        for i in 0..10 {
+            let f = local.path().join(format!("{i}.txt"));
+            std::fs::write(&f, "x").unwrap();
+            jobs.push(mgr.enqueue_location_job(f.to_str().unwrap(), &format!("conn://{id}/dst/{i}.txt"), 1).await.unwrap().id);
+        }
+        for j in &jobs {
+            mgr.spawn_runner(*j).await;
+        }
+        wait_until(|| conn.active_uploads.load(SeqCst) == 3, "three uploads running").await;
+        let queued = jobs.iter().filter(|j| status_of(&mgr, **j) == Some(TransferStatus::Queued)).count();
+        assert!(queued >= 6, "the others wait in the queue ({queued} queued)");
+        wait_until(|| jobs.iter().all(|j| status_of(&mgr, *j) == Some(TransferStatus::Completed)), "all uploads").await;
+        assert_eq!(conn.peak_uploads.load(SeqCst), 3, "never more than the limit at once");
+        assert_eq!(TransferConfig::default().max_location_jobs_per_connection, 4);
+    }
+
+    /// Regression: cancelling or pausing a running pane transfer only
+    /// changed its status; the upload ran on and wrote the destination.
+    /// Now the file stops at once and what it wrote is removed; a paused
+    /// file starts over when resumed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_and_pause_stop_a_running_location_job() {
+        use location::tests::{MemConnector, MemResolver};
+        use std::sync::atomic::Ordering::SeqCst;
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector::with(&[], &["/dst"]));
+        conn.upload_delay_ms.store(60_000, SeqCst);
+        let mgr = TransferManager::new();
+        mgr.set_remote_resolver(Arc::new(MemResolver(HashMap::from([(id, conn.clone())]))));
+        let local = tempfile::tempdir().unwrap();
+        let f = local.path().join("f.txt");
+        std::fs::write(&f, "full").unwrap();
+
+        let job = mgr.enqueue_location_job(f.to_str().unwrap(), &format!("conn://{id}/dst/c.txt"), 4).await.unwrap().id;
+        mgr.spawn_runner(job).await;
+        wait_until(|| conn.file("/dst/c.txt").as_deref() == Some("part"), "the upload to start").await;
+        mgr.cancel(job).await.unwrap();
+        wait_until(|| conn.file("/dst/c.txt").is_none() && conn.active_uploads.load(SeqCst) == 0, "the cancelled upload to stop").await;
+        assert_eq!(status_of(&mgr, job), Some(TransferStatus::Cancelled));
+
+        let job = mgr.enqueue_location_job(f.to_str().unwrap(), &format!("conn://{id}/dst/p.txt"), 4).await.unwrap().id;
+        mgr.spawn_runner(job).await;
+        wait_until(|| conn.file("/dst/p.txt").as_deref() == Some("part"), "the upload to start").await;
+        mgr.pause(job).await.unwrap();
+        wait_until(|| conn.file("/dst/p.txt").is_none() && conn.active_uploads.load(SeqCst) == 0, "the paused upload to stop").await;
+        assert_eq!(status_of(&mgr, job), Some(TransferStatus::Paused));
+        conn.upload_delay_ms.store(0, SeqCst);
+        mgr.resume(job).await.unwrap();
+        wait_until(|| status_of(&mgr, job) == Some(TransferStatus::Completed), "the resumed upload").await;
+        assert_eq!(conn.file("/dst/p.txt").as_deref(), Some("full"));
     }
 }

@@ -1223,17 +1223,39 @@ impl Connector for GoogleDriveConnector {
     /// A native Google document downloads as an export: the connection's
     /// format's extension is added to its name.
     fn download_name(&self, entry: &FileEntry) -> String {
-        let mime = match entry.extension.as_deref() {
-            Some("gdoc") => "application/vnd.google-apps.document",
-            Some("gsheet") => "application/vnd.google-apps.spreadsheet",
-            Some("gslides") => "application/vnd.google-apps.presentation",
-            Some("gdraw") => "application/vnd.google-apps.drawing",
-            _ => return entry.name.clone(),
+        let Some(mime) = native_mime(entry) else {
+            return entry.name.clone();
         };
         match self.export_format_for(mime) {
             Some(f) if !entry.name.to_ascii_lowercase().ends_with(&format!(".{}", f.extension())) => format!("{}.{}", entry.name, f.extension()),
             _ => entry.name.clone(),
         }
+    }
+
+    /// Docs, Sheets, Slides and Drawings download as exports.
+    fn converts_on_download(&self, entry: &FileEntry) -> bool {
+        !entry.is_dir && native_mime(entry).is_some()
+    }
+
+    /// `files.copy` into `to`'s folder under `to`'s name: the bytes stay in
+    /// Google's data centres, and a Google document is copied as one.
+    fn server_copy(&self, from: &str, to: &str) -> Pin<Box<dyn Future<Output = Result<bool, AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move {
+            let id = last_segment(&from)?;
+            let (to_dir, name) = split_parent(&to)?;
+            let parent = self.folder_for(&to_dir)?;
+            let url = format!("{}/files/{}/copy?supportsAllDrives=true&fields=id", self.api_base, percent_encoding::utf8_percent_encode(&id, percent_encoding::NON_ALPHANUMERIC));
+            let resp = self
+                .http
+                .post(&url)
+                .bearer_auth(self.get_token().await?)
+                .json(&serde_json::json!({ "name": name, "parents": [parent] }))
+                .send()
+                .await
+                .map_err(|e| AppError::transfer(format!("Google Drive is unreachable: {e}"), "Check your network connection."))?;
+            drive_json::<serde_json::Value>(resp, "Copying the file").await.map(|_| true)
+        })
     }
 
     fn connect(
@@ -1600,6 +1622,18 @@ fn about_forbidden(body: &str) -> AppError {
     }
 }
 
+/// The Google mime type of a native document entry (its listed
+/// `gdoc`/`gsheet`/`gslides`/`gdraw` extension).
+fn native_mime(entry: &FileEntry) -> Option<&'static str> {
+    match entry.extension.as_deref() {
+        Some("gdoc") => Some("application/vnd.google-apps.document"),
+        Some("gsheet") => Some("application/vnd.google-apps.spreadsheet"),
+        Some("gslides") => Some("application/vnd.google-apps.presentation"),
+        Some("gdraw") => Some("application/vnd.google-apps.drawing"),
+        _ => None,
+    }
+}
+
 /// The JSON body of a successful Drive reply; a 401 is a rejected sign-in
 /// (a 403 is about the item or a rate limit, not the sign-in).
 async fn drive_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response, what: &str) -> Result<T, AppError> {
@@ -1893,6 +1927,23 @@ mod tests {
         assert!(c.list_remote(&sub).await.unwrap().iter().any(|e| e.path == format!("{sub}/x9") && e.name == "b.txt"));
     }
 
+    /// Copies within one Drive run as `files.copy` (so a Google document
+    /// stays one); documents are the files a download converts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copies_within_drive_run_on_the_server() {
+        let drive = super::fake_drive::start(&[("f1", "Folder 1", "root", true), ("x9", "a.txt", "root", false)]).await;
+        let c = drive.connector.as_ref();
+        assert!(c.server_copy("/x9", "/f1/b.txt").await.unwrap());
+        assert!(drive.id_of("b.txt", "f1").is_some(), "copied into f1 under the new name");
+        assert!(drive.id_of("a.txt", "root").is_some(), "the original stays");
+        assert!(c.server_copy("/missing", "/f1/c.txt").await.is_err());
+        let entry = |ext: Option<&str>, is_dir: bool| FileEntry { name: "Plan".into(), path: "/d1".into(), is_dir, is_symlink: false, size: 0, modified: None, created: None, is_hidden: false, extension: ext.map(String::from), permissions: None };
+        assert!(c.converts_on_download(&entry(Some("gdoc"), false)));
+        assert!(c.converts_on_download(&entry(Some("gsheet"), false)));
+        assert!(!c.converts_on_download(&entry(Some("pdf"), false)));
+        assert!(!c.converts_on_download(&entry(None, true)));
+    }
+
     #[test]
     fn test_export_format_mime_types() {
         assert_eq!(GoogleDocExportFormat::Pdf.mime_type(), "application/pdf");
@@ -1995,6 +2046,14 @@ pub(crate) mod fake_drive {
                 ("POST", "/api/files") => {
                     let m = r.json();
                     create(&mut items, m["name"].as_str().unwrap_or_default().to_string(), m["parents"][0].as_str().unwrap_or("root").to_string(), m["mimeType"] == FOLDER)
+                }
+                ("POST", p) if p.starts_with("/api/files/") && p.ends_with("/copy") => {
+                    let id = p.trim_start_matches("/api/files/").trim_end_matches("/copy").to_string();
+                    let m = r.json();
+                    match items.get(&id).cloned() {
+                        Some((name, parent, false)) => create(&mut items, m["name"].as_str().unwrap_or(&name).to_string(), m["parents"][0].as_str().unwrap_or(&parent).to_string(), false),
+                        _ => not_found(),
+                    }
                 }
                 ("POST", "/upload/files") => {
                     let m = multipart_metadata(&r.body);

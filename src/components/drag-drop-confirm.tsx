@@ -28,7 +28,8 @@ export function DragDropConfirm({
   useEffect(() => {
     let live = true;
     setAssessment(null);
-    void assessIntent(dropIntent(request)).then((a) => live && setAssessment(a));
+    // Assessed once measured: the risk depends on how much it moves.
+    if (!request.measuring) void assessIntent(dropIntent(request)).then((a) => live && setAssessment(a));
     return () => {
       live = false;
     };
@@ -90,7 +91,7 @@ export function DragDropConfirm({
           type="button"
           disabled={!ready}
           aria-busy={!ready}
-          title={ready ? undefined : "Checking the operation with the Safety Interlock…"}
+          title={ready ? undefined : request.measuring ? "Measuring what the drop affects…" : "Checking the operation with the Safety Interlock…"}
           onClick={() => ready && onConfirm(assessment)}
           className={cn("px-2 py-0.5 rounded text-white disabled:opacity-50", risky ? "bg-amber-600 hover:bg-amber-700" : "bg-[var(--color-primary)] hover:opacity-90")}
           data-testid="drag-drop-ok"

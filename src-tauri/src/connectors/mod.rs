@@ -321,6 +321,13 @@ pub trait Connector: Send + Sync {
         entry.name.clone()
     }
 
+    /// Whether downloading `entry` converts it (Google Drive exports native
+    /// documents) rather than copying its bytes. A pane move of such a file
+    /// out of its connection keeps the original.
+    fn converts_on_download(&self, _entry: &FileEntry) -> bool {
+        false
+    }
+
     /// Storage quota of the connected account; `None` when the protocol
     /// has no notion of it (the default).
     fn quota(&self) -> Pin<Box<dyn Future<Output = Result<Option<RemoteQuota>, AppError>> + Send + '_>> {

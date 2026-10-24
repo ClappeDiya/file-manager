@@ -2293,15 +2293,15 @@ impl S3Connector {
             advice: "Check your network connection.".to_string(),
         })?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
             return Err(AppError::Transfer {
                 message: format!("{what} failed (HTTP {status}): {body}"),
                 advice: advice.to_string(),
             });
         }
-        Ok(())
+        copy_reply_ok(&body).map_err(|reason| AppError::Transfer { message: format!("{what} failed: {reason}"), advice: advice.to_string() })
     }
 
     // ── Internal helpers ──
@@ -2703,6 +2703,20 @@ impl S3Connector {
     }
 }
 
+/// Whether a 2xx CopyObject reply reports a copy. S3 may answer 200 and
+/// still fail the copy, with an `<Error>` body; a successful copy always
+/// returns `<CopyObjectResult>`.
+fn copy_reply_ok(body: &str) -> Result<(), String> {
+    if body.contains("<Error>") {
+        let field = |tag: &str| body.split(&format!("<{tag}>")).nth(1).and_then(|r| r.split(&format!("</{tag}>")).next()).unwrap_or_default().to_string();
+        return Err(format!("S3 reported {} {}", field("Code"), field("Message")).trim_end().to_string());
+    }
+    if !body.contains("<CopyObjectResult") {
+        return Err("S3 did not confirm the copy".to_string());
+    }
+    Ok(())
+}
+
 impl Default for S3Connector {
     fn default() -> Self {
         Self::new()
@@ -2731,6 +2745,8 @@ impl Connector for S3Connector {
             let (sb, sk) = super::split_bucket_key(&from)?;
             let (db, dk) = super::split_bucket_key(&to)?;
             self.copy_object(&sb, &sk, &db, &dk).await?;
+            // Delete the original only once the copy is there.
+            self.get_object_properties(&db, &dk).await.map_err(|e| AppError::transfer(format!("The copy of {from} could not be confirmed ({e}); the original was kept."), "Check the destination, then retry."))?;
             self.delete_object(&sb, &sk).await
         })
     }
@@ -3993,10 +4009,11 @@ mod tests {
                     m.as_str(), uri.path(), &[], &signed, "UNSIGNED-PAYLOAD", "AKID", "SECRET", "us-east-1", "s3",
                 );
                 log.lock().unwrap().push(format!("{} {}", uri.path(), h["x-amz-copy-source"].to_str().unwrap()));
+                // What S3 answers a CopyObject (an empty 200 is no copy).
                 if h["authorization"].to_str().unwrap() == expected {
-                    axum::http::StatusCode::OK
+                    (axum::http::StatusCode::OK, COPY_RESULT)
                 } else {
-                    axum::http::StatusCode::FORBIDDEN
+                    (axum::http::StatusCode::FORBIDDEN, "")
                 }
             }
         });
@@ -4023,7 +4040,7 @@ mod tests {
             async move {
                 let src = h.get("x-amz-copy-source").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
                 log.lock().unwrap().push(format!("{m} {} {src}", uri.path()));
-                axum::http::StatusCode::OK
+                (axum::http::StatusCode::OK, if src.is_empty() { "" } else { COPY_RESULT })
             }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4036,6 +4053,46 @@ mod tests {
         let log = seen.lock().unwrap().clone();
         assert_eq!(log[0], "PUT /other/out/a%20b.txt /bucket/in/a%20b.txt");
         assert_eq!(log[1], "PUT /bucket/in/y.txt /bucket/in/x.txt");
-        assert!(log[2].starts_with("DELETE /bucket/in/x.txt"));
+        assert!(log[2].starts_with("HEAD /bucket/in/y.txt"), "the copy is confirmed first: {log:?}");
+        assert!(log[3].starts_with("DELETE /bucket/in/x.txt"));
+    }
+
+    /// A CopyObject reply S3 sends on success.
+    const COPY_RESULT: &str = r#"<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>"e"</ETag></CopyObjectResult>"#;
+
+    /// Regression (data loss): S3 can fail a CopyObject after answering
+    /// 200, with an `<Error>` body. The copy was taken as done, so a rename
+    /// (copy, then delete) deleted the only copy. Now the reply must report
+    /// the copy, and a rename confirms the copy before deleting the source.
+    #[tokio::test]
+    async fn a_copy_failed_inside_a_200_reply_never_deletes_the_source() {
+        use axum::http::{HeaderMap, Method, Uri};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let app = axum::Router::new().fallback(move |m: Method, uri: Uri, h: HeaderMap| {
+            let log = log.clone();
+            async move {
+                log.lock().unwrap().push(format!("{m} {}", uri.path()));
+                match (m.as_str(), h.contains_key("x-amz-copy-source"), uri.path()) {
+                    ("PUT", true, p) if p.ends_with("err.txt") => (axum::http::StatusCode::OK, r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message></Error>"#),
+                    ("PUT", true, p) if p.ends_with("empty.txt") => (axum::http::StatusCode::OK, ""),
+                    ("PUT", true, _) => (axum::http::StatusCode::OK, COPY_RESULT),
+                    // The copy is not there after all.
+                    ("HEAD", _, _) => (axum::http::StatusCode::NOT_FOUND, ""),
+                    _ => (axum::http::StatusCode::OK, ""),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = connected(base).await;
+        let err = c.rename_entry("/bucket/in/x.txt", "/bucket/in/err.txt").await.unwrap_err();
+        assert!(err.to_string().contains("InternalError"), "{err}");
+        assert!(c.server_copy("/bucket/in/x.txt", "/bucket/in/err.txt").await.is_err());
+        assert!(c.rename_entry("/bucket/in/x.txt", "/bucket/in/empty.txt").await.is_err(), "no CopyObjectResult, no copy");
+        assert!(c.rename_entry("/bucket/in/x.txt", "/bucket/in/ok.txt").await.is_err(), "a copy HEAD cannot find is not confirmed");
+        let log = seen.lock().unwrap().clone();
+        assert!(!log.iter().any(|l| l.starts_with("DELETE")), "the source was never deleted: {log:?}");
     }
 }
