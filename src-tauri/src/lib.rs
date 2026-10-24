@@ -1021,6 +1021,7 @@ pub fn run() {
             ai_commands::ai_set_ollama_model,
             // Terminal (T-046)
             terminal_commands::terminal_create_local,
+            terminal_commands::terminal_help_commands,
             terminal_commands::terminal_create_remote,
             terminal_commands::terminal_list_sessions,
             terminal_commands::terminal_close_session,

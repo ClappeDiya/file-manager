@@ -543,6 +543,86 @@ pub async fn terminal_get_default_shell() -> Result<String, AppError> {
     Ok(TerminalManager::default_shell())
 }
 
+// ── Command help drawer (T-046 follow-up) ──
+
+/// One command in the rclone part of the help drawer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RcloneCommandHelp {
+    pub name: String,
+    pub about: String,
+}
+
+/// What the terminal's help drawer lists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalHelp {
+    /// The `ufop` CLI's commands (from the snapshot its own tests keep current).
+    pub ufop: Vec<ufop_core::cli_gen::CommandHelp>,
+    /// rclone's commands, when rclone resolves (Settings → rclone, `RCLONE_BINARY`, or PATH).
+    pub rclone: Option<Vec<RcloneCommandHelp>>,
+    /// rclone's version, when it resolves.
+    pub rclone_version: Option<String>,
+    /// Why there is no rclone list.
+    pub rclone_note: Option<String>,
+}
+
+/// The commands under `Available Commands:` in `rclone help`:
+/// `  copy            Copy files from source to dest.`
+pub fn parse_rclone_commands(help: &str) -> Vec<RcloneCommandHelp> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in help.lines() {
+        if line.trim_end().eq_ignore_ascii_case("available commands:") {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        // The section ends at the first blank or unindented line.
+        if line.trim().is_empty() || !line.starts_with(' ') {
+            break;
+        }
+        let t = line.trim_start();
+        let name_end = t.find(char::is_whitespace).unwrap_or(t.len());
+        let (name, about) = t.split_at(name_end);
+        if !name.is_empty() {
+            out.push(RcloneCommandHelp { name: name.to_string(), about: about.trim().to_string() });
+        }
+    }
+    out
+}
+
+/// The `ufop` and rclone commands for the terminal's help drawer: searchable
+/// lists with one-line descriptions, ready to insert at the prompt.
+#[tauri::command]
+pub async fn terminal_help_commands() -> Result<TerminalHelp, AppError> {
+    Ok(help_with(crate::rclone_engine::resolver::resolve()).await)
+}
+
+/// [`terminal_help_commands`] for a given rclone resolution.
+pub async fn help_with(resolved: crate::rclone_engine::resolver::Resolved) -> TerminalHelp {
+    use crate::rclone_engine::resolver::Rclone;
+    let ufop = ufop_core::cli_gen::bundled_ufop_help();
+    if !resolved.found {
+        return TerminalHelp {
+            ufop,
+            rclone: None,
+            rclone_version: None,
+            rclone_note: Some("rclone was not found. Choose it in Settings \u{2192} rclone, or install it, to list its commands here.".into()),
+        };
+    }
+    let rclone = Rclone::new(resolved.path, resolved.config);
+    let version = rclone.version().await.ok().map(|v| v.raw);
+    match rclone.run(&["help".to_string()], std::time::Duration::from_secs(10)).await {
+        Ok(text) => {
+            let commands = parse_rclone_commands(&text);
+            let note = commands.is_empty().then(|| "rclone did not list its commands.".to_string());
+            TerminalHelp { ufop, rclone: Some(commands), rclone_version: version, rclone_note: note }
+        }
+        Err(e) => TerminalHelp { ufop, rclone: None, rclone_version: version, rclone_note: Some(e.user_message()) },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,5 +709,57 @@ mod tests {
         assert!(validate_ssh_token("host", "-oProxyCommand=evil", true).is_err());
         assert!(validate_ssh_token("username", "bob;rm", false).is_err());
         assert!(validate_ssh_token("username", "", false).is_err());
+    }
+
+    const RCLONE_HELP: &str = "Usage:
+  rclone [flags]
+  rclone [command]
+
+Available Commands:
+  about           Get quota information from the remote.
+  copy            Copy files from source to dest, skipping identical files.
+  genautocomplete Output completion script for a given shell.
+  help            Show help for rclone commands, flags and backends.
+
+Flags:
+      --ask-password   Allow prompt for password for encrypted configuration (default true)
+";
+
+    #[test]
+    fn rclone_commands_are_read_from_its_help() {
+        let cmds = parse_rclone_commands(RCLONE_HELP);
+        assert_eq!(cmds.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["about", "copy", "genautocomplete", "help"]);
+        assert_eq!(cmds[1].about, "Copy files from source to dest, skipping identical files.");
+        assert_eq!(cmds[2].about, "Output completion script for a given shell.");
+        assert!(parse_rclone_commands("no commands here").is_empty());
+        assert!(parse_rclone_commands("Available Commands:\nnot indented\n").is_empty());
+    }
+
+    #[test]
+    fn the_bundled_ufop_list_has_commands_with_descriptions() {
+        let ufop = ufop_core::cli_gen::bundled_ufop_help();
+        assert!(ufop.len() > 20, "{} commands", ufop.len());
+        assert!(ufop.iter().any(|c| c.path == ["backup", "run"] && c.usage.starts_with("backup run")));
+        assert!(ufop.iter().all(|c| !c.about.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn the_help_drawer_lists_ufop_and_says_why_rclone_is_missing() {
+        use crate::rclone_engine::resolver::{BinarySource, Resolved};
+        let missing = Resolved { path: "/no/such/rclone-binary".into(), source: BinarySource::None, found: false, config: None };
+        let help = help_with(missing).await;
+        assert!(!help.ufop.is_empty());
+        assert!(help.rclone.is_none() && help.rclone_version.is_none());
+        assert!(help.rclone_note.unwrap_or_default().contains("Settings"));
+    }
+
+    #[tokio::test]
+    async fn the_help_drawer_lists_the_commands_of_a_real_rclone() {
+        use crate::rclone_engine::resolver::{which, BinarySource, Resolved};
+        let Some(path) = which("rclone") else { return };
+        let help = help_with(Resolved { path: path.to_string_lossy().into_owned(), source: BinarySource::Path, found: true, config: None }).await;
+        let cmds = help.rclone.expect("rclone's commands");
+        assert!(cmds.iter().any(|c| c.name == "copy" && !c.about.is_empty()), "{cmds:?}");
+        assert!(help.rclone_version.is_some_and(|v| v.contains("rclone") || v.starts_with('v')));
     }
 }

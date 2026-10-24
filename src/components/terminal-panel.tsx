@@ -14,6 +14,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { useTerminalStore, type TerminalSession } from "@/stores/terminal-store";
 import { XtermView } from "./xterm-view";
+import { TerminalHelpDrawer } from "./terminal-help-drawer";
 import { promptText } from "@/lib/prompt-dialog";
 import { cn } from "@ufop/ui-components";
 import {
@@ -27,6 +28,7 @@ import {
   Monitor,
   ChevronUp,
   GripHorizontal,
+  CircleHelp,
 } from "lucide-react";
 
 // ──────────────────────────────────────────────
@@ -53,6 +55,7 @@ export function TerminalPanel({ className }: TerminalPanelProps) {
 
   const [isDragging, setIsDragging] = useState(false);
   const [showNewMenu, setShowNewMenu] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
 
   // Handle resize drag
@@ -98,6 +101,15 @@ export function TerminalPanel({ className }: TerminalPanelProps) {
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
   }, []);
+
+  // Command help: a click types the command at the prompt, without running it.
+  const insertCommand = useCallback(
+    (text: string) => {
+      const id = activeSessionId ?? sessions[0]?.id;
+      if (id) void useTerminalStore.getState().writeToSession(id, text);
+    },
+    [activeSessionId, sessions],
+  );
 
   // Handle split
   const handleSplit = useCallback(
@@ -214,6 +226,21 @@ export function TerminalPanel({ className }: TerminalPanelProps) {
               "h-6 w-6 flex items-center justify-center rounded-sm",
               "text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)]",
               "hover:bg-[var(--color-hover-bg)] transition-theme",
+              helpOpen && "bg-[var(--color-hover-bg)] text-[color:var(--color-text)]",
+            )}
+            onClick={() => setHelpOpen((o) => !o)}
+            aria-label="Command help"
+            aria-pressed={helpOpen}
+            title="Command help: ufop and rclone commands"
+            data-testid="terminal-help-btn"
+          >
+            <CircleHelp className="h-3.5 w-3.5" />
+          </button>
+          <button
+            className={cn(
+              "h-6 w-6 flex items-center justify-center rounded-sm",
+              "text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)]",
+              "hover:bg-[var(--color-hover-bg)] transition-theme",
             )}
             onClick={() => handleSplit("horizontal")}
             aria-label="Split terminal horizontally"
@@ -251,16 +278,19 @@ export function TerminalPanel({ className }: TerminalPanelProps) {
       </div>
 
       {/* Terminal content area */}
-      <div className="flex-1 overflow-hidden">
-        {sessions.length === 0 ? (
-          <EmptyTerminal onCreateLocal={createLocalSession} />
-        ) : layout && layout.session_ids.length === 2 ? (
-          <SplitTerminalView layout={layout} sessions={sessions} />
-        ) : (
-          <SingleTerminalView
-            session={sessions.find((s) => s.id === activeSessionId) || sessions[0]}
-          />
-        )}
+      <div className="flex-1 overflow-hidden flex">
+        <div className="flex-1 min-w-0 overflow-hidden">
+          {sessions.length === 0 ? (
+            <EmptyTerminal onCreateLocal={createLocalSession} />
+          ) : layout && layout.session_ids.length === 2 ? (
+            <SplitTerminalView layout={layout} sessions={sessions} />
+          ) : (
+            <SingleTerminalView
+              session={sessions.find((s) => s.id === activeSessionId) || sessions[0]}
+            />
+          )}
+        </div>
+        {helpOpen && <TerminalHelpDrawer onInsert={insertCommand} canInsert={sessions.length > 0} onClose={() => setHelpOpen(false)} />}
       </div>
     </div>
   );

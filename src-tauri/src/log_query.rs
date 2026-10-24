@@ -294,7 +294,6 @@ pub(crate) fn query_with(dir: &Path, q: &LogQuery, block: usize, budget: u64) ->
     let mut page = LogPage { directory: dir.to_string_lossy().into_owned(), ..Default::default() };
     let mut sources: BTreeSet<String> = BTreeSet::new();
     let mut read: u64 = 0;
-    let mut last_scanned: Option<String> = None;
 
     'days: for day in day_files(dir) {
         // Days newer than the cursor's were already shown.
@@ -313,7 +312,7 @@ pub(crate) fn query_with(dir: &Path, q: &LogQuery, block: usize, budget: u64) ->
             if sources.len() < MAX_SOURCES {
                 sources.insert(module_of(&r.target));
             }
-            last_scanned = Some(r.id.clone());
+            let scanned_id = r.id.clone();
             let ts = DateTime::parse_from_rfc3339(&r.ts).ok().map(|t| t.with_timezone(&Utc));
             // Newest first: once a record is older than `since`, so is everything after it.
             if let (Some(since), Some(ts)) = (filters.since, ts) {
@@ -332,7 +331,7 @@ pub(crate) fn query_with(dir: &Path, q: &LogQuery, block: usize, budget: u64) ->
             }
             if read >= budget {
                 page.scan_limited = true;
-                page.next_cursor = last_scanned.clone();
+                page.next_cursor = Some(scanned_id);
                 break 'days;
             }
         }
