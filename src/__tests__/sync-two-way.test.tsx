@@ -125,3 +125,21 @@ describe("compare mode and presets", () => {
     );
   });
 });
+
+describe("versioned backup: versions to keep", () => {
+  it("is an Advanced option of versioned pairs", async () => {
+    const { SyncRunOptionsSection } = await import("@/components/sync-run-options");
+    const { DEFAULT_RUN_OPTIONS } = await import("@/stores/sync-store");
+    const onChange = vi.fn();
+    const { rerender } = render(
+      <SyncRunOptionsSection mode="versioned_backup" runOptions={DEFAULT_RUN_OPTIONS} copyOptions={DEFAULT_COPY_OPTIONS} onChange={onChange} />,
+    );
+    expect(screen.queryByText("Versions to keep of each file")).toBeNull();
+    useUIStore.setState({ appMode: "advanced" });
+    rerender(<SyncRunOptionsSection mode="versioned_backup" runOptions={DEFAULT_RUN_OPTIONS} copyOptions={DEFAULT_COPY_OPTIONS} onChange={onChange} />);
+    fireEvent.change(screen.getByLabelText(/Versions to keep of each file/), { target: { value: "3" } });
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ keep_versions: 3 }), DEFAULT_COPY_OPTIONS);
+    rerender(<SyncRunOptionsSection mode="one_way" runOptions={DEFAULT_RUN_OPTIONS} copyOptions={DEFAULT_COPY_OPTIONS} onChange={onChange} />);
+    expect(screen.queryByText("Versions to keep of each file")).toBeNull();
+  });
+});

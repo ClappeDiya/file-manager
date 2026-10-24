@@ -156,6 +156,7 @@ mod tests {
             error_messages: vec![],
             resumed: false,
             exit_code: 0,
+            versions_pruned: 0,
         }
     }
 

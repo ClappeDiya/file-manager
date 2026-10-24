@@ -24,6 +24,7 @@ pub mod naming;
 pub mod netacl;
 pub mod policy;
 pub mod preload;
+pub mod retention;
 pub mod retry;
 pub mod session;
 pub mod stability;

@@ -1441,6 +1441,7 @@ mod tests {
                 settle_secs: 30,
                 completion_marker: Some("_DONE".into()),
                 version_template: Some("{name}~{num}.{ext}".into()),
+                keep_versions: Some(5),
             },
             ..SyncPair::default()
         };

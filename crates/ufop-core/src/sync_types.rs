@@ -427,6 +427,10 @@ pub struct SyncRunOptions {
     /// `{name}.v{num}.{ext}`.
     #[serde(default)]
     pub version_template: Option<String>,
+    /// Versioned-backup mode: keep at most this many versions of each file
+    /// (the oldest go after each run). `None` = keep every version.
+    #[serde(default)]
+    pub keep_versions: Option<u32>,
 }
 
 /// Sync pair configuration (enhanced for T-039..T-042).
@@ -697,6 +701,9 @@ pub struct SyncReport {
     /// 2 = extra destination files, 4 = mismatches, 8 = failures, 16 = fatal.
     #[serde(default)]
     pub exit_code: u8,
+    /// Versioned-backup mode: old versions removed by `keep_versions`.
+    #[serde(default)]
+    pub versions_pruned: u64,
 }
 
 /// A step of a run that finished, recorded as it happens so a run that

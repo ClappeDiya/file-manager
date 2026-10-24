@@ -8,6 +8,7 @@ use crate::sync::conflict::{self, ConflictAction};
 use crate::sync::copier;
 use crate::sync::planner;
 use crate::sync::rollback::RollbackManager;
+use crate::sync::versions::{StoredVersion, VersionIndex};
 use crate::sync_types::*;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -186,7 +187,18 @@ pub fn execute_sync_with(
     if let Some(cb) = &hooks.progress {
         cb(&planning);
     }
-    let plan = planner::plan(pair, &planner::PlanContext { baseline: config.baseline.as_ref(), ..Default::default() })?;
+    let stored_versions = StoredVersions {
+        index: if pair.mode == SyncMode::VersionedBackup { VersionIndex::load(Path::new(&pair.dest_path)) } else { VersionIndex::default() },
+        stored: Mutex::new(Vec::new()),
+    };
+    let plan = planner::plan(
+        pair,
+        &planner::PlanContext {
+            baseline: config.baseline.as_ref(),
+            versions: (pair.mode == SyncMode::VersionedBackup).then_some(&stored_versions.index),
+            ..Default::default()
+        },
+    )?;
     let preview = &plan.preview;
 
     // Phase 2: Ensure destination exists
@@ -297,7 +309,7 @@ pub fn execute_sync_with(
                     }
                     let entry = additions[idx];
                     tracker.start_file(&entry.relative_path);
-                    let r = copier::with_retries(opts, || add_file(pair, entry));
+                    let r = copier::with_retries(opts, || add_file(pair, entry, None));
                     if r.is_ok() {
                         hooks.step_done(entry);
                     }
@@ -341,13 +353,7 @@ pub fn execute_sync_with(
 
             tracker.start_file(&entry.relative_path);
             let result = copier::with_retries(opts, || {
-                execute_single_operation(
-                    pair,
-                    entry,
-                    op_type,
-                    &mut rollback,
-                    config.quarantine_dir.as_deref(),
-                )
+                execute_single_operation(pair, entry, op_type, &mut rollback, &stored_versions)
             });
             tracker.finish_file(match &result {
                 Ok(OperationResult::Added(b)) | Ok(OperationResult::Modified(b)) => *b,
@@ -523,6 +529,38 @@ pub fn execute_sync_with(
         }
     }
 
+    // Versioned backup: record the new versions, then drop the oldest ones
+    // beyond `keep_versions`.
+    let mut versions_pruned: u64 = 0;
+    if pair.mode == SyncMode::VersionedBackup {
+        let StoredVersions { mut index, stored } = stored_versions;
+        let stored = stored.into_inner().unwrap_or_default();
+        let keep = pair.run_options.keep_versions.filter(|k| *k > 0);
+        if !stored.is_empty() || keep.is_some() {
+            for (rel, v) in stored {
+                index.record(&rel, v);
+            }
+            if let Some(keep) = keep.filter(|_| !was_cancelled) {
+                match index.prune(dest_root, keep) {
+                    Ok(r) => {
+                        versions_pruned = r.removed.len() as u64;
+                        log_lines.extend(r.removed.iter().map(|p| format!("\t*Old version\t\t{p}")));
+                        errors += r.errors.len() as u32;
+                        error_messages.extend(r.errors);
+                    }
+                    Err(e) => {
+                        errors += 1;
+                        error_messages.push(format!("Pruning old versions: {e}"));
+                    }
+                }
+            }
+            if let Err(e) = index.save(dest_root) {
+                errors += 1;
+                error_messages.push(format!("Could not save the version index: {e}"));
+            }
+        }
+    }
+
     if let Ok(mut c) = tracker.current.lock() {
         *c = None;
     }
@@ -586,6 +624,7 @@ pub fn execute_sync_with(
             preview.total_conflicts.saturating_sub(conflicts_resolved),
             errors,
         ),
+        versions_pruned,
     };
 
     if report.status == SyncRunStatus::Success {
@@ -707,7 +746,7 @@ enum OperationResult {
 
 /// Copy a new file (the "add" operation). Needs no rollback snapshot, so it
 /// is safe to run from several threads at once (/MT).
-fn add_file(pair: &SyncPair, entry: &SyncDiffEntry) -> Result<OperationResult, AppError> {
+fn add_file(pair: &SyncPair, entry: &SyncDiffEntry, versions: Option<&StoredVersions>) -> Result<OperationResult, AppError> {
     let opts = &pair.copy_options;
     let source_root = Path::new(&pair.source_path);
     let dest_root = Path::new(&pair.dest_path);
@@ -721,13 +760,40 @@ fn add_file(pair: &SyncPair, entry: &SyncDiffEntry) -> Result<OperationResult, A
     }
 
     // For versioned backup, add version suffix
-    let target = if pair.mode == SyncMode::VersionedBackup {
-        versioned_path(&dest_file, pair.run_options.version_template.as_deref())?
-    } else {
-        dest_file
-    };
-    let bytes = copier::copy_file(&source_file, &target, opts)?;
+    if pair.mode == SyncMode::VersionedBackup {
+        return Ok(OperationResult::Added(store_version(pair, entry, versions)?));
+    }
+    let bytes = copier::copy_file(&source_file, &dest_file, opts)?;
     Ok(OperationResult::Added(bytes))
+}
+
+/// Versioned backup: the index as the run started, and the versions the
+/// run stores (source path, version).
+struct StoredVersions {
+    index: VersionIndex,
+    stored: Mutex<Vec<(String, StoredVersion)>>,
+}
+
+/// Versioned backup: copy the source file to its next version name and
+/// note the version for the index.
+fn store_version(pair: &SyncPair, entry: &SyncDiffEntry, versions: Option<&StoredVersions>) -> Result<u64, AppError> {
+    let dest_root = Path::new(&pair.dest_path);
+    let start = versions.and_then(|v| v.index.latest(&entry.relative_path)).map_or(1, |v| v.seq + 1);
+    let (target, seq) = versioned_path_from(&dest_root.join(&entry.relative_path), pair.run_options.version_template.as_deref(), start)?;
+    let bytes = copier::copy_file(&Path::new(&pair.source_path).join(&entry.relative_path), &target, &pair.copy_options)?;
+    if let (Some(out), Ok(rel)) = (versions, target.strip_prefix(dest_root)) {
+        let version = StoredVersion {
+            path: rel.to_string_lossy().to_string(),
+            size: entry.source_size.unwrap_or(bytes),
+            source_modified: entry.source_modified,
+            stored_at: Utc::now(),
+            seq,
+        };
+        if let Ok(mut v) = out.stored.lock() {
+            v.push((entry.relative_path.clone(), version));
+        }
+    }
+    Ok(bytes)
 }
 
 /// Execute a single file operation (add/modify/delete).
@@ -736,7 +802,7 @@ fn execute_single_operation(
     entry: &SyncDiffEntry,
     op_type: &str,
     rollback: &mut RollbackManager,
-    _quarantine_dir: Option<&Path>,
+    versions: &StoredVersions,
 ) -> Result<OperationResult, AppError> {
     let opts = &pair.copy_options;
     let source_root = Path::new(&pair.source_path);
@@ -745,7 +811,7 @@ fn execute_single_operation(
     let dest_file = dest_root.join(&entry.relative_path);
 
     match op_type {
-        "add" => add_file(pair, entry),
+        "add" => add_file(pair, entry, Some(versions)),
 
         "modify" if entry.direction == SyncDirection::ToSource => {
             // Two-way: the destination changed; bring the source up to date.
@@ -774,9 +840,7 @@ fn execute_single_operation(
 
             if pair.mode == SyncMode::VersionedBackup {
                 // Keep old version, write new version
-                let target = versioned_path(&dest_file, pair.run_options.version_template.as_deref())?;
-                let bytes = copier::copy_file(&source_file, &target, opts)?;
-                Ok(OperationResult::Modified(bytes))
+                Ok(OperationResult::Modified(store_version(pair, entry, Some(versions))?))
             } else {
                 let bytes = copier::copy_file(&source_file, &dest_file, opts)?;
                 Ok(OperationResult::Modified(bytes))
@@ -976,6 +1040,12 @@ pub const DEFAULT_VERSION_TEMPLATE: &str = "{name}.v{num}.{ext}";
 /// Name for the next kept version of `path` from the pair's template; the
 /// first free one. A template without `{num}` gets ` (n)` added on clashes.
 fn versioned_path(path: &Path, template: Option<&str>) -> Result<PathBuf, AppError> {
+    versioned_path_from(path, template, 1).map(|(p, _)| p)
+}
+
+/// [`versioned_path`] trying version numbers from `start` (numbers freed by
+/// pruning are not reused); also returns the number used.
+fn versioned_path_from(path: &Path, template: Option<&str>, start: u64) -> Result<(PathBuf, u64), AppError> {
     use crate::naming::{render, sanitize_segment, TokenContext, UnknownTokens};
     let template = template.map(str::trim).filter(|t| !t.is_empty()).unwrap_or(DEFAULT_VERSION_TEMPLATE);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -986,7 +1056,7 @@ fn versioned_path(path: &Path, template: Option<&str>) -> Result<PathBuf, AppErr
         base.modified = Some(Utc::now());
     }
     let numbered = template.contains("{num") || template.contains("{counter");
-    for n in 1..100_000u64 {
+    for n in start.max(1)..start.max(1) + 100_000u64 {
         let mut name = render(template, &base.clone().with_counter(n, 0), UnknownTokens::Error).map_err(|e| AppError::Sync {
             message: format!("Version name template \"{template}\" is invalid: {e}"),
             advice: "Fix the version naming template in the pair's options.".to_string(),
@@ -1003,7 +1073,7 @@ fn versioned_path(path: &Path, template: Option<&str>) -> Result<PathBuf, AppErr
         }
         let candidate = parent.join(sanitize_segment(name));
         if candidate != path && !candidate.exists() {
-            return Ok(candidate);
+            return Ok((candidate, n));
         }
     }
     Err(AppError::Sync {
@@ -1015,6 +1085,12 @@ fn versioned_path(path: &Path, template: Option<&str>) -> Result<PathBuf, AppErr
 /// Reject run options that would fail every run: a broken version
 /// template or a marker name that isn't a plain file name.
 pub fn validate_run_options(o: &crate::sync_types::SyncRunOptions) -> Result<(), AppError> {
+    if o.keep_versions == Some(0) {
+        return Err(AppError::Sync {
+            message: "Keep at least one version of each file.".to_string(),
+            advice: "Set the number of versions to keep to 1 or more, or clear it to keep every version.".to_string(),
+        });
+    }
     if let Some(t) = o.version_template.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         let ctx = crate::naming::TokenContext {
             file_name: "file.txt".into(),
@@ -1410,6 +1486,7 @@ mod tests {
                 error_messages: vec![],
                 resumed: false,
                 exit_code: 0,
+                versions_pruned: 0,
             },
         )
         .unwrap();
@@ -1532,7 +1609,7 @@ mod tests {
     #[test]
     fn run_options_validation() {
         use crate::sync_types::SyncRunOptions;
-        let ok = SyncRunOptions { settle_secs: 5, completion_marker: Some("_DONE".into()), version_template: Some("{name}.{now:%Y}.{ext}".into()) };
+        let ok = SyncRunOptions { settle_secs: 5, completion_marker: Some("_DONE".into()), version_template: Some("{name}.{now:%Y}.{ext}".into()), keep_versions: Some(3) };
         assert!(validate_run_options(&ok).is_ok());
         assert!(validate_run_options(&SyncRunOptions { version_template: Some("{nope}".into()), ..Default::default() }).is_err());
         for bad in ["a/b", "..", ".ufop-sync-inventory.json"] {
@@ -2176,5 +2253,70 @@ mod tests {
         let p = planner::compute_preview(&pair).unwrap();
         let a = p.modifications.iter().find(|e| e.relative_path == "a.txt").unwrap();
         assert!(!checkpoint.covers(a));
+    }
+
+    // ── Versioned backup ──
+
+    /// Regression: versioned mode writes every copy under a version name and
+    /// never at the plain path, so the next run saw "doc.txt" missing at the
+    /// destination and stored another, identical version — every run.
+    #[test]
+    fn versioned_backup_keeps_no_duplicate_versions_of_unchanged_files() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("doc.txt"), "v1").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::VersionedBackup;
+        assert_eq!(run_with(pair.clone()).files_added, 1);
+        let second = run_with(pair.clone());
+        assert_eq!(second.files_added + second.files_modified, 0, "an unchanged file got another version");
+        let stored = || fs::read_dir(dst.path()).unwrap().flatten().filter(|e| !planner::is_internal_entry(&e.file_name().to_string_lossy())).count();
+        assert_eq!(stored(), 1);
+        // A real change does get a new version.
+        fs::write(src.path().join("doc.txt"), "v2, longer").unwrap();
+        let third = run_with(pair);
+        assert_eq!(third.files_added + third.files_modified, 1);
+        assert_eq!(stored(), 2);
+    }
+
+    #[test]
+    fn versioned_backup_prunes_beyond_keep_versions() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::VersionedBackup;
+        pair.run_options.keep_versions = Some(2);
+        let mut pruned = 0;
+        fs::write(src.path().join("stable.txt"), "never changes").unwrap();
+        for i in 1..=4 {
+            fs::write(src.path().join("doc.txt"), "x".repeat(i)).unwrap();
+            let r = run_with(pair.clone());
+            assert_eq!(r.errors, 0, "{:?}", r.error_messages);
+            pruned += r.versions_pruned;
+        }
+        assert_eq!(pruned, 2);
+        let index = VersionIndex::load(dst.path());
+        let kept: Vec<String> = index.files["doc.txt"].iter().map(|v| v.path.clone()).collect();
+        assert_eq!(kept, vec!["doc.v3.txt".to_string(), "doc.v4.txt".to_string()]);
+        assert!(!dst.path().join("doc.v1.txt").exists() && !dst.path().join("doc.v2.txt").exists());
+        assert_eq!(fs::read_to_string(dst.path().join("doc.v4.txt")).unwrap(), "xxxx");
+        assert_eq!(index.files["stable.txt"].len(), 1, "unchanged files keep a single version");
+        // Unlimited (the default) never removes anything; the index is never synced.
+        assert!(planner::is_internal_entry(crate::sync::versions::VERSIONS_FILE));
+        assert!(validate_run_options(&SyncRunOptions { keep_versions: Some(0), ..Default::default() }).is_err());
+    }
+
+    #[test]
+    fn versioned_backup_purge_never_deletes_versions() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "a").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::VersionedBackup;
+        pair.copy_options.purge = true;
+        run_with(pair.clone());
+        let again = planner::compute_preview(&pair).unwrap();
+        assert_eq!(again.total_deletions, 0, "stored versions are not extras");
+        assert_eq!(again.total_additions + again.total_modifications, 0);
     }
 }

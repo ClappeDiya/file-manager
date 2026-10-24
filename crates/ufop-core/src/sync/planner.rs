@@ -72,7 +72,10 @@ fn still_changing(file: &FileMeta, settle_secs: u64, now: DateTime<Utc>) -> bool
 }
 
 pub fn is_internal_entry(name: &str) -> bool {
-    INTERNAL_DIRS.contains(&name) || name == INVENTORY_FILE || name.ends_with(super::copier::PARTIAL_SUFFIX)
+    INTERNAL_DIRS.contains(&name)
+        || name == INVENTORY_FILE
+        || name == super::versions::VERSIONS_FILE
+        || name.ends_with(super::copier::PARTIAL_SUFFIX)
 }
 
 /// Destination inventory written after a clean run (`TrustedInventory`).
@@ -318,6 +321,9 @@ pub struct PlanContext<'a> {
     /// files itself when this is `None`; [`diff_trees`] without one compares
     /// by size and time and says so in the preview notes.
     pub hasher: Option<&'a dyn ContentHasher>,
+    /// Versioned-backup mode: the stored versions. [`plan`] reads the
+    /// destination's index itself when this is `None`.
+    pub versions: Option<&'a super::versions::VersionIndex>,
 }
 
 /// Content hashes for checksum comparison: a storage provider's own hashes,
@@ -475,8 +481,11 @@ pub fn plan(pair: &SyncPair, ctx: &PlanContext<'_>) -> Result<Plan, AppError> {
     };
 
     let local = LocalHasher;
+    let index = (pair.mode == SyncMode::VersionedBackup && ctx.versions.is_none() && dest_root.exists())
+        .then(|| super::versions::VersionIndex::load(dest_root));
     let ctx = PlanContext {
         hasher: ctx.hasher.or((opts.compare_mode == CompareMode::Checksum).then_some(&local as &dyn ContentHasher)),
+        versions: ctx.versions.or(index.as_ref()),
         ..*ctx
     };
     let mut plan = diff_trees(pair, &source_files, &dest_files, &ctx)?;
@@ -595,9 +604,15 @@ pub fn diff_trees(
         .map(|f| (f.relative_path.as_str(), f))
         .collect();
 
+    // Versioned mode: stored versions are the engine's own files — never
+    // purged, never compared as if they were synced copies.
+    let version_paths = match (pair.mode, ctx.versions) {
+        (SyncMode::VersionedBackup, Some(v)) => v.version_paths(),
+        _ => Default::default(),
+    };
     let dest_map: HashMap<&str, &FileMeta> = dest_files
         .iter()
-        .filter(|f| !f.is_dir && Some(f.relative_path.as_str()) != marker)
+        .filter(|f| !f.is_dir && Some(f.relative_path.as_str()) != marker && !version_paths.contains(f.relative_path.as_str()))
         .map(|f| (f.relative_path.as_str(), f))
         .collect();
 
@@ -769,6 +784,26 @@ fn diff_legacy(
 
         // Check path length
         let path_warning = check_path_length(&pair.dest_path, rel_path);
+
+        // Versioned mode: compare with the newest stored version.
+        if let Some(latest) = ctx.versions.filter(|_| pair.mode == SyncMode::VersionedBackup).and_then(|v| v.latest(rel_path)) {
+            let stored = FileMeta {
+                relative_path: latest.path.clone(),
+                absolute_path: dest_root.join(&latest.path),
+                size: latest.size,
+                modified: latest.source_modified,
+                is_dir: false,
+                is_symlink: false,
+                hidden: false,
+                readonly: false,
+                attributes: 0,
+            };
+            if opts.include_same || !cmp.same(src, &stored, latest.source_modified) {
+                let reason = if opts.include_same { "Stored again (/IS)" } else { "Changed since the last stored version" };
+                acc.push(diff_entry(rel_path, SyncAction::Modify, Some(src), dest_map.get(rel_path).copied(), reason, SyncDirection::ToDest, path_warning));
+            }
+            continue;
+        }
 
         if let Some(dest) = dest_map.get(rel_path) {
             // File exists at destination - check if changed

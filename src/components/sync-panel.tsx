@@ -124,6 +124,7 @@ interface SyncReport {
   error_messages: string[];
   resumed: boolean;
   exit_code?: number;
+  versions_pruned?: number;
 }
 
 interface SyncConflictItem {
@@ -1508,6 +1509,7 @@ function ReportsView({
             </div>
             <div>Status: {report.status}</div>
             {report.resumed && <div>Resumed from interruption</div>}
+            {!!report.versions_pruned && <div>Old versions removed: {report.versions_pruned}</div>}
             {report.exit_code !== undefined && (
               <div className="col-span-2" title="Robocopy-compatible exit code">
                 Exit code {report.exit_code}: {describeExitCode(report.exit_code)}

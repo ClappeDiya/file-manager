@@ -7,4 +7,5 @@ pub mod filter;
 pub mod planner;
 pub mod robocopy;
 pub mod rollback;
+pub mod versions;
 pub mod winattr;

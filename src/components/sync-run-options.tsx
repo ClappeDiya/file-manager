@@ -9,6 +9,7 @@ import { tauriInvoke, isTauriAvailable } from "@/hooks/use-tauri";
 import { errorText } from "@/lib/error-text";
 import type { CopyOptions } from "@/lib/copy-options";
 import { DEFAULT_VERSION_TEMPLATE, type SyncRunOptions } from "@/stores/sync-store";
+import { useUIStore } from "@/stores/ui-store";
 
 
 const field = "mt-1 block w-full px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600";
@@ -50,6 +51,7 @@ export function SyncRunOptionsSection({
 }) {
   const set = (patch: Partial<SyncRunOptions>) => onChange({ ...runOptions, ...patch }, copyOptions);
   const twoWay = mode === "two_way";
+  const advanced = useUIStore((s) => s.appMode === "advanced");
   return (
     <fieldset className="space-y-2 rounded border border-zinc-200 dark:border-zinc-700 p-2">
       <legend className="px-1 text-xs font-medium text-zinc-600 dark:text-zinc-400">After copying</legend>
@@ -97,6 +99,23 @@ export function SyncRunOptionsSection({
             onChange={(e) => set({ version_template: e.target.value.trim() ? e.target.value : null })}
           />
           <VersionPreview template={runOptions.version_template ?? DEFAULT_VERSION_TEMPLATE} />
+        </label>
+      )}
+      {mode === "versioned_backup" && advanced && (
+        <label className={labelCls}>
+          Versions to keep of each file
+          <input
+            type="number"
+            min={1}
+            className={field}
+            placeholder="all"
+            value={runOptions.keep_versions ?? ""}
+            onChange={(e) => {
+              const n = parseInt(e.target.value, 10);
+              set({ keep_versions: Number.isNaN(n) || n < 1 ? null : n });
+            }}
+          />
+          <span className="text-[10px] text-zinc-400">After each run the oldest versions beyond this number are deleted. Empty = keep every version.</span>
         </label>
       )}
     </fieldset>

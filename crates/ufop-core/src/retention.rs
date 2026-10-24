@@ -16,8 +16,8 @@
 //! [`RetentionPolicy::plan`] is the single decision function: it gives
 //! every version keep/delete with the rules that keep it, honouring the
 //! newest version (always kept), pins ("Keep forever"), object locks and a
-//! legal hold. Previews and [`apply`](super::maintenance::apply_retention)
-//! both use it.
+//! legal hold. Backup previews and `backup::maintenance::apply_retention`
+//! both use it, and so does sync's versioned mode (`keep_versions`).
 
 use crate::error::AppError;
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};

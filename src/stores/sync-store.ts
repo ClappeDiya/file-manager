@@ -35,6 +35,8 @@ export interface SyncRunOptions {
   settle_secs: number;
   completion_marker: string | null;
   version_template: string | null;
+  /** Versioned backup: keep at most this many versions of each file (null = all). */
+  keep_versions?: number | null;
 }
 
 export const DEFAULT_RUN_OPTIONS: SyncRunOptions = { settle_secs: 0, completion_marker: null, version_template: null };
@@ -104,6 +106,8 @@ export interface SyncReport {
   resumed: boolean;
   /** Robocopy-compatible exit code bitmask (1 copied, 2 extras, 4 mismatches, 8 failures). */
   exit_code?: number;
+  /** Versioned backup: old versions removed by `keep_versions`. */
+  versions_pruned?: number;
 }
 
 export interface SyncConflictItem {
