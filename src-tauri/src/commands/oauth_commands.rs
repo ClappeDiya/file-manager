@@ -217,9 +217,18 @@ pub async fn oauth_sign_out(
     dropbox: State<'_, Arc<DropboxConnector>>,
     onedrive: State<'_, Arc<OneDriveConnector>>,
 ) -> Result<(), AppError> {
-    let (profile, provider) = oauth_profile(&manager, &connection_id).await?;
     let cloud = CloudConnectors { gdrive: &gdrive, dropbox: &dropbox, onedrive: &onedrive };
-    cloud.connector(provider).disconnect().await?;
+    sign_out(&manager, &cloud, &connection_id).await
+}
+
+/// Forget the stored sign-in; disconnect the shared instance only when it
+/// is signed in as this connection (it may be serving another account).
+pub async fn sign_out(manager: &ConnectionManager, cloud: &CloudConnectors<'_>, connection_id: &str) -> Result<(), AppError> {
+    let (profile, provider) = oauth_profile(manager, connection_id).await?;
+    let connector = cloud.connector(provider);
+    if connector.connected_profile_id() == Some(profile.id) {
+        connector.disconnect().await?;
+    }
     manager.delete_password(profile.id).await
 }
 

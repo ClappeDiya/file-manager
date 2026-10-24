@@ -1049,7 +1049,8 @@ mod tests {
         let c = B2Connector::with_authorize_url(&url);
         assert!(c.connect_with_secret(&b2_profile(), None).await.is_err(), "no key, no request with an empty one");
         assert!(mock.requests("/b2api/v2/b2_authorize_account").is_empty());
-        assert!(c.connect_with_secret(&b2_profile(), Some("wrong".into())).await.is_err());
+        let wrong = c.connect_with_secret(&b2_profile(), Some("wrong".into())).await.unwrap_err();
+        assert!(wrong.is_auth_failure(), "a wrong application key is a rejected sign-in: {wrong}");
         assert!(!c.is_connected());
         c.connect_with_secret(&b2_profile(), Some("appkey".into())).await.unwrap();
         assert!(c.is_connected());

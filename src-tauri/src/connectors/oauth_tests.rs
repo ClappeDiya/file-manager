@@ -426,3 +426,29 @@ async fn b2_tracks_the_connection_it_is_authorized_as() {
     c.connect_with_secret(&pb, Some("k2".into())).await.unwrap();
     assert_eq!(c.connected_profile_id(), Some(pb.id));
 }
+
+/// Regression: signing out connection B disconnected the one shared
+/// instance whatever account it held, dropping connection A, which the user
+/// was browsing. Only an instance signed in as B is disconnected.
+#[tokio::test(flavor = "multi_thread")]
+async fn signing_out_another_connection_keeps_the_browsed_one() {
+    use crate::commands::oauth_commands::sign_out;
+    let e = env().await;
+    let (pa, pb) = (e.saved(ConnectionProtocol::Dropbox).await, e.saved(ConnectionProtocol::Dropbox).await);
+    e.mgr.set_password(pa.id, r#"{"access_token":"a1"}"#).await.unwrap();
+    e.mgr.set_password(pb.id, r#"{"access_token":"pasted"}"#).await.unwrap();
+    let (gd, db, od) = (e.gdrive(), e.dropbox(), e.onedrive());
+    let cloud = CloudConnectors { gdrive: &gd, dropbox: &db, onedrive: &od };
+    db.connect_with_secrets(&pa, e.mgr.get_secrets(pa.id).await.unwrap()).await.unwrap();
+
+    sign_out(&e.mgr, &cloud, &pb.id.to_string()).await.unwrap();
+    assert!(e.mgr.get_password(pb.id).await.unwrap().is_none(), "B's sign-in is forgotten");
+    assert!(db.is_connected(), "A stays connected");
+    assert_eq!(db.connected_profile_id(), Some(pa.id));
+    assert!(e.mgr.get_password(pa.id).await.unwrap().is_some());
+
+    // Signing out A, which the instance holds, disconnects it.
+    sign_out(&e.mgr, &cloud, &pa.id.to_string()).await.unwrap();
+    assert!(!db.is_connected());
+    assert!(e.mgr.get_password(pa.id).await.unwrap().is_none());
+}

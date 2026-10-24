@@ -129,8 +129,6 @@ enum RefreshVia {
     Broker { broker_url: String, authid: String },
 }
 
-/// A refused token request: `invalid_grant` / 400 / 401 mean the sign-in is
-/// no longer valid (revoked, expired, changed password).
 /// A sign-in broker URL the AuthID (a bearer secret) may be sent to:
 /// https, or plain http only to this machine (a broker on localhost).
 pub fn check_broker_url(url: &str) -> Result<(), AppError> {
@@ -149,6 +147,8 @@ pub fn check_broker_url(url: &str) -> Result<(), AppError> {
     }
 }
 
+/// A refused token request: `invalid_grant` / 400 / 401 mean the sign-in is
+/// no longer valid (revoked, expired, changed password).
 fn token_error(what: &str, status: reqwest::StatusCode, body: &str) -> AppError {
     let code = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| v["error"].as_str().map(String::from)).unwrap_or_default();
     if matches!(status.as_u16(), 400 | 401 | 403) || code == "invalid_grant" || code == "invalid_client" {

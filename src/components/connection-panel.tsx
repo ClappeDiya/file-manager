@@ -26,7 +26,7 @@ import { PRESET_FIELD_LABELS, fillPreset, type ProviderPreset } from "@/lib/prov
 import { PasswordInput } from "@/components/password-input";
 import { OAuthSignIn } from "@/components/oauth-sign-in";
 import { CloudScopeFields, type CloudExtras, type OAuthSettings } from "@/components/cloud-connection-fields";
-import { CONNECTIONS_CHANGED_EVENT, OAUTH_PROTOCOLS, googleDownloadName } from "@/lib/oauth";
+import { CONNECTIONS_CHANGED_EVENT, OAUTH_PROTOCOLS, googleDownloadName, isSignedIn, signOut } from "@/lib/oauth";
 import { useUIStore } from "@/stores/ui-store";
 
 // ── Types (mirrors Rust types) ──
@@ -611,6 +611,8 @@ function ConnectionForm({
 
   // SFTP private-key passphrase (stored in the credential store; blank = unchanged)
   const [keyPassphrase, setKeyPassphrase] = useState("");
+  // Editing: forget the stored passphrase (sends "" — the backend deletes it)
+  const [removeKeyPassphrase, setRemoveKeyPassphrase] = useState(false);
 
   // WebDAV sign-in mode and server vendor
   const [webdavAuth, setWebdavAuth] = useState<WebDavAuthMode>(initialData?.extras?.webdav?.auth ?? "basic");
@@ -743,8 +745,9 @@ function ConnectionForm({
       // Upload-time permission defaults (SFTP/FTP only)
       defaultFileMode: isSshProtocol || isFtpProtocol ? defaultFileMode || null : null,
       defaultDirMode: isSshProtocol || isFtpProtocol ? defaultDirMode || null : null,
-      // SFTP key passphrase: only sent when typed (null keeps the stored one)
-      keyPassphrase: isSshProtocol && keyPassphrase ? keyPassphrase : null,
+      // SFTP key passphrase: sent when typed, "" removes the stored one,
+      // null keeps it
+      keyPassphrase: !isSshProtocol ? null : removeKeyPassphrase ? "" : keyPassphrase || null,
       extras: {
         // Keep settings this form does not show (other protocols, pickers).
         ...(initialData?.extras ?? {}),
@@ -949,11 +952,18 @@ function ConnectionForm({
           </label>
           <PasswordInput
             id="sftp-key-passphrase"
-            value={keyPassphrase}
+            value={removeKeyPassphrase ? "" : keyPassphrase}
             onChange={(e) => setKeyPassphrase(e.target.value)}
-            placeholder={initialData ? "(unchanged)" : ""}
-            className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+            placeholder={initialData ? (removeKeyPassphrase ? "(will be removed)" : "(unchanged)") : ""}
+            disabled={removeKeyPassphrase}
+            className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 disabled:opacity-50"
           />
+          {initialData && (
+            <label className="mt-1 flex items-center gap-1.5 text-xs text-gray-600 dark:text-gray-400">
+              <input type="checkbox" checked={removeKeyPassphrase} onChange={(e) => setRemoveKeyPassphrase(e.target.checked)} />
+              Remove saved passphrase
+            </label>
+          )}
         </div>
       )}
       {/* AWS Profile selector (S3 only) */}
@@ -1494,6 +1504,8 @@ function ConnectionItem({
   onToggleStar,
   onRetry,
   onSignIn,
+  signedIn,
+  onSignOut,
 }: {
   connection: ConnectionProfile;
   onConnect: (id: string) => void;
@@ -1507,8 +1519,12 @@ function ConnectionItem({
   onToggleStar?: (id: string, starred: boolean) => void;
   onRetry?: (id: string) => void;
   onSignIn?: (conn: ConnectionProfile) => void;
+  /** Google Drive / Dropbox / OneDrive: whether a sign-in is stored (null: unknown). */
+  signedIn?: boolean | null;
+  onSignOut?: (conn: ConnectionProfile) => void;
 }) {
   const starred = !!status?.starred;
+  const isOAuth = OAUTH_PROTOCOLS.has(connection.protocol);
   const rejected = !!status?.credentials_rejected_at;
   return (
     <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-gray-700 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-800/50">
@@ -1559,6 +1575,11 @@ function ConnectionItem({
           {connection.port ? `:${connection.port}` : ""}{" "}
           {connection.username ? `(${connection.username})` : ""}
         </div>
+        {isOAuth && signedIn === false && (
+          <div className="text-xs text-amber-600 dark:text-amber-400 truncate" data-testid={`not-signed-in-${connection.id}`}>
+            Not signed in: click Sign in to connect.
+          </div>
+        )}
         {rejected && (
           <div className="text-xs text-red-600 dark:text-red-400 truncate" data-testid={`rejected-${connection.id}`} title={status?.credentials_rejected_reason ?? undefined}>
             Credentials rejected: automatic reconnects are paused. Edit the connection or click Retry.
@@ -1576,7 +1597,7 @@ function ConnectionItem({
             Retry
           </button>
         )}
-        {onSignIn && OAUTH_PROTOCOLS.has(connection.protocol) && (
+        {onSignIn && isOAuth && (
           <button
             onClick={() => onSignIn(connection)}
             className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
@@ -1584,6 +1605,17 @@ function ConnectionItem({
             title="Sign in"
           >
             Sign in
+          </button>
+        )}
+        {onSignOut && isOAuth && signedIn === true && (
+          <button
+            onClick={() => onSignOut(connection)}
+            className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+            type="button"
+            title="Sign out"
+            aria-label={`Sign out ${connection.name}`}
+          >
+            Sign out
           </button>
         )}
         <button
@@ -1647,6 +1679,9 @@ export function ConnectionPanel() {
   const [statuses, setStatuses] = useState<Record<string, ConnectionStatus>>({});
   // Google Drive / Dropbox / OneDrive connection being signed in
   const [signInFor, setSignInFor] = useState<ConnectionProfile | null>(null);
+  // Whether each cloud connection has a stored sign-in, by connection id
+  const [signedIn, setSignedIn] = useState<Record<string, boolean>>({});
+  const [signOutError, setSignOutError] = useState<string | null>(null);
   // Storage of the connected account
   const [quota, setQuota] = useState<RemoteQuota | null>(null);
   // "Calculate size" results, by remote path
@@ -1673,6 +1708,18 @@ export function ConnectionPanel() {
     }
     void refreshStatus();
   }, [refreshStatus]);
+
+  // Which cloud connections have a stored sign-in.
+  useEffect(() => {
+    let live = true;
+    const cloud = connections.filter((c) => OAUTH_PROTOCOLS.has(c.protocol));
+    void Promise.all(cloud.map(async (c) => [c.id, await isSignedIn(c.id).catch(() => false)] as const)).then((pairs) => {
+      if (live) setSignedIn(Object.fromEntries(pairs));
+    });
+    return () => {
+      live = false;
+    };
+  }, [connections]);
 
   // A guided cloud wizard saved a connection elsewhere: reload.
   useEffect(() => {
@@ -1946,6 +1993,24 @@ export function ConnectionPanel() {
     setSizes({});
   }, [connectedProtocol]);
 
+  // Forget a cloud connection's sign-in; stop browsing it if it is open.
+  const handleSignOut = useCallback(
+    async (conn: ConnectionProfile) => {
+      setSignOutError(null);
+      try {
+        await signOut(conn.id);
+      } catch (err) {
+        setSignOutError(`${conn.name}: ${errorText(err)}`);
+        return;
+      }
+      // The row now reads "Not signed in".
+      setSignedIn((prev) => ({ ...prev, [conn.id]: false }));
+      if (connectedId === conn.id) await handleDisconnect();
+      void refreshStatus();
+    },
+    [connectedId, handleDisconnect, refreshStatus]
+  );
+
   const handleBrowse = useCallback(
     async (path: string) => {
       if (!connectedProtocol) return;
@@ -2201,6 +2266,8 @@ export function ConnectionPanel() {
     onToggleStar: (id: string, starred: boolean) => void handleToggleStar(id, starred),
     onRetry: (id: string) => void handleRetry(id),
     onSignIn: (c: ConnectionProfile) => setSignInFor(c),
+    signedIn: signedIn[conn.id] ?? null,
+    onSignOut: (c: ConnectionProfile) => void handleSignOut(c),
   });
 
   return (
@@ -2333,6 +2400,15 @@ export function ConnectionPanel() {
             className="text-xs ml-2 hover:text-red-800 dark:hover:text-red-300"
             type="button"
           >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {signOutError && (
+        <div className="px-3 py-1.5 text-xs text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between" role="alert">
+          <span>Sign out failed: {signOutError}</span>
+          <button onClick={() => setSignOutError(null)} className="text-xs ml-2 hover:text-red-800 dark:hover:text-red-300" type="button">
             Dismiss
           </button>
         </div>
@@ -2738,6 +2814,7 @@ export function ConnectionPanel() {
               onSignedIn={(r) => {
                 const id = signInFor.id;
                 setSignInFor(null);
+                setSignedIn((prev) => ({ ...prev, [id]: true }));
                 setTransferStatus(r.account ? `Signed in as ${r.account}.` : "Signed in.");
                 refresh();
                 void handleConnect(id);

@@ -323,7 +323,7 @@ For **OpenStack Swift**, choose how to sign in:
 
 ### Signing in to Google Drive, Dropbox and OneDrive
 
-Add the connection from **Connections → + Cloud** (a guided wizard) or with **+ New** and the provider as protocol. After it is saved, **Sign in with …** opens the provider's page in your browser; when you approve, the browser returns to UFOP (on `http://localhost:9876`, `9877` or `9878` for Google Drive, Dropbox and OneDrive) and the connection is signed in. No password is stored: the access the provider grants (OAuth tokens) is kept in the OS keychain and renewed automatically when it expires. Use **Sign in** on the connection later to switch accounts.
+Add the connection from **Connections → + Cloud** (a guided wizard) or with **+ New** and the provider as protocol. After it is saved, **Sign in with …** opens the provider's page in your browser; when you approve, the browser returns to UFOP (on `http://localhost:9876`, `9877` or `9878` for Google Drive, Dropbox and OneDrive) and the connection is signed in. No password is stored: the access the provider grants (OAuth tokens) is kept in the OS keychain and renewed automatically when it expires. Use **Sign in** on the connection later to switch accounts. A connection without a stored sign-in reads *Not signed in*; **Sign out** forgets its sign-in (and disconnects it if it is open).
 
 - **Browser on another device**: open the sign-in page there and paste the code (or the whole address the browser was sent to) into *Paste the code*.
 - **Computer without a browser** (*Sign in on a computer without a browser*): paste tokens (an access token, or JSON with a refresh token and its client ID), or an **AuthID** from your self-hosted sign-in broker (`ufop-server --oauth-config`, open `/oauth/<provider>/start` there). The credential is checked by connecting before it is saved.
@@ -337,7 +337,7 @@ Add the connection from **Connections → + Cloud** (a guided wizard) or with **
 
 ### Connection settings
 
-- **SFTP**: the password, or the private key path (*Password*) and the key's **passphrase**. A key generated in the form with a passphrase fills it in.
+- **SFTP**: the password, or the private key path (*Password*) and the key's **passphrase**. A key generated in the form with a passphrase fills it in. When editing, a blank passphrase keeps the saved one; tick *Remove saved passphrase* to forget it.
 - **WebDAV**: sign in with a user name and password, a **bearer token** (app passwords and tokens), or none; choose **Nextcloud** or **ownCloud** for their chunked uploads.
 - **SMB**: the Windows **domain** (optional). On Linux the password reaches `mount.cifs` through the environment, not the command line. On macOS (`mount_smbfs`) and Windows (`net use`) those tools only take it as a command argument, so while the mount command runs (a moment) other programs of the same user can see it in the process list; avoid mounting with a password on a shared machine, or use a Kerberos / saved Windows credential (leave the password empty).
 - **Backblaze B2**: the **application key ID** and **application key**.

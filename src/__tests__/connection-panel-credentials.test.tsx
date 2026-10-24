@@ -125,6 +125,21 @@ describe("profile fields reach the backend", () => {
     expect(JSON.stringify(args.extras)).not.toContain("correct horse");
   });
 
+  it("editing keeps the stored passphrase unless told to remove it", async () => {
+    connections = [ALPHA];
+    render(<ConnectionPanel />);
+    fireEvent.click(await screen.findByTitle("Edit"));
+    fireEvent.submit(document.querySelector("form")!);
+    expect((await savedArgs()).keyPassphrase).toBeNull();
+    await waitFor(() => expect(document.querySelector("form")).toBeNull());
+    fireEvent.click(screen.getByTitle("Edit"));
+    fireEvent.click(await screen.findByLabelText("Remove saved passphrase"));
+    expect(screen.getByLabelText(/Key passphrase/)).toBeDisabled();
+    fireEvent.submit(document.querySelector("form")!);
+    await waitFor(() => expect(calls("save_connection").length).toBe(2));
+    expect(calls("save_connection").at(-1)!.keyPassphrase).toBe("");
+  });
+
   it("saves the WebDAV bearer mode and vendor", async () => {
     const form = await openNewForm();
     await chooseProtocol(form, "webdav");
@@ -206,6 +221,41 @@ describe("cloud connections", () => {
     fireEvent.click(await screen.findByRole("button", { name: "+ Cloud" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "Dropbox" }));
     expect(useUIStore.getState().activeGuidedFlow).toBe("connect-dropbox");
+  });
+
+  it("shows whether a cloud connection is signed in and signs it out", async () => {
+    const DROPBOX = { ...DRIVE, id: "d", name: "Team Dropbox", protocol: "dropbox" };
+    connections = [DRIVE, DROPBOX];
+    const stored = new Set(["g"]);
+    backend({
+      oauth_status: (a) => stored.has(a.connectionId as string),
+      oauth_sign_out: (a) => {
+        stored.delete(a.connectionId as string);
+      },
+    });
+    render(<ConnectionPanel />);
+    expect(await screen.findByTestId("not-signed-in-d")).toHaveTextContent("Not signed in");
+    expect(screen.queryByTestId("not-signed-in-g")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Sign out Team Dropbox" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Sign out My Drive" }));
+    await waitFor(() => expect(calls("oauth_sign_out")).toEqual([{ connectionId: "g" }]));
+    expect(await screen.findByTestId("not-signed-in-g")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign out My Drive" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("reports a failed sign out", async () => {
+    connections = [DRIVE];
+    backend({
+      oauth_status: () => true,
+      oauth_sign_out: () => {
+        throw { message: "Keychain locked", advice: "Unlock it." };
+      },
+    });
+    render(<ConnectionPanel />);
+    fireEvent.click(await screen.findByRole("button", { name: "Sign out My Drive" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Sign out failed: My Drive");
+    expect(screen.getByRole("button", { name: "Sign out My Drive" })).toBeInTheDocument();
   });
 
   it("Sign in on a saved cloud connection opens the sign-in dialog", async () => {
