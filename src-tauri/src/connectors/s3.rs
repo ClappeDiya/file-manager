@@ -2230,6 +2230,25 @@ impl S3Connector {
         key: &str,
         version_id: &str,
     ) -> Result<(), AppError> {
+        let copy_source = format!(
+            "/{bucket}/{}?versionId={}",
+            percent_encode_path(key),
+            percent_encoding::percent_encode(version_id.as_bytes(), S3_ENCODE_SET)
+        );
+        self.put_copy(bucket, key, &copy_source, "S3 version restore", "Check bucket permissions and versioning config.").await?;
+        tracing::info!("Restored s3://{bucket}/{key} to version {version_id}");
+        Ok(())
+    }
+
+    /// Server-side copy of `src_bucket/src_key` to `dst_bucket/dst_key`
+    /// (CopyObject; objects up to 5 GB).
+    pub async fn copy_object(&self, src_bucket: &str, src_key: &str, dst_bucket: &str, dst_key: &str) -> Result<(), AppError> {
+        let copy_source = format!("/{src_bucket}/{}", percent_encode_path(src_key));
+        self.put_copy(dst_bucket, dst_key, &copy_source, "S3 copy", "Check you may read the source and write the destination.").await
+    }
+
+    /// PUT `bucket/key` with `x-amz-copy-source` (CopyObject).
+    async fn put_copy(&self, bucket: &str, key: &str, copy_source: &str, what: &str, advice: &str) -> Result<(), AppError> {
         let state = self.state.read().await;
         let state = state.as_ref().ok_or_else(|| AppError::Connection {
             message: "Not connected to S3".to_string(),
@@ -2250,11 +2269,6 @@ impl S3Connector {
             format!("/{encoded_key}")
         };
 
-        let copy_source = format!(
-            "/{bucket}/{encoded_key}?versionId={}",
-            percent_encoding::percent_encode(version_id.as_bytes(), S3_ENCODE_SET)
-        );
-
         let headers = self.sign_request(
             &state.credentials,
             "PUT",
@@ -2268,14 +2282,14 @@ impl S3Connector {
         for (k, v) in &headers {
             req = req.header(k.as_str(), v.as_str());
         }
-        req = req.header("x-amz-copy-source", &copy_source);
+        req = req.header("x-amz-copy-source", copy_source);
         if !state.credentials.path_style {
             let host = self.bucket_host(&state.credentials, bucket);
             req = req.header("Host", &host);
         }
 
         let resp = req.send().await.map_err(|e| AppError::Transfer {
-            message: format!("S3 version restore failed: {e}"),
+            message: format!("{what} failed: {e}"),
             advice: "Check your network connection.".to_string(),
         })?;
 
@@ -2283,12 +2297,10 @@ impl S3Connector {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(AppError::Transfer {
-                message: format!("S3 version restore failed (HTTP {status}): {body}"),
-                advice: "Check bucket permissions and versioning config.".to_string(),
+                message: format!("{what} failed (HTTP {status}): {body}"),
+                advice: advice.to_string(),
             });
         }
-
-        tracing::info!("Restored s3://{bucket}/{key} to version {version_id}");
         Ok(())
     }
 
@@ -2698,6 +2710,31 @@ impl Default for S3Connector {
 }
 
 impl Connector for S3Connector {
+    /// CopyObject between `/bucket/key` paths of this connection.
+    fn server_copy(&self, from: &str, to: &str) -> Pin<Box<dyn Future<Output = Result<bool, AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move {
+            let (sb, sk) = super::split_bucket_key(&from)?;
+            let (db, dk) = super::split_bucket_key(&to)?;
+            self.copy_object(&sb, &sk, &db, &dk).await.map(|()| true)
+        })
+    }
+
+    /// S3 has no rename: a file is copied on the server, then the original
+    /// deleted. Folders (prefixes) are moved file by file by the caller.
+    fn rename_entry(&self, from: &str, to: &str) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move {
+            if from.ends_with('/') {
+                return Err(AppError::validation("S3 folders are moved file by file"));
+            }
+            let (sb, sk) = super::split_bucket_key(&from)?;
+            let (db, dk) = super::split_bucket_key(&to)?;
+            self.copy_object(&sb, &sk, &db, &dk).await?;
+            self.delete_object(&sb, &sk).await
+        })
+    }
+
     fn connect(
         &self,
         profile: &ConnectionProfile,
@@ -3972,5 +4009,33 @@ mod tests {
             seen.lock().unwrap()[0],
             "/bucket/dir/my%20file.txt /bucket/dir/my%20file.txt?versionId=v1"
         );
+    }
+
+    /// Pane copies inside one S3 connection run as CopyObject (signed like
+    /// the other requests); a rename is that copy, then a delete.
+    #[tokio::test]
+    async fn server_copy_and_rename_use_copy_object() {
+        use axum::http::{HeaderMap, Method, Uri};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let app = axum::Router::new().fallback(move |m: Method, uri: Uri, h: HeaderMap| {
+            let log = log.clone();
+            async move {
+                let src = h.get("x-amz-copy-source").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+                log.lock().unwrap().push(format!("{m} {} {src}", uri.path()));
+                axum::http::StatusCode::OK
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = connected(base).await;
+        assert!(c.server_copy("/bucket/in/a b.txt", "/other/out/a b.txt").await.unwrap());
+        c.rename_entry("/bucket/in/x.txt", "/bucket/in/y.txt").await.unwrap();
+        assert!(c.rename_entry("/bucket/in/", "/bucket/out/").await.is_err());
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(log[0], "PUT /other/out/a%20b.txt /bucket/in/a%20b.txt");
+        assert_eq!(log[1], "PUT /bucket/in/y.txt /bucket/in/x.txt");
+        assert!(log[2].starts_with("DELETE /bucket/in/x.txt"));
     }
 }

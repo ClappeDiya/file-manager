@@ -277,7 +277,12 @@ pub trait Connector: Send + Sync {
         _from: &str,
         _to: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
-        Box::pin(async { Err(unsupported_op("rename")) })
+        Box::pin(async {
+            Err(AppError::Connection {
+                message: "Renaming is not supported for this connection type.".to_string(),
+                advice: "Copy the item under the new name, then delete the original.".to_string(),
+            })
+        })
     }
 
     /// Copy the file `from` to `to` on the server without the bytes passing
