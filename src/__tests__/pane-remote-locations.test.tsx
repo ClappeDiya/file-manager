@@ -76,6 +76,8 @@ beforeEach(() => {
         return args?.path === "/" ? [entry("/Reports", "Reports", true, 0), entry("/a.txt", "a.txt")] : [];
       case "list_directory":
         return args?.path === "/home" ? [entry("/home/local.txt", "local.txt", false, 5)] : [];
+      case "connector_stat":
+        return args?.path === "/Reports" ? entry("/Reports", "Reports", true, 0) : null;
       case "enqueue_location_transfer":
         return { jobs: [], moved: [], folders_created: 0 };
       case "connector_quota":
@@ -227,4 +229,19 @@ describe("connections in the panes", () => {
     await waitFor(() => expect(calls("connector_remove")).toEqual([{ protocol: "dropbox", remotePath: "/a.txt", isDir: false, connectionId: ID }]));
     expect(calls("delete_files")).toHaveLength(0);
   });
+
+  it("Ctrl+L turns the breadcrumb into the address field; <connection>:path goes there", async () => {
+    setPanes("/home", "/home", true);
+    render(<FileManager />);
+    await settled("local.txt");
+    fireEvent.keyDown(window, { key: "l", ctrlKey: true });
+    const input = (await screen.findByTestId("address-bar-input")) as HTMLInputElement;
+    expect(input.value).toBe("/home");
+    await waitFor(() => expect(useConnectionsStore.getState().loaded).toBe(true));
+    fireEvent.change(input, { target: { value: "Work Drive:/Reports" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(useFileManagerStore.getState().getActivePath(0)).toBe(`conn://${ID}/Reports`));
+    expect(screen.queryByTestId("address-bar-input")).not.toBeInTheDocument();
+  });
 });
+
