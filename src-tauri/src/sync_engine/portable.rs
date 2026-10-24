@@ -51,7 +51,7 @@ pub struct ImportResult {
 }
 
 fn protocol_name(p: &ConnectionProfile) -> String {
-    serde_json::to_value(&p.protocol).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
+    serde_json::to_value(p.protocol).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
 }
 
 fn under(path: &str, root: &str) -> bool {
@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(nas.protocol, ConnectionProtocol::Sftp);
         let pair = SyncPair { name: "Photos".into(), source_path: "/home/me/Pictures".into(), dest_path: "/mnt/nas/photos/2026".into(), ..Default::default() };
         let mounts = vec![(nas.id.to_string(), "/mnt/nas".to_string()), (nas.id.to_string(), "/mnt/nas/photos".to_string())];
-        let refs = connection_refs(&pair, &mounts, &[nas.clone()]);
+        let refs = connection_refs(&pair, &mounts, std::slice::from_ref(&nas));
         assert_eq!(refs.len(), 1);
         assert_eq!((refs[0].side.as_str(), refs[0].mount_point.as_str(), refs[0].name.as_str()), ("dest", "/mnt/nas/photos", "NAS"));
 
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(doc.version, VERSION);
         assert_eq!(doc.pair.name, "Photos");
         // Same profile here (matched by id): only the missing folder is flagged.
-        let w = warnings(&doc, &[nas.clone()], |p| p.starts_with("/mnt"));
+        let w = warnings(&doc, std::slice::from_ref(&nas), |p| p.starts_with("/mnt"));
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("/home/me/Pictures"));
         // Another computer with a same-named profile (different id) is fine too.
