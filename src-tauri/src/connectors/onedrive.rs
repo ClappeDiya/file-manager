@@ -352,8 +352,8 @@ impl OneDriveConnector {
     ) -> Result<Vec<FileEntry>, AppError> {
         let token = self.get_token().await?;
 
-        let url = match path.map(|p| p.trim_matches('/')).filter(|p| !p.is_empty()) {
-            Some(p) => format!("{}/root:/{}:/children?$top=200", self.drive_base(), encode_path(p)),
+        let url = match path.map(drive_relative).filter(|p| !p.is_empty()) {
+            Some(p) => format!("{}/root:/{}:/children?$top=200", self.drive_base(), encode_path(&p)),
             None => format!("{}/root/children?$top=200", self.drive_base()),
         };
 
@@ -1024,7 +1024,7 @@ impl Connector for OneDriveConnector {
         Box::pin(async move {
             let data = tokio::fs::read(&l).await.map_err(|e| AppError::file_op(format!("Cannot read {l}: {e}"), "Check the file."))?;
             let n = data.len() as u64;
-            self.upload_file(r.trim_start_matches('/'), data).await?;
+            self.upload_file(&drive_relative(&r), data).await?;
             Ok(n)
         })
     }
@@ -1045,7 +1045,7 @@ impl Connector for OneDriveConnector {
     }
 
     fn make_directory(&self, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
-        let r = remote_path.trim_matches('/').to_string();
+        let r = drive_relative(remote_path);
         Box::pin(async move {
             let (parent, name) = r.rsplit_once('/').unwrap_or(("", r.as_str()));
             self.create_folder(parent, name).await.map(|_| ())
@@ -1082,11 +1082,11 @@ impl Connector for OneDriveConnector {
         let (r, o) = (remote_path.to_string(), options.clone());
         Box::pin(async move {
             let token = self.get_token().await?;
-            let path = r.trim_matches('/');
+            let path = drive_relative(&r);
             if path.is_empty() {
                 return Err(AppError::validation("Choose a file or folder to share"));
             }
-            let encoded = encode_path(path);
+            let encoded = encode_path(&path);
             let url = format!("{}/root:/{encoded}:/createLink", self.drive_base());
             let resp = self
                 .http
@@ -1109,9 +1109,28 @@ impl Connector for OneDriveConnector {
     }
 }
 
-/// Percent-encode each segment of a drive path (`/` stays a separator).
+/// The path below the drive root: entries carry Graph's form
+/// (`/drive/root:/Folder/file`, `/drives/{id}/root:/…`), typed paths are
+/// plain (`/Folder/file`).
+fn drive_relative(path: &str) -> String {
+    let p = path.trim();
+    let rest = if let Some(i) = p.find("root:") {
+        &p[i + 5..]
+    } else if p == "/drive" {
+        ""
+    } else if let Some(r) = p.strip_prefix("/drives/") {
+        r.split_once('/').map(|(_, r)| r).unwrap_or("")
+    } else {
+        p
+    };
+    rest.trim_matches('/').to_string()
+}
+
+/// Percent-encode each segment of a drive path (`/` stays a separator);
+/// Graph-form paths are reduced to the part below the drive root first.
 fn encode_path(p: &str) -> String {
-    p.split('/').filter(|s| !s.is_empty()).map(|seg| percent_encoding::utf8_percent_encode(seg, percent_encoding::NON_ALPHANUMERIC).to_string()).collect::<Vec<_>>().join("/")
+    drive_relative(p)
+        .split('/').filter(|s| !s.is_empty()).map(|seg| percent_encoding::utf8_percent_encode(seg, percent_encoding::NON_ALPHANUMERIC).to_string()).collect::<Vec<_>>().join("/")
 }
 
 // ── Naming Restriction Enforcement ──
@@ -1259,18 +1278,12 @@ fn graph_item_to_file_entry(item: GraphDriveItem) -> FileEntry {
         .as_deref()
         .and_then(|d| d.parse::<DateTime<Utc>>().ok());
 
-    // parentReference.path is `/drive/root:/Folder` (or `/drives/{id}/root:`):
-    // entries carry the path below the drive root, which `list_items` takes.
-    let parent = item
+    let path = item
         .parent_reference
         .as_ref()
         .and_then(|p| p.path.clone())
-        .map(|p| match p.split_once("root:") {
-            Some((_, rest)) => rest.trim_end_matches('/').to_string(),
-            None => p.trim_end_matches('/').to_string(),
-        })
-        .unwrap_or_default();
-    let path = format!("{parent}/{}", item.name);
+        .map(|p| format!("{}/{}", p, item.name))
+        .unwrap_or_else(|| format!("/{}", item.name));
 
     let extension = if !is_dir {
         item.name
@@ -1360,7 +1373,9 @@ mod library_tests {
         c.connect_with_secret(&p, Some("tok".into())).await.unwrap();
         assert_eq!(c.quota().await.unwrap().unwrap(), crate::connectors::RemoteQuota { total: Some(100), used: Some(30), free: Some(70), trashed: Some(2) });
         let list = c.list_remote("/").await.unwrap();
-        assert_eq!((list[0].name.as_str(), list[0].path.as_str()), ("Q3", "/Q3"));
+        assert_eq!((list[0].name.as_str(), list[0].path.as_str()), ("Q3", "/drives/LIB1/root:/Q3"));
+        // Graph-form and plain paths address the same item.
+        assert_eq!((drive_relative(&list[0].path), drive_relative("/Q3/"), drive_relative("/drive/root:"), drive_relative("/drive")), ("Q3".into(), "Q3".into(), String::new(), String::new()));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("a b.txt");
         assert_eq!(c.download("/Q3/a b.txt", out.to_str().unwrap()).await.unwrap(), 4);

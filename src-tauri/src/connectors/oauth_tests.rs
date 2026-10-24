@@ -243,7 +243,7 @@ async fn dropbox_and_onedrive_connect_and_list() {
     let po = e.saved(ConnectionProtocol::OneDrive).await;
     assert_eq!(finish_sign_in(&e.mgr, &cloud, po.id, grant()).await.unwrap().account.as_deref(), Some("cy@example.com"));
     let list = od.list_remote("/").await.unwrap();
-    assert_eq!((list[0].name.as_str(), list[0].path.as_str(), list[0].is_dir), ("Docs", "/Docs", true));
+    assert_eq!((list[0].name.as_str(), list[0].path.as_str(), list[0].is_dir), ("Docs", "/drive/root:/Docs", true));
     assert!(od.is_connected() && db.is_connected());
     // Expired Dropbox token on the next start: refreshed (and the rotated one saved).
     let OAuthGrant::Token { mut token, client_id, client_secret, token_url } = e.stored_grant(&pd).await else { panic!() };
