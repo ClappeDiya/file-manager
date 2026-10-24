@@ -14,7 +14,7 @@ import { useTerminalStore } from "@/stores/terminal-store";
 import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { loadSmartDestinations, fileExtension, type SmartDestination } from "@/hooks/use-smart-destinations";
 import { assessBeforeExecute, confirmIntent, measureSelection, FS_INTENT_KIND } from "@/lib/safety";
-import { formatAddress, isRemotePath, joinLocation, locationConnectionId, parentLocation, remoteLocation } from "@/lib/location";
+import { formatAddress, isRemotePath, joinLocation, locationConnectionId, parentLocation, remoteLocation, sameFolder } from "@/lib/location";
 import {
   connectionQuota,
   dragDropMode,
@@ -36,7 +36,7 @@ import {
 } from "@/lib/location-provider";
 import { useConnectionsStore } from "@/stores/connections-store";
 import { DragDropConfirm } from "./drag-drop-confirm";
-import { dropIntent, type DropRequest } from "@/lib/drag-drop";
+import { dropIntent, dropPreconfirmed, measuredDrop, type DropRequest } from "@/lib/drag-drop";
 import { formatQuota } from "@/lib/remote-quota";
 import { ShareLinkDialog } from "./share-link-dialog";
 import { SHAREABLE_PROTOCOLS } from "@/stores/share-store";
@@ -4371,7 +4371,7 @@ function FilePane({
       // Moving an item into the folder it already lives in is a no-op.
       const movable = paths.filter((p) =>
         isRemotePath(p) || isRemotePath(currentPath)
-          ? parentLocation(p) !== currentPath
+          ? !sameFolder(parentLocation(p), currentPath)
           : p.slice(0, p.lastIndexOf("/")) !== (currentPath === "/" ? "" : currentPath),
       );
       if (movable.length === 0) { clear(); return; }
@@ -5285,11 +5285,11 @@ function FilePane({
               // counted through), so a large folder is not a "low risk" item.
               const req: DropRequest = { sources: droppedPaths, destDir: currentPath, mode, destLabel: formatAddress(currentPath, nameOfConnection), totalBytes: 0, measuring: true };
               setDropRequest(req);
-              const measuredReq = (m: { files: number; bytes: number } | null): DropRequest =>
-                m ? { ...req, measuring: false, affectedFiles: m.files, totalBytes: m.bytes } : { ...req, measuring: false };
+              // Measuring failed: shown as "size unknown", and a move then
+              // goes through the interlock again (see dropPreconfirmed).
               void measureLocations(droppedPaths, files)
                 .catch(() => null)
-                .then((m) => setDropRequest((cur) => (cur === req ? measuredReq(m) : cur)));
+                .then((m) => setDropRequest((cur) => (cur === req ? measuredDrop(req, m) : cur)));
               return;
             }
             if (needsLocationTransfer(droppedPaths, currentPath)) {
@@ -5337,10 +5337,11 @@ function FilePane({
             const req = dropRequest;
             setDropRequest(null);
             // Confirmed here: the interlock's audit entry, without asking twice.
-            // (The button waits for the assessment; without one the
-            // interlock still runs before a move.)
+            // (The button waits for the assessment; without one, or when
+            // the drop could not be measured, the interlock still runs
+            // before a move.)
             if (assessment?.requires_confirmation) void confirmIntent(dropIntent(req), assessment);
-            void performDrop(req.sources, req.mode, assessment !== null);
+            void performDrop(req.sources, req.mode, dropPreconfirmed(req, assessment));
           }}
         />
       )}

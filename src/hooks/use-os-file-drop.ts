@@ -11,7 +11,7 @@ import { useEffect } from "react";
 import { isTauriAvailable, tauriInvoke } from "@/hooks/use-tauri";
 import { dispatchRefresh } from "@/lib/refresh-affected";
 import { reportOperationFailure } from "@/lib/op-error-toast";
-import { isRemotePath, parentLocation } from "@/lib/location";
+import { isRemotePath, parentLocation, sameFolder } from "@/lib/location";
 import { resolveItems, statLocation, transferItems } from "@/lib/location-provider";
 
 export const OS_DROP_ATTR = "data-os-drop-dir";
@@ -52,7 +52,7 @@ export async function handleOsDrop(event: OsDropEvent, scale: number): Promise<{
   setHover(null);
   const dest = target?.getAttribute(OS_DROP_ATTR);
   // Dropping a pane's own files back onto it would copy them onto themselves.
-  const paths = event.paths.filter((p) => dest && parentLocation(p) !== dest);
+  const paths = event.paths.filter((p) => dest && !sameFolder(parentLocation(p), dest));
   if (!dest || paths.length === 0) return null;
   try {
     if (isRemotePath(dest)) {

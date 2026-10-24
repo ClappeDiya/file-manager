@@ -11,7 +11,7 @@ const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
 import { DragDropConfirm } from "@/components/drag-drop-confirm";
-import { dropIntent } from "@/lib/drag-drop";
+import { dropIntent, dropPreconfirmed, measuredDrop } from "@/lib/drag-drop";
 import { GeneralSection } from "@/components/settings-panel";
 import { ConnectionPanel } from "@/components/connection-panel";
 import { useUIStore } from "@/stores/ui-store";
@@ -104,6 +104,29 @@ describe("drag-and-drop confirmation", () => {
     expect(calls("safety_assess_intent")[0]).toMatchObject({ intent: { affected_files: 4000, total_bytes: 8_000_000_000, kind: "move" } });
     await waitFor(() => expect(screen.getByTestId("drag-drop-ok")).toBeEnabled());
     expect(screen.getByTestId("drag-drop-summary")).toHaveTextContent("(8.0 GB)");
+  });
+
+  it("does not let an unmeasured drop stand in for the interlock", async () => {
+    // Regression: when measuring failed the drop was assessed on its
+    // top-level item count, and confirming it skipped the interlock for a
+    // possibly large folder move on that understated risk.
+    const measuring = { ...request, sources: ["/big"], totalBytes: 0, measuring: true };
+    const failed = measuredDrop(measuring, null);
+    expect(failed).toMatchObject({ measuring: false, unmeasured: true, totalBytes: 0 });
+    const onConfirm = vi.fn();
+    render(<DragDropConfirm request={failed} onConfirm={onConfirm} onCancel={vi.fn()} />);
+    expect(screen.getByTestId("drag-drop-summary")).toHaveTextContent("Move 1 item to dst? (size unknown)");
+    expect(screen.getByTestId("drag-drop-unmeasured")).toHaveTextContent("checks the move again");
+    await waitFor(() => expect(screen.getByTestId("drag-drop-ok")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("drag-drop-ok"));
+    const assessment = onConfirm.mock.calls[0][0];
+    expect(assessment).not.toBeNull();
+    expect(dropPreconfirmed(failed, assessment)).toBe(false);
+    // Measured: confirming here is the interlock's confirmation.
+    const measured = measuredDrop(measuring, { files: 3, bytes: 10 });
+    expect(measured).toMatchObject({ measuring: false, unmeasured: false, affectedFiles: 3, totalBytes: 10 });
+    expect(dropPreconfirmed(measured, assessment)).toBe(true);
+    expect(dropPreconfirmed(measured, null)).toBe(false);
   });
 
   it("shows the Safety Interlock's risk when it would ask", async () => {

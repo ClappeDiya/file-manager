@@ -161,7 +161,7 @@ pub(crate) async fn location_transfer(
             rest.push(item);
             continue;
         }
-        if loc::remote_parent(from).trim_end_matches('/') == dest_path.trim_end_matches('/') {
+        if loc::same_remote_folder(&loc::remote_parent(from), dest_path) {
             continue; // already there
         }
         // Never ask the server to move a folder into itself.
@@ -865,6 +865,24 @@ mod tests {
         conn.dirs.lock().unwrap().insert("/c".into());
         location_transfer(&mgr, resolver.as_ref(), vec![item(format!("conn://{id}/a"), "a", true, 0)], &format!("conn://{id}/c"), TransferMode::Move).await.unwrap();
         assert_eq!(conn.file("/c/a/x.txt").as_deref(), Some("x"));
+    }
+
+    /// Regression: a OneDrive pane opened at `/` lists items in Graph's form
+    /// (`/drive/root:/a.txt`), whose parent `/drive/root:` did not equal the
+    /// pane's `/`, so moving an item into the folder it is already in renamed
+    /// it to `a (copy).txt` on the server. Both spellings are one folder.
+    #[tokio::test]
+    async fn moving_a_onedrive_item_into_its_own_folder_is_a_no_op() {
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector::with(&[("/drive/root:/a.txt", "a"), ("/drives/LIB1/root:/Q3/b.txt", "b")], &["/drives/LIB1/root:/Q3"]));
+        let resolver = Arc::new(MemResolver(HashMap::from([(id, conn.clone())])));
+        let mgr = TransferManager::new();
+        for (path, name, dest) in [("/drive/root:/a.txt", "a.txt", "/"), ("/drive/root:/a.txt", "a.txt", "/drive/root:/"), ("/drives/LIB1/root:/Q3/b.txt", "b.txt", "/Q3/")] {
+            let out = location_transfer(&mgr, resolver.as_ref(), vec![item(format!("conn://{id}{path}"), name, false, 1)], &format!("conn://{id}{dest}"), TransferMode::Move).await.unwrap();
+            assert!(out.jobs.is_empty() && out.moved.is_empty(), "{path} -> {dest}: {out:?}");
+        }
+        assert!(conn.renames.lock().unwrap().is_empty(), "the server was never asked to rename");
+        assert_eq!(conn.file("/drive/root:/a.txt").as_deref(), Some("a"));
     }
 
     #[tokio::test]

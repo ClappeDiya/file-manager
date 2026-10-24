@@ -19,6 +19,22 @@ export interface DropRequest {
   affectedFiles?: number;
   /** Still being measured: not assessed or confirmable yet. */
   measuring?: boolean;
+  /** Measuring failed: size unknown, and the counts are the top-level items only. */
+  unmeasured?: boolean;
+}
+
+/** `req` once measured: `m` is what it affects, or null when measuring failed. */
+export function measuredDrop(req: DropRequest, m: { files: number; bytes: number } | null): DropRequest {
+  return m ? { ...req, measuring: false, unmeasured: false, affectedFiles: m.files, totalBytes: m.bytes } : { ...req, measuring: false, unmeasured: true };
+}
+
+/**
+ * Whether confirming the drop counts as the Safety Interlock's
+ * confirmation: only when it was assessed on what the drop really affects.
+ * An unmeasured drop (possibly understated) goes through the interlock again.
+ */
+export function dropPreconfirmed(req: DropRequest, assessment: unknown): boolean {
+  return assessment !== null && assessment !== undefined && !req.unmeasured;
 }
 
 /** The interlock intent of a drop. */

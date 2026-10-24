@@ -212,8 +212,12 @@ pub struct TransferManager {
     /// Transfer slots per saved connection for location jobs (see
     /// [`TransferConfig::max_location_jobs_per_connection`]), with the limit
     /// each semaphore was made for.
-    location_slots: Arc<std::sync::Mutex<HashMap<Uuid, (u32, Arc<Semaphore>)>>>,
+    location_slots: Arc<std::sync::Mutex<LocationSlots>>,
 }
+
+/// Per-connection transfer slots: the limit each semaphore was made for,
+/// and the semaphore.
+type LocationSlots = HashMap<Uuid, (u32, Arc<Semaphore>)>;
 
 /// Move groups by id, and the group of each job.
 #[derive(Default)]
@@ -295,22 +299,26 @@ impl TransferManager {
     /// After a location job ended: finish its part of a move.
     async fn settle_move(&self, job_id: Uuid, status: TransferStatus) {
         let Some(resolver) = self.remote_resolver() else { return };
+        // A failed job with no retries left will not complete: release it
+        // like a cancelled one (the move keeps its source folders), so the
+        // group does not wait for it for the rest of the session.
+        let given_up = status == TransferStatus::Cancelled || (status == TransferStatus::Failed && !self.can_still_retry(job_id).await);
         let (source, cleanup) = {
             let mut book = self.moves.lock().await;
             let Some(gid) = book.by_job.get(&job_id).copied() else { return };
             let Some(group) = book.groups.get_mut(&gid) else { return };
             let source = match status {
                 TransferStatus::Completed => group.pending.remove(&job_id),
-                TransferStatus::Cancelled => {
+                _ if given_up => {
                     group.pending.remove(&job_id);
                     group.incomplete = true;
                     None
                 }
-                // A failed job stays pending: a retry that succeeds still
-                // completes the move.
+                // A failed job with retries left stays pending: a retry
+                // that succeeds still completes the move.
                 _ => return,
             };
-            if source.is_some() || status == TransferStatus::Cancelled {
+            if source.is_some() || given_up {
                 book.by_job.remove(&job_id);
             }
             let done = book.groups.get(&gid).map(|g| g.pending.is_empty()).unwrap_or(false);
@@ -334,6 +342,13 @@ impl TransferManager {
                 }
             }
         }
+    }
+
+    /// Whether failed job `job_id` may still be retried (see
+    /// [`Self::increment_retry`]).
+    async fn can_still_retry(&self, job_id: Uuid) -> bool {
+        let max = self.retry_policy.read().await.max_retries;
+        self.jobs.read().await.get(&job_id).is_some_and(|j| j.retry_count < max)
     }
 
     /// Attach a note to a finished job (shown with it in the queue).
@@ -1845,6 +1860,43 @@ mod tests {
         let j = mgr.get_job(job.id).await.unwrap().unwrap();
         assert!(j.error_message.unwrap_or_default().contains("upload refused"));
         assert!(down.exists(), "the source of a failed move is kept");
+    }
+
+    /// Regression: a failed job of a move stayed pending in its move group
+    /// for the rest of the session unless it was retried, so the group (and
+    /// its source-folder list) was never released. A failed job with retries
+    /// left still waits; once they are used up it is released, and the move
+    /// keeps every original.
+    #[tokio::test]
+    async fn a_move_releases_failed_jobs_once_their_retries_are_used_up() {
+        use location::tests::{MemConnector, MemResolver};
+        let id = Uuid::new_v4();
+        let failing = Arc::new(MemConnector { fail_upload: true, ..MemConnector::default() });
+        let mgr = TransferManager::new();
+        mgr.set_remote_resolver(Arc::new(MemResolver(HashMap::from([(id, failing)]))));
+        mgr.set_retry_policy(RetryPolicy { max_retries: 1, backoff_seconds: vec![1] }).await;
+        let local = tempfile::tempdir().unwrap();
+        let (a, b) = (local.path().join("a.txt"), local.path().join("b.txt"));
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let ja = mgr.enqueue_location_job(a.to_str().unwrap(), &format!("conn://{id}/a.txt"), 1).await.unwrap();
+        let jb = mgr.enqueue_location_job(b.to_str().unwrap(), &format!("conn://{id}/b.txt"), 1).await.unwrap();
+        mgr.register_move(vec![(ja.id, a.to_string_lossy().to_string()), (jb.id, b.to_string_lossy().to_string())], vec![local.path().to_string_lossy().to_string()]).await;
+
+        for j in [ja.id, jb.id] {
+            mgr.run_location_job(j).await;
+            assert_eq!(status_of(&mgr, j), Some(TransferStatus::Failed));
+        }
+        assert_eq!(mgr.moves.lock().await.by_job.len(), 2, "with retries left, both still belong to the move");
+
+        for j in [ja.id, jb.id] {
+            assert!(mgr.increment_retry(j).await.unwrap());
+            mgr.run_location_job(j).await;
+            assert_eq!(status_of(&mgr, j), Some(TransferStatus::Failed));
+        }
+        let book = mgr.moves.lock().await;
+        assert!(book.by_job.is_empty() && book.groups.is_empty(), "the move is released");
+        assert!(a.exists() && b.exists() && local.path().exists(), "every original is kept");
     }
 
     /// Without connections (no resolver yet) a location job fails with a

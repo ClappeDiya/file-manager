@@ -117,6 +117,35 @@ pub fn remote_parent(path: &str) -> String {
     }
 }
 
+/// A connector folder path in one spelling for comparisons: OneDrive's
+/// Graph prefixes (`/drive/root:`, `/drives/<id>/root:`) name the drive
+/// root, which panes opened at `/` call `/`; trailing slashes are dropped.
+/// Mirrored by `normalizeRemoteFolder` in `src/lib/location.ts`.
+pub fn normalize_remote_folder(path: &str) -> String {
+    let p = path.trim();
+    let graph_rest = |rest: &str| rest.is_empty() || rest.starts_with('/');
+    let rest = if let Some(r) = p.strip_prefix("/drive/root:").filter(|r| graph_rest(r)) {
+        r
+    } else if let Some(r) = p.strip_prefix("/drives/").and_then(|r| r.split_once('/')).and_then(|(_, r)| r.strip_prefix("root:")).filter(|r| graph_rest(r)) {
+        r
+    } else {
+        p
+    };
+    let rest = rest.trim_end_matches('/');
+    if rest.is_empty() {
+        "/".to_string()
+    } else if rest.starts_with('/') {
+        rest.to_string()
+    } else {
+        format!("/{rest}")
+    }
+}
+
+/// Whether two connector paths name the same folder.
+pub fn same_remote_folder(a: &str, b: &str) -> bool {
+    normalize_remote_folder(a) == normalize_remote_folder(b)
+}
+
 /// Signs in to saved connections for the transfer queue.
 pub trait RemoteResolver: Send + Sync {
     /// The connector serving saved connection `connection_id`, connected.
@@ -265,8 +294,8 @@ pub fn is_within(outer: &Location, inner: &Location) -> bool {
     match (outer, inner) {
         (Location::Local(o), Location::Local(i)) => std::path::Path::new(i).starts_with(o),
         (Location::Remote { path: o, .. }, Location::Remote { path: i, .. }) => {
-            let o = o.trim_end_matches('/');
-            i == o || i.starts_with(&format!("{o}/"))
+            let (o, i) = (normalize_remote_folder(o), normalize_remote_folder(i));
+            o == "/" || i == o || i.starts_with(&format!("{o}/"))
         }
         _ => false,
     }
@@ -356,9 +385,19 @@ fn rebase(path: &str, created: &HashMap<String, Location>) -> Result<Location, A
 /// Whether a remote `path` exists: its parent lists an entry with that path
 /// or (for id-path providers such as Google Drive) that name.
 pub async fn remote_exists(conn: &dyn Connector, path: &str) -> Result<bool, AppError> {
-    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
     let listing = conn.list_remote(&remote_parent(path)).await?;
-    Ok(listing.iter().any(|e| e.path == path || e.name == name))
+    Ok(listing.iter().any(|e| at_path(e, path) || e.name == last_name(path)))
+}
+
+/// The last segment of a connector path.
+fn last_name(path: &str) -> &str {
+    path.trim_end_matches('/').rsplit('/').next().unwrap_or_default()
+}
+
+/// Whether listed `entry` is at connector path `path` (OneDrive lists
+/// `/drive/root:/a` for `/a`).
+fn at_path(entry: &FileEntry, path: &str) -> bool {
+    entry.path == path || same_remote_folder(&entry.path, path)
 }
 
 /// The hidden sibling a download is written to before it is renamed into
@@ -383,8 +422,8 @@ pub async fn transfer_file_until(job_id: Uuid, source: &Location, dest: &Locatio
     match (source, dest) {
         (Location::Local(l), Location::Remote { connection_id, path }) => {
             let conn = resolver.connector(*connection_id).await?;
-            refuse_existing_remote(conn.as_ref(), path).await?;
-            write_remote(control, conn.as_ref(), path, conn.upload(l, path)).await
+            let before = refuse_existing_remote(conn.as_ref(), path).await?;
+            write_remote(control, conn.as_ref(), path, &before, conn.upload(l, path)).await
         }
         (Location::Remote { connection_id, path }, Location::Local(l)) => {
             let conn = resolver.connector(*connection_id).await?;
@@ -392,9 +431,9 @@ pub async fn transfer_file_until(job_id: Uuid, source: &Location, dest: &Locatio
         }
         (Location::Remote { connection_id: a, path: from }, Location::Remote { connection_id: b, path: to }) => {
             let (src, dst) = (resolver.connector(*a).await?, resolver.connector(*b).await?);
-            refuse_existing_remote(dst.as_ref(), to).await?;
+            let before = refuse_existing_remote(dst.as_ref(), to).await?;
             if a == b {
-                match write_remote(control, dst.as_ref(), to, src.server_copy(from, to)).await {
+                match write_remote(control, dst.as_ref(), to, &before, src.server_copy(from, to)).await {
                     Ok(Some(true)) => return Ok(Some(0)),
                     Ok(Some(false)) => {}
                     Ok(None) => return Ok(None),
@@ -406,7 +445,7 @@ pub async fn transfer_file_until(job_id: Uuid, source: &Location, dest: &Locatio
                     }
                 }
             }
-            relay(job_id, control, src.as_ref(), from, dst.as_ref(), to).await
+            relay(job_id, control, src.as_ref(), from, dst.as_ref(), to, &before).await
         }
         (Location::Local(_), Location::Local(_)) => Err(AppError::validation("Both ends are on this computer: the local queue runs this job")),
     }
@@ -423,28 +462,40 @@ async fn unless_stopped<T>(control: &JobControl, op: impl std::future::Future<Ou
 }
 
 /// Run `op`, which writes remote `path`: if it fails or is stopped, remove
-/// what it left there (the caller checked `path` was free beforehand).
-async fn write_remote<T>(control: &JobControl, conn: &dyn Connector, path: &str, op: impl std::future::Future<Output = Result<T, AppError>>) -> Result<Option<T>, AppError> {
+/// what it left there. `before` is what [`refuse_existing_remote`] saw in
+/// the folder (`path` was free then).
+async fn write_remote<T>(control: &JobControl, conn: &dyn Connector, path: &str, before: &HashSet<String>, op: impl std::future::Future<Output = Result<T, AppError>>) -> Result<Option<T>, AppError> {
     let result = unless_stopped(control, op).await;
     if !matches!(result, Ok(Some(_))) {
-        remove_partial(conn, path).await;
+        remove_partial(conn, path, before).await;
     }
     result
 }
 
-/// Best-effort removal of a file a failed or stopped write left at `path`
-/// (found by path or name: Google Drive lists it under its new id).
-async fn remove_partial(conn: &dyn Connector, path: &str) {
-    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
-    match conn.list_remote(&remote_parent(path)).await {
-        Ok(listing) => {
-            if let Some(entry) = listing.into_iter().find(|e| !e.is_dir && (e.path == path || e.name == name)) {
-                if let Err(e) = conn.remove(&entry.path, false).await {
-                    tracing::warn!("Could not remove the incomplete {path}: {e}");
-                }
+/// Best-effort removal of a file a failed or stopped write left at `path`.
+/// The file at `path` itself is removed. Where items are listed by id
+/// (Google Drive) the write's own item can only be found by name: a file of
+/// that name is removed only when it was not in the folder before the write
+/// (`before`) and it is the only one, so nothing anyone else put there is.
+async fn remove_partial(conn: &dyn Connector, path: &str, before: &HashSet<String>) {
+    let listing = match conn.list_remote(&remote_parent(path)).await {
+        Ok(listing) => listing,
+        Err(e) => return tracing::warn!("Could not check for an incomplete {path}: {e}"),
+    };
+    let files: Vec<FileEntry> = listing.into_iter().filter(|e| !e.is_dir && !before.contains(&e.path)).collect();
+    let target = match files.iter().find(|e| at_path(e, path)) {
+        Some(exact) => exact,
+        None => {
+            let named: Vec<&FileEntry> = files.iter().filter(|e| e.name == last_name(path)).collect();
+            match named[..] {
+                [only] => only,
+                [] => return,
+                _ => return tracing::warn!("Several new files are named like the incomplete {path}; none was removed"),
             }
         }
-        Err(e) => tracing::warn!("Could not check for an incomplete {path}: {e}"),
+    };
+    if let Err(e) = conn.remove(&target.path, false).await {
+        tracing::warn!("Could not remove the incomplete {path}: {e}");
     }
 }
 
@@ -462,11 +513,14 @@ async fn refuse_conversion(conn: &dyn Connector, from: &str) -> Result<(), AppEr
     }
 }
 
-async fn refuse_existing_remote(conn: &dyn Connector, path: &str) -> Result<(), AppError> {
-    if remote_exists(conn, path).await? {
+/// Refuse a write to `path` when something is there already; otherwise the
+/// paths its folder lists now (for [`remove_partial`]).
+async fn refuse_existing_remote(conn: &dyn Connector, path: &str) -> Result<HashSet<String>, AppError> {
+    let listing = conn.list_remote(&remote_parent(path)).await?;
+    if listing.iter().any(|e| at_path(e, path) || e.name == last_name(path)) {
         return Err(AppError::file_op(format!("{path} already exists; it was not overwritten."), "Rename or remove it, then retry the transfer."));
     }
-    Ok(())
+    Ok(listing.into_iter().map(|e| e.path).collect())
 }
 
 async fn download_into_place(control: &JobControl, conn: &dyn Connector, remote: &str, local: &str) -> Result<Option<u64>, AppError> {
@@ -498,7 +552,7 @@ pub fn relay_dir() -> std::path::PathBuf {
 }
 
 /// Download to a temporary file on this computer, upload it, delete it.
-async fn relay(job_id: Uuid, control: &JobControl, src: &dyn Connector, from: &str, dst: &dyn Connector, to: &str) -> Result<Option<u64>, AppError> {
+async fn relay(job_id: Uuid, control: &JobControl, src: &dyn Connector, from: &str, dst: &dyn Connector, to: &str, before: &HashSet<String>) -> Result<Option<u64>, AppError> {
     let dir = relay_dir();
     tokio::fs::create_dir_all(&dir).await.map_err(|e| AppError::file_op(format!("Cannot create a temporary folder: {e}"), "Free some disk space and retry."))?;
     let temp = dir.join(job_id.to_string()).to_string_lossy().to_string();
@@ -508,7 +562,7 @@ async fn relay(job_id: Uuid, control: &JobControl, src: &dyn Connector, from: &s
         if unless_stopped(control, src.download(from, &temp)).await?.is_none() {
             return Ok(None);
         }
-        write_remote(control, dst, to, dst.upload(&temp, to)).await
+        write_remote(control, dst, to, before, dst.upload(&temp, to)).await
     }
     .await;
     let _ = tokio::fs::remove_file(&temp).await;
@@ -568,6 +622,17 @@ pub(crate) mod tests {
         assert!(r.same_root(&Location::parse(&format!("conn://{id}/x")).unwrap()));
         assert!(!r.same_root(&Location::Local("/x".into())));
         assert_eq!((remote_parent("/a/b.txt"), remote_parent("/b.txt"), remote_parent("/a/b/")), ("/a".into(), "/".into(), "/a".into()));
+        // OneDrive's Graph prefixes name the drive root.
+        for (a, b) in [("/drive/root:", "/"), ("/drive/root:/", ""), ("/drives/LIB1/root:/Q3", "/Q3/"), ("/drive/root:/Docs", "/Docs")] {
+            assert!(same_remote_folder(a, b), "{a} = {b}");
+        }
+        for (a, b) in [("/drive/rootx:/Docs", "/Docs"), ("/drive/root:/Docs", "/"), ("/a", "/b")] {
+            assert!(!same_remote_folder(a, b), "{a} != {b}");
+        }
+        let (id, r) = (Uuid::new_v4(), |id: Uuid, p: &str| Location::Remote { connection_id: id, path: p.into() });
+        assert!(is_within(&r(id, "/drive/root:/Docs"), &r(id, "/Docs/sub")));
+        assert!(is_within(&r(id, "/"), &r(id, "/drive/root:/Docs")));
+        assert!(!is_within(&r(id, "/drive/root:/Docs"), &r(id, "/")));
         assert_eq!(local_staging_path("/d/a.txt"), "/d/.a.txt.ufop-part");
     }
 
@@ -866,6 +931,65 @@ pub(crate) mod tests {
         let err = transfer_file(Uuid::new_v4(), &r("/r/Plan"), &r("/o/Plan"), &resolver).await.unwrap_err();
         assert!(err.to_string().contains("convert"), "{err}");
         assert!(conn.file("/o/Plan").is_none());
+    }
+
+    /// A folder listing as given (paths need not end in the name, as on
+    /// Google Drive), recording what is removed.
+    struct Listed {
+        entries: Vec<(&'static str, &'static str)>,
+        removed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Connector for Listed {
+        fn connect(&self, _: &crate::core::types::ConnectionProfile) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn disconnect(&self) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn list_remote(&self, _: &str) -> Fut<'_, Vec<FileEntry>> {
+            let out = self
+                .entries
+                .iter()
+                .map(|(path, name)| FileEntry { name: name.to_string(), path: path.to_string(), is_dir: false, is_symlink: false, size: 1, modified: None, created: None, is_hidden: false, extension: None, permissions: None })
+                .collect();
+            Box::pin(async move { Ok(out) })
+        }
+        fn remove(&self, remote: &str, _: bool) -> Fut<'_, ()> {
+            self.removed.lock().unwrap().push(remote.to_string());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Regression: cleanup after a failed or stopped write removed the first
+    /// file in the folder with the written name, so on Google Drive (items
+    /// listed by id, duplicate names allowed) it could delete a file of that
+    /// name that was there before. Only the write's own file goes now.
+    #[tokio::test]
+    async fn partial_cleanup_removes_only_the_writes_own_file() {
+        let set = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<HashSet<String>>();
+        let cases: [(&[(&'static str, &'static str)], &str, HashSet<String>, &[&str]); 6] = [
+            // Path-addressed: the file at the written path.
+            (&[("/d/a.txt", "a.txt"), ("/d/b.txt", "b.txt")], "/d/a.txt", set(&["/d/b.txt"]), &["/d/a.txt"]),
+            // OneDrive lists `/d/a.txt` in Graph's form.
+            (&[("/drive/root:/d/a.txt", "a.txt")], "/d/a.txt", set(&[]), &["/drive/root:/d/a.txt"]),
+            // Drive: a same-named file that was there before is kept.
+            (&[("/f1/o1", "a.txt")], "/f1/a.txt", set(&["/f1/o1"]), &[]),
+            // Drive: the one new file of that name is the write's.
+            (&[("/f1/o1", "a.txt"), ("/f1/n1", "a.txt")], "/f1/a.txt", set(&["/f1/o1"]), &["/f1/n1"]),
+            // Drive: two new files of that name: which is ours is unknown, keep both.
+            (&[("/f1/n1", "a.txt"), ("/f1/n2", "a.txt")], "/f1/a.txt", set(&[]), &[]),
+            // Nothing of that name: nothing removed.
+            (&[("/f1/o1", "b.txt")], "/f1/a.txt", set(&[]), &[]),
+        ];
+        for (entries, path, before, want) in cases {
+            let conn = Listed { entries: entries.to_vec(), removed: Default::default() };
+            remove_partial(&conn, path, &before).await;
+            assert_eq!(*conn.removed.lock().unwrap(), want.iter().map(|p| p.to_string()).collect::<Vec<_>>(), "{path} in {entries:?}");
+        }
     }
 
     /// Regression: an upload that failed half-way left a partial file under

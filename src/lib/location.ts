@@ -63,6 +63,28 @@ export function parentLocation(p: string): string {
   return p.replace(/[\\/][^\\/]*$/, "") || "/";
 }
 
+/**
+ * A connector folder path in one spelling for comparisons: OneDrive's Graph
+ * prefixes (`/drive/root:`, `/drives/<id>/root:`) name the drive root, which
+ * a pane opened at `/` calls `/`; trailing slashes are dropped. Mirrors
+ * `normalize_remote_folder` in `transfer_engine/location.rs`.
+ */
+export function normalizeRemoteFolder(path: string): string {
+  const p = path.trim();
+  const m = /^(?:\/drive\/root:|\/drives\/[^/]+\/root:)(\/.*)?$/.exec(p);
+  const rest = (m ? (m[1] ?? "") : p).replace(/\/+$/, "");
+  if (!rest) return "/";
+  return rest.startsWith("/") ? rest : `/${rest}`;
+}
+
+/** Whether two pane paths name the same folder (remote paths compared normalised). */
+export function sameFolder(a: string, b: string): boolean {
+  const la = parseLocation(a);
+  const lb = parseLocation(b);
+  if (la.kind === "local" || lb.kind === "local") return a === b;
+  return la.connectionId === lb.connectionId && normalizeRemoteFolder(la.path) === normalizeRemoteFolder(lb.path);
+}
+
 /** Both on this computer, or both on the same connection. */
 export function sameLocationRoot(a: string, b: string): boolean {
   const la = parseLocation(a);

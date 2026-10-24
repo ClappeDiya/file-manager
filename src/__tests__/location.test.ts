@@ -7,11 +7,13 @@ import {
   locationLabel,
   locationRoot,
   locationSegments,
+  normalizeRemoteFolder,
   parentLocation,
   parseAddressInput,
   parseLocation,
   rememberRemoteNames,
   remoteLocation,
+  sameFolder,
   sameLocationRoot,
   splitAddressForCompletion,
 } from "@/lib/location";
@@ -54,6 +56,22 @@ describe("pane locations", () => {
     expect(sameLocationRoot(`conn://${ID}/a`, `conn://${ID}/b`)).toBe(true);
     expect(sameLocationRoot(`conn://${ID}/a`, `conn://${other}/a`)).toBe(false);
     expect(sameLocationRoot("/a", `conn://${ID}/a`)).toBe(false);
+  });
+
+  it("treats OneDrive's Graph root prefixes as the connection root when comparing folders", () => {
+    // Regression: `/drive/root:/a.txt` listed in a pane opened at `/` has
+    // the parent `/drive/root:`, which did not equal `/`, so cutting and
+    // pasting it into its own folder renamed it to `a (copy).txt`.
+    expect(normalizeRemoteFolder("/drive/root:")).toBe("/");
+    expect(normalizeRemoteFolder("/drive/root:/Docs/")).toBe("/Docs");
+    expect(normalizeRemoteFolder("/drives/LIB1/root:/Q3")).toBe("/Q3");
+    expect(normalizeRemoteFolder("/drive/rootx:/Docs")).toBe("/drive/rootx:/Docs");
+    expect(sameFolder(parentLocation(`conn://${ID}/drive/root:/a.txt`), `conn://${ID}/`)).toBe(true);
+    expect(sameFolder(`conn://${ID}/drives/LIB1/root:/Q3`, `conn://${ID}/Q3/`)).toBe(true);
+    expect(sameFolder(`conn://${ID}/drive/root:/Docs`, `conn://${ID}/`)).toBe(false);
+    expect(sameFolder(`conn://${ID}/`, "conn://0b5d8c3e-aaaa-4bbb-8ccc-dddddddddddd/")).toBe(false);
+    expect(sameFolder("/home", `conn://${ID}/home`)).toBe(false);
+    expect(sameFolder("/home", "/home")).toBe(true);
   });
 
   it("labels and breadcrumbs use listed names (Drive paths are ids)", () => {

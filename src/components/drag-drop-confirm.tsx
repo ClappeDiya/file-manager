@@ -67,7 +67,13 @@ export function DragDropConfirm({
         <div className="font-medium text-[color:var(--color-text)]" data-testid="drag-drop-summary">
           {request.mode === "move" ? "Move" : "Copy"} {n} item{n === 1 ? "" : "s"} to {request.destLabel}?
           {request.totalBytes > 0 && <span className="font-normal text-[color:var(--color-text-secondary)]"> ({formatBytes(request.totalBytes)})</span>}
+          {request.unmeasured && <span className="font-normal text-[color:var(--color-text-secondary)]"> (size unknown)</span>}
         </div>
+        {request.unmeasured && request.mode === "move" && (
+          <div className="mt-0.5 text-[11px] text-[color:var(--color-text-secondary)]" data-testid="drag-drop-unmeasured">
+            What the folders hold could not be counted, so the Safety Interlock checks the move again before it starts.
+          </div>
+        )}
         {risky && assessment && (
           <ul className="mt-1 list-disc pl-4 text-[11px] text-amber-700 dark:text-amber-300" data-testid="drag-drop-risk">
             <li className="list-none -ml-4 font-medium">{assessment.level === "high" ? "High risk" : "Unusual operation"}:</li>
