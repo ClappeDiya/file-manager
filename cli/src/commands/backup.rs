@@ -16,7 +16,7 @@ use ufop_core::backup::engine::Repo;
 use ufop_core::backup::restore::ConflictPolicy;
 use ufop_core::backup::versions::MetadataPatch;
 use ufop_core::backup::{
-    maintenance, run_backup, run_restore, Backend, BackupOptions, FilterAction, FilterKind, FilterRule, LocalBackend, OpContext,
+    maintenance, run_backup, run_restore, Backend, BackupOptions, LocalBackend, OpContext,
     ReadOnlyBackend, RestoreOptions, RetentionPolicy, SourceFilter,
 };
 
@@ -1417,10 +1417,6 @@ pub enum BackupCommands {
     },
 }
 
-pub fn parse_filter(spec: &str, action: FilterAction) -> FilterRule {
-    ufop_core::filter_rules::parse_cli_filter(spec, action)
-}
-
 pub fn parse_retention(keep_versions: Option<u32>, keep_days: Option<u32>, policy: Option<String>) -> RetentionPolicy {
     match (keep_versions, keep_days, policy) {
         (Some(c), _, _) => RetentionPolicy::KeepCount { count: c },
@@ -2185,6 +2181,8 @@ fn run(cmd: BackupCommands, format: &OutputFormat, dry_run: bool) -> Result<u8, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ufop_core::backup::{FilterAction, FilterKind};
+    use ufop_core::filter_rules::parse_cli_filter as parse_filter;
 
     #[test]
     fn filter_specs() {
