@@ -76,6 +76,129 @@ pub async fn enqueue_transfer(
     Ok(job)
 }
 
+/// An item a pane move renamed on the server (same connection).
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct MovedItem {
+    pub from: String,
+    pub to: String,
+}
+
+/// What `enqueue_location_transfer` started.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LocationTransferOutcome {
+    /// One queued job per file.
+    pub jobs: Vec<TransferJob>,
+    /// Moved on the server, immediately (a move within one connection).
+    pub moved: Vec<MovedItem>,
+    /// Destination folders created for the copied folders.
+    pub folders_created: usize,
+}
+
+/// Copy or move pane items into `dest_dir` when either end is a saved
+/// connection (`conn://<id>/<path>`): files become transfer-queue jobs
+/// (upload, download, server-side copy or relay), folders are created first,
+/// and a move deletes each source once its copy completed. A move within one
+/// connection is a server-side rename where the connector has one. Between
+/// two folders of this computer use `copy_files` / `move_files`.
+#[tauri::command]
+pub async fn enqueue_location_transfer(
+    items: Vec<crate::transfer_engine::location::LocationItem>,
+    dest_dir: String,
+    mode: crate::transfer_engine::location::TransferMode,
+    manager: State<'_, TransferManager>,
+    ledger: State<'_, OperationLedger>,
+) -> Result<LocationTransferOutcome, AppError> {
+    let resolver = manager.remote_resolver().ok_or_else(|| AppError::connection("Connections are not available yet.", "Try again in a moment."))?;
+    let outcome = location_transfer(&manager, resolver.as_ref(), items, &dest_dir, mode).await?;
+    record_xfer(
+        &ledger,
+        "enqueue",
+        LedgerStatus::Ok,
+        &outcome.jobs.first().map(|j| j.id.to_string()).unwrap_or_else(|| Uuid::new_v4().to_string()),
+        format!("{} {} job(s), {} moved on the server → {dest_dir}", if mode == crate::transfer_engine::location::TransferMode::Move { "move" } else { "copy" }, outcome.jobs.len(), outcome.moved.len()),
+        None,
+        Some(dest_dir.clone()),
+        Some(outcome.jobs.iter().map(|j| j.total_bytes).sum()),
+    )
+    .await;
+    Ok(outcome)
+}
+
+pub(crate) async fn location_transfer(
+    manager: &TransferManager,
+    resolver: &dyn crate::transfer_engine::location::RemoteResolver,
+    items: Vec<crate::transfer_engine::location::LocationItem>,
+    dest_dir: &str,
+    mode: crate::transfer_engine::location::TransferMode,
+) -> Result<LocationTransferOutcome, AppError> {
+    use crate::transfer_engine::location::{self as loc, Location, TransferMode};
+    let dest = Location::parse(dest_dir)?;
+    let mut sources = Vec::with_capacity(items.len());
+    for item in &items {
+        sources.push(Location::parse(&item.path)?);
+    }
+    if !dest.is_remote() && sources.iter().all(|s| !s.is_remote()) {
+        return Err(AppError::validation("Both ends are on this computer: use the regular copy or move."));
+    }
+    if let Location::Local(d) = &dest {
+        for item in &items {
+            super::policy_commands::enforce_path(&std::path::Path::new(d).join(&item.name))?;
+        }
+    }
+
+    // A move inside one connection: rename on the server where possible.
+    let mut moved = Vec::new();
+    let mut rest = Vec::new();
+    for (item, source) in items.into_iter().zip(sources) {
+        let (Location::Remote { connection_id, path: from }, Location::Remote { path: dest_path, .. }) = (&source, &dest) else {
+            rest.push(item);
+            continue;
+        };
+        if mode != TransferMode::Move || !source.same_root(&dest) {
+            rest.push(item);
+            continue;
+        }
+        if loc::remote_parent(from).trim_end_matches('/') == dest_path.trim_end_matches('/') {
+            continue; // already there
+        }
+        let conn = resolver.connector(*connection_id).await?;
+        let taken: std::collections::HashSet<String> = conn.list_remote(dest_path).await?.into_iter().map(|e| e.name).collect();
+        let name = if taken.contains(&item.name) { super::file_ops_commands::next_copy_name(&item.name, |n| taken.contains(n))? } else { item.name.clone() };
+        let to = loc::join_remote(dest_path, &name);
+        match conn.rename_entry(from, &to).await {
+            Ok(()) => moved.push(MovedItem { from: item.path.clone(), to: Location::Remote { connection_id: *connection_id, path: to }.to_location_string() }),
+            // No server-side move here: copy, then delete.
+            Err(e) => {
+                tracing::info!("Server-side move of {from} unavailable ({e}); copying instead");
+                rest.push(item);
+            }
+        }
+    }
+
+    let plan = loc::plan_transfer(&rest, &dest, resolver).await?;
+    for dir in &plan.dirs {
+        loc::make_dir(&Location::parse(dir)?, resolver).await?;
+    }
+    let mut jobs = Vec::with_capacity(plan.files.len());
+    for f in &plan.files {
+        jobs.push(manager.enqueue_location_job(&f.source, &f.dest, f.size).await?);
+    }
+    if mode == TransferMode::Move {
+        if jobs.is_empty() {
+            for dir in &plan.source_dirs {
+                let _ = loc::remove_empty_dir(&Location::parse(dir)?, resolver).await;
+            }
+        } else {
+            let pairs = jobs.iter().zip(&plan.files).map(|(j, f)| (j.id, f.source.clone())).collect();
+            manager.register_move(pairs, plan.source_dirs.clone()).await;
+        }
+    }
+    for job in &jobs {
+        manager.spawn_runner(job.id).await;
+    }
+    Ok(LocationTransferOutcome { jobs, moved, folders_created: plan.dirs.len() })
+}
+
 /// Pause a transfer job.
 #[tauri::command]
 pub async fn pause_transfer(
@@ -630,4 +753,71 @@ fn parse_uuid(s: &str) -> Result<Uuid, AppError> {
         message: format!("Invalid transfer ID: {s}"),
         advice: "Provide a valid UUID.".to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transfer_engine::location::tests::{MemConnector, MemResolver};
+    use crate::transfer_engine::location::{LocationItem, TransferMode};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn item(path: String, name: &str, is_dir: bool, size: u64) -> LocationItem {
+        LocationItem { path, name: name.into(), is_dir, size, extension: None }
+    }
+
+    async fn settle(mgr: &TransferManager, jobs: &[TransferJob]) {
+        for _ in 0..500 {
+            let all = mgr.list_jobs().await.unwrap();
+            if jobs.iter().all(|j| all.iter().any(|a| a.id == j.id && matches!(a.status, TransferStatus::Completed | TransferStatus::Failed))) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("jobs did not settle");
+    }
+
+    #[tokio::test]
+    async fn pane_transfers_between_this_computer_and_connections() {
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector::with(&[("/inbox/r.txt", "remote"), ("/dst/up", "taken")], &["/inbox", "/dst"]));
+        let resolver = Arc::new(MemResolver(HashMap::from([(id, conn.clone())])));
+        let mgr = TransferManager::new();
+        mgr.set_remote_resolver(resolver.clone());
+        let local = tempfile::tempdir().unwrap();
+        let folder = local.path().join("up");
+        std::fs::create_dir_all(folder.join("inner")).unwrap();
+        std::fs::write(folder.join("inner/f.txt"), "f").unwrap();
+
+        // Copy a local folder up: folders first (keep-both name), one job per file.
+        let out = location_transfer(&mgr, resolver.as_ref(), vec![item(folder.to_string_lossy().into(), "up", true, 0)], &format!("conn://{id}/dst"), TransferMode::Copy).await.unwrap();
+        assert_eq!(out.folders_created, 2);
+        assert_eq!(out.jobs.len(), 1);
+        settle(&mgr, &out.jobs).await;
+        assert_eq!(conn.file("/dst/up (copy)/inner/f.txt").as_deref(), Some("f"));
+        assert!(folder.join("inner/f.txt").exists(), "a copy keeps the source");
+
+        // Move a remote file down: downloaded, then the remote original deleted.
+        let out = location_transfer(&mgr, resolver.as_ref(), vec![item(format!("conn://{id}/inbox/r.txt"), "r.txt", false, 6)], local.path().to_str().unwrap(), TransferMode::Move).await.unwrap();
+        settle(&mgr, &out.jobs).await;
+        for _ in 0..200 {
+            if conn.file("/inbox/r.txt").is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(std::fs::read_to_string(local.path().join("r.txt")).unwrap(), "remote");
+        assert!(conn.file("/inbox/r.txt").is_none());
+
+        // A move inside one connection is a server-side rename, no job.
+        let out = location_transfer(&mgr, resolver.as_ref(), vec![item(format!("conn://{id}/dst/up"), "up", false, 5)], &format!("conn://{id}/inbox"), TransferMode::Move).await.unwrap();
+        assert!(out.jobs.is_empty());
+        assert_eq!(out.moved, vec![MovedItem { from: format!("conn://{id}/dst/up"), to: format!("conn://{id}/inbox/up") }]);
+        assert_eq!(conn.file("/inbox/up").as_deref(), Some("taken"));
+
+        // Two folders of this computer: not this command's job.
+        let err = location_transfer(&mgr, resolver.as_ref(), vec![item(folder.to_string_lossy().into(), "up", true, 0)], local.path().to_str().unwrap(), TransferMode::Copy).await.unwrap_err();
+        assert!(err.to_string().contains("Both ends"));
+    }
 }

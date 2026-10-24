@@ -132,6 +132,16 @@ impl AzureFilesConnector {
 }
 
 impl Connector for AzureFilesConnector {
+    fn rename_entry(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { let ((share, a), (share2, b)) = (az::split_root(&from), az::split_root(&to));
+            if share.is_empty() || a.is_empty() || share != share2 || b.is_empty() {
+                return Err(AppError::validation("Rename within one share: /share/path"));
+            }
+            self.rename(&share, &a, &b).await })
+    }
+
+
     fn connect(&self, profile: &ConnectionProfile) -> Fut<'_, ()> {
         self.connect_with_secret(profile, None)
     }

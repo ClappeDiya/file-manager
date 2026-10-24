@@ -426,6 +426,132 @@ pub async fn connector_folder_size_cancel(job_id: String) -> Result<bool, AppErr
     })
 }
 
+/// Rename or move `from_path` to `to_path` within one connection, on the
+/// server (panes: rename, and moves inside one connection).
+#[tauri::command]
+pub async fn connector_rename(
+    protocol: String,
+    from_path: String,
+    to_path: String,
+    connection_id: Option<String>,
+    registry: State<'_, ConnectorRegistry>,
+    manager: State<'_, ConnectionManager>,
+) -> Result<(), AppError> {
+    if from_path.trim_end_matches('/') == to_path.trim_end_matches('/') {
+        return Ok(());
+    }
+    let connector = user_instance(&registry, &manager, &protocol, connection_id.as_deref()).await?;
+    connector.rename_entry(&from_path, &to_path).await
+}
+
+/// The entry at `path` (from its folder's listing); `None` when there is
+/// none. Panes use it to validate typed addresses.
+#[tauri::command]
+pub async fn connector_stat(
+    protocol: String,
+    path: String,
+    connection_id: Option<String>,
+    registry: State<'_, ConnectorRegistry>,
+    manager: State<'_, ConnectionManager>,
+) -> Result<Option<FileEntry>, AppError> {
+    let connector = user_instance(&registry, &manager, &protocol, connection_id.as_deref()).await?;
+    stat_entry(connector.as_ref(), &path).await
+}
+
+pub(crate) async fn stat_entry(connector: &dyn Connector, path: &str) -> Result<Option<FileEntry>, AppError> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        // The root always exists once connected.
+        return Ok(Some(FileEntry { name: "/".into(), path: "/".into(), is_dir: true, is_symlink: false, size: 0, modified: None, created: None, is_hidden: false, extension: None, permissions: None }));
+    }
+    let name = trimmed.rsplit('/').next().unwrap_or_default();
+    let listing = connector.list_remote(&crate::transfer_engine::location::remote_parent(trimmed)).await?;
+    // Same path, else same name: listings may spell paths their own way
+    // (OneDrive `/drive/root:/Docs` for a typed `/Docs`).
+    let by_path = listing.iter().position(|e| e.path.trim_end_matches('/') == trimmed);
+    let at = by_path.or_else(|| listing.iter().position(|e| e.name == name));
+    Ok(at.map(|i| listing[i].clone()))
+}
+
+/// Largest remote file `connector_fetch_preview` downloads.
+pub const PREVIEW_MAX_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Download a remote file into the preview cache (a temporary folder) so
+/// the local previewers and the default app can open it; returns the local
+/// copy's path. `size` is the listed size: larger than `max_bytes`
+/// (default [`PREVIEW_MAX_BYTES`]) is refused before anything downloads.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn connector_fetch_preview(
+    protocol: String,
+    remote_path: String,
+    name: String,
+    size: Option<u64>,
+    max_bytes: Option<u64>,
+    connection_id: Option<String>,
+    registry: State<'_, ConnectorRegistry>,
+    manager: State<'_, ConnectionManager>,
+) -> Result<String, AppError> {
+    let limit = max_bytes.unwrap_or(PREVIEW_MAX_BYTES).min(PREVIEW_MAX_BYTES);
+    if size.unwrap_or(0) > limit {
+        return Err(AppError::validation(format!("{name} is too large to open from the connection ({} MB at most)", limit / (1024 * 1024))));
+    }
+    let connector = user_instance(&registry, &manager, &protocol, connection_id.as_deref()).await?;
+    fetch_preview(connector.as_ref(), &remote_path, &name, connection_id.as_deref().unwrap_or(&protocol)).await
+}
+
+/// The preview-cache file for `remote_path` of `scope` (a connection id):
+/// one folder per remote path, so two files with one name never collide.
+pub(crate) fn preview_cache_path(scope: &str, remote_path: &str, name: &str) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (scope, remote_path).hash(&mut h);
+    let safe: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '\0') { '_' } else { c }).collect();
+    std::env::temp_dir().join("ufop-remote-preview").join(format!("{:016x}", h.finish())).join(if safe.is_empty() { "file".into() } else { safe })
+}
+
+pub(crate) async fn fetch_preview(connector: &dyn Connector, remote_path: &str, name: &str, scope: &str) -> Result<String, AppError> {
+    let local = preview_cache_path(scope, remote_path, name);
+    if let Some(dir) = local.parent() {
+        tokio::fs::create_dir_all(dir).await.map_err(|e| AppError::file_op(format!("Cannot create the preview folder: {e}"), "Free some disk space and retry."))?;
+    }
+    let local_str = local.to_string_lossy().to_string();
+    let staging = crate::transfer_engine::location::local_staging_path(&local_str);
+    if let Err(e) = connector.download(remote_path, &staging).await {
+        let _ = tokio::fs::remove_file(&staging).await;
+        return Err(e);
+    }
+    tokio::fs::rename(&staging, &local).await.map_err(|e| AppError::file_op(format!("Cannot place the preview copy: {e}"), "Retry."))?;
+    Ok(local_str)
+}
+
+/// Signs the transfer queue in to saved connections: the protocol comes from
+/// the saved profile, the instance from [`user_instance`] (the user queued
+/// the transfer).
+pub struct PaneResolver {
+    registry: ConnectorRegistry,
+    connections: ConnectionManager,
+}
+
+impl PaneResolver {
+    pub fn new(registry: ConnectorRegistry, connections: ConnectionManager) -> Self {
+        Self { registry, connections }
+    }
+}
+
+impl crate::transfer_engine::location::RemoteResolver for PaneResolver {
+    fn connector(&self, connection_id: uuid::Uuid) -> crate::core::traits::BoxFuture<'_, Result<std::sync::Arc<dyn Connector>, AppError>> {
+        Box::pin(async move {
+            let profile = self
+                .connections
+                .get_connection(connection_id)
+                .await?
+                .ok_or_else(|| AppError::not_found(format!("Saved connection {connection_id} not found")))?;
+            user_instance(&self.registry, &self.connections, profile.protocol.as_str(), Some(&connection_id.to_string())).await
+        })
+    }
+}
+
 /// rclone remotes from the user's rclone config (`rclone listremotes`).
 #[tauri::command]
 pub async fn rclone_list_remotes() -> Result<Vec<crate::connectors::rclone::RcloneRemote>, AppError> {
@@ -463,5 +589,28 @@ mod tests {
         let (adhoc, none) = resolve_connect(&mgr, req(), None).await.unwrap();
         assert_eq!((adhoc.protocol, adhoc.extras.webdav), (ConnectionProtocol::WebDav, None));
         assert_eq!(none, crate::connectors::ConnectionSecrets::default());
+    }
+
+    /// `connector_stat` and `connector_fetch_preview` against an in-memory
+    /// connection: entries by path (or by name), the root, missing paths;
+    /// previews land under the final name only when complete.
+    #[tokio::test]
+    async fn stat_and_fetch_preview() {
+        use crate::transfer_engine::location::tests::MemConnector;
+        let c = MemConnector::with(&[("/docs/a.txt", "hello")], &["/docs"]);
+        assert!(stat_entry(&c, "/").await.unwrap().unwrap().is_dir);
+        assert_eq!(stat_entry(&c, "/docs/a.txt").await.unwrap().unwrap().size, 5);
+        assert!(stat_entry(&c, "/docs").await.unwrap().unwrap().is_dir);
+        assert!(stat_entry(&c, "/docs/").await.unwrap().is_some(), "a trailing slash is the same folder");
+        assert!(stat_entry(&c, "/docs/b.txt").await.unwrap().is_none());
+
+        let scope = uuid::Uuid::new_v4().to_string();
+        let local = fetch_preview(&c, "/docs/a.txt", "a.txt", &scope).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), "hello");
+        assert!(local.ends_with("a.txt"));
+        assert_ne!(preview_cache_path(&scope, "/docs/a.txt", "a.txt"), preview_cache_path(&scope, "/other/a.txt", "a.txt"));
+        assert!(preview_cache_path(&scope, "/x", "../../etc").file_name().unwrap() == ".._.._etc", "names cannot leave the cache folder");
+        assert!(fetch_preview(&c, "/docs/missing.txt", "m.txt", &scope).await.is_err());
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&local).parent().unwrap());
     }
 }

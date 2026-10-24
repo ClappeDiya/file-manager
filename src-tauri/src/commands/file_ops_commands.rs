@@ -353,15 +353,17 @@ pub async fn count_affected_files(paths: Vec<String>) -> Result<AffectedFiles, A
 /// Shared by copy (which only needs it on a name collision) and duplicate
 /// (which always renames, since it writes beside the original).
 fn next_available_copy_name(dir: &Path, src: &Path) -> Result<PathBuf, AppError> {
-    let stem = src
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let ext = src
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
+    let name = src.file_name().unwrap_or_default().to_string_lossy().to_string();
+    next_copy_name(&name, |candidate| dir.join(candidate).exists()).map(|n| dir.join(n))
+}
+
+/// First `"<stem> (copy)"` / `"<stem> (copy N)"` variant of `name` that
+/// `taken` does not claim. The naming of every keep-both copy (local copy,
+/// duplicate, and pane transfers to and from connections).
+pub(crate) fn next_copy_name(name: &str, taken: impl Fn(&str) -> bool) -> Result<String, AppError> {
+    let p = Path::new(name);
+    let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
 
     for counter in 1..=1000 {
         let new_name = if counter == 1 {
@@ -369,9 +371,8 @@ fn next_available_copy_name(dir: &Path, src: &Path) -> Result<PathBuf, AppError>
         } else {
             format!("{stem} (copy {counter}){ext}")
         };
-        let candidate = dir.join(&new_name);
-        if !candidate.exists() {
-            return Ok(candidate);
+        if !taken(&new_name) {
+            return Ok(new_name);
         }
     }
 

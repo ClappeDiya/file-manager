@@ -506,6 +506,14 @@ pub fn run() {
         }
     };
 
+    // Pane transfers to and from saved connections run in the transfer queue;
+    // it signs in through the registry and the saved connections (set here so
+    // both init paths above get it).
+    app_state.transfer_mgr.set_remote_resolver(std::sync::Arc::new(commands::connector_commands::PaneResolver::new(
+        app_state.connector_registry.clone(),
+        app_state.connection_mgr.clone(),
+    )));
+
     // Clone for shutdown hook
     let shutdown_repo = app_state.repo.clone();
     let setup_backup_mgr = app_state.backup_mgr.clone();
@@ -666,6 +674,7 @@ pub fn run() {
             confirmation_commands::request_destructive_confirmation,
             // Transfer management (T-015)
             transfer_commands::enqueue_transfer,
+            transfer_commands::enqueue_location_transfer,
             transfer_commands::pause_transfer,
             transfer_commands::resume_transfer,
             transfer_commands::cancel_transfer,
@@ -752,6 +761,9 @@ pub fn run() {
             connector_commands::connector_quota,
             connector_commands::connector_folder_size,
             connector_commands::connector_folder_size_cancel,
+            connector_commands::connector_rename,
+            connector_commands::connector_stat,
+            connector_commands::connector_fetch_preview,
             // SMB/CIFS (T-023)
             drive_commands::smb_discover_shares,
             drive_commands::smb_list_shares,

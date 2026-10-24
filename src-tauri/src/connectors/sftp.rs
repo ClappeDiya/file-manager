@@ -1038,6 +1038,12 @@ impl Default for SftpConnector {
 // ── Connector trait implementation ──
 
 impl super::Connector for SftpConnector {
+    fn rename_entry(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { self.rename(&from, &to).await })
+    }
+
+
     fn connect(
         &self,
         profile: &ConnectionProfile,

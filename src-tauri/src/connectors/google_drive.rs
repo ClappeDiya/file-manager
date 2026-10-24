@@ -1188,6 +1188,39 @@ impl Default for GoogleDriveConnector {
 }
 
 impl Connector for GoogleDriveConnector {
+    /// Paths are folder-id chains ending in the item's id; the last segment
+    /// of `to` is the new name. A different parent folder moves it first.
+    fn rename_entry(&self, from: &str, to: &str) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move {
+            let id = last_segment(&from)?;
+            let (from_dir, _) = split_parent(&from)?;
+            let (to_dir, name) = split_parent(&to)?;
+            if from_dir != to_dir {
+                let parent = self.folder_for(&to_dir)?;
+                let old = self.folder_for(&from_dir).ok();
+                self.move_file(&id, &parent, old.as_deref()).await?;
+            }
+            self.rename_file(&id, &name).await
+        })
+    }
+
+    /// A native Google document downloads as an export: the connection's
+    /// format's extension is added to its name.
+    fn download_name(&self, entry: &FileEntry) -> String {
+        let mime = match entry.extension.as_deref() {
+            Some("gdoc") => "application/vnd.google-apps.document",
+            Some("gsheet") => "application/vnd.google-apps.spreadsheet",
+            Some("gslides") => "application/vnd.google-apps.presentation",
+            Some("gdraw") => "application/vnd.google-apps.drawing",
+            _ => return entry.name.clone(),
+        };
+        match self.export_format_for(mime) {
+            Some(f) if !entry.name.to_ascii_lowercase().ends_with(&format!(".{}", f.extension())) => format!("{}.{}", entry.name, f.extension()),
+            _ => entry.name.clone(),
+        }
+    }
+
     fn connect(
         &self,
         profile: &ConnectionProfile,

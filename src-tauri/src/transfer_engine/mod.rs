@@ -15,6 +15,7 @@ pub mod chunk;
 pub mod conflict;
 pub mod history;
 pub mod journal;
+pub mod location;
 pub mod pipeline;
 pub mod resume;
 pub mod throttle;
@@ -176,6 +177,21 @@ pub struct TransferManager {
     /// Called for every job that completes or fails (desktop notifications);
     /// added at start-up.
     terminal_hooks: Arc<std::sync::RwLock<Vec<TerminalHook>>>,
+
+    /// Signs in to saved connections for jobs to or from `conn://` pane
+    /// locations; set once at start-up (both init paths).
+    resolver: Arc<std::sync::RwLock<Option<Arc<dyn location::RemoteResolver>>>>,
+
+    /// Pane moves in flight (in memory: after a restart the restored jobs
+    /// are plain copies and the originals are kept).
+    moves: Arc<Mutex<MoveBook>>,
+}
+
+/// Move groups by id, and the group of each job.
+#[derive(Default)]
+struct MoveBook {
+    groups: HashMap<Uuid, location::MoveGroup>,
+    by_job: HashMap<Uuid, Uuid>,
 }
 
 /// Listener for jobs reaching a final Completed or Failed status.
@@ -203,7 +219,100 @@ impl TransferManager {
             executors: Arc::new(Mutex::new(HashSet::new())),
             history: Arc::new(RwLock::new(None)),
             terminal_hooks: Arc::new(std::sync::RwLock::new(Vec::new())),
+            resolver: Arc::new(std::sync::RwLock::new(None)),
+            moves: Arc::new(Mutex::new(MoveBook::default())),
         }
+    }
+
+    /// Let jobs reach saved connections (`conn://` locations).
+    pub fn set_remote_resolver(&self, resolver: Arc<dyn location::RemoteResolver>) {
+        *self.resolver.write().unwrap_or_else(|e| e.into_inner()) = Some(resolver);
+    }
+
+    pub fn remote_resolver(&self) -> Option<Arc<dyn location::RemoteResolver>> {
+        self.resolver.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Queue a job between two pane locations (local path or `conn://`),
+    /// tagged with the connection it uses, and start it.
+    pub async fn enqueue_location_job(&self, source: &str, dest: &str, total_bytes: u64) -> Result<TransferJob, AppError> {
+        let connection_id = location::Location::parse(dest)?.connection_id().or(location::Location::parse(source)?.connection_id());
+        let job = self.enqueue(source, dest, total_bytes).await?;
+        let job = {
+            let mut map = self.jobs.write().await;
+            match map.get_mut(&job.id) {
+                Some(j) => {
+                    j.connection_id = connection_id;
+                    j.clone()
+                }
+                None => job,
+            }
+        };
+        Ok(job)
+    }
+
+    /// Make `jobs` (job id, source it copies) one move: each source is
+    /// deleted when its job completes, then `source_dirs` (deepest first)
+    /// once all did.
+    pub async fn register_move(&self, jobs: Vec<(Uuid, String)>, source_dirs: Vec<String>) {
+        let group = Uuid::new_v4();
+        let mut book = self.moves.lock().await;
+        for (job, _) in &jobs {
+            book.by_job.insert(*job, group);
+        }
+        book.groups.insert(group, location::MoveGroup { pending: jobs.into_iter().collect(), source_dirs, incomplete: false });
+    }
+
+    /// After a location job ended: finish its part of a move.
+    async fn settle_move(&self, job_id: Uuid, status: TransferStatus) {
+        let Some(resolver) = self.remote_resolver() else { return };
+        let (source, cleanup) = {
+            let mut book = self.moves.lock().await;
+            let Some(gid) = book.by_job.get(&job_id).copied() else { return };
+            let Some(group) = book.groups.get_mut(&gid) else { return };
+            let source = match status {
+                TransferStatus::Completed => group.pending.remove(&job_id),
+                TransferStatus::Cancelled => {
+                    group.pending.remove(&job_id);
+                    group.incomplete = true;
+                    None
+                }
+                // A failed job stays pending: a retry that succeeds still
+                // completes the move.
+                _ => return,
+            };
+            if source.is_some() || status == TransferStatus::Cancelled {
+                book.by_job.remove(&job_id);
+            }
+            let done = book.groups.get(&gid).map(|g| g.pending.is_empty()).unwrap_or(false);
+            let cleanup = if done { book.groups.remove(&gid).filter(|g| !g.incomplete).map(|g| g.source_dirs) } else { None };
+            (source, cleanup)
+        };
+        if let Some(src) = source {
+            match location::Location::parse(&src) {
+                Ok(loc) => {
+                    if let Err(e) = location::remove_source(&loc, resolver.as_ref()).await {
+                        let _ = self.note_job(job_id, &format!("Copied; the original was kept: {e}")).await;
+                    }
+                }
+                Err(e) => tracing::warn!("Move source {src}: {e}"),
+            }
+        }
+        for dir in cleanup.unwrap_or_default() {
+            if let Ok(loc) = location::Location::parse(&dir) {
+                if let Err(e) = location::remove_empty_dir(&loc, resolver.as_ref()).await {
+                    tracing::info!("Moved folder kept: {e}");
+                }
+            }
+        }
+    }
+
+    /// Attach a note to a finished job (shown with it in the queue).
+    async fn note_job(&self, job_id: Uuid, note: &str) -> Result<(), AppError> {
+        if let Some(j) = self.jobs.write().await.get_mut(&job_id) {
+            j.error_message = Some(note.to_string());
+        }
+        Ok(())
     }
 
     /// Listen for jobs that complete or fail.
@@ -238,10 +347,76 @@ impl TransferManager {
             }
         }
         let runner = self.clone();
+        let remote = self
+            .jobs
+            .read()
+            .await
+            .get(&job_id)
+            .map(|j| j.source_path.starts_with(location::CONN_SCHEME) || j.dest_path.starts_with(location::CONN_SCHEME))
+            .unwrap_or(false);
         tokio::spawn(async move {
-            runner.run_local_job(job_id).await;
+            if remote {
+                runner.run_location_job(job_id).await;
+            } else {
+                runner.run_local_job(job_id).await;
+            }
             runner.executors.lock().await.remove(&job_id);
         });
+    }
+
+    /// Execute a queued job to or from a saved connection (see
+    /// [`location`]), record the outcome, and finish its part of a move.
+    pub async fn run_location_job(&self, job_id: Uuid) {
+        let started_at = Utc::now();
+        let started = std::time::Instant::now();
+        if let Err(message) = self.run_location_job_inner(job_id).await {
+            if !self.control(job_id).await.is_cancelled() {
+                let _ = self.fail_job(job_id, &message).await;
+            }
+        }
+        self.record_history(job_id, started_at, started.elapsed()).await;
+        let status = self.jobs.read().await.get(&job_id).map(|j| j.status);
+        if let Some(status) = status {
+            self.settle_move(job_id, status).await;
+        }
+    }
+
+    async fn run_location_job_inner(&self, job_id: Uuid) -> Result<(), String> {
+        let control = self.control(job_id).await;
+        control.wait_if_paused().await;
+        let (source, dest, total) = {
+            let mut map = self.jobs.write().await;
+            let job = map.get_mut(&job_id).ok_or_else(|| "Transfer job not found".to_string())?;
+            if job.status != TransferStatus::Queued {
+                return Ok(());
+            }
+            job.status = TransferStatus::Active;
+            job.updated_at = Utc::now();
+            (job.source_path.clone(), job.dest_path.clone(), job.total_bytes)
+        };
+        if control.is_cancelled() {
+            return Ok(());
+        }
+        let resolver = self.remote_resolver().ok_or_else(|| "Connections are not available yet; try again in a moment.".to_string())?;
+        let src = location::Location::parse(&source).map_err(|e| e.to_string())?;
+        let dst = location::Location::parse(&dest).map_err(|e| e.to_string())?;
+        let started = std::time::Instant::now();
+        let bytes = location::transfer_file(job_id, &src, &dst, resolver.as_ref()).await.map_err(|e| e.to_string())?;
+        if control.is_cancelled() {
+            return Ok(());
+        }
+        // A server-side copy reports no byte count: the listed size moved.
+        let bytes = if bytes == 0 { total } else { bytes };
+        {
+            let mut map = self.jobs.write().await;
+            if let Some(job) = map.get_mut(&job_id) {
+                job.total_bytes = bytes;
+            }
+        }
+        let secs = started.elapsed().as_secs_f64();
+        let speed = if secs > 0.0 { (bytes as f64 / secs) as u64 } else { 0 };
+        let _ = self.update_progress(job_id, bytes, speed).await;
+        self.complete_job(job_id).await.map_err(|e| e.to_string())
     }
 
     /// Execute a queued local-file job through the three-layer pipeline
@@ -1553,5 +1728,58 @@ mod tests {
         let j = mgr.get_job(job.id).await.unwrap().unwrap();
         assert_eq!(j.status, TransferStatus::Cancelled);
         assert!(!dst.exists());
+    }
+
+    /// Pane transfers to and from connections run through the queue: a move
+    /// deletes each source once its copy completed, then the emptied folder.
+    #[tokio::test]
+    async fn location_jobs_copy_and_move_through_the_queue() {
+        use location::tests::{MemConnector, MemResolver};
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector::with(&[("/src/a.txt", "aaa")], &["/src", "/dst"]));
+        let mgr = TransferManager::new();
+        mgr.set_remote_resolver(Arc::new(MemResolver(HashMap::from([(id, conn.clone())]))));
+        let local = tempfile::tempdir().unwrap();
+        let up = local.path().join("up.txt");
+        std::fs::write(&up, "local").unwrap();
+
+        // Copy up: completed, connection recorded, the local file stays.
+        let job = mgr.enqueue_location_job(up.to_str().unwrap(), &format!("conn://{id}/dst/up.txt"), 5).await.unwrap();
+        assert_eq!(job.connection_id, Some(id));
+        mgr.spawn_runner(job.id).await;
+        wait_until(|| mgr.jobs.try_read().map(|m| m[&job.id].status == TransferStatus::Completed).unwrap_or(false), "upload").await;
+        assert_eq!(conn.file("/dst/up.txt").as_deref(), Some("local"));
+        assert!(up.exists());
+
+        // Move down: the remote source and its emptied folder are removed.
+        let down = local.path().join("a.txt");
+        let job = mgr.enqueue_location_job(&format!("conn://{id}/src/a.txt"), down.to_str().unwrap(), 3).await.unwrap();
+        mgr.register_move(vec![(job.id, format!("conn://{id}/src/a.txt"))], vec![format!("conn://{id}/src")]).await;
+        mgr.spawn_runner(job.id).await;
+        wait_until(|| conn.file("/src/a.txt").is_none() && !conn.dirs.lock().unwrap().contains("/src"), "move cleanup").await;
+        assert_eq!(std::fs::read_to_string(&down).unwrap(), "aaa");
+
+        // A failed job keeps the move's source (and reports why).
+        let failing = Arc::new(MemConnector { fail_upload: true, ..MemConnector::default() });
+        let id2 = Uuid::new_v4();
+        mgr.set_remote_resolver(Arc::new(MemResolver(HashMap::from([(id2, failing)]))));
+        let job = mgr.enqueue_location_job(down.to_str().unwrap(), &format!("conn://{id2}/x.txt"), 3).await.unwrap();
+        mgr.register_move(vec![(job.id, down.to_string_lossy().to_string())], vec![]).await;
+        mgr.spawn_runner(job.id).await;
+        wait_until(|| mgr.jobs.try_read().map(|m| m[&job.id].status == TransferStatus::Failed).unwrap_or(false), "failure").await;
+        let j = mgr.get_job(job.id).await.unwrap().unwrap();
+        assert!(j.error_message.unwrap_or_default().contains("upload refused"));
+        assert!(down.exists(), "the source of a failed move is kept");
+    }
+
+    /// Without connections (no resolver yet) a location job fails with a
+    /// reason instead of hanging or copying anything.
+    #[tokio::test]
+    async fn location_job_without_connections_fails() {
+        let mgr = TransferManager::new();
+        let job = mgr.enqueue("/no/such/file", "/tmp/x", 1).await.unwrap();
+        mgr.run_location_job(job.id).await;
+        let j = mgr.get_job(job.id).await.unwrap().unwrap();
+        assert_eq!(j.status, TransferStatus::Failed);
     }
 }

@@ -269,6 +269,34 @@ pub trait Connector: Send + Sync {
         Box::pin(async { Err(unsupported_op("delete")) })
     }
 
+    /// Rename or move `from` to `to` on the server (both remote paths of
+    /// this connection). Connectors without a server-side rename keep the
+    /// default, which refuses; callers then copy and delete instead.
+    fn rename_entry(
+        &self,
+        _from: &str,
+        _to: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        Box::pin(async { Err(unsupported_op("rename")) })
+    }
+
+    /// Copy the file `from` to `to` on the server without the bytes passing
+    /// through this machine. `Ok(false)` (the default): not supported here,
+    /// relay it (download + upload) instead.
+    fn server_copy(
+        &self,
+        _from: &str,
+        _to: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, AppError>> + Send + '_>> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// The local file name `entry` is saved as when downloaded (Google Drive
+    /// exports native documents and adds the format's extension).
+    fn download_name(&self, entry: &FileEntry) -> String {
+        entry.name.clone()
+    }
+
     /// Storage quota of the connected account; `None` when the protocol
     /// has no notion of it (the default).
     fn quota(&self) -> Pin<Box<dyn Future<Output = Result<Option<RemoteQuota>, AppError>> + Send + '_>> {
@@ -377,7 +405,9 @@ pub(crate) fn split_bucket_key(path: &str) -> Result<(String, String), AppError>
     }
 }
 
-/// Registry that maps protocols to connector implementations.
+/// Registry that maps protocols to connector implementations. Clones share
+/// the same connector instances.
+#[derive(Clone)]
 pub struct ConnectorRegistry {
     connectors: HashMap<String, Arc<dyn Connector>>,
 }

@@ -925,6 +925,17 @@ pub struct DropboxFileMetadata {
 }
 
 impl Connector for DropboxConnector {
+    fn rename_entry(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { self.move_entry(&from, &to).await })
+    }
+
+    fn server_copy(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { self.copy_entry(&from, &to).await.map(|()| true) })
+    }
+
+
     fn connect(
         &self,
         profile: &ConnectionProfile,
