@@ -84,9 +84,11 @@ mod tests {
         FileEntry { is_dir: true, ..f(path, 0) }
     }
 
+    type Listing = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<FileEntry>, AppError>> + Send>>;
+
     /// A tree: /a (2 files), /a/b (1 file), /c (empty), plus 1 file at the
     /// root; each listing takes `delay_ms` and in-flight listings are counted.
-    fn tree(delay_ms: u64) -> (impl Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<FileEntry>, AppError>> + Send>>, Arc<AtomicUsize>) {
+    fn tree(delay_ms: u64) -> (impl Fn(String) -> Listing, Arc<AtomicUsize>) {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max = Arc::new(AtomicUsize::new(0));
         let m2 = max.clone();
@@ -103,7 +105,7 @@ mod tests {
                     "/a/b" => vec![f("/a/b/3", 100)],
                     _ => vec![],
                 })
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<FileEntry>, AppError>> + Send>>
+            }) as Listing
         };
         (lister, max)
     }
