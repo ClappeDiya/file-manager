@@ -397,8 +397,9 @@ fn start_background_engines(app: tauri::AppHandle) {
 
 /// Persist transfer queue and workspace state on shutdown.
 async fn persist_on_shutdown(repo: &Repository, transfer_mgr: &TransferManager) {
-    // Save transfer queue
-    let jobs = transfer_mgr.snapshot_jobs().await;
+    // Save transfer queue. Connector transfers shown in it (a folder
+    // comparison's) end with the app: the queue cannot resume them.
+    let jobs: Vec<_> = transfer_mgr.snapshot_jobs().await.into_iter().filter(|j| !j.external).collect();
     if let Err(e) = StorageOperations::save_transfer_queue(repo, &jobs).await {
         tracing::error!("Failed to persist transfer queue on shutdown: {e}");
     } else {

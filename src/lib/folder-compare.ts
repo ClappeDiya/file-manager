@@ -144,6 +144,8 @@ export interface ApplyOutcome {
   notes: string[];
   cancelled: boolean;
   undo_id: string | null;
+  /** Everything "Undo copies" reverses, in order (the copies, then the folders made for them). */
+  undo_ids: string[];
   changed: CompareEntry[];
   removed: string[];
   summary: CompareSummary;

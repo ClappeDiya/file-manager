@@ -527,6 +527,10 @@ pub struct TransferJob {
     pub speed_bps: u64,
     /// Estimated time remaining in seconds.
     pub eta_seconds: Option<u64>,
+    /// Run by another engine (a connector transfer of a folder comparison)
+    /// and only shown in the queue: it can be cancelled, not paused or retried.
+    #[serde(default)]
+    pub external: bool,
 }
 
 /// A resolved conflict with the decision made.

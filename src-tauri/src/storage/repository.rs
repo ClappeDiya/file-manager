@@ -355,6 +355,7 @@ impl Repository {
             dest_checksum: row.get(18)?,
             speed_bps: row.get::<_, Option<i64>>(19)?.unwrap_or(0) as u64,
             eta_seconds: row.get::<_, Option<i64>>(20)?.map(|e| e as u64),
+            external: false,
         })
     }
 
@@ -960,6 +961,7 @@ mod tests {
                 dest_checksum: None,
                 speed_bps: 0,
                 eta_seconds: None,
+                external: false,
             },
             TransferJob {
                 id: Uuid::new_v4(),
@@ -983,6 +985,7 @@ mod tests {
                 dest_checksum: None,
                 speed_bps: 0,
                 eta_seconds: None,
+                external: false,
             },
         ];
 

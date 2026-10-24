@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use ufop_core::sync::versions::is_safe_relative;
 
 /// Event carrying [`CompareProgress`] while a comparison or action runs.
 pub const COMPARE_PROGRESS_EVENT: &str = "compare-progress";
@@ -99,32 +100,50 @@ impl ResolvedSide {
         matches!(self, Self::Local { .. })
     }
 
+    /// `rel` when it is a plain path inside the root (`""` is the root): no
+    /// `..`, no absolute or drive part, no backslash tricks.
+    pub fn check_relative(rel: &str) -> Result<&str, String> {
+        if rel.is_empty() || is_safe_relative(rel) {
+            Ok(rel)
+        } else {
+            Err(format!("\"{rel}\" is not a path inside the compared folder, so it was left alone."))
+        }
+    }
+
     /// Where `rel` (relative, `/`-separated) is on this side: a local path or
-    /// a remote path.
-    pub fn abs(&self, rel: &str) -> String {
+    /// a remote path. Refuses a path that would leave the root.
+    pub fn abs(&self, rel: &str) -> Result<String, String> {
+        let rel = Self::check_relative(rel)?;
+        Ok(self.joined(rel))
+    }
+
+    /// `rel` under the root, as text (callers check `rel` first).
+    fn joined(&self, rel: &str) -> String {
         match self {
-            Self::Local { root } => self.local_path(rel).unwrap_or_else(|| root.clone()).to_string_lossy().to_string(),
+            Self::Local { root } if rel.is_empty() => root.to_string_lossy().to_string(),
+            Self::Local { root } => rel.split('/').fold(root.clone(), |p, part| p.join(part)).to_string_lossy().to_string(),
             Self::Remote { root, .. } if rel.is_empty() => root.clone(),
             Self::Remote { root, .. } if root == "/" => format!("/{rel}"),
             Self::Remote { root, .. } => format!("{root}/{rel}"),
         }
     }
 
-    /// The local path of `rel`, for a local side.
-    pub fn local_path(&self, rel: &str) -> Option<PathBuf> {
-        match self {
-            Self::Local { root } if rel.is_empty() => Some(root.clone()),
-            Self::Local { root } => Some(rel.split('/').fold(root.clone(), |p, part| p.join(part))),
+    /// The local path of `rel` for a local side (`None` for a connection).
+    /// Refuses a path that would leave the root.
+    pub fn local_path(&self, rel: &str) -> Result<Option<PathBuf>, String> {
+        let rel = Self::check_relative(rel)?;
+        Ok(match self {
+            Self::Local { root } => Some(rel.split('/').filter(|p| !p.is_empty()).fold(root.clone(), |p, part| p.join(part))),
             Self::Remote { .. } => None,
-        }
+        })
     }
 
     /// How the UI, the queue and the ledger name `rel` on this side
-    /// (`sftp://My server/docs/a.txt` for a connection).
+    /// (`sftp://My server/docs/a.txt` for a connection). Display only.
     pub fn label(&self, rel: &str) -> String {
         match self {
-            Self::Local { .. } => self.abs(rel),
-            Self::Remote { protocol, name, .. } => format!("{protocol}://{name}{}", self.abs(rel)),
+            Self::Local { .. } => self.joined(rel),
+            Self::Remote { protocol, name, .. } => format!("{protocol}://{name}{}", self.joined(rel)),
         }
     }
 
@@ -291,7 +310,18 @@ where
                 continue;
             }
             counters.entries.fetch_add(1, Ordering::Relaxed);
-            let child = if rel.is_empty() { it.name.clone() } else { format!("{rel}/{}", it.name) };
+            // A name with a path separator or `..` in it (legal on many
+            // servers) must never become a path that climbs out of the
+            // root: it is shown, with its separators replaced, as an entry
+            // that cannot be compared or acted on.
+            let plain = !it.name.contains(['/', '\\']) && is_safe_relative(&it.name);
+            let shown = if plain { it.name.clone() } else { it.name.replace('/', "\u{2215}").replace('\\', "\u{29F5}") };
+            let child = if rel.is_empty() { shown } else { format!("{rel}/{shown}") };
+            if !plain {
+                let message = format!("\"{}\" is not a plain name (it holds a path separator or \"..\"), so it is left alone.", it.name);
+                listing.errors.push(ListingError { path: child, is_dir: it.is_dir, message });
+                continue;
+            }
             if let Some(message) = it.error {
                 listing.errors.push(ListingError { path: child, is_dir: it.is_dir, message });
                 continue;
@@ -401,8 +431,25 @@ pub struct StoredCompare {
 /// Running comparisons and actions (cancellable by id) and the latest results.
 #[derive(Clone, Default)]
 pub struct CompareManager {
-    running: Arc<std::sync::Mutex<std::collections::HashMap<String, CancellationToken>>>,
+    /// Each run's token, with the run number it was started as.
+    running: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, CancellationToken)>>>,
+    runs: Arc<AtomicU64>,
     results: Arc<tokio::sync::Mutex<Vec<StoredCompare>>>,
+}
+
+/// A run started with [`CompareManager::begin`]: its cancellation token
+/// (dereferences to it) and which run it is, for [`CompareManager::end`].
+#[derive(Clone)]
+pub struct CompareRun {
+    token: CancellationToken,
+    number: u64,
+}
+
+impl std::ops::Deref for CompareRun {
+    type Target = CancellationToken;
+    fn deref(&self) -> &CancellationToken {
+        &self.token
+    }
 }
 
 impl CompareManager {
@@ -410,28 +457,32 @@ impl CompareManager {
         Self::default()
     }
 
-    fn running(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, CancellationToken>> {
+    fn running(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, (u64, CancellationToken)>> {
         self.running.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Start task `id`: the token [`CompareManager::cancel`] fires.
-    pub fn begin(&self, id: &str) -> CancellationToken {
-        let token = CancellationToken::new();
-        if let Some(old) = self.running().insert(id.to_string(), token.clone()) {
+    /// Start task `id`: the token [`CompareManager::cancel`] fires. A run
+    /// still going under the same id is cancelled and replaced.
+    pub fn begin(&self, id: &str) -> CompareRun {
+        let run = CompareRun { token: CancellationToken::new(), number: self.runs.fetch_add(1, Ordering::Relaxed) };
+        if let Some((_, old)) = self.running().insert(id.to_string(), (run.number, run.token.clone())) {
             old.cancel();
         }
-        token
+        run
     }
 
-    /// Task `id` ended.
-    pub fn end(&self, id: &str) {
-        self.running().remove(id);
+    /// `run` of task `id` ended (a newer run under the same id is kept).
+    pub fn end(&self, id: &str, run: &CompareRun) {
+        let mut running = self.running();
+        if running.get(id).is_some_and(|(n, _)| *n == run.number) {
+            running.remove(id);
+        }
     }
 
     /// Stop task `id`; `false` when it is not running.
     pub fn cancel(&self, id: &str) -> bool {
         match self.running().remove(id) {
-            Some(t) => {
+            Some((_, t)) => {
                 t.cancel();
                 true
             }

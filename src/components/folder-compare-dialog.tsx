@@ -90,7 +90,8 @@ interface Message {
   tone: "ok" | "info" | "error";
   text: string;
   details?: string[];
-  undoId?: string | null;
+  /** Ledger ids "Undo copies" reverses, in order. */
+  undoIds?: string[];
 }
 
 function describeSkips(plan: CompareActionPlan["plan"]): string {
@@ -107,7 +108,8 @@ function describeOutcome(o: ApplyOutcome): Message {
   if (o.skipped.length) parts.push(`${o.skipped.length} skipped`);
   if (o.cancelled) parts.push("stopped early");
   const details = [...o.failed.map((f) => `${f.path}: ${f.error}`), ...o.notes];
-  return { tone: o.failed.length ? "error" : "ok", text: `${ACTION_LABEL[o.action]}: ${parts.join(", ")}.`, details, undoId: o.undo_id };
+  const undoIds = o.undo_ids?.length ? o.undo_ids : o.undo_id ? [o.undo_id] : [];
+  return { tone: o.failed.length ? "error" : "ok", text: `${ACTION_LABEL[o.action]}: ${parts.join(", ")}.`, details, undoIds };
 }
 
 function SideCell({ present, size, modified, isDir }: { present: boolean; size: number | null; modified: string | null; isDir: boolean }) {
@@ -153,7 +155,9 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
   const [focused, setFocused] = useState<string | null>(null);
   const [sort, setSort] = useState<CompareSort>("name");
   const [permanent, setPermanent] = useState(false);
-  const [pendingDelete, setPendingDelete] = useState<{ action: CompareAction; planned: CompareActionPlan; paths: string[] } | null>(null);
+  // A planned delete waiting for confirmation, with the "Delete permanently"
+  // choice it was planned (and assessed) with.
+  const [pendingDelete, setPendingDelete] = useState<{ action: CompareAction; planned: CompareActionPlan; paths: string[]; permanent: boolean } | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
   const [showRules, setShowRules] = useState(false);
   const groups = useFilterGroups();
@@ -308,8 +312,10 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
       return next;
     });
 
+  // Runs exactly what was planned: `perm` is the choice the plan's intent was
+  // made with, so the Safety Interlock assesses the operation that runs.
   const execute = useCallback(
-    async (action: CompareAction, planned: CompareActionPlan, paths: string[]) => {
+    async (action: CompareAction, planned: CompareActionPlan, paths: string[], perm: boolean) => {
       const current = resultRef.current;
       if (!current) return;
       const applyId = `${current.task_id}:apply:${Date.now().toString(36)}`;
@@ -319,7 +325,7 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
       setMessage(null);
       try {
         const outcome = await assessBeforeExecute(planned.intent, () =>
-          tauriInvoke<ApplyOutcome>("compare_apply", { taskId: current.task_id, paths, action, permanent, applyId }),
+          tauriInvoke<ApplyOutcome>("compare_apply", { taskId: current.task_id, paths, action, permanent: perm, applyId }),
         );
         if (outcome === null) {
           setMessage({ tone: "info", text: "Cancelled — nothing was changed." });
@@ -334,20 +340,19 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
         setRunning(null);
       }
     },
-    [permanent],
+    [],
   );
 
-  const runAction = useCallback(
-    async (action: CompareAction) => {
+  const planAction = useCallback(
+    async (action: CompareAction, paths: string[], perm: boolean) => {
       const current = resultRef.current;
-      if (!current || selected.size === 0) return;
-      const paths = selectionRoots(selected);
+      if (!current || paths.length === 0) return;
       const targetLabel = action === "copy_to_left" || action === "delete_left" ? current.left_label : current.right_label;
       setMessage(null);
       setPendingDelete(null);
       let planned: CompareActionPlan;
       try {
-        planned = await tauriInvoke<CompareActionPlan>("compare_plan_action", { taskId: current.task_id, paths, action, permanent, targetLabel });
+        planned = await tauriInvoke<CompareActionPlan>("compare_plan_action", { taskId: current.task_id, paths, action, permanent: perm, targetLabel });
       } catch (err) {
         setMessage({ tone: "error", text: errorText(err) });
         return;
@@ -357,22 +362,44 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
         return;
       }
       if (isDelete(action)) {
-        setPendingDelete({ action, planned, paths });
+        setPendingDelete({ action, planned, paths, permanent: perm });
         return;
       }
-      await execute(action, planned, paths);
+      await execute(action, planned, paths, perm);
     },
-    [selected, permanent, execute],
+    [execute],
   );
 
+  const runAction = useCallback((action: CompareAction) => planAction(action, selectionRoots(selected), permanent), [planAction, selected, permanent]);
+
+  // Changing "Delete permanently" while a delete waits for confirmation
+  // plans (and so assesses) it again with the new choice.
+  const changePermanent = useCallback(
+    (perm: boolean) => {
+      setPermanent(perm);
+      if (pendingDelete) void planAction(pendingDelete.action, pendingDelete.paths, perm);
+    },
+    [pendingDelete, planAction],
+  );
+
+  // Undo each recorded operation in turn: the copies, then the folders made for them.
   const handleUndo = useCallback(
-    async (undoId: string) => {
+    async (undoIds: string[]) => {
+      const done: string[] = [];
       try {
-        const out = await tauriInvoke<{ success: boolean; summary: string }>("undo_by_correlation", { correlationId: undoId });
-        setMessage({ tone: out.success ? "ok" : "error", text: out.summary });
-        if (out.success) await runCompare();
+        for (const correlationId of undoIds) {
+          const out = await tauriInvoke<{ success: boolean; summary: string }>("undo_by_correlation", { correlationId });
+          if (!out.success) {
+            setMessage({ tone: "error", text: out.summary });
+            return;
+          }
+          done.push(out.summary);
+        }
+        setMessage({ tone: "ok", text: done.join(" ") });
+        await runCompare();
       } catch (err) {
         setMessage({ tone: "error", text: `Undo failed: ${errorText(err)}` });
+        if (done.length > 0) await runCompare();
       }
     },
     [runCompare],
@@ -608,9 +635,9 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
                 <span>
                   Delete {pendingDelete.planned.plan.files} file{pendingDelete.planned.plan.files === 1 ? "" : "s"}
                   {pendingDelete.planned.plan.folders > 0 ? ` and up to ${pendingDelete.planned.plan.folders} folder${pendingDelete.planned.plan.folders === 1 ? "" : "s"}` : ""} ({formatBytes(pendingDelete.planned.plan.bytes)}) on the {pendingDelete.action === "delete_left" ? "left" : "right"}
-                  {permanent ? " permanently" : " (to the Trash where the side is a local folder)"}?
+                  {pendingDelete.permanent ? " permanently" : " (to the Trash where the side is a local folder)"}?
                 </span>
-                <button type="button" className="rounded bg-red-600 px-2 py-0.5 text-white" onClick={() => { const p = pendingDelete; setPendingDelete(null); void execute(p.action, p.planned, p.paths); }} data-testid="compare-confirm-delete-yes">
+                <button type="button" className="rounded bg-red-600 px-2 py-0.5 text-white" onClick={() => { const p = pendingDelete; setPendingDelete(null); void execute(p.action, p.planned, p.paths, p.permanent); }} data-testid="compare-confirm-delete-yes">
                   Delete
                 </button>
                 <button type="button" className="rounded border border-[var(--color-border)] px-2 py-0.5" onClick={() => setPendingDelete(null)}>
@@ -621,8 +648,8 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
             {message && (
               <div className={message.tone === "error" ? "text-red-700 dark:text-red-400" : message.tone === "ok" ? "text-green-700 dark:text-green-400" : "text-zinc-500"} data-testid="compare-message">
                 <span>{message.text}</span>
-                {message.undoId && (
-                  <button type="button" className="ml-2 underline" onClick={() => void handleUndo(message.undoId as string)} data-testid="compare-undo">
+                {message.undoIds && message.undoIds.length > 0 && (
+                  <button type="button" className="ml-2 underline" onClick={() => void handleUndo(message.undoIds as string[])} data-testid="compare-undo">
                     Undo copies
                   </button>
                 )}
@@ -648,7 +675,7 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
           </span>
           <span className="ml-auto flex flex-wrap items-center gap-1.5">
             <label className="flex items-center gap-1 text-zinc-500" title="Deleted and replaced files are removed instead of going to the Trash">
-              <input type="checkbox" checked={permanent} onChange={(e) => setPermanent(e.target.checked)} data-testid="compare-permanent" />
+              <input type="checkbox" checked={permanent} onChange={(e) => changePermanent(e.target.checked)} disabled={busy} data-testid="compare-permanent" />
               Delete permanently
             </label>
             {(["copy_to_right", "copy_to_left", "delete_left", "delete_right"] as CompareAction[]).map((a) => (

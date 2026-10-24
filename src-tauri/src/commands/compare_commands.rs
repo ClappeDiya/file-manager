@@ -55,7 +55,7 @@ pub async fn compare_folders(
         Ok((l, r, out))
     }
     .await;
-    manager.end(&task_id);
+    manager.end(&task_id, &cancel);
     let (l, r, out) = outcome?;
     manager
         .store(StoredCompare { task_id: task_id.clone(), left: left.clone(), right: right.clone(), options: options.clone(), entries: out.entries.clone() })
@@ -181,7 +181,7 @@ pub async fn compare_apply(
     let progress = emitter(app);
     let env = ApplyEnv { transfer: &transfer, ledger: &ledger, permanent: permanent.unwrap_or(false), cancel: &cancel, progress: &progress, task_id: &task_id };
     let report = apply::execute(&plan, &l, &r, &env).await;
-    manager.end(&run_id);
+    manager.end(&run_id, &cancel);
 
     progress(CompareProgress { task_id: task_id.clone(), phase: crate::compare_engine::ComparePhase::Refreshing, folders_listed: 0, entries_found: 0, done: 0, total: report.touched.len() as u64, current: None });
     let refreshed = apply::refresh(&l, &r, &options, &report.touched).await?;
@@ -196,6 +196,7 @@ pub async fn compare_apply(
         notes: report.notes,
         cancelled: report.cancelled,
         undo_id: report.undo_id,
+        undo_ids: report.undo_ids,
         changed: merged.changed,
         removed: merged.removed,
         summary: merged.summary,

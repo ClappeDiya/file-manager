@@ -416,6 +416,7 @@ mod tests {
             dest_checksum: None,
             speed_bps: 100000,
             eta_seconds: None,
+            external: false,
         }
     }
 

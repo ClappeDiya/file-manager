@@ -406,6 +406,7 @@ impl TransferManager {
         let mut map = self.jobs.write().await;
         let job = map.get_mut(&job.id).ok_or_else(|| AppError::internal("Tracked transfer vanished"))?;
         job.status = TransferStatus::Active;
+        job.external = true;
         job.connection_id = connection_id;
         // Connectors verify their own uploads; the engine computed no checksums.
         job.verify_checksum = false;
@@ -414,9 +415,12 @@ impl TransferManager {
     }
 
     /// End a job started with [`TransferManager::track_external`]: completed
-    /// with the bytes moved, or failed with the error. Recorded in history.
+    /// with the bytes moved, or failed with the error (a job cancelled from
+    /// the queue stays cancelled). Recorded in history.
     pub async fn finish_external(&self, job_id: Uuid, outcome: Result<u64, String>, started_at: chrono::DateTime<Utc>, elapsed: std::time::Duration) {
+        let cancelled = self.jobs.read().await.get(&job_id).is_some_and(|j| j.status == TransferStatus::Cancelled);
         let _ = match outcome {
+            _ if cancelled => Ok(()),
             Ok(bytes) => {
                 if let Some(job) = self.jobs.write().await.get_mut(&job_id) {
                     job.total_bytes = bytes.max(job.total_bytes);
@@ -722,6 +726,9 @@ impl TransferManager {
             message: format!("Transfer job {job_id} not found."),
             advice: "The transfer may have already completed or been removed.".to_string(),
         })?;
+        if job.external {
+            return Err(external_only("retried"));
+        }
         job.retry_count += 1;
         let can_retry = job.retry_count <= policy.max_retries;
         if can_retry {
@@ -760,7 +767,7 @@ impl TransferManager {
         let mut map = self.jobs.write().await;
         let mut requeued = Vec::new();
         for job in map.values_mut() {
-            if job.status == TransferStatus::Failed && job.retry_count < policy.max_retries {
+            if job.status == TransferStatus::Failed && !job.external && job.retry_count < policy.max_retries {
                 job.status = TransferStatus::Queued;
                 job.error_message = None;
                 job.retry_count += 1;
@@ -884,6 +891,7 @@ impl TransferOperations for TransferManager {
                 dest_checksum: None,
                 speed_bps: 0,
                 eta_seconds: None,
+                external: false,
             };
             drop(config);
 
@@ -905,6 +913,9 @@ impl TransferOperations for TransferManager {
                 message: format!("Transfer job {job_id} not found."),
                 advice: "The transfer may have already completed or been removed.".to_string(),
             })?;
+            if job.external {
+                return Err(external_only("paused"));
+            }
             // Pausing a finished job must not corrupt its status.
             if !matches!(
                 job.status,
@@ -1015,6 +1026,14 @@ impl TransferOperations for TransferManager {
     }
 }
 
+/// Why the queue refuses to pause or retry a job another engine runs.
+fn external_only(what: &str) -> AppError {
+    AppError::Transfer {
+        message: format!("This transfer runs through a connection and cannot be {what} from the queue."),
+        advice: "Cancel it here, or run the action again from where it started (for example the compare window).".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,6 +1110,7 @@ mod tests {
             dest_checksum: None,
             speed_bps: 0,
             eta_seconds: None,
+            external: false,
         };
         mgr.restore_jobs(vec![job.clone()]).await;
 
@@ -1585,5 +1605,26 @@ mod tests {
         let j = mgr.get_job(job.id).await.unwrap().unwrap();
         assert_eq!(j.status, TransferStatus::Cancelled);
         assert!(!dst.exists());
+    }
+
+    /// Regression: connector transfers shown in the queue offered Pause and
+    /// Retry that did nothing, and a cancelled one turned "completed" once
+    /// the connector finished.
+    #[tokio::test]
+    async fn tracked_external_jobs_refuse_pause_and_retry_and_stay_cancelled() {
+        let mgr = TransferManager::new();
+        let job = mgr.track_external("sftp://Server/a.txt", "/tmp/a.txt", 10, None).await.unwrap();
+        assert!(job.external);
+        assert!(mgr.pause(job.id).await.is_err(), "pausing a connector transfer is refused");
+        assert_eq!(mgr.get_job(job.id).await.unwrap().unwrap().status, TransferStatus::Active);
+        mgr.cancel(job.id).await.unwrap();
+        mgr.finish_external(job.id, Ok(10), Utc::now(), std::time::Duration::ZERO).await;
+        assert_eq!(mgr.get_job(job.id).await.unwrap().unwrap().status, TransferStatus::Cancelled);
+
+        let failed = mgr.track_external("sftp://Server/b.txt", "/tmp/b.txt", 10, None).await.unwrap();
+        mgr.finish_external(failed.id, Err("boom".into()), Utc::now(), std::time::Duration::ZERO).await;
+        assert!(mgr.increment_retry(failed.id).await.is_err(), "the queue cannot re-run a connector transfer");
+        assert!(mgr.retry_all_failed().await.unwrap().is_empty());
+        assert_eq!(mgr.get_job(failed.id).await.unwrap().unwrap().status, TransferStatus::Failed);
     }
 }

@@ -1016,7 +1016,10 @@ pub async fn undo_file_operation_inner(
             }
         }
         "create_folder" | "create_file" => {
-            // Undo create = delete
+            // Undo create = delete, deepest first: a folder created inside
+            // another must go before it, whatever order the ledger kept.
+            let mut dest_paths = dest_paths;
+            dest_paths.sort_by_key(|p| std::cmp::Reverse(Path::new(p).components().count()));
             for dest in &dest_paths {
                 let p = Path::new(dest);
                 if p.exists() {
@@ -1541,7 +1544,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), AppError> {
 /// Move `path` into the trash folder `trash_dir`; returns where it went.
 /// A name already in the trash gets a number (`notes 2.txt`), so trashing
 /// two files of the same name never overwrites the first.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn trash_into(trash_dir: &Path, path: &Path) -> Result<PathBuf, AppError> {
     let file_name = path.file_name().unwrap_or_default();
     let mut target = trash_dir.join(file_name);
@@ -1583,34 +1586,7 @@ pub(crate) fn move_to_trash(path: &Path) -> Result<(), AppError> {
             })?;
         }
 
-        let file_name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let mut target = trash_dir.join(&file_name);
-
-        // Handle name conflicts in trash
-        if target.exists() {
-            let stem = path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let ext = path
-                .extension()
-                .map(|e| format!(".{}", e.to_string_lossy()))
-                .unwrap_or_default();
-            let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-            target = trash_dir.join(format!("{stem} {timestamp}{ext}"));
-        }
-
-        std::fs::rename(path, &target).map_err(|e| {
-            AppError::file_op(
-                format!("Failed to move to Trash: {e}"),
-                "Try permanent delete instead.",
-            )
-        })?;
+        trash_into(&trash_dir, path)?;
     }
 
     #[cfg(target_os = "linux")]
@@ -1757,7 +1733,9 @@ fn is_default_port(protocol: &str, port: u16) -> bool {
 #[cfg(test)]
 mod tests {
     /// Regression: trashing a second file with the same name as one already
-    /// in the trash renamed it over the first, destroying it.
+    /// in the trash renamed it over the first, destroying it (Linux and macOS
+    /// both trash through `trash_into`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn trash_keeps_files_that_share_a_name() {
         let base = tempfile::tempdir().unwrap();

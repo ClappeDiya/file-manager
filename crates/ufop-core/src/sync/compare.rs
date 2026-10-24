@@ -15,6 +15,7 @@
 
 use super::filter::CompiledSyncFilter;
 use super::planner::{Comparer, ContentHasher, FileMeta};
+use super::versions::is_safe_relative;
 use crate::error::AppError;
 use crate::sync_types::{CompareMode, CopyOptions, SyncFilter, SyncSide};
 use chrono::{DateTime, Utc};
@@ -242,6 +243,9 @@ pub fn compare_entries(
         }
     }
     let paths: BTreeSet<&String> = lmap.keys().chain(rmap.keys()).chain(lerr.keys()).chain(rerr.keys()).collect();
+    // Folders a side could not list: nothing below them is known there.
+    let unlisted = |errs: &HashMap<String, ListingError>| -> HashSet<String> { errs.iter().filter(|(_, e)| e.is_dir).map(|(p, _)| p.clone()).collect() };
+    let (lunlisted, runlisted) = (unlisted(&lerr), unlisted(&rerr));
 
     let mut entries = Vec::with_capacity(paths.len());
     for (i, path) in paths.into_iter().enumerate() {
@@ -264,6 +268,12 @@ pub fn compare_entries(
             error: None,
             children_skipped: left.truncated.contains(path.as_str()) || right.truncated.contains(path.as_str()),
         };
+        if !is_safe_relative(path) {
+            entry.status = CompareStatus::Error;
+            entry.error = Some(NOT_PLAIN.to_string());
+            entries.push(entry);
+            continue;
+        }
         let unreadable: Vec<String> = [("Left", lerr.get(path)), ("Right", rerr.get(path))]
             .into_iter()
             .filter_map(|(side, e)| e.map(|e| format!("{side}: {}", e.message)))
@@ -277,6 +287,17 @@ pub fn compare_entries(
         // The filter judges files, by each side's own size.
         let accepted = |m: Option<&FileMeta>| m.is_some_and(|m| m.is_dir || filter.accepts(path, m.size));
         if !accepted(l) && !accepted(r) {
+            continue;
+        }
+        let inside_unlisted: Vec<&str> = [("left", &lunlisted), ("right", &runlisted)]
+            .into_iter()
+            .filter(|(_, dirs)| ancestors(path).any(|a| dirs.contains(a)))
+            .map(|(side, _)| side)
+            .collect();
+        if !inside_unlisted.is_empty() {
+            entry.status = CompareStatus::Error;
+            entry.error = Some(format!("Inside a folder that could not be read on the {}.", inside_unlisted.join(" and the ")));
+            entries.push(entry);
             continue;
         }
         match (l, r) {
@@ -317,6 +338,9 @@ pub fn compare_entries(
     entries.retain(|e| stands_alone(e) || kept_dirs.contains(&e.path));
     Ok((entries, cmp.notes()))
 }
+
+/// Why an entry whose path is not a plain path inside the root is left alone.
+const NOT_PLAIN: &str = "The name is not a plain name inside the folder (it holds \"..\" or a path separator), so it is left alone.";
 
 fn index_entries(l: &SideListing) -> HashMap<String, FileMeta> {
     l.entries.iter().map(|f| (f.relative_path.replace('\\', "/"), f.clone())).collect()
@@ -561,9 +585,23 @@ pub fn plan_action(entries: &[CompareEntry], selected: &[String], action: Compar
         }
     }
     chosen.sort_by(|a, b| tree_order(&a.path, &b.path));
-    // Below a folder that could not be read nothing is known: leave it all.
-    let unreadable: Vec<&str> = chosen.iter().filter(|e| e.is_dir && e.status == CompareStatus::Error).map(|e| e.path.as_str()).collect();
-    let under_unreadable = |p: &str| unreadable.iter().any(|u| p.starts_with(&format!("{u}/")));
+    // Below a folder that could not be read nothing is known, and a path
+    // that is not plain could point outside the root: leave them alone
+    // (quietly when the folder itself is part of the selection and says why).
+    let unreadable_folder = |p: &str| ancestors(p).find(|a| by_path.get(a).is_some_and(|d| d.is_dir && d.status == CompareStatus::Error)).map(str::to_string);
+    let left_alone = |e: &CompareEntry, skipped: &mut Vec<SkippedEntry>| -> bool {
+        let reason = if !is_safe_relative(&e.path) {
+            NOT_PLAIN.to_string()
+        } else {
+            match unreadable_folder(&e.path) {
+                Some(folder) if seen.contains(folder.as_str()) => return true,
+                Some(folder) => format!("Inside {folder}, which could not be read."),
+                None => return false,
+            }
+        };
+        skipped.push(SkippedEntry { path: e.path.clone(), reason });
+        true
+    };
 
     match action {
         CompareAction::CopyToRight | CompareAction::CopyToLeft => {
@@ -571,11 +609,15 @@ pub fn plan_action(entries: &[CompareEntry], selected: &[String], action: Compar
             let mut dirs: BTreeSet<String> = BTreeSet::new();
             let mut copies = Vec::new();
             for e in &chosen {
-                if under_unreadable(&e.path) {
+                if left_alone(e, &mut plan.skipped) {
                     continue;
                 }
                 let skip = match e.status {
                     CompareStatus::Error => Some(format!("Could not be compared: {}", e.error.as_deref().unwrap_or("unreadable"))),
+                    // Its contents were never listed: copying it would make an empty folder.
+                    _ if e.is_dir && e.children_skipped && on(e, from) && !on(e, target) => {
+                        Some("Contents were not compared (depth limit or linked folder); compare with a deeper limit to copy them.".to_string())
+                    }
                     _ if e.is_dir => None,
                     CompareStatus::Same => Some("Already the same on both sides.".to_string()),
                     _ if !on(e, from) => Some(format!("Not on the {} side.", from.label())),
@@ -621,7 +663,7 @@ pub fn plan_action(entries: &[CompareEntry], selected: &[String], action: Compar
             let mut files = Vec::new();
             let mut dirs = Vec::new();
             for e in &chosen {
-                if under_unreadable(&e.path) {
+                if left_alone(e, &mut plan.skipped) {
                     continue;
                 }
                 if e.status == CompareStatus::Error {
@@ -950,6 +992,91 @@ mod tests {
         let affected: HashSet<String> = ["docs/only-right.txt".to_string()].into();
         let out = merge_refreshed(&mut entries, &affected, vec![]);
         assert!(out.changed.iter().any(|e| e.path == "docs" && e.status == CompareStatus::Same));
+    }
+
+    /// Regression: only the unreadable folder itself was an error; what the
+    /// other side had inside it showed as one-sided and could be copied over
+    /// files nobody had seen.
+    #[test]
+    fn entries_below_an_unreadable_folder_are_errors_and_never_acted_on() {
+        let l = listing(vec![dir("locked"), file("locked/a.txt", 1, 1), dir("locked/sub"), file("locked/sub/b.txt", 2, 1), file("ok.txt", 1, 1)]);
+        let mut r = listing(vec![dir("locked"), file("ok.txt", 1, 1)]);
+        r.errors.push(ListingError { path: "locked".into(), is_dir: true, message: "denied".into() });
+        let out = compare_listings(&l, &r, &CompareOptions::default(), None, None).unwrap();
+        for p in ["locked", "locked/a.txt", "locked/sub", "locked/sub/b.txt"] {
+            assert_eq!(status_of(&out.entries, p), CompareStatus::Error, "{p}");
+        }
+        let a = out.entries.iter().find(|e| e.path == "locked/a.txt").unwrap();
+        assert!(a.error.as_deref().unwrap().contains("could not be read on the right"), "{:?}", a.error);
+        assert_eq!(status_of(&out.entries, "ok.txt"), CompareStatus::Same);
+        assert_eq!((out.summary.left_only.files, out.summary.left_only.folders), (0, 0));
+        assert_eq!((out.summary.error.files, out.summary.error.folders), (2, 2));
+
+        // Selecting the files inside (not the folder) copies nothing either.
+        let picked = ["locked/a.txt".to_string(), "locked/sub".to_string()];
+        let plan = plan_action(&out.entries, &picked, CompareAction::CopyToRight);
+        assert!(plan.steps.is_empty(), "{:?}", plan.steps);
+        assert!(plan.skipped.iter().any(|s| s.path == "locked/a.txt"), "{:?}", plan.skipped);
+
+        // Even entries that say otherwise (results from elsewhere) are left
+        // alone below a folder that could not be read.
+        let mut entries = out.entries.clone();
+        for e in entries.iter_mut().filter(|e| e.path.starts_with("locked/")) {
+            (e.status, e.error) = (CompareStatus::LeftOnly, None);
+        }
+        for action in [CompareAction::CopyToRight, CompareAction::DeleteLeft] {
+            let plan = plan_action(&entries, &picked, action);
+            assert!(plan.steps.is_empty(), "{action:?}: {:?}", plan.steps);
+        }
+    }
+
+    /// Regression: copying a one-sided folder whose contents were never
+    /// listed (depth limit, linked folder) created an empty folder and
+    /// reported it as copied.
+    #[test]
+    fn copying_a_folder_whose_contents_were_not_compared_is_skipped() {
+        let mut l = listing(vec![dir("deep"), dir("a"), file("a/f.txt", 1, 1), dir("a/linked")]);
+        l.truncated.insert("deep".into());
+        l.truncated.insert("a/linked".into());
+        let out = compare_listings(&l, &listing(vec![]), &CompareOptions::default(), None, None).unwrap();
+        let plan = plan_action(&out.entries, &["deep".to_string()], CompareAction::CopyToRight);
+        assert!(plan.steps.is_empty(), "{:?}", plan.steps);
+        assert!(plan.skipped[0].reason.contains("not compared"), "{:?}", plan.skipped);
+
+        // Inside a folder that is copied, the unlisted folder is left out.
+        let plan = plan_action(&out.entries, &["a".to_string()], CompareAction::CopyToRight);
+        let paths: Vec<&str> = plan.steps.iter().map(|s| s.path()).collect();
+        assert_eq!(paths, ["a", "a/f.txt"]);
+        assert!(plan.skipped.iter().any(|s| s.path == "a/linked" && s.reason.contains("deeper limit")), "{:?}", plan.skipped);
+        assert_eq!(plan.folders, 1);
+    }
+
+    /// Regression: a name like `..\..\evil` (legal on many servers) became
+    /// the path `../../evil`, and copying it wrote outside the folder.
+    #[test]
+    fn paths_that_leave_the_folder_are_errors_and_never_acted_on() {
+        let l = listing(vec![file("..\\..\\evil", 1, 1), file("a/../../b", 1, 1), file("fine.txt", 1, 1)]);
+        let out = compare_listings(&l, &listing(vec![]), &CompareOptions::default(), None, None).unwrap();
+        for e in out.entries.iter().filter(|e| e.path != "fine.txt") {
+            assert_eq!(e.status, CompareStatus::Error, "{}", e.path);
+            assert!(e.error.as_deref().unwrap().contains("not a plain name"), "{:?}", e.error);
+        }
+        assert_eq!(status_of(&out.entries, "fine.txt"), CompareStatus::LeftOnly);
+        let all: Vec<String> = out.entries.iter().map(|e| e.path.clone()).collect();
+        let plan = plan_action(&out.entries, &all, CompareAction::CopyToRight);
+        let paths: Vec<&str> = plan.steps.iter().map(|s| s.path()).collect();
+        assert_eq!(paths, ["fine.txt"]);
+
+        // Planning refuses such a path even when an entry claims it is fine.
+        let mut entries = out.entries.clone();
+        for e in entries.iter_mut() {
+            (e.status, e.error) = (CompareStatus::LeftOnly, None);
+        }
+        for action in [CompareAction::CopyToRight, CompareAction::DeleteLeft] {
+            let plan = plan_action(&entries, &all, action);
+            let paths: Vec<&str> = plan.steps.iter().map(|s| s.path()).collect();
+            assert_eq!(paths, ["fine.txt"], "{action:?}");
+        }
     }
 
     #[test]

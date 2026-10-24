@@ -34,6 +34,9 @@ interface TransferJob {
   speed_bps: number;
   eta_seconds: number | null;
   verify_checksum: boolean;
+  /** Run by another engine (a folder comparison's connector transfer): it
+   *  can be cancelled here, but the queue cannot pause, retry or reorder it. */
+  external?: boolean;
 }
 
 interface ThrottleConfig {
@@ -198,7 +201,7 @@ function TransferPanelMini({
 
 // ── Transfer Item Component ──
 
-function TransferItem({
+export function TransferItem({
   job,
   onPause,
   onResume,
@@ -226,6 +229,8 @@ function TransferItem({
   const isPaused = job.status === "paused";
   const isFailed = job.status === "failed";
   const hasConflict = job.status === "conflict";
+  // Connector transfers are only shown here: the queue does not run them.
+  const queued = !job.external;
 
   return (
     <div
@@ -275,19 +280,21 @@ function TransferItem({
         </div>
         <div className="flex items-center gap-1 ml-2">
           {/* Priority selector */}
-          <select
-            value={job.priority}
-            onChange={(e) => onSetPriority(job.id, e.target.value)}
-            className="text-xs bg-transparent border border-gray-300 dark:border-gray-600 rounded px-1 py-0.5"
-            aria-label="Set priority"
-          >
-            <option value="high">High</option>
-            <option value="normal">Normal</option>
-            <option value="low">Low</option>
-          </select>
+          {queued && (
+            <select
+              value={job.priority}
+              onChange={(e) => onSetPriority(job.id, e.target.value)}
+              className="text-xs bg-transparent border border-gray-300 dark:border-gray-600 rounded px-1 py-0.5"
+              aria-label="Set priority"
+            >
+              <option value="high">High</option>
+              <option value="normal">Normal</option>
+              <option value="low">Low</option>
+            </select>
+          )}
 
           {/* Per-item conflict policy (only for queued/active) */}
-          {isActive && (
+          {isActive && queued && (
             <select
               value={job.verify_checksum ? "overwrite" : "skip"}
               onChange={(e) => onSetConflictPolicy(job.id, e.target.value)}
@@ -303,7 +310,7 @@ function TransferItem({
           )}
 
           {/* Action buttons */}
-          {isActive && (
+          {isActive && queued && (
             <button
               onClick={() => onPause(job.id)}
               className="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-400"
@@ -325,7 +332,7 @@ function TransferItem({
               &gt;
             </button>
           )}
-          {isFailed && (
+          {isFailed && queued && (
             <button
               onClick={() => onRetry(job.id)}
               className="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700 text-orange-600 dark:text-orange-400"
@@ -823,6 +830,8 @@ function TransferPanelFull({
   );
   const pausedJobs = jobs.filter((j) => j.status === "paused");
   const failedJobs = jobs.filter((j) => j.status === "failed");
+  // "Retry All Failed" re-runs queue jobs only (connector transfers cannot be).
+  const retryableFailed = failedJobs.filter((j) => !j.external);
   const completedJobs = jobs.filter((j) => j.status === "completed");
   const cancelledJobs = jobs.filter((j) => j.status === "cancelled");
 
@@ -865,13 +874,13 @@ function TransferPanelFull({
           >
             {showFailedOnly ? "Show All" : "Show Failed Only"}
           </button>
-          {failedJobs.length > 0 && (
+          {retryableFailed.length > 0 && (
             <button
               onClick={onRetryAllFailed}
               className="text-xs px-2 py-1 rounded bg-orange-100 text-orange-700 hover:bg-orange-200 dark:bg-orange-900/30 dark:text-orange-400 dark:hover:bg-orange-900/50"
               type="button"
             >
-              Retry All Failed ({failedJobs.length})
+              Retry All Failed ({retryableFailed.length})
             </button>
           )}
           <button

@@ -23,12 +23,13 @@ pub(crate) struct DirConnector {
     root: PathBuf,
     fail: Vec<String>,
     delay_ms: u64,
+    upload_delay_ms: u64,
     pub listings: Mutex<u64>,
 }
 
 impl DirConnector {
     pub(crate) fn new(root: &Path) -> Self {
-        Self { root: root.to_path_buf(), fail: Vec::new(), delay_ms: 0, listings: Mutex::new(0) }
+        Self { root: root.to_path_buf(), fail: Vec::new(), delay_ms: 0, upload_delay_ms: 0, listings: Mutex::new(0) }
     }
 
     fn local(&self, remote: &str) -> PathBuf {
@@ -82,8 +83,11 @@ impl Connector for DirConnector {
         })
     }
     fn upload(&self, local: &str, remote: &str) -> Fut<'_, u64> {
-        let (local, target) = (local.to_string(), self.local(remote));
-        Box::pin(async move { std::fs::copy(local, target).map_err(io) })
+        let (local, target, delay) = (local.to_string(), self.local(remote), self.upload_delay_ms);
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            std::fs::copy(local, target).map_err(io)
+        })
     }
     fn download(&self, remote: &str, local: &str) -> Fut<'_, u64> {
         let (src, local) = (self.local(remote), local.to_string());
@@ -465,4 +469,210 @@ async fn cancelling_an_action_stops_between_steps() {
     assert!(report.cancelled);
     assert!(report.done.is_empty());
     assert!(!r.path().join("docs/left-only.txt").exists());
+}
+
+// ── Regressions (review round 1) ──
+
+async fn run_plan(plan: &compare::ActionPlan, left: &ResolvedSide, right: &ResolvedSide, tm: &TransferManager, ledger: &OperationLedger) -> apply::ExecReport {
+    let cancel = CancellationToken::new();
+    let progress = no_progress();
+    let env = ApplyEnv { transfer: tm, ledger, permanent: false, cancel: &cancel, progress: &progress, task_id: "t" };
+    apply::execute(plan, left, right, &env).await
+}
+
+fn copy_step(from: compare::CompareSideId, path: &str, replace: bool) -> compare::ActionPlan {
+    let to = from.other();
+    let action = if to == compare::CompareSideId::Right { CompareAction::CopyToRight } else { CompareAction::CopyToLeft };
+    compare::ActionPlan {
+        action,
+        steps: vec![compare::ActionStep::Copy { from, to, path: path.into(), size: 1, modified: None, replace }],
+        skipped: vec![],
+        files: 1,
+        folders: 0,
+        bytes: 1,
+        replaced: u64::from(replace),
+    }
+}
+
+/// Regression: a remote file named `..\..\evil` became the entry
+/// `../../evil`, and "Copy ← left" wrote it two folders above the root.
+#[tokio::test]
+async fn a_remote_name_that_climbs_out_is_never_copied_outside_the_root() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("a/b");
+    std::fs::create_dir_all(&root).unwrap();
+    let left = ResolvedSide::Local { root: root.clone() };
+    let r = tempfile::tempdir().unwrap();
+    write(r.path(), "..\\..\\evil", "pwned", 1_000_000);
+    write(r.path(), "fine.txt", "ok", 1_000_000);
+    let (right, _) = remote(&r);
+    let mut entries = compare(&left, &right, &CompareOptions::default()).await.entries;
+    let odd: Vec<&CompareEntry> = entries.iter().filter(|e| e.path != "fine.txt").collect();
+    assert_eq!(odd.len(), 1, "{entries:?}");
+    assert_eq!(odd[0].status, CompareStatus::Error);
+    // Shown under its own name with the separators replaced: one plain name.
+    assert!(ufop_core::sync::versions::is_safe_relative(&odd[0].path), "{}", odd[0].path);
+    assert!(!odd[0].path.contains('\\') && !odd[0].path.contains('/'), "{}", odd[0].path);
+    assert!(odd[0].error.as_deref().unwrap().contains("not a plain name"), "{:?}", odd[0].error);
+
+    // Copying everything brings fine.txt only.
+    let all: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+    let all: Vec<&str> = all.iter().map(String::as_str).collect();
+    let (tm, ledger) = env_parts().await;
+    let (report, _) = act(&left, &right, &mut entries, &all, CompareAction::CopyToLeft, &tm, &ledger).await;
+    assert_eq!(report.done, ["fine.txt"], "{:?}", report.failed);
+    assert!(!base.path().join("evil").exists(), "written outside the root");
+    assert_eq!(std::fs::read_dir(base.path()).unwrap().count(), 1, "only a/ is in the base folder");
+
+    // A step with such a path is refused by the sides themselves.
+    let report = run_plan(&copy_step(compare::CompareSideId::Right, "../../evil", false), &left, &right, &tm, &ledger).await;
+    assert!(report.done.is_empty());
+    assert_eq!(report.failed.len(), 1);
+    assert!(report.failed[0].error.contains("not a path inside"), "{:?}", report.failed);
+    assert!(!base.path().join("evil").exists());
+    assert!(left.local_path("../x").is_err() && right.abs("a/../../x").is_err());
+}
+
+/// Regression: what the left had inside a folder the right could not
+/// list showed as left-only, and copying it uploaded over unseen files.
+#[tokio::test]
+async fn entries_inside_a_folder_one_side_could_not_list_are_errors() {
+    let (l, r) = fixture();
+    let mut c = DirConnector::new(r.path());
+    c.fail.push("/docs".into());
+    let right = ResolvedSide::remote(Arc::new(c), "sftp", "Test", "/", None);
+    let left = local(&l);
+    let entries = compare(&left, &right, &CompareOptions::default()).await.entries;
+    for p in ["docs/same.txt", "docs/changed.txt", "docs/left-only.txt"] {
+        let e = entries.iter().find(|e| e.path == p).unwrap_or_else(|| panic!("{p}"));
+        assert_eq!(e.status, CompareStatus::Error, "{p}");
+        assert!(e.error.as_deref().unwrap().contains("could not be read on the right"), "{:?}", e.error);
+    }
+    let plan = plan_action(&entries, &["docs/left-only.txt".to_string(), "docs/same.txt".to_string()], CompareAction::CopyToRight);
+    assert!(plan.steps.is_empty(), "{:?}", plan.steps);
+
+    // An upload that is not meant to replace refuses when the folder
+    // cannot be checked…
+    let (tm, ledger) = env_parts().await;
+    write(l.path(), "docs/same.txt", "CHANGED", 1_000_000);
+    let report = run_plan(&copy_step(compare::CompareSideId::Left, "docs/same.txt", false), &left, &right, &tm, &ledger).await;
+    assert_eq!(report.failed.len(), 1, "{:?}", report.done);
+    assert_eq!(std::fs::read_to_string(r.path().join("docs/same.txt")).unwrap(), "same");
+}
+
+/// Regression: an upload of a file that was not on the connection when
+/// compared overwrote one that appeared since (local targets refused).
+#[tokio::test]
+async fn an_upload_never_overwrites_a_file_that_appeared_after_the_comparison() {
+    let (l, r) = fixture();
+    let (left, (right, _)) = (local(&l), remote(&r));
+    let mut entries = compare(&left, &right, &CompareOptions::default()).await.entries;
+    assert_eq!(status(&entries, "docs/left-only.txt"), CompareStatus::LeftOnly);
+    write(r.path(), "docs/left-only.txt", "someone else's", 1);
+    let (tm, ledger) = env_parts().await;
+    let (report, _) = act(&left, &right, &mut entries, &["docs/left-only.txt"], CompareAction::CopyToRight, &tm, &ledger).await;
+    assert!(report.done.is_empty(), "{:?}", report.done);
+    assert!(report.failed[0].error.contains("appeared after the comparison"), "{:?}", report.failed);
+    assert_eq!(std::fs::read_to_string(r.path().join("docs/left-only.txt")).unwrap(), "someone else's");
+}
+
+/// Regression: copying a left-only folder below the depth limit made an
+/// empty folder, reported it as done, and the row then read "Same".
+#[tokio::test]
+async fn copying_a_folder_whose_contents_were_not_listed_does_nothing_and_says_so() {
+    let (l, r) = fixture();
+    let (left, right) = (local(&l), local(&r));
+    let depth1 = CompareOptions { max_depth: 1, ..Default::default() };
+    let mut entries = compare(&left, &right, &depth1).await.entries;
+    let extra = entries.iter().find(|e| e.path == "extra").unwrap();
+    assert!(extra.children_skipped);
+    let plan = plan_action(&entries, &["extra".to_string()], CompareAction::CopyToRight);
+    assert!(plan.steps.is_empty());
+    assert!(plan.skipped[0].reason.contains("not compared"));
+    let (tm, ledger) = env_parts().await;
+    let (report, _) = act(&left, &right, &mut entries, &["extra"], CompareAction::CopyToRight, &tm, &ledger).await;
+    assert!(report.done.is_empty());
+    assert!(!r.path().join("extra").exists());
+    assert_eq!(status(&entries, "extra"), CompareStatus::LeftOnly);
+}
+
+/// Regression: Undo copies removed the files but left the folders made
+/// for them (they were recorded under another id).
+#[tokio::test]
+async fn undo_removes_the_copies_and_the_folders_made_for_them() {
+    let (l, r) = fixture();
+    let (left, right) = (local(&l), local(&r));
+    let mut entries = compare(&left, &right, &CompareOptions::default()).await.entries;
+    let (tm, ledger) = env_parts().await;
+    let (report, _) = act(&left, &right, &mut entries, &["extra"], CompareAction::CopyToRight, &tm, &ledger).await;
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert!(r.path().join("extra/deep/x.bin").exists());
+    let undo_ids: Vec<String> = report.undo_ids.clone();
+    assert_eq!(undo_ids.len(), 2, "copies, then the folders: {undo_ids:?}");
+    assert_eq!(report.undo_id.as_deref(), Some(undo_ids[0].as_str()));
+    // What "Undo copies" does: each id in turn, as the timeline's Undo would.
+    let metadata = crate::metadata_engine::MetadataStore::new(crate::storage::Repository::open_in_memory().await.unwrap());
+    for id in &undo_ids {
+        crate::commands::undo_commands::undo_by_correlation_impl(id.clone(), &ledger, &metadata).await.unwrap();
+    }
+    assert!(!r.path().join("extra").exists(), "the folders made for the copies are gone too");
+}
+
+/// Regression: a run ending removed the token of a newer run with the same
+/// id, so that run could no longer be cancelled.
+#[tokio::test]
+async fn an_ended_run_leaves_a_newer_run_with_the_same_id_cancellable() {
+    let m = CompareManager::new();
+    let first = m.begin("x:apply");
+    let second = m.begin("x:apply");
+    assert!(first.is_cancelled(), "a new run replaces the old one");
+    m.end("x:apply", &first);
+    assert!(m.cancel("x:apply"), "the newer run is still known");
+    assert!(second.is_cancelled());
+    let third = m.begin("x:apply");
+    m.end("x:apply", &third);
+    assert!(!m.cancel("x:apply"));
+}
+
+/// Regression: Cancel on a connector transfer's row in the transfer queue
+/// did not stop it, and the row then turned "completed".
+#[tokio::test]
+async fn cancelling_a_tracked_upload_in_the_queue_stops_it() {
+    let (l, r) = fixture();
+    let mut c = DirConnector::new(r.path());
+    c.upload_delay_ms = 5_000;
+    let right = ResolvedSide::remote(Arc::new(c), "sftp", "Test", "/", None);
+    let left = local(&l);
+    let entries = compare(&left, &right, &CompareOptions::default()).await.entries;
+    let (tm, ledger) = env_parts().await;
+    let plan = plan_action(&entries, &["docs/left-only.txt".to_string()], CompareAction::CopyToRight);
+    let started = std::time::Instant::now();
+    let canceller = async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if let Some(job) = tm.list_jobs().await.unwrap().into_iter().find(|j| j.external) {
+                tm.cancel(job.id).await.unwrap();
+                return job.id;
+            }
+        }
+    };
+    let (report, job_id) = tokio::join!(run_plan(&plan, &left, &right, &tm, &ledger), canceller);
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "the upload was not stopped");
+    assert!(report.done.is_empty(), "{:?}", report.done);
+    assert!(report.failed[0].error.contains("Cancelled from the transfer queue"), "{:?}", report.failed);
+    assert_eq!(tm.get_job(job_id).await.unwrap().unwrap().status, TransferStatus::Cancelled);
+    assert!(!r.path().join("docs/left-only.txt").exists());
+}
+
+/// Regression (found while fixing Undo copies): undoing created folders
+/// listed parent-first failed with "Directory not empty"; the ledger does
+/// not keep the order rows written in the same instant were recorded in.
+#[tokio::test]
+async fn undoing_created_folders_works_in_any_listed_order() {
+    let base = tempfile::tempdir().unwrap();
+    let (a, ab) = (base.path().join("a"), base.path().join("a/b"));
+    std::fs::create_dir_all(&ab).unwrap();
+    let listed = vec![a.to_string_lossy().to_string(), ab.to_string_lossy().to_string()];
+    crate::commands::file_ops_commands::undo_file_operation_inner("create_folder".into(), vec![], listed).await.unwrap();
+    assert!(!a.exists());
 }

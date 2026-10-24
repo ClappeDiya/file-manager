@@ -77,14 +77,15 @@ function result(taskId: string): CompareResult {
 
 const LOW = { level: "low", reasons: [], baseline_sample_size: 0, baseline_median_files: 0, baseline_median_bytes: 0, intent_hash: "h", requires_confirmation: false };
 
-function plan(action: string, paths: string[]) {
+// Like the backend: a delete's intent kind follows the "permanent" choice it is planned with.
+function plan(action: string, paths: string[], permanent = false) {
   const steps = paths
     .filter((p) => p !== "docs/a.txt")
     .map((p) => (action.startsWith("delete") ? { type: "delete", side: "right", path: p, is_dir: false, size: 30 } : { type: "copy", from: "left", to: "right", path: p, size: 10, modified: null, replace: p === "docs/b.txt" }));
   const skipped = paths.includes("docs/a.txt") ? [{ path: "docs/a.txt", reason: "Already the same on both sides." }] : [];
   return {
     plan: { action, steps, skipped, files: steps.length, folders: 0, bytes: steps.length * 10, replaced: 0 },
-    intent: { engine: "fs", kind: action.startsWith("delete") ? "delete_trash" : "copy", affected_files: steps.length, total_bytes: 10, subject_path: "/home/me/b", summary: "s" },
+    intent: { engine: "fs", kind: action.startsWith("delete") ? (permanent ? "delete_permanent" : "delete_trash") : "copy", affected_files: steps.length, total_bytes: 10, subject_path: "/home/me/b", summary: "s" },
   };
 }
 
@@ -99,6 +100,7 @@ function outcome(args: { paths: string[]; action: string; taskId: string }): App
     notes: [],
     cancelled: false,
     undo_id: args.action.startsWith("copy") ? "undo-1" : null,
+    undo_ids: args.action.startsWith("copy") ? ["undo-1", "undo-folders-1"] : [],
     changed: args.action.startsWith("copy") ? args.paths.map((p) => entry(p, "same")) : [],
     removed: args.action.startsWith("delete") ? args.paths : [],
     summary: SUMMARY,
@@ -114,7 +116,7 @@ function backend(cmd: string, args: Record<string, unknown>): unknown {
       if (holdCompare) return new Promise((r) => (compareResolver = r));
       return result(args.taskId as string);
     case "compare_plan_action":
-      return plan(args.action as string, args.paths as string[]);
+      return plan(args.action as string, args.paths as string[], args.permanent === true);
     case "safety_assess_intent":
       return LOW;
     case "compare_apply":
@@ -231,7 +233,8 @@ describe("FolderCompareDialog", () => {
     expect(row("docs/b.txt")).toHaveAttribute("aria-selected", "false");
 
     fireEvent.click(screen.getByTestId("compare-undo"));
-    await waitFor(() => expect(calls("undo_by_correlation")).toEqual([{ correlationId: "undo-1" }]));
+    // The copies, then the folders made for them, in that order.
+    await waitFor(() => expect(calls("undo_by_correlation")).toEqual([{ correlationId: "undo-1" }, { correlationId: "undo-folders-1" }]));
     // Undo compares again.
     await waitFor(() => expect(calls("compare_folders")).toHaveLength(2));
   });
@@ -264,9 +267,29 @@ describe("FolderCompareDialog", () => {
     expect(calls("compare_apply")).toEqual([]);
     fireEvent.click(within(confirm).getByTestId("compare-confirm-delete-yes"));
     await screen.findByText(/Delete on right: 1 done/);
-    expect(calls("safety_assess_intent")[0]).toEqual({ intent: expect.objectContaining({ kind: "delete_trash" }) });
+    expect(calls("safety_assess_intent")[0]).toEqual({ intent: expect.objectContaining({ kind: "delete_permanent" }) });
     expect(calls("compare_apply")[0]).toEqual(expect.objectContaining({ paths: ["zzz.txt"], action: "delete_right", permanent: true }));
     expect(row("zzz.txt")).toBeNull();
+  });
+
+  // Regression: toggling "Delete permanently" after planning sent permanent=true
+  // while the interlock assessed (and the ledger recorded) the Trash intent.
+  it("toggling Delete permanently while a delete waits re-plans it, so the interlock assesses what runs", async () => {
+    await openCompare();
+    fireEvent.click(screen.getByTestId("compare-select-zzz.txt"));
+    fireEvent.click(screen.getByTestId("compare-action-delete_right"));
+    expect(await screen.findByTestId("compare-confirm-delete")).toHaveTextContent(/to the Trash/);
+    fireEvent.click(screen.getByTestId("compare-permanent"));
+    await waitFor(() => expect(calls("compare_plan_action")).toHaveLength(2));
+    expect(calls("compare_plan_action")[1]).toEqual(expect.objectContaining({ paths: ["zzz.txt"], action: "delete_right", permanent: true }));
+    const confirm = await screen.findByTestId("compare-confirm-delete");
+    await waitFor(() => expect(confirm).toHaveTextContent(/permanently/));
+    fireEvent.click(within(confirm).getByTestId("compare-confirm-delete-yes"));
+    await screen.findByText(/Delete on right: 1 done/);
+    const assessed = calls("safety_assess_intent")[0].intent as { kind: string };
+    const sent = calls("compare_apply")[0];
+    expect(assessed.kind).toBe(sent.permanent ? "delete_permanent" : "delete_trash");
+    expect(sent.permanent).toBe(true);
   });
 
   it("cancels a running comparison by its task id", async () => {
