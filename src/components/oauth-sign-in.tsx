@@ -85,13 +85,20 @@ export function OAuthSignIn({
   const start = async () => {
     setError(null);
     setBusy(true);
+    let started: string | null = null;
     try {
       const s = await beginSignIn(connectionId, customClient || null, advanced ? clientSecret : null);
+      started = s.state;
       stateRef.current = s.state;
       setPending(s);
       setBusy(false);
-      finish(await awaitSignIn(s.state));
+      const signedIn = await awaitSignIn(s.state);
+      // Already finished another way (a pasted code) or cancelled meanwhile.
+      if (stateRef.current !== started) return;
+      finish(signedIn);
     } catch (e) {
+      // Finished another way (a pasted code) or cancelled: not an error here.
+      if (started && stateRef.current !== started) return;
       stateRef.current = null;
       setPending(null);
       setError(errorText(e));

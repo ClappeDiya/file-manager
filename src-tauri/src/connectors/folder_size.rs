@@ -22,6 +22,19 @@ pub async fn folder_size(connector: Arc<dyn Connector>, root: &str, concurrency:
 
 /// Walk every folder below `root`, `concurrency` listings at a time.
 pub async fn walk(connector: Arc<dyn Connector>, root: &str, concurrency: usize, cancel: CancellationToken) -> Result<FolderSize, AppError> {
+    walk_with(move |dir: String| {
+        let c = connector.clone();
+        async move { c.list_remote(&dir).await }
+    }, root, concurrency, cancel)
+    .await
+}
+
+/// [`walk`] over any lister (`list(dir)` → the entries in `dir`).
+pub async fn walk_with<L, F>(list: L, root: &str, concurrency: usize, cancel: CancellationToken) -> Result<FolderSize, AppError>
+where
+    L: Fn(String) -> F,
+    F: std::future::Future<Output = Result<Vec<crate::core::types::FileEntry>, AppError>> + Send + 'static,
+{
     let mut total = FolderSize { complete: true, folders: Some(0), ..Default::default() };
     let mut pending: Vec<String> = vec![root.to_string()];
     let mut running: JoinSet<Result<Vec<crate::core::types::FileEntry>, AppError>> = JoinSet::new();
@@ -29,8 +42,7 @@ pub async fn walk(connector: Arc<dyn Connector>, root: &str, concurrency: usize,
     loop {
         while running.len() < limit {
             let Some(dir) = pending.pop() else { break };
-            let c = connector.clone();
-            running.spawn(async move { c.list_remote(&dir).await });
+            running.spawn(list(dir));
         }
         if running.is_empty() {
             break;
@@ -61,18 +73,8 @@ pub async fn walk(connector: Arc<dyn Connector>, root: &str, concurrency: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{ConnectionProfile, FileEntry};
-    use std::future::Future;
-    use std::pin::Pin;
+    use crate::core::types::FileEntry;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// A tree: /a (2 files), /a/b (1 file), /c (empty), plus 1 file at the
-    /// root; each listing takes a moment and in-flight listings are counted.
-    struct Tree {
-        in_flight: AtomicUsize,
-        max_in_flight: AtomicUsize,
-        delay_ms: u64,
-    }
 
     fn f(path: &str, size: u64) -> FileEntry {
         FileEntry { name: path.rsplit('/').next().unwrap().into(), path: path.into(), is_dir: false, is_symlink: false, size, modified: None, created: None, is_hidden: false, extension: None, permissions: None }
@@ -82,44 +84,38 @@ mod tests {
         FileEntry { is_dir: true, ..f(path, 0) }
     }
 
-    impl Connector for Tree {
-        fn connect(&self, _: &ConnectionProfile) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
-            Box::pin(async { Ok(()) })
-        }
-        fn disconnect(&self) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
-            Box::pin(async { Ok(()) })
-        }
-        fn is_connected(&self) -> bool {
-            true
-        }
-        fn list_remote(&self, path: &str) -> Pin<Box<dyn Future<Output = Result<Vec<FileEntry>, AppError>> + Send + '_>> {
-            let path = path.to_string();
+    /// A tree: /a (2 files), /a/b (1 file), /c (empty), plus 1 file at the
+    /// root; each listing takes `delay_ms` and in-flight listings are counted.
+    fn tree(delay_ms: u64) -> (impl Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<FileEntry>, AppError>> + Send>>, Arc<AtomicUsize>) {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max = Arc::new(AtomicUsize::new(0));
+        let m2 = max.clone();
+        let lister = move |path: String| {
+            let (in_flight, max) = (in_flight.clone(), m2.clone());
             Box::pin(async move {
-                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
-                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
                 Ok(match path.as_str() {
                     "/" => vec![d("/a"), d("/c"), f("/top.bin", 5)],
                     "/a" => vec![f("/a/1", 10), f("/a/2", 20), d("/a/b")],
                     "/a/b" => vec![f("/a/b/3", 100)],
                     _ => vec![],
                 })
-            })
-        }
-    }
-
-    fn tree(delay_ms: u64) -> Arc<Tree> {
-        Arc::new(Tree { in_flight: AtomicUsize::new(0), max_in_flight: AtomicUsize::new(0), delay_ms })
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<FileEntry>, AppError>> + Send>>
+        };
+        (lister, max)
     }
 
     #[tokio::test]
     async fn walks_the_whole_tree_with_bounded_concurrency() {
-        let t = tree(20);
-        let size = folder_size(t.clone(), "/", 2, CancellationToken::new()).await.unwrap();
+        let (list, max) = tree(20);
+        let size = walk_with(list, "/", 2, CancellationToken::new()).await.unwrap();
         assert_eq!(size, FolderSize { bytes: 135, files: 4, folders: Some(3), complete: true });
-        assert!(t.max_in_flight.load(Ordering::SeqCst) <= 2);
-        assert_eq!(walk(tree(0), "/a", 8, CancellationToken::new()).await.unwrap(), FolderSize { bytes: 130, files: 3, folders: Some(1), complete: true });
+        assert!(max.load(Ordering::SeqCst) <= 2);
+        let (list, _) = tree(0);
+        assert_eq!(walk_with(list, "/a", 8, CancellationToken::new()).await.unwrap(), FolderSize { bytes: 130, files: 3, folders: Some(1), complete: true });
     }
 
     #[tokio::test]
@@ -130,8 +126,23 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             c2.cancel();
         });
-        let size = walk(tree(1000), "/", 1, cancel).await.unwrap();
+        let (list, _) = tree(1000);
+        let size = walk_with(list, "/", 1, cancel).await.unwrap();
         assert!(!size.complete);
         assert_eq!(size.files, 0);
+    }
+
+    /// The real connector path, over a local folder tree.
+    #[tokio::test]
+    async fn walks_a_real_connector() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t.path().join("x/y")).unwrap();
+        std::fs::write(t.path().join("x/a.bin"), [0u8; 7]).unwrap();
+        std::fs::write(t.path().join("x/y/b.bin"), [0u8; 5]).unwrap();
+        let c: Arc<dyn Connector> = Arc::new(crate::connectors::LocalDriveConnector::new());
+        let root = t.path().to_string_lossy().to_string();
+        c.connect(&crate::connectors::live_tests::profile(crate::core::types::ConnectionProtocol::Local, "", None, "", &root)).await.unwrap();
+        let size = folder_size(c, &t.path().join("x").to_string_lossy(), 4, CancellationToken::new()).await.unwrap();
+        assert_eq!((size.bytes, size.files, size.folders, size.complete), (12, 2, Some(1), true));
     }
 }

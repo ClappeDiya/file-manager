@@ -808,6 +808,7 @@ function ConnectionForm({
             ))}
           </select>
         </div>
+        {!isOAuth && !isB2 && (
         <div>
           <label className="block text-xs font-medium mb-1">Port</label>
           <input
@@ -818,6 +819,7 @@ function ConnectionForm({
             className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
           />
         </div>
+        )}
       </div>
       {isOAuth && (
         <p className="text-xs text-gray-500 dark:text-gray-400" data-testid="oauth-form-hint">

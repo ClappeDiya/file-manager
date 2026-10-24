@@ -85,6 +85,32 @@ describe("OAuthSignIn", () => {
     await act(async () => resolveAwait(SIGNED));
   });
 
+  it("a pasted code that finishes the sign-in is not followed by an error or a second finish", async () => {
+    // Regression: when the pasted code finished the sign-in, the browser wait
+    // ended (rejected, or resolved late) and showed an error / finished twice.
+    for (const ending of ["rejects", "resolves"] as const) {
+      mockInvoke.mockReset();
+      let endAwait: () => void = () => {};
+      backend({
+        oauth_await: () =>
+          new Promise((resolve, reject) => {
+            endAwait = () => (ending === "rejects" ? reject({ message: "No sign-in is waiting for that state", advice: "Start again." }) : resolve(SIGNED));
+          }),
+        oauth_complete: () => SIGNED,
+      });
+      const done = vi.fn();
+      const { unmount } = render(<OAuthSignIn connectionId="c1" protocol="google_drive" onSignedIn={done} />);
+      fireEvent.click(await screen.findByRole("button", { name: "Sign in with Google Drive" }));
+      fireEvent.change(await screen.findByLabelText(/Paste the code/), { target: { value: "abc" } });
+      fireEvent.click(screen.getByRole("button", { name: "Use code" }));
+      await waitFor(() => expect(done).toHaveBeenCalledTimes(1));
+      await act(async () => endAwait());
+      expect(done).toHaveBeenCalledTimes(1);
+      expect(screen.queryByTestId("oauth-error")).toBeNull();
+      unmount();
+    }
+  });
+
   it("cancels a waiting sign-in", async () => {
     backend({ oauth_await: () => new Promise(() => {}) });
     render(<OAuthSignIn connectionId="c1" protocol="google_drive" onSignedIn={vi.fn()} />);

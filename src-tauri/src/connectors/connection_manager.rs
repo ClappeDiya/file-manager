@@ -194,18 +194,34 @@ impl ConnectionManager {
             }
             _ => {
                 // For remote connections, try a TCP connect to the host:port
-                let host = profile.host.clone();
-                let port = profile.port.unwrap_or(Self::default_port(profile.protocol));
+                // (host names are resolved; cloud services probe their API host).
+                let (host, embedded_port) = Self::split_host_port(&Self::probe_host(profile));
+                let port = profile.port.or(embedded_port).unwrap_or(Self::default_port(profile.protocol));
+
+                if host.is_empty() {
+                    return Err(AppError::Connection {
+                        message: "The connection has no host.".to_string(),
+                        advice: "Enter the server's host name or address.".to_string(),
+                    });
+                }
 
                 tokio::task::spawn_blocking(move || {
-                    let addr = format!("{host}:{port}");
-                    match std::net::TcpStream::connect_timeout(
-                        &addr.parse().map_err(|e| AppError::Connection {
-                            message: format!("Invalid address {addr}: {e}"),
+                    use std::net::ToSocketAddrs;
+                    let addr = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+                    let resolved = match addr.to_socket_addrs() {
+                        Ok(mut addrs) => addrs.next(),
+                        Err(e) => {
+                            tracing::warn!("Connection test could not resolve {addr}: {e}");
+                            return Ok(false);
+                        }
+                    };
+                    let Some(sock) = resolved else {
+                        return Err(AppError::Connection {
+                            message: format!("Invalid address {addr}"),
                             advice: "Check the host and port.".to_string(),
-                        })?,
-                        std::time::Duration::from_secs(5),
-                    ) {
+                        });
+                    };
+                    match std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_secs(5)) {
                         Ok(_) => Ok(true),
                         Err(e) => {
                             tracing::warn!("Connection test failed for {addr}: {e}");
@@ -230,6 +246,43 @@ impl ConnectionManager {
                 Some("Host is not reachable.".to_string())
             },
         })
+    }
+
+    /// The host a connection test probes: the profile's host without any
+    /// scheme or path, or the service's API host for cloud connections
+    /// saved without one.
+    pub(crate) fn probe_host(profile: &ConnectionProfile) -> String {
+        let raw = profile.host.trim();
+        let raw = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
+        let host = raw.split(['/', '?', '#']).next().unwrap_or("").to_string();
+        if !host.is_empty() {
+            return host;
+        }
+        match profile.protocol {
+            ConnectionProtocol::GoogleDrive => "www.googleapis.com",
+            ConnectionProtocol::Dropbox => "api.dropboxapi.com",
+            ConnectionProtocol::OneDrive => "graph.microsoft.com",
+            ConnectionProtocol::B2 => "api.backblazeb2.com",
+            ConnectionProtocol::S3 => "s3.amazonaws.com",
+            _ => "",
+        }
+        .to_string()
+    }
+
+    /// Split `host:port` (or `[v6]:port`); a bare IPv6 address has no port.
+    fn split_host_port(host: &str) -> (String, Option<u16>) {
+        if let Some(rest) = host.strip_prefix('[') {
+            if let Some((h, tail)) = rest.split_once(']') {
+                return (h.to_string(), tail.strip_prefix(':').and_then(|p| p.parse().ok()));
+            }
+        }
+        match host.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') => match p.parse() {
+                Ok(port) => (h.to_string(), Some(port)),
+                Err(_) => (host.to_string(), None),
+            },
+            _ => (host.to_string(), None),
+        }
     }
 
     /// Get default port for a protocol.
@@ -584,6 +637,22 @@ mod tests {
 
         let results = mgr.search_connections("example").await.unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    /// Regression: the test parsed `host:port` as a socket address, so every
+    /// connection with a host name (not an IP) failed with "Invalid address".
+    #[tokio::test]
+    async fn test_connection_resolves_host_names() {
+        let mgr = setup().await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut profile = make_test_profile();
+        profile.host = "localhost".into();
+        profile.port = Some(listener.local_addr().unwrap().port());
+        let r = mgr.test_connection(&profile).await.unwrap();
+        assert!(r.reachable, "{:?}", r.error);
+        // Cloud connections have no host: the service's API host is probed.
+        assert_eq!(ConnectionManager::probe_host(&{ let mut p = make_test_profile(); p.protocol = ConnectionProtocol::Dropbox; p.host = String::new(); p }), "api.dropboxapi.com");
+        assert_eq!(ConnectionManager::probe_host(&{ let mut p = make_test_profile(); p.protocol = ConnectionProtocol::WebDav; p.host = "https://dav.example.com/remote.php".into(); p }), "dav.example.com");
     }
 
     #[tokio::test]
