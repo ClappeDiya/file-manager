@@ -165,7 +165,8 @@ fn ok<T: Serialize>(v: T) -> Result<Value, AppError> {
 /// (exactly what the frontend sends to `invoke`).
 pub async fn dispatch(mgr: &BackupManager, command: &str, a: &Value) -> Result<Value, AppError> {
     // Boxed: the match holds a future per command, too large for a caller's stack frame.
-    Box::pin(dispatch_inner(mgr, command, a)).await
+    // Every caller is another program (REST/RPC, fleet agent): its runs are API runs.
+    Box::pin(super::trigger::scoped(ufop_core::run_trigger::RunTrigger::Api, dispatch_inner(mgr, command, a))).await
 }
 
 async fn dispatch_inner(mgr: &BackupManager, command: &str, a: &Value) -> Result<Value, AppError> {
@@ -208,7 +209,10 @@ async fn dispatch_inner(mgr: &BackupManager, command: &str, a: &Value) -> Result
             .await?),
         "backup_run_all" => ok(mgr.run_all(opt(a, "filter")?.unwrap_or_default()).await?),
         "backup_estimate" => ok(mgr.estimate(&arg::<String>(a, "jobId")?, opt(a, "assumedBytesPerSec")?).await?),
-        "backup_run_history" => ok(mgr.run_history_listing(opt(a, "jobId")?, opt(a, "limit")?.unwrap_or(50), opt(a, "page")?).await?),
+        "backup_run_history" => {
+            let (from, to) = crate::core::date_range::parse_range(opt::<String>(a, "dateFrom")?.as_deref(), opt::<String>(a, "dateTo")?.as_deref())?;
+            ok(mgr.run_history_listing_between(opt(a, "jobId")?, opt(a, "limit")?.unwrap_or(50), opt(a, "page")?, from.map(|d| d.to_rfc3339()), to.map(|d| d.to_rfc3339())).await?)
+        }
         "backup_prune_history" => ok(mgr.prune_history(arg::<u32>(a, "days")?.max(1)).await?),
         "backup_export_config" => ok(export_config(
             mgr,

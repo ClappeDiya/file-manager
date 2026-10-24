@@ -830,6 +830,7 @@ pub fn run() {
             backup_commands::backup_search,
             backup_commands::backup_compare,
             backup_commands::backup_run_history,
+            backup_commands::backup_replica_history,
             backup_commands::desktop_metrics_status,
             backup_commands::desktop_metrics_configure,
             backup_commands::backup_prune_history,

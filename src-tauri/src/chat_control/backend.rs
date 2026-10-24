@@ -55,7 +55,9 @@ impl BotBackend for TauriBackend {
         Box::pin(async move {
             match job.kind {
                 JobKind::Backup => {
-                    self.app.state::<BackupManager>().start_backup(&job.id, false).await.map_err(|e| e.user_message())?;
+                    crate::backup_engine::trigger::scoped(ufop_core::run_trigger::RunTrigger::Api, self.app.state::<BackupManager>().start_backup(&job.id, false))
+                        .await
+                        .map_err(|e| e.user_message())?;
                     Ok(format!("Started the backup \"{}\".", job.name))
                 }
                 JobKind::Sync => {

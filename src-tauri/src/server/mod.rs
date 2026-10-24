@@ -303,7 +303,8 @@ async fn require_auth(State(st): State<ServerState>, mut req: Request, next: Nex
         Ok((principal, acc)) => {
             req.extensions_mut().insert(principal);
             req.extensions_mut().insert(acc);
-            next.run(req).await
+            // Whatever an authenticated request starts is an API run.
+            crate::backup_engine::trigger::scoped(ufop_core::run_trigger::RunTrigger::Api, next.run(req)).await
         }
         Err(e) => ApiError(e).into_response(),
     }
