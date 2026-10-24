@@ -1,14 +1,23 @@
-/** Billing: Stripe checkout/portal/invoices against a mock API, signed webhooks → license seats, idempotency, step-up. */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+/**
+ * Billing: Stripe checkout/portal/invoices against a mock API, signed webhooks → license seats, idempotency, step-up;
+ * free trial (first subscription only), annual interval, trial-ending notices and applied coupons.
+ */
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import crypto from 'crypto';
 import http from 'http';
 import net from 'net';
 import { NextRequest } from 'next/server';
-import { db } from '@/lib/db';
+import Database from 'better-sqlite3';
+import { db, migrate } from '@/lib/db';
 import { listAudit } from '@/lib/db/repos/audit';
 import { createOrg, license } from '@/lib/db/repos/orgs';
+import { createChannel } from '@/lib/db/repos/channels';
+import { createLink, registerWithToken } from '@/lib/db/repos/machines';
+import { listOutbox } from '@/lib/db/repos/outbox';
 import { createSession } from '@/lib/db/repos/sessions';
-import { billingAccount, setBillingProvider } from '@/lib/billing';
+import { billingAccount, setBillingProvider, trialEligible } from '@/lib/billing';
+import { trialDaysLeft, discountAmount, discountDuration, hasPaymentMethod, trialEndsPhrase, trialOutcome } from '@/lib/billing/trial';
+import { DEFAULT_TRIAL_DAYS } from '@/lib/billing/config';
 import { StripeProvider } from '@/lib/billing/stripe';
 import { json, makeUser, req } from './helpers';
 import * as billing from '@/app/api/billing/route';
@@ -18,19 +27,52 @@ import * as webhook from '@/app/api/billing/webhook/route';
 
 const SECRET = 'whsec_test';
 const PRICE = 'price_business_test';
+const ANNUAL = 'price_business_annual_test';
 let server: http.Server;
 let base = '';
+/** Customers that have a subscription at the mock provider (answers GET /v1/subscriptions). */
+const customersWithSubscriptions = new Set<string>();
+/** Checkout sessions that can no longer be expired because they completed. */
+const finishedSessions = new Set<string>();
+/** Checkout sessions that expired by themselves (they cannot be expired again). */
+const lapsedSessions = new Set<string>();
+/** Sessions the console expired. */
+const expiredByConsole = new Set<string>();
+/** Make the checkout lookup fail (the state of an earlier session cannot be read). */
+let sessionLookupDown = false;
+let sessionCount = 0;
 const calls: { method: string; url: string; body: string; auth: string }[] = [];
 
 beforeAll(async () => {
   process.env.STRIPE_PRICE_BUSINESS = PRICE;
+  process.env.STRIPE_PRICE_BUSINESS_ANNUAL = ANNUAL;
   server = http.createServer((rq, rs) => {
     let body = '';
     rq.on('data', (c) => (body += c));
     rq.on('end', () => {
       calls.push({ method: rq.method ?? '', url: rq.url ?? '', body, auth: String(rq.headers.authorization) });
       const send = (status: number, v: unknown) => rs.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(v));
-      if (rq.url === '/v1/checkout/sessions') return send(200, { id: 'cs_1', url: 'https://checkout.stripe.test/cs_1' });
+      if (rq.url === '/v1/checkout/sessions') {
+        const id = `cs_${++sessionCount}`;
+        return send(200, { id, url: `https://checkout.stripe.test/${id}` });
+      }
+      const expire = /^\/v1\/checkout\/sessions\/(cs_\d+)\/expire$/.exec(rq.url ?? '');
+      if (expire) {
+        if (finishedSessions.has(expire[1]) || lapsedSessions.has(expire[1])) return send(400, { error: { message: 'Only open sessions can be expired' } });
+        expiredByConsole.add(expire[1]);
+        return send(200, { id: expire[1], status: 'expired' });
+      }
+      const lookup = /^\/v1\/checkout\/sessions\/(cs_\d+)$/.exec(rq.url ?? '');
+      if (lookup) {
+        if (sessionLookupDown) return send(500, { error: { message: 'boom' } });
+        const id = lookup[1];
+        return send(200, { id, status: finishedSessions.has(id) ? 'complete' : lapsedSessions.has(id) || expiredByConsole.has(id) ? 'expired' : 'open' });
+      }
+      if (rq.url?.startsWith('/v1/subscriptions?')) {
+        const customer = new URLSearchParams(rq.url.split('?')[1]).get('customer') ?? '';
+        if (customer === 'cus_lookup_down') return send(500, { error: { message: 'boom' } });
+        return send(200, { data: customersWithSubscriptions.has(customer) ? [{ id: 'sub_x', status: 'canceled' }] : [] });
+      }
       if (rq.url === '/v1/billing_portal/sessions') return send(200, { id: 'bps_1', url: 'https://billing.stripe.test/p/1' });
       if (rq.url?.startsWith('/v1/invoices')) {
         if (rq.url.includes('cus_broken')) return send(500, { error: { message: 'boom' } });
@@ -49,6 +91,7 @@ beforeAll(async () => {
 afterAll(() => {
   setBillingProvider(undefined);
   delete process.env.STRIPE_PRICE_BUSINESS;
+  delete process.env.STRIPE_PRICE_BUSINESS_ANNUAL;
   server.close();
 });
 
@@ -234,5 +277,545 @@ describe('billing', () => {
     } finally {
       setBillingProvider(new StripeProvider('sk_test', SECRET, base));
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Trial, annual billing, trial-ending notices and coupons
+// ---------------------------------------------------------------------------------------------
+
+const DAY = 86_400_000;
+const unix = (ms: number) => Math.floor(ms / 1000);
+
+/** A subscription event carrying trial and discount data. */
+function trialSub(orgId: string, o: { status?: string; price?: string; seats?: number; trialEnd?: number | null; type?: string; discount?: unknown; customer?: string; sub?: string } = {}) {
+  const ev = subscription(orgId, { status: o.status ?? 'trialing', price: o.price, seats: o.seats ?? 5, type: o.type, customer: o.customer });
+  const obj = ev.data.object as Record<string, unknown>;
+  obj.id = o.sub ?? 'sub_t';
+  obj.trial_end = o.trialEnd === undefined ? unix(Date.now() + 10 * DAY) : o.trialEnd;
+  obj.discount = o.discount ?? null;
+  return ev;
+}
+
+async function startCheckoutFor(orgName: string, body: Record<string, unknown> = { plan: 'business', seats: 3 }) {
+  const org = createOrg({ name: orgName });
+  const owner = makeUser(`owner@${orgName.toLowerCase().replace(/\W+/g, '')}.test`, 'org_owner', org.id);
+  const post = async (b: Record<string, unknown> = body) => json<{ url?: string; error?: string }>(await checkout.POST(await req('POST', '/api/billing/checkout', { as: owner, body: b })));
+  return { org, owner, post, params: () => new URLSearchParams(calls.findLast((c) => c.url === '/v1/checkout/sessions')!.body) };
+}
+
+describe('billing: free trial', () => {
+  it('starts a first-time subscription with the promised trial, no card up front, and a promotion-code field', async () => {
+    const t = await startCheckoutFor('First timer');
+    expect((await t.post()).status).toBe(200);
+    const p = t.params();
+    expect(p.get('line_items[0][price]')).toBe(PRICE);
+    expect(p.get('subscription_data[trial_period_days]')).toBe(String(DEFAULT_TRIAL_DAYS));
+    expect(DEFAULT_TRIAL_DAYS).toBe(14);
+    expect(p.get('payment_method_collection')).toBe('if_required');
+    expect(p.get('subscription_data[trial_settings][end_behavior][missing_payment_method]')).toBe('cancel');
+    expect(p.get('allow_promotion_codes')).toBe('true');
+  });
+
+  it('takes the trial length from BILLING_TRIAL_DAYS; 0 turns trials off and a bad value falls back to the default', async () => {
+    const t = await startCheckoutFor('Configured trial');
+    try {
+      process.env.BILLING_TRIAL_DAYS = '30';
+      await t.post();
+      expect(t.params().get('subscription_data[trial_period_days]')).toBe('30');
+      process.env.BILLING_TRIAL_DAYS = '0';
+      await t.post();
+      expect([...t.params().keys()].filter((k) => k.includes('trial') || k === 'payment_method_collection')).toEqual([]);
+      process.env.BILLING_TRIAL_DAYS = 'soon';
+      await t.post();
+      expect(t.params().get('subscription_data[trial_period_days]')).toBe('14');
+    } finally {
+      delete process.env.BILLING_TRIAL_DAYS;
+    }
+  });
+
+  it('hides the promotion-code field when BILLING_ALLOW_PROMOTION_CODES is off', async () => {
+    const t = await startCheckoutFor('No coupons');
+    try {
+      process.env.BILLING_ALLOW_PROMOTION_CODES = 'false';
+      await t.post();
+      expect(t.params().has('allow_promotion_codes')).toBe(false);
+    } finally {
+      delete process.env.BILLING_ALLOW_PROMOTION_CODES;
+    }
+  });
+
+  it('gives an organization one trial only: none after any earlier subscription, even a cancelled one', async () => {
+    const t = await startCheckoutFor('Repeat trialer');
+    expect(trialEligible(t.org.id)).toBe(true);
+    // Abandoning a checkout (no provider event) keeps the trial available.
+    await t.post();
+    await t.post();
+    expect(t.params().get('subscription_data[trial_period_days]')).toBe('14');
+
+    await deliver(trialSub(t.org.id, { customer: 'cus_repeat' }));
+    expect(billingAccount(t.org.id)).toMatchObject({ status: 'trialing', trialUsed: true });
+    expect(trialEligible(t.org.id)).toBe(false);
+    await deliver(trialSub(t.org.id, { customer: 'cus_repeat', type: 'customer.subscription.deleted', status: 'canceled' }));
+    expect(billingAccount(t.org.id)).toMatchObject({ status: 'canceled', trialUsed: true, trialEnd: null });
+
+    expect((await t.post()).status).toBe(200);
+    const p = t.params();
+    expect(p.get('line_items[0][price]')).toBe(PRICE);
+    expect([...p.keys()].filter((k) => k.includes('trial') || k === 'payment_method_collection')).toEqual([]);
+    expect(p.get('customer')).toBe('cus_repeat');
+  });
+
+  it('counts a completed checkout and a paid subscription as the first-time trial used', async () => {
+    const a = await startCheckoutFor('Checkout done');
+    await deliver({ id: 'evt_cd', type: 'checkout.session.completed', data: { object: { client_reference_id: a.org.id, customer: 'cus_cd', subscription: 'sub_cd' } } });
+    expect(trialEligible(a.org.id)).toBe(false);
+    const b = await startCheckoutFor('Paid directly');
+    await deliver(subscription(b.org.id, { status: 'active' }));
+    expect(trialEligible(b.org.id)).toBe(false);
+  });
+
+  it('reports trial eligibility and annual availability on the billing page', async () => {
+    const t = await startCheckoutFor('Page data');
+    const get = async () => json<{ trial: { days: number; eligible: boolean }; promotionCodes: boolean; plans: { id: string; annualPrice: string | null; annualPeriod: string | null; annualPurchasable: boolean }[]; account: { trialEnd: string | null; interval: string | null } | null }>(await billing.GET(await req('GET', '/api/billing', { as: t.owner })));
+    let g = await get();
+    expect(g.body.trial).toEqual({ days: 14, eligible: true });
+    expect(g.body.promotionCodes).toBe(true);
+    expect(g.body.plans.map((p) => [p.id, p.annualPurchasable])).toEqual([
+      ['starter', false],
+      ['business', true],
+      ['enterprise', false],
+    ]);
+    expect(g.body.plans[1]).toMatchObject({ annualPrice: '$95.90', annualPeriod: '/machine/year' });
+    const end = unix(Date.now() + 9 * DAY);
+    await deliver(trialSub(t.org.id, { trialEnd: end, price: ANNUAL }));
+    g = await get();
+    expect(g.body.trial.eligible).toBe(false);
+    expect(g.body.account).toMatchObject({ trialEnd: new Date(end * 1000).toISOString(), interval: 'year' });
+  });
+});
+
+describe('billing: trialing subscriptions', () => {
+  it('grants the subscribed plan and seats during the trial and enforces the seat limit', async () => {
+    const org = createOrg({ name: 'Trial seats' });
+    await deliver(trialSub(org.id, { seats: 2 }));
+    expect(license(org.id)).toMatchObject({ plan: 'business', seats: 2 });
+    expect(billingAccount(org.id)).toMatchObject({ status: 'trialing', plan: 'business', seats: 2, interval: 'month' });
+    const { token } = createLink(org.id, {}, 'tester');
+    for (let i = 0; i < 2; i++) registerWithToken(token, { name: `m${i}` });
+    expect(() => registerWithToken(token, { name: 'm3' })).toThrow(/license allows 2 machine/);
+    // Converting to a paid subscription keeps the plan; the status follows the provider (and trialEnd stays the past timestamp it reports).
+    await deliver(trialSub(org.id, { seats: 4, status: 'active', trialEnd: unix(Date.now() - DAY) }));
+    expect(license(org.id).seats).toBe(4);
+    expect(billingAccount(org.id)!.status).toBe('active');
+    expect(billingAccount(org.id)!.trialEnd).toBe(new Date(unix(Date.now() - DAY) * 1000).toISOString());
+  });
+
+  it('drops back to the free plan when a trial ends without a payment method (subscription deleted)', async () => {
+    const org = createOrg({ name: 'Trial lapses' });
+    await deliver(trialSub(org.id, { seats: 6, sub: 'sub_lapse' }));
+    await deliver(trialSub(org.id, { type: 'customer.subscription.deleted', status: 'canceled', sub: 'sub_lapse' }));
+    expect(license(org.id)).toMatchObject({ plan: 'starter', seats: 5 });
+    expect(billingAccount(org.id)).toMatchObject({ status: 'canceled', trialUsed: true });
+  });
+
+  it('records the interval of the subscribed price', async () => {
+    const m = createOrg({ name: 'Monthly' });
+    const y = createOrg({ name: 'Yearly' });
+    await deliver(trialSub(m.id, { status: 'active' }));
+    await deliver(trialSub(y.id, { status: 'active', price: ANNUAL, seats: 12 }));
+    expect(billingAccount(m.id)!.interval).toBe('month');
+    expect(billingAccount(y.id)).toMatchObject({ interval: 'year', plan: 'business', seats: 12 });
+    expect(license(y.id)).toMatchObject({ plan: 'business', seats: 12 });
+  });
+});
+
+describe('billing: annual interval', () => {
+  it('checks out the annual price when asked and rejects unknown or unavailable intervals', async () => {
+    const t = await startCheckoutFor('Annual buyer');
+    expect((await t.post({ plan: 'business', seats: 4, interval: 'year' })).status).toBe(200);
+    expect(t.params().get('line_items[0][price]')).toBe(ANNUAL);
+    expect(t.params().get('line_items[0][quantity]')).toBe('4');
+    expect((await t.post({ plan: 'business', seats: 4, interval: 'month' })).status).toBe(200);
+    expect(t.params().get('line_items[0][price]')).toBe(PRICE);
+    expect((await t.post({ plan: 'business', seats: 4, interval: 'weekly' })).status).toBe(400);
+    delete process.env.STRIPE_PRICE_BUSINESS_ANNUAL;
+    try {
+      const r = await t.post({ plan: 'business', seats: 4, interval: 'year' });
+      expect(r.status).toBe(400);
+      expect(r.body.error).toContain('annual');
+    } finally {
+      process.env.STRIPE_PRICE_BUSINESS_ANNUAL = ANNUAL;
+    }
+  });
+});
+
+describe('billing: trial ending notice', () => {
+  let hookServer: http.Server;
+  let hookUrl = '';
+  const hookBodies: string[] = [];
+  beforeAll(async () => {
+    hookServer = http.createServer((rq, rs) => {
+      let b = '';
+      rq.on('data', (c) => (b += c));
+      rq.on('end', () => {
+        hookBodies.push(b);
+        rs.statusCode = 200;
+        rs.end();
+      });
+    });
+    await new Promise<void>((r) => hookServer.listen(0, '127.0.0.1', r));
+    hookUrl = `http://127.0.0.1:${(hookServer.address() as net.AddressInfo).port}/hook`;
+  });
+  afterAll(() => hookServer.close());
+
+  const trialWillEnd = (orgId: string, trialEnd: number | null, id = `evt_twe_${++n}`) => ({
+    id,
+    type: 'customer.subscription.trial_will_end',
+    data: { object: { id: 'sub_t', customer: `cus_${orgId}`, metadata: { org_id: orgId }, trial_end: trialEnd } },
+  });
+
+  it('audits the notice, delivers it to the organization’s channels once and shows it nowhere else', async () => {
+    const org = createOrg({ name: 'Ending trial' });
+    const ch = createChannel(org.id, { name: 'ops', kind: 'webhook', config: { url: hookUrl } });
+    await deliver(trialSub(org.id));
+    const ev = trialWillEnd(org.id, unix(Date.now() + 2 * DAY + 3600_000));
+    hookBodies.length = 0;
+    expect((await deliver(ev)).body.result).toBe('applied');
+    const audited = listAudit({ eventType: 'billing.trial_will_end' }).entries.find((e) => e.orgId === org.id)!;
+    expect(audited).toMatchObject({ severity: 'warning', resourceType: 'billing' });
+    expect(audited.description).toContain('ends in 3 days');
+    // The first send is not awaited (a slow channel must not hold up the answer to Stripe), so wait for it.
+    await vi.waitFor(() => expect(hookBodies).toHaveLength(1));
+    expect(JSON.parse(hookBodies[0])).toMatchObject({ event: 'billing.trial_will_end', subject: expect.stringContaining('Your free trial ends in 3 days') });
+    await vi.waitFor(() => expect(listOutbox(org.id, { status: 'sent' }).map((e) => e.channelId)).toEqual([ch.id]));
+    // A redelivered event is not notified again.
+    expect((await deliver(ev)).body.result).toBe('duplicate');
+    expect(hookBodies).toHaveLength(1);
+  });
+
+  it('still audits when the organization has no channel, and ignores events for unknown organizations', async () => {
+    const org = createOrg({ name: 'No channels' });
+    await deliver(trialSub(org.id));
+    expect((await deliver(trialWillEnd(org.id, unix(Date.now() + DAY)))).body.result).toBe('applied');
+    expect(listAudit({ eventType: 'billing.trial_will_end' }).entries.some((e) => e.orgId === org.id)).toBe(true);
+    expect(listOutbox(org.id, {})).toHaveLength(0);
+    const lost = trialWillEnd('org_missing', null);
+    (lost.data.object as Record<string, unknown>).customer = 'cus_nobody';
+    expect((await deliver(lost)).body.result).toBe('unmatched');
+  });
+});
+
+describe('billing: coupons', () => {
+  const coupon = (c: Record<string, unknown>, end: number | null = null) => ({ coupon: { id: 'cp_1', ...c }, end });
+
+  it('keeps the applied discount for the billing page and clears it when the coupon is removed or the subscription ends', async () => {
+    const org = createOrg({ name: 'Discounted' });
+    const owner = makeUser('owner@discounted.test', 'org_owner', org.id);
+    const end = unix(Date.now() + 60 * DAY);
+    await deliver(trialSub(org.id, { status: 'active', discount: coupon({ name: 'Launch 20', percent_off: 20, duration: 'repeating' }, end) }));
+    expect(billingAccount(org.id)!.discount).toEqual({ name: 'Launch 20', percentOff: 20, amountOff: null, currency: null, duration: 'repeating', endsAt: new Date(end * 1000).toISOString() });
+    const g = await json<{ account: { discount: { name: string } } }>(await billing.GET(await req('GET', '/api/billing', { as: owner })));
+    expect(g.body.account.discount.name).toBe('Launch 20');
+
+    await deliver(trialSub(org.id, { status: 'active', discount: coupon({ amount_off: 500, currency: 'usd', duration: 'once' }) }));
+    expect(billingAccount(org.id)!.discount).toEqual({ name: 'cp_1', percentOff: null, amountOff: 500, currency: 'USD', duration: 'once', endsAt: null });
+
+    await deliver(trialSub(org.id, { status: 'active', discount: null }));
+    expect(billingAccount(org.id)!.discount).toBeNull();
+
+    await deliver(trialSub(org.id, { status: 'active', discount: coupon({ percent_off: 10, duration: 'forever' }) }));
+    expect(billingAccount(org.id)!.discount).toMatchObject({ percentOff: 10, duration: 'forever' });
+    await deliver(trialSub(org.id, { type: 'customer.subscription.deleted', status: 'canceled', discount: coupon({ percent_off: 10, duration: 'forever' }) }));
+    expect(billingAccount(org.id)!.discount).toBeNull();
+  });
+
+  it('reads the discount and period end the way newer API versions send them (discounts[], period on the item)', async () => {
+    // Webhook payloads use the endpoint's API version, not the 2024-06-20 the console sends on its own calls.
+    const org = createOrg({ name: 'Newer API' });
+    const ev = trialSub(org.id, { status: 'active' });
+    const obj = ev.data.object as Record<string, unknown>;
+    delete obj.discount;
+    delete obj.current_period_end;
+    obj.discounts = ['di_unexpanded', coupon({ percent_off: 15, duration: 'forever' })];
+    ((obj.items as { data: Record<string, unknown>[] }).data[0]).current_period_end = 1_900_000_000;
+    await deliver(ev);
+    expect(billingAccount(org.id)).toMatchObject({ discount: { percentOff: 15, duration: 'forever' }, currentPeriodEnd: new Date(1_900_000_000 * 1000).toISOString() });
+  });
+});
+
+describe('billing: schema upgrade', () => {
+  it('marks organizations that already subscribed as having used their trial', () => {
+    const d = new Database(':memory:');
+    migrate(d);
+    // Roll the billing table back to its version-33 shape, as a console upgraded from before trials would have it.
+    for (const c of ['billing_interval', 'trial_end', 'trial_used', 'discount']) d.exec(`ALTER TABLE billing_accounts DROP COLUMN ${c}`);
+    for (const c of ['sub_payment_method', 'customer_payment_method', 'checkout_session_id']) d.exec(`ALTER TABLE billing_accounts DROP COLUMN ${c}`);
+    d.pragma('user_version = 33');
+    const org = (id: string) => d.prepare("INSERT INTO organizations (id, name, created_at, updated_at) VALUES (?, ?, 'now', 'now')").run(id, id);
+    for (const id of ['org_old_sub', 'org_old_customer_only']) org(id);
+    d.prepare("INSERT INTO billing_accounts (org_id, provider, customer_id, subscription_id, plan, seats, status, updated_at) VALUES ('org_old_sub', 'stripe', 'cus_1', 'sub_1', 'business', 5, 'active', 'now')").run();
+    d.prepare("INSERT INTO billing_accounts (org_id, provider, customer_id, status, updated_at) VALUES ('org_old_customer_only', 'stripe', 'cus_2', 'none', 'now')").run();
+    expect(migrate(d)).toBe(2);
+    expect(d.prepare('SELECT org_id, trial_used FROM billing_accounts ORDER BY org_id').all()).toEqual([
+      { org_id: 'org_old_customer_only', trial_used: 0 },
+      { org_id: 'org_old_sub', trial_used: 1 },
+    ]);
+  });
+});
+
+describe('billing: one trial even with concurrent checkouts', () => {
+  const sessionIds = () => calls.filter((c) => c.url === '/v1/checkout/sessions').length;
+
+  it('asks the provider whether the customer already subscribed and drops the trial if so', async () => {
+    const t = await startCheckoutFor('Lagging webhooks');
+    // The console knows the customer (checkout completed without a subscription event yet) but not the subscription.
+    await deliver({ id: `evt_lag_${++n}`, type: 'checkout.session.completed', data: { object: { client_reference_id: t.org.id, customer: 'cus_lag', subscription: null } } });
+    expect(billingAccount(t.org.id)).toMatchObject({ customerId: 'cus_lag', trialUsed: false });
+    expect(trialEligible(t.org.id)).toBe(true);
+    customersWithSubscriptions.add('cus_lag');
+    expect((await t.post()).status).toBe(200);
+    expect(calls.some((c) => c.method === 'GET' && c.url.startsWith('/v1/subscriptions?') && c.url.includes('customer=cus_lag') && c.url.includes('status=all'))).toBe(true);
+    expect([...t.params().keys()].filter((k) => k.includes('trial') || k === 'payment_method_collection')).toEqual([]);
+    expect(trialEligible(t.org.id)).toBe(false);
+  });
+
+  it('keeps the trial for a known customer who never subscribed, and does not ask the provider for a new one', async () => {
+    const t = await startCheckoutFor('Known customer');
+    await deliver({ id: `evt_kc_${++n}`, type: 'checkout.session.completed', data: { object: { client_reference_id: t.org.id, customer: 'cus_known', subscription: null } } });
+    expect((await t.post()).status).toBe(200);
+    expect(t.params().get('subscription_data[trial_period_days]')).toBe('14');
+    const first = calls.filter((c) => c.url.startsWith('/v1/subscriptions?')).length;
+    const fresh = await startCheckoutFor('Brand new customer');
+    await fresh.post();
+    expect(calls.filter((c) => c.url.startsWith('/v1/subscriptions?')).length).toBe(first);
+  });
+
+  it('does not start a checkout when the subscription lookup fails (no surprise charge, no trial)', async () => {
+    const t = await startCheckoutFor('Lookup down');
+    await deliver({ id: `evt_ld_${++n}`, type: 'checkout.session.completed', data: { object: { client_reference_id: t.org.id, customer: 'cus_lookup_down', subscription: null } } });
+    const before = sessionIds();
+    const r = await t.post();
+    expect(r.status).toBe(502);
+    expect(sessionIds()).toBe(before);
+  });
+
+  it('expires the earlier open checkout session when a newer one is started, so two tabs cannot both start a trial', async () => {
+    const t = await startCheckoutFor('Two tabs');
+    await t.post();
+    const first = billingAccount(t.org.id)!.checkoutSessionId!;
+    expect(first).toMatch(/^cs_\d+$/);
+    await t.post();
+    const second = billingAccount(t.org.id)!.checkoutSessionId!;
+    expect(second).not.toBe(first);
+    expect(calls.some((c) => c.method === 'POST' && c.url === `/v1/checkout/sessions/${first}/expire`)).toBe(true);
+    expect(calls.some((c) => c.url === `/v1/checkout/sessions/${second}/expire`)).toBe(false);
+  });
+
+  it('leaves exactly one open session when two checkouts start at the same moment (no session is orphaned)', async () => {
+    const t = await startCheckoutFor('Interleaved starts');
+    await t.post();
+    const s0 = billingAccount(t.org.id)!.checkoutSessionId!;
+    const before = sessionIds();
+    const [a, b] = await Promise.all([t.post(), t.post()]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+    const created = calls.filter((c) => c.url === '/v1/checkout/sessions').length - before;
+    expect(created).toBe(2);
+    const kept = billingAccount(t.org.id)!.checkoutSessionId!;
+    const expired = new Set(calls.filter((c) => c.method === 'POST' && /^\/v1\/checkout\/sessions\/cs_\d+\/expire$/.test(c.url)).map((c) => c.url.split('/')[4]));
+    // Every session ever opened for the organization except the one that is stored has been expired.
+    const opened = [s0, ...[a, b].map((r) => /(cs_\d+)$/.exec(r.body.url ?? '')![1])];
+    expect(opened).toContain(kept);
+    for (const id of opened.filter((i) => i !== kept)) expect(expired.has(id), `${id} should be expired`).toBe(true);
+    expect(expired.has(kept)).toBe(false);
+  });
+
+  it('refuses a new checkout when the earlier one has just completed (its webhook is still on the way), and expires the new session', async () => {
+    const t = await startCheckoutFor('Finished earlier');
+    await t.post();
+    const first = billingAccount(t.org.id)!.checkoutSessionId!;
+    finishedSessions.add(first);
+    const r = await t.post();
+    expect(r.status).toBe(409);
+    expect(r.body.error).toContain('A subscription was just started');
+    expect(r.body.url).toBeUndefined();
+    const second = `cs_${sessionCount}`; // the session that was just created
+    expect(second).not.toBe(first);
+    expect(calls.some((c) => c.method === 'POST' && c.url === `/v1/checkout/sessions/${second}/expire`)).toBe(true);
+    // No second trial for this organization, and the finished session stays the one the webhook closes.
+    const acct = billingAccount(t.org.id)!;
+    expect(acct.trialUsed).toBe(true);
+    expect(acct.checkoutSessionId).toBe(first);
+    expect(trialEligible(t.org.id)).toBe(false);
+    await deliver({ id: `evt_fin_${++n}`, type: 'checkout.session.completed', data: { object: { id: first, client_reference_id: t.org.id, customer: 'cus_fin', subscription: 'sub_fin' } } });
+    expect(billingAccount(t.org.id)).toMatchObject({ subscriptionId: 'sub_fin', checkoutSessionId: null, trialUsed: true });
+  });
+
+  it('still opens the new checkout when the earlier session has expired', async () => {
+    const t = await startCheckoutFor('Lapsed earlier');
+    await t.post();
+    lapsedSessions.add(billingAccount(t.org.id)!.checkoutSessionId!);
+    const r = await t.post();
+    expect(r.status).toBe(200);
+    expect(r.body.url).toMatch(/^https:\/\/checkout\.stripe\.test\/cs_\d+$/);
+    expect(billingAccount(t.org.id)!.checkoutSessionId).toBe(/(cs_\d+)$/.exec(r.body.url!)![1]);
+  });
+
+  it('fails safe when the state of the earlier session cannot be read: the new session is expired and nothing is opened', async () => {
+    const t = await startCheckoutFor('Unknown earlier');
+    await t.post();
+    const first = billingAccount(t.org.id)!.checkoutSessionId!;
+    finishedSessions.add(first);
+    sessionLookupDown = true;
+    try {
+      const r = await t.post();
+      expect(r.status).toBe(502);
+      expect(r.body.url).toBeUndefined();
+    } finally {
+      sessionLookupDown = false;
+    }
+    expect(billingAccount(t.org.id)!.checkoutSessionId).toBe(first);
+    expect(calls.some((c) => c.method === 'POST' && c.url === `/v1/checkout/sessions/cs_${sessionCount}/expire`)).toBe(true);
+  });
+
+  it('forgets the open session once it completes', async () => {
+    const t = await startCheckoutFor('Completes');
+    await t.post();
+    const open = billingAccount(t.org.id)!.checkoutSessionId!;
+    await deliver({ id: `evt_done_${++n}`, type: 'checkout.session.completed', data: { object: { id: 'cs_other', client_reference_id: t.org.id, customer: 'cus_done', subscription: 'sub_done' } } });
+    expect(billingAccount(t.org.id)!.checkoutSessionId).toBe(open);
+    await deliver({ id: `evt_done_${++n}`, type: 'checkout.session.completed', data: { object: { id: open, client_reference_id: t.org.id, customer: 'cus_done', subscription: 'sub_done' } } });
+    expect(billingAccount(t.org.id)!.checkoutSessionId).toBeNull();
+  });
+});
+
+describe('billing: payment method on file', () => {
+  const withCard = (ev: ReturnType<typeof trialSub>, card: unknown) => {
+    (ev.data.object as Record<string, unknown>).default_payment_method = card;
+    return ev;
+  };
+
+  it('is unknown until an event says so, then follows the subscription and the customer', async () => {
+    const org = createOrg({ name: 'Cards' });
+    await deliver(trialSub(org.id, { customer: 'cus_cards' }));
+    expect(billingAccount(org.id)).toMatchObject({ subPaymentMethod: false, customerPaymentMethod: null });
+    // Without a customer.updated event (an endpoint not subscribed to it) a missing subscription default proves nothing.
+    expect(hasPaymentMethod(billingAccount(org.id)!)).toBeNull();
+    // A card added in the portal becomes the customer's default.
+    const update = (id: string, def: unknown) => ({ id, type: 'customer.updated', data: { object: { id: 'cus_cards', invoice_settings: { default_payment_method: def } } } });
+    expect((await deliver(update(`evt_cu_${++n}`, 'pm_1'))).body.result).toBe('applied');
+    expect(hasPaymentMethod(billingAccount(org.id)!)).toBe(true);
+    // A later subscription event without its own default does not wipe the customer's card.
+    await deliver(trialSub(org.id, { customer: 'cus_cards' }));
+    expect(hasPaymentMethod(billingAccount(org.id)!)).toBe(true);
+    // Removing it again: now both are known to have none.
+    await deliver(update(`evt_cu_${++n}`, null));
+    expect(hasPaymentMethod(billingAccount(org.id)!)).toBe(false);
+    // The subscription's own default (a string id or an expanded object) counts.
+    await deliver(withCard(trialSub(org.id, { customer: 'cus_cards' }), { id: 'pm_2' }));
+    expect(hasPaymentMethod(billingAccount(org.id)!)).toBe(true);
+    // Unknown customers are recorded, not applied.
+    expect((await deliver({ id: `evt_cu_${++n}`, type: 'customer.updated', data: { object: { id: 'cus_nobody' } } })).body.result).toBe('unmatched');
+  });
+
+  it('reports unknown for accounts that predate the flags', () => {
+    expect(hasPaymentMethod({ subPaymentMethod: null, customerPaymentMethod: null })).toBeNull();
+    expect(hasPaymentMethod({ subPaymentMethod: null, customerPaymentMethod: true })).toBe(true);
+    expect(hasPaymentMethod({ subPaymentMethod: false, customerPaymentMethod: null })).toBeNull();
+    expect(hasPaymentMethod({ subPaymentMethod: null, customerPaymentMethod: false })).toBeNull();
+    expect(hasPaymentMethod({ subPaymentMethod: false, customerPaymentMethod: false })).toBe(false);
+  });
+
+  it('words the days left the same way everywhere', () => {
+    expect(trialEndsPhrase(null)).toBe('soon');
+    expect(trialEndsPhrase(0)).toBe('today');
+    expect(trialEndsPhrase(1)).toBe('in 1 day');
+    expect(trialEndsPhrase(3)).toBe('in 3 days');
+  });
+
+  it('words the trial outcome after the card state (no add-a-card warning once one is on file)', () => {
+    expect(trialOutcome(true)).toContain('converts to a paid subscription');
+    expect(trialOutcome(true)).not.toMatch(/add one|cancelled/);
+    expect(trialOutcome(false)).toMatch(/No payment method is on file: add one/);
+    expect(trialOutcome(null)).toMatch(/Check in the billing portal/);
+  });
+
+  it('keeps the cancellation warning out of the trial-ending notice when a card is on file', async () => {
+    const withCardOrg = createOrg({ name: 'Has card' });
+    const noCardOrg = createOrg({ name: 'No card' });
+    const warn = async (org: { id: string }, card: unknown, customerEvent = false) => {
+      await deliver(withCard(trialSub(org.id, { customer: `cus_${org.id}` }), card));
+      // customer.updated tells the console the customer has no default card either.
+      if (customerEvent) await deliver({ id: `evt_cu_${++n}`, type: 'customer.updated', data: { object: { id: `cus_${org.id}`, invoice_settings: { default_payment_method: null } } } });
+      const ev = { id: `evt_tw_${++n}`, type: 'customer.subscription.trial_will_end', data: { object: { id: 'sub_t', customer: `cus_${org.id}`, metadata: { org_id: org.id }, trial_end: unix(Date.now() + 3 * DAY), default_payment_method: card } } };
+      await deliver(ev);
+      return listAudit({ eventType: 'billing.trial_will_end' }).entries.find((e) => e.orgId === org.id)!;
+    };
+    const ok = await warn(withCardOrg, 'pm_ok');
+    expect(ok.severity).toBe('info');
+    expect(ok.description).toContain('converts to a paid subscription');
+    const missing = await warn(noCardOrg, null, true);
+    expect(missing.severity).toBe('warning');
+    expect(missing.description).toContain('add a payment method');
+  });
+
+  it('does not claim there is no card when the console never received customer.updated (neutral notice, warning severity)', async () => {
+    const org = createOrg({ name: 'Card unknown' });
+    await deliver(withCard(trialSub(org.id, { customer: `cus_${org.id}` }), null));
+    await deliver({ id: `evt_tw_${++n}`, type: 'customer.subscription.trial_will_end', data: { object: { id: 'sub_t', customer: `cus_${org.id}`, metadata: { org_id: org.id }, trial_end: unix(Date.now() + 3 * DAY), default_payment_method: null } } });
+    const e = listAudit({ eventType: 'billing.trial_will_end' }).entries.find((x) => x.orgId === org.id)!;
+    expect(e.severity).toBe('warning');
+    expect(e.description).not.toContain('add a payment method');
+    expect(e.description).toContain('check in the billing portal');
+  });
+});
+
+describe('billing: marketing copy units', () => {
+  it('says "per machine", never "per user", on the pricing page and cards', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    for (const f of ['src/app/pricing/page.tsx', 'src/components/pricing-cards.tsx']) {
+      const text = fs.readFileSync(path.resolve(process.cwd(), '..', 'marketing', f), 'utf8');
+      expect(text, f).not.toMatch(/per user|per-user|\/user\//i);
+    }
+  });
+});
+
+describe('billing: marketing copy', () => {
+  it('quotes the trial length and prices the code actually uses', async () => {
+    // The pricing page and cards import these constants; they must match what checkout does.
+    const copy = await import('../../../marketing/src/lib/pricing');
+    const { PLANS, ANNUAL_DISCOUNT_PERCENT } = await import('@/lib/billing/plans');
+    const business = PLANS.find((p) => p.id === 'business')!;
+    expect(copy.TRIAL_DAYS).toBe(DEFAULT_TRIAL_DAYS);
+    expect(copy.BUSINESS_MONTHLY_PRICE).toBe(business.price);
+    expect(copy.BUSINESS_ANNUAL_PRICE).toBe(business.annualPrice);
+    expect(copy.ANNUAL_SAVINGS_PERCENT).toBe(ANNUAL_DISCOUNT_PERCENT);
+    // The unit too: seats are enrolled machines, so the copy must not say "per user".
+    expect(copy.BUSINESS_MONTHLY_PERIOD).toBe(business.period);
+    expect(copy.BUSINESS_ANNUAL_PERIOD).toBe(business.annualPeriod);
+    const monthly = Number(business.price.slice(1));
+    const yearly = Number(business.annualPrice!.slice(1));
+    expect(yearly).toBeCloseTo(monthly * 12 * (1 - ANNUAL_DISCOUNT_PERCENT / 100), 2);
+  });
+});
+
+describe('billing: display helpers', () => {
+  it('counts whole days left in a trial', () => {
+    const at = new Date('2026-01-01T00:00:00Z');
+    expect(trialDaysLeft('2026-01-04T00:00:00Z', at)).toBe(3);
+    expect(trialDaysLeft('2026-01-01T06:00:00Z', at)).toBe(1);
+    expect(trialDaysLeft('2025-12-30T00:00:00Z', at)).toBe(0);
+    expect(trialDaysLeft(null, at)).toBeNull();
+    expect(trialDaysLeft('not a date', at)).toBeNull();
+  });
+
+  it('describes discounts', () => {
+    const base = { name: 'x', percentOff: null, amountOff: null, currency: null, duration: null, endsAt: null };
+    expect(discountAmount({ ...base, percentOff: 20 })).toBe('20% off');
+    expect(discountAmount({ ...base, percentOff: 12.5 })).toBe('12.5% off');
+    expect(discountAmount({ ...base, amountOff: 500, currency: 'USD' })).toContain('5.00');
+    expect(discountDuration({ ...base, duration: 'forever' })).toBe('every invoice');
+    expect(discountDuration({ ...base, duration: 'once' })).toBe('the first invoice');
   });
 });
