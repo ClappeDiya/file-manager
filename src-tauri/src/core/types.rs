@@ -678,6 +678,8 @@ pub enum ConnectionProtocol {
     Swift,
     /// Any rclone remote (GCS, Box, pCloud, Mega…).
     Rclone,
+    /// Backblaze B2 native API (key ID + application key).
+    B2,
 }
 
 impl ConnectionProtocol {
@@ -699,6 +701,7 @@ impl ConnectionProtocol {
             Self::AzureFiles => "azure_files",
             Self::Swift => "swift",
             Self::Rclone => "rclone",
+            Self::B2 => "b2",
         }
     }
 
@@ -720,6 +723,7 @@ impl ConnectionProtocol {
             "azure_files" => Self::AzureFiles,
             "swift" => Self::Swift,
             "rclone" => Self::Rclone,
+            "b2" => Self::B2,
             _ => Self::Local,
         }
     }
@@ -803,6 +807,19 @@ pub struct ConnectionProfile {
     pub extras: ConnectionExtras,
 }
 
+/// Per-connection flags kept outside the profile (they change without the
+/// profile being edited).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectionStatus {
+    pub id: Uuid,
+    /// Listed first in the Connections panel.
+    pub starred: bool,
+    /// When the service last rejected the credentials; `None` = not flagged.
+    pub credentials_rejected_at: Option<DateTime<Utc>>,
+    /// What the service said.
+    pub credentials_rejected_reason: Option<String>,
+}
+
 /// STS AssumeRole on top of a connection's keys.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssumeRoleConfig {
@@ -827,6 +844,127 @@ pub struct ConnectionExtras {
     pub preset: Option<String>,
     /// OpenStack Swift sign-in settings.
     pub swift: Option<SwiftSettings>,
+    /// WebDAV sign-in mode and server vendor.
+    pub webdav: Option<WebDavSettings>,
+    /// SMB/CIFS Windows domain.
+    pub smb: Option<SmbSettings>,
+    /// OAuth sign-in (Google Drive, Dropbox, OneDrive): which app to use.
+    pub oauth: Option<OAuthSettings>,
+    /// Google Drive: which part of Drive to open, export formats.
+    pub google_drive: Option<GoogleDriveSettings>,
+    /// OneDrive / SharePoint document library.
+    pub onedrive: Option<OneDriveSettings>,
+    /// Dropbox team space / team folder (namespace root).
+    pub dropbox: Option<DropboxSettings>,
+}
+
+/// How a WebDAV connection signs in. The secret is the password (basic)
+/// or the bearer token.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebDavAuthMode {
+    #[default]
+    Basic,
+    /// `Authorization: Bearer <token>` (app passwords / OAuth tokens).
+    Bearer,
+    /// No credentials.
+    None,
+}
+
+/// WebDAV server family; Nextcloud and ownCloud get their chunked uploads.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebDavVendor {
+    #[default]
+    Generic,
+    Nextcloud,
+    Owncloud,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WebDavSettings {
+    pub auth: WebDavAuthMode,
+    pub vendor: WebDavVendor,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SmbSettings {
+    /// Windows domain or workgroup (`CORP`); empty = none.
+    pub domain: Option<String>,
+}
+
+/// OneDrive account kind, which decides the Microsoft sign-in endpoint.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OneDriveAccountKind {
+    #[default]
+    Personal,
+    /// Work or school (Microsoft 365, SharePoint).
+    Business,
+}
+
+/// OAuth app settings. Tokens never live here: they are in the credential
+/// store under the connection's credential key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OAuthSettings {
+    /// Your own OAuth client ID (Advanced); `None` = the app's built-in one.
+    pub client_id: Option<String>,
+    /// OneDrive: personal or work/school account.
+    pub account_kind: OneDriveAccountKind,
+}
+
+/// Which part of Google Drive a connection opens.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoogleDriveRoot {
+    #[default]
+    MyDrive,
+    SharedWithMe,
+    /// One shared drive (`shared_drive_id`).
+    SharedDrive,
+}
+
+/// Google Docs export format per native type (Advanced); `None` = default
+/// (Docs → docx, Sheets → xlsx, Slides → pptx, Drawings → pdf).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GoogleExportFormats {
+    pub document: Option<String>,
+    pub spreadsheet: Option<String>,
+    pub presentation: Option<String>,
+    pub drawing: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GoogleDriveSettings {
+    pub root: GoogleDriveRoot,
+    pub shared_drive_id: Option<String>,
+    pub shared_drive_name: Option<String>,
+    pub export_formats: GoogleExportFormats,
+}
+
+/// A SharePoint site's document library to open instead of the user's
+/// own OneDrive.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OneDriveSettings {
+    pub site_id: Option<String>,
+    pub site_name: Option<String>,
+    pub drive_id: Option<String>,
+    pub drive_name: Option<String>,
+}
+
+/// Dropbox namespace to use as the root (`Dropbox-API-Path-Root`): a team
+/// space root or a team folder.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DropboxSettings {
+    pub root_namespace_id: Option<String>,
+    pub root_label: Option<String>,
 }
 
 /// How a Swift connection signs in.

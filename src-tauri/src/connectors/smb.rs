@@ -330,8 +330,10 @@ impl SmbConnector {
                 // Credential values are validated upstream via validate_mount_credential()
                 opts.push(format!("username={user}"));
             }
+            // mount.cifs reads the password from PASSWD, which keeps it off
+            // the process list and allows commas in it.
             if let Some(pass) = password {
-                opts.push(format!("password={pass}"));
+                cmd.env("PASSWD", pass);
             }
             if let Some(domain) = &config.domain {
                 opts.push(format!("domain={domain}"));
@@ -777,47 +779,65 @@ impl Default for SmbConnector {
     }
 }
 
+impl SmbConnector {
+    /// The mount command for `profile`: share from the remote path, the
+    /// user, the stored password and the domain. Returns the command, the
+    /// local mount point and the share name.
+    pub(crate) async fn mount_command_for(&self, profile: &ConnectionProfile, password: Option<&str>) -> Result<(Command, PathBuf, String), AppError> {
+        let host = profile.host.clone();
+        let username = profile.username.clone().filter(|u| !u.is_empty());
+        let mut config = self.state.read().await.config.clone();
+        // The saved domain overrides the connector default.
+        if let Some(domain) = profile.extras.smb.as_ref().and_then(|s| s.domain.clone()) {
+            let domain = domain.trim().to_string();
+            config.domain = (!domain.is_empty()).then_some(domain);
+        }
+        if let Some(d) = &config.domain {
+            validate_mount_credential(d, "Domain")?;
+            validate_hostname(d).map_err(|_| AppError::validation("The SMB domain may only contain letters, digits, dots and hyphens"))?;
+        }
+        let password = password.filter(|p| !p.is_empty());
+        // Parse share name from remote_path (format: /ShareName/path/to/dir)
+        let share_name = profile.remote_path.trim_start_matches('/').split('/').next().unwrap_or("").to_string();
+        if share_name.is_empty() {
+            return Err(AppError::Connection {
+                message: "No share name specified.".to_string(),
+                advice: "Set the remote path to /ShareName or /ShareName/subfolder.".to_string(),
+            });
+        }
+        // Validate hostname to prevent command injection
+        validate_hostname(&host)?;
+        // Validate credentials to prevent mount option injection
+        if let Some(ref user) = username {
+            validate_mount_credential(user, "Username")?;
+        }
+        // Validate SMB version
+        Self::validate_version(&config)?;
+        let mount_point = Self::mount_point_path(&host, &share_name);
+        let cmd = Self::build_mount_command(&host, &share_name, &mount_point, username.as_deref(), password, &config);
+        Ok((cmd, mount_point, share_name))
+    }
+}
+
 impl Connector for SmbConnector {
     fn connect(
         &self,
         profile: &ConnectionProfile,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
-        let host = profile.host.clone();
-        let username = profile.username.clone();
-        let remote_path = profile.remote_path.clone();
+        self.connect_with_secret(profile, None)
+    }
 
+    fn connect_with_secret(
+        &self,
+        profile: &ConnectionProfile,
+        secret: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let profile = profile.clone();
         Box::pin(async move {
-            let mut state = self.state.write().await;
-
-            // Parse share name from remote_path (format: /ShareName/path/to/dir)
-            let share_name = remote_path
-                .trim_start_matches('/')
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .to_string();
-
-            if share_name.is_empty() {
-                return Err(AppError::Connection {
-                    message: "No share name specified.".to_string(),
-                    advice: "Set the remote path to /ShareName or /ShareName/subfolder."
-                        .to_string(),
-                });
-            }
-
-            // Validate hostname to prevent command injection
-            validate_hostname(&host)?;
-
-            // Validate credentials to prevent mount option injection
-            if let Some(ref user) = username {
-                validate_mount_credential(user, "Username")?;
-            }
-
-            // Validate SMB version
-            Self::validate_version(&state.config)?;
+            let (mut cmd, mount_point, share_name) = self.mount_command_for(&profile, secret.as_deref()).await?;
+            let host = profile.host.clone();
 
             // Create mount point directory
-            let mount_point = Self::mount_point_path(&host, &share_name);
             tokio::fs::create_dir_all(&mount_point).await.map_err(|e| {
                 AppError::Connection {
                     message: format!("Failed to create mount point: {e}"),
@@ -825,24 +845,7 @@ impl Connector for SmbConnector {
                 }
             })?;
 
-            // Build and execute mount command
-            // Note: password would come from credential store in production
-            let mount_point_clone = mount_point.clone();
-            let host_clone = host.clone();
-            let share_clone = share_name.clone();
-            let user_clone = username.clone();
-            let config_clone = state.config.clone();
-
             let result = tokio::task::spawn_blocking(move || {
-                let mut cmd = Self::build_mount_command(
-                    &host_clone,
-                    &share_clone,
-                    &mount_point_clone,
-                    user_clone.as_deref(),
-                    None, // Password handled via credential store
-                    &config_clone,
-                );
-
                 let output = cmd.output().map_err(|e| AppError::Connection {
                     message: format!("Failed to execute mount command: {e}"),
                     advice: "Ensure SMB client tools are installed on your system.".to_string(),
@@ -850,10 +853,7 @@ impl Connector for SmbConnector {
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(AppError::Connection {
-                        message: format!("SMB mount failed: {stderr}"),
-                        advice: "Check the hostname, share name, and credentials.".to_string(),
-                    });
+                    return Err(smb_mount_error(&stderr));
                 }
 
                 Ok(())
@@ -866,6 +866,7 @@ impl Connector for SmbConnector {
 
             result?;
 
+            let mut state = self.state.write().await;
             state.connected = true;
             state.mount_point = Some(mount_point);
             state.host = host;
@@ -981,6 +982,14 @@ impl Connector for SmbConnector {
 // ──────────────────────────────────────────────
 // Helper Functions
 // ──────────────────────────────────────────────
+
+/// A failed mount: refused credentials are told apart from other failures.
+fn smb_mount_error(stderr: &str) -> AppError {
+    AppError::Connection {
+        message: format!("SMB mount failed: {stderr}"),
+        advice: "Check the hostname, share name, and credentials.".to_string(),
+    }
+}
 
 /// URL-encode a string for SMB URLs.
 #[cfg(any(target_os = "macos", test))]
@@ -1104,6 +1113,38 @@ async fn list_directory_entries(path: &Path) -> Result<Vec<FileEntry>, AppError>
 // ──────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use crate::core::types::{ConnectionProtocol, SmbSettings};
+
+    fn args(cmd: &Command) -> Vec<String> {
+        cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect()
+    }
+
+    /// Regression: the configured domain (and the stored password) never
+    /// reached the mount command.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn domain_and_password_reach_the_mount_command() {
+        let mut p = crate::connectors::live_tests::profile(ConnectionProtocol::Smb, "nas.local", None, "alice", "/Share/docs");
+        p.extras.smb = Some(SmbSettings { domain: Some("CORP".into()) });
+        let c = SmbConnector::new();
+        let (cmd, mount_point, share) = c.mount_command_for(&p, Some("s3cret")).await.unwrap();
+        assert_eq!(share, "Share");
+        let a = args(&cmd);
+        assert_eq!(a[..4], ["-t".to_string(), "cifs".into(), "//nas.local/Share".into(), mount_point.to_string_lossy().to_string()]);
+        let opts = a.last().unwrap();
+        assert!(opts.contains("username=alice") && opts.contains("domain=CORP"), "{opts}");
+        // The password goes to mount.cifs in the environment, not the command line.
+        assert!(!opts.contains("s3cret"), "{opts}");
+        assert!(cmd.get_envs().any(|(k, v)| k == "PASSWD" && v.map(|v| v == "s3cret").unwrap_or(false)));
+        // A domain that would inject mount options is refused.
+        p.extras.smb = Some(SmbSettings { domain: Some("CORP,uid=0".into()) });
+        assert!(c.mount_command_for(&p, None).await.is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {

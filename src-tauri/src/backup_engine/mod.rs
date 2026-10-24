@@ -1626,8 +1626,12 @@ impl BackupManager {
                 let conns = self.inner.conns.as_ref().ok_or_else(|| AppError::state("Connections are unavailable", "Restart the app."))?;
                 let id = uuid::Uuid::parse_str(connection_id).map_err(|_| AppError::validation("Invalid connection id"))?;
                 let profile = conns.get_connection(id).await?.ok_or_else(|| AppError::not_found("The destination connection no longer exists"))?;
-                let secret = conns.get_password(id).await.unwrap_or(None);
-                let mut b = connector_backend::ConnectorBackend::connect(&profile, secret, remote_path).await?;
+                // Backups reconnect on their own: a connection whose
+                // credentials were rejected is skipped, not retried.
+                let secrets = conns.background_secrets(id, &profile.name).await?;
+                let connected = connector_backend::ConnectorBackend::connect_with_secrets(&profile, secrets, remote_path).await;
+                conns.record_connect_outcome(id, &connected).await;
+                let mut b = connected?;
                 b.set_timeout((timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs)));
                 b.set_list_parallelism(parallel);
                 Box::new(b)
@@ -2808,7 +2812,7 @@ impl BackupManager {
                         P::Sftp => (22, false),
                         P::Ftp => (21, false),
                         P::Ftps => (990, false),
-                        P::WebDav | P::S3 | P::GoogleDrive | P::Dropbox | P::OneDrive | P::AzureBlob | P::AdlsGen2 | P::AzureFiles | P::Swift => (443, true),
+                        P::WebDav | P::S3 | P::GoogleDrive | P::Dropbox | P::OneDrive | P::AzureBlob | P::AdlsGen2 | P::AzureFiles | P::Swift | P::B2 => (443, true),
                         P::Smb => (445, false),
                         P::Nfs => (2049, false),
                         P::Local | P::Rclone => return None,

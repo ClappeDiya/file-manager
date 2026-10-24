@@ -762,6 +762,12 @@ impl MountManager {
             // `mount_remote` is idempotent enough for this: it rejects a
             // duplicate mount point that is already Mounted, so a race with a
             // manual mount degrades to a logged skip rather than a double mount.
+            // Rejected credentials: skip until the user fixes the connection.
+            if let Err(e) = connection_mgr.ensure_not_rejected(cid, &mount_point).await {
+                failed += 1;
+                tracing::warn!("Auto-mount of {mount_point} skipped: {}", e.user_message());
+                continue;
+            }
             let options: MountOptions = serde_json::from_str(&options_json).unwrap_or_default();
             let config_id = Uuid::parse_str(&config_id).ok();
             match self.mount_remote_with(cid, mount_point.clone(), options, config_id, repo, connection_mgr).await {
@@ -1113,6 +1119,31 @@ mod tests {
             failed, 1,
             "exactly the auto_mount=1 row may be attempted; the manual one must be left alone"
         );
+    }
+
+    /// A connection whose credentials were rejected is not auto-mounted (no
+    /// mount attempt, so its saved row is left as it was).
+    #[tokio::test]
+    async fn auto_mount_skips_connections_with_rejected_credentials() {
+        let (repo, conns) = auto_mount_fixture().await;
+        let p = crate::connectors::live_tests::profile(crate::core::types::ConnectionProtocol::Sftp, "127.0.0.1", Some(1), "u", "/");
+        conns.save_connection(p.clone(), Some("pw".into())).await.unwrap();
+        conns.record_connect_outcome::<()>(p.id, &Err(AppError::auth("HTTP 401", "check"))).await;
+        let pid = p.id.to_string();
+        repo.pool()
+            .execute(move |c| {
+                c.execute("INSERT INTO mount_configs (id, connection_id, mount_point, auto_mount, status) VALUES ('cfg', ?1, '/mnt/flagged', 1, 'unmounted')", [pid])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(MountManager::new().auto_mount_saved(&repo, &conns).await, (0, 1));
+        let (status, err): (String, Option<String>) = repo
+            .pool()
+            .execute(|c| Ok(c.query_row("SELECT status, error_message FROM mount_configs WHERE id = 'cfg'", [], |r| Ok((r.get(0)?, r.get(1)?)))?))
+            .await
+            .unwrap();
+        assert_eq!((status.as_str(), err), ("unmounted", None), "no mount was attempted");
     }
 
     /// One unreachable server must not stop the others being tried, and must

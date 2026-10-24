@@ -1000,7 +1000,7 @@ impl super::Connector for FtpConnector {
                 let mut stream = ftp_stream;
                 stream
                     .login(&username_for_auth, &password)
-                    .map_err(|e| AppError::Connection {
+                    .map_err(|e| AppError::Authentication {
                         message: format!("FTP authentication failed: {e}"),
                         advice: "Check your username and password.".to_string(),
                     })?;

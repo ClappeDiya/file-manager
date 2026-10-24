@@ -50,7 +50,8 @@ pub async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Respo
     let body = resp.text().await.unwrap_or_default();
     let excerpt: String = body.chars().take(400).collect();
     Err(match status.as_u16() {
-        401 | 403 => AppError::connection(format!("{what} was refused ({status}): {excerpt}"), "Check the credentials and their permissions."),
+        // Rejected credentials: not retried (ufop_core::retry::is_retryable).
+        401 | 403 => AppError::auth(format!("{what} was refused ({status}): {excerpt}"), "Check the credentials and their permissions."),
         404 => AppError::not_found(format!("{what}: not found {NOT_FOUND_TAG} {excerpt}")),
         429 | 503 => AppError::connection(format!("{what}: service busy ({status})"), "The service is rate-limiting; retries will back off."),
         _ => AppError::connection(format!("{what} failed ({status}): {excerpt}"), "Check the destination settings."),
@@ -91,4 +92,25 @@ pub fn xml_one(xml: &str, tag: &str) -> Option<String> {
 /// Minimal XML entity decoding for keys returned by object stores.
 pub fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resp(code: u16) -> reqwest::Response {
+        reqwest::Response::from(axum::http::Response::builder().status(code).body("nope").unwrap())
+    }
+
+    /// Regression: a 401/403 was a plain connection error, so the backup
+    /// retry policy retried rejected credentials with backoff.
+    #[tokio::test]
+    async fn rejected_credentials_are_auth_errors() {
+        for code in [401, 403] {
+            let e = check(resp(code), "Upload").await.unwrap_err();
+            assert!(e.is_auth_failure() && !ufop_core::retry::is_retryable(&e), "{code}: {e}");
+        }
+        let busy = check(resp(503), "Upload").await.unwrap_err();
+        assert!(!busy.is_auth_failure() && ufop_core::retry::is_retryable(&busy));
+    }
 }

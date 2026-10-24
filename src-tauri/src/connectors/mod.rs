@@ -54,6 +54,8 @@ pub mod azure_adls;
 pub mod azure_files;
 #[cfg(test)]
 pub(crate) mod azure_tests;
+#[cfg(test)]
+pub(crate) mod mock_http;
 
 use crate::core::error::AppError;
 use crate::core::types::{ConnectionProfile, ConnectionProtocol, FileEntry};
@@ -122,6 +124,31 @@ pub struct ShareLink {
     pub note: Option<String>,
 }
 
+/// Everything secret a saved connection keeps in the credential store.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ConnectionSecrets {
+    /// Password, access secret, private-key path, bearer token or OAuth
+    /// grant, depending on the protocol.
+    pub secret: Option<String>,
+    /// SFTP: passphrase of the private key.
+    pub key_passphrase: Option<String>,
+}
+
+impl ConnectionSecrets {
+    pub fn new(secret: Option<String>) -> Self {
+        Self { secret, key_passphrase: None }
+    }
+}
+
+impl std::fmt::Debug for ConnectionSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionSecrets")
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("key_passphrase", &self.key_passphrase.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 pub(crate) fn share_unsupported(what: &str) -> AppError {
     AppError::validation(format!("This provider can't {what} on share links"))
 }
@@ -145,6 +172,16 @@ pub trait Connector: Send + Sync {
         _secret: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         self.connect(profile)
+    }
+
+    /// Connect with every stored secret of the connection. Only connectors
+    /// with more than one secret (SFTP key + passphrase) override this.
+    fn connect_with_secrets(
+        &self,
+        profile: &ConnectionProfile,
+        secrets: ConnectionSecrets,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        self.connect_with_secret(profile, secrets.secret)
     }
 
     /// Upload a local file to `remote_path`; returns bytes written.

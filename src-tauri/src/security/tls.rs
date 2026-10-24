@@ -222,7 +222,8 @@ pub fn check_transport_security(
         | ConnectionProtocol::AzureBlob
         | ConnectionProtocol::AdlsGen2
         | ConnectionProtocol::AzureFiles
-        | ConnectionProtocol::Swift => {
+        | ConnectionProtocol::Swift
+        | ConnectionProtocol::B2 => {
             // Cloud APIs always use HTTPS
             check.secure = true;
             if !security.verify_certificates {
@@ -284,7 +285,8 @@ pub fn recommended_security(protocol: ConnectionProtocol) -> TransportSecurity {
         | ConnectionProtocol::AzureBlob
         | ConnectionProtocol::AdlsGen2
         | ConnectionProtocol::AzureFiles
-        | ConnectionProtocol::Swift => TransportSecurity::strict(),
+        | ConnectionProtocol::Swift
+        | ConnectionProtocol::B2 => TransportSecurity::strict(),
         ConnectionProtocol::Rclone => TransportSecurity::default(),
         ConnectionProtocol::Local => TransportSecurity {
             require_encryption: false,

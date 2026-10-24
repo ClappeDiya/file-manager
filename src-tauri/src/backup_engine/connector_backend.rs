@@ -43,6 +43,11 @@ impl ConnectorBackend {
     /// Connect with the profile's stored secret. Must be called from within
     /// a Tokio runtime; the returned backend is used from a blocking thread.
     pub async fn connect(profile: &ConnectionProfile, secret: Option<String>, remote_dir: &str) -> Result<Self, AppError> {
+        Self::connect_with_secrets(profile, crate::connectors::ConnectionSecrets::new(secret), remote_dir).await
+    }
+
+    /// [`ConnectorBackend::connect`] with every stored secret (SFTP key passphrase).
+    pub async fn connect_with_secrets(profile: &ConnectionProfile, secrets: crate::connectors::ConnectionSecrets, remote_dir: &str) -> Result<Self, AppError> {
         let protocol = profile.protocol.as_str();
         let connector = new_connector(protocol).ok_or_else(|| {
             AppError::connection(
@@ -50,7 +55,7 @@ impl ConnectorBackend {
                 format!("Use one of: {}, or a local / mounted folder.", BACKUP_PROTOCOLS.join(", ")),
             )
         })?;
-        connector.connect_with_secret(profile, secret).await?;
+        connector.connect_with_secrets(profile, secrets).await?;
         let dir = if remote_dir.trim().is_empty() { profile.remote_path.clone() } else { remote_dir.to_string() };
         Ok(Self {
             connector,

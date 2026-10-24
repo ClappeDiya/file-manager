@@ -34,8 +34,19 @@ impl ConnectionManager {
     /// Save a connection profile (credentials go to keychain).
     pub async fn save_connection(
         &self,
+        profile: ConnectionProfile,
+        password: Option<String>,
+    ) -> Result<ConnectionProfile, AppError> {
+        self.save_connection_with_secrets(profile, password, None).await
+    }
+
+    /// Save a connection and its secrets. `key_passphrase`: `None` keeps the
+    /// stored one, `Some("")` removes it, anything else replaces it.
+    pub async fn save_connection_with_secrets(
+        &self,
         mut profile: ConnectionProfile,
         password: Option<String>,
+        key_passphrase: Option<String>,
     ) -> Result<ConnectionProfile, AppError> {
         // Store password in keychain if provided
         if let Some(pwd) = password {
@@ -43,10 +54,81 @@ impl ConnectionManager {
             self.credential_store.store(&cred_key, &pwd).await?;
             profile.credential_ref = Some(cred_key);
         }
+        match key_passphrase {
+            Some(p) if p.is_empty() => self.credential_store.delete(&CredentialStore::passphrase_key(&profile.id)).await?,
+            Some(p) => self.credential_store.store(&CredentialStore::passphrase_key(&profile.id), &p).await?,
+            None => {}
+        }
 
         self.repo.save_connection(&profile).await?;
+        // Editing a connection is how the user fixes rejected credentials.
+        self.repo.set_credentials_rejected(profile.id, None).await?;
         tracing::info!("Connection saved: {} ({})", profile.name, profile.id);
         Ok(profile)
+    }
+
+    /// Star or unstar a connection.
+    pub async fn set_starred(&self, id: Uuid, starred: bool) -> Result<(), AppError> {
+        if !self.repo.set_connection_starred(id, starred).await? {
+            return Err(AppError::not_found(format!("Connection {id} not found")));
+        }
+        Ok(())
+    }
+
+    /// Starred / credentials-rejected flags of every connection.
+    pub async fn list_status(&self) -> Result<Vec<crate::core::types::ConnectionStatus>, AppError> {
+        self.repo.list_connection_status().await
+    }
+
+    /// Clear the credentials-rejected flag (the user clicked Retry).
+    pub async fn clear_credentials_rejected(&self, id: Uuid) -> Result<(), AppError> {
+        self.repo.set_credentials_rejected(id, None).await
+    }
+
+    /// Remember how a connect attempt went: rejected credentials flag the
+    /// connection, a success clears the flag, other failures (network,
+    /// server down) leave it as it was.
+    pub async fn record_connect_outcome<T>(&self, id: Uuid, outcome: &Result<T, AppError>) {
+        let r = match outcome {
+            Ok(_) => match self.repo.get_connection_status(id).await {
+                Ok(Some(s)) if s.credentials_rejected_at.is_some() => self.repo.set_credentials_rejected(id, None).await,
+                _ => Ok(()),
+            },
+            Err(e) if e.is_auth_failure() => {
+                tracing::warn!("Credentials of connection {id} were rejected; automatic reconnects are paused: {}", e.user_message());
+                self.repo.set_credentials_rejected(id, Some(e.user_message())).await
+            }
+            Err(_) => Ok(()),
+        };
+        if let Err(e) = r {
+            tracing::warn!("Could not record the connect outcome of {id}: {e}");
+        }
+    }
+
+    /// Secrets for an automatic (background) connect: sync, automation,
+    /// backup, auto-mount. A connection whose credentials were rejected is
+    /// skipped with a clear error instead of being retried with the same
+    /// credentials (which can lock the account).
+    pub async fn background_secrets(&self, id: Uuid, name: &str) -> Result<super::ConnectionSecrets, AppError> {
+        self.ensure_not_rejected(id, name).await?;
+        self.get_secrets(id).await
+    }
+
+    /// `Err` when the connection is flagged as having rejected credentials.
+    pub async fn ensure_not_rejected(&self, id: Uuid, name: &str) -> Result<(), AppError> {
+        if let Some(s) = self.repo.get_connection_status(id).await? {
+            if let Some(at) = s.credentials_rejected_at {
+                return Err(AppError::auth(
+                    format!(
+                        "Skipped '{name}': its credentials were rejected on {} ({})",
+                        at.format("%Y-%m-%d %H:%M UTC"),
+                        s.credentials_rejected_reason.unwrap_or_else(|| "sign-in refused".into())
+                    ),
+                    "Edit the connection with the current credentials, or click Retry in Connections.",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// List all saved connections.
@@ -64,6 +146,7 @@ impl ConnectionManager {
         // Delete credentials from keychain
         let cred_key = CredentialStore::credential_key(&id);
         self.credential_store.delete(&cred_key).await?;
+        self.credential_store.delete(&CredentialStore::passphrase_key(&id)).await?;
 
         self.repo.delete_connection(id).await?;
         tracing::info!("Connection deleted: {id}");
@@ -74,6 +157,25 @@ impl ConnectionManager {
     pub async fn get_password(&self, connection_id: Uuid) -> Result<Option<String>, AppError> {
         let cred_key = CredentialStore::credential_key(&connection_id);
         self.credential_store.retrieve(&cred_key).await
+    }
+
+    /// Every stored secret of a connection (password / key path / token and
+    /// the SFTP key passphrase).
+    pub async fn get_secrets(&self, connection_id: Uuid) -> Result<super::ConnectionSecrets, AppError> {
+        Ok(super::ConnectionSecrets {
+            secret: self.get_password(connection_id).await?,
+            key_passphrase: self.credential_store.retrieve(&CredentialStore::passphrase_key(&connection_id)).await?,
+        })
+    }
+
+    /// Store a new primary secret (e.g. rotated OAuth tokens) for a saved connection.
+    pub async fn set_password(&self, connection_id: Uuid, secret: &str) -> Result<(), AppError> {
+        self.credential_store.store(&CredentialStore::credential_key(&connection_id), secret).await
+    }
+
+    /// The credential store (OAuth connectors persist rotated tokens through it).
+    pub fn credential_store(&self) -> Arc<CredentialStore> {
+        self.credential_store.clone()
     }
 
     /// Test a connection (checks if we can reach the host).
@@ -142,6 +244,7 @@ impl ConnectionManager {
             ConnectionProtocol::Swift => 5000,
             ConnectionProtocol::Local => 0,
             ConnectionProtocol::Rclone => 0,
+            ConnectionProtocol::B2 => 443,
         }
     }
 
@@ -486,6 +589,79 @@ mod tests {
 
         let result = mgr.test_connection(&profile).await.unwrap();
         assert!(result.reachable);
+    }
+
+    /// Regression: an SFTP key passphrase had nowhere to be stored.
+    #[tokio::test]
+    async fn key_passphrase_is_stored_kept_and_removed() {
+        let mgr = setup().await;
+        let p = make_test_profile();
+        let id = p.id;
+        mgr.save_connection_with_secrets(p.clone(), Some("/keys/id_ed25519".into()), Some("pp".into())).await.unwrap();
+        let s = mgr.get_secrets(id).await.unwrap();
+        assert_eq!((s.secret.as_deref(), s.key_passphrase.as_deref()), (Some("/keys/id_ed25519"), Some("pp")));
+        // Editing without touching the secrets keeps both.
+        mgr.save_connection_with_secrets(p.clone(), None, None).await.unwrap();
+        assert_eq!(mgr.get_secrets(id).await.unwrap().key_passphrase.as_deref(), Some("pp"));
+        // An empty passphrase removes it.
+        mgr.save_connection_with_secrets(p, None, Some(String::new())).await.unwrap();
+        assert_eq!(mgr.get_secrets(id).await.unwrap().key_passphrase, None);
+        mgr.save_connection_with_secrets(make_test_profile(), None, Some("x".into())).await.unwrap();
+        mgr.delete_connection(id).await.unwrap();
+        assert_eq!(mgr.get_secrets(id).await.unwrap(), crate::connectors::ConnectionSecrets::default());
+    }
+
+    #[tokio::test]
+    async fn starred_connections_are_listed_first() {
+        let mgr = setup().await;
+        let mut a = make_test_profile();
+        a.name = "Alpha".into();
+        let mut b = make_test_profile();
+        b.id = Uuid::new_v4();
+        b.name = "Beta".into();
+        mgr.save_connection(a.clone(), None).await.unwrap();
+        mgr.save_connection(b.clone(), None).await.unwrap();
+        assert_eq!(mgr.list_connections().await.unwrap()[0].name, "Alpha");
+        mgr.set_starred(b.id, true).await.unwrap();
+        assert_eq!(mgr.list_connections().await.unwrap()[0].name, "Beta");
+        let st = mgr.list_status().await.unwrap();
+        assert_eq!((st[0].id, st[0].starred, st[1].starred), (b.id, true, false));
+        // Editing keeps the star.
+        mgr.save_connection(b.clone(), None).await.unwrap();
+        assert!(mgr.list_status().await.unwrap()[0].starred);
+        mgr.set_starred(b.id, false).await.unwrap();
+        assert_eq!(mgr.list_connections().await.unwrap()[0].name, "Alpha");
+        assert!(mgr.set_starred(Uuid::new_v4(), true).await.is_err());
+    }
+
+    /// Rejected credentials flag the connection; background reconnects are
+    /// refused until the profile is edited or the user retries.
+    #[tokio::test]
+    async fn rejected_credentials_pause_background_reconnects() {
+        let mgr = setup().await;
+        let p = make_test_profile();
+        let id = p.id;
+        mgr.save_connection(p.clone(), Some("old".into())).await.unwrap();
+        assert_eq!(mgr.background_secrets(id, "Test").await.unwrap().secret.as_deref(), Some("old"));
+        // A network failure does not flag it.
+        mgr.record_connect_outcome::<()>(id, &Err(AppError::connection("timed out", "retry"))).await;
+        assert!(mgr.background_secrets(id, "Test").await.is_ok());
+        // A rejected sign-in does.
+        mgr.record_connect_outcome::<()>(id, &Err(AppError::auth("HTTP 401", "check"))).await;
+        let e = mgr.background_secrets(id, "Test").await.unwrap_err();
+        assert!(e.is_auth_failure() && e.user_message().contains("Skipped 'Test'"), "{e}");
+        let st = mgr.list_status().await.unwrap();
+        assert!(st[0].credentials_rejected_at.is_some() && st[0].credentials_rejected_reason.as_deref().unwrap().contains("HTTP 401"));
+        // Retry clears it…
+        mgr.clear_credentials_rejected(id).await.unwrap();
+        assert!(mgr.background_secrets(id, "Test").await.is_ok());
+        // …and so does editing the profile, and a successful connect.
+        mgr.record_connect_outcome::<()>(id, &Err(AppError::auth("HTTP 403", "check"))).await;
+        mgr.save_connection(p.clone(), Some("new".into())).await.unwrap();
+        assert_eq!(mgr.background_secrets(id, "Test").await.unwrap().secret.as_deref(), Some("new"));
+        mgr.record_connect_outcome::<()>(id, &Err(AppError::auth("HTTP 401", "check"))).await;
+        mgr.record_connect_outcome(id, &Ok(())).await;
+        assert!(mgr.background_secrets(id, "Test").await.is_ok());
     }
 
     #[tokio::test]

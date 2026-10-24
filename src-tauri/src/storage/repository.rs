@@ -106,6 +106,17 @@ fn row_to_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConnectionProfile
     })
 }
 
+fn row_to_status(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConnectionStatus> {
+    Ok(ConnectionStatus {
+        id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+        starred: row.get::<_, Option<bool>>(1)?.unwrap_or(false),
+        credentials_rejected_at: row
+            .get::<_, Option<String>>(2)?
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc)),
+        credentials_rejected_reason: row.get(3)?,
+    })
+}
 
 /// Repository wrapping a database pool.
 #[derive(Clone, Debug)]
@@ -412,7 +423,7 @@ impl Repository {
         self.pool
             .execute(|conn| {
                 let mut stmt = conn.prepare(
-                    &format!("SELECT {CONNECTION_COLUMNS} FROM connections ORDER BY name"),
+                    &format!("SELECT {CONNECTION_COLUMNS} FROM connections ORDER BY starred DESC, name"),
                 )?;
                 let connections = stmt
                     .query_map([], |row| {
@@ -449,6 +460,50 @@ impl Repository {
                     })
                     .ok();
                 Ok(result)
+            })
+            .await
+    }
+
+    /// Star or unstar a connection (starred ones are listed first).
+    pub async fn set_connection_starred(&self, id: Uuid, starred: bool) -> Result<bool, AppError> {
+        self.pool
+            .execute(move |conn| {
+                let n = conn.execute("UPDATE connections SET starred = ?2 WHERE id = ?1", rusqlite::params![id.to_string(), starred])?;
+                Ok(n > 0)
+            })
+            .await
+    }
+
+    /// Flag (`Some(reason)`) or clear (`None`) a connection's rejected credentials.
+    pub async fn set_credentials_rejected(&self, id: Uuid, reason: Option<String>) -> Result<(), AppError> {
+        self.pool
+            .execute(move |conn| {
+                let at = reason.as_ref().map(|_| Utc::now().to_rfc3339());
+                conn.execute(
+                    "UPDATE connections SET credentials_rejected_at = ?2, credentials_rejected_reason = ?3 WHERE id = ?1",
+                    rusqlite::params![id.to_string(), at, reason],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Starred and credentials-rejected flags of every connection.
+    pub async fn list_connection_status(&self) -> Result<Vec<ConnectionStatus>, AppError> {
+        self.pool
+            .execute(|conn| {
+                let mut stmt = conn.prepare("SELECT id, starred, credentials_rejected_at, credentials_rejected_reason FROM connections ORDER BY starred DESC, name")?;
+                let rows = stmt.query_map([], row_to_status)?.filter_map(|r| r.ok()).collect();
+                Ok(rows)
+            })
+            .await
+    }
+
+    pub async fn get_connection_status(&self, id: Uuid) -> Result<Option<ConnectionStatus>, AppError> {
+        self.pool
+            .execute(move |conn| {
+                let mut stmt = conn.prepare("SELECT id, starred, credentials_rejected_at, credentials_rejected_reason FROM connections WHERE id = ?1")?;
+                Ok(stmt.query_row([id.to_string()], row_to_status).ok())
             })
             .await
     }
@@ -789,7 +844,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(version, 31);
+        assert_eq!(version, 32);
     }
 
     #[tokio::test]

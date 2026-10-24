@@ -28,22 +28,54 @@ pub async fn connector_connect(
             message: format!("Unsupported protocol: {protocol}"),
             advice: "Use one of: sftp, ftp, ftps, webdav, s3, smb, nfs, local.".to_string(),
         })?;
+    let request = ConnectRequest { protocol, host, port, username, remote_path };
+    let (profile, secrets) = resolve_connect(&manager, request, connection_id.as_deref()).await?;
+    // The user asked for this connection: try it even when it is flagged,
+    // and record the outcome.
+    let result = connector.connect_with_secrets(&profile, secrets).await;
+    if connection_id.is_some() {
+        manager.record_connect_outcome(profile.id, &result).await;
+    }
+    result
+}
 
-    // The secret (password / access secret / key path) lives in the credential store.
-    let secret = match connection_id.as_deref().map(uuid::Uuid::parse_str) {
-        Some(Ok(id)) => manager.get_password(id).await.unwrap_or(None),
-        _ => None,
-    };
+/// What the UI asked to connect to.
+pub(crate) struct ConnectRequest {
+    pub protocol: String,
+    pub host: String,
+    pub port: Option<u16>,
+    pub username: Option<String>,
+    pub remote_path: Option<String>,
+}
 
-    let profile = ConnectionProfile {
+/// The profile and secrets to connect with: the saved connection when
+/// `connection_id` names one (so its connector settings - WebDAV mode, SMB
+/// domain, OAuth app, scopes - apply), else an ad-hoc profile.
+pub(crate) async fn resolve_connect(
+    manager: &ConnectionManager,
+    req: ConnectRequest,
+    connection_id: Option<&str>,
+) -> Result<(ConnectionProfile, crate::connectors::ConnectionSecrets), AppError> {
+    if let Some(Ok(id)) = connection_id.map(uuid::Uuid::parse_str) {
+        let secrets = manager.get_secrets(id).await.unwrap_or_default();
+        if let Some(saved) = manager.get_connection(id).await? {
+            return Ok((saved, secrets));
+        }
+        return Ok((adhoc_profile(req), secrets));
+    }
+    Ok((adhoc_profile(req), Default::default()))
+}
+
+fn adhoc_profile(req: ConnectRequest) -> ConnectionProfile {
+    ConnectionProfile {
         id: uuid::Uuid::new_v4(),
-        name: format!("{protocol}://{host}"),
-        protocol: ConnectionProtocol::from_str_lossy(&protocol),
-        host,
-        port,
-        username,
+        name: format!("{}://{}", req.protocol, req.host),
+        protocol: ConnectionProtocol::from_str_lossy(&req.protocol),
+        host: req.host,
+        port: req.port,
+        username: req.username,
         credential_ref: None,
-        remote_path: remote_path.unwrap_or_else(|| "/".to_string()),
+        remote_path: req.remote_path.unwrap_or_else(|| "/".to_string()),
         created_at: chrono::Utc::now(),
         last_used: None,
         group_id: None,
@@ -67,9 +99,7 @@ pub async fn connector_connect(
         ftp_post_login_commands: None,
         symlink_policy: None,
         extras: Default::default(),
-    };
-
-    connector.connect_with_secret(&profile, secret).await
+    }
 }
 
 fn require_connector(
@@ -241,11 +271,15 @@ pub async fn ensure_connected(
                 .get_connection(id)
                 .await?
                 .ok_or_else(|| AppError::validation(format!("Saved connection {cid} not found")))?;
-            let secret = connections.get_password(id).await.unwrap_or(None);
-            connector
-                .connect_with_secret(&profile, secret)
-                .await
-                .map_err(|e| AppError::connection(format!("Cannot connect to {}: {e}", profile.name), "Check the connection's settings."))?;
+            // An automatic reconnect: skip a connection whose credentials
+            // were rejected until the user fixes them.
+            let secrets = connections.background_secrets(id, &profile.name).await?;
+            let result = connector.connect_with_secrets(&profile, secrets).await;
+            connections.record_connect_outcome(id, &result).await;
+            result.map_err(|e| match e {
+                AppError::Authentication { message, advice } => AppError::Authentication { message: format!("Cannot connect to {}: {message}", profile.name), advice },
+                e => AppError::connection(format!("Cannot connect to {}: {e}", profile.name), "Check the connection's settings."),
+            })?;
         }
     }
     Ok(connector)

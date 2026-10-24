@@ -135,15 +135,25 @@ struct B2State {
     application_key: String,
 }
 
+const B2_AUTHORIZE_URL: &str = "https://api.backblazeb2.com/b2api/v2/b2_authorize_account";
+
 /// Backblaze B2 connector.
 pub struct B2Connector {
     state: Arc<RwLock<Option<B2State>>>,
+    /// `b2_authorize_account` URL (overridable for tests).
+    authorize_url: String,
 }
 
 impl B2Connector {
     pub fn new() -> Self {
+        Self::with_authorize_url(B2_AUTHORIZE_URL)
+    }
+
+    /// A connector that authorizes against `url` instead of Backblaze.
+    pub fn with_authorize_url(url: &str) -> Self {
         Self {
             state: Arc::new(RwLock::new(None)),
+            authorize_url: url.to_string(),
         }
     }
 
@@ -163,7 +173,7 @@ impl B2Connector {
 
         // B2 authorize_account
         let auth_resp = http
-            .get("https://api.backblazeb2.com/b2api/v2/b2_authorize_account")
+            .get(&self.authorize_url)
             .basic_auth(key_id, Some(application_key))
             .send()
             .await
@@ -175,10 +185,9 @@ impl B2Connector {
         if !auth_resp.status().is_success() {
             let status = auth_resp.status();
             let body = auth_resp.text().await.unwrap_or_default();
-            return Err(AppError::Connection {
-                message: format!("B2 authorization failed (HTTP {status}): {body}"),
-                advice: "Check your application key ID and key.".to_string(),
-            });
+            let message = format!("B2 authorization failed (HTTP {status}): {body}");
+            let advice = "Check your application key ID and key.";
+            return Err(if matches!(status.as_u16(), 401 | 403) { AppError::auth(message, advice) } else { AppError::connection(message, advice) });
         }
 
         let auth: B2AuthResponse = auth_resp.json().await.map_err(|e| AppError::Connection {
@@ -229,6 +238,21 @@ impl B2Connector {
 
     /// List all buckets.
     pub async fn list_buckets(&self) -> Result<Vec<FileEntry>, AppError> {
+        match self.list_buckets_once().await? {
+            Some(list) => Ok(list),
+            None => {
+                // The authorization token expired: sign in again (the read
+                // lock is released by now) and retry once.
+                self.reauthorize().await?;
+                self.list_buckets_once().await?.ok_or_else(|| {
+                    AppError::auth("Backblaze B2 refused the new authorization token", "Check the application key's capabilities (listBuckets).")
+                })
+            }
+        }
+    }
+
+    /// One `b2_list_buckets` call; `None` when the token has expired.
+    async fn list_buckets_once(&self) -> Result<Option<Vec<FileEntry>>, AppError> {
         let state = self.state.read().await;
         let state = state.as_ref().ok_or_else(|| AppError::Connection {
             message: "Not connected to B2".to_string(),
@@ -254,12 +278,9 @@ impl B2Connector {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            // Check for expired auth
+            // Expired auth: the caller re-authorizes without holding the lock.
             if status.as_u16() == 401 {
-                // state is a reference and dropping it is a no-op; the read guard
-                // will be released when it goes out of scope.
-                self.reauthorize().await?;
-                return Box::pin(self.list_buckets()).await;
+                return Ok(None);
             }
             return Err(AppError::Connection {
                 message: format!("B2 list buckets failed (HTTP {status}): {body}"),
@@ -272,7 +293,7 @@ impl B2Connector {
             advice: "Try again.".to_string(),
         })?;
 
-        Ok(list
+        Ok(Some(list
             .buckets
             .into_iter()
             .map(|b| FileEntry {
@@ -287,7 +308,7 @@ impl B2Connector {
                 extension: None,
                 permissions: Some(b.bucket_type),
             })
-            .collect())
+            .collect()))
     }
 
     /// List files in a bucket with optional prefix (virtual folder browsing).
@@ -880,12 +901,24 @@ impl Connector for B2Connector {
         &self,
         profile: &ConnectionProfile,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
-        let profile = profile.clone();
+        self.connect_with_secret(profile, None)
+    }
+
+    /// The key ID is the user name; the application key is the stored secret.
+    fn connect_with_secret(
+        &self,
+        profile: &ConnectionProfile,
+        secret: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let key_id = profile.username.clone().unwrap_or_default();
         Box::pin(async move {
-            // For B2, username = key_id, password = application_key (from credential store)
-            let key_id = profile.username.clone().unwrap_or_default();
-            // Application key would come from credential store, pass empty for now
-            self.connect_with_credentials(&key_id, "").await
+            let key = secret.filter(|k| !k.trim().is_empty()).ok_or_else(|| {
+                AppError::validation("Enter the B2 application key (as the connection's password)")
+            })?;
+            if key_id.trim().is_empty() {
+                return Err(AppError::validation("Enter the B2 application key ID (as the user name)"));
+            }
+            self.connect_with_credentials(key_id.trim(), key.trim()).await
         })
     }
 
@@ -920,7 +953,7 @@ impl Connector for B2Connector {
     }
 
     fn is_connected(&self) -> bool {
-        false // Conservative default
+        self.state.try_read().map(|s| s.is_some()).unwrap_or(false)
     }
 }
 
@@ -949,6 +982,54 @@ mod tests {
         // Test via the list_files parsing logic
         let connector = B2Connector::new();
         assert!(!connector.is_connected());
+    }
+
+    fn b2_profile() -> ConnectionProfile {
+        crate::connectors::live_tests::profile(crate::core::types::ConnectionProtocol::B2, "", None, "kid", "/")
+    }
+
+    /// Regression: `connect` sent an empty application key, so every B2
+    /// connection was refused; the key comes from the credential store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connects_with_the_stored_application_key() {
+        use crate::connectors::mock_http::{json, serve, status};
+        use base64::Engine;
+        let expired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let e2 = expired.clone();
+        let mock = serve(move |r| {
+            let base = format!("http://{}", r.header("host").unwrap_or_default());
+            match r.path.as_str() {
+                "/b2api/v2/b2_authorize_account" => {
+                    if r.header("authorization") != Some(format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("kid:appkey"))) {
+                        return status(401, r#"{"code":"unauthorized"}"#);
+                    }
+                    json(serde_json::json!({
+                        "accountId": "acc", "authorizationToken": "tok", "apiUrl": base, "downloadUrl": base,
+                        "recommendedPartSize": 100000000u64, "absoluteMinimumPartSize": 5000000u64,
+                        "allowed": { "capabilities": ["listBuckets"] }
+                    }))
+                }
+                // The first listing finds the token expired: the connector re-authorizes.
+                "/b2api/v2/b2_list_buckets" if e2.swap(false, std::sync::atomic::Ordering::SeqCst) => status(401, "expired"),
+                "/b2api/v2/b2_list_buckets" if r.header("authorization").as_deref() == Some("tok") => json(serde_json::json!({
+                    "buckets": [{ "bucketId": "b1", "accountId": "acc", "bucketName": "photos", "bucketType": "allPrivate" }]
+                })),
+                _ => status(404, "no route"),
+            }
+        })
+        .await;
+        let url = format!("{}/b2api/v2/b2_authorize_account", mock.base);
+        let c = B2Connector::with_authorize_url(&url);
+        assert!(c.connect_with_secret(&b2_profile(), None).await.is_err(), "no key, no request with an empty one");
+        assert!(mock.requests("/b2api/v2/b2_authorize_account").is_empty());
+        assert!(c.connect_with_secret(&b2_profile(), Some("wrong".into())).await.is_err());
+        assert!(!c.is_connected());
+        c.connect_with_secret(&b2_profile(), Some("appkey".into())).await.unwrap();
+        assert!(c.is_connected());
+        let list = tokio::time::timeout(std::time::Duration::from_secs(10), c.list_remote("/")).await.expect("re-authorizing must not deadlock").unwrap();
+        assert_eq!(list.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), vec!["photos"]);
+        c.disconnect().await.unwrap();
+        assert!(!c.is_connected());
     }
 
     #[test]

@@ -173,6 +173,11 @@ fn all_migrations() -> Vec<Migration> {
             description: "ufop-server accounts, per-job access rules, token owners",
             sql: V31_SCHEMA,
         },
+        Migration {
+            version: 32,
+            description: "Starred connections and the credentials-rejected flag",
+            sql: V32_SCHEMA,
+        },
     ]
 }
 
@@ -197,6 +202,16 @@ fn rust_step(version: u32) -> Option<RustStep> {
 /// Schema v31: `ufop-server` accounts (Argon2 PHC hashes, role, disabled,
 /// console-managed flag), per-job access rules, and the account that owns
 /// each session and API token (existing ones: `admin`).
+/// Schema v32: `starred` connections (listed first) and the
+/// credentials-rejected flag: set when a service refuses the sign-in, so
+/// background reconnects stop retrying until the user edits the connection
+/// or clicks Retry.
+const V32_SCHEMA: &str = r#"
+ALTER TABLE connections ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE connections ADD COLUMN credentials_rejected_at TEXT;
+ALTER TABLE connections ADD COLUMN credentials_rejected_reason TEXT;
+"#;
+
 const V31_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS server_users (
     username      TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
@@ -1086,7 +1101,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 31);
+        assert_eq!(applied, 32);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -1121,7 +1136,7 @@ mod tests {
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 31);
+        assert_eq!(first, 32);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -1134,7 +1149,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 31);
+        assert_eq!(current_version(&conn).unwrap(), 32);
     }
 
     #[test]

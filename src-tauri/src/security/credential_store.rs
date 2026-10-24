@@ -363,6 +363,11 @@ impl CredentialStore {
         format!("conn_{connection_id}")
     }
 
+    /// Credential key of a connection's SFTP private-key passphrase.
+    pub fn passphrase_key(connection_id: &uuid::Uuid) -> String {
+        format!("conn_{connection_id}_key_passphrase")
+    }
+
     /// Check if the OS keychain is available.
     pub fn is_keychain_available(&self) -> bool {
         self.keychain_available
