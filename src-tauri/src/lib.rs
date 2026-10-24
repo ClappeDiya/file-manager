@@ -1067,6 +1067,7 @@ pub fn run() {
             mount_commands::mount_clear_cache,
             mount_commands::delete_mount_config,
             mount_commands::update_mount_config,
+            mount_commands::saved_mount_options,
             mount_commands::mount_saved_config,
             mount_commands::unmount_all_mounts,
             mount_commands::free_drive_letters,

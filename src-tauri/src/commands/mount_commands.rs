@@ -208,6 +208,13 @@ pub async fn update_mount_config(
         .await
 }
 
+/// The options a saved mount was saved with (what the user chose, before the organization's
+/// limits). The Edit dialog starts from these, so saving does not turn forced values into choices.
+#[tauri::command]
+pub async fn saved_mount_options(mount_id: String, mount_mgr: State<'_, MountManager>, repo: State<'_, Repository>) -> Result<MountOptions, AppError> {
+    mount_mgr.saved_options(mount_uuid(&mount_id)?, &repo).await
+}
+
 /// Mount a saved mount again with its own settings.
 #[tauri::command]
 pub async fn mount_saved_config(

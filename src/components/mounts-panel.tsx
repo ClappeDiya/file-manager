@@ -28,9 +28,11 @@ import { MountOfflineActions } from "@/components/mount-options";
 import {
   isCloudMount,
   type MountInfo,
+  type MountOptions,
   type MountResult,
   type UnmountAllReport,
 } from "@/lib/mount-options";
+import { errorText } from "@/lib/error-text";
 import { useMountsUi } from "@/stores/mounts-ui-store";
 
 export const MOUNTS_CHANGED_EVENT = "ufop://mounts-changed";
@@ -272,10 +274,10 @@ export function MountsPanel() {
       const msg = await f();
       if (msg) setNote(msg);
     } catch (err) {
-      setRowErrors((e) => ({ ...e, [m.id]: String(err) }));
+      setRowErrors((e) => ({ ...e, [m.id]: errorText(err) }));
     } finally {
       setBusyId(null);
-      await load();
+      // Reloads this list and any other open one.
       bump();
     }
   };
@@ -314,12 +316,19 @@ export function MountsPanel() {
           : `Unmounted ${r.unmounted} drive${r.unmounted === 1 ? "" : "s"}.`,
       );
     } catch (err) {
-      setNote(String(err));
+      setNote(errorText(err));
     } finally {
       setAllBusy(false);
-      await load();
+      // Reloads this list and any other open one.
       bump();
     }
+  };
+
+  // Edit starts from what the user saved, not from the options the organization's
+  // profile forced onto the running mount.
+  const edit = async (m: MountInfo) => {
+    const saved = await tauriInvokeSafe<MountOptions | null>("saved_mount_options", { mountId: m.id }, null);
+    openDialog({ editing: saved ? { ...m, options: saved } : m });
   };
 
   const anyMounted = mounts.some((m) => m.status === "mounted");
@@ -386,7 +395,7 @@ export function MountsPanel() {
                 onUnmount={unmount}
                 onOpen={open}
                 onRemove={remove}
-                onEdit={(x) => openDialog({ editing: x })}
+                onEdit={edit}
               />
             ))}
           </ul>

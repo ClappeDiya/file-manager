@@ -27,6 +27,7 @@ import {
   type MountResult,
 } from "@/lib/mount-options";
 import { useUIStore } from "@/stores/ui-store";
+import { errorText } from "@/lib/error-text";
 import { pickFolder } from "@/lib/folder-picker";
 import { HardDrive, FolderOpen, Plug } from "lucide-react";
 
@@ -186,7 +187,7 @@ function MountForm({
         setError(`Mount returned status: ${result.status}`);
       }
     } catch (err) {
-      setError(String(err));
+      setError(errorText(err));
     } finally {
       setWorking(false);
     }

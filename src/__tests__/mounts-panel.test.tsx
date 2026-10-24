@@ -157,6 +157,54 @@ describe("Mounts list", () => {
     expect(row("m2").queryByRole("alert")).not.toBeInTheDocument();
   });
 
+  // Tauri rejects with the backend's AppError payload, never an Error.
+  const appError = (message: string) => ({
+    error_type: "validation",
+    message,
+    advice: "Try again.",
+  });
+
+  it("shows the reason from the backend's error payload, not [object Object]", async () => {
+    const original = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, a: unknown) => {
+      if (cmd === "mount_saved_config")
+        throw appError("Unmount the drive before editing it");
+      return original(cmd, a);
+    });
+    render(<MountsPanel />);
+    await screen.findByText("Broken");
+    fireEvent.click(row("m3").getByLabelText("Mount Broken"));
+    const alert = await row("m3").findByRole("alert");
+    expect(alert).toHaveTextContent("Unmount the drive before editing it");
+    expect(alert).toHaveTextContent("Try again.");
+    expect(alert).not.toHaveTextContent("[object Object]");
+  });
+
+  it("shows the backend's reason when unmount all fails", async () => {
+    const original = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, a: unknown) => {
+      if (cmd === "unmount_all_mounts") throw appError("Nothing could be done");
+      return original(cmd, a);
+    });
+    render(<MountsPanel />);
+    await screen.findByText("Work");
+    fireEvent.click(screen.getByText("Unmount all"));
+    const note = await screen.findByRole("status");
+    expect(note).toHaveTextContent("Nothing could be done");
+    expect(note).not.toHaveTextContent("[object Object]");
+  });
+
+  it("reloads the list once per action", async () => {
+    render(<MountsPanel />);
+    await screen.findByText("Photos");
+    await waitFor(() => expect(calls("list_mounts")).toHaveLength(1));
+    fireEvent.click(row("m2").getByLabelText("Mount Photos"));
+    await screen.findByRole("status");
+    await waitFor(() => expect(calls("list_mounts")).toHaveLength(2));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(calls("list_mounts")).toHaveLength(2);
+  });
+
   it("unmounts and opens a mounted drive", async () => {
     render(<MountsPanel />);
     await screen.findByText("Work");
@@ -225,6 +273,30 @@ describe("Mounts list", () => {
     const dialog = await screen.findByRole("dialog", { name: "Edit Mount" });
     expect(useMountsUi.getState().editing?.id).toBe("m3");
     expect(dialog).toBeInTheDocument();
+  });
+
+  it("edits from the options the user saved, not the ones a profile forced", async () => {
+    mounts = [
+      mk("m3", "Broken", "error", {
+        options: { ...opts, read_only: true, max_cache_mb: 32 },
+      }),
+    ];
+    const original = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, a: unknown) =>
+      cmd === "saved_mount_options"
+        ? { ...opts, read_only: false, max_cache_mb: 4096 }
+        : original(cmd, a),
+    );
+    render(<MountsPanel />);
+    await screen.findByText("Broken");
+    fireEvent.click(row("m3").getByLabelText("Edit Broken"));
+    await waitFor(() =>
+      expect(useMountsUi.getState().editing?.options).toMatchObject({
+        read_only: false,
+        max_cache_mb: 4096,
+      }),
+    );
+    expect(calls("saved_mount_options")).toEqual([{ mountId: "m3" }]);
   });
 
   it("reloads when a mount changes elsewhere", async () => {

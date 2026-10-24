@@ -369,6 +369,27 @@ describe("editing a saved mount", () => {
     expect(calls("mount_remote")).toEqual([]);
   });
 
+  it("shows the backend's reason when saving fails, not [object Object]", async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_connections")
+        return [conn("bucket", "s3"), conn("nas", "sftp")];
+      if (cmd === "check_mount_capability")
+        return { native_mount: { command: "rclone mount" } };
+      if (cmd === "update_mount_config")
+        throw {
+          error_type: "validation",
+          message: "Unmount the drive before editing it",
+          advice: "Unmount it from the Mounts list first.",
+        };
+      return null;
+    });
+    await openForm("bucket", { editing: saved });
+    fireEvent.click(screen.getByText("Save changes"));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Unmount the drive before editing it");
+    expect(alert).not.toHaveTextContent("[object Object]");
+  });
+
   it("keeps the saved mount point when the connection is the same (no suggested name)", async () => {
     await openForm("bucket", { editing: saved });
     expect(screen.getByLabelText("Mount Point")).toHaveValue(

@@ -457,14 +457,6 @@ pub fn effective_on(requested: &MountOptions, protocol: &str, mount_point: &Path
     Ok((o, notes))
 }
 
-/// The Windows mount target for `o`: the drive letter (`X:`) when one is chosen, else `mount_point`.
-pub fn mount_target(mount_point: &str, o: &MountOptions, os: Os) -> String {
-    match (&o.drive_letter, os) {
-        (Some(l), Os::Windows) => format!("{l}:"),
-        _ => mount_point.to_string(),
-    }
-}
-
 /// `rclone mount` flags for `o`, with the cache in `cache_dir`.
 pub fn rclone_flags(o: &MountOptions, cache_dir: &Path) -> Vec<String> {
     rclone_flags_on(o, cache_dir, Os::current())
@@ -617,9 +609,7 @@ mod tests {
         let o = MountOptions { drive_letter: Some("e:".into()), ..Default::default() };
         assert_eq!(drive_mount_point(&o, Os::Windows).as_deref(), Some("E:"));
         assert_eq!(drive_mount_point(&o, Os::Linux), None);
-        assert_eq!(mount_target("/mnt/x", &MountOptions { drive_letter: Some("E".into()), ..Default::default() }, Os::Windows), "E:");
-        assert_eq!(mount_target("/mnt/x", &MountOptions { drive_letter: Some("E".into()), ..Default::default() }, Os::Linux), "/mnt/x");
-        assert_eq!(mount_target("C:\\Mounts\\x", &MountOptions::default(), Os::Windows), "C:\\Mounts\\x");
+        assert_eq!(drive_mount_point(&MountOptions::default(), Os::Windows), None);
         let free = free_drive_letters_with(|c| matches!(c, 'D' | 'F'));
         assert_eq!((free.first().map(String::as_str), free.get(1).map(String::as_str), free.len()), (Some("E"), Some("G"), 21));
     }

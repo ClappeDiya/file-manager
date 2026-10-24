@@ -520,6 +520,8 @@ impl MountManager {
 
         // The organization's mount profile: allowed protocols, mount root, forced options.
         let is_rclone = matches!(protocol_str, "rclone" | "s3");
+        // What the user asked for is what gets saved; the organization's limits are re-applied at every mount.
+        let requested = options.clone();
         let (options, policy_notes) = policy::effective_on(&options, protocol_str, &canonical, self.managed().await.as_ref(), os)?;
         // A subfolder mounts that part of the connection (rclone remote path or native share path).
         let mut profile = profile;
@@ -595,7 +597,7 @@ impl MountManager {
         let ts = now.to_rfc3339();
         let status_str = status.as_str().to_string();
         let err_msg = error_message.clone();
-        let opts = serde_json::to_string(&options)?;
+        let opts = serde_json::to_string(&requested)?;
         let saved = config_id.is_some();
         repo.pool()
             .execute(move |conn| {
@@ -991,23 +993,38 @@ impl MountManager {
             })
             .await
             .unwrap_or_default();
-            for (id, mount_point) in gone {
-                let message = "The drive is no longer mounted (it was disconnected or unmounted outside UFOP)".to_string();
-                if let Some(m) = self.mounts.write().await.get_mut(&id) {
-                    m.status = MountStatus::Error;
-                    m.error_message = Some(message.clone());
-                }
-                // Stop what is left of the process and clear a stale mount.
-                self.rclone.unmount(id, &mount_point).await;
-                let (mid, msg) = (id.to_string(), message);
-                if let Err(e) = repo.pool().execute(move |c| Ok(c.execute(UPDATE_MOUNT_STATUS_SQL, rusqlite::params![mid, MountStatus::Error.as_str(), msg])?)).await {
-                    tracing::warn!("Could not record that mount {id} stopped: {e}");
-                }
-                self.notify();
-            }
+            self.mark_gone(gone, repo).await;
         }
         #[cfg(not(unix))]
         let _ = repo;
+    }
+
+    /// Record that these mounts (id, mount point) stopped. Only an entry that is still
+    /// there and still Mounted is touched: one the user unmounted meanwhile stays
+    /// 'unmounted' instead of turning into an error.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    async fn mark_gone(&self, gone: Vec<(Uuid, String)>, repo: &Repository) {
+        for (id, mount_point) in gone {
+            let message = "The drive is no longer mounted (it was disconnected or unmounted outside UFOP)".to_string();
+            let still_mounted = match self.mounts.write().await.get_mut(&id) {
+                Some(m) if m.status == MountStatus::Mounted => {
+                    m.status = MountStatus::Error;
+                    m.error_message = Some(message.clone());
+                    true
+                }
+                _ => false,
+            };
+            if !still_mounted {
+                continue;
+            }
+            // Stop what is left of the process and clear a stale mount.
+            self.rclone.unmount(id, &mount_point).await;
+            let (mid, msg) = (id.to_string(), message);
+            if let Err(e) = repo.pool().execute(move |c| Ok(c.execute(UPDATE_MOUNT_STATUS_SQL, rusqlite::params![mid, MountStatus::Error.as_str(), msg])?)).await {
+                tracing::warn!("Could not record that mount {id} stopped: {e}");
+            }
+            self.notify();
+        }
     }
 
     /// Every mount: the running ones, then the saved ones that are not running.
@@ -1499,6 +1516,28 @@ mod tests {
         assert!(!info.auto_mount, "a manual saved mount must stay manual");
     }
 
+    /// Regression: the row stored the options after the organization's limits were applied,
+    /// so editing a mount saved forced values (read-only, capped cache) as the user's own
+    /// choices and they outlived the profile.
+    #[tokio::test]
+    async fn the_saved_row_keeps_what_the_user_asked_for_not_what_the_profile_forced() {
+        if !rclone_mount::rclone_available() || rclone_mount::fuse_available().is_err() {
+            return;
+        }
+        let (repo, conns) = auto_mount_fixture().await;
+        let profile = conns.save_connection(rclone_profile("no-such-remote:", "/"), None).await.unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mp = home.path().join("Drives/forced").to_string_lossy().to_string();
+        let mgr = MountManager::with_cache_root(home.path().join("cache"));
+        mgr.set_managed(Some(ufop_core::agent::ManagedMounts { read_only: Some(true), max_cache_mb: Some(32), ..Default::default() })).await;
+        let asked = MountOptions { read_only: false, max_cache_mb: Some(4096), ..Default::default() };
+        // rclone fails at once on an unknown remote: the attempt is recorded as an error row.
+        assert!(mgr.mount_remote_with(profile.id, mp, asked.clone(), None, &repo, &conns).await.is_err());
+        let info = mgr.list_mounts(&repo, &conns).await.unwrap().into_iter().next().unwrap();
+        assert!(info.options.read_only && info.options.max_cache_mb == Some(32), "what is applied: {:?}", info.options);
+        assert_eq!(mgr.saved_options(info.id, &repo).await.unwrap(), asked, "what is saved");
+    }
+
     /// Regression: a row left as 'mounted' by an app that exited (or crashed)
     /// while a drive was mounted was listed as mounted after the restart,
     /// although nothing is mounted until the app mounts it.
@@ -1550,6 +1589,25 @@ mod tests {
             },
         );
         id
+    }
+
+    /// Regression: reconcile looked at a mount, the user unmounted it, and the late
+    /// "no longer mounted" write turned the clean unmount into an error row.
+    #[tokio::test]
+    async fn a_drive_unmounted_while_reconcile_looked_is_not_marked_as_an_error() {
+        let (repo, conns) = auto_mount_fixture().await;
+        let mgr = MountManager::new();
+        let id = inject_mounted(&mgr, &repo, "Raced", "/mnt/raced").await;
+        // reconcile's snapshot says the drive is gone ...
+        let stale = vec![(id, "/mnt/raced".to_string())];
+        // ... but the user unmounts it first (unmount_remote removes the entry and writes 'unmounted').
+        mgr.unmount_remote(id, &repo).await.unwrap();
+        let changes = mgr.subscribe();
+        mgr.mark_gone(stale, &repo).await;
+        assert!(!changes.has_changed().unwrap(), "nothing changed, so nobody is told");
+        let info = mgr.list_mounts(&repo, &conns).await.unwrap().into_iter().find(|m| m.id == id).unwrap();
+        assert_eq!(info.status, MountStatus::Unmounted, "{info:?}");
+        assert!(info.error_message.is_none());
     }
 
     #[tokio::test]
