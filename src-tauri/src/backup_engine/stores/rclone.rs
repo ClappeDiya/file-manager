@@ -25,9 +25,10 @@ pub struct RcloneConfig {
     pub remote: String,
     /// Folder on the remote.
     pub path: String,
-    /// rclone executable.
+    /// rclone executable; `rclone` (the default) or empty = the binary
+    /// chosen in Settings → rclone / `UFOP_RCLONE` / `PATH`.
     pub binary: String,
-    /// Alternative rclone config file.
+    /// Alternative rclone config file; `None` = the one in Settings → rclone.
     pub config_file: Option<String>,
     /// Extra flags passed to every call (e.g. `--tpslimit 4`).
     pub extra_args: Vec<String>,
@@ -114,12 +115,34 @@ impl RcloneStore {
         }
     }
 
+    /// The binary and config file for this store: the job's own when set,
+    /// else the app's resolved ones.
+    pub fn rclone(&self) -> crate::rclone_engine::Rclone {
+        self.rclone_with(crate::rclone_engine::Rclone::current())
+    }
+
+    /// [`Self::rclone`] against the app's rclone `app`. A job that names its
+    /// config through `RCLONE_CONFIG` (its env, or passed into an isolated
+    /// environment) keeps it: the Settings file would arrive as `--config`,
+    /// which beats the variable.
+    fn rclone_with(&self, app: crate::rclone_engine::Rclone) -> crate::rclone_engine::Rclone {
+        let bin = self.cfg.binary.trim();
+        let program = if bin.is_empty() || bin == "rclone" { app.program } else { bin.to_string() };
+        let fallback = if self.job_sets_config_env() { None } else { app.config };
+        crate::rclone_engine::Rclone::new(program, self.cfg.config_file.clone().filter(|c| !c.trim().is_empty()).or(fallback))
+    }
+
+    fn job_sets_config_env(&self) -> bool {
+        // Variable names are case-insensitive on Windows only.
+        let is_var = |k: &String| if cfg!(windows) { k.trim().eq_ignore_ascii_case("RCLONE_CONFIG") } else { k.trim() == "RCLONE_CONFIG" };
+        self.cfg.env.keys().any(is_var) || (self.cfg.isolate_env && self.cfg.env_passthrough.iter().any(is_var))
+    }
+
     async fn run(&self, args: &[&str], stdin: Option<Vec<u8>>) -> Result<Vec<u8>, AppError> {
         let what = args.first().copied().unwrap_or("");
-        let mut cmd = tokio::process::Command::new(&self.cfg.binary);
-        if let Some(c) = &self.cfg.config_file {
-            cmd.arg("--config").arg(c);
-        }
+        let rc = self.rclone();
+        let mut cmd = tokio::process::Command::new(&rc.program);
+        cmd.args(rc.base_args());
         cmd.args(&self.cfg.extra_args).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
         // Killed when the operation is dropped; the group kill (below) also
         // reaches anything rclone started.
@@ -138,7 +161,7 @@ impl RcloneStore {
         if let Some(p) = &self.config_pass {
             cmd.env("RCLONE_CONFIG_PASS", p);
         }
-        let mut child = cmd.spawn().map_err(|e| AppError::connection(format!("Could not run {}: {e}", self.cfg.binary), "Install rclone (https://rclone.org) or set its path."))?;
+        let mut child = crate::rclone_engine::resolver::spawn(&mut cmd).await.map_err(|e| AppError::connection(format!("Could not run {}: {e}", rc.program), "Install rclone (https://rclone.org), or choose its path in Settings → rclone."))?;
         let reaper = Reaper { pid: child.id() };
         let (mut out, mut err, input) = (child.stdout.take(), child.stderr.take(), child.stdin.take());
         let feed = async {
@@ -209,7 +232,11 @@ impl RcloneStore {
         };
         // rclone exited; anything it left behind in its group goes too.
         drop(reaper);
-        fed?;
+        // A failed rclone often stops before reading its input: its own error
+        // explains that better than the broken pipe the write then hit.
+        if status.success() {
+            fed?;
+        }
         if !status.success() {
             let err = String::from_utf8_lossy(&stderr);
             let last = err.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("").to_string();
@@ -297,6 +324,62 @@ esac
 
     fn alive(pid: i32) -> bool {
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// The job's own binary/config win; the defaults follow the app's resolver.
+    #[test]
+    fn binary_and_config_come_from_the_job_or_the_resolver() {
+        let app = crate::rclone_engine::Rclone::current();
+        let s = RcloneStore::new(RcloneConfig::default(), None);
+        assert_eq!(s.rclone(), app);
+        let s = RcloneStore::new(RcloneConfig { binary: " ".into(), ..Default::default() }, None);
+        assert_eq!(s.rclone().program, app.program);
+        let s = RcloneStore::new(RcloneConfig { binary: "/opt/rclone/rclone".into(), config_file: Some("/job/rclone.conf".into()), ..Default::default() }, None);
+        assert_eq!(s.rclone(), crate::rclone_engine::Rclone::new("/opt/rclone/rclone", Some("/job/rclone.conf".into())));
+        assert_eq!(s.rclone().base_args(), vec!["--config", "/job/rclone.conf"]);
+    }
+
+    /// Regression: a job that names its config through `RCLONE_CONFIG` (its
+    /// own env, or passed through into an isolated environment) kept it only
+    /// until a config file was chosen in Settings: that one then arrived as
+    /// `--config`, which beats the variable.
+    #[test]
+    fn job_rclone_config_env_is_not_overridden_by_the_settings_config() {
+        let app = crate::rclone_engine::Rclone::new("/usr/bin/rclone", Some("/settings/rclone.conf".into()));
+        // No job config: the Settings file.
+        let s = RcloneStore::new(RcloneConfig::default(), None);
+        assert_eq!(s.rclone_with(app.clone()).config.as_deref(), Some("/settings/rclone.conf"));
+        // RCLONE_CONFIG in the job's env: no `--config`, the variable decides.
+        let mut c = RcloneConfig::default();
+        c.env.insert("RCLONE_CONFIG".into(), "/job/env.conf".into());
+        let rc = RcloneStore::new(c.clone(), None).rclone_with(app.clone());
+        assert_eq!((rc.program.as_str(), rc.config.as_deref()), ("/usr/bin/rclone", None));
+        assert!(rc.base_args().is_empty());
+        // Passed through into an isolated environment: the same.
+        let iso = RcloneConfig { isolate_env: true, env_passthrough: vec!["RCLONE_CONFIG".into()], ..Default::default() };
+        assert_eq!(RcloneStore::new(iso.clone(), None).rclone_with(app.clone()).config, None);
+        // A passthrough list only applies to an isolated environment.
+        let not_iso = RcloneConfig { isolate_env: false, ..iso };
+        assert_eq!(RcloneStore::new(not_iso, None).rclone_with(app.clone()).config.as_deref(), Some("/settings/rclone.conf"));
+        // Other RCLONE_* variables change nothing.
+        let mut other = RcloneConfig::default();
+        other.env.insert("RCLONE_CONFIG_PASS".into(), "x".into());
+        assert_eq!(RcloneStore::new(other, None).rclone_with(app.clone()).config.as_deref(), Some("/settings/rclone.conf"));
+        // The job's own config file still wins over everything.
+        c.config_file = Some("/job/rclone.conf".into());
+        assert_eq!(RcloneStore::new(c, None).rclone_with(app).config.as_deref(), Some("/job/rclone.conf"));
+    }
+
+    /// Regression: rclone failing before it reads its input (quota, auth)
+    /// used to surface as "rclone input: Broken pipe" instead of rclone's
+    /// own error. A 4 MiB upload never fits the pipe buffer, so the write
+    /// always breaks.
+    #[tokio::test]
+    async fn early_failure_reports_rclone_error_not_broken_pipe() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = RcloneConfig { remote: "fake:".into(), binary: fake(d.path()), ..Default::default() };
+        let e = RcloneStore::new(cfg, None).put("big", vec![7u8; 4 * 1024 * 1024]).await.unwrap_err();
+        assert!(e.user_message().contains("quota exceeded"), "{}", e.user_message());
     }
 
     #[tokio::test]

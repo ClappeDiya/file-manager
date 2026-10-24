@@ -13,6 +13,8 @@
  * - Starred connections first; show/hide on password fields
  * - Google Drive / Dropbox / OneDrive sign-in and where they open
  * - "Credentials rejected" flag with Retry; remote quota; folder size
+ * - rclone remote manager (create/edit/test/delete, "Add as connection");
+ *   crypt banner with "Open underlying remote" and name decoding (Advanced)
  */
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { ShareLinkDialog } from "@/components/share-link-dialog";
@@ -30,6 +32,10 @@ import { OAuthSignIn } from "@/components/oauth-sign-in";
 import { CloudScopeFields, type CloudExtras, type OAuthSettings } from "@/components/cloud-connection-fields";
 import { CONNECTIONS_CHANGED_EVENT, OAUTH_PROTOCOLS, googleDownloadName, isSignedIn, signOut } from "@/lib/oauth";
 import { useUIStore } from "@/stores/ui-store";
+import { useRcloneUi } from "@/stores/rclone-ui-store";
+import { RcloneRemoteManager } from "@/components/rclone/rclone-remote-manager";
+import { CryptBanner, CryptNamesDialog } from "@/components/rclone/rclone-crypt";
+import { RCLONE_REMOTES_CHANGED_EVENT, rcloneCryptInfo, type RcloneCryptInfo } from "@/lib/rclone";
 
 // ── Types (mirrors Rust types) ──
 
@@ -227,6 +233,9 @@ const DEFAULT_PORTS: Record<string, number> = {
 
 
 // ── Helpers ──
+
+/** Browser key of an ad-hoc rclone remote (not a saved connection). */
+const ADHOC_PREFIX = "adhoc:";
 
 /** Sizes follow Settings → Appearance → Size units. */
 const formatFileSize = (bytes: number): string => formatBytes(bytes);
@@ -498,22 +507,34 @@ function SshKeyGenSection({
   );
 }
 
+/** A new connection pre-filled from elsewhere (an rclone remote's "Add as connection"). */
+export interface ConnectionPrefill {
+  protocol: string;
+  host: string;
+  name: string;
+}
+
 function ConnectionForm({
   initialData,
+  prefill,
   onSave,
   onCancel,
+  onManageRclone,
   groups,
   protocols,
 }: {
   initialData?: ConnectionProfile | null;
+  prefill?: ConnectionPrefill | null;
   onSave: (data: Record<string, unknown>) => void;
   onCancel: () => void;
+  /** Open the rclone remote manager. */
+  onManageRclone?: () => void;
   groups: ConnectionGroup[];
   protocols: ProtocolOption[];
 }) {
-  const [name, setName] = useState(initialData?.name || "");
-  const [protocol, setProtocol] = useState(initialData?.protocol || "sftp");
-  const [host, setHost] = useState(initialData?.host || "");
+  const [name, setName] = useState(initialData?.name || prefill?.name || "");
+  const [protocol, setProtocol] = useState(initialData?.protocol || prefill?.protocol || "sftp");
+  const [host, setHost] = useState(initialData?.host || prefill?.host || "");
   const [port, setPort] = useState<string>(
     initialData?.port?.toString() || ""
   );
@@ -592,6 +613,15 @@ function ConnectionForm({
         setRcloneError(errorText(e));
       });
   }, [protocol, rcloneRemotes]);
+  // A remote was created or deleted in the rclone manager: list again.
+  useEffect(() => {
+    const reload = () => {
+      setRcloneError(null);
+      setRcloneRemotes(null);
+    };
+    window.addEventListener(RCLONE_REMOTES_CHANGED_EVENT, reload);
+    return () => window.removeEventListener(RCLONE_REMOTES_CHANGED_EVENT, reload);
+  }, []);
 
   // STS AssumeRole (S3): temporary credentials from the keys above
   const [roleArn, setRoleArn] = useState(initialData?.extras?.assume_role?.role_arn ?? "");
@@ -1056,6 +1086,11 @@ function ConnectionForm({
           <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">
             {rcloneError ?? "Remotes come from `rclone config`. You can also type one in Host, e.g. gcs:my-bucket or :s3,provider=AWS:."}
           </p>
+          {onManageRclone && (
+            <button type="button" onClick={onManageRclone} className="mt-1 text-[11px] text-blue-600 dark:text-blue-400 hover:underline" data-testid="rclone-manage-remotes">
+              New or edit rclone remotes…
+            </button>
+          )}
         </div>
       )}
       {/* STS AssumeRole (S3 only) */}
@@ -1707,6 +1742,15 @@ export function ConnectionPanel() {
   const [entryMenu, setEntryMenu] = useState<{ entry: RemoteFileEntry; x: number; y: number } | null>(null);
   const setActiveGuidedFlow = useUIStore((st) => st.setActiveGuidedFlow);
   const [showCloudMenu, setShowCloudMenu] = useState(false);
+  // rclone remote manager, "Add as connection" pre-fill, crypt browsing
+  const rcloneUi = useRcloneUi();
+  const [formPrefill, setFormPrefill] = useState<ConnectionPrefill | null>(null);
+  const advancedMode = useUIStore((st) => st.appMode === "advanced");
+  const [cryptInfo, setCryptInfo] = useState<RcloneCryptInfo | null>(null);
+  const [cryptNamesFor, setCryptNamesFor] = useState<string | null>(null);
+  // The browser shows an ad-hoc rclone remote (a crypt remote's underlying
+  // one) as `adhoc:<remote>`; it has no saved connection id.
+  const connArg = connectedId?.startsWith(ADHOC_PREFIX) ? null : connectedId;
 
   const refreshStatus = useCallback(async () => {
     const list = await tauriInvoke<ConnectionStatus[]>("list_connection_status", undefined, []).catch(() => []);
@@ -1960,13 +2004,13 @@ export function ConnectionPanel() {
       const jobId = `size-${Date.now()}-${++sizeJob.current}`;
       setSizes((prev) => ({ ...prev, [entry.path]: { jobId, running: true } }));
       try {
-        const result = await tauriInvoke<FolderSize>("connector_folder_size", { protocol: connectedProtocol, path: entry.path, jobId, connectionId: connectedId });
+        const result = await tauriInvoke<FolderSize>("connector_folder_size", { protocol: connectedProtocol, path: entry.path, jobId, connectionId: connArg });
         setSizes((prev) => ({ ...prev, [entry.path]: { running: false, result } }));
       } catch (err) {
         setSizes((prev) => ({ ...prev, [entry.path]: { running: false, error: errorText(err) } }));
       }
     },
-    [connectedProtocol, connectedId]
+    [connectedProtocol, connArg]
   );
 
   const handleCancelSize = useCallback(async (path: string) => {
@@ -2037,7 +2081,7 @@ export function ConnectionPanel() {
       try {
         const files = await tauriInvoke<RemoteFileEntry[]>(
           "connector_list_remote",
-          { protocol: connectedProtocol, path, connectionId: connectedId },
+          { protocol: connectedProtocol, path, connectionId: connArg },
           []
         );
         setRemoteFiles(files);
@@ -2050,15 +2094,60 @@ export function ConnectionPanel() {
         setBrowsing(false);
       }
     },
-    [connectedProtocol, connectedId]
+    [connectedProtocol, connArg]
   );
 
   // Derive the connected connection name for the header
   const connectedName = useMemo(() => {
     if (!connectedId) return null;
+    if (connectedId.startsWith(ADHOC_PREFIX)) return connectedId.slice(ADHOC_PREFIX.length);
     const conn = connections.find((c) => c.id === connectedId);
     return conn?.name || connectedId;
   }, [connectedId, connections]);
+
+  // The rclone remote the browser shows (saved connection or ad-hoc).
+  const connectedRcloneRemote = useMemo(() => {
+    if (connectedProtocol !== "rclone" || !connectedId) return null;
+    if (connectedId.startsWith(ADHOC_PREFIX)) return connectedId.slice(ADHOC_PREFIX.length);
+    const conn = connections.find((c) => c.id === connectedId);
+    return conn ? conn.extras?.rclone_remote?.trim() || conn.host : null;
+  }, [connectedProtocol, connectedId, connections]);
+
+  // Advanced: is it a crypt remote? (banner + underlying remote)
+  useEffect(() => {
+    setCryptInfo(null);
+    if (!advancedMode || !connectedRcloneRemote) return;
+    let live = true;
+    rcloneCryptInfo(connectedRcloneRemote).then(
+      (i) => live && setCryptInfo(i),
+      () => live && setCryptInfo(null),
+    );
+    return () => {
+      live = false;
+    };
+  }, [advancedMode, connectedRcloneRemote]);
+
+  // Browse an rclone remote that has no saved connection (a crypt remote's
+  // underlying remote) with the shared rclone connector.
+  const handleOpenAdhoc = useCallback(async (remote: string) => {
+    setBrowseError(null);
+    setBrowsing(true);
+    try {
+      await tauriInvoke("connector_connect", { protocol: "rclone", host: remote, port: null, username: null, remotePath: "/", connectionId: null });
+      const files = await tauriInvoke<RemoteFileEntry[]>("connector_list_remote", { protocol: "rclone", path: "/", connectionId: null }, []);
+      setConnectedId(`${ADHOC_PREFIX}${remote}`);
+      setConnectedProtocol("rclone");
+      setRemotePath("/");
+      setRemoteFiles(files);
+      setSizes({});
+      setQuota(null);
+      setConnectedProtocols((prev) => new Set([...prev, "rclone"]));
+    } catch (err) {
+      setBrowseError(errorText(err));
+    } finally {
+      setBrowsing(false);
+    }
+  }, []);
 
   const [sharingEntry, setSharing] = useState<RemoteFileEntry | null>(null);
 
@@ -2068,11 +2157,11 @@ export function ConnectionPanel() {
     if (!connectedProtocol) return;
     const files = await tauriInvoke<RemoteFileEntry[]>(
       "connector_list_remote",
-      { protocol: connectedProtocol, path: remotePath, connectionId: connectedId },
+      { protocol: connectedProtocol, path: remotePath, connectionId: connArg },
       [],
     );
     setRemoteFiles(files);
-  }, [connectedProtocol, connectedId, remotePath]);
+  }, [connectedProtocol, connArg, remotePath]);
 
   const handleUpload = useCallback(async () => {
     if (!connectedProtocol) return;
@@ -2088,7 +2177,7 @@ export function ConnectionPanel() {
           protocol: connectedProtocol,
           localPath: local,
           remotePath: joinRemote(remotePath, name),
-          connectionId: connectedId,
+          connectionId: connArg,
         });
         done++;
       }
@@ -2098,7 +2187,7 @@ export function ConnectionPanel() {
       setTransferStatus(null);
       setBrowseError(`Upload failed after ${done}/${files.length}: ${errorText(err)}`);
     }
-  }, [connectedProtocol, connectedId, remotePath, reloadRemote]);
+  }, [connectedProtocol, connArg, remotePath, reloadRemote]);
 
   const handleDownload = useCallback(async (entry: RemoteFileEntry) => {
     if (!connectedProtocol) return;
@@ -2115,14 +2204,14 @@ export function ConnectionPanel() {
         protocol: connectedProtocol,
         remotePath: entry.path,
         localPath: `${dir.replace(/\/$/, "")}/${fileName}`,
-        connectionId: connectedId,
+        connectionId: connArg,
       });
       setTransferStatus(`Downloaded ${fileName} (${formatFileSize(bytes)}) to ${dir}.`);
     } catch (err) {
       setTransferStatus(null);
       setBrowseError(`Download failed: ${errorText(err)}`);
     }
-  }, [connectedProtocol, connectedId, connections]);
+  }, [connectedProtocol, connectedId, connArg, connections]);
 
   const handleRemoteMkdir = useCallback(async () => {
     if (!connectedProtocol) return;
@@ -2133,14 +2222,14 @@ export function ConnectionPanel() {
       await tauriInvoke("connector_make_directory", {
         protocol: connectedProtocol,
         remotePath: joinRemote(remotePath, name),
-        connectionId: connectedId,
+        connectionId: connArg,
       });
       setTransferStatus(`Created folder ${name}.`);
       await reloadRemote();
     } catch (err) {
       setBrowseError(`Create folder failed: ${errorText(err)}`);
     }
-  }, [connectedProtocol, connectedId, remotePath, reloadRemote]);
+  }, [connectedProtocol, connArg, remotePath, reloadRemote]);
 
   const handleRemoteDelete = useCallback(async (entry: RemoteFileEntry) => {
     if (!connectedProtocol) return;
@@ -2156,14 +2245,14 @@ export function ConnectionPanel() {
         protocol: connectedProtocol,
         remotePath: entry.path,
         isDir: entry.is_dir,
-        connectionId: connectedId,
+        connectionId: connArg,
       });
       setTransferStatus(`Deleted ${entry.name}.`);
       await reloadRemote();
     } catch (err) {
       setBrowseError(`Delete failed: ${errorText(err)}`);
     }
-  }, [connectedProtocol, connectedId, reloadRemote]);
+  }, [connectedProtocol, connArg, reloadRemote]);
 
   const handleExport = useCallback(async () => {
     try {
@@ -2301,12 +2390,22 @@ export function ConnectionPanel() {
           <button
             onClick={() => {
               setEditingConnection(null);
+              setFormPrefill(null);
               setShowForm(true);
             }}
             className="text-xs px-2 py-1 rounded bg-blue-500 text-white hover:bg-blue-600"
             type="button"
           >
             + New
+          </button>
+          <button
+            onClick={() => (rcloneUi.managerOpen ? rcloneUi.closeManager() : rcloneUi.openManager())}
+            className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+            type="button"
+            aria-pressed={rcloneUi.managerOpen}
+            title="Create and manage rclone remotes (70+ storage providers)"
+          >
+            rclone remotes
           </button>
           <div className="relative">
             <button
@@ -2339,6 +2438,17 @@ export function ConnectionPanel() {
                     {label}
                   </button>
                 ))}
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setShowCloudMenu(false);
+                    rcloneUi.openManager({ create: true });
+                  }}
+                  className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-700 border-t border-gray-100 dark:border-gray-700"
+                  type="button"
+                >
+                  More (Box, pCloud, MEGA… via rclone)
+                </button>
               </div>
             )}
           </div>
@@ -2437,16 +2547,41 @@ export function ConnectionPanel() {
         <QuickConnectBar onConnect={handleConnect} />
       </div>
 
+      {/* rclone remote manager */}
+      {rcloneUi.managerOpen && (
+        <div className="border-b border-gray-200 dark:border-gray-700 max-h-[60%] overflow-y-auto">
+          <RcloneRemoteManager
+            key={`${rcloneUi.startInCreate}:${rcloneUi.createType ?? ""}`}
+            startInCreate={rcloneUi.startInCreate}
+            initialType={rcloneUi.createType}
+            onClose={rcloneUi.closeManager}
+            onAddConnection={(remote, remoteName) => {
+              rcloneUi.closeManager();
+              setEditingConnection(null);
+              setFormPrefill({ protocol: "rclone", host: remote, name: remoteName });
+              setShowForm(true);
+            }}
+          />
+        </div>
+      )}
+
       {/* Form */}
       {showForm && (
         <div className="border-b border-gray-200 dark:border-gray-700">
           <ConnectionForm
+            key={editingConnection?.id ?? formPrefill?.host ?? "new"}
             initialData={editingConnection}
-            onSave={handleSave}
+            prefill={editingConnection ? null : formPrefill}
+            onSave={(data) => {
+              setFormPrefill(null);
+              void handleSave(data);
+            }}
             onCancel={() => {
               setShowForm(false);
               setEditingConnection(null);
+              setFormPrefill(null);
             }}
+            onManageRclone={() => rcloneUi.openManager()}
             groups={groups}
             protocols={protocols}
           />
@@ -2570,6 +2705,10 @@ export function ConnectionPanel() {
               Disconnect
             </button>
           </div>
+          {cryptInfo?.is_crypt && (
+            <CryptBanner info={cryptInfo} onOpenUnderlying={(r) => void handleOpenAdhoc(r)} onNames={() => setCryptNamesFor(`${cryptInfo.remote}:`)} />
+          )}
+          {cryptNamesFor && <CryptNamesDialog remote={cryptNamesFor} onClose={() => setCryptNamesFor(null)} />}
           {quota && formatQuota(quota) && (
             <div className="px-3 py-1 text-xs text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-gray-700" data-testid="remote-quota">
               Storage: {formatQuota(quota)}
@@ -2780,7 +2919,7 @@ export function ConnectionPanel() {
         </div>
       )}
       {sharingEntry && connectedProtocol && (
-        <ShareLinkDialog protocol={connectedProtocol} connectionId={connectedId} path={sharingEntry.path} name={sharingEntry.name} onClose={() => setSharing(null)} />
+        <ShareLinkDialog protocol={connectedProtocol} connectionId={connArg} path={sharingEntry.path} name={sharingEntry.name} onClose={() => setSharing(null)} />
       )}
       {entryMenu && (
         <div

@@ -101,8 +101,9 @@ pub fn fuse_available() -> Result<(), (String, String)> {
     Err(("FUSE".into(), "This OS has no FUSE support".into()))
 }
 
+/// The resolved rclone binary runs (`rclone version`).
 pub fn rclone_available() -> bool {
-    std::process::Command::new(std::env::var("UFOP_RCLONE").unwrap_or_else(|_| "rclone".into())).arg("version").output().is_ok_and(|o| o.status.success())
+    crate::rclone_engine::Rclone::current().version_blocking().is_ok()
 }
 
 /// Whether `p` is a mount point now (Unix: a different device than its parent).
@@ -134,10 +135,10 @@ pub struct RcloneProcesses {
 impl RcloneProcesses {
     /// Start `rclone mount` and wait until the mount point is live.
     pub async fn mount(&self, id: uuid::Uuid, spec: &RcloneSpec, mount_point: &str, flags: &[String]) -> Result<(), String> {
-        let exe = std::env::var("UFOP_RCLONE").unwrap_or_else(|_| "rclone".into());
-        let mut cmd = tokio::process::Command::new(exe);
-        cmd.args(mount_args(spec, mount_point, flags)).envs(spec.env.iter().cloned()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| format!("Could not start rclone: {e}"))?;
+        let rc = crate::rclone_engine::Rclone::current();
+        let mut cmd = tokio::process::Command::new(&rc.program);
+        cmd.args(rc.base_args()).args(mount_args(spec, mount_point, flags)).envs(spec.env.iter().cloned()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        let mut child = crate::rclone_engine::resolver::spawn(&mut cmd).await.map_err(|e| format!("Could not start rclone: {e}"))?;
         let deadline = tokio::time::Instant::now() + MOUNT_WAIT;
         loop {
             if is_mounted(Path::new(mount_point)) {

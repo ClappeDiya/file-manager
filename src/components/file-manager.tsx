@@ -55,6 +55,9 @@ import { KeyboardCheatSheet } from "./keyboard-cheat-sheet";
 import { BatchRename } from "./batch-rename";
 import SettingsPanel from "./settings-panel";
 import { ConnectionPanel } from "./connection-panel";
+import { useRcloneUi } from "@/stores/rclone-ui-store";
+import { RcloneEngineInfo } from "@/components/rclone/rclone-settings-section";
+import { rcloneStatus, type RcloneStatus } from "@/lib/rclone";
 import { SyncPanel } from "./sync-panel";
 import { BackupPanel } from "./backup/backup-panel";
 import { PeerSidebar } from "./peer-sidebar";
@@ -447,6 +450,8 @@ export function FileManager() {
   // `batchRenameFiles`: the keyboard handler in the useEffect
   // below needs the setter in scope.
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** Settings section to open on (`"rclone"` from the palette), else none. */
+  const [settingsFocus, setSettingsFocus] = useState<string | null>(null);
   // Two more orphaned panels surfaced the same way as Connections/Sync:
   // vault-panel.tsx (1421 LOC) and migration-wizard.tsx (1626 LOC) had
   // zero importers — the features existed but no UI path reached them.
@@ -721,6 +726,10 @@ export function FileManager() {
   // Cmd+Shift+U and a palette entry. Same TDZ-safe placement
   // as the iter 25/26 orphan dialogs.
   const [connectionsOpen, setConnectionsOpen] = useState(false);
+  // Closing the Connection Manager also leaves its rclone remote manager.
+  useEffect(() => {
+    if (!connectionsOpen) useRcloneUi.getState().closeManager();
+  }, [connectionsOpen]);
   // Iter 28: Sync panel modal state. SyncPanel is 1454 LOC of
   // sync-pair management UI \u2014 health indicators, create-pair
   // wizard (simple + advanced), dry-run preview with category
@@ -1461,6 +1470,7 @@ export function FileManager() {
       // System Settings and Cross-platform IDEs exactly.
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key === ",") {
         e.preventDefault();
+        setSettingsFocus(null);
         setSettingsOpen((open) => !open);
       }
       // Cmd+Shift+U \u2014 open the Connection Manager. Surfaces
@@ -2138,9 +2148,18 @@ export function FileManager() {
           })();
         },
         onOpenSettings: () => {
+          setSettingsFocus(null);
+          setSettingsOpen(true);
+        },
+        onOpenRcloneSettings: () => {
+          setSettingsFocus("rclone");
           setSettingsOpen(true);
         },
         onOpenConnections: () => {
+          setConnectionsOpen(true);
+        },
+        onOpenRcloneRemotes: () => {
+          useRcloneUi.getState().openManager();
           setConnectionsOpen(true);
         },
         onOpenSync: () => {
@@ -3208,7 +3227,7 @@ export function FileManager() {
                   <path d="M18 6L6 18M6 6l12 12" />
                 </svg>
               </button>
-              <SettingsPanel />
+              <SettingsPanel focusSection={settingsFocus} />
             </div>
           </div>
         </div>
@@ -5103,6 +5122,8 @@ function StatusBarContent() {
   const [configKey, setConfigKey] = useState("");
   const [configValue, setConfigValue] = useState("");
   const [configError, setConfigError] = useState<string | null>(null);
+  // About: the rclone engine in use (read when the popover opens).
+  const [rclone, setRclone] = useState<RcloneStatus | null>(null);
 
   useEffect(() => {
     if (isTauriAvailable()) {
@@ -5164,7 +5185,10 @@ function StatusBarContent() {
   const toggleSettings = async () => {
     const willOpen = !showSettings;
     setShowSettings(willOpen);
-    if (willOpen) { await loadConfig(); }
+    if (willOpen) {
+      if (isTauriAvailable()) rcloneStatus().then(setRclone, () => setRclone(null));
+      await loadConfig();
+    }
   };
 
   const platformTooltip = platformInfo
@@ -5236,11 +5260,16 @@ function StatusBarContent() {
             <span className="text-xs font-semibold">Settings</span>
             <button onClick={() => setShowSettings(false)} className="text-xs text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)]">Close</button>
           </div>
-          {platformInfo && (
+          {(platformInfo || rclone) && (
             <div className="px-3 py-2 border-b border-[var(--color-border)] text-xs text-[color:var(--color-text-secondary)]">
-              <div>OS: {platformInfo.os}</div>
-              <div>Arch: {platformInfo.arch}</div>
-              <div>Version: {platformInfo.version}</div>
+              {platformInfo && (
+                <>
+                  <div>OS: {platformInfo.os}</div>
+                  <div>Arch: {platformInfo.arch}</div>
+                  <div>Version: {platformInfo.version}</div>
+                </>
+              )}
+              <RcloneEngineInfo status={rclone} />
             </div>
           )}
           <div className="px-3 py-2 space-y-2 max-h-48 overflow-y-auto">
