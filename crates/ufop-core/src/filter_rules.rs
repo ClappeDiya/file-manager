@@ -433,12 +433,93 @@ pub fn parse_filter_file(text: &str) -> Result<Vec<FilterRule>, AppError> {
     Ok(rules)
 }
 
+/// Read a `ufop backup` `--include` / `--exclude` value: `[regex]`,
+/// `{group}`, a wildcard (has `*` or `?`) or an exact path.
+pub fn parse_cli_filter(spec: &str, action: FilterAction) -> FilterRule {
+    let (kind, pattern) = if let Some(r) = spec.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        (FilterKind::Regex, r.to_string())
+    } else if let Some(g) = spec.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        (FilterKind::Group, g.to_string())
+    } else if spec.contains('*') || spec.contains('?') {
+        (FilterKind::Wildcard, spec.to_string())
+    } else {
+        (FilterKind::Exact, spec.to_string())
+    };
+    FilterRule { action, kind, pattern }
+}
+
+/// Read a `ufop backup` `--filter` value: one rclone `+ pattern` /
+/// `- pattern` line (an rclone glob, matched inside each source folder as
+/// in the app).
+pub fn parse_cli_filter_line(line: &str) -> Result<FilterRule, AppError> {
+    match parse_filter_file(line)?.as_slice() {
+        [rule] => Ok(rule.clone()),
+        _ => Err(AppError::validation(format!("--filter \"{line}\" must be one \"+ pattern\" or \"- pattern\" rule"))),
+    }
+}
+
+/// The rules of a `ufop backup` command line, in the order it applies
+/// them: every `--include`, then every `--exclude`, then the `--filter`
+/// lines in order.
+pub fn cli_rules(include: &[String], exclude: &[String], filter: &[String]) -> Result<Vec<FilterRule>, AppError> {
+    let mut rules: Vec<FilterRule> = include.iter().map(|s| parse_cli_filter(s, FilterAction::Include)).collect();
+    rules.extend(exclude.iter().map(|s| parse_cli_filter(s, FilterAction::Exclude)));
+    for line in filter {
+        rules.push(parse_cli_filter_line(line)?);
+    }
+    Ok(rules)
+}
+
+/// The `ufop backup` command-line flag and value for `rule`, read back by
+/// [`parse_cli_filter`] (`--include` / `--exclude`) or
+/// [`parse_cli_filter_line`] (`--filter`, for rclone globs, which keep
+/// their own syntax and their source-relative matching).
+pub fn cli_filter_arg(rule: &FilterRule) -> (&'static str, String) {
+    let flag = match rule.action {
+        FilterAction::Include => "--include",
+        FilterAction::Exclude => "--exclude",
+    };
+    match rule.kind {
+        FilterKind::Regex => (flag, format!("[{}]", rule.pattern)),
+        FilterKind::Group => (flag, format!("{{{}}}", rule.pattern)),
+        FilterKind::Rclone => {
+            let sign = if rule.action == FilterAction::Include { '+' } else { '-' };
+            ("--filter", format!("{sign} {}", rule.pattern))
+        }
+        FilterKind::Exact | FilterKind::Wildcard => (flag, rule.pattern.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rule(action: FilterAction, kind: FilterKind, p: &str) -> FilterRule {
         FilterRule { action, kind, pattern: p.into() }
+    }
+
+    #[test]
+    fn cli_filter_args_read_back_as_the_same_rules() {
+        let rules = vec![
+            rule(FilterAction::Include, FilterKind::Exact, "/a/b"),
+            rule(FilterAction::Exclude, FilterKind::Wildcard, "*.log"),
+            rule(FilterAction::Exclude, FilterKind::Regex, "\\.tmp$"),
+            rule(FilterAction::Exclude, FilterKind::Group, "cache_files"),
+            rule(FilterAction::Include, FilterKind::Rclone, "/Photos/**"),
+            rule(FilterAction::Exclude, FilterKind::Rclone, "*"),
+        ];
+        let (mut inc, mut exc, mut fil) = (vec![], vec![], vec![]);
+        for r in &rules {
+            let (flag, value) = cli_filter_arg(r);
+            match flag {
+                "--include" => inc.push(value),
+                "--exclude" => exc.push(value),
+                _ => fil.push(value),
+            }
+        }
+        assert_eq!(fil, vec!["+ /Photos/**".to_string(), "- *".to_string()]);
+        assert_eq!(cli_rules(&inc, &exc, &fil).unwrap(), rules);
+        assert!(parse_cli_filter_line("+ a\n- b").is_err());
     }
 
     #[test]
