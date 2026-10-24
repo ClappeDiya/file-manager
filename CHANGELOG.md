@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Two-way pairs with *Blind upload* never delete: the destination is not read, so no baseline is used or recorded.
   - Crash-recovery checkpoints record the pair's folders and mode and are dropped when the pair is edited or deleted; a step is skipped only while its result is still in place, and versions stored before a crash are added to the version index on resume.
   - `planner::diff_trees`: the planner's decisions on two listings, pure and cancellable, for folder comparisons.
+  - Sync filter rules match folders like backup does: folder rules and the groups' folder entries (`*/tmp/`, `*/node_modules/`, `cache/`) exclude everything inside, and `*/Thumbs.db`-style entries match at the pair's top folder.
+  - Two-way: a file changed on both sides to the same bytes (e.g. copied by a failed run without kept timestamps) is settled by content hash instead of becoming a conflict.
+  - Editing a pair with an invalid schedule is rejected before anything changes.
 
 - **Simple and Advanced mode in the backup screens**: in Simple mode (the default) the job editor, Restore, Maintenance, Settings and Recovery show the everyday flow; advanced options appear in Advanced mode or with *Show advanced backup options* (a per-area override in the UI store), behind one `AdvancedOnly` gate with a "Switch to Advanced" hint.
 - **`SECURITY.md`**: how to report a vulnerability privately (GitHub private vulnerability reporting), supported versions and response times.

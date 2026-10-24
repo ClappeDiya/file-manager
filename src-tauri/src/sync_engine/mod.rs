@@ -846,6 +846,13 @@ impl SyncManager {
     /// pending crash-recovery checkpoint: its steps were planned for the old
     /// definition.
     pub async fn update_pair(&self, pair: SyncPair) -> Result<SyncPair, AppError> {
+        // Rejected before anything changes: re-arming below must not fail
+        // after the pair was replaced.
+        if let SyncTrigger::Scheduled { cron_expr } = &pair.trigger {
+            if pair.enabled {
+                scheduler::SyncScheduler::validate_cron(cron_expr)?;
+            }
+        }
         let (reset, rearm, stale_checkpoint) = {
             let mut pairs = self.pairs.write().await;
             if let std::collections::hash_map::Entry::Occupied(mut e) = pairs.entry(pair.id) {
@@ -2312,6 +2319,25 @@ mod tests {
         assert_eq!(mgr.scheduler.list_schedules().len(), 1);
         mgr.update_pair(pair).await.unwrap();
         assert!(mgr.scheduler.list_schedules().is_empty());
+    }
+
+    /// Regression: an edit with an invalid cron expression replaced the pair
+    /// in memory and dropped its schedule before failing, so memory, the
+    /// database (never saved) and the scheduler disagreed.
+    #[tokio::test]
+    async fn invalid_cron_edit_changes_nothing() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        let pair = temp_pair(src.path(), dst.path(), SyncMode::OneWay);
+        let (mgr, _state) = mgr_with(&pair).await;
+        let scheduled = SyncPair { trigger: SyncTrigger::Scheduled { cron_expr: "0 0 * * * * *".into() }, ..pair.clone() };
+        mgr.update_pair(scheduled.clone()).await.unwrap();
+        let bad = SyncPair { name: "Renamed".into(), trigger: SyncTrigger::Scheduled { cron_expr: "not a cron".into() }, ..scheduled.clone() };
+        assert!(mgr.update_pair(bad).await.is_err());
+        let kept = mgr.pairs.read().await.get(&pair.id).cloned().unwrap();
+        assert_eq!(kept.name, scheduled.name);
+        assert_eq!(kept.trigger, scheduled.trigger);
+        assert_eq!(mgr.scheduler.list_schedules().len(), 1, "the old schedule stays armed");
     }
 
     #[tokio::test]

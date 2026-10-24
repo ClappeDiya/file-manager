@@ -279,7 +279,7 @@ A two-way pair remembers what both folders looked like after its last successful
 
 - A file deleted on one side and unchanged on the other is **deleted on the other side too** (with a rollback copy). Renaming a file is a delete plus an add.
 - A file changed on one side is copied to the other, in either direction.
-- A file changed on **both** sides is a conflict and goes through the pair's conflict policy. *Destination wins* and *Keep both* leave both folders identical (keep both: the destination's version under the name, the source's as `name (conflict DATE).ext`, on both sides).
+- A file changed on **both** sides is a conflict and goes through the pair's conflict policy, unless both sides now hold the same bytes (checked by content hash), which counts as in sync. *Destination wins* and *Keep both* leave both folders identical (keep both: the destination's version under the name, the source's as `name (conflict DATE).ext`, on both sides).
 - The **first run** (no history yet) only combines both folders; it never deletes. The preview says so.
 - A run that fails, is cancelled or stops at the end of its run hours keeps the previous history, so nothing it left half done is mistaken for a deletion.
 - **Safety stop**: a run that would delete more than 50% of the synced files on one side (more than two files), or everything because one folder is empty or missing, is refused — usually an unplugged drive or an unmounted share. Change the limit in *Cleanup & moving* (0 turns it off) or reset the history.
@@ -302,7 +302,7 @@ Besides the include/exclude lists, a pair (and a backup job) can have **ordered 
 
 ### Comparing files
 
-In the Advanced view, *When to overwrite › Compare files by* chooses **size and date** (default), **checksum** (xxHash3; reads every file whose size matches, finds changes even when the date did not change and ignores files that were only touched), or **size only**. When checksums are not available the preview notes that size and date were used. The **Ignore existing** preset (Advanced) copies only files the destination does not have.
+In the Advanced view, *When to overwrite › Compare files by* chooses **size and date** (default), **checksum** (xxHash3; reads every file whose size matches, finds changes even when the date did not change and ignores files that were only touched), or **size only**. When checksums are not available the preview notes that size and date were used. Checksums are computed by reading the files through their local or mounted path; hashes stored by a cloud provider are not used yet. The **Ignore existing** preset (Advanced) copies only files the destination does not have.
 
 ### Versioned backup: versions to keep
 
