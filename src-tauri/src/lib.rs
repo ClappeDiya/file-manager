@@ -362,7 +362,7 @@ fn start_background_engines(app: tauri::AppHandle) {
             let manager = app.state::<SyncManager>();
             let ledger = app.state::<OperationLedger>();
             let repo = app.state::<Repository>();
-            match commands::sync_commands::run_sync_pair(&manager, &ledger, &repo, &pair_id.to_string()).await {
+            match commands::sync_commands::run_sync_pair_as(&manager, &ledger, &repo, &pair_id.to_string(), ufop_core::run_trigger::RunTrigger::Scheduled).await {
                 Ok(report) => tracing::info!("Scheduled sync {} finished: {:?}", report.pair_name, report.status),
                 Err(e) => tracing::warn!("Scheduled sync {pair_id} failed: {e}"),
             }
@@ -919,6 +919,7 @@ pub fn run() {
             sync_commands::update_sync_pair,
             sync_commands::run_sync,
             sync_commands::get_sync_run_history,
+            sync_commands::get_sync_run_items,
             sync_commands::prune_sync_run_history,
             sync_commands::get_sync_health,
             sync_commands::sync_dry_run,

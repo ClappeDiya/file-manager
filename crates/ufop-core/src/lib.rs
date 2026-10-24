@@ -27,6 +27,7 @@ pub mod preload;
 pub mod retention;
 pub mod retry;
 pub mod run_notify;
+pub mod run_trigger;
 pub mod session;
 pub mod stability;
 pub mod webdav;

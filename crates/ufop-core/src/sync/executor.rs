@@ -393,6 +393,9 @@ pub fn execute_sync_with(
 
     // Two-way: what each finished step means for the next baseline.
     let mut baseline_updates: Vec<(String, Option<BaselineEntry>)> = Vec::new();
+    // What the run did to each file, for the run's changed-items list.
+    let mut items: Vec<SyncRunItem> = Vec::new();
+    let moves_source = opts.move_files || opts.move_dirs;
     for (idx, result) in outcomes {
         let (entry, op_type) = operations[idx];
         if pair.mode == SyncMode::TwoWay {
@@ -411,15 +414,21 @@ pub fn execute_sync_with(
                         files_added += 1;
                         bytes_transferred += bytes;
                         log_lines.push(format!("\tNew File\t{}\t{}", bytes, entry.relative_path));
+                        let moved = moves_source && entry.direction == SyncDirection::ToDest && entry.source_size.is_some();
+                        items.push(SyncRunItem::done(&entry.relative_path, if moved { SyncItemAction::Moved } else { SyncItemAction::Copied }, bytes));
                     }
                     OperationResult::Modified(bytes, _) => {
                         files_modified += 1;
                         bytes_transferred += bytes;
                         log_lines.push(format!("\tNewer\t\t{}\t{}", bytes, entry.relative_path));
+                        let moved = moves_source && entry.direction == SyncDirection::ToDest && entry.source_size.is_some();
+                        items.push(SyncRunItem::done(&entry.relative_path, if moved { SyncItemAction::Moved } else { SyncItemAction::Updated }, bytes));
                     }
                     OperationResult::Deleted => {
                         files_deleted += 1;
                         log_lines.push(format!("\t*EXTRA File\t\t{}", entry.relative_path));
+                        let gone = if entry.direction == SyncDirection::ToSource { entry.source_size } else { entry.dest_size };
+                        items.push(SyncRunItem::done(&entry.relative_path, SyncItemAction::Deleted, gone.unwrap_or(0)));
                     }
                     OperationResult::Skipped => {
                         files_skipped += 1;
@@ -459,6 +468,7 @@ pub fn execute_sync_with(
                 errors += 1;
                 error_messages.push(format!("{}: {}", entry.relative_path, e));
                 log_lines.push(format!("\tERROR\t\t{}\t{}", entry.relative_path, e));
+                items.push(SyncRunItem::failed(&entry.relative_path, entry.source_size.or(entry.dest_size).unwrap_or(0), e.to_string()));
             }
         }
     }
@@ -509,6 +519,7 @@ pub fn execute_sync_with(
                     OperationResult::ConflictResolved(bytes, synced) => {
                         conflicts_resolved += 1;
                         bytes_transferred += bytes;
+                        items.push(SyncRunItem::done(&entry.relative_path, SyncItemAction::Conflict, bytes));
                         if pair.mode == SyncMode::TwoWay {
                             baseline_updates.push((entry.relative_path.clone(), synced));
                         }
@@ -521,6 +532,7 @@ pub fn execute_sync_with(
                 Err(e) => {
                     errors += 1;
                     error_messages.push(format!("Conflict {}: {}", entry.relative_path, e));
+                    items.push(SyncRunItem::failed(&entry.relative_path, entry.source_size.or(entry.dest_size).unwrap_or(0), e.to_string()));
                     if !config.continue_on_error {
                         conflicts_halted = true;
                         break;
@@ -666,6 +678,9 @@ pub fn execute_sync_with(
             errors,
         ),
         versions_pruned,
+        trigger: Default::default(),
+        items_truncated: cap_run_items(&mut items, MAX_RUN_ITEMS),
+        items,
     };
 
     if report.status == SyncRunStatus::Success {
@@ -1536,6 +1551,67 @@ mod tests {
         assert!(!dst.path().join("extra.txt").exists());
     }
 
+    fn cfg_of(pair: SyncPair) -> ExecutorConfig {
+        ExecutorConfig { pair, run_id: Uuid::new_v4(), continue_on_error: true, resume_from: None, quarantine_dir: None, rollback_dir: None, baseline: None }
+    }
+
+    #[test]
+    fn a_run_lists_each_file_it_copied_updated_and_deleted() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("new.txt"), "brand new").unwrap();
+        fs::write(src.path().join("changed.txt"), "changed and longer").unwrap();
+        fs::write(dst.path().join("changed.txt"), "old").unwrap();
+        fs::write(dst.path().join("extra.txt"), "gone soon").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::Mirror;
+
+        let report = execute_sync(&cfg_of(pair)).unwrap();
+
+        let action = |p: &str| report.items.iter().find(|i| i.rel_path == p).map(|i| (i.action, i.bytes));
+        assert_eq!(action("new.txt"), Some((SyncItemAction::Copied, 9)));
+        assert_eq!(action("changed.txt"), Some((SyncItemAction::Updated, 18)));
+        assert_eq!(action("extra.txt"), Some((SyncItemAction::Deleted, 9)));
+        assert_eq!(report.items.len(), 3);
+        assert!(!report.items_truncated);
+        // The list is never part of the serialized report (it lives in sync_run_items).
+        assert!(serde_json::to_value(&report).unwrap().get("items").is_none());
+    }
+
+    #[test]
+    fn a_move_run_lists_files_as_moved() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "payload").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.copy_options.move_files = true;
+
+        let report = execute_sync(&cfg_of(pair)).unwrap();
+
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].action, SyncItemAction::Moved);
+        assert!(!src.path().join("a.txt").exists());
+    }
+
+    #[test]
+    fn a_failed_copy_is_listed_with_its_error() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::create_dir(src.path().join("sub")).unwrap();
+        fs::write(src.path().join("sub").join("inner.txt"), "cannot land").unwrap();
+        fs::write(src.path().join("fine.txt"), "fine").unwrap();
+        // A file where the destination needs a folder: the copy cannot succeed.
+        fs::write(dst.path().join("sub"), "i am a file").unwrap();
+
+        let report = execute_sync(&cfg_of(make_test_pair(src.path(), dst.path()))).unwrap();
+
+        let failed = report.items.iter().find(|i| i.action == SyncItemAction::Failed).expect("a failed item");
+        assert!(failed.rel_path.replace('\\', "/").ends_with("sub/inner.txt"), "{failed:?}");
+        assert!(failed.error.as_deref().is_some_and(|e| !e.is_empty()));
+        assert!(report.errors >= 1);
+        assert!(report.items.iter().any(|i| i.rel_path == "fine.txt" && i.action == SyncItemAction::Copied));
+    }
+
     #[test]
     fn test_execute_sync_versioned_backup() {
         let src = TempDir::new().unwrap();
@@ -1673,6 +1749,9 @@ mod tests {
                 resumed: false,
                 exit_code: 0,
                 versions_pruned: 0,
+                trigger: Default::default(),
+                items_truncated: false,
+                items: vec![],
             },
         )
         .unwrap();

@@ -71,7 +71,7 @@ impl BotBackend for TauriBackend {
                     let app = self.app.clone();
                     tauri::async_runtime::spawn(async move {
                         let (manager, ledger, repo) = (app.state::<SyncManager>(), app.state::<OperationLedger>(), app.state::<Repository>());
-                        if let Err(e) = crate::commands::sync_commands::run_sync_pair(&manager, &ledger, &repo, &id.to_string()).await {
+                        if let Err(e) = crate::commands::sync_commands::run_sync_pair_as(&manager, &ledger, &repo, &id.to_string(), ufop_core::run_trigger::RunTrigger::Api).await {
                             tracing::warn!("Remote control: sync {id} failed: {e}");
                         }
                     });
