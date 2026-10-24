@@ -238,12 +238,13 @@ macro; if you add a new one here, register it there too.
 - `set_global_proxy`
 - `test_connection`
 
-## `connector_commands` (14 commands)
+## `connector_commands` (17 commands)
 
 - `connection_presets`
 - `connector_connect`
 - `connector_disconnect`
 - `connector_download`
+- `connector_fetch_preview`
 - `connector_folder_size`
 - `connector_folder_size_cancel`
 - `connector_is_connected`
@@ -252,6 +253,8 @@ macro; if you add a new one here, register it there too.
 - `connector_make_directory`
 - `connector_quota`
 - `connector_remove`
+- `connector_rename`
+- `connector_stat`
 - `connector_upload`
 - `rclone_list_remotes`
 
@@ -745,13 +748,14 @@ macro; if you add a new one here, register it there too.
 - `thumbnail_cache_clear`
 - `thumbnail_get`
 
-## `transfer_commands` (35 commands)
+## `transfer_commands` (36 commands)
 
 - `cancel_transfer`
 - `check_conflict`
 - `cleanup_transfer_history`
 - `complete_transfer`
 - `compute_checksum`
+- `enqueue_location_transfer`
 - `enqueue_transfer`
 - `export_transfer_history`
 - `fail_transfer`
@@ -806,4 +810,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 629 commands across 54 modules.
+**Surface:** 633 commands across 54 modules.

@@ -140,6 +140,33 @@ Files can be displayed in four modes (set per pane in Advanced mode):
 
 In Advanced mode, the workspace splits into two panes. Each pane has its own tabs, view mode, sorting, and filter settings. The split ratio is adjustable between 20%-80%.
 
+### Address bar
+
+Click the empty part of the breadcrumb bar, press **Ctrl+L** (⌘L), or choose **Go to Address…** in the command palette to type where to go:
+
+- a folder on this computer (`/home/me/Documents`, `C:\Users\me`);
+- a saved connection as `<connection name>:<path>` (`Work Drive:/Reports`), or `conn://<connection id>/<path>`.
+
+Suggestions list the folders of the folder you are typing in (as you type) and places you visited recently. **Tab** completes the highlighted suggestion, **Enter** goes there, **Esc** cancels. An address that does not exist, or names a file or an unknown connection, is shown in red and the field stays open.
+
+### Cloud and server folders in the panes
+
+Both panes can show a saved connection (SFTP, S3, Google Drive, Dropbox, OneDrive, WebDAV, rclone remotes…) next to, or instead of, a folder on this computer:
+
+- **Open one**: click it under **Connections** in the sidebar (opens in the active pane), **Open in pane** in the Connection Manager (also for the folder being browsed there), **Open <name> in Pane** in the command palette, or type its address.
+- Breadcrumbs start at the connection (cloud icon and name); tabs, back/forward and the open tabs at the next start keep connection folders like any other.
+- **Copy and move between any two places** with F5 / F6, Copy/Cut + Paste, or drag-and-drop: this computer → connection uploads, connection → this computer downloads, and between connections the files are copied on the server when both ends are the same connection and it can (WebDAV, Dropbox, rclone), else downloaded and uploaded through a temporary file. Every file is a job in the transfer queue (progress, pause/cancel, history). Folders are copied with everything in them. Names already taken at the destination get ` (copy)`; nothing is overwritten. A move within one connection is a server-side rename where possible; other moves delete each original once its copy has finished, then the emptied folders (if the app is closed meanwhile, the originals of unfinished files are kept).
+- From a connection with no other pane to copy to (single-pane view, or the other pane shows the same folder), F5/F6 use the **default download folder** (Settings › General), else ask for a folder.
+- **Rename** (F2), **New folder**, **Delete** (on the server: there is no local Trash; Google Drive, OneDrive and Dropbox keep deleted items in their own trash), **Calculate size**, **Share Link…** (providers with links) and **Get Info** work on connection items. The status bar shows the account's storage.
+- Opening a connection file downloads a copy (up to 25 MB) and shows it in the preview pane, or in its default app; changes to that copy are not uploaded.
+- Actions that only work on this computer's files (duplicate, compress, extract, convert, GPG, integrity tools, terminal, batch rename, file history, thumbnails, subfolder/content search…) stay in the menus but are disabled, with the reason in their tooltip.
+- A connection that cannot be listed (offline, signed out, credentials rejected) shows why, with **Reconnect** (which also clears a *Credentials rejected* flag) and **Connections…**.
+- Undo covers operations on this computer's files only.
+
+### Drag-and-drop
+
+Dropping files in the same place (this computer, or the same connection) moves them (hold **Alt** to copy); dropping onto another connection, or between this computer and a connection, copies them. **Settings › General › Ask before drag-and-drop copies or moves** (off by default) shows what a drop will do first — with the Safety Interlock's warning for unusually large moves — and runs it only when you confirm.
+
 ---
 
 ## File Operations
@@ -352,6 +379,9 @@ Add the connection from **Connections → + Cloud** (a guided wizard) or with **
 - **Import/Export** - Share connection profiles between machines
 - **Credential Storage** - Passwords and keys stored in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service)
 - **Rejected credentials** - When a server refuses the sign-in (wrong password, expired or revoked access), the connection is marked *Credentials rejected* and automatic reconnects (backups, automation, auto-mount) skip it instead of retrying the same credentials, which could lock the account. Edit the connection with the current credentials, or click **Retry**. Network errors are still retried.
+- **Default folders** - Settings › General: the default download folder (where the download folder picker opens) and the default upload source folder (where the upload file picker opens).
+- **Open in pane** - Browse a connection (or the folder open in the panel) in the active file pane; see *Cloud and server folders in the panes*.
+- **Folder picker** - Sync pairs, backup sources and destinations (including a folder on a backup connection) and the mount dialog's subfolder have **Pick…**: a folder tree of this computer and your connections, with **New folder**. The system **Browse…** button is still there for local folders.
 - **Storage and folder size** - When connected, the panel shows the account's storage (Google Drive, OneDrive, Dropbox, rclone remotes). Right-click a remote folder → **Calculate size** to add up everything below it (rclone asks the server; other connections walk the folders, eight at a time); *Stop* ends it early with partial figures.
 
 ### rclone remotes (70+ more providers)
