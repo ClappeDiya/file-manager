@@ -73,6 +73,15 @@ describe("Settings → rclone", () => {
     await waitFor(() => expect(calls("rclone_settings_set")[1]).toEqual({ settings: { binary_path: "/opt/old/rclone", config_path: "/etc/rclone.conf" } }));
   });
 
+  it("shows a failed Detect as an error, not as 'No rclone found'", async () => {
+    mockInvoke.mockImplementation((cmd: string) => (cmd === "rclone_detect" ? Promise.reject({ message: "Detect failed: permission denied", advice: "" }) : Promise.resolve(current)));
+    render(<RcloneSettingsSection />);
+    await screen.findByTestId("rclone-status");
+    fireEvent.click(screen.getByText("Detect"));
+    expect(await screen.findByText(/Detect failed: permission denied/)).toBeTruthy();
+    expect(screen.queryByText("No rclone found on this computer.")).toBeNull();
+  });
+
   it("warns about old and missing rclone", async () => {
     current = view({}, { version: "v1.50.0", meets_minimum: false });
     const { unmount } = render(<RcloneSettingsSection />);

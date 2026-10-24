@@ -21,6 +21,8 @@ import {
   findProvider,
   getRcloneRemote,
   isOAuthQuestion,
+  isRcloneUnavailable,
+  isSecret,
   listRcloneRemotes,
   missingRequired,
   notifyRemotesChanged,
@@ -70,6 +72,9 @@ export function RcloneRemoteManager({
   const advanced = useUIStore((s) => s.appMode === "advanced");
   const [remotes, setRemotes] = useState<RcloneRemote[] | null>(null);
   const [providers, setProviders] = useState<RcloneProvider[] | null>(null);
+  /** rclone itself failed (list or providers): the message to show above everything. */
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [providersFailed, setProvidersFailed] = useState(false);
   const [mode, setMode] = useState<Mode>(startInCreate || initialType ? { kind: "create", type: initialType } : { kind: "list" });
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -79,19 +84,23 @@ export function RcloneRemoteManager({
   const refresh = useCallback(async () => {
     try {
       setRemotes(await listRcloneRemotes());
+      setLoadError(null);
     } catch (e) {
-      setRemotes([]);
-      setError(errorText(e));
+      setRemotes(null);
+      setLoadError(errorText(e));
     }
   }, []);
 
   useEffect(() => {
     void refresh();
     rcloneProviders().then(
-      (p) => setProviders(p ?? []),
+      (p) => {
+        setProviders(p ?? []);
+        setProvidersFailed(false);
+      },
       (e) => {
-        setProviders([]);
-        setError(errorText(e));
+        setProvidersFailed(true);
+        setLoadError((prev) => prev ?? errorText(e));
       },
     );
   }, [refresh]);
@@ -115,14 +124,21 @@ export function RcloneRemoteManager({
     void refresh();
   }, [refresh]);
 
+  /**
+   * Show rclone's next step. `created` = the remote is new in this flow (it
+   * is carried through every follow-up question, so the done screen still
+   * says "created" and offers Add as connection); `first` = this is the
+   * reply to the create call itself, the moment the remote appears in
+   * rclone.conf.
+   */
   const handleStep = useCallback(
-    (name: string, type: string, step: RcloneConfigStep, params: Record<string, string>, created: boolean) => {
+    (name: string, type: string, step: RcloneConfigStep, params: Record<string, string>, created: boolean, first = false) => {
       if (step.done) {
         setMode({ kind: "done", name, type, created });
         changed();
       } else {
         setMode({ kind: "question", name, type, step, params, created, manual: false });
-        if (created) changed();
+        if (first) changed();
       }
     },
     [changed],
@@ -148,7 +164,13 @@ export function RcloneRemoteManager({
         <h3 className="text-sm font-semibold">rclone remotes</h3>
         <div className="flex gap-1">
           {mode.kind === "list" ? (
-            <button type="button" className={primary} onClick={() => setMode({ kind: "create", type: null })} disabled={!providers}>
+            <button
+              type="button"
+              className={primary}
+              onClick={() => setMode({ kind: "create", type: null })}
+              disabled={!providers || providersFailed}
+              title={providersFailed ? "rclone's storage types could not be loaded" : undefined}
+            >
               + New remote
             </button>
           ) : (
@@ -166,13 +188,20 @@ export function RcloneRemoteManager({
         </div>
       </div>
 
+      {loadError && (
+        <div className="rounded border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 p-2 space-y-1" role="alert" data-testid="rclone-load-error">
+          {isRcloneUnavailable(loadError) && <p className="text-sm font-medium">rclone is not installed or not working — Settings → rclone</p>}
+          <p className="text-xs text-red-600 dark:text-red-400">{loadError}</p>
+        </div>
+      )}
+
       {error && (
         <p className="text-xs text-red-600 dark:text-red-400" role="alert">
           {error}
         </p>
       )}
 
-      {mode.kind === "list" && (
+      {mode.kind === "list" && !(remotes === null && loadError) && (
         <RemoteList
           remotes={remotes}
           tests={tests}
@@ -210,7 +239,7 @@ export function RcloneRemoteManager({
           onCreate={(name, provider, params, obscure) =>
             run(async () => {
               const step = await createRcloneRemote(name, provider.name, params, obscure);
-              handleStep(name, provider.name, step, params, true);
+              handleStep(name, provider.name, step, params, true, true);
             })
           }
         />
@@ -240,7 +269,7 @@ export function RcloneRemoteManager({
           onAnswer={(answer) =>
             run(async () => {
               const step = await continueRcloneConfig(mode.name, mode.step.state, answer, mode.params);
-              handleStep(mode.name, mode.type, step, mode.params, false);
+              handleStep(mode.name, mode.type, step, mode.params, mode.created);
             })
           }
           onSignIn={() =>
@@ -249,7 +278,7 @@ export function RcloneRemoteManager({
               setMode({ kind: "signing-in", name: mode.name, type: mode.type, url: null });
               try {
                 const step = await signInRcloneRemote(mode.name, mode.step.state, mode.params);
-                handleStep(mode.name, mode.type, step, mode.params, false);
+                handleStep(mode.name, mode.type, step, mode.params, mode.created);
               } catch (e) {
                 setError(errorText(e));
                 setMode(mode);
@@ -626,7 +655,7 @@ function Question({
                 </option>
               ))}
             </select>
-          ) : o.is_password ? (
+          ) : isSecret(o) ? (
             <PasswordInput id="rclone-answer" value={answer} onChange={(e) => setAnswer(e.target.value)} className={input} />
           ) : (
             <input id="rclone-answer" value={answer} onChange={(e) => setAnswer(e.target.value)} className={`${input} font-mono`} />

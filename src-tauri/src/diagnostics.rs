@@ -90,7 +90,7 @@ pub fn rclone_info(s: &crate::rclone_engine::RcloneStatus) -> Value {
         "minVersion": s.min_version,
         "managed": s.managed,
         "configPath": s.config_path.as_deref().map(home),
-        "error": s.error,
+        "error": s.error.as_deref().map(home),
     })
 }
 
@@ -207,6 +207,16 @@ mod tests {
         if home.len() > 1 {
             assert_eq!(v["path"], "~/bin/rclone");
             assert_eq!(v["configPath"], "~/.config/rclone/rclone.conf");
+        }
+        // A broken binary's error names its path: the home folder is hidden there too.
+        let broken = status_of(
+            &Resolved { path: format!("{home}/bin/rclone"), source: BinarySource::Settings, found: true, config: None },
+            Err(format!("{home}/bin/rclone did not report an rclone version")),
+        );
+        let v = rclone_info(&broken);
+        if home.len() > 1 {
+            assert_eq!(v["error"], "~/bin/rclone did not report an rclone version");
+            assert!(!v.to_string().contains(&home), "home folder leaked: {v}");
         }
     }
 

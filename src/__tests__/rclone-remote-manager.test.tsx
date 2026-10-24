@@ -134,7 +134,8 @@ describe("RcloneRemoteManager", () => {
   });
 
   it("signs in to an OAuth backend through the browser", async () => {
-    render(<RcloneRemoteManager />);
+    const onAdd = vi.fn();
+    render(<RcloneRemoteManager onAddConnection={onAdd} />);
     fireEvent.click(await screen.findByText("+ New remote"));
     fireEvent.click(within(await screen.findByTestId("rclone-popular")).getByText("Box"));
     fireEvent.click(screen.getByText("Create remote"));
@@ -143,20 +144,96 @@ describe("RcloneRemoteManager", () => {
     await waitFor(() => expect(authListener).not.toBeNull());
     act(() => authListener?.({ payload: { name: "box", url: "http://127.0.0.1:53682/auth?state=x", opened: true } }));
     expect(await screen.findByText("Open the sign-in page")).toHaveAttribute("href", "http://127.0.0.1:53682/auth?state=x");
-    await screen.findByTestId("rclone-done");
+    const done = await screen.findByTestId("rclone-done");
     expect(calls("rclone_config_oauth")).toEqual([{ name: "box", state: "*oauth-islocal,choose,,", params: {}, openBrowser: true }]);
+    // The remote was created through a question: the done screen still says so and offers Add as connection.
+    expect(done).toHaveTextContent("was created");
+    fireEvent.click(within(done).getByText("Add as connection"));
+    expect(onAdd).toHaveBeenCalledWith("box:", "box");
   });
 
   it("answers rclone's questions manually when asked to", async () => {
-    render(<RcloneRemoteManager />);
+    const onAdd = vi.fn();
+    render(<RcloneRemoteManager onAddConnection={onAdd} />);
     fireEvent.click(await screen.findByText("+ New remote"));
     fireEvent.click(within(await screen.findByTestId("rclone-popular")).getByText("Box"));
     fireEvent.click(screen.getByText("Create remote"));
     fireEvent.click(await screen.findByText("Answer rclone's questions manually"));
     fireEvent.change(screen.getByLabelText("config_is_local"), { target: { value: "false" } });
     fireEvent.click(screen.getByText("Continue"));
-    await screen.findByTestId("rclone-done");
+    const done = await screen.findByTestId("rclone-done");
     expect(calls("rclone_config_continue")).toEqual([{ name: "box", state: "*oauth-islocal,choose,,", result: "false", params: {} }]);
+    expect(done).toHaveTextContent("was created");
+    fireEvent.click(within(done).getByText("Add as connection"));
+    expect(onAdd).toHaveBeenCalledWith("box:", "box");
+  });
+
+  it("keeps a new remote's Discard and Add as connection across follow-up questions, and masks sensitive answers", async () => {
+    const onAdd = vi.fn();
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "rclone_config_continue" && args?.state === "*oauth-islocal,choose,,")
+        return Promise.resolve({ state: "*oauth-authorize,,", option: opt("config_token", { help: "Paste the result of rclone authorize", required: true, sensitive: true }), error: "", result: "", done: false });
+      return Promise.resolve(backend(cmd, args));
+    });
+    render(
+      <>
+        <RcloneRemoteManager onAddConnection={onAdd} />
+        <PromptDialogHost />
+      </>,
+    );
+    fireEvent.click(await screen.findByText("+ New remote"));
+    fireEvent.click(within(await screen.findByTestId("rclone-popular")).getByText("Box"));
+    fireEvent.click(screen.getByText("Create remote"));
+    expect(await screen.findByText("Discard this remote")).toBeTruthy();
+    fireEvent.click(await screen.findByText("Answer rclone's questions manually"));
+    fireEvent.change(screen.getByLabelText("config_is_local"), { target: { value: "false" } });
+    fireEvent.click(screen.getByText("Continue"));
+    // Second question of the same new remote: Discard is still offered, the token is masked.
+    const token = (await screen.findByLabelText(/^config_token/)) as HTMLInputElement;
+    expect(token.type).toBe("password");
+    expect(screen.getByText("Discard this remote")).toBeTruthy();
+    fireEvent.change(token, { target: { value: '{"access_token":"x"}' } });
+    fireEvent.click(screen.getByText("Continue"));
+    const done = await screen.findByTestId("rclone-done");
+    expect(done).toHaveTextContent("was created");
+    fireEvent.click(within(done).getByText("Add as connection"));
+    expect(onAdd).toHaveBeenCalledWith("box:", "box");
+  });
+
+  it("does not offer Add as connection after editing a remote", async () => {
+    render(<RcloneRemoteManager onAddConnection={vi.fn()} />);
+    fireEvent.click(within(await screen.findByTestId("rclone-remote-sec")).getByText("Edit"));
+    fireEvent.change(await screen.findByLabelText(/^remote/), { target: { value: "al:vault2" } });
+    fireEvent.click(screen.getByText("Save"));
+    const done = await screen.findByTestId("rclone-done");
+    expect(done).toHaveTextContent("was updated");
+    expect(within(done).queryByText("Add as connection")).toBeNull();
+  });
+
+  it("says rclone is not working instead of 'No rclone remotes yet' when rclone cannot start", async () => {
+    const notStarted = { message: "Could not start rclone: No such file or directory (os error 2)", advice: "Check the rclone binary in Settings → rclone." };
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) =>
+      cmd === "rclone_list_remotes" || cmd === "rclone_providers" ? Promise.reject(notStarted) : Promise.resolve(backend(cmd, args)),
+    );
+    render(<RcloneRemoteManager />);
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("rclone is not installed or not working — Settings → rclone");
+    expect(alert).toHaveTextContent("Could not start rclone");
+    expect(screen.queryByText(/No rclone remotes yet/)).toBeNull();
+    await waitFor(() => expect(screen.getByText("+ New remote")).toBeDisabled());
+  });
+
+  it("shows rclone's error when the remotes cannot be listed", async () => {
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) =>
+      cmd === "rclone_list_remotes"
+        ? Promise.reject({ message: "rclone: Failed to load config file: unable to decrypt configuration", advice: "Check the remote with `rclone config` and try again." })
+        : Promise.resolve(backend(cmd, args)),
+    );
+    render(<RcloneRemoteManager />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("unable to decrypt configuration");
+    expect(screen.queryByText(/No rclone remotes yet/)).toBeNull();
+    // The providers loaded, so a new remote can still be started.
+    await waitFor(() => expect(screen.getByText("+ New remote")).not.toBeDisabled());
   });
 
   it("edits a remote without sending stored secrets back", async () => {

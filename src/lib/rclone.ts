@@ -72,7 +72,8 @@ export function describeStatus(s: RcloneStatus): string {
 export const rcloneStatus = () => tauriInvoke<RcloneStatus>("rclone_status");
 export const getRcloneSettings = () => tauriInvoke<RcloneSettingsView>("rclone_settings_get");
 export const setRcloneSettings = (settings: RcloneSettings) => tauriInvoke<RcloneSettingsView>("rclone_settings_set", { settings });
-export const detectRclone = () => tauriInvoke<RcloneCandidate[]>("rclone_detect", undefined, []);
+/** Rejects on failure, so Settings shows the error rather than "No rclone found". */
+export const detectRclone = () => tauriInvoke<RcloneCandidate[]>("rclone_detect");
 export const installManagedRclone = () => tauriInvoke<RcloneInstallOutcome>("rclone_install_managed");
 
 // ── Remote manager ──
@@ -155,8 +156,10 @@ export const RCLONE_AUTH_URL_EVENT = "rclone-auth-url";
 /** Fired on `window` after a remote is created, changed or deleted. */
 export const RCLONE_REMOTES_CHANGED_EVENT = "ufop:rclone-remotes-changed";
 
-export const listRcloneRemotes = () => tauriInvoke<RcloneRemote[]>("rclone_list_remotes", undefined, []);
-export const rcloneProviders = () => tauriInvoke<RcloneProvider[]>("rclone_providers", undefined, []);
+// No `[]` fallback: a missing or failing rclone must reach the caller as an
+// error, not look like "no remotes" / "no storage types".
+export const listRcloneRemotes = () => tauriInvoke<RcloneRemote[]>("rclone_list_remotes");
+export const rcloneProviders = () => tauriInvoke<RcloneProvider[]>("rclone_providers");
 export const getRcloneRemote = (name: string) => tauriInvoke<RcloneRemoteDetails>("rclone_remote_get", { name });
 export const createRcloneRemote = (name: string, remoteType: string, params: Record<string, string>, obscure: RcloneObscureMode) =>
   tauriInvoke<RcloneConfigStep>("rclone_remote_create", { name, remoteType, params, obscure });
@@ -182,6 +185,15 @@ export async function onRcloneAuthUrl(cb: (e: RcloneAuthUrl) => void): Promise<(
   } catch {
     return () => {};
   }
+}
+
+/**
+ * Whether an error means the rclone program itself could not run (missing,
+ * not executable, not rclone, outside the desktop app) rather than a
+ * problem with a remote or rclone.conf.
+ */
+export function isRcloneUnavailable(message: string): boolean {
+  return /Could not start rclone|did not report an rclone version|rclone is not installed|Tauri IPC not available/i.test(message);
 }
 
 /** rclone's "Use auto config?" question (OAuth backends). */

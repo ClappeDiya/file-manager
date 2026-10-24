@@ -450,6 +450,8 @@ export function FileManager() {
   // `batchRenameFiles`: the keyboard handler in the useEffect
   // below needs the setter in scope.
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** Settings section to open on (`"rclone"` from the palette), else none. */
+  const [settingsFocus, setSettingsFocus] = useState<string | null>(null);
   // Two more orphaned panels surfaced the same way as Connections/Sync:
   // vault-panel.tsx (1421 LOC) and migration-wizard.tsx (1626 LOC) had
   // zero importers — the features existed but no UI path reached them.
@@ -1468,6 +1470,7 @@ export function FileManager() {
       // System Settings and Cross-platform IDEs exactly.
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key === ",") {
         e.preventDefault();
+        setSettingsFocus(null);
         setSettingsOpen((open) => !open);
       }
       // Cmd+Shift+U \u2014 open the Connection Manager. Surfaces
@@ -2145,6 +2148,11 @@ export function FileManager() {
           })();
         },
         onOpenSettings: () => {
+          setSettingsFocus(null);
+          setSettingsOpen(true);
+        },
+        onOpenRcloneSettings: () => {
+          setSettingsFocus("rclone");
           setSettingsOpen(true);
         },
         onOpenConnections: () => {
@@ -3219,7 +3227,7 @@ export function FileManager() {
                   <path d="M18 6L6 18M6 6l12 12" />
                 </svg>
               </button>
-              <SettingsPanel />
+              <SettingsPanel focusSection={settingsFocus} />
             </div>
           </div>
         </div>

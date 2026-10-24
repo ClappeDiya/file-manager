@@ -9,7 +9,7 @@
  * Accessible from toolbar/menu. Uses progressive disclosure with
  * collapsible sections to avoid cognitive overload.
  */
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useAiStore } from "@/stores/ai-store";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
@@ -68,15 +68,27 @@ interface NotificationPrefs {
 function Section({
   title,
   defaultOpen = false,
+  id,
+  focus = false,
   children,
 }: {
   title: string;
   defaultOpen?: boolean;
+  /** Names the section for `SettingsPanel`'s `focusSection`. */
+  id?: string;
+  /** Open this section and scroll it into view (e.g. from the palette). */
+  focus?: boolean;
   children: React.ReactNode;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const [open, setOpen] = useState(defaultOpen || focus);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!focus) return;
+    setOpen(true);
+    ref.current?.scrollIntoView?.({ block: "start", behavior: "smooth" });
+  }, [focus]);
   return (
-    <div className="border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+    <div ref={ref} className="border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden" data-testid={id ? `settings-section-${id}` : undefined}>
       <button
         type="button"
         onClick={() => setOpen(!open)}
@@ -1270,8 +1282,11 @@ function OllamaSection() {
 
 export default function SettingsPanel({
   onOpenNetworkWizard,
+  focusSection = null,
 }: {
   onOpenNetworkWizard?: () => void;
+  /** Open with this section expanded and scrolled to (`"rclone"`). */
+  focusSection?: string | null;
 }) {
   const [summary, setSummary] = useState<SettingsSummary | null>(null);
   const portable = usePortableStatus();
@@ -1379,7 +1394,7 @@ export default function SettingsPanel({
         </Section>
 
         {/* Which rclone binary and rclone.conf every rclone feature uses */}
-        <Section title="rclone">
+        <Section title="rclone" id="rclone" focus={focusSection === "rclone"}>
           <RcloneSettingsSection />
         </Section>
 

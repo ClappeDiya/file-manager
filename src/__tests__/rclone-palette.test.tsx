@@ -15,4 +15,13 @@ describe("command palette × rclone", () => {
     expect(onOpenSettings).toHaveBeenCalledOnce();
     expect(settings?.keywords).toContain("rclone.conf");
   });
+
+  it("opens Settings on the rclone section when the host supports it", () => {
+    const onOpenSettings = vi.fn();
+    const onOpenRcloneSettings = vi.fn();
+    const settings = getDefaultCommands({ onOpenSettings, onOpenRcloneSettings }).find((c) => c.id === "rclone-settings");
+    settings?.action();
+    expect(onOpenRcloneSettings).toHaveBeenCalledOnce();
+    expect(onOpenSettings).not.toHaveBeenCalled();
+  });
 });
