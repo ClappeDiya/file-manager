@@ -1,57 +1,36 @@
 /**
- * Mount Drive Dialog - Finder-mounted remote storage management
+ * Mount Drive Dialog - mount a remote/cloud connection as a local folder (or,
+ * on Windows, a drive letter), or edit a saved mount.
  *
- * Allows users to mount remote/cloud connections as local filesystem directories,
- * similar to FileZilla's RemoteDrive feature.
+ * Reached from the Connection Manager ("Mount as drive"), the Mounts list
+ * ("Mount drive…", "Edit"), the toolbar and the command palette (see
+ * `mounts-host.tsx`). The list of active and saved mounts, with their
+ * actions, lives in `mounts-panel.tsx`.
  *
- * Features:
- * - Mount new drive: pick connection, set mount point, optional auto-mount
- * - Active mounts: list with status badges, unmount button
- * - Saved configs: collapsible section with auto-mount toggle, delete
- *
- * Integration notes for device-sidebar.tsx (DO NOT modify device-sidebar.tsx directly):
- * - Add a "Mount Remote Drive" button that opens this dialog (e.g. setShowMountDialog(true))
- * - Add a "Remote Drives" section listing mounted drives from list_mounts()
- * - Mounted drives should show connection name, mount path, and status badge
- * - Clicking a mounted drive could navigate the file list to that mount point
+ * Fields: connection, mount point, an optional subfolder of the connection,
+ * cache options for cloud drives (locked where the organization's mount
+ * profile forces them), auto-mount, "open after mounting", and, in Advanced
+ * mode, the cloud drive's advanced options.
  */
-import { useState, useCallback, useEffect } from "react";
+import { useState, useEffect } from "react";
 import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
-import { MountCacheFields, MountOfflineActions } from "@/components/mount-options";
-import { DEFAULT_MOUNT_OPTIONS, describePolicy, isCloudMount, useMountPolicy, type MountOptions } from "@/lib/mount-options";
-import { pickFolder } from "@/lib/folder-picker";
+import { MountAdvancedFields, MountCacheFields } from "@/components/mount-options";
 import {
-  HardDrive,
-  FolderOpen,
-  Plug,
-  PlugZap,
-  Trash2,
-  ChevronDown,
-  ChevronRight,
-  RefreshCw,
-  AlertCircle,
-  CheckCircle2,
-  Circle,
-} from "lucide-react";
+  DEFAULT_MOUNT_OPTIONS,
+  describePolicy,
+  isCloudMount,
+  mountPayloadOptions,
+  useMountPolicy,
+  type MountInfo,
+  type MountOptions,
+  type MountResult,
+} from "@/lib/mount-options";
+import { useUIStore } from "@/stores/ui-store";
+import { pickFolder } from "@/lib/folder-picker";
+import { HardDrive, FolderOpen, Plug } from "lucide-react";
 
 // ── Types (mirrors Rust mount_engine types) ──
-
-interface MountInfo {
-  id: string;
-  connection_id: string;
-  connection_name: string;
-  protocol: string;
-  mount_point: string;
-  status: "mounted" | "unmounted" | "error";
-  auto_mount: boolean;
-  created_at: string;
-  error_message: string | null;
-  /** Cache and read-only options in force. */
-  options?: MountOptions;
-  /** What the organization's mount profile changed. */
-  policy_notes?: string[];
-}
 
 /** Mirrors `mount_engine::MountCapability`. */
 type MountCapability =
@@ -81,13 +60,6 @@ function CapabilityBadge({ capability }: { capability: MountCapability }) {
   );
 }
 
-interface MountResult {
-  mount_id: string;
-  mount_point: string;
-  status: "mounted" | "unmounted" | "error";
-  message: string;
-}
-
 interface ConnectionProfile {
   id: string;
   name: string;
@@ -98,54 +70,35 @@ interface ConnectionProfile {
   remote_path: string;
 }
 
-// ── Status Badge ──
+// ── Mount / Edit Form ──
 
-function StatusBadge({ status }: { status: MountInfo["status"] }) {
-  switch (status) {
-    case "mounted":
-      return (
-        <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">
-          <CheckCircle2 size={12} />
-          Mounted
-        </span>
-      );
-    case "unmounted":
-      return (
-        <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400">
-          <Circle size={12} />
-          Unmounted
-        </span>
-      );
-    case "error":
-      return (
-        <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400">
-          <AlertCircle size={12} />
-          Error
-        </span>
-      );
-  }
-}
-
-// ── Mount New Drive Form ──
-
-function MountNewDriveForm({
+function MountForm({
   connections,
-  onMounted,
+  initialConnectionId,
+  editing,
+  onDone,
+  onClose,
 }: {
   connections: ConnectionProfile[];
-  onMounted: () => void;
+  initialConnectionId: string | null;
+  editing: MountInfo | null;
+  onDone: () => void;
+  onClose: () => void;
 }) {
-  const [selectedConnectionId, setSelectedConnectionId] = useState("");
-  const [mountPoint, setMountPoint] = useState("");
-  const [autoMount, setAutoMount] = useState(false);
-  const [mounting, setMounting] = useState(false);
+  const [selectedConnectionId, setSelectedConnectionId] = useState(editing?.connection_id ?? initialConnectionId ?? "");
+  const [mountPoint, setMountPoint] = useState(editing?.mount_point ?? "");
+  const [autoMount, setAutoMount] = useState(editing?.auto_mount ?? false);
+  const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
+  const [done, setDone] = useState(false);
   const [capability, setCapability] = useState<MountCapability | null>(null);
-  const [options, setOptions] = useState<MountOptions>(DEFAULT_MOUNT_OPTIONS);
+  const [options, setOptions] = useState<MountOptions>({ ...DEFAULT_MOUNT_OPTIONS, ...editing?.options });
+  const advanced = useUIStore((s) => s.appMode === "advanced");
   const policy = useMountPolicy();
   const selected = connections.find((c) => c.id === selectedConnectionId);
   const cloud = !!selected && isCloudMount(selected.protocol);
+  const usesDriveLetter = cloud && !!options.drive_letter;
 
   // What mounting this connection needs (rclone, FUSE, sshfs…), shown as a badge.
   useEffect(() => {
@@ -161,18 +114,24 @@ function MountNewDriveForm({
     };
   }, [selectedConnectionId, connections]);
 
-  // Auto-generate mount point based on selected connection
+  // The result stays on screen for a moment, then the dialog closes.
   useEffect(() => {
-    if (selectedConnectionId) {
-      const conn = connections.find((c) => c.id === selectedConnectionId);
-      if (conn) {
-        const safeName = conn.name.replace(/[^a-zA-Z0-9_-]/g, "_");
-        setMountPoint(`~/UFOP-Mounts/${safeName}`);
-      }
-    }
-  }, [selectedConnectionId, connections]);
+    if (!done) return;
+    const t = setTimeout(onClose, 2000);
+    return () => clearTimeout(t);
+  }, [done, onClose]);
 
-  const handleMount = async (e: React.FormEvent) => {
+  // Suggest a mount point when a connection is picked for a new mount.
+  useEffect(() => {
+    if (editing || !selectedConnectionId) return;
+    const conn = connections.find((c) => c.id === selectedConnectionId);
+    if (conn) {
+      const safeName = conn.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+      setMountPoint(`~/UFOP-Mounts/${safeName}`);
+    }
+  }, [selectedConnectionId, connections, editing]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
     setSuccessMessage("");
@@ -181,17 +140,33 @@ function MountNewDriveForm({
       setError("Please select a connection.");
       return;
     }
-    if (!mountPoint.trim()) {
+    // A drive letter stands in for the mount point (Windows).
+    const point = usesDriveLetter ? `${options.drive_letter}:` : mountPoint.trim();
+    if (!point) {
       setError("Please specify a mount point.");
       return;
     }
+    const sent = mountPayloadOptions(cloud, options);
 
-    setMounting(true);
+    setWorking(true);
     try {
+      if (editing) {
+        await tauriInvoke("update_mount_config", {
+          mountId: editing.id,
+          connectionId: selectedConnectionId,
+          mountPoint: point,
+          autoMount,
+          options: sent,
+        });
+        setSuccessMessage("Saved. The new settings apply the next time the drive is mounted.");
+        setDone(true);
+        onDone();
+        return;
+      }
       const result = await tauriInvoke<MountResult>("mount_remote", {
         connectionId: selectedConnectionId,
-        mountPoint: mountPoint.trim(),
-        options: cloud ? options : null,
+        mountPoint: point,
+        options: sent,
       });
 
       if (result.status === "mounted") {
@@ -200,34 +175,29 @@ function MountNewDriveForm({
         if (autoMount) {
           await tauriInvoke("save_mount_config", {
             connectionId: selectedConnectionId,
-            mountPoint: mountPoint.trim(),
+            mountPoint: point,
             autoMount: true,
-            options: cloud ? options : null,
+            options: sent,
           });
         }
-        onMounted();
-        // Reset form after short delay
-        setTimeout(() => {
-          setSelectedConnectionId("");
-          setMountPoint("");
-          setAutoMount(false);
-          setSuccessMessage("");
-        }, 2000);
+        setDone(true);
+        onDone();
       } else {
         setError(`Mount returned status: ${result.status}`);
       }
     } catch (err) {
       setError(String(err));
     } finally {
-      setMounting(false);
+      setWorking(false);
     }
   };
 
   return (
-    <form onSubmit={handleMount} className="space-y-3">
+    <form onSubmit={handleSubmit} className="space-y-3">
       <div>
-        <label className="block text-xs font-medium mb-1">Connection</label>
+        <label className="block text-xs font-medium mb-1" htmlFor="mount-connection">Connection</label>
         <select
+          id="mount-connection"
           value={selectedConnectionId}
           onChange={(e) => setSelectedConnectionId(e.target.value)}
           className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
@@ -244,34 +214,54 @@ function MountNewDriveForm({
 
       {capability && <CapabilityBadge capability={capability} />}
 
-      <div>
-        <label className="block text-xs font-medium mb-1">Mount Point</label>
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={mountPoint}
-            onChange={(e) => setMountPoint(e.target.value)}
-            placeholder="~/UFOP-Mounts/my-server"
-            className="flex-1 text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-          />
-          <button
-            type="button"
-            onClick={async () => {
-              const path = await pickFolder("Select mount point");
-              if (path) setMountPoint(path);
-            }}
-            className="text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800"
-            title="Browse for folder"
-          >
-            <FolderOpen size={16} />
-          </button>
+      {!usesDriveLetter && (
+        <div>
+          <label className="block text-xs font-medium mb-1" htmlFor="mount-point">Mount Point</label>
+          <div className="flex gap-2">
+            <input
+              id="mount-point"
+              type="text"
+              value={mountPoint}
+              onChange={(e) => setMountPoint(e.target.value)}
+              placeholder="~/UFOP-Mounts/my-server"
+              className="flex-1 text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+            />
+            <button
+              type="button"
+              onClick={async () => {
+                const path = await pickFolder("Select mount point");
+                if (path) setMountPoint(path);
+              }}
+              className="text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800"
+              title="Browse for folder"
+              aria-label="Browse for mount point"
+            >
+              <FolderOpen size={16} />
+            </button>
+          </div>
+          <p className="text-xs text-gray-400 mt-1">
+            Default: ~/UFOP-Mounts/&#123;connection-name&#125;
+          </p>
         </div>
+      )}
+
+      <div>
+        <label className="block text-xs font-medium mb-1" htmlFor="mount-subfolder">Subfolder (optional)</label>
+        <input
+          id="mount-subfolder"
+          type="text"
+          value={options.subfolder ?? ""}
+          onChange={(e) => setOptions({ ...options, subfolder: e.target.value === "" ? null : e.target.value })}
+          placeholder="e.g. photos/2024"
+          className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+        />
         <p className="text-xs text-gray-400 mt-1">
-          Default: ~/UFOP-Mounts/&#123;connection-name&#125;
+          Mount only this folder of the connection{selected?.remote_path && selected.remote_path !== "/" ? ` (inside ${selected.remote_path})` : ""}.
         </p>
       </div>
 
       {cloud && <MountCacheFields value={options} onChange={setOptions} policy={policy} />}
+      {cloud && advanced && <MountAdvancedFields value={options} onChange={setOptions} policy={policy} />}
       {policy && describePolicy(policy) && (
         <p className="text-xs text-gray-500" data-testid="mount-policy">
           Your organization's mount profile: {describePolicy(policy)}
@@ -287,10 +277,19 @@ function MountNewDriveForm({
         />
         Auto-mount on startup
       </label>
+      <label className="flex items-center gap-2 text-sm cursor-pointer">
+        <input
+          type="checkbox"
+          checked={!!options.open_after_mount}
+          onChange={(e) => setOptions({ ...options, open_after_mount: e.target.checked })}
+          className="rounded"
+        />
+        Open the drive after mounting
+      </label>
 
-      {error && <p className="text-xs text-red-500">{error}</p>}
+      {error && <p className="text-xs text-red-500" role="alert">{error}</p>}
       {successMessage && (
-        <p className="text-xs text-green-600 dark:text-green-400">
+        <p className="text-xs text-green-600 dark:text-green-400" role="status">
           {successMessage}
         </p>
       )}
@@ -298,109 +297,14 @@ function MountNewDriveForm({
       <div className="flex justify-end">
         <button
           type="submit"
-          disabled={mounting || !selectedConnectionId || (capability !== null && !("native_mount" in capability))}
+          disabled={working || done || !selectedConnectionId || (!editing && capability !== null && !("native_mount" in capability))}
           className="inline-flex items-center gap-1.5 text-sm px-4 py-1.5 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <Plug size={14} />
-          {mounting ? "Mounting..." : "Mount"}
+          {editing ? (working ? "Saving..." : "Save changes") : working ? "Mounting..." : "Mount"}
         </button>
       </div>
     </form>
-  );
-}
-
-// ── Active Mount Item ──
-
-function ActiveMountItem({
-  mount,
-  onUnmount,
-  unmounting,
-}: {
-  mount: MountInfo;
-  onUnmount: (mountId: string) => void;
-  unmounting: boolean;
-}) {
-  return (
-    <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-gray-700 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-800/50">
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2">
-          <HardDrive size={14} className="text-gray-500 flex-shrink-0" />
-          <span className="text-sm font-medium truncate">
-            {mount.connection_name}
-          </span>
-          <StatusBadge status={mount.status} />
-        </div>
-        <p className="text-xs text-gray-500 mt-0.5 truncate pl-5">
-          {mount.mount_point}
-        </p>
-        <p className="text-xs text-gray-400 pl-5">
-          {mount.protocol.toUpperCase()}
-          {mount.auto_mount ? " | Auto-mount" : ""}
-        </p>
-        {mount.error_message && (
-          <p className="text-xs text-red-500 pl-5 mt-0.5">
-            {mount.error_message}
-          </p>
-        )}
-        {!!mount.policy_notes?.length && <p className="text-xs text-gray-400 pl-5">Profile: {mount.policy_notes.join(", ")}</p>}
-        {isCloudMount(mount.protocol) && mount.options && (
-          <MountOfflineActions mountId={mount.id} mounted={mount.status === "mounted"} options={mount.options} />
-        )}
-      </div>
-      {mount.status === "mounted" && (
-        <button
-          onClick={() => onUnmount(mount.id)}
-          disabled={unmounting}
-          className="flex-shrink-0 ml-2 p-1.5 rounded text-gray-500 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50"
-          title="Unmount"
-        >
-          <PlugZap size={14} />
-        </button>
-      )}
-    </div>
-  );
-}
-
-// ── Saved Config Item ──
-
-function SavedConfigItem({
-  config,
-  connectionName,
-  onDelete,
-  deleting,
-}: {
-  config: MountInfo;
-  connectionName: string;
-  onDelete: (mountId: string) => void;
-  deleting: boolean;
-}) {
-  return (
-    <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-gray-700 last:border-b-0">
-      <div className="flex-1 min-w-0">
-        <span className="text-sm truncate">{connectionName}</span>
-        <p className="text-xs text-gray-400 truncate">{config.mount_point}</p>
-        {isCloudMount(config.protocol) && config.options && <MountOfflineActions mountId={config.id} mounted={false} options={config.options} />}
-      </div>
-      <div className="flex items-center gap-2 flex-shrink-0">
-        <span
-          className={`text-xs px-1.5 py-0.5 rounded ${
-            config.auto_mount
-              ? "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"
-              : "bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400"
-          }`}
-        >
-          {config.auto_mount ? "Auto" : "Manual"}
-        </span>
-        <button
-          onClick={() => onDelete(config.id)}
-          disabled={deleting}
-          className="p-1 rounded text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50"
-          title="Delete saved config"
-        >
-          <Trash2 size={12} />
-        </button>
-      </div>
-    </div>
   );
 }
 
@@ -409,197 +313,71 @@ function SavedConfigItem({
 export default function MountDriveDialog({
   open,
   onClose,
+  connectionId = null,
+  editing = null,
+  onChanged,
 }: {
   open: boolean;
   onClose: () => void;
+  /** Connection to preselect for a new mount. */
+  connectionId?: string | null;
+  /** A saved mount to edit (null = mount a new drive). */
+  editing?: MountInfo | null;
+  /** Called after a mount or an edit changed something (reload lists). */
+  onChanged?: () => void;
 }) {
-  const [connections, setConnections] = useState<ConnectionProfile[]>([]);
-  const [mounts, setMounts] = useState<MountInfo[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [unmountingId, setUnmountingId] = useState<string | null>(null);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [savedConfigsExpanded, setSavedConfigsExpanded] = useState(false);
+  const [connections, setConnections] = useState<ConnectionProfile[] | null>(null);
   const containerRef = useFocusTrap<HTMLDivElement>({ active: open, onEscape: onClose });
 
-  // Load connections and mounts
-  const loadData = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [conns, mountList] = await Promise.all([
-        tauriInvokeSafe<ConnectionProfile[]>(
-          "list_connections",
-          undefined,
-          []
-        ),
-        tauriInvokeSafe<MountInfo[]>("list_mounts", undefined, []),
-      ]);
-      setConnections(conns);
-      setMounts(mountList);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
   useEffect(() => {
-    if (open) {
-      loadData();
-    }
-  }, [open, loadData]);
-
-  const handleUnmount = async (mountId: string) => {
-    setUnmountingId(mountId);
-    try {
-      await tauriInvoke("unmount_remote", { mountId });
-      await loadData();
-    } catch (err) {
-      console.error("Unmount failed:", err);
-    } finally {
-      setUnmountingId(null);
-    }
-  };
-
-  const handleDeleteConfig = async (mountId: string) => {
-    setDeletingId(mountId);
-    try {
-      await tauriInvoke("delete_mount_config", { mountId });
-      await loadData();
-    } catch (err) {
-      console.error("Delete config failed:", err);
-    } finally {
-      setDeletingId(null);
-    }
-  };
-
-  // Separate active (mounted) from saved-only (unmounted) configs
-  const activeMounts = mounts.filter((m) => m.status === "mounted");
-  const savedConfigs = mounts.filter((m) => m.status !== "mounted");
+    if (!open) return;
+    let live = true;
+    void tauriInvokeSafe<ConnectionProfile[]>("list_connections", undefined, []).then((c) => live && setConnections(c));
+    return () => {
+      live = false;
+    };
+  }, [open]);
 
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center" role="dialog" aria-modal="true" aria-labelledby="mount-drive-title">
+    <div className="fixed inset-0 z-[60] flex items-center justify-center" role="dialog" aria-modal="true" aria-labelledby="mount-drive-title">
       {/* Backdrop */}
-      <div
-        className="absolute inset-0 bg-black/50"
-        onClick={onClose}
-        aria-hidden="true"
-      />
+      <div className="absolute inset-0 bg-black/50" onClick={onClose} aria-hidden="true" />
 
       {/* Dialog */}
       <div ref={containerRef} className="relative bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg max-h-[85vh] overflow-hidden flex flex-col">
-        {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
           <div className="flex items-center gap-2">
             <HardDrive size={18} className="text-blue-500" aria-hidden="true" />
-            <h2 id="mount-drive-title" className="text-base font-semibold">Mount Remote Drive</h2>
+            <h2 id="mount-drive-title" className="text-base font-semibold">
+              {editing ? "Edit Mount" : "Mount Remote Drive"}
+            </h2>
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={loadData}
-              disabled={loading}
-              className="p-1 rounded text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
-              title="Refresh"
-            >
-              <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
-            </button>
-            <button
-              onClick={onClose}
-              className="text-sm text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 px-2 py-0.5"
-            >
-              Close
-            </button>
-          </div>
+          <button
+            onClick={onClose}
+            className="text-sm text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 px-2 py-0.5"
+          >
+            Close
+          </button>
         </div>
 
-        {/* Scrollable Content */}
-        <div className="flex-1 overflow-y-auto">
-          {/* Mount New Drive Section */}
-          <div className="p-4 border-b border-gray-200 dark:border-gray-700">
-            <h3 className="text-sm font-medium mb-3 flex items-center gap-1.5">
-              <Plug size={14} />
-              Mount New Drive
-            </h3>
-            {connections.length === 0 ? (
-              <p className="text-sm text-gray-500 text-center py-4">
-                No saved connections found. Add a connection in the Connection
-                Manager first.
-              </p>
-            ) : (
-              <MountNewDriveForm
-                connections={connections}
-                onMounted={loadData}
-              />
-            )}
-          </div>
-
-          {/* Active Mounts Section */}
-          <div className="border-b border-gray-200 dark:border-gray-700">
-            <h3 className="text-sm font-medium px-4 py-2 flex items-center gap-1.5 bg-gray-50 dark:bg-gray-800/50">
-              <PlugZap size={14} />
-              Active Mounts
-              {activeMounts.length > 0 && (
-                <span className="text-xs text-gray-400 ml-1">
-                  ({activeMounts.length})
-                </span>
-              )}
-            </h3>
-            {activeMounts.length === 0 ? (
-              <p className="text-sm text-gray-500 text-center py-6 px-4">
-                No drives mounted. Mount a connection to access it as a local
-                folder.
-              </p>
-            ) : (
-              <div>
-                {activeMounts.map((mount) => (
-                  <ActiveMountItem
-                    key={mount.id}
-                    mount={mount}
-                    onUnmount={handleUnmount}
-                    unmounting={unmountingId === mount.id}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Saved Configs Section (collapsed by default) */}
-          <div>
-            <button
-              onClick={() => setSavedConfigsExpanded(!savedConfigsExpanded)}
-              className="w-full text-sm font-medium px-4 py-2 flex items-center gap-1.5 bg-gray-50 dark:bg-gray-800/50 hover:bg-gray-100 dark:hover:bg-gray-800 text-left"
-            >
-              {savedConfigsExpanded ? (
-                <ChevronDown size={14} />
-              ) : (
-                <ChevronRight size={14} />
-              )}
-              Saved Configurations
-              {savedConfigs.length > 0 && (
-                <span className="text-xs text-gray-400 ml-1">
-                  ({savedConfigs.length})
-                </span>
-              )}
-            </button>
-            {savedConfigsExpanded && (
-              <div>
-                {savedConfigs.length === 0 ? (
-                  <p className="text-sm text-gray-500 text-center py-4 px-4">
-                    No saved mount configurations.
-                  </p>
-                ) : (
-                  savedConfigs.map((config) => (
-                    <SavedConfigItem
-                      key={config.id}
-                      config={config}
-                      connectionName={config.connection_name}
-                      onDelete={handleDeleteConfig}
-                      deleting={deletingId === config.id}
-                    />
-                  ))
-                )}
-              </div>
-            )}
-          </div>
+        <div className="flex-1 overflow-y-auto p-4">
+          {connections === null ? (
+            <p className="text-sm text-gray-500 text-center py-4">Loading connections…</p>
+          ) : connections.length === 0 ? (
+            <p className="text-sm text-gray-500 text-center py-4">
+              No saved connections found. Add a connection in the Connection Manager first.
+            </p>
+          ) : (
+            <MountForm
+              connections={connections}
+              initialConnectionId={connectionId}
+              editing={editing}
+              onDone={() => onChanged?.()}
+              onClose={onClose}
+            />
+          )}
         </div>
       </div>
     </div>

@@ -19,6 +19,8 @@ import { formatBytes } from "@/lib/format-bytes";
 import { pickFiles, pickFolder } from "@/lib/folder-picker";
 import { promptText, confirmText } from "@/lib/prompt-dialog";
 import { errorText } from "@/lib/error-text";
+import { isMountable } from "@/lib/mount-options";
+import { useMountsUi } from "@/stores/mounts-ui-store";
 import { PRESET_FIELD_LABELS, fillPreset, type ProviderPreset } from "@/lib/provider-presets";
 
 // ── Types (mirrors Rust types) ──
@@ -1307,6 +1309,7 @@ function ConnectionForm({
 function ConnectionItem({
   connection,
   onConnect,
+  onMount,
   onTest,
   onEdit,
   onDelete,
@@ -1316,6 +1319,7 @@ function ConnectionItem({
 }: {
   connection: ConnectionProfile;
   onConnect: (id: string) => void;
+  onMount: (conn: ConnectionProfile) => void;
   onTest: (id: string) => void;
   onEdit: (conn: ConnectionProfile) => void;
   onDelete: (id: string) => void;
@@ -1370,6 +1374,17 @@ function ConnectionItem({
         >
           {testing ? "..." : "Test"}
         </button>
+        {isMountable(connection.protocol) && (
+          <button
+            onClick={() => onMount(connection)}
+            className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+            type="button"
+            title="Mount as drive"
+            aria-label={`Mount ${connection.name} as drive`}
+          >
+            Mount
+          </button>
+        )}
         <button
           onClick={() => onEdit(connection)}
           className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
@@ -1390,6 +1405,9 @@ function ConnectionItem({
     </div>
   );
 }
+
+/** "Mount as drive": open the mount dialog with this connection selected. */
+const openMountDialog = (conn: ConnectionProfile) => useMountsUi.getState().openDialog({ connectionId: conn.id });
 
 // ── Main Connection Panel ──
 
@@ -2006,6 +2024,7 @@ export function ConnectionPanel() {
                     key={conn.id}
                     connection={conn}
                     onConnect={handleConnect}
+                    onMount={openMountDialog}
                     onTest={handleTest}
                     onEdit={(c) => {
                       setEditingConnection(c);
@@ -2032,6 +2051,7 @@ export function ConnectionPanel() {
             key={conn.id}
             connection={conn}
             onConnect={handleConnect}
+            onMount={openMountDialog}
             onTest={handleTest}
             onEdit={(c) => {
               setEditingConnection(c);

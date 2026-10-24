@@ -7,10 +7,13 @@
  */
 import { useEffect, useState } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
+import { pickFolder } from "@/lib/folder-picker";
 import {
   CACHE_MODES,
   human,
+  hostOs,
   type CacheMode,
+  type HostOs,
   type ManagedMounts,
   type MountOptions,
   type PinReport,
@@ -107,6 +110,218 @@ export function MountCacheFields({
           without a connection.
         </p>
       )}
+    </fieldset>
+  );
+}
+
+/**
+ * Advanced options of a cloud mount: drive letter, volume label, permissions,
+ * cache folder, directory-cache time and extra rclone flags. Options the
+ * operating system lacks are not shown (the engine refuses them there too).
+ */
+export function MountAdvancedFields({
+  value,
+  onChange,
+  policy,
+  os = hostOs(),
+}: {
+  value: MountOptions;
+  onChange: (o: MountOptions) => void;
+  policy: ManagedMounts | null;
+  os?: HostOs;
+}) {
+  const [letters, setLetters] = useState<string[]>([]);
+  const [flagsText, setFlagsText] = useState(
+    (value.extra_flags ?? []).join(" "),
+  );
+  useEffect(() => {
+    if (os !== "windows") return;
+    let live = true;
+    void tauriInvokeSafe<string[]>("free_drive_letters", undefined, []).then(
+      (l) => live && setLetters(l),
+    );
+    return () => {
+      live = false;
+    };
+  }, [os]);
+  const text = (v: string) => (v === "" ? null : v);
+  const id = (v: string) =>
+    v.trim() === "" ? null : Math.max(0, Math.floor(Number(v)));
+  const set = (patch: Partial<MountOptions>) =>
+    onChange({ ...value, ...patch });
+  // The chosen letter stays selectable even when it is no longer listed as free.
+  const choices =
+    value.drive_letter && !letters.includes(value.drive_letter)
+      ? [value.drive_letter, ...letters]
+      : letters;
+  return (
+    <fieldset
+      className="space-y-2 rounded border border-gray-200 dark:border-gray-700 p-2"
+      aria-label="Advanced mount options"
+      data-testid="mount-advanced"
+    >
+      <legend className="text-xs font-medium px-1">Advanced</legend>
+      {os === "windows" && (
+        <label className="block text-xs">
+          Drive letter
+          <select
+            aria-label="Drive letter"
+            className={field}
+            value={value.drive_letter ?? ""}
+            disabled={!!policy?.mountRoot}
+            onChange={(e) => set({ drive_letter: text(e.target.value) })}
+          >
+            <option value="">None — mount in a folder</option>
+            {choices.map((l) => (
+              <option key={l} value={l}>
+                {l}:
+              </option>
+            ))}
+          </select>
+          {policy?.mountRoot && (
+            <span className="text-gray-500">
+              Your organization requires mount points inside {policy.mountRoot}.
+            </span>
+          )}
+        </label>
+      )}
+      {os !== "linux" && (
+        <label className="block text-xs">
+          Volume label
+          <input
+            aria-label="Volume label"
+            className={field}
+            maxLength={32}
+            placeholder="Name shown in the file manager"
+            value={value.volume_label ?? ""}
+            onChange={(e) => set({ volume_label: text(e.target.value) })}
+          />
+        </label>
+      )}
+      {os === "windows" && (
+        <label className="flex items-center gap-2 text-xs">
+          <input
+            type="checkbox"
+            aria-label="Network drive"
+            checked={!!value.network_mode}
+            onChange={(e) => set({ network_mode: e.target.checked })}
+          />
+          Show as a network drive
+        </label>
+      )}
+      {os !== "windows" && (
+        <label className="flex items-center gap-2 text-xs">
+          <input
+            type="checkbox"
+            aria-label="Allow other users"
+            checked={!!value.allow_other}
+            onChange={(e) => set({ allow_other: e.target.checked })}
+          />
+          Let other users of this computer see the drive (needs user_allow_other
+          in /etc/fuse.conf)
+        </label>
+      )}
+      <div className="grid grid-cols-2 gap-2">
+        <label className="block text-xs">
+          File permissions
+          <input
+            aria-label="File permissions"
+            className={field}
+            placeholder="0644"
+            value={value.file_perms ?? ""}
+            onChange={(e) => set({ file_perms: text(e.target.value) })}
+          />
+        </label>
+        <label className="block text-xs">
+          Folder permissions
+          <input
+            aria-label="Folder permissions"
+            className={field}
+            placeholder="0755"
+            value={value.dir_perms ?? ""}
+            onChange={(e) => set({ dir_perms: text(e.target.value) })}
+          />
+        </label>
+        {os !== "windows" && (
+          <>
+            <label className="block text-xs">
+              Owner (user id)
+              <input
+                aria-label="Owner"
+                type="number"
+                min={0}
+                className={field}
+                value={value.uid ?? ""}
+                onChange={(e) => set({ uid: id(e.target.value) })}
+              />
+            </label>
+            <label className="block text-xs">
+              Group (group id)
+              <input
+                aria-label="Group"
+                type="number"
+                min={0}
+                className={field}
+                value={value.gid ?? ""}
+                onChange={(e) => set({ gid: id(e.target.value) })}
+              />
+            </label>
+          </>
+        )}
+      </div>
+      <label className="block text-xs">
+        Cache folder
+        <span className="flex gap-1">
+          <input
+            aria-label="Cache folder"
+            className={field}
+            placeholder="Default: the app's cache folder"
+            value={value.cache_dir ?? ""}
+            onChange={(e) => set({ cache_dir: text(e.target.value) })}
+          />
+          <button
+            type="button"
+            className="shrink-0 px-2 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800"
+            onClick={async () => {
+              const dir = await pickFolder("Choose a cache folder");
+              if (dir) set({ cache_dir: dir });
+            }}
+          >
+            Browse
+          </button>
+        </span>
+      </label>
+      <label className="block text-xs">
+        Directory cache
+        <input
+          aria-label="Directory cache"
+          className={field}
+          placeholder="30s"
+          value={value.dir_cache_time ?? ""}
+          onChange={(e) => set({ dir_cache_time: text(e.target.value) })}
+        />
+        <span className="text-gray-500">
+          How long folder listings are trusted, e.g. 30s, 5m, 1h.
+        </span>
+      </label>
+      <label className="block text-xs">
+        Extra rclone flags
+        <input
+          aria-label="Extra rclone flags"
+          className={field}
+          placeholder="--buffer-size=64M --no-modtime"
+          value={flagsText}
+          onChange={(e) => {
+            setFlagsText(e.target.value);
+            set({ extra_flags: e.target.value.split(/\s+/).filter(Boolean) });
+          }}
+        />
+        <span className="text-gray-500">
+          Only read and timeout tuning flags are accepted; options with their
+          own field above, and anything your organization sets, can't be changed
+          here.
+        </span>
+      </label>
     </fieldset>
   );
 }

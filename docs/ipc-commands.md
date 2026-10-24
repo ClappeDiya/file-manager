@@ -449,10 +449,11 @@ macro; if you add a new one here, register it there too.
 - `set_master_password`
 - `verify_master_password`
 
-## `mount_commands` (11 commands)
+## `mount_commands` (16 commands)
 
 - `check_mount_capability`
 - `delete_mount_config`
+- `free_drive_letters`
 - `get_mount_status`
 - `list_mounts`
 - `mount_cache_usage`
@@ -460,8 +461,12 @@ macro; if you add a new one here, register it there too.
 - `mount_pin_offline`
 - `mount_policy`
 - `mount_remote`
+- `mount_saved_config`
+- `open_mount_point`
 - `save_mount_config`
+- `unmount_all_mounts`
 - `unmount_remote`
+- `update_mount_config`
 
 ## `narrator_commands` (1 command)
 
@@ -751,4 +756,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 583 commands across 51 modules.
+**Surface:** 588 commands across 51 modules.

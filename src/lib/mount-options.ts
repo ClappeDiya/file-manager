@@ -13,6 +13,64 @@ export interface MountOptions {
   max_cache_mb: number | null;
   max_cache_age_hours: number | null;
   read_only: boolean;
+  /** Mount this folder of the connection instead of its whole remote path. */
+  subfolder?: string | null;
+  /** Open the folder in the file manager after it mounts. */
+  open_after_mount?: boolean;
+  /** Windows: mount as this drive letter (D–Z). */
+  drive_letter?: string | null;
+  /** The name Explorer / Finder shows (Windows and macOS). */
+  volume_label?: string | null;
+  /** Windows: show as a network drive. */
+  network_mode?: boolean;
+  /** Not Windows: let other users of this computer see the mount. */
+  allow_other?: boolean;
+  /** Octal, e.g. "0644". */
+  file_perms?: string | null;
+  dir_perms?: string | null;
+  /** Not Windows. */
+  uid?: number | null;
+  gid?: number | null;
+  /** Keep this drive's cache under this folder (default: the app's cache folder). */
+  cache_dir?: string | null;
+  /** How long a folder listing is trusted, e.g. "30s" (default 30s). */
+  dir_cache_time?: string | null;
+  /** Extra rclone mount flags from the allow-list: `--name` or `--name=value`. */
+  extra_flags?: string[];
+}
+
+/** Mirrors `mount_engine::MountStatus`. */
+export type MountStatus = "mounted" | "unmounted" | "error";
+
+/** Mirrors `mount_engine::MountInfo`. */
+export interface MountInfo {
+  id: string;
+  connection_id: string;
+  connection_name: string;
+  protocol: string;
+  mount_point: string;
+  status: MountStatus;
+  auto_mount: boolean;
+  created_at: string;
+  error_message: string | null;
+  /** Cache and read-only options in force (after the mount profile). */
+  options?: MountOptions;
+  /** What the organization's mount profile changed. */
+  policy_notes?: string[];
+}
+
+/** Mirrors `mount_engine::MountResult`. */
+export interface MountResult {
+  mount_id: string;
+  mount_point: string;
+  status: MountStatus;
+  message: string;
+}
+
+/** Mirrors `mount_engine::UnmountAllReport`. */
+export interface UnmountAllReport {
+  unmounted: number;
+  failed: string[];
 }
 
 export interface ManagedMounts {
@@ -74,4 +132,73 @@ export function useMountPolicy(): ManagedMounts | null {
     ).then(setP);
   }, []);
   return p;
+}
+
+/** Protocols the Mounts screen can mount (natively, or through rclone). */
+const MOUNTABLE_PROTOCOLS = [
+  "smb",
+  "cifs",
+  "nfs",
+  "sftp",
+  "webdav",
+  "rclone",
+  "s3",
+];
+export const isMountable = (protocol: string) =>
+  MOUNTABLE_PROTOCOLS.includes(protocol.toLowerCase());
+
+export type HostOs = "windows" | "mac" | "linux";
+
+/** The OS the window runs on (which mount options exist differs). */
+export function hostOs(): HostOs {
+  if (typeof navigator === "undefined") return "linux";
+  const p = `${navigator.platform} ${navigator.userAgent}`;
+  if (/win/i.test(navigator.platform)) return "windows";
+  if (/mac/i.test(p)) return "mac";
+  return "linux";
+}
+
+/**
+ * The options to send: the four cache options always, and an advanced option
+ * only when it has a value, so a default mount sends what it always sent.
+ */
+export function cleanMountOptions(o: MountOptions): MountOptions {
+  const out: MountOptions = {
+    cache_mode: o.cache_mode,
+    max_cache_mb: o.max_cache_mb,
+    max_cache_age_hours: o.max_cache_age_hours,
+    read_only: o.read_only,
+  };
+  const text = (v: string | null | undefined) => v?.trim() || null;
+  const set = <K extends keyof MountOptions>(
+    k: K,
+    v: MountOptions[K] | null | undefined | false,
+  ) => {
+    if (v !== null && v !== undefined && v !== false)
+      out[k] = v as MountOptions[K];
+  };
+  set("subfolder", text(o.subfolder));
+  set("open_after_mount", o.open_after_mount);
+  set("drive_letter", text(o.drive_letter));
+  set("volume_label", text(o.volume_label));
+  set("network_mode", o.network_mode);
+  set("allow_other", o.allow_other);
+  set("file_perms", text(o.file_perms));
+  set("dir_perms", text(o.dir_perms));
+  set("uid", o.uid);
+  set("gid", o.gid);
+  set("cache_dir", text(o.cache_dir));
+  set("dir_cache_time", text(o.dir_cache_time));
+  if (o.extra_flags?.length) out.extra_flags = o.extra_flags;
+  return out;
+}
+
+/** Native (non-rclone) mounts take only the subfolder and "open after mounting". */
+export function mountPayloadOptions(
+  cloud: boolean,
+  o: MountOptions,
+): MountOptions | null {
+  const clean = cleanMountOptions(o);
+  if (cloud) return clean;
+  return clean.subfolder || clean.open_after_mount ? clean : null;
 }

@@ -349,6 +349,21 @@ Simple mode provides step-by-step wizards for:
 - With the full cache, **Make available offline** downloads a folder (or the whole drive) into the cache; the cache size shows per drive, and **Clear cache** frees it once the drive is unmounted.
 - Your organization's **mount profile** (from the management console) may allow only some kinds of drives, require read-only mounts or a cache mode, cap the cache, or require mount points inside a folder; the dialog shows it and locks the options it forces.
 
+**Where to find it.** In the Connection Manager, **Mount** on a connection row opens the mount dialog with that connection selected. The command palette has *Mount Drive…* and *Show Mounts*, and the toolbar customizer has a **Mounts** item. The tray icon has a **Mounts** submenu: a check mark shows which saved mounts are mounted, a click mounts or unmounts one, and *Unmount all* unmounts everything.
+
+**The Mounts list** shows every saved and running mount with its state: *Mounted*, *Unmounted* or *Error* (with the reason). A mounted drive has **Open** (shows it in the file manager) and **Unmount**; the others have **Mount**. **Edit** opens the dialog filled in with the saved settings (unmount the drive first; the new settings apply to the next mount), **Remove** deletes the saved mount (after you confirm; a mounted drive is unmounted first) and **Unmount all** unmounts every mounted drive. A mount marked *Auto-mount* is mounted again when the app starts. A drive that stops by itself (rclone ends, or it is unmounted outside the app) shows as an error.
+
+**In the dialog.** *Subfolder* mounts one folder of the connection (for example `photos/2024` inside the connection's path; `..` is not allowed) instead of everything. *Open the drive after mounting* opens the folder in your file manager once it is mounted (not when the app mounts it at start-up).
+
+**Advanced options** (Advanced mode, cloud drives; the organization's mount profile still decides what it fixes):
+
+- **Drive letter** (Windows): mount as `E:` instead of a folder; only free letters from D to Z are offered. Not possible when the profile requires mount points inside a folder.
+- **Volume label** (Windows and macOS), **Show as a network drive** (Windows), **Let other users see the drive** (macOS and Linux; needs `user_allow_other` in `/etc/fuse.conf`).
+- **File permissions** and **Folder permissions** as octal numbers (for example `0644`, `0755`); **Owner** and **Group** ids (macOS and Linux).
+- **Cache folder**: keep this drive's cache somewhere else (it is kept in a folder named after the drive, so *Clear cache* never touches other files there).
+- **Directory cache**: how long folder listings are trusted (`30s` by default, `5m`, `1h`). Longer is faster but shows changes made elsewhere later.
+- **Extra rclone flags**: read and timeout tuning such as `--buffer-size=64M` or `--no-modtime`. Flags that have a field above, or that the profile controls (read-only, cache mode and size), are refused.
+
 ## Peer-to-Peer Transfers
 
 Send files straight to another computer running UFOP on the same network, over an encrypted connection. Open **Nearby Computers** from the toolbar (add it in the toolbar customizer) or the command palette.
