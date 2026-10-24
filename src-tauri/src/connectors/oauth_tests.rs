@@ -276,6 +276,12 @@ async fn sign_in_cancel_and_manual_code() {
     // A refused code is a rejected sign-in.
     let start = flows.begin(OAuthProvider::GoogleDrive, &p, ("c".into(), None), Some(0), endpoints()).await.unwrap();
     assert!(flows.complete(&start.state, "wrong-code").await.unwrap_err().is_auth_failure());
+    // Regression: the flow was dropped before the exchange, so a mistyped
+    // code meant starting over. It stays open until a code is accepted.
+    assert!(flows.is_pending(&start.state).await, "a refused code keeps the sign-in open");
+    let (id, _) = flows.complete(&start.state, "c1").await.unwrap();
+    assert_eq!(id, p.id);
+    assert!(!flows.is_pending(&start.state).await);
 }
 
 /// Regression: the one shared Dropbox instance stayed signed in as the

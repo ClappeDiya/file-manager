@@ -206,6 +206,21 @@ pub fn resolve_client(provider: OAuthProvider, profile: &ConnectionProfile, expl
     provider.builtin_client().ok_or_else(|| no_client_error(provider))
 }
 
+/// The client a new sign-in uses ([`resolve_client`]). Signing in again
+/// with your own app and no secret typed reuses the secret saved with the
+/// connection's current sign-in (`stored`) when it belongs to the same app.
+pub fn sign_in_client(provider: OAuthProvider, profile: &ConnectionProfile, explicit: Option<(String, Option<String>)>, stored: Option<&str>) -> Result<(String, Option<String>), AppError> {
+    let (id, secret) = resolve_client(provider, profile, explicit)?;
+    if secret.is_some() {
+        return Ok((id, secret));
+    }
+    let saved = stored.and_then(|s| OAuthGrant::parse(s).ok()).and_then(|g| match g {
+        OAuthGrant::Token { client_id: Some(c), client_secret, .. } if c.trim() == id => client_secret.filter(|s| !s.trim().is_empty()),
+        _ => None,
+    });
+    Ok((id, saved))
+}
+
 fn account_kind(profile: &ConnectionProfile) -> OneDriveAccountKind {
     profile.extras.oauth.as_ref().map(|o| o.account_kind).unwrap_or_default()
 }
@@ -280,8 +295,10 @@ pub struct OAuthStart {
 
 struct PendingFlow {
     connection_id: Uuid,
-    client: OAuthClient,
+    client: Arc<OAuthClient>,
     loopback: Option<Loopback>,
+    /// A code is being exchanged (the flow stays open until one succeeds).
+    exchanging: bool,
     done: Arc<tokio::sync::Notify>,
     started: Instant,
 }
@@ -324,7 +341,7 @@ impl OAuthFlows {
         let redirect_uri = loopback.redirect_uri.clone();
         self.pending.lock().await.insert(
             state.clone(),
-            PendingFlow { connection_id: profile.id, client: oauth, loopback: Some(loopback), done: Arc::new(tokio::sync::Notify::new()), started: Instant::now() },
+            PendingFlow { connection_id: profile.id, client: Arc::new(oauth), loopback: Some(loopback), exchanging: false, done: Arc::new(tokio::sync::Notify::new()), started: Instant::now() },
         );
         Ok(OAuthStart { state, provider, auth_url, redirect_uri, browser_opened: false })
     }
@@ -341,9 +358,13 @@ impl OAuthFlows {
             _ = done.notified() => return Err(AppError::state("The sign-in was cancelled or finished another way", "Start it again if you still need it.")),
         };
         match code {
-            Ok(code) => self.exchange(state, &code).await,
+            Ok(code) => self.exchange(state, &code, false).await,
             Err(e) => {
-                self.pending.lock().await.remove(state);
+                let mut pending = self.pending.lock().await;
+                // A pasted code being exchanged right now finishes the flow.
+                if pending.get(state).is_some_and(|f| !f.exchanging) {
+                    pending.remove(state);
+                }
                 Err(e)
             }
         }
@@ -366,15 +387,47 @@ impl OAuthFlows {
         if code.is_empty() {
             return Err(AppError::validation("Paste the code (or the whole address the browser was sent to)"));
         }
-        self.exchange(state, &code).await
+        // A mistyped code can be pasted again: the flow stays open.
+        self.exchange(state, &code, true).await
     }
 
-    async fn exchange(&self, state: &str, code: &str) -> Result<(Uuid, OAuthGrant), AppError> {
-        let flow = self.pending.lock().await.remove(state).ok_or_else(not_pending)?;
-        flow.done.notify_one();
-        flow.client.exchange_code(code).await?;
-        let grant = flow.client.grant().await.ok_or_else(|| AppError::internal("Token exchange returned no token"))?;
-        Ok((flow.connection_id, grant))
+    /// Exchange `code`; the flow ends (and a waiter is woken) only once it
+    /// succeeds, or on any failure unless `keep_on_failure`.
+    async fn exchange(&self, state: &str, code: &str, keep_on_failure: bool) -> Result<(Uuid, OAuthGrant), AppError> {
+        let (client, connection_id) = {
+            let mut pending = self.pending.lock().await;
+            let f = pending.get_mut(state).ok_or_else(not_pending)?;
+            if f.exchanging {
+                return Err(AppError::state("This sign-in is already being finished", "Wait for it to finish."));
+            }
+            f.exchanging = true;
+            (f.client.clone(), f.connection_id)
+        };
+        let result = match client.exchange_code(code).await {
+            Ok(_) => client.grant().await.ok_or_else(|| AppError::internal("Token exchange returned no token")),
+            Err(e) => Err(e),
+        };
+        let mut pending = self.pending.lock().await;
+        match result {
+            Ok(grant) => match pending.remove(state) {
+                Some(f) => {
+                    f.done.notify_one();
+                    Ok((connection_id, grant))
+                }
+                // Cancelled (or replaced by a new sign-in) meanwhile.
+                None => Err(not_pending()),
+            },
+            Err(e) => {
+                if keep_on_failure {
+                    if let Some(f) = pending.get_mut(state) {
+                        f.exchanging = false;
+                    }
+                } else if let Some(f) = pending.remove(state) {
+                    f.done.notify_one();
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Abandon a sign-in.
@@ -448,6 +501,25 @@ mod tests {
             let e = resolve_client(OAuthProvider::GoogleDrive, &p, None).unwrap_err();
             assert!(e.to_string().contains("no built-in Google Drive app") && e.to_string().contains("Advanced"), "{e}");
         }
+    }
+
+    /// Regression: re-signing in with your own Google desktop app sent no
+    /// client secret (it is kept with the tokens, not the profile), so
+    /// Google refused the code exchange.
+    #[test]
+    fn signing_in_again_with_your_own_app_reuses_its_stored_secret() {
+        let mut p = profile(ConnectionProtocol::GoogleDrive);
+        p.extras.oauth = Some(OAuthSettings { client_id: Some("mine".into()), ..Default::default() });
+        let stored = r#"{"kind":"token","token":{"access_token":"a","refresh_token":"r","expires_at":null,"token_type":"Bearer","scope":null},"client_id":"mine","client_secret":"sec"}"#;
+        let gd = OAuthProvider::GoogleDrive;
+        // From the saved client ID, or the same ID typed in the dialog with an empty secret.
+        assert_eq!(sign_in_client(gd, &p, None, Some(stored)).unwrap(), ("mine".into(), Some("sec".into())));
+        assert_eq!(sign_in_client(gd, &p, Some(("mine".into(), Some(" ".into()))), Some(stored)).unwrap(), ("mine".into(), Some("sec".into())));
+        // A newly typed secret wins; another app never gets this one.
+        assert_eq!(sign_in_client(gd, &p, Some(("mine".into(), Some("new".into()))), Some(stored)).unwrap().1.as_deref(), Some("new"));
+        assert_eq!(sign_in_client(gd, &p, Some(("other".into(), None)), Some(stored)).unwrap(), ("other".into(), None));
+        assert_eq!(sign_in_client(gd, &p, None, None).unwrap(), ("mine".into(), None));
+        assert_eq!(sign_in_client(gd, &p, None, Some("not json")).unwrap(), ("mine".into(), None));
     }
 
     #[test]

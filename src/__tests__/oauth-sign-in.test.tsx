@@ -111,6 +111,51 @@ describe("OAuthSignIn", () => {
     }
   });
 
+  it("the browser wait ending while a pasted code is still being exchanged is not an error", async () => {
+    // Regression: the wait rejected ("finished another way") before the
+    // pasted code's exchange returned, so the panel showed an error and
+    // reset to "Sign in"; the success arrived afterwards.
+    let rejectAwait: () => void = () => {};
+    let resolveComplete: () => void = () => {};
+    backend({
+      oauth_await: () => new Promise((_, reject) => (rejectAwait = () => reject({ message: "The sign-in was cancelled or finished another way", advice: "" }))),
+      oauth_complete: () => new Promise((r) => (resolveComplete = () => r(SIGNED))),
+    });
+    const done = vi.fn();
+    render(<OAuthSignIn connectionId="c1" protocol="google_drive" onSignedIn={done} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Sign in with Google Drive" }));
+    fireEvent.change(await screen.findByLabelText(/Paste the code/), { target: { value: "abc" } });
+    fireEvent.click(screen.getByRole("button", { name: "Use code" }));
+    await waitFor(() => expect(calls("oauth_complete")).toHaveLength(1));
+    await act(async () => rejectAwait());
+    expect(screen.queryByTestId("oauth-error")).toBeNull();
+    expect(screen.getByTestId("oauth-waiting")).toBeInTheDocument();
+    await act(async () => resolveComplete());
+    await waitFor(() => expect(done).toHaveBeenCalledTimes(1));
+    expect(done).toHaveBeenCalledWith(SIGNED);
+    expect(screen.queryByTestId("oauth-error")).toBeNull();
+  });
+
+  it("a mistyped pasted code can be corrected without starting over", async () => {
+    backend({
+      oauth_await: () => new Promise(() => {}),
+      oauth_complete: (a) => {
+        if (a.code === "typo") throw { message: "The code was refused (invalid_grant)", advice: "Paste it again." };
+        return SIGNED;
+      },
+    });
+    const done = vi.fn();
+    render(<OAuthSignIn connectionId="c1" protocol="google_drive" onSignedIn={done} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Sign in with Google Drive" }));
+    fireEvent.change(await screen.findByLabelText(/Paste the code/), { target: { value: "typo" } });
+    fireEvent.click(screen.getByRole("button", { name: "Use code" }));
+    expect(await screen.findByTestId("oauth-error")).toHaveTextContent("invalid_grant");
+    fireEvent.change(screen.getByLabelText(/Paste the code/), { target: { value: "good" } });
+    fireEvent.click(screen.getByRole("button", { name: "Use code" }));
+    await waitFor(() => expect(done).toHaveBeenCalledTimes(1));
+    expect(calls("oauth_begin")).toHaveLength(1);
+  });
+
   it("cancels a waiting sign-in", async () => {
     backend({ oauth_await: () => new Promise(() => {}) });
     render(<OAuthSignIn connectionId="c1" protocol="google_drive" onSignedIn={vi.fn()} />);

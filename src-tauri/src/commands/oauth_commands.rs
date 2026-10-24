@@ -119,7 +119,8 @@ pub async fn oauth_begin(
     flows: State<'_, Arc<OAuthFlows>>,
 ) -> Result<OAuthStart, AppError> {
     let (profile, provider) = oauth_profile(&manager, &connection_id).await?;
-    let client = oauth_flow::resolve_client(provider, &profile, client_id.map(|id| (id, client_secret)))?;
+    let stored = manager.get_password(profile.id).await.ok().flatten();
+    let client = oauth_flow::sign_in_client(provider, &profile, client_id.map(|id| (id, client_secret)), stored.as_deref())?;
     let mut start = flows.begin(provider, &profile, client, None, None).await?;
     if open_browser.unwrap_or(true) {
         #[allow(deprecated)]

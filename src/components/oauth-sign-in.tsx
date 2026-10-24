@@ -57,6 +57,8 @@ export function OAuthSignIn({
   const [brokerUrl, setBrokerUrl] = useState("");
   const [authid, setAuthid] = useState("");
   const stateRef = useRef<string | null>(null);
+  /** A pasted code is being exchanged: the browser wait ending meanwhile is not an error. */
+  const completingRef = useRef(false);
 
   useEffect(() => {
     providerInfo(protocol).then(setInfo, (e) => setError(errorText(e)));
@@ -97,8 +99,9 @@ export function OAuthSignIn({
       if (stateRef.current !== started) return;
       finish(signedIn);
     } catch (e) {
-      // Finished another way (a pasted code) or cancelled: not an error here.
-      if (started && stateRef.current !== started) return;
+      // Finished another way (a pasted code, maybe still being exchanged)
+      // or cancelled: not an error here.
+      if (started && (stateRef.current !== started || completingRef.current)) return;
       stateRef.current = null;
       setPending(null);
       setError(errorText(e));
@@ -109,11 +112,18 @@ export function OAuthSignIn({
 
   const submitCode = async () => {
     if (!pending || !code.trim()) return;
+    const flow = pending.state;
     setError(null);
+    completingRef.current = true;
     try {
-      finish(await completeSignIn(pending.state, code));
+      const signedIn = await completeSignIn(flow, code);
+      // The browser may have finished it first (finish already ran).
+      if (stateRef.current === flow) finish(signedIn);
     } catch (e) {
-      setError(errorText(e));
+      // The sign-in stays open: a mistyped code can be pasted again.
+      if (stateRef.current === flow) setError(errorText(e));
+    } finally {
+      completingRef.current = false;
     }
   };
 
@@ -172,7 +182,8 @@ export function OAuthSignIn({
             )}
             <p className="text-[10px] text-gray-500 dark:text-gray-400">
               Register this redirect URI with your app: <code className="font-mono">{info.redirect_uri}</code>. The secret is
-              stored with the tokens in the system keychain.
+              stored with the tokens in the system keychain; signing in again with the same app, leave it empty to keep the
+              saved one.
             </p>
           </div>
         </details>
