@@ -48,6 +48,7 @@ import {
   DatabaseBackup,
   HardDrive,
   CalendarClock,
+  ScrollText,
   MonitorSmartphone,
   Upload,
   History,
@@ -772,6 +773,8 @@ export function getDefaultCommands(actions: {
   onOpenBackups?: () => void;
   /** Advanced mode only (undefined hides the entry). */
   onOpenSchedules?: () => void;
+  /** Advanced mode only (undefined hides the entry). */
+  onOpenLogViewer?: () => void;
   /** Open Nearby computers (peer discovery and transfers). */
   onOpenNearby?: () => void;
   /** Open the Mounts list (saved and running mounts, with mount/unmount/edit/remove). */
@@ -1259,6 +1262,19 @@ export function getDefaultCommands(actions: {
             category: "File",
             action: actions.onSendToComputer,
             keywords: ["send", "share", "peer", "airdrop", "transfer", "computer", "nearby"],
+          },
+        ]
+      : []),
+    ...(actions.onOpenLogViewer
+      ? [
+          {
+            id: "open-log-viewer",
+            label: "Open Log Viewer\u2026",
+            description: "Read the app's own log: filter by level, module, time and text, follow it live, copy lines",
+            icon: <ScrollText className="h-4 w-4" />,
+            category: "Navigation",
+            action: actions.onOpenLogViewer,
+            keywords: ["log", "logs", "logging", "viewer", "debug", "errors", "tail", "diagnostics"],
           },
         ]
       : []),

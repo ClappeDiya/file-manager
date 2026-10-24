@@ -1,4 +1,4 @@
-import { useRef, useCallback, useEffect, useState, type ReactNode } from "react";
+import { useRef, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { formatBytes } from "@/lib/format-bytes";
 import { observeElementRect, useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@ufop/ui-components";
@@ -178,6 +178,8 @@ export function VirtualList({
 
 // ── Generic virtualised rows ──
 
+type RowKey = string | number;
+
 export interface VirtualRowsProps<T> {
   items: T[];
   /** Draws one row's content; the row box (height, selection colour) is ours. */
@@ -194,8 +196,12 @@ export interface VirtualRowsProps<T> {
   onCopy?: (indexes: number[]) => void;
   /** Stay on the newest (last) row while rows are added, until the reader scrolls up. */
   followTail?: boolean;
-  /** Row `id` attribute; defaults to the index. */
-  rowKey?: (item: T, index: number) => string | number;
+  /**
+   * A stable key per row. With keys, a selection and the scroll position
+   * survive rows being added above them (older log lines loaded); without,
+   * rows are identified by their index.
+   */
+  rowKey?: (item: T, index: number) => RowKey;
   className?: string;
 }
 
@@ -219,13 +225,22 @@ export function VirtualRows<T>({
   className,
 }: VirtualRowsProps<T>) {
   const parentRef = useRef<HTMLDivElement>(null);
-  const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
-  const [active, setActive] = useState(0);
-  const anchor = useRef(0);
+  const keyOf = useCallback((i: number): RowKey => (rowKey && items[i] !== undefined ? rowKey(items[i], i) : i), [rowKey, items]);
+  const [selected, setSelected] = useState<ReadonlySet<RowKey>>(new Set());
+  const [active, setActive] = useState<RowKey>(0);
+  const anchor = useRef<RowKey>(0);
   const atTail = useRef(true);
+  const length = items.length;
+
+  // key → index, for selections that must survive the list changing.
+  const indexByKey = useMemo(() => {
+    const m = new Map<RowKey, number>();
+    for (let i = 0; i < items.length; i++) m.set(rowKey ? rowKey(items[i], i) : i, i);
+    return m;
+  }, [items, rowKey]);
 
   const virtualizer = useVirtualizer({
-    count: items.length,
+    count: length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => rowHeight,
     overscan: 12,
@@ -234,27 +249,41 @@ export function VirtualRows<T>({
     observeElementRect: (instance, cb) => observeElementRect(instance, (rect) => cb(rect.height > 0 ? rect : { width: rect.width || 800, height })),
   });
 
+  const indexesOf = useCallback(
+    (keys: ReadonlySet<RowKey>) =>
+      [...keys]
+        .map((k) => indexByKey.get(k))
+        .filter((i): i is number => i !== undefined)
+        .sort((a, b) => a - b),
+    [indexByKey],
+  );
   const commit = useCallback(
-    (next: Set<number>) => {
+    (next: Set<RowKey>) => {
       setSelected(next);
-      onSelectionChange?.([...next].sort((a, b) => a - b));
+      onSelectionChange?.(indexesOf(next));
     },
-    [onSelectionChange],
+    [onSelectionChange, indexesOf],
   );
 
-  // A new list (filters changed, rows cleared) starts without a selection.
-  const length = items.length;
+  // Rows that are gone leave the selection; rows added above keep the reader's place.
+  const firstKey = useRef<RowKey | null>(null);
   useEffect(() => {
     setSelected((prev) => {
       if (prev.size === 0) return prev;
-      const kept = new Set([...prev].filter((i) => i < length));
+      const kept = new Set([...prev].filter((k) => indexByKey.has(k)));
       if (kept.size === prev.size) return prev;
-      onSelectionChange?.([...kept].sort((a, b) => a - b));
+      onSelectionChange?.(indexesOf(kept));
       return kept;
     });
-    setActive((a) => Math.min(a, Math.max(0, length - 1)));
+    const el = parentRef.current;
+    const previousFirst = firstKey.current;
+    firstKey.current = length > 0 ? keyOf(0) : null;
+    if (el && previousFirst !== null && !(followTail && atTail.current)) {
+      const moved = indexByKey.get(previousFirst);
+      if (moved && moved > 0) el.scrollTop += moved * rowHeight;
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [length]);
+  }, [indexByKey]);
 
   // Follow the tail while the reader has not scrolled away from it.
   useEffect(() => {
@@ -268,26 +297,29 @@ export function VirtualRows<T>({
 
   const pick = useCallback(
     (index: number, mods: { shift: boolean; toggle: boolean }) => {
-      if (!selectable) return;
+      if (!selectable || index < 0 || index >= length) return;
+      const key = keyOf(index);
       if (mods.shift) {
-        const [a, b] = [Math.min(anchor.current, index), Math.max(anchor.current, index)];
-        const range = new Set<number>(mods.toggle ? selected : []);
-        for (let i = a; i <= b; i++) range.add(i);
+        const from = indexByKey.get(anchor.current) ?? index;
+        const [a, b] = [Math.min(from, index), Math.max(from, index)];
+        const range = new Set<RowKey>(mods.toggle ? selected : []);
+        for (let i = a; i <= b; i++) range.add(keyOf(i));
         commit(range);
       } else if (mods.toggle) {
         const next = new Set(selected);
-        if (!next.delete(index)) next.add(index);
-        anchor.current = index;
+        if (!next.delete(key)) next.add(key);
+        anchor.current = key;
         commit(next);
       } else {
-        anchor.current = index;
-        commit(new Set([index]));
+        anchor.current = key;
+        commit(new Set([key]));
       }
-      setActive(index);
+      setActive(key);
     },
-    [selectable, selected, commit],
+    [selectable, length, keyOf, indexByKey, selected, commit],
   );
 
+  const activeIndex = indexByKey.get(active) ?? 0;
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (length === 0) return;
     const mod = e.ctrlKey || e.metaKey;
@@ -296,28 +328,28 @@ export function VirtualRows<T>({
       e.preventDefault();
       virtualizer.scrollToIndex(i, { align: "auto" });
       if (selectable) pick(i, { shift: e.shiftKey, toggle: false });
-      else setActive(i);
+      else setActive(keyOf(i));
     };
     const page = Math.max(1, Math.floor((parentRef.current?.clientHeight || height) / rowHeight));
     switch (e.key) {
-      case "ArrowDown": return move(active + 1);
-      case "ArrowUp": return move(active - 1);
-      case "PageDown": return move(active + page);
-      case "PageUp": return move(active - page);
+      case "ArrowDown": return move(activeIndex + 1);
+      case "ArrowUp": return move(activeIndex - 1);
+      case "PageDown": return move(activeIndex + page);
+      case "PageUp": return move(activeIndex - page);
       case "Home": return move(0);
       case "End": return move(length - 1);
       case "a":
       case "A":
         if (mod && selectable) {
           e.preventDefault();
-          commit(new Set(Array.from({ length }, (_, i) => i)));
+          commit(new Set(Array.from({ length }, (_, i) => keyOf(i))));
         }
         return;
       case "c":
       case "C":
         if (mod && onCopy && selected.size > 0) {
           e.preventDefault();
-          onCopy([...selected].sort((a, b) => a - b));
+          onCopy(indexesOf(selected));
         }
         return;
     }
@@ -336,7 +368,7 @@ export function VirtualRows<T>({
       aria-label={ariaLabel}
       aria-multiselectable={selectable || undefined}
       aria-rowcount={length}
-      aria-activedescendant={length > 0 ? `vrow-${ariaLabel}-${active}` : undefined}
+      aria-activedescendant={length > 0 ? `vrow-${ariaLabel}-${activeIndex}` : undefined}
       tabIndex={0}
       onKeyDown={onKeyDown}
       onScroll={onScroll}
@@ -345,10 +377,11 @@ export function VirtualRows<T>({
         {virtualizer.getVirtualItems().map((v) => {
           const item = items[v.index];
           if (item === undefined) return null;
-          const isSel = selected.has(v.index);
+          const key = keyOf(v.index);
+          const isSel = selected.has(key);
           return (
             <div
-              key={rowKey ? rowKey(item, v.index) : v.key}
+              key={key}
               id={`vrow-${ariaLabel}-${v.index}`}
               role="option"
               aria-selected={selectable ? isSel : undefined}
@@ -357,7 +390,7 @@ export function VirtualRows<T>({
               className={cn(
                 "absolute left-0 top-0 w-full flex items-center px-2 gap-2",
                 isSel ? "bg-[var(--color-selection-bg)] text-[color:var(--color-selection-text)]" : "hover:bg-[var(--color-hover-bg)]",
-                v.index === active && "outline outline-1 -outline-offset-1 outline-[var(--color-focus-ring)]",
+                key === active && "outline outline-1 -outline-offset-1 outline-[var(--color-focus-ring)]",
               )}
               style={{ height: `${v.size}px`, transform: `translateY(${v.start}px)` }}
               onClick={(e) => pick(v.index, { shift: e.shiftKey, toggle: e.ctrlKey || e.metaKey })}

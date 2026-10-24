@@ -56,6 +56,8 @@ import { BatchRename } from "./batch-rename";
 import SettingsPanel from "./settings-panel";
 import { ConnectionPanel } from "./connection-panel";
 import { useConnectionBrowse } from "@/stores/connection-browse-store";
+import { LogViewerDialog } from "./log-viewer-dialog";
+import { useLogViewer } from "@/stores/log-viewer-store";
 import { useRcloneUi } from "@/stores/rclone-ui-store";
 import { RcloneEngineInfo } from "@/components/rclone/rclone-settings-section";
 import { rcloneStatus, type RcloneStatus } from "@/lib/rclone";
@@ -153,6 +155,7 @@ import {
   CalendarClock,
   MonitorSmartphone,
   HardDrive,
+  ScrollText,
 } from "lucide-react";
 
 // Toolbar customization definition (#14)
@@ -169,6 +172,7 @@ const ALL_TOOLBAR_ITEMS = [
   { id: "sync-browse", label: "Sync Browse" },
   { id: "backups", label: "Backups" },
   { id: "schedules", label: "Schedules & holiday calendars" },
+  { id: "logs", label: "Log viewer (Advanced)" },
   { id: "operations", label: "Operations" },
   { id: "nearby", label: "Nearby Computers" },
   { id: "mounts", label: "Mounts" },
@@ -2179,6 +2183,7 @@ export function FileManager() {
         onMountDrive: () => useMountsUi.getState().openDialog(),
         onSendToComputer: () => openNearby(getAllSelectedPaths()),
         onOpenSchedules: appMode === "advanced" ? () => setSchedulesOpen(true) : undefined,
+        onOpenLogViewer: appMode === "advanced" ? () => useLogViewer.getState().setOpen(true) : undefined,
         onOpenTransferHistory: () => {
           setTransferHistoryOpen(true);
         },
@@ -2528,6 +2533,18 @@ export function FileManager() {
               data-testid="toggle-schedules"
             >
               <CalendarClock className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
+          {appMode === "advanced" && toolbarItems.includes("logs") && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => useLogViewer.getState().toggle()}
+              aria-label="Log viewer"
+              title="Log viewer"
+              data-testid="toggle-log-viewer"
+            >
+              <ScrollText className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
           {toolbarItems.includes("smart-spaces") && (
@@ -2951,6 +2968,9 @@ export function FileManager() {
           </div>
         </div>
       )}
+
+      {/* In-app log viewer (Advanced) */}
+      <LogViewerDialog />
 
       {/* Schedules & holiday calendars (Advanced): shared by sync pairs,
           automation rules and backup jobs. */}
