@@ -14,6 +14,40 @@ use crate::storage::pool::DbPool;
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 
+/// The WHERE clause (and its parameters) for a history filter, shared by
+/// search, export and count so they always agree about which rows match.
+fn history_where(filter: &TransferHistoryFilter) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut conditions = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut idx = 1;
+    if let Some(ref path) = filter.path_contains {
+        conditions.push(format!("(source_path LIKE ?{idx} OR dest_path LIKE ?{idx})"));
+        params.push(Box::new(format!("%{path}%")));
+        idx += 1;
+    }
+    if let Some(status) = filter.status {
+        conditions.push(format!("status = ?{idx}"));
+        params.push(Box::new(status.as_str().to_string()));
+        idx += 1;
+    }
+    if let Some(conn_id) = filter.connection_id {
+        conditions.push(format!("connection_id = ?{idx}"));
+        params.push(Box::new(conn_id.to_string()));
+        idx += 1;
+    }
+    if let Some(from) = filter.date_from {
+        conditions.push(format!("started_at >= ?{idx}"));
+        params.push(Box::new(from.to_rfc3339()));
+        idx += 1;
+    }
+    if let Some(to) = filter.date_to {
+        conditions.push(format!("started_at <= ?{idx}"));
+        params.push(Box::new(to.to_rfc3339()));
+    }
+    let clause = if conditions.is_empty() { String::new() } else { format!("WHERE {}", conditions.join(" AND ")) };
+    (clause, params)
+}
+
 /// Transfer history manager backed by SQLite.
 #[derive(Clone, Debug)]
 pub struct TransferHistory {
@@ -126,47 +160,8 @@ impl TransferHistory {
     ) -> Result<Vec<TransferHistoryRecord>, AppError> {
         self.pool
             .execute(move |conn| {
-                let mut conditions = Vec::new();
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                let mut param_idx = 1;
-
-                if let Some(ref path) = filter.path_contains {
-                    conditions.push(format!(
-                        "(source_path LIKE ?{param_idx} OR dest_path LIKE ?{param_idx})"
-                    ));
-                    params.push(Box::new(format!("%{path}%")));
-                    param_idx += 1;
-                }
-
-                if let Some(status) = filter.status {
-                    conditions.push(format!("status = ?{param_idx}"));
-                    params.push(Box::new(status.as_str().to_string()));
-                    param_idx += 1;
-                }
-
-                if let Some(conn_id) = filter.connection_id {
-                    conditions.push(format!("connection_id = ?{param_idx}"));
-                    params.push(Box::new(conn_id.to_string()));
-                    param_idx += 1;
-                }
-
-                if let Some(from) = filter.date_from {
-                    conditions.push(format!("started_at >= ?{param_idx}"));
-                    params.push(Box::new(from.to_rfc3339()));
-                    param_idx += 1;
-                }
-
-                if let Some(to) = filter.date_to {
-                    conditions.push(format!("started_at <= ?{param_idx}"));
-                    params.push(Box::new(to.to_rfc3339()));
-                    param_idx += 1;
-                }
-
-                let where_clause = if conditions.is_empty() {
-                    String::new()
-                } else {
-                    format!("WHERE {}", conditions.join(" AND "))
-                };
+                let (where_clause, mut params) = history_where(&filter);
+                let param_idx = params.len() + 1;
 
                 let limit = filter.limit.unwrap_or(100);
                 let offset = filter.offset.unwrap_or(0);
@@ -235,7 +230,8 @@ impl TransferHistory {
         filter: TransferHistoryFilter,
         format: ExportFormat,
     ) -> Result<String, AppError> {
-        let records = self.search(filter).await?;
+        // The whole matching history: the search's default page size is for the UI list.
+        let records = self.search(TransferHistoryFilter { limit: Some(filter.limit.unwrap_or(u32::MAX)), ..filter }).await?;
 
         match format {
             ExportFormat::Json => {
@@ -337,29 +333,7 @@ impl TransferHistory {
     pub async fn count(&self, filter: TransferHistoryFilter) -> Result<u64, AppError> {
         self.pool
             .execute(move |conn| {
-                let mut conditions = Vec::new();
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                let mut param_idx = 1;
-
-                if let Some(ref path) = filter.path_contains {
-                    conditions.push(format!(
-                        "(source_path LIKE ?{param_idx} OR dest_path LIKE ?{param_idx})"
-                    ));
-                    params.push(Box::new(format!("%{path}%")));
-                    param_idx += 1;
-                }
-
-                if let Some(status) = filter.status {
-                    conditions.push(format!("status = ?{param_idx}"));
-                    params.push(Box::new(status.as_str().to_string()));
-                    let _ = param_idx; // Suppress unused warning
-                }
-
-                let where_clause = if conditions.is_empty() {
-                    String::new()
-                } else {
-                    format!("WHERE {}", conditions.join(" AND "))
-                };
+                let (where_clause, params) = history_where(&filter);
 
                 let sql = format!(
                     "SELECT COUNT(*) FROM transfer_history_log {where_clause}"
@@ -580,5 +554,58 @@ mod tests {
 
         let count = history.count(TransferHistoryFilter::default()).await.unwrap();
         assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn search_and_export_honour_a_date_range() {
+        let pool = setup_db().await;
+        let history = TransferHistory::new(pool);
+        for days in [0i64, 2, 10, 40] {
+            let mut job = make_test_job(TransferStatus::Completed);
+            job.source_path = format!("/test/{days}-days-old.txt");
+            history.record_transfer(&job, Utc::now() - Duration::days(days), Some(1), false, None, None).await.unwrap();
+        }
+        let names = |v: Vec<TransferHistoryRecord>| v.into_iter().map(|r| r.source_path).collect::<Vec<_>>();
+        let week = TransferHistoryFilter { date_from: Some(Utc::now() - Duration::days(7)), ..Default::default() };
+        assert_eq!(names(history.search(week.clone()).await.unwrap()), ["/test/0-days-old.txt", "/test/2-days-old.txt"]);
+        let window = TransferHistoryFilter { date_from: Some(Utc::now() - Duration::days(30)), date_to: Some(Utc::now() - Duration::days(5)), ..Default::default() };
+        assert_eq!(names(history.search(window).await.unwrap()), ["/test/10-days-old.txt"]);
+        let csv = history.export(week, ExportFormat::Csv).await.unwrap();
+        assert!(csv.contains("2-days-old") && !csv.contains("10-days-old"));
+    }
+
+    /// `count` once ignored the connection and date filters, so a filtered
+    /// view reported the size of the whole table.
+    #[tokio::test]
+    async fn count_applies_the_same_filters_as_search() {
+        let pool = setup_db().await;
+        let history = TransferHistory::new(pool);
+        let conn = Uuid::new_v4();
+        for days in [0i64, 2, 10, 40] {
+            let mut job = make_test_job(TransferStatus::Completed);
+            job.connection_id = (days < 5).then_some(conn);
+            history.record_transfer(&job, Utc::now() - Duration::days(days), Some(1), false, None, None).await.unwrap();
+        }
+        let by_date = TransferHistoryFilter { date_from: Some(Utc::now() - Duration::days(7)), ..Default::default() };
+        assert_eq!(history.count(by_date.clone()).await.unwrap(), history.search(by_date).await.unwrap().len() as u64);
+        let by_conn = TransferHistoryFilter { connection_id: Some(conn), ..Default::default() };
+        assert_eq!(history.count(by_conn).await.unwrap(), 2);
+        let both = TransferHistoryFilter { connection_id: Some(conn), date_from: Some(Utc::now() - Duration::days(1)), ..Default::default() };
+        assert_eq!(history.count(both).await.unwrap(), 1);
+    }
+
+    /// An export is the whole matching history, not the first page the
+    /// search would show.
+    #[tokio::test]
+    async fn export_is_not_cut_off_at_the_search_page_size() {
+        let pool = setup_db().await;
+        let history = TransferHistory::new(pool);
+        for _ in 0..130 {
+            let job = make_test_job(TransferStatus::Completed);
+            history.record_transfer(&job, Utc::now(), Some(1), false, None, None).await.unwrap();
+        }
+        let json = history.export(TransferHistoryFilter::default(), ExportFormat::Json).await.unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(rows.len(), 130);
     }
 }

@@ -11,6 +11,7 @@
 //! - Partial failure continuation and resumable sync
 
 pub mod filter_presets;
+pub mod live_files;
 pub mod portable;
 pub mod report;
 pub mod scheduler;
@@ -23,6 +24,8 @@ use crate::core::error::AppError;
 use crate::core::traits::{BoxFuture, SyncOperations};
 use crate::core::types::*;
 use chrono::{DateTime, Utc};
+use ufop_core::run_trigger::RunTrigger;
+use ufop_core::sync_types::{SyncItemAction, SyncRunItem};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -160,6 +163,8 @@ pub struct SyncManager {
     running: Arc<RwLock<HashMap<Uuid, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Latest progress of each run in progress, by pair.
     progress: Arc<std::sync::Mutex<HashMap<Uuid, executor::SyncProgress>>>,
+    /// The files each run in progress is working on and has finished, by pair.
+    live: Arc<std::sync::Mutex<HashMap<Uuid, live_files::LiveRun>>>,
     /// Told about every finished run (desktop and profile notifications).
     run_listeners: Arc<std::sync::RwLock<Vec<RunListener>>>,
     /// Database for two-way baselines; without one (unit tests) they are
@@ -230,6 +235,7 @@ impl SyncManager {
             state_dir,
             running: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            live: Arc::new(std::sync::Mutex::new(HashMap::new())),
             run_listeners: Arc::new(std::sync::RwLock::new(Vec::new())),
             pairs: Arc::new(RwLock::new(HashMap::new())),
             reports: Arc::new(RwLock::new(HashMap::new())),
@@ -460,6 +466,12 @@ impl SyncManager {
     }
 
     /// Progress of every running sync.
+    /// The files a pair's running sync is working on and has finished (a
+    /// bounded list); `None` when the pair is not syncing.
+    pub fn live_files(&self, pair_id: Uuid, limit: usize) -> Option<live_files::LiveFiles> {
+        self.live.lock().ok()?.get(&pair_id).map(|run| run.snapshot(limit))
+    }
+
     pub fn all_progress(&self) -> Vec<executor::SyncProgress> {
         self.progress.lock().map(|m| m.values().cloned().collect()).unwrap_or_default()
     }
@@ -476,8 +488,16 @@ impl SyncManager {
         }
     }
 
-    /// Execute a sync run for a pair.
+    /// Execute a sync run for a pair, started by hand.
     pub async fn execute_sync(&self, pair_id: Uuid) -> Result<SyncReport, AppError> {
+        self.execute_sync_as(pair_id, RunTrigger::Manual).await
+    }
+
+    /// Execute a sync run for a pair; `trigger` is what the run history
+    /// says started it. The returned report carries the run's changed items
+    /// (store them with [`Self::save_report_to_db`]); the copy kept in
+    /// memory for health and reports does not, to keep the history light.
+    pub async fn execute_sync_as(&self, pair_id: Uuid, trigger: RunTrigger) -> Result<SyncReport, AppError> {
         let pair = {
             let pairs = self.pairs.read().await;
             pairs.get(&pair_id).cloned().ok_or_else(|| AppError::Sync {
@@ -514,13 +534,20 @@ impl SyncManager {
         if let Ok(mut p) = self.progress.lock() {
             p.remove(&pair_id);
         }
-        let report = match result {
+        if let Ok(mut l) = self.live.lock() {
+            l.remove(&pair_id);
+        }
+        let mut report = match result {
             Ok(report) => report,
             Err(e) => {
                 self.announce(&pair, Err(e.user_message()), 0);
                 return Err(e);
             }
         };
+        report.trigger = trigger;
+        // Everything below passes the report around (history in memory,
+        // notifications): only the caller that stores the run needs the items.
+        let items = std::mem::take(&mut report.items);
 
         // Update pair last_run
         {
@@ -572,7 +599,7 @@ impl SyncManager {
         }
 
         self.announce(&pair, Ok(report.clone()), verify_mismatches);
-        Ok(report)
+        Ok(SyncReport { items, ..report })
     }
 
     /// Tell the run listener (notifications) how a run ended.
@@ -627,6 +654,11 @@ impl SyncManager {
         }
 
         let progress_map = self.progress.clone();
+        let live_map = self.live.clone();
+        // A fresh list for this run.
+        if let Ok(mut m) = self.live.lock() {
+            m.insert(pair_id, live_files::LiveRun::default());
+        }
         let hooks = executor::RunHooks {
             progress: Some(Arc::new(move |p: &executor::SyncProgress| {
                 if let Ok(mut m) = progress_map.lock() {
@@ -635,6 +667,11 @@ impl SyncManager {
             })),
             cancel: Some(cancel),
             on_step: journal.as_ref().map(|j| j.recorder()),
+            on_file: Some(Arc::new(move |event: &executor::FileEvent| {
+                if let Ok(mut m) = live_map.lock() {
+                    m.entry(pair_id).or_default().apply(event);
+                }
+            })),
         };
 
         let result = tokio::task::spawn_blocking(move || executor::execute_sync_with(&config, &hooks))
@@ -1084,6 +1121,16 @@ impl Default for SyncManager {
     }
 }
 
+/// One page of a stored run's changed items.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunItemsPage {
+    pub items: Vec<SyncRunItem>,
+    /// Items stored for the run (at most [`ufop_core::sync_types::MAX_RUN_ITEMS`]).
+    pub total: u64,
+    /// The run changed more files than were kept.
+    pub truncated: bool,
+}
+
 // ── Persistence ──────────────────────────────────────────────────────────
 //
 // Sync pairs were pure in-memory state: `create_pair` inserted into a HashMap
@@ -1113,16 +1160,25 @@ impl SyncManager {
         repo.pool()
             .execute(move |conn| {
                 let status = serde_json::to_value(r.status).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
-                conn.execute(
-                    "INSERT OR REPLACE INTO sync_runs (id, pair_id, pair_name, status, started_at, ended_at, report_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    rusqlite::params![r.id.to_string(), r.pair_id.to_string(), r.pair_name, status, r.started_at.to_rfc3339(), r.ended_at.to_rfc3339(), json],
+                let tx = conn.unchecked_transaction()?;
+                // Replacing a run drops its items (ON DELETE CASCADE); they are written again below.
+                tx.execute(
+                    "INSERT OR REPLACE INTO sync_runs (id, pair_id, pair_name, status, started_at, ended_at, report_json, run_trigger, items_truncated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![r.id.to_string(), r.pair_id.to_string(), r.pair_name, status, r.started_at.to_rfc3339(), r.ended_at.to_rfc3339(), json, r.trigger.as_str(), r.items_truncated],
                 )?;
+                {
+                    let mut ins = tx.prepare("INSERT INTO sync_run_items (run_id, rel_path, action, bytes, error) VALUES (?1, ?2, ?3, ?4, ?5)")?;
+                    for item in r.items.iter().take(ufop_core::sync_types::MAX_RUN_ITEMS) {
+                        ins.execute(rusqlite::params![r.id.to_string(), item.rel_path, item.action.as_str(), item.bytes as i64, item.error])?;
+                    }
+                }
                 if keep > 0 {
-                    conn.execute(
+                    tx.execute(
                         "DELETE FROM sync_runs WHERE pair_id = ?1 AND id NOT IN (SELECT id FROM sync_runs WHERE pair_id = ?1 ORDER BY started_at DESC LIMIT ?2)",
                         rusqlite::params![r.pair_id.to_string(), keep],
                     )?;
                 }
+                tx.commit()?;
                 Ok(())
             })
             .await
@@ -1130,11 +1186,64 @@ impl SyncManager {
 
     /// Stored runs, newest first, optionally for one pair.
     pub async fn run_history(&self, repo: &crate::storage::Repository, pair_id: Option<Uuid>, limit: u32) -> Result<Vec<SyncReport>, AppError> {
+        self.run_history_between(repo, pair_id, limit, None, None).await
+    }
+
+    /// [`Self::run_history`] limited to runs that started in `[from, to]`.
+    pub async fn run_history_between(
+        &self,
+        repo: &crate::storage::Repository,
+        pair_id: Option<Uuid>,
+        limit: u32,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Result<Vec<SyncReport>, AppError> {
         repo.pool()
             .execute(move |conn| {
-                let mut st = conn.prepare("SELECT report_json FROM sync_runs WHERE (?1 IS NULL OR pair_id = ?1) ORDER BY started_at DESC LIMIT ?2")?;
-                let rows = st.query_map(rusqlite::params![pair_id.map(|p| p.to_string()), limit.clamp(1, 10_000)], |r| r.get::<_, String>(0))?;
-                Ok(rows.filter_map(|r| r.ok()).filter_map(|j| serde_json::from_str::<SyncReport>(&j).ok()).collect())
+                let mut st = conn.prepare(
+                    "SELECT report_json, run_trigger, items_truncated FROM sync_runs
+                     WHERE (?1 IS NULL OR pair_id = ?1) AND (?3 IS NULL OR started_at >= ?3) AND (?4 IS NULL OR started_at <= ?4)
+                     ORDER BY started_at DESC LIMIT ?2",
+                )?;
+                let rows = st.query_map(
+                    rusqlite::params![pair_id.map(|p| p.to_string()), limit.clamp(1, 10_000), from.map(|d| d.to_rfc3339()), to.map(|d| d.to_rfc3339())],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)),
+                )?;
+                // The columns are the source of truth for what the report JSON
+                // did not know when an older version stored it.
+                Ok(rows
+                    .filter_map(|r| r.ok())
+                    .filter_map(|(j, trig, trunc)| {
+                        serde_json::from_str::<SyncReport>(&j).ok().map(|rep| SyncReport { trigger: RunTrigger::from_str_lossy(&trig), items_truncated: trunc, ..rep })
+                    })
+                    .collect())
+            })
+            .await
+    }
+
+    /// The files a stored run changed, in the order they were handled, one
+    /// page at a time. `None` when no such run is stored.
+    pub async fn run_items(&self, repo: &crate::storage::Repository, run_id: Uuid, offset: u32, limit: u32) -> Result<Option<RunItemsPage>, AppError> {
+        repo.pool()
+            .execute(move |conn| {
+                use rusqlite::OptionalExtension;
+                let id = run_id.to_string();
+                let truncated: Option<bool> = conn.query_row("SELECT items_truncated FROM sync_runs WHERE id = ?1", [&id], |r| r.get(0)).optional()?;
+                let Some(truncated) = truncated else { return Ok(None) };
+                let total: i64 = conn.query_row("SELECT COUNT(*) FROM sync_run_items WHERE run_id = ?1", [&id], |r| r.get(0))?;
+                let mut st = conn.prepare("SELECT rel_path, action, bytes, error FROM sync_run_items WHERE run_id = ?1 ORDER BY rowid LIMIT ?2 OFFSET ?3")?;
+                let items = st
+                    .query_map(rusqlite::params![id, limit.clamp(1, 5_000), offset], |r| {
+                        Ok(SyncRunItem {
+                            rel_path: r.get(0)?,
+                            action: SyncItemAction::from_str_lossy(&r.get::<_, String>(1)?),
+                            bytes: r.get::<_, i64>(2)?.max(0) as u64,
+                            error: r.get(3)?,
+                        })
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(Some(RunItemsPage { items, total: total.max(0) as u64, truncated }))
             })
             .await
     }
@@ -1720,6 +1829,117 @@ mod tests {
 
         assert_eq!(mgr.prune_run_history(&repo, 0).await.unwrap(), 2);
         assert!(mgr.run_history(&repo, None, 10).await.unwrap().is_empty());
+    }
+
+    /// Row 73: a run says what started it and what it did to each file,
+    /// and both survive the history round trip.
+    #[tokio::test]
+    async fn run_history_keeps_the_trigger_and_the_changed_items() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = SyncManager::new();
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), "alpha").unwrap();
+        std::fs::write(src.path().join("b.txt"), "bravo!").unwrap();
+        let pair = make_test_pair(src.path(), dst.path());
+        mgr.create_pair(pair.clone()).await.unwrap();
+
+        let manual = mgr.execute_sync(pair.id).await.unwrap();
+        assert_eq!(manual.trigger, RunTrigger::Manual);
+        assert_eq!(manual.items.len(), 2, "the caller gets the items to store");
+        mgr.save_report_to_db(&repo, &manual, 0).await.unwrap();
+
+        std::fs::write(src.path().join("c.txt"), "charlie").unwrap();
+        let scheduled = mgr.execute_sync_as(pair.id, RunTrigger::Scheduled).await.unwrap();
+        mgr.save_report_to_db(&repo, &scheduled, 0).await.unwrap();
+
+        let hist = mgr.run_history(&repo, Some(pair.id), 10).await.unwrap();
+        assert_eq!(hist.iter().map(|r| r.trigger).collect::<Vec<_>>(), vec![RunTrigger::Scheduled, RunTrigger::Manual]);
+        assert!(hist.iter().all(|r| r.items.is_empty()), "history rows are light");
+        assert!(mgr.get_reports(pair.id).await.iter().all(|r| r.items.is_empty()), "so is the in-memory copy");
+
+        let page = mgr.run_items(&repo, manual.id, 0, 100).await.unwrap().unwrap();
+        let mut got: Vec<(String, &str, u64)> = page.items.iter().map(|i| (i.rel_path.clone(), i.action.as_str(), i.bytes)).collect();
+        got.sort();
+        assert_eq!(got, vec![("a.txt".into(), "copied", 5), ("b.txt".into(), "copied", 6)]);
+        assert_eq!((page.total, page.truncated), (2, false));
+        let second = mgr.run_items(&repo, scheduled.id, 0, 100).await.unwrap().unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].rel_path, "c.txt");
+        let paged = mgr.run_items(&repo, manual.id, 1, 1).await.unwrap().unwrap();
+        assert_eq!((paged.items.len(), paged.total), (1, 2));
+        assert!(mgr.run_items(&repo, Uuid::new_v4(), 0, 10).await.unwrap().is_none());
+
+        // Trimming a run takes its items with it.
+        mgr.save_report_to_db(&repo, &scheduled, 1).await.unwrap();
+        assert!(mgr.run_items(&repo, manual.id, 0, 10).await.unwrap().is_none());
+        let left: i64 = repo.pool().execute(|c| Ok(c.query_row("SELECT COUNT(*) FROM sync_run_items", [], |r| r.get(0))?)).await.unwrap();
+        assert_eq!(left, 1);
+    }
+
+    #[tokio::test]
+    async fn run_history_can_be_limited_to_a_date_range() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = SyncManager::new();
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let pair = make_test_pair(src.path(), dst.path());
+        mgr.create_pair(pair.clone()).await.unwrap();
+        let base = mgr.execute_sync(pair.id).await.unwrap();
+        let day = |n: i64| Utc::now() - chrono::Duration::days(n);
+        for (i, age) in [0i64, 2, 10, 40].into_iter().enumerate() {
+            let r = SyncReport { id: Uuid::new_v4(), started_at: day(age), ended_at: day(age), pair_name: format!("run{i}"), ..base.clone() };
+            mgr.save_report_to_db(&repo, &r, 0).await.unwrap();
+        }
+        let names = |v: Vec<SyncReport>| v.into_iter().map(|r| r.pair_name).collect::<Vec<_>>();
+        let all = mgr.run_history_between(&repo, None, 50, None, None).await.unwrap();
+        assert_eq!(names(all), vec!["run0", "run1", "run2", "run3"]);
+        let week = mgr.run_history_between(&repo, None, 50, Some(day(7)), None).await.unwrap();
+        assert_eq!(names(week), vec!["run0", "run1"]);
+        let window = mgr.run_history_between(&repo, None, 50, Some(day(30)), Some(day(5))).await.unwrap();
+        assert_eq!(names(window), vec!["run2"]);
+    }
+
+    /// Row 72: a running sync exposes the files it is on, bounded; once it
+    /// ends the list is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_running_sync_lists_its_files_and_the_list_goes_with_the_run() {
+        let mgr = Arc::new(SyncManager::new());
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        for i in 0..600 {
+            std::fs::write(src.path().join(format!("f{i:03}.txt")), format!("file number {i}")).unwrap();
+        }
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.copy_options.threads = 1;
+        mgr.create_pair(pair.clone()).await.unwrap();
+        assert!(mgr.live_files(pair.id, 50).is_none(), "idle pairs have no live list");
+
+        let poller = {
+            let mgr = mgr.clone();
+            let id = pair.id;
+            tokio::spawn(async move {
+                let mut best: Option<live_files::LiveFiles> = None;
+                for _ in 0..20_000 {
+                    if let Some(snap) = mgr.live_files(id, 50) {
+                        if snap.finished_total > 0 && best.as_ref().map_or(true, |b| snap.finished_total > b.finished_total) {
+                            best = Some(snap);
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_micros(500)).await;
+                    if best.as_ref().is_some_and(|b| b.finished_total >= 300) {
+                        break;
+                    }
+                }
+                best
+            })
+        };
+        let report = mgr.execute_sync(pair.id).await.unwrap();
+        assert_eq!(report.files_added, 600);
+        let seen = poller.await.unwrap().expect("a snapshot taken while the run was going");
+        assert!(seen.files.len() <= 50, "bounded by the limit");
+        assert!(seen.files.iter().any(|f| f.state == "done" && f.action.as_deref() == Some("copied")));
+        assert!(mgr.live_files(pair.id, 50).is_none(), "the list goes with the run");
     }
 
     #[tokio::test]
@@ -2678,6 +2898,7 @@ mod tests {
             })),
             cancel: None,
             on_step: None,
+            on_file: None,
         };
         let outcome = executor::execute_sync_with(&config, &hooks).unwrap();
         assert_eq!(outcome.report.files_added, 5);

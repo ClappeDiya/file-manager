@@ -199,6 +199,9 @@ mod tests {
             resumed: false,
             exit_code: 0,
             versions_pruned: 0,
+            trigger: Default::default(),
+            items_truncated: false,
+            items: vec![],
         }
     }
 

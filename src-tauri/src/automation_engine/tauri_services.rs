@@ -30,7 +30,7 @@ impl ActionServices for TauriActionServices {
             let manager = self.app.state::<SyncManager>();
             let ledger = self.app.state::<OperationLedger>();
             let repo = self.app.state::<Repository>();
-            let report = crate::commands::sync_commands::run_sync_pair(&manager, &ledger, &repo, &pair_id)
+            let report = crate::commands::sync_commands::run_sync_pair_as(&manager, &ledger, &repo, &pair_id, ufop_core::run_trigger::RunTrigger::Automation)
                 .await
                 .map_err(|e| format!("Sync failed: {e}"))?;
             Ok(format!(

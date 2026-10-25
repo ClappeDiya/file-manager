@@ -1196,6 +1196,24 @@ export interface BackupRun {
   summary: string;
   report: Record<string, unknown>;
   log: LogLine[];
+  /** What started the run: manual, scheduled, watcher, api or automation (absent before triggers were recorded). */
+  trigger?: string;
+}
+
+/** One replica's result in one replication (`backup_replica_history`). */
+export interface ReplicaRun {
+  id: string;
+  run_id: string;
+  job_id: string;
+  replica_id: string;
+  replica_name: string;
+  status: "success" | "error" | string;
+  started_at: string;
+  finished_at: string | null;
+  files: number;
+  bytes: number;
+  error: string | null;
+  trigger: string;
 }
 
 export interface OperationResult {

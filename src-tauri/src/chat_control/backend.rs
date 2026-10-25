@@ -55,7 +55,9 @@ impl BotBackend for TauriBackend {
         Box::pin(async move {
             match job.kind {
                 JobKind::Backup => {
-                    self.app.state::<BackupManager>().start_backup(&job.id, false).await.map_err(|e| e.user_message())?;
+                    crate::backup_engine::trigger::scoped(ufop_core::run_trigger::RunTrigger::Api, self.app.state::<BackupManager>().start_backup(&job.id, false))
+                        .await
+                        .map_err(|e| e.user_message())?;
                     Ok(format!("Started the backup \"{}\".", job.name))
                 }
                 JobKind::Sync => {
@@ -71,7 +73,7 @@ impl BotBackend for TauriBackend {
                     let app = self.app.clone();
                     tauri::async_runtime::spawn(async move {
                         let (manager, ledger, repo) = (app.state::<SyncManager>(), app.state::<OperationLedger>(), app.state::<Repository>());
-                        if let Err(e) = crate::commands::sync_commands::run_sync_pair(&manager, &ledger, &repo, &id.to_string()).await {
+                        if let Err(e) = crate::commands::sync_commands::run_sync_pair_as(&manager, &ledger, &repo, &id.to_string(), ufop_core::run_trigger::RunTrigger::Api).await {
                             tracing::warn!("Remote control: sync {id} failed: {e}");
                         }
                     });

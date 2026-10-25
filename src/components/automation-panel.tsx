@@ -19,6 +19,7 @@ import {
 import { conditionsSummary } from "@/lib/automation-rule-model";
 import { cn } from "@ufop/ui-components";
 import { Button, Badge, ScrollArea } from "@ufop/ui-components";
+import { automationTrigger } from "@/lib/run-trigger";
 import { FeaturePeek } from "@/components/feature-peek";
 import {
   X,
@@ -433,6 +434,8 @@ function RunGraph({ log, onClose }: { log: AutomationLog; onClose: () => void })
 
 function LogEntry({ log }: { log: AutomationLog }) {
   const [graph, setGraph] = useState(false);
+  // What started the run: manual, schedule, a watched file, a webhook.
+  const trigger = automationTrigger(log.trigger_event);
   const hasGraph = (log.steps ?? []).some((s) => s.node);
   const statusIcon = {
     success: <CheckCircle2 className="h-3 w-3 text-green-500" />,
@@ -450,7 +453,15 @@ function LogEntry({ log }: { log: AutomationLog }) {
           <span className="text-[var(--color-text-muted)]">
             {new Date(log.triggered_at).toLocaleTimeString()}
           </span>
+          <span className="text-[var(--color-text-muted)]" data-testid="log-trigger" title={trigger.detail ?? undefined}>
+            · {trigger.label}
+          </span>
         </div>
+        {trigger.detail && (
+          <div className="text-[10px] text-[var(--color-text-muted)] truncate" title={trigger.detail}>
+            {trigger.detail}
+          </div>
+        )}
         {log.error_message && (
           <div className="text-[10px] text-red-400 truncate">{log.error_message}</div>
         )}

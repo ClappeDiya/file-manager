@@ -41,19 +41,46 @@ pub type ProgressFn = Arc<dyn Fn(&SyncProgress) + Send + Sync>;
 /// worker threads), for crash-recovery checkpoints.
 pub type StepFn = Arc<dyn Fn(&str, &CompletedStep) + Send + Sync>;
 
-/// Optional observers for a run: a progress callback, a cancel flag and a
-/// finished-step callback.
+/// What happened to one file during a run, for a live per-file view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileEvent {
+    /// The run began working on this file.
+    Started(String),
+    /// The run is done with this file; `item` says what it did (none when
+    /// it left the file alone).
+    Finished { path: String, item: Option<SyncRunItem> },
+}
+
+/// Callback told about every file as the run starts and finishes it (called
+/// from worker threads).
+pub type FileFn = Arc<dyn Fn(&FileEvent) + Send + Sync>;
+
+/// Optional observers for a run: a progress callback, a cancel flag, a
+/// finished-step callback and a per-file callback.
 #[derive(Default, Clone)]
 pub struct RunHooks {
     pub progress: Option<ProgressFn>,
     pub cancel: Option<Arc<AtomicBool>>,
     pub on_step: Option<StepFn>,
+    pub on_file: Option<FileFn>,
 }
 
 impl RunHooks {
     fn step_done(&self, entry: &SyncDiffEntry, version: Option<StoredVersion>) {
         if let Some(f) = &self.on_step {
             f(&entry.relative_path, &CompletedStep { version, ..CompletedStep::of(entry) });
+        }
+    }
+
+    fn file_started(&self, path: &str) {
+        if let Some(f) = &self.on_file {
+            f(&FileEvent::Started(path.to_string()));
+        }
+    }
+
+    fn file_finished(&self, path: &str, item: Option<SyncRunItem>) {
+        if let Some(f) = &self.on_file {
+            f(&FileEvent::Finished { path: path.to_string(), item });
         }
     }
 
@@ -102,6 +129,7 @@ impl Tracker<'_> {
     }
 
     fn start_file(&self, path: &str) {
+        self.hooks.file_started(path);
         if let Ok(mut c) = self.current.lock() {
             *c = Some(path.to_string());
         }
@@ -283,6 +311,7 @@ pub fn execute_sync_with(
     }
     files_skipped += resumed_skips;
     let additions: Vec<&SyncDiffEntry> = operations.iter().filter(|(_, op)| *op == "add").map(|(e, _)| *e).collect();
+    let moves_source = opts.move_files || opts.move_dirs;
     let tracker = Tracker {
         hooks,
         base: SyncProgress {
@@ -332,6 +361,7 @@ pub fn execute_sync_with(
                     if r.is_ok() {
                         hooks.step_done(entry, None);
                     }
+                    hooks.file_finished(&entry.relative_path, run_item(entry, &r, moves_source));
                     tracker.finish_file(match &r {
                         Ok(OperationResult::Added(b, _)) => *b,
                         _ => 0,
@@ -383,6 +413,7 @@ pub fn execute_sync_with(
             if !failed {
                 hooks.step_done(entry, stored_versions.last_for(&entry.relative_path));
             }
+            hooks.file_finished(&entry.relative_path, run_item(entry, &result, moves_source));
             outcomes.push((idx, result));
             if failed && !config.continue_on_error {
                 halted = true;
@@ -393,8 +424,11 @@ pub fn execute_sync_with(
 
     // Two-way: what each finished step means for the next baseline.
     let mut baseline_updates: Vec<(String, Option<BaselineEntry>)> = Vec::new();
+    // What the run did to each file, for the run's changed-items list.
+    let mut items: Vec<SyncRunItem> = Vec::new();
     for (idx, result) in outcomes {
         let (entry, op_type) = operations[idx];
+        items.extend(run_item(entry, &result, moves_source));
         if pair.mode == SyncMode::TwoWay {
             match &result {
                 Ok(OperationResult::Deleted) => baseline_updates.push((entry.relative_path.clone(), None)),
@@ -451,6 +485,11 @@ pub fn execute_sync_with(
                                 "{}: copied but source not removed: {}",
                                 entry.relative_path, e
                             ));
+                            // Not a move after all: the file is in both places.
+                            if let Some(item) = items.last_mut().filter(|i| i.rel_path == entry.relative_path) {
+                                item.action = SyncItemAction::Failed;
+                                item.error = Some(format!("copied but source not removed: {e}"));
+                            }
                         }
                     }
                 }
@@ -503,6 +542,9 @@ pub fn execute_sync_with(
                 Ok(OperationResult::ConflictResolved(b, _)) => *b,
                 _ => 0,
             });
+            let item = run_item(entry, &result, moves_source);
+            hooks.file_finished(&entry.relative_path, item.clone());
+            items.extend(item);
 
             match result {
                 Ok(op_result) => match op_result {
@@ -666,6 +708,9 @@ pub fn execute_sync_with(
             errors,
         ),
         versions_pruned,
+        trigger: Default::default(),
+        items_truncated: cap_run_items(&mut items, MAX_RUN_ITEMS),
+        items,
     };
 
     if report.status == SyncRunStatus::Success {
@@ -787,6 +832,25 @@ enum OperationResult {
     Deleted,
     Skipped,
     ConflictResolved(u64, Option<BaselineEntry>),
+}
+
+/// What a finished step did to its file, for the run's changed-items list
+/// (none for a file the run left alone).
+fn run_item(entry: &SyncDiffEntry, result: &Result<OperationResult, AppError>, moves_source: bool) -> Option<SyncRunItem> {
+    let path = &entry.relative_path;
+    // /MOV, /MOVE: the source copy goes once the destination has it.
+    let moved = moves_source && entry.direction == SyncDirection::ToDest && entry.source_size.is_some();
+    match result {
+        Ok(OperationResult::Added(bytes, _)) => Some(SyncRunItem::done(path, if moved { SyncItemAction::Moved } else { SyncItemAction::Copied }, *bytes)),
+        Ok(OperationResult::Modified(bytes, _)) => Some(SyncRunItem::done(path, if moved { SyncItemAction::Moved } else { SyncItemAction::Updated }, *bytes)),
+        Ok(OperationResult::Deleted) => {
+            let gone = if entry.direction == SyncDirection::ToSource { entry.source_size } else { entry.dest_size };
+            Some(SyncRunItem::done(path, SyncItemAction::Deleted, gone.unwrap_or(0)))
+        }
+        Ok(OperationResult::ConflictResolved(bytes, _)) => Some(SyncRunItem::done(path, SyncItemAction::Conflict, *bytes)),
+        Ok(OperationResult::Skipped) => None,
+        Err(e) => Some(SyncRunItem::failed(path, entry.source_size.or(entry.dest_size).unwrap_or(0), e.to_string())),
+    }
 }
 
 /// Copy a new file (the "add" operation). Needs no rollback snapshot, so it
@@ -1536,6 +1600,123 @@ mod tests {
         assert!(!dst.path().join("extra.txt").exists());
     }
 
+    fn cfg_of(pair: SyncPair) -> ExecutorConfig {
+        ExecutorConfig { pair, run_id: Uuid::new_v4(), continue_on_error: true, resume_from: None, quarantine_dir: None, rollback_dir: None, baseline: None }
+    }
+
+    #[test]
+    fn a_run_lists_each_file_it_copied_updated_and_deleted() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("new.txt"), "brand new").unwrap();
+        fs::write(src.path().join("changed.txt"), "changed and longer").unwrap();
+        fs::write(dst.path().join("changed.txt"), "old").unwrap();
+        fs::write(dst.path().join("extra.txt"), "gone soon").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::Mirror;
+
+        let report = execute_sync(&cfg_of(pair)).unwrap();
+
+        let action = |p: &str| report.items.iter().find(|i| i.rel_path == p).map(|i| (i.action, i.bytes));
+        assert_eq!(action("new.txt"), Some((SyncItemAction::Copied, 9)));
+        assert_eq!(action("changed.txt"), Some((SyncItemAction::Updated, 18)));
+        assert_eq!(action("extra.txt"), Some((SyncItemAction::Deleted, 9)));
+        assert_eq!(report.items.len(), 3);
+        assert!(!report.items_truncated);
+        // The list is never part of the serialized report (it lives in sync_run_items).
+        assert!(serde_json::to_value(&report).unwrap().get("items").is_none());
+    }
+
+    #[test]
+    fn the_file_hook_sees_every_file_start_and_finish() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(src.path().join(n), n).unwrap();
+        }
+        // The same extra file in both places, so one is left alone.
+        fs::write(src.path().join("same.txt"), "same").unwrap();
+        fs::write(dst.path().join("same.txt"), "same").unwrap();
+        let events: Arc<Mutex<Vec<FileEvent>>> = Arc::default();
+        let sink = events.clone();
+        let hooks = RunHooks { on_file: Some(Arc::new(move |e: &FileEvent| sink.lock().unwrap().push(e.clone()))), ..Default::default() };
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.copy_options.threads = 1;
+
+        let outcome = execute_sync_with(&cfg_of(pair), &hooks).unwrap();
+
+        let events = events.lock().unwrap();
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            let started = events.iter().position(|e| *e == FileEvent::Started(n.into()));
+            let finished = events.iter().position(|e| matches!(e, FileEvent::Finished { path, item: Some(i) } if path == n && i.action == SyncItemAction::Copied));
+            assert!(started.is_some() && finished.is_some() && started < finished, "{n}: {events:?}");
+        }
+        assert!(!events.iter().any(|e| matches!(e, FileEvent::Started(p) if p == "same.txt")), "an unchanged file is never worked on");
+        assert_eq!(outcome.report.items.len(), 3);
+    }
+
+    #[test]
+    fn the_file_hook_also_works_with_parallel_copies() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        for i in 0..20 {
+            fs::write(src.path().join(format!("f{i}.txt")), format!("file {i}")).unwrap();
+        }
+        let finished: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = finished.clone();
+        let hooks = RunHooks {
+            on_file: Some(Arc::new(move |e: &FileEvent| {
+                if let FileEvent::Finished { path, item: Some(_) } = e {
+                    sink.lock().unwrap().push(path.clone());
+                }
+            })),
+            ..Default::default()
+        };
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.copy_options.threads = 4;
+
+        execute_sync_with(&cfg_of(pair), &hooks).unwrap();
+
+        let mut got = finished.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(got.len(), 20);
+        assert_eq!(got.iter().collect::<std::collections::HashSet<_>>().len(), 20, "each file finishes once");
+    }
+
+    #[test]
+    fn a_move_run_lists_files_as_moved() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("a.txt"), "payload").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.copy_options.move_files = true;
+
+        let report = execute_sync(&cfg_of(pair)).unwrap();
+
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].action, SyncItemAction::Moved);
+        assert!(!src.path().join("a.txt").exists());
+    }
+
+    #[test]
+    fn a_failed_copy_is_listed_with_its_error() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::create_dir(src.path().join("sub")).unwrap();
+        fs::write(src.path().join("sub").join("inner.txt"), "cannot land").unwrap();
+        fs::write(src.path().join("fine.txt"), "fine").unwrap();
+        // A file where the destination needs a folder: the copy cannot succeed.
+        fs::write(dst.path().join("sub"), "i am a file").unwrap();
+
+        let report = execute_sync(&cfg_of(make_test_pair(src.path(), dst.path()))).unwrap();
+
+        let failed = report.items.iter().find(|i| i.action == SyncItemAction::Failed).expect("a failed item");
+        assert!(failed.rel_path.replace('\\', "/").ends_with("sub/inner.txt"), "{failed:?}");
+        assert!(failed.error.as_deref().is_some_and(|e| !e.is_empty()));
+        assert!(report.errors >= 1);
+        assert!(report.items.iter().any(|i| i.rel_path == "fine.txt" && i.action == SyncItemAction::Copied));
+    }
+
     #[test]
     fn test_execute_sync_versioned_backup() {
         let src = TempDir::new().unwrap();
@@ -1673,6 +1854,9 @@ mod tests {
                 resumed: false,
                 exit_code: 0,
                 versions_pruned: 0,
+                trigger: Default::default(),
+                items_truncated: false,
+                items: vec![],
             },
         )
         .unwrap();

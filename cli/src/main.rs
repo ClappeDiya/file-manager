@@ -252,6 +252,10 @@ pub enum Commands {
         /// Command path (empty = the top page)
         command: Vec<String>,
     },
+
+    /// Print every command and option as JSON (what the desktop terminal's help drawer lists)
+    #[command(hide = true)]
+    HelpJson,
 }
 
 #[derive(Subcommand, Debug)]
@@ -555,6 +559,11 @@ async fn main() -> ExitCode {
                 print!("{s}");
                 0
             }).map_err(Into::into)
+        }
+        Commands::HelpJson => {
+            use clap::CommandFactory;
+            println!("{}", ufop_core::cli_gen::describe_json(&Cli::command()));
+            Ok(0)
         }
         Commands::Man { out, command } => {
             use clap::CommandFactory;

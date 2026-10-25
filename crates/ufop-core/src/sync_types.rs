@@ -789,6 +789,104 @@ pub struct SyncReport {
     /// Versioned-backup mode: old versions removed by `keep_versions`.
     #[serde(default)]
     pub versions_pruned: u64,
+    /// What started the run (set by the sync manager; the executor leaves it manual).
+    #[serde(default)]
+    pub trigger: crate::run_trigger::RunTrigger,
+    /// The run changed more items than [`MAX_RUN_ITEMS`]; `items` holds the
+    /// failures and conflicts first, then the earliest of the rest.
+    #[serde(default)]
+    pub items_truncated: bool,
+    /// What the run did to each file. Never serialized with the report (it
+    /// can hold thousands of rows): the manager stores it in `sync_run_items`
+    /// and hands it out on request.
+    #[serde(skip)]
+    pub items: Vec<SyncRunItem>,
+}
+
+/// Most changed-item rows kept for one run.
+pub const MAX_RUN_ITEMS: usize = 10_000;
+
+/// What a run did to one file.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncItemAction {
+    /// A new file was written.
+    Copied,
+    /// An existing file was overwritten (or a new version stored).
+    Updated,
+    Deleted,
+    /// Copied, then removed from the source (/MOV, /MOVE).
+    Moved,
+    /// Reserved for engines that detect renames; the sync engine reads a
+    /// rename as a delete plus a copy and never reports this.
+    Renamed,
+    Failed,
+    /// A conflict was resolved (or queued for the user).
+    Conflict,
+}
+
+impl SyncItemAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Copied => "copied",
+            Self::Updated => "updated",
+            Self::Deleted => "deleted",
+            Self::Moved => "moved",
+            Self::Renamed => "renamed",
+            Self::Failed => "failed",
+            Self::Conflict => "conflict",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        [Self::Copied, Self::Updated, Self::Deleted, Self::Moved, Self::Renamed, Self::Failed, Self::Conflict]
+            .into_iter()
+            .find(|a| a.as_str() == s)
+            .unwrap_or(Self::Updated)
+    }
+}
+
+/// One row of a run's changed-items list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncRunItem {
+    pub rel_path: String,
+    pub action: SyncItemAction,
+    pub bytes: u64,
+    pub error: Option<String>,
+}
+
+impl SyncRunItem {
+    pub fn done(rel_path: &str, action: SyncItemAction, bytes: u64) -> Self {
+        Self { rel_path: rel_path.to_string(), action, bytes, error: None }
+    }
+
+    pub fn failed(rel_path: &str, bytes: u64, error: String) -> Self {
+        Self { rel_path: rel_path.to_string(), action: SyncItemAction::Failed, bytes, error: Some(error) }
+    }
+}
+
+/// Keeps at most `cap` items: every failure and conflict first (they are
+/// what a reader looks for), then the rest in their original order. Returns
+/// whether anything was dropped.
+pub fn cap_run_items(items: &mut Vec<SyncRunItem>, cap: usize) -> bool {
+    if items.len() <= cap {
+        return false;
+    }
+    let important = |i: &SyncRunItem| matches!(i.action, SyncItemAction::Failed | SyncItemAction::Conflict);
+    let mut room = cap.saturating_sub(items.iter().filter(|i| important(i)).count());
+    let mut kept = Vec::with_capacity(cap);
+    for item in items.drain(..) {
+        if important(&item) {
+            if kept.len() < cap {
+                kept.push(item);
+            }
+        } else if room > 0 {
+            room -= 1;
+            kept.push(item);
+        }
+    }
+    *items = kept;
+    true
 }
 
 /// A step of a run that finished, recorded as it happens so a run that
@@ -968,5 +1066,43 @@ mod tests {
         let one_way = SyncPair { mode: SyncMode::OneWay, ..two_way };
         let eff = one_way.effective(&defaults).copy_options;
         assert!(eff.move_files && eff.move_dirs);
+    }
+
+    fn item(path: &str, action: SyncItemAction) -> SyncRunItem {
+        SyncRunItem::done(path, action, 1)
+    }
+
+    #[test]
+    fn run_items_over_the_cap_keep_failures_and_conflicts_first() {
+        let mut items: Vec<SyncRunItem> = (0..10).map(|i| item(&format!("ok{i}"), SyncItemAction::Copied)).collect();
+        items.push(SyncRunItem::failed("bad", 0, "denied".into()));
+        items.push(item("clash", SyncItemAction::Conflict));
+        assert!(cap_run_items(&mut items, 5));
+        assert_eq!(items.len(), 5);
+        let paths: Vec<&str> = items.iter().map(|i| i.rel_path.as_str()).collect();
+        assert!(paths.contains(&"bad") && paths.contains(&"clash"), "{paths:?}");
+        // The rest are the earliest copies, in order.
+        assert_eq!(paths.iter().filter(|p| p.starts_with("ok")).copied().collect::<Vec<_>>(), vec!["ok0", "ok1", "ok2"]);
+    }
+
+    #[test]
+    fn run_items_under_the_cap_are_untouched() {
+        let mut items = vec![item("a", SyncItemAction::Copied)];
+        assert!(!cap_run_items(&mut items, 5));
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn run_items_of_only_failures_never_exceed_the_cap() {
+        let mut items: Vec<SyncRunItem> = (0..8).map(|i| SyncRunItem::failed(&format!("f{i}"), 0, "x".into())).collect();
+        assert!(cap_run_items(&mut items, 3));
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn item_actions_round_trip_through_their_stored_names() {
+        for a in [SyncItemAction::Copied, SyncItemAction::Updated, SyncItemAction::Deleted, SyncItemAction::Moved, SyncItemAction::Renamed, SyncItemAction::Failed, SyncItemAction::Conflict] {
+            assert_eq!(SyncItemAction::from_str_lossy(a.as_str()), a);
+        }
     }
 }

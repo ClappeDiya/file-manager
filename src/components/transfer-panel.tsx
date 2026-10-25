@@ -15,6 +15,13 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
+import { DIRECTION_CHIPS, jobMatches, syncsMatch, type DirectionFilter } from "@/lib/transfer-direction";
+import { SyncGroupRow } from "@/components/transfer-sync-groups";
+import { useRunningSyncs } from "@/hooks/use-running-syncs";
+import { HistoryRangeChips } from "@/components/history-range-chips";
+import { FailedRetentionSettings } from "@/components/failed-retention-settings";
+import { ALL_TIME, formatLocalTime, rangeArgs, type HistoryRange } from "@/lib/history-range";
+import type { OpItem } from "@/stores/operations-store";
 
 // ── Types (mirrors Rust types) ──
 
@@ -427,19 +434,20 @@ function TransferSettings({
   onSetChecksumAlgorithm: (algorithm: string) => void;
   onSetRetryPolicy: (maxRetries: number, backoffSeconds: number[]) => void;
   onSetConflictPolicy: (policy: string) => void;
-  onSearchHistory: (query: string) => Promise<TransferHistoryRecord[]>;
-  onExportHistory: (format: string) => void;
+  onSearchHistory: (query: string, range: HistoryRange) => Promise<TransferHistoryRecord[]>;
+  onExportHistory: (format: string, query: string, range: HistoryRange) => void;
   onCleanupHistory: (days: number) => Promise<number | null>;
   onSaveAllSettings: (config: TransferConfig) => void;
 }) {
   const [maxRetries, setMaxRetries] = useState(config.max_retries);
+  const [historyRange, setHistoryRange] = useState<HistoryRange>(ALL_TIME);
   const [historySearch, setHistorySearch] = useState("");
   const [cleanupDays, setCleanupDays] = useState(30);
   const [historyResults, setHistoryResults] = useState<TransferHistoryRecord[] | null>(null);
   const [historyMessage, setHistoryMessage] = useState<string | null>(null);
-  const runHistorySearch = async () => {
+  const runHistorySearch = async (range: HistoryRange = historyRange) => {
     setHistoryMessage(null);
-    setHistoryResults(await onSearchHistory(historySearch));
+    setHistoryResults(await onSearchHistory(historySearch, range));
   };
   const runHistoryCleanup = async () => {
     const removed = await onCleanupHistory(cleanupDays);
@@ -448,7 +456,7 @@ function TransferSettings({
         ? "Cleanup failed. Try again."
         : `Removed ${removed} record${removed === 1 ? "" : "s"} older than ${cleanupDays} day${cleanupDays === 1 ? "" : "s"}.`,
     );
-    if (historyResults) setHistoryResults(await onSearchHistory(historySearch));
+    if (historyResults) setHistoryResults(await onSearchHistory(historySearch, historyRange));
   };
 
   // Completion hooks state – loaded from and saved to backend
@@ -688,6 +696,15 @@ function TransferSettings({
         <div className="text-xs font-semibold text-gray-700 dark:text-gray-300 mb-1.5">
           Transfer History
         </div>
+        <div className="mb-1.5">
+          <HistoryRangeChips
+            value={historyRange}
+            onChange={(r) => {
+              setHistoryRange(r);
+              void runHistorySearch(r);
+            }}
+          />
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex items-center gap-1.5">
             <input
@@ -695,14 +712,14 @@ function TransferSettings({
               value={historySearch}
               onChange={(e) => setHistorySearch(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") runHistorySearch();
+                if (e.key === "Enter") void runHistorySearch();
               }}
               placeholder="Search history..."
               className="w-36 text-xs px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
               aria-label="Search transfer history"
             />
             <button
-              onClick={runHistorySearch}
+              onClick={() => void runHistorySearch()}
               className="text-xs px-2 py-0.5 rounded bg-blue-500 text-white hover:bg-blue-600"
               type="button"
             >
@@ -710,7 +727,7 @@ function TransferSettings({
             </button>
           </div>
           <button
-            onClick={() => onExportHistory("json")}
+            onClick={() => onExportHistory("json", historySearch, historyRange)}
             className="text-xs px-2 py-0.5 rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-300"
             type="button"
             title="Export transfer history as JSON"
@@ -742,6 +759,7 @@ function TransferSettings({
             {historyMessage}
           </div>
         )}
+        <FailedRetentionSettings />
         {historyResults && (
           <div className="mt-1.5" data-testid="history-results">
             {historyResults.length === 0 ? (
@@ -754,7 +772,7 @@ function TransferSettings({
                       {r.source_path.split(/[\\/]/).pop()} → {r.dest_path}
                     </span>
                     <span className="shrink-0 text-gray-500">{r.status}</span>
-                    <span className="shrink-0 text-gray-400 tabular-nums">
+                    <span className="shrink-0 text-gray-400 tabular-nums" title={formatLocalTime(r.started_at)}>
                       {new Date(r.started_at).toLocaleDateString()}
                     </span>
                   </li>
@@ -818,8 +836,8 @@ function TransferPanelFull({
   onSetItemConflictPolicy: (jobId: string, policy: string) => void;
   onReorder: (jobId: string, newSortOrder: number) => void;
   onResolveConflict: (job: TransferJob) => void;
-  onSearchHistory: (query: string) => Promise<TransferHistoryRecord[]>;
-  onExportHistory: (format: string) => void;
+  onSearchHistory: (query: string, range: HistoryRange) => Promise<TransferHistoryRecord[]>;
+  onExportHistory: (format: string, query: string, range: HistoryRange) => void;
   onCleanupHistory: (days: number) => Promise<number | null>;
   onSaveAllSettings: (config: TransferConfig) => void;
   showFailedOnly: boolean;
@@ -834,6 +852,15 @@ function TransferPanelFull({
   const retryableFailed = failedJobs.filter((j) => !j.external);
   const completedJobs = jobs.filter((j) => j.status === "completed");
   const cancelledJobs = jobs.filter((j) => j.status === "cancelled");
+
+  // Upload / Download / Sync / Local chips; running syncs are groups with a per-file list.
+  const [direction, setDirection] = useState<DirectionFilter>("all");
+  const runningSyncs = useRunningSyncs(1000);
+  const visibleSyncs = syncsMatch(direction) ? runningSyncs : [];
+  const visibleJobs = jobs.filter((j) => jobMatches(direction, j.source_path, j.dest_path));
+  const cancelSync = useCallback((item: OpItem) => {
+    void tauriInvoke("operations_cancel", { engine: "sync", id: item.id }).catch((err) => console.error("Failed to cancel the sync:", err));
+  }, []);
 
   const [showThrottle, setShowThrottle] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -1013,14 +1040,42 @@ function TransferPanelFull({
         />
       )}
 
+      {/* Direction chips */}
+      <div className="flex items-center gap-1 px-3 py-1.5 border-b border-gray-200 dark:border-gray-700" role="group" aria-label="Transfer direction">
+        {DIRECTION_CHIPS.map((c) => (
+          <button
+            key={c.id}
+            type="button"
+            aria-pressed={direction === c.id}
+            onClick={() => setDirection(c.id)}
+            className={`px-2 py-0.5 text-xs rounded-full border ${
+              direction === c.id
+                ? "bg-blue-500 border-blue-500 text-white"
+                : "border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800"
+            }`}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
+
       {/* Job list */}
       <div className="flex-1 overflow-y-auto" role="list">
-        {jobs.length === 0 ? (
+        {visibleSyncs.map((item) => (
+          <SyncGroupRow key={`sync-${item.id}`} item={item} onCancel={cancelSync} />
+        ))}
+        {visibleJobs.length === 0 && visibleSyncs.length === 0 ? (
           <div className="flex items-center justify-center h-24 text-sm text-gray-400 dark:text-gray-500">
-            {showFailedOnly ? "No failed transfers" : "No transfers"}
+            {showFailedOnly
+              ? "No failed transfers"
+              : direction === "all"
+                ? "No transfers"
+                : direction === "sync"
+                  ? "No sync is running"
+                  : `No ${direction} transfers`}
           </div>
         ) : (
-          jobs.map((job) => (
+          visibleJobs.map((job) => (
             <TransferItem
               key={job.id}
               job={job}
@@ -1032,7 +1087,7 @@ function TransferPanelFull({
               onSetConflictPolicy={onSetItemConflictPolicy}
               onReorder={onReorder}
               onResolveConflict={onResolveConflict}
-              totalJobs={jobs.length}
+              totalJobs={visibleJobs.length}
             />
           ))
         )}
@@ -1376,11 +1431,11 @@ export function TransferPanel() {
     []
   );
 
-  const handleSearchHistory = useCallback(async (query: string): Promise<TransferHistoryRecord[]> => {
+  const handleSearchHistory = useCallback(async (query: string, range: HistoryRange): Promise<TransferHistoryRecord[]> => {
     try {
       return await tauriInvoke<TransferHistoryRecord[]>(
         "search_transfer_history",
-        { pathContains: query.trim() || null, limit: 100 },
+        { pathContains: query.trim() || null, limit: 100, ...rangeArgs(range) },
         []
       );
     } catch (err) {
@@ -1389,9 +1444,9 @@ export function TransferPanel() {
     }
   }, []);
 
-  const handleExportHistory = useCallback(async (format: string) => {
+  const handleExportHistory = useCallback(async (format: string, query: string, range: HistoryRange) => {
     try {
-      const data = await tauriInvoke<string>("export_transfer_history", { format }, "");
+      const data = await tauriInvoke<string>("export_transfer_history", { format, pathContains: query.trim() || null, ...rangeArgs(range) }, "");
       // Trigger a file download in the browser
       const blob = new Blob([data], { type: format === "json" ? "application/json" : "text/csv" });
       const url = URL.createObjectURL(blob);

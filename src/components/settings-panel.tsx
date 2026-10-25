@@ -23,6 +23,8 @@ import { ProxySection } from "@/components/proxy-section";
 import { RcloneSettingsSection } from "@/components/rclone/rclone-settings-section";
 import { FleetAgentSection } from "@/components/fleet-agent-section";
 import { DiagnosticsSection } from "@/components/diagnostics-section";
+import { useLogViewer } from "@/stores/log-viewer-store";
+import { useUIStore } from "@/stores/ui-store";
 import { AppearanceSettings } from "@/components/appearance-settings";
 import { ManagedSettingsNotice } from "@/components/managed-settings-notice";
 import { FleetAgentLimits } from "@/components/fleet-agent-limits";
@@ -33,6 +35,7 @@ import { ChatControlSection } from "@/components/chat-control-section";
 import { SyncDefaultsSection } from "@/components/sync-defaults-section";
 import { BandwidthTimetableSection } from "@/components/bandwidth-timetable-section";
 import { AdvancedOnly } from "@/components/backup/advanced-only";
+import { LocalServerSection } from "@/components/local-server-section";
 
 // ── Types ──
 
@@ -901,6 +904,7 @@ function EditorMappingsSection() {
 type LogLevel = "error" | "warn" | "info" | "debug" | "trace";
 
 function LogControlsSection() {
+  const advanced = useUIStore((st) => st.appMode === "advanced");
   const [logLevel, setLogLevel] = useState<LogLevel>("info");
   const [logDir, setLogDir] = useState("");
   const [exporting, setExporting] = useState(false);
@@ -977,6 +981,18 @@ function LogControlsSection() {
       {logDir && (
         <div className="text-xs text-gray-500 dark:text-gray-400">
           Log directory: <span className="font-mono">{logDir}</span>
+        </div>
+      )}
+
+      {advanced && (
+        <div>
+          <button
+            type="button"
+            onClick={() => useLogViewer.getState().setOpen(true)}
+            className="text-sm px-3 py-1.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800"
+          >
+            Open log viewer
+          </button>
         </div>
       )}
 
@@ -1434,6 +1450,8 @@ export default function SettingsPanel({
             <MetricsExporterSection />
             <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Remote control from chat</h3>
             <ChatControlSection />
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Local web server</h3>
+            <LocalServerSection />
             <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Sync defaults</h3>
             <SyncDefaultsSection />
             <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Bandwidth timetable</h3>

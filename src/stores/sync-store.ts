@@ -114,6 +114,10 @@ export interface SyncReport {
   exit_code?: number;
   /** Versioned backup: old versions removed by `keep_versions`. */
   versions_pruned?: number;
+  /** What started the run: manual, scheduled, watcher, api or automation. */
+  trigger?: string;
+  /** The run changed more files than its stored item list holds. */
+  items_truncated?: boolean;
 }
 
 export interface SyncConflictItem {

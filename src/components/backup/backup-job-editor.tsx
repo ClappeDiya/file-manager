@@ -440,7 +440,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
             </AdvancedOnly>
           </Section>
             <AdvancedOnly hint>
-              <BackupReplicas replicas={job.replicas} onChange={(r) => patch({ replicas: r })} connections={connections} library={library} />
+              <BackupReplicas replicas={job.replicas} onChange={(r) => patch({ replicas: r })} connections={connections} library={library} jobId={job.id || undefined} />
             </AdvancedOnly>
             <BackupHardening job={job} />
           </>

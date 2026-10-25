@@ -9,6 +9,7 @@ use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
 use crate::storage::Repository;
 use crate::sync_engine::SyncManager;
 use tauri::State;
+use ufop_core::run_trigger::RunTrigger;
 use uuid::Uuid;
 
 // ── Helper ──
@@ -265,15 +266,51 @@ pub async fn update_sync_pair(
 }
 
 /// Stored sync runs, newest first (all pairs when `pair_id` is omitted).
+/// `date_from` / `date_to` (RFC 3339 instants) keep the runs that started in that range.
 #[tauri::command]
 pub async fn get_sync_run_history(
     pair_id: Option<String>,
     limit: Option<u32>,
+    date_from: Option<String>,
+    date_to: Option<String>,
     manager: State<'_, SyncManager>,
     repo: State<'_, Repository>,
 ) -> Result<Vec<SyncReport>, AppError> {
     let id = pair_id.as_deref().map(parse_uuid).transpose()?;
-    manager.run_history(&repo, id, limit.unwrap_or(100)).await
+    let (from, to) = crate::core::date_range::parse_range(date_from.as_deref(), date_to.as_deref())?;
+    manager.run_history_between(&repo, id, limit.unwrap_or(100), from, to).await
+}
+
+/// The files a running sync is working on and has finished, newest first
+/// (bounded; `limit` is capped). `null` when the pair is not syncing.
+#[tauri::command]
+pub async fn get_sync_live_files(
+    pair_id: String,
+    limit: Option<u32>,
+    manager: State<'_, SyncManager>,
+) -> Result<Option<crate::sync_engine::live_files::LiveFiles>, AppError> {
+    let id = parse_uuid(&pair_id)?;
+    Ok(manager.live_files(id, limit.unwrap_or(200) as usize))
+}
+
+/// The files a stored sync run changed (copied, updated, deleted, failed…),
+/// one page at a time.
+#[tauri::command]
+pub async fn get_sync_run_items(
+    run_id: String,
+    offset: Option<u32>,
+    limit: Option<u32>,
+    manager: State<'_, SyncManager>,
+    repo: State<'_, Repository>,
+) -> Result<crate::sync_engine::RunItemsPage, AppError> {
+    let id = parse_uuid(&run_id)?;
+    manager
+        .run_items(&repo, id, offset.unwrap_or(0), limit.unwrap_or(500))
+        .await?
+        .ok_or_else(|| AppError::Sync {
+            message: "That run is no longer in the history.".to_string(),
+            advice: "Older runs are removed when the history is trimmed.".to_string(),
+        })
 }
 
 /// Delete stored sync runs older than `days`.
@@ -302,9 +339,22 @@ pub async fn run_sync_pair(
     repo: &Repository,
     pair_id: &str,
 ) -> Result<SyncReport, AppError> {
+    run_sync_pair_as(manager, ledger, repo, pair_id, RunTrigger::Manual).await
+}
+
+/// [`run_sync_pair`] for a run that something other than a person started
+/// (the scheduler, an automation action, the API): `trigger` is what the run
+/// history shows.
+pub async fn run_sync_pair_as(
+    manager: &SyncManager,
+    ledger: &OperationLedger,
+    repo: &Repository,
+    pair_id: &str,
+    trigger: RunTrigger,
+) -> Result<SyncReport, AppError> {
     let pair_id = pair_id.to_string();
     let id = parse_uuid(&pair_id)?;
-    let result = manager.execute_sync(id).await;
+    let result = manager.execute_sync_as(id, trigger).await;
 
     // `execute_sync` stamps `last_run` on the in-memory pair. Without this the
     // field would silently revert to its last-saved value on restart — the

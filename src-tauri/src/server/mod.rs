@@ -105,6 +105,10 @@ pub struct ServerConfig {
     pub metrics_basic_auth: Option<String>,
     /// Push `/metrics` to a Prometheus push gateway.
     pub pushgateway: Option<otlp::PushConfig>,
+    /// Running inside the desktop app, sharing its backup manager: stopping the
+    /// server stops only the listener. It installs no signal handlers and never
+    /// drains, refuses work in or cancels the backup manager.
+    pub embedded: bool,
 }
 
 impl Default for ServerConfig {
@@ -134,6 +138,7 @@ impl Default for ServerConfig {
             metrics_listen: None,
             metrics_basic_auth: None,
             pushgateway: None,
+            embedded: false,
         }
     }
 }
@@ -303,7 +308,8 @@ async fn require_auth(State(st): State<ServerState>, mut req: Request, next: Nex
         Ok((principal, acc)) => {
             req.extensions_mut().insert(principal);
             req.extensions_mut().insert(acc);
-            next.run(req).await
+            // Whatever an authenticated request starts is an API run.
+            crate::backup_engine::trigger::scoped(ufop_core::run_trigger::RunTrigger::Api, next.run(req)).await
         }
         Err(e) => ApiError(e).into_response(),
     }
@@ -1423,7 +1429,9 @@ pub async fn serve(st: ServerState) -> Result<(), AppError> {
     let addr = st.cfg.bind_addr()?;
     let tls = st.cfg.tls.clone();
     let min_tls = st.cfg.min_tls;
-    st.life.listen_for_signals();
+    if !st.cfg.embedded {
+        st.life.listen_for_signals();
+    }
     if let Some(maddr) = st.cfg.metrics_listen {
         let (mst, auth) = (st.clone(), st.cfg.metrics_basic_auth.clone());
         tokio::spawn(async move {
@@ -1437,7 +1445,13 @@ pub async fn serve(st: ServerState) -> Result<(), AppError> {
     let drain = {
         let (st, handle) = (st.clone(), handle.clone());
         tokio::spawn(async move {
-            let report = lifecycle::drain_when_requested(st.clone()).await;
+            let report = if st.cfg.embedded {
+                // The backup manager belongs to the desktop app: only the listener stops.
+                st.life.requested().await;
+                crate::backup_engine::shutdown::ShutdownReport { cancelled: 0, still_running: 0, waited_ms: 0 }
+            } else {
+                lifecycle::drain_when_requested(st.clone()).await
+            };
             tracing::info!("Backups stopped ({} cancelled, {} still running after {} ms); closing connections", report.cancelled, report.still_running, report.waited_ms);
             if st.life.is_immediate() {
                 handle.shutdown();
@@ -1469,7 +1483,7 @@ pub async fn serve(st: ServerState) -> Result<(), AppError> {
     };
     served?;
     // The listener only stops after a stop request, so the drain is done or ending.
-    if !drain.is_finished() {
+    if !drain.is_finished() && !st.cfg.embedded {
         st.mgr.begin_shutdown();
         st.mgr.cancel_all();
     }

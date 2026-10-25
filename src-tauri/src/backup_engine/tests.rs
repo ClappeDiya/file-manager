@@ -1768,6 +1768,7 @@ async fn run_history_and_files_page_with_totals() {
             summary: summary.into(),
             report: serde_json::Value::Null,
             log: vec![],
+            trigger: Default::default(),
         };
         m.insert_run(&run).await.unwrap();
     }

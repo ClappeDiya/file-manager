@@ -86,7 +86,7 @@ macro; if you add a new one here, register it there too.
 - `resolve_aws_profile`
 - `start_sso_auth`
 
-## `backup_commands` (110 commands)
+## `backup_commands` (111 commands)
 
 - `backup_adopt_repository`
 - `backup_apply_template`
@@ -168,6 +168,7 @@ macro; if you add a new one here, register it there too.
 - `backup_remote_get`
 - `backup_remote_list`
 - `backup_remote_put`
+- `backup_replica_history`
 - `backup_resolve_version`
 - `backup_resume`
 - `backup_run`
@@ -309,6 +310,19 @@ macro; if you add a new one here, register it there too.
 - `editor_draft_load`
 - `editor_draft_save`
 
+## `embedded_server_commands` (10 commands)
+
+- `embedded_server_save_settings`
+- `embedded_server_set_password`
+- `embedded_server_start`
+- `embedded_server_status`
+- `embedded_server_stop`
+- `open_server_in_browser`
+- `server_profile_remove`
+- `server_profile_save`
+- `server_profile_test`
+- `server_profiles_list`
+
 ## `encryption_commands` (20 commands)
 
 - `add_encryption_policy`
@@ -331,6 +345,11 @@ macro; if you add a new one here, register it there too.
 - `unlock_vault`
 - `vault_decrypt_file`
 - `vault_encrypt_file`
+
+## `feedback_commands` (2 commands)
+
+- `feedback_destination`
+- `feedback_submit`
 
 ## `file_ops_commands` (26 commands)
 
@@ -452,7 +471,7 @@ macro; if you add a new one here, register it there too.
 
 - `get_file_lineage`
 
-## `log_commands` (13 commands)
+## `log_commands` (14 commands)
 
 - `add_trusted_host_ca`
 - `check_gssapi_available`
@@ -464,6 +483,7 @@ macro; if you add a new one here, register it there too.
 - `get_log_level`
 - `get_log_retention`
 - `list_trusted_host_cas`
+- `query_logs`
 - `remove_trusted_host_ca`
 - `set_log_level`
 - `set_log_retention`
@@ -707,7 +727,7 @@ macro; if you add a new one here, register it there too.
 - `save_workspace_state`
 - `set_config`
 
-## `sync_commands` (33 commands)
+## `sync_commands` (35 commands)
 
 - `cancel_sync`
 - `create_sync_pair`
@@ -724,9 +744,11 @@ macro; if you add a new one here, register it there too.
 - `get_sync_default_options`
 - `get_sync_filter_presets`
 - `get_sync_health`
+- `get_sync_live_files`
 - `get_sync_progress`
 - `get_sync_reports`
 - `get_sync_run_history`
+- `get_sync_run_items`
 - `import_sync_pair`
 - `list_sync_pairs`
 - `parse_robocopy_command`
@@ -750,7 +772,7 @@ macro; if you add a new one here, register it there too.
 - `get_portable_status`
 - `greet`
 
-## `terminal_commands` (11 commands)
+## `terminal_commands` (12 commands)
 
 - `terminal_close_session`
 - `terminal_create_local`
@@ -758,6 +780,7 @@ macro; if you add a new one here, register it there too.
 - `terminal_escape_path`
 - `terminal_get_default_shell`
 - `terminal_get_layout`
+- `terminal_help_commands`
 - `terminal_list_sessions`
 - `terminal_read_scrollback`
 - `terminal_resize`
@@ -769,7 +792,7 @@ macro; if you add a new one here, register it there too.
 - `thumbnail_cache_clear`
 - `thumbnail_get`
 
-## `transfer_commands` (37 commands)
+## `transfer_commands` (39 commands)
 
 - `cancel_transfer`
 - `check_conflict`
@@ -781,6 +804,7 @@ macro; if you add a new one here, register it there too.
 - `fail_transfer`
 - `get_bandwidth_schedule`
 - `get_completion_hooks`
+- `get_failed_transfer_retention`
 - `get_throttle_config`
 - `get_transfer`
 - `get_transfer_config`
@@ -799,6 +823,7 @@ macro; if you add a new one here, register it there too.
 - `set_completion_hooks`
 - `set_conflict_policy`
 - `set_connection_throttle`
+- `set_failed_transfer_retention`
 - `set_global_throttle`
 - `set_retry_policy`
 - `set_transfer_config`
@@ -832,4 +857,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 649 commands across 56 modules.
+**Surface:** 668 commands across 58 modules.

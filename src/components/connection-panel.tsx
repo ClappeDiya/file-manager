@@ -35,6 +35,7 @@ import { useUIStore } from "@/stores/ui-store";
 import { useRcloneUi } from "@/stores/rclone-ui-store";
 import { useCompareStore } from "@/stores/compare-store";
 import { useFileManagerStore } from "@/stores/file-manager-store";
+import { useConnectionBrowse } from "@/stores/connection-browse-store";
 import { RcloneRemoteManager } from "@/components/rclone/rclone-remote-manager";
 import { CryptBanner, CryptNamesDialog } from "@/components/rclone/rclone-crypt";
 import { RCLONE_REMOTES_CHANGED_EVENT, rcloneCryptInfo, type RcloneCryptInfo } from "@/lib/rclone";
@@ -1932,7 +1933,7 @@ export function ConnectionPanel() {
   }, []);
 
   const handleConnect = useCallback(
-    async (id: string) => {
+    async (id: string, startPath?: string) => {
       setBrowseError(null);
       setBrowsing(true);
       try {
@@ -1952,7 +1953,7 @@ export function ConnectionPanel() {
         });
 
         // 3. List remote directory contents
-        const initialPath = conn.remote_path || "/";
+        const initialPath = startPath || conn.remote_path || "/";
         const files = await tauriInvoke<RemoteFileEntry[]>(
           "connector_list_remote",
           { protocol: conn.protocol, path: initialPath, connectionId: id },
@@ -1998,6 +1999,14 @@ export function ConnectionPanel() {
     },
     [handleConnect]
   );
+
+  // A history row asked to open a folder of a saved connection here.
+  const browseRequest = useConnectionBrowse((st) => st.request);
+  useEffect(() => {
+    if (!browseRequest) return;
+    const req = useConnectionBrowse.getState().consume();
+    if (req) void handleConnect(req.connectionId, req.path);
+  }, [browseRequest, handleConnect]);
 
   const sizeJob = useRef(0);
   const handleCalculateSize = useCallback(

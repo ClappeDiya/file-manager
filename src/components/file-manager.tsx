@@ -55,6 +55,11 @@ import { KeyboardCheatSheet } from "./keyboard-cheat-sheet";
 import { BatchRename } from "./batch-rename";
 import SettingsPanel from "./settings-panel";
 import { ConnectionPanel } from "./connection-panel";
+import { useConnectionBrowse } from "@/stores/connection-browse-store";
+import { LogViewerDialog } from "./log-viewer-dialog";
+import { useLogViewer } from "@/stores/log-viewer-store";
+import { FeedbackDialog } from "./feedback-dialog";
+import { useFeedbackDialog } from "@/stores/feedback-store";
 import { useRcloneUi } from "@/stores/rclone-ui-store";
 import { RcloneEngineInfo } from "@/components/rclone/rclone-settings-section";
 import { rcloneStatus, type RcloneStatus } from "@/lib/rclone";
@@ -155,6 +160,7 @@ import {
   MonitorSmartphone,
   HardDrive,
   GitCompareArrows,
+  ScrollText,
 } from "lucide-react";
 
 // Toolbar customization definition (#14)
@@ -171,6 +177,7 @@ const ALL_TOOLBAR_ITEMS = [
   { id: "sync-browse", label: "Sync Browse" },
   { id: "backups", label: "Backups" },
   { id: "schedules", label: "Schedules & holiday calendars" },
+  { id: "logs", label: "Log viewer (Advanced)" },
   { id: "operations", label: "Operations" },
   { id: "nearby", label: "Nearby Computers" },
   { id: "mounts", label: "Mounts" },
@@ -730,6 +737,11 @@ export function FileManager() {
   // Cmd+Shift+U and a palette entry. Same TDZ-safe placement
   // as the iter 25/26 orphan dialogs.
   const [connectionsOpen, setConnectionsOpen] = useState(false);
+  // A history row asked to open a folder of a saved connection: show the manager.
+  const browseRequested = useConnectionBrowse((s) => s.request !== null);
+  useEffect(() => {
+    if (browseRequested) setConnectionsOpen(true);
+  }, [browseRequested]);
   // Closing the Connection Manager also leaves its rclone remote manager.
   useEffect(() => {
     if (!connectionsOpen) useRcloneUi.getState().closeManager();
@@ -2177,6 +2189,8 @@ export function FileManager() {
         onMountDrive: () => useMountsUi.getState().openDialog(),
         onSendToComputer: () => openNearby(getAllSelectedPaths()),
         onOpenSchedules: appMode === "advanced" ? () => setSchedulesOpen(true) : undefined,
+        onOpenLogViewer: appMode === "advanced" ? () => useLogViewer.getState().setOpen(true) : undefined,
+        onSendFeedback: () => useFeedbackDialog.getState().setOpen(true),
         onOpenTransferHistory: () => {
           setTransferHistoryOpen(true);
         },
@@ -2552,6 +2566,18 @@ export function FileManager() {
               data-testid="toggle-schedules"
             >
               <CalendarClock className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
+          {appMode === "advanced" && toolbarItems.includes("logs") && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => useLogViewer.getState().toggle()}
+              aria-label="Log viewer"
+              title="Log viewer"
+              data-testid="toggle-log-viewer"
+            >
+              <ScrollText className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
           {toolbarItems.includes("smart-spaces") && (
@@ -2978,6 +3004,12 @@ export function FileManager() {
           </div>
         </div>
       )}
+
+      {/* In-app log viewer (Advanced) */}
+      <LogViewerDialog />
+
+      {/* Help > Send feedback */}
+      <FeedbackDialog />
 
       {/* Schedules & holiday calendars (Advanced): shared by sync pairs,
           automation rules and backup jobs. */}

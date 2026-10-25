@@ -3,8 +3,15 @@
  * each backup, on their own interval, or on demand. Each replica can be
  * restored from on its own (Restore from folder).
  */
+import { useEffect, useState } from "react";
+import { tauriInvoke } from "@/hooks/use-tauri";
+import { errorText } from "@/lib/error-text";
+import { formatBytes } from "@/lib/format-bytes";
+import { formatLocalTime } from "@/lib/history-range";
+import { runDuration } from "@/lib/backup-time";
+import { triggerLabel } from "@/lib/run-trigger";
 import { inputCls } from "@/lib/backup-helpers";
-import type { BackupDestination, Replica, ReplicaSchedule, SavedDestination } from "@/stores/backup-store";
+import type { BackupDestination, Replica, ReplicaRun, ReplicaSchedule, SavedDestination } from "@/stores/backup-store";
 import { Btn, Check, Field, PathInput, Section } from "./backup-ui";
 import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
 
@@ -84,17 +91,74 @@ function DestinationPicker({ value, onChange, connections, library }: { value: B
   );
 }
 
+/** The last copies made to one replica: every run, not only the latest result. */
+export function ReplicaHistory({ jobId, replicaId }: { jobId: string; replicaId: string }) {
+  const [rows, setRows] = useState<ReplicaRun[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    tauriInvoke<ReplicaRun[]>("backup_replica_history", { jobId, replicaId, limit: 30 })
+      .then((r) => live && setRows(r))
+      .catch((e) => live && setError(errorText(e)));
+    return () => {
+      live = false;
+    };
+  }, [jobId, replicaId]);
+  if (error) return <div className="text-xs text-red-600" role="alert">{error}</div>;
+  if (!rows) return <div className="text-xs text-zinc-500">Loading…</div>;
+  if (rows.length === 0) return <div className="text-xs text-zinc-500">No copies to this destination yet.</div>;
+  return (
+    <table className="w-full text-[11px]" data-testid="replica-history">
+      <thead>
+        <tr className="text-left text-zinc-500">
+          <th>When</th>
+          <th>Result</th>
+          <th>Files</th>
+          <th>Size</th>
+          <th>Took</th>
+          <th>Started by</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => (
+          <tr key={r.id}>
+            <td>{formatLocalTime(r.started_at)}</td>
+            <td className={r.status === "success" ? "text-green-600" : "text-red-600"} title={r.error ?? undefined}>
+              {r.status}
+              {r.error ? ` — ${r.error}` : ""}
+            </td>
+            <td>{r.files}</td>
+            <td>{formatBytes(r.bytes)}</td>
+            <td>{runDuration(r.started_at, r.finished_at)}</td>
+            <td>{triggerLabel(r.trigger)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 export function BackupReplicas({
   replicas,
   onChange,
   connections,
   library,
+  jobId,
 }: {
   replicas: Replica[];
   onChange: (r: Replica[]) => void;
   connections: Conn[];
   library: SavedDestination[];
+  /** The saved job these replicas belong to; without it (a new job) there is no history to show. */
+  jobId?: string;
 }) {
+  const [historyOf, setHistoryOf] = useState<Set<string>>(new Set());
+  const toggleHistory = (id: string) =>
+    setHistoryOf((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
   const set = (i: number, p: Partial<Replica>) => onChange(replicas.map((r, j) => (j === i ? { ...r, ...p } : r)));
   return (
     <Section title="Extra destinations (replicas)" hint="Full copies of this backup on other destinations, kept in sync. Each one can be restored from on its own.">
@@ -144,7 +208,15 @@ export function BackupReplicas({
           </Field>
           {r.last_run && (
             <div className="text-xs text-zinc-500">
-              Last copy {new Date(r.last_run).toLocaleString()}: {r.last_result}
+              Last copy {formatLocalTime(r.last_run)}: {r.last_result}
+            </div>
+          )}
+          {jobId && r.id && (
+            <div className="space-y-1">
+              <Btn testId={`replica-history-toggle-${r.id}`} onClick={() => toggleHistory(r.id)}>
+                {historyOf.has(r.id) ? "Hide history" : "Show history"}
+              </Btn>
+              {historyOf.has(r.id) && <ReplicaHistory jobId={jobId} replicaId={r.id} />}
             </div>
           )}
         </div>

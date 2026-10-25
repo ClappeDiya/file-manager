@@ -2374,6 +2374,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "uuid",
  "windows",
