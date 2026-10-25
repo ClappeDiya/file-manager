@@ -752,6 +752,10 @@ export function getDefaultCommands(actions: {
    *  destination — the only user-facing path that feeds the Transfer
    *  Queue (previously the engine queue had zero producers). */
   onQueueCopyTo?: () => void;
+  /** Compare the left and right panes' folders (standalone folder compare). */
+  onComparePanes?: () => void;
+  /** Compare the active pane's folder with a folder picked next. */
+  onCompareFolderWith?: () => void;
   /** Open the Connection Manager panel \u2014 saved profiles,
    *  quick-connect, connection test, third-party import, and
    *  the 17-protocol registry (SFTP, S3, Google Drive, WebDAV,
@@ -1774,6 +1778,24 @@ export function getDefaultCommands(actions: {
         "multi rename",
         "mass rename",
       ],
+    },
+    {
+      id: "compare-panes",
+      label: "Compare Panes",
+      description: "Compare the left and right folders recursively, then copy or delete the differences",
+      icon: <FolderSync className="h-4 w-4" />,
+      category: "File Operations",
+      action: actions.onComparePanes || (() => {}),
+      keywords: ["compare", "compare folders", "diff folders", "folder diff", "reconcile", "differences", "check"],
+    },
+    {
+      id: "compare-folder-with",
+      label: "Compare Folder With…",
+      description: "Compare the active pane's folder with another folder you pick",
+      icon: <FolderSync className="h-4 w-4" />,
+      category: "File Operations",
+      action: actions.onCompareFolderWith || (() => {}),
+      keywords: ["compare", "compare with", "diff folders", "folder diff", "reconcile"],
     },
     {
       id: "queue-copy",

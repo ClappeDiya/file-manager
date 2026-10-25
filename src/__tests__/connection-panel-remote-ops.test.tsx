@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor, within } from "@testing-library/rea
 import { ConnectionPanel } from "@/components/connection-panel";
 import { PromptDialogHost } from "@/components/prompt-dialog-host";
 import { pickFiles, pickFolder } from "@/lib/folder-picker";
+import { useCompareStore } from "@/stores/compare-store";
 
 const mockInvoke = vi.fn();
 
@@ -225,5 +226,23 @@ describe("ConnectionPanel remote browser", () => {
       expect.objectContaining({ protocol: "google_drive", remotePath: "/f1", localPath: "/downloads/Plan.pdf", connectionId: "g-1" }),
       expect.objectContaining({ protocol: "google_drive", remotePath: "/f2", localPath: "/downloads/Budget.xlsx", connectionId: "g-1" }),
     ]);
+  });
+
+  it("Compare with… compares a picked local folder with the folder being browsed", async () => {
+    vi.mocked(pickFolder).mockResolvedValue("/home/me/site");
+    useCompareStore.setState({ request: null });
+    render(
+      <>
+        <ConnectionPanel />
+        <PromptDialogHost />
+      </>,
+    );
+    await connectAndBrowse();
+    fireEvent.click(screen.getByTestId("remote-compare-with"));
+    fireEvent.click(screen.getByTestId("remote-compare-pick"));
+    await waitFor(() => expect(useCompareStore.getState().request).not.toBeNull());
+    const req = useCompareStore.getState().request!;
+    expect(req.left).toEqual({ type: "local", path: "/home/me/site" });
+    expect(req.right).toEqual({ type: "remote", connection_id: "conn-1", protocol: "sftp", path: "/" });
   });
 });

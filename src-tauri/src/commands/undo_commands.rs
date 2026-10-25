@@ -262,6 +262,12 @@ pub async fn undo_by_correlation(
     ledger: State<'_, OperationLedger>,
     metadata: State<'_, MetadataStore>,
 ) -> Result<UndoOutcome, AppError> {
+    undo_by_correlation_impl(correlation_id, &ledger, &metadata).await
+}
+
+/// Undo the correlation group `correlation_id` (shared by the command and
+/// by callers that hand back several ids to undo in turn).
+pub(crate) async fn undo_by_correlation_impl(correlation_id: String, ledger: &OperationLedger, metadata: &MetadataStore) -> Result<UndoOutcome, AppError> {
     // Query the group directly: it is named, so there is no reason to scan the
     // recent tail hoping it is still in the window.
     let rows = ledger.by_correlation(correlation_id.clone()).await?;
@@ -271,7 +277,7 @@ pub async fn undo_by_correlation(
             "It may have already been undone, or may be older than the 30-day ledger retention.",
         ));
     };
-    perform_undo(op, &ledger, &metadata).await
+    perform_undo(op, ledger, metadata).await
 }
 
 /// Shared worker: call the existing fs inverse logic, then emit an

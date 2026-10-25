@@ -174,6 +174,7 @@ mod tests {
             dest_checksum: None,
             speed_bps: 0,
             eta_seconds: None,
+            external: false,
         }
     }
 

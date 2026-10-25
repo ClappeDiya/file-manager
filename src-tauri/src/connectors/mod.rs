@@ -22,6 +22,7 @@
 //! - OpenStack Swift: Keystone v3/TempAuth, container/object ops, SLO/DLO, TempURL
 
 pub mod folder_size;
+pub mod walk;
 pub mod presets;
 pub mod rclone;
 pub mod connection_manager;

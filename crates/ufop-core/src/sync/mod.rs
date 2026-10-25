@@ -1,5 +1,6 @@
 //! The sync/copy engine.
 
+pub mod compare;
 pub mod conflict;
 pub mod copier;
 pub mod executor;

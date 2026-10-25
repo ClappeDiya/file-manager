@@ -3,6 +3,7 @@ pub mod automation_engine;
 pub mod backup_engine;
 pub mod chat_control;
 pub mod commands;
+pub mod compare_engine;
 pub mod paths;
 pub mod compat_engine;
 pub mod convert_engine;
@@ -83,6 +84,8 @@ struct AppState {
     confirmation_mgr: ConfirmationManager,
     ledger: OperationLedger,
     safety_interlock: SafetyInterlock,
+    /// Folder comparisons: running tasks and results to act on.
+    compare_mgr: compare_engine::CompareManager,
     narrator: OperationNarrator,
     quickflow_suggester: LedgerSuggester,
     backup_mgr: BackupManager,
@@ -330,6 +333,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         ledger,
         schedule_library,
         safety_interlock,
+        compare_mgr: compare_engine::CompareManager::new(),
         narrator,
         quickflow_suggester,
         desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics::new(backup_mgr.clone()),
@@ -392,9 +396,17 @@ fn start_background_engines(app: tauri::AppHandle) {
 }
 
 /// Persist transfer queue and workspace state on shutdown.
+/// The queued jobs kept over a restart. A folder comparison's transfers
+/// end with the app: its connector transfers (only shown in the queue) and
+/// its local copies into a staging file (only moved into place by the
+/// comparison that started them) are not resumed.
+fn jobs_to_persist(jobs: Vec<core::types::TransferJob>) -> Vec<core::types::TransferJob> {
+    jobs.into_iter().filter(|j| !j.external && !compare_engine::apply::is_staging(&j.dest_path)).collect()
+}
+
 async fn persist_on_shutdown(repo: &Repository, transfer_mgr: &TransferManager) {
-    // Save transfer queue
-    let jobs = transfer_mgr.snapshot_jobs().await;
+    // Save transfer queue (see `jobs_to_persist`).
+    let jobs = jobs_to_persist(transfer_mgr.snapshot_jobs().await);
     if let Err(e) = StorageOperations::save_transfer_queue(repo, &jobs).await {
         tracing::error!("Failed to persist transfer queue on shutdown: {e}");
     } else {
@@ -506,6 +518,7 @@ pub fn run() {
                     ledger,
                     schedule_library: fallback_schedules,
                     safety_interlock,
+                    compare_mgr: compare_engine::CompareManager::new(),
                     narrator,
                     quickflow_suggester,
                     desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics::new(backup_mgr.clone()),
@@ -637,6 +650,7 @@ pub fn run() {
         .manage(app_state.ledger)
         .manage(app_state.schedule_library)
         .manage(app_state.safety_interlock)
+        .manage(app_state.compare_mgr)
         .manage(app_state.narrator)
         .manage(app_state.quickflow_suggester)
         .manage(app_state.backup_mgr)
@@ -766,6 +780,12 @@ pub fn run() {
             connector_commands::connector_quota,
             connector_commands::connector_folder_size,
             connector_commands::connector_folder_size_cancel,
+            // Folder compare and reconcile
+            commands::compare_commands::compare_folders,
+            commands::compare_commands::compare_cancel,
+            commands::compare_commands::compare_release,
+            commands::compare_commands::compare_plan_action,
+            commands::compare_commands::compare_apply,
             // SMB/CIFS (T-023)
             drive_commands::smb_discover_shares,
             drive_commands::smb_list_shares,
@@ -1406,6 +1426,23 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a folder comparison's local copy (into a hidden staging
+    /// file) was saved with the queue at exit and could resume on restart,
+    /// leaving the staging file behind; only connector transfers were left out.
+    #[tokio::test]
+    async fn the_queue_kept_over_a_restart_leaves_out_a_comparisons_transfers() {
+        use crate::core::traits::TransferOperations;
+        let mgr = TransferManager::new();
+        mgr.enqueue("/a/file.zip", "/b/file.zip", 10).await.unwrap();
+        mgr.enqueue("/a/x.txt", "/b/.x.txt.ufop-compare-0a1b2c3d", 10).await.unwrap();
+        mgr.track_external("sftp://s/y.txt", "/b/y.txt", 10, None).await.unwrap();
+        let kept = jobs_to_persist(mgr.snapshot_jobs().await);
+        assert_eq!(kept.iter().map(|j| j.dest_path.as_str()).collect::<Vec<_>>(), ["/b/file.zip"]);
+        assert!(!compare_engine::apply::is_staging("/b/.x.txt.ufop-compare-notahex!"));
+        assert!(!compare_engine::apply::is_staging("/b/x.txt.ufop-compare-0a1b2c3d"), "not hidden");
+        assert!(compare_engine::apply::is_staging("C:\\b\\.x.ufop-compare-0A1B2C3D"));
+    }
 
     /// The stored rclone settings become the ones every rclone call uses.
     #[tokio::test]

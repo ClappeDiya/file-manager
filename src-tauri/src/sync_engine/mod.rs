@@ -17,7 +17,7 @@ pub mod scheduler;
 pub mod watcher;
 
 // The engine itself lives in `ufop-core` (shared with the CLI).
-pub use ufop_core::sync::{conflict, copier, executor, planner, robocopy, rollback, winattr};
+pub use ufop_core::sync::{compare, conflict, copier, executor, planner, robocopy, rollback, winattr};
 
 use crate::core::error::AppError;
 use crate::core::traits::{BoxFuture, SyncOperations};

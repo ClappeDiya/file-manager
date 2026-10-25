@@ -33,6 +33,8 @@ import { CloudScopeFields, type CloudExtras, type OAuthSettings } from "@/compon
 import { CONNECTIONS_CHANGED_EVENT, OAUTH_PROTOCOLS, googleDownloadName, isSignedIn, signOut } from "@/lib/oauth";
 import { useUIStore } from "@/stores/ui-store";
 import { useRcloneUi } from "@/stores/rclone-ui-store";
+import { useCompareStore } from "@/stores/compare-store";
+import { useFileManagerStore } from "@/stores/file-manager-store";
 import { RcloneRemoteManager } from "@/components/rclone/rclone-remote-manager";
 import { CryptBanner, CryptNamesDialog } from "@/components/rclone/rclone-crypt";
 import { RCLONE_REMOTES_CHANGED_EVENT, rcloneCryptInfo, type RcloneCryptInfo } from "@/lib/rclone";
@@ -2778,6 +2780,11 @@ export function ConnectionPanel() {
               >
                 New Folder
               </button>
+              <CompareWithMenu
+                protocol={connectedProtocol}
+                connectionId={connArg}
+                remotePath={remotePath}
+              />
             </div>
           </div>
 
@@ -2987,3 +2994,63 @@ export function ConnectionPanel() {
 }
 
 export default ConnectionPanel;
+
+/**
+ * "Compare with…" for the folder being browsed: compares a local folder
+ * (a pane's, or one picked) on the left with this remote folder on the
+ * right, in the folder compare window.
+ */
+function CompareWithMenu({ protocol, connectionId, remotePath }: { protocol: string | null; connectionId: string | null; remotePath: string }) {
+  const [open, setOpen] = useState(false);
+  const leftPane = useFileManagerStore((s) => s.getActiveTab(0)?.path);
+  const rightPane = useFileManagerStore((s) => s.getActiveTab(1)?.path);
+  const panes = [leftPane, rightPane];
+  if (!protocol) return null;
+  const compare = (local: string) => {
+    setOpen(false);
+    useCompareStore.getState().open(
+      { type: "local", path: local },
+      { type: "remote", connection_id: connectionId, protocol, path: remotePath },
+    );
+  };
+  const localPanes = panes
+    .map((p, i) => ({ path: p, label: i === 0 ? "Left pane" : "Right pane" }))
+    .filter((p): p is { path: string; label: string } => !!p.path && !p.path.includes("://"));
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className="text-xs px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700"
+        data-testid="remote-compare-with"
+      >
+        Compare with…
+      </button>
+      {open && (
+        <div role="menu" className="absolute right-0 top-full z-50 mt-1 w-64 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 shadow-lg py-1">
+          {localPanes.map((p) => (
+            <button key={p.label} type="button" role="menuitem" onClick={() => compare(p.path)} className="block w-full truncate px-3 py-1 text-left text-xs hover:bg-gray-100 dark:hover:bg-gray-800" title={p.path} data-testid={`remote-compare-${p.label === "Left pane" ? "left" : "right"}-pane`}>
+              {p.label}: {p.path}
+            </button>
+          ))}
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              void pickFolder(`Compare ${remotePath} with…`).then((dir) => {
+                if (dir) compare(dir);
+              });
+            }}
+            className="block w-full px-3 py-1 text-left text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
+            data-testid="remote-compare-pick"
+          >
+            Choose a local folder…
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}

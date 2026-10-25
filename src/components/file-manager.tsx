@@ -120,6 +120,8 @@ import { PromptDialogHost } from "./prompt-dialog-host";
 import { promptText, confirmText } from "@/lib/prompt-dialog";
 import { usePathJumpStore } from "@/stores/path-jump-store";
 import { SafetyInterlockDialog } from "./safety-interlock-dialog";
+import { FolderCompareDialog } from "./folder-compare-dialog";
+import { useCompareStore } from "@/stores/compare-store";
 import { EnginePulseIndicator } from "./engine-pulse-indicator";
 import { errorText } from "@/lib/error-text";
 import { useDirectoryActivity, useRecentlyTouchedSet } from "@/hooks/use-directory-activity";
@@ -152,6 +154,7 @@ import {
   CalendarClock,
   MonitorSmartphone,
   HardDrive,
+  GitCompareArrows,
 } from "lucide-react";
 
 // Toolbar customization definition (#14)
@@ -171,6 +174,7 @@ const ALL_TOOLBAR_ITEMS = [
   { id: "operations", label: "Operations" },
   { id: "nearby", label: "Nearby Computers" },
   { id: "mounts", label: "Mounts" },
+  { id: "compare", label: "Compare Folders" },
 ];
 
 /** Peer transfers send local files only. */
@@ -2232,6 +2236,20 @@ export function FileManager() {
           }
           setBatchRenameFiles(paths);
         },
+        onComparePanes: () => useCompareStore.getState().openPanes(),
+        onCompareFolderWith: () => {
+          void (async () => {
+            const fm = useFileManagerStore.getState();
+            const left = fm.getActiveTab(fm.activePaneIndex)?.path;
+            if (!left || left.includes("://")) {
+              useCompareStore.getState().openPanes();
+              return;
+            }
+            const right = await pickFolder(`Compare ${left} with…`);
+            if (!right) return;
+            useCompareStore.getState().open({ type: "local", path: left }, { type: "local", path: right });
+          })();
+        },
         onQueueCopyTo: () => {
           // Feeds the transfer-engine queue from a real selection —
           // before this, `enqueue_transfer` had zero production
@@ -2500,6 +2518,18 @@ export function FileManager() {
               <MonitorSmartphone className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
+          {toolbarItems.includes("compare") && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => useCompareStore.getState().openPanes()}
+              aria-label="Compare folders"
+              title="Compare the left and right folders"
+              data-testid="toggle-compare"
+            >
+              <GitCompareArrows className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          )}
           {toolbarItems.includes("mounts") && (
             <Button
               variant={mountsOpen ? "secondary" : "ghost"}
@@ -2752,6 +2782,9 @@ export function FileManager() {
 
       {/* Safety Interlock — context-aware confirmation for anomalous ops */}
       <SafetyInterlockDialog />
+
+      {/* Folder compare window (Compare panes / Compare with…) */}
+      <FolderCompareDialog />
 
       {/* Transfer queue dock — the real engine queue (pause / resume /
           cancel / retry / throttle). Was an orphaned component. */}

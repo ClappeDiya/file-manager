@@ -6,7 +6,6 @@
 use super::{Connector, FolderSize};
 use crate::core::error::AppError;
 use std::sync::Arc;
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 /// Listings in flight at once while walking.
@@ -36,37 +35,21 @@ where
     F: std::future::Future<Output = Result<Vec<crate::core::types::FileEntry>, AppError>> + Send + 'static,
 {
     let mut total = FolderSize { complete: true, folders: Some(0), ..Default::default() };
-    let mut pending: Vec<String> = vec![root.to_string()];
-    let mut running: JoinSet<Result<Vec<crate::core::types::FileEntry>, AppError>> = JoinSet::new();
-    let limit = concurrency.max(1);
-    loop {
-        while running.len() < limit {
-            let Some(dir) = pending.pop() else { break };
-            running.spawn(list(dir));
-        }
-        if running.is_empty() {
-            break;
-        }
-        let next = tokio::select! {
-            r = running.join_next() => r,
-            _ = cancel.cancelled() => {
-                running.abort_all();
-                total.complete = false;
-                return Ok(total);
-            }
-        };
-        let Some(joined) = next else { break };
-        let entries = joined.map_err(|e| AppError::internal(format!("Folder size task failed: {e}")))??;
-        for e in entries {
+    let complete = super::walk::walk_tree(list, root.to_string(), concurrency, &cancel, |_dir, listing| {
+        let mut dirs = Vec::new();
+        for e in listing? {
             if e.is_dir {
                 *total.folders.get_or_insert(0) += 1;
-                pending.push(e.path);
+                dirs.push(e.path);
             } else {
                 total.files += 1;
                 total.bytes += e.size;
             }
         }
-    }
+        Ok(dirs)
+    })
+    .await?;
+    total.complete = complete;
     Ok(total)
 }
 
