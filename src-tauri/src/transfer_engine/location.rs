@@ -6,8 +6,8 @@
 //! Copies and moves between any two locations run as transfer-queue jobs:
 //!
 //! - this computer → connection: the connector uploads the file;
-//! - connection → this computer: it downloads to a hidden sibling, renamed
-//!   into place when complete;
+//! - connection → this computer: it downloads to a hidden sibling, given
+//!   the final name when complete (never over a file saved meanwhile);
 //! - connection → connection: a server-side copy when both ends are the same
 //!   connection and the connector has one, else (or when that copy fails,
 //!   e.g. an S3 object over CopyObject's 5 GB) download + upload through a
@@ -23,7 +23,8 @@
 //! first). A move is copy jobs plus a [`MoveGroup`]: each source file is
 //! deleted once its copy completed, and the emptied source folders once every
 //! job of the group did. Existing destinations are never overwritten: the
-//! top-level names get the keep-both `(copy)` naming, and a job fails rather
+//! top-level names get the keep-both `(copy)` naming (names compared
+//! ignoring case, as many providers match them), and a job fails rather
 //! than replace a file that appeared meanwhile.
 
 use super::JobControl;
@@ -249,11 +250,27 @@ async fn dest_name(entry: &FileEntry, source: &Location, dest: &Location, resolv
     }
 }
 
+/// The names `listing` takes, lowercased: many providers match names
+/// ignoring case (Dropbox, SFTP/FTP servers on Windows, this computer on
+/// Windows and macOS) and write or rename over a name that differs only by
+/// case, so a name is free only when no listed name matches it ignoring case.
+pub fn taken_names(listing: impl IntoIterator<Item = FileEntry>) -> HashSet<String> {
+    listing.into_iter().map(|e| e.name.to_lowercase()).collect()
+}
+
+/// `wanted`, or its first keep-both `(copy)` name free in `taken` (see
+/// [`taken_names`]); the name chosen is added to `taken`.
+pub fn free_name(wanted: &str, taken: &mut HashSet<String>) -> Result<String, AppError> {
+    let name = if taken.contains(&wanted.to_lowercase()) { crate::commands::file_ops_commands::next_copy_name(wanted, |n| taken.contains(&n.to_lowercase()))? } else { wanted.to_string() };
+    taken.insert(name.to_lowercase());
+    Ok(name)
+}
+
 /// Expand `items` (copied or moved into `dest_dir`) into folders and files.
-/// Top-level names already present in `dest_dir` get keep-both `(copy)`
-/// names, so nothing at the destination is ever replaced.
+/// Top-level names already present in `dest_dir` (ignoring case) get
+/// keep-both `(copy)` names, so nothing at the destination is ever replaced.
 pub async fn plan_transfer(items: &[LocationItem], dest_dir: &Location, resolver: &dyn RemoteResolver) -> Result<TransferPlan, AppError> {
-    let mut taken: HashSet<String> = list(dest_dir, resolver).await?.into_iter().map(|e| e.name).collect();
+    let mut taken = taken_names(list(dest_dir, resolver).await?);
     let mut plan = TransferPlan::default();
     for item in items {
         let source = Location::parse(&item.path)?;
@@ -270,8 +287,7 @@ pub async fn plan_transfer(items: &[LocationItem], dest_dir: &Location, resolver
             permissions: None,
         };
         let (wanted, converted) = dest_name(&entry, &source, dest_dir, resolver).await?;
-        let name = if taken.contains(&wanted) { crate::commands::file_ops_commands::next_copy_name(&wanted, |n| taken.contains(n))? } else { wanted };
-        taken.insert(name.clone());
+        let name = free_name(&wanted, &mut taken)?;
         let dest = dest_dir.join(&name);
         if item.is_dir {
             if dest_dir.same_root(&source) && is_within(&source, dest_dir) {
@@ -400,9 +416,10 @@ pub async fn rename_target_taken(conn: &dyn Connector, from: &str, to: &str) -> 
     Ok(listing.iter().any(|e| (at_path(e, to) || e.name.to_lowercase() == name) && !at_path(e, from)))
 }
 
-/// Whether listed `entry` is the item at `path`, or carries its name.
+/// Whether listed `entry` is the item at `path`, or carries its name
+/// (ignoring case, as [`taken_names`]).
 fn names(entry: &FileEntry, path: &str) -> bool {
-    at_path(entry, path) || entry.name == last_name(path)
+    at_path(entry, path) || entry.name.to_lowercase() == last_name(path).to_lowercase()
 }
 
 /// The last segment of a connector path.
@@ -412,7 +429,7 @@ fn last_name(path: &str) -> &str {
 
 /// Whether listed `entry` is at connector path `path` (OneDrive lists
 /// `/drive/root:/a` for `/a`).
-fn at_path(entry: &FileEntry, path: &str) -> bool {
+pub fn at_path(entry: &FileEntry, path: &str) -> bool {
     entry.path == path || same_remote_folder(&entry.path, path)
 }
 
@@ -433,7 +450,8 @@ pub async fn transfer_file(job_id: Uuid, source: &Location, dest: &Location, res
 }
 
 /// [`transfer_file`], stopped as soon as `control` is cancelled or paused:
-/// `Ok(None)`, with what it had written removed.
+/// `Ok(None)`, with what it had written removed. A server-side copy is
+/// waited for first (the server completes it anyway), then removed.
 pub async fn transfer_file_until(job_id: Uuid, source: &Location, dest: &Location, resolver: &dyn RemoteResolver, control: &JobControl) -> Result<Option<u64>, AppError> {
     match (source, dest) {
         (Location::Local(l), Location::Remote { connection_id, path }) => {
@@ -449,10 +467,19 @@ pub async fn transfer_file_until(job_id: Uuid, source: &Location, dest: &Locatio
             let (src, dst) = (resolver.connector(*a).await?, resolver.connector(*b).await?);
             let before = refuse_existing_remote(dst.as_ref(), to).await?;
             if a == b {
-                match write_remote(control, dst.as_ref(), to, &before, src.server_copy(from, to)).await {
-                    Ok(Some(true)) => return Ok(Some(0)),
-                    Ok(Some(false)) => {}
-                    Ok(None) => return Ok(None),
+                // Not raced against a pause or cancel: the server finishes a
+                // copy it accepted even when nobody waits for the answer, so
+                // it is waited for and then its result removed, and a
+                // resumed job starts over instead of finding it there.
+                let copied = src.server_copy(from, to).await;
+                let stopped = control.is_cancelled() || control.is_paused();
+                if stopped || copied.is_err() {
+                    remove_partial(dst.as_ref(), to, &before).await;
+                }
+                match copied {
+                    _ if stopped => return Ok(None),
+                    Ok(true) => return Ok(Some(0)),
+                    Ok(false) => {}
                     // Not possible for this file (S3 CopyObject stops at
                     // 5 GB; some WebDAV servers refuse COPY): relay it.
                     Err(e) => {
@@ -554,11 +581,24 @@ async fn download_into_place(control: &JobControl, conn: &dyn Connector, remote:
             return other;
         }
     };
-    if let Err(e) = tokio::fs::rename(&staging, local).await {
-        let _ = tokio::fs::remove_file(&staging).await;
-        return Err(AppError::file_op(format!("Downloaded, but could not move it into place as {local}: {e}"), "Check you may write to the destination folder."));
+    let placed = place_without_replacing(&staging, local).await;
+    let _ = tokio::fs::remove_file(&staging).await;
+    placed.map(|()| Some(bytes))
+}
+
+/// Give the finished `staging` file its final name `local`, failing if a
+/// file of that name appeared since the download started (a rename would
+/// replace it): a hard link, which never replaces, then the staging name
+/// is dropped by the caller. Where links are not supported (FAT, some
+/// network shares) `local` is re-checked right before a rename.
+async fn place_without_replacing(staging: &str, local: &str) -> Result<(), AppError> {
+    let appeared = || AppError::file_op(format!("{local} appeared during the download; it was not overwritten."), "Rename or remove it, then retry the transfer.");
+    match tokio::fs::hard_link(staging, local).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(appeared()),
+        Err(_) if tokio::fs::symlink_metadata(local).await.is_ok() => Err(appeared()),
+        Err(_) => tokio::fs::rename(staging, local).await.map_err(|e| AppError::file_op(format!("Downloaded, but could not move it into place as {local}: {e}"), "Check you may write to the destination folder.")),
     }
-    Ok(Some(bytes))
 }
 
 /// Where relayed files are held: this user's private temporary folder
@@ -1053,5 +1093,137 @@ pub(crate) mod tests {
         assert!(folder.files.iter().any(|f| f.dest == format!("conn://{b}/in/r/Plan.docx") && f.converted), "{folder:?}");
         let within = plan_transfer(&[plan_item], &Location::Remote { connection_id: a, path: "/".into() }, &resolver).await.unwrap();
         assert_eq!((within.files[0].dest.as_str(), within.files[0].converted), (format!("conn://{a}/Plan").as_str(), false));
+    }
+
+    /// Resolves connection ids to any connector.
+    pub(crate) struct DynResolver(pub HashMap<Uuid, Arc<dyn Connector>>);
+
+    impl RemoteResolver for DynResolver {
+        fn connector(&self, id: Uuid) -> BoxFuture<'_, Result<Arc<dyn Connector>, AppError>> {
+            let c = self.0.get(&id).cloned();
+            Box::pin(async move { c.ok_or_else(|| AppError::not_found("no such connection")) })
+        }
+    }
+
+    /// Regression: "never overwrite" compared names exactly, but Dropbox
+    /// (uploads with mode=overwrite) and case-insensitive SFTP/FTP servers
+    /// treat `A.txt` and `a.txt` as one file, so copying `A.txt` into a
+    /// folder holding `a.txt` replaced it. Names are taken ignoring case.
+    #[tokio::test]
+    async fn destination_names_are_taken_ignoring_case() {
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector::with(&[("/d/a.txt", "old")], &["/d"]));
+        let resolver = MemResolver(HashMap::from([(id, conn.clone())]));
+        let local = tempfile::tempdir().unwrap();
+        let upper = local.path().join("A.txt");
+        std::fs::write(&upper, "new").unwrap();
+        let plan = plan_transfer(&[item(upper.to_string_lossy().into(), "A.txt", false, 3)], &Location::Remote { connection_id: id, path: "/d".into() }, &resolver).await.unwrap();
+        assert_eq!(plan.files[0].dest, format!("conn://{id}/d/A (copy).txt"), "a keep-both name");
+        // A direct write onto the other-case name is refused.
+        let err = transfer_file(Uuid::new_v4(), &Location::Local(upper.to_string_lossy().into()), &Location::Remote { connection_id: id, path: "/d/A.txt".into() }, &resolver).await.unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert!(remote_exists(conn.as_ref(), "/d/A.TXT").await.unwrap());
+        assert_eq!(conn.file("/d/a.txt").as_deref(), Some("old"));
+        assert!(conn.file("/d/A.txt").is_none());
+    }
+
+    /// A server-side copy the server completes even when nobody waits for
+    /// its answer any more (as S3, Drive, WebDAV and Dropbox do).
+    struct LateServerCopy(Arc<MemConnector>);
+
+    impl Connector for LateServerCopy {
+        fn connect(&self, _: &crate::core::types::ConnectionProfile) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn disconnect(&self) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn list_remote(&self, path: &str) -> Fut<'_, Vec<FileEntry>> {
+            self.0.list_remote(path)
+        }
+        fn remove(&self, remote: &str, is_dir: bool) -> Fut<'_, ()> {
+            self.0.remove(remote, is_dir)
+        }
+        fn server_copy(&self, from: &str, to: &str) -> Fut<'_, bool> {
+            let (inner, f, t) = (self.0.clone(), from.to_string(), to.to_string());
+            let done = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                let data = inner.files.lock().unwrap().get(&f).cloned().unwrap_or_default();
+                inner.files.lock().unwrap().insert(t, data);
+            });
+            Box::pin(async move {
+                done.await.map_err(|e| AppError::internal(e.to_string()))?;
+                Ok(true)
+            })
+        }
+    }
+
+    /// Regression: pausing a server-side copy dropped the request and
+    /// cleaned up at once; the server then finished the copy anyway, so the
+    /// resumed job was refused ("already exists"). The copy is waited for
+    /// and its result removed, so a resumed job starts over.
+    #[tokio::test]
+    async fn a_stopped_server_copy_is_waited_for_and_removed() {
+        let id = Uuid::new_v4();
+        let mem = Arc::new(MemConnector::with(&[("/r/a.txt", "a")], &["/r", "/o"]));
+        let resolver = DynResolver(HashMap::from([(id, Arc::new(LateServerCopy(mem.clone())) as Arc<dyn Connector>)]));
+        let r = |p: &str| Location::Remote { connection_id: id, path: p.into() };
+        let control = Arc::new(JobControl::default());
+        let pauser = control.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            pauser.pause();
+        });
+        assert_eq!(transfer_file_until(Uuid::new_v4(), &r("/r/a.txt"), &r("/o/a.txt"), &resolver, &control).await.unwrap(), None);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(mem.file("/o/a.txt").is_none(), "nothing of the stopped copy is left");
+        control.unpause();
+        assert_eq!(transfer_file_until(Uuid::new_v4(), &r("/r/a.txt"), &r("/o/a.txt"), &resolver, &control).await.unwrap(), Some(0), "the resumed copy is not refused");
+        assert_eq!(mem.file("/o/a.txt").as_deref(), Some("a"));
+    }
+
+    /// A download during which a file of the destination's name appears
+    /// (saved by the user or a sync tool).
+    struct AppearingDuringDownload(std::path::PathBuf);
+
+    impl Connector for AppearingDuringDownload {
+        fn connect(&self, _: &crate::core::types::ConnectionProfile) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn disconnect(&self) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn list_remote(&self, _: &str) -> Fut<'_, Vec<FileEntry>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn download(&self, _: &str, local: &str) -> Fut<'_, u64> {
+            let (local, appear) = (local.to_string(), self.0.clone());
+            Box::pin(async move {
+                std::fs::write(&local, "downloaded").map_err(|e| AppError::file_op(e.to_string(), ""))?;
+                std::fs::write(&appear, "saved meanwhile").map_err(|e| AppError::file_op(e.to_string(), ""))?;
+                Ok(10)
+            })
+        }
+    }
+
+    /// Regression: the downloaded file was renamed into place, which
+    /// replaces a file saved at the destination during the download.
+    #[tokio::test]
+    async fn a_file_saved_during_a_download_is_not_replaced() {
+        let id = Uuid::new_v4();
+        let local = tempfile::tempdir().unwrap();
+        let dest = local.path().join("a.txt");
+        let resolver = DynResolver(HashMap::from([(id, Arc::new(AppearingDuringDownload(dest.clone())) as Arc<dyn Connector>)]));
+        let dest_str = dest.to_string_lossy().to_string();
+        let err = transfer_file(Uuid::new_v4(), &Location::Remote { connection_id: id, path: "/a.txt".into() }, &Location::Local(dest_str.clone()), &resolver).await.unwrap_err();
+        assert!(err.to_string().contains("not overwritten"), "{err}");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "saved meanwhile");
+        assert!(!std::path::Path::new(&local_staging_path(&dest_str)).exists(), "the staging file is removed");
     }
 }

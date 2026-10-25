@@ -11,10 +11,12 @@ import { clearRemoteNames, remoteName } from "@/lib/location";
 import {
   connectionQuota,
   dragDropMode,
+  isRunnableName,
   listDirectory,
   localCopyOf,
   makeDirectory,
   measureLocations,
+  movableInto,
   needsLocationTransfer,
   removeEntries,
   renameEntry,
@@ -144,5 +146,27 @@ describe("location provider routing", () => {
     expect(invoke).toHaveBeenCalledWith("connector_folder_size", expect.objectContaining({ protocol: "google_drive", path: "/f1", connectionId: ID }));
     // 120 local + 300 in the remote folder + 1 remote file (3 bytes).
     expect(out).toEqual({ files: 421, bytes: 14003 });
+  });
+});
+
+describe("moves and opening connection files", () => {
+  it("a move skips what is already in the destination, however the folder is spelled", () => {
+    // Local: by parent folder.
+    expect(movableInto(["/home/a.txt", "/other/b.txt"], "/home", [])).toEqual(["/other/b.txt"]);
+    expect(movableInto(["/a.txt"], "/", [])).toEqual([]);
+    // OneDrive's Graph spelling of the root.
+    expect(movableInto([`conn://${ID}/drive/root:/a.txt`], `conn://${ID}/`, [])).toEqual([]);
+    // A Google shared-drive root lists `/shared-drives/<id>/…` in a pane at `/`.
+    const listed = [entry(`conn://${ID}/shared-drives/D/x9`, "a.txt")];
+    expect(movableInto([`conn://${ID}/shared-drives/D/x9`, `conn://${ID}/f1/y`], `conn://${ID}/`, listed)).toEqual([`conn://${ID}/f1/y`]);
+  });
+
+  it("knows which file names run programs", () => {
+    for (const n of ["setup.EXE", "x.bat", "a.cmd", "s.ps1", "l.lnk", "app.desktop", "run.sh", "i.msi", "v.vbs", "t.jar", "a.AppImage"]) {
+      expect(isRunnableName(n), n).toBe(true);
+    }
+    for (const n of ["report.pdf", "notes.odt", "photo.jpg", "Makefile", "exe", ".bashrc"]) {
+      expect(isRunnableName(n), n).toBe(false);
+    }
   });
 });

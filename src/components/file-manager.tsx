@@ -14,13 +14,15 @@ import { useTerminalStore } from "@/stores/terminal-store";
 import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { loadSmartDestinations, fileExtension, type SmartDestination } from "@/hooks/use-smart-destinations";
 import { assessBeforeExecute, confirmIntent, measureSelection, FS_INTENT_KIND } from "@/lib/safety";
-import { formatAddress, isRemotePath, joinLocation, locationConnectionId, parentLocation, remoteLocation, sameFolder } from "@/lib/location";
+import { formatAddress, isRemotePath, joinLocation, locationConnectionId, parentLocation, remoteLocation } from "@/lib/location";
 import {
   connectionQuota,
   dragDropMode,
+  isRunnableName,
   listDirectory,
   localCopyOf,
   makeDirectory,
+  movableInto,
   needsLocationTransfer,
   remoteFolderSize,
   measureLocations,
@@ -3977,6 +3979,18 @@ function FilePane({
   const openRemoteFile = useCallback(async (entry: FileEntryData) => {
     if (!isTauriAvailable()) return;
     try {
+      // A program or script from a (possibly shared) connection would run
+      // with one click, with no mark of where it came from: ask first.
+      if (isRunnableName(entry.name)) {
+        const id = locationConnectionId(entry.path);
+        const from = (id && useConnectionsStore.getState().nameOf(id)) || "a connection";
+        const ok = await confirmText(
+          `${entry.name} came from ${from}. Opening it may run a program or script on this computer.\n\nOpen it only if you trust where it came from. To keep it, copy it to this computer first.`,
+          "Open",
+          true,
+        );
+        if (!ok) return;
+      }
       const local = await localCopyOf(entry);
       if (isPreviewablePath(entry.name) || isPlainTextPath(entry.name)) {
         useUIStore.getState().openPreviewFor(local);
@@ -4369,17 +4383,13 @@ function FilePane({
     if (paths.length === 0) return;
     if (mode === "cut") {
       // Moving an item into the folder it already lives in is a no-op.
-      const movable = paths.filter((p) =>
-        isRemotePath(p) || isRemotePath(currentPath)
-          ? !sameFolder(parentLocation(p), currentPath)
-          : p.slice(0, p.lastIndexOf("/")) !== (currentPath === "/" ? "" : currentPath),
-      );
+      const movable = movableInto(paths, currentPath, files);
       if (movable.length === 0) { clear(); return; }
       if (await transferPaths(movable, currentPath, "move")) clear();
     } else {
       await transferPaths(paths, currentPath, "copy");
     }
-  }, [currentPath, transferPaths]);
+  }, [currentPath, transferPaths, files]);
 
   /**
    * Where F5 / F6 send the selection: the other pane. From a connection
@@ -5283,6 +5293,8 @@ function FilePane({
             // Same location ⇒ move (Alt ⇒ copy); across connections or
             // between this computer and a connection ⇒ copy.
             const mode = dragDropMode(droppedPaths, currentPath, e.altKey);
+            // Dropped back where they are: nothing to move.
+            if (mode === "move" && movableInto(droppedPaths, currentPath, files).length === 0) return;
             if (useUIStore.getState().confirmDragDrop) {
               // Shown at once; assessed once the drop is measured (folders
               // counted through), so a large folder is not a "low risk" item.

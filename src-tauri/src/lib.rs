@@ -223,6 +223,14 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     if let Err(e) = ledger.prune(30).await {
         tracing::warn!("Operation ledger prune failed (non-fatal): {e}");
     }
+    // Copies of connection files opened or previewed: keep a week, 1 GB.
+    tokio::task::spawn_blocking(|| {
+        use commands::connector_commands::{preview_cache_root, prune_preview_cache, PREVIEW_CACHE_MAX_AGE, PREVIEW_CACHE_MAX_BYTES};
+        let removed = prune_preview_cache(&preview_cache_root(), PREVIEW_CACHE_MAX_AGE, PREVIEW_CACHE_MAX_BYTES);
+        if removed > 0 {
+            tracing::info!("Removed {removed} cached connection previews");
+        }
+    });
 
     // Initialize automation manager (Quickflows)
     let mut automation_mgr = AutomationManager::new();

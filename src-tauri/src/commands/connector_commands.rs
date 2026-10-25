@@ -534,10 +534,61 @@ fn find_listed(listing: Vec<FileEntry>, path: &str, name: &str) -> Option<FileEn
 /// Largest remote file `connector_fetch_preview` downloads.
 pub const PREVIEW_MAX_BYTES: u64 = 25 * 1024 * 1024;
 
+/// Preview copies kept at most this long ([`prune_preview_cache`] at startup).
+pub const PREVIEW_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
+
+/// Most the preview cache keeps on disk.
+pub const PREVIEW_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The preview cache folder (one subfolder per remote file).
+pub fn preview_cache_root() -> std::path::PathBuf {
+    crate::paths::cache_dir().join("remote-previews")
+}
+
+fn too_large(name: &str, limit: u64) -> AppError {
+    AppError::validation(format!("{name} is too large to open from the connection ({} MB at most)", limit / (1024 * 1024)))
+}
+
+/// Remove preview-cache folders older than `max_age`, then the oldest ones
+/// while the cache holds more than `max_bytes`; returns how many went.
+pub fn prune_preview_cache(root: &std::path::Path, max_age: std::time::Duration, max_bytes: u64) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else { return 0 };
+    // (last written, bytes, folder) of each cached file's folder.
+    let mut folders: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| {
+            let files: Vec<std::fs::Metadata> = std::fs::read_dir(e.path()).into_iter().flatten().flatten().filter_map(|f| f.metadata().ok()).filter(|m| m.is_file()).collect();
+            let newest = files.iter().filter_map(|m| m.modified().ok()).max().unwrap_or(std::time::UNIX_EPOCH);
+            (newest, files.iter().map(|m| m.len()).sum(), e.path())
+        })
+        .collect();
+    folders.sort_by_key(|(written, ..)| *written);
+    let now = std::time::SystemTime::now();
+    let mut total: u64 = folders.iter().map(|(_, bytes, _)| bytes).sum();
+    let mut removed = 0;
+    for (written, bytes, dir) in folders {
+        let expired = now.duration_since(written).is_ok_and(|age| age > max_age);
+        if !expired && total <= max_bytes {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                total = total.saturating_sub(bytes);
+                removed += 1;
+            }
+            Err(e) => tracing::warn!("Could not remove the cached preview {}: {e}", dir.display()),
+        }
+    }
+    removed
+}
+
 /// Download a remote file into the preview cache (the app cache folder) so
 /// the local previewers and the default app can open it; returns the local
 /// copy's path. `size` is the listed size: larger than `max_bytes`
-/// (default [`PREVIEW_MAX_BYTES`]) is refused before anything downloads.
+/// (default [`PREVIEW_MAX_BYTES`]) is refused before anything downloads,
+/// and a download growing past it (listed sizes can be 0 or missing) is
+/// stopped and removed.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn connector_fetch_preview(
@@ -552,10 +603,10 @@ pub async fn connector_fetch_preview(
 ) -> Result<String, AppError> {
     let limit = max_bytes.unwrap_or(PREVIEW_MAX_BYTES).min(PREVIEW_MAX_BYTES);
     if size.unwrap_or(0) > limit {
-        return Err(AppError::validation(format!("{name} is too large to open from the connection ({} MB at most)", limit / (1024 * 1024))));
+        return Err(too_large(&name, limit));
     }
     let connector = user_instance(&registry, &manager, &protocol, connection_id.as_deref()).await?;
-    fetch_preview(connector.as_ref(), &remote_path, &name, connection_id.as_deref().unwrap_or(&protocol)).await
+    fetch_preview(connector.as_ref(), &remote_path, &name, connection_id.as_deref().unwrap_or(&protocol), limit).await
 }
 
 /// The preview-cache file for `remote_path` of `scope` (a connection id):
@@ -567,10 +618,10 @@ pub(crate) fn preview_cache_path(scope: &str, remote_path: &str, name: &str) -> 
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (scope, remote_path).hash(&mut h);
     let safe: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '\0') { '_' } else { c }).collect();
-    crate::paths::cache_dir().join("remote-previews").join(format!("{:016x}", h.finish())).join(if safe.is_empty() || safe == "." || safe == ".." { "file".into() } else { safe })
+    preview_cache_root().join(format!("{:016x}", h.finish())).join(if safe.is_empty() || safe == "." || safe == ".." { "file".into() } else { safe })
 }
 
-pub(crate) async fn fetch_preview(connector: &dyn Connector, remote_path: &str, name: &str, scope: &str) -> Result<String, AppError> {
+pub(crate) async fn fetch_preview(connector: &dyn Connector, remote_path: &str, name: &str, scope: &str, limit: u64) -> Result<String, AppError> {
     let local = preview_cache_path(scope, remote_path, name);
     if let Some(dir) = local.parent() {
         tokio::fs::create_dir_all(dir).await.map_err(|e| AppError::file_op(format!("Cannot create the preview folder: {e}"), "Free some disk space and retry."))?;
@@ -579,9 +630,26 @@ pub(crate) async fn fetch_preview(connector: &dyn Connector, remote_path: &str, 
     let staging = crate::transfer_engine::location::local_staging_path(&local_str);
     // Never write through something already there (a leftover or a link).
     let _ = tokio::fs::remove_file(&staging).await;
-    if let Err(e) = connector.download(remote_path, &staging).await {
+    let over_limit = |m: std::io::Result<std::fs::Metadata>| m.is_ok_and(|m| m.len() > limit);
+    // Watch the copy grow: the connector downloads to a path, so it is
+    // stopped (dropped) once the file is over the cap.
+    let grown_past_limit = async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if over_limit(tokio::fs::metadata(&staging).await) {
+                return;
+            }
+        }
+    };
+    let downloaded = tokio::select! {
+        r = connector.download(remote_path, &staging) => r.map(Some),
+        () = grown_past_limit => Ok(None),
+    };
+    let fits = matches!(downloaded, Ok(Some(_))) && !over_limit(tokio::fs::metadata(&staging).await);
+    if !fits {
         let _ = tokio::fs::remove_file(&staging).await;
-        return Err(e);
+        downloaded?;
+        return Err(too_large(name, limit));
     }
     tokio::fs::rename(&staging, &local).await.map_err(|e| AppError::file_op(format!("Cannot place the preview copy: {e}"), "Retry."))?;
     Ok(local_str)
@@ -713,7 +781,7 @@ mod tests {
         assert!(stat_entry(&c, "/docs/b.txt").await.unwrap().is_none());
 
         let scope = uuid::Uuid::new_v4().to_string();
-        let local = fetch_preview(&c, "/docs/a.txt", "a.txt", &scope).await.unwrap();
+        let local = fetch_preview(&c, "/docs/a.txt", "a.txt", &scope, PREVIEW_MAX_BYTES).await.unwrap();
         assert_eq!(std::fs::read_to_string(&local).unwrap(), "hello");
         assert!(local.ends_with("a.txt"));
         // In this user's app cache, not the shared temporary folder.
@@ -726,7 +794,82 @@ mod tests {
             assert_eq!(p.file_name().and_then(|n| n.to_str()), Some("file"), "{dots:?} names a real file in the cache folder");
             assert_eq!(p.parent(), preview_cache_path(&scope, "/x", "a").parent());
         }
-        assert!(fetch_preview(&c, "/docs/missing.txt", "m.txt", &scope).await.is_err());
+        assert!(fetch_preview(&c, "/docs/missing.txt", "m.txt", &scope, PREVIEW_MAX_BYTES).await.is_err());
         let _ = std::fs::remove_dir_all(std::path::Path::new(&local).parent().unwrap());
+    }
+
+    /// A download that writes past any cap and never finishes on its own.
+    struct Endless;
+
+    type Fut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, AppError>> + Send + 'a>>;
+
+    impl Connector for Endless {
+        fn connect(&self, _: &crate::core::types::ConnectionProfile) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn disconnect(&self) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn list_remote(&self, _: &str) -> Fut<'_, Vec<FileEntry>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn download(&self, _: &str, local: &str) -> Fut<'_, u64> {
+            let local = local.to_string();
+            Box::pin(async move {
+                std::fs::write(&local, [0u8; 64]).map_err(|e| AppError::file_op(e.to_string(), ""))?;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok(64)
+            })
+        }
+    }
+
+    /// Regression: the preview cap held only for a listed size, so files
+    /// listed with size 0 (Google documents, some WebDAV/FTP servers,
+    /// items resolved without a listing) downloaded without limit. The cap
+    /// holds for what is actually downloaded.
+    #[tokio::test]
+    async fn previews_are_capped_while_downloading() {
+        use crate::transfer_engine::location::{local_staging_path, tests::MemConnector};
+        let big = "x".repeat(64);
+        let c = MemConnector::with(&[("/big.bin", big.as_str())], &[]);
+        let scope = uuid::Uuid::new_v4().to_string();
+        let local = preview_cache_path(&scope, "/big.bin", "big.bin");
+        let err = fetch_preview(&c, "/big.bin", "big.bin", &scope, 16).await.unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        assert!(!local.exists() && !std::path::Path::new(&local_staging_path(&local.to_string_lossy())).exists(), "nothing is kept");
+        // A download still running is stopped once it is over the cap.
+        let endless = preview_cache_path(&scope, "/x.bin", "x.bin");
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), fetch_preview(&Endless, "/x.bin", "x.bin", &scope, 16)).await.expect("stopped, not waited out");
+        assert!(stopped.unwrap_err().to_string().contains("too large"));
+        assert!(!std::path::Path::new(&local_staging_path(&endless.to_string_lossy())).exists());
+        for p in [local, endless] {
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
+    }
+
+    /// Regression: the preview cache was never pruned, so every remote file
+    /// opened stayed on disk for good.
+    #[test]
+    fn the_preview_cache_is_pruned_by_age_and_size() {
+        let root = tempfile::tempdir().unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+        let make = |dir: &str, bytes: usize, age: std::time::Duration| {
+            let d = root.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            let f = d.join("file.bin");
+            std::fs::write(&f, vec![0u8; bytes]).unwrap();
+            std::fs::File::options().write(true).open(&f).unwrap().set_modified(std::time::SystemTime::now() - age).unwrap();
+        };
+        make("old", 10, day * 10);
+        make("a", 40, day * 2);
+        make("b", 40, day);
+        make("c", 40, std::time::Duration::ZERO);
+        assert_eq!(prune_preview_cache(root.path(), day * 7, 100), 2);
+        let left: std::collections::BTreeSet<String> = std::fs::read_dir(root.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        assert_eq!(left, ["b", "c"].iter().map(|s| s.to_string()).collect(), "too old, then the oldest over the size cap");
+        assert_eq!(prune_preview_cache(&root.path().join("missing"), day, 0), 0, "no cache yet: nothing to do");
     }
 }

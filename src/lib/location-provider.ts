@@ -21,6 +21,7 @@ import {
   rememberRemoteNames,
   remoteLocation,
   remoteName,
+  sameFolder,
   sameLocationRoot,
 } from "@/lib/location";
 
@@ -235,6 +236,37 @@ export function needsLocationTransfer(sources: ReadonlyArray<string>, destDir: s
 export function dragDropMode(sources: ReadonlyArray<string>, destDir: string, altKey: boolean): TransferMode {
   if (sources.some((s) => !sameLocationRoot(s, destDir))) return "copy";
   return altKey ? "copy" : "move";
+}
+
+/**
+ * The paths a move into `destDir` really moves: not those already there,
+ * by their folder or by the destination's own listing `listed` (some
+ * connections spell a folder's items differently from the pane: a Google
+ * shared-drive root lists `/shared-drives/<id>/…` in a pane at `/`).
+ */
+export function movableInto(paths: ReadonlyArray<string>, destDir: string, listed: ReadonlyArray<Pick<FileEntryData, "path">>): string[] {
+  const here = new Set(listed.map((e) => e.path));
+  return paths.filter((p) => {
+    if (here.has(p)) return false;
+    if (isRemotePath(p) || isRemotePath(destDir)) return !sameFolder(parentLocation(p), destDir);
+    return p.slice(0, p.lastIndexOf("/")) !== (destDir === "/" ? "" : destDir);
+  });
+}
+
+/** Extensions of files that run programs or scripts when opened. */
+const RUNNABLE_EXTENSIONS = new Set([
+  "exe", "com", "scr", "pif", "msi", "msix", "msp", "appx", "appxbundle", "cpl", "dll", "sys",
+  "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta", "reg", "inf",
+  "lnk", "url", "scf", "jar", "jnlp", "application", "gadget",
+  "sh", "bash", "zsh", "csh", "ksh", "command", "tool", "desktop", "run", "bin", "appimage",
+  "app", "pkg", "dmg", "workflow", "scpt", "deb", "rpm", "py", "pyw", "pl", "rb", "php",
+]);
+
+/** Whether opening a file of this name may run a program or script. */
+export function isRunnableName(name: string): boolean {
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0) return false;
+  return RUNNABLE_EXTENSIONS.has(name.slice(dot + 1).toLowerCase());
 }
 
 /** Mirrors `FolderSize`. */

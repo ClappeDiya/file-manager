@@ -134,6 +134,18 @@ pub(crate) async fn location_transfer(
     dest_dir: &str,
     mode: crate::transfer_engine::location::TransferMode,
 ) -> Result<LocationTransferOutcome, AppError> {
+    location_transfer_with(manager, resolver, items, dest_dir, mode, &ufop_core::policy::active()).await
+}
+
+/// [`location_transfer`] checked against the filename rules `policy`.
+pub(crate) async fn location_transfer_with(
+    manager: &TransferManager,
+    resolver: &dyn crate::transfer_engine::location::RemoteResolver,
+    items: Vec<crate::transfer_engine::location::LocationItem>,
+    dest_dir: &str,
+    mode: crate::transfer_engine::location::TransferMode,
+    policy: &ufop_core::policy::PolicySet,
+) -> Result<LocationTransferOutcome, AppError> {
     use crate::transfer_engine::location::{self as loc, Location, TransferMode};
     let dest = Location::parse(dest_dir)?;
     let mut sources = Vec::with_capacity(items.len());
@@ -143,12 +155,6 @@ pub(crate) async fn location_transfer(
     if !dest.is_remote() && sources.iter().all(|s| !s.is_remote()) {
         return Err(AppError::validation("Both ends are on this computer: use the regular copy or move."));
     }
-    if let Location::Local(d) = &dest {
-        for item in &items {
-            super::policy_commands::enforce_path(&std::path::Path::new(d).join(&item.name))?;
-        }
-    }
-
     // A move inside one connection: rename on the server where possible.
     let mut moved = Vec::new();
     let mut rest = Vec::new();
@@ -169,8 +175,14 @@ pub(crate) async fn location_transfer(
             return Err(AppError::validation(format!("Cannot put {} inside itself", item.name)));
         }
         let conn = resolver.connector(*connection_id).await?;
-        let taken: std::collections::HashSet<String> = conn.list_remote(dest_path).await?.into_iter().map(|e| e.name).collect();
-        let name = if taken.contains(&item.name) { super::file_ops_commands::next_copy_name(&item.name, |n| taken.contains(n))? } else { item.name.clone() };
+        let listing = conn.list_remote(dest_path).await?;
+        // Already listed there, however the connector spells the folder
+        // (Google Drive lists a shared-drive root's items under
+        // `/shared-drives/<id>/`, which the pane calls `/`).
+        if listing.iter().any(|e| loc::at_path(e, from)) {
+            continue;
+        }
+        let name = loc::free_name(&item.name, &mut loc::taken_names(listing))?;
         let to = loc::join_remote(dest_path, &name);
         match conn.rename_entry(from, &to).await {
             // Where it is listed now (Google Drive: its id under the new folder).
@@ -184,6 +196,13 @@ pub(crate) async fn location_transfer(
     }
 
     let mut plan = loc::plan_transfer(&rest, &dest, resolver).await?;
+    // Every file landing on this computer (those inside folders, export and
+    // keep-both names too) is checked before anything is created or queued.
+    let local_targets: Vec<std::path::PathBuf> = plan.files.iter().filter_map(|f| match Location::parse(&f.dest) {
+        Ok(Location::Local(p)) => Some(std::path::PathBuf::from(p)),
+        _ => None,
+    }).collect();
+    super::policy_commands::enforce(policy.check_all(&local_targets))?;
     loc::create_dirs(&mut plan, resolver).await?;
     let mut jobs = Vec::with_capacity(plan.files.len());
     for f in &plan.files {
@@ -767,7 +786,7 @@ fn parse_uuid(s: &str) -> Result<Uuid, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transfer_engine::location::tests::{MemConnector, MemResolver};
+    use crate::transfer_engine::location::tests::{DynResolver, MemConnector, MemResolver};
     use crate::transfer_engine::location::{LocationItem, TransferMode};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -785,16 +804,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("jobs did not settle");
-    }
-
-    /// Resolves connection ids to any connector (a fake Google Drive here).
-    struct DynResolver(HashMap<Uuid, Arc<dyn crate::connectors::Connector>>);
-
-    impl crate::transfer_engine::location::RemoteResolver for DynResolver {
-        fn connector(&self, id: Uuid) -> crate::core::traits::BoxFuture<'_, Result<Arc<dyn crate::connectors::Connector>, AppError>> {
-            let c = self.0.get(&id).cloned();
-            Box::pin(async move { c.ok_or_else(|| AppError::not_found("no such connection")) })
-        }
     }
 
     fn drive_resolver(id: Uuid, drive: &crate::connectors::google_drive::fake_drive::FakeDrive) -> Arc<DynResolver> {
@@ -926,6 +935,91 @@ mod tests {
         // Two folders of this computer: not this command's job.
         let err = location_transfer(&mgr, resolver.as_ref(), vec![item(folder.to_string_lossy().into(), "up", true, 0)], local.path().to_str().unwrap(), TransferMode::Copy).await.unwrap_err();
         assert!(err.to_string().contains("Both ends"));
+    }
+
+    /// Regression: a same-connection move picked its name by exact match,
+    /// so `A.txt` moved into a folder holding `a.txt` kept its name and a
+    /// case-insensitive server (Dropbox, SFTP on Windows) replaced `a.txt`.
+    #[tokio::test]
+    async fn a_move_onto_a_name_differing_only_by_case_keeps_both() {
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector::with(&[("/s/A.txt", "new"), ("/d/a.txt", "old")], &["/s", "/d"]));
+        let resolver = Arc::new(MemResolver(HashMap::from([(id, conn.clone())])));
+        let mgr = TransferManager::new();
+        let out = location_transfer(&mgr, resolver.as_ref(), vec![item(format!("conn://{id}/s/A.txt"), "A.txt", false, 3)], &format!("conn://{id}/d"), TransferMode::Move).await.unwrap();
+        assert_eq!(out.moved, vec![MovedItem { from: format!("conn://{id}/s/A.txt"), to: format!("conn://{id}/d/A (copy).txt") }]);
+        assert_eq!((conn.file("/d/a.txt").as_deref(), conn.file("/d/A (copy).txt").as_deref()), (Some("old"), Some("new")));
+    }
+
+    /// Regression: a download onto this computer checked only the dropped
+    /// items' own names against the filename policy, so the files inside a
+    /// remote folder (and export / keep-both names) were never checked. Every
+    /// planned file is checked, before anything is created or queued.
+    #[tokio::test]
+    async fn downloads_check_every_planned_file_against_the_filename_policy() {
+        use ufop_core::policy::{FilenameRule, PolicySet};
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector::with(&[("/r/tools/x.exe", "mz"), ("/r/tools/ok.txt", "ok"), ("/r/Plan", "doc")], &["/r", "/r/tools"]));
+        conn.native.lock().unwrap().insert("/r/Plan".into());
+        let resolver = Arc::new(MemResolver(HashMap::from([(id, conn.clone())])));
+        let mgr = TransferManager::new();
+        let local = tempfile::tempdir().unwrap();
+        let blocking = PolicySet::new(vec![FilenameRule { blocked_extensions: vec!["exe".into(), "docx".into()], ..FilenameRule::new("t", "") }]).unwrap();
+        let dest = local.path().to_str().unwrap();
+        let err = location_transfer_with(&mgr, resolver.as_ref(), vec![item(format!("conn://{id}/r/tools"), "tools", true, 0)], dest, TransferMode::Copy, &blocking).await.unwrap_err();
+        assert!(err.to_string().contains("Blocked by filename policy"), "{err}");
+        assert!(mgr.list_jobs().await.unwrap().is_empty(), "no job was queued");
+        assert!(!local.path().join("tools").exists(), "no folder was created");
+        // A Google document's export name is checked too (`Plan` → `Plan.docx`).
+        let mut doc = item(format!("conn://{id}/r/Plan"), "Plan", false, 3);
+        doc.extension = Some("gdoc".into());
+        assert!(location_transfer_with(&mgr, resolver.as_ref(), vec![doc], dest, TransferMode::Copy, &blocking).await.is_err());
+        assert!(mgr.list_jobs().await.unwrap().is_empty());
+        // Without the rule the folder downloads.
+        let out = location_transfer_with(&mgr, resolver.as_ref(), vec![item(format!("conn://{id}/r/tools"), "tools", true, 0)], dest, TransferMode::Copy, &PolicySet::default()).await.unwrap();
+        assert_eq!(out.jobs.len(), 2);
+    }
+
+    /// A Google Drive connection whose root is a shared drive: the pane is at
+    /// `/`, but `/` lists its items as `/shared-drives/<id>/<item>`.
+    struct SharedDriveRoot(Arc<MemConnector>);
+
+    type Fut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, AppError>> + Send + 'a>>;
+
+    impl crate::connectors::Connector for SharedDriveRoot {
+        fn connect(&self, _: &crate::core::types::ConnectionProfile) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn disconnect(&self) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn list_remote(&self, path: &str) -> Fut<'_, Vec<crate::core::types::FileEntry>> {
+            self.0.list_remote(if path == "/" { "/shared-drives/D" } else { path })
+        }
+        fn rename_entry(&self, from: &str, to: &str) -> Fut<'_, ()> {
+            self.0.rename_entry(from, to)
+        }
+    }
+
+    /// Regression: in a Drive whose root is a shared drive (or Shared with
+    /// me), an item's listed parent `/shared-drives/D` is not spelled like
+    /// the pane's `/`, so dropping or cut+pasting it into the folder it is in
+    /// renamed it to `a (copy).txt` on the server. An item the destination
+    /// already lists is left alone.
+    #[tokio::test]
+    async fn moving_an_item_into_the_folder_that_lists_it_is_a_no_op() {
+        let id = Uuid::new_v4();
+        let mem = Arc::new(MemConnector::with(&[("/shared-drives/D/a.txt", "a")], &["/shared-drives/D", "/shared-drives/D/f"]));
+        let resolver = Arc::new(DynResolver(HashMap::from([(id, Arc::new(SharedDriveRoot(mem.clone())) as Arc<dyn crate::connectors::Connector>)])));
+        let mgr = TransferManager::new();
+        let items = vec![item(format!("conn://{id}/shared-drives/D/a.txt"), "a.txt", false, 1), item(format!("conn://{id}/shared-drives/D/f"), "f", true, 0)];
+        let out = location_transfer(&mgr, resolver.as_ref(), items, &format!("conn://{id}/"), TransferMode::Move).await.unwrap();
+        assert!(out.jobs.is_empty() && out.moved.is_empty(), "{out:?}");
+        assert!(mem.renames.lock().unwrap().is_empty(), "the server was never asked to rename");
+        assert_eq!(mem.file("/shared-drives/D/a.txt").as_deref(), Some("a"));
     }
 
     /// Moving a Google document out of its connection exports it (a lossy

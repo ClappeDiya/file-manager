@@ -346,5 +346,61 @@ describe("connections in the panes", () => {
     await waitFor(() => expect(calls("enqueue_location_transfer")).toContainEqual(expect.objectContaining({ mode: "move" })));
     await waitFor(() => expect(useUIStore.getState().structuredErrors.map((e) => e.what)).toContain("1 Google document was copied, not moved"));
   });
+
+  it("a drop or cut+paste back into the folder that lists the items moves nothing (Google shared-drive roots)", async () => {
+    // Regression: a Drive whose root is a shared drive lists `/` items as
+    // `/shared-drives/<id>/<item>`; dropping one back on its own pane (or
+    // Cut then Paste there) sent a move, and the item became "a (copy).txt".
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "connector_list_remote" && args?.path === "/" ? [entry("/shared-drives/D/x9", "a.txt")] : base(cmd, args),
+    );
+    setPanes(ROOT, "/home", true);
+    render(<FileManager />);
+    const row = await settled("a.txt");
+    const target = screen.getByTestId("pane-0").firstElementChild as HTMLElement;
+    const data = new Map<string, string>([["application/x-ufop-files", JSON.stringify([`conn://${ID}/shared-drives/D/x9`])]]);
+    fireEvent.drop(target, { dataTransfer: { getData: (t: string) => data.get(t) ?? "", types: [...data.keys()] } });
+    fireEvent.click(row);
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "x", ctrlKey: true });
+    });
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "v", ctrlKey: true });
+    });
+    await act(() => new Promise((r) => setTimeout(r, 100)));
+    expect(calls("enqueue_location_transfer")).toHaveLength(0);
+  });
+
+  it("asks before opening a program or script from a connection", async () => {
+    // Regression: a double-click downloaded `x.bat` from a (possibly
+    // shared) connection and ran it with no warning.
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "connector_list_remote" && args?.path === "/"
+        ? [entry("/x.bat", "x.bat"), entry("/scene.blend", "scene.blend")]
+        : cmd === "connector_fetch_preview"
+          ? `/cache/${args?.name}`
+          : base(cmd, args),
+    );
+    setPanes(ROOT, "/home", true);
+    render(<FileManager />);
+    fireEvent.doubleClick(await settled("x.bat"));
+    let dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("x.bat came from Work Drive");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await act(() => new Promise((r) => setTimeout(r, 50)));
+    expect(calls("connector_fetch_preview")).toHaveLength(0);
+    expect(calls("open_file_with_default")).toHaveLength(0);
+    // Confirmed: downloaded and opened.
+    fireEvent.doubleClick(screen.getByText("x.bat"));
+    dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Open" }));
+    await waitFor(() => expect(calls("open_file_with_default")).toEqual([{ path: "/cache/x.bat" }]));
+    // An ordinary document opens without asking.
+    fireEvent.doubleClick(screen.getByText("scene.blend"));
+    await waitFor(() => expect(calls("open_file_with_default")).toContainEqual({ path: "/cache/scene.blend" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
 });
 
