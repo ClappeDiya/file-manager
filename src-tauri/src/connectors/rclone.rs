@@ -167,6 +167,19 @@ impl RcloneConnector {
 type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
 
 impl Connector for RcloneConnector {
+    fn rename_entry(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { let r = self.remote().await?;
+            run(&["moveto".into(), target(&r, &from), target(&r, &to)], TRANSFER_TIMEOUT).await.map(|_| ()) })
+    }
+
+    fn server_copy(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { let r = self.remote().await?;
+            run(&["copyto".into(), target(&r, &from), target(&r, &to)], TRANSFER_TIMEOUT).await.map(|_| true) })
+    }
+
+
     fn connect(&self, profile: &ConnectionProfile) -> Fut<'_, ()> {
         let remote = profile.extras.rclone_remote.clone().filter(|r| !r.trim().is_empty()).unwrap_or_else(|| profile.host.clone());
         Box::pin(async move { self.connect_remote(&remote).await })

@@ -261,6 +261,18 @@ pub trait Connector: Send + Sync {
         Box::pin(async { Err(unsupported_op("create folder")) })
     }
 
+    /// Create a remote directory and return its path as this connector
+    /// lists it, which is where its contents go. Path-based connectors
+    /// return `remote_path` (the default); Google Drive addresses folders
+    /// by id, so it returns the parent's path plus the new folder's id.
+    fn make_directory_path(&self, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + '_>> {
+        let path = remote_path.to_string();
+        Box::pin(async move {
+            self.make_directory(&path).await?;
+            Ok(path)
+        })
+    }
+
     /// Delete a remote file or (empty) directory.
     fn remove(
         &self,
@@ -268,6 +280,53 @@ pub trait Connector: Send + Sync {
         _is_dir: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         Box::pin(async { Err(unsupported_op("delete")) })
+    }
+
+    /// Rename or move `from` to `to` on the server (both remote paths of
+    /// this connection). Connectors without a server-side rename keep the
+    /// default, which refuses; callers then copy and delete instead.
+    fn rename_entry(
+        &self,
+        _from: &str,
+        _to: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        Box::pin(async {
+            Err(AppError::Connection {
+                message: "Renaming is not supported for this connection type.".to_string(),
+                advice: "Copy the item under the new name, then delete the original.".to_string(),
+            })
+        })
+    }
+
+    /// Where the item at `from` is listed after `rename_entry(from, to)`:
+    /// `to` for path-based connectors (the default). Google Drive keeps the
+    /// item's id, so it is the new parent's path plus that id.
+    fn renamed_path(&self, _from: &str, to: &str) -> String {
+        to.to_string()
+    }
+
+    /// Copy the file `from` to `to` on the server without the bytes passing
+    /// through this machine. `Ok(false)` (the default): not supported here,
+    /// relay it (download + upload) instead.
+    fn server_copy(
+        &self,
+        _from: &str,
+        _to: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, AppError>> + Send + '_>> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// The local file name `entry` is saved as when downloaded (Google Drive
+    /// exports native documents and adds the format's extension).
+    fn download_name(&self, entry: &FileEntry) -> String {
+        entry.name.clone()
+    }
+
+    /// Whether downloading `entry` converts it (Google Drive exports native
+    /// documents) rather than copying its bytes. A pane move of such a file
+    /// out of its connection keeps the original.
+    fn converts_on_download(&self, _entry: &FileEntry) -> bool {
+        false
     }
 
     /// Storage quota of the connected account; `None` when the protocol
@@ -378,7 +437,9 @@ pub(crate) fn split_bucket_key(path: &str) -> Result<(String, String), AppError>
     }
 }
 
-/// Registry that maps protocols to connector implementations.
+/// Registry that maps protocols to connector implementations. Clones share
+/// the same connector instances.
+#[derive(Clone)]
 pub struct ConnectorRegistry {
     connectors: HashMap<String, Arc<dyn Connector>>,
 }

@@ -764,6 +764,8 @@ export function getDefaultCommands(actions: {
    *  SMB, FTP, Azure Blob, GCS, Dropbox, Box, OneDrive, iCloud
    *  Drive, Mega, pCloud, Nextcloud, OpenStack Swift, MinIO). */
   onOpenConnections?: () => void;
+  /** Turn the active pane's breadcrumb into the editable address field. */
+  onEditAddress?: () => void;
   /** Open the Connection Manager on its rclone remote manager. */
   onOpenRcloneRemotes?: () => void;
   /** Open Settings expanded and scrolled to its rclone section. */
@@ -1505,6 +1507,16 @@ export function getDefaultCommands(actions: {
         "manager",
         "new connection",
       ],
+    },
+    {
+      id: "edit-address",
+      label: "Go to Address\u2026",
+      description: "Type a folder path, conn://\u2026 or <connection name>:path in the active pane",
+      icon: <Globe className="h-4 w-4" />,
+      shortcut: `${cmd}L`,
+      category: "Navigation",
+      action: actions.onEditAddress || (() => {}),
+      keywords: ["address", "path", "go to", "location", "breadcrumb", "type path", "cloud", "connection"],
     },
     {
       id: "open-rclone-remotes",

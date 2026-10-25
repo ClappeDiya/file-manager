@@ -32,6 +32,8 @@ import { OAuthSignIn } from "@/components/oauth-sign-in";
 import { CloudScopeFields, type CloudExtras, type OAuthSettings } from "@/components/cloud-connection-fields";
 import { CONNECTIONS_CHANGED_EVENT, OAUTH_PROTOCOLS, googleDownloadName, isSignedIn, signOut } from "@/lib/oauth";
 import { useUIStore } from "@/stores/ui-store";
+import { useConnectionsStore } from "@/stores/connections-store";
+import { remoteLocation } from "@/lib/location";
 import { useRcloneUi } from "@/stores/rclone-ui-store";
 import { useCompareStore } from "@/stores/compare-store";
 import { useFileManagerStore } from "@/stores/file-manager-store";
@@ -1547,8 +1549,11 @@ function ConnectionItem({
   onSignIn,
   signedIn,
   onSignOut,
+  onOpenInPane,
 }: {
   connection: ConnectionProfile;
+  /** Open this connection in the active file pane. */
+  onOpenInPane?: (conn: ConnectionProfile) => void;
   onConnect: (id: string) => void;
   onMount: (conn: ConnectionProfile) => void;
   onTest: (id: string) => void;
@@ -1660,6 +1665,17 @@ function ConnectionItem({
             Sign out
           </button>
         )}
+        {onOpenInPane && (
+          <button
+            onClick={() => onOpenInPane(connection)}
+            className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+            type="button"
+            title="Browse this connection in the active pane"
+            aria-label={`Open ${connection.name} in pane`}
+          >
+            Open in pane
+          </button>
+        )}
         <button
           onClick={() => onTest(connection.id)}
           disabled={testing}
@@ -1706,7 +1722,12 @@ const openMountDialog = (conn: ConnectionProfile) => useMountsUi.getState().open
 
 // ── Main Connection Panel ──
 
-export function ConnectionPanel() {
+export function ConnectionPanel({
+  onOpenInPane,
+}: {
+  /** "Open in pane": show this connection folder (pane path) in the active pane. */
+  onOpenInPane?: (panePath: string, name: string) => void;
+} = {}) {
   const [connections, setConnections] = useState<ConnectionProfile[]>([]);
   const [groups, setGroups] = useState<ConnectionGroup[]>([]);
   const [protocols, setProtocols] = useState<ProtocolOption[]>(FALLBACK_PROTOCOLS);
@@ -1768,6 +1789,8 @@ export function ConnectionPanel() {
       ]);
       setConnections(conns);
       setGroups(grps);
+      // Panes, sidebar and pickers see saved / deleted connections at once.
+      if (useConnectionsStore.getState().loaded) void useConnectionsStore.getState().load();
     } catch (err) {
       console.error("Failed to load connections:", err);
     }
@@ -2176,7 +2199,7 @@ export function ConnectionPanel() {
 
   const handleUpload = useCallback(async () => {
     if (!connectedProtocol) return;
-    const files = await pickFiles("Select files to upload");
+    const files = await pickFiles("Select files to upload", useUIStore.getState().defaultUploadDir);
     if (files.length === 0) return;
     setBrowseError(null);
     let done = 0;
@@ -2202,7 +2225,7 @@ export function ConnectionPanel() {
 
   const handleDownload = useCallback(async (entry: RemoteFileEntry) => {
     if (!connectedProtocol) return;
-    const dir = await pickFolder(`Choose where to save ${entry.name}`);
+    const dir = await pickFolder(`Choose where to save ${entry.name}`, useUIStore.getState().defaultDownloadDir);
     if (!dir) return;
     setBrowseError(null);
     // A native Google file downloads as an export: give it the format's extension.
@@ -2386,6 +2409,7 @@ export function ConnectionPanel() {
     onSignIn: (c: ConnectionProfile) => setSignInFor(c),
     signedIn: signedIn[conn.id] ?? null,
     onSignOut: (c: ConnectionProfile) => void handleSignOut(c),
+    onOpenInPane: onOpenInPane ? (c: ConnectionProfile) => onOpenInPane(remoteLocation(c.id, c.remote_path || "/"), c.name) : undefined,
   });
 
   return (
@@ -2781,6 +2805,17 @@ export function ConnectionPanel() {
               >
                 Upload
               </button>
+              {onOpenInPane && connArg && (
+                <button
+                  onClick={() => onOpenInPane(remoteLocation(connArg, remotePath), connectedName ?? "Connection")}
+                  className="text-xs px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700"
+                  type="button"
+                  title="Show this folder in the active file pane"
+                  data-testid="remote-open-in-pane"
+                >
+                  Open in pane
+                </button>
+              )}
               <button
                 onClick={handleRemoteMkdir}
                 className="text-xs px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700"

@@ -51,6 +51,8 @@ export interface ContextMenuItem {
   icon?: React.ReactNode;
   shortcut?: string;
   disabled?: boolean;
+  /** Why it is disabled (shown as the item's tooltip). */
+  disabledReason?: string;
   danger?: boolean;
   separator?: boolean;
   advancedOnly?: boolean;
@@ -228,6 +230,8 @@ export function ContextMenu({ items, position, onClose }: ContextMenuProps) {
               index === focusedIndex && !item.disabled && "bg-[var(--color-hover-bg)]",
             )}
             disabled={item.disabled}
+            title={item.disabled ? item.disabledReason : undefined}
+            aria-description={item.disabled ? item.disabledReason : undefined}
             onClick={() => {
               if (!item.disabled) {
                 item.action?.();
@@ -267,6 +271,33 @@ function shortenFolderName(path: string): string {
   const tail = trimmed.slice(lastSlash + 1);
   return tail.length > 0 ? tail : trimmed;
 }
+
+/** Menu actions that only make sense for files on this computer. */
+const LOCAL_ONLY_ITEM_IDS = new Set([
+  "reveal-in-os",
+  "extract-here",
+  "edit-remote",
+  "open-with",
+  "open-in-editor",
+  "verify-integrity",
+  "copy-remote-path",
+  "copy-url",
+  "copy-relative-path",
+  "copy-to-many",
+  "duplicate",
+  "compress",
+  "send-to-computer",
+  "convert",
+  "show-history",
+  "show-folder-activity",
+  "new-file",
+  "set-permissions",
+  "create-symlink",
+  "copy-as-script",
+  "open-in-terminal",
+  "git-add",
+  "git-commit",
+]);
 
 export function getFileContextMenuItems(options: {
   hasSelection: boolean;
@@ -364,6 +395,12 @@ export function getFileContextMenuItems(options: {
   /** Handler invoked when the user clicks a Send-To entry. Receives
    *  the destination directory the user picked. */
   onSendTo?: (destDir: string) => void;
+  /** Create a share link for the item (connection folders whose provider has links). */
+  onShareLink?: () => void;
+  /** Set when the pane shows a connection folder: actions that only work
+   *  on this computer's files stay listed but disabled with this reason,
+   *  and "Move to Trash" reads "Delete" (servers have no local Trash). */
+  remoteReason?: string;
 }): ContextMenuItem[] {
   const items: ContextMenuItem[] = [];
   const isMac = typeof navigator !== "undefined" && navigator.platform.startsWith("Mac");
@@ -535,6 +572,14 @@ export function getFileContextMenuItems(options: {
         icon: <Copy className="h-3.5 w-3.5" />,
         shortcut: "F5",
         action: options.onCopyToOtherPane,
+      });
+    }
+    if (options.onShareLink) {
+      items.push({
+        id: "share-link",
+        label: "Share Link…",
+        icon: <Link className="h-3.5 w-3.5" />,
+        action: options.onShareLink,
       });
     }
     if (options.onCopyToMany) {
@@ -851,6 +896,18 @@ export function getFileContextMenuItems(options: {
     shortcut: `${cmdKey}R`,
     action: options.onRefresh,
   });
+
+  if (options.remoteReason) {
+    const reason = options.remoteReason;
+    for (const item of items) {
+      if (item.separator) continue;
+      if (LOCAL_ONLY_ITEM_IDS.has(item.id) || item.id.startsWith("gpg-") || item.id.startsWith("send-to-")) {
+        item.disabled = true;
+        item.disabledReason = reason;
+      }
+      if (item.id === "delete") item.label = "Delete";
+    }
+  }
 
   return items;
 }

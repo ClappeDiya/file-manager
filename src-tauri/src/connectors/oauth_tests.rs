@@ -82,6 +82,10 @@ async fn env() -> Env {
             "/content/files/upload" => json(j!({ "name": "x.txt", "path_display": "/in/x.txt", "size": 3 })),
             "/dbx/files/list_folder" => json(j!({ "entries": [{ ".tag": "file", "name": "a.txt", "path_display": "/a.txt", "size": 3 }], "cursor": "c", "has_more": false })),
             "/graph/me/drive" => json(j!({ "id": "d1", "owner": { "user": { "email": "cy@example.com" } }, "quota": { "total": 1000, "used": 10 } })),
+            "/dbx/files/move_v2" | "/dbx/files/copy_v2" => json(j!({ "metadata": { ".tag": "file", "name": "b.txt" } })),
+            "/graph/me/drive/root:/Archive" => json(j!({ "id": "p9", "name": "Archive", "folder": { "childCount": 0 } })),
+            "/graph/me/drive/root:/Docs/a%2Etxt" if r.method == "PATCH" => json(j!({ "id": "i2", "name": "b.txt" })),
+            p if p.starts_with("/drive/files/") && r.method == "PATCH" => json(j!({ "id": "x" })),
             "/graph/me/drive/root/children" => json(j!({ "value": [{ "id": "i1", "name": "Docs", "folder": { "childCount": 0 }, "parentReference": { "path": "/drive/root:" } }] })),
             _ => status(404, "no route"),
         }
@@ -451,4 +455,49 @@ async fn signing_out_another_connection_keeps_the_browsed_one() {
     sign_out(&e.mgr, &cloud, &pa.id.to_string()).await.unwrap();
     assert!(!db.is_connected());
     assert!(e.mgr.get_password(pa.id).await.unwrap().is_none());
+}
+
+/// Pane renames and moves within one cloud connection (`rename_entry`) and
+/// Dropbox's server-side copy (`server_copy`).
+#[tokio::test(flavor = "multi_thread")]
+async fn cloud_rename_move_and_server_copy() {
+    let e = env().await;
+    let (gd, db, od) = (e.gdrive(), e.dropbox(), e.onedrive());
+    let cloud = CloudConnectors { gdrive: &gd, dropbox: &db, onedrive: &od };
+    let grant = || OAuthGrant::parse(r#"{"access_token":"a1","refresh_token":"r1","client_id":"c","expires_at":"2999-01-01T00:00:00Z"}"#).unwrap();
+
+    // Google Drive: same folder = rename by id; another folder = move first.
+    let pg = e.saved(ConnectionProtocol::GoogleDrive).await;
+    finish_sign_in(&e.mgr, &cloud, pg.id, grant()).await.unwrap();
+    gd.rename_entry("/f1/f2", "/f1/renamed.txt").await.unwrap();
+    let patch = e.mock.requests("/drive/files/f2");
+    assert_eq!((patch.len(), patch[0].json()["name"].as_str()), (1, Some("renamed.txt")));
+    gd.rename_entry("/f1/f2", "/f9/renamed.txt").await.unwrap();
+    let patch = e.mock.requests("/drive/files/f2");
+    assert_eq!(patch.len(), 3, "a move PATCH, then the name");
+    assert_eq!((patch[1].query_param("addParents").as_deref(), patch[1].query_param("removeParents").as_deref()), (Some("f9"), Some("f1")));
+    // A native document downloads with its export extension.
+    let doc = crate::core::types::FileEntry { name: "Plan".into(), path: "/d1".into(), is_dir: false, is_symlink: false, size: 0, modified: None, created: None, is_hidden: false, extension: Some("gdoc".into()), permissions: None };
+    assert_eq!(gd.download_name(&doc), "Plan.docx");
+    assert_eq!(od.download_name(&doc), "Plan", "other providers keep the name");
+
+    // OneDrive: PATCH by path, with the new parent looked up by path.
+    let po = e.saved(ConnectionProtocol::OneDrive).await;
+    finish_sign_in(&e.mgr, &cloud, po.id, grant()).await.unwrap();
+    od.rename_entry("/drive/root:/Docs/a.txt", "/Archive/b.txt").await.unwrap();
+    let patch = e.mock.requests("/graph/me/drive/root:/Docs/a%2Etxt");
+    assert_eq!(patch[0].json(), j!({ "name": "b.txt", "parentReference": { "id": "p9" } }));
+    od.rename_entry("/Docs/a.txt", "/Docs/b.txt").await.unwrap();
+    assert_eq!(e.mock.requests("/graph/me/drive/root:/Docs/a%2Etxt")[1].json(), j!({ "name": "b.txt" }));
+    assert!(od.rename_entry("/Docs/a.txt", "/Docs/bad:name").await.is_err(), "OneDrive naming rules apply");
+
+    // Dropbox: move_v2 and copy_v2.
+    let pd = e.saved(ConnectionProtocol::Dropbox).await;
+    finish_sign_in(&e.mgr, &cloud, pd.id, grant()).await.unwrap();
+    db.rename_entry("/a.txt", "/in/b.txt").await.unwrap();
+    assert_eq!(e.mock.requests("/dbx/files/move_v2")[0].json()["to_path"], "/in/b.txt");
+    assert!(db.server_copy("/a.txt", "/in/c.txt").await.unwrap());
+    assert_eq!(e.mock.requests("/dbx/files/copy_v2")[0].json()["from_path"], "/a.txt");
+    // A connector without a server-side copy relays instead.
+    assert!(!super::nfs::NfsConnector::new().server_copy("/a", "/b").await.unwrap());
 }

@@ -30,6 +30,8 @@ import { useUIStore } from "@/stores/ui-store";
 import { errorText } from "@/lib/error-text";
 import { pickFolder } from "@/lib/folder-picker";
 import { HardDrive, FolderOpen, Plug } from "lucide-react";
+import { FolderField } from "@/components/remote-folder-picker";
+import { parseLocation, relativeToRoot, remoteLocation } from "@/lib/location";
 
 // ── Types (mirrors Rust mount_engine types) ──
 
@@ -269,14 +271,32 @@ function MountForm({
 
       <div>
         <label className="block text-xs font-medium mb-1" htmlFor="mount-subfolder">Subfolder (optional)</label>
-        <input
-          id="mount-subfolder"
-          type="text"
-          value={options.subfolder ?? ""}
-          onChange={(e) => setOptions({ ...options, subfolder: e.target.value === "" ? null : e.target.value })}
-          placeholder="e.g. photos/2024"
-          className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-        />
+        {selected ? (
+          <FolderField
+            value={options.subfolder ?? ""}
+            onChange={(v) => setOptions({ ...options, subfolder: v === "" ? null : v })}
+            placeholder="e.g. photos/2024"
+            testId="mount-subfolder"
+            inputClassName="flex-1 min-w-0 text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+            pickerTitle={`Subfolder of ${selected.name}`}
+            lockRoot={remoteLocation(selected.id, selected.remote_path || "/")}
+            toValue={(p) => relativeToRoot(selected.remote_path || "/", parseLocation(p).path)}
+            fromValue={(v) => {
+              const root = (selected.remote_path || "/").replace(/\/+$/, "");
+              return remoteLocation(selected.id, v ? `${root}/${v.replace(/^\/+/, "")}` : root || "/");
+            }}
+            inputId="mount-subfolder"
+          />
+        ) : (
+          <input
+            id="mount-subfolder"
+            type="text"
+            value={options.subfolder ?? ""}
+            onChange={(e) => setOptions({ ...options, subfolder: e.target.value === "" ? null : e.target.value })}
+            placeholder="e.g. photos/2024"
+            className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+          />
+        )}
         <p className="text-xs text-gray-400 mt-1">
           Mount only this folder of the connection{selected?.remote_path && selected.remote_path !== "/" ? ` (inside ${selected.remote_path})` : ""}.
         </p>

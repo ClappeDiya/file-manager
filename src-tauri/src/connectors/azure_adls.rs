@@ -161,6 +161,16 @@ impl AdlsGen2Connector {
 }
 
 impl Connector for AdlsGen2Connector {
+    fn rename_entry(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { let ((fs, a), (fs2, b)) = (az::split_root(&from), az::split_root(&to));
+            if fs.is_empty() || a.is_empty() || fs != fs2 || b.is_empty() {
+                return Err(AppError::validation("Rename within one file system: /filesystem/path"));
+            }
+            self.rename(&fs, &a, &b).await })
+    }
+
+
     fn connect(&self, profile: &ConnectionProfile) -> Fut<'_, ()> {
         self.connect_with_secret(profile, None)
     }

@@ -1,5 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { locationLabel } from "@/lib/location";
+import { useConnectionsStore } from "@/stores/connections-store";
 
 // ──────────────────────────────────────────────
 // Types
@@ -461,6 +463,12 @@ export interface FileManagerState {
 let _idCounter = 0;
 function genId(): string {
   return `id-${Date.now()}-${++_idCounter}`;
+}
+
+/** Tab label of a pane path: local paths as always; a connection folder's
+ *  listed name, or the connection's name at its root. */
+export function paneLabel(path: string): string {
+  return locationLabel(path, (id) => useConnectionsStore.getState().nameOf(id));
 }
 
 function getHomePath(): string {
@@ -1356,7 +1364,7 @@ export const useFileManagerStore = create<FileManagerState>()(
           if (idx <= 0) return s;
           const newIdx = idx - 1;
           const newPath = history[newIdx];
-          const newLabel = newPath === "/" ? "Root" : newPath.split("/").filter(Boolean).pop() || "Root";
+          const newLabel = paneLabel(newPath);
           pane.tabs = pane.tabs.map((t) =>
             t.id === tab.id ? { ...t, path: newPath, label: newLabel, historyIndex: newIdx } : t,
           );
@@ -1375,7 +1383,7 @@ export const useFileManagerStore = create<FileManagerState>()(
           if (idx >= history.length - 1) return s;
           const newIdx = idx + 1;
           const newPath = history[newIdx];
-          const newLabel = newPath === "/" ? "Root" : newPath.split("/").filter(Boolean).pop() || "Root";
+          const newLabel = paneLabel(newPath);
           pane.tabs = pane.tabs.map((t) =>
             t.id === tab.id ? { ...t, path: newPath, label: newLabel, historyIndex: newIdx } : t,
           );

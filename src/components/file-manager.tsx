@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  paneLabel,
   useFileManagerStore,
   type ViewMode,
 } from "@/stores/file-manager-store";
@@ -12,7 +13,35 @@ import { useSpacesStore } from "@/stores/spaces-store";
 import { useTerminalStore } from "@/stores/terminal-store";
 import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { loadSmartDestinations, fileExtension, type SmartDestination } from "@/hooks/use-smart-destinations";
-import { assessBeforeExecute, measureSelection, FS_INTENT_KIND } from "@/lib/safety";
+import { assessBeforeExecute, confirmIntent, measureSelection, FS_INTENT_KIND } from "@/lib/safety";
+import { formatAddress, isRemotePath, joinLocation, locationConnectionId, parentLocation, remoteLocation } from "@/lib/location";
+import {
+  connectionQuota,
+  dragDropMode,
+  isRunnableName,
+  listDirectory,
+  localCopyOf,
+  makeDirectory,
+  movableInto,
+  needsLocationTransfer,
+  remoteFolderSize,
+  measureLocations,
+  removeEntries,
+  renameEntry,
+  resolveItems,
+  statLocation,
+  transferItems,
+  connectorPath,
+  LOCAL_ONLY_REASON,
+  type LocationTransferOutcome,
+  type RemoteQuotaInfo,
+} from "@/lib/location-provider";
+import { useConnectionsStore } from "@/stores/connections-store";
+import { DragDropConfirm } from "./drag-drop-confirm";
+import { dropIntent, dropPreconfirmed, measuredDrop, type DropRequest } from "@/lib/drag-drop";
+import { formatQuota } from "@/lib/remote-quota";
+import { ShareLinkDialog } from "./share-link-dialog";
+import { SHAREABLE_PROTOCOLS } from "@/stores/share-store";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
 import { reportOperationFailure } from "@/lib/op-error-toast";
 import { OS_DROP_ATTR, useOsFileDrop } from "@/hooks/use-os-file-drop";
@@ -161,6 +190,7 @@ import {
   HardDrive,
   GitCompareArrows,
   ScrollText,
+  Globe,
 } from "lucide-react";
 
 // Toolbar customization definition (#14)
@@ -334,6 +364,24 @@ interface MigrationRunState {
   filesTransferred: number;
   folderBytes: Map<string, number>;
 }
+/** Asks a pane to open its address field (`detail.paneIndex`). */
+const EDIT_ADDRESS_EVENT = "ufop:edit-address";
+
+/** An action that works on this computer's files only, asked for a connection item. */
+function refuseRemote(what: string, userAction = "Copy the item to this computer first") {
+  useUIStore.getState().addStructuredError({
+    what: `${what} is not available in connection folders`,
+    why: LOCAL_ONLY_REASON,
+    appDid: `Did not run ${what}`,
+    userAction,
+  });
+}
+
+/** Batch Rename works on this computer's files: say so for connection items. */
+function refuseRemoteBatchRename() {
+  refuseRemote("Batch Rename", "Rename connection items one at a time (F2), or copy them to this computer first");
+}
+
 let migrationRun: MigrationRunState | null = null;
 let migrationRunDest: string | null = null;
 
@@ -773,6 +821,17 @@ export function FileManager() {
   const openNearby = useCallback((send: string[] = []) => {
     setNearbySend(localPaths(send));
     setNearbyOpen(true);
+  }, []);
+  /** "Open in pane": a saved connection at its start folder, in the active pane. */
+  const openConnectionInPane = useCallback((connectionId: string, paneIndex?: 0 | 1) => {
+    const conn = useConnectionsStore.getState().byId(connectionId);
+    const store = useFileManagerStore.getState();
+    const index = paneIndex ?? store.activePaneIndex;
+    const tab = store.getActiveTab(index);
+    if (!tab) return;
+    const path = remoteLocation(connectionId, conn?.remote_path || "/");
+    store.navigateTab(index, tab.id, path, conn?.name ?? paneLabel(path));
+    store.addRecentLocation(path);
   }, []);
   const [schedulesOpen, setSchedulesOpen] = useState(false);
   // The tray's "Backups…" item opens this panel.
@@ -1471,7 +1530,9 @@ export function FileManager() {
         const store = useFileManagerStore.getState();
         const pane = store.getActivePane();
         const sel = store.selectedPaths[pane.id];
-        if (sel && sel.length > 0) {
+        if (sel && sel.some(isRemotePath)) {
+          refuseRemoteBatchRename();
+        } else if (sel && sel.length > 0) {
           setBatchRenameFiles([...sel]);
         }
       }
@@ -1549,13 +1610,18 @@ export function FileManager() {
       // default base path. Toggle closes on second press.
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "i") {
         e.preventDefault();
-        setIntegrityToolsOpen((prev) => {
-          if (prev !== null) return null;
-          const fmStore = useFileManagerStore.getState();
-          const pane = fmStore.panes[fmStore.activePaneIndex];
-          const tab = pane.tabs.find((t) => t.id === pane.activeTabId);
-          return { dir: tab?.path ?? "/", files: [] };
-        });
+        const fmNow = useFileManagerStore.getState();
+        if (isRemotePath(fmNow.getActivePath(fmNow.activePaneIndex))) {
+          refuseRemote("Integrity Tools");
+        } else {
+          setIntegrityToolsOpen((prev) => {
+            if (prev !== null) return null;
+            const fmStore = useFileManagerStore.getState();
+            const pane = fmStore.panes[fmStore.activePaneIndex];
+            const tab = pane.tabs.find((t) => t.id === pane.activeTabId);
+            return { dir: tab?.path ?? "/", files: [] };
+          });
+        }
       }
       // Cmd+Shift+P \u2014 toggle the Preview panel on the first
       // selected file. Routes through the ui-store's pre-
@@ -1576,7 +1642,12 @@ export function FileManager() {
           const fmStore = useFileManagerStore.getState();
           const pane = fmStore.getActivePane();
           const sel = fmStore.selectedPaths[pane.id];
-          if (sel && sel.length > 0) {
+          if (sel && sel.length > 0 && isRemotePath(sel[0])) {
+            // A connection file previews from a downloaded copy.
+            void resolveItems([sel[0]])
+              .then(([en]) => localCopyOf(en))
+              .then((local) => useUIStore.getState().openPreviewFor(local), (err) => reportOperationFailure("Preview", err));
+          } else if (sel && sel.length > 0) {
             uiStore.openPreviewFor(sel[0]);
           }
         }
@@ -1909,6 +1980,10 @@ export function FileManager() {
   }, [automationRules, runAutomationRule]);
 
   // Default commands for command palette
+  const paletteConnections = useConnectionsStore((s) => s.connections);
+  useEffect(() => {
+    if (isTauriAvailable()) void useConnectionsStore.getState().ensureLoaded();
+  }, []);
   const commands = useMemo(
     () => [
       ...quickflowCommands,
@@ -1955,11 +2030,12 @@ export function FileManager() {
         onCopyPath: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
-          await copyToClipboardWithToast(path, "Copy Path");
+          await copyToClipboardWithToast(formatAddress(path, useConnectionsStore.getState().nameOf), "Copy Path");
         },
         onCopyRemotePath: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
+          if (isRemotePath(path)) return refuseRemote("Copy Remote Path");
           let resolved: string;
           try {
             const result = await tauriInvoke<{ path: string }>("copy_remote_path", { path, remoteBase: null });
@@ -1978,6 +2054,7 @@ export function FileManager() {
         onCopyUrl: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
+          if (isRemotePath(path)) return refuseRemote("Copy URL");
           let resolved: string;
           try {
             const result = await tauriInvoke<{ path: string }>("copy_url", { path, protocol: "local", host: "localhost", port: null, username: null });
@@ -1996,6 +2073,7 @@ export function FileManager() {
         onCopyRelativePath: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
+          if (isRemotePath(path)) return refuseRemote("Copy Relative Path");
           const store = useFileManagerStore.getState();
           const basePath = store.getActivePath(store.activePaneIndex);
           let resolved: string;
@@ -2016,6 +2094,7 @@ export function FileManager() {
         onOpenInEditor: async () => {
           const path = getFirstSelectedPath();
           if (!path) return;
+          if (isRemotePath(path)) return refuseRemote("Open in Editor");
           const ext = path.split('.').pop() || "";
           try {
             const mapping = await tauriInvoke<{ app_path: string; args: string[] } | null>("resolve_editor", { extension: ext });
@@ -2174,6 +2253,9 @@ export function FileManager() {
         onOpenConnections: () => {
           setConnectionsOpen(true);
         },
+        onEditAddress: () => {
+          window.dispatchEvent(new CustomEvent(EDIT_ADDRESS_EVENT, { detail: { paneIndex: useFileManagerStore.getState().activePaneIndex } }));
+        },
         onOpenRcloneRemotes: () => {
           useRcloneUi.getState().openManager();
           setConnectionsOpen(true);
@@ -2215,6 +2297,7 @@ export function FileManager() {
           const fmStore = useFileManagerStore.getState();
           const pane = fmStore.panes[fmStore.activePaneIndex];
           const tab = pane.tabs.find((t) => t.id === pane.activeTabId);
+          if (isRemotePath(tab?.path)) return refuseRemote("Integrity Tools");
           setIntegrityToolsOpen({ dir: tab?.path ?? "/", files: [] });
         },
         onJumpLastTouched: () => {
@@ -2222,7 +2305,12 @@ export function FileManager() {
         },
         onOpenPreview: () => {
           const path = getFirstSelectedPath();
-          if (path) {
+          if (path && isRemotePath(path)) {
+            // A connection file previews from a downloaded copy.
+            void resolveItems([path])
+              .then(([e]) => localCopyOf(e))
+              .then((local) => useUIStore.getState().openPreviewFor(local), (err) => reportOperationFailure("Preview", err));
+          } else if (path) {
             useUIStore.getState().openPreviewFor(path);
           } else {
             useUIStore.getState().addStructuredError({
@@ -2246,6 +2334,10 @@ export function FileManager() {
               userAction:
                 "Select one or more files in the active pane and try again",
             });
+            return;
+          }
+          if (paths.some(isRemotePath)) {
+            refuseRemoteBatchRename();
             return;
           }
           setBatchRenameFiles(paths);
@@ -2276,9 +2368,7 @@ export function FileManager() {
             // One directory listing yields is_dir + size for the whole
             // selection (the pane's `files` array isn't in the store).
             const listing = tab
-              ? await tauriInvoke<FileEntryData[]>("list_directory", {
-                  path: tab.path,
-                }).catch(() => [] as FileEntryData[])
+              ? await listDirectory(tab.path).catch(() => [] as FileEntryData[])
               : [];
             const selected = listing.filter(
               (f) => paths.includes(f.path) && !f.is_dir,
@@ -2294,8 +2384,19 @@ export function FileManager() {
               });
               return;
             }
-            const dest = await pickFolder("Choose destination for queued copy");
+            const fromConnection = selected.some((f) => isRemotePath(f.path));
+            const dest = await pickFolder("Choose destination for queued copy", fromConnection ? useUIStore.getState().defaultDownloadDir : null);
             if (!dest) return;
+            if (fromConnection) {
+              // Downloads from a connection: the location route names each file.
+              try {
+                const outcome = await transferItems(selected, dest, "copy");
+                if (outcome.jobs.length > 0) setTransfersOpen(true);
+              } catch (err) {
+                reportOperationFailure("Queue copy", err);
+              }
+              return;
+            }
             let queued = 0;
             for (const f of selected) {
               try {
@@ -2342,8 +2443,18 @@ export function FileManager() {
           });
         },
       }),
+      // "Open <connection> in pane" for each saved connection.
+      ...paletteConnections.map((c): CommandItem => ({
+        id: `open-connection-${c.id}`,
+        label: `Open ${c.name} in Pane`,
+        description: "Browse this connection in the active pane",
+        icon: <Globe className="h-4 w-4" />,
+        category: "Navigation",
+        action: () => openConnectionInPane(c.id),
+        keywords: ["connection", "cloud", "remote", "open in pane", c.protocol, c.name.toLowerCase()],
+      })),
     ],
-    [quickflowCommands, toggleSidebar, handleUndo, handleRedo, handleSaveWorkspace, getFirstSelectedPath, getAllSelectedPaths, toggleAutomationPanel, automationPanelOpen, toggleActivityTimeline, favorites, handleJumpLastTouched, appMode],
+    [quickflowCommands, toggleSidebar, handleUndo, handleRedo, handleSaveWorkspace, getFirstSelectedPath, getAllSelectedPaths, toggleAutomationPanel, automationPanelOpen, toggleActivityTimeline, favorites, handleJumpLastTouched, appMode, paletteConnections, openConnectionInPane],
   );
 
   return (
@@ -2712,11 +2823,11 @@ export function FileManager() {
                 const paneIndex = store.activePaneIndex;
                 const activeTab = store.getActiveTab(paneIndex);
                 if (activeTab) {
-                  const label = path === "/" ? "Root" : path.split("/").filter(Boolean).pop() || "Root";
-                  store.navigateTab(paneIndex, activeTab.id, path, label);
+                  store.navigateTab(paneIndex, activeTab.id, path, paneLabel(path));
                   store.addRecentLocation(path);
                 }
               }}
+              onOpenConnection={openConnectionInPane}
               onLoadChildren={isTauriAvailable() ? async (path: string) => {
                 try {
                   return await tauriInvoke<FileEntryData[]>("list_directory", { path });
@@ -2764,6 +2875,7 @@ export function FileManager() {
                   onCompress={(files) => setCreateArchiveSources(files)}
                   onShowTransfers={() => setTransfersOpen(true)}
                   onSendToComputer={openNearby}
+                  onOpenConnections={() => setConnectionsOpen(true)}
                 />
               )}
             />
@@ -3250,7 +3362,17 @@ export function FileManager() {
                   <path d="M18 6L6 18M6 6l12 12" />
                 </svg>
               </button>
-              <ConnectionPanel />
+              <ConnectionPanel
+                onOpenInPane={(panePath, name) => {
+                  const store = useFileManagerStore.getState();
+                  const tab = store.getActiveTab(store.activePaneIndex);
+                  if (tab) {
+                    store.navigateTab(store.activePaneIndex, tab.id, panePath, paneLabel(panePath) || name);
+                    store.addRecentLocation(panePath);
+                  }
+                  setConnectionsOpen(false);
+                }}
+              />
             </div>
           </div>
         </div>
@@ -3417,6 +3539,40 @@ function HiddenFilesToggle() {
 // FilePane - single pane with tabs, breadcrumbs, file list
 // ──────────────────────────────────────────────
 
+/** A connection folder that could not be listed: why, and Reconnect. */
+function RemoteErrorState({
+  name,
+  message,
+  rejectedReason,
+  onReconnect,
+  onOpenConnections,
+}: {
+  name: string;
+  message: string;
+  rejectedReason: string | null;
+  onReconnect: () => void | Promise<void>;
+  onOpenConnections?: () => void;
+}) {
+  return (
+    <div role="alert" className="flex items-start gap-2 px-3 py-2 text-[length:var(--font-size-xs)] bg-[var(--color-error)]/10 border-b border-[var(--color-border)]" data-testid="remote-error-state">
+      <div className="flex-1 min-w-0">
+        <div className="font-medium text-[color:var(--color-text)]">
+          {rejectedReason ? `${name}: credentials rejected` : `Cannot open ${name}`}
+        </div>
+        <div className="text-[color:var(--color-text-secondary)] break-words">{rejectedReason ? `${rejectedReason}. Automatic reconnects are paused.` : message}</div>
+      </div>
+      <button type="button" onClick={() => void onReconnect()} className="shrink-0 rounded px-2 py-0.5 text-[11px] font-medium bg-[var(--color-primary)] text-white" data-testid="remote-reconnect">
+        Reconnect
+      </button>
+      {onOpenConnections && (
+        <button type="button" onClick={onOpenConnections} className="shrink-0 rounded px-2 py-0.5 text-[11px] border border-[var(--color-border)]">
+          Connections…
+        </button>
+      )}
+    </div>
+  );
+}
+
 interface FilePaneProps {
   paneIndex: 0 | 1;
   onContextMenu: (menu: { position: { x: number; y: number }; items: ContextMenuItem[] }) => void;
@@ -3450,6 +3606,8 @@ interface FilePaneProps {
   onShowTransfers: () => void;
   /** Opens Nearby computers to send these local files. */
   onSendToComputer: (files: string[]) => void;
+  /** Opens the Connections panel (a connection folder that cannot be listed). */
+  onOpenConnections?: () => void;
 }
 
 function FilePane({
@@ -3461,6 +3619,7 @@ function FilePane({
   onCompress,
   onShowTransfers,
   onSendToComputer,
+  onOpenConnections,
 }: FilePaneProps) {
   const pane = useFileManagerStore((s) => s.panes[paneIndex]);
   const navigateTab = useFileManagerStore((s) => s.navigateTab);
@@ -3472,6 +3631,26 @@ function FilePane({
 
   const activeTab = pane.tabs.find((t) => t.id === pane.activeTabId);
   const currentPath = activeTab?.path || "/";
+  // A connection folder (`conn://…`): listed and changed through the
+  // location provider; actions that only work on this computer are
+  // disabled with a reason.
+  const isRemote = isRemotePath(currentPath);
+  const remoteConnId = locationConnectionId(currentPath);
+  const remoteConn = useConnectionsStore((s) => (remoteConnId ? s.connections.find((c) => c.id === remoteConnId) : undefined));
+  const remoteRejected = useConnectionsStore((s) => (remoteConnId ? s.statuses[remoteConnId] : undefined));
+  const connectionsList = useConnectionsStore((s) => s.connections);
+  const nameOfConnection = useConnectionsStore((s) => s.nameOf);
+  useEffect(() => {
+    if (isRemote) void useConnectionsStore.getState().ensureLoaded();
+  }, [isRemote]);
+  /** Why the connection folder could not be listed (null = it could). */
+  const [remoteError, setRemoteError] = useState<string | null>(null);
+  const [shareEntry, setShareEntry] = useState<FileEntryData | null>(null);
+  /** A drop waiting for the inline confirmation (Settings › General). */
+  const [dropRequest, setDropRequest] = useState<DropRequest | null>(null);
+  /** The breadcrumb is the editable address field (click / Ctrl+L). */
+  const [addressEditing, setAddressEditing] = useState(false);
+  const [addressHistory, setAddressHistory] = useState<string[]>([]);
 
   const [files, setFiles] = useState<FileEntryData[]>([]);
   const [focusedIndex, setFocusedIndex] = useState(0);
@@ -3558,18 +3737,34 @@ function FilePane({
   const loadDirectory = useCallback(async (path: string) => {
     setLoading(true);
     setError(null);
+    setRemoteError(null);
     setPathRecall(null);
     // Bump the recall token before any async work so any earlier
     // in-flight lineage fetch becomes a no-op when it resolves.
     const token = ++pathRecallTokenRef.current;
+    // Stale-result guard for the listing itself: a slow listing of a
+    // folder the user already left (likely for connection folders) must
+    // not replace the newer folder's files, error or loading state.
+    const isCurrent = () => token === pathRecallTokenRef.current;
     try {
       if (isTauriAvailable()) {
-        const entries = await tauriInvoke<FileEntryData[]>("list_directory", { path });
+        const entries = await listDirectory(path);
+        if (!isCurrent()) return;
         setFiles(entries);
       } else {
-        setFiles(generateDemoFiles(path));
+        setFiles(isRemotePath(path) ? [] : generateDemoFiles(path));
       }
     } catch (err) {
+      if (!isCurrent()) return;
+      if (isRemotePath(path)) {
+        // A connection folder that cannot be listed (signed out, offline,
+        // credentials rejected) says why and offers Reconnect — never
+        // demo files or path-recall guesses.
+        setFiles([]);
+        setRemoteError(errorText(err));
+        void useConnectionsStore.getState().load();
+        return;
+      }
       console.error("Failed to list directory:", err);
       setError(String(err));
       setFiles(generateDemoFiles(path));
@@ -3598,8 +3793,10 @@ function FilePane({
         }
       }
     } finally {
-      setLoading(false);
-      setFocusedIndex(0);
+      if (isCurrent()) {
+        setLoading(false);
+        setFocusedIndex(0);
+      }
     }
   }, []);
 
@@ -3835,13 +4032,46 @@ function FilePane({
   const handleNavigate = useCallback(
     (path: string) => {
       if (activeTab) {
-        const label = path === "/" ? "Root" : path.split("/").filter(Boolean).pop() || "Root";
-        navigateTab(paneIndex, activeTab.id, path, label);
+        navigateTab(paneIndex, activeTab.id, path, paneLabel(path));
         addRecentLocation(path);
       }
     },
     [paneIndex, activeTab, navigateTab, addRecentLocation],
   );
+
+  /** A connection file: a downloaded copy shows in the preview pane
+   *  (images, PDFs, text) or opens in its default app. */
+  const openRemoteFile = useCallback(async (entry: FileEntryData) => {
+    if (!isTauriAvailable()) return;
+    try {
+      // A program or script from a (possibly shared) connection would run
+      // with one click, with no mark of where it came from: ask first.
+      if (isRunnableName(entry.name)) {
+        const id = locationConnectionId(entry.path);
+        const from = (id && useConnectionsStore.getState().nameOf(id)) || "a connection";
+        const ok = await confirmText(
+          `${entry.name} came from ${from}. Opening it may run a program or script on this computer.\n\nOpen it only if you trust where it came from. To keep it, copy it to this computer first.`,
+          "Open",
+          true,
+        );
+        if (!ok) return;
+      }
+      const local = await localCopyOf(entry);
+      if (isPreviewablePath(entry.name) || isPlainTextPath(entry.name)) {
+        useUIStore.getState().openPreviewFor(local);
+        return;
+      }
+      await tauriInvoke("open_file_with_default", { path: local });
+      useUIStore.getState().addStructuredError({
+        what: `Opened a downloaded copy of ${entry.name}`,
+        why: "The file is on a connection, so a copy was downloaded to open it",
+        appDid: `Saved the copy in a temporary folder (${local})`,
+        userAction: "Changes to the copy are not uploaded: copy the file back to the connection to keep them",
+      });
+    } catch (err) {
+      reportOperationFailure(`Open ${entry.name}`, err);
+    }
+  }, []);
 
   // Open file/folder — iter 38: unified smart-open dispatcher.
   // Uses the module-level extension predicates (iter 37) as the
@@ -3862,6 +4092,10 @@ function FilePane({
     (entry: FileEntryData) => {
       if (entry.is_dir) {
         handleNavigate(entry.path);
+        return;
+      }
+      if (isRemotePath(entry.path)) {
+        void openRemoteFile(entry);
         return;
       }
       if (isArchivePath(entry.path)) {
@@ -3897,11 +4131,21 @@ function FilePane({
         });
       }
     },
-    [handleNavigate, onArchiveBrowse, onTextEdit],
+    [handleNavigate, onArchiveBrowse, onTextEdit, openRemoteFile],
   );
 
   // Feature 2: Calculate folder size (#83)
   const handleCalculateSize = useCallback(async (folderPath: string) => {
+    if (isRemotePath(folderPath)) {
+      // Server-side size where the connection has one, else a listing walk.
+      try {
+        const r = await remoteFolderSize(folderPath, `pane-size-${Date.now()}`);
+        setFolderSizes((prev) => ({ ...prev, [folderPath]: r.bytes }));
+      } catch (err) {
+        reportOperationFailure("Calculate size", err);
+      }
+      return;
+    }
     const calculateRecursive = async (dirPath: string): Promise<number> => {
       try {
         let entries: FileEntryData[];
@@ -3970,10 +4214,71 @@ function FilePane({
    * direct "to other pane" transfers so conflict checks, the Safety Interlock,
    * undo entries and pane refreshes behave identically on every route.
    */
+  /**
+   * Copy or move to or from a connection: files ride the transfer queue
+   * (upload, download, server-side copy or relay), folders are created
+   * first, and a move inside one connection is a server-side rename. A move
+   * goes through the Safety Interlock unless the user already confirmed it
+   * (drag-and-drop confirmation). Undo covers this computer's operations
+   * only, so none is recorded here.
+   */
+  const transferAcrossLocations = useCallback(async (paths: string[], destDir: string, mode: "copy" | "move", preconfirmed = false): Promise<boolean> => {
+    const label = mode === "copy" ? "Copy" : "Move";
+    try {
+      const items = await resolveItems(paths, files);
+      const destLabel = formatAddress(destDir, useConnectionsStore.getState().nameOf);
+      const run = () => transferItems(items, destDir, mode);
+      // The interlock assesses what the move really affects (folders
+      // counted through), not the number of top-level items.
+      const measured = mode === "move" && !preconfirmed ? await measureLocations(paths, files) : null;
+      const outcome: LocationTransferOutcome | null = measured
+        ? await assessBeforeExecute(
+            {
+              engine: "fs",
+              kind: FS_INTENT_KIND.move,
+              affected_files: measured.files,
+              total_bytes: measured.bytes,
+              subject_path: currentPath,
+              summary: `Move ${items.length} item${items.length === 1 ? "" : "s"} → ${destLabel}`,
+            },
+            run,
+          )
+        : await run();
+      if (outcome === null) return false;
+      const kept = outcome.kept ?? [];
+      if (kept.length > 0) {
+        useUIStore.getState().addStructuredError({
+          what: `${kept.length} Google document${kept.length === 1 ? " was" : "s were"} copied, not moved`,
+          why: "Outside Google Drive a document is an export (for example .docx), not the document itself",
+          appDid: "Copied the export and kept the original document in Drive",
+          userAction: "Delete the original in Drive yourself if you no longer need it",
+        });
+      }
+      const touched = [currentPath, destDir, ...paths.map(parentLocation)];
+      const jobIds = outcome.jobs.map((j) => j.id);
+      if (jobIds.length > 0) {
+        onShowTransfers();
+        void awaitPaneCopyJobs(jobIds, () => tauriInvoke<{ id: string; status: string }[]>("list_transfers", undefined, []), {
+          onSettle: () => dispatchRefresh(touched),
+        }).then(() => dispatchRefresh(touched));
+      }
+      dispatchRefresh(touched);
+      return true;
+    } catch (err) {
+      reportOperationFailure(label, err);
+      // Part of a move may have happened on the server (the error names
+      // what moved): show both ends as they are now.
+      dispatchRefresh([currentPath, destDir, ...paths.map(parentLocation)]);
+      return false;
+    }
+  }, [files, currentPath, onShowTransfers]);
+
   const transferPaths = useCallback(async (paths: string[], destDir: string, mode: "copy" | "move"): Promise<boolean> => {
     if (paths.length === 0) return false;
     const label = mode === "copy" ? "Copy" : "Move";
     if (!isTauriAvailable()) { console.log(`${label} (demo mode):`, paths); return false; }
+    // Either end on a connection: the location route (transfer queue).
+    if (needsLocationTransfer(paths, destDir)) return transferAcrossLocations(paths, destDir, mode);
     try {
       // Copying into the folder an item already lives in just makes a
       // "(copy)" sibling, so there is nothing to confirm.
@@ -4059,7 +4364,71 @@ function FilePane({
       reportOperationFailure(label, err);
       return false;
     }
-  }, [pushUndo, checkConflicts, currentPath, onShowTransfers]);
+  }, [pushUndo, checkConflicts, currentPath, onShowTransfers, transferAcrossLocations]);
+
+  /** Run a (confirmed) drop: the location route when a connection is
+   *  involved, else copy_files / move_files exactly as before. */
+  const performDrop = useCallback(async (sources: string[], mode: "copy" | "move", preconfirmed = true) => {
+    if (needsLocationTransfer(sources, currentPath)) {
+      await transferAcrossLocations(sources, currentPath, mode, preconfirmed);
+      return;
+    }
+    const command = mode === "copy" ? "copy_files" : "move_files";
+    try {
+      await tauriInvoke(command, { sourcePaths: sources, destDir: currentPath });
+      dispatchRefresh([currentPath, ...sources]);
+    } catch (err) {
+      console.error(`${mode === "copy" ? "Copy" : "Move"} via DnD failed:`, err);
+    }
+  }, [currentPath, transferAcrossLocations]);
+
+  // Palette "Go to Address…": edit this pane's address when it is the active one.
+  useEffect(() => {
+    const onEdit = (e: Event) => {
+      const want = (e as CustomEvent<{ paneIndex: number }>).detail?.paneIndex;
+      const fm = useFileManagerStore.getState();
+      if (want === paneIndex || (fm.singlePaneMode && paneIndex === 0)) setAddressEditing(true);
+    };
+    window.addEventListener(EDIT_ADDRESS_EVENT, onEdit);
+    return () => window.removeEventListener(EDIT_ADDRESS_EVENT, onEdit);
+  }, [paneIndex]);
+
+  // Address-bar history: places visited in the panes, then the ledger's
+  // recent paths (what Instant Jump lists), loaded when editing starts.
+  useEffect(() => {
+    if (!addressEditing) return;
+    let live = true;
+    const visited = useFileManagerStore.getState().recentLocations.map((r) => r.path);
+    void tauriInvokeSafe<{ path: string }[]>("ledger_recent_paths", { limit: 50, query: null }, []).then((hits) => {
+      if (live) setAddressHistory([...new Set([...visited, ...hits.map((h) => h.path)])]);
+    });
+    setAddressHistory(visited);
+    return () => {
+      live = false;
+    };
+  }, [addressEditing]);
+
+  const addressProps = useMemo(
+    () => ({
+      connections: connectionsList,
+      listFolders: (p: string) => listDirectory(p),
+      validate: async (p: string): Promise<string | null | { path: string }> => {
+        if (!isTauriAvailable()) return null;
+        try {
+          const entry = await statLocation(p);
+          if (!entry) return "That folder does not exist";
+          if (!entry.is_dir) return "That is a file, not a folder";
+          // A connection may know the folder by another path (Google Drive: ids, not names).
+          const trim = (x: string) => x.replace(/\/+$/, "");
+          return isRemotePath(p) && trim(entry.path) !== trim(p) ? { path: entry.path } : null;
+        } catch (err) {
+          return errorText(err);
+        }
+      },
+      history: addressHistory,
+    }),
+    [connectionsList, addressHistory],
+  );
 
   const otherPanePath = useCallback(() => {
     const store = useFileManagerStore.getState();
@@ -4082,24 +4451,84 @@ function FilePane({
     if (paths.length === 0) return;
     if (mode === "cut") {
       // Moving an item into the folder it already lives in is a no-op.
-      const movable = paths.filter((p) => p.slice(0, p.lastIndexOf("/")) !== (currentPath === "/" ? "" : currentPath));
+      const movable = movableInto(paths, currentPath, files);
       if (movable.length === 0) { clear(); return; }
       if (await transferPaths(movable, currentPath, "move")) clear();
     } else {
       await transferPaths(paths, currentPath, "copy");
     }
-  }, [currentPath, transferPaths]);
+  }, [currentPath, transferPaths, files]);
+
+  /**
+   * Where F5 / F6 send the selection: the other pane. From a connection
+   * folder when the other pane is no target (hidden in single-pane mode,
+   * or showing this same folder), the default download folder
+   * (Settings › General), else a folder the user picks.
+   */
+  const transferTarget = useCallback(async (): Promise<string | null> => {
+    const other = otherPanePath();
+    const usable = !useFileManagerStore.getState().singlePaneMode && other !== currentPath;
+    if (!isRemote || usable) return other;
+    const fallback = useUIStore.getState().defaultDownloadDir;
+    if (fallback) return fallback;
+    return pickFolder("Choose where to download", null);
+  }, [otherPanePath, currentPath, isRemote]);
 
   const handleCopyToOtherPane = useCallback(async () => {
-    await transferPaths(selectedPaths, otherPanePath(), "copy");
-  }, [selectedPaths, transferPaths, otherPanePath]);
+    const dest = await transferTarget();
+    if (dest) await transferPaths(selectedPaths, dest, "copy");
+  }, [selectedPaths, transferPaths, transferTarget]);
 
   const handleMoveToOtherPane = useCallback(async () => {
-    await transferPaths(selectedPaths, otherPanePath(), "move");
-  }, [selectedPaths, transferPaths, otherPanePath]);
+    const dest = await transferTarget();
+    if (dest) await transferPaths(selectedPaths, dest, "move");
+  }, [selectedPaths, transferPaths, transferTarget]);
+
+  /** Delete connection items on the server (no local Trash): confirm with
+   *  the names, then the Safety Interlock, then delete. */
+  const deleteRemoteItems = useCallback(async (paths: string[]) => {
+    if (paths.length === 0 || !isTauriAvailable()) return;
+    try {
+      const items = await resolveItems(paths, files);
+      const names = items.map((i) => i.name).join(", ");
+      const where = formatAddress(currentPath, useConnectionsStore.getState().nameOf);
+      const ok = await confirmText(
+        `Delete ${items.length} item${items.length === 1 ? "" : "s"} from ${where}?\n\n${names}\n\nGoogle Drive, OneDrive and Dropbox keep deleted items in their own trash; other servers delete them for good.`,
+        "Delete",
+        true,
+      );
+      if (!ok) return;
+      // Assessed with what the delete really affects (folders counted
+      // through), as moves are, not the number of top-level items.
+      const measured = await measureLocations(paths, files);
+      const result = await assessBeforeExecute(
+        {
+          engine: "fs",
+          kind: FS_INTENT_KIND.deletePermanent,
+          affected_files: measured.files,
+          total_bytes: measured.bytes,
+          subject_path: currentPath,
+          summary: `Delete ${items.length} item${items.length === 1 ? "" : "s"} from ${where}`,
+        },
+        async () => {
+          await removeEntries(items, true);
+          return true;
+        },
+      );
+      if (result === null) return;
+      dispatchRefresh([currentPath, ...paths]);
+    } catch (err) {
+      reportOperationFailure("Delete", err, { userAction: "Check you may delete these items on the server, then retry" });
+      dispatchRefresh([currentPath]);
+    }
+  }, [files, currentPath]);
 
   const handleDelete = useCallback(async () => {
     if (selectedPaths.length === 0) return;
+    if (selectedPaths.some(isRemotePath)) {
+      await deleteRemoteItems(selectedPaths);
+      return;
+    }
     if (isTauriAvailable()) {
       try {
         const measured = await measureSelection(selectedPaths);
@@ -4127,10 +4556,14 @@ function FilePane({
         });
       }
     } else { console.log("Delete (demo mode):", selectedPaths); }
-  }, [selectedPaths, pushUndo, currentPath]);
+  }, [selectedPaths, pushUndo, currentPath, deleteRemoteItems]);
 
   const handleDeletePermanently = useCallback(async (paths: string[]) => {
     if (paths.length === 0) return;
+    if (paths.some(isRemotePath)) {
+      await deleteRemoteItems(paths);
+      return;
+    }
     const fileNames = paths.map((p) => p.split("/").pop()).join(", ");
     const confirmed = await confirmText(
       `Permanently delete ${paths.length} item(s)?\n\n${fileNames}\n\nThis action cannot be undone.`,
@@ -4173,17 +4606,19 @@ function FilePane({
         });
       }
     } else { console.log("Delete permanently (demo mode):", paths); }
-  }, [currentPath]);
+  }, [currentPath, deleteRemoteItems]);
 
   const handleRename = useCallback(async (filePath: string) => {
     if (isTauriAvailable()) {
-      const oldName = filePath.split(/[\\/]/).pop() || "";
+      const remote = isRemotePath(filePath);
+      // Connection paths may be ids (Google Drive): the name is the listed one.
+      const oldName = remote ? files.find((f) => f.path === filePath)?.name ?? "" : filePath.split(/[\\/]/).pop() || "";
       const newName = await promptText("Enter new name:", oldName);
       if (newName && newName !== oldName) {
         try {
-          await tauriInvoke("rename_file", { path: filePath, newName });
-          const newPath = filePath.replace(/[^\\/]+$/, newName);
-          pushUndo({ id: `rename-${Date.now()}`, type: "rename", sourcePaths: [filePath], destPaths: [newPath], timestamp: Date.now() });
+          const newPath = await renameEntry(filePath, newName);
+          // Undo replays this computer's operations only.
+          if (!remote) pushUndo({ id: `rename-${Date.now()}`, type: "rename", sourcePaths: [filePath], destPaths: [newPath], timestamp: Date.now() });
           // Iter 19: passing both old and new paths so any pane
           // viewing the parent directory refreshes (because either
           // path is a child of the parent, so the helper's prefix
@@ -4197,10 +4632,11 @@ function FilePane({
         }
       }
     } else { console.log("Rename (demo mode):", filePath); }
-  }, [pushUndo]);
+  }, [pushUndo, files]);
 
   const handleDuplicate = useCallback(async () => {
     if (selectedPaths.length === 0) return;
+    if (selectedPaths.some(isRemotePath)) return refuseRemote("Duplicate");
     if (isTauriAvailable()) {
       try {
         await tauriInvoke("duplicate_files", { paths: selectedPaths });
@@ -4219,9 +4655,9 @@ function FilePane({
       const name = await promptText("New folder name:", "New Folder");
       if (name) {
         try {
-          const newPath = `${currentPath === "/" ? "" : currentPath}/${name}`;
-          await tauriInvoke("create_directory", { path: newPath });
-          pushUndo({ id: `mkdir-${Date.now()}`, type: "create_folder", sourcePaths: [], destPaths: [newPath], timestamp: Date.now() });
+          const newPath = isRemote ? joinLocation(currentPath, name) : `${currentPath === "/" ? "" : currentPath}/${name}`;
+          await makeDirectory(newPath);
+          if (!isRemote) pushUndo({ id: `mkdir-${Date.now()}`, type: "create_folder", sourcePaths: [], destPaths: [newPath], timestamp: Date.now() });
           // Iter 19: the new folder's parent (currentPath) is where
           // listings change; passing newPath as well for any pane
           // that might already be viewing it (unusual but safe).
@@ -4234,9 +4670,10 @@ function FilePane({
         }
       }
     } else { console.log("New Folder (demo mode) in", currentPath); }
-  }, [currentPath, pushUndo]);
+  }, [currentPath, pushUndo, isRemote]);
 
   const handleNewFile = useCallback(async () => {
+    if (isRemote) return refuseRemote("New File"); // the menu item is disabled with the reason too
     if (isTauriAvailable()) {
       const name = await promptText("New file name:", "untitled.txt");
       if (name) {
@@ -4254,13 +4691,22 @@ function FilePane({
         }
       }
     } else { console.log("New File (demo mode) in", currentPath); }
-  }, [currentPath, pushUndo]);
+  }, [currentPath, pushUndo, isRemote]);
 
   const handleGetInfo = useCallback(async (filePath: string) => {
     const fileName = filePath.split("/").pop() || filePath;
     let metadata: Record<string, any> | null = null;
     let comment = "";
 
+    if (isRemotePath(filePath)) {
+      // From the listing; comments are stored for this computer's files only.
+      const e = files.find((f) => f.path === filePath);
+      metadata = e
+        ? { name: e.name, size: e.is_dir ? "folder" : formatBytes(e.size), modified: e.modified ?? "unknown", location: formatAddress(filePath, useConnectionsStore.getState().nameOf) }
+        : { location: formatAddress(filePath, useConnectionsStore.getState().nameOf) };
+      setInfoDialog({ path: filePath, name: e?.name ?? fileName, metadata, comment: "" });
+      return;
+    }
     if (isTauriAvailable()) {
       try {
         metadata = await tauriInvoke<Record<string, unknown>>("get_file_metadata", { path: filePath });
@@ -4277,7 +4723,7 @@ function FilePane({
     }
 
     setInfoDialog({ path: filePath, name: fileName, metadata, comment });
-  }, []);
+  }, [files]);
 
   // Feature 5: Save comment (#82)
   const handleSaveComment = useCallback(async (filePath: string, commentText: string) => {
@@ -4456,7 +4902,8 @@ function FilePane({
   // they explicitly distinguish "IPC failed" from "clipboard failed".
   const handleCopyPath = useCallback(async () => {
     if (selectedPaths.length === 0) return;
-    await copyToClipboardWithToast(selectedPaths[0], "Copy Path");
+    // A connection item copies as `<connection name>:<path>` (what the address bar accepts).
+    await copyToClipboardWithToast(formatAddress(selectedPaths[0], useConnectionsStore.getState().nameOf), "Copy Path");
   }, [selectedPaths]);
 
   const handleCopyRemotePath = useCallback(async () => {
@@ -4558,9 +5005,12 @@ function FilePane({
     const nameB = pathB.split("/").pop() || pathB;
     if (isTauriAvailable()) {
       try {
+        // Connection files are compared from downloaded copies.
+        const localA = await localCopyOf(files.find((f) => f.path === pathA) ?? { path: pathA, name: nameA, size: 0 });
+        const localB = await localCopyOf(files.find((f) => f.path === pathB) ?? { path: pathB, name: nameB, size: 0 });
         const [contentA, contentB] = await Promise.all([
-          tauriInvoke<string>("preview_file", { path: pathA }),
-          tauriInvoke<string>("preview_file", { path: pathB }),
+          tauriInvoke<string>("preview_file", { path: localA }),
+          tauriInvoke<string>("preview_file", { path: localB }),
         ]);
         setCompareData({ left: contentA, right: contentB, leftName: nameA, rightName: nameB });
       } catch (err) { console.error("Compare files failed:", err); }
@@ -4571,11 +5021,14 @@ function FilePane({
         leftName: nameA, rightName: nameB,
       });
     }
-  }, [selectedPaths]);
+  }, [selectedPaths, files]);
 
   // Indexed search (names in all subfolders / file contents) from the
   // filter bar; "This folder" keeps the live listing filter.
-  const [searchScope, setSearchScope] = useState<SearchScope>("folder");
+  const [chosenScope, setSearchScope] = useState<SearchScope>("folder");
+  // The search index covers this computer's folders: connection folders
+  // filter their listing only.
+  const searchScope: SearchScope = isRemote ? "folder" : chosenScope;
   const indexedQuery = searchScope !== "folder" && pane.filterText.trim().length >= 2 ? pane.filterText.trim() : null;
   const handleOpenSearchHit = useCallback(
     (path: string, isDir: boolean) => {
@@ -4645,7 +5098,7 @@ function FilePane({
       // the module-level cache. The menu opens after the await so the
       // user never sees a flicker as items get inserted.
       let smartDestinations: SmartDestination[] = [];
-      if (!entry.is_dir) {
+      if (!entry.is_dir && !isRemotePath(entry.path)) {
         const ext = fileExtension(entry.path);
         if (ext !== "") {
           smartDestinations = await loadSmartDestinations(ext, 3);
@@ -4794,10 +5247,14 @@ function FilePane({
         // Smart Send-To: ledger-derived frecency-ranked destinations.
         smartDestinations,
         onSendTo: handleSendTo,
+        // Connection folders: share links where the provider has them;
+        // this-computer-only actions stay listed, disabled with the reason.
+        onShareLink: isRemote && remoteConn && SHAREABLE_PROTOCOLS.has(remoteConn.protocol) ? () => setShareEntry(entry) : undefined,
+        remoteReason: isRemote ? LOCAL_ONLY_REASON : undefined,
       });
       onContextMenu({ position: { x: event.clientX, y: event.clientY }, items });
     },
-    [selectedPaths, currentPath, handleOpen, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleDelete, handleDeletePermanently, handleRename, handleDuplicate, handleNewFolder, handleNewFile, handleGetInfo, handleCalculateSize, handleEditRemote, handleCompareFiles, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, selectAll, invertSelection, onContextMenu, loadDirectory, isGitRepo, handleSendTo, onVerifyIntegrity, onCompress, onSendToComputer, handleExtractHere],
+    [selectedPaths, currentPath, handleOpen, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleDelete, handleDeletePermanently, handleRename, handleDuplicate, handleNewFolder, handleNewFile, handleGetInfo, handleCalculateSize, handleEditRemote, handleCompareFiles, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, selectAll, invertSelection, onContextMenu, loadDirectory, isGitRepo, handleSendTo, onVerifyIntegrity, onCompress, onSendToComputer, handleExtractHere, isRemote, remoteConn],
   );
 
   // Keyboard shortcuts for compare (#47), quick select (#71), and the
@@ -4840,6 +5297,14 @@ function FilePane({
         if (fmState.singlePaneMode || fmState.activePaneIndex === paneIndex) {
           e.preventDefault();
           void handleNewFolder();
+        }
+      }
+      // Ctrl/Cmd+L: type an address (local path, conn://… or <connection>:path).
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "l" && !inTextEntry) {
+        const fmState = useFileManagerStore.getState();
+        if (fmState.singlePaneMode || fmState.activePaneIndex === paneIndex) {
+          e.preventDefault();
+          setAddressEditing(true);
         }
       }
       const transferKey = resolveFileTransferKey(e, inTextEntry);
@@ -4893,7 +5358,28 @@ function FilePane({
         const droppedPaths = handleDrop(e);
         if (droppedPaths) {
           if (isTauriAvailable()) {
-            const isCopy = e.altKey;
+            // Same location ⇒ move (Alt ⇒ copy); across connections or
+            // between this computer and a connection ⇒ copy.
+            const mode = dragDropMode(droppedPaths, currentPath, e.altKey);
+            // Dropped back where they are: nothing to move.
+            if (mode === "move" && movableInto(droppedPaths, currentPath, files).length === 0) return;
+            if (useUIStore.getState().confirmDragDrop) {
+              // Shown at once; assessed once the drop is measured (folders
+              // counted through), so a large folder is not a "low risk" item.
+              const req: DropRequest = { sources: droppedPaths, destDir: currentPath, mode, destLabel: formatAddress(currentPath, nameOfConnection), totalBytes: 0, measuring: true };
+              setDropRequest(req);
+              // Measuring failed: shown as "size unknown", and a move then
+              // goes through the interlock again (see dropPreconfirmed).
+              void measureLocations(droppedPaths, files)
+                .catch(() => null)
+                .then((m) => setDropRequest((cur) => (cur === req ? measuredDrop(req, m) : cur)));
+              return;
+            }
+            if (needsLocationTransfer(droppedPaths, currentPath)) {
+              void transferAcrossLocations(droppedPaths, currentPath, mode);
+              return;
+            }
+            const isCopy = mode === "copy";
             const command = isCopy ? "copy_files" : "move_files";
             tauriInvoke(command, { sourcePaths: droppedPaths, destDir: currentPath })
               .then(() => {
@@ -4921,14 +5407,52 @@ function FilePane({
         onForward={() => useFileManagerStore.getState().navigateForward(paneIndex)}
         canGoBack={useFileManagerStore.getState().canNavigateBack(paneIndex)}
         canGoForward={useFileManagerStore.getState().canNavigateForward(paneIndex)}
+        connectionName={nameOfConnection}
+        address={addressProps}
+        editing={addressEditing}
+        onEditingChange={setAddressEditing}
       />
+      {dropRequest && (
+        <DragDropConfirm
+          request={dropRequest}
+          onCancel={() => setDropRequest(null)}
+          onConfirm={(assessment) => {
+            const req = dropRequest;
+            setDropRequest(null);
+            // Confirmed here: the interlock's audit entry, without asking twice.
+            // (The button waits for the assessment; without one, or when
+            // the drop could not be measured, the interlock still runs
+            // before a move.)
+            if (assessment?.requires_confirmation) void confirmIntent(dropIntent(req), assessment);
+            void performDrop(req.sources, req.mode, dropPreconfirmed(req, assessment));
+          }}
+        />
+      )}
+      {isRemote && remoteError && (
+        <RemoteErrorState
+          name={remoteConn?.name ?? "This connection"}
+          message={remoteError}
+          rejectedReason={remoteRejected?.credentials_rejected_at ? remoteRejected.credentials_rejected_reason ?? "The service rejected the sign-in" : null}
+          onReconnect={async () => {
+            if (remoteConnId && remoteRejected?.credentials_rejected_at) {
+              await tauriInvoke("clear_connection_credentials_rejected", { connectionId: remoteConnId }).catch(() => undefined);
+            }
+            void loadDirectory(currentPath);
+          }}
+          onOpenConnections={onOpenConnections}
+        />
+      )}
+      {shareEntry && remoteConn && (
+        <ShareLinkDialog protocol={remoteConn.protocol} connectionId={remoteConn.id} path={connectorPath(shareEntry.path)} name={shareEntry.name} onClose={() => setShareEntry(null)} />
+      )}
       <FilterBar
         paneIndex={paneIndex}
         totalCount={files.length}
         filteredCount={visibleFiles.length}
         scope={searchScope}
         onScopeChange={setSearchScope}
-        staleCount={staleCount}
+        scopeDisabledReason={isRemote ? "Subfolder and content search cover this computer's indexed folders" : undefined}
+        staleCount={isRemote ? undefined : staleCount}
         staleActive={staleOnly}
         onToggleStale={() => setStaleOnly((v) => !v)}
         onArchiveStale={handleArchiveStale}
@@ -5095,10 +5619,12 @@ function FilePane({
                   value={infoDialog.comment}
                   onChange={(e) => setInfoDialog((prev) => prev ? { ...prev, comment: e.target.value } : null)}
                   onBlur={() => {
-                    if (infoDialog) {
+                    if (infoDialog && !isRemotePath(infoDialog.path)) {
                       handleSaveComment(infoDialog.path, infoDialog.comment);
                     }
                   }}
+                  disabled={isRemotePath(infoDialog.path)}
+                  title={isRemotePath(infoDialog.path) ? LOCAL_ONLY_REASON : undefined}
                   className="w-full h-20 mt-1 p-2 text-xs border border-[var(--color-border)] rounded resize-none bg-[var(--color-bg)] text-[color:var(--color-text)]"
                   placeholder="Add a comment..."
                 />
@@ -5179,6 +5705,23 @@ function StatusBarContent() {
   const drive = useDriveSpace(activePath);
   const driveLabel = drive ? formatDriveSpace(drive) : null;
   const driveDetail = drive ? formatDriveSpaceDetail(drive) : null;
+  // A connection folder: the account's storage (where the provider reports it).
+  const activeConnId = locationConnectionId(activePath);
+  const [quota, setQuota] = useState<RemoteQuotaInfo | null>(null);
+  useEffect(() => {
+    setQuota(null);
+    if (!activeConnId || !isTauriAvailable()) return;
+    let live = true;
+    connectionQuota(activePath).then(
+      (q) => live && setQuota(q),
+      () => live && setQuota(null),
+    );
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- per connection, not per folder
+  }, [activeConnId]);
+  const quotaLabel = quota ? formatQuota(quota) : null;
 
   const [appVersion, setAppVersion] = useState<string>("UFOP v0.1.0");
   const [platformInfo, setPlatformInfo] = useState<{ os: string; arch: string; version: string } | null>(null);
@@ -5283,6 +5826,16 @@ function StatusBarContent() {
             "{drive name}: X free of Y" lives in the tooltip so
             casual users see the glanceable number while power
             users get the full picture on hover. */}
+        {quotaLabel && (
+          <span
+            className="text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)] cursor-help"
+            data-testid="status-bar-quota"
+            title={quotaLabel.detail}
+            aria-label={quotaLabel.detail}
+          >
+            {quotaLabel.short}
+          </span>
+        )}
         {driveLabel && (
           <span
             className="text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)] cursor-help"

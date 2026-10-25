@@ -996,6 +996,44 @@ impl Default for OneDriveConnector {
 }
 
 impl Connector for OneDriveConnector {
+    /// PATCH the item by path: a new name, and a new parent (looked up by
+    /// path) when it moves to another folder.
+    fn rename_entry(&self, from: &str, to: &str) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let (from, to) = (drive_relative(from), drive_relative(to));
+        Box::pin(async move {
+            let split = |p: &str| p.rsplit_once('/').map(|(d, n)| (d.to_string(), n.to_string())).unwrap_or_default();
+            let ((from_dir, _), (to_dir, name)) = (split(&format!("/{from}")), split(&format!("/{to}")));
+            if from.is_empty() || name.is_empty() {
+                return Err(AppError::validation("Choose an item and give it a name"));
+            }
+            let check = check_onedrive_naming(&name);
+            if !check.is_valid {
+                let issues: Vec<String> = check.issues.iter().map(|i| i.description.clone()).collect();
+                return Err(AppError::validation(format!("OneDrive naming restrictions: {}", issues.join("; "))));
+            }
+            let token = self.get_token().await?;
+            let mut body = serde_json::json!({ "name": name });
+            if from_dir != to_dir {
+                let dir = to_dir.trim_matches('/');
+                let url = if dir.is_empty() { format!("{}/root", self.drive_base()) } else { format!("{}/root:/{}", self.drive_base(), encode_path(dir)) };
+                let resp = self.http.get(&url).bearer_auth(&token).send().await.map_err(|e| AppError::transfer(format!("OneDrive move failed: {e}"), "Check your network connection."))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    return Err(AppError::transfer(format!("OneDrive move failed (HTTP {status}): {}", graph_error_message(&resp.text().await.unwrap_or_default())), "Check the destination folder exists."));
+                }
+                let parent: GraphDriveItem = resp.json().await.map_err(|e| AppError::transfer(format!("OneDrive move failed: {e}"), "Try again."))?;
+                body["parentReference"] = serde_json::json!({ "id": parent.id });
+            }
+            let url = format!("{}/root:/{}", self.drive_base(), encode_path(&from));
+            let resp = self.http.patch(&url).bearer_auth(&token).json(&body).send().await.map_err(|e| AppError::transfer(format!("OneDrive rename failed: {e}"), "Check your network connection."))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                return Err(AppError::transfer(format!("OneDrive rename failed (HTTP {status}): {}", graph_error_message(&resp.text().await.unwrap_or_default())), "Check the name is free and you may change the item."));
+            }
+            Ok(())
+        })
+    }
+
     fn connect(
         &self,
         profile: &ConnectionProfile,
