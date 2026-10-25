@@ -773,6 +773,8 @@ export function getDefaultCommands(actions: {
   onOpenRcloneRemotes?: () => void;
   /** Open Settings expanded and scrolled to its rclone section. */
   onOpenRcloneSettings?: () => void;
+  /** Open Settings at one section (`startup`, `app-lock`, `reset`…). */
+  onOpenSettingsSection?: (section: string) => void;
   /** Open the Sync Panel \u2014 sync-pair health indicators,
    *  create-pair wizard, dry-run preview, conflict resolution,
    *  reports, and rollback. Iter 28 surfaces the long-orphaned
@@ -1539,6 +1541,15 @@ export function getDefaultCommands(actions: {
       category: "Navigation",
       action: actions.onOpenRcloneRemotes || (() => {}),
       keywords: ["rclone", "remote", "remotes", "rclone config", "box", "pcloud", "mega", "crypt", "provider", "cloud"],
+    },
+    {
+      id: "startup-tray-settings",
+      label: "Startup & Tray Settings\u2026",
+      description: "Start at login, start minimised, minimise or close to the tray, show the tray icon",
+      icon: <Settings className="h-4 w-4" />,
+      category: "Navigation",
+      action: () => (actions.onOpenSettingsSection ? actions.onOpenSettingsSection("startup") : actions.onOpenSettings?.()),
+      keywords: ["startup", "login", "autostart", "tray", "minimise", "minimize", "close", "background", "menu bar"],
     },
     {
       id: "rclone-settings",

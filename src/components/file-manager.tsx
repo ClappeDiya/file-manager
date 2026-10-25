@@ -2250,6 +2250,10 @@ export function FileManager() {
           setSettingsFocus("rclone");
           setSettingsOpen(true);
         },
+        onOpenSettingsSection: (section: string) => {
+          setSettingsFocus(section);
+          setSettingsOpen(true);
+        },
         onOpenConnections: () => {
           setConnectionsOpen(true);
         },

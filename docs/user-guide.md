@@ -892,6 +892,16 @@ Theme switching is instant with no restart required. The theme applies immediate
 - **Size units** - *Decimal* (default; 1 KB = 1,000 bytes, as macOS and disk makers count) or *Binary* (1 KiB = 1,024 bytes, labelled KiB, MiB, GiB). Every size in the app follows it: file lists, transfers, sync, backups, mounts and drives. Sizes already on screen in a panel update the next time it redraws.
 - **Backup times** - show the times of backup versions, runs and files in this computer's time zone (default) or in UTC (marked "UTC"). Schedules keep their own time zone; see [backup-policies-and-schedules.md](backup-policies-and-schedules.md#time-zone).
 
+### Startup and tray
+
+**Settings → Startup & Tray** (desktop app; also *Startup & Tray Settings…* in the command palette):
+
+- **Start UFOP when I log in**, and **…in the tray, without opening the window** (on by default, as before).
+- **Start minimised** - every start keeps the window in the tray until you open it from the tray menu.
+- **Keep running in the tray when the window is closed** - scheduled backups, syncs and automations keep running; quit from the tray menu. The same setting is on the Backups screen.
+- **Minimise to the tray** - minimising the window removes it from the taskbar or Dock; open it again from the tray.
+- **Show the tray icon** - with the icon hidden nothing can hide the window: closing quits, minimising stays in the taskbar, and *Start minimised* starts minimised in the taskbar. The same applies when the desktop has no tray (some Linux desktops).
+
 ### Accessibility
 
 - Full keyboard navigation with visible focus indicators

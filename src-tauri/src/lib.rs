@@ -36,6 +36,7 @@ pub mod schedule_library;
 pub mod sync_engine;
 pub mod spaces_engine;
 pub mod transfer_engine;
+pub mod startup;
 pub mod tray;
 pub mod tray_labels;
 
@@ -100,6 +101,7 @@ struct AppState {
     /// Optional loopback Prometheus exporter (Settings → Advanced; off by default).
     desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics,
     background_mode: tray::BackgroundMode,
+    startup: startup::StartupState,
     audit_trail: security::audit::AuditTrail,
     metadata_store: metadata_engine::MetadataStore,
     search_manager: search_engine::SearchManager,
@@ -324,6 +326,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // The scheduler starts in Tauri's `setup` hook: this function runs on a
     // throwaway runtime whose spawned tasks die when it is dropped.
     let background_mode = tray::load_background_mode(&repo).await;
+    let startup = startup::load(&repo).await;
 
     Ok(AppState {
         repo,
@@ -359,6 +362,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         fleet_agent,
         embedded_server,
         background_mode,
+        startup,
         audit_trail,
         metadata_store: metadata_engine::MetadataStore::new(repo_for_metadata),
         search_manager: search_engine::SearchManager::open_default(),
@@ -552,6 +556,7 @@ pub fn run() {
                     fleet_agent,
                     embedded_server,
                     background_mode: tray::BackgroundMode::default(),
+                    startup: startup::StartupState::default(),
                     audit_trail,
                 }
             }
@@ -570,6 +575,8 @@ pub fn run() {
     let shutdown_repo = app_state.repo.clone();
     let setup_backup_mgr = app_state.backup_mgr.clone();
     let close_mode = app_state.background_mode.clone();
+    let window_startup = app_state.startup.clone();
+    let setup_startup = app_state.startup.clone();
     let shutdown_transfer = app_state.transfer_mgr.clone();
     let shutdown_backup = app_state.backup_mgr.clone();
     let setup_audit = app_state.audit_trail.clone();
@@ -649,13 +656,26 @@ pub fn run() {
             // Signed audit checkpoints: once at start-up, then hourly.
             tauri::async_runtime::spawn(setup_audit.clone().run_anchor_loop(security::audit::ANCHOR_INTERVAL));
             commands::mount_commands::forward_mount_changes(app.handle().clone(), &app.state::<MountManager>());
-            if let Err(e) = tray::setup(app, mgr) {
-                tracing::warn!("System tray unavailable (non-fatal): {e}");
+            match tray::setup(app, mgr) {
+                Ok(()) => setup_startup.set_tray_created(true),
+                Err(e) => tracing::warn!("System tray unavailable (non-fatal): {e}"),
             }
-            // Launched at login: start hidden in the tray.
-            if std::env::args().any(|a| a == "--background") {
-                for w in app.webview_windows().values() {
-                    let _ = w.hide();
+            // Settings → Startup & Tray: tray icon, and the window at launch
+            // (hidden at login, or every launch when asked).
+            let prefs = setup_startup.get();
+            if let Some(tray) = app.tray_by_id("ufop") {
+                let _ = tray.set_visible(prefs.show_tray_icon);
+            }
+            let launch = setup_startup.effective(app.state::<tray::BackgroundMode>().enabled()).launch;
+            for w in app.webview_windows().values() {
+                match launch {
+                    startup::LaunchWindow::Show => {}
+                    startup::LaunchWindow::Hide => {
+                        let _ = w.hide();
+                    }
+                    startup::LaunchWindow::Minimize => {
+                        let _ = w.minimize();
+                    }
                 }
             }
             Ok(())
@@ -693,6 +713,7 @@ pub fn run() {
         .manage(app_state.embedded_server)
         .manage(app_state.desktop_metrics)
         .manage(app_state.background_mode)
+        .manage(app_state.startup)
         .manage(app_state.audit_trail)
         .manage(app_state.metadata_store)
         .manage(app_state.search_manager)
@@ -710,6 +731,8 @@ pub fn run() {
             system_commands::get_app_version,
             system_commands::get_portable_status,
             desktop_commands::set_ui_language,
+            desktop_commands::get_startup_settings,
+            desktop_commands::set_startup_settings,
             system_commands::get_platform_info,
             // Filesystem
             fs_commands::list_directory,
@@ -1447,10 +1470,16 @@ pub fn run() {
             // "Keep running in the tray": closing hides the window so
             // scheduled backups continue.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if close_mode.enabled() {
+                if window_startup.effective(close_mode.enabled()).close_to_tray {
                     api.prevent_close();
                     let _ = window.hide();
                     return;
+                }
+            }
+            // "Minimise to the tray": a minimised window leaves the taskbar.
+            if let tauri::WindowEvent::Resized(_) = event {
+                if window_startup.effective(close_mode.enabled()).minimize_to_tray && window.is_minimized().unwrap_or(false) {
+                    let _ = window.hide();
                 }
             }
             if let tauri::WindowEvent::Destroyed = event {

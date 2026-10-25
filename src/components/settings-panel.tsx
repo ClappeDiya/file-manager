@@ -38,6 +38,7 @@ import { AdvancedOnly } from "@/components/backup/advanced-only";
 import { LocalServerSection } from "@/components/local-server-section";
 import { FolderField } from "@/components/remote-folder-picker";
 import { useT } from "@/lib/i18n";
+import { StartupTraySection } from "@/components/startup-tray-section";
 
 // ── Types ──
 
@@ -1389,6 +1390,10 @@ export default function SettingsPanel({
 
         <Section title={t("settings.general")} id="general" focus={focusSection === "general"}>
           <GeneralSection />
+        </Section>
+
+        <Section title={t("settings.startupTray")} id="startup" focus={focusSection === "startup"}>
+          <StartupTraySection />
         </Section>
 
         {/* Export */}
