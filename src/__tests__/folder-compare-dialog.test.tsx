@@ -108,12 +108,17 @@ function outcome(args: { paths: string[]; action: string; taskId: string }): App
 }
 
 let compareResolver: ((v: unknown) => void) | null = null;
+let compareRejecter: ((e: unknown) => void) | null = null;
 let holdCompare = false;
 
 function backend(cmd: string, args: Record<string, unknown>): unknown {
   switch (cmd) {
     case "compare_folders":
-      if (holdCompare) return new Promise((r) => (compareResolver = r));
+      if (holdCompare)
+        return new Promise((r, j) => {
+          compareResolver = r;
+          compareRejecter = j;
+        });
       return result(args.taskId as string);
     case "compare_plan_action":
       return plan(args.action as string, args.paths as string[], args.permanent === true);
@@ -154,6 +159,7 @@ afterAll(() => {
 beforeEach(() => {
   holdCompare = false;
   compareResolver = null;
+  compareRejecter = null;
   mockInvoke.mockReset();
   mockInvoke.mockImplementation((cmd: string, args: Record<string, unknown>) => Promise.resolve(backend(cmd, args ?? {})));
   useUIStore.setState({ appMode: "simple" });
@@ -302,6 +308,63 @@ describe("FolderCompareDialog", () => {
     fireEvent.click(cancel);
     await waitFor(() => expect(calls("compare_cancel")).toEqual([{ taskId: calls("compare_folders")[0].taskId }]));
     await act(async () => compareResolver?.(result("x")));
+  });
+
+  it("a cancelled 'Compare again' keeps the previous results usable (they are freed only once replaced)", async () => {
+    await openCompare();
+    const first = calls("compare_folders")[0].taskId;
+    holdCompare = true;
+    fireEvent.click(screen.getByTestId("compare-run"));
+    fireEvent.click(await screen.findByTestId("compare-cancel"));
+    await act(async () => compareRejecter?.("Comparison cancelled."));
+    expect(calls("compare_release")).toEqual([]);
+    // The rows shown are still the first comparison's, and acting on them works.
+    fireEvent.click(screen.getByTestId("compare-select-docs/new.txt"));
+    fireEvent.click(screen.getByTestId("compare-action-copy_to_right"));
+    await screen.findByText(/Copy → right: 1 done/);
+    expect(calls("compare_apply")).toEqual([expect.objectContaining({ taskId: first, paths: ["docs/new.txt"] })]);
+
+    // A successful "Compare again" frees the previous results.
+    holdCompare = false;
+    fireEvent.click(screen.getByTestId("compare-run"));
+    await waitFor(() => expect(calls("compare_release")).toEqual([{ taskId: first }]));
+  });
+
+  it("on a connection: a copy that overwrites asks first, and a delete says it cannot be undone", async () => {
+    mockInvoke.mockImplementation((cmd: string, args: Record<string, unknown>) => {
+      if (cmd === "compare_folders") {
+        const r = result(args.taskId as string);
+        return Promise.resolve({ ...r, right: { type: "remote", connection_id: "c1", protocol: "sftp", path: "/b" }, right_label: "sftp://srv/b" });
+      }
+      if (cmd === "compare_plan_action") {
+        const p = plan(args.action as string, args.paths as string[], args.permanent === true);
+        const replaced = p.plan.steps.filter((s) => "replace" in s && s.replace).length;
+        return Promise.resolve({ ...p, plan: { ...p.plan, replaced }, intent: { ...p.intent, engine: "connector" } });
+      }
+      return Promise.resolve(backend(cmd, args ?? {}));
+    });
+    await openCompare();
+    fireEvent.click(screen.getByTestId("compare-select-docs/b.txt"));
+    fireEvent.click(screen.getByTestId("compare-action-copy_to_right"));
+    const confirm = await screen.findByTestId("compare-confirm-replace");
+    expect(confirm).toHaveTextContent(/overwrites 1 file on the right connection/);
+    expect(confirm).toHaveTextContent(/cannot be undone/);
+    expect(calls("compare_apply")).toEqual([]);
+    fireEvent.click(within(confirm).getByTestId("compare-confirm-replace-yes"));
+    await screen.findByText(/Copy → right: 1 done/);
+    expect(calls("compare_apply")).toEqual([expect.objectContaining({ paths: ["docs/b.txt"], action: "copy_to_right" })]);
+
+    // A new file (nothing replaced) is copied without asking.
+    fireEvent.click(screen.getByTestId("compare-select-docs/new.txt"));
+    fireEvent.click(screen.getByTestId("compare-action-copy_to_right"));
+    await waitFor(() => expect(calls("compare_apply")).toHaveLength(2));
+    expect(screen.queryByTestId("compare-confirm-replace")).toBeNull();
+
+    // Deleting on the connection: no Trash there.
+    fireEvent.click(screen.getByTestId("compare-select-zzz.txt"));
+    fireEvent.click(screen.getByTestId("compare-action-delete_right"));
+    expect(await screen.findByTestId("compare-confirm-delete")).toHaveTextContent(/on the connection: this cannot be undone/);
+    expect(screen.getByTestId("compare-confirm-delete")).not.toHaveTextContent(/Trash/);
   });
 
   it("closing releases the results", async () => {

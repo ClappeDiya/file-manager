@@ -49,11 +49,25 @@ pub enum CompareSide {
     },
 }
 
+/// Where a connection listed each entry of a comparison (its
+/// `FileEntry.path`), by relative path. Connectors address items by these
+/// paths, which are not always folder names joined up: Google Drive's are
+/// chains of item IDs.
+pub type ListedPaths = std::collections::HashMap<String, String>;
+
 /// A side ready to list and change.
 #[derive(Clone)]
 pub enum ResolvedSide {
     Local { root: PathBuf },
-    Remote { connector: Arc<dyn Connector>, protocol: String, name: String, root: String, connection_id: Option<uuid::Uuid> },
+    Remote {
+        connector: Arc<dyn Connector>,
+        protocol: String,
+        name: String,
+        root: String,
+        connection_id: Option<uuid::Uuid>,
+        /// What the connection listed so far (see [`ListedPaths`]).
+        listed: Arc<std::sync::Mutex<ListedPaths>>,
+    },
 }
 
 impl ResolvedSide {
@@ -93,7 +107,41 @@ impl ResolvedSide {
             r if r.starts_with('/') => r.to_string(),
             r => format!("/{r}"),
         };
-        Self::Remote { connector, protocol: protocol.to_string(), name: name.to_string(), root, connection_id }
+        Self::Remote { connector, protocol: protocol.to_string(), name: name.to_string(), root, connection_id, listed: Default::default() }
+    }
+
+    /// This side with the connection's listed paths of an earlier
+    /// comparison (no change for a local folder).
+    pub fn with_listed(self, paths: ListedPaths) -> Self {
+        if let Self::Remote { listed, .. } = &self {
+            *listed.lock().unwrap_or_else(|e| e.into_inner()) = paths;
+        }
+        self
+    }
+
+    /// The connection's listed paths (empty for a local folder).
+    pub fn listed_paths(&self) -> ListedPaths {
+        match self {
+            Self::Remote { listed, .. } => listed.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            Self::Local { .. } => ListedPaths::new(),
+        }
+    }
+
+    /// The connection listed `rel` at `path`.
+    pub(crate) fn remember(&self, rel: &str, path: &str) {
+        if let Self::Remote { listed, .. } = self {
+            if !rel.is_empty() && !path.is_empty() {
+                listed.lock().unwrap_or_else(|e| e.into_inner()).insert(rel.to_string(), path.to_string());
+            }
+        }
+    }
+
+    /// `rel` (and everything below it) is no longer on the connection.
+    pub(crate) fn forget(&self, rel: &str) {
+        if let Self::Remote { listed, .. } = self {
+            let below = format!("{rel}/");
+            listed.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| k != rel && !k.starts_with(&below));
+        }
     }
 
     pub fn is_local(&self) -> bool {
@@ -110,15 +158,47 @@ impl ResolvedSide {
         }
     }
 
-    /// Where `rel` (relative, `/`-separated) is on this side: a local path or
-    /// a remote path. Refuses a path that would leave the root.
+    /// Where `rel` (relative, `/`-separated) is on this side: a local path,
+    /// or the path the connection listed it at (what its download, remove
+    /// and listing take). Refuses a path that would leave the root.
     pub fn abs(&self, rel: &str) -> Result<String, String> {
         let rel = Self::check_relative(rel)?;
-        Ok(self.joined(rel))
+        Ok(self.located(rel))
     }
 
-    /// `rel` under the root, as text (callers check `rel` first).
-    fn joined(&self, rel: &str) -> String {
+    /// Where a new item `rel` is created on this side (what an upload or a
+    /// new folder takes): on a connection, the listed path of the folder it
+    /// goes in, then its name. Refuses a path that would leave the root.
+    pub fn abs_new(&self, rel: &str) -> Result<String, String> {
+        let rel = Self::check_relative(rel)?;
+        Ok(match (self, rel.rsplit_once('/')) {
+            (Self::Local { .. }, _) => self.named(rel),
+            (Self::Remote { root, .. }, _) if rel.is_empty() => root.clone(),
+            (Self::Remote { .. }, Some((parent, name))) => child_path(&self.located(parent), name),
+            (Self::Remote { root, .. }, None) => child_path(root, rel),
+        })
+    }
+
+    /// `rel` as this side addresses it (callers check `rel` first): a
+    /// connection's listed path when it has one, else the listed path of
+    /// the nearest folder above it with the rest of the names joined on.
+    fn located(&self, rel: &str) -> String {
+        let Self::Remote { root, listed, .. } = self else { return self.named(rel) };
+        if rel.is_empty() {
+            return root.clone();
+        }
+        if let Some(p) = listed.lock().unwrap_or_else(|e| e.into_inner()).get(rel) {
+            return p.clone();
+        }
+        match rel.rsplit_once('/') {
+            Some((parent, name)) => child_path(&self.located(parent), name),
+            None => child_path(root, rel),
+        }
+    }
+
+    /// `rel`'s names joined onto the root, as text (callers check `rel`
+    /// first). How the UI names it; a connection may address it otherwise.
+    fn named(&self, rel: &str) -> String {
         match self {
             Self::Local { root } if rel.is_empty() => root.to_string_lossy().to_string(),
             Self::Local { root } => rel.split('/').fold(root.clone(), |p, part| p.join(part)).to_string_lossy().to_string(),
@@ -142,8 +222,8 @@ impl ResolvedSide {
     /// (`sftp://My server/docs/a.txt` for a connection). Display only.
     pub fn label(&self, rel: &str) -> String {
         match self {
-            Self::Local { .. } => self.joined(rel),
-            Self::Remote { protocol, name, .. } => format!("{protocol}://{name}{}", self.joined(rel)),
+            Self::Local { .. } => self.named(rel),
+            Self::Remote { protocol, name, .. } => format!("{protocol}://{name}{}", self.named(rel)),
         }
     }
 
@@ -153,6 +233,11 @@ impl ResolvedSide {
             Self::Local { .. } => None,
         }
     }
+}
+
+/// `name` inside the remote folder at `dir`.
+fn child_path(dir: &str, name: &str) -> String {
+    format!("{}/{name}", dir.trim_end_matches('/'))
 }
 
 /// What a running comparison or action is doing.
@@ -268,7 +353,7 @@ async fn list_side(side: &ResolvedSide, max_depth: u32, cancel: &CancellationTok
             };
             walk_side(lister, root.to_string_lossy().to_string(), max_depth, cancel, counters).await
         }
-        ResolvedSide::Remote { connector, root, .. } => {
+        ResolvedSide::Remote { connector, root, listed, .. } => {
             let connector = connector.clone();
             let lister = move |(abs, _rel, _depth): (String, String, u32)| {
                 let c = connector.clone();
@@ -277,13 +362,17 @@ async fn list_side(side: &ResolvedSide, max_depth: u32, cancel: &CancellationTok
                     Ok(entries
                         .into_iter()
                         .map(|e| {
-                            let child = if e.path.is_empty() { format!("{}/{}", abs.trim_end_matches('/'), e.name) } else { e.path.clone() };
+                            let child = if e.path.is_empty() { child_path(&abs, &e.name) } else { e.path.clone() };
                             Listed { is_dir: e.is_dir, size: if e.is_dir { 0 } else { e.size }, modified: e.modified, descend: e.is_dir, abs: child, error: None, name: e.name.trim_end_matches('/').to_string() }
                         })
                         .collect::<Vec<_>>())
                 }
             };
-            walk_side(lister, root.clone(), max_depth, cancel, counters).await
+            let listing = walk_side(lister, root.clone(), max_depth, cancel, counters).await?;
+            // Every action on these entries addresses them by these paths.
+            let paths = listing.entries.iter().map(|m| (m.relative_path.clone(), m.absolute_path.to_string_lossy().to_string())).collect();
+            *listed.lock().unwrap_or_else(|e| e.into_inner()) = paths;
+            Ok(listing)
         }
     }
 }
@@ -426,6 +515,10 @@ pub struct StoredCompare {
     pub right: CompareSide,
     pub options: CompareOptions,
     pub entries: Vec<CompareEntry>,
+    /// Where each connection listed the entries (kept server side; the
+    /// actions address remote entries by these).
+    pub left_paths: ListedPaths,
+    pub right_paths: ListedPaths,
 }
 
 /// Running comparisons and actions (cancellable by id) and the latest results.

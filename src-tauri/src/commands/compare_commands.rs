@@ -58,7 +58,15 @@ pub async fn compare_folders(
     manager.end(&task_id, &cancel);
     let (l, r, out) = outcome?;
     manager
-        .store(StoredCompare { task_id: task_id.clone(), left: left.clone(), right: right.clone(), options: options.clone(), entries: out.entries.clone() })
+        .store(StoredCompare {
+            task_id: task_id.clone(),
+            left: left.clone(),
+            right: right.clone(),
+            options: options.clone(),
+            entries: out.entries.clone(),
+            left_paths: l.listed_paths(),
+            right_paths: r.listed_paths(),
+        })
         .await;
     Ok(CompareResult {
         task_id,
@@ -171,11 +179,14 @@ pub async fn compare_apply(
     transfer: State<'_, TransferManager>,
     ledger: State<'_, OperationLedger>,
 ) -> Result<ApplyOutcome, AppError> {
-    let (plan, left, right, options) = manager
-        .with(&task_id, |s| (compare::plan_action(&s.entries, &paths, action), s.left.clone(), s.right.clone(), s.options.clone()))
+    let (plan, left, right, options, left_paths, right_paths) = manager
+        .with(&task_id, |s| {
+            (compare::plan_action(&s.entries, &paths, action), s.left.clone(), s.right.clone(), s.options.clone(), s.left_paths.clone(), s.right_paths.clone())
+        })
         .await?;
-    let l = ResolvedSide::resolve(&left, &registry, &connections).await?;
-    let r = ResolvedSide::resolve(&right, &registry, &connections).await?;
+    // Remote entries are addressed where their connection listed them.
+    let l = ResolvedSide::resolve(&left, &registry, &connections).await?.with_listed(left_paths);
+    let r = ResolvedSide::resolve(&right, &registry, &connections).await?.with_listed(right_paths);
     let run_id = apply_id.filter(|a| !a.is_empty()).unwrap_or_else(|| format!("{task_id}:apply"));
     let cancel = manager.begin(&run_id);
     let progress = emitter(app);
@@ -185,7 +196,13 @@ pub async fn compare_apply(
 
     progress(CompareProgress { task_id: task_id.clone(), phase: crate::compare_engine::ComparePhase::Refreshing, folders_listed: 0, entries_found: 0, done: 0, total: report.touched.len() as u64, current: None });
     let refreshed = apply::refresh(&l, &r, &options, &report.touched).await?;
-    let merged = manager.with(&task_id, |s| compare::merge_refreshed(&mut s.entries, &report.touched, refreshed)).await?;
+    let merged = manager
+        .with(&task_id, |s| {
+            // Folders made, files uploaded and items deleted move these.
+            (s.left_paths, s.right_paths) = (l.listed_paths(), r.listed_paths());
+            compare::merge_refreshed(&mut s.entries, &report.touched, refreshed)
+        })
+        .await?;
     Ok(ApplyOutcome {
         task_id,
         action,

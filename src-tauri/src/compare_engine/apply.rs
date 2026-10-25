@@ -2,26 +2,38 @@
 //! just the entries that changed.
 //!
 //! - Local → local copies are transfer-engine jobs (the queue's verified,
-//!   journalled, pausable copy) into a hidden sibling, moved into place
-//!   once complete; the copy keeps the source's modification time.
+//!   journalled, pausable copy) into a hidden sibling
+//!   (`.<name>.ufop-compare-<tag>`), moved into place once complete; the
+//!   copy keeps the source's modification time. The queue does not keep
+//!   these jobs over a restart ([`is_staging`]), and a staging file left by
+//!   a copy the app closed during is removed when a copy next goes to that
+//!   folder.
 //! - Copies to or from a connection go through its connector (upload,
 //!   download, or download-then-upload between two connections) and show
 //!   in the transfer queue as tracked jobs, which Cancel there stops.
-//! - A copy that replaces a different file first moves the old one to the
-//!   Trash (or deletes it, when the user chose permanent). A copy that is
+//!   Remote entries are addressed by the paths the connection listed them
+//!   at ([`ResolvedSide::abs`]), new ones by their folder's listed path and
+//!   their name ([`ResolvedSide::abs_new`]): on Google Drive those are IDs.
+//! - A copy that replaces a different local file first moves the old one
+//!   to the Trash (on Windows `move_to_trash` deletes it: no Trash there
+//!   yet), or deletes it when the user chose permanent. On a connection the
+//!   upload overwrites the old file: nothing of it is kept. A copy that is
 //!   not meant to replace anything never overwrites a file that appeared
 //!   since the comparison, on a local folder or a connection.
 //! - Every step's path must be a plain path inside the side's root
 //!   ([`ResolvedSide::check_relative`]); anything else is refused.
 //! - Local deletes go through the file manager's own delete (Trash unless
-//!   permanent); connection deletes through the connector. A folder is
+//!   permanent, and not on Windows yet); connection deletes through the
+//!   connector's remove, which most protocols cannot undo. A folder is
 //!   removed only once nothing is left in it.
 //!
 //! Everything is recorded in the operation ledger. Local copies of new files
 //! and local folders created are recorded as `fs` copy / create-folder
 //! operations, so Undo removes them (`undo_ids`: the copies, then the
-//! folders); replacements and deletes are recorded as such (the Trash holds
-//! what they removed).
+//! folders); replacements and deletes are recorded as such (for a local
+//! folder outside Windows, the Trash holds what they removed). What is done
+//! on a connection is recorded as `connector` operations, which Undo cannot
+//! reverse.
 
 use super::{ComparePhase, CompareProgress, ProgressFn, ResolvedSide};
 use crate::commands::file_ops_commands::{delete_files_impl, move_to_trash, record_fs_ok};
@@ -113,6 +125,8 @@ struct Records {
     /// Names in each folder of a connection the copies go to, listed once
     /// per action to check that a new file is not already there.
     remote_names: HashMap<String, HashSet<String>>,
+    /// Local folders already cleared of stale staging files.
+    swept: HashSet<PathBuf>,
 }
 
 fn side<'a>(id: CompareSideId, left: &'a ResolvedSide, right: &'a ResolvedSide) -> &'a ResolvedSide {
@@ -203,7 +217,8 @@ pub async fn execute(plan: &ActionPlan, left: &ResolvedSide, right: &ResolvedSid
     if !rec.replaced.1.is_empty() {
         let id = uuid::Uuid::new_v4().to_string();
         record_fs_ok(env.ledger, "overwrite", &rec.replaced.0, &rec.replaced.1, &id).await;
-        let kept = if env.permanent { "deleted" } else { "moved to the Trash" };
+        // `move_to_trash` deletes on Windows (no Trash support there yet).
+        let kept = if env.permanent || cfg!(windows) { "deleted" } else { "moved to the Trash" };
         report.notes.push(format!("{} replaced file(s): the previous versions were {kept}.", rec.replaced.1.len()));
     }
     if rec.uploads_with_new_time > 0 {
@@ -288,52 +303,113 @@ async fn make_dir(target: &ResolvedSide, rel: &str, ledger: &OperationLedger, re
             Ok(())
         }
         ResolvedSide::Remote { connector, .. } => {
-            let abs = target.abs(rel)?;
+            let abs = target.abs_new(rel)?;
             match connector.make_directory(&abs).await {
                 Ok(()) => {
                     ledger.record(connector_event("create_folder", LedgerStatus::Ok, &target.label(rel), None, None)).await;
+                    // What goes in it is addressed by the path the
+                    // connection lists it at (an ID on Google Drive).
+                    if let Err(e) = remote_lookup(target, rel).await {
+                        tracing::debug!("Could not list the folder {abs} was made in: {e}");
+                    }
                     Ok(())
                 }
                 // Some servers refuse to create a folder that exists.
-                Err(e) if remote_kind(target, rel).await == Some(true) => {
-                    tracing::debug!("{abs} already exists: {e}");
-                    Ok(())
-                }
-                Err(e) => Err(e.to_string()),
+                Err(e) => match remote_lookup(target, rel).await {
+                    Ok(Some(found)) if found.is_dir => {
+                        tracing::debug!("{abs} already exists: {e}");
+                        Ok(())
+                    }
+                    _ => Err(e.to_string()),
+                },
             }
         }
     }
 }
 
-/// Whether `rel` exists on a remote side, and is a folder (`Some(true)`).
-async fn remote_kind(target: &ResolvedSide, rel: &str) -> Option<bool> {
-    let ResolvedSide::Remote { connector, .. } = target else { return None };
-    let (parent, name) = match rel.rsplit_once('/') {
-        Some((p, n)) => (p, n),
-        None => ("", rel),
-    };
-    let listing = connector.list_remote(&target.abs(parent).ok()?).await.ok()?;
-    listing.iter().find(|e| e.name.trim_end_matches('/') == name).map(|e| e.is_dir)
+/// List the folder `rel` is in on a remote side, noting where the
+/// connection lists each item in it.
+async fn list_parent(target: &ResolvedSide, rel: &str) -> Result<Vec<crate::core::types::FileEntry>, String> {
+    let ResolvedSide::Remote { connector, .. } = target else { return Err("not a connection".to_string()) };
+    let parent = rel.rsplit_once('/').map_or("", |(p, _)| p);
+    let dir = target.abs(parent)?;
+    let listing = connector.list_remote(&dir).await.map_err(|e| e.to_string())?;
+    for e in &listing {
+        let name = e.name.trim_end_matches('/');
+        let child = if parent.is_empty() { name.to_string() } else { format!("{parent}/{name}") };
+        target.remember(&child, &e.path);
+    }
+    Ok(listing)
+}
+
+/// What `rel` is on a remote side now: `Ok(None)` only when the folder it is
+/// in lists without it; a listing that fails is an error, never "gone".
+async fn remote_lookup(target: &ResolvedSide, rel: &str) -> Result<Option<crate::core::types::FileEntry>, String> {
+    let name = rel.rsplit_once('/').map_or(rel, |(_, n)| n);
+    let found = list_parent(target, rel).await?.into_iter().find(|e| e.name.trim_end_matches('/') == name);
+    if found.is_none() {
+        target.forget(rel);
+    }
+    Ok(found)
 }
 
 /// Whether `rel` is on a remote side now. Each folder is listed once per
 /// action (`cache`); a folder that cannot be listed is an error, so the
 /// caller never writes where it could not look.
 async fn remote_exists(target: &ResolvedSide, rel: &str, cache: &mut HashMap<String, HashSet<String>>) -> Result<bool, String> {
-    let ResolvedSide::Remote { connector, .. } = target else { return Err("not a connection".to_string()) };
     let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
     if !cache.contains_key(parent) {
-        let listing = connector.list_remote(&target.abs(parent)?).await.map_err(|e| e.to_string())?;
+        let listing = list_parent(target, rel).await?;
         cache.insert(parent.to_string(), listing.into_iter().map(|e| e.name.trim_end_matches('/').to_string()).collect());
     }
     Ok(cache.get(parent).is_some_and(|names| names.contains(name)))
 }
 
+/// Marks the hidden sibling a local copy is written to.
+const STAGING_MARK: &str = ".ufop-compare-";
+
 /// Hidden sibling a local copy is written to before it is moved into place.
 fn staging_for(dest: &Path) -> PathBuf {
     let name = dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
-    dest.with_file_name(format!(".{name}.ufop-compare-{tag}"))
+    dest.with_file_name(format!(".{name}{STAGING_MARK}{tag}"))
+}
+
+/// Whether `path` is a staging file of a local copy
+/// (`.<name>.ufop-compare-<8 hex digits>`). The transfer queue does not
+/// keep such jobs over a restart: the copy they belong to ended with the app.
+pub fn is_staging(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.strip_prefix('.')
+        .and_then(|n| n.rsplit_once(STAGING_MARK))
+        .is_some_and(|(stem, tag)| !stem.is_empty() && tag.len() == 8 && tag.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Remove staging files in `dir` left by local copies that were interrupted
+/// (the app closed mid-copy), except those an unfinished queue job writes.
+async fn sweep_staging(dir: &Path, transfer: &TransferManager) {
+    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let stale: Vec<PathBuf> = read
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && is_staging(&e.file_name().to_string_lossy()))
+        .map(|e| e.path())
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    let busy: HashSet<PathBuf> = transfer
+        .snapshot_jobs()
+        .await
+        .into_iter()
+        .filter(|j| !matches!(j.status, TransferStatus::Completed | TransferStatus::Failed | TransferStatus::Cancelled))
+        .map(|j| PathBuf::from(j.dest_path))
+        .collect();
+    for path in stale.into_iter().filter(|p| !busy.contains(p)) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!("Removed a staging file left by an interrupted copy: {}", path.display()),
+            Err(e) => tracing::debug!("Could not remove {}: {e}", path.display()),
+        }
+    }
 }
 
 /// Move a finished local copy at `staging` to `dest`, keeping `modified`.
@@ -438,6 +514,9 @@ async fn copy_file(
             crate::commands::policy_commands::enforce_path(&dest).map_err(|e| e.to_string())?;
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create folder {}: {e}", parent.display()))?;
+                if rec.swept.insert(parent.to_path_buf()) {
+                    sweep_staging(parent, env.transfer).await;
+                }
             }
             let staging = staging_for(&dest);
             let staging_str = staging.to_string_lossy().to_string();
@@ -467,7 +546,9 @@ async fn copy_file(
             Ok(())
         }
         ResolvedSide::Remote { connector, .. } => {
-            let remote = to.abs(rel)?;
+            // Uploads name the folder (as the connection listed it) and the
+            // file's name; the file's own listed path may be an ID.
+            let remote = to.abs_new(rel)?;
             // A file the comparison did not see on the connection is never
             // overwritten (uploads replace silently), like local copies.
             if !replace {
@@ -505,7 +586,13 @@ async fn copy_file(
                 Err(e) => {
                     // A new file stopped half way is not left behind.
                     if !replace && (env.cancel.is_cancelled() || e == CANCELLED_IN_QUEUE) {
-                        let _ = connector.remove(&remote, false).await;
+                        let partial = match remote_lookup(to, rel).await {
+                            Ok(Some(found)) if !found.path.is_empty() => found.path,
+                            _ => remote.clone(),
+                        };
+                        if connector.remove(&partial, false).await.is_ok() {
+                            to.forget(rel);
+                        }
                     }
                     env.ledger.record(connector_event(kind, LedgerStatus::Failed, &src_label, Some(&dest_label), None)).await;
                     Err(e)
@@ -520,7 +607,7 @@ async fn delete_remote_file(target: &ResolvedSide, rel: &str, ledger: &Operation
     let result = connector.remove(&target.abs(rel)?, false).await;
     let status = if result.is_ok() { LedgerStatus::Ok } else { LedgerStatus::Failed };
     ledger.record(connector_event("delete", status, &target.label(rel), None, None)).await;
-    result.map_err(|e| e.to_string())
+    result.map(|_| target.forget(rel)).map_err(|e| e.to_string())
 }
 
 /// Remove a folder once it is empty: `Ok(false)` when something is still in it.
@@ -543,14 +630,21 @@ async fn delete_dir(target: &ResolvedSide, rel: &str, env: &ApplyEnv<'_>) -> Res
             match connector.list_remote(&abs).await {
                 Ok(list) if !list.is_empty() => return Ok(false),
                 Ok(_) => {}
-                // Already gone.
-                Err(_) if remote_kind(target, rel).await.is_none() => return Ok(true),
-                Err(e) => return Err(e.to_string()),
+                // Already gone only when the folder it was in lists without
+                // it; when that cannot be listed either, it is a failure.
+                Err(e) => match remote_lookup(target, rel).await {
+                    Ok(None) => return Ok(true),
+                    Ok(Some(_)) | Err(_) => return Err(e.to_string()),
+                },
             }
             let result = connector.remove(&abs, true).await;
             let status = if result.is_ok() { LedgerStatus::Ok } else { LedgerStatus::Failed };
             env.ledger.record(connector_event("delete", status, &target.label(rel), None, None)).await;
-            result.map(|_| true).map_err(|e| e.to_string())
+            result.map(|_| {
+                target.forget(rel);
+                true
+            })
+            .map_err(|e| e.to_string())
         }
     }
 }
@@ -603,6 +697,7 @@ async fn stat_side(side: &ResolvedSide, paths: &[String]) -> SideListing {
                 let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel.as_str()));
                 if absent.contains(parent) {
                     absent.insert(rel.clone());
+                    side.forget(rel);
                     continue;
                 }
                 if !listings.contains_key(parent) {
@@ -615,7 +710,9 @@ async fn stat_side(side: &ResolvedSide, paths: &[String]) -> SideListing {
                 let found = match &listings[parent] {
                     Ok(list) => Ok(list.iter().find(|e| e.name.trim_end_matches('/') == name).map(|e| FileMeta {
                         relative_path: rel.clone(),
-                        absolute_path: PathBuf::from(side.abs(rel).unwrap_or_default()),
+                        // Where the connection lists it (an ID on Google
+                        // Drive); what is below it is listed from there.
+                        absolute_path: PathBuf::from(if e.path.is_empty() { side.abs_new(rel).unwrap_or_default() } else { e.path.clone() }),
                         size: if e.is_dir { 0 } else { e.size },
                         modified: e.modified,
                         is_dir: e.is_dir,
@@ -626,8 +723,13 @@ async fn stat_side(side: &ResolvedSide, paths: &[String]) -> SideListing {
                     })),
                     Err(e) => Err(e.clone()),
                 };
-                if matches!(found, Ok(None)) {
-                    absent.insert(rel.clone());
+                match &found {
+                    Ok(Some(m)) => side.remember(rel, &m.absolute_path.to_string_lossy()),
+                    Ok(None) => {
+                        absent.insert(rel.clone());
+                        side.forget(rel);
+                    }
+                    Err(_) => {}
                 }
                 add(rel, found, &mut listing);
             }

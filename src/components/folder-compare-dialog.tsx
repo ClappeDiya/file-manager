@@ -24,7 +24,7 @@ import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { errorText } from "@/lib/error-text";
 import { formatBytes } from "@/lib/format-bytes";
 import { assessBeforeExecute } from "@/lib/safety";
-import type { CompareMode } from "@/lib/copy-options";
+import { isWindowsPlatform, type CompareMode } from "@/lib/copy-options";
 import {
   COMPARE_PROGRESS_EVENT,
   COMPARE_STATUSES,
@@ -74,6 +74,18 @@ const ACTION_LABEL: Record<CompareAction, string> = {
 };
 
 const isDelete = (a: CompareAction) => a === "delete_left" || a === "delete_right";
+const targetsLeft = (a: CompareAction) => a === "copy_to_left" || a === "delete_left";
+/** Whether `action` changes a folder on a connection (no Trash, no Undo there). */
+const targetsConnection = (r: CompareResult, a: CompareAction) => (targetsLeft(a) ? r.left : r.right).type === "remote";
+
+/** What a delete does with what it removes, as the confirmation says it. */
+function deleteFate(remote: boolean, permanent: boolean): string {
+  if (remote) return " on the connection: this cannot be undone from here";
+  if (permanent) return " permanently";
+  // The file manager's Trash is not implemented on Windows yet: it deletes.
+  if (isWindowsPlatform()) return " permanently (the Trash is not available on Windows yet)";
+  return " (to the Trash)";
+}
 
 let taskCounter = 0;
 const newTaskId = () => `cmp-${Date.now().toString(36)}-${++taskCounter}`;
@@ -155,9 +167,10 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
   const [focused, setFocused] = useState<string | null>(null);
   const [sort, setSort] = useState<CompareSort>("name");
   const [permanent, setPermanent] = useState(false);
-  // A planned delete waiting for confirmation, with the "Delete permanently"
-  // choice it was planned (and assessed) with.
-  const [pendingDelete, setPendingDelete] = useState<{ action: CompareAction; planned: CompareActionPlan; paths: string[]; permanent: boolean } | null>(null);
+  // A planned delete (or a copy that overwrites files on a connection)
+  // waiting for confirmation, with the "Delete permanently" choice it was
+  // planned (and assessed) with.
+  const [pendingConfirm, setPendingConfirm] = useState<{ action: CompareAction; planned: CompareActionPlan; paths: string[]; permanent: boolean; remote: boolean } | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
   const [showRules, setShowRules] = useState(false);
   const groups = useFilterGroups();
@@ -192,21 +205,23 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
   }, []);
 
   const runCompare = useCallback(async () => {
-    const previous = resultRef.current;
-    if (previous) void tauriInvokeSafe("compare_release", { taskId: previous.task_id }, false);
     const taskId = newTaskId();
     taskRef.current = taskId;
     setRunning({ id: taskId, kind: "compare" });
     setError(null);
     setProgress(null);
     setMessage(null);
-    setPendingDelete(null);
+    setPendingConfirm(null);
     const opts: CompareOptions = {
       ...options,
       filter: { ...options.filter, include_patterns: parsePatterns(include), exclude_patterns: parsePatterns(exclude) },
     };
     try {
       const r = await tauriInvoke<CompareResult>("compare_folders", { left: request.left, right: request.right, options: opts, taskId });
+      // The previous results are freed only once these replace them: a
+      // "Compare again" that fails or is cancelled keeps them usable.
+      const previous = resultRef.current;
+      if (previous && previous.task_id !== r.task_id) void tauriInvokeSafe("compare_release", { taskId: previous.task_id }, false);
       setResult(r);
       setSelected(new Set());
       setAnchor(null);
@@ -347,9 +362,9 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
     async (action: CompareAction, paths: string[], perm: boolean) => {
       const current = resultRef.current;
       if (!current || paths.length === 0) return;
-      const targetLabel = action === "copy_to_left" || action === "delete_left" ? current.left_label : current.right_label;
+      const targetLabel = targetsLeft(action) ? current.left_label : current.right_label;
       setMessage(null);
-      setPendingDelete(null);
+      setPendingConfirm(null);
       let planned: CompareActionPlan;
       try {
         planned = await tauriInvoke<CompareActionPlan>("compare_plan_action", { taskId: current.task_id, paths, action, permanent: perm, targetLabel });
@@ -361,8 +376,11 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
         setMessage({ tone: "info", text: describeSkips(planned.plan), details: planned.plan.skipped.slice(0, 20).map((s) => `${s.path}: ${s.reason}`) });
         return;
       }
-      if (isDelete(action)) {
-        setPendingDelete({ action, planned, paths, permanent: perm });
+      const remote = targetsConnection(current, action);
+      // Deletes always ask; so does a copy that overwrites files on a
+      // connection, which keeps no previous version.
+      if (isDelete(action) || (remote && planned.plan.replaced > 0)) {
+        setPendingConfirm({ action, planned, paths, permanent: perm, remote });
         return;
       }
       await execute(action, planned, paths, perm);
@@ -377,9 +395,9 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
   const changePermanent = useCallback(
     (perm: boolean) => {
       setPermanent(perm);
-      if (pendingDelete) void planAction(pendingDelete.action, pendingDelete.paths, perm);
+      if (pendingConfirm) void planAction(pendingConfirm.action, pendingConfirm.paths, perm);
     },
-    [pendingDelete, planAction],
+    [pendingConfirm, planAction],
   );
 
   // Undo each recorded operation in turn: the copies, then the folders made for them.
@@ -628,19 +646,33 @@ function FolderCompareWindow({ request, onClose }: { request: CompareRequest; on
         </div>
 
         {/* Messages */}
-        {(message || pendingDelete || (result && result.notes.length > 0)) && (
+        {(message || pendingConfirm || (result && result.notes.length > 0)) && (
           <div className="space-y-1 border-t border-[var(--color-border)] px-3 py-1.5 text-[11px]">
-            {pendingDelete && (
+            {pendingConfirm && isDelete(pendingConfirm.action) && (
               <div className="flex flex-wrap items-center gap-2 text-red-700 dark:text-red-400" data-testid="compare-confirm-delete">
                 <span>
-                  Delete {pendingDelete.planned.plan.files} file{pendingDelete.planned.plan.files === 1 ? "" : "s"}
-                  {pendingDelete.planned.plan.folders > 0 ? ` and up to ${pendingDelete.planned.plan.folders} folder${pendingDelete.planned.plan.folders === 1 ? "" : "s"}` : ""} ({formatBytes(pendingDelete.planned.plan.bytes)}) on the {pendingDelete.action === "delete_left" ? "left" : "right"}
-                  {pendingDelete.permanent ? " permanently" : " (to the Trash where the side is a local folder)"}?
+                  Delete {pendingConfirm.planned.plan.files} file{pendingConfirm.planned.plan.files === 1 ? "" : "s"}
+                  {pendingConfirm.planned.plan.folders > 0 ? ` and up to ${pendingConfirm.planned.plan.folders} folder${pendingConfirm.planned.plan.folders === 1 ? "" : "s"}` : ""} ({formatBytes(pendingConfirm.planned.plan.bytes)}) on the {pendingConfirm.action === "delete_left" ? "left" : "right"}
+                  {deleteFate(pendingConfirm.remote, pendingConfirm.permanent)}?
                 </span>
-                <button type="button" className="rounded bg-red-600 px-2 py-0.5 text-white" onClick={() => { const p = pendingDelete; setPendingDelete(null); void execute(p.action, p.planned, p.paths, p.permanent); }} data-testid="compare-confirm-delete-yes">
+                <button type="button" className="rounded bg-red-600 px-2 py-0.5 text-white" onClick={() => { const p = pendingConfirm; setPendingConfirm(null); void execute(p.action, p.planned, p.paths, p.permanent); }} data-testid="compare-confirm-delete-yes">
                   Delete
                 </button>
-                <button type="button" className="rounded border border-[var(--color-border)] px-2 py-0.5" onClick={() => setPendingDelete(null)}>
+                <button type="button" className="rounded border border-[var(--color-border)] px-2 py-0.5" onClick={() => setPendingConfirm(null)}>
+                  Keep
+                </button>
+              </div>
+            )}
+            {pendingConfirm && !isDelete(pendingConfirm.action) && (
+              <div className="flex flex-wrap items-center gap-2 text-amber-700 dark:text-amber-400" data-testid="compare-confirm-replace">
+                <span>
+                  This overwrites {pendingConfirm.planned.plan.replaced} file{pendingConfirm.planned.plan.replaced === 1 ? "" : "s"} on the {targetsLeft(pendingConfirm.action) ? "left" : "right"} connection.
+                  The current versions are not kept and this cannot be undone from here. Copy anyway?
+                </span>
+                <button type="button" className="rounded bg-amber-600 px-2 py-0.5 text-white" onClick={() => { const p = pendingConfirm; setPendingConfirm(null); void execute(p.action, p.planned, p.paths, p.permanent); }} data-testid="compare-confirm-replace-yes">
+                  Copy and overwrite
+                </button>
+                <button type="button" className="rounded border border-[var(--color-border)] px-2 py-0.5" onClick={() => setPendingConfirm(null)}>
                   Keep
                 </button>
               </div>

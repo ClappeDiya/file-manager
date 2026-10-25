@@ -282,7 +282,7 @@ async fn manager_cancels_and_keeps_results() {
     assert!(t.is_cancelled());
     assert!(!m.cancel("a"));
     for i in 0..10 {
-        m.store(StoredCompare { task_id: format!("r{i}"), left: CompareSide::Local { path: "/".into() }, right: CompareSide::Local { path: "/".into() }, options: Default::default(), entries: vec![] }).await;
+        m.store(StoredCompare { task_id: format!("r{i}"), left: CompareSide::Local { path: "/".into() }, right: CompareSide::Local { path: "/".into() }, options: Default::default(), entries: vec![], left_paths: Default::default(), right_paths: Default::default() }).await;
     }
     assert!(m.with("r0", |_| ()).await.is_err(), "oldest results are dropped");
     assert!(m.with("r9", |_| ()).await.is_ok());
@@ -675,4 +675,253 @@ async fn undoing_created_folders_works_in_any_listed_order() {
     let listed = vec![a.to_string_lossy().to_string(), ab.to_string_lossy().to_string()];
     crate::commands::file_ops_commands::undo_file_operation_inner("create_folder".into(), vec![], listed).await.unwrap();
     assert!(!a.exists());
+}
+
+// ── Regressions (review round 2) ──
+
+/// A connection addressed by IDs, like Google Drive: an entry's path is
+/// `/<parent ids…>/<its id>`, and only the last segment counts. Downloads
+/// and removes read the last segment as the item's ID; uploads and new
+/// folders read the parent's last segment as the folder's ID and the last
+/// segment as the new name. Files live under a local folder.
+pub(crate) struct IdConnector {
+    root: PathBuf,
+    /// id → path relative to `root` (`""` is the root, id `ROOT`).
+    ids: Mutex<HashMap<String, String>>,
+    next: Mutex<u64>,
+    /// Listings that fail (by folder id).
+    pub fail: Mutex<Vec<String>>,
+}
+
+use std::collections::HashMap;
+
+impl IdConnector {
+    pub(crate) fn new(root: &Path) -> Self {
+        let ids = HashMap::from([("ROOT".to_string(), String::new())]);
+        Self { root: root.to_path_buf(), ids: Mutex::new(ids), next: Mutex::new(0), fail: Mutex::new(Vec::new()) }
+    }
+
+    fn last(path: &str) -> String {
+        path.trim_end_matches('/').rsplit('/').next().unwrap_or_default().to_string()
+    }
+
+    /// The local path of the item whose ID ends `path`.
+    fn by_id(&self, path: &str) -> Result<PathBuf, AppError> {
+        let id = Self::last(path);
+        let rel = self.ids.lock().unwrap().get(&id).cloned().ok_or_else(|| AppError::not_found(format!("File not found: {id}")))?;
+        Ok(if rel.is_empty() { self.root.clone() } else { self.root.join(rel) })
+    }
+
+    fn id_for(&self, rel: &str) -> String {
+        let mut ids = self.ids.lock().unwrap();
+        if let Some((id, _)) = ids.iter().find(|(_, r)| r.as_str() == rel) {
+            return id.clone();
+        }
+        let mut n = self.next.lock().unwrap();
+        *n += 1;
+        let id = format!("id{n:04}");
+        ids.insert(id.clone(), rel.to_string());
+        id
+    }
+
+    /// The folder (by its ID, the parent's last segment) and the new name.
+    fn new_item(&self, path: &str) -> Result<PathBuf, AppError> {
+        let (parent, name) = path.trim_end_matches('/').rsplit_once('/').ok_or_else(|| AppError::validation("bad path"))?;
+        let dir = self.by_id(if parent.is_empty() { "/ROOT" } else { parent })?;
+        if !dir.is_dir() {
+            return Err(AppError::not_found(format!("Folder not found: {parent}")));
+        }
+        Ok(dir.join(name))
+    }
+
+    fn rel_of(&self, p: &Path) -> String {
+        p.strip_prefix(&self.root).unwrap().to_string_lossy().replace('\\', "/")
+    }
+}
+
+impl Connector for IdConnector {
+    fn connect(&self, _profile: &ConnectionProfile) -> Fut<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn disconnect(&self) -> Fut<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn is_connected(&self) -> bool {
+        true
+    }
+    fn list_remote(&self, path: &str) -> Fut<'_, Vec<FileEntry>> {
+        let path = path.to_string();
+        Box::pin(async move {
+            if self.fail.lock().unwrap().contains(&Self::last(&path)) {
+                return Err(AppError::connection("The network dropped", "fake"));
+            }
+            let dir = self.by_id(&path)?;
+            if !dir.is_dir() {
+                return Err(AppError::not_found(format!("Not a folder: {path}")));
+            }
+            let mut out = Vec::new();
+            for e in std::fs::read_dir(&dir).map_err(io)? {
+                let e = e.map_err(io)?;
+                let m = e.metadata().map_err(io)?;
+                let name = e.file_name().to_string_lossy().to_string();
+                let id = self.id_for(&self.rel_of(&e.path()));
+                out.push(FileEntry {
+                    path: format!("{}/{id}", path.trim_end_matches('/')),
+                    name,
+                    is_dir: m.is_dir(),
+                    is_symlink: false,
+                    size: if m.is_dir() { 0 } else { m.len() },
+                    modified: m.modified().ok().map(DateTime::<Utc>::from),
+                    created: None,
+                    is_hidden: false,
+                    extension: None,
+                    permissions: None,
+                });
+            }
+            Ok(out)
+        })
+    }
+    fn upload(&self, local: &str, remote: &str) -> Fut<'_, u64> {
+        let (local, remote) = (local.to_string(), remote.to_string());
+        Box::pin(async move {
+            // Replaces the file with that name in the folder, as Drive does.
+            let target = self.new_item(&remote)?;
+            std::fs::copy(local, target).map_err(io)
+        })
+    }
+    fn download(&self, remote: &str, local: &str) -> Fut<'_, u64> {
+        let (remote, local) = (remote.to_string(), local.to_string());
+        Box::pin(async move {
+            let src = self.by_id(&remote)?;
+            let n = std::fs::copy(&src, &local).map_err(io)?;
+            if let Ok(t) = std::fs::metadata(&src).and_then(|m| m.modified()) {
+                let _ = std::fs::File::options().write(true).open(&local).and_then(|f| f.set_modified(t));
+            }
+            Ok(n)
+        })
+    }
+    fn make_directory(&self, remote: &str) -> Fut<'_, ()> {
+        let remote = remote.to_string();
+        Box::pin(async move { std::fs::create_dir(self.new_item(&remote)?).map_err(io) })
+    }
+    fn remove(&self, remote: &str, is_dir: bool) -> Fut<'_, ()> {
+        let remote = remote.to_string();
+        Box::pin(async move {
+            let p = self.by_id(&remote)?;
+            if is_dir { std::fs::remove_dir(&p) } else { std::fs::remove_file(&p) }.map_err(io)?;
+            // A removed item's ID is gone for good (a new one gets another).
+            let rel = self.rel_of(&p);
+            self.ids.lock().unwrap().retain(|_, r| r != &rel);
+            Ok(())
+        })
+    }
+}
+
+/// Regression: copy, delete, new folders and the re-compare built remote
+/// paths by joining names onto the root, so on an ID-addressed connection
+/// (Google Drive) every download, delete and nested upload failed, and the
+/// re-compare turned the entries into errors.
+#[tokio::test]
+async fn acting_on_an_id_addressed_connection_uses_its_listed_paths() {
+    let (l, r) = fixture();
+    let left = local(&l);
+    let conn = Arc::new(IdConnector::new(r.path()));
+    let right = ResolvedSide::remote(conn.clone(), "google_drive", "Drive", "/ROOT", None);
+    let mut entries = compare(&left, &right, &CompareOptions::default()).await.entries;
+    check_fixture(&entries);
+    let (tm, ledger) = env_parts().await;
+
+    // Downloads (by the file's ID) and a folder made on the left.
+    let (report, _) = act(&left, &right, &mut entries, &["docs/right-only.txt", "top.md", "empty"], CompareAction::CopyToLeft, &tm, &ledger).await;
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!(std::fs::read_to_string(l.path().join("docs/right-only.txt")).unwrap(), "RR");
+    for p in ["docs/right-only.txt", "top.md", "empty"] {
+        assert_eq!(status(&entries, p), CompareStatus::Same, "{p}");
+    }
+
+    // Uploads: into an existing folder (by its ID), replacing a file, and
+    // into folders made by this action (nested).
+    let (report, _) = act(&left, &right, &mut entries, &["extra", "docs/left-only.txt", "docs/changed.txt"], CompareAction::CopyToRight, &tm, &ledger).await;
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!(std::fs::read_to_string(r.path().join("extra/deep/x.bin")).unwrap(), "xx");
+    assert_eq!(std::fs::read_to_string(r.path().join("docs/left-only.txt")).unwrap(), "L");
+    assert_eq!(std::fs::read_to_string(r.path().join("docs/changed.txt")).unwrap(), "left version");
+    for p in ["extra", "extra/deep", "extra/deep/x.bin", "docs/left-only.txt", "docs/changed.txt"] {
+        let e = entries.iter().find(|e| e.path == p).unwrap_or_else(|| panic!("{p}"));
+        assert!(e.in_left && e.in_right && e.status != CompareStatus::Error, "{p}: {e:?}");
+    }
+
+    // Deletes (by ID): a file and an empty folder.
+    let (report, merged) = act(&left, &right, &mut entries, &["docs/right-only.txt", "empty"], CompareAction::DeleteRight, &tm, &ledger).await;
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert!(!r.path().join("docs/right-only.txt").exists());
+    assert!(!r.path().join("empty").exists());
+    assert_eq!(status(&entries, "docs/right-only.txt"), CompareStatus::LeftOnly);
+    assert_eq!(status(&entries, "empty"), CompareStatus::LeftOnly, "copied to the left earlier");
+    assert!(merged.removed.is_empty(), "{:?}", merged.removed);
+
+    // A later action resolves the side afresh with the paths the results
+    // keep (as compare_apply does): the folders this comparison made on the
+    // connection, and the file uploaded into them, are deleted by their IDs.
+    let again = ResolvedSide::remote(conn.clone(), "google_drive", "Drive", "/ROOT", None).with_listed(right.listed_paths());
+    assert!(again.abs("extra/deep/x.bin").unwrap().starts_with("/ROOT/id"), "{:?}", again.abs("extra/deep/x.bin"));
+    let (report, _) = act(&left, &again, &mut entries, &["extra"], CompareAction::DeleteRight, &tm, &ledger).await;
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert!(!r.path().join("extra").exists());
+    assert_eq!(status(&entries, "extra/deep/x.bin"), CompareStatus::LeftOnly);
+    assert!(!again.listed_paths().keys().any(|k| k.starts_with("extra")), "deleted items keep no listed path");
+}
+
+/// Regression: deleting a folder on a connection reported it deleted when
+/// listing it failed and listing its parent failed too (a network drop):
+/// any listing error read as "already gone".
+#[tokio::test]
+async fn a_remote_folder_delete_is_not_reported_done_when_nothing_can_be_listed() {
+    let (l, r) = fixture();
+    let (left, (right, _)) = (local(&l), remote(&r));
+    let entries = compare(&left, &right, &CompareOptions::default()).await.entries;
+    let plan = plan_action(&entries, &["empty".to_string()], CompareAction::DeleteRight);
+    assert_eq!(plan.steps.len(), 1);
+    // The network drops: neither the folder nor its parent can be listed.
+    let mut c = DirConnector::new(r.path());
+    c.fail = vec!["/empty".into(), "/".into()];
+    let offline = ResolvedSide::remote(Arc::new(c), "sftp", "Test server", "/", None);
+    let (tm, ledger) = env_parts().await;
+    let report = run_plan(&plan, &left, &offline, &tm, &ledger).await;
+    assert!(report.done.is_empty(), "reported deleted: {:?}", report.done);
+    assert_eq!(report.failed.len(), 1);
+    assert!(report.failed[0].error.contains("Permission denied"), "{:?}", report.failed);
+    assert!(r.path().join("empty").is_dir());
+
+    // A folder that really is gone (its parent lists without it) is done.
+    std::fs::remove_dir(r.path().join("empty")).unwrap();
+    let mut c = DirConnector::new(r.path());
+    c.fail = vec!["/empty".into()];
+    let gone = ResolvedSide::remote(Arc::new(c), "sftp", "Test server", "/", None);
+    let report = run_plan(&plan, &left, &gone, &tm, &ledger).await;
+    assert_eq!(report.done, ["empty"], "{:?}", report.failed);
+}
+
+/// Regression: a local copy interrupted by the app closing left its hidden
+/// staging file (`.<name>.ufop-compare-xxxxxxxx`) behind for good. Stale
+/// ones are cleared when a copy next goes to that folder; one an active
+/// queue job is still writing is kept.
+#[tokio::test]
+async fn stale_staging_files_are_cleared_when_copying_into_their_folder() {
+    let (l, r) = fixture();
+    let (left, right) = (local(&l), local(&r));
+    let mut entries = compare(&left, &right, &CompareOptions::default()).await.entries;
+    let (tm, ledger) = env_parts().await;
+    let stale = r.path().join("docs/.changed.txt.ufop-compare-deadbeef");
+    let live = r.path().join("docs/.other.txt.ufop-compare-cafebabe");
+    std::fs::write(&stale, "half").unwrap();
+    std::fs::write(&live, "being written").unwrap();
+    let src = l.path().join("top.md");
+    tm.enqueue(&src.to_string_lossy(), &live.to_string_lossy(), 1).await.unwrap();
+    let (report, _) = act(&left, &right, &mut entries, &["docs/left-only.txt"], CompareAction::CopyToRight, &tm, &ledger).await;
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert!(!stale.exists(), "the stale staging file is still there");
+    assert!(live.exists(), "a staging file an active job writes was removed");
+    // A file that only looks a bit like one is never touched.
+    assert!(r.path().join("docs/same.txt").exists());
 }
