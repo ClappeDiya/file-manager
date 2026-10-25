@@ -1,3 +1,4 @@
+import { t } from "@/lib/i18n";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { useAiStore, type AiExecutionResult, type ParsedJobConfig } from "@/stores/ai-store";
@@ -495,7 +496,7 @@ export function CommandPalette({ commands, isOpen, onClose, onExecutionResult }:
             placeholder={
               ollamaAvailable
                 ? "Type a command or describe what you want..."
-                : "Type a command..."
+                : t("commandPalette.placeholder")
             }
             className={cn(
               "flex-1 h-12 bg-transparent border-none outline-none",

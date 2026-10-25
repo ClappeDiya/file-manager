@@ -142,14 +142,15 @@ fn rebuild_mounts_submenu(app: &AppHandle, sub: &Submenu<tauri::Wry>, model: &Mo
     for item in sub.items()? {
         sub.remove(&item)?;
     }
+    let text = crate::tray_labels::current();
     if model.items.is_empty() {
-        sub.append(&MenuItem::with_id(app, "mounts_none", "No saved mounts", false, None::<&str>)?)?;
+        sub.append(&MenuItem::with_id(app, "mounts_none", text.no_mounts, false, None::<&str>)?)?;
     }
     for it in &model.items {
         sub.append(&CheckMenuItem::with_id(app, &it.id, &it.label, true, it.mounted, None::<&str>)?)?;
     }
     sub.append(&PredefinedMenuItem::separator(app)?)?;
-    sub.append(&MenuItem::with_id(app, UNMOUNT_ALL_ID, "Unmount all", model.can_unmount_all, None::<&str>)?)?;
+    sub.append(&MenuItem::with_id(app, UNMOUNT_ALL_ID, text.unmount_all, model.can_unmount_all, None::<&str>)?)?;
     Ok(())
 }
 
@@ -212,17 +213,51 @@ pub fn run_all_summary(r: &crate::backup_engine::runs::RunAllReport) -> String {
     s
 }
 
+/// The tray items whose text follows the app's language.
+pub struct TrayMenuItems {
+    open: MenuItem<tauri::Wry>,
+    backups: MenuItem<tauri::Wry>,
+    run_all: MenuItem<tauri::Wry>,
+    pause: MenuItem<tauri::Wry>,
+    resume: MenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
+    mounts: Submenu<tauri::Wry>,
+}
+
+impl TrayMenuItems {
+    /// Apply the current language's texts (the mounts submenu is rebuilt by its own task).
+    pub fn relabel(&self) {
+        let t = crate::tray_labels::current();
+        let _ = self.open.set_text(t.open);
+        let _ = self.backups.set_text(t.backups);
+        let _ = self.run_all.set_text(t.run_all);
+        let _ = self.pause.set_text(t.pause);
+        let _ = self.resume.set_text(t.resume);
+        let _ = self.quit.set_text(t.quit);
+        let _ = self.mounts.set_text(t.mounts);
+    }
+}
+
+/// The web view's language changed: relabel the tray and its mounts submenu.
+pub fn apply_language(app: &AppHandle) {
+    if let Some(items) = app.try_state::<TrayMenuItems>() {
+        items.relabel();
+        app.state::<MountManager>().notify();
+    }
+}
+
 pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
+    let text = crate::tray_labels::current();
     let status_item = MenuItem::with_id(app, "status", "Loading…", false, None::<&str>)?;
     // Shown only while a sync pair or automation rule has a schedule.
     let next_item = MenuItem::with_id(app, "next_other", "", false, None::<&str>)?;
-    let open = MenuItem::with_id(app, "open", "Open UFOP", true, None::<&str>)?;
-    let backups = MenuItem::with_id(app, "backups", "Backups…", true, None::<&str>)?;
-    let run_all = MenuItem::with_id(app, "run_all", "Back up all now", true, None::<&str>)?;
-    let pause = MenuItem::with_id(app, "pause", "Pause backups for 1 hour", true, None::<&str>)?;
-    let resume = MenuItem::with_id(app, "resume", "Resume backups", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let mounts_menu = Submenu::with_id(app, "mounts", "Mounts", true)?;
+    let open = MenuItem::with_id(app, "open", text.open, true, None::<&str>)?;
+    let backups = MenuItem::with_id(app, "backups", text.backups, true, None::<&str>)?;
+    let run_all = MenuItem::with_id(app, "run_all", text.run_all, true, None::<&str>)?;
+    let pause = MenuItem::with_id(app, "pause", text.pause, true, None::<&str>)?;
+    let resume = MenuItem::with_id(app, "resume", text.resume, true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", text.quit, true, None::<&str>)?;
+    let mounts_menu = Submenu::with_id(app, "mounts", text.mounts, true)?;
     rebuild_mounts_submenu(app.handle(), &mounts_menu, &MountsMenu::default())?;
     let menu = Menu::with_items(
         app,
@@ -257,6 +292,7 @@ pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
         builder = builder.icon(icon.clone());
     }
     let tray = builder.build(app)?;
+    app.manage(TrayMenuItems { open, backups, run_all, pause: pause.clone(), resume: resume.clone(), quit, mounts: mounts_menu.clone() });
     spawn_mounts_menu(app.handle().clone(), mounts_menu);
 
     // Refresh the status lines and tooltip.

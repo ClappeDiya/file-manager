@@ -283,6 +283,10 @@ macro; if you add a new one here, register it there too.
 - `list_custom_commands`
 - `save_custom_command`
 
+## `desktop_commands` (1 command)
+
+- `set_ui_language`
+
 ## `drive_commands` (6 commands)
 
 - `detect_drives`
@@ -861,4 +865,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 672 commands across 58 modules.
+**Surface:** 673 commands across 59 modules.

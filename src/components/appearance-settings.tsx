@@ -1,11 +1,37 @@
 /**
- * Settings → Appearance: theme, accent colour, text size (K121) and display units. All
+ * Settings → Appearance: language, theme, accent colour, text size (K121) and display units. All
  * Standard settings, stored in the persisted UI store.
  */
 import { FONT_SCALES, useUIStore, type ByteUnits, type FontScale, type TimeDisplay } from "@/stores/ui-store";
 import { formatBytes } from "@/lib/format-bytes";
 import { ThemeSwitcher } from "./theme-switcher";
 import { ACCENT_PRESETS, accentHex } from "@/lib/accent";
+import { detectLocale, LOCALE_NATIVE_NAMES, SUPPORTED_LOCALES, useI18n, useT, type LocalePreference } from "@/lib/i18n";
+
+/** Language: follow the computer's, or one of the translations. */
+export function LanguagePicker() {
+  const t = useT();
+  const preference = useI18n((s) => s.preference);
+  const setPreference = useI18n((s) => s.setPreference);
+  const loading = useI18n((s) => s.isLoading);
+  return (
+    <select
+      aria-label={t("settings.language")}
+      value={preference}
+      disabled={loading}
+      onChange={(e) => void setPreference(e.target.value as LocalePreference)}
+      className="px-2 py-1 rounded border border-gray-300 dark:border-gray-600 bg-transparent text-xs"
+      data-testid="language-select"
+    >
+      <option value="system">{t("settings.languageSystem", { name: LOCALE_NATIVE_NAMES[detectLocale()] })}</option>
+      {SUPPORTED_LOCALES.map((l) => (
+        <option key={l} value={l} lang={l}>
+          {LOCALE_NATIVE_NAMES[l]}
+        </option>
+      ))}
+    </select>
+  );
+}
 
 /** Accent colour swatches plus a custom colour. */
 function AccentPicker() {
@@ -105,6 +131,7 @@ const TIME_CHOICES: readonly { value: TimeDisplay; label: string }[] = [
 const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
 
 export function AppearanceSettings() {
+  const t = useT();
   const fontScale = useUIStore((s) => s.fontScale);
   const setFontScale = useUIStore((s) => s.setFontScale);
   const byteUnits = useUIStore((s) => s.byteUnits);
@@ -114,10 +141,13 @@ export function AppearanceSettings() {
   const mod = isMac ? "⌘" : "Ctrl";
   return (
     <div className="space-y-3 pt-3" data-testid="appearance-settings">
-      <Row label="Theme">
+      <Row label={t("settings.language")} hint={t("settings.languageHint")}>
+        <LanguagePicker />
+      </Row>
+      <Row label={t("settings.theme")}>
         <ThemeSwitcher />
       </Row>
-      <Row label="Accent colour" hint="Buttons, selection, links and focus outlines. High contrast keeps its own colours.">
+      <Row label={t("settings.accentColor")} hint="Buttons, selection, links and focus outlines. High contrast keeps its own colours.">
         <AccentPicker />
       </Row>
       <Row label="Text size" hint={`Shortcuts: ${mod} + (larger), ${mod} − (smaller), ${mod} 0 (default).`}>

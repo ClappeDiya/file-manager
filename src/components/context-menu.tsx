@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@ufop/ui-components";
 import { useUIStore } from "@/stores/ui-store";
+import { t } from "@/lib/i18n";
 import {
   Copy,
   Scissors,
@@ -449,7 +450,7 @@ export function getFileContextMenuItems(options: {
     if (options.onExtract) {
       items.push({
         id: "extract-here",
-        label: "Extract Here",
+        label: t("fileManager.extractHere"),
         icon: <PackageOpen className="h-3.5 w-3.5" />,
         action: options.onExtract,
       });
@@ -480,7 +481,7 @@ export function getFileContextMenuItems(options: {
     if (options.onOpenWith && !options.isDirectory) {
       items.push({
         id: "open-with",
-        label: "Open With...",
+        label: t("fileManager.openWith"),
         icon: <FolderOpen className="h-3.5 w-3.5" />,
         action: options.onOpenWith,
       });
@@ -515,7 +516,7 @@ export function getFileContextMenuItems(options: {
 
     items.push({
       id: "copy",
-      label: "Copy",
+      label: t("common.copy"),
       icon: <Copy className="h-3.5 w-3.5" />,
       shortcut: `${cmdKey}C`,
       action: options.onCopy,
@@ -526,7 +527,7 @@ export function getFileContextMenuItems(options: {
       items.push({ id: "sep-copy-path", label: "", separator: true });
       items.push({
         id: "copy-path",
-        label: "Copy Path",
+        label: t("fileManager.copyPath"),
         icon: <Clipboard className="h-3.5 w-3.5" />,
         shortcut: `${cmdKey}Shift+C`,
         action: options.onCopyPath,
@@ -559,7 +560,7 @@ export function getFileContextMenuItems(options: {
 
     items.push({
       id: "cut",
-      label: "Cut",
+      label: t("common.cut"),
       icon: <Scissors className="h-3.5 w-3.5" />,
       shortcut: `${cmdKey}X`,
       action: options.onCut,
@@ -624,7 +625,7 @@ export function getFileContextMenuItems(options: {
 
   items.push({
     id: "paste",
-    label: "Paste",
+    label: t("common.paste"),
     icon: <ClipboardPaste className="h-3.5 w-3.5" />,
     shortcut: `${cmdKey}V`,
     action: options.onPaste,
@@ -683,7 +684,7 @@ export function getFileContextMenuItems(options: {
 
     items.push({
       id: "rename",
-      label: "Rename",
+      label: t("common.rename"),
       icon: <Pencil className="h-3.5 w-3.5" />,
       shortcut: "F2",
       action: options.onRename,
@@ -692,7 +693,7 @@ export function getFileContextMenuItems(options: {
 
     items.push({
       id: "delete",
-      label: "Move to Trash",
+      label: t("fileManager.moveToTrash"),
       icon: <Trash2 className="h-3.5 w-3.5" />,
       shortcut: `${cmdKey}Backspace`,
       danger: true,
@@ -702,7 +703,7 @@ export function getFileContextMenuItems(options: {
     if (options.onDeletePermanently) {
       items.push({
         id: "delete-permanently",
-        label: "Delete Permanently",
+        label: t("fileManager.deletePermanently"),
         icon: <Trash2 className="h-3.5 w-3.5 text-red-500" />,
         shortcut: "\u21E7\u232B",
         danger: true,
@@ -772,7 +773,7 @@ export function getFileContextMenuItems(options: {
 
   items.push({
     id: "new-folder",
-    label: "New Folder",
+    label: t("fileManager.newFolder"),
     icon: <FolderPlus className="h-3.5 w-3.5" />,
     shortcut: `${cmdKey}Shift+N`,
     action: options.onNewFolder,
@@ -789,7 +790,7 @@ export function getFileContextMenuItems(options: {
 
   items.push({
     id: "select-all",
-    label: "Select All",
+    label: t("common.selectAll"),
     icon: <CheckSquare className="h-3.5 w-3.5" />,
     shortcut: `${cmdKey}A`,
     action: options.onSelectAll,
@@ -855,7 +856,7 @@ export function getFileContextMenuItems(options: {
     if (options.onOpenInTerminal && options.hasSelection && options.isDirectory) {
       items.push({
         id: "open-in-terminal",
-        label: "Open in Terminal",
+        label: t("fileManager.openInTerminal"),
         icon: <Terminal className="h-3.5 w-3.5" />,
         action: options.onOpenInTerminal,
       });
@@ -891,7 +892,7 @@ export function getFileContextMenuItems(options: {
 
   items.push({
     id: "refresh",
-    label: "Refresh",
+    label: t("common.refresh"),
     icon: <RefreshCw className="h-3.5 w-3.5" />,
     shortcut: `${cmdKey}R`,
     action: options.onRefresh,

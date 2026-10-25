@@ -37,6 +37,7 @@ import { BandwidthTimetableSection } from "@/components/bandwidth-timetable-sect
 import { AdvancedOnly } from "@/components/backup/advanced-only";
 import { LocalServerSection } from "@/components/local-server-section";
 import { FolderField } from "@/components/remote-folder-picker";
+import { useT } from "@/lib/i18n";
 
 // ── Types ──
 
@@ -1355,6 +1356,7 @@ export default function SettingsPanel({
   /** Open with this section expanded and scrolled to (`"rclone"`). */
   focusSection?: string | null;
 }) {
+  const t = useT();
   const [summary, setSummary] = useState<SettingsSummary | null>(null);
   const portable = usePortableStatus();
 
@@ -1375,17 +1377,17 @@ export default function SettingsPanel({
     <div className="h-full flex flex-col">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-        <h2 className="text-sm font-semibold">Settings</h2>
+        <h2 className="text-sm font-semibold">{t("settings.title")}</h2>
         <PortableModeBadge status={portable} />
       </div>
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
-        <Section title="Appearance" defaultOpen>
+        <Section title={t("settings.appearance")} defaultOpen>
           <AppearanceSettings />
         </Section>
 
-        <Section title="General" id="general" focus={focusSection === "general"}>
+        <Section title={t("settings.general")} id="general" focus={focusSection === "general"}>
           <GeneralSection />
         </Section>
 
@@ -1415,12 +1417,12 @@ export default function SettingsPanel({
         </Section>
 
         {/* Notifications */}
-        <Section title="Notifications">
+        <Section title={t("settings.notifications")}>
           <NotificationSection />
         </Section>
 
         {/* Privacy */}
-        <Section title="Privacy">
+        <Section title={t("settings.privacy")}>
           <PrivacySection />
         </Section>
 
@@ -1430,7 +1432,7 @@ export default function SettingsPanel({
         </Section>
 
         {/* Log Controls */}
-        <Section title="Logging">
+        <Section title={t("settings.logging")}>
           <LogControlsSection />
           <DiagnosticsSection />
         </Section>
@@ -1495,7 +1497,7 @@ export default function SettingsPanel({
         </Section>
 
         {/* Advanced: local monitoring (Prometheus exporter, off by default) */}
-        <Section title="Advanced">
+        <Section title={t("settings.advanced")}>
           <div className="pt-3" />
           <AdvancedOnly hint>
             <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Prometheus metrics</h3>
@@ -1512,7 +1514,7 @@ export default function SettingsPanel({
         </Section>
 
         {/* Network Diagnostics */}
-        <Section title="Network">
+        <Section title={t("settings.network")}>
           <div className="pt-3">
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
               Run network diagnostics to troubleshoot connection issues.

@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { cn } from "@ufop/ui-components";
 import { ArrowUp, ChevronLeft, ChevronRight, Cloud, Home } from "lucide-react";
 import { AddressBar, type AddressBarProps } from "./address-bar";
+import { useT } from "@/lib/i18n";
 import { isRemotePath, locationConnectionId, locationRoot, locationSegments } from "@/lib/location";
 
 /**
@@ -49,6 +50,7 @@ export function BreadcrumbBar({
   editing = false,
   onEditingChange,
 }: BreadcrumbBarProps) {
+  const t = useT();
   const segments = useMemo(() => locationSegments(path), [path]);
   const remote = isRemotePath(path);
   const rootLabel = remote ? connectionName?.(locationConnectionId(path) ?? "") ?? "Connection" : null;
@@ -62,7 +64,7 @@ export function BreadcrumbBar({
         "overflow-x-auto scrollbar-none",
         className,
       )}
-      aria-label="Breadcrumb navigation"
+      aria-label={t("accessibility.breadcrumb")}
       data-testid="breadcrumb-bar"
     >
       {/* Back / Forward buttons */}
@@ -77,7 +79,7 @@ export function BreadcrumbBar({
         )}
         onClick={canGoBack ? onBack : undefined}
         disabled={!canGoBack}
-        aria-label="Navigate back"
+        aria-label={t("nav.back")}
         data-testid="breadcrumb-back"
         type="button"
       >
@@ -94,7 +96,7 @@ export function BreadcrumbBar({
         )}
         onClick={canGoForward ? onForward : undefined}
         disabled={!canGoForward}
-        aria-label="Navigate forward"
+        aria-label={t("nav.forward")}
         data-testid="breadcrumb-forward"
         type="button"
       >
@@ -112,7 +114,7 @@ export function BreadcrumbBar({
           )}
           onClick={canGoUp ? onUp : undefined}
           disabled={!canGoUp}
-          aria-label="Go to parent folder"
+          aria-label={t("nav.up")}
           title={`Parent folder (${isMac ? "⌘↑" : "Alt+↑"} or Backspace)`}
           data-testid="breadcrumb-up"
           type="button"
@@ -134,7 +136,7 @@ export function BreadcrumbBar({
           "focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]",
         )}
         onClick={() => onNavigate(locationRoot(path))}
-        aria-label={rootLabel ? `Navigate to the top of ${rootLabel}` : "Navigate to root"}
+        aria-label={rootLabel ? `Navigate to the top of ${rootLabel}` : t("nav.root")}
         title={rootLabel ?? undefined}
         data-testid="breadcrumb-root"
         type="button"
