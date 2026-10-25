@@ -4201,6 +4201,9 @@ function FilePane({
       return true;
     } catch (err) {
       reportOperationFailure(label, err);
+      // Part of a move may have happened on the server (the error names
+      // what moved): show both ends as they are now.
+      dispatchRefresh([currentPath, destDir, ...paths.map(parentLocation)]);
       return false;
     }
   }, [files, currentPath, onShowTransfers]);

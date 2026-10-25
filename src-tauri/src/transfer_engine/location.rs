@@ -84,6 +84,13 @@ impl Location {
         }
     }
 
+    /// `name` inside this folder, refused when `name` is not one plain
+    /// name (see [`checked_name`]): names come from remote listings and
+    /// must never climb out of the folder.
+    pub fn join_checked(&self, name: &str) -> Result<Self, AppError> {
+        Ok(self.join(checked_name(name)?))
+    }
+
     /// Both on this computer, or both on the same connection.
     pub fn same_root(&self, other: &Self) -> bool {
         match (self, other) {
@@ -147,6 +154,41 @@ pub fn same_remote_folder(a: &str, b: &str) -> bool {
     normalize_remote_folder(a) == normalize_remote_folder(b)
 }
 
+/// Whether `c` may not appear in a file or folder name written here: path
+/// separators (`\` too: one on Windows, and kept out everywhere so a
+/// name means the same on every computer), NUL, and on Windows `:` (a
+/// drive prefix or an alternate data stream).
+fn forbidden_in_name(c: char) -> bool {
+    matches!(c, '/' | '\\' | '\0') || (cfg!(windows) && c == ':')
+}
+
+/// Names that are not a name of their own: they mean this folder or its parent.
+fn reserved_name(name: &str) -> bool {
+    matches!(name, "" | "." | "..")
+}
+
+/// `name` when it is one plain name, safe to join onto a destination
+/// folder; names supplied by a server or a shared folder (Google Drive
+/// allows `/` and `..`, a WebDAV href can decode to `..`) are refused when
+/// empty, `.`, `..`, or holding a separator or NUL (see [`forbidden_in_name`]).
+pub fn checked_name(name: &str) -> Result<&str, AppError> {
+    if reserved_name(name) || name.chars().any(forbidden_in_name) {
+        return Err(AppError::file_op(
+            format!("The name {name:?} cannot be used as a file or folder name here: it is not a plain name and could place the item outside the destination folder."),
+            "Rename the item at its source (for example in the provider's web app), then retry.",
+        ));
+    }
+    Ok(name)
+}
+
+/// `name` made into one plain name (for caches, where an item must be
+/// stored whatever it is called): characters [`checked_name`] refuses
+/// become `_`, and `.`, `..` or an empty name become `file`.
+pub fn sanitized_name(name: &str) -> String {
+    let safe: String = name.chars().map(|c| if forbidden_in_name(c) { '_' } else { c }).collect();
+    if reserved_name(&safe) { "file".into() } else { safe }
+}
+
 /// Signs in to saved connections for the transfer queue.
 pub trait RemoteResolver: Send + Sync {
     /// The connector serving saved connection `connection_id`, connected.
@@ -200,7 +242,7 @@ pub struct TransferPlan {
 pub const MAX_PLANNED_FILES: usize = 100_000;
 
 /// Listing of a folder at either kind of location.
-async fn list(loc: &Location, resolver: &dyn RemoteResolver) -> Result<Vec<FileEntry>, AppError> {
+pub async fn list(loc: &Location, resolver: &dyn RemoteResolver) -> Result<Vec<FileEntry>, AppError> {
     match loc {
         Location::Local(p) => {
             let dir = p.clone();
@@ -271,6 +313,14 @@ pub fn free_name(wanted: &str, taken: &mut HashSet<String>) -> Result<String, Ap
 /// keep-both `(copy)` names, so nothing at the destination is ever replaced.
 pub async fn plan_transfer(items: &[LocationItem], dest_dir: &Location, resolver: &dyn RemoteResolver) -> Result<TransferPlan, AppError> {
     let mut taken = taken_names(list(dest_dir, resolver).await?);
+    plan_transfer_taking(items, dest_dir, resolver, &mut taken).await
+}
+
+/// [`plan_transfer`] with the destination's names already `taken` (see
+/// [`taken_names`]); the top-level names chosen are added to it. Every
+/// name joined onto a destination is checked ([`checked_name`]) before it
+/// is planned.
+pub async fn plan_transfer_taking(items: &[LocationItem], dest_dir: &Location, resolver: &dyn RemoteResolver, taken: &mut HashSet<String>) -> Result<TransferPlan, AppError> {
     let mut plan = TransferPlan::default();
     for item in items {
         let source = Location::parse(&item.path)?;
@@ -287,8 +337,8 @@ pub async fn plan_transfer(items: &[LocationItem], dest_dir: &Location, resolver
             permissions: None,
         };
         let (wanted, converted) = dest_name(&entry, &source, dest_dir, resolver).await?;
-        let name = free_name(&wanted, &mut taken)?;
-        let dest = dest_dir.join(&name);
+        let name = free_name(checked_name(&wanted)?, taken)?;
+        let dest = dest_dir.join_checked(&name)?;
         if item.is_dir {
             if dest_dir.same_root(&source) && is_within(&source, dest_dir) {
                 return Err(AppError::validation(format!("Cannot put {} inside itself", item.name)));
@@ -330,7 +380,7 @@ async fn expand_dir(source: &Location, dest: &Location, resolver: &dyn RemoteRes
                 Location::Remote { connection_id, .. } => Location::Remote { connection_id: *connection_id, path: entry.path.clone() },
             };
             let (name, converted) = dest_name(&entry, &src, &dst, resolver).await?;
-            let child_dst = dst.join(&name);
+            let child_dst = dst.join_checked(&name)?;
             if entry.is_dir {
                 stack.push((child_src, child_dst));
             } else {
@@ -433,12 +483,14 @@ pub fn at_path(entry: &FileEntry, path: &str) -> bool {
     entry.path == path || same_remote_folder(&entry.path, path)
 }
 
-/// The hidden sibling a download is written to before it is renamed into
-/// place (so a half-written file never has the final name).
-pub fn local_staging_path(dest: &str) -> String {
+/// The hidden sibling a download is written to before it is placed (so a
+/// half-written file never has the final name). `tag` (the job's id) makes
+/// it the writer's own: two jobs downloading to one name never write one
+/// staging file together.
+pub fn local_staging_path(dest: &str, tag: impl std::fmt::Display) -> String {
     let p = std::path::Path::new(dest);
     let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    p.with_file_name(format!(".{name}{}", crate::connectors::STAGING_SUFFIX)).to_string_lossy().to_string()
+    p.with_file_name(format!(".{name}.{tag}{}", crate::connectors::STAGING_SUFFIX)).to_string_lossy().to_string()
 }
 
 /// Run one file job between two locations (at least one remote); returns the
@@ -461,7 +513,7 @@ pub async fn transfer_file_until(job_id: Uuid, source: &Location, dest: &Locatio
         }
         (Location::Remote { connection_id, path }, Location::Local(l)) => {
             let conn = resolver.connector(*connection_id).await?;
-            download_into_place(control, conn.as_ref(), path, l).await
+            download_into_place(job_id, control, conn.as_ref(), path, l).await
         }
         (Location::Remote { connection_id: a, path: from }, Location::Remote { connection_id: b, path: to }) => {
             let (src, dst) = (resolver.connector(*a).await?, resolver.connector(*b).await?);
@@ -566,14 +618,24 @@ async fn refuse_existing_remote(conn: &dyn Connector, path: &str) -> Result<Hash
     Ok(listing.into_iter().map(|e| e.path).collect())
 }
 
-async fn download_into_place(control: &JobControl, conn: &dyn Connector, remote: &str, local: &str) -> Result<Option<u64>, AppError> {
+/// Download `remote` to `local` through the job's own staging file, placed
+/// without replacing anything (see [`place_without_replacing`]).
+async fn download_into_place(job_id: Uuid, control: &JobControl, conn: &dyn Connector, remote: &str, local: &str) -> Result<Option<u64>, AppError> {
+    // Planned names are plain names (checked_name); a path that still
+    // climbs (`..`) or has no name of its own is refused, never written.
+    let path = std::path::Path::new(local);
+    if path.file_name().is_none() || path.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)) {
+        return Err(AppError::file_op(format!("{local} is not a plain destination path; nothing was written."), "Choose the destination folder again and retry."));
+    }
     if tokio::fs::metadata(local).await.is_ok() {
         return Err(AppError::file_op(format!("{local} already exists; it was not overwritten."), "Rename or remove it, then retry the transfer."));
     }
     if let Some(parent) = std::path::Path::new(local).parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|e| AppError::file_op(format!("Cannot create the destination folder: {e}"), "Check you may write there."))?;
     }
-    let staging = local_staging_path(local);
+    let staging = local_staging_path(local, job_id);
+    // Never write through something already there (a leftover or a link).
+    let _ = tokio::fs::remove_file(&staging).await;
     let bytes = match unless_stopped(control, conn.download(remote, &staging)).await {
         Ok(Some(b)) => b,
         other => {
@@ -689,7 +751,26 @@ pub(crate) mod tests {
         assert!(is_within(&r(id, "/drive/root:/Docs"), &r(id, "/Docs/sub")));
         assert!(is_within(&r(id, "/"), &r(id, "/drive/root:/Docs")));
         assert!(!is_within(&r(id, "/drive/root:/Docs"), &r(id, "/")));
-        assert_eq!(local_staging_path("/d/a.txt"), "/d/.a.txt.ufop-part");
+        assert_eq!(local_staging_path("/d/a.txt", "j1"), "/d/.a.txt.j1.ufop-part");
+    }
+
+    #[test]
+    fn only_plain_names_are_joined() {
+        for ok in ["a.txt", "..a", "a..", "...", ".hidden", "a b (copy).txt", "名前.pdf"] {
+            assert_eq!(checked_name(ok).unwrap(), ok);
+        }
+        for bad in ["", ".", "..", "../x", "a/b", "/abs", "a\\b", "..\\x", "a\0b"] {
+            let err = checked_name(bad).unwrap_err();
+            assert!(err.to_string().contains("cannot be used"), "{bad:?}: {err}");
+        }
+        assert_eq!(checked_name("C:x").is_err(), cfg!(windows), "':' only matters on Windows");
+        assert_eq!(sanitized_name("../../etc"), ".._.._etc");
+        for reserved in ["", ".", ".."] {
+            assert_eq!(sanitized_name(reserved), "file");
+        }
+        let dir = Location::Local("/d".into());
+        assert!(dir.join_checked("..").is_err());
+        assert_eq!(dir.join_checked("a").unwrap(), Location::Local("/d/a".into()));
     }
 
     /// An in-memory connection: a map of path → contents (folders are paths
@@ -935,7 +1016,7 @@ pub(crate) mod tests {
         // Download: lands under the final name only when complete.
         assert_eq!(transfer_file(job, &ra("/r/one.txt"), &Location::Local(l("one.txt")), &resolver).await.unwrap(), 3);
         assert_eq!(std::fs::read_to_string(l("one.txt")).unwrap(), "one");
-        assert!(!std::path::Path::new(&local_staging_path(&l("one.txt"))).exists());
+        assert!(!std::path::Path::new(&local_staging_path(&l("one.txt"), job)).exists());
         // ...and never replaces an existing file.
         assert!(transfer_file(job, &ra("/r/one.txt"), &Location::Local(l("one.txt")), &resolver).await.is_err());
         // Upload.
@@ -953,7 +1034,7 @@ pub(crate) mod tests {
         assert!(relay_dir().starts_with(ufop_core::session::user_temp_dir().unwrap()), "a private folder of this user");
         // A failed download leaves no staging file behind.
         assert!(transfer_file(job, &ra("/r/missing.txt"), &Location::Local(l("m.txt")), &resolver).await.is_err());
-        assert!(!std::path::Path::new(&local_staging_path(&l("m.txt"))).exists());
+        assert!(!std::path::Path::new(&local_staging_path(&l("m.txt"), job)).exists());
     }
 
     #[tokio::test]
@@ -1221,9 +1302,166 @@ pub(crate) mod tests {
         let dest = local.path().join("a.txt");
         let resolver = DynResolver(HashMap::from([(id, Arc::new(AppearingDuringDownload(dest.clone())) as Arc<dyn Connector>)]));
         let dest_str = dest.to_string_lossy().to_string();
-        let err = transfer_file(Uuid::new_v4(), &Location::Remote { connection_id: id, path: "/a.txt".into() }, &Location::Local(dest_str.clone()), &resolver).await.unwrap_err();
+        let job = Uuid::new_v4();
+        let err = transfer_file(job, &Location::Remote { connection_id: id, path: "/a.txt".into() }, &Location::Local(dest_str.clone()), &resolver).await.unwrap_err();
         assert!(err.to_string().contains("not overwritten"), "{err}");
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "saved meanwhile");
-        assert!(!std::path::Path::new(&local_staging_path(&dest_str)).exists(), "the staging file is removed");
+        assert!(!std::path::Path::new(&local_staging_path(&dest_str, job)).exists(), "the staging file is removed");
+    }
+
+    /// A connection listing whatever names a server or a shared folder
+    /// supplies: `folders` maps a listed path to `(path, name, is_dir)`.
+    #[derive(Default)]
+    pub(crate) struct Hostile {
+        pub folders: HashMap<String, Vec<(String, String, bool)>>,
+    }
+
+    /// Listed `(path, name, is_dir)` entries.
+    pub(crate) type Listing<'a> = &'a [(&'a str, &'a str, bool)];
+
+    impl Hostile {
+        pub fn with(folders: &[(&str, Listing<'_>)]) -> Self {
+            Self { folders: folders.iter().map(|(p, es)| (p.to_string(), es.iter().map(|(a, b, d)| (a.to_string(), b.to_string(), *d)).collect())).collect() }
+        }
+    }
+
+    impl Connector for Hostile {
+        fn connect(&self, _: &crate::core::types::ConnectionProfile) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn disconnect(&self) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn list_remote(&self, path: &str) -> Fut<'_, Vec<FileEntry>> {
+            let out = self
+                .folders
+                .get(path)
+                .into_iter()
+                .flatten()
+                .map(|(path, name, is_dir)| FileEntry { name: name.clone(), path: path.clone(), is_dir: *is_dir, is_symlink: false, size: 1, modified: None, created: None, is_hidden: false, extension: None, permissions: None })
+                .collect();
+            Box::pin(async move { Ok(out) })
+        }
+        fn download(&self, _: &str, local: &str) -> Fut<'_, u64> {
+            let local = local.to_string();
+            Box::pin(async move {
+                std::fs::write(&local, "payload").map_err(|e| AppError::file_op(e.to_string(), ""))?;
+                Ok(7)
+            })
+        }
+    }
+
+    /// Regression: names a remote listing supplies (a Google Drive name may
+    /// hold `/` and `..`, a WebDAV href may decode to `..`; on Windows `\`
+    /// separates too) were joined onto local destination paths unchecked, so
+    /// a download could write outside the chosen folder (e.g. into
+    /// `~/.config/autostart`). Such names are refused before anything is
+    /// planned, created or written.
+    #[tokio::test]
+    async fn remote_names_cannot_leave_the_destination_folder() {
+        let id = Uuid::new_v4();
+        let hostile = Hostile::with(&[
+            ("/shared", &[("/shared/f1", "../../escape.txt", false)]),
+            ("/dotdot", &[("/dotdot/d1", "..", true)]),
+            ("/d1", &[("/d1/f2", "inside-parent.txt", false)]),
+            ("/abs", &[("/abs/f3", "/tmp/abs.txt", false)]),
+            ("/back", &[("/back/f4", "..\\..\\win.txt", false)]),
+            ("/nul", &[("/nul/f5", "a\0b", false)]),
+        ]);
+        let resolver = DynResolver(HashMap::from([(id, Arc::new(hostile) as Arc<dyn Connector>)]));
+        let root = tempfile::tempdir().unwrap();
+        let dst = root.path().join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        let dest = Location::Local(dst.to_string_lossy().into());
+        for folder in ["shared", "dotdot", "abs", "back", "nul"] {
+            let err = plan_transfer(&[item(format!("conn://{id}/{folder}"), folder, true, 0)], &dest, &resolver).await;
+            assert!(err.is_err(), "{folder}: {err:?}");
+        }
+        // The picked items' own names (sent by the frontend) are checked too.
+        for name in ["..", ".", "", "../up.txt", "/etc/x", "a\\b"] {
+            assert!(plan_transfer(&[item(format!("conn://{id}/shared/f1"), name, false, 1)], &dest, &resolver).await.is_err(), "{name:?}");
+        }
+        // A direct job onto a path that climbs out is refused as well.
+        let climbing = format!("{}/sub/../../escape.txt", dst.to_string_lossy());
+        assert!(transfer_file(Uuid::new_v4(), &Location::Remote { connection_id: id, path: "/shared/f1".into() }, &Location::Local(climbing), &resolver).await.is_err());
+        let left: Vec<_> = std::fs::read_dir(root.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("dst")], "nothing was written outside dst");
+        assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0);
+    }
+
+    /// A download in a fixed order with its racing twin: the `first`
+    /// writes its bytes, then the other writes its own, then the first
+    /// finishes (and is placed) while the other is still running.
+    struct Racing {
+        data: &'static str,
+        first: bool,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    impl Connector for Racing {
+        fn connect(&self, _: &crate::core::types::ConnectionProfile) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn disconnect(&self) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn list_remote(&self, _: &str) -> Fut<'_, Vec<FileEntry>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn download(&self, _: &str, local: &str) -> Fut<'_, u64> {
+            let (local, data, first, barrier) = (local.to_string(), self.data, self.first, self.barrier.clone());
+            Box::pin(async move {
+                let write = || std::fs::write(&local, data).map_err(|e| AppError::file_op(e.to_string(), ""));
+                if first {
+                    write()?;
+                }
+                barrier.wait().await;
+                if !first {
+                    write()?;
+                }
+                barrier.wait().await;
+                if !first {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                Ok(data.len() as u64)
+            })
+        }
+    }
+
+    /// Regression: every download to one local name was staged in the same
+    /// `.<name>.ufop-part`, so two jobs planning the same destination (e.g.
+    /// two moves from different connections into one folder) wrote one file
+    /// together; one placed the mix and completed (its move then deleted the
+    /// source) while the other failed. Each job stages in its own file: one
+    /// wins with exactly its bytes, the other is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_downloads_to_one_name_never_mix() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let resolver = Arc::new(DynResolver(HashMap::from([
+            (a, Arc::new(Racing { data: "AAAAaaaa", first: true, barrier: barrier.clone() }) as Arc<dyn Connector>),
+            (b, Arc::new(Racing { data: "BBBBbbbb", first: false, barrier }) as Arc<dyn Connector>),
+        ])));
+        let local = tempfile::tempdir().unwrap();
+        let dest = Location::Local(local.path().join("report.pdf").to_string_lossy().into());
+        let run = |id: Uuid| {
+            let (resolver, dest) = (resolver.clone(), dest.clone());
+            tokio::spawn(async move { transfer_file_until(Uuid::new_v4(), &Location::Remote { connection_id: id, path: "/report.pdf".into() }, &dest, resolver.as_ref(), &JobControl::default()).await })
+        };
+        let (ra, rb) = (run(a), run(b));
+        let (ra, rb) = (ra.await.unwrap(), rb.await.unwrap());
+        let content = std::fs::read_to_string(local.path().join("report.pdf")).unwrap();
+        assert!(matches!(ra, Ok(Some(8))), "the first placed wins: {ra:?}");
+        assert_eq!(content, "AAAAaaaa", "the winner's bytes, never the other job's");
+        let err = rb.unwrap_err();
+        assert!(err.to_string().contains("not overwritten"), "{err}");
+        let left: Vec<_> = std::fs::read_dir(local.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        assert_eq!(left, vec!["report.pdf".to_string()], "no staging file is left");
     }
 }

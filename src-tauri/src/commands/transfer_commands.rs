@@ -155,9 +155,14 @@ pub(crate) async fn location_transfer_with(
     if !dest.is_remote() && sources.iter().all(|s| !s.is_remote()) {
         return Err(AppError::validation("Both ends are on this computer: use the regular copy or move."));
     }
-    // A move inside one connection: rename on the server where possible.
-    let mut moved = Vec::new();
+    // Everything is decided before anything changes: the server renames of
+    // a move inside one connection, and the plan (and filename-policy
+    // check) of what is copied, sharing the destination's taken names. A
+    // refusal then leaves every item where it was.
+    let mut renames = Vec::new();
     let mut rest = Vec::new();
+    let dest_listing = loc::list(&dest, resolver).await?;
+    let mut taken = loc::taken_names(dest_listing.clone());
     for (item, source) in items.into_iter().zip(sources) {
         let (Location::Remote { connection_id, path: from }, Location::Remote { path: dest_path, .. }) = (&source, &dest) else {
             rest.push(item);
@@ -174,39 +179,49 @@ pub(crate) async fn location_transfer_with(
         if loc::is_within(&source, &dest) {
             return Err(AppError::validation(format!("Cannot put {} inside itself", item.name)));
         }
-        let conn = resolver.connector(*connection_id).await?;
-        let listing = conn.list_remote(dest_path).await?;
         // Already listed there, however the connector spells the folder
         // (Google Drive lists a shared-drive root's items under
         // `/shared-drives/<id>/`, which the pane calls `/`).
-        if listing.iter().any(|e| loc::at_path(e, from)) {
+        if dest_listing.iter().any(|e| loc::at_path(e, from)) {
             continue;
         }
-        let name = loc::free_name(&item.name, &mut loc::taken_names(listing))?;
-        let to = loc::join_remote(dest_path, &name);
-        match conn.rename_entry(from, &to).await {
+        let name = loc::free_name(loc::checked_name(&item.name)?, &mut taken)?;
+        renames.push((*connection_id, from.clone(), loc::join_remote(dest_path, &name), name, item));
+    }
+    let mut plan = planned(&rest, &dest, resolver, &mut taken, policy).await?;
+
+    // A move inside one connection: rename on the server where possible.
+    let mut moved = Vec::new();
+    let mut fallback = Vec::new();
+    for (connection_id, from, to, name, item) in renames {
+        let renamed = match resolver.connector(connection_id).await {
+            Ok(conn) => conn.rename_entry(&from, &to).await.map(|()| conn.renamed_path(&from, &to)),
+            Err(e) => Err(e),
+        };
+        match renamed {
             // Where it is listed now (Google Drive: its id under the new folder).
-            Ok(()) => moved.push(MovedItem { from: item.path.clone(), to: Location::Remote { connection_id: *connection_id, path: conn.renamed_path(from, &to) }.to_location_string() }),
+            Ok(path) => moved.push(MovedItem { from: item.path.clone(), to: Location::Remote { connection_id, path }.to_location_string() }),
             // No server-side move here: copy, then delete.
             Err(e) => {
                 tracing::info!("Server-side move of {from} unavailable ({e}); copying instead");
-                rest.push(item);
+                // The name it was to take is free again for its copy.
+                taken.remove(&name.to_lowercase());
+                fallback.push(item);
             }
         }
     }
-
-    let mut plan = loc::plan_transfer(&rest, &dest, resolver).await?;
-    // Every file landing on this computer (those inside folders, export and
-    // keep-both names too) is checked before anything is created or queued.
-    let local_targets: Vec<std::path::PathBuf> = plan.files.iter().filter_map(|f| match Location::parse(&f.dest) {
-        Ok(Location::Local(p)) => Some(std::path::PathBuf::from(p)),
-        _ => None,
-    }).collect();
-    super::policy_commands::enforce(policy.check_all(&local_targets))?;
-    loc::create_dirs(&mut plan, resolver).await?;
+    // From here on some items may have moved already: a failure says which.
+    let partial = |e: AppError| partial_move_error(e, &moved);
+    if !fallback.is_empty() {
+        let more = planned(&fallback, &dest, resolver, &mut taken, policy).await.map_err(partial)?;
+        plan.dirs.extend(more.dirs);
+        plan.files.extend(more.files);
+        plan.source_dirs.extend(more.source_dirs);
+    }
+    loc::create_dirs(&mut plan, resolver).await.map_err(partial)?;
     let mut jobs = Vec::with_capacity(plan.files.len());
     for f in &plan.files {
-        jobs.push(manager.enqueue_location_job(&f.source, &f.dest, f.size).await?);
+        jobs.push(manager.enqueue_location_job(&f.source, &f.dest, f.size).await.map_err(partial)?);
     }
     if mode == TransferMode::Move {
         // A converted copy is not the original: keep that one (its folder
@@ -225,6 +240,41 @@ pub(crate) async fn location_transfer_with(
         manager.spawn_runner(job.id).await;
     }
     Ok(LocationTransferOutcome { jobs, moved, folders_created: plan.dirs.len(), kept })
+}
+
+/// The plan of copying `items` into `dest` (see
+/// [`crate::transfer_engine::location::plan_transfer_taking`]), refused when
+/// a file landing on this computer breaks the filename rules `policy`.
+async fn planned(
+    items: &[crate::transfer_engine::location::LocationItem],
+    dest: &crate::transfer_engine::location::Location,
+    resolver: &dyn crate::transfer_engine::location::RemoteResolver,
+    taken: &mut std::collections::HashSet<String>,
+    policy: &ufop_core::policy::PolicySet,
+) -> Result<crate::transfer_engine::location::TransferPlan, AppError> {
+    use crate::transfer_engine::location::{self as loc, Location};
+    let plan = loc::plan_transfer_taking(items, dest, resolver, taken).await?;
+    // Every file landing on this computer (those inside folders, export and
+    // keep-both names too) is checked before anything is created or queued.
+    let local_targets: Vec<std::path::PathBuf> = plan.files.iter().filter_map(|f| match Location::parse(&f.dest) {
+        Ok(Location::Local(p)) => Some(std::path::PathBuf::from(p)),
+        _ => None,
+    }).collect();
+    super::policy_commands::enforce(policy.check_all(&local_targets))?;
+    Ok(plan)
+}
+
+/// `e`, telling which items a move had already moved on the server when it
+/// failed (so they are not mistaken for still being at the source).
+fn partial_move_error(e: AppError, moved: &[MovedItem]) -> AppError {
+    if moved.is_empty() {
+        return e;
+    }
+    let names: Vec<&str> = moved.iter().map(|m| m.to.rsplit('/').next().unwrap_or(&m.to)).collect();
+    AppError::file_op(
+        format!("{e} {} item(s) had already been moved on the server: {}.", moved.len(), names.join(", ")),
+        "Refresh both folders: the items named are at the destination; the rest are still at the source. Retry the move for those.",
+    )
 }
 
 /// Pause a transfer job.
@@ -1049,5 +1099,118 @@ mod tests {
         assert_eq!(cb.file("/in/Plan.docx").as_deref(), Some("doc"), "the export has the format's extension");
         assert_eq!(ca.file("/r/Plan").as_deref(), Some("doc"), "the document itself is kept");
         assert!(ca.dirs.lock().unwrap().contains("/r"));
+    }
+
+    /// Regression: a shared Google Drive folder holding a file named
+    /// `../../escape.txt` (or a WebDAV collection named `..`) downloaded
+    /// outside the chosen folder. The transfer is refused: nothing is
+    /// queued, created or written, inside or outside the destination.
+    #[tokio::test]
+    async fn a_remote_name_climbing_out_of_the_destination_is_refused() {
+        use crate::transfer_engine::location::tests::Hostile;
+        let id = Uuid::new_v4();
+        let hostile = Hostile::with(&[
+            ("/shared", &[("/shared/ok", "fine.txt", false), ("/shared/f1", "../escape.txt", false)]),
+            ("/dav", &[("/dav/up", "..", true)]),
+            ("/dav/up", &[("/dav/up/x", "x.txt", false)]),
+        ]);
+        let resolver = Arc::new(DynResolver(HashMap::from([(id, Arc::new(hostile) as Arc<dyn crate::connectors::Connector>)])));
+        let mgr = TransferManager::new();
+        mgr.set_remote_resolver(resolver.clone());
+        let root = tempfile::tempdir().unwrap();
+        let dst = root.path().join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        for folder in ["shared", "dav"] {
+            for mode in [TransferMode::Copy, TransferMode::Move] {
+                let err = location_transfer(&mgr, resolver.as_ref(), vec![item(format!("conn://{id}/{folder}"), folder, true, 0)], dst.to_str().unwrap(), mode).await.unwrap_err();
+                assert!(err.to_string().contains("cannot be used"), "{folder}: {err}");
+            }
+        }
+        assert!(mgr.list_jobs().await.unwrap().is_empty(), "no job was queued");
+        let left: Vec<_> = std::fs::read_dir(root.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("dst")], "nothing outside dst");
+        assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0, "no folder was created either");
+    }
+
+    /// Regression: a move within one connection renamed items on the server
+    /// first; when planning the rest then failed the command returned an
+    /// error, so the UI reported the whole move as failed although some
+    /// items had moved. Everything is planned before any server rename.
+    #[tokio::test]
+    async fn a_move_that_cannot_be_planned_renames_nothing() {
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector::with(&[("/s/a.txt", "a")], &["/s", "/d"]));
+        let resolver = Arc::new(MemResolver(HashMap::from([(id, conn.clone())])));
+        let mgr = TransferManager::new();
+        let local = tempfile::tempdir().unwrap();
+        let missing = local.path().join("gone");
+        let items = vec![item(format!("conn://{id}/s/a.txt"), "a.txt", false, 1), item(missing.to_string_lossy().into(), "gone", true, 0)];
+        assert!(location_transfer(&mgr, resolver.as_ref(), items, &format!("conn://{id}/d"), TransferMode::Move).await.is_err());
+        assert!(conn.renames.lock().unwrap().is_empty(), "nothing was moved on the server");
+        assert_eq!(conn.file("/s/a.txt").as_deref(), Some("a"));
+        assert!(mgr.list_jobs().await.unwrap().is_empty());
+    }
+
+    /// The server rename and the copies of one move share the destination's
+    /// names: an uploaded `a.txt` and a renamed `a.txt` keep both.
+    #[tokio::test]
+    async fn renamed_and_copied_items_of_one_move_keep_both_names() {
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector::with(&[("/s/a.txt", "remote")], &["/s", "/d"]));
+        let resolver = Arc::new(MemResolver(HashMap::from([(id, conn.clone())])));
+        let mgr = TransferManager::new();
+        mgr.set_remote_resolver(resolver.clone());
+        let local = tempfile::tempdir().unwrap();
+        let up = local.path().join("a.txt");
+        std::fs::write(&up, "local").unwrap();
+        let items = vec![item(format!("conn://{id}/s/a.txt"), "a.txt", false, 6), item(up.to_string_lossy().into(), "a.txt", false, 5)];
+        let out = location_transfer(&mgr, resolver.as_ref(), items, &format!("conn://{id}/d"), TransferMode::Move).await.unwrap();
+        assert_eq!(out.moved, vec![MovedItem { from: format!("conn://{id}/s/a.txt"), to: format!("conn://{id}/d/a.txt") }]);
+        settle(&mgr, &out.jobs).await;
+        assert_eq!((conn.file("/d/a.txt").as_deref(), conn.file("/d/a (copy).txt").as_deref()), (Some("remote"), Some("local")));
+    }
+
+    /// A connection without a server-side move for `/s/b`, whose listing of
+    /// `/s/b` fails.
+    struct NoRenameForB(Arc<MemConnector>);
+
+    impl crate::connectors::Connector for NoRenameForB {
+        fn connect(&self, _: &crate::core::types::ConnectionProfile) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn disconnect(&self) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn list_remote(&self, path: &str) -> Fut<'_, Vec<crate::core::types::FileEntry>> {
+            if path == "/s/b" {
+                return Box::pin(async { Err(AppError::connection("listing failed", "test")) });
+            }
+            self.0.list_remote(path)
+        }
+        fn rename_entry(&self, from: &str, to: &str) -> Fut<'_, ()> {
+            if from == "/s/b" {
+                return Box::pin(async { Err(AppError::validation("no server-side move")) });
+            }
+            self.0.rename_entry(from, to)
+        }
+    }
+
+    /// When an item of a move falls back to copy + delete after other items
+    /// were already renamed on the server and that copy cannot be planned,
+    /// the error names what had moved (and nothing is queued).
+    #[tokio::test]
+    async fn a_failure_after_server_renames_names_what_moved() {
+        let id = Uuid::new_v4();
+        let mem = Arc::new(MemConnector::with(&[("/s/a.txt", "a"), ("/s/b/x.txt", "x")], &["/s", "/s/b", "/d"]));
+        let resolver = Arc::new(DynResolver(HashMap::from([(id, Arc::new(NoRenameForB(mem.clone())) as Arc<dyn crate::connectors::Connector>)])));
+        let mgr = TransferManager::new();
+        let items = vec![item(format!("conn://{id}/s/a.txt"), "a.txt", false, 1), item(format!("conn://{id}/s/b"), "b", true, 0)];
+        let err = location_transfer(&mgr, resolver.as_ref(), items, &format!("conn://{id}/d"), TransferMode::Move).await.unwrap_err();
+        assert!(err.to_string().contains("already been moved on the server: a.txt"), "{err}");
+        assert_eq!(mem.file("/d/a.txt").as_deref(), Some("a"));
+        assert!(mgr.list_jobs().await.unwrap().is_empty());
     }
 }

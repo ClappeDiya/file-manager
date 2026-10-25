@@ -617,8 +617,7 @@ pub(crate) fn preview_cache_path(scope: &str, remote_path: &str, name: &str) -> 
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (scope, remote_path).hash(&mut h);
-    let safe: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '\0') { '_' } else { c }).collect();
-    preview_cache_root().join(format!("{:016x}", h.finish())).join(if safe.is_empty() || safe == "." || safe == ".." { "file".into() } else { safe })
+    preview_cache_root().join(format!("{:016x}", h.finish())).join(crate::transfer_engine::location::sanitized_name(name))
 }
 
 pub(crate) async fn fetch_preview(connector: &dyn Connector, remote_path: &str, name: &str, scope: &str, limit: u64) -> Result<String, AppError> {
@@ -627,7 +626,9 @@ pub(crate) async fn fetch_preview(connector: &dyn Connector, remote_path: &str, 
         tokio::fs::create_dir_all(dir).await.map_err(|e| AppError::file_op(format!("Cannot create the preview folder: {e}"), "Free some disk space and retry."))?;
     }
     let local_str = local.to_string_lossy().to_string();
-    let staging = crate::transfer_engine::location::local_staging_path(&local_str);
+    // This preview's own staging file: two previews of one file at once
+    // never write one file together.
+    let staging = crate::transfer_engine::location::local_staging_path(&local_str, uuid::Uuid::new_v4());
     // Never write through something already there (a leftover or a link).
     let _ = tokio::fs::remove_file(&staging).await;
     let over_limit = |m: std::io::Result<std::fs::Metadata>| m.is_ok_and(|m| m.len() > limit);
@@ -832,19 +833,20 @@ mod tests {
     /// holds for what is actually downloaded.
     #[tokio::test]
     async fn previews_are_capped_while_downloading() {
-        use crate::transfer_engine::location::{local_staging_path, tests::MemConnector};
+        use crate::transfer_engine::location::tests::MemConnector;
+        let no_staging = |p: &std::path::Path| std::fs::read_dir(p.parent().unwrap()).map(|d| d.flatten().all(|e| !e.file_name().to_string_lossy().ends_with(crate::connectors::STAGING_SUFFIX))).unwrap_or(true);
         let big = "x".repeat(64);
         let c = MemConnector::with(&[("/big.bin", big.as_str())], &[]);
         let scope = uuid::Uuid::new_v4().to_string();
         let local = preview_cache_path(&scope, "/big.bin", "big.bin");
         let err = fetch_preview(&c, "/big.bin", "big.bin", &scope, 16).await.unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
-        assert!(!local.exists() && !std::path::Path::new(&local_staging_path(&local.to_string_lossy())).exists(), "nothing is kept");
+        assert!(!local.exists() && no_staging(&local), "nothing is kept");
         // A download still running is stopped once it is over the cap.
         let endless = preview_cache_path(&scope, "/x.bin", "x.bin");
         let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), fetch_preview(&Endless, "/x.bin", "x.bin", &scope, 16)).await.expect("stopped, not waited out");
         assert!(stopped.unwrap_err().to_string().contains("too large"));
-        assert!(!std::path::Path::new(&local_staging_path(&endless.to_string_lossy())).exists());
+        assert!(no_staging(&endless));
         for p in [local, endless] {
             let _ = std::fs::remove_dir_all(p.parent().unwrap());
         }

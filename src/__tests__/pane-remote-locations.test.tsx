@@ -347,6 +347,27 @@ describe("connections in the panes", () => {
     await waitFor(() => expect(useUIStore.getState().structuredErrors.map((e) => e.what)).toContain("1 Google document was copied, not moved"));
   });
 
+  it("re-lists both panes when a move fails part-way (items may have moved on the server)", async () => {
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "enqueue_location_transfer") throw new Error("Listing failed. 1 item(s) had already been moved on the server: a.txt.");
+      if (cmd === "count_affected_files") return { files: 1, bytes: 3, capped: false };
+      return base(cmd, args);
+    });
+    setPanes(ROOT, "/home", false);
+    render(<FileManager />);
+    fireEvent.click(await settled("a.txt", screen.getByTestId("pane-0")));
+    const before = { remote: calls("connector_list_remote").length, local: calls("list_directory").filter((a) => a?.path === "/home").length };
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "F6" });
+    });
+    await waitFor(() => expect(calls("enqueue_location_transfer")).toContainEqual(expect.objectContaining({ mode: "move" })));
+    await waitFor(() => {
+      expect(calls("connector_list_remote").length).toBeGreaterThan(before.remote);
+      expect(calls("list_directory").filter((a) => a?.path === "/home").length).toBeGreaterThan(before.local);
+    });
+  });
+
   it("a drop or cut+paste back into the folder that lists the items moves nothing (Google shared-drive roots)", async () => {
     // Regression: a Drive whose root is a shared drive lists `/` items as
     // `/shared-drives/<id>/<item>`; dropping one back on its own pane (or
