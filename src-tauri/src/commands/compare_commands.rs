@@ -193,13 +193,17 @@ pub async fn compare_apply(
     let env = ApplyEnv { transfer: &transfer, ledger: &ledger, permanent: permanent.unwrap_or(false), cancel: &cancel, progress: &progress, task_id: &task_id };
     let report = apply::execute(&plan, &l, &r, &env).await;
     manager.end(&run_id, &cancel);
+    // Keep where the folders made and files sent are, even if the
+    // re-compare below fails.
+    let save_paths = |s: &mut StoredCompare| (s.left_paths, s.right_paths) = (l.listed_paths(), r.listed_paths());
+    let _ = manager.with(&task_id, save_paths).await;
 
     progress(CompareProgress { task_id: task_id.clone(), phase: crate::compare_engine::ComparePhase::Refreshing, folders_listed: 0, entries_found: 0, done: 0, total: report.touched.len() as u64, current: None });
     let refreshed = apply::refresh(&l, &r, &options, &report.touched).await?;
     let merged = manager
         .with(&task_id, |s| {
-            // Folders made, files uploaded and items deleted move these.
-            (s.left_paths, s.right_paths) = (l.listed_paths(), r.listed_paths());
+            // The re-compare saw where each touched entry is now.
+            save_paths(s);
             compare::merge_refreshed(&mut s.entries, &report.touched, refreshed)
         })
         .await?;
