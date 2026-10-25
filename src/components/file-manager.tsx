@@ -14,7 +14,7 @@ import { useTerminalStore } from "@/stores/terminal-store";
 import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { loadSmartDestinations, fileExtension, type SmartDestination } from "@/hooks/use-smart-destinations";
 import { assessBeforeExecute, confirmIntent, measureSelection, FS_INTENT_KIND } from "@/lib/safety";
-import { formatAddress, isRemotePath, joinLocation, locationConnectionId, parentLocation, remoteLocation } from "@/lib/location";
+import { formatAddress, isRemotePath, isTopFolder, joinLocation, locationConnectionId, parentLocation, remoteLocation } from "@/lib/location";
 import {
   connectionQuota,
   dragDropMode,
@@ -53,7 +53,7 @@ import {
 import { archiveExtractDest } from "@/lib/archive-paths";
 import { pickFolder } from "@/lib/folder-picker";
 import { planPaneCopy, awaitPaneCopyJobs } from "@/lib/pane-copy";
-import { resolveFileActionKey, resolveFileTransferKey, resolveNewFolderKey } from "@/lib/file-action-keys";
+import { resolveFileActionKey, resolveFileTransferKey, resolveNewFolderKey, resolveParentFolderKey } from "@/lib/file-action-keys";
 import {
   useDriveSpace,
   useAllDrives,
@@ -2255,6 +2255,15 @@ export function FileManager() {
         },
         onEditAddress: () => {
           window.dispatchEvent(new CustomEvent(EDIT_ADDRESS_EVENT, { detail: { paneIndex: useFileManagerStore.getState().activePaneIndex } }));
+        },
+        onGoToParentFolder: () => {
+          const fm = useFileManagerStore.getState();
+          const pane = fm.singlePaneMode ? 0 : fm.activePaneIndex;
+          const tab = fm.getActiveTab(pane);
+          if (tab && !isTopFolder(tab.path)) {
+            const up = parentLocation(tab.path);
+            fm.navigateTab(pane, tab.id, up, paneLabel(up));
+          }
         },
         onOpenRcloneRemotes: () => {
           useRcloneUi.getState().openManager();
@@ -5307,6 +5316,14 @@ function FilePane({
           setAddressEditing(true);
         }
       }
+      // Alt+↑ / ⌘+↑ / Backspace: the parent folder (not while a dialog is open).
+      if (resolveParentFolderKey(e, inTextEntry) && !document.querySelector('[role="dialog"], [role="alertdialog"]')) {
+        const fmState = useFileManagerStore.getState();
+        if (fmState.singlePaneMode || fmState.activePaneIndex === paneIndex) {
+          e.preventDefault();
+          if (!isTopFolder(currentPath)) handleNavigate(parentLocation(currentPath));
+        }
+      }
       const transferKey = resolveFileTransferKey(e, inTextEntry);
       if (transferKey) {
         const fmState = useFileManagerStore.getState();
@@ -5347,7 +5364,7 @@ function FilePane({
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectedPaths, handleCompareFiles, handleDelete, handleRename, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleNewFolder, selectAll, paneIndex]);
+  }, [selectedPaths, handleCompareFiles, handleDelete, handleRename, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleNewFolder, selectAll, paneIndex, currentPath, handleNavigate]);
 
   return (
     <div
@@ -5407,6 +5424,8 @@ function FilePane({
         onForward={() => useFileManagerStore.getState().navigateForward(paneIndex)}
         canGoBack={useFileManagerStore.getState().canNavigateBack(paneIndex)}
         canGoForward={useFileManagerStore.getState().canNavigateForward(paneIndex)}
+        onUp={() => handleNavigate(parentLocation(currentPath))}
+        canGoUp={!isTopFolder(currentPath)}
         connectionName={nameOfConnection}
         address={addressProps}
         editing={addressEditing}

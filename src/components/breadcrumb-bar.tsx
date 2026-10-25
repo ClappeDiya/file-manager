@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { cn } from "@ufop/ui-components";
-import { ChevronLeft, ChevronRight, Cloud, Home } from "lucide-react";
+import { ArrowUp, ChevronLeft, ChevronRight, Cloud, Home } from "lucide-react";
 import { AddressBar, type AddressBarProps } from "./address-bar";
 import { isRemotePath, locationConnectionId, locationRoot, locationSegments } from "@/lib/location";
 
@@ -19,6 +19,9 @@ interface BreadcrumbBarProps {
   onForward?: () => void;
   canGoBack?: boolean;
   canGoForward?: boolean;
+  /** Go to the parent folder (shown when given). */
+  onUp?: () => void;
+  canGoUp?: boolean;
   className?: string;
   /** Name of a connection id (remote roots show it). */
   connectionName?: (id: string) => string | undefined;
@@ -29,6 +32,8 @@ interface BreadcrumbBarProps {
   onEditingChange?: (editing: boolean) => void;
 }
 
+const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
+
 export function BreadcrumbBar({
   path,
   onNavigate,
@@ -36,6 +41,8 @@ export function BreadcrumbBar({
   onForward,
   canGoBack = false,
   canGoForward = false,
+  onUp,
+  canGoUp = false,
   className,
   connectionName,
   address,
@@ -93,6 +100,26 @@ export function BreadcrumbBar({
       >
         <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
       </button>
+      {onUp && (
+        <button
+          className={cn(
+            "flex items-center justify-center w-6 h-6 rounded-[var(--radius-sm)]",
+            "transition-theme shrink-0",
+            "focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]",
+            canGoUp
+              ? "text-[color:var(--color-text-secondary)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover-bg)]"
+              : "text-[color:var(--color-text-tertiary)] opacity-40 cursor-default",
+          )}
+          onClick={canGoUp ? onUp : undefined}
+          disabled={!canGoUp}
+          aria-label="Go to parent folder"
+          title={`Parent folder (${isMac ? "⌘↑" : "Alt+↑"} or Backspace)`}
+          data-testid="breadcrumb-up"
+          type="button"
+        >
+          <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
+      )}
 
       {/* Separator */}
       <div className="w-px h-4 bg-[var(--color-border)] shrink-0 mx-0.5" />

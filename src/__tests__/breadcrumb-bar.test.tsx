@@ -50,4 +50,18 @@ describe("T-009: BreadcrumbBar", () => {
     render(<BreadcrumbBar path="/home" onNavigate={vi.fn()} />);
     expect(screen.getByRole("navigation", { name: /breadcrumb/i })).toBeInTheDocument();
   });
+
+  it("shows an Up button when asked, disabled at the top", () => {
+    const onUp = vi.fn();
+    const { rerender } = render(<BreadcrumbBar path="/home/user" onNavigate={vi.fn()} onUp={onUp} canGoUp />);
+    fireEvent.click(screen.getByTestId("breadcrumb-up"));
+    expect(onUp).toHaveBeenCalledTimes(1);
+    rerender(<BreadcrumbBar path="/" onNavigate={vi.fn()} onUp={onUp} canGoUp={false} />);
+    expect(screen.getByTestId("breadcrumb-up")).toBeDisabled();
+  });
+
+  it("has no Up button without onUp", () => {
+    render(<BreadcrumbBar path="/home/user" onNavigate={vi.fn()} />);
+    expect(screen.queryByTestId("breadcrumb-up")).not.toBeInTheDocument();
+  });
 });

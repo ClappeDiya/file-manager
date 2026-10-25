@@ -52,15 +52,41 @@ export function joinLocation(dir: string, name: string): string {
   return dir.endsWith(sep) ? `${dir}${name}` : `${dir}${sep}${name}`;
 }
 
-/** The folder containing `p` (a connection's root has itself as parent). */
+/** The root a local path starts with: `C:\`, `\\server\share`, or `/`. */
+function localRoot(p: string): string {
+  const drive = /^([A-Za-z]:)([\\/]?)/.exec(p);
+  if (drive) return `${drive[1]}${drive[2] || "\\"}`;
+  const unc = /^(\\\\[^\\/]+[\\/][^\\/]+)/.exec(p);
+  if (unc) return unc[1];
+  return "/";
+}
+
+/**
+ * Whether `p` is the top of its location (`/`, a drive, a network share, a
+ * connection's root), where going to the parent folder stays put.
+ */
+export function isTopFolder(p: string): boolean {
+  const loc = parseLocation(p);
+  if (loc.kind === "remote") return normalizeRemoteFolder(loc.path) === "/";
+  const root = localRoot(p);
+  const trimmed = p.replace(/[\\/]+$/, "");
+  return trimmed === "" || trimmed === root.replace(/[\\/]+$/, "");
+}
+
+/** The folder containing `p` (a root — `/`, `C:\`, a share, a connection's root — has itself as parent). */
 export function parentLocation(p: string): string {
   const loc = parseLocation(p);
   if (loc.kind === "remote") {
+    if (normalizeRemoteFolder(loc.path) === "/") return p;
     const trimmed = loc.path.replace(/\/+$/, "");
     const cut = trimmed.lastIndexOf("/");
     return remoteLocation(loc.connectionId, cut <= 0 ? "/" : trimmed.slice(0, cut));
   }
-  return p.replace(/[\\/][^\\/]*$/, "") || "/";
+  if (isTopFolder(p)) return /^[A-Za-z]:$/.test(p) ? `${p}\\` : p;
+  const parent = p.replace(/[\\/]+$/, "").replace(/[\\/][^\\/]*$/, "");
+  if (!parent) return "/";
+  const root = localRoot(p);
+  return parent.length < root.length || parent === root.replace(/[\\/]+$/, "") ? root : parent;
 }
 
 /**

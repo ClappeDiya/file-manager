@@ -42,6 +42,7 @@ import {
   Sparkles,
   ArrowRight,
   ArrowLeftRight,
+  FolderUp,
   Shield,
   Filter,
   FolderSync,
@@ -766,6 +767,7 @@ export function getDefaultCommands(actions: {
   onOpenConnections?: () => void;
   /** Turn the active pane's breadcrumb into the editable address field. */
   onEditAddress?: () => void;
+  onGoToParentFolder?: () => void;
   /** Open the Connection Manager on its rclone remote manager. */
   onOpenRcloneRemotes?: () => void;
   /** Open Settings expanded and scrolled to its rclone section. */
@@ -1517,6 +1519,16 @@ export function getDefaultCommands(actions: {
       category: "Navigation",
       action: actions.onEditAddress || (() => {}),
       keywords: ["address", "path", "go to", "location", "breadcrumb", "type path", "cloud", "connection"],
+    },
+    {
+      id: "go-to-parent-folder",
+      label: "Go to Parent Folder",
+      description: "Open the folder that contains the active pane's folder",
+      icon: <FolderUp className="h-4 w-4" />,
+      shortcut: isMac ? `${cmd}\u2191` : "Alt+\u2191",
+      category: "Navigation",
+      action: actions.onGoToParentFolder || (() => {}),
+      keywords: ["up", "parent", "back up", "folder up", "..", "backspace", "go up"],
     },
     {
       id: "open-rclone-remotes",

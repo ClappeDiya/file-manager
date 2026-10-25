@@ -126,6 +126,7 @@ Files can be displayed in four modes (set per pane in Advanced mode):
 ### Navigation
 
 - **Breadcrumb Bar** - Click any segment to navigate up the directory tree
+- **Parent folder** - The ↑ button next to Back/Forward, **Alt+↑** (Windows, Linux), **⌘↑** (macOS) or **Backspace** (when no text field has focus) opens the folder one level up, locally and on a connection. It stops at the top: `/`, a drive (`C:\`), a network share (`\\server\share`) or the connection's root. Also in the command palette: *Go to Parent Folder*.
 - **Tab Bar** - Open multiple directories in tabs (Advanced mode). Tabs can be pinned, reordered, and closed.
 - **Favorites** - Star any folder for quick access from the sidebar
 - **Recent Locations** - The last 20 visited paths are remembered

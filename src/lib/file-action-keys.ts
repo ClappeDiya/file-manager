@@ -132,3 +132,15 @@ export function resolveFileTransferKey(
   if (bare && e.key === "F6") return "move_to_pane";
   return null;
 }
+
+/**
+ * Go to the parent folder: Alt+↑ (Windows Explorer, Linux file managers),
+ * ⌘+↑ (Finder) and bare Backspace (Explorer, RcloneView). Never while a
+ * text field has focus, so Backspace keeps deleting characters. Going up
+ * changes nothing on disk, so the bare key is safe here (unlike trashing).
+ */
+export function resolveParentFolderKey(e: KeyGesture, textEntryFocused: boolean): boolean {
+  if (textEntryFocused) return false;
+  if (e.key === "ArrowUp" && !e.shiftKey && !e.ctrlKey && (e.altKey !== e.metaKey)) return true;
+  return e.key === "Backspace" && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey;
+}
