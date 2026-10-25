@@ -233,6 +233,25 @@ describe("connections in the panes", () => {
     expect(calls("delete_files")).toHaveLength(0);
   });
 
+  it("assesses deleting a connection folder with what is inside it, not as one empty item", async () => {
+    // Regression: the Safety Interlock saw one item of 0 bytes for a
+    // folder of thousands of files.
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "connector_folder_size" ? { files: 1200, folders: 30, bytes: 9_000_000_000, complete: true } : base(cmd, args),
+    );
+    setPanes(ROOT, "/home", true);
+    render(<FileManager />);
+    fireEvent.click(await settled("Reports"));
+    fireEvent.keyDown(window, { key: "Delete" });
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(calls("safety_assess_intent")).toHaveLength(1));
+    expect(calls("connector_folder_size")).toContainEqual(expect.objectContaining({ protocol: "dropbox", path: "/Reports", connectionId: ID }));
+    expect(calls("safety_assess_intent")[0]).toMatchObject({ intent: { affected_files: 1200, total_bytes: 9_000_000_000 } });
+    await waitFor(() => expect(calls("connector_remove")).toEqual([{ protocol: "dropbox", remotePath: "/Reports", isDir: true, connectionId: ID }]));
+  });
+
   it("Ctrl+L turns the breadcrumb into the address field; <connection>:path goes there", async () => {
     setPanes("/home", "/home", true);
     render(<FileManager />);

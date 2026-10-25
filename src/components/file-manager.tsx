@@ -4420,13 +4420,15 @@ function FilePane({
         true,
       );
       if (!ok) return;
-      const bytes = items.reduce((n, i) => n + (i.is_dir ? 0 : i.size || 0), 0);
+      // Assessed with what the delete really affects (folders counted
+      // through), as moves are, not the number of top-level items.
+      const measured = await measureLocations(paths, files);
       const result = await assessBeforeExecute(
         {
           engine: "fs",
           kind: FS_INTENT_KIND.deletePermanent,
-          affected_files: items.length,
-          total_bytes: bytes,
+          affected_files: measured.files,
+          total_bytes: measured.bytes,
           subject_path: currentPath,
           summary: `Delete ${items.length} item${items.length === 1 ? "" : "s"} from ${where}`,
         },
@@ -4555,7 +4557,8 @@ function FilePane({
   }, [pushUndo, files]);
 
   const handleDuplicate = useCallback(async () => {
-    if (selectedPaths.length === 0 || selectedPaths.some(isRemotePath)) return;
+    if (selectedPaths.length === 0) return;
+    if (selectedPaths.some(isRemotePath)) return refuseRemote("Duplicate");
     if (isTauriAvailable()) {
       try {
         await tauriInvoke("duplicate_files", { paths: selectedPaths });
@@ -4592,7 +4595,7 @@ function FilePane({
   }, [currentPath, pushUndo, isRemote]);
 
   const handleNewFile = useCallback(async () => {
-    if (isRemote) return; // disabled in connection folders (menu says why)
+    if (isRemote) return refuseRemote("New File"); // the menu item is disabled with the reason too
     if (isTauriAvailable()) {
       const name = await promptText("New file name:", "untitled.txt");
       if (name) {

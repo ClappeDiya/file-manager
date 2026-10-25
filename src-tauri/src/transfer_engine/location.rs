@@ -386,7 +386,23 @@ fn rebase(path: &str, created: &HashMap<String, Location>) -> Result<Location, A
 /// or (for id-path providers such as Google Drive) that name.
 pub async fn remote_exists(conn: &dyn Connector, path: &str) -> Result<bool, AppError> {
     let listing = conn.list_remote(&remote_parent(path)).await?;
-    Ok(listing.iter().any(|e| at_path(e, path) || e.name == last_name(path)))
+    Ok(listing.iter().any(|e| names(e, path)))
+}
+
+/// Whether something other than the item at `from` is at `to` (by path or
+/// name, as [`remote_exists`], names ignoring case: case-insensitive servers
+/// would replace `b.txt` with a rename to `B.txt`): a rename to `to` would
+/// replace it. The item itself does not count, so a case-only rename stays
+/// possible.
+pub async fn rename_target_taken(conn: &dyn Connector, from: &str, to: &str) -> Result<bool, AppError> {
+    let listing = conn.list_remote(&remote_parent(to)).await?;
+    let name = last_name(to).to_lowercase();
+    Ok(listing.iter().any(|e| (at_path(e, to) || e.name.to_lowercase() == name) && !at_path(e, from)))
+}
+
+/// Whether listed `entry` is the item at `path`, or carries its name.
+fn names(entry: &FileEntry, path: &str) -> bool {
+    at_path(entry, path) || entry.name == last_name(path)
 }
 
 /// The last segment of a connector path.
@@ -517,7 +533,7 @@ async fn refuse_conversion(conn: &dyn Connector, from: &str) -> Result<(), AppEr
 /// paths its folder lists now (for [`remove_partial`]).
 async fn refuse_existing_remote(conn: &dyn Connector, path: &str) -> Result<HashSet<String>, AppError> {
     let listing = conn.list_remote(&remote_parent(path)).await?;
-    if listing.iter().any(|e| at_path(e, path) || e.name == last_name(path)) {
+    if listing.iter().any(|e| names(e, path)) {
         return Err(AppError::file_op(format!("{path} already exists; it was not overwritten."), "Rename or remove it, then retry the transfer."));
     }
     Ok(listing.into_iter().map(|e| e.path).collect())

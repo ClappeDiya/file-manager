@@ -446,7 +446,15 @@ pub async fn connector_rename(
     rename_at(connector.as_ref(), &from_path, &to_path).await
 }
 
+/// Refuses a `to` another item already has, as local `rename_file` does:
+/// several connectors' renames would replace it (SFTP renames with
+/// OVERWRITE, S3 copies over the key, rclone `moveto`, ADLS without
+/// If-None-Match, many FTP servers on RNTO).
 pub(crate) async fn rename_at(connector: &dyn Connector, from: &str, to: &str) -> Result<String, AppError> {
+    if crate::transfer_engine::location::rename_target_taken(connector, from, to).await? {
+        let name = to.trim_end_matches('/').rsplit('/').next().unwrap_or(to);
+        return Err(AppError::file_op(format!("A file named '{name}' already exists"), "Choose a different name."));
+    }
     connector.rename_entry(from, to).await?;
     Ok(connector.renamed_path(from, to))
 }
@@ -559,7 +567,7 @@ pub(crate) fn preview_cache_path(scope: &str, remote_path: &str, name: &str) -> 
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (scope, remote_path).hash(&mut h);
     let safe: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '\0') { '_' } else { c }).collect();
-    crate::paths::cache_dir().join("remote-previews").join(format!("{:016x}", h.finish())).join(if safe.is_empty() { "file".into() } else { safe })
+    crate::paths::cache_dir().join("remote-previews").join(format!("{:016x}", h.finish())).join(if safe.is_empty() || safe == "." || safe == ".." { "file".into() } else { safe })
 }
 
 pub(crate) async fn fetch_preview(connector: &dyn Connector, remote_path: &str, name: &str, scope: &str) -> Result<String, AppError> {
@@ -663,6 +671,34 @@ mod tests {
         assert!(stat_entry(c, "/Nope/Q1").await.unwrap().is_none());
     }
 
+    /// A pane rename never replaces an existing item (several connectors'
+    /// renames overwrite: SFTP OVERWRITE, S3 copy + delete, rclone moveto),
+    /// as local `rename_file` refuses an existing target. A case-only rename
+    /// of the item itself stays allowed.
+    #[tokio::test]
+    async fn rename_refuses_an_existing_target() {
+        use crate::transfer_engine::location::tests::MemConnector;
+        let c = MemConnector::with(&[("/d/a.txt", "aaa"), ("/d/b.txt", "bbb"), ("/d/sub/x.txt", "x")], &["/d", "/d/sub", "/d/old"]);
+        let err = rename_at(&c, "/d/a.txt", "/d/b.txt").await.unwrap_err();
+        assert!(err.to_string().contains("A file named 'b.txt' already exists"), "{err}");
+        assert_eq!(c.file("/d/a.txt").as_deref(), Some("aaa"), "the source is untouched");
+        assert_eq!(c.file("/d/b.txt").as_deref(), Some("bbb"), "the existing item is not overwritten");
+        assert!(c.renames.lock().unwrap().is_empty(), "the connector was never asked to rename");
+        // Case-insensitive servers (Windows FTP, OneDrive, Dropbox) would
+        // replace b.txt with a rename to B.TXT: refused everywhere.
+        assert!(rename_at(&c, "/d/a.txt", "/d/B.TXT").await.is_err());
+        assert_eq!(c.file("/d/b.txt").as_deref(), Some("bbb"));
+        // Onto a folder of that name, too.
+        assert!(rename_at(&c, "/d/a.txt", "/d/sub").await.is_err());
+        assert!(rename_at(&c, "/d/old", "/d/sub").await.is_err());
+        assert_eq!(c.file("/d/sub/x.txt").as_deref(), Some("x"));
+        // A free name, and a case-only rename of the same item, still work.
+        assert_eq!(rename_at(&c, "/d/a.txt", "/d/A.txt").await.unwrap(), "/d/A.txt");
+        assert_eq!(rename_at(&c, "/d/A.txt", "/d/c.txt").await.unwrap(), "/d/c.txt");
+        assert_eq!(c.file("/d/c.txt").as_deref(), Some("aaa"));
+        assert_eq!(c.file("/d/b.txt").as_deref(), Some("bbb"));
+    }
+
     /// `connector_stat` and `connector_fetch_preview` against an in-memory
     /// connection: entries by path (or by name), the root, missing paths;
     /// previews land under the final name only when complete.
@@ -685,6 +721,11 @@ mod tests {
         assert!(!std::path::Path::new(&local).starts_with(std::env::temp_dir()), "{local}");
         assert_ne!(preview_cache_path(&scope, "/docs/a.txt", "a.txt"), preview_cache_path(&scope, "/other/a.txt", "a.txt"));
         assert!(preview_cache_path(&scope, "/x", "../../etc").file_name().unwrap() == ".._.._etc", "names cannot leave the cache folder");
+        for dots in [".", ".."] {
+            let p = preview_cache_path(&scope, "/x", dots);
+            assert_eq!(p.file_name().and_then(|n| n.to_str()), Some("file"), "{dots:?} names a real file in the cache folder");
+            assert_eq!(p.parent(), preview_cache_path(&scope, "/x", "a").parent());
+        }
         assert!(fetch_preview(&c, "/docs/missing.txt", "m.txt", &scope).await.is_err());
         let _ = std::fs::remove_dir_all(std::path::Path::new(&local).parent().unwrap());
     }

@@ -1927,6 +1927,20 @@ mod tests {
         assert!(c.list_remote(&sub).await.unwrap().iter().any(|e| e.path == format!("{sub}/x9") && e.name == "b.txt"));
     }
 
+    /// A pane rename onto a name a sibling already has is refused here too
+    /// (as local renames are); the item's own name does not count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rename_refuses_a_name_a_sibling_has() {
+        let drive = super::fake_drive::start(&[("f1", "Folder 1", "root", true), ("x9", "a.txt", "f1", false), ("y1", "b.txt", "f1", false)]).await;
+        let c = drive.connector.as_ref();
+        let err = crate::commands::connector_commands::rename_at(c, "/f1/x9", "/f1/b.txt").await.unwrap_err();
+        assert!(err.to_string().contains("'b.txt' already exists"), "{err}");
+        let names: Vec<String> = c.list_remote("/f1").await.unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&"a.txt".to_string()) && names.contains(&"b.txt".to_string()), "{names:?}");
+        assert_eq!(crate::commands::connector_commands::rename_at(c, "/f1/x9", "/f1/a.txt").await.unwrap(), "/f1/x9", "its own name is free");
+        assert_eq!(crate::commands::connector_commands::rename_at(c, "/f1/x9", "/f1/c.txt").await.unwrap(), "/f1/x9");
+    }
+
     /// Copies within one Drive run as `files.copy` (so a Google document
     /// stays one); documents are the files a download converts.
     #[tokio::test(flavor = "multi_thread")]
