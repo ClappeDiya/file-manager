@@ -970,26 +970,25 @@ pub(crate) mod tests {
     /// name that was there before. Only the write's own file goes now.
     #[tokio::test]
     async fn partial_cleanup_removes_only_the_writes_own_file() {
-        let set = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<HashSet<String>>();
-        let cases: [(&[(&'static str, &'static str)], &str, HashSet<String>, &[&str]); 6] = [
-            // Path-addressed: the file at the written path.
-            (&[("/d/a.txt", "a.txt"), ("/d/b.txt", "b.txt")], "/d/a.txt", set(&["/d/b.txt"]), &["/d/a.txt"]),
-            // OneDrive lists `/d/a.txt` in Graph's form.
-            (&[("/drive/root:/d/a.txt", "a.txt")], "/d/a.txt", set(&[]), &["/drive/root:/d/a.txt"]),
-            // Drive: a same-named file that was there before is kept.
-            (&[("/f1/o1", "a.txt")], "/f1/a.txt", set(&["/f1/o1"]), &[]),
-            // Drive: the one new file of that name is the write's.
-            (&[("/f1/o1", "a.txt"), ("/f1/n1", "a.txt")], "/f1/a.txt", set(&["/f1/o1"]), &["/f1/n1"]),
-            // Drive: two new files of that name: which is ours is unknown, keep both.
-            (&[("/f1/n1", "a.txt"), ("/f1/n2", "a.txt")], "/f1/a.txt", set(&[]), &[]),
-            // Nothing of that name: nothing removed.
-            (&[("/f1/o1", "b.txt")], "/f1/a.txt", set(&[]), &[]),
-        ];
-        for (entries, path, before, want) in cases {
+        /// What `remove_partial` removes for a write to `path`, with the
+        /// folder listing `entries` now and `before` at the pre-check.
+        async fn removed(entries: &[(&'static str, &'static str)], path: &str, before: &[&str]) -> Vec<String> {
             let conn = Listed { entries: entries.to_vec(), removed: Default::default() };
-            remove_partial(&conn, path, &before).await;
-            assert_eq!(*conn.removed.lock().unwrap(), want.iter().map(|p| p.to_string()).collect::<Vec<_>>(), "{path} in {entries:?}");
+            remove_partial(&conn, path, &before.iter().map(|p| p.to_string()).collect()).await;
+            conn.removed.into_inner().unwrap()
         }
+        // Path-addressed: the file at the written path.
+        assert_eq!(removed(&[("/d/a.txt", "a.txt"), ("/d/b.txt", "b.txt")], "/d/a.txt", &["/d/b.txt"]).await, ["/d/a.txt"]);
+        // OneDrive lists `/d/a.txt` in Graph's form.
+        assert_eq!(removed(&[("/drive/root:/d/a.txt", "a.txt")], "/d/a.txt", &[]).await, ["/drive/root:/d/a.txt"]);
+        // Drive: a same-named file that was there before is kept.
+        assert!(removed(&[("/f1/o1", "a.txt")], "/f1/a.txt", &["/f1/o1"]).await.is_empty());
+        // Drive: the one new file of that name is the write's.
+        assert_eq!(removed(&[("/f1/o1", "a.txt"), ("/f1/n1", "a.txt")], "/f1/a.txt", &["/f1/o1"]).await, ["/f1/n1"]);
+        // Drive: two new files of that name: which is ours is unknown, keep both.
+        assert!(removed(&[("/f1/n1", "a.txt"), ("/f1/n2", "a.txt")], "/f1/a.txt", &[]).await.is_empty());
+        // Nothing of that name: nothing removed.
+        assert!(removed(&[("/f1/o1", "b.txt")], "/f1/a.txt", &[]).await.is_empty());
     }
 
     /// Regression: an upload that failed half-way left a partial file under
