@@ -1,10 +1,50 @@
 /**
- * Settings → Appearance: theme, text size (K121) and display units. All
+ * Settings → Appearance: theme, accent colour, text size (K121) and display units. All
  * Standard settings, stored in the persisted UI store.
  */
 import { FONT_SCALES, useUIStore, type ByteUnits, type FontScale, type TimeDisplay } from "@/stores/ui-store";
 import { formatBytes } from "@/lib/format-bytes";
 import { ThemeSwitcher } from "./theme-switcher";
+import { ACCENT_PRESETS, accentHex } from "@/lib/accent";
+
+/** Accent colour swatches plus a custom colour. */
+function AccentPicker() {
+  const accent = useUIStore((s) => s.accentColor);
+  const setAccent = useUIStore((s) => s.setAccentColor);
+  const custom = accent.startsWith("#");
+  return (
+    <div role="radiogroup" aria-label="Accent colour" className="flex flex-wrap items-center gap-1.5" data-testid="accent-color">
+      {ACCENT_PRESETS.map((p) => (
+        <button
+          key={p.id}
+          type="button"
+          role="radio"
+          aria-checked={accent === p.id}
+          aria-label={p.label}
+          title={p.label}
+          onClick={() => setAccent(p.id)}
+          className={`h-6 w-6 rounded-full border-2 ${accent === p.id ? "border-gray-900 dark:border-white" : "border-transparent"}`}
+          style={{ backgroundColor: p.hex }}
+          data-testid={`accent-${p.id}`}
+        />
+      ))}
+      <label
+        className={`flex items-center gap-1 px-2 py-0.5 rounded border text-xs cursor-pointer ${custom ? "border-gray-900 dark:border-white" : "border-gray-300 dark:border-gray-600"}`}
+        title="Choose any colour"
+      >
+        <input
+          type="color"
+          aria-label="Custom accent colour"
+          value={accentHex(accent)}
+          onChange={(e) => setAccent(e.target.value)}
+          className="h-4 w-5 border-0 bg-transparent p-0"
+          data-testid="accent-custom"
+        />
+        Custom
+      </label>
+    </div>
+  );
+}
 
 /** A labelled radio group of segmented buttons. */
 export function ChoiceGroup<T extends string | number>({
@@ -76,6 +116,9 @@ export function AppearanceSettings() {
     <div className="space-y-3 pt-3" data-testid="appearance-settings">
       <Row label="Theme">
         <ThemeSwitcher />
+      </Row>
+      <Row label="Accent colour" hint="Buttons, selection, links and focus outlines. High contrast keeps its own colours.">
+        <AccentPicker />
       </Row>
       <Row label="Text size" hint={`Shortcuts: ${mod} + (larger), ${mod} − (smaller), ${mod} 0 (default).`}>
         <ChoiceGroup<FontScale>
