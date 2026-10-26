@@ -337,7 +337,8 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     }
 
-    /// A local stand-in for downloads.rclone.org.
+    /// A local stand-in for downloads.rclone.org (the tests using it are Unix-only).
+    #[cfg(unix)]
     async fn mirror(files: Vec<(String, Vec<u8>)>) -> String {
         let files = std::sync::Arc::new(files.into_iter().collect::<HashMap<_, _>>());
         let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {

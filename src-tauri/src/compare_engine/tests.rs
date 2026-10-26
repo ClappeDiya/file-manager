@@ -925,3 +925,23 @@ async fn stale_staging_files_are_cleared_when_copying_into_their_folder() {
     // A file that only looks a bit like one is never touched.
     assert!(r.path().join("docs/same.txt").exists());
 }
+
+/// Regression (WS-Z1): a folder found empty was then deleted with whatever
+/// had been put in it since; a file saved there at that moment went with it.
+#[tokio::test]
+async fn a_file_put_in_a_folder_while_it_is_deleted_is_kept() {
+    let (l, r) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    std::fs::create_dir_all(l.path().join("emptied")).unwrap();
+    let (left, right) = (local(&l), local(&r));
+    let entries = compare(&left, &right, &CompareOptions::default()).await.entries;
+    let (tm, ledger) = env_parts().await;
+    let plan = plan_action(&entries, &["emptied".to_string()], CompareAction::DeleteLeft);
+    *apply::BEFORE_EMPTY_FOLDER_DELETE.lock().unwrap() = Some(Box::new(|dir: &std::path::Path| std::fs::write(dir.join("new.txt"), "saved just now").unwrap()));
+    let cancel = CancellationToken::new();
+    let progress = no_progress();
+    let env = ApplyEnv { transfer: &tm, ledger: &ledger, permanent: true, cancel: &cancel, progress: &progress, task_id: "t" };
+    let report = apply::execute(&plan, &left, &right, &env).await;
+    *apply::BEFORE_EMPTY_FOLDER_DELETE.lock().unwrap() = None;
+    assert_eq!(std::fs::read_to_string(l.path().join("emptied/new.txt")).unwrap(), "saved just now", "{report:?}");
+    assert_eq!(report.kept, ["emptied"]);
+}

@@ -10,7 +10,7 @@ use crate::sync::planner;
 use crate::sync::rollback::RollbackManager;
 use crate::sync::versions::{StoredVersion, VersionIndex};
 use crate::sync_types::*;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1019,6 +1019,25 @@ impl ListedNames {
     }
 }
 
+/// Refuse to delete a file that changed after the plan saw it (an edit made
+/// while the run was going): it is kept, reported, and synced next run.
+/// Folders, and entries the plan has no size for, are not compared.
+fn unchanged_since_plan(path: &Path, size: Option<u64>, modified: Option<DateTime<Utc>>, rel_path: &str) -> Result<(), AppError> {
+    let Some(size) = size else { return Ok(()) };
+    let Ok(meta) = fs::symlink_metadata(path) else { return Ok(()) };
+    if meta.is_dir() {
+        return Ok(());
+    }
+    let now_modified = meta.modified().ok().map(DateTime::<Utc>::from);
+    if meta.len() == size && (modified.is_none() || now_modified == modified) {
+        return Ok(());
+    }
+    Err(AppError::Sync {
+        message: format!("Not deleted {rel_path}: it changed after this run was planned."),
+        advice: "It is kept; the next sync handles it as an edited file.".to_string(),
+    })
+}
+
 /// Execute a single file operation (add/modify/delete).
 fn execute_single_operation(
     pair: &SyncPair,
@@ -1048,6 +1067,7 @@ fn execute_single_operation(
             // Two-way: deleted in the destination since the last sync.
             if source_file.exists() {
                 listed.check_delete(&source_file, &entry.relative_path)?;
+                unchanged_since_plan(&source_file, entry.source_size, entry.source_modified, &entry.relative_path)?;
                 rollback.snapshot_on(SyncSide::Source, &entry.relative_path, &source_file)?;
                 fs::remove_file(&source_file).map_err(|e| AppError::Sync {
                     message: format!("Delete failed {}: {}", entry.relative_path, e),
@@ -1075,6 +1095,7 @@ fn execute_single_operation(
         "delete" => {
             if dest_file.exists() {
                 listed.check_delete(&dest_file, &entry.relative_path)?;
+                unchanged_since_plan(&dest_file, entry.dest_size, entry.dest_modified, &entry.relative_path)?;
                 // Take pre-destructive snapshot
                 rollback.snapshot_file(&entry.relative_path, &dest_file)?;
 
@@ -2920,6 +2941,42 @@ mod tests {
             *baseline = Some(b.clone());
         }
         outcome
+    }
+
+    /// Regression (WS-Z1): a two-way delete removed whatever had the name
+    /// when it ran, so a file edited between planning and that step was
+    /// deleted with its edit. It is now kept and reported.
+    #[test]
+    fn two_way_keeps_a_file_edited_after_the_plan_said_to_delete_it() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("x.txt"), "v1").unwrap();
+        fs::write(src.path().join("y.txt"), "y").unwrap();
+        for k in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(src.path().join(k), "kept").unwrap();
+        }
+        let pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+        // Deleted in the destination: the plan deletes the source copies.
+        fs::remove_file(dst.path().join("x.txt")).unwrap();
+        fs::remove_file(dst.path().join("y.txt")).unwrap();
+        let edited = src.path().join("x.txt");
+        let hooks = RunHooks {
+            on_file: Some(Arc::new(move |ev: &FileEvent| {
+                if matches!(ev, FileEvent::Started(p) if p == "x.txt") {
+                    fs::write(&edited, "v2, edited while the sync ran").unwrap();
+                }
+            })),
+            ..Default::default()
+        };
+        let rollback = TempDir::new().unwrap().keep();
+        let out = execute_sync_with(&ExecutorConfig { baseline: base.clone(), rollback_dir: Some(rollback), ..cfg(pair.clone()) }, &hooks).unwrap();
+        assert_eq!(fs::read_to_string(src.path().join("x.txt")).unwrap(), "v2, edited while the sync ran", "the edit was deleted");
+        assert!(!src.path().join("y.txt").exists(), "an unchanged file is still deleted");
+        assert_eq!(out.report.files_deleted, 1);
+        assert_eq!(out.report.errors, 1);
+        assert!(out.report.error_messages.iter().any(|m| m.contains("x.txt") && m.contains("changed")), "{:?}", out.report.error_messages);
     }
 
     /// Regression (review): the baseline was read from both sides after the

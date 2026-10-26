@@ -618,12 +618,28 @@ async fn delete_dir(target: &ResolvedSide, rel: &str, env: &ApplyEnv<'_>) -> Res
             if !path.exists() {
                 return Ok(true);
             }
-            let empty = std::fs::read_dir(&path).map(|mut d| d.next().is_none()).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-            if !empty {
-                return Ok(false);
+            #[cfg(test)]
+            before_empty_folder_delete(&path);
+            // `remove_dir` removes the folder only while it is empty, in one
+            // step: a file saved into it meanwhile keeps the folder (a check
+            // first and a recursive delete after could take that file along).
+            match std::fs::remove_dir(&path) {
+                Ok(()) => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    record_fs_ok(env.ledger, "delete", &[path.to_string_lossy().to_string()], &[], &id).await;
+                    Ok(true)
+                }
+                Err(e) => {
+                    let has_entries = std::fs::read_dir(&path).map(|mut d| d.next().is_some()).unwrap_or(false);
+                    if has_entries {
+                        Ok(false)
+                    } else if !path.exists() {
+                        Ok(true)
+                    } else {
+                        Err(format!("Cannot delete {}: {e}", path.display()))
+                    }
+                }
             }
-            delete_files_impl(vec![path.to_string_lossy().to_string()], env.permanent, env.ledger).await.map_err(|e| e.to_string())?;
-            Ok(true)
         }
         ResolvedSide::Remote { connector, .. } => {
             let abs = target.abs(rel)?;
@@ -753,4 +769,16 @@ pub async fn refresh(left: &ResolvedSide, right: &ResolvedSide, opts: &CompareOp
 /// Every path an action covers (for re-comparing): the steps' paths.
 pub fn touched_by(plan: &ActionPlan) -> HashSet<String> {
     plan.steps.iter().map(|s| s.path().to_string()).collect()
+}
+
+/// Tests: runs just before an empty local folder is removed (to put a file
+/// in it at the worst moment).
+#[cfg(test)]
+pub(crate) static BEFORE_EMPTY_FOLDER_DELETE: std::sync::Mutex<Option<Box<dyn Fn(&Path) + Send>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn before_empty_folder_delete(path: &Path) {
+    if let Some(f) = BEFORE_EMPTY_FOLDER_DELETE.lock().unwrap().as_ref() {
+        f(path);
+    }
 }

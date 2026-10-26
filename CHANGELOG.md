@@ -165,6 +165,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Security: on macOS and Windows the SMB password was on the mount command line (`mount_smbfs` URL, `net use /password:`), visible to every user in the process list. macOS now mounts through NetFS and Windows connects through `WNetAddConnection2` (to the UNC path; the old code also picked the drive letter from the temporary mount folder's first character), with the password as an API argument; Linux keeps passing it to `mount.cifs` in the environment.
+- Two-way sync (and any delete step) removed a file that was edited after the run was planned, edit included. A delete now goes ahead only while the file has the size and modification time the plan saw; otherwise it is kept, reported, and synced as an edited file next run.
+- Folder compare: removing a folder found empty could take along a file saved into it in the meantime. Local folders are now removed with an atomic "remove only if empty".
 - The window `Destroyed` handler stopped backups and saved the queue whenever any window closed; with several windows it now runs only when the last one closes, and the tray's *Backups…* opens the Backups screen in the first window only.
 - Choosing English on a computer set to another language did not stick: English counted as "no choice", so the computer's language came back at the next start. The choice is now stored as such (persisted state v1; an older non-English choice is kept).
 - The parent of a Windows folder directly on a drive (`C:\Users`) was `C:` (that drive's current folder) instead of `C:\`, and the parent of OneDrive's root (`/drive/root:`) was `/drive`, which cannot be listed; both now stop at the root.

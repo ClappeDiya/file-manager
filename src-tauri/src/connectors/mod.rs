@@ -36,6 +36,7 @@ pub mod peer_wire;
 pub mod server_to_server;
 pub mod sftp;
 pub mod smb;
+pub mod smb_native;
 pub mod webdav;
 // T-026..T-030: Cloud connectors
 pub mod b2;

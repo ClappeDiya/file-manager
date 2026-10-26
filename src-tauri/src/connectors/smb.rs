@@ -247,150 +247,94 @@ impl SmbConnector {
         base.join(format!("{sanitized_host}_{sanitized_share}"))
     }
 
-    /// Build platform-specific mount command.
-    fn build_mount_command(
+    /// How to mount a share on `os` (pure, so every platform's plan is
+    /// tested anywhere). The password never goes on a command line.
+    pub(crate) fn plan(
+        os: crate::cloud_folders::Os,
         host: &str,
         share: &str,
-        mount_point: &Path,
         username: Option<&str>,
         password: Option<&str>,
         config: &SmbConfig,
-    ) -> Command {
-        // Only the Linux branch uses the plain share path.
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-        let smb_path = format!("//{host}/{share}");
-
-        #[cfg(target_os = "macos")]
-        {
-            let mut cmd = Command::new("mount_smbfs");
-
-            // Build credentials portion of the URL
-            let auth = match (&config.auth_method, username, password) {
-                (SmbAuthMethod::Guest, _, _) => "guest@".to_string(),
-                (_, Some(user), Some(pass)) => {
-                    let domain_prefix = config
-                        .domain
-                        .as_ref()
-                        .map(|d| format!("{d};"))
-                        .unwrap_or_default();
-                    format!(
-                        "{domain_prefix}{}:{}@",
-                        urlencoded(user),
-                        urlencoded(pass)
-                    )
+    ) -> MountPlan {
+        use crate::cloud_folders::Os;
+        let user_with_domain = |sep: &str| username.map(|u| config.domain.as_ref().map(|d| format!("{d}{sep}{u}")).unwrap_or_else(|| u.to_string()));
+        match os {
+            Os::MacOs => {
+                let guest = matches!(config.auth_method, SmbAuthMethod::Guest);
+                MountPlan::NetFs {
+                    url: format!("smb://{host}/{}", urlencoded(share)),
+                    user: if guest { None } else { user_with_domain(";") },
+                    password: if guest { None } else { password.map(str::to_string) },
+                    guest,
                 }
-                (_, Some(user), None) => {
-                    let domain_prefix = config
-                        .domain
-                        .as_ref()
-                        .map(|d| format!("{d};"))
-                        .unwrap_or_default();
-                    format!("{domain_prefix}{}@", urlencoded(user))
+            }
+            Os::Windows => MountPlan::WNet { remote: format!("\\\\{host}\\{share}"), user: user_with_domain("\\"), password: password.map(str::to_string) },
+            Os::Linux => {
+                let mut opts = vec![format!("vers={}", config.max_version.as_mount_option())];
+                opts.push(
+                    match &config.auth_method {
+                        SmbAuthMethod::Guest => "guest",
+                        SmbAuthMethod::Kerberos => "sec=krb5",
+                        SmbAuthMethod::Ntlm => "sec=ntlm",
+                        SmbAuthMethod::Password => "sec=ntlmssp",
+                    }
+                    .to_string(),
+                );
+                if let Some(user) = username {
+                    // Credential values are validated upstream via validate_mount_credential()
+                    opts.push(format!("username={user}"));
                 }
-                _ => String::new(),
-            };
-
-            let url = format!("//{auth}{host}/{share}");
-            cmd.arg("-o")
-                .arg(format!("vers={}", config.max_version.as_mount_option()));
-            cmd.arg(&url);
-            cmd.arg(mount_point);
-            cmd
+                if let Some(domain) = &config.domain {
+                    opts.push(format!("domain={domain}"));
+                }
+                if config.encryption {
+                    opts.push("seal".to_string());
+                }
+                for (k, v) in &config.mount_options {
+                    opts.push(if v.is_empty() { k.clone() } else { format!("{k}={v}") });
+                }
+                MountPlan::Cifs { args: vec!["-t".into(), "cifs".into(), format!("//{host}/{share}"), String::new(), "-o".into(), opts.join(",")], password: password.map(str::to_string) }
+            }
         }
+    }
 
-        #[cfg(target_os = "linux")]
-        {
-            let mut cmd = Command::new("mount");
-            cmd.arg("-t").arg("cifs");
-            cmd.arg(&smb_path);
-            cmd.arg(mount_point);
-
-            let mut opts = Vec::new();
-
-            // SMB version
-            opts.push(format!("vers={}", config.max_version.as_mount_option()));
-
-            // Authentication
-            match &config.auth_method {
-                SmbAuthMethod::Guest => {
-                    opts.push("guest".to_string());
+    /// Mount following `plan` at `mount_point`; the folder the share's files
+    /// are then read through (the mount point, or the UNC path on Windows).
+    fn execute(plan: &MountPlan, mount_point: &Path) -> Result<PathBuf, AppError> {
+        match plan {
+            MountPlan::Cifs { args, password } => {
+                let mut cmd = Command::new("mount");
+                for a in args {
+                    // The empty placeholder is the mount point.
+                    if a.is_empty() { cmd.arg(mount_point) } else { cmd.arg(a) };
                 }
-                SmbAuthMethod::Kerberos => {
-                    opts.push("sec=krb5".to_string());
+                // mount.cifs reads the password from PASSWD, which keeps it off
+                // the process list and allows commas in it.
+                if let Some(p) = password {
+                    cmd.env("PASSWD", p);
                 }
-                SmbAuthMethod::Ntlm => {
-                    opts.push("sec=ntlm".to_string());
+                let output = cmd.output().map_err(|e| AppError::Connection {
+                    message: format!("Failed to execute mount command: {e}"),
+                    advice: "Ensure SMB client tools are installed on your system.".to_string(),
+                })?;
+                if !output.status.success() {
+                    return Err(smb_mount_error(&String::from_utf8_lossy(&output.stderr)));
                 }
-                SmbAuthMethod::Password => {
-                    opts.push("sec=ntlmssp".to_string());
-                }
+                Ok(mount_point.to_path_buf())
             }
-
-            if let Some(user) = username {
-                // Credential values are validated upstream via validate_mount_credential()
-                opts.push(format!("username={user}"));
+            #[cfg(target_os = "macos")]
+            MountPlan::NetFs { url, user, password, guest } => {
+                super::smb_native::netfs_mount(url, mount_point, user.as_deref(), password.as_deref(), *guest).map_err(|e| smb_mount_error(&e))?;
+                Ok(mount_point.to_path_buf())
             }
-            // mount.cifs reads the password from PASSWD, which keeps it off
-            // the process list and allows commas in it.
-            if let Some(pass) = password {
-                cmd.env("PASSWD", pass);
+            #[cfg(windows)]
+            MountPlan::WNet { remote, user, password } => {
+                super::smb_native::wnet_connect(remote, user.as_deref(), password.as_deref()).map_err(|e| smb_mount_error(&e))?;
+                Ok(PathBuf::from(remote))
             }
-            if let Some(domain) = &config.domain {
-                opts.push(format!("domain={domain}"));
-            }
-
-            if config.encryption {
-                opts.push("seal".to_string());
-            }
-
-            // Custom mount options
-            for (k, v) in &config.mount_options {
-                if v.is_empty() {
-                    opts.push(k.clone());
-                } else {
-                    opts.push(format!("{k}={v}"));
-                }
-            }
-
-            cmd.arg("-o").arg(opts.join(","));
-            cmd
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            let mut cmd = Command::new("net");
-            cmd.arg("use");
-
-            // Find available drive letter or use mount_point
-            let drive_letter = mount_point
-                .to_string_lossy()
-                .chars()
-                .next()
-                .unwrap_or('Z');
-            cmd.arg(format!("{drive_letter}:"));
-            cmd.arg(&smb_path);
-
-            if let Some(pass) = password {
-                cmd.arg(format!("/password:{pass}"));
-            }
-            if let Some(user) = username {
-                let full_user = config
-                    .domain
-                    .as_ref()
-                    .map(|d| format!("{d}\\{user}"))
-                    .unwrap_or_else(|| user.to_string());
-                cmd.arg(format!("/user:{full_user}"));
-            }
-
-            cmd
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        {
-            let _ = (smb_path, username, password, config);
-            let mut cmd = Command::new("echo");
-            cmd.arg("SMB mount not supported on this platform");
-            cmd
+            #[allow(unreachable_patterns)]
+            _ => Err(AppError::Connection { message: "SMB mounting is not supported on this platform.".into(), advice: "Use an SMB connection from macOS, Windows or Linux.".into() }),
         }
     }
 
@@ -405,13 +349,9 @@ impl SmbConnector {
 
         #[cfg(target_os = "windows")]
         {
-            let drive_letter = mount_point
-                .to_string_lossy()
-                .chars()
-                .next()
-                .unwrap_or('Z');
+            // Connected without a drive letter: end the UNC connection.
             let mut cmd = Command::new("net");
-            cmd.arg("use").arg(format!("{drive_letter}:")).arg("/delete");
+            cmd.arg("use").arg(mount_point).arg("/delete").arg("/y");
             cmd
         }
 
@@ -783,7 +723,7 @@ impl SmbConnector {
     /// The mount command for `profile`: share from the remote path, the
     /// user, the stored password and the domain. Returns the command, the
     /// local mount point and the share name.
-    pub(crate) async fn mount_command_for(&self, profile: &ConnectionProfile, password: Option<&str>) -> Result<(Command, PathBuf, String), AppError> {
+    pub(crate) async fn mount_command_for(&self, profile: &ConnectionProfile, password: Option<&str>) -> Result<(MountPlan, PathBuf, String), AppError> {
         let host = profile.host.clone();
         let username = profile.username.clone().filter(|u| !u.is_empty());
         let mut config = self.state.read().await.config.clone();
@@ -814,8 +754,8 @@ impl SmbConnector {
         // Validate SMB version
         Self::validate_version(&config)?;
         let mount_point = Self::mount_point_path(&host, &share_name);
-        let cmd = Self::build_mount_command(&host, &share_name, &mount_point, username.as_deref(), password, &config);
-        Ok((cmd, mount_point, share_name))
+        let plan = Self::plan(crate::cloud_folders::Os::current(), &host, &share_name, username.as_deref(), password, &config);
+        Ok((plan, mount_point, share_name))
     }
 }
 
@@ -834,7 +774,7 @@ impl Connector for SmbConnector {
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         let profile = profile.clone();
         Box::pin(async move {
-            let (mut cmd, mount_point, share_name) = self.mount_command_for(&profile, secret.as_deref()).await?;
+            let (plan, mount_point, share_name) = self.mount_command_for(&profile, secret.as_deref()).await?;
             let host = profile.host.clone();
 
             // Create mount point directory
@@ -845,30 +785,17 @@ impl Connector for SmbConnector {
                 }
             })?;
 
-            let result = tokio::task::spawn_blocking(move || {
-                let output = cmd.output().map_err(|e| AppError::Connection {
-                    message: format!("Failed to execute mount command: {e}"),
-                    advice: "Ensure SMB client tools are installed on your system.".to_string(),
-                })?;
-
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(smb_mount_error(&stderr));
-                }
-
-                Ok(())
-            })
-            .await
-            .map_err(|e| AppError::Connection {
-                message: format!("Mount task failed: {e}"),
-                advice: "Try again.".to_string(),
-            })?;
-
-            result?;
+            let mp = mount_point.clone();
+            let root = tokio::task::spawn_blocking(move || Self::execute(&plan, &mp))
+                .await
+                .map_err(|e| AppError::Connection {
+                    message: format!("Mount task failed: {e}"),
+                    advice: "Try again.".to_string(),
+                })??;
 
             let mut state = self.state.write().await;
             state.connected = true;
-            state.mount_point = Some(mount_point);
+            state.mount_point = Some(root);
             state.host = host;
             state.share_name = share_name;
 
@@ -1016,8 +943,29 @@ pub(crate) fn smb_credentials_rejected(stderr: &str) -> bool {
     .any(|k| s.contains(k))
 }
 
+/// How a share is mounted on this platform (see `SmbConnector::plan`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MountPlan {
+    /// Linux: `mount -t cifs`, the password in its environment.
+    Cifs { args: Vec<String>, password: Option<String> },
+    /// macOS: NetFS (no child process; the password is an argument).
+    NetFs { url: String, user: Option<String>, password: Option<String>, guest: bool },
+    /// Windows: a connection to the UNC path (no child process, no drive letter).
+    WNet { remote: String, user: Option<String>, password: Option<String> },
+}
+
+impl MountPlan {
+    /// What a mount following this plan shows in the process list.
+    #[cfg(test)]
+    pub(crate) fn visible_command_line(&self) -> Vec<String> {
+        match self {
+            Self::Cifs { args, .. } => std::iter::once("mount".to_string()).chain(args.iter().cloned()).collect(),
+            Self::NetFs { .. } | Self::WNet { .. } => Vec::new(),
+        }
+    }
+}
+
 /// URL-encode a string for SMB URLs.
-#[cfg(any(target_os = "macos", test))]
 fn urlencoded(s: &str) -> String {
     s.replace('%', "%25")
         .replace(' ', "%20")
@@ -1144,30 +1092,58 @@ mod profile_tests {
     use super::*;
     use crate::core::types::{ConnectionProtocol, SmbSettings};
 
-    fn args(cmd: &Command) -> Vec<String> {
-        cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect()
-    }
-
     /// Regression: the configured domain (and the stored password) never
     /// reached the mount command.
-    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn domain_and_password_reach_the_mount_command() {
+    async fn domain_and_password_reach_the_mount() {
         let mut p = crate::connectors::live_tests::profile(ConnectionProtocol::Smb, "nas.local", None, "alice", "/Share/docs");
         p.extras.smb = Some(SmbSettings { domain: Some("CORP".into()) });
         let c = SmbConnector::new();
-        let (cmd, mount_point, share) = c.mount_command_for(&p, Some("s3cret")).await.unwrap();
+        let (plan, _mount_point, share) = c.mount_command_for(&p, Some("s3cret")).await.unwrap();
         assert_eq!(share, "Share");
-        let a = args(&cmd);
-        assert_eq!(a[..4], ["-t".to_string(), "cifs".into(), "//nas.local/Share".into(), mount_point.to_string_lossy().to_string()]);
-        let opts = a.last().unwrap();
-        assert!(opts.contains("username=alice") && opts.contains("domain=CORP"), "{opts}");
-        // The password goes to mount.cifs in the environment, not the command line.
-        assert!(!opts.contains("s3cret"), "{opts}");
-        assert!(cmd.get_envs().any(|(k, v)| k == "PASSWD" && v.map(|v| v == "s3cret").unwrap_or(false)));
+        match plan {
+            MountPlan::Cifs { args, password } => {
+                assert_eq!(args[..4], ["-t".to_string(), "cifs".into(), "//nas.local/Share".into(), String::new()]);
+                let opts = args.last().unwrap();
+                assert!(opts.contains("username=alice") && opts.contains("domain=CORP"), "{opts}");
+                assert_eq!(password.as_deref(), Some("s3cret"));
+            }
+            MountPlan::NetFs { user, password, .. } | MountPlan::WNet { user, password, .. } => {
+                assert!(user.unwrap().contains("CORP"));
+                assert_eq!(password.as_deref(), Some("s3cret"));
+            }
+        }
         // A domain that would inject mount options is refused.
         p.extras.smb = Some(SmbSettings { domain: Some("CORP,uid=0".into()) });
         assert!(c.mount_command_for(&p, None).await.is_err());
+    }
+
+    /// Review finding (WS-Z1): on macOS the password was in the
+    /// `mount_smbfs` URL and on Windows in `net use /password:`, both visible
+    /// to every user in the process list. Every platform now keeps it off
+    /// the command line.
+    #[test]
+    fn the_password_is_never_on_a_command_line() {
+        use crate::cloud_folders::Os;
+        let mut config = SmbConfig { domain: Some("CORP".into()), ..SmbConfig::default() };
+        for os in [Os::Linux, Os::MacOs, Os::Windows] {
+            let plan = SmbConnector::plan(os, "nas.local", "Team Share", Some("alice"), Some("p@ss:w0rd"), &config);
+            let line = plan.visible_command_line().join(" ");
+            assert!(!line.contains("p@ss") && !line.contains("w0rd") && !line.contains("p%40ss"), "{os:?}: {line}");
+        }
+        assert_eq!(
+            SmbConnector::plan(Os::Windows, "nas.local", "Team Share", Some("alice"), Some("pw"), &config),
+            MountPlan::WNet { remote: "\\\\nas.local\\Team Share".into(), user: Some("CORP\\alice".into()), password: Some("pw".into()) }
+        );
+        assert_eq!(
+            SmbConnector::plan(Os::MacOs, "nas.local", "Team Share", Some("alice"), Some("pw"), &config),
+            MountPlan::NetFs { url: "smb://nas.local/Team%20Share".into(), user: Some("CORP;alice".into()), password: Some("pw".into()), guest: false }
+        );
+        config.auth_method = SmbAuthMethod::Guest;
+        assert_eq!(
+            SmbConnector::plan(Os::MacOs, "nas.local", "S", Some("alice"), Some("pw"), &config),
+            MountPlan::NetFs { url: "smb://nas.local/S".into(), user: None, password: None, guest: true }
+        );
     }
 }
 
