@@ -23,6 +23,10 @@ pub struct OAuthSignedIn {
     pub provider: OAuthProvider,
     /// The account signed in (e-mail or name), as the service reports it.
     pub account: Option<String>,
+    /// Signed in, but the service could not be reached to check it (the
+    /// tokens are kept; it connects once the service answers).
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 /// The app's OAuth connector instances (shared with the connector registry).
@@ -79,7 +83,21 @@ pub async fn finish_sign_in(manager: &ConnectionManager, cloud: &CloudConnectors
     let mut profile = manager.get_connection(connection_id).await?.ok_or_else(|| AppError::not_found("The connection no longer exists"))?;
     let provider = OAuthProvider::from_protocol(profile.protocol).ok_or_else(|| AppError::validation("This connection does not sign in with OAuth"))?;
     let connector = cloud.connector(provider);
-    connector.connect_with_secret(&profile, Some(grant.to_json()?)).await?;
+    if let Err(e) = connector.connect_with_secret(&profile, Some(grant.to_json()?)).await {
+        // A refused credential is not stored (the caller shows why).
+        if e.is_auth_failure() {
+            return Err(e);
+        }
+        // Anything else (no network, a server error) says nothing about the
+        // tokens, and the code they came from cannot be used again: keep them.
+        manager.save_connection(profile, Some(grant.to_json()?)).await?;
+        return Ok(OAuthSignedIn {
+            connection_id: connection_id.to_string(),
+            provider,
+            account: None,
+            warning: Some(format!("Signed in, but the service could not be reached to check it ({}). It connects once the service answers.", e.user_message())),
+        });
+    }
     let stored = cloud.grant(provider).await.unwrap_or(grant);
     // A sign-in with your own app: remember it, so the next sign-in uses it too.
     if let OAuthGrant::Token { client_id: Some(id), .. } = &stored {
@@ -91,7 +109,7 @@ pub async fn finish_sign_in(manager: &ConnectionManager, cloud: &CloudConnectors
     }
     // Saving stores the credential and clears any credentials-rejected flag.
     manager.save_connection(profile, Some(stored.to_json()?)).await?;
-    Ok(OAuthSignedIn { connection_id: connection_id.to_string(), provider, account: cloud.account(provider) })
+    Ok(OAuthSignedIn { connection_id: connection_id.to_string(), provider, account: cloud.account(provider), warning: None })
 }
 
 /// What the sign-in screen should say about a provider (is there a

@@ -32,6 +32,8 @@ export interface OAuthSignedIn {
   connection_id: string;
   provider: OAuthProvider;
   account: string | null;
+  /** Signed in, but the service could not be reached to check it (the tokens are kept). */
+  warning: string | null;
 }
 
 export function providerInfo(protocol: string): Promise<OAuthProviderInfo> {

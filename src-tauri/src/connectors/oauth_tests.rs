@@ -501,3 +501,22 @@ async fn cloud_rename_move_and_server_copy() {
     // A connector without a server-side copy relays instead.
     assert!(!super::nfs::NfsConnector::new().server_copy("/a", "/b").await.unwrap());
 }
+
+/// Regression (WS-Z1): the tokens from a finished sign-in were stored only
+/// after connecting with them worked. A network error at that moment threw
+/// them away, and the one-time code could not be exchanged again: the user
+/// had to sign in once more. Now they are stored, and the result says the
+/// service could not be reached yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_network_error_after_sign_in_keeps_the_tokens() {
+    let e = env().await;
+    let p = e.saved(ConnectionProtocol::GoogleDrive).await;
+    // The API cannot be reached (nothing listens on that port).
+    let gd = GoogleDriveConnector::new().with_credentials(e.store.clone()).with_endpoints("http://127.0.0.1:9/drive", "http://127.0.0.1:9/upload", "http://127.0.0.1:9/token");
+    let (db, od) = (e.dropbox(), e.onedrive());
+    let cloud = CloudConnectors { gdrive: &gd, dropbox: &db, onedrive: &od };
+    let grant = OAuthGrant::parse(r#"{"access_token":"a1","refresh_token":"r1","client_id":"c","expires_at":"2999-01-01T00:00:00Z"}"#).unwrap();
+    let signed = finish_sign_in(&e.mgr, &cloud, p.id, grant).await.expect("signed in although the service was not reachable");
+    assert!(signed.warning.as_deref().is_some_and(|w| w.contains("could not be reached")), "{:?}", signed.warning);
+    assert!(matches!(e.stored_grant(&p).await, OAuthGrant::Token { token, .. } if token.refresh_token.as_deref() == Some("r1")));
+}

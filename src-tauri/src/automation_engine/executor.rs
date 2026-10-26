@@ -737,6 +737,22 @@ fn purge_guard(path: &Path, home: Option<&Path>) -> Result<(), String> {
     if !meta.is_dir() {
         return Err(format!("{} is a file; use the Delete action for files", path.display()));
     }
+    // A linked folder on the way leads somewhere else: refused. Top-level
+    // aliases the system itself keeps (macOS /tmp, /var) are fine.
+    let mut ancestor = PathBuf::new();
+    for (i, c) in path.components().enumerate() {
+        ancestor.push(c);
+        let normal_depth = ancestor.components().filter(|c| matches!(c, std::path::Component::Normal(_))).count();
+        if i > 0 && normal_depth >= 2 && ancestor != path && std::fs::symlink_metadata(&ancestor).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("Purge refuses {}: it goes through the link {}", path.display(), ancestor.display()));
+        }
+    }
+    // Judge where it really is, too (the home folder behind an alias).
+    let real = std::fs::canonicalize(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    let real_home = home.and_then(|h| std::fs::canonicalize(h).ok());
+    if real_home.as_deref().is_some_and(|h| h.starts_with(&real)) || home.is_some_and(|h| h.starts_with(&real)) {
+        return Err(format!("Purge refuses {}: it is your home folder or contains it", path.display()));
+    }
     Ok(())
 }
 
@@ -783,7 +799,8 @@ async fn purge(path: &Path, max_files: Option<u64>, services: Option<&dyn Action
     if assessment.level == crate::safety::RiskLevel::High {
         return Err(format!("Safety check refused the purge of {display}: {} Delete it by hand in the file manager, which asks you to confirm.", assessment.reasons.join(" ")));
     }
-    let target = path.to_path_buf();
+    // Exactly the folder the guard judged.
+    let target = std::fs::canonicalize(path).map_err(|e| format!("Purge of {display} failed: {e}"))?;
     tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&target)).await.map_err(|e| format!("Purge failed: {e}"))?.map_err(|e| format!("Purge of {display} failed: {e}"))?;
     if let Some(s) = services {
         s.record_operation(&intent).await;
@@ -2418,6 +2435,27 @@ mod step_tests {
             std::os::unix::fs::symlink(&deep, &link).unwrap();
             assert!(purge_guard(&link, None).unwrap_err().contains("is a link"));
         }
+    }
+
+    /// Regression (WS-Z1): only the target itself was checked for being a
+    /// link; a link among its parent folders led the purge somewhere else
+    /// (another drive, the home folder) and deleted that.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn purge_does_not_go_through_a_linked_parent_folder() {
+        let t = tempfile::tempdir().unwrap();
+        let elsewhere = t.path().join("elsewhere/important");
+        write(&elsewhere.join("keep.txt"), "precious");
+        std::fs::create_dir_all(t.path().join("jobs")).unwrap();
+        std::os::unix::fs::symlink(t.path().join("elsewhere"), t.path().join("jobs/link")).unwrap();
+        let through_link = t.path().join("jobs/link/important");
+        let e = run(RuleAction::Purge { path: s(&through_link), max_files: None }, None, None).await.unwrap_err();
+        assert!(e.contains("link"), "{e}");
+        assert_eq!(std::fs::read_to_string(elsewhere.join("keep.txt")).unwrap(), "precious");
+        // The guard also judges where a path really leads.
+        let home_link = t.path().join("jobs/home");
+        std::os::unix::fs::symlink(t.path().join("elsewhere"), &home_link).unwrap();
+        assert!(purge_guard(&home_link.join("important"), Some(&elsewhere)).is_err());
     }
 
     #[tokio::test]

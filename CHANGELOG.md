@@ -165,6 +165,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Automation *Purge* step: only the target folder itself was checked for being a link; a linked folder among its parents led the purge elsewhere (another drive, the home folder) and deleted that. A path through a linked folder (below the top level) is refused, the home-folder check also judges the real location, and exactly that folder is removed.
+- Signing in to Google Drive, Dropbox or OneDrive: the new tokens were stored only after connecting with them worked, so a network error at that moment discarded them (and the one-time code), and you had to sign in again. They are now kept on any error other than a refused credential, and the sign-in says the service could not be reached yet.
 - Security: on macOS and Windows the SMB password was on the mount command line (`mount_smbfs` URL, `net use /password:`), visible to every user in the process list. macOS now mounts through NetFS and Windows connects through `WNetAddConnection2` (to the UNC path; the old code also picked the drive letter from the temporary mount folder's first character), with the password as an API argument; Linux keeps passing it to `mount.cifs` in the environment.
 - Two-way sync (and any delete step) removed a file that was edited after the run was planned, edit included. A delete now goes ahead only while the file has the size and modification time the plan saw; otherwise it is kept, reported, and synced as an edited file next run.
 - Folder compare: removing a folder found empty could take along a file saved into it in the meantime. Local folders are now removed with an atomic "remove only if empty".

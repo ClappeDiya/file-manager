@@ -86,6 +86,18 @@ describe("Google Drive wizard", () => {
     window.removeEventListener("ufop:connections-changed", changed);
   });
 
+  // WS-Z1: a sign-in whose check could not reach the service keeps the
+  // tokens; the wizard says so instead of failing.
+  it("says when the service could not be reached right after signing in", async () => {
+    backend({ oauth_await: () => ({ connection_id: "c1", provider: "google_drive", account: null, warning: "Signed in, but the service could not be reached to check it (timeout)." }) });
+    render(<ConnectGDriveWizard />);
+    fireEvent.change(screen.getByLabelText("Connection name"), { target: { value: "Drive" } });
+    next();
+    fireEvent.click(await screen.findByRole("button", { name: "Sign in with Google Drive" }));
+    expect(await screen.findByTestId("cloud-signed-in-warning")).toHaveTextContent("could not be reached");
+    expect(screen.getByTestId("cloud-signed-in")).toHaveTextContent("Signed in.");
+  });
+
   // Regression: a sign-in with your own OAuth app stores its client id on
   // the connection; the wizard's later saves sent client_id: null and
   // wiped it, so the next sign-in fell back to the built-in app.
